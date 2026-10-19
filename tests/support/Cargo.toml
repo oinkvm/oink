@@ -1,0 +1,33 @@
+[package]
+name = "oink-test-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = ["clipboard", "input", "network"]
+network = ["dep:oink-network"]
+clipboard = ["dep:oink-clipboard"]
+input = ["dep:oink-input"]
+protocol = ["dep:oink-protocol", "dep:serde_json"]
+
+[[bin]]
+name = "v1-peer"
+required-features = ["protocol"]
+
+[[bin]]
+name = "v1-fixtures"
+required-features = ["protocol"]
+
+[dependencies]
+oink-network = { workspace = true, optional = true, features = ["test-support"] }
+oink-input = { path = "../../crates/oink-input", optional = true }
+oink-foundation = { path = "../../crates/oink-foundation" }
+oink-clipboard = { workspace = true, optional = true }
+oink-protocol = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[lints]
+workspace = true

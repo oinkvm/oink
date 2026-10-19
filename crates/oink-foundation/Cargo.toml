@@ -1,0 +1,30 @@
+[package]
+name = "oink-foundation"
+description = "基础设施：共用数据类型（设备、坐标、屏幕、输入事件、剪贴板）、配置与日志"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["rc"] }
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+arc-swap = "1.7"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Threading", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming"] }
+
+[[test]]
+name = "process_priority"
+harness = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+serde_json.workspace = true

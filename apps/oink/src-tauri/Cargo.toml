@@ -1,0 +1,66 @@
+[package]
+name = "oink-ui"
+description = "Oink 界面：Tauri 托盘应用与各视图（前端在 apps/oink/src）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+default-run = "oink"
+autobins = false
+
+[lib]
+name = "oink_ui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "oink"
+path = "src/main.rs"
+
+[dependencies]
+oink-agent.workspace = true
+# 登录时自动启动：本次是否由登录项启动（不弹主窗口）、Windows 登录项的 `--autostart` 参数
+oink-autostart.workspace = true
+oink-foundation.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+# Vector-only icon rendering: no fonts or external raster-image loaders.
+resvg = { version = "0.45.1", default-features = false }
+tokio.workspace = true
+base64 = "0.22"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
+
+# 产品只支持 macOS 与 Windows：其他系统上只编译与平台无关的部分（JSON 约定测试），
+# 这样 Linux CI 不需要安装 WebKitGTK 等系统依赖。
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+tauri = { version = "~2.12.4", features = ["tray-icon", "image-png"] }
+
+[target.'cfg(any(target_os = "macos", windows))'.build-dependencies]
+tauri-build = { version = "~2.7.3", features = [] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSWindow", "NSButton", "NSControl", "NSPanel", "NSView", "NSEvent", "NSGraphics", "NSScreen", "NSColor", "NSImage", "NSAppearance", "NSHapticFeedback"] }
+
+[dev-dependencies]
+tempfile = "3"
+# IPC 生命周期测试：假的输入，不操作桌面。
+oink-test-support = { path = "../../../tests/support" }
+oink-network.workspace = true
+
+[features]
+# `tauri build` 打开此特性，让前端资源嵌入可执行文件（否则 debug 构建从 devUrl 加载）。
+custom-protocol = ["tauri/custom-protocol"]
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Globalization", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Oink third-party Rust licenses</title>
+<body><h1>Rust dependency licenses</h1>
+<p>The complete Rust, npm and native inventory is in third-party-licenses.json and THIRD_PARTY_LICENSES.md.</p>
+{{#each licenses}}
+<section><h2>{{name}} ({{id}})</h2><ul>
+{{#each used_by}}<li>{{crate.name}} {{crate.version}} — <a href="{{crate.repository}}">source repository</a></li>{{/each}}
+</ul><pre>{{text}}</pre></section>
+{{/each}}
+</body></html>

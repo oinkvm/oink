@@ -1,0 +1,96 @@
+name: Build and test
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  PYTHONUTF8: '1'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  MACOSX_DEPLOYMENT_TARGET: '14.2'
+  CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+jobs:
+  platforms:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            jobs: '2'
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            jobs: '4'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: ${{ matrix.jobs }}
+      RUST_TEST_THREADS: '4'
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        with:
+          toolchain: '1.99.0'
+          components: rustfmt, clippy
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.14.6'
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '24.14.1'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-about*
+            ~/.cargo/bin/cargo-deny*
+          key: policy-tools-${{ runner.os }}-${{ runner.arch }}-rust1.99.0-about0.9.2-deny0.20.2
+      - name: Assert product architecture and pin npm
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == macOS ]]; then test "$(uname -m)" = arm64; fi
+          if [[ "$RUNNER_OS" == Windows ]]; then test "$PROCESSOR_ARCHITECTURE" = AMD64; fi
+          npm install --global npm@11.11.0
+      - name: Frontend and attribution
+        shell: bash
+        run: |
+          npm ci
+          npm run -w apps/oink typecheck
+          npm run -w apps/oink test
+          npm run -w apps/oink build
+          if ! cargo about --version 2>/dev/null | grep -q '0.9.2$'; then cargo install cargo-about --version 0.9.2 --locked --features cli; fi
+          npm run licenses:check -- --release-sources
+      - name: File Provider compile and pure tests
+        if: runner.os == 'macOS'
+        run: python packaging/macos/check.py --test
+      - name: Rust formatting, all targets, integration and release parser tests
+        shell: bash
+        run: |
+          cargo fmt --all --check
+          python build-support/ci.py
+      - name: Packaging pure tests
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == Windows ]]; then export PATH="/c/Program Files/Git/usr/bin:$PATH"; fi
+          python -m unittest discover -s packaging/tests -v
+      - name: Compile and inspect Windows MSI without installation
+        if: runner.os == 'Windows'
+        run: python build-support/package.py --public-version --platform windows --build 28 --output-root "${{ runner.temp }}/package-check"
+      - name: Dependency policy
+        shell: bash
+        run: |
+          if ! cargo deny --version 2>/dev/null | grep -q '0.20.2$'; then cargo install cargo-deny --version 0.20.2 --locked; fi
+          cargo deny check

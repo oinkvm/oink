@@ -1,0 +1,107 @@
+name: Publish Windows feed
+on:
+  workflow_call:
+    inputs:
+      artifact:
+        description: This run's SignPath-verified MSI, release.json and update.json
+        required: true
+        type: string
+      source_tree_sha256:
+        required: true
+        type: string
+      release_tag:
+        required: true
+        type: string
+      signpath_approval:
+        required: true
+        type: string
+      qualified_build:
+        required: true
+        type: string
+    secrets:
+      UPDATE_FEED_WRITER_TOKEN:
+        required: true
+      WINDOWS_UPDATE_ED25519_PEM_WIN_2026_01:
+        required: false
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+jobs:
+  gate:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.repository_owner == 'oinkvm'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - id: gate
+        run: |
+          enabled=$(python3 build-support/update/feed_site.py enabled --platform windows --config-only)
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        if: steps.gate.outputs.enabled == 'true'
+        with:
+          ref: update-feed-state
+          path: feed-state
+          persist-credentials: false
+  sign:
+    needs: gate
+    if: needs.gate.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    environment: windows-update-signing
+    concurrency:
+      group: oink-update-feed-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: update-feed-state
+          path: feed-state
+          token: ${{ secrets.UPDATE_FEED_WRITER_TOKEN }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.artifact }}
+          path: release-input
+      - name: Sign qualified Windows package only
+        env:
+          OINK_SOURCE_TREE_SHA256: ${{ inputs.source_tree_sha256 }}
+          OINK_RELEASE_TAG: ${{ inputs.release_tag }}
+          OINK_SIGNPATH_APPROVAL_ID: ${{ inputs.signpath_approval }}
+          WINDOWS_UPDATE_ED25519_PEM_WIN_2026_01: ${{ secrets.WINDOWS_UPDATE_ED25519_PEM_WIN_2026_01 }}
+        run: python3 build-support/update/release.py sign-package
+      - name: Register immutable public asset and reserve Windows sequences
+        env:
+          OINK_UPDATE_QUALIFIED_BUILD: ${{ inputs.qualified_build }}
+        run: |
+          python3 build-support/update/release.py register
+          python3 build-support/update/reserve.py
+      - name: Sign reserved Windows manifests
+        env:
+          WINDOWS_UPDATE_ED25519_PEM_WIN_2026_01: ${{ secrets.WINDOWS_UPDATE_ED25519_PEM_WIN_2026_01 }}
+        run: |
+          python3 build-support/update/feed.py sign
+          python3 build-support/update/feed_site.py candidate --platform windows --output windows-candidate
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-windows-feed
+          path: windows-candidate
+          retention-days: 2
+  deploy:
+    needs: sign
+    uses: ./.github/workflows/deploy-feed.yml
+    with:
+      platform: windows
+      artifact: verified-windows-feed
+    secrets:
+      UPDATE_FEED_WRITER_TOKEN: ${{ secrets.UPDATE_FEED_WRITER_TOKEN }}

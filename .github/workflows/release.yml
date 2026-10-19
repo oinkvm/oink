@@ -1,0 +1,196 @@
+name: Release packages
+on:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: Reserved monotonically increasing product build (first public release is 28)
+        required: true
+        default: '28'
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: release-packages
+  cancel-in-progress: false
+env:
+  CARGO_INCREMENTAL: '0'
+  PYTHONUTF8: '1'
+  MACOSX_DEPLOYMENT_TARGET: '14.2'
+  CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+  OINK_REPORT_REGION: eu
+jobs:
+  package:
+    if: github.repository == 'oinkvm/oink' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            platform: macos
+            target: aarch64-apple-darwin
+            jobs: '2'
+          - os: windows-2022
+            platform: windows
+            target: x86_64-pc-windows-msvc
+            jobs: '4'
+    runs-on: ${{ matrix.os }}
+    environment: release
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CARGO_BUILD_JOBS: ${{ matrix.jobs }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        with:
+          toolchain: '1.99.0'
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-${{ matrix.target }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.14.6'
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '24.14.1'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-about*
+            ${{ runner.temp }}/package-tools
+          key: release-tools-${{ runner.os }}-${{ runner.arch }}-rust1.99.0-about0.9.2-wix5.0.2-sparkle2.9.6
+      - name: Validate release inputs
+        id: inputs
+        shell: bash
+        env:
+          BUILD: ${{ inputs.build }}
+          OINK_REPORT_DSN: ${{ secrets.OINK_REPORT_DSN }}
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+        run: python build-support/public_release.py inputs
+      - name: Check native installer policy before product compilation
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vs = & "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dev = Join-Path $vs 'Common7/Tools/VsDevCmd.bat'
+          $out = Join-Path $env:RUNNER_TEMP 'installer-policy'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          foreach ($name in @('AuthorizationTests','QuiescenceTests','MaintenanceCleanupTests','CloudFilesCleanupTests','FinishInstallTests','GracefulStopTests')) {
+            $src = Join-Path $env:GITHUB_WORKSPACE "packaging/windows/$name.cpp"
+            cmd /d /c "`"$dev`" -arch=x64 >nul && cl.exe /nologo /EHsc /std:c++17 /W4 /WX /MT `"$src`" /Fo`"$out/$name.obj`" /Fe`"$out/$name.exe`" advapi32.lib user32.lib && `"$out/$name.exe`""
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+      - name: Pin build tools
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == macOS ]]; then test "$(uname -m)" = arm64; fi
+          npm install --global npm@11.11.0
+          if ! cargo about --version 2>/dev/null | grep -q '0.9.2$'; then cargo install cargo-about --version 0.9.2 --locked --features cli; fi
+      - name: Prepare ephemeral signing keychain and notary profile
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_FINGERPRINT: ${{ vars.MACOS_SIGNING_FINGERPRINT }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
+        run: python packaging/macos/ci-keychain.py
+      - name: Use TCP for Apple ticket delivery on hosted Macs
+        if: runner.os == 'macOS' && runner.environment == 'github-hosted'
+        shell: bash
+        run: |
+          # Confirmed hosted-runner HTTP/3 drops to CloudKit cause stapler exit68.
+          # This disposable VM rule forces HTTPS/TCP; never run it on local hosts.
+          # https://github.com/actions/runner-images/issues/14924
+          echo 'block return out quick proto udp from any to any port 443' | sudo pfctl -f -
+          sudo pfctl -E
+      - name: Build and audit production packages
+        shell: bash
+        env:
+          OINK_REPORT_DSN: ${{ secrets.OINK_REPORT_DSN }}
+          MACOS_SIGNING_FINGERPRINT: ${{ vars.MACOS_SIGNING_FINGERPRINT }}
+          BUILD: ${{ inputs.build }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          args=()
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            args+=(--notary-profile release-notary --notary-keychain "$RUNNER_TEMP/release-signing/signing.keychain-db" --notary-timeout 1200)
+          fi
+          python build-support/package.py --public-version --platform "$PLATFORM" --build "$BUILD" --output-root "$RUNNER_TEMP/packages" --tool-cache "$RUNNER_TEMP/package-tools" "${args[@]}"
+          python build-support/check-report-configuration.py --packages "$RUNNER_TEMP/packages" --platform "$PLATFORM"
+          python build-support/public_release.py stage --packages "$RUNNER_TEMP/packages" --platform "$PLATFORM" --build "$BUILD" --output "$RUNNER_TEMP/distribution"
+      - name: Remove ephemeral signing material
+        if: always() && runner.os == 'macOS'
+        run: python packaging/macos/ci-keychain.py cleanup
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: runner.os == 'Windows' && steps.inputs.outputs.sign_windows == 'true'
+        id: unsigned
+        with:
+          name: windows-signing-input-${{ inputs.build }}
+          path: ${{ runner.temp }}/distribution/*
+          if-no-files-found: error
+      - name: Sign Windows MSI when configured
+        if: runner.os == 'Windows' && steps.inputs.outputs.sign_windows == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: windows-msi-v1
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: ${{ runner.temp }}/signed
+      - name: Verify final Windows signatures and replace unsigned installer
+        if: runner.os == 'Windows' && steps.inputs.outputs.sign_windows == 'true'
+        shell: pwsh
+        run: |
+          ./packaging/windows/verify.ps1 -Directory "$env:RUNNER_TEMP/signed" -Record "$env:RUNNER_TEMP/distribution/release-windows.json" -ToolCache "$env:RUNNER_TEMP/package-tools"
+          Copy-Item "$env:RUNNER_TEMP/signed/*.msi" "$env:RUNNER_TEMP/distribution/" -Force
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-${{ matrix.platform }}-${{ inputs.build }}
+          path: ${{ runner.temp }}/distribution/*
+          if-no-files-found: error
+      - name: Preserve symbols separately (never release assets)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: symbols-${{ matrix.platform }}-${{ inputs.build }}
+          path: ${{ runner.temp }}/packages/**/symbols.noindex/**
+          include-hidden-files: true
+          if-no-files-found: error
+  draft:
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.14.6'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: package-*-${{ inputs.build }}
+          path: ${{ runner.temp }}/downloaded
+      - name: Assemble matching final assets and create draft
+        env:
+          BUILD: ${{ inputs.build }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python build-support/public_release.py assemble --downloads "$RUNNER_TEMP/downloaded" --output "$RUNNER_TEMP/release" --build "$BUILD"
+          python build-support/public_release.py publish --output "$RUNNER_TEMP/release" --notes .github/release-notes.txt

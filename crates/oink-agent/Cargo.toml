@@ -1,0 +1,106 @@
+[package]
+name = "oink-agent"
+description = "服务进程：组装各模块；对界面提供 API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[features]
+sparkle = []
+
+[dependencies]
+oink-update = { path = "../oink-update" }
+oink-foundation.workspace = true
+oink-telemetry.workspace = true
+oink-crash.workspace = true
+oink-input.workspace = true
+oink-locator.workspace = true
+oink-display.workspace = true
+oink-routing.workspace = true
+oink-clipboard.workspace = true
+oink-network.workspace = true
+oink-protocol.workspace = true
+oink-audio.workspace = true
+oink-autostart.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender = "0.2"
+fs2 = "0.4"
+blake3 = "1.8"
+sha2 = "0.10"
+crossbeam-queue = "0.3"
+arc-swap = "1.7"
+tempfile = "3"
+flate2 = "1.1"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+zip = { version = "9.0", default-features = false, features = ["deflate"] }
+serde.workspace = true
+serde_path_to_error = "0.1"
+# float_roundtrip：布局以 JSON 同步、保存，浮点数必须逐位往返，否则同一个
+# 布局版本在各设备上会差 1 ULP。
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+anyhow.workspace = true
+tokio.workspace = true
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+getrandom = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+unicode-casefold = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+notify = "8"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSAppearance", "NSResponder", "NSRunningApplication", "NSMenu", "NSMenuItem", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSCell", "NSView", "NSWindow", "NSEvent", "NSGraphics", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSImageView", "NSPanel", "NSScreen", "NSColor", "NSTextField", "NSFont", "NSText"] }
+
+objc2-core-foundation = "0.3"
+objc2-core-graphics = "0.3"
+
+# 合成的「外设」按键与光标可见性（`synth`，实机自测用）。
+[target.'cfg(windows)'.dependencies]
+oink-winsvc = { path = "../oink-winsvc" }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_WindowsFirewall",
+    "Win32_System_Com",
+    "Win32_System_Services",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_RemoteDesktop",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    # synth：按物理像素合成移动（Per-Monitor-V2）
+    "Win32_UI_HiDpi",
+] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+resvg = { version = "0.45.1", default-features = false }
+oink-test-support = { path = "../../tests/support" }
+tokio = { workspace = true, features = ["test-util"] }
+
+# 例子 aim_selftest：主线程跑 AppKit 的事件循环（叠加层窗口要收到鼠标事件）
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication"] }
+
+[[bin]]
+name = "oink-backend"
+path = "src/backend/main.rs"
+
+[build-dependencies]
+cc = "1.2"

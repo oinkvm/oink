@@ -1,0 +1,66 @@
+[package]
+name = "oink-locator"
+description = "屏幕覆盖层：光标定位拖尾（快速画圈时在光标后面绘制），瞄准小游戏的规则、画面与全屏叠加层（macOS / Windows）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+oink-foundation.workspace = true
+oink-display.workspace = true
+oink-protocol.workspace = true
+oink-routing.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFData", "CFCGTypes"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGImage", "CGColorSpace", "CGDataProvider", "CGDirectDisplay"] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CALayer", "CATransaction", "objc2-core-foundation"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry", "NSObject", "NSArray", "NSNotification", "NSString"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSWorkspace",
+    "NSEvent",
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+    "NSPanel",
+    "NSColor",
+    "NSGraphics",
+    "NSScreen",
+    "objc2-core-foundation",
+    "objc2-quartz-core",
+] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi",
+    "Win32_System_Threading",
+    "Win32_UI_Input_Ime",
+    "Win32_Globalization",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+# 例子里把叠加层的日志打到标准错误
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFRunLoop", "CFString"] }
+# 例子 aim_demo / key_sink：AppKit 的事件循环、一个带文本框的普通窗口
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication", "NSWorkspace", "libc", "NSWindow", "NSView", "NSControl", "NSTextField", "NSEvent", "NSScreen", "NSGraphics"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSDate", "NSRunLoop", "NSGeometry"] }
+
+[lints]
+workspace = true

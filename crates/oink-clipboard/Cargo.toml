@@ -1,0 +1,84 @@
+[package]
+name = "oink-clipboard"
+description = "剪贴板：读写系统剪贴板（src/macos、src/windows）；同步逻辑（通用）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+oink-foundation.workspace = true
+oink-protocol.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+getrandom = "0.3"
+# 同步逻辑（src/sync*）：内容哈希
+blake3 = "1"
+# Native content transfers run on ordinary background tasks.
+tokio.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+block2 = "0.6"
+dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-core-foundation = "0.3"
+objc2-image-io = { version = "0.3", default-features = false, features = ["std", "CGImageSource", "CGImageDestination", "objc2-core-graphics"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGEvent", "CGEventSource", "CGEventTypes", "CGGeometry", "CGImage", "CGColorSpace", "CGContext", "CGBitmapContext"] }
+# NSPasteboard legacy-name/dynamic-UTI aliases must not be published twice.
+objc2-core-services = { version = "0.3", default-features = false, features = ["std", "LaunchServices", "UTType", "FSEvents", "dispatch2"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem", "NSImageRep", "NSStringDrawing", "NSAttributedString", "NSBitmapImageRep", "block2", "NSApplication", "NSResponder", "NSView", "NSWindow", "NSPanel", "NSColor", "NSGraphics", "NSScreen", "NSEvent", "NSImage", "NSWorkspace", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSFilePromiseProvider", "NSFilePromiseReceiver", "NSRunningApplication", "objc2-core-foundation", "objc2-core-graphics"] }
+
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_CloudFilters", "Win32_Storage_FileSystem", "Win32_System_CorrelationVector", "Win32_System_LibraryLoader", "Win32_Foundation", "Win32_Security"] }
+png = "0.18"
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg"] }
+# `#[implement]` 生成的代码引用 `::windows_core`
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_Marshal",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+    # 拖放（src/windows/dnd.rs）：拖放线程按显示器 DPI 感知
+    "Win32_UI_HiDpi",
+] }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg"] }
+png = "0.18"
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
+tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+anyhow.workspace = true
+# examples/windows_dnd.rs：注入鼠标事件
+windows = { version = "0.62", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Accessibility", "Win32_System_Variant", "Win32_System_Com", "Win32_System_StationsAndDesktops", "Win32_Security"] }
+
+# examples/mac_dnd.rs：注入鼠标事件、找 Finder 窗口
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSGraphicsContext"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGEvent", "CGEventSource", "CGEventTypes", "CGRemoteOperation", "CGWindow", "CGGeometry", "CGDirectDisplay"] }
+
+[lints]
+workspace = true

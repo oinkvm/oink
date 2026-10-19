@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "product": "Oink",
+  "source_tree_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "version": "0.1.0",
+  "build": 1,
+  "architecture": "x64",
+  "minimum_os": "10.0",
+  "minimumWindowsBuild": 19045,
+  "updater_included": true,
+  "collector_included": true,
+  "protocol_baseline": 1,
+  "upgrade_code": "4D39E4BE-6792-4CD6-B344-A5E95A270EA6",
+  "components": [
+    "oink.exe",
+    "oink-agent.exe",
+    "oink-service.exe",
+    "oink-update-worker.exe",
+    "oink-crash-collector.exe"
+  ],
+  "signature": "verify Authenticode on final installed files; signing changes file hashes"
+}

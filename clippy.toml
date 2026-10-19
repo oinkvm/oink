@@ -1,0 +1,2 @@
+# 与 workspace.package.rust-version 保持一致
+msrv = "1.99.0"

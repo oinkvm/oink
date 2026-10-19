@@ -1,0 +1,61 @@
+[package]
+name = "oink-network"
+description = "组网：身份、设备组、发现、加入、连接与中继"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[features]
+# Enabled only by the unpublished shared test-support package.
+test-support = []
+
+[dependencies]
+oink-foundation.workspace = true
+oink-protocol.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64 = "0.22"
+tokio.workspace = true
+anyhow.workspace = true
+
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+socket2 = "0.6"
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8", "serde"] }
+spake2 = "0.4"
+rand = "0.8"
+sha2 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+zeroize = { version = "1", features = ["derive"] }
+if-addrs = "0.13"
+gethostname = "0.5"
+bytes = "1"
+arc-swap = "1.7"
+crossbeam-queue = "0.3"
+
+# 非 macOS 平台的 mDNS；macOS 上默认使用系统 DNS-SD，
+# 也可用 OINK_MDNS=builtin 切换到它做对比测试。
+mdns-sd = "0.21"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+oink-audio.workspace = true
+oink-clipboard.workspace = true
+blake3 = "1"
+tracing-subscriber.workspace = true
+tempfile = "3"
+
+[lints]
+workspace = true

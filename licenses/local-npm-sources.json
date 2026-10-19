@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "packages": [
+    {
+      "name": "oink-ui",
+      "version": "1.0.2",
+      "integrity": "sha512-6wv2z3DUIvGrUXTe3hCOtLbUPmBVk750feYZCZB2EU+TbvzuBQX1NXQypccpuFYz6GP2tt6OcaN/qtVl88s2WQ==",
+      "repository": "https://github.com/oinkvm/oink-ui",
+      "source": "https://github.com/oinkvm/oink-ui/tree/7df1837a48b8d01e1f688b232ac7b36280c7220f",
+      "reason": "User-authorized local-beta input only. Identical published exact package/version/integrity must replace the local lock resolution before public export. --release-sources rejects this local input."
+    }
+  ]
+}

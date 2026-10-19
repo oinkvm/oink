@@ -1,0 +1,524 @@
+{
+  "schemaVersion": 1,
+  "packages": [
+    {
+      "name": "@rolldown/binding-android-arm-eabi",
+      "version": "1.2.14",
+      "licenseExpression": "MIT",
+      "sourcePackage": "rolldown",
+      "sourceVersion": "1.2.14",
+      "reason": "Platform-specific native binary of the same rolldown release; its npm tarball omits license files. The parent package retains the shared project license and full embedded third-party notices.",
+      "files": [
+        {
+          "path": "node_modules/rolldown/LICENSE",
+          "sha256": "23ecfff35a5a2e80d92142f75228912c3b1abc4b5a8337a821ff4397e2f9f734"
+        },
+        {
+          "path": "node_modules/rolldown/THIRD-PARTY-LICENSE",
+          "sha256": "a877291d800ed43692f3f9ae09d8e01cc6f7293ad39d43896059c188ffbb8b7c"
+        }
+      ]
+    },
+    {
+      "name": "@rolldown/binding-android-arm64",
+      "version": "1.2.14",
+      "licenseExpression": "MIT",
+      "sourcePackage": "rolldown",
+      "sourceVersion": "1.2.14",
+      "reason": "Platform-specific native binary of the same rolldown release; its npm tarball omits license files. The parent package retains the shared project license and full embedded third-party notices.",
+      "files": [
+        {
+          "path": "node_modules/rolldown/LICENSE",
+          "sha256": "23ecfff35a5a2e80d92142f75228912c3b1abc4b5a8337a821ff4397e2f9f734"
+        },
+        {
+          "path": "node_modules/rolldown/THIRD-PARTY-LICENSE",
+          "sha256": "a877291d800ed43692f3f9ae09d8e01cc6f7293ad39d43896059c188ffbb8b7c"
+        }
+      ]
+    },
+    {
+      "name": "@rolldown/binding-darwin-arm64",
+      "version": "1.2.14",
+      "licenseExpression": "MIT",
+      "sourcePackage": "rolldown",
+      "sourceVersion": "1.2.14",
+      "reason": "Platform-specific native binary of the same rolldown release; its npm tarball omits license files. The parent package retains the shared project license and full embedded third-party notices.",
+      "files": [
+        {
+          "path": "node_modules/rolldown/LICENSE",
+          "sha256": "23ecfff35a5a2e80d92142f75228912c3b1abc4b5a8337a821ff4397e2f9f734"
+        },
+        {
+          "path": "node_modules/rolldown/THIRD-PARTY-LICENSE",
+          "sha256": "a877291d800ed43692f3f9ae09d8e01cc6f7293ad39d43896059c188ffbb8b7c"
+        }
+      ]
+    },
+    {
+      "name": "@rolldown/binding-darwin-x64",
+      "version": "1.2.14",
+      "licenseExpression": "MIT",
+      "sourcePackage": "rolldown",
+      "sourceVersion": "1.2.14",
+      "reason": "Platform-specific native binary of the same rolldown release; its npm tarball omits license files. The parent package retains the shared project license and full embedded third-party notices.",
+      "files": [
+        {
+          "path": "node_modules/rolldown/LICENSE",
+          "sha256": "23ecfff35a5a2e80d92142f75228912c3b1abc4b5a8337a821ff4397e2f9f734"
+        },
+        {
+          "path": "node_modules/rolldown/THIRD-PARTY-LICENSE",
+          "sha256": "a877291d800ed43692f3f9ae09d8e01cc6f7293ad39d43896059c188ffbb8b7c"
+        }
+      ]
+    },
+    {
+      "name": "@rolldown/binding-freebsd-x64",
+      "version": "1.2.14",
+      "licenseExpression": "MIT",
+      "sourcePackage": "rolldown",
+      "sourceVersion": "1.2.14",
+      "reason": "Platform-specific native binary of the same rolldown release; its npm tarball omits license files. The parent package retains the shared project license and full embedded third-party notices.",
+      "files": [
+        {
+          "path": "node_modules/rolldown/LICENSE",
+          "sha256": "23ecfff35a5a2e80d92142f75228912c3b1abc4b5a8337a821ff4397e2f9f734"
+        },
+        {
+          "path": "node_modules/rolldown/THIRD-PARTY-LICENSE",
+          "sha256": "a877291d800ed43692f3f9ae09d8e01cc6f7293ad39d43896059c188ffbb8b7c"
+        }
+      ]
+    },
+    {
+      "name": "@rolldown/binding-linux-arm-gnueabihf",
+      "version": "1.2.14",
+      "licenseExpression": "MIT",
+      "sourcePackage": "rolldown",
+      "sourceVersion": "1.2.14",
+      "reason": "Platform-specific native binary of the same rolldown release; its npm tarball omits license files. The parent package retains the shared project license and full embedded third-party notices.",
+      "files": [
+        {
+          "path": "node_modules/rolldown/LICENSE",
+          "sha256": "23ecfff35a5a2e80d92142f75228912c3b1abc4b5a8337a821ff4397e2f9f734"
+        },
+        {
+          "path": "node_modules/rolldown/THIRD-PARTY-LICENSE",
+          "sha256": "a877291d800ed43692f3f9ae09d8e01cc6f7293ad39d43896059c188ffbb8b7c"
+        }
+      ]
+    },
+    {
+      "name": "@rolldown/binding-linux-arm64-gnu",
+      "version": "1.2.14",
+      "licenseExpression": "MIT",
+      "sourcePackage": "rolldown",
+      "sourceVersion": "1.2.14",
+      "reason": "Platform-specific native binary of the same rolldown release; its npm tarball omits license files. The parent package retains the shared project license and full embedded third-party notices.",
+      "files": [
+        {
+          "path": "node_modules/rolldown/LICENSE",
+          "sha256": "23ecfff35a5a2e80d92142f75228912c3b1abc4b5a8337a821ff4397e2f9f734"
+        },
+        {
+          "path": "node_modules/rolldown/THIRD-PARTY-LICENSE",
+          "sha256": "a877291d800ed43692f3f9ae09d8e01cc6f7293ad39d43896059c188ffbb8b7c"
+        }
+      ]
+    },
+    {
+      "name": "@rolldown/binding-linux-arm64-musl",
+      "version": "1.2.14",
+      "licenseExpression": "MIT",
+      "sourcePackage": "rolldown",
+      "sourceVersion": "1.2.14",
+      "reason": "Platform-specific native binary of the same rolldown release; its npm tarball omits license files. The parent package retains the shared project license and full embedded third-party notices.",
+      "files": [
+        {
+          "path": "node_modules/rolldown/LICENSE",
+          "sha256": "23ecfff35a5a2e80d92142f75228912c3b1abc4b5a8337a821ff4397e2f9f734"
+        },
+        {
+          "path": "node_modules/rolldown/THIRD-PARTY-LICENSE",
+          "sha256": "a877291d800ed43692f3f9ae09d8e01cc6f7293ad39d43896059c188ffbb8b7c"
+        }
+      ]
+    },
+    {
+      "name": "@rolldown/binding-linux-ppc64-gnu",
+      "version": "1.2.14",
+      "licenseExpression": "MIT",
+      "sourcePackage": "rolldown",
+      "sourceVersion": "1.2.14",
+      "reason": "Platform-specific native binary of the same rolldown release; its npm tarball omits license files. The parent package retains the shared project license and full embedded third-party notices.",
+      "files": [
+        {
+          "path": "node_modules/rolldown/LICENSE",
+          "sha256": "23ecfff35a5a2e80d92142f75228912c3b1abc4b5a8337a821ff4397e2f9f734"
+        },
+        {
+          "path": "node_modules/rolldown/THIRD-PARTY-LICENSE",
+          "sha256": "a877291d800ed43692f3f9ae09d8e01cc6f7293ad39d43896059c188ffbb8b7c"
+        }
+      ]
+    },
+    {
+      "name": "@rolldown/binding-linux-s390x-gnu",
+      "version": "1.2.14",
+      "licenseExpression": "MIT",
+      "sourcePackage": "rolldown",
+      "sourceVersion": "1.2.14",
+      "reason": "Platform-specific native binary of the same rolldown release; its npm tarball omits license files. The parent package retains the shared project license and full embedded third-party notices.",
+      "files": [
+        {
+          "path": "node_modules/rolldown/LICENSE",
+          "sha256": "23ecfff35a5a2e80d92142f75228912c3b1abc4b5a8337a821ff4397e2f9f734"
+        },
+        {
+          "path": "node_modules/rolldown/THIRD-PARTY-LICENSE",
+          "sha256": "a877291d800ed43692f3f9ae09d8e01cc6f7293ad39d43896059c188ffbb8b7c"
+        }
+      ]
+    },
+    {
+      "name": "@rolldown/binding-linux-x64-gnu",
+      "version": "1.2.14",
+      "licenseExpression": "MIT",
+      "sourcePackage": "rolldown",
+      "sourceVersion": "1.2.14",
+      "reason": "Platform-specific native binary of the same rolldown release; its npm tarball omits license files. The parent package retains the shared project license and full embedded third-party notices.",
+      "files": [
+        {
+          "path": "node_modules/rolldown/LICENSE",
+          "sha256": "23ecfff35a5a2e80d92142f75228912c3b1abc4b5a8337a821ff4397e2f9f734"
+        },
+        {
+          "path": "node_modules/rolldown/THIRD-PARTY-LICENSE",
+          "sha256": "a877291d800ed43692f3f9ae09d8e01cc6f7293ad39d43896059c188ffbb8b7c"
+        }
+      ]
+    },
+    {
+      "name": "@rolldown/binding-linux-x64-musl",
+      "version": "1.2.14",
+      "licenseExpression": "MIT",
+      "sourcePackage": "rolldown",
+      "sourceVersion": "1.2.14",
+      "reason": "Platform-specific native binary of the same rolldown release; its npm tarball omits license files. The parent package retains the shared project license and full embedded third-party notices.",
+      "files": [
+        {
+          "path": "node_modules/rolldown/LICENSE",
+          "sha256": "23ecfff35a5a2e80d92142f75228912c3b1abc4b5a8337a821ff4397e2f9f734"
+        },
+        {
+          "path": "node_modules/rolldown/THIRD-PARTY-LICENSE",
+          "sha256": "a877291d800ed43692f3f9ae09d8e01cc6f7293ad39d43896059c188ffbb8b7c"
+        }
+      ]
+    },
+    {
+      "name": "@rolldown/binding-openharmony-arm64",
+      "version": "1.2.14",
+      "licenseExpression": "MIT",
+      "sourcePackage": "rolldown",
+      "sourceVersion": "1.2.14",
+      "reason": "Platform-specific native binary of the same rolldown release; its npm tarball omits license files. The parent package retains the shared project license and full embedded third-party notices.",
+      "files": [
+        {
+          "path": "node_modules/rolldown/LICENSE",
+          "sha256": "23ecfff35a5a2e80d92142f75228912c3b1abc4b5a8337a821ff4397e2f9f734"
+        },
+        {
+          "path": "node_modules/rolldown/THIRD-PARTY-LICENSE",
+          "sha256": "a877291d800ed43692f3f9ae09d8e01cc6f7293ad39d43896059c188ffbb8b7c"
+        }
+      ]
+    },
+    {
+      "name": "@rolldown/binding-win32-arm64-msvc",
+      "version": "1.2.14",
+      "licenseExpression": "MIT",
+      "sourcePackage": "rolldown",
+      "sourceVersion": "1.2.14",
+      "reason": "Platform-specific native binary of the same rolldown release; its npm tarball omits license files. The parent package retains the shared project license and full embedded third-party notices.",
+      "files": [
+        {
+          "path": "node_modules/rolldown/LICENSE",
+          "sha256": "23ecfff35a5a2e80d92142f75228912c3b1abc4b5a8337a821ff4397e2f9f734"
+        },
+        {
+          "path": "node_modules/rolldown/THIRD-PARTY-LICENSE",
+          "sha256": "a877291d800ed43692f3f9ae09d8e01cc6f7293ad39d43896059c188ffbb8b7c"
+        }
+      ]
+    },
+    {
+      "name": "@rolldown/binding-win32-x64-msvc",
+      "version": "1.2.14",
+      "licenseExpression": "MIT",
+      "sourcePackage": "rolldown",
+      "sourceVersion": "1.2.14",
+      "reason": "Platform-specific native binary of the same rolldown release; its npm tarball omits license files. The parent package retains the shared project license and full embedded third-party notices.",
+      "files": [
+        {
+          "path": "node_modules/rolldown/LICENSE",
+          "sha256": "23ecfff35a5a2e80d92142f75228912c3b1abc4b5a8337a821ff4397e2f9f734"
+        },
+        {
+          "path": "node_modules/rolldown/THIRD-PARTY-LICENSE",
+          "sha256": "a877291d800ed43692f3f9ae09d8e01cc6f7293ad39d43896059c188ffbb8b7c"
+        }
+      ]
+    },
+    {
+      "name": "@tauri-apps/cli-darwin-arm64",
+      "version": "2.12.3",
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "sourcePackage": "@tauri-apps/cli",
+      "sourceVersion": "2.12.3",
+      "reason": "Platform-specific binary of this exact Tauri CLI release. The parent package retains the shared Apache and MIT license files; no canonical-license substitution is used.",
+      "files": [
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-APACHE-2.0",
+          "sha256": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
+        },
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-MIT",
+          "sha256": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d"
+        }
+      ]
+    },
+    {
+      "name": "@tauri-apps/cli-darwin-x64",
+      "version": "2.12.3",
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "sourcePackage": "@tauri-apps/cli",
+      "sourceVersion": "2.12.3",
+      "reason": "Platform-specific binary of this exact Tauri CLI release. The parent package retains the shared Apache and MIT license files; no canonical-license substitution is used.",
+      "files": [
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-APACHE-2.0",
+          "sha256": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
+        },
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-MIT",
+          "sha256": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d"
+        }
+      ]
+    },
+    {
+      "name": "@tauri-apps/cli-linux-arm-gnueabihf",
+      "version": "2.12.3",
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "sourcePackage": "@tauri-apps/cli",
+      "sourceVersion": "2.12.3",
+      "reason": "Platform-specific binary of this exact Tauri CLI release. The parent package retains the shared Apache and MIT license files; no canonical-license substitution is used.",
+      "files": [
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-APACHE-2.0",
+          "sha256": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
+        },
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-MIT",
+          "sha256": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d"
+        }
+      ]
+    },
+    {
+      "name": "@tauri-apps/cli-linux-arm64-gnu",
+      "version": "2.12.3",
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "sourcePackage": "@tauri-apps/cli",
+      "sourceVersion": "2.12.3",
+      "reason": "Platform-specific binary of this exact Tauri CLI release. The parent package retains the shared Apache and MIT license files; no canonical-license substitution is used.",
+      "files": [
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-APACHE-2.0",
+          "sha256": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
+        },
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-MIT",
+          "sha256": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d"
+        }
+      ]
+    },
+    {
+      "name": "@tauri-apps/cli-linux-arm64-musl",
+      "version": "2.12.3",
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "sourcePackage": "@tauri-apps/cli",
+      "sourceVersion": "2.12.3",
+      "reason": "Platform-specific binary of this exact Tauri CLI release. The parent package retains the shared Apache and MIT license files; no canonical-license substitution is used.",
+      "files": [
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-APACHE-2.0",
+          "sha256": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
+        },
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-MIT",
+          "sha256": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d"
+        }
+      ]
+    },
+    {
+      "name": "@tauri-apps/cli-linux-riscv64-gnu",
+      "version": "2.12.3",
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "sourcePackage": "@tauri-apps/cli",
+      "sourceVersion": "2.12.3",
+      "reason": "Platform-specific binary of this exact Tauri CLI release. The parent package retains the shared Apache and MIT license files; no canonical-license substitution is used.",
+      "files": [
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-APACHE-2.0",
+          "sha256": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
+        },
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-MIT",
+          "sha256": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d"
+        }
+      ]
+    },
+    {
+      "name": "@tauri-apps/cli-linux-x64-gnu",
+      "version": "2.12.3",
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "sourcePackage": "@tauri-apps/cli",
+      "sourceVersion": "2.12.3",
+      "reason": "Platform-specific binary of this exact Tauri CLI release. The parent package retains the shared Apache and MIT license files; no canonical-license substitution is used.",
+      "files": [
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-APACHE-2.0",
+          "sha256": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
+        },
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-MIT",
+          "sha256": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d"
+        }
+      ]
+    },
+    {
+      "name": "@tauri-apps/cli-linux-x64-musl",
+      "version": "2.12.3",
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "sourcePackage": "@tauri-apps/cli",
+      "sourceVersion": "2.12.3",
+      "reason": "Platform-specific binary of this exact Tauri CLI release. The parent package retains the shared Apache and MIT license files; no canonical-license substitution is used.",
+      "files": [
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-APACHE-2.0",
+          "sha256": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
+        },
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-MIT",
+          "sha256": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d"
+        }
+      ]
+    },
+    {
+      "name": "@tauri-apps/cli-win32-arm64-msvc",
+      "version": "2.12.3",
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "sourcePackage": "@tauri-apps/cli",
+      "sourceVersion": "2.12.3",
+      "reason": "Platform-specific binary of this exact Tauri CLI release. The parent package retains the shared Apache and MIT license files; no canonical-license substitution is used.",
+      "files": [
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-APACHE-2.0",
+          "sha256": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
+        },
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-MIT",
+          "sha256": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d"
+        }
+      ]
+    },
+    {
+      "name": "@tauri-apps/cli-win32-ia32-msvc",
+      "version": "2.12.3",
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "sourcePackage": "@tauri-apps/cli",
+      "sourceVersion": "2.12.3",
+      "reason": "Platform-specific binary of this exact Tauri CLI release. The parent package retains the shared Apache and MIT license files; no canonical-license substitution is used.",
+      "files": [
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-APACHE-2.0",
+          "sha256": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
+        },
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-MIT",
+          "sha256": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d"
+        }
+      ]
+    },
+    {
+      "name": "@tauri-apps/cli-win32-x64-msvc",
+      "version": "2.12.3",
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "sourcePackage": "@tauri-apps/cli",
+      "sourceVersion": "2.12.3",
+      "reason": "Platform-specific binary of this exact Tauri CLI release. The parent package retains the shared Apache and MIT license files; no canonical-license substitution is used.",
+      "files": [
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-APACHE-2.0",
+          "sha256": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
+        },
+        {
+          "path": "node_modules/@tauri-apps/cli/LICENSE-MIT",
+          "sha256": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d"
+        }
+      ]
+    },
+    {
+      "name": "spdx-exceptions",
+      "version": "2.5.0",
+      "licenseExpression": "CC-BY-3.0",
+      "sourcePackage": "spdx-exceptions",
+      "sourceVersion": "2.5.0",
+      "reason": "The package README identifies the license and attribution but the tarball omits the full legal text. Preserve the README and a hash-pinned copy of the publisher-linked Creative Commons legal code.",
+      "files": [
+        {
+          "path": "node_modules/spdx-exceptions/README.md",
+          "sha256": "554b19eee11d2964e9f7b244e47944c08d52ca75539260a04f3227e6c0144513"
+        },
+        {
+          "path": "licenses/native/CC-BY-3.0.txt",
+          "sha256": "e6bc9e9c474700b708f568bac9e5a8a9bcb2b1dad53442f5ba449fcb848b8e76"
+        }
+      ]
+    },
+    {
+      "name": "spdx-license-ids",
+      "version": "3.0.24",
+      "licenseExpression": "CC0-1.0",
+      "sourcePackage": "spdx-license-ids",
+      "sourceVersion": "3.0.24",
+      "reason": "The package README identifies the license and attribution but the tarball omits the full legal text. Preserve the README and a hash-pinned copy of the publisher-linked Creative Commons legal code.",
+      "files": [
+        {
+          "path": "node_modules/spdx-license-ids/README.md",
+          "sha256": "b4807793db6058c819f76c023362b7d522b3d19c9b41563fcc01c2b2c5b1ccd3"
+        },
+        {
+          "path": "licenses/native/CC0-1.0.txt",
+          "sha256": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499"
+        }
+      ]
+    },
+    {
+      "name": "saxes",
+      "version": "6.0.0",
+      "licenseExpression": "ISC",
+      "sourcePackage": "saxes",
+      "sourceVersion": "6.0.0",
+      "reason": "The npm tarball omits its license text. Preserve the complete license from the exact upstream v6.0.0 tag, including inherited notices.",
+      "sourceUrl": "https://raw.githubusercontent.com/lddubeau/saxes/v6.0.0/LICENSE",
+      "files": [
+        {
+          "path": "licenses/npm/saxes-6.0.0-LICENSE.txt",
+          "sha256": "0fac2374380621b22e6b50451057721a9c52935b02d16d106a9f04897f061d0e"
+        }
+      ]
+    }
+  ]
+}

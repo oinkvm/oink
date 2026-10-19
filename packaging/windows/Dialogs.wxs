@@ -1,0 +1,117 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <!-- A custom minimal dialog set using WiX v4 UI references and control
+       events. The stock welcome/exit fragments are not linked: a third welcome
+       checkbox and two independent finish choices require owned dialogs. -->
+  <Fragment>
+    <UI Id="OinkInstallDialogs">
+      <ProgressText Action="PrepareUserSessions" Message="Waiting for Oink to quit safely" />
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+      <DialogRef Id="MaintenanceWelcomeDlg" />
+      <DialogRef Id="MaintenanceTypeDlg" />
+      <DialogRef Id="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" />
+
+      <Dialog Id="OinkWelcomeDlg" Width="370" Height="270" Title="Oink Setup">
+        <!-- Include the background in the control chain, as WiX's stock dialogs
+             do. A tab-skipped bitmap repaints over the rich-edit client area.
+             Artwork stays in the left gutter; native controls use the plain
+             button-face area on the right rather than overlaying the drawing. -->
+        <Control Id="Artwork" Type="Bitmap" X="0" Y="0" Width="370" Height="234" TabSkip="no" Text="WixUI_Bmp_Dialog" />
+        <Control Id="Heading" Type="Text" X="130" Y="8" Width="226" Height="25" Transparent="yes"
+                 Text="{\WixUI_Font_Title}Welcome to Oink Setup" />
+        <Control Id="LicenseText" Type="ScrollableText" X="130" Y="36" Width="226" Height="142" Sunken="yes" TabSkip="no">
+          <Text SourceFile="$(var.LicenseRtf)" />
+        </Control>
+        <Control Id="DesktopChoice" Type="CheckBox" X="130" Y="183" Width="226" Height="18"
+                 Property="OinkDesktop" CheckBoxValue="1" Text="Create a desktop shortcut" />
+        <Control Id="LicenseAcceptedCheckBox" Type="CheckBox" X="130" Y="207" Width="226" Height="18"
+                 Property="LicenseAccepted" CheckBoxValue="1" Text="I accept the license agreement" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Install" Type="PushButton" X="212" Y="243" Width="80" Height="17" Default="yes"
+                 ElevationShield="yes" Text="Install" DisableCondition="LicenseAccepted &lt;&gt; &quot;1&quot;"
+                 EnableCondition="LicenseAccepted = &quot;1&quot;">
+          <!-- An explicit zero survives the UI -> server property transfer and
+               prevents AppSearch from restoring an unchecked upgrade choice.
+               This dialog runs BEFORE CostFinalize: changing a conditional
+               component after costing leaves its action state stale. Do not
+               wait for CostingComplete here; costing resumes after Return. -->
+          <Publish Property="OINK_DESKTOP_SHORTCUT" Value="0" Order="1" Condition="OinkDesktop &lt;&gt; &quot;1&quot;" />
+          <Publish Property="OINK_DESKTOP_SHORTCUT" Value="1" Order="2" Condition="OinkDesktop = &quot;1&quot;" />
+          <Publish Event="EndDialog" Value="Return" Order="3" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancel">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
+      <Dialog Id="OinkExitDlg" Width="370" Height="270" Title="Oink Setup">
+        <Control Id="Artwork" Type="Bitmap" X="0" Y="0" Width="370" Height="234" TabSkip="no" Text="WixUI_Bmp_Dialog" />
+        <Control Id="Heading" Type="Text" X="135" Y="20" Width="220" Height="45" Transparent="yes"
+                 Text="{\WixUI_Font_Title}Oink Setup completed" />
+        <Control Id="Description" Type="Text" X="135" Y="75" Width="220" Height="35" Transparent="yes"
+                 Text="Click Finish to close Setup." />
+        <Control Id="LaunchChoice" Type="CheckBox" X="135" Y="135" Width="220" Height="18" Hidden="yes"
+                 Property="OinkLaunch" CheckBoxValue="1" Text="Launch Oink"
+                 ShowCondition="UILevel = 5 AND NOT Installed AND NOT REMOVE" />
+        <Control Id="LoginChoice" Type="CheckBox" X="135" Y="160" Width="220" Height="18" Hidden="yes"
+                 Property="OinkLogin" CheckBoxValue="1" Text="Start Oink when I sign in"
+                 ShowCondition="UILevel = 5 AND NOT Installed AND NOT REMOVE" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Finish" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Cancel="yes" Text="Finish">
+          <Publish Event="EndDialog" Value="Return" Order="999" />
+          <Publish Event="DoAction" Value="FinishInstall" Order="1"
+                   Condition="UILevel = 5 AND NOT Installed AND NOT REMOVE AND (OinkLaunch = &quot;1&quot; OR OinkLogin = &quot;1&quot;)" />
+          <!-- Refresh the CA result for later ControlEvent conditions. Native
+               DoAction CAs cannot display warnings with MsiProcessMessage. -->
+          <Publish Property="OinkFinishFailed" Value="[OinkFinishFailed]" Order="2" />
+          <Publish Event="SpawnDialog" Value="OinkFinishWarningDlg" Order="3" Condition="OinkFinishFailed = &quot;1&quot;" />
+        </Control>
+      </Dialog>
+      <Dialog Id="OinkFinishWarningDlg" Width="370" Height="150" Title="Oink Setup">
+        <Control Id="Heading" Type="Text" X="20" Y="18" Width="330" Height="24"
+                 Text="{\WixUI_Font_Title}Setup is complete" />
+        <Control Id="Description" Type="Text" X="20" Y="49" Width="330" Height="58"
+                 Text="One or more Finish choices could not be completed. Open Oink from the Start menu and check Start at login in Settings. If Setup was started as administrator, reopen it normally for user launch choices." />
+        <Control Id="BottomLine" Type="Line" X="0" Y="112" Width="370" Height="0" />
+        <Control Id="Done" Type="PushButton" X="290" Y="123" Width="66" Height="17" Default="yes" Cancel="yes" Text="OK">
+          <Publish Event="EndDialog" Value="Return" />
+        </Control>
+      </Dialog>
+      <Dialog Id="OinkRunningDlg" Width="370" Height="150" Title="Oink Setup">
+        <Control Id="Heading" Type="Text" X="20" Y="18" Width="330" Height="24"
+                 Text="{\WixUI_Font_Title}Oink is running. Quit Oink and click Retry." />
+        <Control Id="Description" Type="Text" X="20" Y="51" Width="330" Height="44"
+                 Text="Oink could not quit automatically. Another signed-in user may also need to quit Oink. Setup will continue when all Oink user sessions have closed." />
+        <Control Id="BottomLine" Type="Line" X="0" Y="112" Width="370" Height="0" />
+        <Control Id="Retry" Type="PushButton" X="212" Y="123" Width="66" Height="17" Default="yes" Text="Retry">
+          <Publish Event="DoAction" Value="RefreshUserSessions" Order="1" />
+          <Publish Event="EndDialog" Value="Return" Order="2" Condition="NOT OinkSessionsRunning" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="290" Y="123" Width="66" Height="17" Cancel="yes" Text="Cancel">
+          <Publish Event="EndDialog" Value="Exit" />
+        </Control>
+      </Dialog>
+      <InstallUISequence>
+        <Show Dialog="OinkWelcomeDlg" Before="CostFinalize" Condition="NOT Installed" />
+        <Custom Action="PrepareUserSessions" Before="OinkRunningDlg" Condition="UILevel = 5 AND NOT UPGRADINGPRODUCTCODE" />
+        <Show Dialog="OinkRunningDlg" Before="ExecuteAction" Condition="OinkSessionsRunning = &quot;1&quot;" />
+        <Show Dialog="OinkExitDlg" OnExit="success" />
+      </InstallUISequence>
+    </UI>
+    <UIRef Id="WixUI_Common" />
+  </Fragment>
+</Wix>

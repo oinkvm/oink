@@ -1,0 +1,52 @@
+[package]
+name = "oink-display"
+description = "屏幕与布局：枚举显示器（src/macos、src/windows）；布局模型、传送门、死区（通用）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+oink-foundation.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-core-foundation = "0.3"
+objc2-core-graphics = "0.3"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSArray", "NSDictionary", "NSGeometry", "NSNotification", "NSOperation", "NSString", "NSURL", "NSValue"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSColor", "NSColorSpace", "NSGraphics", "NSScreen", "NSWorkspace", "objc2-core-foundation"] }
+objc2-image-io = { version = "0.3", default-features = false, features = ["std", "CGImageSource", "CGImageDestination", "objc2-core-graphics"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_Devices_Display",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_System_Registry",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_Ole",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = "1"
+serde_json.workspace = true

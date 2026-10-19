@@ -1,0 +1,45 @@
+[package]
+name = "oink-winsvc"
+default-run = "oink-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+oink-update = { path = "../oink-update" }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+base64 = "0.22"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+tracing.workspace = true
+crossbeam-queue = "0.3"
+
+[dev-dependencies]
+oink-input = { path = "../oink-input" }
+
+[target.'cfg(windows)'.dependencies]
+oink-foundation.workspace = true
+windows = { version = "0.62", features = ["Win32_System_TaskScheduler", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+cab = "0.6"
+getrandom = "0.3"
+windows-sys = { version = "0.61", features = [
+ "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization",
+ "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes",
+ "Win32_System_Threading", "Win32_System_RemoteDesktop", "Win32_System_Services",
+ "Win32_System_StationsAndDesktops", "Win32_System_Com", "Win32_UI_Shell",
+ "Win32_Security_Cryptography_Catalog", "Win32_Security_Cryptography_Sip", "Win32_Security_WinTrust", "Win32_Security_Cryptography",
+ "Win32_System_Environment", "Win32_System_Registry", "Win32_System_Diagnostics_ToolHelp", "Win32_System_ApplicationInstallationAndServicing", "Win32_System_SystemInformation",
+ "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging",
+] }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "oink-service"
+path = "src/main.rs"

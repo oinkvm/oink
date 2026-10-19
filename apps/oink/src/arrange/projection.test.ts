@@ -1,0 +1,31 @@
+import { afterEach, expect, it, vi } from 'vitest';
+import { LayoutProjectionPreview } from './projection';
+const frame = (x: number) => [{device:'computer',origin:{x,y:0},scale:0.001}];
+afterEach(() => vi.useRealTimers());
+it('orders IPC, coalesces backlogged frames, closes and rejects old gestures at the backend barrier', async () => {
+  let release!: () => void;
+  const send=vi.fn().mockImplementationOnce(() => new Promise<void>(r => {release=r;})).mockResolvedValue(null);
+  const preview=new LayoutProjectionPreview(send);
+  preview.update(frame(1));preview.update(frame(2));preview.update(frame(3));
+  expect(send).toHaveBeenCalledTimes(1);
+  release();await vi.waitFor(()=>expect(send).toHaveBeenCalledTimes(2));
+  expect(send.mock.calls[1][1]).toEqual(frame(3));
+  expect(send.mock.calls[1][2]).toEqual([]);
+  const id=send.mock.calls[0][0];
+  preview.end();await vi.waitFor(()=>expect(send).toHaveBeenCalledTimes(3));
+  expect(send.mock.calls[2]).toEqual([id,[],[],true]);
+  preview.update(frame(4));await vi.waitFor(()=>expect(send).toHaveBeenCalledTimes(4));
+  expect(send.mock.calls[3][0]).toBeGreaterThan(id);
+  preview.close();
+});
+it('renews a stationary gesture and stops heartbeats on unmount', async () => {
+  vi.useFakeTimers();
+  const send=vi.fn().mockResolvedValue(null),preview=new LayoutProjectionPreview(send);
+  preview.update(frame(1));
+  await vi.advanceTimersByTimeAsync(1500);
+  expect(send).toHaveBeenCalledTimes(4);
+  expect(send.mock.calls.every(c=>c[0]===send.mock.calls[0][0] && c[3]===false)).toBe(true);
+  preview.close();await vi.advanceTimersByTimeAsync(5000);
+  expect(send).toHaveBeenCalledTimes(5);
+  expect(send.mock.lastCall?.[3]).toBe(true);
+});

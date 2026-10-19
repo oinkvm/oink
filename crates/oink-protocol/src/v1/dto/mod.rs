@@ -1,0 +1,42 @@
+//! Wire-only maps retain unknown keys recursively. Endpoint owners validate
+//! execution semantics after structural decoding and negotiated admission.
+mod attachment;
+mod auxiliary;
+mod business;
+mod cache;
+mod carried;
+mod content;
+mod core;
+mod diagnostic_values;
+mod drag;
+mod facts;
+mod input_values;
+mod pairing;
+mod transport;
+use super::schema::{Ascii, Bytes, FixedBytes, List, Text};
+pub use attachment::*;
+pub use auxiliary::*;
+pub use business::*;
+pub use cache::*;
+pub use carried::*;
+pub use content::*;
+pub use core::*;
+pub use diagnostic_values::*;
+pub use drag::*;
+pub use facts::*;
+pub use input_values::*;
+pub use pairing::*;
+pub use transport::*;
+pub type Id16 = FixedBytes<16>;
+pub type Hash32 = FixedBytes<32>;
+pub type AlgorithmId = Ascii<96>;
+pub type CapabilityId = Ascii<96>;
+pub type CapabilityList = List<CapabilityId, 128>;
+pub const ED25519: &str = "ed25519";
+pub const PAIRING_SUITE: &str = "spake2-ed25519-hkdf-sha256-hmac-sha256/1";
+pub const ADMISSION_SUITE: &str = "tls-signed-roster/1";
+pub const CONTENT_DIGEST: &str = "blake3-256";
+pub const STATE_DIGEST: &str = "sha256";
+
+mod presentation;
+pub use presentation::*;

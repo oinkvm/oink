@@ -1,0 +1,118 @@
+[package]
+name = "oink-input"
+description = "采集与注入：截获本机键鼠/触摸板事件、向本机注入事件（src/macos、src/windows）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+oink-foundation.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+crossbeam-queue = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+objc2-core-foundation = "0.3"
+objc2-core-graphics = "0.3"
+objc2 = "0.6"
+# AppKit：主线程光标窗口、系统设置查询与诊断示例
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSEvent",
+    "NSScreen",
+    "NSWorkspace",
+    "libc",
+    "NSRunningApplication",
+    "NSGraphicsContext",
+    "NSApplication",
+    "NSResponder",
+    "objc2-core-foundation",
+    "NSPanel",
+    "NSWindow",
+    "NSView",
+    "NSCursor",
+    "NSColor",
+    "NSImage",
+    "NSBitmapImageRep",
+    "NSImageRep",
+    "NSGraphics",
+    "NSTrackingArea",
+    "objc2-core-graphics",
+] }
+
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry", "NSObject", "NSString"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# mac_remote_motion：OINK_LOG 控制截获线程的日志
+tracing-subscriber.workspace = true
+# mac_tis_threads：模拟界面程序（NSApplication + 文本框窗口），在后台线程读取 / 设置键盘状态
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDate", "NSGeometry", "NSRunLoop", "NSString"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSEvent",
+    "objc2-core-foundation",
+    "NSGraphics",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSWorkspace",
+    "libc",
+    "NSText",
+    "NSTextView",
+    "NSView",
+    "NSWindow",
+] }
+
+[target.'cfg(windows)'.dependencies]
+oink-winsvc = { path = "../oink-winsvc" }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Console",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Shutdown",
+    "Win32_System_Power",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Input",
+    "Win32_UI_Input_Pointer",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+serde_json.workspace = true
+# 验证程序：测试窗口取消输入法关联（避免注入的 Shift 切换用户的输入法中英文状态）
+# windows_inject_diag：进程 token、桌面、会话
+windows = { version = "0.62", features = [
+    "Win32_UI_Input_Ime",
+    # 显示器状态通知、SetThreadExecutionState、GetTickCount
+    "Win32_System_Power",
+    "Win32_System_SystemInformation",
+    "Win32_Security",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Threading",
+    # 音量（Core Audio）
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
+
+[lints]
+workspace = true

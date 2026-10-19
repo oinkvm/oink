@@ -1,0 +1,158 @@
+
+
+.ob {
+  --ob-top: 44px;
+  position: absolute; inset: 0; z-index: 4;
+  box-sizing: border-box; padding-top: var(--ob-top);
+  container: ob / size;
+  background: var(--ok-surface); color: var(--ok-text);
+  transition: opacity var(--ok-dur-5) var(--ok-ease-out), transform var(--ok-dur-5) var(--ok-ease-out), visibility 0s;
+}
+.ob[data-platform="win"] { --ob-top: 48px; }
+.ob[data-leaving] { opacity: 0; transform: scale(1.015); visibility: hidden; pointer-events: none; transition-delay: 0s, 0s, var(--ok-dur-5); }
+
+.ob-page { box-sizing: border-box; height: 100%; display: grid; grid-template-rows: minmax(0, 1fr) auto; }
+.ob-main { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 8px 32px 0; }
+.ob-col { box-sizing: border-box; width: min(100%, 560px); min-height: 100%; margin: 0 auto; padding: 24px 0 8px; display: flex; flex-direction: column; justify-content: center; }
+.ob-col--narrow { width: min(100%, 460px); }
+.ob-title { margin: 0; font: 600 22px/1.3 var(--ok-font); letter-spacing: -.01em; text-align: center; color: var(--ok-text); }
+.ob-sub { margin: 8px auto 24px; max-width: 420px; font: 400 13.5px/1.6 var(--ok-font); text-align: center; color: var(--ok-text-2); text-wrap: pretty; }
+.ob-foot { display: grid; justify-items: center; gap: 10px; padding: 14px 32px 22px; }
+
+.ob-in { animation: ob-rise var(--ok-dur-5) var(--ok-ease-out) calc(var(--d, 0s) * var(--ok-ms)) backwards; }
+@keyframes ob-rise { from { opacity: 0; transform: translateY(10px); } }
+
+.ob-page[data-leaving] .ob-in,
+.ob-page[data-leaving] .ob-logo__word { animation: ob-out var(--ok-dur-3) var(--ok-ease-in) forwards; }
+@keyframes ob-out { to { opacity: 0; transform: translateY(-6px); } }
+.ob-page[data-leaving] { pointer-events: none; }
+
+.ob-lang { display: inline-flex; align-items: center; color: var(--ok-text-2); animation: ob-rise var(--ok-dur-5) var(--ok-ease-out) calc(.3s * var(--ok-ms)) backwards; transition: opacity var(--ok-dur-4) var(--ok-ease-out); }
+.ob-lang[data-leaving] { opacity: 0; pointer-events: none; }
+
+.ob-welcome { grid-template-rows: minmax(min-content, 1fr) auto auto; overflow-y: auto; overscroll-behavior: contain; }
+
+.ob-welcome__hero { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; padding: 8px 32px 4px; min-height: 0; }
+.ob-welcome__prefs { display: grid; justify-items: center; gap: 18px; padding: 8px 32px 0; }
+.ob-ver { margin: -8px 0 0; font: 400 12px/1 var(--ok-font); font-variant-numeric: tabular-nums; color: var(--ok-text-3); }
+.ob-field { display: grid; justify-items: center; gap: 10px; }
+.ob-field__label { font: 500 12px/1 var(--ok-font); color: var(--ok-text-3); letter-spacing: .02em; }
+.ob-next { min-width: 120px; }
+
+.ob-logo { --ink: #1B1E28; display: flex; flex-direction: column; align-items: center; gap: 14px; }
+:root[data-theme="dark"] .ob-logo { --ink: #F2F3F5; }
+.ob-logo__mark { width: 84px; height: auto; overflow: visible; }
+.ob-logo__word { width: 112px; height: auto; overflow: visible; }
+.ob-logo path { stroke-dasharray: 1 2; stroke-dashoffset: 1; opacity: 0; }
+.ob-logo__ptr-path {
+  fill: var(--ink); fill-opacity: 0; stroke: var(--ink); stroke-width: 5; stroke-linejoin: round;
+  animation:
+    ob-draw calc(.62s * var(--ok-ms)) var(--ok-ease-in-out) calc(.2s * var(--ok-ms)) forwards,
+    ob-fill calc(.28s * var(--ok-ms)) var(--ok-ease-out) calc(.74s * var(--ok-ms)) forwards;
+}
+.ob-logo__tail { fill: none; stroke-width: 5.5; stroke-linecap: round; animation: ob-draw calc(.6s * var(--ok-ms)) var(--ok-ease-out) calc(.86s * var(--ok-ms)) forwards; }
+.ob-logo__stroke {
+  fill: none; stroke: var(--ink); stroke-width: 11; stroke-linecap: round; stroke-linejoin: round;
+  animation: ob-draw calc(.26s * var(--ok-ms)) var(--ok-ease-in-out) calc((1.2s + var(--i) * .08s) * var(--ok-ms)) forwards;
+}
+.ob-logo__stroke:first-child { animation-duration: calc(.42s * var(--ok-ms)); }
+
+.ob-logo__dot { fill: none; stroke: var(--ink); stroke-linecap: round; stroke-dasharray: none; stroke-width: 0; animation: ob-dot calc(.34s * var(--ok-ms)) var(--ok-spring-bouncy) calc((1.2s + var(--i) * .08s) * var(--ok-ms)) forwards; }
+@keyframes ob-draw { from { opacity: 1; stroke-dashoffset: 1; } to { opacity: 1; stroke-dashoffset: 0; } }
+
+@keyframes ob-fill { to { fill-opacity: 1; stroke-dasharray: none; } }
+@keyframes ob-dot { from { opacity: 1; stroke-width: 0; } to { opacity: 1; stroke-width: 13.6; } }
+
+.ob-themes { display: flex; gap: 14px; }
+.ob-theme { position: relative; display: grid; justify-items: center; gap: 8px; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.ob-theme__input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; pointer-events: none; }
+.ob-theme__card {
+  position: relative; display: block; width: 128px; aspect-ratio: 140 / 96;
+  --ob-theme-r: calc(12px * var(--ok-rk));
+  border-radius: var(--ob-theme-r); corner-shape: var(--ok-corner); --ok-shape: var(--ok-corner);
+  box-shadow: 0 0 0 1px var(--ok-line-2);
+  transition: box-shadow var(--ok-dur-3) var(--ok-ease-out), transform var(--ok-spring-dur) var(--ok-spring);
+}
+/* WebKit's corner fallback admits outer shadows into the host clip. Keep
+   edge-to-edge art in a shadow-free shape; otherwise its square corners leak.
+   A filtered shadow follows that clipped shape without the fallback's opaque
+   border-image backing, which can cover a neighbouring card's selection ring.
+   Verified in WKWebView on macOS 14.7.8 and 26.6.2. */
+.ob-theme__clip {
+  position: absolute; inset: 0; overflow: hidden;
+  border-radius: var(--ob-theme-r); corner-shape: var(--ok-corner); --ok-shape: var(--ok-corner);
+}
+.ob-theme__art { display: block; width: 100%; height: 100%; }
+.ob-theme__label { font: 400 12.5px/1 var(--ok-font); color: var(--ok-text-2); transition: color var(--ok-dur-2); }
+@media (hover: hover) {
+  .ob-theme:hover .ob-theme__input:not(:checked) + .ob-theme__card { filter: drop-shadow(0 6px 9px rgb(20 22 30 / .1)); }
+}
+.ob-theme:active .ob-theme__card { transform: scale(.97); }
+.ob-theme__input:checked + .ob-theme__card { box-shadow: 0 0 0 2px var(--ok-surface), 0 0 0 4px var(--ok-accent); }
+.ob-theme__input:checked ~ .ob-theme__label { color: var(--ok-text); font-weight: 500; }
+.ob-theme__input:focus-visible + .ob-theme__card { outline: 2px solid var(--ok-accent); outline-offset: 6px; }
+.ob-mini__accent { fill: var(--ok-accent); }
+.ob-mini__sel { fill: color-mix(in srgb, var(--ok-accent) 30%, transparent); stroke: var(--ok-accent); stroke-width: 1.5; }
+
+.ob-perms__card { text-align: start; }
+.ob-perms .ob-col { width: min(100%, 720px); padding-bottom: 0; }
+.ob-perms .ob-sub { max-width: 720px; }
+.ob-perms .ob-perms__card { width: 100%; max-width: 560px; align-self: center; }
+.ob-perms__card .ok-row { font-size: 14px; font-weight: 400; }
+.ob-perms__card .ok-row__desc { font-size: 12.5px; font-weight: 300; }
+.ob .ok-btn { font-weight: 400; }
+.ob-perms__row .ok-btn { --_h: 28px; font-size: 12.5px; font-weight: 400; }
+.ob-granted { display: inline-flex; align-items: center; gap: 6px; font: 500 13px/1 var(--ok-font); color: var(--ok-success-text); white-space: nowrap; animation: ob-pop var(--ok-spring-bouncy-dur) var(--ok-spring-bouncy); }
+.ob-granted .ok-icon { width: 16px; height: 16px; }
+@keyframes ob-pop { from { opacity: 0; transform: scale(.6); } }
+.ob-done { display: inline-flex; align-items: center; gap: 6px; height: 32px; margin: 0; font: 500 13px/1 var(--ok-font); color: var(--ok-success-text); animation: ob-pop var(--ok-spring-bouncy-dur) var(--ok-spring-bouncy); }
+.ob-done .ok-icon { width: 16px; height: 16px; }
+.ob-link { color: var(--ok-text-2); font-weight: 400; }
+
+.ob-telemetry__card { margin-top: 24px; }
+.ob-a { color: var(--ok-accent-text); text-decoration: underline; text-decoration-color: color-mix(in srgb, currentColor 40%, transparent); text-underline-offset: 2px; border-radius: 3px; }
+@media (hover: hover) { .ob-a:hover { text-decoration-color: currentColor; } }
+
+.ob-connect .ob-main { overflow: hidden; }
+.ob-col--fit { height: 100%; min-height: 0; padding-bottom: 4px; }
+.ob-col--fit > * { flex: none; }
+.ob-col--fit > .ob-devs-wrap { flex: 0 1 auto; min-height: 96px; display: flex; flex-direction: column; }
+.ob-devs {
+  box-sizing: border-box; flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column;
+  padding: 6px; border-radius: calc(16px * var(--ok-rk)); corner-shape: var(--ok-corner); --ok-shape: var(--ok-corner);
+  box-shadow: inset 0 0 0 1px var(--ok-line);
+  text-align: start;
+}
+.ob-devs__scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: none; }
+.ob-devs__scroll::-webkit-scrollbar { display: none; }
+.ob-devs__label {
+  flex: none; display: flex; align-items: center; gap: 6px; height: 30px; margin: 0; padding: 0 4px 0 10px;
+  font: 500 12px/1 var(--ok-font); color: var(--ok-text-3);
+}
+.ob-devs__tools { margin-left: auto; display: flex; }
+.ob-devs .peer { min-height: 56px; }
+.ob-or { margin: 22px 0 16px; color: var(--ok-text-3); font-size: 12px; }
+.ob-manual { text-align: start; }
+.ob-foot--connect { gap: 8px; }
+.ob-tip { margin: 0; font: 400 11.5px/1.5 var(--ok-font); color: var(--ok-text-3); }
+.ob-self { display: flex; flex-wrap: wrap; justify-content: center; gap: 4px 16px; margin: 0; font: 400 11.5px/1.5 var(--ok-font); color: var(--ok-text-3); }
+.ob-self b { font: 500 11.5px/1.5 var(--ok-font-mono); font-variant-numeric: tabular-nums; color: var(--ok-text-2); }
+
+.ob-pair { position: relative; top: -32px; display: grid; }
+.ob-pair__head { display: flex; align-items: center; gap: 8px; margin-left: -6px; }
+.ob-pair__title { margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 600 20px/1.3 var(--ok-font); }
+.ob-pair__lead { margin: 6px 0 28px; max-width: none; text-align: start; }
+
+@container ob (max-height: 560px) {
+  .ob-welcome__hero { gap: 12px; padding-top: 4px; }
+  .ob-logo { gap: 10px; }
+  .ob-logo__mark { width: 60px; }
+  .ob-logo__word { width: 84px; }
+  .ob-welcome__prefs { gap: 12px; padding-top: 14px; }
+  .ob-field { gap: 8px; }
+  .ob-theme__card { width: 112px; }
+  .ob-foot { padding: 12px 32px 16px; }
+  .ob-col { padding-top: 12px; }
+  .ob-sub { margin-bottom: 16px; }
+  .ob-or { margin: 16px 0 12px; }
+}

@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "repository": "oinkvm/oink",
+  "windows": [
+    {
+      "epoch": "win-2026-01",
+      "public_key": null,
+      "authenticode_spki_sha256": [],
+      "channels": [
+        "stable",
+        "beta"
+      ],
+      "enabled": false
+    }
+  ],
+  "mac": {
+    "epoch": "mac-2026-01",
+    "public_key": null,
+    "sparkle_version": "2.9.6",
+    "sparkle_archive_sha256": "52bf9e88cdd972fc0c81501377a880e90d47031bd8ca5462488f843e2609e192",
+    "enabled": false
+  }
+}

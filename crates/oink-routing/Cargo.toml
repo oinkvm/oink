@@ -1,0 +1,24 @@
+[package]
+name = "oink-routing"
+description = "输入路由：焦点、移交、防卡键、手感换算（与系统和网络无关的状态机）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+oink-foundation.workspace = true
+oink-protocol.workspace = true
+oink-display.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+getrandom = "0.3.4"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

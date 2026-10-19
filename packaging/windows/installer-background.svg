@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1479" height="936" viewBox="0 0 493 312">
+  <!-- Existing B2 cursor-tail lockup, centred in the native left gutter.
+       Render at 3x so MSI can downsample through 200% display scaling. -->
+  <rect width="493" height="312" fill="#F0F0F0" />
+  <rect width="149" height="312" fill="#FDFDFE" />
+  <path d="M149 0V312" stroke="#E2E2E8" />
+  <svg x="11" y="139.2" width="127" height="33.61" viewBox="14.5 13 203.1 53.75"><g xmlns="http://www.w3.org/2000/svg" transform="translate(8 8)"><g transform="translate(0 1.5)"><path d="M20.5 32C20.5 46 31 54.5 45 54.5A9.5 9.5 0 1 0 36.3 41.2" fill="none" stroke="#FF6F91" stroke-width="5.5" stroke-linecap="round" /><path d="M9 6V39L33.5 29.5Q23.5 15.5 9 6Z" fill="#1B1E28" stroke="#1B1E28" stroke-width="5" stroke-linejoin="round" /></g></g><g xmlns="http://www.w3.org/2000/svg" transform="translate(88 17) scale(0.72)"><circle cx="32" cy="32" r="26.5" fill="none" stroke="#1B1E28" stroke-width="11" /><path d="M79.5 25.5V58.5" fill="none" stroke="#1B1E28" stroke-width="11" stroke-linecap="round" /><circle cx="79.5" cy="7" r="6.8" fill="#1B1E28" /><path d="M102.5 25.5V58.5M102.5 38.5a13 13 0 0 1 26 0V58.5" fill="none" stroke="#1B1E28" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" /><path d="M151.5 5.5V58.5M151.5 44L172 25.5M159.5 37.5L174.5 58.5" fill="none" stroke="#1B1E28" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" /></g></svg>
+</svg>

@@ -1,0 +1,15 @@
+# build outputs
+target/
+node_modules/
+dist/
+.release-tools/
+__pycache__/
+*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# agent worktrees (Agent isolation: worktree)
+/.claude/worktrees/

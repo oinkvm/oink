@@ -1,0 +1,4 @@
+/* Reserve the action width so a wrapping hint only changes the text column. */
+.ok-row.permission-row { flex-wrap: nowrap; align-items: center; }
+.ok-row.permission-row > .ok-row__control { flex: none; justify-content: flex-end; margin-left: auto; }
+.ok-btn.permission-button { --_h: 26px; font-size: 12.5px; font-weight: 400; margin-right: -4px; width: 136px; flex: none; justify-content: center; }

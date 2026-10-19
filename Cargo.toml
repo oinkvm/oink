@@ -1,0 +1,70 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/oink-foundation",
+    "crates/oink-input",
+    "crates/oink-locator",
+    "crates/oink-winsvc",
+    "crates/oink-update",
+    "crates/oink-display",
+    "crates/oink-routing",
+    "crates/oink-clipboard",
+    "crates/oink-network",
+    "crates/oink-protocol",
+    "crates/oink-agent",
+    "crates/oink-telemetry",
+    "crates/oink-crash",
+    "crates/oink-audio",
+    "crates/oink-autostart",
+    "apps/oink/src-tauri",
+    "tests/support",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.0"
+license = "GPL-3.0-only"
+# 内部 crate，不发布到 crates.io
+publish = false
+repository = "https://github.com/oinkvm/oink"
+
+[workspace.dependencies]
+# Workspace crates share the foundational types defined in oink-foundation.
+oink-foundation = { path = "crates/oink-foundation" }
+oink-input = { path = "crates/oink-input" }
+oink-locator = { path = "crates/oink-locator" }
+oink-display = { path = "crates/oink-display" }
+oink-routing = { path = "crates/oink-routing" }
+oink-clipboard = { path = "crates/oink-clipboard" }
+oink-network = { path = "crates/oink-network" }
+oink-protocol = { path = "crates/oink-protocol" }
+oink-agent = { path = "crates/oink-agent" }
+oink-telemetry = { path = "crates/oink-telemetry" }
+oink-crash = { path = "crates/oink-crash" }
+oink-audio = { path = "crates/oink-audio" }
+oink-autostart = { path = "crates/oink-autostart" }
+
+# 各模块共用的第三方依赖。模块专用的依赖写在各自 crate 的 Cargo.toml 里。
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

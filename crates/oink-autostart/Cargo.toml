@@ -1,0 +1,49 @@
+[package]
+name = "oink-autostart"
+description = "登录时自动启动：系统登录项的查询、注册与注销（macOS SMAppService、Windows 的 Run 注册表项），以及「本次是否由登录项启动」的判断"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+# 不依赖含 C 代码的 crate：本机可以用 `cargo check -p oink-autostart --target x86_64-pc-windows-msvc`
+# 交叉检查 Windows 部分。
+[dependencies]
+serde.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSString",
+    "NSBundle",
+    "NSError",
+    "NSAppleEventManager",
+    "NSAppleEventDescriptor",
+    # 事件类别 / 事件 ID / 参数的读取（AEEventClass 等类型）
+    "objc2-core-services",
+] }
+objc2-service-management = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    "objc2-foundation",
+    "SMAppService",
+] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+serde_json.workspace = true
+oink-foundation.workspace = true
+
+[lints]
+workspace = true

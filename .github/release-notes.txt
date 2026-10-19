@@ -1,0 +1,22 @@
+The first public release of Oink. Your computers, working as one.
+
+## Highlights
+
+- **Keyboard, mouse and trackpad** — move the pointer across the edge of a screen to control the next computer, with the same native feel on every device. Any device's keyboard and mouse can control the others; there is no server.
+- **Clipboard** — text, images and files sync between devices automatically.
+- **Drag and drop** — drag text, images and files from one computer straight into apps on another.
+- **Audio forwarding** — play the audio of several devices through the speakers or headphones connected to one of them.
+- **Layout editor** — arrange the screens of every device in the group the way they sit on your desk.
+
+## Downloads
+
+- **Mac:** the `.dmg` file — Apple silicon, macOS 14.2 or later. Developer ID signed and notarized.
+- **Windows:** the `.msi` file — x64, Windows 10 22H2 (build 19045) or later, or Windows 11. Requires the Microsoft Edge WebView2 Evergreen runtime (preinstalled on current Windows).
+
+Verify downloads against `SHA256SUMS`.
+
+## Known limitations
+
+- The Windows MSI is not code-signed in this release. SmartScreen may say "Windows protected your PC": choose **More info → Run anyway**. UAC shows an unknown publisher.
+
+Please report problems in [Issues](https://github.com/oinkvm/oink/issues) with your environment, diagnostic data and steps to reproduce.

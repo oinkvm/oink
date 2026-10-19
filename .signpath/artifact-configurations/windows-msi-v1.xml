@@ -1,0 +1,25 @@
+<?xml version='1.0' encoding='utf-8'?>
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <msi-file path="Oink-*-windows-x64.msi">
+      <directory path="application/Oink">
+        <pe-file path="oink.exe">
+          <authenticode-sign />
+        </pe-file>
+        <pe-file path="oink-agent.exe">
+          <authenticode-sign />
+        </pe-file>
+        <pe-file path="oink-service.exe">
+          <authenticode-sign />
+        </pe-file>
+        <pe-file path="oink-update-worker.exe">
+          <authenticode-sign />
+        </pe-file>
+        <pe-file path="oink-crash-collector.exe">
+          <authenticode-sign />
+        </pe-file>
+      </directory>
+      <authenticode-sign />
+    </msi-file>
+  </zip-file>
+</artifact-configuration>

@@ -1,0 +1,52 @@
+{
+  "schema": 1,
+  "name": "Oink",
+  "bundle_id": "com.hachiwii.oink",
+  "publisher": "Oink contributors",
+  "repository_org": "oinkvm",
+  "macos_minimum": "14.2",
+  "windows_minimum": "10.0",
+  "minimumWindowsBuild": 19045,
+  "data_directory": "Oink",
+  "unix_data_directory": "oink",
+  "macos_logs_directory": "Oink",
+  "bonjour_service": "_oink._udp",
+  "macos": {
+    "app": "Oink.app",
+    "ui_id": "com.hachiwii.oink.ui",
+    "agent_id": "com.hachiwii.oink.agent",
+    "file_provider_id": "com.hachiwii.oink.fileprovider",
+    "file_provider_bundle": "OinkFileProvider.appex",
+    "file_provider_name": "Oink File Provider",
+    "app_group_suffix": "com.hachiwii.oink.files",
+    "app_group_key": "OinkAppGroup",
+    "file_provider_domain": "oink-files",
+    "team_id": "893V37X2CW"
+  },
+  "windows": {
+    "install_directory": "Oink",
+    "service_name": "OinkInput",
+    "service_display_name": "Oink Input Service",
+    "run_value": "Oink",
+    "registry_key": "Software\\Oink",
+    "upgrade_code": "4D39E4BE-6792-4CD6-B344-A5E95A270EA6",
+    "maintenance_directory": "maintenance",
+    "maintenance_lock": "maintenance.lock",
+    "receipt": "installed.json",
+    "copied_worker": "worker.exe",
+    "installer_event_prefix": "Global\\Oink.Installer."
+  },
+  "binaries": {
+    "backend": "oink-backend",
+    "ui": "oink",
+    "agent": "oink-agent",
+    "service": "oink-service",
+    "file_provider_manager": "oink-file-provider",
+    "file_provider_extension": "OinkFileProvider",
+    "file_provider_class": "OinkFileProvider",
+    "update_worker": "oink-update-worker",
+    "crash_collector": "oink-crash-collector"
+  },
+  "metadata_file": "oink-build.json",
+  "version": "0.1.0"
+}

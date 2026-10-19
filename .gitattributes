@@ -1,0 +1,2 @@
+# Preserve exact source bytes on every host; build provenance hashes those bytes.
+* -text

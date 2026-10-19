@@ -1,0 +1,23 @@
+[package]
+name = "oink-protocol"
+description = "Typed v1 wire protocol, canonical CBOR framing and admission"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+oink-foundation.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+minicbor = { version = "2.3", features = ["std"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+oink-test-support = { path = "../../tests/support", default-features = false, features = ["protocol"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true
