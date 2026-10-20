@@ -93,6 +93,7 @@ struct BatchInner {
     id: BatchId,
     lease: Option<SourceLease>,
     record: Mutex<Record>,
+    snapshots: Mutex<()>,
 }
 impl Drop for BatchInner {
     fn drop(&mut self) {
@@ -462,6 +463,7 @@ impl Batch {
             id,
             lease: Some(lease),
             record: Mutex::new(record),
+            snapshots: Mutex::new(()),
         })))
     }
     /// Only complete target batches survive as readable content across restart.
@@ -492,6 +494,7 @@ impl Batch {
             id,
             lease: Some(lease),
             record: Mutex::new(record.unwrap()),
+            snapshots: Mutex::new(()),
         })))
     }
     /// Native placeholder caches must not extend an already completed delivery's
@@ -637,16 +640,20 @@ impl Batch {
         per_rep: u64,
         total: u64,
     ) -> io::Result<(u64, [u8; 32])> {
-        // Serial per-batch snapshot writes keep the shared aggregate exact, while
-        // input/network/cleanup never wait on this data executor's mutex.
-        let mut record = self.0.record.lock().unwrap_or_else(|e| e.into_inner());
-        if record.state != State::Receiving {
-            return Err(invalid());
-        }
-        let remaining = total
-            .checked_sub(record.snapshot_bytes)
-            .ok_or_else(invalid)?
-            .min(per_rep);
+        // Serialize writers for the aggregate budget, but never hold the batch
+        // metadata lock while reading a native/network source. A reader of an
+        // already stored representation needs that lock to acquire its lease.
+        let _snapshot = self.0.snapshots.lock().unwrap_or_else(|e| e.into_inner());
+        let remaining = {
+            let record = self.0.record.lock().unwrap_or_else(|e| e.into_inner());
+            if record.state != State::Receiving {
+                return Err(invalid());
+            }
+            total
+                .checked_sub(record.snapshot_bytes)
+                .ok_or_else(invalid)?
+                .min(per_rep)
+        };
         let part = self.path().join(format!("r-{representation}.part"));
         let destination = self.path().join(format!("r-{representation}"));
         if destination.try_exists()? {
@@ -675,6 +682,12 @@ impl Batch {
             }
             file.sync_all()?;
             drop(file);
+            let mut record = self.0.record.lock().unwrap_or_else(|e| e.into_inner());
+            // Abandon/complete can now run while the source is blocked. Such a
+            // transition must retire this staged payload before publication.
+            if record.state != State::Receiving {
+                return Err(invalid());
+            }
             replace(&part, &destination)?;
             let mut next = record.clone();
             next.snapshot_bytes += bytes;

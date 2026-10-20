@@ -132,10 +132,19 @@ fn joining_a_group_with_an_explicit_exit_keeps_new_sources_local() {
             let a = Node::start_with_fake_platform(options(temp.path(), "a")).await.unwrap();
             let b = Node::start_with_fake_platform(options(temp.path(), "b")).await.unwrap();
             common::pair(&a, &b).await;
-            let card = b.device_cards().unwrap().cards.into_iter().find(|c| c.is_self).unwrap();
-            let CardAction::Invoke { token, .. } = card.status.unwrap().speaker.make_exit_action else {
-                panic!("explicit exit command unavailable")
-            };
+            // Input admission does not establish audio ordering readiness.
+            let mut token = None;
+            common::until("explicit exit command ready", || {
+                let card = b.device_cards().unwrap().cards.into_iter().find(|c| c.is_self).unwrap();
+                if let CardAction::Invoke { token: ready, .. } = card.status.unwrap().speaker.make_exit_action {
+                    token = Some(ready);
+                    true
+                } else {
+                    false
+                }
+            })
+            .await;
+            let token = token.unwrap();
             let exit = b.clone();
             let reply = tokio::task::spawn_blocking(move || {
                 exit.invoke_device_card_action("19191919-1919-1919-1919-191919191919".into(), token)

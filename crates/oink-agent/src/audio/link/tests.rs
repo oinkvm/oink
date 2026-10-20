@@ -1080,6 +1080,7 @@ fn permission_card(group: &ConfigModule, source: DeviceId, nonce: [u8; 16]) -> c
         }],
         focus: FocusObservation::default(),
         exit_baseline: true,
+        local_exit_selection_ready: true,
         selected_exit: None,
         exit_claim: None,
         emergency_delivery: None,

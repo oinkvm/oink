@@ -37,6 +37,9 @@ pub struct CardInputs {
     pub focus: FocusObservation,
     /// None with baseline=false is unknown; None with baseline=true means no claim.
     pub exit_baseline: bool,
+    /// The local owner has retained every current member's audio claim baseline.
+    /// Historical resolution may still be unknown until an explicit selection.
+    pub local_exit_selection_ready: bool,
     pub selected_exit: Option<DeviceKey>,
     pub exit_claim: Option<(u64, DeviceKey)>,
     pub emergency_delivery: Option<EmergencyDeliveryCard>,
@@ -707,7 +710,11 @@ impl<'a> OwnerContext<'a> {
                     CardCondition::Ready
                 },
             },
-            make_exit_action: self.action(CardOptionEdit::AudioExitClaim(true)),
+            make_exit_action: if self.member.is_self && !input.local_exit_selection_ready {
+                CardAction::unavailable(CardActionUnavailable::StateUnknown)
+            } else {
+                self.action(CardOptionEdit::AudioExitClaim(true))
+            },
             forwarding_controls_token,
             forwarding_enabled: enabled,
             activity,
@@ -756,6 +763,7 @@ mod tests {
             members,
             focus: FocusObservation::default(),
             exit_baseline: false,
+            local_exit_selection_ready: true,
             selected_exit: None,
             exit_claim: None,
             emergency_delivery: None,
@@ -965,6 +973,44 @@ mod tests {
         assert!(status.screen.configured_mode.is_none());
         assert!(status.screen.fault.is_none());
         assert!(next.cards[0].pause.is_none());
+    }
+    #[test]
+    fn local_exit_selection_waits_for_baselines_but_not_historical_resolution() {
+        let mut me = row(1, "self", true);
+        let mut peer = row(2, "peer", true);
+        for member in [&mut me, &mut peer] {
+            let mut raw = facts(member, 0).raw().clone();
+            let RawValue::Array(preferences) = raw.get_mut(&18).unwrap() else {
+                panic!()
+            };
+            preferences.push(map([(1, 20u32.write()), (2, 5u64.write()), (3, RawValue::Null)]));
+            member.facts = Some(Arc::new(dto::DeviceFacts::from_raw(raw).unwrap()));
+        }
+        let mut input = inputs(vec![me, peer]);
+        input.local_exit_selection_ready = false;
+        let mut projector = Projector::new().unwrap();
+        let before = projector.update(&input, 1).unwrap();
+        assert_eq!(
+            before.cards[0].status.as_ref().unwrap().speaker.make_exit_action,
+            CardAction::unavailable(CardActionUnavailable::StateUnknown)
+        );
+        // Our retained baselines do not establish the remote owner's readiness.
+        assert!(matches!(
+            before.cards[1].status.as_ref().unwrap().speaker.make_exit_action,
+            CardAction::Invoke { .. }
+        ));
+        // No local owner revision or historical resolution needs to change.
+        // Completing coverage alone must publish a new card and usable token.
+        input.local_exit_selection_ready = true;
+        let after = projector.update(&input, 2).unwrap();
+        assert_eq!(after.revision.0, before.revision.0 + 1);
+        assert!(!input.exit_baseline);
+        let CardAction::Invoke { token, .. } = &after.cards[0].status.as_ref().unwrap().speaker.make_exit_action else {
+            panic!("complete current baselines permit an explicit takeover")
+        };
+        let binding = projector.tokens().read(token).unwrap();
+        assert_eq!(binding.owner.revision, 5);
+        assert_eq!(binding.owner.device, input.members[0].device);
     }
     #[test]
     fn volume_controls_bind_claim_boot_output_and_readback() {

@@ -185,6 +185,27 @@ fn reinstalled_member_can_replace_the_removed_audio_exit() {
                 })
             })
             .await;
+            // Force the legal observation order: the new member receives the
+            // historical watermark and its own withdrawal before the last
+            // current member's AudioExitClaim baseline. A matching local owner
+            // revision alone must not advertise a selection that returns Busy.
+            let gate = b.node.inner.owner_gate.clone();
+            let (held, holding) = tokio::sync::oneshot::channel();
+            let (resume_baseline, resumed) = std::sync::mpsc::channel::<()>();
+            let baseline_worker = tokio::task::spawn_blocking(move || {
+                let _guard = gate.lock().unwrap();
+                let _ = held.send(());
+                let _ = resumed.recv();
+            });
+            holding.await.unwrap();
+            api(&b.node, |node| {
+                let mut preferences = crate::node::lock(&node.inner.config).owner().preferences();
+                preferences.retain(|item| item.option() != Ok(dto::LocalOption::AudioExitClaim));
+                let group = node.inner.group.get().unwrap();
+                let pause = group.local_facts().pause().unwrap().unwrap();
+                group.publish_local_owner(preferences, pause).unwrap();
+            })
+            .await;
             let fresh = start("exit-new", 0).await;
             let group = a.node.group_id().unwrap();
             common::pair(&fresh.node, &a.node).await;
@@ -253,11 +274,22 @@ fn reinstalled_member_can_replace_the_removed_audio_exit() {
                 .owner()
                 .revision(dto::LocalOption::AudioExitClaim)
                 .unwrap();
+            fresh.node.refresh_device_cards();
+            let cards = fresh.node.device_cards().unwrap();
+            let card = cards.cards.iter().find(|card| card.is_self).unwrap();
+            assert_eq!(
+                card.status.as_ref().unwrap().speaker.make_exit_action,
+                crate::device_cards::CardAction::unavailable(crate::device_cards::CardActionUnavailable::StateUnknown),
+                "selection must wait for the last current member's baseline"
+            );
+            resume_baseline.send(()).unwrap();
+            baseline_worker.await.unwrap();
             // Facts and device cards are separate asynchronous observations.
             // The withdrawal's Facts20 can precede its card; selecting an older
             // cached token correctly refuses StaleRevision instead of applying.
+            // Baseline completion must also enable the action at this revision.
             let mut token = None;
-            wait_for("yielded claim revision reaches the device card", 5., || {
+            wait_for("audio selection ready at yielded claim revision", 5., || {
                 let cards = fresh.node.device_cards().unwrap();
                 let card = cards.cards.iter().find(|card| card.is_self).unwrap();
                 let Some(status) = &card.status else { return false };

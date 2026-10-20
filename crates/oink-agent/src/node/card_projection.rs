@@ -34,12 +34,27 @@ impl Node {
                 }],
                 focus,
                 exit_baseline: false,
+                local_exit_selection_ready: false,
                 selected_exit: None,
                 exit_claim: None,
                 emergency_delivery,
             };
         };
         let state = config.applied();
+        // A current local option revision does not prove that the owner can
+        // order a selection above every member. Use the same durable baseline
+        // coverage as the audio command, including records retained while peers
+        // are offline; unknown historical resolution alone must not block it.
+        let local_exit_selection_ready = {
+            let store = lock(&self.inner.config);
+            let owner = store.owner();
+            let claims = owner.claims(state.group);
+            owner.active_group() == Some(state.group)
+                && state
+                    .members
+                    .iter()
+                    .all(|member| claims.records.iter().any(|record| record.owner == *member))
+        };
         let links = self.links().ok().map(|links| links.links());
         let members = config
             .members()
@@ -110,6 +125,7 @@ impl Node {
             members,
             focus,
             exit_baseline,
+            local_exit_selection_ready,
             selected_exit,
             exit_claim,
             emergency_delivery,

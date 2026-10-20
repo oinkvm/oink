@@ -559,7 +559,11 @@ impl Remote {
             }
             wait.result(result.as_ref().unwrap().as_ref().err().map_or(0, |e| -1 - *e as i32));
             drop(wait);
-            result.as_ref().unwrap().map_err(unavailable)?;
+            let completed = result.unwrap();
+            // The async completion guard also locks this slot. Native file
+            // acquisition must not keep an executor worker waiting on disk.
+            drop(result);
+            completed.map_err(unavailable)?;
             let read = self.0.batch.read_lease()?;
             let file = std::fs::File::open(self.0.batch.path().join(format!("r-{}", id.0)))?;
             Ok(Box::new(LocalReader {

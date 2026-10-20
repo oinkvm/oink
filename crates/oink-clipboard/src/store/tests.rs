@@ -67,6 +67,68 @@ fn snapshots_fail_without_publishing_truncated_bytes_and_aggregate_all_represent
 }
 
 #[test]
+fn a_stalled_snapshot_does_not_block_reading_an_already_stored_representation() {
+    use std::{sync::mpsc, time::Duration};
+
+    struct Stalled {
+        entered: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    }
+    impl Read for Stalled {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            self.entered.send(()).unwrap();
+            self.resume.recv().unwrap();
+            Ok(0)
+        }
+    }
+    for state in [State::Receiving, State::Abandoned, State::Complete] {
+        let data = tempfile::tempdir().unwrap();
+        let batch = Batch::create(data.path(), StoreKind::CompletedDelivery, BatchId([72; 16])).unwrap();
+        batch.snapshot(0, &mut &b"ready"[..]).unwrap();
+        let (entered, waiting) = mpsc::channel();
+        let (resume, paused) = mpsc::channel();
+        let writing = batch.clone();
+        let writer = std::thread::spawn(move || {
+            writing.snapshot(
+                1,
+                &mut Stalled {
+                    entered,
+                    resume: paused,
+                },
+            )
+        });
+        waiting.recv().unwrap();
+        let reading = batch.clone();
+        let (opened, result) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _lease = reading.read_lease().unwrap();
+            let bytes = fs::read(reading.path().join("r-0")).unwrap();
+            match state {
+                State::Receiving => {}
+                State::Abandoned => reading.abandon().unwrap(),
+                State::Complete => reading.complete().unwrap(),
+            }
+            opened.send(bytes).unwrap();
+        });
+        let available = result.recv_timeout(Duration::from_secs(1));
+        // Always release and join before asserting, including on the broken path.
+        resume.send(()).unwrap();
+        let stored = writer.join().unwrap();
+        reader.join().unwrap();
+        assert_eq!(
+            available.expect("a completed representation must not wait for another download"),
+            b"ready"
+        );
+        assert_eq!(stored.is_ok(), state == State::Receiving);
+        assert_eq!(batch.path().join("r-1").exists(), state == State::Receiving);
+        assert!(!batch.path().join("r-1.part").exists());
+        let record = batch.0.record.lock().unwrap();
+        assert_eq!(record.snapshot_bytes, 5);
+        assert_eq!(record.state, state);
+    }
+}
+
+#[test]
 fn pins_share_cache_clear_lifetime_and_completed_batches_restore_without_the_source() {
     let data = tempfile::tempdir().unwrap();
     let id = BatchId([2; 16]);
