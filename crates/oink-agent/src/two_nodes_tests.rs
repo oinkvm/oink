@@ -65,15 +65,27 @@ async fn start(name: &str, port: u16) -> Dev {
     }
 }
 
-async fn wait_for(what: &str, secs: f64, mut f: impl FnMut() -> bool) {
+async fn wait_for(what: &str, secs: f64, f: impl FnMut() -> bool) {
     let end = Instant::now() + Duration::from_secs_f64(secs);
-    while Instant::now() < end {
+    if observe_until(end, Instant::now, f).await {
+        return;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+async fn observe_until(end: Instant, mut now: impl FnMut() -> Instant, mut f: impl FnMut() -> bool) -> bool {
+    loop {
+        // A delayed wake may cross the deadline after the producer became
+        // ready. Observe that result before declaring a timeout; never wait
+        // again past the same deadline when the condition is still false.
         if f() {
-            return;
+            return true;
+        }
+        if now() >= end {
+            return false;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("timed out waiting for {what}");
 }
 
 /// 在阻塞线程里调用 API（API 会等网络，不能在运行时的工作线程里直接调用）。

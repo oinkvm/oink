@@ -1,4 +1,5 @@
 use super::*;
+use oink_audio::claims::Resolution;
 use oink_protocol::v1::{
     dto,
     schema::{WireDto, WireValue},
@@ -54,10 +55,10 @@ fn concurrent_exit_selections_converge_after_directional_group_merge() {
             }
             common::active(&nodes).await;
             assert!(nodes.iter().all(|node| node.group_id() == Some(target_group)));
-            wait_for("destination exit survives group merge", 5., || {
-                nodes
+            wait_for_audio("destination exit survives group merge", &nodes, |resolutions| {
+                resolutions
                     .iter()
-                    .all(|node| node.audio_status().unwrap().resolution.owner() == Some(a.node.id()))
+                    .all(|resolution| resolution.owner() == Some(a.node.id()))
             })
             .await;
             assert!(
@@ -69,14 +70,16 @@ fn concurrent_exit_selections_converge_after_directional_group_merge() {
                     .any(|record| record.owner == b.node.id() && record.claim.is_some())
             );
             tokio::join!(select_exit(&ap.node), select_exit(&b.node));
-            wait_for("concurrent exit selections converge across merged members", 5., || {
-                let resolution = a.node.audio_status().unwrap().resolution;
-                resolution.available()
-                    && matches!(resolution.owner(), Some(owner) if owner == ap.node.id() || owner == b.node.id())
-                    && nodes
-                        .iter()
-                        .all(|node| node.audio_status().unwrap().resolution == resolution)
-            })
+            wait_for_audio(
+                "concurrent exit selections converge across merged members",
+                &nodes,
+                |resolutions| {
+                    let resolution = resolutions[0];
+                    resolution.available()
+                        && matches!(resolution.owner(), Some(owner) if owner == ap.node.id() || owner == b.node.id())
+                        && resolutions.iter().all(|current| *current == resolution)
+                },
+            )
             .await;
             for node in nodes {
                 assert!(!node.audio_status().unwrap().settings.forwarding_enabled);
@@ -84,6 +87,122 @@ fn concurrent_exit_selections_converge_after_directional_group_merge() {
             }
         },
     );
+}
+
+async fn wait_for_audio(what: &str, nodes: &[&Node], mut ready: impl FnMut(&[Resolution]) -> bool) {
+    let started = Instant::now();
+    let end = started + Duration::from_secs(5);
+    let mut observations = std::collections::VecDeque::new();
+    let observed = observe_until(end, Instant::now, || {
+        let at = started.elapsed();
+        let resolutions = audio_resolutions(nodes);
+        let matches = ready(&resolutions);
+        if observations.len() == 8 {
+            observations.pop_front();
+        }
+        observations.push_back((at, started.elapsed(), resolutions));
+        matches
+    })
+    .await;
+    if observed {
+        return;
+    }
+    eprintln!(
+        "AUDIO_CONVERGENCE_TIMING stage={what} elapsed={:?} last_observations={observations:?} final_observation={:?}",
+        started.elapsed(),
+        audio_resolutions(nodes)
+    );
+    dump_audio_convergence(what, nodes);
+    panic!("timed out waiting for {what}");
+}
+
+#[tokio::test]
+async fn readiness_is_observed_after_a_delayed_deadline_wakeup() {
+    // The producer becomes ready inside the deadline, then the waiter cannot
+    // run until after it. A controllable clock forces that order without a
+    // machine-speed assertion or a long blocked executor.
+    for becomes_ready in [true, false] {
+        let started = Instant::now();
+        let end = started + Duration::from_secs(5);
+        let now = std::cell::Cell::new(started);
+        let ready = std::cell::Cell::new(false);
+        let mut waiting = Box::pin(observe_until(end, || now.get(), || ready.get()));
+        let pending = std::future::poll_fn(|context| {
+            std::task::Poll::Ready(std::future::Future::poll(waiting.as_mut(), context).is_pending())
+        })
+        .await;
+        assert!(pending, "the first false observation waits for a notification");
+        ready.set(becomes_ready);
+        now.set(end + Duration::from_millis(1));
+        assert_eq!(waiting.await, becomes_ready, "ready={becomes_ready} at wakeup");
+    }
+}
+
+fn audio_resolutions(nodes: &[&Node]) -> Vec<Resolution> {
+    nodes
+        .iter()
+        .map(|node| node.audio_status().unwrap().resolution)
+        .collect()
+}
+
+fn dump_audio_convergence(what: &str, nodes: &[&Node]) {
+    eprintln!("AUDIO_CONVERGENCE_TIMEOUT stage={what}");
+    for (index, node) in nodes.iter().enumerate() {
+        let group = node.inner.group.get().unwrap();
+        let applied = group.applied();
+        let (active_group, claims, local) = {
+            let config = crate::node::lock(&node.inner.config);
+            let owner = config.owner();
+            (
+                owner.active_group(),
+                owner.claims(applied.group),
+                owner.item(dto::LocalOption::AudioExitClaim),
+            )
+        };
+        eprintln!(
+            "node[{index}] id={:?} boot={:?} group={:?} active_group={active_group:?} paused={} members={:?} audio={:?}",
+            node.id(),
+            node.boot(),
+            applied.group,
+            applied.paused,
+            applied.members,
+            node.audio_status()
+                .map(|status| (status.resolution, status.phase, status.problem))
+        );
+        eprintln!("node[{index}] local_option20={local:?} retained={claims:?}");
+        let links = node.links().unwrap().links();
+        for (peer_index, peer) in nodes.iter().enumerate() {
+            let link = links
+                .by_peer(peer.id())
+                .map(|link| (link.link, link.state, link.path, link.peer_boot, link.remote_address));
+            let facts = node.device_facts(peer.id());
+            eprintln!(
+                "node[{index}]->node[{peer_index}] link={link:?} current_boot={:?}",
+                if node.id() == peer.id() {
+                    Some(node.boot())
+                } else {
+                    group.peer_boot(peer.id())
+                }
+            );
+            eprintln!(
+                "node[{index}]->node[{peer_index}] facts_boot={:?} facts_group={:?} fact_sequence={:?} preference20={:?} claim20={:?} watermark21={:?} observed={:?} pause={:?}",
+                facts.as_ref().map(|facts| facts.boot()),
+                facts.as_ref().map(|facts| facts.group()),
+                facts.as_ref().map(|facts| facts.fact_sequence()),
+                facts
+                    .as_ref()
+                    .map(|facts| facts.preferences().map(|items| items.map(|items| items
+                        .0
+                        .into_iter()
+                        .filter(|item| item.option() == Ok(dto::LocalOption::AudioExitClaim))
+                        .collect::<Vec<_>>()))),
+                facts.as_ref().map(|facts| facts.audio_exit_claim()),
+                facts.as_ref().map(|facts| facts.audio_claim_watermark()),
+                facts.as_ref().map(|facts| facts.observed()),
+                facts.as_ref().map(|facts| facts.pause())
+            );
+        }
+    }
 }
 
 #[test]
@@ -369,7 +488,7 @@ async fn select_exit(node: &Node) {
         .owner()
         .revision(dto::LocalOption::AudioExitClaim)
         .unwrap();
-    let applied = node
+    let result = node
         .inner
         .audio
         .get()
@@ -380,8 +499,13 @@ async fn select_exit(node: &Node) {
             true,
             revision,
         )
-        .await
-        .unwrap();
+        .await;
+    eprintln!(
+        "AUDIO_EXIT_SELECTION owner={:?} group={:?} expected_revision={revision} result={result:?}",
+        node.id(),
+        node.group_id()
+    );
+    let applied = result.unwrap();
     assert_eq!(applied.outcome, dto::ControlOutcome::Applied);
     assert!(applied.persisted);
     assert!(applied.fact_sequence.is_some());
