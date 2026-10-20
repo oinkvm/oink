@@ -872,11 +872,11 @@ fn validate_volume(raw: &RawMap) -> Result<()> {
 }
 
 fn validate_clipboard_offer(raw: &RawMap) -> Result<()> {
-    let inventory = required::<Inventory>(raw, 6)?;
-    if required::<OfferId>(raw, 1)? != inventory.id()? {
+    let inventory = super::content::map_field(raw, 6)?;
+    if required::<OfferId>(raw, 1)? != required::<OfferId>(inventory, 1)? {
         return Err(ErrorCode::StateConflict.into());
     }
-    if inventory.inline_bytes()? > 4096 {
+    if super::content::inventory_inline_bytes(inventory)? > 4096 {
         return Err(ErrorCode::LimitExceeded.into());
     }
     Ok(())

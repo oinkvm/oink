@@ -62,19 +62,19 @@ fn validate_drag_image(raw: &RawMap) -> Result<()> {
 }
 pub(super) fn validate_dnd_notice(raw: &RawMap) -> Result<()> {
     let key = required::<DragKey>(raw, 1)?;
-    let inventory = required::<Inventory>(raw, 7)?;
-    if key.offer()? != inventory.id()?
+    let inventory = super::content::map_field(raw, 7)?;
+    if key.offer()? != required::<OfferId>(inventory, 1)?
         || key.native_generation()? == 0
         || required::<u64>(raw, 2)? == 0
         || required::<MetadataVersion>(raw, 5)?.revision()? == 0
     {
         return Err(ErrorCode::StateConflict.into());
     }
-    if inventory.inline_bytes()? > 4096 {
+    if super::content::inventory_inline_bytes(inventory)? > 4096 {
         return Err(ErrorCode::LimitExceeded.into());
     }
     if required::<DragState>(raw, 4)?.variant()? == Open::Known(DragStateKind::Announced)
-        && !inventory.items()?.0.is_empty()
+        && !super::content::array_field(inventory, 3)?.is_empty()
     {
         return Err(ErrorCode::UnsupportedValue.into());
     }

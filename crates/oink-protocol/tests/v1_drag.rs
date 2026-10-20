@@ -34,19 +34,21 @@ fn drag_notice_binds_native_generation_and_inventory() {
 }
 #[test]
 fn attachment_remainder_is_metadata_only_and_counted() {
-    let mut rep = support::sample_named("Representation");
-    rep.insert(
-        7,
-        V::Map([(1, V::Uint(1)), (2, V::Map([(1, V::Bytes(vec![1]))].into()))].into()),
-    );
-    let mut item = support::sample_named("ContentItem");
-    item.insert(3, V::Array(vec![V::Map(rep)]));
-    let mut raw = support::sample_named("InventoryRemainder");
-    raw.insert(1, V::Array(vec![V::Map(item)]));
-    assert_eq!(
-        InventoryRemainder::from_raw(raw).unwrap_err().code,
-        ErrorCode::UnsupportedValue
-    );
+    for kind in [1, 400] {
+        let mut rep = support::sample_named("Representation");
+        rep.insert(
+            7,
+            V::Map([(1, V::Uint(kind)), (2, V::Map([(1, V::Bytes(vec![1]))].into()))].into()),
+        );
+        let mut item = support::sample_named("ContentItem");
+        item.insert(3, V::Array(vec![V::Map(rep)]));
+        let mut raw = support::sample_named("InventoryRemainder");
+        raw.insert(1, V::Array(vec![V::Map(item)]));
+        assert_eq!(
+            InventoryRemainder::from_raw(raw).unwrap_err().code,
+            ErrorCode::UnsupportedValue
+        );
+    }
     let mut raw = support::sample_named("AttachmentItems");
     raw.insert(5, V::Uint(1));
     assert_eq!(

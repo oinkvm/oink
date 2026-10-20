@@ -356,7 +356,7 @@ impl StreamModule for ClipboardStreams {
             rx: None,
             packets_tx: None,
             packets_rx: None,
-            wanted: false,
+            wanted: self.offer.is_some(),
             supported,
             opening: Vec::new(),
             tail: None,
@@ -365,7 +365,6 @@ impl StreamModule for ClipboardStreams {
             finishing: Vec::new(),
             early_tail: None,
         });
-        self.refresh_offer(peer);
         self.advance(peer, Instant::now());
     }
     fn link_lost(&mut self, link: LinkId, peer: DeviceId, reason: LinkLost) {

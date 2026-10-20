@@ -35,7 +35,7 @@ fn display(key: &str) -> DisplayInfo {
 struct Dev {
     node: Node,
     input: FakeInput,
-    events: Arc<Mutex<Vec<ApiEvent>>>,
+    events: Arc<Mutex<Vec<(ApiEvent, Instant)>>>,
     _dir: tempfile::TempDir,
 }
 
@@ -59,7 +59,7 @@ async fn start(name: &str, port: u16) -> Dev {
     let sink = events.clone();
     node.subscribe(Arc::new(move |ev: &ApiEvent| {
         if matches!(ev, ApiEvent::EmergencyStop(_)) {
-            sink.lock().unwrap().push(ev.clone());
+            sink.lock().unwrap().push((ev.clone(), Instant::now()));
         }
     }));
     Dev {
@@ -72,9 +72,12 @@ async fn start(name: &str, port: u16) -> Dev {
 
 async fn wait_for(what: &str, secs: f64, mut f: impl FnMut() -> bool) {
     let end = Instant::now() + Duration::from_secs_f64(secs);
-    while Instant::now() < end {
+    loop {
         if f() {
             return;
+        }
+        if Instant::now() >= end {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -158,13 +161,15 @@ async fn long_press_esc_pauses_group_and_resume_is_local_scenario() {
     })
     .await;
     // A 的键盘上按住 Esc。
+    let hold = Duration::from_millis(an.input_settings().unwrap().emergency_hold_ms.into());
+    let pressed_at = Instant::now();
     key(&a.input, KeyCode::ESCAPE, true);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(an.overview().unwrap().sharing_enabled, "not before the hold time");
     wait_for("A paused", 7.0, || !an.overview().unwrap().sharing_enabled).await;
     wait_for("B paused", 3.0, || !bn.overview().unwrap().sharing_enabled).await;
     wait_for("pause teardown completed", 3.0, || {
-        !an.pause_status().settling && !bn.pause_status().settling
+        !an.pause_status().settling
+            && !bn.pause_status().settling
+            && [&a, &b].iter().all(|d| !d.events.lock().unwrap().is_empty())
     })
     .await;
     key(&a.input, KeyCode::ESCAPE, false);
@@ -182,11 +187,14 @@ async fn long_press_esc_pauses_group_and_resume_is_local_scenario() {
     }
     // 事件：A 是本机触发（界面把窗口弹到前台），B 不是。
     let ev = |d: &Dev| {
-        d.events.lock().unwrap().iter().find_map(|e| match e {
+        d.events.lock().unwrap().iter().find_map(|(e, _)| match e {
             ApiEvent::EmergencyStop(s) => Some(s.local),
             _ => None,
         })
     };
+    // Check the recorded transition time, even if the observer was descheduled
+    // past the hold deadline. A sleep cannot establish a countdown phase.
+    assert!(a.events.lock().unwrap()[0].1.duration_since(pressed_at) >= hold);
     assert_eq!(ev(&a), Some(true));
     assert_eq!(ev(&b), Some(false));
 

@@ -374,6 +374,17 @@ impl Node {
         crate::aim::set_config(self, config);
     }
 
+    /// Control Aim rule time in integration fixtures; transport timers remain real.
+    /// Install once before starting a game, then advance the clock monotonically.
+    #[cfg(debug_assertions)]
+    pub fn set_aim_clock_for_test(&self, clock: Arc<std::sync::atomic::AtomicU64>) {
+        self.inner
+            .aim
+            .test_clock
+            .set(clock)
+            .expect("Aim test clock already installed");
+    }
+
     pub fn start_platform_dnd(&self) {
         let _runtime = self.inner.rt.enter();
         if let Some(handle) = self.inner.dnd.get() {

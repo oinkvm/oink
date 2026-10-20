@@ -24,6 +24,10 @@ pub trait WireDto: Clone + std::fmt::Debug + PartialEq {
         super::cbor::skip_profile(d, depth)
     }
     fn from_raw(raw: RawMap) -> Result<Self>;
+    /// Check a retained subtree without constructing another owned DTO.
+    fn validate_raw(raw: &RawMap) -> Result<()> {
+        Self::from_raw(raw.clone()).map(|_| ())
+    }
     fn raw(&self) -> &RawMap;
     fn into_raw(self) -> RawMap;
     fn encode(&self, maximum: usize) -> Result<Vec<u8>> {
@@ -49,11 +53,17 @@ pub trait WireValue: Sized {
         super::cbor::skip_profile(d, depth)
     }
     fn read(raw: &RawValue) -> Result<Self>;
+    fn validate(raw: &RawValue) -> Result<()> {
+        Self::read(raw).map(|_| ())
+    }
     fn write(&self) -> RawValue;
 }
 impl<T: WireDto> WireValue for T {
     fn preflight(d: &mut minicbor::Decoder<'_>, depth: usize) -> Result<()> {
         <Self as WireDto>::preflight(d, depth)
+    }
+    fn validate(raw: &RawValue) -> Result<()> {
+        Self::validate_raw(raw.as_map()?)
     }
     fn read(raw: &RawValue) -> Result<Self> {
         Self::from_raw(raw.as_map()?.clone())
@@ -63,6 +73,9 @@ impl<T: WireDto> WireValue for T {
     }
 }
 impl WireValue for RawMap {
+    fn validate(raw: &RawValue) -> Result<()> {
+        raw.as_map().map(|_| ())
+    }
     fn read(raw: &RawValue) -> Result<Self> {
         Ok(raw.as_map()?.clone())
     }
@@ -71,6 +84,9 @@ impl WireValue for RawMap {
     }
 }
 impl WireValue for RawValue {
+    fn validate(_: &RawValue) -> Result<()> {
+        Ok(())
+    }
     fn read(raw: &RawValue) -> Result<Self> {
         Ok(raw.clone())
     }
@@ -124,6 +140,13 @@ macro_rules! float {
 float!(f32, F32);
 float!(f64, F64);
 impl<T: WireValue> WireValue for Option<T> {
+    fn validate(raw: &RawValue) -> Result<()> {
+        if matches!(raw, RawValue::Null) {
+            Ok(())
+        } else {
+            T::validate(raw)
+        }
+    }
     fn preflight(d: &mut minicbor::Decoder<'_>, depth: usize) -> Result<()> {
         if d.input().get(d.position()) == Some(&0xf6) {
             super::cbor::skip_profile(d, depth)
@@ -145,6 +168,13 @@ impl<T: WireValue> WireValue for Option<T> {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Bytes<const MAX: usize>(pub Vec<u8>);
 impl<const MAX: usize> WireValue for Bytes<MAX> {
+    fn validate(raw: &RawValue) -> Result<()> {
+        match raw {
+            RawValue::Bytes(b) if b.len() <= MAX => Ok(()),
+            RawValue::Bytes(_) => Err(ErrorCode::LimitExceeded.into()),
+            _ => Err(ErrorCode::MalformedFrame.into()),
+        }
+    }
     fn preflight(d: &mut minicbor::Decoder<'_>, depth: usize) -> Result<()> {
         let mut probe = d.clone();
         if probe.bytes()?.len() > MAX {
@@ -186,6 +216,13 @@ impl<const N: usize> WireValue for FixedBytes<N> {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Text<const MAX: usize>(pub String);
 impl<const MAX: usize> WireValue for Text<MAX> {
+    fn validate(raw: &RawValue) -> Result<()> {
+        match raw {
+            RawValue::Text(s) if s.len() <= MAX => Ok(()),
+            RawValue::Text(_) => Err(ErrorCode::LimitExceeded.into()),
+            _ => Err(ErrorCode::MalformedFrame.into()),
+        }
+    }
     fn preflight(d: &mut minicbor::Decoder<'_>, depth: usize) -> Result<()> {
         let mut probe = d.clone();
         if probe.str()?.len() > MAX {
@@ -207,6 +244,14 @@ impl<const MAX: usize> WireValue for Text<MAX> {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Ascii<const MAX: usize>(pub String);
 impl<const MAX: usize> WireValue for Ascii<MAX> {
+    fn validate(raw: &RawValue) -> Result<()> {
+        Text::<MAX>::validate(raw)?;
+        let RawValue::Text(s) = raw else { unreachable!() };
+        if s.is_empty() || !s.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+            return Err(ErrorCode::MalformedFrame.into());
+        }
+        Ok(())
+    }
     fn preflight(d: &mut minicbor::Decoder<'_>, depth: usize) -> Result<()> {
         Text::<MAX>::preflight(d, depth)
     }
@@ -224,6 +269,18 @@ impl<const MAX: usize> WireValue for Ascii<MAX> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct List<T, const MAX: usize>(pub Vec<T>);
 impl<T: WireValue, const MAX: usize> WireValue for List<T, MAX> {
+    fn validate(raw: &RawValue) -> Result<()> {
+        let RawValue::Array(items) = raw else {
+            return Err(ErrorCode::MalformedFrame.into());
+        };
+        if items.len() > MAX {
+            return Err(ErrorCode::LimitExceeded.into());
+        }
+        for item in items {
+            T::validate(item)?;
+        }
+        Ok(())
+    }
     fn preflight(d: &mut minicbor::Decoder<'_>, depth: usize) -> Result<()> {
         if depth >= super::limits::DEPTH {
             return Err(ErrorCode::LimitExceeded.into());
@@ -280,6 +337,22 @@ macro_rules! field_read {
     };
 }
 pub(crate) use field_read;
+// Validation traverses borrowed fields; only a getter needs an owned value.
+macro_rules! field_validate {
+    ($m:expr, $k:expr, $t:ty, required) => {
+        $m.get(&$k)
+            .ok_or_else(|| $crate::v1::Error::from($crate::v1::ErrorCode::MalformedFrame))
+            .and_then(<$t as $crate::v1::schema::WireValue>::validate)
+            .map_err(|e| e.at_field($k))
+    };
+    ($m:expr, $k:expr, $t:ty, $d:tt) => {
+        $m.get(&$k)
+            .map_or(Ok(()), <$t as $crate::v1::schema::WireValue>::validate)
+            .map_err(|e| e.at_field($k))
+    };
+}
+pub(crate) use field_validate;
+
 // Known diagnostic kinds select their recursive body contract before any raw
 // tree is materialized. Unrecognized kinds retain their bounded opaque maps.
 pub(crate) fn preflight_diagnostic_event(d: &mut minicbor::Decoder<'_>, depth: usize) -> Result<()> {
@@ -332,10 +405,13 @@ macro_rules! wire_map {
                 $crate::v1::schema::check_dto_size(stringify!($name),d.position()-start)
             }
             fn from_raw(raw: $crate::v1::RawMap) -> $crate::v1::Result<Self> {
-                $crate::v1::schema::check_dto_size(stringify!($name),$crate::v1::cbor::map_len(&raw)?)?;
-                $($crate::v1::schema::field_read!(&raw, $key, $ty, $default)?;)*
-                $validate(&raw)?;
+                <Self as $crate::v1::schema::WireDto>::validate_raw(&raw)?;
                 Ok(Self(raw))
+            }
+            fn validate_raw(raw: &$crate::v1::RawMap) -> $crate::v1::Result<()> {
+                $crate::v1::schema::check_dto_size(stringify!($name),$crate::v1::cbor::map_len(raw)?)?;
+                $($crate::v1::schema::field_validate!(raw, $key, $ty, $default)?;)*
+                $validate(raw)
             }
             fn raw(&self) -> &$crate::v1::RawMap { &self.0 }
             fn into_raw(self) -> $crate::v1::RawMap { self.0 }
@@ -449,14 +525,21 @@ impl<K: EnumSchema> WireDto for OpenEnvelope<K> {
         Ok(())
     }
     fn from_raw(raw: RawMap) -> Result<Self> {
-        super::cbor::map_len(&raw)?;
-        let kind: K = required(&raw, 1)?;
-        let body: RawMap = defaulted(&raw, 2, RawMap::new)?;
-        kind.validate_body(&body).map_err(|e| e.at_field(2))?;
+        Self::validate_raw(&raw)?;
         Ok(Self {
             raw,
             marker: std::marker::PhantomData,
         })
+    }
+    fn validate_raw(raw: &RawMap) -> Result<()> {
+        super::cbor::map_len(raw)?;
+        let kind: K = required(raw, 1)?;
+        let empty = RawMap::new();
+        let body = match raw.get(&2) {
+            Some(body) => body.as_map().map_err(|e| e.at_field(2))?,
+            None => &empty,
+        };
+        kind.validate_body(body).map_err(|e| e.at_field(2))
     }
     fn raw(&self) -> &RawMap {
         &self.raw
@@ -471,7 +554,7 @@ macro_rules! enum_body {
             fn known(&self) -> bool { !matches!(self, Self::Unknown(_)) }
             fn number(&self) -> u32 { (*self).number() }
             fn validate_body(&self, body: &$crate::v1::RawMap) -> $crate::v1::Result<()> {
-                match self { $(Self::$variant => { <$body as $crate::v1::schema::WireDto>::from_raw(body.clone())?; },)* _ => {} }
+                match self { $(Self::$variant => { <$body as $crate::v1::schema::WireDto>::validate_raw(body)?; },)* _ => {} }
                 Ok(())
             }
             fn preflight_body(&self, d: &mut minicbor::Decoder<'_>, depth: usize) -> $crate::v1::Result<()> {
@@ -503,4 +586,71 @@ pub(crate) fn check_dto_size(name: &str, size: usize) -> Result<()> {
         return Err(ErrorCode::LimitExceeded.into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(dead_code)] // The fixture DTOs also generate getters and edit methods.
+mod validation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static READS: AtomicUsize = AtomicUsize::new(0);
+    static CHECKS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) struct Counted;
+    impl WireValue for Counted {
+        fn read(raw: &RawValue) -> Result<Self> {
+            READS.fetch_add(1, Ordering::Relaxed);
+            Self::validate(raw)?;
+            Ok(Self)
+        }
+        fn validate(raw: &RawValue) -> Result<()> {
+            CHECKS.fetch_add(1, Ordering::Relaxed);
+            u32::read(raw).map(|_| ())
+        }
+        fn write(&self) -> RawValue {
+            RawValue::Uint(1)
+        }
+    }
+    wire_map!(Leaf, no_validation, { 1 => value: Counted = required; });
+    wire_map!(Middle, no_validation, { 2 => leaves: List<Leaf, 600> = required; });
+    wire_map!(Outer, no_validation, {
+        3 => middle: Middle = required;
+        4 => optional: Option<Middle> = optional;
+        5 => default: bool = false;
+    });
+
+    #[test]
+    fn nested_validation_checks_each_leaf_once_without_constructing_owned_values() {
+        READS.store(0, Ordering::Relaxed);
+        CHECKS.store(0, Ordering::Relaxed);
+        let leaves = (0..600)
+            .map(|_| RawValue::Map([(1, RawValue::Uint(1))].into()))
+            .collect();
+        let middle = RawValue::Map([(2, RawValue::Array(leaves))].into());
+        let raw: RawMap = [(3, middle), (900, RawValue::Text("retained".into()))].into();
+        let value = Outer::from_raw(raw.clone()).unwrap();
+        assert_eq!(value.raw(), &raw);
+        assert_eq!(READS.load(Ordering::Relaxed), 0);
+        assert_eq!(CHECKS.load(Ordering::Relaxed), 600);
+
+        let mut bad = raw.clone();
+        let RawValue::Map(middle) = bad.get_mut(&3).unwrap() else {
+            panic!()
+        };
+        let RawValue::Array(leaves) = middle.get_mut(&2).unwrap() else {
+            panic!()
+        };
+        leaves[0] = RawValue::Map([(1, RawValue::Bool(false))].into());
+        let error = Outer::from_raw(bad).unwrap_err();
+        assert_eq!(error.code, ErrorCode::MalformedFrame);
+        assert_eq!(error.field_path, vec![3, 2, 1]);
+        assert_eq!(Outer::from_raw(RawMap::new()).unwrap_err().field_path, vec![3]);
+
+        // Explicit null is accepted only by Option, never by a defaulted bool.
+        let mut explicit = raw;
+        explicit.insert(4, RawValue::Null);
+        Outer::from_raw(explicit.clone()).unwrap();
+        explicit.insert(5, RawValue::Null);
+        assert_eq!(Outer::from_raw(explicit).unwrap_err().field_path, vec![5]);
+    }
 }

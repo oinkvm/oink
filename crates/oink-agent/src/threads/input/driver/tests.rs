@@ -718,6 +718,8 @@ fn ordinary_command_flood_has_a_defined_nonblocking_outcome() {
     // command API; the harness owns and drains the native owner at the end.
     let handle = std::mem::ManuallyDrop::new(InputThread {
         source_start: h.driver.inject.source_start(),
+        #[cfg(debug_assertions)]
+        source_motion_for_test: h.driver.inject.source_motion_counter_for_test(),
         shared: h.driver.shared.clone(),
         backend: h.driver.inject.backend(),
         inject_scheduler: h.driver.inject.scheduler_snapshot(),
@@ -739,6 +741,8 @@ fn full_action_queue_rejects_and_counts_but_keeps_latest_state_and_shutdown() {
     let mut h = Harness::new();
     let handle = std::mem::ManuallyDrop::new(InputThread {
         source_start: h.driver.inject.source_start(),
+        #[cfg(debug_assertions)]
+        source_motion_for_test: h.driver.inject.source_motion_counter_for_test(),
         shared: h.driver.shared.clone(),
         backend: h.driver.inject.backend(),
         inject_scheduler: h.driver.inject.scheduler_snapshot(),

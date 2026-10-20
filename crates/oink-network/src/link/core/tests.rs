@@ -897,3 +897,28 @@ fn retiring_direct_member_revokes_existing_transit_but_preserves_its_c0_link() {
     assert!(rig.nodes[0].peer_link(rig.peer(2)).is_none());
     assert!(rig.nodes[2].peer_link(rig.peer(0)).is_none());
 }
+
+#[test]
+fn fresh_addresses_join_a_pending_relay_search_once() {
+    let mut r = Rig::new(2);
+    let target = r.peer(1);
+    r.nodes[0].dial(target, vec![], DialMode::PreferDirect, r.now).unwrap();
+    let deadline = r.nodes[0].dials[&target].deadline;
+    r.nodes[0].effects.clear();
+    let first: SocketAddr = "127.0.0.1:47001".parse().unwrap();
+    let second: SocketAddr = "127.0.0.1:47002".parse().unwrap();
+    for addresses in [vec![first], vec![first], vec![first, second], vec![second, first]] {
+        r.nodes[0].update_addresses(target, addresses, r.now);
+    }
+    let candidates = r.nodes[0]
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Dial { peer, addresses } if *peer == target => Some(addresses.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(candidates, vec![vec![first], vec![second]]);
+    assert_eq!(r.nodes[0].dials[&target].deadline, deadline);
+    assert!(r.nodes[0].dials[&target].direct);
+}

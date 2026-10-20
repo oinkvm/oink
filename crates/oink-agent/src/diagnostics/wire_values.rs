@@ -57,6 +57,11 @@ impl Value for (f64, f64) {
     }
 }
 pub(super) fn dto<T: WireDto>(values: impl IntoIterator<Item = (&'static str, RawValue)>) -> v1::Result<T> {
+    T::from_raw(raw_fields::<T>(values)?)
+}
+// Assemble newly projected children without copying them into intermediate
+// DTOs. The owning top-level DTO recursively validates the entire tree once.
+fn raw_fields<T: WireDto>(values: impl IntoIterator<Item = (&'static str, RawValue)>) -> v1::Result<RawMap> {
     let mut raw = RawMap::new();
     for (name, value) in values {
         let field = T::SCHEMA
@@ -68,16 +73,18 @@ pub(super) fn dto<T: WireDto>(values: impl IntoIterator<Item = (&'static str, Ra
             return Err(v1::ErrorCode::MalformedFrame.into());
         }
     }
-    T::from_raw(raw)
+    Ok(raw)
 }
 fn envelope<K: EnumSchema>(kind: K, body: RawMap) -> v1::Result<RawValue> {
-    Ok(OpenEnvelope::<K>::from_raw([(1, kind.write()), (2, RawValue::Map(body))].into())?.write())
+    Ok(RawValue::Map(
+        OpenEnvelope::<K>::from_raw([(1, kind.write()), (2, RawValue::Map(body))].into())?.into_raw(),
+    ))
 }
 macro_rules! structure {
     ($domain:ty=>$wire:ty {$($field:ident),*$(,)?}) => {
         impl Value for $domain { fn wire(&self)->v1::Result<RawValue> {
             $(let _ = <$wire>::$field;)*
-            Ok(dto::<$wire>([$((stringify!($field),self.$field.wire()?),)*])?.write())
+            Ok(RawValue::Map(dto::<$wire>([$((stringify!($field),self.$field.wire()?),)*])?.into_raw()))
         } }
     };
 }
@@ -534,11 +541,21 @@ fn topology_summary(layout: &super::layout::CompleteLayout) -> v1::Result<RawMap
     ])
 }
 impl Event {
+    #[cfg(test)]
     pub(super) fn network(&self, rich: bool) -> v1::Result<w::DiagnosticEvent> {
+        w::DiagnosticEvent::from_raw(self.network_raw(rich)?)
+    }
+    fn network_raw(&self, rich: bool) -> v1::Result<RawMap> {
         macro_rules! fields {($t:ty,$($name:ident),*$(,)?)=>{body::<$t>([$((stringify!($name),$name.wire()?),)*])?};}
         macro_rules! projected {
             ($kind:literal,$value:expr) => {
-                ($kind, $value.wire()?.as_map()?.clone())
+                (
+                    $kind,
+                    match $value.wire()? {
+                        RawValue::Map(fields) => fields,
+                        _ => return Err(v1::ErrorCode::MalformedFrame.into()),
+                    },
+                )
             };
         }
         let (kind, fields) = match self {
@@ -758,7 +775,7 @@ impl Event {
             Self::SourceRouting(v) => projected!("source-routing/1", v),
             Self::ProtocolViolation(v) => projected!("protocol-violation/1", v),
         };
-        dto::<w::DiagnosticEvent>([("kind", RawValue::from(kind)), ("fields", RawValue::Map(fields))])
+        raw_fields::<w::DiagnosticEvent>([("kind", RawValue::from(kind)), ("fields", RawValue::Map(fields))])
     }
 }
 pub(super) fn snapshot(value: &Snapshot, rich: bool) -> v1::Result<w::Snapshot> {
@@ -829,13 +846,13 @@ pub(super) fn segment(value: &store::Segment, rich: bool) -> v1::Result<w::Diagn
         .rows
         .iter()
         .map(|row| {
-            dto::<w::DiagnosticRow>([
+            raw_fields::<w::DiagnosticRow>([
                 ("mono_us", row.mono_us.wire()?),
                 ("clock_id", row.clock_id.wire()?),
                 ("utc_us", row.utc_us.wire()?),
-                ("event", row.event.network(rich)?.write()),
+                ("event", RawValue::Map(row.event.network_raw(rich)?)),
             ])
-            .map(|v| v.write())
+            .map(RawValue::Map)
         })
         .collect::<v1::Result<_>>()?;
     dto::<w::DiagnosticSegment>([
@@ -844,7 +861,7 @@ pub(super) fn segment(value: &store::Segment, rich: bool) -> v1::Result<w::Diagn
         ("instance", value.instance.wire()?),
         ("seq", value.seq.wire()?),
         ("dropped", value.dropped.wire()?),
-        ("snapshot", snapshot(&value.snapshot, rich)?.write()),
+        ("snapshot", RawValue::Map(snapshot(&value.snapshot, rich)?.into_raw())),
         ("clock_samples", value.clock_samples.wire()?),
         ("rows", RawValue::Array(rows)),
     ])

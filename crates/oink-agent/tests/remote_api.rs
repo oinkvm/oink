@@ -262,9 +262,12 @@ fn configured_game_hotkey_reaches_the_agent_action() {
 
 fn wait(what: &str, mut f: impl FnMut() -> bool) {
     let end = std::time::Instant::now() + Duration::from_secs(5);
-    while std::time::Instant::now() < end {
+    loop {
         if f() {
             return;
+        }
+        if std::time::Instant::now() >= end {
+            break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -372,11 +375,20 @@ fn remote_pairing_installs_membership_and_fences_prepared_client() {
         pairing::PairReply::Problem(_)
     ));
     assert!(matches!(
-        rb.submit_pairing_code(pair_id, session.revision, 1, code).unwrap(),
+        rb.submit_pairing_code(pair_id.clone(), session.revision, 1, code)
+            .unwrap(),
         pairing::PairReply::Value(_)
     ));
-    wait("IPC membership", || {
-        ra.group().unwrap().members.len() == 2 && rb.group().unwrap().members.len() == 2
+    wait("IPC pairing committed on both peers", || {
+        [&ra, &rb].iter().all(|api| {
+            api.group().unwrap().members.len() == 2
+                && api
+                    .pairings()
+                    .unwrap()
+                    .sessions
+                    .iter()
+                    .any(|s| s.id == pair_id && s.phase == 7)
+        })
     });
     assert_eq!(ra.group().unwrap().id, rb.group().unwrap().id);
     // The address editor is local storage access, including when the member is

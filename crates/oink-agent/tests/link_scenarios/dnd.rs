@@ -580,8 +580,13 @@ async fn fast_motion_between_start_window_and_press_cannot_lose_drag_scenario() 
     common::watchdog::until("source window placed", || db.calls.lock().unwrap().contains(&"placed")).await;
     let at = b.input.cursor_position().unwrap();
     b.input.take_injected();
+    let input = b.node.input_thread().unwrap();
+    let dropped_before = input.source_motion_discarded_for_test();
     os_move(&a.input, 120.);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    common::watchdog::until("remote motion discarded during source press", || {
+        input.source_motion_discarded_for_test() > dropped_before
+    })
+    .await;
     let during = b.input.cursor_position().unwrap();
     release.send(()).unwrap();
     common::watchdog::until("native drag begins after source press release", || {

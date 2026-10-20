@@ -831,6 +831,24 @@ impl Core {
         self.lose(id, LinkLost::ConnectionLost);
     }
     pub fn update_addresses(&mut self, peer: DeviceId, addresses: Vec<SocketAddr>, now: Instant) {
+        // Discovery can learn a direct route while a relay search is still
+        // pending. Add only unseen candidates to that attempt; do not discard
+        // the hint until failure/backoff or restart its deadline.
+        if let Some(dial) = self.dials.get_mut(&peer)
+            && now < dial.deadline
+        {
+            let mut fresh = Vec::new();
+            for address in &addresses {
+                if !dial.addresses.contains(address) {
+                    dial.addresses.push(*address);
+                    fresh.push(*address);
+                }
+            }
+            if !fresh.is_empty() {
+                dial.direct = true;
+                self.effects.push_back(Effect::Dial { peer, addresses: fresh });
+            }
+        }
         if let Some(id) = self.peer_link(peer) {
             let link = self.links.get_mut(&id).expect("link");
             if link.addresses == addresses {

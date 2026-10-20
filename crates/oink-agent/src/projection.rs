@@ -29,6 +29,8 @@ pub(crate) struct State {
     surface: OnceLock<ProjectionOverlay>,
     control: Mutex<Control>,
     wake: tokio::sync::Notify,
+    #[cfg(test)]
+    lease_clock: OnceLock<Mutex<Instant>>,
 }
 #[derive(Default)]
 struct Control {
@@ -92,6 +94,16 @@ pub(crate) fn status(node: &Node) -> api::ProjectionStatus {
         editing: lock(&node.inner.projection.control).mode.is_some(),
     }
 }
+// Tests can freeze preview leases while real stream pacing and heartbeats run.
+fn lease_now(node: &Node, now: Instant) -> Instant {
+    #[cfg(test)]
+    if let Some(clock) = node.inner.projection.lease_clock.get() {
+        return *lock(clock);
+    }
+    let _ = node;
+    now
+}
+
 fn emit_status(node: &Node) {
     node.emit(api::ApiEvent::LayoutProjection(status(node)));
 }
@@ -105,7 +117,7 @@ pub(crate) fn set_mode(node: &Node, enabled: bool) -> api::ProjectionStatus {
             serial: c.serial,
             boot_nonce: node.boot().nonce,
         };
-        c.mode = Some((id, Instant::now() + LEASE));
+        c.mode = Some((id, lease_now(node, Instant::now()) + LEASE));
         c.immediate.push(Action::Mode { id, enabled: true });
     } else if !enabled && let Some((id, _)) = c.mode.take() {
         c.closed.insert(id);
@@ -200,7 +212,7 @@ pub(crate) fn preview_ui(
                 .into_iter()
                 .map(|id| ScreenId::new(id.device.0, id.display))
                 .collect(),
-            Instant::now(),
+            lease_now(node, Instant::now()),
         );
     }
     drop(c);
@@ -209,6 +221,7 @@ pub(crate) fn preview_ui(
 }
 
 fn receive(node: &Node, peer: DeviceId, msg: Action, now: Instant) {
+    let now = lease_now(node, now);
     if !msg.valid() {
         return;
     }
@@ -296,6 +309,7 @@ fn receive(node: &Node, peer: DeviceId, msg: Action, now: Instant) {
 }
 
 async fn native_event(node: &Node, event: Event, now: Instant) {
+    let now = lease_now(node, now);
     if matches!(event, Event::Escape) {
         set_mode(node, false);
         return;
@@ -384,23 +398,24 @@ fn expire_previews(c: &mut Control, now: Instant) {
 }
 
 fn tick(node: &Node, now: Instant, heartbeat: bool) -> Vec<Action> {
+    let lease_now = lease_now(node, now);
     let mut c = lock(&node.inner.projection.control);
     let mut changed = false;
     if let Some((id, expiry)) = c.mode {
         if id.owner == node.id() {
-            c.mode = Some((id, now + LEASE));
+            c.mode = Some((id, lease_now + LEASE));
             if heartbeat {
                 c.immediate.push(Action::Mode { id, enabled: true });
             }
-        } else if expiry <= now {
+        } else if expiry <= lease_now {
             c.mode = None;
             c.gesture = None;
             c.gestures.clear();
             changed = true;
         }
     }
-    expire_previews(&mut c, now);
-    c.gestures.retain(|_, expiry| *expiry > now);
+    expire_previews(&mut c, lease_now);
+    c.gestures.retain(|_, expiry| *expiry > lease_now);
     if c.gesture.is_some() && heartbeat {
         let id = c.mode.expect("active mode").0;
         c.immediate.push(Action::Gesture { id, active: true });
@@ -410,7 +425,7 @@ fn tick(node: &Node, now: Instant, heartbeat: bool) -> Vec<Action> {
         // Native held gestures renew themselves; UI previews require the UI's
         // explicit lease renewal so a closed/crashed editor cannot leave overlays.
         let expiry = local.expires;
-        preview_locked(&mut c, layout, affected, now);
+        preview_locked(&mut c, layout, affected, lease_now);
         if c.gesture.is_none()
             && let Some(p) = c.local.as_mut()
         {
@@ -694,6 +709,13 @@ mod integration_tests {
                     .unwrap(),
                 );
             }
+            for node in &nodes {
+                node.inner
+                    .projection
+                    .lease_clock
+                    .set(Mutex::new(Instant::now()))
+                    .unwrap();
+            }
             let (upper, left, right) = (&nodes[0], &nodes[1], &nodes[2]);
             common::pair(upper, left).await;
             common::pair(upper, right).await;
@@ -748,9 +770,11 @@ mod integration_tests {
             .await;
             preview_ui(upper, 2, placements, vec![], false).unwrap();
             let expires = lock(&upper.inner.projection.control).local.as_ref().unwrap().expires;
-            tick(upper, expires - Duration::from_millis(1), true);
+            *lock(upper.inner.projection.lease_clock.get().unwrap()) = expires - Duration::from_millis(1);
+            tick(upper, Instant::now(), true);
             assert!(!view(upper, &online).projections.is_empty());
-            tick(upper, expires, false);
+            *lock(upper.inner.projection.lease_clock.get().unwrap()) = expires;
+            tick(upper, Instant::now(), false);
             assert_eq!(
                 view(upper, &online),
                 View::default(),
@@ -790,6 +814,13 @@ mod integration_tests {
             None,
         )
         .await;
+        for node in [&a, &b] {
+            node.inner
+                .projection
+                .lease_clock
+                .set(Mutex::new(Instant::now()))
+                .unwrap();
+        }
         common::pair(&a, &b).await;
         common::until("same layout", || {
             a.layout().0 == b.layout().0 && a.layout().0.screens.len() == 2

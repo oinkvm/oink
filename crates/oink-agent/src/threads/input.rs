@@ -346,6 +346,8 @@ struct Shared {
 /// router's ownership away from that thread.
 pub struct InputThread {
     source_start: oink_clipboard::dnd::SourceStart,
+    #[cfg(debug_assertions)]
+    source_motion_for_test: Arc<std::sync::atomic::AtomicU64>,
     shared: Arc<Shared>,
     backend: Arc<dyn oink_input::InputBackend>,
     inject_scheduler: Arc<Snapshot<oink_network::link::SchedulerStatus>>,
@@ -376,6 +378,8 @@ impl InputThread {
     ) -> std::io::Result<(Self, InputNotices)> {
         let local = boot.device_id;
         let source_start = inject.source_start();
+        #[cfg(debug_assertions)]
+        let source_motion_for_test = inject.source_motion_counter_for_test();
         let backend = inject.backend();
         let inject_scheduler = inject.scheduler_snapshot();
         let inject_failures = inject.failure_counter();
@@ -403,6 +407,8 @@ impl InputThread {
         Ok((
             Self {
                 source_start,
+                #[cfg(debug_assertions)]
+                source_motion_for_test,
                 shared,
                 backend,
                 inject_scheduler,
@@ -439,6 +445,12 @@ impl InputThread {
     }
     pub fn status(&self) -> Arc<InputStatus> {
         self.shared.status.load()
+    }
+
+    /// Observe receipt of discarded motion while a test holds native source press.
+    #[cfg(debug_assertions)]
+    pub fn source_motion_discarded_for_test(&self) -> u64 {
+        self.source_motion_for_test.load(std::sync::atomic::Ordering::Acquire) & !(1 << 63)
     }
     pub fn touchpad_contacts(&self) -> Option<u8> {
         self.backend.touchpad_contacts()

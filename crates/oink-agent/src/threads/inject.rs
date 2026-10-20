@@ -406,6 +406,11 @@ impl InjectHandle {
             )
             .is_ok()
     }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn source_motion_counter_for_test(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.source_motion.clone()
+    }
     fn enqueue_reported(
         &self,
         safety: oink_input::session_gate::InputSafety,

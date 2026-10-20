@@ -465,3 +465,17 @@ fn address_probe_failures_keep_local_network_causes() {
         AddressProbeError::Timeout
     );
 }
+
+#[tokio::test]
+async fn a_new_address_connects_during_a_pending_relay_search() {
+    let (a, mut ac, _) = node().await;
+    let (b, mut bc, _) = node().await;
+    a.dial(b.id(), vec![], DialMode::PreferDirect).unwrap();
+    // FIFO commands guarantee the address arrives after the empty search starts.
+    a.update_addresses(b.id(), vec![b.local_addr()]);
+    let (al, bl) = tokio::join!(connected(&mut ac), connected(&mut bc));
+    assert_ne!(al.direction, bl.direction);
+    assert_eq!(a.links().links.len(), 1);
+    assert_eq!(b.links().links.len(), 1);
+    tokio::join!(a.stop(), b.stop());
+}

@@ -60,9 +60,8 @@ fn physical_user_hooks_ignore_wake_setting_but_respect_full_pause() {
 
 async fn physical_user_hooks_ignore_wake_setting_but_respect_full_pause_scenario() {
     let dir = tempfile::tempdir().unwrap();
-    let port = 46000 + (std::process::id() % 1000) as u16 * 8;
-    let (a, ai) = start(&dir.path().join("a"), "activity-a", port).await;
-    let (b, bi) = start(&dir.path().join("b"), "activity-b", port + 4).await;
+    let (a, ai) = start(&dir.path().join("a"), "activity-a", 0).await;
+    let (b, bi) = start(&dir.path().join("b"), "activity-b", 0).await;
     common::pair(&a, &b).await;
     for node in [&a, &b] {
         let mut settings = node.input_settings().unwrap();
@@ -89,7 +88,10 @@ async fn physical_user_hooks_ignore_wake_setting_but_respect_full_pause_scenario
     for _ in 0..3 {
         tokio::time::sleep(Duration::from_millis(1100)).await;
         motion(&ai, true, 1.0);
-        assert!(sa().limited && sb().limited);
+        wait("renewed local and remote activity pacing", || {
+            sa().limited && sb().limited
+        })
+        .await;
     }
     let capture_sessions = ai.capture_sessions();
     let injection_sessions = ai.injection_sessions();

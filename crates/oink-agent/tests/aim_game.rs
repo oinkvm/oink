@@ -2,7 +2,7 @@
 //! Two real loopback nodes run the aiming game with fake input and overlay
 //! backends. This checks game messages and closure paths without native windows.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -119,6 +119,13 @@ fn display(key: &str) -> DisplayInfo {
 struct Dev {
     node: Node,
     surface: Arc<FakeSurface>,
+    clock: Arc<AtomicU64>,
+}
+
+impl Dev {
+    fn advance_game(&self, micros: u64) {
+        self.clock.fetch_add(micros, Ordering::AcqRel);
+    }
 }
 
 #[derive(Default)]
@@ -249,6 +256,8 @@ async fn start_with_input(name: &str, port: u16, input: Arc<dyn InputBackend>) -
     })
     .await
     .unwrap();
+    let clock = Arc::new(AtomicU64::new(1_000_000));
+    node.set_aim_clock_for_test(clock.clone());
     let surface = Arc::new(FakeSurface::default());
     node.set_aim_surface(Some(surface.clone()));
     // 一局缩短到 2.5 秒、倒计时 0.3 秒。
@@ -257,14 +266,17 @@ async fn start_with_input(name: &str, port: u16, input: Arc<dyn InputBackend>) -
         duration: 2_500_000,
         ..Config::default()
     });
-    Dev { node, surface }
+    Dev { node, surface, clock }
 }
 
 async fn wait_for(what: &str, secs: f64, mut f: impl FnMut() -> bool) {
     let end = Instant::now() + Duration::from_secs_f64(secs);
-    while Instant::now() < end {
+    loop {
         if f() {
             return;
+        }
+        if Instant::now() >= end {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -377,14 +389,24 @@ async fn game_runs_across_two_devices_and_always_closes_scenario() {
     let st = api(&an, |n| n.aim_start()).await.unwrap();
     assert!(st.host && st.phase == AimPhase::Countdown);
     assert!(a.surface.is_open());
-    wait_for("overlay on B", 5.0, || b.surface.is_open()).await;
+    wait_for("countdown view on B", 5.0, || {
+        b.surface.view().is_some_and(|view| view.phase == WirePhase::Countdown)
+    })
+    .await;
     wait_for("B joined", 5.0, || an.aim_status().unwrap().devices == 2).await;
     assert!(api(&an, |n| n.aim_start()).await.is_err(), "one game at a time");
     assert!(api(&bn, |n| n.aim_start()).await.is_err(), "B is in A's game");
-    assert_eq!(targets(&a, &b), (0, 0));
-    // 两台都常驻拖尾（共享开着：由路由驱动）。
-    assert!(an.input_status().unwrap().trail_pinned);
-    wait_for("trail pinned on B", 2.0, || bn.input_status().unwrap().trail_pinned).await;
+    for dev in [&a, &b] {
+        let view = dev.surface.view().unwrap();
+        assert_eq!(view.phase, WirePhase::Countdown);
+        assert!(view.targets.is_empty(), "no targets during countdown");
+    }
+    // Both input owners consume the pin independently of the Aim owner.
+    wait_for("trail pinned on both", 2.0, || {
+        an.input_status().unwrap().trail_pinned && bn.input_status().unwrap().trail_pinned
+    })
+    .await;
+    a.advance_game(300_000);
     wait_for("running on both", 5.0, || running(&a) && running(&b)).await;
     wait_for("three targets in total", 2.0, || {
         let (x, y) = targets(&a, &b);
@@ -430,7 +452,8 @@ async fn game_runs_across_two_devices_and_always_closes_scenario() {
     let on_b = bn.aim_status().unwrap();
     assert!(!on_b.host && on_b.phase == AimPhase::Running && on_b.results.is_empty());
 
-    // 时间到：结果只记在 A；叠加层留着显示结果。
+    // Advance rule time only after all clicks and score publications completed.
+    a.advance_game(2_500_000);
     wait_for("finished", 5.0, || an.aim_status().unwrap().phase == AimPhase::Finished).await;
     let done = an.aim_status().unwrap();
     assert_eq!(done.results.len(), 1);
@@ -446,10 +469,11 @@ async fn game_runs_across_two_devices_and_always_closes_scenario() {
     })
     .await;
     // 结束后马上的点击不关（保护时间），之后在任一台上点一下就全组收起。
-    b.surface.click(Point::new(800.0, 500.0));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    a.advance_game(200_000);
+    // A local host click is processed synchronously, proving the guard has run.
+    a.surface.click(Point::new(800.0, 500.0));
     assert!(a.surface.is_open() && b.surface.is_open());
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    a.advance_game(600_000);
     b.surface.click(Point::new(800.0, 500.0));
     wait_for("both overlays closed", 3.0, || {
         !a.surface.is_open() && !b.surface.is_open()
@@ -459,8 +483,10 @@ async fn game_runs_across_two_devices_and_always_closes_scenario() {
         an.aim_status().unwrap().phase == AimPhase::Idle && bn.aim_status().unwrap().phase == AimPhase::Idle
     })
     .await;
-    assert!(!an.input_status().unwrap().trail_pinned, "trail restored on A");
-    wait_for("trail restored on B", 2.0, || !bn.input_status().unwrap().trail_pinned).await;
+    wait_for("trail restored on both", 2.0, || {
+        !an.input_status().unwrap().trail_pinned && !bn.input_status().unwrap().trail_pinned
+    })
+    .await;
     assert_eq!(an.aim_status().unwrap().results.len(), 1, "not recorded twice");
 
     // Each participant pauses locally; the explicitly invited game continues
@@ -499,6 +525,7 @@ async fn game_runs_across_two_devices_and_always_closes_scenario() {
     assert!(an.aim_status().unwrap().native_input);
     api(&an, |n| n.aim_start()).await.unwrap();
     wait_for("overlay on B while paused", 5.0, || b.surface.is_open()).await;
+    a.advance_game(301_000);
     wait_for("running on both while paused", 5.0, || running(&a) && running(&b)).await;
     assert!(b.surface.view().unwrap().native_input);
     // 暂停时拖尾不由路由驱动（每台按本机光标位置画自己的）。
@@ -644,6 +671,7 @@ async fn a_single_device_plays_alone_and_a_lost_participant_frees_its_targets_sc
     let an = a.node.clone();
     // 没有别的设备：只在本机进行。
     api(&an, |n| n.aim_start()).await.unwrap();
+    a.advance_game(300_000);
     wait_for("running alone", 5.0, || running(&a)).await;
     assert_eq!(an.aim_status().unwrap().devices, 1);
     wait_for("three targets on the only screen", 2.0, || {

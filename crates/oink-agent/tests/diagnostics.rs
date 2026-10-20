@@ -70,9 +70,12 @@ async fn call<T: Send + 'static>(n: &Node, f: impl FnOnce(&Node) -> T + Send + '
 }
 async fn wait(what: &str, mut condition: impl FnMut() -> bool) {
     let until = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < until {
+    loop {
         if condition() {
             return;
+        }
+        if Instant::now() >= until {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -351,7 +354,19 @@ async fn local_recording_three_member_save_offline_pause_emergency_and_privacy_s
         .collect();
     call(&a, move |n| n.save_layout(placements)).await.unwrap();
     wait("row compiled everywhere", || {
-        [&b, &c].iter().all(|n| n.layout().0 == a.layout().0)
+        let expected = a.layout().0;
+        [&a, &b, &c].iter().all(|n| {
+            let compiled = n.link_config().unwrap().router_layout().load();
+            n.layout().0 == expected
+                && expected.screens.iter().all(|screen| {
+                    compiled
+                        .topology
+                        .topology()
+                        .screen(&screen.id)
+                        .is_some_and(|actual| actual.placement == *screen)
+                        && compiled.topology.topology().is_active(&screen.id)
+                })
+        })
     })
     .await;
     // Focus locking pins the current holder; returning home explicitly selects the source.
@@ -395,8 +410,7 @@ async fn local_recording_three_member_save_offline_pause_emergency_and_privacy_s
             }),
         });
     }
-    // Actual callback/ordinary queue must drain on the remote recording owner before save.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Export samples and drains each recording owner before taking its snapshot.
     let bundle = call(&a, |n| n.export_diagnostics()).await.unwrap();
     assert_eq!(
         (

@@ -330,7 +330,18 @@ fn admitted_low_rejects_mixed_ids_offsets_lengths_and_digests_before_commit() {
                 // The request end is within t1 in production. This adversarial peer
                 // echoes it, so the receiver's validation is independent of clocks.
                 let response = respond(&mut operation.stream, request, device, mode, &remote_config).await;
-                assert!(response.is_ok(), "{mode}: {response:?}");
+                // The receiver can reject a malformed frame and revoke the
+                // operation before the sender's final flush returns. Validate
+                // the receiver's exact rejection below, not sender completion.
+                if let Err(error) = &response {
+                    assert!(
+                        matches!(
+                            error.downcast_ref::<oink_network::link::LowError>(),
+                            Some(oink_network::link::LowError::Interrupted)
+                        ),
+                        "{mode}: {response:?}"
+                    );
+                }
                 // A C0-only refusal completes the receiver without relying on a
                 // Low EOF winning its race with the correlated control event.
                 if mode != "c0-unsupported" {
@@ -339,16 +350,22 @@ fn admitted_low_rejects_mixed_ids_offsets_lengths_and_digests_before_commit() {
                 let result = gathering.await.unwrap();
                 let committed = lock(&destination).segments.iter().filter(|m| m.network).count();
                 if ["none", "deflate", "c0-unrelated", "c0-other-scope"].contains(&mode) {
+                    assert!(response.is_ok(), "{mode}: {response:?}");
                     assert!(result.is_ok(), "{mode}: {result:?}");
                     assert_eq!(committed, 1);
                 } else {
                     assert!(result.is_err(), "{mode} accepted");
                     assert_eq!(committed, usize::from(mode == "missing-coverage"), "{mode}");
                 }
-                if mode == "partial-environment" {
-                    assert_eq!(result.unwrap_err().to_string(), "member:partial_coverage");
-                } else if mode == "c0-unsupported" {
-                    assert_eq!(result.unwrap_err().to_string(), "member:unsupported");
+                let expected_error = match mode {
+                    "none" | "deflate" | "c0-unrelated" | "c0-other-scope" => None,
+                    "partial-environment" => Some("member:partial_coverage"),
+                    "c0-unsupported" => Some("member:unsupported"),
+                    "raw-length" => Some("invalid diagnostic expansion length"),
+                    _ => Some("invalid diagnostic operation"),
+                };
+                if let Some(expected) = expected_error {
+                    assert_eq!(result.unwrap_err().to_string(), expected, "{mode}");
                 }
                 let _ = tokio::time::timeout(Duration::from_secs(2), operation.stream.recv()).await;
             }

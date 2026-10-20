@@ -251,7 +251,9 @@ impl Node {
             // The event owner already deduplicated this emergency. Collection
             // runs independently so disk/network waits cannot delay safety ACKs.
             self.inner.rt.spawn_blocking(move || {
-                let _ = recorder.save(crate::diagnostics::Reason::Emergency);
+                if let Err(error) = recorder.save(crate::diagnostics::Reason::Emergency) {
+                    tracing::warn!(%error, "emergency diagnostic save failed");
+                }
             });
         }
         self.emit(ApiEvent::EmergencyStop(crate::api::EmergencyStop {

@@ -1,8 +1,8 @@
 //! Retained peer CBOR lives only in a detached export, never the local recorder.
 use super::*;
 use oink_protocol::v1::{
-    self, RawValue, dto as w,
-    schema::{WireDto, WireValue},
+    self, RawMap, RawValue, dto as w,
+    schema::{WireDto, WireValue, required},
 };
 
 pub(in crate::diagnostics) fn json(value: &RawValue) -> serde_json::Value {
@@ -15,11 +15,22 @@ pub(in crate::diagnostics) fn json(value: &RawValue) -> serde_json::Value {
         RawValue::Bytes(bytes) => json!({"bytes":bytes}),
         RawValue::Text(text) => json!(text),
         RawValue::Array(values) => values.iter().map(json).collect(),
-        RawValue::Map(map) => map.iter().map(|(k, v)| (k.to_string(), json(v))).collect(),
+        RawValue::Map(map) => json_map(map),
         RawValue::Bool(v) => json!(v),
         RawValue::Null => serde_json::Value::Null,
         RawValue::F32(v) => json!({"f32":v}),
         RawValue::F64(v) => json!({"f64":v}),
+    }
+}
+pub(in crate::diagnostics) fn json_map(map: &RawMap) -> serde_json::Value {
+    map.iter().map(|(k, v)| (k.to_string(), json(v))).collect()
+}
+// DiagnosticSegment::decode has already validated all nested row/event fields.
+// Reading timestamps must not clone and validate the entire event list again.
+pub(in crate::diagnostics) fn rows(segment: &w::DiagnosticSegment) -> v1::Result<&[RawValue]> {
+    match segment.raw().get(&8) {
+        Some(RawValue::Array(rows)) => Ok(rows),
+        _ => Err(v1::ErrorCode::MalformedFrame.into()),
     }
 }
 pub(in crate::diagnostics) fn segment(bytes: &[u8]) -> anyhow::Result<w::DiagnosticSegment> {
@@ -28,56 +39,46 @@ pub(in crate::diagnostics) fn segment(bytes: &[u8]) -> anyhow::Result<w::Diagnos
         token_ok(&segment.device()?.0) && token_ok(&segment.instance()?.0),
         "invalid diagnostic aliases"
     );
-    let rows = segment.rows()?.0;
+    let rows = rows(&segment)?;
     anyhow::ensure!(!rows.is_empty(), "empty diagnostic segment");
-    let epoch = rows[0].clock_id()?;
-    anyhow::ensure!(
-        rows.iter().all(|r| r.clock_id().ok() == Some(epoch)),
-        "mixed clock epochs"
-    );
+    let epoch = required::<i64>(rows[0].as_map()?, 2)?;
+    for row in rows {
+        anyhow::ensure!(required::<i64>(row.as_map()?, 2)? == epoch, "mixed clock epochs");
+    }
     Ok(segment)
 }
 pub(in crate::diagnostics) fn meta(s: &w::DiagnosticSegment, bytes: u64) -> anyhow::Result<Meta> {
-    let rows = s.rows()?.0;
+    let rows = rows(s)?;
     anyhow::ensure!(!rows.is_empty(), "empty diagnostic segment");
+    let first = rows[0].as_map()?;
+    let mut first_mono_us = required::<u64>(first, 1)?;
+    let mut last_mono_us = first_mono_us;
+    let mut first_us = required::<i64>(first, 3)?;
+    let mut last_us = first_us;
+    for row in &rows[1..] {
+        let row = row.as_map()?;
+        let mono = required::<u64>(row, 1)?;
+        let utc = required::<i64>(row, 3)?;
+        first_mono_us = first_mono_us.min(mono);
+        last_mono_us = last_mono_us.max(mono);
+        first_us = first_us.min(utc);
+        last_us = last_us.max(utc);
+    }
     Ok(Meta {
         device: s.device()?.0,
         instance: s.instance()?.0,
         seq: s.seq()?,
-        clock_id: rows[0].clock_id()?,
-        first_mono_us: rows
-            .iter()
-            .map(|r| r.mono_us())
-            .collect::<v1::Result<Vec<_>>>()?
-            .into_iter()
-            .min()
-            .unwrap(),
-        last_mono_us: rows
-            .iter()
-            .map(|r| r.mono_us())
-            .collect::<v1::Result<Vec<_>>>()?
-            .into_iter()
-            .max()
-            .unwrap(),
-        first_us: rows
-            .iter()
-            .map(|r| r.utc_us())
-            .collect::<v1::Result<Vec<_>>>()?
-            .into_iter()
-            .min()
-            .unwrap(),
-        last_us: rows
-            .iter()
-            .map(|r| r.utc_us())
-            .collect::<v1::Result<Vec<_>>>()?
-            .into_iter()
-            .max()
-            .unwrap(),
+        clock_id: required::<i64>(first, 2)?,
+        first_mono_us,
+        last_mono_us,
+        first_us,
+        last_us,
         bytes,
         received_us: utc_us(),
         network: true,
     })
 }
+
 impl Store {
     /// One shared budget for the whole multi-peer save, charged before buffering.
     pub(in crate::diagnostics) fn receive_bytes(&mut self, bytes: usize) -> anyhow::Result<()> {
@@ -120,14 +121,18 @@ impl Store {
             .insert(device.into(), (instance.into(), snapshot));
         Ok(())
     }
-    pub(in crate::diagnostics) fn add_network(&mut self, device: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    pub(in crate::diagnostics) fn add_network(
+        &mut self,
+        device: &str,
+        bytes: &[u8],
+        segment: &w::DiagnosticSegment,
+    ) -> anyhow::Result<()> {
         self.check_cancelled()?;
         anyhow::ensure!(
             self.segments.iter().filter(|m| m.network).count() < 4096,
             "member:size_limit"
         );
-        let segment = segment(bytes)?;
-        let meta = meta(&segment, bytes.len() as u64)?;
+        let meta = meta(segment, bytes.len() as u64)?;
         anyhow::ensure!(
             meta.device == device && device != self.device,
             "diagnostic origin mismatch"
@@ -284,7 +289,9 @@ mod tests {
         let mut local = local.export_snapshot().unwrap();
         let original = peer_segment();
         let bytes = original.encode(MAX_SEGMENT_RAW).unwrap();
-        local.add_network(&"b".repeat(24), &bytes).unwrap();
+        local
+            .add_network(&"b".repeat(24), &bytes, &segment(&bytes).unwrap())
+            .unwrap();
         let mut current = original.snapshot().unwrap();
         current
             .edit(|raw| {
@@ -357,6 +364,43 @@ mod tests {
         };
         let row: serde_json::Value = serde_json::from_str(timeline.trim()).unwrap();
         assert_eq!(row["event"]["recognized"], false);
+    }
+    #[test]
+    fn borrowed_rows_preserve_time_bounds_and_reject_mixed_epochs() {
+        let mut source = peer_segment();
+        source
+            .edit(|raw| {
+                let RawValue::Array(rows) = raw.get_mut(&8).unwrap() else {
+                    panic!()
+                };
+                for (row, (mono, utc)) in rows.iter_mut().zip([(30, 10), (10, 30), (20, 20)]) {
+                    let RawValue::Map(row) = row else { panic!() };
+                    row.insert(1, RawValue::Uint(mono));
+                    row.insert(3, RawValue::Uint(utc));
+                }
+            })
+            .unwrap();
+        let bytes = source.encode(MAX_SEGMENT_RAW).unwrap();
+        let parsed = segment(&bytes).unwrap();
+        let bounds = meta(&parsed, bytes.len() as u64).unwrap();
+        assert_eq!((bounds.first_mono_us, bounds.last_mono_us), (10, 30));
+        assert_eq!((bounds.first_us, bounds.last_us), (10, 30));
+        assert_eq!(bounds.bytes, bytes.len() as u64);
+        source
+            .edit(|raw| {
+                let RawValue::Array(rows) = raw.get_mut(&8).unwrap() else {
+                    panic!()
+                };
+                let RawValue::Map(row) = &mut rows[1] else { panic!() };
+                row.insert(2, RawValue::Uint(1));
+            })
+            .unwrap();
+        assert!(
+            segment(&source.encode(MAX_SEGMENT_RAW).unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("mixed clock epochs")
+        );
     }
     #[test]
     fn all_peers_share_one_compressed_and_expanded_collection_budget() {

@@ -663,12 +663,19 @@ impl Network {
                             unique.push_back(address);
                         }
                     }
-                    self.dials.push(Dialing {
-                        identity_mismatch: false,
-                        peer,
-                        addresses: unique,
-                        attempts: Vec::new(),
-                    });
+                    if let Some(dial) = self.dials.iter_mut().find(|dial| dial.peer == peer) {
+                        // New hints join the same candidate owner. A second
+                        // owner could report completion while this one's
+                        // handshakes are still running.
+                        dial.addresses.extend(unique);
+                    } else {
+                        self.dials.push(Dialing {
+                            identity_mismatch: false,
+                            peer,
+                            addresses: unique,
+                            attempts: Vec::new(),
+                        });
+                    }
                 }
                 Effect::DialFinished(peer) => {
                     self.dials.retain(|dial| dial.peer != peer);

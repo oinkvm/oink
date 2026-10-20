@@ -1355,20 +1355,24 @@ impl TimelineSpool {
             let rows: Vec<(usize, u64, i64, i64, serde_json::Value)> = if meta.network {
                 let segment = wire::segment(&store.read(meta)?)?;
                 let mut current = Vec::new();
-                use oink_protocol::v1::schema::WireValue;
-                for (index, row) in segment.rows()?.0.into_iter().enumerate() {
-                    let event = row.event()?;
-                    let kind = event.kind()?.0;
+                use oink_protocol::v1::schema::{Ascii, required};
+                for (index, row) in wire::rows(&segment)?.iter().enumerate() {
+                    let row = row.as_map()?;
+                    let event = row
+                        .get(&4)
+                        .ok_or_else(|| anyhow::anyhow!("diagnostic row has no event"))?
+                        .as_map()?;
+                    let kind = required::<Ascii<96>>(event, 1)?.0;
                     let recognized = oink_protocol::v1::dto::diagnostic_event_schema(&kind).is_some();
                     if !recognized {
                         *unrecognized.entry(kind.clone()).or_insert(0u64) += 1;
                     }
                     current.push((
                         index,
-                        row.mono_us()?,
-                        row.clock_id()?,
-                        row.utc_us()?,
-                        serde_json::json!({"kind":kind,"recognized":recognized,"retained":wire::json(&event.write())}),
+                        required::<u64>(row, 1)?,
+                        required::<i64>(row, 2)?,
+                        required::<i64>(row, 3)?,
+                        serde_json::json!({"kind":kind,"recognized":recognized,"retained":wire::json_map(event)}),
                     ));
                 }
                 let snapshot = segment.snapshot()?;

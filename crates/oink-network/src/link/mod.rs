@@ -241,8 +241,8 @@ impl LinkLayer {
         let _ = receive.recv();
     }
 
-    /// Newest candidate addresses of `peer`. Used for the direct attempts of a relayed
-    /// link; if the link to `peer` is relayed now, one attempt starts at once.
+    /// Newest candidate addresses of `peer`. Fresh addresses join a pending
+    /// search; an established relayed link also attempts its direct path at once.
     pub fn update_addresses(&self, peer: DeviceId, mut candidates: Vec<SocketAddr>) {
         candidates.retain(SocketAddr::is_ipv4);
         self.0.send(handle::Command::Addresses(peer, candidates));

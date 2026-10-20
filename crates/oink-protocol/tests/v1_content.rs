@@ -122,6 +122,10 @@ fn preflight_applies_nested_data_variant_bounds_before_materialization() {
     );
     let mut offer = support::sample_named("ClipboardOffer");
     offer.insert(6, V::Map(object));
+    assert_eq!(
+        ClipboardOffer::from_raw(offer.clone()).unwrap_err().code,
+        ErrorCode::LimitExceeded
+    );
     let bytes = v1::cbor::encode_map(&offer, 128 * 1024).unwrap();
     assert_eq!(
         Message::preflight(0x0300, &bytes).unwrap_err().code,
@@ -153,4 +157,35 @@ fn current_file_version_is_one_bounded_clipboard_low_message() {
             .version()
             .unwrap()
     );
+}
+
+#[test]
+fn inventory_checks_cross_item_representation_ids_and_root_identity() {
+    let mut first = support::sample_named("ContentItem");
+    first.insert(1, V::Uint(1));
+    first.insert(3, V::Array(vec![inline(1).write()]));
+    let mut second = first.clone();
+    second.insert(1, V::Uint(2));
+    let mut raw = support::sample_named("Inventory");
+    raw.insert(3, V::Array(vec![V::Map(first.clone()), V::Map(second.clone())]));
+    assert_eq!(
+        Inventory::from_raw(raw.clone()).unwrap_err().code,
+        ErrorCode::MalformedFrame
+    );
+    let mut rep = inline(1).into_raw();
+    rep.insert(1, V::Uint(2));
+    second.insert(3, V::Array(vec![V::Map(rep)]));
+    raw.insert(3, V::Array(vec![V::Map(first), V::Map(second)]));
+    assert!(Inventory::from_raw(raw.clone()).is_ok());
+    let mut root = support::sample_named("FileNode");
+    root.insert(1, V::Uint(1));
+    root.remove(&2);
+    raw.insert(4, V::Array(vec![V::Map(root.clone()), V::Map(root.clone())]));
+    assert_eq!(
+        Inventory::from_raw(raw.clone()).unwrap_err().code,
+        ErrorCode::MalformedFrame
+    );
+    root.insert(2, V::Uint(2));
+    raw.insert(4, V::Array(vec![V::Map(root)]));
+    assert_eq!(Inventory::from_raw(raw).unwrap_err().code, ErrorCode::MalformedFrame);
 }

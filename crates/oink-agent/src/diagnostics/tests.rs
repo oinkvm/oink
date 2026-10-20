@@ -2919,4 +2919,39 @@ fn baseline_collection_omits_rich_layout_and_keeps_typed_availability() {
             .unwrap()
     );
     assert_eq!(event.network(true).unwrap().kind().unwrap().0, "layout-change/1");
+
+    // Building the owning segment validates raw child rows recursively and
+    // preserves the same rich/baseline projection as standalone typed events.
+    let mut segment = store::Segment {
+        schema: SCHEMA,
+        device: "a".repeat(24),
+        instance: "b".repeat(24),
+        seq: 1,
+        dropped: 0,
+        snapshot,
+        clock_samples: vec![],
+        rows: vec![Row {
+            mono_us: 1,
+            clock_id: 2,
+            utc_us: 3,
+            event,
+        }],
+    };
+    for rich in [false, true] {
+        let projected = super::wire_values::segment(&segment, rich).unwrap();
+        assert_eq!(
+            projected.rows().unwrap().0[0].event().unwrap(),
+            segment.rows[0].event.network(rich).unwrap()
+        );
+        assert_eq!(projected.snapshot().unwrap().layout().unwrap().is_some(), rich);
+        let bytes = projected.encode(oink_protocol::v1::limits::DIAGNOSTIC_SEGMENT).unwrap();
+        assert_eq!(w::DiagnosticSegment::decode(&bytes, bytes.len()).unwrap(), projected);
+    }
+    segment.rows[0].event = Event::State {
+        kind: StateKind::RecorderTick,
+        active: true,
+        count: 1,
+        value: f64::NAN,
+    };
+    assert!(super::wire_values::segment(&segment, true).is_err());
 }

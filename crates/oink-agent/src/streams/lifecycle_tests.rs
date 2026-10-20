@@ -608,13 +608,13 @@ pub(super) async fn replacement_and_pause<O: Owner>() {
     assert_eq!(f.owner.current(f.peer).is_none(), obeys);
     assert_eq!(f.owner.incoming(f.peer), Some(new));
     new_tx.post(encode(&message(O::KIND, 4)).unwrap()).unwrap();
-    // Clipboard retains state while paused; audio continues control telemetry.
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    let paused = f.owner.tick(Instant::now());
+    // Clipboard retains state while paused; other owners still deliver inbound
+    // telemetry. Posting to a real stream is not a receive-completion barrier.
     if matches!(O::KIND, StreamKind::Clipboard) {
-        assert!(paused.is_empty());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(f.owner.tick(Instant::now()).is_empty());
     } else {
-        assert_eq!(paused.last().unwrap().1, message(O::KIND, 4));
+        assert_eq!(f.deliveries().await.last().unwrap().1, message(O::KIND, 4));
     }
     f.owner.pause_changed(false);
     if matches!(O::KIND, StreamKind::Clipboard) {
@@ -1242,10 +1242,13 @@ async fn clipboard_current_six_hundred_items_during_open_in_both_roles_scenario(
     let mut f = Fixture::<super::clipboard::ClipboardStreams>::start().await;
     let local = f.nodes[0].links.id();
     let mut remote = super::clipboard::ClipboardStreams::new(f.nodes[1].links.clone(), f.nodes[1].group.clone());
+    remote.set_offer(Some(large_clipboard_offer(f.peer, 1)));
+    assert_eq!(remote.attachment_count(), 0, "no encoding before a peer is ready");
     remote.link_ready(f.remote_link, local);
+    assert_eq!(remote.attachment_count(), 1, "a newly ready peer encodes only once");
     for (index, owner) in [&mut f.owner, &mut remote].into_iter().enumerate() {
         let origin = if index == 0 { local } else { f.peer };
-        for sequence in [1, 2] {
+        for sequence in if index == 0 { 1..=2 } else { 2..=2 } {
             let offer = large_clipboard_offer(origin, sequence);
             owner.set_offer(Some(offer));
             assert_eq!(

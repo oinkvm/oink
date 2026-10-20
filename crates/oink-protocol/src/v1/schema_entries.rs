@@ -7,7 +7,7 @@ macro_rules! dto_schemas {
             match name {$(stringify!($name)=><$name as WireDto>::preflight(d,depth),)* _=>Err(ErrorCode::UnsupportedValue.into())}
         }
         pub fn validate_schema(name:&str,raw:&RawMap)->Result<()> {
-            match name {$(stringify!($name)=>{$name::from_raw(raw.clone())?;},)* _=>return Err(ErrorCode::UnsupportedValue.into())}
+            match name {$(stringify!($name)=>{$name::validate_raw(raw)?;},)* _=>return Err(ErrorCode::UnsupportedValue.into())}
             Ok(())
         }
     };
@@ -335,4 +335,37 @@ enum_schemas! {
     SpeakerActivity,
     SpeedMode,
     VolumeKey,
+}
+
+
+#[cfg(test)]
+mod validation_dispatch_tests {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct BorrowedOnly(RawMap);
+    impl WireDto for BorrowedOnly {
+        const SCHEMA: Schema = Schema { name: "BorrowedOnly", fields: &[] };
+        fn from_raw(_: RawMap) -> Result<Self> {
+            panic!("schema validation must not construct an owned DTO")
+        }
+        fn validate_raw(raw: &RawMap) -> Result<()> {
+            if raw.is_empty() { Ok(()) } else { Err(ErrorCode::MalformedFrame.into()) }
+        }
+        fn raw(&self) -> &RawMap { &self.0 }
+        fn into_raw(self) -> RawMap { self.0 }
+    }
+    dto_schemas!(BorrowedOnly);
+
+    #[test]
+    fn dynamic_schema_validation_borrows_and_preserves_errors() {
+        assert_eq!(SCHEMAS[0].name, "BorrowedOnly");
+        preflight_schema("BorrowedOnly", &mut minicbor::Decoder::new(&[0xa0]), 0).unwrap();
+        validate_schema("BorrowedOnly", &RawMap::new()).unwrap();
+        assert_eq!(
+            validate_schema("BorrowedOnly", &[(1, super::super::RawValue::Null)].into()).unwrap_err().code,
+            ErrorCode::MalformedFrame
+        );
+        assert_eq!(validate_schema("unknown", &RawMap::new()).unwrap_err().code, ErrorCode::UnsupportedValue);
+    }
 }

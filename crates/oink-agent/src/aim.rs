@@ -74,6 +74,8 @@ pub(crate) struct Aim {
     game_counter: AtomicU64,
     event_counter: AtomicU64,
     send_diagnostics: Arc<Mutex<SendDiagnostics>>,
+    #[cfg(debug_assertions)]
+    pub(crate) test_clock: std::sync::OnceLock<Arc<AtomicU64>>,
 }
 
 #[derive(Default)]
@@ -138,6 +140,10 @@ fn boot(node: &Node) -> Boot {
     node.links().map_or_else(|_| node.boot(), |links| links.boot())
 }
 fn now(node: &Node) -> Micros {
+    #[cfg(debug_assertions)]
+    if let Some(clock) = node.inner.aim.test_clock.get() {
+        return clock.load(Ordering::Acquire);
+    }
     node.now()
 }
 fn layout(node: &Node) -> Layout {
@@ -604,7 +610,8 @@ fn publish(node: &Node, st: &mut State) {
     devices.insert(me);
     h.game.set_regions(regions_now(node, &devices, h.game.config().radius));
     h.seq = h.seq.checked_add(1).expect("game state counter exhausted");
-    h.sent_at = now;
+    // Heartbeats keep real time even when a fixture controls game-rule time.
+    h.sent_at = node.now();
     let state = h.game.state(session.id, h.seq, now, h.native_input);
     // Invitation and snapshot are normal periodic state, never reconnect work.
     for p in online_peers(node) {
@@ -670,7 +677,7 @@ fn host_tick(node: &Node, id: GameInstance) -> bool {
             let due = match st.session.as_ref() {
                 Some(Session {
                     role: Role::Host(h), ..
-                }) => now.saturating_sub(h.sent_at) >= HEARTBEAT,
+                }) => node.now().saturating_sub(h.sent_at) >= HEARTBEAT,
                 _ => false,
             };
             if changed || due {

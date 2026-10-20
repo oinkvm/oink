@@ -157,9 +157,12 @@ async fn start_config(root: &Path, name: &str, net: NetworkConfig) -> Dev {
 async fn wait_for(what: &str, secs: f64, mut f: impl FnMut() -> bool) {
     common::phase(what);
     let end = Instant::now() + Duration::from_secs_f64(secs);
-    while Instant::now() < end {
+    loop {
         if f() {
             return;
+        }
+        if Instant::now() >= end {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -1857,11 +1860,15 @@ async fn manually_entered_address_moves_a_relayed_link_to_the_direct_path_scenar
     tokio::time::sleep(Duration::from_millis(3500)).await;
     let result = common::query(&a.node, &b.node).await;
     let end = Instant::now() + Duration::from_secs(20);
-    let mut direct = false;
-    while Instant::now() < end && !direct {
-        direct = path_to(&a.node, &b.node) == Some(LinkPath::Direct);
+    let direct = loop {
+        if path_to(&a.node, &b.node) == Some(LinkPath::Direct) {
+            break true;
+        }
+        if Instant::now() >= end {
+            break false;
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    };
     let path = path_to(&a.node, &b.node);
     shutdown(vec![a, b, r]).await;
     assert!(

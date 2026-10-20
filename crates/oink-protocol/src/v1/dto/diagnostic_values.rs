@@ -231,9 +231,9 @@ pub fn diagnostic_event_schema(kind: &str) -> Option<crate::v1::schema::Schema> 
 }
 pub(super) fn validate_event(raw: &crate::v1::RawMap) -> crate::v1::Result<()> {
     let kind = required::<Ascii<96>>(raw, 1)?;
-    let fields = required::<crate::v1::RawMap>(raw, 2)?;
+    let fields = super::content::map_field(raw, 2)?;
     if let Some(schema) = diagnostic_event_schema(&kind.0) {
-        crate::v1::registry::validate_schema(schema.name, &fields)?;
+        crate::v1::registry::validate_schema(schema.name, fields)?;
     }
     Ok(())
 }

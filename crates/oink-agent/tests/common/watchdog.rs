@@ -18,12 +18,12 @@ impl Scenario {
     pub fn new(module: &str, name: &str) -> Self {
         // This is a deadlock watchdog, not a product performance budget. It
         // allows the 60-second collection deadline plus setup and teardown.
-        Self::with_limit(format!("{module}::{name}"), Duration::from_secs(180))
+        Self::with_limit(format!("{module}::{name}"), Duration::from_secs(180), "scenario entry")
     }
-    fn with_limit(name: String, limit: Duration) -> Self {
+    fn with_limit(name: String, limit: Duration, initial_phase: &str) -> Self {
         let state = Arc::new((Mutex::new((false, String::new())), Condvar::new()));
         CURRENT.with(|current| *current.borrow_mut() = Arc::downgrade(&state));
-        phase("scenario entry");
+        phase(initial_phase);
         let waiting = state.clone();
         let worker = std::thread::Builder::new()
             .name("scenario-watchdog".into())
@@ -80,17 +80,6 @@ pub fn run(module: &str, name: &str, workers: Option<usize>, scenario: impl std:
     run_runtime(workers, scenario);
 }
 
-fn run_with_limit(
-    module: &str,
-    name: &str,
-    workers: Option<usize>,
-    scenario: impl std::future::Future<Output = ()>,
-    limit: Duration,
-) {
-    let _scenario = Scenario::with_limit(format!("{module}::{name}"), limit);
-    run_runtime(workers, scenario);
-}
-
 fn run_runtime(workers: Option<usize>, scenario: impl std::future::Future<Output = ()>) {
     let mut builder = match workers {
         Some(count) => {
@@ -122,17 +111,26 @@ mod tests {
     fn process_watchdog_bounds_a_blocked_executor() {
         const CHILD: &str = "OINK_TEST_WATCHDOG_CHILD";
         if let Ok(case) = std::env::var(CHILD) {
-            run_with_limit(
-                module_path!(),
-                "watchdog fixture",
-                Some(2),
-                async {
-                    if case == "executor" {
-                        phase("blocked synchronous call");
-                        loop {
-                            std::thread::park();
-                        }
+            // Build the executor and enter the blocking task before arming the
+            // short fixture deadline. Runtime/thread startup is not under test.
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            if case == "executor" {
+                runtime.block_on(async {
+                    let _scenario = Scenario::with_limit(
+                        format!("{}::watchdog fixture", module_path!()),
+                        Duration::from_millis(50),
+                        "blocked synchronous call",
+                    );
+                    loop {
+                        std::thread::park();
                     }
+                });
+            } else {
+                runtime.block_on(async {
                     let (ready, entered) = tokio::sync::oneshot::channel();
                     tokio::task::spawn_blocking(move || {
                         ready.send(()).unwrap();
@@ -141,11 +139,16 @@ mod tests {
                         }
                     });
                     entered.await.unwrap();
-                    phase("blocked runtime teardown");
-                    panic!("force unwind with an unfinished blocking task");
-                },
-                Duration::from_millis(50),
-            );
+                });
+                let _scenario = Scenario::with_limit(
+                    format!("{}::watchdog fixture", module_path!()),
+                    Duration::from_millis(50),
+                    "blocked runtime teardown",
+                );
+                // Drop the runtime before its watchdog when unwinding.
+                let _runtime = runtime;
+                panic!("force unwind with an unfinished blocking task");
+            }
             unreachable!();
         }
         run(module_path!(), "normal completion", None, async {});

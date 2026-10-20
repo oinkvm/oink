@@ -201,9 +201,12 @@ async fn start(name: &str, port: u16, input: Arc<dyn InputBackend>) -> Node {
 
 async fn wait_for(what: &str, secs: f64, mut f: impl FnMut() -> bool) {
     let end = Instant::now() + Duration::from_secs_f64(secs);
-    while Instant::now() < end {
+    loop {
         if f() {
             return;
+        }
+        if Instant::now() >= end {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

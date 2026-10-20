@@ -5,7 +5,7 @@ use super::*;
 use crate::v1::schema::{
     Open, OpenEnvelope, WireDto, defaulted, enum_body, no_validation, open_enum, required, wire_map,
 };
-use crate::v1::{ErrorCode, RawMap, Result};
+use crate::v1::{ErrorCode, RawMap, RawValue, Result};
 
 /// Portable single-URL contract: UTF-8 JSON with `url` and optional `title`.
 /// Native-format identities and payloads are retained for same-system delivery.
@@ -98,16 +98,28 @@ fn validate_node(raw: &RawMap) -> Result<()> {
     Ok(())
 }
 
+// Field validation has already checked these trees. Cross-field checks borrow
+// them instead of reconstructing and recursively validating each nested DTO.
+pub(super) fn array_field(raw: &RawMap, key: u32) -> Result<&[RawValue]> {
+    match raw.get(&key) {
+        Some(RawValue::Array(values)) => Ok(values),
+        _ => Err(ErrorCode::MalformedFrame.into()),
+    }
+}
+pub(super) fn map_field(raw: &RawMap, key: u32) -> Result<&RawMap> {
+    raw.get(&key).ok_or(ErrorCode::MalformedFrame)?.as_map()
+}
 fn validate_inventory(raw: &RawMap) -> Result<()> {
     let mut items = std::collections::BTreeSet::new();
     let mut representations = std::collections::BTreeSet::new();
     let mut roots = std::collections::BTreeSet::new();
-    for item in required::<List<ContentItem, 65535>>(raw, 3)?.0 {
-        if !items.insert(item.id()?) {
+    for item in array_field(raw, 3)? {
+        let item = item.as_map()?;
+        if !items.insert(required::<u32>(item, 1)?) {
             return Err(ErrorCode::MalformedFrame.into());
         }
-        for representation in item.representations()?.0 {
-            if !representations.insert(representation.id()?) {
+        for representation in array_field(item, 3)? {
+            if !representations.insert(required::<u32>(representation.as_map()?, 1)?) {
                 return Err(ErrorCode::MalformedFrame.into());
             }
             if representations.len() > 65535 {
@@ -115,8 +127,9 @@ fn validate_inventory(raw: &RawMap) -> Result<()> {
             }
         }
     }
-    for root in required::<List<FileNode, 65535>>(raw, 4)?.0 {
-        if root.parent()?.is_some() || !roots.insert(root.id()?) {
+    for root in array_field(raw, 4)? {
+        let root = root.as_map()?;
+        if defaulted::<Option<u64>>(root, 2, || None)?.is_some() || !roots.insert(required::<u64>(root, 1)?) {
             return Err(ErrorCode::MalformedFrame.into());
         }
     }
@@ -143,17 +156,22 @@ impl Inventory {
     /// Reliable heads share one 4 KiB inline budget; Low inventories still use
     /// the independent 64 KiB bound on each individual inline representation.
     pub fn inline_bytes(&self) -> Result<usize> {
-        let mut total = 0_usize;
-        for item in self.items()?.0 {
-            for representation in item.representations()?.0 {
-                let data = representation.data()?;
-                if data.variant()? == Open::Known(RepresentationDataKind::Inline) {
-                    total = total
-                        .checked_add(RepresentationInline::from_raw(data.body()?)?.bytes()?.0.len())
-                        .ok_or(ErrorCode::LimitExceeded)?;
-                }
+        inventory_inline_bytes(self.raw())
+    }
+}
+
+pub(super) fn inventory_inline_bytes(raw: &RawMap) -> Result<usize> {
+    let mut total = 0_usize;
+    for item in array_field(raw, 3)? {
+        for representation in array_field(item.as_map()?, 3)? {
+            let data = map_field(representation.as_map()?, 7)?;
+            if required::<RepresentationDataKind>(data, 1)? == RepresentationDataKind::Inline {
+                let Some(RawValue::Bytes(bytes)) = map_field(data, 2)?.get(&1) else {
+                    return Err(ErrorCode::MalformedFrame.into());
+                };
+                total = total.checked_add(bytes.len()).ok_or(ErrorCode::LimitExceeded)?;
             }
         }
-        Ok(total)
     }
+    Ok(total)
 }

@@ -534,7 +534,7 @@ impl Context {
                         let segment = store::wire::segment(&raw)?;
                         anyhow::ensure!(rich || baseline(&segment)?, "unnegotiated diagnostic layout");
                         anyhow::ensure!((validity)(), "collection revoked");
-                        lock(&destination).add_network(&device, &raw)?;
+                        lock(&destination).add_network(&device, &raw, &segment)?;
                         Ok(started.elapsed())
                     })
                     .await?;
