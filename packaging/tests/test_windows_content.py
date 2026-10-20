@@ -36,7 +36,7 @@ class MsiContent(unittest.TestCase):
 
     def test_receipt_contract_excludes_detached_release_fields(self):
         fixture = json.loads((ROOT / 'packaging/tests/fixtures/windows-receipt.json').read_text())
-        record = {**fixture, 'provenance': 'source-tree', 'signing': 'unsigned', 'update_policy': 'manual-only'}
+        record = {**fixture, 'provenance': 'source-tree', 'signing': 'unsigned'}
         self.assertEqual(B.installed_receipt(record), fixture)
 
     def fixture(self, root):
@@ -50,7 +50,7 @@ class MsiContent(unittest.TestCase):
         for name in ('installed.json', 'oink-build.json'):
             ET.SubElement(xml, 'File', Name=name, Id=name)
             (extracted / 'File' / name).write_text(json.dumps({
-                'update_policy': 'manual-only', 'source_tree_sha256': 'a' * 64,
+                'source_tree_sha256': 'a' * 64,
                 'version': '0.1.0', 'build': 1}))
         ET.SubElement(xml, 'File', Name='report-manifest.json', Id='report')
         write_manifest(extracted / 'File/report', 'a' * 64, '0.1.0', 1,

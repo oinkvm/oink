@@ -148,9 +148,15 @@ class Redirects(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def download(url, limit, redirects=False):
+def download(url, limit, redirects=False, revalidate=False):
     opener = urllib.request.build_opener(Redirects() if redirects else NoRedirects())
-    with opener.open(urllib.request.Request(url, headers={'User-Agent': 'Oink-feed-verifier/1'}), timeout=60) as response:
+    headers = {'User-Agent': 'Oink-feed-verifier/1'}
+    if revalidate:
+        # Pages deployment status describes the origin, not its CDN caches.
+        # Revalidate canonical URLs after deployment/rollback: the previous
+        # publisher may have just cached heartbeat.json for max-age=600.
+        headers['Cache-Control'] = 'no-cache'
+    with opener.open(urllib.request.Request(url, headers=headers), timeout=60) as response:
         require(response.status == 200, 'http_status')
         result = response.read(limit + 1)
         require(len(result) <= limit, 'download_limit')

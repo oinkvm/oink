@@ -541,7 +541,7 @@ impl Router {
             gain,
             zone,
         });
-        self.reset_resistance();
+        self.resistance = None;
         self.pointer = Some(self.gap.as_ref().unwrap().position());
         if let Some(target) = target {
             let dst = screen_position(&target, head);

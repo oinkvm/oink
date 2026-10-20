@@ -185,6 +185,12 @@ host (and checks absent platforms return 404), then commits state with a normal
 fast-forward Git push as CAS. Deployment, readback or state-CAS failures redeploy
 the frozen prior snapshot and verify its bytes. Rollback failure is reported as
 failure; it must be repaired from that prior snapshot before another publication.
+The pinned Pages action waits for the deployment API's `succeed` status before
+readback. Every publication and rollback readback sends `Cache-Control: no-cache`
+to revalidate canonical URLs. Pages caches responses for ten minutes; the shared
+heartbeat from an immediately preceding platform publication must not be accepted
+as the current origin snapshot. Each path is requested once; no sleep or retry
+loop substitutes for deployment status or exact byte comparison.
 A canceled runner or unavailable Pages service cannot guarantee remote rollback;
 the stored parent and previous-feed artifact remain recovery inputs.
 

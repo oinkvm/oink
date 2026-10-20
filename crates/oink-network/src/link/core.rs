@@ -1435,11 +1435,25 @@ impl Core {
         );
         self.effects.push_back(Effect::PathChanged { link: id, old });
     }
+    fn candidate_waiting_for_path(&self, connection: ConnectionId, candidate: &Candidate) -> bool {
+        // Selection can finish while a prior relay install is still pending.
+        // If that install fails, the selected direct connection has no path or
+        // cutover to time it out. Keep its original candidate budget until a
+        // link owns it; an orphan selection would reject every later candidate.
+        !matches!(candidate.choice, Choice::Selected(_))
+            || !self.links.values().any(|link| {
+                link.hop.connection_id == connection
+                    || link
+                        .cutover
+                        .as_ref()
+                        .is_some_and(|cutover| cutover.next_hop.connection_id == connection)
+            })
+    }
     pub fn next_deadline(&self) -> Option<Instant> {
         let mut next = None;
         let mut include = |at: Instant| next = Some(next.map_or(at, |old: Instant| old.min(at)));
-        for c in self.candidates.values() {
-            if !matches!(c.choice, Choice::Selected(_)) {
+        for (&connection, c) in &self.candidates {
+            if self.candidate_waiting_for_path(connection, c) {
                 include(c.deadline);
             }
         }
@@ -1491,7 +1505,7 @@ impl Core {
         let expired: Vec<_> = self
             .candidates
             .iter()
-            .filter(|(_, c)| !matches!(c.choice, Choice::Selected(_)) && now >= c.deadline)
+            .filter(|(connection, c)| self.candidate_waiting_for_path(**connection, c) && now >= c.deadline)
             .map(|(id, _)| *id)
             .collect();
         for id in expired {

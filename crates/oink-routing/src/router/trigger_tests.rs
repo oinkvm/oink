@@ -1070,10 +1070,6 @@ fn separate_screens_on_one_device_use_their_own_remote_gains() {
 /// Above-primary native geometry with a short touching bottom segment. The
 /// physical layout sends the exposed segment to a peer below the external.
 fn multidisplay_bottom_setup(backing_scale: u32) -> Router {
-    multidisplay_setup(backing_scale, false)
-}
-
-fn multidisplay_setup(backing_scale: u32, gap_travel: bool) -> Router {
     use oink_foundation::input::{EdgeResistanceRegion, ScreenEdge};
     let primary = Rect::new(0., 0., 1728., 1117.);
     let external = Rect::new(1560., -1080., 1920., 1080.);
@@ -1097,7 +1093,7 @@ fn multidisplay_setup(backing_scale: u32, gap_travel: bool) -> Router {
         screens,
         ..Default::default()
     };
-    layout.settings.gap_travel = gap_travel;
+    layout.settings.gap_travel = false;
     layout.settings.endpoint_reach = 0.;
     layout.settings.portal_snap = 0.;
     let mut r = native_router(&layout, A, 1.);
@@ -1222,181 +1218,5 @@ fn multidisplay_small_native_gap_is_not_exempt_from_bottom_damping() {
         let dst = ScreenPos::new(ScreenId::new(B, "screen"), Point::new(-1000., -1079.));
         assert!(!r.push_resistance(A, &at, Some(&at), &dst, (0., 1.), 1), "gap={gap}");
         assert!(r.resistance.is_some());
-    }
-}
-
-fn stillness_setup(corner: bool) -> Router {
-    use oink_foundation::input::{EdgeResistanceRegion, ScreenCorner};
-    let mut r = multidisplay_bottom_setup(1);
-    if corner {
-        r.set_edge_resistance_regions(vec![EdgeResistanceRegion {
-            display: "external".into(),
-            edges: vec![],
-            corners: vec![ScreenCorner::BottomRight],
-        }]);
-        r.set_cursor(Point::new(3479.98, -0.02));
-    }
-    r
-}
-
-fn stillness_motion(r: &mut Router, remote: bool, delta: (f64, f64), now: Micros) {
-    let from = r.pointer.as_ref().unwrap().clone();
-    if remote {
-        let k = r.layout.reference_per_native_unit(&from.screen).unwrap();
-        r.remote_motion(SOURCE, delta.0 * k, delta.1 * k, now);
-    } else {
-        let bounds = r.displays.iter().find(|d| d.key == from.screen.display).unwrap().bounds;
-        let pos = bounds.clamp(Point::new(from.local.x + delta.0, from.local.y + delta.1));
-        r.local_motion(delta.0, delta.1, Some(pos), now);
-    }
-}
-
-#[test]
-fn edge_stillness_requires_100ms_for_local_remote_and_hot_corner_segments() {
-    for remote in [false, true] {
-        for corner in [false, true] {
-            for wait in [99_000, 100_000, 150_000] {
-                let mut r = stillness_setup(corner);
-                // Arrival with no outward pressure must start an edge visit too.
-                stillness_motion(&mut r, remote, (0., 0.), 0);
-                for now in [10_000, 50_000, 90_000] {
-                    stillness_motion(&mut r, remote, (0., 0.), now);
-                }
-                stillness_motion(&mut r, remote, (0., 2.), wait);
-                assert_eq!(
-                    r.holder == B,
-                    wait >= 100_000,
-                    "remote={remote},corner={corner},wait={wait}"
-                );
-                if wait >= 100_000 {
-                    assert!(
-                        r.resting_edges.iter().all(Option::is_none),
-                        "handoff ends the edge visit"
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn clamped_outward_motion_is_not_stillness_then_silence_releases_damping() {
-    for remote in [false, true] {
-        let mut r = stillness_setup(false);
-        stillness_motion(&mut r, remote, (0., 2.), 0);
-        let at = r.pointer.as_ref().unwrap().local;
-        for now in (10_000..=500_000).step_by(10_000) {
-            stillness_motion(&mut r, remote, (0., 0.1), now);
-            assert_eq!(r.holder, A);
-            assert_eq!(r.pointer.as_ref().unwrap().local, at, "native cursor remains clamped");
-        }
-        // No events at all between the last push and this one.
-        stillness_motion(&mut r, remote, (0., 2.), 600_000);
-        assert_eq!(r.holder, B);
-    }
-}
-
-#[test]
-fn raw_jitter_and_tangential_sliding_restart_the_edge_stillness_clock() {
-    for remote in [false, true] {
-        for delta in [(0., 0.000001), (1., 0.)] {
-            let mut r = stillness_setup(false);
-            stillness_motion(&mut r, remote, (0., 2.), 0);
-            stillness_motion(&mut r, remote, delta, 90_000);
-            stillness_motion(&mut r, remote, (0., 2.), 100_000);
-            assert_eq!(r.holder, A, "remote={remote},delta={delta:?}");
-            stillness_motion(&mut r, remote, (0., 2.), 200_000);
-            assert_eq!(r.holder, B);
-        }
-    }
-    // The separate raw-capture event must count even before a position sample.
-    let mut r = stillness_setup(false);
-    stillness_motion(&mut r, false, (0., 2.), 0);
-    r.on_local_event(
-        &CapturedEvent {
-            event: InputEvent::RawPointerDelta { dx: 0., dy: 1. },
-            source: SourceKind::Mouse,
-            physical: true,
-            time_us: 90_000,
-            cursor: None,
-        },
-        90_000,
-    );
-    stillness_motion(&mut r, false, (0., 2.), 100_000);
-    assert_eq!(r.holder, A);
-}
-
-#[test]
-fn released_damping_lasts_only_for_the_same_boundary_visit() {
-    for remote in [false, true] {
-        for reset in 0..6 {
-            let mut r = stillness_setup(false);
-            stillness_motion(&mut r, remote, (0., 2.), 0);
-            stillness_motion(&mut r, remote, (0., 0.), 100_000);
-            match reset {
-                0 => {
-                    // Moving within the boundary preserves an acquired bypass.
-                    stillness_motion(&mut r, remote, (1., 0.), 100_001);
-                }
-                1 => {
-                    stillness_motion(&mut r, remote, (0., -3.), 100_001);
-                    stillness_motion(&mut r, remote, (0., 3.), 100_002);
-                }
-                2 => r.set_local_displays(r.displays.clone()),
-                3 => r.set_layout(r.layout.clone()),
-                4 => {
-                    r.set_locked(true);
-                    r.set_locked(false);
-                }
-                _ => {
-                    r.set_projection_gesture(true);
-                    r.set_projection_gesture(false);
-                }
-            }
-            stillness_motion(&mut r, remote, (0., 2.), 100_003);
-            assert_eq!(r.holder == B, reset == 0, "remote={remote},reset={reset}");
-        }
-        let mut r = stillness_setup(true);
-        stillness_motion(&mut r, remote, (0., 2.), 0);
-        stillness_motion(&mut r, remote, (0., 0.), 100_000);
-        stillness_motion(&mut r, remote, (-50., 0.), 100_001); // outside hot corner
-        stillness_motion(&mut r, remote, (50., 0.), 100_002);
-        stillness_motion(&mut r, remote, (0., 2.), 100_003);
-        assert_eq!(r.holder, A, "leaving the protected corner resets its bypass");
-    }
-}
-
-#[test]
-fn stillness_release_applies_to_gap_travel_and_manual_windows_damping() {
-    for remote in [false, true] {
-        for gap in [false, true] {
-            for os in [Os::MacOS, Os::Windows] {
-                // Windows platform regions are empty; explicit manual rules
-                // opt it into the same damping and stillness policy.
-                let mut r = multidisplay_setup(1, gap);
-                r.cfg.os = os;
-                if os == Os::Windows {
-                    r.cfg.settings.damping.rules = vec![crate::damping::DampingRule {
-                        segment: crate::damping::DampingSegment {
-                            source: Some(A),
-                            target: Some(B),
-                            display: Some("external".into()),
-                            edge: oink_foundation::input::ScreenEdge::Bottom,
-                            start: 0.,
-                            end: 1.,
-                        },
-                        profile: crate::damping::DampingProfile::DepthOnly { depth: 0.5 },
-                    }];
-                    // Physical-gap system-edge damping is Mac-only by design.
-                    if gap {
-                        continue;
-                    }
-                }
-                stillness_motion(&mut r, remote, (0., 2.), 0);
-                assert_eq!(r.holder, A);
-                stillness_motion(&mut r, remote, (0., 2.), 100_000);
-                assert_eq!(r.holder, B, "remote={remote},gap={gap},os={os:?}");
-            }
-        }
     }
 }

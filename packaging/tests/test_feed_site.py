@@ -140,6 +140,65 @@ class SiteTests(unittest.TestCase):
             feed.write(self.state / 'registry.json', reg)
         return output
 
+    def test_windows_commit_then_mac_readback_revalidates_the_cached_heartbeat(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import shutil
+        import threading
+
+        # Both sign against the original platform revisions. The serialized
+        # Mac transaction must preserve the Windows commit that lands first.
+        mac = self.make_candidate('mac')
+        windows = self.make_candidate('windows')
+        windows_state = self.root / 'windows-committed'
+        feed_site.merge(self.state, windows, windows_state, 0)
+        shutil.copytree(windows_state, self.state, dirs_exist_ok=True)
+        mac_state = self.root / 'mac-next'
+        feed_site.merge(self.state, mac, mac_state, 1)
+        self.assertEqual(feed_site.files(mac_state / 'site/windows'),
+                         feed_site.files(windows_state / 'site/windows'))
+        active = feed_site.files(windows_state / 'site')
+        cache = {}
+        requests = []
+
+        class PagesCache(BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+
+            def do_GET(self):
+                path = self.path.removeprefix('/')
+                requests.append(path)
+                # Pages API success changes the origin; it does not invalidate
+                # an intermediary's still-fresh max-age=600 response.
+                if self.headers.get('Cache-Control') == 'no-cache' or path not in cache:
+                    if path not in active:
+                        self.send_error(404)
+                        return
+                    cache[path] = active[path]
+                self.send_response(200)
+                self.send_header('Cache-Control', 'max-age=600')
+                self.end_headers()
+                self.wfile.write(cache[path])
+
+        self.download.stop()  # Exercise the real HTTP downloader, not a mock.
+        server = ThreadingHTTPServer(('localhost', 0), PagesCache)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch.object(feed, 'BASE', f'http://localhost:{server.server_port}/'):
+                feed_site.verify_public(windows_state)
+                self.assertEqual(cache['heartbeat.json'], active['heartbeat.json'])
+                active = feed_site.files(mac_state / 'site')
+                requests.clear()
+                feed_site.verify_public(mac_state)
+                self.assertEqual(cache['heartbeat.json'], active['heartbeat.json'])
+                self.assertEqual(len(requests), len(set(requests)), 'each path is checked once; no retry')
+                active['heartbeat.json'] = b'wrong deployed snapshot'
+                with self.assertRaisesRegex(ValueError, 'deployment_digest'):
+                    feed_site.verify_public(mac_state)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     def test_all_four_present_absent_combinations_and_both_publishers(self):
         for mac in [False, True]:
             for windows in [False, True]:
@@ -443,6 +502,7 @@ class DeploymentTests(unittest.TestCase):
         workflow = (root / 'deploy-feed.yml').read_text()
         self.assertNotIn('WINDOWS_UPDATE_ED25519', workflow)
         self.assertIn('group: oink-update-feed-publish', workflow)
+        self.assertIn("if: steps.publish.outputs.status == 'succeed'", workflow)
         self.assertIn('artifact_name: previous-feed', workflow)
         self.assertIn("steps.publish.outcome == 'failure'", workflow)
         self.assertIn("steps.commit.outcome != 'success'", workflow)

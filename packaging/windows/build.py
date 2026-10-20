@@ -176,7 +176,7 @@ def main():
                   upgrade_code=w['upgrade_code'], components=[b[r] + '.exe' for r in roles], updater_included=has_worker,
                   collector_included=has_collector, update_test_feed=a.windows_update_test_feed,
                   update_test_fail_health=provenance.get('update_test_fail_health', False),
-                  update_policy='manual-only', signing='unsigned', report_manifest=report)
+                  signing='unsigned', report_manifest=report)
     notice_files = copy_notices(payload)
     (payload / I['metadata_file']).write_text(json.dumps(record, indent=2) + '\n')
     (payload / w['receipt']).write_text(json.dumps(installed_receipt(record), indent=2) + '\n')

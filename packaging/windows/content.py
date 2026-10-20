@@ -235,9 +235,8 @@ def verify_msi(manifest, extracted, identity, tables):
         if name not in names:
             raise RuntimeError('MSI build metadata missing')
         record = json.loads((extracted / 'File' / names[name].get('Id')).read_text())
-        if (len(record['source_tree_sha256']) != 64 or
-                (name == identity['metadata_file'] and record['update_policy'] != 'manual-only')):
-            raise RuntimeError('MSI build provenance or update policy mismatch')
+        if len(record['source_tree_sha256']) != 64:
+            raise RuntimeError('MSI build provenance mismatch')
     if 'report-manifest.json' not in names:
         raise RuntimeError('MSI crash report manifest missing')
     report = json.loads((extracted / 'File' / names['report-manifest.json'].get('Id')).read_text())

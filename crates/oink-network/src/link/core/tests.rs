@@ -529,6 +529,62 @@ fn loser_authentication_and_close_callbacks_in_both_orders_never_notify() {
 }
 
 #[test]
+fn selected_direct_candidate_expires_when_pending_relay_installation_is_lost() {
+    let mut r = Rig::new(3);
+    r.connect(0, 1);
+    r.connect(1, 2);
+    r.pump();
+    r.ready(0, 1);
+    r.ready(1, 2);
+    let target = r.peer(2);
+    r.nodes[0].dial(target, vec![], DialMode::PreferDirect, r.now).unwrap();
+    let mut held = Vec::new();
+    r.pump_holding(&mut held, |_, effect| {
+        matches!(effect, Effect::Control { message, .. } if matches!(message.as_ref(), LinkMsg::PathInstall(_)))
+    });
+    let relay = r.link(0, 2);
+    assert!(!r.nodes[0].links[&relay].installed);
+    // A direct candidate is selected before the earlier relay installation
+    // completes. It waits for that installation, without a cutover yet.
+    let direct = r.connect(2, 0);
+    r.pump();
+    assert!(r.nodes[0].selected_connection_id(direct));
+    assert!(r.nodes[2].selected_connection_id(direct));
+    assert!(r.nodes[0].links[&relay].cutover.is_none());
+    r.nodes[0].lose(relay, LinkLost::HeartbeatTimeout);
+    r.nodes[0].effects.clear();
+    r.nodes[2].effects.clear();
+    r.now += DIAL_BUDGET;
+    for node in [0, 2] {
+        r.nodes[node].tick(r.now);
+        assert!(
+            !r.nodes[node].candidates.contains_key(&direct),
+            "selected candidate without a path must retain its setup deadline; node={node}"
+        );
+        assert!(
+            r.nodes[node]
+                .effects
+                .iter()
+                .any(|effect| { matches!(effect, Effect::CloseConnection(connection) if *connection == direct) })
+        );
+    }
+    // Deliver the executor's close callbacks, then show that the stale
+    // selection cannot reject the next authenticated connection as superseded.
+    for node in [0, 2] {
+        r.nodes[node].connection_lost(direct, r.now);
+    }
+    r.pump();
+    let replacement = r.connect(2, 0);
+    r.pump();
+    for (local, remote) in [(0, 2), (2, 0)] {
+        let link = &r.nodes[local].links[&r.link(local, remote)];
+        assert!(link.installed);
+        assert_eq!(link.hop.connection_id, replacement);
+        assert_eq!(link.path(), LinkPath::Direct);
+    }
+}
+
+#[test]
 fn executor_finishes_direct_candidates_and_loss_closes_the_selected_connection() {
     let mut r = Rig::new(2);
     let peer = r.peer(1);

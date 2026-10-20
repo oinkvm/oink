@@ -216,7 +216,7 @@ def verify_public(state, platform=None):
     for path, raw in files(state / 'site').items():
         if platform is not None and not path.startswith(platform + '/'):
             continue
-        feed.require(feed.download(feed.BASE + path, max(feed.MAX_FEED, len(raw))) == raw, 'deployment_digest')
+        feed.require(feed.download(feed.BASE + path, max(feed.MAX_FEED, len(raw)), False, True) == raw, 'deployment_digest')
     verify_absent(state_info(state), PLATFORMS if platform is None else (platform,))
 
 
@@ -229,7 +229,7 @@ def verify_absent(reg, platforms=PLATFORMS):
             filename = 'appcast.xml' if platform == 'mac' else 'manifest.json'
             for channel in ('stable', 'beta'):
                 try:
-                    feed.download(f'{feed.BASE}{platform}/v1/{epoch}/{channel}/{filename}', feed.MAX_FEED)
+                    feed.download(f'{feed.BASE}{platform}/v1/{epoch}/{channel}/{filename}', feed.MAX_FEED, False, True)
                 except urllib.error.HTTPError as error:
                     try:
                         feed.require(error.code == 404, 'disabled_feed_status')

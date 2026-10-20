@@ -1,6 +1,6 @@
 //! Edge selection and gesture lifetime; sampling/rules live in crate::damping.
 use super::*;
-use crate::damping::{DampingMeter, DampingProfile, DampingStillness, nonnegative};
+use crate::damping::{DampingMeter, DampingProfile, nonnegative};
 use oink_foundation::input::{EdgeResistanceRegion, ScreenCorner, ScreenEdge};
 
 #[derive(Clone, Debug)]
@@ -14,40 +14,12 @@ pub(super) struct Resistance {
     meter: DampingMeter,
 }
 
-#[derive(Clone, Debug)]
-pub(super) struct RestingEdge {
-    screen: ScreenId,
-    target: Option<ScreenId>,
-    origin: DeviceId,
-    normal: (f64, f64),
-    rule: Option<usize>,
-    stillness: DampingStillness,
-}
-
 impl Router {
-    pub(super) fn reset_resistance(&mut self) {
-        self.resistance = None;
-        self.resting_edges = Default::default();
-    }
-
-    /// Raw capture can precede the position-bearing event. It is still device
-    /// movement, including pressure which leaves the native cursor clamped.
-    pub(super) fn raw_resistance_motion(&mut self, origin: DeviceId, delta: (f64, f64), now: Micros) {
-        for edge in self
-            .resting_edges
-            .iter_mut()
-            .flatten()
-            .filter(|edge| edge.origin == origin)
-        {
-            edge.stillness.observe(delta, now);
-        }
-    }
-
     /// Replace the platform snapshot; a real change invalidates the current push gesture.
     pub fn set_edge_resistance_regions(&mut self, regions: Vec<EdgeResistanceRegion>) {
         if self.edge_regions != regions {
             self.edge_regions = regions;
-            self.reset_resistance();
+            self.resistance = None;
         }
     }
 
@@ -132,8 +104,7 @@ impl Router {
 
     /// Keep a gesture on the same active portal or protected gap edge segment.
     /// Tangential motion does not add energy.
-    pub(super) fn retain_resistance(&mut self, p: &ScreenPos, origin: DeviceId, delta: (f64, f64), now: Micros) {
-        self.observe_edge_stillness(p, origin, delta, now);
+    pub(super) fn retain_resistance(&mut self, p: &ScreenPos, origin: DeviceId, delta: (f64, f64)) {
         let Some(r) = &self.resistance else { return };
         let n = r.normal;
         let valid = p.screen == r.screen
@@ -167,65 +138,6 @@ impl Router {
             if r.meter.depth() <= 0.0 {
                 self.resistance = None;
             }
-        }
-    }
-
-    /// Track all protected boundaries at a corner, including arrival with no
-    /// outward pressure yet. Each entry belongs to one uninterrupted edge visit.
-    fn observe_edge_stillness(&mut self, p: &ScreenPos, origin: DeviceId, delta: (f64, f64), now: Micros) {
-        if self.leave_blocked() {
-            self.resting_edges = Default::default();
-            return;
-        }
-        let Some(bounds) = self
-            .displays
-            .iter()
-            .find(|d| d.key == p.screen.display)
-            .map(|d| d.bounds)
-        else {
-            self.resting_edges = Default::default();
-            return;
-        };
-        for (index, normal) in [(-1., 0.), (1., 0.), (0., -1.), (0., 1.)].into_iter().enumerate() {
-            let previous = self.resting_edges[index].take();
-            let distance = edge_distance(bounds, p.local, normal);
-            if !(0.0..=EDGE_UNITS).contains(&distance)
-                || self
-                    .displays
-                    .iter()
-                    .any(|d| d.key != p.screen.display && native_seam(bounds, d.bounds, p.local, normal))
-            {
-                continue;
-            }
-            let target = self
-                .layout
-                .exit_through_edge(p, (normal.0 * 2., normal.1 * 2.))
-                .map(|p| p.screen);
-            if target.as_ref().is_some_and(|target| target.device == self.me())
-                || (target.is_none() && !self.gap_allowed())
-            {
-                continue;
-            }
-            let Some((rule, _)) = self.damping_rule(p, normal, target.as_ref().map_or(self.me(), |p| p.device)) else {
-                continue;
-            };
-            let previous = previous.filter(|edge| {
-                edge.screen == p.screen
-                    && edge.target == target
-                    && edge.origin == origin
-                    && edge.normal == normal
-                    && edge.rule == rule
-            });
-            let mut edge = previous.unwrap_or_else(|| RestingEdge {
-                screen: p.screen.clone(),
-                target,
-                origin,
-                normal,
-                rule,
-                stillness: DampingStillness::new(now),
-            });
-            edge.stillness.observe(delta, now);
-            self.resting_edges[index] = Some(edge);
         }
     }
 
@@ -268,7 +180,6 @@ impl Router {
         delta: (f64, f64),
         now: Micros,
     ) -> bool {
-        self.observe_edge_stillness(at, origin, delta, now);
         let Some(normal) = self.exit_normal(at, delta) else {
             return true;
         };
@@ -288,16 +199,6 @@ impl Router {
             return true;
         }
         let target = dst.map(|p| p.screen.clone());
-        if self.resting_edges.iter().flatten().any(|edge| {
-            edge.screen == at.screen
-                && edge.origin == origin
-                && edge.normal == normal
-                && edge.rule == rule
-                && (dst.is_none() || edge.target == target)
-                && edge.stillness.released()
-        }) {
-            return true;
-        }
         let same = self.resistance.as_ref().is_some_and(|r| {
             r.screen == at.screen && r.target == target && r.origin == origin && r.normal == normal && r.rule == rule
         });

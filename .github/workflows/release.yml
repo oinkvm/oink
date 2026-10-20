@@ -5,9 +5,9 @@ on:
   workflow_dispatch:
     inputs:
       build:
-        description: Reserved monotonically increasing product build (0.1.1 uses 31, above local build 30)
+        description: Reserved monotonically increasing product build (0.1.2 uses 32, above public build 31)
         required: true
-        default: '31'
+        default: '32'
         type: string
 permissions:
   contents: read

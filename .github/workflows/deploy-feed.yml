@@ -58,6 +58,9 @@ jobs:
           artifact_name: next-feed-${{ inputs.platform }}
       - name: Read back custom domain and commit state with CAS
         id: commit
+        # The pinned deploy-pages action polls the deployment API until succeed.
+        # HTTP readback then revalidates CDN caches; there is no delay/retry loop.
+        if: steps.publish.outputs.status == 'succeed'
         run: python3 build-support/update/deploy.py commit
       - name: Restore previous hosted bytes on deployment, readback or CAS failure
         if: ${{ always() && (steps.publish.outcome == 'failure' || steps.publish.outcome == 'cancelled' || (steps.publish.outcome == 'success' && steps.commit.outcome != 'success')) }}

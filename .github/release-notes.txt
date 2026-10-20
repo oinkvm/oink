@@ -1,26 +1,12 @@
-Oink 0.1.1 adds in-app updates, desktop notifications and more control over how your pointer moves between screens.
-
-## Highlights
-
-- **In-app updates** — check, download and install updates in Oink on Mac and Windows. Mac updates use Sparkle; Windows updates use signed manifests. Install interrupts sharing and restarts Oink immediately. If you use 0.1.0, install 0.1.1 manually once to get this feature.
-- **Desktop notifications** — game-mode changes and pointer or keyboard locks appear on the affected computer, with Undo. Choose Off, Minimal, Default or Verbose in the Notifications setting.
-- **Per-screen pointer speed** — adjust pointer speed when remotely controlling each screen, without changing local use or game mode.
-- **Edge resistance** — keeping the mouse completely still at an edge for 100 ms releases the resistance for that edge visit.
-- **Connection chart** — Settings now shows RTT P90, the 90th-percentile round-trip time, instead of jitter.
+Oink 0.1.2 improves reconnection reliability and restores the original edge-resistance behavior.
 
 ## Fixes
 
-- Corrected cross-device dragging from displays placed above or to the left of the primary display, and the drag start position on Windows.
-- Fixed the Dock staying visible after leaving an external display and false automatic game-mode entry.
-- Corrected last-seen times and hidden-screen visibility for offline devices.
-- Fixed overlays using the primary display's refresh rate on mixed-refresh-rate setups.
-- Fixed edge resistance being bypassed across a gap between displays.
-- Fixed audio forwarding failing to recover after packet loss.
-- Fixed manual update checks being refused or getting stuck after a failed download.
-- Improved reconnection after another computer restarts.
-- Fixed startup when Oink is run as administrator or Windows UAC is off.
-- Reduced idle CPU use from connection charts and layout animations.
-- Removed the device-address-changed alert.
+- Fixed devices sometimes being unable to reconnect until Oink restarts, after a relayed connection switches to direct.
+
+## Changes
+
+- Removed the edge-resistance release after the mouse stays still for 100 ms. Edge resistance now always applies as in 0.1.0.
 
 ## Downloads
 

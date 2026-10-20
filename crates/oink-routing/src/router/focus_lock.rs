@@ -156,7 +156,7 @@ impl Router {
         let locked = state.locked;
         tracing::info!(locked, holder = ?state.holder, revision = state.revision, "group focus lock changed");
         self.focus_lock = Some(state);
-        self.reset_resistance();
+        self.resistance = None;
         if locked {
             self.gap_cancel();
             self.enter_due = None;

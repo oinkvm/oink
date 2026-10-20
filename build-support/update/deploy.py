@@ -62,7 +62,7 @@ def verify_rollback():
     names = git('ls-tree', '-r', '--name-only', fence['head'], '--', 'site').splitlines()
     for name in names:
         raw = subprocess.check_output(['git', '-C', str(STATE), 'show', f'{fence["head"]}:{name}'])
-        feed.require(feed.download(feed.BASE + name.removeprefix('site/'), max(feed.MAX_FEED, len(raw))) == raw,
+        feed.require(feed.download(feed.BASE + name.removeprefix('site/'), max(feed.MAX_FEED, len(raw)), False, True) == raw,
                      'rollback_digest')
     feed_site.verify_absent(reg)
 
