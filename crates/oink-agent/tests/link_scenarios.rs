@@ -17,7 +17,7 @@ use oink_input::InputBackend;
 use oink_network::NetworkConfig;
 use oink_network::link::{Disconnect, LinkPath};
 use oink_test_support::clipboard::FakeClipboard;
-use oink_test_support::input::FakeInput;
+use oink_test_support::input::{FakeInput, PendingMode};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -272,6 +272,12 @@ fn key(input: &FakeInput, code: u32, pressed: bool) {
 
 fn holder(node: &Node) -> Option<DeviceId> {
     node.input_status().ok()?.focus_info.clone().map(|f| f.holder)
+}
+
+// Link loss publishes router focus after enqueueing native restoration. The
+// injection worker applies that mode separately, so focus alone is not readiness.
+fn local_pointer_ready(dev: &Dev) -> bool {
+    holder(&dev.node) == Some(dev.node.id()) && matches!(dev.input.mode(), Some(CaptureMode::Local))
 }
 
 /// Injected key events on a device as (usage, pressed).
@@ -677,6 +683,62 @@ async fn leave_and_remove_give_only_the_departed_a_new_group_scenario() {
 // ───────────── 4. link drop and reconnect ─────────────
 
 #[test]
+fn link_loss_waits_for_native_local_mode_after_focus_returns() {
+    common::watchdog::run(
+        module_path!(),
+        "link_loss_waits_for_native_local_mode_after_focus_returns",
+        Some(4),
+        async {
+            let root = tempfile::tempdir().unwrap();
+            let a = start(root.path(), "alpha").await;
+            let b = start(root.path(), "beta").await;
+            common::pair(&a.node, &b.node).await;
+            row(&[&a, &b]).await;
+            cross(&a, &b, 1.0).await;
+            wait_for("A captures remotely", 5.0, || {
+                matches!(a.input.mode(), Some(CaptureMode::Remote { .. }))
+            })
+            .await;
+            a.input.set_deferred_modes(true);
+            let link = a.node.links().unwrap().links().by_peer(b.node.id()).unwrap().link;
+            a.node
+                .links()
+                .unwrap()
+                .disconnect(link, Disconnect::ControlStreamFailed);
+            wait_for("focus returned with native restore still queued", 5.0, || {
+                holder(&a.node) == Some(a.node.id())
+                    && a.input.pending_modes().iter().any(|mode| {
+                        matches!(
+                            mode,
+                            PendingMode::RestoreLocal(_) | PendingMode::Set(CaptureMode::Local)
+                        )
+                    })
+            })
+            .await;
+            let mode_at_focus_return = a.input.mode();
+            let early = {
+                let mut ready = std::pin::pin!(wait_for("A's native pointer is local", 5.0, || {
+                    local_pointer_ready(&a)
+                }));
+                let early = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(std::future::Future::poll(ready.as_mut(), cx).is_ready())
+                })
+                .await;
+                // Release the native gate before asserting, including on regression.
+                a.input.set_deferred_modes(false);
+                if !early {
+                    ready.await;
+                }
+                early
+            };
+            assert!(matches!(mode_at_focus_return, Some(CaptureMode::Remote { .. })));
+            assert!(!early, "local readiness must wait for native restoration");
+            shutdown(vec![a, b]).await;
+        },
+    );
+}
+
+#[test]
 fn link_drop_releases_keys_and_every_module_stream_comes_back() {
     common::watchdog::run(
         module_path!(),
@@ -738,14 +800,10 @@ async fn link_drop_releases_keys_and_every_module_stream_comes_back_scenario() {
             keys(&b.input).last() == Some(&(0x50, false))
         })
         .await;
-        wait_for("focus returns to each device", 5.0, || {
-            holder(&a.node) == Some(a.node.id()) && holder(&b.node) == Some(b.node.id())
+        wait_for("focus and native pointer return to each device", 5.0, || {
+            local_pointer_ready(&a) && local_pointer_ready(&b)
         })
         .await;
-        assert!(
-            matches!(a.input.mode(), Some(CaptureMode::Local)),
-            "A's pointer is local again"
-        );
         key(&a.input, 0x50, false);
 
         // Reconnect without any user action.
@@ -779,13 +837,15 @@ async fn link_drop_releases_keys_and_every_module_stream_comes_back_scenario() {
         );
         // Bring the pointer home for the next round.
         for _ in 0..400 {
-            if holder(&a.node) == Some(a.node.id()) {
+            if local_pointer_ready(&a) {
                 break;
             }
-            os_move(&a.input, -20.0);
+            if holder(&a.node) != Some(a.node.id()) {
+                os_move(&a.input, -20.0);
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert_eq!(holder(&a.node), Some(a.node.id()), "pointer came back to A");
+        assert!(local_pointer_ready(&a), "pointer came back to A in native Local mode");
 
         // Clipboard both ways, audio control, wallpaper, diagnostics.
         clipboard_reaches(&a, &b, &format!("a to b after drop {round}")).await;
@@ -1050,13 +1110,15 @@ async fn pause_and_resume_from_either_side_restore_every_stream_scenario() {
         cross(&a, &b, 1.0).await;
         type_and_check(&a, &b, 20, "after resume").await;
         for _ in 0..400 {
-            if holder(&a.node) == Some(a.node.id()) {
+            if local_pointer_ready(&a) {
                 break;
             }
-            os_move(&a.input, -20.0);
+            if holder(&a.node) != Some(a.node.id()) {
+                os_move(&a.input, -20.0);
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert_eq!(holder(&a.node), Some(a.node.id()), "pointer came back to A");
+        assert!(local_pointer_ready(&a), "pointer came back to A in native Local mode");
         clipboard_reaches(&a, &b, &format!("a to b after resume {round}")).await;
         clipboard_reaches(&b, &a, &format!("b to a after resume {round}")).await;
     }
@@ -1189,9 +1251,8 @@ async fn restarted_backend_rejoins_and_every_module_works_scenario() {
         wait_for("held key on B", 5.0, || keys(&b.input).last() == Some(&(0x52, true))).await;
         // B's backend goes away while A drives it.
         b.node.shutdown().await;
-        wait_for("A takes focus back", 8.0, || holder(&a.node) == Some(a.node.id())).await;
+        wait_for("A takes focus and native pointer back", 8.0, || local_pointer_ready(&a)).await;
         key(&a.input, 0x52, false);
-        assert!(matches!(a.input.mode(), Some(CaptureMode::Local)));
         // A changes shared state while B is away.
         api(&a.node, move |n| {
             n.rename_device(n.id().into(), format!("renamed {round}"))
@@ -1216,23 +1277,28 @@ async fn restarted_backend_rejoins_and_every_module_works_scenario() {
         cross(&a, &b, 1.0).await;
         type_and_check(&a, &b, 20, "after restart").await;
         for _ in 0..400 {
-            if holder(&a.node) == Some(a.node.id()) {
+            if local_pointer_ready(&a) {
                 break;
             }
-            os_move(&a.input, -20.0);
+            if holder(&a.node) != Some(a.node.id()) {
+                os_move(&a.input, -20.0);
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert_eq!(holder(&a.node), Some(a.node.id()), "pointer came back to A");
+        assert!(local_pointer_ready(&a), "pointer came back to A in native Local mode");
         // And the restarted side can drive the resident one.
         cross(&b, &a, -1.0).await;
         type_and_check(&b, &a, 10, "restarted device drives the resident one").await;
         for _ in 0..400 {
-            if holder(&b.node) == Some(b.node.id()) {
+            if local_pointer_ready(&b) {
                 break;
             }
-            os_move(&b.input, 20.0);
+            if holder(&b.node) != Some(b.node.id()) {
+                os_move(&b.input, 20.0);
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        assert!(local_pointer_ready(&b), "pointer came back to B in native Local mode");
         clipboard_reaches(&a, &b, &format!("a to b after restart {round}")).await;
         clipboard_reaches(&b, &a, &format!("b to a after restart {round}")).await;
         wait_for("wallpapers after restart", 10.0, || {
