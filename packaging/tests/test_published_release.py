@@ -16,6 +16,12 @@ import mac_release
 
 
 class PublishedFeedContract(unittest.TestCase):
+    def test_platform_deployments_do_not_collide_in_same_run_artifacts(self):
+        workflow = (ROOT / '.github/workflows/deploy-feed.yml').read_text()
+        for prefix in ('previous-feed', 'next-feed'):
+            self.assertIn('name: ' + prefix + '-${{ inputs.platform }}', workflow)
+            self.assertIn('artifact_name: ' + prefix + '-${{ inputs.platform }}', workflow)
+
     def test_every_publisher_caller_forwards_required_environment_key(self):
         for platform, key in [('macos', 'SPARKLE_ED25519_PRIVATE_KEY'),
                               ('windows', 'WINDOWS_UPDATE_ED25519_PEM_WIN_2026_01')]:

@@ -45,17 +45,17 @@ jobs:
       - name: Preserve exact prior deployment for rollback
         uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
         with:
-          name: previous-feed
+          name: previous-feed-${{ inputs.platform }}
           path: feed-state/site
       - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
         with:
-          name: next-feed
+          name: next-feed-${{ inputs.platform }}
           path: next-state/site
       - name: Deploy complete merged snapshot
         id: publish
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
         with:
-          artifact_name: next-feed
+          artifact_name: next-feed-${{ inputs.platform }}
       - name: Read back custom domain and commit state with CAS
         id: commit
         run: python3 build-support/update/deploy.py commit
@@ -63,7 +63,7 @@ jobs:
         if: ${{ always() && (steps.publish.outcome == 'failure' || steps.publish.outcome == 'cancelled' || (steps.publish.outcome == 'success' && steps.commit.outcome != 'success')) }}
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
         with:
-          artifact_name: previous-feed
+          artifact_name: previous-feed-${{ inputs.platform }}
       - name: Verify rollback bytes
         if: ${{ always() && (steps.publish.outcome == 'failure' || steps.publish.outcome == 'cancelled' || (steps.publish.outcome == 'success' && steps.commit.outcome != 'success')) }}
         run: python3 build-support/update/deploy.py verify-rollback
