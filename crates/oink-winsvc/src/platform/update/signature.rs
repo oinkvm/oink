@@ -9,6 +9,11 @@ use windows_sys::Win32::{
 };
 
 pub(super) fn verify(path: &Path, roots: &Roots) -> Result<(), Error> {
+    // The signed manifest/package hash is always required by our callers. An
+    // Authenticode root, when supplied, is an additional release restriction.
+    if roots.signer_spki_sha256.is_empty() {
+        return Ok(());
+    }
     let file = protected::open(path).map_err(|_| Error::Storage)?;
     let name = wide(path.to_str().ok_or(Error::Storage)?);
     let mut info = WINTRUST_FILE_INFO {

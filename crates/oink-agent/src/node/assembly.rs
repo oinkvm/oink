@@ -12,6 +12,13 @@ impl Node {
     }
 
     pub(super) async fn start_sharing(&self) -> anyhow::Result<()> {
+        self.start_sharing_with_profile(application_profile()).await
+    }
+
+    pub(super) async fn start_sharing_with_profile(
+        &self,
+        profile: oink_network::negotiation::OfferProfile,
+    ) -> anyhow::Result<()> {
         // The caller serializes first start/reset. Check before LinkLayer::start: even
         // a bound socket would violate the IPC-only unreadable-state contract.
         crate::config_module::group_store::load(
@@ -28,7 +35,7 @@ impl Node {
             )?;
         }
         let (links, config_port) = LinkLayer::start(LinkConfig {
-            profile: application_profile(),
+            profile,
             identity: self.inner.identity.clone(),
             boot: self.inner.boot,
             bind: (self.inner.network.bind_ip, self.inner.network.port).into(),
@@ -272,6 +279,7 @@ fn application_profile() -> oink_network::negotiation::OfferProfile {
                 "oink.device-resources/1",
                 "oink.device-options/1",
                 "oink.aim/1",
+                "oink.notify/1",
                 "oink.wallpaper/1",
                 "oink.layout.projection/1",
                 "oink.diagnostics.collect/1",

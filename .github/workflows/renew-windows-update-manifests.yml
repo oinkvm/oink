@@ -43,7 +43,7 @@ jobs:
     permissions:
       contents: read
     timeout-minutes: 30
-    environment: windows-update-signing
+    environment: release
     concurrency:
       group: oink-update-feed-publish
       cancel-in-progress: false

@@ -167,6 +167,7 @@ fn auto_places_devices_side_by_side_and_syncs() {
     owner.screens.insert(
         "rdp".into(),
         ScreenPreference {
+            remote_gain: 1.0,
             enabled: false,
             ..Default::default()
         },
@@ -804,6 +805,7 @@ fn portal_does_not_pass_over_a_participating_screen() {
     owner.screens.insert(
         "c".into(),
         ScreenPreference {
+            remote_gain: 1.0,
             enabled: false,
             ..Default::default()
         },
@@ -990,6 +992,7 @@ fn gain_and_speed_modes() {
     owner.screens.insert(
         "tv".into(),
         ScreenPreference {
+            remote_gain: 1.0,
             gain: 2.0,
             ..Default::default()
         },
@@ -1932,6 +1935,7 @@ fn owner_gain_modes_and_screen_enable_never_enter_shared_geometry() {
     owners.get_mut(&A).unwrap().screens.insert(
         "a".into(),
         ScreenPreference {
+            remote_gain: 1.0,
             gain: 3.,
             enabled: true,
         },

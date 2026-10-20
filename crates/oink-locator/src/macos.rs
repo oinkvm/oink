@@ -10,7 +10,7 @@
 //!   那一小块有内容，图层随拖尾移动。
 //! - 线程：AppKit / 图层只在主线程上改（经主 dispatch 队列）；绘制线程只做计算。主线程来不及时丢帧
 //!   （最多两帧在路上），不排队。
-//! - 帧率：按主屏 `maximumFramesPerSecond`（ProMotion 为 120）定时出帧。
+//! - 帧率：按连接屏幕中最高的 `maximumFramesPerSecond` 定时出帧。
 //! - 不画时撤掉窗口（`orderOut`），不刷新、不占用。
 
 use std::cell::RefCell;
@@ -105,9 +105,13 @@ impl Backend {
                     }
                 }
             });
-            let fps = NSScreen::mainScreen(mtm).map_or(60, |s| s.maximumFramesPerSecond());
-            let fps = if (30..=240).contains(&fps) { fps } else { 60 };
-            interval.store(1_000_000_000 / fps as u64, Ordering::Relaxed);
+            let fps = overlay_refresh_rate(
+                NSScreen::screens(mtm)
+                    .to_vec()
+                    .iter()
+                    .map(|s| s.maximumFramesPerSecond()),
+            );
+            interval.store(1_000_000_000 / fps, Ordering::Relaxed);
         });
     }
 
@@ -181,6 +185,28 @@ impl Backend {
         if next > now {
             std::thread::sleep(next - now);
         }
+    }
+}
+
+/// One worker draws every display. The key-window screen may be slower than
+/// another surface, so it cannot determine the cadence for the whole overlay.
+pub(crate) fn overlay_refresh_rate(rates: impl Iterator<Item = isize>) -> u64 {
+    rates.filter(|fps| (30..=240).contains(fps)).max().unwrap_or(60) as u64
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::overlay_refresh_rate;
+
+    #[test]
+    fn mixed_refresh_displays_do_not_depend_on_primary_or_key_window_order() {
+        for rates in [vec![60, 120], vec![120, 60], vec![0, 144, 60], vec![240, 120]] {
+            let expected = *rates.iter().max().unwrap() as u64;
+            assert_eq!(overlay_refresh_rate(rates.into_iter()), expected);
+        }
+        assert_eq!(overlay_refresh_rate([0, -1].into_iter()), 60);
+        assert_eq!(overlay_refresh_rate([].into_iter()), 60);
+        assert_eq!(overlay_refresh_rate([30].into_iter()), 30);
     }
 }
 

@@ -93,6 +93,13 @@ class MacLocalizations(unittest.TestCase):
 
 
 class MacTccPolicy(unittest.TestCase):
+    def test_production_bundles_forbid_local_network_and_other_ats_exceptions(self):
+        C.verify_update_transport({})
+        C.verify_update_transport({'SUFeedURL':'https://updates.oink.hachiwii.com/mac/v1/mac-2026-01/stable/appcast.xml'})
+        for info in [{'NSAppTransportSecurity':{}}, {'NSAppTransportSecurity':{'NSAllowsLocalNetworking':True}},
+                     {'SUFeedURL':'http://127.0.0.1:9000/appcast.xml'}, {'SUFeedURL':'https://example.test/'}]:
+            with self.subTest(info=info), self.assertRaises(RuntimeError):C.verify_update_transport(info)
+
     def test_audio_capture_requirements_belong_to_backend(self):
         info = {'CFBundleExecutable': 'backend', 'NSAudioCaptureUsageDescription': 'Share system audio.'}
         entitlements = {'com.apple.security.device.audio-input': True}

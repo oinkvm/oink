@@ -7,9 +7,11 @@
 //! normalized reference units, while timestamps use Unix milliseconds.
 //! Device-card TypeScript contracts live beside their Rust types in `device_cards`.
 
+mod notifications;
 pub mod pairing;
 mod preference_patch;
 mod preferences;
+pub use notifications::*;
 pub use preference_patch::PreferencePatch;
 pub(crate) mod request_context;
 pub use preferences::UiPreferences;
@@ -331,10 +333,6 @@ pub enum AlertKind {
     SecureInput {
         app: Option<String>,
     },
-    /// 按记住的地址连不上某台设备，需要重新输入 IP。
-    AddressStale {
-        device: DeviceKey,
-    },
     PeerOffline {
         device: DeviceKey,
     },
@@ -581,6 +579,8 @@ pub struct Screen {
     pub origin: Point,
     /// 该屏的指针速度增益（默认 1.0，范围 0.1–10）。
     pub gain: f64,
+    /// Extra pointer speed multiplier used only for foreign pointer sources.
+    pub remote_gain: f64,
     /// 不参与布局与传送门（虚拟显示器默认隐藏）。
     pub hidden: bool,
     /// Visible/editable placement whose device cannot be a focus target.
@@ -725,6 +725,12 @@ pub fn layout_geometry(
                     .unwrap_or_default()
                     .screen(placement)
                     .gain,
+                remote_gain: owners
+                    .get(&v.id.device)
+                    .cloned()
+                    .unwrap_or_default()
+                    .screen(placement)
+                    .remote_gain,
                 hidden: !v.enabled,
                 device_disabled: owners.get(&v.id.device).is_some_and(|owner| !owner.screen_shared),
                 online: v.online,
@@ -1202,8 +1208,6 @@ pub struct PeerQuality {
     pub p90_ms: Option<f64>,
     pub p99_ms: Option<f64>,
     pub max_ms: Option<f64>,
-    pub average_jitter_ms: Option<f64>,
-    pub max_jitter_ms: Option<f64>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConnectionQuality {
@@ -1764,6 +1768,7 @@ pub trait AgentApi: Send + Sync {
     fn blocked_devices(&self) -> ApiResult<crate::device_cards::BlockedDevicesSnapshot>;
     fn block(&self, operation_id: String, device: DeviceKey) -> ApiResult<crate::device_cards::BlockReply>;
     fn unblock(&self, operation_id: String, device: DeviceKey) -> ApiResult<crate::device_cards::BlockReply>;
+    fn notify(&self, notification: Notification) -> ApiResult<Option<NotificationReceipt>>;
     fn ui_preferences(&self) -> ApiResult<UiPreferences>;
     fn set_ui_preferences(&self, settings: PreferencePatch<UiPreferences>) -> ApiResult<UiPreferences>;
     fn reset_initial_layout(&self) -> ApiResult<Layout>;
@@ -1821,6 +1826,7 @@ pub trait AgentApi: Send + Sync {
     /// 保存完整布局（精确采用位置与尺寸，可用于撤销/恢复测量结果），同步给组内所有设备。
     fn save_layout(&self, placements: Vec<Placement>) -> ApiResult<Layout>;
     fn set_screen_gain(&self, screen: ScreenKey, gain: f64) -> ApiResult<()>;
+    fn set_screen_remote_gain(&self, screen: ScreenKey, gain: f64) -> ApiResult<()>;
     fn set_screen_hidden(&self, screen: ScreenKey, hidden: bool) -> ApiResult<()>;
     /// Briefly identify screens on this device and attached peers.
     fn identify_screens(&self) -> ApiResult<()>;
@@ -2054,6 +2060,9 @@ pub enum Request {
         operation_id: String,
         device: DeviceKey,
     },
+    Notify {
+        notification: Notification,
+    },
     UiPreferences,
     SetUiPreferences {
         settings: PreferencePatch<UiPreferences>,
@@ -2118,6 +2127,10 @@ pub enum Request {
     ResetInitialLayout,
     SaveLayout {
         placements: Vec<Placement>,
+    },
+    SetScreenRemoteGain {
+        screen: ScreenKey,
+        gain: f64,
     },
     SetScreenGain {
         screen: ScreenKey,
@@ -2242,6 +2255,7 @@ pub enum Reply {
     SubscribePairingEvents(Vec<pairing::PairingEvent>),
     BlockedDevices(crate::device_cards::BlockedDevicesSnapshot),
     Block(crate::device_cards::BlockReply),
+    Notification(Option<NotificationReceipt>),
     UiPreferences(UiPreferences),
     ReportStatus(crate::telemetry::ReportStatus),
     UpdateStatus(UpdateStatus),
@@ -2364,6 +2378,7 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
         R::BlockedDevices => api.blocked_devices().map(Reply::BlockedDevices),
         R::Block { operation_id, device } => api.block(operation_id, device).map(Reply::Block),
         R::Unblock { operation_id, device } => api.unblock(operation_id, device).map(Reply::Block),
+        R::Notify { notification } => api.notify(notification).map(Reply::Notification),
         R::UiPreferences => api.ui_preferences().map(Reply::UiPreferences),
         R::SetUiPreferences { settings } => api.set_ui_preferences(settings).map(Reply::UiPreferences),
         R::AudioStatus => api.audio_status().map(Reply::Audio),
@@ -2389,6 +2404,7 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
         R::Layout => api.layout().map(Reply::Layout),
         R::SaveLayout { placements } => api.save_layout(placements).map(Reply::Layout),
         R::SetScreenGain { screen, gain } => unit(api.set_screen_gain(screen, gain)),
+        R::SetScreenRemoteGain { screen, gain } => unit(api.set_screen_remote_gain(screen, gain)),
         R::SetScreenHidden { screen, hidden } => unit(api.set_screen_hidden(screen, hidden)),
         R::IdentifyScreens => unit(api.identify_screens()),
         R::AimStatus => api.aim_status().map(Reply::Aim),

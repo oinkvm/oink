@@ -364,6 +364,10 @@ impl Tap {
         }
     }
 
+    pub(crate) fn observe_local_pointer<T>(&self, read: impl FnOnce() -> T) -> Option<T> {
+        self.shared.observe_local_pointer(read)
+    }
+
     pub(crate) fn set_mode(&self, mode: CaptureMode) {
         let s = self.shared;
         let mode = if s.capture_permitted() {
@@ -762,6 +766,25 @@ impl Shared {
             && self.remote.load(Ordering::Acquire)
             && !self.stop.load(Ordering::Acquire)
             && self.owner_generation.load(Ordering::Acquire) == generation
+    }
+
+    fn observe_local_pointer<T>(&self, read: impl FnOnce() -> T) -> Option<T> {
+        // Router focus can return before Show/associate/blank-owner retirement
+        // completes. HIDDEN alone is insufficient: restore_native clears it
+        // before the synchronous Show call. Sample under the same cursor lock
+        // as native transitions, or withhold immediately while it is busy.
+        let _guard = self.cursor_lock.try_lock().ok()?;
+        if self.remote.load(Ordering::Acquire)
+            || self.hold_motion.load(Ordering::Acquire)
+            || self.restore_pending.load(Ordering::Acquire)
+            || !matches!(
+                *self.hidden.lock().unwrap_or_else(|e| e.into_inner()),
+                HiddenCursor::Shown
+            )
+        {
+            return None;
+        }
+        Some(read())
     }
 
     pub(crate) fn owner_update<T>(&self, generation: u64, f: impl FnOnce() -> T) -> Option<T> {
@@ -2874,6 +2897,42 @@ mod tests {
             freeze_check_ns: AtomicU64::new(0),
             caps_guard: LocalGuard::new(),
         }
+    }
+
+    #[test]
+    fn capture_observation_excludes_our_freeze_and_incomplete_local_restore() {
+        let shared = fake_shared(Arc::new(|_| Disposition::Pass));
+        // A logical focus return can precede the native Show/associate completion.
+        assert_eq!(shared.observe_local_pointer(|| true), None);
+        shared.remote.store(false, Ordering::Release);
+        shared.hold_motion.store(true, Ordering::Release);
+        assert_eq!(shared.observe_local_pointer(|| true), None);
+        shared.hold_motion.store(false, Ordering::Release);
+        assert_eq!(shared.observe_local_pointer(|| true), None);
+        *shared.hidden.lock().unwrap() = HiddenCursor::Shown;
+        shared.restore_pending.store(true, Ordering::Release);
+        assert_eq!(shared.observe_local_pointer(|| true), None);
+        shared.restore_pending.store(false, Ordering::Release);
+        assert_eq!(shared.observe_local_pointer(|| true), Some(true));
+    }
+
+    #[test]
+    fn capture_observation_cannot_sample_half_a_native_transition() {
+        let shared = fake_shared(Arc::new(|_| Disposition::Pass));
+        shared.remote.store(false, Ordering::Release);
+        *shared.hidden.lock().unwrap() = HiddenCursor::Shown;
+        // Native restore may already have cleared HIDDEN before Show returns.
+        // The cursor lock, not that early Boolean, delimits native completion.
+        let transition = shared.cursor_lock.lock().unwrap();
+        assert_eq!(shared.observe_local_pointer(|| true), None);
+        drop(transition);
+        assert_eq!(
+            shared.observe_local_pointer(|| {
+                assert!(shared.cursor_lock.try_lock().is_err(), "sample must remain coherent");
+                true
+            }),
+            Some(true)
+        );
     }
 
     #[test]

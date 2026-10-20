@@ -72,6 +72,19 @@ impl Gate {
         }
         Ok(s.active.keys().copied().collect())
     }
+    /// An explicit Install interrupts existing owners instead of waiting for
+    /// silence/idle. Close admission atomically; owners then tear down before
+    /// replacement, and cancellation reopens the same generation.
+    pub fn close_for_update(&self, generation: u64) -> Result<(), u64> {
+        let mut state = self.0.state.lock().unwrap();
+        if let Some(other) = state.closed
+            && other != generation
+        {
+            return Err(other);
+        }
+        state.closed = Some(generation);
+        Ok(())
+    }
     pub fn reopen(&self, generation: u64) {
         let mut s = self.0.state.lock().unwrap();
         if s.closed == Some(generation) {
@@ -134,6 +147,28 @@ mod tests {
         assert!(g.closed());
         g.reopen(1);
         assert!(g.enter(ActivityKind::Audio).is_some());
+    }
+    #[test]
+    fn manual_install_closes_admission_with_every_owner_active() {
+        let gate = Gate::default();
+        let leases: Vec<_> = [
+            ActivityKind::Drag,
+            ActivityKind::Promise,
+            ActivityKind::Audio,
+            ActivityKind::FileProvider,
+            ActivityKind::FileTransfer,
+            ActivityKind::Configuration,
+        ]
+        .into_iter()
+        .map(|kind| gate.enter(kind).unwrap())
+        .collect();
+        gate.close_for_update(7).unwrap();
+        assert_eq!(gate.generation(), Some(7));
+        assert!(gate.enter(ActivityKind::Audio).is_none());
+        assert_eq!(gate.close_for_update(8), Err(7));
+        gate.reopen(7);
+        assert!(gate.enter(ActivityKind::Promise).is_some());
+        drop(leases);
     }
     #[test]
     fn input_changes_invalidate_preparation_generation() {

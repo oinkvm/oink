@@ -28,7 +28,6 @@ fn check(p: &Value, seen: &Watermark, now: i64) -> Result<VerifiedManifest, Erro
         &Trust {
             epoch: WINDOWS_EPOCH,
             key: &key().verifying_key().to_bytes(),
-            repository: "oinkvm/oink",
         },
         Channel::Stable,
         seen,
@@ -68,7 +67,6 @@ fn tamper_every_payload_byte_wrong_key_and_invalid_signature() {
     let trust = Trust {
         epoch: WINDOWS_EPOCH,
         key: &public,
-        repository: "oinkvm/oink",
     };
     for i in 0..bytes.len() {
         let mut changed = bytes.clone();
@@ -111,7 +109,6 @@ fn duplicate_keys_rejected_even_when_signed() {
             &Trust {
                 epoch: WINDOWS_EPOCH,
                 key: &key().verifying_key().to_bytes(),
-                repository: "oinkvm/oink"
             },
             Channel::Stable,
             &Watermark::default(),
@@ -226,7 +223,6 @@ fn stable_rejects_beta_beta_can_select_stable_and_returning_stable_waits() {
         &Trust {
             epoch: WINDOWS_EPOCH,
             key: &public,
-            repository: "oinkvm/oink",
         },
         Channel::Beta,
         &Watermark::default(),
@@ -260,7 +256,7 @@ fn package_signatures_and_lengths_bind_final_bytes() {
     use sha2::{Digest, Sha256};
     let bytes = b"zip final bytes";
     let p = Package {
-        url: String::new(),
+        url: "https://bucket.account.r2.cloudflarestorage.com/Oink.msi?signature=abc".into(),
         length: bytes.len() as u64,
         sha256: hex(&Sha256::digest(bytes)),
         key_id: WINDOWS_EPOCH.into(),
@@ -270,35 +266,45 @@ fn package_signatures_and_lengths_bind_final_bytes() {
     let t = Trust {
         epoch: WINDOWS_EPOCH,
         key: &public,
-        repository: "oinkvm/oink",
     };
-    assert!(verify_package(bytes, &p, &t).is_ok());
-    assert!(verify_package(b"zip other bytes", &p, &t).is_err());
-    assert!(verify_package(&bytes[..2], &p, &t).is_err());
+    assert_eq!(validate_package_url(&p.url), Ok(()));
+    assert_eq!(verify_package(bytes, &p, &t), Ok(()));
+    assert_eq!(verify_package(b"zip other bytes", &p, &t), Err(Error::Signature));
+    assert_eq!(verify_package(&bytes[..2], &p, &t), Err(Error::Metadata));
+    let mut oversize = p.clone();
+    oversize.length = MAX_PACKAGE + 1;
+    assert_eq!(verify_package(bytes, &oversize, &t), Err(Error::Metadata));
 }
 #[test]
-fn urls_and_redirects_are_closed_to_other_origins() {
-    assert!(
-        validate_asset_url(
-            "https://github.com/oinkvm/oink/releases/download/v1/a.zip",
-            "oinkvm/oink",
-            "v1"
-        )
-        .is_ok()
-    );
-    for s in [
-        "http://github.com/oinkvm/oink/releases/download/v1/a.zip",
-        "https://github.com/evil/oink/releases/download/v1/a.zip",
-        "https://u@github.com/oinkvm/oink/releases/download/v1/a.zip",
-        "https://github.com/oinkvm/oink/releases/download/v1/a.zip?q=1",
-        "file:///a.zip",
-        "https://github.com/oinkvm/oink/releases/download/v1/%2e%2e/a.zip",
+fn signed_packages_and_redirects_accept_any_https_host_without_credentials() {
+    for url in [
+        "https://github.com/oinkvm/oink/releases/download/v1/a.zip",
+        "https://github.com/another/repository/releases/download/v2/a.msi",
+        "https://bucket.account.r2.cloudflarestorage.com/windows/Oink%201.0.msi?X-Amz-Signature=abc",
+        "https://downloads.example.test:9443/any/path?token=x#package",
+        "HTTPS://cdn.example.test/package.msi",
     ] {
-        assert!(validate_asset_url(s, "oinkvm/oink", "v1").is_err());
+        assert_eq!(validate_package_url(url), Ok(()), "{url}");
+        let mut manifest = payload();
+        manifest["releases"][0]["package"]["url"] = url.into();
+        assert!(check(&manifest, &Watermark::default(), NOW).is_ok(), "{url}");
+        for hop in 0..=5 {
+            assert_eq!(validate_redirect(url, hop), Ok(()), "{url}: {hop}");
+        }
+        assert_eq!(validate_redirect(url, 6), Err(Error::Url));
     }
-    assert!(validate_redirect("https://release-assets.githubusercontent.com/a?token=x", 5).is_ok());
-    assert!(validate_redirect("https://release-assets.githubusercontent.com/a", 6).is_err());
-    assert!(validate_redirect("https://github.com/evil/a", 1).is_err());
+    for url in [
+        "http://downloads.example.test/a.msi",
+        "https://user@downloads.example.test/a.msi",
+        "https://user:password@downloads.example.test/a.msi",
+        "https://:password@downloads.example.test/a.msi",
+        "https://@downloads.example.test/a.msi",
+        "file:///a.msi",
+        "https:///",
+    ] {
+        assert_eq!(validate_package_url(url), Err(Error::Url), "{url}");
+        assert_eq!(validate_redirect(url, 1), Err(Error::Url), "{url}");
+    }
 }
 #[test]
 fn rfc8032_empty_message_vector() {
@@ -315,4 +321,61 @@ fn rfc8032_empty_message_vector() {
         "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
     );
     verify_signature(b"", &STANDARD.encode(sig), &public).unwrap();
+}
+
+#[test]
+fn human_version_cannot_decrease_even_when_build_increases() {
+    assert_eq!(verify_version("0.1.0", "0.1.0-beta.test"), Ok(()));
+    assert_eq!(verify_version("0.1.0+build.42", "0.1.0+build.41"), Ok(()));
+    assert_eq!(verify_version("0.2.0", "0.1.0"), Ok(()));
+    assert_eq!(verify_version("0.1.0", "0.2.0"), Err(Error::Replay));
+    assert_eq!(verify_version("0.2.0-beta.1", "0.2.0"), Err(Error::Replay));
+    assert_eq!(verify_version("invalid", "0.1.0"), Err(Error::Metadata));
+}
+
+#[test]
+fn compiled_feed_origin_has_no_runtime_override_and_test_assets_stay_loopback() {
+    #[cfg(not(feature = "test-feed"))]
+    {
+        assert_eq!(
+            manifest_url(Channel::Stable),
+            "https://updates.oink.hachiwii.com/windows/v1/win-2026-01/stable/manifest.json"
+        );
+        assert!(
+            validate_package_url("http://127.0.0.1:8765/oink-update-qualification/packages/candidate.msi").is_err()
+        );
+    }
+    #[cfg(feature = "test-feed")]
+    {
+        let origin = env!("OINK_WINDOWS_UPDATE_TEST_FEED");
+        assert_eq!(
+            manifest_url(Channel::Stable),
+            format!("{origin}/oink-update-qualification/windows/v1/win-2026-01/stable/manifest.json")
+        );
+        assert!(validate_package_url(&format!("{origin}/oink-update-qualification/packages/candidate.msi")).is_ok());
+        for suffix in ["../evil.msi", "file.msi?x", "file.exe", "file.msi/extra"] {
+            assert!(validate_package_url(&format!("{origin}/oink-update-qualification/packages/{suffix}")).is_err());
+        }
+        assert!(
+            validate_package_url("http://127.0.0.2:8765/oink-update-qualification/packages/candidate.msi").is_err()
+        );
+        assert_eq!(
+            oink_update::trust::compiled().unwrap().key,
+            base64::Engine::decode(&STANDARD, "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=")
+                .unwrap()
+                .as_slice()
+        );
+    }
+}
+
+#[test]
+fn health_fault_is_compiled_only_into_explicit_test_candidate() {
+    assert!(!oink_update::trust::health_ready(false));
+    #[cfg(feature = "test-feed")]
+    assert_eq!(
+        oink_update::trust::health_ready(true),
+        env!("OINK_WINDOWS_UPDATE_TEST_FAIL_HEALTH") != "1"
+    );
+    #[cfg(not(feature = "test-feed"))]
+    assert!(oink_update::trust::health_ready(true));
 }

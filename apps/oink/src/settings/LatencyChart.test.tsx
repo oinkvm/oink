@@ -8,14 +8,14 @@ import { readFileSync } from 'node:fs';
 const styles = readFileSync('src/settings/settings.css', 'utf8');
 const mocks = vi.hoisted(() => ({ query: vi.fn(), listen: vi.fn() }));
 vi.mock('../api/client', () => ({ api: { connectionQuality: mocks.query }, onAgentEvent: mocks.listen }));
-const snapshot: ConnectionQuality = { revision:1,sampled_at_ms: 60000, peers: [{ device:'peer',name:'Peer',path:{type:'direct'}, samples:[{at_ms:59000,rtt_ms:4},{at_ms:60000,rtt_ms:6}], current_ms:6,p50_ms:4,p90_ms:6,p99_ms:6,max_ms:6,average_jitter_ms:1.25,max_jitter_ms:3.5 }] };
+const snapshot: ConnectionQuality = { revision:1,sampled_at_ms: 60000, peers: [{ device:'peer',name:'Peer',path:{type:'direct'}, samples:[{at_ms:59000,rtt_ms:4},{at_ms:60000,rtt_ms:6}], current_ms:6,p50_ms:4,p90_ms:5.5,p99_ms:6,max_ms:6 }] };
 beforeEach(() => { setLanguage('en'); mocks.query.mockResolvedValue(snapshot); mocks.listen.mockResolvedValue(vi.fn()); vi.stubGlobal('requestAnimationFrame',vi.fn()); vi.stubGlobal('cancelAnimationFrame',vi.fn()); vi.stubGlobal('ResizeObserver',class {observe(){} disconnect(){}}); });
-afterEach(() => { cleanup(); vi.clearAllMocks(); vi.unstubAllGlobals(); });
+afterEach(() => { cleanup(); vi.clearAllMocks(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 it('renders the backend history and four statistic columns with device colours', async () => {
   const {container} = render(<LatencyChart active/>);
   await screen.findByRole('cell',{name:'Peer'});
-  expect(screen.getAllByRole('columnheader').map(x=>x.textContent)).toEqual(['Device','Current','P50','P99','Jitter (Avg.)','Path']);
-  expect(screen.getAllByRole('cell').map(x=>x.textContent)).toEqual(['Peer','6.00 ms','4.00 ms','6.00 ms','1.25 ms','Direct']);
+  expect(screen.getAllByRole('columnheader').map(x=>x.textContent)).toEqual(['Device','Current','P50','P90','P99','Path']);
+  expect(screen.getAllByRole('cell').map(x=>x.textContent)).toEqual(['Peer','6.00 ms','4.00 ms','5.50 ms','6.00 ms','Direct']);
   expect(container.querySelector('.lat__dot i')?.getAttribute('style')).toContain('background');
   expect(screen.getByRole('img').getAttribute('aria-label')).not.toMatch(/60\s*(?:s|秒)/i);
   expect(container.querySelector('.lat__line')?.getAttribute('d')).toContain('L');
@@ -38,14 +38,14 @@ it('fetches retained history on reopen and prevents a late query overwriting liv
 
 it('renders Chinese route and headings and preserves missing measurements', async () => {
   setLanguage('zh-Hans');
-  mocks.query.mockResolvedValue({...snapshot,peers:[{...snapshot.peers[0],path:{type:'relay',via:'relay',via_name:'中转设备'},current_ms:null,average_jitter_ms:null,max_jitter_ms:null}]});
+  mocks.query.mockResolvedValue({...snapshot,peers:[{...snapshot.peers[0],path:{type:'relay',via:'relay',via_name:'中转设备'},current_ms:null,p90_ms:null}]});
   render(<LatencyChart active/>);
   await screen.findByRole('cell',{name:'经 中转设备 中转'});
-  expect(screen.getByRole('columnheader',{name:'抖动（平均）'})).toBeTruthy();
+  expect(screen.getByRole('columnheader',{name:'P90'})).toBeTruthy();
   expect(screen.getByRole('button',{name:'隐藏 Peer 的曲线'})).toBeTruthy();
   expect(screen.getByRole('button',{name:'显示所有设备的曲线'})).toBeTruthy();
   expect(screen.getAllByRole('cell',{name:'—'})).toHaveLength(2);
-  expect(screen.getAllByRole('columnheader').map(x=>x.textContent)).toEqual(['设备名称','当前延迟','P50','P99','抖动（平均）','路径']);
+  expect(screen.getAllByRole('columnheader').map(x=>x.textContent)).toEqual(['设备名称','当前延迟','P50','P90','P99','路径']);
 });
 
 const withTwoPeers: ConnectionQuality = {...snapshot,peers:[snapshot.peers[0],{...snapshot.peers[0],device:'far',name:'Far peer',samples:[{at_ms:59000,rtt_ms:100},{at_ms:60000,rtt_ms:120}],current_ms:120}]};
@@ -134,10 +134,10 @@ it('aligns Device with names while the focusable colour controls overhang in the
 
 it('formats every table value, axis and tooltip with two decimals and caps at 999.99 without a prefix', async () => {
   vi.stubGlobal('PointerEvent', MouseEvent);
-  mocks.query.mockResolvedValue({...snapshot,peers:[{...snapshot.peers[0],samples:[{at_ms:59000,rtt_ms:1500},{at_ms:60000,rtt_ms:1500}],current_ms:0.004,p50_ms:1.235,p90_ms:999.99,p99_ms:1000,max_ms:1000000,average_jitter_ms:0,max_jitter_ms:12345.678}]});
+  mocks.query.mockResolvedValue({...snapshot,peers:[{...snapshot.peers[0],samples:[{at_ms:59000,rtt_ms:1500},{at_ms:60000,rtt_ms:1500}],current_ms:0.004,p50_ms:1.235,p90_ms:999.99,p99_ms:1000,max_ms:1000000}]});
   const {container} = render(<LatencyChart active/>);
   await screen.findByRole('button',{name:'Show all devices in chart'});
-  expect(screen.getAllByRole('cell').slice(1,-1).map(cell=>cell.textContent)).toEqual(['0.00 ms','1.24 ms','999.99 ms','0.00 ms']);
+  expect(screen.getAllByRole('cell').slice(1,-1).map(cell=>cell.textContent)).toEqual(['0.00 ms','1.24 ms','999.99 ms','999.99 ms']);
   const labels = Array.from(container.querySelectorAll('.lat__grid text'),text=>text.textContent!);
   expect(labels.every(label=>/^\d+\.\d{2} ms$/.test(label))).toBe(true);
   expect(labels[2]).toBe('999.99 ms');
@@ -165,4 +165,87 @@ it('draws one continuous path for every measured second and keeps real missing s
   expect(path().match(/M/g)).toHaveLength(2);
   act(()=>event({type:'connection_quality',data:{...snapshot,revision:3,peers:[{...snapshot.peers[0],samples:samples.map(s=>s.at_ms===30_000?{...s,rtt_ms:null}:s)}]}}));
   expect(path().match(/M/g)).toHaveLength(2);
+});
+
+it.each(['en', 'zh-Hans', 'ja', 'ko'] as const)('renders P90 and no jitter column in %s', async language => {
+  setLanguage(language);
+  render(<LatencyChart active/>);
+  await screen.findByRole('cell', {name:'Peer'});
+  expect(screen.getByRole('columnheader', {name:'P90'})).toBeTruthy();
+  expect(screen.getByRole('cell', {name:'5.50 ms'})).toBeTruthy();
+  expect(screen.getAllByRole('columnheader')).toHaveLength(6);
+});
+
+it('never schedules an animation frame loop between source ticks', async () => {
+  const frames = new Map<number, FrameRequestCallback>();
+  let sequence = 0;
+  const request = vi.fn((callback: FrameRequestCallback) => {frames.set(++sequence, callback); return sequence;});
+  vi.stubGlobal('requestAnimationFrame', request);
+  vi.stubGlobal('cancelAnimationFrame', (id: number) => frames.delete(id));
+  let event!: (value:unknown)=>void;
+  mocks.listen.mockImplementationOnce(async (handler:(value:unknown)=>void)=>{event=handler;return vi.fn();});
+  const {container} = render(<LatencyChart active/>);
+  await screen.findByRole('cell', {name:'Peer'});
+  // Drain finite entry/presence work owned by the component library. At 144 Hz
+  // an idle chart must not keep scheduling SVG writes for the next display frame.
+  for (let tick=0; tick<10 && frames.size; tick++) act(() => {
+    const pending=[...frames.values()]; frames.clear(); pending.forEach(callback=>callback(tick*1000/144));
+  });
+  expect(frames.size).toBe(0);
+  const calls = request.mock.calls.length;
+  const before = container.querySelector('.lat__line')?.getAttribute('d');
+  act(()=>event({type:'connection_quality',data:snapshot}));
+  expect(container.querySelector('.lat__line')?.getAttribute('d')).toBe(before);
+  expect(request).toHaveBeenCalledTimes(calls);
+  act(()=>event({type:'connection_quality',data:{...snapshot,revision:2,peers:[{...snapshot.peers[0],current_ms:9}]}}));
+  expect(screen.getByRole('cell',{name:'9.00 ms'})).toBeTruthy();
+  expect(frames.size).toBe(0);
+});
+
+it('unsubscribes while hidden, off-screen or inactive and fetches retained data on return', async () => {
+  let intersection!: IntersectionObserverCallback;
+  const disconnect = vi.fn();
+  vi.stubGlobal('IntersectionObserver', class {
+    constructor(callback: IntersectionObserverCallback) {intersection=callback;}
+    observe() {} disconnect=disconnect;
+  });
+  const enter = (visible: boolean) => act(() => intersection([{isIntersecting:visible,intersectionRatio:visible?1:0}] as IntersectionObserverEntry[], {} as IntersectionObserver));
+  const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(false);
+  const stop = vi.fn();
+  let event!: (value:unknown)=>void;
+  mocks.listen.mockImplementation(async (handler:(value:unknown)=>void)=>{event=handler;return stop;});
+  const {rerender} = render(<LatencyChart active/>);
+  expect(mocks.query).not.toHaveBeenCalled();
+  enter(true);
+  await screen.findByRole('cell', {name:'Peer'});
+  hidden.mockReturnValue(true);
+  fireEvent(document, new Event('visibilitychange'));
+  await waitFor(()=>expect(stop).toHaveBeenCalledTimes(1));
+  act(()=>event({type:'connection_quality',data:{...snapshot,revision:2,peers:[{...snapshot.peers[0],current_ms:42}]}}));
+  expect(screen.queryByRole('cell',{name:'42.00 ms'})).toBeNull();
+  expect(mocks.query).toHaveBeenCalledTimes(1);
+  hidden.mockReturnValue(false);
+  fireEvent(document, new Event('visibilitychange'));
+  await waitFor(()=>expect(mocks.query).toHaveBeenCalledTimes(2));
+  enter(false);
+  await waitFor(()=>expect(stop).toHaveBeenCalledTimes(2));
+  enter(true);
+  await waitFor(()=>expect(mocks.query).toHaveBeenCalledTimes(3));
+  rerender(<LatencyChart active={false}/>);
+  await waitFor(()=>expect(stop).toHaveBeenCalledTimes(3));
+  expect(disconnect).toHaveBeenCalled();
+});
+
+it('ignores unrelated parent renders while still following locale changes', async () => {
+  const {rerender,container} = render(<LatencyChart active/>);
+  await screen.findByRole('cell', {name:'Peer'});
+  const resize = vi.fn();
+  const mutations = new MutationObserver(resize);
+  mutations.observe(container, {subtree:true,childList:true,attributes:true,characterData:true});
+  rerender(<LatencyChart active/>);
+  await act(async()=>{});
+  expect(resize).not.toHaveBeenCalled();
+  act(()=>setLanguage('ja'));
+  expect(screen.getByRole('columnheader', {name:'デバイス名'})).toBeTruthy();
+  mutations.disconnect();
 });

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage verified packages and assemble the four public draft-release assets."""
+"""Stage verified installers, Sparkle archive and public release metadata."""
 import argparse
 import json
 import os
@@ -9,6 +9,9 @@ import shutil
 import subprocess
 from identity import IDENTITY
 from provenance import digest, source_tree_sha256
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'update'))
+import feed
 
 
 def inputs(build, environment):
@@ -39,6 +42,8 @@ def locate(packages, platform):
 def stage(packages, output, platform, build, commit):
     path = locate(packages, platform)
     record = json.loads(path.read_text())
+    if record.get('update_test_feed') or record.get('mac_update_test_feed'):
+        raise ValueError('qualification test builds cannot become public release assets')
     if (record['version'], record['build'], record['source_tree_sha256']) != (IDENTITY['version'], build, source_tree_sha256()):
         raise ValueError('package version/build/source differs from checkout')
     if record.get('source_commit') is not None:
@@ -58,11 +63,11 @@ def stage(packages, output, platform, build, commit):
         source = path.parent / artifact['name']
         if Path(artifact['name']).name != artifact['name'] or digest(source) != artifact['sha256'] or source.stat().st_size != artifact['size']:
             raise ValueError('package artifact hash/size mismatch')
-        if source.suffix in ('.dmg', '.msi'):
+        if source.suffix in ('.dmg', '.msi', '.zip'):
             shutil.copy2(source, output / source.name)
-    record['artifacts'] = [a for a in record['artifacts'] if Path(a['name']).suffix in ('.dmg', '.msi')]
-    if len(record['artifacts']) != 1:
-        raise ValueError('expected one public installer per platform')
+    record['artifacts'] = [a for a in record['artifacts'] if Path(a['name']).suffix in ('.dmg', '.msi', '.zip')]
+    if sorted(Path(a['name']).suffix for a in record['artifacts']) != (['.dmg', '.zip'] if platform == 'macos' else ['.msi']):
+        raise ValueError('expected Mac DMG + Sparkle ZIP, or Windows MSI')
     record.update(built_commit=commit, reporting=proof)
     (output / f'release-{platform}.json').write_text(json.dumps(record, indent=2) + '\n')
 
@@ -82,13 +87,23 @@ def assemble(downloads, output, build, commit):
             raise ValueError('Mac notarization missing')
         if record['reporting'] != {'configured': True, 'report_sent': False, 'version': record['version'], 'build': build}:
             raise ValueError('reporting check missing')
-        if len(record['artifacts']) != 1:
-            raise ValueError('one installer per platform required')
-        a = record['artifacts'][0]; source = path.parent / a['name']
-        if Path(a['name']).name != a['name'] or source.suffix != suffix or digest(source) != a['sha256'] or source.stat().st_size != a['size']:
-            raise ValueError('final installer hash/size mismatch')
-        shutil.copy2(source, output / source.name)
-        artifacts.append(a); records[platform] = record
+        expected = ['.dmg', '.zip'] if platform == 'macos' else [suffix]
+        if sorted(Path(a['name']).suffix for a in record['artifacts']) != expected:
+            raise ValueError('Mac DMG + ZIP and Windows MSI required')
+        for a in record['artifacts']:
+            source = path.parent / a['name']
+            if Path(a['name']).name != a['name'] or digest(source) != a['sha256'] or source.stat().st_size != a['size']:
+                raise ValueError('final package hash/size mismatch')
+            shutil.copy2(source, output / source.name)
+            artifacts.append(a)
+        records[platform] = record
+    annotations = feed.read(Path('.github/update-notes.json'))
+    if set(annotations) != {'channel', 'severity', 'notes'} or annotations['channel'] not in ('stable', 'beta') or annotations['severity'] not in ('normal', 'critical'):
+        raise ValueError('invalid update annotations')
+    feed.validate_notes(annotations['notes'])
+    update = output / 'update.json'
+    update.write_text(json.dumps(annotations, ensure_ascii=False, indent=2) + '\n')
+    artifacts.append(dict(name=update.name, size=update.stat().st_size, sha256=digest(update)))
     release = dict(schema=1, product=IDENTITY['name'], version=IDENTITY['version'], build=build,
                    built_commit=commit, source_tree_sha256=source_tree_sha256(), platforms=records, artifacts=artifacts)
     record_path = output / 'release.json'
@@ -117,7 +132,7 @@ def publish(directory, commit, notes):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('operation', choices=['inputs', 'locate', 'stage', 'assemble', 'publish'])
-    p.add_argument('--build', default=os.environ.get('BUILD', '28'))
+    p.add_argument('--build', default=os.environ.get('BUILD', '31'))
     p.add_argument('--commit', default=os.environ.get('GITHUB_SHA'))
     p.add_argument('--packages', type=Path)
     p.add_argument('--platform', choices=['macos', 'windows'])

@@ -1,6 +1,7 @@
 import base64
 import importlib.util
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -48,6 +49,16 @@ class MacAppcastTests(unittest.TestCase):
         once = self.path.read_bytes()
         mac.embed_notes(self.path, 2, NOTES)
         self.assertEqual(self.path.read_bytes(), once)
+
+    def test_offline_operator_binds_only_new_archive_without_reading_history(self):
+        archive = self.path.parent / 'new.dmg'
+        archive.write_bytes(b'NEW')
+        mac.embed_archive_hash(self.path, 2, self.path.parent)
+        root = ET.fromstring(self.path.read_bytes())
+        self.assertEqual(root.findall('./channel/item')[1].findtext(f'{{{mac.OINK}}}sha256'),
+                         hashlib.sha256(b'NEW').hexdigest())
+        self.assertIsNone(root.findall('./channel/item')[0].find(f'{{{mac.OINK}}}sha256'))
+        self.assertFalse((self.path.parent / 'old.dmg').exists())
 
     def test_missing_translation_unknown_build_and_ambiguous_build_rejected_before_write(self):
         for build, notes in [(2, {'en': 'missing Chinese'}), (3, NOTES)]:

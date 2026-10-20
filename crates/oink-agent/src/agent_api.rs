@@ -546,19 +546,6 @@ fn alerts(node: &Node) -> Vec<Alert> {
         })
         .map(|s| s.id.clone())
         .collect();
-    if let Ok(group) = node.link_config() {
-        for member in group.members().members.iter().filter(|m| m.address_stale) {
-            out.push(Alert {
-                id: format!("address-stale:{}", member.device),
-                level: AlertLevel::Warning,
-                kind: AlertKind::AddressStale {
-                    device: member.device.into(),
-                },
-                problem: problem(Code::DeviceUnavailable),
-                at_ms: now,
-            });
-        }
-    }
     for screen in missing {
         out.push(Alert {
             id: format!("display-info:{}:{}", screen.device.to_hex(), screen.display),
@@ -945,6 +932,9 @@ impl AgentApi for Node {
     fn unblock(&self, operation_id: String, device: DeviceKey) -> ApiResult<crate::device_cards::BlockReply> {
         self.link_config()?.unblock(operation_id, device.0)
     }
+    fn notify(&self, notification: Notification) -> ApiResult<Option<NotificationReceipt>> {
+        self.raise_notification(notification, None, 0)
+    }
     fn ui_preferences(&self) -> ApiResult<UiPreferences> {
         Ok(UiPreferences::from(&self.settings()))
     }
@@ -961,6 +951,7 @@ impl AgentApi for Node {
             UiPreferences::from(&config.settings)
         };
         self.apply_trail_appearance();
+        self.apply_notification_preferences();
         // Native hosts and log filters consume only the durable applied value.
         crate::logs::set_max_mb(applied.log_max_mb.get().into()).map_err(|error| ApiError::Internal {
             message: format!("applying ordinary log limit: {error}"),
@@ -1190,6 +1181,21 @@ impl AgentApi for Node {
             screen.device,
             dto::LocalOption::ScreenPreferences,
             screen_preference_patch(screen.display, 2, gain.write()),
+        )
+    }
+
+    fn set_screen_remote_gain(&self, screen: ScreenKey, gain: f64) -> ApiResult<()> {
+        if !(0.1..=5.0).contains(&gain) {
+            return Err(invalid("Gain must be within 0.1–5"));
+        }
+        let id = screen_id(&screen);
+        if Node::layout(self).0.screen(&id).is_none() {
+            return Err(not_found("没有这块屏幕"));
+        }
+        self.edit_device_option(
+            screen.device,
+            dto::LocalOption::ScreenPreferences,
+            screen_preference_patch(screen.display, 4, gain.write()),
         )
     }
 

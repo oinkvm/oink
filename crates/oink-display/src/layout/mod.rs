@@ -279,12 +279,15 @@ pub type EffectiveSettings = LayoutSettings;
 /// A device's applied screen preference. Never serialized inside shared geometry.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScreenPreference {
+    /// Target-only multiplier for pointer input from another device.
+    pub remote_gain: f64,
     pub enabled: bool,
     pub gain: f64,
 }
 impl Default for ScreenPreference {
     fn default() -> Self {
         Self {
+            remote_gain: 1.0,
             enabled: true,
             gain: 1.0,
         }
@@ -315,6 +318,7 @@ impl OwnerLayoutPreferences {
             placement: placement.clone(),
             enabled: self.screen_shared && preference.enabled,
             gain: self.device_gain * preference.gain,
+            remote_gain: preference.remote_gain,
             speed_mode: self.speed_mode,
         }
     }
@@ -322,6 +326,7 @@ impl OwnerLayoutPreferences {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EffectiveScreen {
+    pub remote_gain: f64,
     pub placement: ScreenPlacement,
     pub enabled: bool,
     pub gain: f64,
@@ -335,7 +340,11 @@ impl std::ops::Deref for EffectiveScreen {
 }
 impl EffectiveScreen {
     pub(crate) fn is_valid(&self) -> bool {
-        self.placement.is_valid() && self.gain.is_finite() && self.gain > 0.0
+        self.placement.is_valid()
+            && self.gain.is_finite()
+            && self.gain > 0.0
+            && self.remote_gain.is_finite()
+            && self.remote_gain > 0.0
     }
 }
 

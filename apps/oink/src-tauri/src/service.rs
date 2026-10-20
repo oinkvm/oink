@@ -139,57 +139,10 @@ pub fn wait_previous_pair(data_dir: &Path) -> Result<(), String> {
     }
 }
 
-/// The interactive shell never inherits SYSTEM, administrator elevation or
-/// UIAccess. Installer custom actions cannot accidentally create a user WebView.
+/// Only a user's interactive token may host WebView2. Administrator launches
+/// (including the sole elevated token with UAC disabled) are supported. UIAccess
+/// is reserved for the input backend: WebView content never needs its UIPI bypass.
 #[cfg(windows)]
 pub fn require_normal_user_ui() -> std::io::Result<()> {
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::{
-        Foundation::CloseHandle,
-        Security::{GetTokenInformation, TOKEN_QUERY, TokenElevation, TokenSessionId, TokenUIAccess},
-        System::Threading::{GetCurrentProcess, OpenProcessToken},
-    };
-    let mut token = HANDLE::default();
-    // SAFETY: current-process pseudo-handle, valid token and DWORD output buffers.
-    unsafe {
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)?;
-        let query = |class| -> windows::core::Result<u32> {
-            let mut value = 0u32;
-            let mut len = 0;
-            GetTokenInformation(token, class, Some((&mut value as *mut u32).cast()), 4, &mut len)?;
-            Ok(value)
-        };
-        let result = (|| -> windows::core::Result<bool> {
-            Ok(normal_user_ui(
-                query(TokenElevation)?,
-                query(TokenUIAccess)?,
-                query(TokenSessionId)?,
-            ))
-        })();
-        let _ = CloseHandle(token);
-        if result? {
-            Ok(())
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "UI requires an unelevated interactive user token",
-            ))
-        }
-    }
-}
-
-#[cfg(any(windows, test))]
-fn normal_user_ui(elevated: u32, uiaccess: u32, session: u32) -> bool {
-    elevated == 0 && uiaccess == 0 && session != 0
-}
-
-#[cfg(test)]
-mod token_tests {
-    #[test]
-    fn installer_and_backend_tokens_cannot_launch_the_shell() {
-        assert!(super::normal_user_ui(0, 0, 1));
-        for token in [(1, 0, 1), (0, 1, 1), (0, 0, 0), (1, 1, 0)] {
-            assert!(!super::normal_user_ui(token.0, token.1, token.2));
-        }
-    }
+    oink_winsvc::backend::require_interactive_ui()
 }

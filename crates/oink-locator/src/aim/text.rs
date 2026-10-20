@@ -65,6 +65,15 @@ pub fn system() -> Box<dyn TextRaster> {
     Box::new(StrokeText)
 }
 
+/// System UI text at the Toast's title (600) and description (450) weights.
+pub fn system_toast() -> Box<dyn TextRaster> {
+    #[cfg(any(target_os = "macos", windows))]
+    if let Some(t) = platform::SystemText::toast() {
+        return Box::new(t);
+    }
+    Box::new(StrokeText)
+}
+
 /// System UI text at medium (500) weight, matching dimension annotation labels.
 pub fn system_medium() -> Box<dyn TextRaster> {
     #[cfg(any(target_os = "macos", windows))]

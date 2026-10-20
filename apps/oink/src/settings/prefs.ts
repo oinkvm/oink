@@ -36,6 +36,7 @@ export interface Prefs {
     launchAtLogin: boolean;
     showInMenuBar: boolean;
     confirmQuit: boolean;
+    notificationLevel: import("../api/cards").UiPreferences["notification_level"];
     escStop: boolean;
     upgradeHint: boolean;
     language: string;
@@ -67,6 +68,7 @@ export const DEFAULT_PREFS: Prefs = {
     launchAtLogin: false,
     showInMenuBar: true,
     confirmQuit: true,
+    notificationLevel: 'default',
     escStop: true,
     upgradeHint: true,
     language: 'auto',

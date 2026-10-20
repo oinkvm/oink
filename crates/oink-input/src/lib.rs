@@ -268,6 +268,11 @@ pub trait InputBackend: Send + Sync {
     fn pointer_capture_sample(&self) -> Option<pointer_capture::CaptureSample> {
         None
     }
+    /// Bundle identifier for this still-foreground process, for transition diagnostics only.
+    /// Called on the ordinary observer; never returns a window title or executable path.
+    fn foreground_bundle_id(&self, _foreground: u64) -> Option<String> {
+        None
+    }
     /// Reconcile an ambiguous platform snapshot before automatic detection.
     /// Call outside the input callback/router lock, after the read-only sample.
     /// `eligible` means local focus, Auto and not paused; `captured` is the current

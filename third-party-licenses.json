@@ -1167,10 +1167,10 @@
       "selectedLicense": "MIT",
       "modified": false,
       "scope": [
-        "runtime",
         "test"
       ],
       "platforms": [
+        "macos-arm64",
         "windows-x64"
       ],
       "copyright": [
@@ -5820,10 +5820,10 @@
       "selectedLicense": "MIT",
       "modified": false,
       "scope": [
-        "runtime",
         "test"
       ],
       "platforms": [
+        "macos-arm64",
         "windows-x64"
       ],
       "copyright": [

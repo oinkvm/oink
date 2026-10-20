@@ -2189,24 +2189,41 @@ fn to_cocoa(mtm: MainThreadMarker, p: Point) -> NSPoint {
     let h = NSScreen::screens(mtm)
         .firstObject()
         .map_or(0.0, |s| s.frame().size.height);
-    NSPoint::new(p.x, h - p.y)
+    flip_point(p, h)
 }
 
-fn catcher_frame(at: NSPoint, screens: &[NSRect]) -> NSRect {
+fn flip_point(p: Point, primary_height: f64) -> NSPoint {
+    NSPoint::new(p.x, primary_height - p.y)
+}
+
+fn catcher_frame(at: NSPoint, screens: &[NSRect], primary_height: f64) -> NSRect {
     // Keep one stationary strip while metadata is read asynchronously. Moving
     // a cursor-sized panel can cause draggingExited before HoldSource arrives.
     // Use the full screen frame, including the menu bar/notch band: visibleFrame
     // excludes the top pixels where crossing is requested. Native drag probes
     // on macOS 26 enter this inset strip before the Mission Control hot edge;
     // the old half-offscreen square can receive no Enter until mouse-up.
-    for b in screens {
-        if at.x < b.origin.x - 1.0
-            || at.x > b.origin.x + b.size.width + 1.0
-            || at.y < b.origin.y - 1.0
-            || at.y > b.origin.y + b.size.height + 1.0
-        {
-            continue;
-        }
+    // Select the actual screen before allowing an edge tolerance. Otherwise a
+    // point just above the primary can select its top strip instead of the
+    // upper display's bottom strip along their partially touching seam. Cocoa
+    // reverses Quartz's half-open vertical interval: (bottom, top].
+    let screen = screens
+        .iter()
+        .find(|b| {
+            at.x >= b.origin.x
+                && at.x < b.origin.x + b.size.width
+                && at.y > b.origin.y
+                && at.y <= b.origin.y + b.size.height
+        })
+        .or_else(|| {
+            screens.iter().find(|b| {
+                at.x >= b.origin.x - 1.0
+                    && at.x <= b.origin.x + b.size.width + 1.0
+                    && at.y >= b.origin.y - 1.0
+                    && at.y <= b.origin.y + b.size.height + 1.0
+            })
+        });
+    if let Some(b) = screen {
         let edges = [
             ((at.y - b.origin.y - b.size.height).abs(), 0),
             ((at.y - b.origin.y).abs(), 1),
@@ -2217,7 +2234,7 @@ fn catcher_frame(at: NSPoint, screens: &[NSRect]) -> NSRect {
         if distance <= 1.0 {
             let w = SIZE.min(b.size.width);
             let h = SIZE.min(b.size.height);
-            return match edge {
+            let mut frame = match edge {
                 0 => NSRect::new(
                     NSPoint::new(b.origin.x, b.origin.y + b.size.height - h),
                     NSSize::new(b.size.width, h),
@@ -2229,6 +2246,20 @@ fn catcher_frame(at: NSPoint, screens: &[NSRect]) -> NSRect {
                     NSSize::new(w, b.size.height),
                 ),
             };
+            // Cover the edge integer as well as the real native cursor point.
+            // A Quartz hit truncated toward zero lands exactly on the excluded
+            // bottom/right of a negative display. macOS 14 traces show this
+            // strip receives no DragEnter there; explicit hit-query normalization
+            // alone cannot affect AppKit's native destination lookup.
+            // Keep the existing in-screen strip and extend only this outer side.
+            if frame.origin.y == b.origin.y && b.origin.y >= primary_height {
+                frame.origin.y -= 1.;
+                frame.size.height += 1.;
+            }
+            if frame.origin.x + frame.size.width == b.origin.x + b.size.width && b.origin.x + b.size.width <= 0. {
+                frame.size.width += 1.;
+            }
+            return frame;
         }
     }
     NSRect::new(
@@ -2241,7 +2272,7 @@ fn catcher_frame(at: NSPoint, screens: &[NSRect]) -> NSRect {
 fn show_at(panel: &NSPanel, at: NSPoint, role: Role) {
     let frame = if role == Role::Catcher {
         let screens: Vec<_> = NSScreen::screens(panel.mtm()).iter().map(|s| s.frame()).collect();
-        catcher_frame(at, &screens)
+        catcher_frame(at, &screens, screens.first().map_or(0., |s| s.size.height))
     } else {
         NSRect::new(
             NSPoint::new(at.x - SIZE / 2.0, at.y - SIZE / 2.0),
@@ -2278,7 +2309,23 @@ fn cursor_cg() -> Option<Point> {
 /// 窗口服务器是否已经把 `panel` 当作 `at`（Cocoa 坐标）处的点击目标（刚显示或挪动的窗口要过几毫秒才生效，
 /// 在那之前注入的点击会落到下面的窗口上）。
 fn hit_at(mtm: MainThreadMarker, panel: &NSPanel, at: NSPoint) -> bool {
-    NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(at, 0, mtm) == panel.windowNumber()
+    let height = NSScreen::screens(mtm)
+        .firstObject()
+        .map_or(0.0, |s| s.frame().size.height);
+    drag_window_hit(at, height, |query| {
+        NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(query, 0, mtm) == panel.windowNumber()
+    })
+}
+
+fn drag_window_hit(at: NSPoint, primary_height: f64, query: impl FnOnce(NSPoint) -> bool) -> bool {
+    // windowNumberAtPoint truncates fractional Quartz coordinates toward zero
+    // on macOS 14.7. At y=-0.000005 this queries the offscreen y=0 instead of
+    // the upper display, so source placement/cancellation times out. Use the
+    // containing Quartz point, then flip; flooring Cocoa y chooses the other
+    // side of the edge. Only the query changes, never the source press, anchor,
+    // drag image offset or native motion (same rule as cursor ownership).
+    let quartz = Point::new(at.x.floor(), (primary_height - at.y).floor());
+    query(flip_point(quartz, primary_height))
 }
 
 /// 把 `which` 窗口放到光标下，直到窗口服务器把它当作光标处的点击目标（最多 `WAIT`）。光标可能还在动
@@ -3403,9 +3450,9 @@ mod tests {
     fn edge_catcher_covers_the_menu_bar_and_tangent_while_detection_is_pending() {
         let screen = NSRect::new(NSPoint::ZERO, NSSize::new(1728.0, 1117.0));
         for x in [0.0, 600.0, 864.0, 1727.0] {
-            let frame = catcher_frame(NSPoint::new(x, 1117.0), &[screen]);
+            let frame = catcher_frame(NSPoint::new(x, 1117.0), &[screen], 1117.);
             assert_eq!(frame, NSRect::new(NSPoint::new(0.0, 1069.0), NSSize::new(1728.0, 48.0)));
-            assert_eq!(catcher_frame(NSPoint::new(x + 1.0, 1117.0), &[screen]), frame);
+            assert_eq!(catcher_frame(NSPoint::new(x + 1.0, 1117.0), &[screen], 1117.), frame);
         }
     }
 
@@ -3419,17 +3466,116 @@ mod tests {
             ),
             (
                 NSPoint::new(-1.0, 100.0),
-                NSRect::new(NSPoint::new(-48.0, -300.0), NSSize::new(48.0, 900.0)),
+                NSRect::new(NSPoint::new(-48.0, -300.0), NSSize::new(49.0, 900.0)),
             ),
             (
                 NSPoint::new(-600.0, -299.0),
-                NSRect::new(NSPoint::new(-1200.0, -300.0), NSSize::new(1200.0, 48.0)),
+                NSRect::new(NSPoint::new(-1200.0, -300.0), NSSize::new(1201.0, 48.0)),
             ),
         ] {
-            assert_eq!(catcher_frame(at, &[screen]), expected);
+            assert_eq!(catcher_frame(at, &[screen], 1117.), expected);
         }
         let middle = NSPoint::new(-600.0, 100.0);
-        assert_eq!(catcher_frame(middle, &[screen]), catcher_frame(middle, &[]));
+        assert_eq!(
+            catcher_frame(middle, &[screen], 1117.),
+            catcher_frame(middle, &[], 1117.)
+        );
+    }
+
+    fn stacked_screens() -> [NSRect; 2] {
+        [
+            NSRect::new(NSPoint::ZERO, NSSize::new(1728., 1117.)),
+            NSRect::new(NSPoint::new(1560., 1117.), NSSize::new(1920., 1080.)),
+        ]
+    }
+
+    #[test]
+    fn upper_display_catcher_keeps_its_bottom_strip_at_fractional_seam_positions() {
+        let screens = stacked_screens();
+        let expected = NSRect::new(NSPoint::new(1560., 1116.), NSSize::new(1920., SIZE + 1.));
+        for x in [1562., 1600.25, 1727.98, 1728.02, 2577.319, 3478.] {
+            for y in [-0.000005019685, -0.02, -0.99] {
+                let at = flip_point(Point::new(x, y), 1117.);
+                assert_eq!(catcher_frame(at, &screens, 1117.), expected, "Quartz ({x}, {y})");
+                assert_eq!(catcher_frame(at, &[screens[1], screens[0]], 1117.), expected);
+            }
+        }
+        // Exactly on the connected seam belongs to the primary; its top strip
+        // must remain available, independently of NSScreen enumeration order.
+        let at = flip_point(Point::new(1600., 0.), 1117.);
+        let primary_top = NSRect::new(NSPoint::new(0., 1069.), NSSize::new(1728., SIZE));
+        assert_eq!(catcher_frame(at, &screens, 1117.), primary_top);
+        assert_eq!(catcher_frame(at, &[screens[1], screens[0]], 1117.), primary_top);
+    }
+
+    #[test]
+    fn native_drag_lookup_can_enter_catchers_at_negative_bottom_and_right_edges() {
+        let screens = stacked_screens();
+        let left = NSRect::new(NSPoint::new(-1920., 0.), NSSize::new(1920., 1117.));
+        let upper_left = NSRect::new(NSPoint::new(-1920., 1117.), NSSize::new(1920., 1080.));
+        for (p, displays) in [
+            (Point::new(2848.03, -0.000005019685), screens.as_slice()),
+            (Point::new(2625.296875, -0.015625), screens.as_slice()),
+            (Point::new(-0.000001, 500.25), std::slice::from_ref(&left)),
+            (Point::new(-0.02, -0.02), std::slice::from_ref(&upper_left)),
+        ] {
+            let frame = catcher_frame(flip_point(p, 1117.), displays, 1117.);
+            let top = flip_point(Point::new(frame.origin.x, frame.origin.y + frame.size.height), 1117.);
+            let quartz = oink_foundation::Rect::new(top.x, top.y, frame.size.width, frame.size.height);
+            assert!(quartz.contains(p));
+            // Model native destination selection before draggingEntered. Probe
+            // only shows the panel; it cannot normalize an OS-owned hit query.
+            assert!(
+                quartz.contains(Point::new(p.x.trunc(), p.y.trunc())),
+                "{p:?}: {quartz:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn drag_window_hit_preserves_negative_display_ownership_before_press_or_cancel() {
+        let screens = stacked_screens();
+        // Model the observed macOS 14 query: flip to Quartz, truncate there,
+        // then resolve the display and the drag window. No native UI or input.
+        let quartz_screens = [
+            oink_foundation::Rect::new(0., 0., 1728., 1117.),
+            oink_foundation::Rect::new(1560., -1080., 1920., 1080.),
+            oink_foundation::Rect::new(-1920., -1080., 1920., 1080.),
+        ];
+        for p in [
+            Point::new(2577.319, -0.000005019685),
+            Point::new(2500.25, -0.02),
+            Point::new(1600.25, -0.02),
+            Point::new(-0.02, -0.02),
+            Point::new(-1919.98, -1079.98),
+            Point::new(864.25, 1116.98),
+            Point::new(1727.98, 559.25),
+        ] {
+            let display = quartz_screens.iter().position(|b| b.contains(p)).unwrap();
+            let source_window = oink_foundation::Rect::new(p.x - SIZE / 2., p.y - SIZE / 2., SIZE, SIZE);
+            let at = flip_point(p, 1117.);
+            let query = |cocoa: NSPoint| {
+                let hit = Point::new(cocoa.x.trunc(), (1117. - cocoa.y).trunc());
+                quartz_screens.iter().position(|b| b.contains(hit)) == Some(display) && source_window.contains(hit)
+            };
+            if p.y < 0. && p.y > -1. {
+                assert!(!query(at), "the raw query must reproduce the edge failure");
+            }
+            assert!(drag_window_hit(at, 1117., query), "source/cancel window at {p:?}");
+            if display == 1 {
+                let frame = catcher_frame(at, &screens, 1117.);
+                assert!(drag_window_hit(at, 1117., |query_at| {
+                    let q = flip_point(Point::new(query_at.x, query_at.y), 1117.);
+                    let top = flip_point(Point::new(frame.origin.x, frame.origin.y + frame.size.height), 1117.);
+                    query(query_at)
+                        && oink_foundation::Rect::new(top.x, top.y, frame.size.width, frame.size.height)
+                            .contains(Point::new(q.x, q.y))
+                }));
+            }
+            let round_trip = flip_point(Point::new(at.x, at.y), 1117.);
+            assert_eq!(round_trip.x, p.x);
+            assert!((round_trip.y - p.y).abs() < 1e-10);
+        }
     }
 
     #[test]

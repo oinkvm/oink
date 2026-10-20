@@ -32,9 +32,7 @@
     "upgrade_code": "4D39E4BE-6792-4CD6-B344-A5E95A270EA6",
     "maintenance_directory": "maintenance",
     "maintenance_lock": "maintenance.lock",
-    "receipt": "installed.json",
-    "copied_worker": "worker.exe",
-    "installer_event_prefix": "Global\\Oink.Installer."
+    "receipt": "installed.json"
   },
   "binaries": {
     "backend": "oink-backend",
@@ -48,5 +46,5 @@
     "crash_collector": "oink-crash-collector"
   },
   "metadata_file": "oink-build.json",
-  "version": "0.1.0"
+  "version": "0.1.1"
 }

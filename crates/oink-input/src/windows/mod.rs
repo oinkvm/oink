@@ -324,10 +324,7 @@ impl InputBackend for WinInput {
                 GetSystemMetrics(SM_CYVIRTUALSCREEN),
             )
         };
-        send(&[inject::drag_press(
-            inject::normalize(at.x.round() as i32, vx, vw),
-            inject::normalize(at.y.round() as i32, vy, vh),
-        )])
+        send(&[inject::drag_press_at(at, (vx, vy), (vw, vh))])
     }
     fn rebase_pointer_motion(&self) -> Result<Point, InputError> {
         *self

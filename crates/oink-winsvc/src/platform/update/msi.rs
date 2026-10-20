@@ -1,6 +1,6 @@
 //! Read-only MSI database/cabinet inspection. Never uses administrative install.
 use super::super::wide;
-use super::{protected, signature};
+use super::{cabinet, protected, signature};
 use oink_update::{
     Error,
     feed::{MAX_PACKAGE, MAX_UNPACKED, hex},
@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{Cursor, Read},
     path::Path,
     ptr,
 };
@@ -22,7 +21,46 @@ const FILES: &[&str] = &[
     "oink-service.exe",
     "oink-update-worker.exe",
     "installed.json",
+    "oink-build.json",
+    "report-manifest.json",
 ];
+const NOTICES: &[&str] = &[
+    "third-party-licenses.json",
+    "THIRD_PARTY_LICENSES.md",
+    "NOTICE",
+    "LICENSE",
+    "LICENSE-ADDITIONAL-TERMS.md",
+];
+fn relative_file(
+    directory: &str,
+    name: &str,
+    directories: &BTreeMap<String, (String, String)>,
+) -> Result<String, Error> {
+    let mut parts = vec![name.to_owned()];
+    let mut current = directory;
+    let mut seen = BTreeSet::new();
+    while current != "INSTALLFOLDER" {
+        if !seen.insert(current) {
+            return Err(Error::Metadata);
+        }
+        let (parent, name) = directories.get(current).ok_or(Error::Metadata)?;
+        parts.push(name.clone());
+        current = parent;
+    }
+    parts.reverse();
+    let path = parts.join("/");
+    if path != "installed.json" {
+        oink_update::package::validate_path(&path)?;
+    }
+    if !(FILES.contains(&path.as_str())
+        || NOTICES.contains(&path.as_str())
+        || path == "oink-crash-collector.exe"
+        || path.starts_with("licenses/"))
+    {
+        return Err(Error::Metadata);
+    }
+    Ok(path)
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Receipt {
@@ -78,7 +116,7 @@ fn rows(database: &Msi, query: &str) -> Result<Vec<Msi>, Error> {
         }
         ok(code)?;
         rows.push(Msi(row));
-        if rows.len() > 1024 {
+        if rows.len() > 4096 {
             return Err(Error::Limit);
         }
     }
@@ -107,6 +145,59 @@ fn stream(row: &Msi, field: u32, max: usize) -> Result<Vec<u8>, Error> {
         bytes.extend_from_slice(&buf[..length as usize]);
     }
 }
+type FileTable = (BTreeMap<String, (String, u64)>, BTreeSet<String>);
+
+fn file_table(database: &Msi) -> Result<FileTable, Error> {
+    let components: BTreeMap<_, _> = rows(database, "SELECT `Component`, `Directory_` FROM `Component`")?
+        .into_iter()
+        .map(|row| Ok((string(&row, 1)?, string(&row, 2)?)))
+        .collect::<Result<_, Error>>()?;
+    let directories = rows(
+        database,
+        "SELECT `Directory`, `Directory_Parent`, `DefaultDir` FROM `Directory`",
+    )?
+    .into_iter()
+    .map(|row| {
+        Ok((
+            string(&row, 1)?,
+            (
+                string(&row, 2)?,
+                string(&row, 3)?.rsplit('|').next().ok_or(Error::Metadata)?.to_owned(),
+            ),
+        ))
+    })
+    .collect::<Result<BTreeMap<_, _>, Error>>()?;
+    let mut files = BTreeMap::new();
+    let mut names = BTreeSet::new();
+    for row in rows(
+        database,
+        "SELECT `File`, `Component_`, `FileName`, `FileSize` FROM `File`",
+    )? {
+        let id = string(&row, 1)?;
+        let filename = string(&row, 3)?;
+        let name = relative_file(
+            components.get(&string(&row, 2)?).ok_or(Error::Metadata)?,
+            filename.rsplit('|').next().ok_or(Error::Metadata)?,
+            &directories,
+        )?;
+        // MSI file identifiers are used only as cabinet lookup keys, never paths.
+        if !names.insert(name.to_ascii_lowercase()) {
+            return Err(Error::Metadata);
+        }
+        let length: u64 = string(&row, 4)?.parse().map_err(|_| Error::Metadata)?;
+        if length == 0 || length > MAX_UNPACKED {
+            return Err(Error::Limit);
+        }
+        if files.insert(id, (name, length)).is_some() {
+            return Err(Error::Metadata);
+        }
+    }
+    if !FILES.iter().all(|name| names.contains(&name.to_ascii_lowercase())) {
+        return Err(Error::Metadata);
+    }
+    Ok((files, names))
+}
+
 pub(super) fn inspect(
     path: &Path,
     stage: &Path,
@@ -114,7 +205,7 @@ pub(super) fn inspect(
     release: &oink_update::feed::Release,
 ) -> Result<Inventory, Error> {
     let expected_build = release.build;
-    let _locked = protected::open(path).map_err(|_| Error::Storage)?;
+    let _locked = protected::pin(path).map_err(|_| Error::Storage)?;
     signature::verify(path, roots)?;
     if expected_build == 0 || expected_build >= (1u64 << 31) {
         return Err(Error::Metadata);
@@ -147,37 +238,7 @@ pub(super) fn inspect(
     {
         return Err(Error::Metadata);
     }
-    let components: BTreeMap<_, _> = rows(&database, "SELECT `Component`, `Directory_` FROM `Component`")?
-        .into_iter()
-        .map(|row| Ok((string(&row, 1)?, string(&row, 2)?)))
-        .collect::<Result<_, Error>>()?;
-    let mut files = BTreeMap::new();
-    let mut names = BTreeSet::new();
-    for row in rows(
-        &database,
-        "SELECT `File`, `Component_`, `FileName`, `FileSize` FROM `File`",
-    )? {
-        let id = string(&row, 1)?;
-        let filename = string(&row, 3)?;
-        let name = filename.rsplit('|').next().ok_or(Error::Metadata)?.to_owned();
-        // MSI file identifiers are used only as cabinet lookup keys, never paths.
-        if !(FILES.contains(&name.as_str()) || name == "oink-crash-collector.exe")
-            || !names.insert(name.clone())
-            || components.get(&string(&row, 2)?).map(String::as_str) != Some("INSTALLFOLDER")
-        {
-            return Err(Error::Metadata);
-        }
-        let length: u64 = string(&row, 4)?.parse().map_err(|_| Error::Metadata)?;
-        if length == 0 || length > MAX_UNPACKED {
-            return Err(Error::Limit);
-        }
-        if files.insert(id, (name, length)).is_some() {
-            return Err(Error::Metadata);
-        }
-    }
-    if !FILES.iter().all(|name| names.contains(*name)) {
-        return Err(Error::Metadata);
-    }
+    let (files, names) = file_table(&database)?;
     let cabinets: BTreeSet<_> = rows(&database, "SELECT `Cabinet` FROM `Media`")?
         .into_iter()
         .map(|r| string(&r, 1))
@@ -195,34 +256,31 @@ pub(super) fn inspect(
             continue;
         }
         let bytes = stream(&row, 2, MAX_PACKAGE as usize)?;
-        let mut cabinet = cab::Cabinet::new(Cursor::new(bytes)).map_err(|_| Error::Metadata)?;
-        let entries: Vec<_> = cabinet
-            .folder_entries()
-            .flat_map(|f| f.file_entries())
-            .map(|f| (f.name().to_owned(), u64::from(f.uncompressed_size())))
-            .collect();
-        for (id, length) in entries {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).map_err(|_| Error::Storage)?;
+        let native = stage.join(format!("cab-{}", hex(&random)));
+        protected::directory(&native).map_err(|_| Error::Storage)?;
+        let cabinet = native.join("input.cab");
+        protected::write(&cabinet, &bytes)?;
+        let _cabinet = protected::open(&cabinet).map_err(|_| Error::Storage)?;
+        let expected = files.iter().map(|(id, (_, length))| (id.clone(), *length)).collect();
+        for (id, extracted) in cabinet::extract(&cabinet, &native, &expected, &mut seen, &mut total)? {
             let (name, expected) = files.get(&id).ok_or(Error::Metadata)?;
-            total = total.checked_add(length).ok_or(Error::Limit)?;
-            if total > MAX_UNPACKED || length != *expected || !seen.insert(id.clone()) {
-                return Err(Error::Limit);
-            }
-            let mut bytes = Vec::new();
-            cabinet
-                .read_file(&id)
-                .map_err(|_| Error::Metadata)?
-                .take(length + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|_| Error::Metadata)?;
-            if bytes.len() as u64 != length {
+            let bytes = protected::read(&extracted, *expected)?;
+            if bytes.len() as u64 != *expected {
                 return Err(Error::Metadata);
             }
             let output = stage.join(name);
+            let mut parent = stage.to_owned();
+            for part in Path::new(name).parent().ok_or(Error::Metadata)?.components() {
+                parent.push(part);
+                protected::directory(&parent).map_err(|_| Error::Storage)?;
+            }
             protected::write(&output, &bytes)?;
             hashes.insert(name.clone(), hex(&Sha256::digest(&bytes)));
             if name.ends_with(".exe") {
                 signature::verify(&output, roots)?;
-            } else {
+            } else if name == "installed.json" {
                 let receipt: Receipt = oink_update::feed::strict_json(&bytes)?;
                 if receipt.schema != 1
                     || receipt.product != "Oink"
@@ -232,8 +290,16 @@ pub(super) fn inspect(
                     || receipt.minimum_windows_build != release.minimum_windows_build
                     || !receipt.updater_included
                     || receipt.collector_included != names.contains("oink-crash-collector.exe")
-                    || receipt.components.iter().cloned().collect::<BTreeSet<_>>()
-                        != names.iter().filter(|n| n.ends_with(".exe")).cloned().collect()
+                    || receipt
+                        .components
+                        .iter()
+                        .map(|n| n.to_ascii_lowercase())
+                        .collect::<BTreeSet<_>>()
+                        != names
+                            .iter()
+                            .filter(|n| n.ends_with(".exe") && !n.contains('/'))
+                            .cloned()
+                            .collect()
                     || receipt.architecture != "x64"
                     || receipt.protocol_baseline != 1
                     || receipt.upgrade_code != UPGRADE
@@ -246,14 +312,15 @@ pub(super) fn inspect(
     if seen.len() != files.len() {
         return Err(Error::Metadata);
     }
-    // Native custom action code executes as SYSTEM too; verify the embedded DLL.
-    let binaries = rows(&database, "SELECT `Name`, `Data` FROM `Binary`")?;
-    if binaries.len() != 1 || string(&binaries[0], 1)? != "InstallerCA" {
+    // WiX also embeds firewall actions and UI bitmaps. All are covered by the
+    // manifest's whole-MSI hash (and optional MSI Authenticode pin). InstallerCA
+    // is not separately Authenticode-signed by the SignPath MSI configuration.
+    let binaries = rows(&database, "SELECT `Data` FROM `Binary` WHERE `Name` = 'InstallerCA'")?;
+    if binaries.len() != 1 {
         return Err(Error::Metadata);
     }
     let ca = stage.join("InstallerCA.dll");
-    protected::write(&ca, &stream(&binaries[0], 2, 16 * 1024 * 1024)?)?;
-    signature::verify(&ca, roots)?;
+    protected::write(&ca, &stream(&binaries[0], 1, 16 * 1024 * 1024)?)?;
     Ok(Inventory {
         product_code,
         build: expected_build,
@@ -270,4 +337,86 @@ fn valid_product_code(code: &str) -> bool {
                 b.is_ascii_hexdigit()
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    #[ignore = "explicit external TEST MSI and previously verified inventory; no installation"]
+    fn external_msi_native_cabinet_matches_every_previously_verified_file() {
+        let path = std::env::var("OINK_UPDATE_TEST_MSI").expect("external TEST MSI path required");
+        let inventory = std::env::var("OINK_UPDATE_TEST_INVENTORY").expect("external verified inventory required");
+        let inventory: Inventory = serde_json::from_slice(&std::fs::read(inventory).unwrap()).unwrap();
+        let started = std::time::Instant::now();
+        let mut database = 0;
+        // SAFETY: explicit fixture opened read-only, never an administrative installation.
+        ok(unsafe { MsiOpenDatabaseW(wide(&path).as_ptr(), ptr::null(), &mut database) }).unwrap();
+        let database = Msi(database);
+        let (files, _) = file_table(&database).unwrap();
+        let cabinets: BTreeSet<_> = rows(&database, "SELECT `Cabinet` FROM `Media`")
+            .unwrap()
+            .iter()
+            .map(|row| string(row, 1).unwrap())
+            .collect();
+        let temporary = tempfile::tempdir().unwrap();
+        let expected = files.iter().map(|(id, (_, length))| (id.clone(), *length)).collect();
+        let (mut seen, mut total, mut hashes) = (BTreeSet::new(), 0, BTreeMap::new());
+        for (index, row) in rows(&database, "SELECT `Name`, `Data` FROM `_Streams`")
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            if !cabinets.contains(&format!("#{}", string(row, 1).unwrap())) {
+                continue;
+            }
+            let output = temporary.path().join(index.to_string());
+            std::fs::create_dir(&output).unwrap();
+            let path = output.join("input.cab");
+            std::fs::write(&path, stream(row, 2, MAX_PACKAGE as usize).unwrap()).unwrap();
+            for (id, path) in cabinet::extract(&path, &output, &expected, &mut seen, &mut total).unwrap() {
+                let bytes = std::fs::read(path).unwrap();
+                let (name, length) = &files[&id];
+                assert_eq!(bytes.len() as u64, *length);
+                hashes.insert(name.clone(), hex(&Sha256::digest(&bytes)));
+            }
+        }
+        assert_eq!(seen.len(), files.len());
+        assert_eq!(hashes, inventory.hashes);
+        eprintln!(
+            "external MSI: {} complete file hashes matched in {:?}",
+            hashes.len(),
+            started.elapsed()
+        );
+    }
+    #[test]
+    fn current_package_metadata_and_licenses_are_inspected_without_path_escape() {
+        let directories = BTreeMap::from([
+            ("Licenses".into(), ("INSTALLFOLDER".into(), "licenses".into())),
+            ("Dependency".into(), ("Licenses".into(), "dependency".into())),
+            ("Cycle".into(), ("Cycle".into(), "cycle".into())),
+        ]);
+        for name in [
+            "oink-build.json",
+            "report-manifest.json",
+            "installed.json",
+            "THIRD_PARTY_LICENSES.md",
+            "oink.exe",
+        ] {
+            assert_eq!(relative_file("INSTALLFOLDER", name, &directories).unwrap(), name);
+        }
+        assert_eq!(
+            relative_file("Dependency", "LICENSE.txt", &directories).unwrap(),
+            "licenses/dependency/LICENSE.txt"
+        );
+        for (directory, name) in [
+            ("Dependency", "../escape"),
+            ("Dependency", "NUL"),
+            ("INSTALLFOLDER", "arbitrary.exe"),
+            ("Cycle", "x"),
+            ("ProgramFiles64Folder", "x"),
+        ] {
+            assert!(relative_file(directory, name, &directories).is_err());
+        }
+    }
 }

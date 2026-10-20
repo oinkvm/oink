@@ -142,6 +142,29 @@ describe('arrangement camera',()=>{
     });
     expect(frames.size).toBe(0);
   };
+  it('rests during a stationary held drag and pauses all frames while hidden',()=>{
+    const projection=vi.fn();
+    const {container,rerender}=render(<Arrangement screens={screens} onProjection={projection} onScreensChange={vi.fn()} selectedId="one" onSelect={()=>{}} settings={settings}/>);
+    settle();
+    const display=container.querySelector('.scr')!;
+    fireEvent.pointerDown(display,{button:0,clientX:300,clientY:300});
+    fireEvent.pointerMove(display,{clientX:310,clientY:300});
+    settle();
+    expect(frames.size).toBe(0);
+    fireEvent.pointerMove(display,{clientX:320,clientY:300});
+    expect(frames.size).toBeGreaterThan(0);
+    const hidden=vi.spyOn(document,'hidden','get').mockReturnValue(true);
+    try {
+      fireEvent(document,new Event('visibilitychange'));
+      expect(frames.size).toBe(0);
+      expect(projection.mock.lastCall?.[0]).toBeNull();
+      rerender(<Arrangement screens={screens.map(s=>({...s,w:1200}))} onProjection={projection} onScreensChange={vi.fn()} selectedId="one" onSelect={()=>{}} settings={settings}/>);
+      expect(frames.size).toBe(0);
+      hidden.mockReturnValue(false);
+      fireEvent(document,new Event('visibilitychange'));
+      settle();
+    } finally {hidden.mockRestore();}
+  });
   it('refits after sidebar, viewport and layout changes',()=>{
     const props={screens,onScreensChange:vi.fn(),selectedId:null,onSelect:vi.fn(),settings};
     const {rerender}=render(<Arrangement {...props}/>);

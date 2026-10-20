@@ -13,7 +13,7 @@ export function useConnectionQuality(active: boolean) {
     const adopt = (next: ConnectionQuality) => {
       if (!closed) {
         setFailed(false);
-        setSnapshot(previous => !previous || next.revision > previous.revision || (next.revision === previous.revision && next.sampled_at_ms >= previous.sampled_at_ms) ? next : previous);
+        setSnapshot(previous => !previous || next.revision > previous.revision || (next.revision === previous.revision && next.sampled_at_ms > previous.sampled_at_ms) ? next : previous);
       }
     };
     void (async () => {

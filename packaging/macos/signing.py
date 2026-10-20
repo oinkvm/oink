@@ -37,6 +37,16 @@ def verify_signature(path, team):
         raise RuntimeError('Developer ID, hardened runtime, Team ID and secure timestamp verification failed')
 
 
+def verify_published_app(app, team):
+    # Gatekeeper validates the downloaded app's Developer ID signature and
+    # notarization. Read its signer once for our fixed Team ID requirement;
+    # repeating strict codesign/stapler validation here adds no trust.
+    private_run('spctl', '-a', '-t', 'exec', app)
+    details = private_run('codesign', '-dvv', app).stderr
+    if f'TeamIdentifier={team}' not in details:
+        raise RuntimeError('Published app Team ID mismatch')
+
+
 def ticket_operation(operation, path, timeout=120):
     # Both staple AND validate contact Apple's ticket service (stapler(1)).
     # Accepted can precede ticket availability; EX_NOHOST also covers an

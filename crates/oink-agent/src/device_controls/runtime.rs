@@ -180,6 +180,9 @@ impl Node {
             Message::ConfigEmergencyPause(request) => self.receive_emergency(peer, request),
             Message::ConfigEmergencyPauseAck(ack) => self.receive_emergency_ack(peer, ack),
             Message::ConfigExitVolumeChanged(_) => self.refresh_device_cards(),
+            Message::NotifyShow(_) | Message::NotifyAction(_) | Message::NotifyDismiss(_) => {
+                self.receive_notification(peer.0, message)
+            }
             _ => {}
         }
     }

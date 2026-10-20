@@ -87,7 +87,14 @@ impl Clone for StateCommand {
             LocalFeel(v) => LocalFeel(v.clone()),
             LocalDisplays(v) => LocalDisplays(v.clone()),
             EdgeResistance(v) => EdgeResistance(v.clone()),
-            PointerSample { sample, hidden } => PointerSample {
+            PointerSample {
+                scope,
+                application,
+                sample,
+                hidden,
+            } => PointerSample {
+                scope: *scope,
+                application: *application,
                 sample: *sample,
                 hidden: *hidden,
             },

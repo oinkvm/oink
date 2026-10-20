@@ -21,6 +21,7 @@ def main():
     p.add_argument('--platform', choices=['macos', 'windows'], required=True)
     p.add_argument('--output-root', type=Path, required=True)
     p.add_argument('--build', type=int, default=1)
+    p.add_argument('--windows-update-test-feed', help='TEST ONLY: compile a literal HTTP loopback feed and TEST public key')
     versions = p.add_mutually_exclusive_group()
     versions.add_argument('--source-commit', help='Full source commit; required for local source archives')
     versions.add_argument('--public-version', action='store_true', help='Use the canonical manifest version for public releases')
@@ -31,7 +32,17 @@ def main():
     p.add_argument('--notary-profile', default=os.environ.get('NOTARY_PROFILE'))
     p.add_argument('--notary-keychain', type=Path)
     p.add_argument('--notary-timeout', type=int, default=300)
+    p.add_argument('--windows-update-test-fail-health', action='store_true', help='TEST ONLY: withhold candidate health proof for rollback qualification')
     a = p.parse_args()
+    if a.windows_update_test_fail_health and not a.windows_update_test_feed:
+        p.error('test health failure requires a test feed')
+    from update_qualification import origin as test_origin
+    try:
+        test_origin(a.windows_update_test_feed)
+    except ValueError as error:
+        p.error(str(error))
+    if a.windows_update_test_feed and (a.platform != 'windows' or a.public_version):
+        p.error('test update feeds require a local Windows package, never --public-version')
     expected = 'Darwin' if a.platform == 'macos' else 'Windows'
     if platform.system() != expected or not supported_host(a.platform):
         p.error('run on an arm64 Mac or x64 Windows build host for the selected platform')
@@ -68,10 +79,14 @@ def main():
     common = ['--build', str(a.build), '--source-tree-sha256', tree]
     if commit:
         common += ['--source-commit', commit]
+    if a.windows_update_test_feed:
+        common += ['--windows-update-test-feed', a.windows_update_test_feed]
     command = [sys.executable, str(ROOT / 'build-support/build.py'), '--target', target,
                '--source-inventory', str(snapshot), '--symbols-output', str(output / 'symbols.noindex'), *common]
     if macos:
         command += ['--sparkle-cache', str(a.tool_cache)]
+    if a.windows_update_test_fail_health:
+        command += ['--windows-update-test-fail-health']
     subprocess.run(command, cwd=ROOT, check=True)
     binaries = Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target')) / target / 'release'
     command = [sys.executable, str(ROOT / 'packaging' / a.platform / 'build.py'),

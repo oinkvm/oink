@@ -95,8 +95,9 @@ impl Endpoint {
 
     fn read_file(data_dir: &Path, name: &str) -> anyhow::Result<Self> {
         let path = data_dir.join(name);
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("服务进程没有在运行（读不到 {}：{e}）", path.display()))?;
+        let text = std::fs::read_to_string(&path).map_err(|error| {
+            anyhow::Error::new(error).context(format!("服务进程没有在运行（读不到 {}）", path.display()))
+        })?;
         Ok(serde_json::from_str(&text)?)
     }
 }
@@ -123,6 +124,8 @@ pub(crate) struct Envelope {
     pub subscribe: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub ui_ready: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub open_ui: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_views: Option<api::LiveViews>,
 }
@@ -268,13 +271,9 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, text)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    // Publish an owner-only, Medium-minimum file even from an elevated UI.
+    // The loopback transport has no UIPI boundary; its secret remains private.
+    oink_foundation::storage::atomic_write(path, text.as_bytes())
 }
 
 async fn write_line(w: &mut tokio::net::tcp::OwnedWriteHalf, v: &serde_json::Value) -> anyhow::Result<()> {
@@ -453,8 +452,9 @@ impl Client {
     // without comparing elapsed wall time (which also includes scheduler delay).
     fn bounded_stream(&self, timeout: Duration) -> anyhow::Result<std::net::TcpStream> {
         let address = std::net::SocketAddr::from(([127, 0, 0, 1], self.endpoint.port));
-        let s = std::net::TcpStream::connect_timeout(&address, timeout)
-            .map_err(|e| anyhow::anyhow!("连不上服务进程（端口 {}）：{e}", self.endpoint.port))?;
+        let s = std::net::TcpStream::connect_timeout(&address, timeout).map_err(|error| {
+            anyhow::Error::new(error).context(format!("连不上服务进程（端口 {}）", self.endpoint.port))
+        })?;
         s.set_read_timeout(Some(timeout))?;
         s.set_write_timeout(Some(timeout))?;
         Ok(s)

@@ -31,7 +31,8 @@
     "oink.input.edge-trigger/1",
     "oink.device-resources/1",
     "oink.device-options/1",
-    "oink.audio.exit-volume/1"
+    "oink.audio.exit-volume/1",
+    "oink.notify/1"
   ],
   "diagnostic_events": [
     "protocol-violation/1",
@@ -11329,6 +11330,135 @@
         ],
         "name": "ContentFileVersion"
       }
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.notify/1"
+      ],
+      "id": 3372,
+      "name": "NotifyShow",
+      "pause": "Allow",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 2,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "id",
+            "shape": "u64"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "display",
+            "shape": "Text<512>"
+          },
+          {
+            "absence": "required",
+            "key": 3,
+            "name": "level",
+            "shape": "u8"
+          },
+          {
+            "absence": "required",
+            "key": 4,
+            "name": "title",
+            "shape": "Text<512>"
+          },
+          {
+            "absence": "required",
+            "key": 5,
+            "name": "description",
+            "shape": "Text<2048>"
+          },
+          {
+            "absence": "required",
+            "key": 6,
+            "name": "persistent",
+            "shape": "bool"
+          },
+          {
+            "absence": "required",
+            "key": 7,
+            "name": "undo",
+            "shape": "bool"
+          },
+          {
+            "absence": "required",
+            "key": 8,
+            "name": "kind",
+            "shape": "u8"
+          }
+        ],
+        "name": "NotifyShow"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.notify/1"
+      ],
+      "id": 3373,
+      "name": "NotifyAction",
+      "pause": "Allow",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 2,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "id",
+            "shape": "u64"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "undo",
+            "shape": "bool"
+          }
+        ],
+        "name": "NotifyAction"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.notify/1"
+      ],
+      "id": 3374,
+      "name": "NotifyDismiss",
+      "pause": "Allow",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 2,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "id",
+            "shape": "u64"
+          }
+        ],
+        "name": "NotifyDismiss"
+      }
     }
   ],
   "open_enums": [
@@ -12102,6 +12232,87 @@
   ],
   "revision": "2026-10-15-ui-freeze",
   "schemas": [
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "id",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "display",
+          "shape": "Text<512>"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "level",
+          "shape": "u8"
+        },
+        {
+          "absence": "required",
+          "key": 4,
+          "name": "title",
+          "shape": "Text<512>"
+        },
+        {
+          "absence": "required",
+          "key": 5,
+          "name": "description",
+          "shape": "Text<2048>"
+        },
+        {
+          "absence": "required",
+          "key": 6,
+          "name": "persistent",
+          "shape": "bool"
+        },
+        {
+          "absence": "required",
+          "key": 7,
+          "name": "undo",
+          "shape": "bool"
+        },
+        {
+          "absence": "required",
+          "key": 8,
+          "name": "kind",
+          "shape": "u8"
+        }
+      ],
+      "name": "NotifyShow"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "id",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "undo",
+          "shape": "bool"
+        }
+      ],
+      "name": "NotifyAction"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "id",
+          "shape": "u64"
+        }
+      ],
+      "name": "NotifyDismiss"
+    },
     {
       "fields": [
         {
@@ -17052,6 +17263,12 @@
           "key": 3,
           "name": "enabled",
           "shape": "bool"
+        },
+        {
+          "absence": "1.0",
+          "key": 4,
+          "name": "remote_gain",
+          "shape": "f64"
         }
       ],
       "name": "ScreenPreference"

@@ -4,6 +4,7 @@ mod appearance;
 mod assembly;
 mod card_projection;
 mod main_commands;
+mod notifications;
 mod observers;
 #[cfg(all(test, debug_assertions))]
 mod startup_store_tests;
@@ -97,6 +98,7 @@ pub(crate) struct Inner {
     pub(crate) input_settings: Arc<Snapshot<oink_routing::RoutingSettings>>,
     input_environment: Arc<Snapshot<Environment>>,
     cursor_trail: OnceLock<oink_locator::CursorTrail>,
+    notifications: Mutex<notifications::Notifications>,
     native_surfaces: bool,
     system_dark: AtomicBool,
     pub(crate) native_services: bool,
@@ -301,6 +303,7 @@ impl Node {
                 input_settings: Arc::new(Snapshot::new(settings.routing)),
                 input_environment: Arc::new(Snapshot::default()),
                 cursor_trail: OnceLock::new(),
+                notifications: Mutex::default(),
                 system_dark: AtomicBool::new(false),
                 native_surfaces: native,
                 native_services,
@@ -488,6 +491,7 @@ impl Node {
     pub(crate) async fn shutdown_for_process_exit(&self) {
         self.inner.reports.shutdown();
         self.request_stop();
+        self.shutdown_notifications();
         crate::display_overlay::hide(self);
         crate::aim::stop(self);
         // The ordinary command owner cancels native DnD before closing its queue.

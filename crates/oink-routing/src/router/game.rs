@@ -155,7 +155,7 @@ impl Router {
             self.game.generation = self.game.authority_generation;
             self.game.tx = (0, 0., 0.);
             self.game.rx.clear();
-            self.resistance = None;
+            self.reset_resistance();
             if active {
                 self.gap_cancel();
                 self.dnd_abort("game mode");

@@ -11,6 +11,7 @@
 #include "GracefulStop.h"
 #include <string>
 #include <vector>
+#include <cstddef>
 #include "identity.h"
 #include "FinishInstall.h"
 
@@ -57,15 +58,21 @@ static bool protected_handle(HANDLE file) {
             if (!GetAce(acl, index, &raw)) { ok = false; break; }
             auto ace = static_cast<ACCESS_ALLOWED_ACE*>(raw);
             if (ace->Header.AceFlags & INHERIT_ONLY_ACE) continue;
-            // Object/callback allow ACEs require evaluation we do not implement;
-            // fail closed rather than silently overlooking a write grant.
-            if (ace->Header.AceType != ACCESS_ALLOWED_ACE_TYPE) {
-                if (ace->Header.AceType != ACCESS_DENIED_ACE_TYPE) { ok = false; break; }
-                continue;
+            PSID sid = nullptr;
+            if (ace->Header.AceType == ACCESS_ALLOWED_ACE_TYPE || ace->Header.AceType == ACCESS_ALLOWED_CALLBACK_ACE_TYPE)
+                sid = &ace->SidStart;
+            else if (ace->Header.AceType == ACCESS_ALLOWED_OBJECT_ACE_TYPE || ace->Header.AceType == ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE) {
+                auto object = static_cast<ACCESS_ALLOWED_OBJECT_ACE*>(raw);
+                auto offset = offsetof(ACCESS_ALLOWED_OBJECT_ACE, ObjectType);
+                if (object->Flags & ACE_OBJECT_TYPE_PRESENT) offset += sizeof(GUID);
+                if (object->Flags & ACE_INHERITED_OBJECT_TYPE_PRESENT) offset += sizeof(GUID);
+                sid = reinterpret_cast<BYTE*>(raw) + offset;
             }
+            // Deny/audit ACEs do not grant writes and are not an admission veto.
+            if (!sid) continue;
             constexpr DWORD writes = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA |
                 FILE_WRITE_ATTRIBUTES | FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL;
-            if ((ace->Mask & writes) && !trusted(&ace->SidStart)) { ok = false; break; }
+            if ((ace->Mask & writes) && !trusted(sid)) { ok = false; break; }
         }
     }
     if (sd) LocalFree(sd);
@@ -118,7 +125,7 @@ extern "C" __declspec(dllexport) UINT __stdcall FinishInstall(MSIHANDLE install)
     // warning dialog after refreshing the result property.
     MsiSetPropertyW(install, L"OinkFinishStatus", outcome.c_str());
     if (completed) {
-        MsiSetPropertyW(install, L"OinkFinishToken", L"elevated=0, UIAccess=0, interactive session matched client");
+        MsiSetPropertyW(install, L"OinkFinishToken", L"user account, UIAccess=0, interactive session matched client");
         return ERROR_SUCCESS;
     }
     MsiSetPropertyW(install, L"OinkFinishFailed", L"1");
@@ -170,13 +177,20 @@ static bool bind_package(MSIHANDLE install) {
     }
     // Private deferred data is always overwritten here. It carries derived
     // metadata, never a caller-provided "allow update"/"ignore pending" flag.
-    // Immediate actions impersonate the invoking client. Derive this from the
-    // thread token, never CLIENTPROCESSID or another public MSI property. Only
-    // a SYSTEM caller can claim the protected worker's admission record; a
-    // manual elevated administrator must not borrow an in-flight authorization.
+    // Use the effective invoking identity: impersonation token when present,
+    // otherwise the process token (ERROR_NO_TOKEN only). Never use MSI public
+    // properties as authority or borrow SYSTEM while impersonating a user.
     HANDLE caller = nullptr;
-    bool system_caller = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &caller) && maintenance::system_token(caller);
-    if (caller) CloseHandle(caller);
+    auto thread = admission::CallerToken::unreadable;
+    if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &caller)) {
+        thread = maintenance::system_token(caller) ? admission::CallerToken::system : admission::CallerToken::other;
+        CloseHandle(caller);
+    } else if (GetLastError() == ERROR_NO_TOKEN) {
+        thread = admission::CallerToken::absent;
+    }
+    const bool system_caller = admission::effective_system(thread, [] {
+        return maintenance::system_process(GetCurrentProcess());
+    });
     const auto data = source + L"|" + maintenance::wide(hash + "|" + remove + "|" + remove_hash) + (system_caller ? L"|1" : L"|0");
     return MsiSetPropertyW(install, L"CheckProtectedState", data.c_str()) == ERROR_SUCCESS;
 }
@@ -192,47 +206,9 @@ extern "C" __declspec(dllexport) UINT __stdcall CheckInstallPath(MSIHANDLE insta
     return _wcsicmp(value.c_str(), expected.c_str()) == 0 && bind_package(install) ? ERROR_SUCCESS : fail(install, 2);
 }
 
-static bool running_service(const std::wstring& directory, quiescence::Process& identity, HANDLE& process) {
-    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-    if (!scm) return false;
-    SC_HANDLE service = OpenServiceW(scm, ID_SERVICE, SERVICE_QUERY_STATUS);
-    bool ok = false;
-    if (service) {
-        SERVICE_STATUS_PROCESS status{}; DWORD needed = 0;
-        ok = QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<BYTE*>(&status),
-            sizeof(status), &needed) != FALSE;
-        if (ok && status.dwCurrentState != SERVICE_STOPPED) {
-            // SCM only guarantees the PID in stable states. OinkInput does not
-            // pause; fail closed during a concurrent start/stop transition.
-            ok = status.dwCurrentState == SERVICE_RUNNING && status.dwProcessId != 0;
-            if (ok) {
-                process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, status.dwProcessId);
-                DWORD session = 0;
-                ok = process && WaitForSingleObject(process, 0) == WAIT_TIMEOUT &&
-                    ProcessIdToSessionId(status.dwProcessId, &session) && session == 0 && maintenance::system_process(process) &&
-                    _wcsicmp(maintenance::image(process).c_str(), (directory + L"\\" ID_SERVICE_EXE).c_str()) == 0;
-                if (ok) {
-                    identity = {status.dwProcessId, 0, session, maintenance::created(process), true, true};
-                    ok = identity.created != 0;
-                }
-            }
-        }
-        CloseServiceHandle(service);
-    } else ok = GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST;
-    CloseServiceHandle(scm);
-    return ok;
-}
-
-static bool clients_quiescent(const std::wstring& directory, quiescence::Phase phase) {
-    quiescence::Process service{};
-    HANDLE broker = nullptr;
-    if (phase == quiescence::Phase::before_stop && !running_service(directory, service, broker)) {
-        if (broker) CloseHandle(broker);
-        return false;
-    }
+static bool clients_quiescent(const std::wstring& directory) {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
-        if (broker) CloseHandle(broker);
         return false;
     }
     PROCESSENTRY32W entry{sizeof(entry)};
@@ -251,17 +227,7 @@ static bool clients_quiescent(const std::wstring& directory, quiescence::Phase p
             if (WaitForSingleObject(process, 0) != WAIT_OBJECT_0) {
                 const auto image = maintenance::image(process);
                 if (image.empty()) busy = true;
-                else if (_wcsnicmp(image.c_str(), (directory + L"\\").c_str(), directory.size() + 1) == 0) {
-                    DWORD session = 0;
-                    quiescence::Process candidate{entry.th32ProcessID, entry.th32ParentProcessID};
-                    candidate.service_image = _wcsicmp(image.c_str(), (directory + L"\\" ID_SERVICE_EXE).c_str()) == 0;
-                    if (candidate.service_image && ProcessIdToSessionId(candidate.pid, &session)) {
-                        candidate.session = session;
-                        candidate.created = maintenance::created(process);
-                        candidate.system = maintenance::system_process(process);
-                    }
-                    busy = !quiescence::service_owned(candidate, service, phase);
-                }
+                else busy = quiescence::product_path(directory, image, {ID_UI, ID_AGENT, ID_SERVICE_EXE, ID_CRASH_COLLECTOR});
             }
             CloseHandle(process);
         }
@@ -270,13 +236,12 @@ static bool clients_quiescent(const std::wstring& directory, quiescence::Phase p
     }
     if (!more && GetLastError() != ERROR_NO_MORE_FILES) busy = true;
     CloseHandle(snapshot);
-    if (broker) CloseHandle(broker);
     return !busy;
 }
 
 // The client-side scan is advisory: inspect only actual UI/backend/CLI/collector
-// images. SYSTEM broker/helper authentication remains in the two unchanged,
-// elevated service-aware gates; a normal user cannot query their token DACLs.
+// images. The elevated post-StopServices scan also covers the SYSTEM broker
+// and helper; a normal user cannot query their token DACLs.
 static graceful_stop::State user_sessions(const std::wstring& directory) {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) return graceful_stop::State::unavailable;
@@ -307,13 +272,6 @@ static graceful_stop::State user_sessions(const std::wstring& directory) {
     return result;
 }
 
-static bool normal_token(HANDLE token, DWORD& session) {
-    TOKEN_ELEVATION elevation{}; DWORD access = 0, size = 0;
-    return GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) &&
-        GetTokenInformation(token, TokenSessionId, &session, sizeof(session), &size) &&
-        GetTokenInformation(token, TokenUIAccess, &access, sizeof(access), &size) &&
-        finish_install::normal_flags(elevation.TokenIsElevated != 0, access, session);
-}
 
 static bool request_user_stop(MSIHANDLE install, const std::wstring& directory) {
     // Use only the actual caller's token. Never borrow Explorer/another session,
@@ -326,18 +284,12 @@ static bool request_user_stop(MSIHANDLE install, const std::wstring& directory) 
             !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &caller)) return false;
     }
     DWORD session = 0;
-    bool ok = normal_token(caller, session);
+    bool ok = finish_install::normal_token(caller, session);
     HANDLE primary = nullptr;
     if (ok) ok = DuplicateTokenEx(caller, TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY, nullptr,
                                   SecurityImpersonation, TokenPrimary, &primary) != FALSE;
     CloseHandle(caller);
     const auto executable = directory + L"\\" ID_AGENT;
-    for (auto ancestor = directory; ok && !ancestor.empty();) {
-        ok = protected_path(ancestor);
-        const auto slash = ancestor.find_last_of(L'\\');
-        if (slash == std::wstring::npos || slash < 3) break;
-        ancestor.resize(slash);
-    }
     ok = ok && protected_path(executable);
     void* environment = nullptr;
     if (ok) ok = CreateEnvironmentBlock(&environment, primary, FALSE) != FALSE;
@@ -405,24 +357,16 @@ extern "C" __declspec(dllexport) UINT __stdcall RefreshUserSessions(MSIHANDLE in
 }
 
 extern "C" __declspec(dllexport) UINT __stdcall CheckQuiescence(MSIHANDLE install) {
-    // Repeat after StopServices closes the launch endpoint and joins outstanding
-    // launch requests, as the existing installer script does. The first scan
-    // alone has a launch race. MSI rollback restores the old service on failure.
+    // StopServices closes the launch endpoint and joins outstanding helpers.
+    // Check all product roles once here; MSI rollback restores service on failure.
     const auto directory = root();
-    return !directory.empty() && clients_quiescent(directory, quiescence::Phase::after_stop) ? ERROR_SUCCESS : fail(install, 8);
+    return !directory.empty() && clients_quiescent(directory) ? ERROR_SUCCESS : fail(install, 8);
 }
 
 extern "C" __declspec(dllexport) UINT __stdcall CheckProtectedState(MSIHANDLE install) {
     const auto directory = root();
     if (directory.empty()) return fail(install, 3);
-    for (auto ancestor = directory; !ancestor.empty();) {
-        if (!protected_path(ancestor)) return fail(install, 4);
-        const auto slash = ancestor.find_last_of(L'\\');
-        if (slash == std::wstring::npos || slash < 3) break;
-        ancestor.resize(slash);
-    }
-    for (const auto name : {ID_UI, ID_AGENT, ID_SERVICE_EXE, ID_UPDATE_WORKER, ID_CRASH_COLLECTOR, ID_MAINTENANCE, ID_RECEIPT})
-        if (!protected_path(directory + L"\\" + name)) return fail(install, 5);
+    if (!protected_path(maintenance::directory())) return fail(install, 5);
     const auto data = property(install, L"CustomActionData");
     std::vector<std::wstring> parts; size_t offset = 0;
     for (;;) {
@@ -434,7 +378,6 @@ extern "C" __declspec(dllexport) UINT __stdcall CheckProtectedState(MSIHANDLE in
     if (parts.size() != 5 || (parts[4] != L"0" && parts[4] != L"1") || maintenance::sha256(parts[0]) != maintenance::narrow(parts[1]) ||
         !maintenance::admit(admission::guid(maintenance::narrow(ID_PRODUCT_CODE)), maintenance::narrow(parts[1]),
                             maintenance::narrow(parts[2]), maintenance::narrow(parts[3]), parts[4] == L"1")) return fail(install, 6);
-    if (!clients_quiescent(directory, quiescence::Phase::before_stop)) return fail(install, 8);
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (!scm) return fail(install, 9);
     SC_HANDLE service = OpenServiceW(scm, ID_SERVICE, SERVICE_QUERY_CONFIG);
@@ -453,14 +396,6 @@ extern "C" __declspec(dllexport) UINT __stdcall CheckProtectedState(MSIHANDLE in
     return valid ? ERROR_SUCCESS : fail(install, 10);
 }
 
-extern "C" __declspec(dllexport) void CALLBACK MaintenanceGuard(HWND, HINSTANCE, LPSTR command, int) {
-    maintenance::guard(command);
-}
-
-extern "C" __declspec(dllexport) UINT __stdcall ReleaseMaintenance(MSIHANDLE install) {
-    return maintenance::release() ? ERROR_SUCCESS : fail(install, 11);
-}
-
 extern "C" __declspec(dllexport) UINT __stdcall CleanupMaintenance(MSIHANDLE install) {
     const auto directory = root();
     if (directory.empty()) return fail(install, 12);
@@ -470,6 +405,7 @@ extern "C" __declspec(dllexport) UINT __stdcall CleanupMaintenance(MSIHANDLE ins
 }
 
 extern "C" __declspec(dllexport) UINT __stdcall RemoveLoginEntry(MSIHANDLE) {
+    if (cleanup::preserve_user_state(maintenance::directory())) return ERROR_SUCCESS;
     // Only loaded interactive hives. Do not mount profiles, change StartupApproved,
     // touch user data, or delete an unrelated command with the same value name.
     const auto expected = L"\"" + root() + L"\\" ID_UI L"\" --autostart";
@@ -491,6 +427,7 @@ extern "C" __declspec(dllexport) UINT __stdcall RemoveLoginEntry(MSIHANDLE) {
 }
 
 extern "C" __declspec(dllexport) UINT __stdcall CleanupCloudFiles(MSIHANDLE install) {
+    if (cleanup::preserve_user_state(maintenance::directory())) return ERROR_SUCCESS;
     if (cloud_cleanup::profiles(ID_DATA_DIRECTORY)) return ERROR_SUCCESS;
     MSIHANDLE record = MsiCreateRecord(0);
     MsiRecordSetStringW(record, 0, L"Cloud file cache cleanup failed. Close applications using shared files and retry uninstall.");

@@ -11,9 +11,7 @@ pub enum Stage {
     Replacing,
     Starting,
     AwaitingReboot,
-    InstallerBusy,
     RollbackAwaitingReboot,
-    RollbackInstallerBusy,
     HealthCheck,
     Committed,
     Recovering,
@@ -30,6 +28,7 @@ pub struct Journal {
     pub package_sha256: String,
     pub stage: Stage,
     pub rollback_attempted: bool,
+    pub failure: Option<Error>,
 }
 impl Journal {
     pub fn new(transaction: String, old_build: u64, new_build: u64, package_sha256: String) -> Result<Self, Error> {
@@ -41,6 +40,7 @@ impl Journal {
             package_sha256,
             stage: Stage::Prepared,
             rollback_attempted: false,
+            failure: None,
         };
         journal.validate()?;
         Ok(journal)
@@ -113,30 +113,21 @@ pub fn execute(platform: &mut impl Platform, journal: &mut Journal) -> Result<()
         advance(platform, journal, Stage::Committed)?;
         return platform.restore_failure_policy_and_cleanup();
     }
-    let retry_installer = journal.stage == Stage::InstallerBusy;
-    if !retry_installer && journal.stage != Stage::Prepared {
+    if journal.stage != Stage::Prepared {
         return recover_locked(platform, journal);
     }
-    if !retry_installer {
-        platform.persist(journal)?;
-        if let Err(error) = platform
-            .arm_recovery()
-            .and_then(|()| platform.confirm_drain_and_handover())
-        {
-            advance(platform, journal, Stage::RolledBack)?;
-            platform.restore_failure_policy_and_cleanup()?;
-            return Err(error);
-        }
+    platform.persist(journal)?;
+    if let Err(error) = platform
+        .arm_recovery()
+        .and_then(|()| platform.confirm_drain_and_handover())
+    {
+        return finish_failure(platform, journal, error);
     }
     let result = (|| {
-        if !retry_installer {
-            advance(platform, journal, Stage::Stopping)?;
-        }
+        advance(platform, journal, Stage::Stopping)?;
         if let Err(error) = platform.stop_owned_processes() {
             platform.resume_before_replacement()?;
-            advance(platform, journal, Stage::RolledBack)?;
-            platform.restore_failure_policy_and_cleanup()?;
-            return Err(error);
+            return finish_failure(platform, journal, error);
         }
         advance(platform, journal, Stage::Replacing)?;
         match platform.replace_components_and_metadata()? {
@@ -145,8 +136,10 @@ pub fn execute(platform: &mut impl Platform, journal: &mut Journal) -> Result<()
                 return Ok(());
             }
             InstallOutcome::Busy => {
-                advance(platform, journal, Stage::InstallerBusy)?;
-                return Ok(());
+                // 1618 made no package change. Restore the previous live session
+                // and report one failed attempt, without a background MSI retry.
+                platform.resume_before_replacement()?;
+                return finish_failure(platform, journal, Error::Busy);
             }
             InstallOutcome::Installed => {}
         }
@@ -163,9 +156,11 @@ pub fn execute(platform: &mut impl Platform, journal: &mut Journal) -> Result<()
         if journal.stage == Stage::RolledBack {
             return Err(error);
         }
+        journal.failure = Some(error);
+        platform.persist(journal)?;
         return recover_locked(platform, journal);
     }
-    if matches!(journal.stage, Stage::AwaitingReboot | Stage::InstallerBusy) {
+    if journal.stage == Stage::AwaitingReboot {
         return Ok(());
     }
     platform.restore_failure_policy_and_cleanup()
@@ -181,6 +176,12 @@ fn advance(platform: &mut impl Platform, journal: &mut Journal, stage: Stage) ->
     platform.persist(&next)?;
     *journal = next;
     Ok(())
+}
+fn finish_failure(platform: &mut impl Platform, journal: &mut Journal, error: Error) -> Result<(), Error> {
+    journal.failure = Some(error);
+    advance(platform, journal, Stage::RolledBack)?;
+    platform.restore_failure_policy_and_cleanup()?;
+    Err(error)
 }
 fn recover_locked(platform: &mut impl Platform, journal: &mut Journal) -> Result<(), Error> {
     if matches!(journal.stage, Stage::Committed | Stage::RolledBack) {
@@ -201,32 +202,37 @@ fn recover_locked(platform: &mut impl Platform, journal: &mut Journal) -> Result
     // only this transaction's recorded previous successful build. It cannot loop
     // back into candidate installation.
     let result = (|| {
-        let mut next = journal.clone();
-        next.rollback_attempted = true;
-        next.stage = Stage::Recovering;
-        platform.persist(&next)?;
-        *journal = next;
-        platform.stop_owned_processes()?;
-        match platform.restore_previous_components_and_metadata()? {
-            InstallOutcome::Busy => {
-                advance(platform, journal, Stage::RollbackInstallerBusy)?;
-                return Ok(());
+        if journal.stage != Stage::HealthCheck || !journal.rollback_attempted {
+            let mut next = journal.clone();
+            next.rollback_attempted = true;
+            next.stage = Stage::Recovering;
+            platform.persist(&next)?;
+            *journal = next;
+            platform.stop_owned_processes()?;
+            match platform.restore_previous_components_and_metadata()? {
+                InstallOutcome::Busy => {
+                    // Preserve an actual failed recovery for explicit repair;
+                    // never retry an installation in the background.
+                    return Err(Error::Busy);
+                }
+                InstallOutcome::RebootRequired => {
+                    advance(platform, journal, Stage::RollbackAwaitingReboot)?;
+                    return Ok(());
+                }
+                InstallOutcome::Installed => {}
             }
-            InstallOutcome::RebootRequired => {
-                advance(platform, journal, Stage::RollbackAwaitingReboot)?;
-                return Ok(());
-            }
-            InstallOutcome::Installed => {}
+            // Recovering instructs backends to drain and exit. Persist the
+            // health phase before relaunch so the old session can report health
+            // instead of shutting itself down again. Resume here after a crash.
+            advance(platform, journal, Stage::HealthCheck)?;
         }
         platform.health_check_previous()?;
         platform.quarantine_candidate()?;
         advance(platform, journal, Stage::RolledBack)?;
         platform.restore_failure_policy_and_cleanup()
     })();
-    if result == Err(Error::Busy) {
-        return Ok(());
-    }
     if result.is_err() {
+        journal.failure = Some(Error::RepairRequired);
         let _ = advance(platform, journal, Stage::RepairRequired);
         return Err(Error::RepairRequired);
     }
@@ -243,6 +249,7 @@ mod tests {
         install_outcome: Option<InstallOutcome>,
         rollback_outcome: Option<InstallOutcome>,
         rebooted: bool,
+        require_old_health_phase: bool,
     }
     impl Fake {
         fn action(&mut self, name: &'static str) -> Result<(), Error> {
@@ -299,6 +306,10 @@ mod tests {
             self.action("resume")
         }
         fn health_check_previous(&mut self) -> Result<(), Error> {
+            if self.require_old_health_phase && self.saved.as_ref().unwrap().stage != Stage::HealthCheck {
+                // During drain the service asks the backend to exit, not prove health.
+                return Err(Error::Transaction);
+            }
             self.action("old_health")
         }
         fn quarantine_candidate(&mut self) -> Result<(), Error> {
@@ -349,6 +360,39 @@ mod tests {
         }
     }
     #[test]
+    fn pre_replacement_msi_failure_restarts_old_session_without_repair() {
+        let mut p = Fake {
+            fail: Some("replace"),
+            require_old_health_phase: true,
+            ..Default::default()
+        };
+        let mut j = journal();
+        execute(&mut p, &mut j).unwrap();
+        assert_eq!(j.stage, Stage::RolledBack);
+        assert_eq!(j.failure, Some(Error::Transaction));
+        assert!(p.events.contains(&"old_health"));
+        assert!(p.events.contains(&"cleanup"));
+        assert_eq!(p.events.iter().filter(|event| **event == "replace").count(), 1);
+    }
+    #[test]
+    fn interrupted_old_health_resumes_without_draining_the_restarted_session() {
+        let mut j = journal();
+        j.stage = Stage::HealthCheck;
+        j.rollback_attempted = true;
+        j.failure = Some(Error::Transaction);
+        let mut p = Fake {
+            require_old_health_phase: true,
+            saved: Some(j.clone()),
+            ..Default::default()
+        };
+        recover(&mut p, &mut j).unwrap();
+        assert_eq!(j.stage, Stage::RolledBack);
+        assert!(!p.events.contains(&"stop"));
+        assert!(!p.events.contains(&"restore"));
+        assert!(p.events.contains(&"old_health"));
+        assert!(p.events.contains(&"cleanup"));
+    }
+    #[test]
     fn power_loss_recovery_is_idempotent_for_every_pending_stage() {
         for stage in [
             Stage::Prepared,
@@ -382,22 +426,24 @@ mod tests {
         assert!(!p.events.contains(&"start"));
     }
     #[test]
-    fn installer_busy_retries_without_requesting_consent_from_exited_backends() {
+    fn installer_busy_restores_previous_session_and_fails_without_a_candidate_retry() {
         let mut p = Fake {
             install_outcome: Some(InstallOutcome::Busy),
             ..Default::default()
         };
         let mut j = journal();
-        execute(&mut p, &mut j).unwrap();
-        assert_eq!(j.stage, Stage::InstallerBusy);
+        assert_eq!(execute(&mut p, &mut j), Err(Error::Busy));
+        assert_eq!(j.stage, Stage::RolledBack);
+        assert_eq!(j.failure, Some(Error::Busy));
         assert!(!p.events.contains(&"health"));
         assert!(!p.events.contains(&"quarantine"));
+        assert!(p.events.contains(&"resume"));
+        assert!(p.events.contains(&"cleanup"));
+        assert_eq!(p.events.iter().filter(|event| **event == "replace").count(), 1);
         p.events.clear();
-        p.install_outcome = None;
         execute(&mut p, &mut j).unwrap();
-        assert_eq!(j.stage, Stage::Committed);
-        assert!(!p.events.contains(&"drain"));
-        assert!(!p.events.contains(&"arm"));
+        assert_eq!(p.events, ["verify", "cleanup"]);
+        assert_eq!(j.stage, Stage::RolledBack);
     }
     #[test]
     fn reboot_required_keeps_pending_and_cannot_commit_before_a_new_boot() {
@@ -418,7 +464,7 @@ mod tests {
         assert!(!p.events.contains(&"replace"));
     }
     #[test]
-    fn rollback_busy_and_reboot_never_quarantine_or_cleanup_early() {
+    fn rollback_busy_requires_repair_and_reboot_remains_explicit() {
         for outcome in [InstallOutcome::Busy, InstallOutcome::RebootRequired] {
             let mut p = Fake {
                 rollback_outcome: Some(outcome),
@@ -426,16 +472,22 @@ mod tests {
             };
             let mut j = journal();
             j.stage = Stage::Replacing;
-            recover(&mut p, &mut j).unwrap();
+            let result = recover(&mut p, &mut j);
             assert!(!p.events.contains(&"cleanup"));
             assert!(!p.events.contains(&"quarantine"));
             if outcome == InstallOutcome::RebootRequired {
+                result.unwrap();
                 assert_eq!(j.stage, Stage::RollbackAwaitingReboot);
                 p.events.clear();
                 recover(&mut p, &mut j).unwrap();
                 assert_eq!(p.events, ["verify"]);
             } else {
-                assert_eq!(j.stage, Stage::RollbackInstallerBusy);
+                assert_eq!(result, Err(Error::RepairRequired));
+                assert_eq!(j.stage, Stage::RepairRequired);
+                p.events.clear();
+                assert_eq!(recover(&mut p, &mut j), Err(Error::RepairRequired));
+                assert_eq!(p.events, ["verify"]);
+                continue;
             }
             p.rebooted = true;
             p.rollback_outcome = None;

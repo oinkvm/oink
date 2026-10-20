@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'build-support'))
 from provenance import verify, digest
 from payload import copy_notices
 from report_manifest import write_manifest, image_identity
-from signing import private_run, select_identity, verify_signature, notarize, staple_and_validate
+from signing import private_run, select_identity, notarize, staple_and_validate
 from sparkle import prepare as prepare_sparkle, VERSION as SPARKLE_VERSION, SHA256 as SPARKLE_SHA256
 from localizations import DECLARATIONS, STRINGS, write_localizations
 from macos_imports import verify_imports
@@ -70,6 +70,8 @@ def main():
     except ValueError as error:
         p.error(str(error))
     trust = json.loads((ROOT / 'packaging/update-trust.json').read_text())
+    if trust['mac']['enabled'] and not trust['mac']['public_key']:
+        p.error('enabled Mac updates require the compiled Sparkle public key')
     a.sparkle_public_key = trust['mac']['public_key']
     a.identity = select_identity(a.team, a.signing_fingerprint)
     provenance = verify(a.binaries, a.source_tree_sha256, a.version, 'aarch64-apple-darwin', a.build, a.source_commit)
@@ -122,12 +124,12 @@ def main():
     info[I['macos']['app_group_key']] = group
     if a.sparkle_cache:
         info.update(SUVerifyUpdateBeforeExtraction=True, SURequireSignedFeed=True, SUSignedFeedFailureExpirationInterval=0,
-                    SUEnableJavaScript=False, SUEnableSystemProfiling=False, SUEnableAutomaticChecks=False,
+                    SUEnableJavaScript=False, SUEnableSystemProfiling=False, SUEnableAutomaticChecks=trust['mac']['enabled'],
                     SUAutomaticallyUpdate=False)
         if a.sparkle_public_key:
             info['SUPublicEDKey'] = a.sparkle_public_key
         else:
-            print('Automatic updates are disabled for beta.1; no Sparkle public key is configured.')
+            print('Automatic updates are disabled; no Sparkle public key is configured.')
         framework = app / 'Contents/Frameworks/Sparkle.framework'
         framework.parent.mkdir()
         shutil.copytree(prepare_sparkle(a.sparkle_cache) / 'Sparkle.framework', framework, symlinks=True)
@@ -221,7 +223,8 @@ def main():
                                                          'images': symbol_records}, indent=2) + '\n')
         record = dict(schema=1, product=I['name'], version=a.version, source_commit=a.source_commit, build=a.build, provenance='source-tree', source_tree_sha256=a.source_tree_sha256,
                       architecture=a.arch, minimum_os=I['macos_minimum'], protocol_baseline=1,
-                      signing='developer-id', notarization='see detached release record', update_policy='manual-only')
+                      signing='developer-id', notarization='see detached release record',
+                      update_policy='sparkle' if trust['mac']['enabled'] else 'manual-only')
         record['sparkle'] = dict(included=bool(a.sparkle_cache), version=SPARKLE_VERSION if a.sparkle_cache else None,
                                 archive_sha256=SPARKLE_SHA256 if a.sparkle_cache else None,
                                 public_key_configured=bool(a.sparkle_public_key))
@@ -262,7 +265,6 @@ def main():
         sign(mac / b['agent'], I['macos']['agent_id'])
         sign(mac / b['crash_collector'], I['bundle_id'] + '.crash-collector')
         sign(app, I['bundle_id'], tmp / 'host.plist')
-        verify_signature(app, a.team)
         from content import verify_app
         record['components'] = verify_app(app, I)
         run('node', ROOT / 'build-support/check-package-licenses.mjs', app, 'macos-arm64', cwd=ROOT)

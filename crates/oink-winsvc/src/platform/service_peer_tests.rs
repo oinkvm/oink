@@ -140,6 +140,10 @@ impl Drop for Revert {
 }
 
 fn medium_caller() -> io::Result<Revert> {
+    caller_at(WinMediumLabelSid)
+}
+
+fn caller_at(integrity: WELL_KNOWN_SID_TYPE) -> io::Result<Revert> {
     let mut source = ptr::null_mut();
     let mut restricted = ptr::null_mut();
     let mut admin = [0u32; 17];
@@ -178,7 +182,7 @@ fn medium_caller() -> io::Result<Revert> {
         let restricted = Handle::new(restricted)?;
         length = size_of_val(&medium) as u32;
         check(CreateWellKnownSid(
-            WinMediumLabelSid,
+            integrity,
             ptr::null_mut(),
             medium.as_mut_ptr().cast(),
             &mut length,
@@ -198,4 +202,176 @@ fn medium_caller() -> io::Result<Revert> {
         check(ImpersonateLoggedOnUser(restricted.0))?;
     }
     Ok(Revert)
+}
+
+#[test]
+fn user_ipc_accepts_medium_and_high_but_denies_low_and_other_users() {
+    // The non-desktop SSH runner may be High. Lower only disposable tokens on
+    // this test thread; never change UAC, the desktop, installed apps or accounts.
+    // SAFETY: query-only current-process pseudo handle.
+    let own = token(unsafe { GetCurrentProcess() }).unwrap();
+    let sid = security::sid_bytes(own.0).unwrap();
+    let (mut elevated, mut kind, mut len) = (0u32, 0u32, 0);
+    // SAFETY: query-only token, correctly sized DWORD output fields.
+    unsafe {
+        check(GetTokenInformation(
+            own.0,
+            TokenElevation,
+            ptr::addr_of_mut!(elevated).cast(),
+            4,
+            &mut len,
+        ))
+        .unwrap();
+        check(GetTokenInformation(
+            own.0,
+            TokenElevationType,
+            ptr::addr_of_mut!(kind).cast(),
+            4,
+            &mut len,
+        ))
+        .unwrap();
+    }
+    eprintln!(
+        "private IPC fixture creator: elevation_type={kind}, elevated={elevated}, session={}",
+        session().unwrap()
+    );
+    let mut text = ptr::null_mut();
+    // SAFETY: token supplies a valid SID, converted allocation is freed below.
+    let sid_text = unsafe {
+        check(ConvertSidToStringSidW(sid.as_ptr().cast_mut().cast(), &mut text)).unwrap();
+        let mut len = 0;
+        while *text.add(len) != 0 {
+            len += 1;
+        }
+        let value = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+        LocalFree(text.cast());
+        value
+    };
+    let directory = std::env::temp_dir().join(format!("oink-integrity-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let endpoint = directory.join("ipc.json");
+    let lock = directory.join("ui.lock");
+    oink_foundation::storage::atomic_write(&endpoint, b"private endpoint").unwrap();
+    drop(oink_foundation::storage::open_private_lock(&lock).unwrap());
+    for (index, user, allowed) in [(0, sid_text.as_str(), true), (1, "S-1-5-21-1-2-3-1001", false)] {
+        let mut sd = ptr::null_mut();
+        let descriptor = wide(&security::session_pipe_sddl(user));
+        // SAFETY: private test pipe uses the production descriptor seam.
+        unsafe {
+            check(ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                descriptor.as_ptr(),
+                1,
+                &mut sd,
+                ptr::null_mut(),
+            ))
+            .unwrap();
+        }
+        let attrs = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd,
+            bInheritHandle: 0,
+        };
+        let name = wide(&format!(r"\\.\pipe\Oink.Unit.Integrity.{}.{index}", std::process::id()));
+        // SAFETY: unique private local pipe; no installed service is contacted.
+        let server = Handle::new(unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                64,
+                64,
+                0,
+                &attrs,
+            )
+        })
+        .unwrap();
+        // SAFETY: CreateNamedPipe has copied this LocalAlloc descriptor.
+        unsafe {
+            LocalFree(sd);
+        }
+        if allowed {
+            // The creator's own token (High on the SSH validation host) connects.
+            let mut listening = super::super::pipe_io::Operation::new(&server).unwrap();
+            listening.connect().unwrap();
+            drop(open(&name).unwrap());
+            listening.cancel();
+            drop(listening);
+            // SAFETY: private pipe with no pending I/O, client already closed.
+            unsafe {
+                check(DisconnectNamedPipe(server.0)).unwrap();
+            }
+        }
+        let mut listening = super::super::pipe_io::Operation::new(&server).unwrap();
+        listening.connect().unwrap();
+        let medium = medium_caller().unwrap();
+        let connected = open(&name);
+        assert_eq!(
+            connected.is_ok(),
+            allowed,
+            "same user must be required at Medium: {connected:?}"
+        );
+        listening.cancel();
+        drop(listening);
+        if allowed {
+            drop(connected);
+            // SAFETY: client closed and the connect operation has drained.
+            unsafe {
+                check(DisconnectNamedPipe(server.0)).unwrap();
+            }
+            let file = oink_foundation::storage::open_private_lock(&lock).unwrap();
+            fs2_lock(&file);
+            assert_eq!(std::fs::read(&endpoint).unwrap(), b"private endpoint");
+            oink_foundation::storage::atomic_write(&endpoint, b"medium endpoint").unwrap();
+        }
+        drop(medium);
+        if allowed {
+            assert_eq!(std::fs::read(&endpoint).unwrap(), b"medium endpoint");
+            fs2_lock(&oink_foundation::storage::open_private_lock(&lock).unwrap());
+        }
+        let mut listening = super::super::pipe_io::Operation::new(&server).unwrap();
+        listening.connect().unwrap();
+        let low = caller_at(WinLowLabelSid).unwrap();
+        assert_eq!(open(&name).unwrap_err().raw_os_error(), Some(5));
+        // SAFETY: local private pipe, read-only request must also exclude Low.
+        let read_only = Handle::new(unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                FILE_READ_DATA,
+                0,
+                ptr::null(),
+                OPEN_EXISTING,
+                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                ptr::null_mut(),
+            )
+        });
+        assert_eq!(read_only.unwrap_err().raw_os_error(), Some(5));
+        assert!(std::fs::read(&endpoint).is_err(), "Low must not read the IPC secret");
+        assert!(oink_foundation::storage::open_private_lock(&lock).is_err());
+        drop(low);
+        listening.cancel();
+        drop(listening);
+        drop(server);
+    }
+    // Test files only; no product data or installed objects are touched.
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+fn fs2_lock(file: &std::fs::File) {
+    // LockFileEx requires read access only. No dependency on fs2 in this crate.
+    use std::os::windows::io::AsRawHandle;
+    let mut operation = windows_sys::Win32::System::IO::OVERLAPPED::default();
+    // SAFETY: private owned file and valid OVERLAPPED output, no async I/O.
+    unsafe {
+        check(LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut operation,
+        ))
+        .unwrap();
+        check(UnlockFileEx(file.as_raw_handle(), 0, 1, 0, &mut operation)).unwrap();
+    }
 }

@@ -172,7 +172,7 @@ def trust(platform='windows'):
             if not epoch['enabled']:
                 continue
             require(epoch['epoch'] in KEY_ENV and epoch['public_key'] and
-                    epoch['authenticode_spki_sha256'] and all(
+                    type(epoch['authenticode_spki_sha256']) is list and all(
                         re.fullmatch('[0-9a-f]{64}', pin) for pin in epoch['authenticode_spki_sha256']),
                     'trust_unconfigured')
             public_der(epoch['public_key'])
@@ -231,7 +231,7 @@ def catalog(state, slot, config, epoch, channel):
                 record['source_tree_sha256'] == record['release']['sourceTreeSha256'] and
                 re.fullmatch('[0-9a-f]{64}', record['source_tree_sha256']) and
                 type(record['workflow_run_id']) is int and record['workflow_run_id'] > 0 and
-                bool(record['signing_approval']), 'unapproved_record')
+                record['signing_policy'] in ('manifest-ed25519', 'authenticode-and-manifest'), 'unapproved_record')
         release = record['release']
         validate_notes(release['notes'])
         require(channel == 'beta' or release.get('channel', 'stable') == 'stable', 'release_channel')
@@ -269,7 +269,9 @@ def allocate(state, config, now, allow_catalog_change=False):
                 if not changed and timestamp(old['expiresAt']) - now > 21 * 86400:
                     continue
             else:
-                require(slot['last_allocated'] == 0 and not slot.get('manifest_sha256'), 'snapshot_missing')
+                # A failed first publication can consume reservations before a
+                # signed snapshot exists. Never reuse those sequence numbers.
+                require(not slot.get('manifest_sha256'), 'snapshot_missing')
             slot['last_allocated'] += 1
             payload = {'schema': 1, 'product': 'com.hachiwii.oink', 'keyEpoch': epoch['epoch'],
                        'channel': channel, 'sequence': slot['last_allocated'], 'generatedAt': iso(now),

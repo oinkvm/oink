@@ -40,7 +40,7 @@ macro_rules! message_registry {
         pub enum Message { $($variant($dto),)* }
         impl Message {
             pub fn preflight(type_id:u16,bytes:&[u8])->Result<()> {
-                if (0x0d23..=0x0d2b).contains(&type_id) && bytes.len()+6>super::limits::CONTROL_FRAME {return Err(ErrorCode::LimitExceeded.into());}
+                if (0x0d23..=0x0d2e).contains(&type_id) && bytes.len()+6>super::limits::CONTROL_FRAME {return Err(ErrorCode::LimitExceeded.into());}
                 let mut decoder=minicbor::Decoder::new(bytes);
                 match type_id { $($id=><$dto as WireDto>::preflight(&mut decoder,0)?,)* _=>return Err(ErrorCode::UnknownMessage.into()) }
                 if decoder.position()!=bytes.len() {return Err(ErrorCode::MalformedFrame.into());}Ok(())
@@ -50,7 +50,7 @@ macro_rules! message_registry {
             /// Structural decoding only. Admission and business safety validation
             /// must succeed before dispatch.
             pub fn from_payload(type_id:u16, raw:RawMap) -> Result<Self> {
-                if (0x0d23..=0x0d2b).contains(&type_id) && super::cbor::map_len(&raw)?+6>super::limits::CONTROL_FRAME {return Err(ErrorCode::LimitExceeded.into());}
+                if (0x0d23..=0x0d2e).contains(&type_id) && super::cbor::map_len(&raw)?+6>super::limits::CONTROL_FRAME {return Err(ErrorCode::LimitExceeded.into());}
                 let message=match type_id { $($id => <$dto>::from_raw(raw).map(Self::$variant),)* _ => Err(ErrorCode::UnknownMessage.into()) }?;
                 if let Self::ConfigInfo(greeting)=&message && greeting.selected()?.is_none() {return Err(ErrorCode::MalformedFrame.into());}
                 Ok(message)
@@ -101,6 +101,7 @@ pub const CAPABILITIES: &[&str] = &[
     "oink.device-resources/1",
     "oink.device-options/1",
     "oink.audio.exit-volume/1",
+    "oink.notify/1",
 ];
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Stream {

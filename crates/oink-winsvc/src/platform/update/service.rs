@@ -2,7 +2,6 @@ use super::super::{Handle, security, token};
 use super::*;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use oink_update::{
-    barrier::Blocker,
     feed::{self, Selection, VerifiedManifest},
     ipc::{Reply, Request},
     trust::Roots,
@@ -17,8 +16,20 @@ use windows_sys::Win32::System::Threading::GetProcessId;
 struct Registration {
     session: Session,
     seen: Instant,
-    consent: Option<u64>,
     quiesced: Option<String>,
+}
+fn registered_sessions(
+    registrations: &BTreeMap<u32, Registration>,
+    logged_on: &[u32],
+    mut current: impl FnMut(&Session) -> Result<bool, Error>,
+) -> Result<Vec<Session>, Error> {
+    let mut active = Vec::new();
+    for registration in registrations.values() {
+        if logged_on.contains(&registration.session.id) && current(&registration.session)? {
+            active.push(registration.session.clone());
+        }
+    }
+    Ok(active)
 }
 pub(super) struct State {
     status: UpdateStatus,
@@ -26,13 +37,22 @@ pub(super) struct State {
     queued: Option<Command>,
     registrations: BTreeMap<u32, Registration>,
     transaction: Option<String>,
-    automatic: bool,
     shutdown: bool,
     prepared_at: Option<Instant>,
     last_check: Option<Instant>,
     revision: u64,
 }
 impl State {
+    fn request_check(&mut self) {
+        // Check is asynchronous: callers share Checking and its eventual result.
+        // A duplicate must not change the revision checked by the active fetch.
+        if self.status.phase != Phase::Checking && self.queued != Some(Command::Check) {
+            self.revision = self.revision.wrapping_add(1);
+            self.queued = Some(Command::Check);
+        }
+        self.status.phase = Phase::Checking;
+        self.status.error = None;
+    }
     fn new() -> Result<Self, Error> {
         let receipt = installed()?;
         let policy = policy()?;
@@ -41,7 +61,6 @@ impl State {
             current_build: receipt.build,
             version: receipt.version,
             channel: policy.policy.preferences.channel,
-            mode: policy.policy.preferences.mode,
             checks_enabled: configured && policy.policy.preferences.checks_enabled,
             phase: if configured { Phase::Idle } else { Phase::Disabled },
             candidate: None,
@@ -60,7 +79,6 @@ impl State {
             queued: None,
             registrations: BTreeMap::new(),
             transaction: None,
-            automatic: true,
             shutdown: false,
             prepared_at: None,
             last_check: None,
@@ -73,25 +91,28 @@ fn transaction_phase(journal: &oink_update::transaction::Journal) -> Phase {
     match journal.stage {
         Stage::Prepared => Phase::Quiescing,
         Stage::AwaitingReboot | Stage::RollbackAwaitingReboot => Phase::AwaitingReboot,
-        Stage::InstallerBusy | Stage::RollbackInstallerBusy => Phase::InstallerBusy,
         Stage::Committed => Phase::Committed,
         Stage::RolledBack if journal.rollback_attempted => Phase::RolledBack,
+        Stage::RolledBack if journal.failure.is_some() => Phase::Failed,
         Stage::RolledBack => Phase::Idle,
         Stage::RepairRequired => Phase::RepairRequired,
         _ => Phase::Installing,
     }
 }
-fn journal_status(name: &str) -> Result<Phase, Error> {
+fn journal_status(name: &str) -> Result<(Phase, Option<Error>), Error> {
     let journal = oink_update::transaction::Journal::parse(&protected::read(
         &protected::maintenance().map_err(|_| Error::Storage)?.join(name),
         65536,
     )?)?;
-    Ok(transaction_phase(&journal))
+    Ok((transaction_phase(&journal), journal.failure))
 }
 pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, request: Request) -> Reply {
     let mut state = state.lock().unwrap();
     if pending() {
-        state.status.phase = journal_status("pending.json").unwrap_or(Phase::RepairRequired);
+        let (phase, error) =
+            journal_status("pending.json").unwrap_or((Phase::RepairRequired, Some(Error::RepairRequired)));
+        state.status.phase = phase;
+        state.status.error = error;
     }
     let result = (|| {
         // SAFETY: process handle is pinned by authenticated pipe dispatch.
@@ -147,7 +168,6 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
                             build,
                         },
                         seen: Instant::now(),
-                        consent: None,
                         quiesced: None,
                     },
                 );
@@ -166,7 +186,6 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
                     }
                     return Ok(Reply::Prepare {
                         transaction: tx.clone(),
-                        automatic: state.automatic,
                     });
                 }
                 if pending() {
@@ -176,11 +195,7 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
                             .join("pending.json"),
                         65536,
                     )?)?;
-                    if matches!(
-                        journal.stage,
-                        oink_update::transaction::Stage::Recovering
-                            | oink_update::transaction::Stage::RollbackInstallerBusy
-                    ) {
+                    if matches!(journal.stage, oink_update::transaction::Stage::Recovering) {
                         return if state.registrations[&id].quiesced.as_ref() == Some(&journal.transaction) {
                             Ok(Reply::Shutdown {
                                 transaction: journal.transaction,
@@ -188,7 +203,6 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
                         } else {
                             Ok(Reply::Prepare {
                                 transaction: journal.transaction,
-                                automatic: false,
                             })
                         };
                     }
@@ -219,6 +233,8 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
                 state.status.blockers = blockers;
                 if state.transaction.as_ref() == Some(&transaction) {
                     abort(&mut state)?;
+                    state.status.phase = Phase::Failed;
+                    state.status.error = Some(Error::Busy);
                 }
             }
             Request::Health {
@@ -252,10 +268,17 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
             }
             Request::Command { command } => {
                 oink_update::trust::compiled()?;
-                state.revision = state.revision.wrapping_add(1);
-                let preparing = state.transaction.is_some() && !state.shutdown;
-                if !command_admitted(&command, preparing, state.transaction.is_some() || pending()) {
+                let preparing =
+                    (state.transaction.is_some() || state.status.phase == Phase::Quiescing) && !state.shutdown;
+                if !command_admitted(
+                    &command,
+                    preparing,
+                    preparing || state.transaction.is_some() || pending(),
+                ) {
                     return Err(Error::Busy);
+                }
+                if !matches!(command, Command::Check) {
+                    state.revision = state.revision.wrapping_add(1);
                 }
                 match command {
                     Command::SetPreferences { preferences } => {
@@ -272,7 +295,6 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
                             return Err(e);
                         }
                         state.status.channel = preferences.channel;
-                        state.status.mode = preferences.mode;
                         state.status.checks_enabled = preferences.checks_enabled;
                         state.status.candidate = None;
                         state.queued = preferences.checks_enabled.then_some(Command::Check);
@@ -296,22 +318,19 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
                         save_policy(&state.policy)?;
                     }
                     Command::Install { expected_build } => {
-                        if state.status.candidate.as_ref().map(|c| c.build) != Some(expected_build) {
+                        if state.status.phase != Phase::Ready
+                            || state.status.candidate.as_ref().map(|c| c.build) != Some(expected_build)
+                        {
                             return Err(Error::Policy);
                         }
-                        // Each registered user explicitly requests manual install or
-                        // receives machine automatic policy; a different user cannot consent for them.
-                        if let Some(registration) = state.registrations.get_mut(&id) {
-                            registration.consent = Some(expected_build);
-                        }
+                        // Explicit intent closes admission immediately; every live
+                        // backend must still ACK its bounded correctness fence.
+                        state.status.phase = Phase::Quiescing;
+                        state.status.blockers.clear();
+                        state.status.error = None;
                         state.queued = Some(Command::Install { expected_build });
                     }
-                    Command::Check => {
-                        if state.last_check.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
-                            return Err(Error::Busy);
-                        }
-                        state.queued = Some(Command::Check);
-                    }
+                    Command::Check => state.request_check(),
                     Command::Download => state.queued = Some(Command::Download),
                     Command::Cancel => {
                         abort(&mut state)?;
@@ -334,7 +353,7 @@ fn abort(state: &mut State) -> Result<(), Error> {
         protected::write(&transaction_dir(&transaction)?.join("abort.json"), b"{\"schema\":1}")?;
     }
     state.prepared_at = None;
-    state.status.phase = Phase::WaitingForIdle;
+    state.status.phase = Phase::Ready;
     for registration in state.registrations.values_mut() {
         registration.quiesced = None;
     }
@@ -347,6 +366,13 @@ fn command_admitted(command: &Command, preparing: bool, active: bool) -> bool {
                 command,
                 Command::SetPreferences { .. } | Command::Defer { .. } | Command::Skip { .. } | Command::Cancel
             ))
+}
+fn scheduled_command(queued: Option<Command>, policy: &Policy, last_check: Option<Instant>) -> Option<Command> {
+    queued.or_else(|| {
+        (policy.preferences.checks_enabled
+            && last_check.is_none_or(|at| at.elapsed() >= Duration::from_secs(24 * 3600)))
+        .then_some(Command::Check)
+    })
 }
 pub(super) fn serve() {
     if protected::system().is_err() {
@@ -394,6 +420,7 @@ pub(super) fn http(url: &str, length: u64, package: bool) -> Result<Vec<u8>, Err
         reqwest::redirect::Policy::none()
     };
     let client = reqwest::blocking::Client::builder()
+        .https_only(!cfg!(feature = "test-feed"))
         .redirect(policy)
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(60))
@@ -428,15 +455,7 @@ fn check_feed(state: &Arc<Mutex<State>>, roots: &Roots) -> Result<Option<Selecte
         (state.policy.clone(), state.status.current_build, state.revision)
     };
     let channel = policy.policy.preferences.channel;
-    let envelope = http(
-        &format!(
-            "https://updates.oink.hachiwii.com/windows/v1/{}/{}/manifest.json",
-            oink_update::WINDOWS_EPOCH,
-            channel.name()
-        ),
-        feed::MAX_FEED as u64,
-        false,
-    )?;
+    let envelope = http(&feed::manifest_url(channel), feed::MAX_FEED as u64, false)?;
     let seen = policy.watermarks.get(channel.name()).cloned().unwrap_or_default();
     let manifest = feed::verify_manifest(&envelope, &roots.feed(), channel, &seen, now())?;
     let os_build = worker::windows_build()?;
@@ -450,6 +469,9 @@ fn check_feed(state: &Arc<Mutex<State>>, roots: &Roots) -> Result<Option<Selecte
             quarantine: &policy.quarantine,
         })?
         .cloned();
+    if let Some(release) = &release {
+        feed::verify_version(&release.version, &state.lock().unwrap().status.version)?;
+    }
     let mut state = state.lock().unwrap();
     if state.revision != revision {
         return Err(Error::Busy);
@@ -529,9 +551,11 @@ fn engine(state: Arc<Mutex<State>>) {
             }
             state.transaction = None;
             state.shutdown = false;
-            state.status.phase = journal_status("last-result.json").unwrap_or(Phase::RepairRequired);
+            let (phase, error) =
+                journal_status("last-result.json").unwrap_or((Phase::RepairRequired, Some(Error::RepairRequired)));
+            state.status.phase = phase;
             state.status.candidate = None;
-            state.status.error = None;
+            state.status.error = error;
             selected = None;
         }
         was_pending = is_pending;
@@ -540,15 +564,16 @@ fn engine(state: Arc<Mutex<State>>) {
             if state.transaction.is_some() || pending() {
                 None
             } else {
-                let automatic_check = state.policy.policy.preferences.checks_enabled
-                    && state
-                        .last_check
-                        .is_none_or(|at| at.elapsed() >= Duration::from_secs(24 * 3600));
-                state
-                    .queued
-                    .take()
-                    .or_else(|| automatic_check.then_some(Command::Check))
-                    .map(|command| (command, state.revision))
+                let queued = state.queued.take();
+                scheduled_command(queued, &state.policy.policy, state.last_check).map(|command| {
+                    if command == Command::Check {
+                        // Publish background admission under the same lock, so a
+                        // manual check arriving before HTTP starts joins it too.
+                        state.status.phase = Phase::Checking;
+                        state.status.error = None;
+                    }
+                    (command, state.revision)
+                })
             }
         };
         let result = (|| {
@@ -558,40 +583,30 @@ fn engine(state: Arc<Mutex<State>>) {
                         selected = None;
                         selected = check_feed(&state, &roots)?;
                     }
-                    Command::Download | Command::Install { .. } => {
+                    Command::Download => {
                         let candidate = selected.as_mut().ok_or(Error::Policy)?;
                         if !candidate.verified_package {
                             state.lock().unwrap().status.phase = Phase::Downloading;
                             download(candidate, &roots)?;
                         }
-                        state.lock().unwrap().status.phase = Phase::Available;
-                        if matches!(command, Command::Install { .. }) {
-                            prepare(&state, candidate, &roots, false, revision)?;
+                        state.lock().unwrap().status.phase = Phase::Ready;
+                    }
+                    Command::Install { expected_build } => {
+                        let candidate = selected.as_ref().ok_or(Error::Policy)?;
+                        if !candidate.verified_package || candidate.release.build != expected_build {
+                            return Err(Error::Policy);
                         }
+                        prepare(&state, candidate, &roots, revision)?;
                     }
                     Command::Cancel => {
                         selected = None;
+                        let mut state = state.lock().unwrap();
+                        state.status.phase = Phase::Idle;
+                        state.status.candidate = None;
+                        state.status.error = None;
+                        state.status.blockers.clear();
                     }
                     _ => {}
-                }
-            }
-            if let Some(candidate) = selected.as_mut() {
-                let automatic_revision = {
-                    let state = state.lock().unwrap();
-                    (state.transaction.is_none()
-                        && !pending()
-                        && state.policy.policy.preferences.channel == candidate.manifest.manifest().channel
-                        && state
-                            .policy
-                            .policy
-                            .may_download_automatically(candidate.release.build, now()))
-                    .then_some(state.revision)
-                };
-                if let Some(revision) = automatic_revision {
-                    if !candidate.verified_package {
-                        download(candidate, &roots)?;
-                    }
-                    prepare(&state, candidate, &roots, true, revision)?;
                 }
             }
             handover(&state)
@@ -599,53 +614,23 @@ fn engine(state: Arc<Mutex<State>>) {
         if let Err(error) = result {
             let mut state = state.lock().unwrap();
             state.status.error = Some(error);
-            state.status.phase = if error == Error::Busy {
-                Phase::WaitingForIdle
-            } else {
-                Phase::Failed
-            };
+            state.status.phase = Phase::Failed;
         }
         std::thread::sleep(Duration::from_secs(1));
     }
 }
-fn prepare(
-    state: &Arc<Mutex<State>>,
-    selected: &Selected,
-    roots: &Roots,
-    automatic: bool,
-    expected_revision: u64,
-) -> Result<(), Error> {
+fn prepare(state: &Arc<Mutex<State>>, selected: &Selected, roots: &Roots, expected_revision: u64) -> Result<(), Error> {
     selected.manifest.ensure_fresh(now())?;
     let sessions = super::pipe::sessions().map_err(|_| Error::Busy)?;
     let (registrations, revision) = {
-        let mut state = state.lock().unwrap();
+        let state = state.lock().unwrap();
         if state.transaction.is_some() || pending() || state.revision != expected_revision {
             return Err(Error::Busy);
         }
-        if sessions.iter().any(|id| {
-            state
-                .registrations
-                .get(id)
-                .is_none_or(|r| r.seen.elapsed() > Duration::from_secs(5))
-        }) {
-            state.status.blockers = vec![Blocker::OwnerMissing];
-            return Err(Error::Busy);
-        }
-        if !automatic
-            && sessions
-                .iter()
-                .any(|id| state.registrations[id].consent != Some(selected.release.build))
-        {
-            state.status.blockers = vec![Blocker::Consent];
-            return Err(Error::Busy);
-        }
-        (
-            sessions
-                .iter()
-                .map(|id| state.registrations[id].session.clone())
-                .collect::<Vec<_>>(),
-            state.revision,
-        )
+        // Only sessions with a running registered backend participate. A logged
+        // on session with no Oink process does not need a drain ACK or relaunch.
+        let registrations = registered_sessions(&state.registrations, &sessions, worker::process_current)?;
+        (registrations, state.revision)
     };
     let previous_build = state.lock().unwrap().status.current_build;
     let previous = selected
@@ -661,7 +646,6 @@ fn prepare(
         &selected.envelope,
         registrations,
         roots,
-        automatic,
     )?;
     let mut state = state.lock().unwrap();
     if state.revision != revision {
@@ -669,7 +653,6 @@ fn prepare(
         return Err(Error::Busy);
     }
     state.transaction = Some(transaction);
-    state.automatic = automatic;
     state.prepared_at = Some(Instant::now());
     state.status.phase = Phase::Quiescing;
     state.status.blockers.clear();
@@ -702,7 +685,7 @@ fn handover(state: &Arc<Mutex<State>>) -> Result<(), Error> {
     let directory = transaction_dir(&transaction)?;
     let sessions = super::pipe::sessions().map_err(|_| Error::Busy)?;
     let plan: Plan = feed::strict_json(&protected::read(&directory.join("plan.json"), feed::MAX_FEED as u64)?)?;
-    if sessions != plan.sessions.iter().map(|s| s.id).collect::<Vec<_>>() {
+    if plan.sessions.iter().any(|s| !sessions.contains(&s.id)) {
         abort(&mut state)?;
         return Err(Error::Busy);
     }
@@ -742,6 +725,139 @@ fn transaction_matches(state: &State, tx: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn check_state() -> State {
+        State {
+            status: UpdateStatus {
+                current_build: 1,
+                version: "0.1.1".into(),
+                channel: Channel::Stable,
+                checks_enabled: true,
+                phase: Phase::Idle,
+                candidate: None,
+                checked_at: None,
+                next_check: None,
+                deferred_until: None,
+                blockers: Vec::new(),
+                progress: None,
+                error: None,
+                scope: Scope::Machine,
+                can_change_policy: false,
+            },
+            policy: MachinePolicy::default(),
+            queued: None,
+            registrations: BTreeMap::new(),
+            transaction: None,
+            shutdown: false,
+            prepared_at: None,
+            last_check: None,
+            revision: 0,
+        }
+    }
+    #[test]
+    fn manual_checks_are_not_throttled_after_a_recent_result() {
+        let mut state = check_state();
+        state.last_check = Some(Instant::now());
+        state.status.error = Some(Error::Network);
+        state.policy.policy.preferences.checks_enabled = false;
+        state.request_check();
+        assert_eq!(state.status.phase, Phase::Checking);
+        assert_eq!(state.status.error, None);
+        assert_eq!(state.queued, Some(Command::Check));
+        assert_eq!(state.revision, 1);
+        assert!(scheduled_command(None, &state.policy.policy, state.last_check).is_none());
+    }
+    #[test]
+    fn manual_checks_join_a_queued_or_in_flight_check_without_invalidating_its_result() {
+        let mut state = check_state();
+        state.request_check();
+        let revision = state.revision;
+        state.request_check();
+        assert_eq!(state.revision, revision);
+        assert_eq!(state.queued, Some(Command::Check));
+        assert_eq!(state.status.phase, Phase::Checking);
+        // A policy-triggered check can be queued while an old error is visible.
+        state.status.phase = Phase::Failed;
+        state.status.error = Some(Error::Network);
+        state.request_check();
+        assert_eq!(state.revision, revision);
+        assert_eq!(state.status.phase, Phase::Checking);
+        assert_eq!(state.status.error, None);
+        // The engine consumes the command before fetching outside the lock.
+        state.queued = None;
+        state.last_check = Some(Instant::now());
+        let status = state.status.clone();
+        state.request_check();
+        assert_eq!(state.revision, revision);
+        assert_eq!(state.queued, None);
+        assert_eq!(state.status, status);
+        // Both observers read the same completed status, with no queued refetch.
+        state.status.phase = Phase::Idle;
+        state.status.checked_at = Some(123);
+        assert_eq!(state.status.error, None);
+        assert_eq!(state.queued, None);
+    }
+    #[test]
+    fn sessions_without_oink_and_exited_registrations_do_not_block_install() {
+        let registrations = [2, 3, 4]
+            .into_iter()
+            .map(|id| {
+                (
+                    id,
+                    Registration {
+                        session: Session {
+                            id,
+                            pid: id * 10,
+                            created: 1,
+                            sid: "test".into(),
+                            build: 1,
+                        },
+                        seen: Instant::now() - Duration::from_secs(30),
+                        quiesced: None,
+                    },
+                )
+            })
+            .collect();
+        let mut queried = Vec::new();
+        let selected = registered_sessions(&registrations, &[1, 2, 3], |session| {
+            queried.push(session.id);
+            Ok(session.id == 2)
+        })
+        .unwrap();
+        assert_eq!(selected.iter().map(|s| s.id).collect::<Vec<_>>(), [2]);
+        assert_eq!(queried, [2, 3]);
+    }
+    #[test]
+    fn background_checks_and_quit_deferrals_never_create_install_intent() {
+        let now = Instant::now();
+        for choice in [
+            DeferChoice::Hour,
+            DeferChoice::Tomorrow,
+            DeferChoice::NextQuit,
+            DeferChoice::Indefinitely,
+        ] {
+            let mut policy = Policy::default();
+            policy.defer(choice, 100);
+            policy.skipped_build = Some(2);
+            assert!(scheduled_command(None, &policy, Some(now)).is_none());
+            assert!(matches!(scheduled_command(None, &policy, None), Some(Command::Check)));
+            policy.preferences.checks_enabled = false;
+            assert!(scheduled_command(None, &policy, None).is_none());
+            assert!(matches!(
+                scheduled_command(Some(Command::Install { expected_build: 2 }), &policy, Some(now)),
+                Some(Command::Install { expected_build: 2 })
+            ));
+        }
+    }
+    #[test]
+    fn a_failed_attempt_keeps_a_durable_clear_result() {
+        let mut journal = oink_update::transaction::Journal::new("a".repeat(32), 1, 2, "b".repeat(64)).unwrap();
+        journal.stage = oink_update::transaction::Stage::RolledBack;
+        journal.failure = Some(Error::Busy);
+        assert_eq!(transaction_phase(&journal), Phase::Failed);
+        journal.rollback_attempted = true;
+        assert_eq!(transaction_phase(&journal), Phase::RolledBack);
+        assert_eq!(journal.failure, Some(Error::Busy));
+    }
     #[test]
     fn policy_changes_cancel_prepare_but_cannot_interrupt_handover() {
         for command in [

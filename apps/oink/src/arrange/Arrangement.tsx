@@ -18,6 +18,7 @@ import { Icon, ICONS, Kbd, VisuallyHidden } from 'oink-ui';
 import { CORNERS, fitArrangement, bounds, clampMove, facingGap, cornerPoint, cornerClearance, pickRect, resizeAroundCenter, resizeFromCorner, sameRect, } from './geometry';
 import type { Camera, Corner, Rect, Screen, SnapEdges } from './geometry';
 import { useSpringRects } from './springs';
+import { useVisible } from '../window/useVisible';
 import { cornerArcPath, useCornerShape } from './cornerShape';
 import { cameraStore } from './cameraStore';
 import { growArrangementView, SpringCamera, visibleArrangement } from './camera';
@@ -87,7 +88,8 @@ const fmt = (n: number) => String(Math.round(n)).replace('-', '−');
 const noteSuffix = (notes: string[]) => notes.length ? tr('（{0}）', notes.join(tr('；'))) : '';
 export function Arrangement({ screens, platform = 'mac', geometryScreens = screens, onScreensChange, selectedId, selectedGroup, onSelect, settings, onLog, keyScope, hintId, notice, contextFor, onProjection }: ArrangementProps) {
     const root = useRef<HTMLDivElement>(null);
-    const springs = useSpringRects();
+    const visible = useVisible(root);
+    const springs = useSpringRects(visible);
     const [feedback] = useState(() => new SnapFeedback());
     const [camera] = useState(() => new SpringCamera());
     const cameraViewport = useRef({ w: 0, h: 0, padding: settings.padding });
@@ -139,8 +141,8 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
         };
     }, [feedback, springs]);
     useEffect(() => {
-        const show = pressed || lingering
-            || (projectionShown.current && screens.some(s => springs.isMoving(s.id)));
+        const show = visible && (pressed || lingering
+            || (projectionShown.current && screens.some(s => springs.isMoving(s.id))));
         projectionShown.current = show;
         projectionCallback.current?.(show
             ? screens.map(s => ({ ...s, ...(springs.get(s.id) ?? s) })) : null);
@@ -220,10 +222,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
             camera.jump({ zoom, ox, oy });
         cameraViewport.current = { ...size, padding: settings.padding };
         springs.afterStep = (dt, elapsed) => {
-            if (drag.current?.moved) {
-                step(elapsed);
-                return true;
-            }
+            if (drag.current?.moved) return step(elapsed);
             if (drag.current) return false;
             const animated = bounds(screens.map(s => springs.get(s.id) ?? s));
             return camera.step(fitArrangement(animated, size, settings.padding), dt);
@@ -322,12 +321,13 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
     const step = (dt = 0) => {
         const d = drag.current;
         if (!d?.moved)
-            return;
+            return false;
         let cam = camera.get()!;
         let edges: SnapEdges = {};
         let live = liveAt(d, cam, edges);
         const view = growArrangementView(d.view, live, cam.zoom, settings.padding, dt);
-        if (view !== d.view) {
+        const growing = view !== d.view;
+        if (growing) {
             d.view = view;
             cam = fitArrangement(view, size, settings.padding);
             camera.jump(cam);
@@ -343,6 +343,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
         }
         const overlap = groupOverlaps(members(d.id), d.origin, live, others(d.id));
         setActive((a) => (a && a.id === d.id && a.overlap === overlap && a.mode === d.mode ? a : { id: d.id, mode: d.mode, corner: d.corner, overlap }));
+        return growing;
     };
     const move = (e: ReactPointerEvent) => {
         const d = drag.current;
@@ -360,6 +361,9 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
             return;
         }
         step();
+        // A stationary held pointer needs more frames only while edge growth
+        // changes the camera. New pointer data wakes the follower again.
+        springs.wake();
     };
     const end = (e: ReactPointerEvent, cancelled = false) => {
         const d = drag.current;

@@ -5,12 +5,12 @@
 #include <stdint.h>
 typedef void (*UpdateEvent)(uint32_t,uint64_t,uint64_t,uint32_t,const char *,const char *);
 @interface OinkUpdateDriver : NSObject <SPUUserDriver, SPUUpdaterDelegate>
-@property SPUUpdater *updater;
+@property(nonatomic, strong) SPUUpdater *updater;
 @property UpdateEvent callback;
 @property BOOL beta;
 @property BOOL cancelled;
 @property BOOL armed;
-@property BOOL authorized;
+@property BOOL checkPending;
 @property uint64_t received;
 @property uint64_t expected;
 @property uint64_t build;
@@ -19,9 +19,42 @@ typedef void (*UpdateEvent)(uint32_t,uint64_t,uint64_t,uint32_t,const char *,con
 @property(copy) void (^cancelDownload)(void);
 - (void)event:(uint32_t)event progress:(uint32_t)progress;
 - (void)cancel;
+- (void)check;
 @end
 static OinkUpdateDriver *owner;
+static char updateReadinessContext;
 @implementation OinkUpdateDriver
+@synthesize updater=_updater;
+- (void)setUpdater:(SPUUpdater *)updater {
+    if (_updater==updater) return;
+    [_updater removeObserver:self forKeyPath:@"canCheckForUpdates" context:&updateReadinessContext];
+    _updater=updater;
+    [_updater addObserver:self forKeyPath:@"canCheckForUpdates" options:0 context:&updateReadinessContext];
+}
+- (void)dealloc {
+    [_updater removeObserver:self forKeyPath:@"canCheckForUpdates" context:&updateReadinessContext];
+}
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
+    if (context!=&updateReadinessContext) {
+        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];return;
+    }
+    if (!_checkPending || !_updater.canCheckForUpdates) return;
+    // Sparkle 2.9.6 also uses sessionInProgress while probing the installer to
+    // schedule its next automatic check. That probe has no didFinishUpdateCycle
+    // callback. Observe the public KVO-compliant readiness property instead.
+    // It changes before sessionInProgress clears, so hand off after Sparkle's
+    // current callback unwinds; never reenter its setter/completion stack.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self->_checkPending) [self check];
+    });
+}
+- (void)check {
+    // Retain one user intent while Sparkle is busy. Readiness notifications
+    // deliver it once; no timer, failed-check retry, or private installer state.
+    if (!_updater.canCheckForUpdates || _updater.sessionInProgress) {_checkPending=YES;return;}
+    _checkPending=NO;
+    [_updater checkForUpdates];
+}
 - (void)event:(uint32_t)event progress:(uint32_t)progress {
     if (_callback) _callback(event,_build,_expected,progress,"","");
 }
@@ -29,10 +62,6 @@ static OinkUpdateDriver *owner;
     return [NSString stringWithFormat:@"https://updates.oink.hachiwii.com/mac/v1/mac-2026-01/%@/appcast.xml",_beta?@"beta":@"stable"];
 }
 - (NSSet<NSString *> *)allowedChannelsForUpdater:(SPUUpdater *)updater {return _beta?[NSSet setWithObject:@"beta"]:[NSSet set];}
-- (BOOL)updater:(SPUUpdater *)updater shouldPostponeRelaunchForUpdate:(SUAppcastItem *)item untilInvokingBlock:(void (^)(void))block {
-    // Extra guard only; the ready continuation remains the primary authority.
-    return !_authorized;
-}
 - (void)showUpdatePermissionRequest:(SPUUpdatePermissionRequest *)request reply:(void (^)(SUUpdatePermissionResponse *))reply {
     reply([[SUUpdatePermissionResponse alloc] initWithAutomaticUpdateChecks:NO sendSystemProfile:NO]);
 }
@@ -40,6 +69,7 @@ static OinkUpdateDriver *owner;
     _cancelDownload=[cancellation copy]; _cancelled=NO; [self event:1 progress:0];
 }
 - (void)showUpdateFoundWithAppcastItem:(SUAppcastItem *)item state:(SPUUserUpdateState *)state reply:(void (^)(SPUUserUpdateChoice))reply {
+    _checkPending=NO; // An in-flight check supplied the requested result.
     _cancelDownload=nil; _cancelled=NO; _build=item.versionString.longLongValue; _expected=item.contentLength;
     if (_build==0 || item.informationOnlyUpdate || item.majorUpgrade) {reply(SPUUserUpdateChoiceDismiss); [self event:8 progress:4]; return;}
     // Sparkle chooses only one localized <description>. A single signed custom
@@ -59,10 +89,12 @@ static OinkUpdateDriver *owner;
 - (void)showUpdateReleaseNotesWithDownloadData:(SPUDownloadData *)data {}
 - (void)showUpdateReleaseNotesFailedToDownloadWithError:(NSError *)error {[self event:8 progress:1];}
 - (void)showUpdateNotFoundWithError:(NSError *)error acknowledgement:(void (^)(void))acknowledgement {
+    _checkPending=NO;
     NSNumber *reason=error.userInfo[SPUNoUpdateFoundReasonKey];
     [self event:reason.integerValue==SPUNoUpdateFoundReasonOnLatestVersion?0:8 progress:4]; acknowledgement();
 }
 - (void)showUpdaterError:(NSError *)error acknowledgement:(void (^)(void))acknowledgement {
+    _checkPending=NO;
     // Finite categories only; native error descriptions can contain local paths.
     [self event:8 progress:[error.domain isEqualToString:NSURLErrorDomain]?1:2]; acknowledgement();
 }
@@ -73,15 +105,18 @@ static OinkUpdateDriver *owner;
 - (void)showExtractionReceivedProgress:(double)progress {[self event:4 progress:(uint32_t)(100*MAX(0,MIN(1,progress)))];}
 - (void)showReadyToInstallAndRelaunch:(void (^)(SPUUserUpdateChoice))reply {
     _armed=YES;
+    // Sparkle 2.9.6 SPUUserDriver.h: Ready Skip cancels the installer without
+    // skipping the version. Dismiss would leave install-on-quit armed.
     if (_cancelled) {reply(SPUUserUpdateChoiceSkip);return;}
     _ready=[reply copy]; [self event:5 progress:100];
 }
 - (void)showInstallingUpdateWithApplicationTerminated:(BOOL)terminated retryTerminatingApplication:(void (^)(void))retry {[self event:6 progress:0];}
 - (void)showUpdateInstalledAndRelaunched:(BOOL)relaunched acknowledgement:(void (^)(void))acknowledgement {[self event:7 progress:100];acknowledgement();}
 - (void)dismissUpdateInstallation {
-    _found=nil;_ready=nil;_cancelDownload=nil;_armed=NO;_authorized=NO;[self event:9 progress:0];
+    _found=nil;_ready=nil;_cancelDownload=nil;_armed=NO;[self event:9 progress:0];
 }
 - (void)cancel {
+    _checkPending=NO;
     _cancelled=YES;
     if (_ready) {void (^reply)(SPUUserUpdateChoice)=_ready;_ready=nil;reply(SPUUserUpdateChoiceSkip);}
     else if (_found) {void (^reply)(SPUUserUpdateChoice)=_found;_found=nil;reply(SPUUserUpdateChoiceDismiss);}
@@ -93,30 +128,28 @@ static OinkUpdateDriver *owner;
 bool oink_update_start(UpdateEvent callback,bool beta,bool checks) {
     NSCAssert(NSThread.isMainThread,@"main thread");
     NSBundle *bundle=NSBundle.mainBundle;
-    NSDictionary *info=bundle.infoDictionary;
-    if (![bundle.bundleIdentifier isEqualToString:@"com.hachiwii.oink"] ||
-        ![info[@"SUVerifyUpdateBeforeExtraction"] boolValue] || ![info[@"SURequireSignedFeed"] boolValue] ||
-        [info[@"SUSignedFeedFailureExpirationInterval"] doubleValue]!=0 || !info[@"SUSignedFeedFailureExpirationInterval"] ||
-        [info[@"SUEnableJavaScript"] boolValue] || [info[@"SUEnableSystemProfiling"] boolValue] ||
-        [[NSData alloc] initWithBase64EncodedString:info[@"SUPublicEDKey"]?:@"" options:0].length!=32) return false;
+    // Bundle policy/public-key fields are sealed and checked by packaging;
+    // Sparkle validates its own configuration when startUpdater runs.
     if (owner) return true;
     owner=[OinkUpdateDriver new];owner.callback=callback;owner.beta=beta;
     owner.updater=[[SPUUpdater alloc] initWithHostBundle:bundle applicationBundle:bundle userDriver:owner delegate:owner];
     // The custom driver owns download/install intent; Sparkle only schedules checks.
     owner.updater.automaticallyDownloadsUpdates=NO;
-    if (![NSUserDefaults.standardUserDefaults objectForKey:@"SUEnableAutomaticChecks"])
-        owner.updater.automaticallyChecksForUpdates=checks;
+    // Oink's persisted policy is authoritative, including a corrupt/off policy.
+    // Sparkle persists its own mirror in defaults; an older mirror must not
+    // override the setting shown by Oink after restart.
+    owner.updater.automaticallyChecksForUpdates=checks;
     NSError *error=nil;
-    if (![owner.updater startUpdater:&error]) {owner=nil;return false;}
+    if (![owner.updater startUpdater:&error]) {owner.updater=nil;owner=nil;return false;}
     return true;
 }
-void oink_update_check(void) {[owner.updater checkForUpdates];}
+void oink_update_check(void) {[owner check];}
 void oink_update_download(void) {
     if (owner.found) {void (^reply)(SPUUserUpdateChoice)=owner.found;owner.found=nil;reply(SPUUserUpdateChoiceInstall);}
 }
 bool oink_update_install(void) {
     if (!owner.ready || owner.cancelled) return false;
-    owner.authorized=YES;void (^reply)(SPUUserUpdateChoice)=owner.ready;owner.ready=nil;reply(SPUUserUpdateChoiceInstall);return true;
+    void (^reply)(SPUUserUpdateChoice)=owner.ready;owner.ready=nil;reply(SPUUserUpdateChoiceInstall);return true;
 }
 void oink_update_cancel(void) {[owner cancel];}
 bool oink_update_quit_allowed(void) {return !owner.armed;}

@@ -1,8 +1,12 @@
-//! Explicit pre-freeze generation, never run by the compatibility tests.
+//! Explicit fixture maintenance, never run by compatibility tests.
+//! Compatible optional extensions append vectors and preserve existing bytes.
 use oink_protocol::v1::{self, RawValue, frame, registry, schema::WireDto};
 use oink_test_support::protocol as support;
 use serde_json::json;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().nth(1).as_deref() == Some("--append-compatible") {
+        return append_compatible();
+    }
     if std::env::args().nth(1).as_deref() != Some("--regenerate-unfrozen") {
         return Err("pass --regenerate-unfrozen before the public freeze only".into());
     }
@@ -240,5 +244,100 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         manifest["fixtures"].as_array().unwrap().len(),
         support::schema_hash()
     );
+    Ok(())
+}
+
+fn append_compatible() -> Result<(), Box<dyn std::error::Error>> {
+    let directory =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/oink-protocol/tests/fixtures/v1");
+    let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("manifest.json"))?)?;
+    let previous: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("schema.json"))?)?;
+    let schema = support::schema_json();
+    // This append mode permits new messages/DTOs only. It never rewrites an
+    // existing contract, hex vector or cryptographic fixture after release.
+    for (table, key) in [("messages", "id"), ("schemas", "name"), ("streams", "kind")] {
+        for entry in previous[table].as_array().ok_or("missing table")? {
+            if !schema[table]
+                .as_array()
+                .ok_or("missing table")?
+                .iter()
+                .any(|candidate| candidate[key] == entry[key] && candidate == entry)
+            {
+                return Err(format!("changed existing {table} entry").into());
+            }
+        }
+    }
+    for entry in registry::MESSAGES {
+        if previous["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|old| old["id"] == entry.id)
+        {
+            continue;
+        }
+        if !entry.capabilities.iter().any(|cap| {
+            !previous["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|old| old == cap)
+        }) {
+            return Err("new message requires new optional capability".into());
+        }
+        for unknown in [false, true] {
+            let mut raw = support::sample(entry.schema);
+            if unknown {
+                raw.insert(900, support::synthetic_unknown());
+            }
+            let message = v1::Message::from_payload(entry.id, raw.clone())?;
+            let file = format!("{:04x}{}.hex", entry.id, if unknown { "-future" } else { "" });
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(directory.join(&file))?;
+            use std::io::Write;
+            writeln!(
+                output,
+                "{}",
+                support::hex(&frame::encode(&message, v1::limits::LOW_FRAME)?)
+            )?;
+            manifest["fixtures"].as_array_mut().unwrap().push(json!({"file":file,"kind":"frame","type_id":entry.id,"schema":entry.schema.name,"capabilities":entry.capabilities,"routes":entry.routes,"expected":support::describe(&RawValue::Map(raw))}));
+        }
+    }
+    for entry in registry::SCHEMAS {
+        if previous["schemas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|old| old["name"] == entry.name)
+        {
+            continue;
+        }
+        let mut raw = support::sample(*entry);
+        raw.insert(900, support::synthetic_unknown());
+        registry::validate_schema(entry.name, &raw)?;
+        let value = RawValue::Map(raw);
+        let file = format!("dto-{}.hex", entry.name);
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(directory.join(&file))?;
+        use std::io::Write;
+        writeln!(output, "{}", support::hex(&value.encode(v1::limits::LOW_FRAME)?))?;
+        manifest["fixtures"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"file":file,"kind":"dto","schema":entry.name,"expected":support::describe(&value)}));
+    }
+    manifest["schema_sha256"] = support::schema_hash().into();
+    std::fs::write(
+        directory.join("schema.json"),
+        format!("{}\n", serde_json::to_string_pretty(&schema)?),
+    )?;
+    std::fs::write(
+        directory.join("manifest.json"),
+        format!("{}\n", serde_json::to_string_pretty(&manifest)?),
+    )?;
     Ok(())
 }

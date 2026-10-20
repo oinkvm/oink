@@ -11,7 +11,7 @@ vi.mock('../api/store',async()=>{
 vi.mock('../api/client',()=>({call:mocks.call,api:{group:async()=>({members:[]}),setInputSettings:mocks.input,setAudioSettings:mocks.audio,setClipboardSettings:mocks.clipboard,setLaunchAtLogin:mocks.login}}));
 beforeEach(()=>{
   vi.clearAllMocks();localStorage.clear();
-  mocks.state={localPreferences:{ui_language:'system',theme_mode:'system',theme_accent:{light:'#2E7BFF',dark:'#5599FF'},show_status_icon:true,confirm_quit:true,log_level:'info',log_max_mb:1024},
+  mocks.state={localPreferences:{notification_level:'default',ui_language:'system',theme_mode:'system',theme_accent:{light:'#2E7BFF',dark:'#5599FF'},show_status_icon:true,confirm_quit:true,log_level:'info',log_max_mb:1024},
     input:{event_frequency:'unlimited',wake_displays_on_input:true,cursor_trail:false,accept_contacts:true,device_gain:1,emergency_hold_ms:5000,hotkeys:[]},
     clipboard:{text:true,rich_text:true,images:true,files:true,custom:true},audio:{settings:{keep_local_playback:true,receive_output:null,forwarding_enabled:true}}};
   mocks.call.mockResolvedValue(mocks.state.localPreferences);
@@ -76,4 +76,15 @@ it.each([false,true])('does not rewrite explicit forwarding=%s when loading or e
   await act(async()=>result.current.set('keepLocalPlayback',false));
   expect(mocks.audio).toHaveBeenCalledExactlyOnceWith({keep_local_playback:false});
   expect((mocks.state.audio as {settings:{forwarding_enabled:boolean}}).settings.forwarding_enabled).toBe(enabled);
+});
+
+it.each(['disabled','minimal','default','verbose'] as const)('persists notification level %s as one device-local field',async level=>{
+  const {result}=renderHook(usePreferences);
+  expect(result.current.prefs.notificationLevel).toBe('default');
+  expect(result.current.canEdit('notificationLevel')).toBe(true);
+  if(level==='default')return;
+  await act(async()=>result.current.set('notificationLevel',level));
+  expect(mocks.call).toHaveBeenCalledWith('set_ui_preferences',{settings:{notification_level:level}});
+  expect(mocks.input).not.toHaveBeenCalled();
+  expect(localStorage.getItem('oink:prefs')).toBeNull();
 });

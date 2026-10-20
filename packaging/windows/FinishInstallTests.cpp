@@ -1,5 +1,6 @@
 #include "FinishInstall.h"
 #include <cassert>
+#include <sddl.h>
 #include <iostream>
 
 int main() {
@@ -10,12 +11,25 @@ int main() {
                    (std::wstring(ui) == L"5" && mask == 0));
         }
     }
-    assert(normal_flags(false, 0, 1));
-    assert(!normal_flags(true, 0, 1));
-    assert(!normal_flags(false, 1, 1));
-    assert(!normal_flags(false, 0, 0));
-    assert(!normal_flags(false, 0, 1, 2));
-    assert(normal_flags(false, 0, 2, 2));
+    for (const auto type : {TokenElevationTypeLimited, TokenElevationTypeDefault, TokenElevationTypeFull})
+        for (bool elevated : {false, true}) for (DWORD uiaccess : {0UL, 1UL})
+            for (DWORD session : {0UL, 1UL, 8UL}) for (bool service : {false, true}) {
+                // type/elevated intentionally have no bearing on authorization.
+                (void)type; (void)elevated;
+                assert(normal_flags(uiaccess, session, service) == (!uiaccess && session && !service));
+            }
+    assert(!normal_flags(0, 1, false, 2));
+    assert(normal_flags(0, 2, false, 2));
+    for (const auto text : {L"S-1-5-18", L"S-1-5-19", L"S-1-5-20", L"S-1-5-80-1-2-3-4-5", L"S-1-5-82-1-2-3-4-5"}) {
+        PSID sid = nullptr;
+        assert(ConvertStringSidToSidW(text, &sid));
+        assert(service_account(sid));
+        LocalFree(sid);
+    }
+    PSID user = nullptr;
+    assert(ConvertStringSidToSidW(L"S-1-5-21-1-2-3-1001", &user));
+    assert(!service_account(user));
+    LocalFree(user);
     for (bool normal : {false, true}) for (bool launch : {false, true})
         for (bool granted : {false, true}) for (bool resumed : {false, true}) {
             unsigned grants = 0, resumes = 0;
@@ -29,9 +43,9 @@ int main() {
     assert(!helper_completed(WAIT_OBJECT_0, false, ERROR_SUCCESS));
     assert(!helper_completed(WAIT_TIMEOUT, true, ERROR_SUCCESS));
     assert(!helper_completed(WAIT_FAILED, true, ERROR_SUCCESS));
-    // A server/SYSTEM/elevated caller cannot create any child, even a harmless
+    // A server/SYSTEM caller cannot create any child, even a harmless
     // nonexistent one. Native interactive child-token checking is also enforced
     // in launch() before ResumeThread, never inferred from MSI properties.
     if (!normal_user(GetCurrentProcess())) assert(!launch(L"missing.exe", L"", L"."));
-    std::cout << "finish UI/token/focus/helper policy: 155 cases passed\n";
+    std::cout << "finish UI/token/focus/helper policy: matrix and native token checks passed\n";
 }

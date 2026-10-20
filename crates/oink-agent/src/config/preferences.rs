@@ -289,6 +289,8 @@ pub enum SpeedMode {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScreenPreference {
+    #[serde(default = "default_remote_gain")]
+    pub remote_gain: f64,
     pub display: String,
     pub gain: f64,
     pub enabled: bool,
@@ -305,4 +307,8 @@ impl Default for ScreenPreferences {
             device_gain: 1.0,
         }
     }
+}
+
+fn default_remote_gain() -> f64 {
+    1.0
 }

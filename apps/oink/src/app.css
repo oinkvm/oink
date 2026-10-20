@@ -669,3 +669,6 @@ body:has(.oink-app:is([data-view="main"], [data-view="panel"])) { background: tr
 .win[data-platform="mac"] .win__cover-bar { right: 12px; }
 .win[data-platform="win"] .win__cover-bar { right: 150px; }
 .win__promo .ok-btn.win__promo-sponsor { font-weight: 400; padding-inline: 8px 10px; }
+.setp__update{display:grid;gap:10px;min-width:0}
+.setp__update label{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.setp__update p{margin:0;font-size:12px;color:var(--ok-text-2)}

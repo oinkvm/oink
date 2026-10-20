@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
@@ -18,6 +19,11 @@ DSN = 'https://' + '1' * 32 + '@o1.ingest.de.sentry.io/2'
 
 
 class PublicRelease(unittest.TestCase):
+    def setUp(self):
+        identity = patch.object(R, 'IDENTITY', {**R.IDENTITY, 'version': '0.1.0'})
+        identity.start()
+        self.addCleanup(identity.stop)
+
     def test_configuration_is_required_but_signpath_is_optional(self):
         env = dict(OINK_REPORT_DSN=DSN, OINK_REPORT_REGION='eu')
         self.assertFalse(R.inputs('28', env))
@@ -36,6 +42,10 @@ class PublicRelease(unittest.TestCase):
             notarized=True, notarization={k:dict(status='Accepted',stapled=True) for k in ['app','dmg']},
             launch_smoke=dict(status='passed',signed=True,seconds=10),
             artifacts=[dict(name=name,size=f.stat().st_size,sha256=digest(f))])
+        if platform == 'macos':
+            archive = path / name.replace('.dmg', '.zip')
+            archive.write_bytes(b'Stapled Sparkle archive')
+            record['artifacts'].append(dict(name=archive.name, size=archive.stat().st_size, sha256=digest(archive)))
         (path / 'release.json').write_text(json.dumps(record))
         proof = dict(configured=True,report_sent=False,version='0.1.0',build=28)
         (path / 'report-configuration-check.json').write_text(json.dumps(proof))
@@ -50,8 +60,9 @@ class PublicRelease(unittest.TestCase):
                 self.package(p/'packages',platform)
                 R.stage(p/'packages',p/'download'/platform,platform,28,COMMIT)
             assets=R.assemble(p/'download',p/'final',28,COMMIT)
-            self.assertEqual({x.suffix for x in assets},{'.dmg','.msi','.json',''})
-            self.assertEqual(len(list((p/'final').iterdir())),4)
+            self.assertEqual({x.suffix for x in assets},{'.dmg','.zip','.msi','.json',''})
+            self.assertEqual(len(list((p/'final').iterdir())),6)
+            self.assertEqual(json.loads((p/'final/update.json').read_text())['channel'], 'stable')
             for line in (p/'final/SHA256SUMS').read_text().splitlines():
                 sha,name=line.split('  ');self.assertEqual(sha,digest(p/'final'/name))
             record=json.loads((p/'download/windows/release-windows.json').read_text());record['built_commit']='c'*40
@@ -108,6 +119,22 @@ class PublicRelease(unittest.TestCase):
             self.assertFalse((Path(tmp)/'release-signing/certificate.p12').exists())
 
 class WorkflowContract(unittest.TestCase):
+    def test_product_versions_are_aligned_for_public_and_local_labels(self):
+        version = R.IDENTITY['version']
+        cargo = tomllib.loads((ROOT / 'Cargo.toml').read_text(encoding='utf-8'))
+        self.assertEqual(cargo['workspace']['package']['version'], version)
+        for member in cargo['workspace']['members']:
+            package = tomllib.loads((ROOT / member / 'Cargo.toml').read_text(encoding='utf-8'))['package']
+            self.assertEqual(package['version'], {'workspace': True})
+        for path in ('apps/oink/package.json', 'apps/oink/src-tauri/tauri.conf.json'):
+            self.assertEqual(json.loads((ROOT / path).read_text(encoding='utf-8'))['version'], version)
+        lock = json.loads((ROOT / 'package-lock.json').read_text(encoding='utf-8'))
+        self.assertEqual(lock['packages']['apps/oink']['version'], version)
+        rust_lock = tomllib.loads((ROOT / 'Cargo.lock').read_text(encoding='utf-8'))
+        workspace = [p for p in rust_lock['package'] if p['name'].startswith('oink-')]
+        self.assertEqual(len(workspace), len(cargo['workspace']['members']))
+        self.assertTrue(all(p['version'] == version for p in workspace))
+
     def test_workflow_contract_and_only_draft_can_write_contents(self):
         workflow=(ROOT/'.github/workflows/release.yml').read_text()
         self.assertEqual(workflow.count('contents: write'),1)

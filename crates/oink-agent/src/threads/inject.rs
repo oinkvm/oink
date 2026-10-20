@@ -752,11 +752,15 @@ pub(crate) fn start_with_trace(
                     // Pause is out of band: it cannot sit behind a native call,
                     // DnD completion or queued motion. An in-flight OS call cannot be
                     // cancelled, but no subsequent old-epoch work may be replayed.
+                    let mut cleanup_ok = true;
                     for owner in held.0.keys().copied().collect::<Vec<_>>() {
-                        held.release(owner, native.as_ref());
+                        cleanup_ok &= held.release(owner, native.as_ref());
                     }
-                    let _ = native.set_relative_capture(false);
-                    let _ = native.set_mode(CaptureMode::Local);
+                    cleanup_ok &= native.set_relative_capture(false).is_ok();
+                    cleanup_ok &= native.set_mode(CaptureMode::Local).is_ok();
+                    if !cleanup_ok {
+                        failed.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    }
                     dnd_pending = None;
                     source_pending = None;
                     motion_drop.store(0, std::sync::atomic::Ordering::Release);
@@ -1099,12 +1103,16 @@ pub(crate) fn start_with_trace(
                         }
                     }
                     InjectItem::UpdateFence(fence) => {
-                        // The router refuses preparation while any held key/button
-                        // exists. Recheck the injection ledger after queued work.
-                        fence.store(
-                            if held.0.is_empty() { 1 } else { 2 },
-                            std::sync::atomic::Ordering::Release,
-                        );
+                        // Explicit Install interrupts activity. Release the final
+                        // native ledger (including local transformed keys) after
+                        // queued router releases, and acknowledge actual results.
+                        let mut released = true;
+                        for (_, events) in std::mem::take(&mut held.0) {
+                            for event in events {
+                                released &= native.inject(&event).is_ok();
+                            }
+                        }
+                        fence.store(if released { 1 } else { 2 }, std::sync::atomic::Ordering::Release);
                     }
                     InjectItem::Stop => {
                         for owner in held.0.keys().copied().collect::<Vec<_>>() {
@@ -1199,12 +1207,14 @@ impl Held {
             });
         }
     }
-    fn release(&mut self, owner: Option<DeviceId>, native: &dyn oink_input::InputBackend) {
+    fn release(&mut self, owner: Option<DeviceId>, native: &dyn oink_input::InputBackend) -> bool {
+        let mut released = true;
         if let Some(events) = self.0.remove(&owner) {
             for event in events {
-                let _ = native.inject(&event);
+                released &= native.inject(&event).is_ok();
             }
         }
+        released
     }
 }
 

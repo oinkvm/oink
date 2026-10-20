@@ -10,7 +10,7 @@ use oink_network::{
     admission,
     discovery::{Advert, Discovery, DiscoveryConfig, Sighting},
     group_state::State,
-    link::{ConfigEvent, DialMode, Direction, Disconnect, LinkId, LinkPath, PostError},
+    link::{ConfigEvent, DialFailure, DialMode, Direction, Disconnect, LinkId, LinkPath, PostError},
     pair_journal::Journal,
     pair_merge::Transactions,
     pairing::{self, Sessions},
@@ -138,6 +138,43 @@ struct Dial {
     failures: usize,
     active: bool,
     last_relayed: bool,
+    started: bool,
+}
+impl Dial {
+    fn failed(&mut self, reason: DialFailure, now: Instant) {
+        self.active = false;
+        self.started = true;
+        self.failures = self.failures.saturating_add(1);
+        // LinkLayer forgets failed dials; it has no second reconnect schedule.
+        // Timeouts/no route must keep probing even when the other side cannot
+        // originate a connection (for example through the local router's NAT).
+        let backoff = if reason == DialFailure::Unreachable {
+            &RECONNECT_BACKOFF[..]
+        } else {
+            &HANDSHAKE_BACKOFF[..]
+        };
+        self.after = Some(now + backoff[(self.failures - 1).min(backoff.len() - 1)]);
+    }
+    fn reset(&mut self, now: Instant) {
+        self.failures = 0;
+        self.after = Some(now);
+        self.active = false;
+        // The larger-ID delay only applies to the initial round, never to an
+        // explicit recovery signal such as Lost, interface change or wake.
+        self.started = true;
+    }
+    fn due(&mut self, local: DeviceId, peer: DeviceId, now: Instant) -> bool {
+        if self.active {
+            return false;
+        }
+        if !self.started {
+            self.started = true;
+            if local > peer {
+                self.after = Some(now + RECONNECT_BACKOFF[0] * 2);
+            }
+        }
+        self.after.is_none_or(|at| now >= at)
+    }
 }
 pub(super) struct Owner {
     config: Arc<Mutex<crate::config::AgentConfig>>,
@@ -647,9 +684,8 @@ impl Owner {
             ConfigEvent::Lost { link, peer, path, .. } => {
                 self.drop_link(link);
                 let dial = self.dials.entry(peer).or_default();
-                dial.active = false;
                 dial.last_relayed = matches!(path, LinkPath::Relayed { .. });
-                dial.after = Some(Instant::now() + REDIAL_INTERVAL);
+                dial.reset(Instant::now());
             }
             ConfigEvent::Ready { link, .. } => {
                 if self.sessions.get(&link).is_some_and(|s| s.ready) {
@@ -658,9 +694,7 @@ impl Owner {
             }
             ConfigEvent::DialFailed { peer, reason } => {
                 let dial = self.dials.entry(peer).or_default();
-                dial.active = false;
-                dial.failures += 1;
-                dial.after = Some(Instant::now() + HANDSHAKE_BACKOFF[dial.failures.saturating_sub(1).min(3)]);
+                dial.failed(reason, Instant::now());
                 self.fail_connecting(
                     peer,
                     match reason {
@@ -1221,7 +1255,10 @@ impl Owner {
             | Message::ConfigPauseDevice(_)
             | Message::ConfigPauseDeviceResult(_)
             | Message::ConfigEmergencyPause(_)
-            | Message::ConfigEmergencyPauseAck(_) => {
+            | Message::ConfigEmergencyPauseAck(_)
+            | Message::NotifyShow(_)
+            | Message::NotifyAction(_)
+            | Message::NotifyDismiss(_) => {
                 if !self.sessions[&id].ready || !self.state.roster().contains(peer.device_id) {
                     return Err(v1::ErrorCode::NotReady.into());
                 }
@@ -1333,7 +1370,7 @@ impl Owner {
             match self.observe_endpoint_facts() {
                 Ok(true) => {
                     for dial in self.dials.values_mut().filter(|dial| !dial.active) {
-                        dial.after = None;
+                        dial.reset(now);
                     }
                     if let Some(discovery) = &self.discovery {
                         discovery.refresh();
@@ -1435,7 +1472,7 @@ impl Owner {
                 }
                 let addresses = self.member_candidates(peer);
                 let dial = self.dials.entry(peer).or_default();
-                if dial.active || dial.after.is_some_and(|at| now < at) {
+                if !dial.due(self.identity.id(), peer, now) {
                     continue;
                 }
                 let mode = if dial.last_relayed {
@@ -1503,6 +1540,10 @@ impl Owner {
         if self.nearby.len() >= 4096 && !self.nearby.contains_key(&peer) {
             return;
         }
+        let changed = self
+            .nearby
+            .get(&peer)
+            .is_none_or(|seen| seen.sighting.advert != sighting.advert || seen.sighting.addrs != sighting.addrs);
         self.nearby.insert(
             peer,
             Seen {
@@ -1512,7 +1553,11 @@ impl Owner {
         );
         if self.state.roster().contains(peer) {
             self.links.update_addresses(peer, self.member_candidates(peer));
-            self.dials.entry(peer).or_default().after = None;
+            // Repeated beacons must not defeat admission-failure backoff.
+            let dial = self.dials.entry(peer).or_default();
+            if changed && !dial.active && dial.failures > 0 {
+                dial.reset(Instant::now());
+            }
         }
         self.publish_nearby();
     }
@@ -1524,8 +1569,7 @@ impl Owner {
         self.sleeping = false;
         self.network_checked = Instant::now() - Duration::from_secs(2);
         for dial in self.dials.values_mut() {
-            dial.after = None;
-            dial.active = false;
+            dial.reset(Instant::now());
         }
         if let Some(discovery) = &self.discovery {
             discovery.refresh();

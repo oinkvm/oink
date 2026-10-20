@@ -155,7 +155,10 @@ fn run(shared: Arc<Shared>) {
         dirty_since = None;
         last_poll = Instant::now();
         let cur = super::enumerate().ok();
-        if cur.is_some() && cur != last {
+        // Refresh-rate and color-mode changes can leave DisplayInfo unchanged.
+        // A completed native reconfiguration still invalidates consumers' cached
+        // presentation state; only the callback-free fallback may deduplicate it.
+        if should_notify(settled, &cur, &last) {
             tracing::debug!("显示器配置变化");
             last = cur;
             let handlers = shared.handlers.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -174,9 +177,22 @@ fn run(shared: Arc<Shared>) {
     signal.run_loop.remove_source(Some(&signal.source), mode);
 }
 
+fn should_notify<T: PartialEq>(reconfigured: bool, current: &Option<T>, previous: &Option<T>) -> bool {
+    current.is_some() && (reconfigured || current != previous)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_only_reconfiguration_notifies_without_repeating_idle_snapshots() {
+        let geometry = Some(vec![(0, 0, 1728, 1117), (1560, -1080, 1920, 1080)]);
+        assert!(should_notify(true, &geometry, &geometry));
+        assert!(!should_notify(false, &geometry, &geometry));
+        assert!(should_notify(false, &Some(vec![(0, 0, 1728, 1117)]), &geometry));
+        assert!(!should_notify(true, &None, &geometry));
+    }
 
     /// Callback-free idle waits for the two-second fallback, not a polling slice.
     #[test]

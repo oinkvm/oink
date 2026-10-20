@@ -1,8 +1,9 @@
-import { formatList, tr } from '../i18n';
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { Button, Tooltip, speed } from 'oink-ui';
+import { formatList, tr, useLanguage } from '../i18n';
+import { memo, useLayoutEffect, useRef, useState } from 'react';
+import { Button, Tooltip } from 'oink-ui';
 import type { PeerQuality } from '../api/types';
 import { useConnectionQuality } from './useConnectionQuality';
+import { useVisible } from '../window/useVisible';
 const SPAN = 60;
 const TICK = 1000;
 const H = 150;
@@ -21,10 +22,13 @@ const niceMax = (v: number) => {
     const p = 10 ** Math.floor(Math.log10(Math.max(v, 1)));
     return [1, 2, 3, 4, 5, 6, 8, 10].map((m) => m * p).find((x) => x >= v) ?? 10 * p;
 };
-export function LatencyChart({ active }: {
+export const LatencyChart = memo(function LatencyChart({ active }: {
     active: boolean;
 }) {
-    const { snapshot, failed } = useConnectionQuality(active);
+    useLanguage();
+    const root = useRef<HTMLDivElement>(null);
+    const visibleView = useVisible(root, active);
+    const { snapshot, failed } = useConnectionQuality(visibleView);
     const colors = useRef(new Map<string, string>());
     const colorOf = (id: string) => {
         if (!colors.current.has(id)) colors.current.set(id, COLORS[colors.current.size % COLORS.length]);
@@ -51,8 +55,6 @@ export function LatencyChart({ active }: {
     // Clicking the already-soloed colour dot restores all, including new peers.
     const solo = (id: string) => setVisibleIds(isSolo(id) ? null : new Set([id]));
     const empty = series.length === 0 ? tr('没有在线设备') : tr('没有显示的设备');
-    const lastTick = useRef(performance.now());
-    useEffect(() => { lastTick.current = performance.now(); }, [snapshot]);
     // Display values saturate at 999.99 without an overflow prefix; the
     // backend keeps original samples and statistics.
     const decimal = (value: number) => Math.min(value, 999.99).toFixed(2);
@@ -68,23 +70,11 @@ export function LatencyChart({ active }: {
     }, []);
     const plotW = Math.max(40, w - PAD.l - PAD.r);
     const step = plotW / SPAN;
-    const lines = useRef<SVGGElement>(null);
-    useEffect(() => {
-        if (!active)
-            return;
-        let raf = 0;
-        const frame = () => {
-            const s = speed();
-            const f = s > 0 ? Math.min(1, (performance.now() - lastTick.current) / TICK) : 0;
-            lines.current?.setAttribute('transform', `translate(${(-f * step).toFixed(2)} 0)`);
-            raf = requestAnimationFrame(frame);
-        };
-        raf = requestAnimationFrame(frame);
-        return () => cancelAnimationFrame(raf);
-    }, [active, step]);
+    // Render the retained source tick directly. A display-rate translation would
+    // repaint identical one-second telemetry at the monitor's refresh rate.
     const max = Math.min(999.99, niceMax(Math.max(10, ...visible.flatMap((s) => s.values.filter((v): v is number => v != null))) * 1.1));
     const y = (v: number) => PAD.t + (1 - Math.min(v, 999.99) / max) * (H - PAD.t - PAD.b);
-    const x = (i: number) => PAD.l + (i + 1) * step;
+    const x = (i: number) => PAD.l + i * step;
     const pathOf = (vals: Sample[]) => {
         let d = '';
         let pen = false;
@@ -106,12 +96,12 @@ export function LatencyChart({ active }: {
             setHover(null);
             return;
         }
-        setHover(Math.min(SPAN, Math.max(0, Math.round((px - PAD.l) / step - 0.5))));
+        setHover(Math.min(SPAN, Math.max(0, Math.round((px - PAD.l) / step))));
     };
     const hoverRows = hover != null ? visible.map((s) => ({ ...s, v: s.values[hover] })).filter((s) => s.v != null) : [];
     const ago = hover != null ? SPAN - hover : 0;
     const current = visible.map(s => s.statistics.current_ms == null ? tr('{0}：延迟未知', s.name) : tr('{0} {1} 毫秒', s.name, decimal(s.statistics.current_ms)));
-    return (<div className="lat">
+    return (<div className="lat" ref={root}>
       <div className="lat__plot" ref={box} onPointerMove={onMove} onPointerLeave={() => setHover(null)}>
         <svg width={w} height={H} role="img" aria-label={tr('设备延迟：{0}', formatList(current) || empty)}>
           <defs>
@@ -122,7 +112,7 @@ export function LatencyChart({ active }: {
               <text x={PAD.l - 8} y={y(max * k)} dy="0.32em" textAnchor="end">{format(max * k)}</text>
             </g>))}
           <g clipPath="url(#lat-clip)">
-            <g ref={lines}>
+            <g>
               {visible.map((s) => <path key={s.id} className="lat__line" d={pathOf(s.values)} stroke={s.color}/>)}
               
               {hover != null && (<g className="lat__cursor">
@@ -132,7 +122,7 @@ export function LatencyChart({ active }: {
             </g>
           </g>
         </svg>
-        {hover != null && hoverRows.length > 0 && (<div className="lat__tip" style={{ left: Math.max(PAD.l, Math.min(x(hover) - step + 10, w - 170)) }} aria-hidden>
+        {hover != null && hoverRows.length > 0 && (<div className="lat__tip" style={{ left: Math.max(PAD.l, Math.min(x(hover) + 10, w - 170)) }} aria-hidden>
             <div className="lat__tip-t">{ago === 0 ? tr('刚刚') : tr('{0} 秒前', ago)}</div>
             {hoverRows.map((s) => (<div key={s.id} className="lat__tip-row"><i style={{ background: s.color }}/><span>{s.name}</span><b>{format(s.v!)}</b></div>))}
           </div>)}
@@ -143,8 +133,8 @@ export function LatencyChart({ active }: {
         <table className="lat__table" aria-label={tr('连接质量')}>
           <thead><tr>
             <th scope="col">{tr('设备名称')}</th><th scope="col">{tr('当前延迟')}</th>
-            <th scope="col">P50</th><th scope="col">P99</th>
-            <th scope="col">{tr('抖动（平均）')}</th><th scope="col">{tr('路径')}</th>
+            <th scope="col">P50</th><th scope="col">{tr('P90')}</th>
+            <th scope="col">P99</th><th scope="col">{tr('路径')}</th>
           </tr></thead>
           <tbody>{series.map(s => <tr key={s.id}>
             <td><span className="lat__device">
@@ -155,10 +145,10 @@ export function LatencyChart({ active }: {
               </Tooltip>
               <button type="button" className="lat__name" aria-pressed={visibleIds == null || visibleIds.has(s.id)} aria-label={visibleIds == null || visibleIds.has(s.id) ? tr('隐藏 {0} 的曲线', s.name) : tr('显示 {0} 的曲线', s.name)} onClick={() => toggle(s.id)}>{s.name}</button>
             </span></td>
-            {[s.statistics.current_ms,s.statistics.p50_ms,s.statistics.p99_ms,s.statistics.average_jitter_ms].map((value,index) => <td key={index}>{format(value)}</td>)}
+            {[s.statistics.current_ms,s.statistics.p50_ms,s.statistics.p90_ms,s.statistics.p99_ms].map((value,index) => <td key={index}>{format(value)}</td>)}
             <td>{s.statistics.path.type === 'relay' ? tr('经 {0} 中转', s.statistics.path.via_name) : tr('直连')}</td>
           </tr>)}</tbody>
         </table>
       </div>
     </div>);
-}
+});

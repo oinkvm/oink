@@ -50,6 +50,7 @@ pub(super) fn values(settings: &Settings) -> Vec<(LocalOption, RawValue)> {
                             (1, RawValue::Text(s.display.clone())),
                             (2, s.gain.write()),
                             (3, s.enabled.write()),
+                            (4, s.remote_gain.write()),
                         ])
                     })),
                 ),
@@ -256,6 +257,7 @@ pub(super) fn apply(owner: &OwnerStore, settings: &mut Settings) -> Result<(), S
                         .into_iter()
                         .map(|s| {
                             Ok(ScreenPreference {
+                                remote_gain: s.remote_gain()?,
                                 display: s.display()?.0,
                                 gain: s.gain()?,
                                 enabled: s.enabled()?,

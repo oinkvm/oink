@@ -1,23 +1,40 @@
 #pragma once
 #include <windows.h>
 #include <string>
+#include <cstring>
 
 namespace finish_install {
 inline bool allowed(const std::wstring& ui, bool installed, bool removing, bool scheduled, bool commit, bool rollback) {
     return ui == L"5" && !installed && !removing && !scheduled && !commit && !rollback;
 }
 
-inline bool normal_flags(bool elevated, DWORD uiaccess, DWORD session, DWORD expected_session = MAXDWORD) {
-    return !elevated && !uiaccess && session && (expected_session == MAXDWORD || expected_session == session);
+inline bool normal_flags(DWORD uiaccess, DWORD session, bool service, DWORD expected_session = MAXDWORD) {
+    return !uiaccess && !service && session && (expected_session == MAXDWORD || expected_session == session);
+}
+inline bool service_account(PSID sid) {
+    const SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+    if (memcmp(GetSidIdentifierAuthority(sid), &nt, sizeof(nt)) != 0 || !*GetSidSubAuthorityCount(sid)) return false;
+    const DWORD rid = *GetSidSubAuthority(sid, 0);
+    return rid == SECURITY_SERVICE_ID_BASE_RID || rid == 82 ||
+        (*GetSidSubAuthorityCount(sid) == 1 && (rid == SECURITY_LOCAL_SYSTEM_RID ||
+            rid == SECURITY_LOCAL_SERVICE_RID || rid == SECURITY_NETWORK_SERVICE_RID));
+}
+inline bool normal_token(HANDLE token, DWORD& session, DWORD expected_session = MAXDWORD) {
+    DWORD uiaccess = 0, size = 0;
+    alignas(TOKEN_USER) BYTE user[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE]{};
+    // Elevation is supported both for explicit administrator launches and for
+    // the user's sole token with UAC disabled. Never host WebView2 as a service;
+    // UIAccess is reserved for the input backend, not the WebView shell.
+    return GetTokenInformation(token, TokenUser, user, sizeof(user), &size) &&
+        GetTokenInformation(token, TokenSessionId, &session, sizeof(session), &size) &&
+        GetTokenInformation(token, TokenUIAccess, &uiaccess, sizeof(uiaccess), &size) &&
+        normal_flags(uiaccess, session, service_account(reinterpret_cast<TOKEN_USER*>(user)->User.Sid), expected_session);
 }
 inline bool normal_user(HANDLE process, DWORD expected_session = MAXDWORD) {
     HANDLE token = nullptr;
     if (!OpenProcessToken(process, TOKEN_QUERY, &token)) return false;
-    TOKEN_ELEVATION elevation{}; DWORD session = 0, uiaccess = 0, size = 0;
-    bool ok = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) &&
-        GetTokenInformation(token, TokenSessionId, &session, sizeof(session), &size) &&
-        GetTokenInformation(token, TokenUIAccess, &uiaccess, sizeof(uiaccess), &size) &&
-        normal_flags(elevation.TokenIsElevated != 0, uiaccess, session, expected_session);
+    DWORD session = 0;
+    const bool ok = normal_token(token, session, expected_session);
     CloseHandle(token);
     return ok;
 }
@@ -40,7 +57,7 @@ inline bool helper_completed(DWORD wait, bool queried, DWORD exit) {
 // The client UI keeps its original token across UAC; never create this process
 // in a deferred/server CA. Check the real suspended child's token before it can
 // run login registration or any app code. An installer explicitly started as
-// administrator must instead be opened normally; do not leak elevation to Oink.
+// administrator is allowed; the caller's elevation is an explicit user choice.
 inline bool launch(const std::wstring& exe, const std::wstring& arguments, const std::wstring& directory,
                    bool* foreground_granted = nullptr) {
     DWORD session = 0;

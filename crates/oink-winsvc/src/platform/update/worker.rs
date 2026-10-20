@@ -53,20 +53,29 @@ fn command(binary: &'static str) -> Result<Command, Error> {
         .creation_flags(CREATE_NO_WINDOW);
     Ok(command)
 }
-fn run_command(mut command: Command, timeout: Duration) -> Result<u32, Error> {
-    let mut child = command.spawn().map_err(|_| Error::Transaction)?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait().map_err(|_| Error::Transaction)? {
-            return status.code().map(|n| n as u32).ok_or(Error::Transaction);
-        }
-        if Instant::now() >= deadline {
-            // Never kill Windows Installer. Leave pending for its own engine and
-            // recovery task; no second MSI may begin until this engine completes.
-            return Err(Error::Busy);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+fn msi_arguments(operation: &str, target: &std::ffi::OsStr, log: &Path) -> Vec<std::ffi::OsString> {
+    [
+        std::ffi::OsStr::new(operation),
+        target,
+        std::ffi::OsStr::new("/qn"),
+        std::ffi::OsStr::new("/norestart"),
+        std::ffi::OsStr::new("/L*v!"),
+        log.as_os_str(),
+    ]
+    .into_iter()
+    .map(std::ffi::OsStr::to_owned)
+    .collect()
+}
+fn run_command(mut command: Command) -> Result<u32, Error> {
+    // Keep the package and ancestor locks on our caller's stack until the MSI
+    // engine exits. Timing out and dropping them leaves an in-flight install
+    // using an unpinned path. A stalled engine stays pending; never kill it.
+    command
+        .status()
+        .map_err(|_| Error::Transaction)?
+        .code()
+        .map(|n| n as u32)
+        .ok_or(Error::Transaction)
 }
 pub(super) fn windows_build() -> Result<u32, Error> {
     let mut value = [0u16; 32];
@@ -98,21 +107,12 @@ fn cache(build: u64) -> Result<PathBuf, Error> {
         .join("cache")
         .join(build.to_string()))
 }
-fn verify_release(path: &Path, release: &feed::Release, roots: &Roots) -> Result<(), Error> {
-    feed::validate_asset_url(&release.package.url, &roots.repository, &release.tag)?;
-    feed::verify_package(
-        &protected::read(path, feed::MAX_PACKAGE)?,
-        &release.package,
-        &roots.feed(),
-    )
-}
 pub(super) fn stage(
     candidate: feed::Release,
     previous: Option<feed::Release>,
     envelope: &[u8],
     sessions: Vec<Session>,
     roots: &Roots,
-    automatic: bool,
 ) -> Result<String, Error> {
     protected::system().map_err(|_| Error::Policy)?;
     let lock = protected::lock()?;
@@ -125,6 +125,7 @@ pub(super) fn stage(
     if candidate.build <= receipt.build.max(machine.successful_build) {
         return Err(Error::Replay);
     }
+    feed::verify_version(&candidate.version, &receipt.version)?;
     let maintenance = protected::maintenance().map_err(|_| Error::Storage)?;
     for name in ["transactions", "cache"] {
         protected::directory(&maintenance.join(name)).map_err(|_| Error::Storage)?;
@@ -145,7 +146,6 @@ pub(super) fn stage(
         protected::write(&previous_msi, &bytes)?;
         protected::write(&previous_directory.join("release.json"), &json(&previous)?)?;
     }
-    verify_release(&previous_msi, &previous, roots)?;
     let mut random = [0u8; 16];
     getrandom::fill(&mut random).map_err(|_| Error::Storage)?;
     let tx = feed::hex(&random);
@@ -153,17 +153,11 @@ pub(super) fn stage(
     protected::directory(&directory).map_err(|_| Error::Storage)?;
     let candidate_msi = directory.join("candidate.msi");
     let candidate_bytes = protected::read(&maintenance.join("downloads/candidate.msi"), feed::MAX_PACKAGE)?;
-    feed::verify_package(&candidate_bytes, &candidate.package, &roots.feed())?;
     protected::write(&candidate_msi, &candidate_bytes)?;
     protected::write(&directory.join("manifest.json"), envelope)?;
     let candidate_inventory = msi::inspect(&candidate_msi, &directory.join("candidate-check"), roots, &candidate)?;
     let previous_inventory = msi::inspect(&previous_msi, &directory.join("previous-check"), roots, &previous)?;
     let root = protected::root().map_err(|_| Error::Storage)?;
-    for (name, hash) in &previous_inventory.hashes {
-        if protected::hash(&root.join(name))? != *hash {
-            return Err(Error::Signature);
-        }
-    }
     let source = root.join("oink-update-worker.exe");
     signature::verify(&source, roots)?;
     let worker = directory.join("worker.exe");
@@ -192,7 +186,6 @@ pub(super) fn stage(
         candidate_inventory,
         previous_inventory,
         sessions,
-        automatic,
         reboot_marker_armed: false,
         lock_handle: format!("{:016x}", lock.0 as usize),
         worker_pid: 0,
@@ -300,6 +293,7 @@ struct Worker {
     roots: Roots,
     lock: Option<Handle>,
     failure: Option<FailurePolicy>,
+    canceled: bool,
 }
 pub(super) fn run() -> Result<(), Error> {
     protected::system().map_err(|_| Error::Policy)?;
@@ -337,11 +331,32 @@ pub(super) fn run() -> Result<(), Error> {
         roots,
         lock: None,
         failure: None,
+        canceled: false,
     };
     transaction::execute(&mut worker, &mut journal)
 }
 
 impl Worker {
+    fn verify_candidate_manifest(&self) -> Result<(), Error> {
+        let machine = policy()?;
+        let channel = machine.policy.preferences.channel;
+        let manifest = feed::verify_manifest(
+            &protected::read(&self.directory.join("manifest.json"), feed::MAX_FEED as u64)?,
+            &self.roots.feed(),
+            channel,
+            &machine.watermarks.get(channel.name()).cloned().unwrap_or_default(),
+            now(),
+        )?;
+        feed::verify_version(&self.plan.candidate.version, &self.plan.previous.version)?;
+        if !manifest.manifest().releases.contains(&self.plan.candidate)
+            || self.plan.candidate.architecture != "x64"
+            || self.plan.candidate.build <= self.plan.previous.build.max(machine.successful_build)
+            || machine.quarantine.contains(&self.plan.candidate.build)
+        {
+            return Err(Error::Policy);
+        }
+        Ok(())
+    }
     fn save(&self, journal: &Journal) -> Result<(), Error> {
         protected::write(
             &protected::maintenance()
@@ -352,7 +367,6 @@ impl Worker {
     }
     fn authorize(
         &self,
-        rollback: bool,
         target: &msi::Inventory,
         package: &feed::Package,
         remove: Option<(&msi::Inventory, &feed::Package)>,
@@ -360,29 +374,15 @@ impl Worker {
         #[derive(Serialize)]
         struct Authorization<'a> {
             schema: u32,
-            transaction: &'a str,
-            pending_sha256: String,
-            worker_pid: u32,
-            worker_created_filetime: &'a str,
-            worker_sha256: &'a str,
-            lock_handle: String,
-            operation: &'a str,
             product_code: &'a str,
             package_sha256: &'a str,
             remove_product_code: &'a str,
             remove_package_sha256: &'a str,
         }
         let maintenance = protected::maintenance().map_err(|_| Error::Storage)?;
-        let lock = self.lock.as_ref().ok_or(Error::Transaction)?;
+        self.lock.as_ref().ok_or(Error::Transaction)?;
         let auth = Authorization {
             schema: 1,
-            transaction: &self.plan.transaction,
-            pending_sha256: protected::hash(&maintenance.join("pending.json"))?,
-            worker_pid: self.plan.worker_pid,
-            worker_created_filetime: &self.plan.worker_created_filetime,
-            worker_sha256: &self.plan.worker_sha256,
-            lock_handle: format!("{:016x}", lock.0 as usize),
-            operation: if rollback { "rollback" } else { "install" },
             product_code: &target.product_code,
             package_sha256: &package.sha256,
             remove_product_code: remove.map(|(i, _)| i.product_code.as_str()).unwrap_or(""),
@@ -391,6 +391,12 @@ impl Worker {
         protected::write(&maintenance.join("msi-authorization.json"), &json(&auth)?)
     }
     fn install(&self, rollback: bool) -> Result<InstallOutcome, Error> {
+        if !rollback {
+            // Recheck manifest freshness immediately before the candidate MSI.
+            // Expired metadata must never authorize a new invocation;
+            // restoring the previously verified version remains possible offline.
+            self.verify_candidate_manifest()?;
+        }
         let (inventory, release, path, removal_inventory, removal_release) = if rollback {
             (
                 &self.plan.previous_inventory,
@@ -415,13 +421,19 @@ impl Worker {
         } else {
             None
         };
-        verify_release(&path, release, &self.roots)?;
-        signature::verify(&path, &self.roots)?;
-        self.authorize(rollback, inventory, &release.package, removal)?;
-        let _package = protected::open(&path).map_err(|_| Error::Storage)?;
+        // Package bytes were verified before staging. The protected copy is
+        // immutable to users; hold its read-only handle while msiexec opens it.
+        let _package = protected::pin(&path).map_err(|_| Error::Storage)?;
+        self.authorize(inventory, &release.package, removal)?;
         let mut install = command("msiexec.exe")?;
-        install.arg("/i").arg(&path).args(["/qn", "/norestart"]);
-        self.installer_outcome(run_command(install, Duration::from_secs(20 * 60))?)
+        install.args(msi_arguments(
+            "/i",
+            path.as_os_str(),
+            &self
+                .directory
+                .join(if rollback { "rollback.log" } else { "install.log" }),
+        ));
+        self.installer_outcome(run_command(install)?)
     }
     fn installer_outcome(&self, code: u32) -> Result<InstallOutcome, Error> {
         let result = outcome(code)?;
@@ -445,13 +457,14 @@ impl Worker {
         let cached_hash = cached_package_hash(&self.plan.candidate_inventory.product_code)?;
         let mut cached_package = self.plan.candidate.package.clone();
         cached_package.sha256 = cached_hash;
-        self.authorize(true, &self.plan.candidate_inventory, &cached_package, None)?;
+        self.authorize(&self.plan.candidate_inventory, &cached_package, None)?;
         let mut uninstall = command("msiexec.exe")?;
-        uninstall
-            .arg("/x")
-            .arg(&self.plan.candidate_inventory.product_code)
-            .args(["/qn", "/norestart"]);
-        self.installer_outcome(run_command(uninstall, Duration::from_secs(20 * 60))?)
+        uninstall.args(msi_arguments(
+            "/x",
+            self.plan.candidate_inventory.product_code.as_ref(),
+            &self.directory.join("remove-candidate.log"),
+        ));
+        self.installer_outcome(run_command(uninstall)?)
     }
     fn health(&self, previous: bool) -> Result<(), Error> {
         let inventory = if previous {
@@ -557,60 +570,24 @@ impl Platform for Worker {
         self.plan.worker_created_filetime = format!("{:016x}", protected::created(unsafe { GetCurrentProcess() })?);
         self.plan.lock_handle = format!("{:016x}", self.lock.as_ref().unwrap().0 as usize);
         write_plan(&self.plan)?;
-        verify_release(&self.directory.join("candidate.msi"), &self.plan.candidate, &self.roots)?;
-        verify_release(
-            &cache(self.plan.previous.build)?.join("package.msi"),
-            &self.plan.previous,
-            &self.roots,
-        )?;
-        // Reinspect from source MSI; service-provided inventories are not authority.
-        let candidate = msi::inspect(
-            &self.directory.join("candidate.msi"),
-            &self.directory.join("worker-candidate-check"),
-            &self.roots,
-            &self.plan.candidate,
-        )?;
-        let previous = msi::inspect(
-            &cache(self.plan.previous.build)?.join("package.msi"),
-            &self.directory.join("worker-previous-check"),
-            &self.roots,
-            &self.plan.previous,
-        )?;
-        if candidate.hashes != self.plan.candidate_inventory.hashes
-            || candidate.product_code != self.plan.candidate_inventory.product_code
-            || previous.hashes != self.plan.previous_inventory.hashes
-            || previous.product_code != self.plan.previous_inventory.product_code
-        {
-            return Err(Error::Signature);
-        }
-        if journal.stage == Stage::Prepared {
-            let machine = policy()?;
-            let channel = machine.policy.preferences.channel;
-            let manifest = feed::verify_manifest(
-                &protected::read(&self.directory.join("manifest.json"), feed::MAX_FEED as u64)?,
-                &self.roots.feed(),
-                channel,
-                &machine.watermarks.get(channel.name()).cloned().unwrap_or_default(),
-                now(),
-            )?;
-            if !manifest.manifest().releases.contains(&self.plan.candidate)
-                || machine.quarantine.contains(&journal.new_build)
-            {
-                return Err(Error::Policy);
-            }
-        }
         if self.directory.join("failure-policy.json").exists() {
             self.failure = Some(feed::strict_json(&protected::read(
                 &self.directory.join("failure-policy.json"),
                 65536,
             )?)?);
         }
+        self.canceled = journal.stage == Stage::Prepared && self.directory.join("abort.json").exists();
+        // The service verified and inspected each package once before persisting
+        // this SYSTEM-owned plan. Recovery trusts that protected state.
         Ok(())
     }
     fn persist(&mut self, journal: &Journal) -> Result<(), Error> {
         self.save(journal)
     }
     fn arm_recovery(&mut self) -> Result<(), Error> {
+        if self.canceled {
+            return Ok(());
+        }
         arm_task(&self.plan, &self.directory)?;
         if !self.plan.reboot_marker_armed {
             mark_boot(&self.plan.transaction)?;
@@ -620,6 +597,9 @@ impl Platform for Worker {
         Ok(())
     }
     fn confirm_drain_and_handover(&mut self) -> Result<(), Error> {
+        if self.canceled || self.directory.join("abort.json").exists() {
+            return Err(Error::Busy);
+        }
         protected::write(&self.directory.join("worker-ready.json"), &json(&self.plan.worker_pid)?)?;
         let deadline = Instant::now() + Duration::from_secs(25);
         while !self.directory.join("drained.json").exists() {
@@ -751,10 +731,34 @@ impl Platform for Worker {
                 std::fs::remove_file(path).map_err(|_| Error::Storage)?;
             }
         }
+        // Only after health commit/rollback and pending removal: ordinary UI
+        // activation follows the same entry as the installer's Launch Oink.
+        if self.directory.join("drained.json").exists() {
+            let reopen = || -> Result<(), Error> {
+                let live = super::pipe::sessions().map_err(|_| Error::Transaction)?;
+                for original in &self.plan.sessions {
+                    if live.contains(&original.id)
+                        && STANDARD.encode(security::user_sid(original.id).map_err(|_| Error::Policy)?) == original.sid
+                    {
+                        super::super::backend::spawn_update_ui(
+                            original.id,
+                            &STANDARD.decode(&original.sid).map_err(|_| Error::Metadata)?,
+                        )
+                        .map_err(|_| Error::Transaction)?;
+                    }
+                }
+                Ok(())
+            };
+            if let Err(error) = reopen() {
+                // UI activation is best effort after the durable product result;
+                // it must not turn an already completed rollback into RepairRequired.
+                tracing::warn!(%error, "could not reopen Oink after update");
+            }
+        }
         Ok(())
     }
 }
-fn process_current(session: &Session) -> Result<bool, Error> {
+pub(super) fn process_current(session: &Session) -> Result<bool, Error> {
     // SAFETY: query-only process open; no exit/termination privilege requested.
     let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, session.pid) };
     if raw.is_null() {
@@ -805,9 +809,14 @@ fn product_processes(include_service: bool) -> Result<Vec<Handle>, Error> {
             .unwrap_or(entry.szExeFile.len());
         let name = String::from_utf16_lossy(&entry.szExeFile[..n]);
         if (include_service || !name.eq_ignore_ascii_case("oink-service.exe"))
-            && ["oink.exe", "oink-agent.exe", "oink-service.exe"]
-                .iter()
-                .any(|n| name.eq_ignore_ascii_case(n))
+            && [
+                "oink.exe",
+                "oink-agent.exe",
+                "oink-service.exe",
+                "oink-crash-collector.exe",
+            ]
+            .iter()
+            .any(|n| name.eq_ignore_ascii_case(n))
         {
             // SAFETY: pin only candidate product processes; actual image path is checked next.
             let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, entry.th32ProcessID) };
@@ -912,22 +921,28 @@ fn boot_changed(plan: &Plan) -> Result<bool, Error> {
     }
     Ok(false)
 }
-fn arm_task(plan: &Plan, directory: &Path) -> Result<(), Error> {
+fn recovery_task_xml(transaction: &str, directory: &Path) -> Result<String, Error> {
     let escape = |s: String| {
         s.replace('&', "&amp;")
             .replace('<', "&lt;")
             .replace('>', "&gt;")
             .replace('"', "&quot;")
     };
-    let task = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><RegistrationInfo><SecurityDescriptor>O:SYG:SYD:P(A;;GA;;;SY)</SecurityDescriptor></RegistrationInfo><Triggers><BootTrigger><Enabled>true</Enabled><Delay>PT30S</Delay></BootTrigger><TimeTrigger><Repetition><Interval>PT1M</Interval></Repetition><StartBoundary>{}</StartBoundary><Enabled>true</Enabled></TimeTrigger></Triggers><Principals><Principal id="System"><UserId>S-1-5-18</UserId><LogonType>ServiceAccount</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT30M</ExecutionTimeLimit></Settings><Actions Context="System"><Exec><Command>{}</Command><Arguments>{}</Arguments><WorkingDirectory>{}</WorkingDirectory></Exec></Actions></Task>"#,
+    // The COM API receives UTF-16 BSTR, while the diagnostic file is UTF-8:
+    // leave encoding unspecified. ServiceAccount is a registration flag, not
+    // a valid XML LogonType; task::register supplies TASK_LOGON_SERVICE_ACCOUNT.
+    Ok(format!(
+        r#"<?xml version="1.0"?><Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><RegistrationInfo><SecurityDescriptor>O:SYG:SYD:P(A;;GA;;;SY)</SecurityDescriptor></RegistrationInfo><Triggers><BootTrigger><Enabled>true</Enabled><Delay>PT30S</Delay></BootTrigger><TimeTrigger><Repetition><Interval>PT1M</Interval></Repetition><StartBoundary>{}</StartBoundary><Enabled>true</Enabled></TimeTrigger></Triggers><Principals><Principal id="System"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT30M</ExecutionTimeLimit></Settings><Actions Context="System"><Exec><Command>{}</Command><Arguments>{}</Arguments><WorkingDirectory>{}</WorkingDirectory></Exec></Actions></Task>"#,
         time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|_| Error::Clock)?,
         escape(directory.join("worker.exe").display().to_string()),
-        plan.transaction,
+        transaction,
         escape(directory.display().to_string())
-    );
+    ))
+}
+fn arm_task(plan: &Plan, directory: &Path) -> Result<(), Error> {
+    let task = recovery_task_xml(&plan.transaction, directory)?;
     let path = directory.join("task.xml");
     protected::write(&path, task.as_bytes())?;
     super::task::register(&plan.transaction, &task)
@@ -1193,4 +1208,36 @@ pub(super) fn resume_pending() -> Result<(), Error> {
         return Err(Error::Transaction);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn recovery_task_definition_is_accepted_by_native_scheduler() {
+        let directory = Path::new(r"C:\Program Files\Oink\maintenance\transactions\0123456789abcdef0123456789abcdef");
+        let xml = recovery_task_xml("0123456789abcdef0123456789abcdef", directory).unwrap();
+        super::super::task::validate_definition(&xml).unwrap();
+    }
+    #[test]
+    fn installer_has_only_quiet_no_restart_and_protected_verbose_log_arguments() {
+        let package = Path::new(r"C:\Program Files\Oink\maintenance\transactions\test\candidate.msi");
+        let log = package.with_file_name("install.log");
+        let arguments = msi_arguments("/i", package.as_os_str(), &log);
+        assert_eq!(
+            arguments,
+            [
+                "/i".as_ref(),
+                package.as_os_str(),
+                "/qn".as_ref(),
+                "/norestart".as_ref(),
+                "/L*v!".as_ref(),
+                log.as_os_str()
+            ]
+        );
+        assert_eq!(outcome(0), Ok(InstallOutcome::Installed));
+        assert_eq!(outcome(3010), Ok(InstallOutcome::RebootRequired));
+        assert_eq!(outcome(1618), Ok(InstallOutcome::Busy));
+        assert_eq!(outcome(1603), Err(Error::Transaction));
+    }
 }

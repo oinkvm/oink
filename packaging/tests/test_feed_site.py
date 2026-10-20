@@ -49,19 +49,49 @@ class SiteTests(unittest.TestCase):
         self.download.start()
         self.addCleanup(self.download.stop)
 
-    def mac(self, build):
+    def test_bootstrap_only_copies_original_disabled_landing_site(self):
+        initial = self.root / 'initial'
+        feed_site.initialize(initial)
+        before = feed_site.files(initial)
+        output = self.root / 'landing'
+        feed_site.bootstrap(initial, output)
+        self.assertEqual(feed_site.files(output), feed_site.files(initial / 'site'))
+        self.assertEqual(feed_site.files(initial), before)
+        self.assertEqual(set(feed_site.files(output)), {'CNAME', 'index.html'})
+
+    def test_bootstrap_refuses_live_or_modified_state(self):
+        for change in ('revision', 'enabled', 'site', 'record', 'symlink'):
+            with self.subTest(change=change):
+                initial = self.root / change
+                feed_site.initialize(initial)
+                if change in ('revision', 'enabled'):
+                    reg = feed.registry(initial)
+                    if change == 'revision': reg['revision'] = 1
+                    else: reg['platforms']['mac']['enabled'] = True
+                    feed.write(initial / 'registry.json', reg)
+                elif change == 'site': feed.write(initial / 'site/extra.html', b'extra')
+                elif change == 'record': feed.write(initial / 'records/extra.json', {})
+                elif os.name == 'nt': continue  # Symlink privilege is not assumed on Windows.
+                else: (initial / 'site/link').symlink_to('index.html')
+                with self.assertRaises(ValueError):
+                    feed_site.bootstrap(initial, self.root / ('output-' + change))
+                self.assertFalse((self.root / ('output-' + change)).exists())
+
+    def mac(self, build, channel='beta'):
         package = b'PUBLIC TEST ARCHIVE ' + str(build).encode()
         url = f'https://github.com/oinkvm/oink/releases/download/v1.0.{build}/Oink-arm64.zip'
         self.packages[url] = package
+        channel_tag = '<sparkle:channel>beta</sparkle:channel>' if channel == 'beta' else ''
         xml = f'''<rss xmlns:sparkle="{feed_site.SPARKLE}" xmlns:oink="{feed_site.OINK}"><channel><item>
 <sparkle:version>{build}</sparkle:version><sparkle:shortVersionString>1.0.{build}</sparkle:shortVersionString>
-<sparkle:channel>beta</sparkle:channel><enclosure url="{url}" length="{len(package)}" sparkle:edSignature="{feed.sign(package,EPOCH['epoch'],PUB)}"/>
+<oink:sha256>{feed.digest(package)}</oink:sha256>
+{channel_tag}<enclosure url="{url}" length="{len(package)}" sparkle:edSignature="{feed.sign(package,EPOCH['epoch'],PUB)}"/>
 <oink:releaseNotes>{{"en":"Test update","zh-Hans":"测试更新"}}</oink:releaseNotes>
 </item></channel></rss>'''.encode()
         raw = xml + f'<!-- sparkle-signatures:\nedSignature: {feed.sign(xml,EPOCH["epoch"],PUB)}\nlength: {len(xml)}\n-->\n'.encode()
         record = {'architecture': 'arm64', 'build': build, 'qualified_build': build, 'developer_id_verified': True,
                   'notarized': True, 'sha256': feed.digest(package), 'url': url, 'length': len(package), 'version': f'1.0.{build}'}
-        feed.write(self.state / 'site' / MAC_PATH, raw)
+        feed.write(self.state / 'site' / MAC_PATH.replace('/beta/', f'/{channel}/'), raw)
         return record
 
     def windows(self, sequence, releases=None):
@@ -125,8 +155,11 @@ class SiteTests(unittest.TestCase):
                             other = 'windows' if platform == 'mac' else 'mac'
                             preserved = feed_site.files(case.state / 'site' / other)
                             proposed = case.make_candidate(platform)
+                            if not list((case.state / 'records').iterdir()):
+                                (case.state / 'records').rmdir()  # Git drops empty directories on checkout.
                             output = case.root / 'next'
                             feed_site.merge(case.state, proposed, output, 0)
+                            self.assertTrue((output / 'records').is_dir())
                             self.assertEqual(feed_site.files(output / 'site' / other), preserved)
                             self.assertEqual(feed.registry(output)['revision'], 1)
                             # Readback verifies bytes and absent-platform 404s without a real deployment.
@@ -139,6 +172,62 @@ class SiteTests(unittest.TestCase):
                                 feed_site.verify_public(output)
                         finally:
                             case.doCleanups()
+
+    def test_mac_candidate_and_merge_do_not_depend_on_historical_archives(self):
+        self.install('mac', 1)
+        old_xml = (self.state / 'site' / MAC_PATH).read_bytes()
+        catalog = {MAC_PATH: self.mac(2)}
+        new_xml = (self.state / 'site' / MAC_PATH).read_bytes()
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(new_xml)
+        root.find('channel').append(ET.fromstring(old_xml).find('./channel/item'))
+        xml = ET.tostring(root)
+        raw = xml + f'<!-- sparkle-signatures:\nedSignature: {feed.sign(xml,EPOCH["epoch"],PUB)}\nlength: {len(xml)}\n-->\n'.encode()
+        feed.write(self.state / 'site' / MAC_PATH, raw)
+        feed.write(self.root / 'catalog.json', catalog)
+        before = feed.registry(self.state)
+        # The signer already verified the NEW archive. Old release assets need
+        # not remain online for a subsequent publication to succeed.
+        with patch.object(feed, 'download', side_effect=AssertionError('archives must not be downloaded again')), \
+             patch.object(feed, 'verify', wraps=feed.verify) as verify:
+            candidate = self.root / 'no-archive-candidate'
+            feed_site.candidate(self.state, 'mac', candidate, self.root / 'catalog.json')
+            self.assertEqual(verify.call_count, 0, 'candidate checks structure; signature belongs to the final write boundary')
+            feed.write(self.state / 'site' / MAC_PATH, old_xml)
+            feed.write(self.state / 'registry.json', before)
+            feed_site.merge(self.state, candidate, self.root / 'next', 0)
+            self.assertEqual(verify.call_count, 1, 'verify the appcast once at the final write boundary')
+
+    def test_unchanged_channel_retains_its_prior_qualification_without_reapproval(self):
+        self.install('mac', 1)
+        before = feed.registry(self.state)['platforms']['mac']['catalog']
+        stable = MAC_PATH.replace('/beta/', '/stable/')
+        catalog = {**before, stable: self.mac(2, 'stable')}
+        path = self.root / 'catalog.json'
+        feed.write(path, catalog)
+        with patch.dict(os.environ, {'OINK_UPDATE_QUALIFIED_BUILD': '2'}):
+            feed_site.candidate(self.state, 'mac', self.root / 'candidate', path)
+            # Keeping old bytes is insufficient if their trusted catalog changes.
+            catalog[MAC_PATH]['version'] = 'forged'
+            feed.write(path, catalog)
+            with self.assertRaisesRegex(ValueError, 'update_not_qualified'):
+                feed_site.candidate(self.state, 'mac', self.root / 'bad', path)
+
+    def test_unchanged_mac_channel_does_not_repeat_its_signature_verification(self):
+        self.install('mac', 1)
+        before = feed_site.files(self.state)
+        reg = feed.registry(self.state)
+        stable = MAC_PATH.replace('/beta/', '/stable/')
+        catalog = {**reg['platforms']['mac']['catalog'], stable: self.mac(2, 'stable')}
+        feed.write(self.root / 'catalog.json', catalog)
+        candidate = self.root / 'one-channel-candidate'
+        feed_site.candidate(self.state, 'mac', candidate, self.root / 'catalog.json')
+        for path in self.state.rglob('*'):
+            if path.is_file(): path.unlink()
+        for name, raw in before.items(): feed.write(self.state / name, raw)
+        with patch.object(feed, 'verify', wraps=feed.verify) as verify:
+            feed_site.merge(self.state, candidate, self.root / 'next', 0)
+            self.assertEqual(verify.call_count, 1, 'the retained beta appcast was already trusted')
 
     def test_both_absent_requires_neither_platform_trust(self):
         with patch.object(feed, 'trust', side_effect=AssertionError('disabled platform must not load trust')):
@@ -230,7 +319,7 @@ class SiteTests(unittest.TestCase):
                    'package': {'url': url, 'length': len(raw), 'sha256': feed.digest(raw),
                                'keyId': EPOCH['epoch'], 'ed25519': feed.sign(raw, EPOCH['epoch'], PUB)}}
         record = {'schema': 1, 'approved': True, 'published': True, 'source_tree_sha256': 'a'*64,
-                  'workflow_run_id': 1, 'signing_approval': 'TEST', 'release': release}
+                  'workflow_run_id': 1, 'signing_policy': 'manifest-ed25519', 'release': release}
         encoded = feed.encode(record)
         record_hash = feed.digest(encoded)
         feed.write(self.state / 'records' / (record_hash + '.json'), encoded)
@@ -264,14 +353,16 @@ class SiteTests(unittest.TestCase):
 
 class TrustTests(unittest.TestCase):
     def test_disabled_is_explicit_and_enabled_missing_roots_is_an_error(self):
-        config = feed.read(feed.ROOT / 'packaging/update-trust.json')
+        config = {'schema': 1, 'repository': 'oinkvm/oink',
+                  'windows': [{**copy.deepcopy(EPOCH), 'enabled': False, 'public_key': PUB}],
+                  'mac': {'epoch': 'mac-2026-01', 'enabled': False, 'public_key': PUB}}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with patch.object(feed, 'ROOT', root):
                 feed.write(root / 'packaging/update-trust.json', config)
                 self.assertEqual(feed.trust('windows')['windows'], [])
                 self.assertFalse(feed.trust('mac')['mac']['enabled'])
-                config['windows'][0]['enabled'] = True
+                config['windows'][0].update(enabled=True, public_key=None)
                 feed.write(root / 'packaging/update-trust.json', config)
                 with self.assertRaisesRegex(ValueError, 'trust_unconfigured'): feed.trust('windows')
                 # Mac trust validation has no dependency on Windows trust.
@@ -361,6 +452,13 @@ class DeploymentTests(unittest.TestCase):
             self.assertIn('uses: ./.github/workflows/deploy-feed.yml', text)
         mac = (root / 'publish-macos-feed.yml').read_text()
         self.assertNotIn('windows', mac.lower())
+        bootstrap = (root / 'bootstrap-update-site.yml').read_text()
+        self.assertIn('group: oink-update-feed-publish', bootstrap)
+        self.assertIn('environment: github-pages', bootstrap)
+        self.assertIn('feed_site.py bootstrap', bootstrap)
+        self.assertIn('github.event.repository.default_branch', bootstrap)
+        self.assertNotIn('secrets.', bootstrap)
+        self.assertNotIn('contents: write', bootstrap)
 
 
 if __name__ == '__main__': unittest.main()

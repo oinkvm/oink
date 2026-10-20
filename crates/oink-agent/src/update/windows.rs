@@ -21,8 +21,8 @@ pub(super) fn attach(node: &Node) {
             transaction,
             Prepared {
                 node: node.clone(),
+                gate: maintenance::process().clone(),
                 generation: BOOT_GENERATION,
-                input_generation: maintenance::process().input_generation(),
                 expires: Instant::now() + Duration::from_secs(600),
                 consumed: false,
             },
@@ -67,10 +67,10 @@ pub(super) fn attach(node: &Node) {
                 transaction: prepared.as_ref().map(|(tx, _)| tx.clone()),
             };
             match oink_winsvc::update::request(request) {
-                Ok(Reply::Prepare { transaction, automatic }) => {
+                Ok(Reply::Prepare { transaction }) => {
                     if prepared.as_ref().is_none_or(|(tx, _)| *tx != transaction) {
                         prepared = None;
-                        match node.prepare_for_update(automatic) {
+                        match node.prepare_for_update() {
                             Ok(token) => prepared = Some((transaction.clone(), token)),
                             Err(blockers) => {
                                 let _ = oink_winsvc::update::request(Request::Busy { transaction, blockers });
@@ -81,14 +81,14 @@ pub(super) fn attach(node: &Node) {
                     let _ = oink_winsvc::update::request(Request::Quiesced { transaction });
                 }
                 Ok(Reply::Shutdown { transaction }) => {
-                    if let Some((tx, mut token)) = prepared.take()
+                    if let Some((tx, token)) = prepared.take()
                         && tx == transaction
                     {
-                        if health_mode && token.refresh_health_input().is_err() {
+                        if health_mode && token.validate().is_err() {
                             prepared = Some((tx, token));
                             continue;
                         }
-                        match token.shutdown() {
+                        match token.shutdown_with_ui(true) {
                             Ok(()) => break,
                             Err(blockers) => {
                                 let _ = oink_winsvc::update::request(Request::Busy { transaction, blockers });
@@ -104,7 +104,7 @@ pub(super) fn attach(node: &Node) {
                         continue;
                     }
                     if prepared.is_none() {
-                        match node.prepare_for_update(false) {
+                        match node.prepare_for_update() {
                             Ok(mut token) => {
                                 token.hold_for_health();
                                 prepared = Some((transaction.clone(), token));
@@ -117,7 +117,7 @@ pub(super) fn attach(node: &Node) {
                         let _ = oink_winsvc::update::request(Request::Health {
                             transaction,
                             build,
-                            input_ready: status.helper_priority.is_some(),
+                            input_ready: oink_update::trust::health_ready(status.helper_priority.is_some()),
                             routing_ready: status.focus_info.is_some(),
                         });
                     }
@@ -164,13 +164,9 @@ pub(crate) fn startup_gate() -> Result<(), Error> {
             if env!("OINK_RELEASE_BUILD").parse::<u64>().ok() != Some(build) {
                 return Err(Error::Policy);
             }
-            if !maintenance::process()
-                .close(BOOT_GENERATION)
-                .map_err(|_| Error::Busy)?
-                .is_empty()
-            {
-                return Err(Error::Busy);
-            }
+            maintenance::process()
+                .close_for_update(BOOT_GENERATION)
+                .map_err(|_| Error::Busy)?;
             *STARTUP.lock().unwrap() = Some(transaction);
             Ok(())
         }

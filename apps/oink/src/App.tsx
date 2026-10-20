@@ -18,7 +18,7 @@ import { Arrangement } from './arrange/Arrangement';
 import type { Placement } from './api/types';
 import type { Screen } from './arrange/geometry';
 import { useHistory } from './arrange/useHistory';
-import { renderLayout, layoutPlacements, presentScreens, replayPlacements } from './arrange/adapter';
+import { renderLayout, layoutPlacements, presentScreens, replayPlacements, visibleScreens } from './arrange/adapter';
 import { DesktopWindow } from './window/DesktopWindow';
 import { ResizeEdges } from './window/ResizeEdges';
 import { QuitDialog } from './window/QuitDialog';
@@ -349,11 +349,7 @@ export function App() {
         const rank=(id:string)=>fromRequestPeekId(id)?-1:list.indexOf(id);
         setGrowIds(previous=>{const next=new Set([...previous].filter(id=>rank(id)<=rank(peekId)));if(peekId===selectedDevice)next.add(peekId);return next.size===previous.size&&[...next].every(id=>previous.has(id))?previous:next;});
     },[peekId,selectedDevice]);
-    const visible = useMemo(()=>screens.filter(s => {
-        const owner = devices.find(d => d.id === s.device);
-        const backend = state.layout?.geometry.screens.find(b => `${b.key.device}:${b.key.display}` === s.id);
-        return owner?.screenSharing !== false && owner?.screen !== 'disabled' && !backend?.hidden && !backend?.device_disabled;
-    }),[screens,state.cards,state.pending,state.layout]);
+    const visible = useMemo(()=>visibleScreens(screens, state.layout, devices),[screens,state.cards,state.pending,state.layout]);
     useEffect(()=>{if(selected&&!visible.some(s=>s.id===selected))setSelected(null);},[visible,selected]);
     const permissions: Record<PermissionId, PermState> = {
         accessibility: 'unknown', input: 'unknown', network: 'unknown', files: 'unknown', audio: 'unknown',

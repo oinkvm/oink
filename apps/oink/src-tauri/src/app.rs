@@ -259,9 +259,11 @@ pub fn run() {
             }
             let handle = app.handle().clone();
             let quitting = handle.clone();
-            let control = tauri::async_runtime::block_on(oink_agent::ipc::UiControl::start(
+            let opening = handle.clone();
+            let control = tauri::async_runtime::block_on(oink_agent::ipc::UiControl::start_with_open(
                 &oink_foundation::paths::data_dir(),
                 move || quitting.exit(0),
+                move || show_main(&opening),
             ))?;
             *handle.state::<Backend>().control.lock().unwrap() = Some(control);
             crate::app_icon::initialize(&handle);

@@ -144,16 +144,12 @@ mod windows_impl {
         // Local\ mutexes are session-scoped: an SSH/installer caller in another
         // session would falsely see no owner. All sessions using this same home
         // share state and IPC, so they must also share one backend and one UI lock.
-        // File locks inherit the user's directory ACL, without a Global\ object
-        // namespace or SID/ACL setup. Never unlink/truncate or allow deletion of
+        // User-only file locks use a Medium minimum integrity label, so an
+        // elevated UI and normal backend still share ownership. LockFileEx needs
+        // only read access, including when opening an older High-labeled file.
+        // Never unlink/truncate or allow deletion of
         // an open lock file: a replacement could otherwise admit a second owner.
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
-            .open(data_dir.join(role.file()))?;
+        let file = oink_foundation::storage::open_private_lock(&data_dir.join(role.file()))?;
         if let Err(error) = file.try_lock_exclusive() {
             if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
                 return Err(AlreadyRunning(data_dir.display().to_string()).into());

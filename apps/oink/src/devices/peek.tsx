@@ -89,17 +89,36 @@ function usePeek(collapsed: boolean, suspended = false) {
     useEffect(() => {
         if (!open || !targetEl.current)
             return;
-        let raf = 0;
-        const tick = () => {
-            const el = targetEl.current;
-            if (el) {
-                const r = el.getBoundingClientRect();
-                setTarget((t) => (t && Math.abs(t.rect.top - r.top) > 0.5 ? { ...t, rect: r } : t));
-            }
-            raf = requestAnimationFrame(tick);
+        const el = targetEl.current;
+        const measure = () => {
+            const r = el.getBoundingClientRect();
+            setTarget(t => t && Math.abs(t.rect.top - r.top) > 0.5 ? { ...t, rect: r } : t);
         };
-        raf = requestAnimationFrame(tick);
-        return () => cancelAnimationFrame(raf);
+        // Sidebar changes and native resize can move the anchor. Observe those
+        // changes instead of reading layout on every display frame while idle.
+        const resize = new ResizeObserver(measure);
+        for (let node: HTMLElement | null = el; node; node = node.parentElement) {
+            resize.observe(node);
+            if (node.classList.contains('win')) break;
+        }
+        const mutations = new MutationObserver(measure);
+        mutations.observe(el.closest('.win__side') ?? el.parentElement ?? el, {
+            childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style'],
+        });
+        const visibility = () => { if (document.hidden) close(); };
+        const intersection = typeof IntersectionObserver === 'undefined' ? undefined : new IntersectionObserver(([entry]) => {
+            if (!entry.isIntersecting || entry.intersectionRatio === 0) close();
+        });
+        intersection?.observe(el);
+        document.addEventListener('visibilitychange', visibility);
+        window.addEventListener('resize', measure);
+        visibility();
+        measure();
+        return () => {
+            resize.disconnect(); mutations.disconnect(); intersection?.disconnect();
+            document.removeEventListener('visibilitychange', visibility);
+            window.removeEventListener('resize', measure);
+        };
     }, [open, target?.id]);
     useEffect(() => { if (!open)
         releaseFocusEl(); }, [open]);

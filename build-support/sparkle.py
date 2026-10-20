@@ -23,9 +23,9 @@ def prepare(cache):
             destination.mkdir()
             source.extractall(destination, filter='data')
         # Never trust a previously extracted cache merely because its directory
-        # exists. Compare the framework bytes and symlinks to the pinned archive.
+        # exists. Compare framework AND signing/key tools to the pinned archive.
         for member in source.getmembers():
-            if not member.name.startswith('Sparkle.framework/'):
+            if not member.name.startswith(('Sparkle.framework/', 'bin/')):
                 continue
             path = destination / member.name
             if member.issym():

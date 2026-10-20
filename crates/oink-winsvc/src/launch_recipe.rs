@@ -31,12 +31,14 @@ pub(crate) fn validate_environment(environment: &[u16]) -> io::Result<()> {
 pub(crate) enum Target {
     Backend,
     Reopen,
+    UpdateUi,
 }
 impl Target {
     pub(crate) fn argument(self) -> &'static str {
         match self {
             Self::Backend => "--service",
             Self::Reopen => "--reopen",
+            Self::UpdateUi => "",
         }
     }
     pub(crate) fn uiaccess(self) -> bool {
@@ -77,6 +79,11 @@ pub(crate) fn dispatch(
 mod tests {
     use super::*;
     use std::cell::Cell;
+    #[test]
+    fn update_relaunch_is_fixed_ordinary_ui_entry() {
+        assert_eq!(Target::UpdateUi.argument(), "");
+        assert!(!Target::UpdateUi.uiaccess());
+    }
 
     #[test]
     fn every_token_failure_stops_the_recipe_without_fallback() {

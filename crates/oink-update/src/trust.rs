@@ -5,13 +5,11 @@ use serde::Deserialize;
 #[derive(Debug)]
 pub struct Roots {
     pub key: [u8; 32],
-    pub repository: String,
     pub signer_spki_sha256: Vec<String>,
 }
 #[derive(Deserialize)]
 struct Config {
     schema: u32,
-    repository: String,
     windows: Vec<Windows>,
     mac: Mac,
 }
@@ -47,8 +45,22 @@ fn mac_configured(raw: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 pub fn compiled() -> Result<Roots, Error> {
+    #[cfg(feature = "test-feed")]
+    {
+        let _: Config = crate::feed::strict_json(CONFIG)?;
+        // RFC 8032 public TEST key. No production secret or config override.
+        let public = STANDARD
+            .decode("11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=")
+            .map_err(|_| Error::NotConfigured)?;
+        Ok(Roots {
+            key: public.try_into().map_err(|_| Error::NotConfigured)?,
+            signer_spki_sha256: vec![],
+        })
+    }
+    #[cfg(not(feature = "test-feed"))]
     windows_configured(CONFIG)
 }
+#[cfg_attr(all(feature = "test-feed", not(test)), allow(dead_code))]
 fn windows_configured(raw: &[u8]) -> Result<Roots, Error> {
     let config: Config = crate::feed::strict_json(raw)?;
     if config.schema != 1 {
@@ -65,17 +77,15 @@ fn windows_configured(raw: &[u8]) -> Result<Roots, Error> {
     let key = STANDARD
         .decode(windows.public_key.ok_or(Error::NotConfigured)?)
         .map_err(|_| Error::NotConfigured)?;
-    if windows.authenticode_spki_sha256.is_empty()
-        || windows
-            .authenticode_spki_sha256
-            .iter()
-            .any(|pin| pin.len() != 64 || !pin.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    if windows
+        .authenticode_spki_sha256
+        .iter()
+        .any(|pin| pin.len() != 64 || !pin.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
     {
         return Err(Error::NotConfigured);
     }
     Ok(Roots {
         key: key.try_into().map_err(|_| Error::NotConfigured)?,
-        repository: config.repository,
         signer_spki_sha256: windows.authenticode_spki_sha256,
     })
 }
@@ -84,24 +94,42 @@ impl Roots {
         crate::feed::Trust {
             epoch: WINDOWS_EPOCH,
             key: &self.key,
-            repository: &self.repository,
         }
     }
+}
+
+/// A TEST-only candidate can withhold health proof to qualify real rollback.
+/// This is compiled into that candidate; neither IPC nor runtime env enables it.
+pub fn health_ready(ready: bool) -> bool {
+    #[cfg(feature = "test-feed")]
+    if env!("OINK_WINDOWS_UPDATE_TEST_FAIL_HEALTH") == "1" {
+        return false;
+    }
+    ready
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn beta_is_manual_only_on_both_platforms() {
-        assert!(!mac_enabled());
-        assert!(matches!(compiled(), Err(Error::NotConfigured)));
+    fn disabled_release_gates_are_independent_of_configured_keys() {
+        let mut config: serde_json::Value = serde_json::from_slice(CONFIG).unwrap();
+        config["mac"]["enabled"] = false.into();
+        config["mac"]["public_key"] = STANDARD.encode([1; 32]).into();
+        config["windows"][0]["enabled"] = false.into();
+        config["windows"][0]["public_key"] = STANDARD.encode([2; 32]).into();
+        let disabled = serde_json::to_vec(&config).unwrap();
+        assert!(matches!(mac_configured(&disabled), Err(Error::NotConfigured)));
+        assert!(matches!(windows_configured(&disabled), Err(Error::NotConfigured)));
     }
     #[test]
     fn each_platform_requires_enablement_and_its_own_roots() {
         for mac in [false, true] {
             for windows in [false, true] {
                 let mut config: serde_json::Value = serde_json::from_slice(CONFIG).unwrap();
+                config["mac"]["public_key"] = serde_json::Value::Null;
+                config["windows"][0]["public_key"] = serde_json::Value::Null;
+                config["windows"][0]["authenticode_spki_sha256"] = serde_json::json!([]);
                 config["mac"]["enabled"] = mac.into();
                 config["windows"][0]["enabled"] = windows.into();
                 let empty = serde_json::to_vec(&config).unwrap();
@@ -114,6 +142,26 @@ mod tests {
                 assert_eq!(mac_configured(&roots).is_ok(), mac);
                 assert_eq!(windows_configured(&roots).is_ok(), windows);
             }
+        }
+    }
+    #[test]
+    fn windows_manifest_root_allows_unsigned_packages_and_validates_optional_pins() {
+        let mut config: serde_json::Value = serde_json::from_slice(CONFIG).unwrap();
+        config["windows"][0]["enabled"] = true.into();
+        config["windows"][0]["public_key"] = STANDARD.encode([2; 32]).into();
+        config["windows"][0]["authenticode_spki_sha256"] = serde_json::json!([]);
+        assert!(
+            windows_configured(&serde_json::to_vec(&config).unwrap())
+                .unwrap()
+                .signer_spki_sha256
+                .is_empty()
+        );
+        for pin in ["", "garbage", &"A".repeat(64), &"a".repeat(63)] {
+            config["windows"][0]["authenticode_spki_sha256"] = serde_json::json!([pin]);
+            assert!(matches!(
+                windows_configured(&serde_json::to_vec(&config).unwrap()),
+                Err(Error::NotConfigured)
+            ));
         }
     }
 }

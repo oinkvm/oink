@@ -24,7 +24,7 @@ struct Font {
 }
 
 impl Font {
-    fn new(bold: bool, em: f64, medium: bool) -> Option<Self> {
+    fn new(bold: bool, em: f64, medium: u8) -> Option<Self> {
         // SAFETY: 标准的 GDI 对象创建；失败时释放已创建的对象。高度为负：按字身（em）的像素数。
         unsafe {
             let dc = CreateCompatibleDC(None);
@@ -36,14 +36,15 @@ impl Font {
                 0,
                 0,
                 0,
-                (if bold {
-                    FW_BOLD
-                } else if medium {
-                    FW_MEDIUM
+                if medium == 2 {
+                    if bold { 600 } else { 450 }
+                } else if bold {
+                    FW_BOLD.0 as i32
+                } else if medium == 1 {
+                    FW_MEDIUM.0 as i32
                 } else {
-                    FW_NORMAL
-                })
-                .0 as i32,
+                    FW_NORMAL.0 as i32
+                },
                 0,
                 0,
                 0,
@@ -75,8 +76,8 @@ impl Drop for Font {
 }
 
 /// cap 高与字身的比例：量「H」的墨迹高度（按字重各算一次）。
-fn cap_ratio(bold: bool, medium: bool) -> Option<f64> {
-    static RATIO: [OnceLock<Option<f64>>; 4] = [const { OnceLock::new() }; 4];
+fn cap_ratio(bold: bool, medium: u8) -> Option<f64> {
+    static RATIO: [OnceLock<Option<f64>>; 6] = [const { OnceLock::new() }; 6];
     *RATIO[usize::from(bold) + usize::from(medium) * 2].get_or_init(|| {
         let f = Font::new(bold, 200.0, medium)?;
         let mut gm = GLYPHMETRICS::default();
@@ -93,15 +94,18 @@ fn cap_ratio(bold: bool, medium: bool) -> Option<f64> {
 
 #[derive(Debug)]
 pub(super) struct SystemText {
-    medium: bool,
+    medium: u8,
 }
 
 impl SystemText {
+    pub(super) fn toast() -> Option<Self> {
+        (cap_ratio(false, 2).is_some() && cap_ratio(true, 2).is_some()).then_some(Self { medium: 2 })
+    }
     pub(super) fn medium() -> Option<Self> {
-        cap_ratio(false, true).map(|_| Self { medium: true })
+        cap_ratio(false, 1).map(|_| Self { medium: 1 })
     }
     pub(super) fn new() -> Option<Self> {
-        (cap_ratio(false, false).is_some() && cap_ratio(true, false).is_some()).then_some(Self { medium: false })
+        (cap_ratio(false, 0).is_some() && cap_ratio(true, 0).is_some()).then_some(Self { medium: 0 })
     }
 }
 
@@ -111,7 +115,7 @@ impl TextRaster for SystemText {
     }
 }
 
-fn render(text: &str, cap: f64, bold: bool, medium: bool) -> Option<Mask> {
+fn render(text: &str, cap: f64, bold: bool, medium: u8) -> Option<Mask> {
     let f = Font::new(bold, cap.max(1.0) / cap_ratio(bold, medium)?, medium)?;
     let wide: Vec<u16> = text.encode_utf16().collect();
     let mut size = SIZE::default();

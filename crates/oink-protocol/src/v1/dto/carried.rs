@@ -24,7 +24,7 @@ wire_map!(KeyboardMapping,validate_keyboard_mapping,{
 wire_map!(TargetTransform,no_validation,{1=>reverse_wheel:bool=required;2=>keyboard:KeyboardMapping=required;});
 wire_map!(TargetOverride,no_validation,{1=>target:DeviceId=required;2=>reverse_wheel:Option<bool>=optional;3=>keyboard:Option<KeyboardMapping>=optional;});
 wire_map!(ScreenPreferencesValue,validate_device_gain,{1=>screens:List<ScreenPreference,256>=required;2=>device_gain:f64=1.0;});
-wire_map!(ScreenPreference,validate_screen_gain,{1=>display:Text<512>=required;2=>gain:f64=required;3=>enabled:bool=required;});
+wire_map!(ScreenPreference,validate_screen_gain,{1=>display:Text<512>=required;2=>gain:f64=required;3=>enabled:bool=required;4=>remote_gain:f64=1.0;});
 wire_map!(SourceInputPolicyValue,no_validation,{
     1=>reference_display:Option<Text<512>>=optional;2=>button_handoff:ButtonHandoff=required;
     3=>forward_gestures:bool=required;4=>return_pointer_on_display_sleep:bool=required;
@@ -168,7 +168,7 @@ fn validate_caps(raw: &RawMap) -> crate::v1::Result<()> {
     Ok(())
 }
 fn validate_screen_gain(raw: &RawMap) -> crate::v1::Result<()> {
-    if !(0.1..=5.0).contains(&required::<f64>(raw, 2)?) {
+    if !(0.1..=5.0).contains(&required::<f64>(raw, 2)?) || !(0.1..=5.0).contains(&defaulted::<f64>(raw, 4, || 1.0)?) {
         return Err(crate::v1::ErrorCode::UnsupportedValue.into());
     }
     Ok(())

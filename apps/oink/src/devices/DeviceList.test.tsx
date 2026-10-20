@@ -64,6 +64,8 @@ describe('offline device row', () => {
     const {container, rerender} = render(<OinkProvider><DeviceItem d={{...device, group:'offline', lastSeen:now - 3_600_000}} now={now} selected={false} collapsed={false} onSelect={()=>{}}/></OinkProvider>);
     expect(container.querySelector('.dev__seen')?.textContent).toBe(language === 'en' ? 'Last seen 1 hour ago' : '上次在线 1 小时前');
     expect(container.querySelector('.dev__hit')?.getAttribute('aria-label')).toBe(language === 'en' ? 'Remote, offline, last seen 1 hour ago' : 'Remote，离线，上次在线 1 小时前');
+    rerender(<OinkProvider><DeviceItem d={{...device, group:'offline', lastSeen:now}} now={now} selected={false} collapsed={false} onSelect={()=>{}}/></OinkProvider>);
+    expect(container.querySelector('.dev__seen')?.textContent).toBe(language === 'en' ? 'Last seen Just now' : '上次在线 刚刚');
     rerender(<OinkProvider><DeviceItem d={{...device, group:'offline', lastSeen:null}} now={now} selected={false} collapsed={false} onSelect={()=>{}}/></OinkProvider>);
     expect(container.querySelector('.dev__seen')?.textContent).toBe(language === 'en' ? 'Last seen Unknown' : '上次在线 未知');
   });

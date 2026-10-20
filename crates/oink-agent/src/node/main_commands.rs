@@ -137,6 +137,7 @@ impl Node {
         match command {
             MainCommand::Wake => {}
             MainCommand::InputStatusChanged => {
+                self.sync_notifications();
                 self.consume_local_emergency();
                 #[cfg(target_os = "macos")]
                 self.inner.file_provider_safety_wake.notify_one();
@@ -407,7 +408,9 @@ impl Node {
     }
 
     fn routing_status(&self, status: StatusEvent) {
+        self.notification_status(&status);
         match status {
+            StatusEvent::FocusLock { .. } => {}
             StatusEvent::TouchpadContacts {
                 mode,
                 frames,

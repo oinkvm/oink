@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { Layout, Placement, Rect, Screen } from '../api/types';
-import { layoutPlacements, presentScreens, renderLayout, replayPlacements } from './adapter';
+import { layoutPlacements, presentScreens, renderLayout, replayPlacements, visibleScreens } from './adapter';
 import { cornerPoint, opposite, resizeFromCorner } from './geometry';
 import { edgeProjections, sameProjections, tolerance } from './facing';
 import { presentCards } from '../devices/project';
@@ -121,3 +121,26 @@ it('keeps resized native geometry and facing intervals through the frozen placem
         expect(actual.y).toBeCloseTo(expected.y, 10);
     }
 });
+
+it.each(['disconnected', 'connecting', 'address_stale'] as const)(
+    'keeps hidden screens and disabled devices out of the %s canvas through history and reconnect', reason => {
+        const value = layout([
+            screen('a', {x:0,y:0,w:1000,h:600}),
+            {...screen('b', {x:1000,y:0,w:800,h:600}), hidden:true, online:false},
+            {...screen('c', {x:1800,y:0,w:800,h:600}), key:{device:'disabled',display:'c'}, device_disabled:true, online:false},
+        ]);
+        const cards:DeviceCardsView={schema:1,stream:'visibility',revision:'1',group:null,generatedAtMs:0,
+            exitVolume:null,emergencyDelivery:null,cards:[{
+                device:'computer',name:'Computer',isSelf:false,os:'windows',logo:'windows10',section:'offline',
+                connection:{kind:'offline',reason,signal:{kind:'offline',rttMs:null,bars:0,colour:'grey'}},
+                lastSeenMs:100,status:null,pause:null,
+            }]};
+        const devices=presentCards(cards,[]);
+        const history=presentScreens(renderLayout(value,{},[placement]),devices);
+        expect(visibleScreens(history,value,devices).map(s=>s.id)).toEqual(['computer:a']);
+        expect(history).toHaveLength(3); // Hidden geometry remains available to placement history.
+        cards.cards[0]={...cards.cards[0],section:'online',connection:{kind:'online',signal:{kind:'unknown',rttMs:null,bars:0,colour:'grey'}}};
+        const reconnected=presentCards(cards,[]);
+        expect(visibleScreens(presentScreens(history,reconnected),value,reconnected).map(s=>s.id)).toEqual(['computer:a']);
+    },
+);

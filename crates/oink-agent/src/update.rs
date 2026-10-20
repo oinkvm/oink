@@ -3,13 +3,25 @@ use crate::{
     api::{ApiError, ApiEvent, ApiResult},
     node::{Node, lock},
 };
-use oink_foundation::maintenance::{self, ActivityKind};
+use oink_foundation::maintenance;
 use oink_update::{Error, barrier::Blocker, policy::*};
 use std::{
     path::Path,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Duration, Instant},
 };
+
+const INPUT_PREPARATION_BUDGET: Duration = Duration::from_secs(6);
+const AUDIO_PREPARATION_BUDGET: Duration = Duration::from_secs(3);
+// One absolute Mac preparation deadline: 3s input reply + 3s fence + 3s
+// current audio cleanup + two 8s provider commands. Each step uses its remainder;
+// the approval itself is retained until Sparkle finishes or dismisses it.
+#[cfg(target_os = "macos")]
+const PREPARATION_BUDGET: Duration = INPUT_PREPARATION_BUDGET
+    .saturating_add(AUDIO_PREPARATION_BUDGET)
+    .saturating_add(mac_provider::PREPARATION_BUDGET);
+#[cfg(not(target_os = "macos"))]
+const PREPARATION_BUDGET: Duration = Duration::from_secs(25);
 
 #[derive(Debug)]
 pub(crate) struct Controller {
@@ -18,8 +30,6 @@ pub(crate) struct Controller {
     pub status: UpdateStatus,
     #[cfg(not(windows))]
     pub ready: bool,
-    #[cfg(not(windows))]
-    install_requested: bool,
     #[cfg(not(windows))]
     installing: bool,
 }
@@ -43,7 +53,6 @@ impl Controller {
                 .unwrap_or(0),
             version: oink_update::RELEASE_VERSION.into(),
             channel: policy.preferences.channel,
-            mode: policy.preferences.mode,
             checks_enabled: false,
             phase: Phase::Disabled,
             candidate: None,
@@ -63,9 +72,52 @@ impl Controller {
             #[cfg(not(windows))]
             ready: false,
             #[cfg(not(windows))]
-            install_requested: false,
-            #[cfg(not(windows))]
             installing: false,
+        }
+    }
+    #[cfg(not(windows))]
+    fn begin_check(&mut self) -> Result<bool, Error> {
+        if self.status.error == Some(Error::NotConfigured) {
+            return Err(Error::NotConfigured);
+        }
+        if matches!(
+            self.status.phase,
+            Phase::Checking | Phase::Available | Phase::Downloading | Phase::Verifying | Phase::Ready
+        ) {
+            return Ok(false);
+        }
+        self.status.phase = Phase::Checking;
+        self.status.error = None;
+        Ok(true)
+    }
+    #[cfg(not(windows))]
+    fn begin_install(&mut self, expected_build: u64) -> Result<(), Error> {
+        if self.installing {
+            return Err(Error::Transaction);
+        }
+        if !self.ready
+            || self.status.phase != Phase::Ready
+            || self.status.candidate.as_ref().map(|c| c.build) != Some(expected_build)
+        {
+            return Err(Error::Policy);
+        }
+        self.installing = true;
+        self.status.phase = Phase::Quiescing;
+        self.status.error = None;
+        self.status.blockers.clear();
+        Ok(())
+    }
+    #[cfg(all(not(windows), any(feature = "sparkle", test)))]
+    fn dismissed(&mut self) {
+        self.ready = false;
+        if self.installing {
+            self.installing = false;
+            if self.status.phase != Phase::Committed {
+                self.status.phase = Phase::Failed;
+                self.status.error = Some(Error::Transaction);
+            }
+        } else if self.status.phase != Phase::Failed {
+            self.status.phase = Phase::Idle;
         }
     }
     #[cfg(not(windows))]
@@ -111,11 +163,9 @@ impl Node {
             }
             match command {
                 Command::Check => {
-                    if state.status.error == Some(Error::NotConfigured) {
-                        return Err(api_error(Error::NotConfigured));
+                    if state.begin_check().map_err(api_error)? {
+                        crate::backend::on_main(native::check);
                     }
-                    state.status.phase = Phase::Checking;
-                    crate::backend::on_main(native::check);
                 }
                 Command::Download => {
                     if state.status.candidate.is_none() {
@@ -124,13 +174,7 @@ impl Node {
                     crate::backend::on_main(native::download);
                 }
                 Command::Install { expected_build } => {
-                    if state.status.candidate.as_ref().map(|c| c.build) != Some(expected_build) {
-                        return Err(api_error(Error::Policy));
-                    }
-                    state.install_requested = true;
-                    if !state.ready {
-                        crate::backend::on_main(native::download);
-                    }
+                    state.begin_install(expected_build).map_err(api_error)?;
                 }
                 Command::SetPreferences { preferences } => {
                     let previous = state.policy.clone();
@@ -139,9 +183,7 @@ impl Node {
                         state.policy = previous;
                         return Err(api_error(error));
                     }
-                    state.install_requested = false;
                     state.status.channel = preferences.channel;
-                    state.status.mode = preferences.mode;
                     state.status.checks_enabled = preferences.checks_enabled;
                     state.status.candidate = None;
                     state.ready = false;
@@ -155,7 +197,6 @@ impl Node {
                         return Err(api_error(error));
                     }
                     state.status.deferred_until = state.policy.deferred_until;
-                    state.install_requested = false;
                     state.ready = false;
                     crate::backend::on_main(native::cancel);
                 }
@@ -169,7 +210,6 @@ impl Node {
                         state.policy = previous;
                         return Err(api_error(error));
                     }
-                    state.install_requested = false;
                     state.ready = false;
                     crate::backend::on_main(native::cancel);
                 }
@@ -177,7 +217,6 @@ impl Node {
                     if state.installing {
                         return Err(api_error(Error::Transaction));
                     }
-                    state.install_requested = false;
                     state.ready = false;
                     crate::backend::on_main(native::cancel);
                 }
@@ -185,75 +224,84 @@ impl Node {
             let status = state.status.clone();
             drop(state);
             self.emit(ApiEvent::UpdateStatusChanged(status.clone()));
+            if status.phase == Phase::Quiescing {
+                let node = self.clone();
+                std::thread::spawn(move || install_candidate(node));
+            }
             Ok(status)
         }
     }
-    /// All activity owners use the same admission gate. A failed prepare restores
-    /// admission and input routing; no active transfer or audio is forcibly ended.
-    pub fn prepare_for_update(&self, automatic: bool) -> Result<Prepared, Vec<Blocker>> {
+    /// Explicit Install interrupts activity; only bounded cleanup/availability
+    /// errors can refuse replacement. Admission closes before input is released.
+    pub fn prepare_for_update(&self) -> Result<Prepared, Vec<Blocker>> {
         let gate = maintenance::process();
-        if automatic && gate.idle_millis() < 60_000 {
-            return Err(vec![Blocker::IdleInterval]);
-        }
         static GENERATION: AtomicU64 = AtomicU64::new(1);
         let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
-        let input_generation = gate.input_generation();
-        let busy = gate.close(generation).map_err(|_| vec![Blocker::OwnerMissing])?;
-        if !busy.is_empty() {
-            gate.reopen(generation);
-            return Err(busy.into_iter().map(activity_blocker).collect());
-        }
+        gate.close_for_update(generation)
+            .map_err(|_| vec![Blocker::OwnerMissing])?;
         let token = Prepared {
             node: self.clone(),
+            gate: gate.clone(),
             generation,
-            input_generation,
-            expires: Instant::now() + Duration::from_secs(25),
+            expires: Instant::now() + PREPARATION_BUDGET,
             consumed: false,
+            #[cfg(target_os = "macos")]
+            provider: None,
         };
         let input = self.input_thread().map_err(|_| vec![Blocker::OwnerMissing])?;
         let failures = input.injection_failures();
         let (reply, wait) = std::sync::mpsc::sync_channel(1);
         input.send(crate::threads::input::InputCommand::PrepareUpdate { generation, reply });
         let fence = wait
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(if cfg!(target_os = "macos") {
+                token.remaining()
+            } else {
+                INPUT_PREPARATION_BUDGET / 2
+            })
             .map_err(|_| vec![Blocker::OwnerMissing])??;
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = if cfg!(target_os = "macos") {
+            token.expires
+        } else {
+            Instant::now() + INPUT_PREPARATION_BUDGET / 2
+        };
         while fence.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
         if fence.load(Ordering::Acquire) != 1 || input.injection_failures() != failures {
             return Err(vec![Blocker::HeldInput]);
         }
+        if let Some(audio) = self.inner.audio.get() {
+            let deadline = if cfg!(target_os = "macos") {
+                token.expires
+            } else {
+                Instant::now() + AUDIO_PREPARATION_BUDGET
+            };
+            audio.prepare_update(deadline).map_err(|error| {
+                tracing::warn!(%error, "update audio cleanup failed");
+                vec![Blocker::IntegrationUnavailable]
+            })?;
+        }
         token.validate()?;
         Ok(token)
-    }
-}
-fn activity_blocker(kind: ActivityKind) -> Blocker {
-    match kind {
-        ActivityKind::Drag => Blocker::Drag,
-        ActivityKind::Promise => Blocker::Promise,
-        ActivityKind::FileProvider => Blocker::FileProvider,
-        ActivityKind::FileTransfer => Blocker::ClipboardBulk,
-        ActivityKind::Audio => Blocker::Audio,
-        ActivityKind::Configuration => Blocker::Configuration,
     }
 }
 #[derive(Debug)]
 pub struct Prepared {
     node: Node,
+    gate: maintenance::Gate,
     generation: u64,
-    input_generation: u64,
     expires: Instant,
     consumed: bool,
+    #[cfg(target_os = "macos")]
+    provider: Option<mac_provider::Suspension>,
 }
 impl Prepared {
+    fn remaining(&self) -> Duration {
+        self.expires.saturating_duration_since(Instant::now())
+    }
     pub fn validate(&self) -> Result<(), Vec<Blocker>> {
-        if Instant::now() >= self.expires || maintenance::process().input_generation() != self.input_generation {
+        if Instant::now() >= self.expires || self.gate.generation() != Some(self.generation) {
             return Err(vec![Blocker::SessionChanged]);
-        }
-        let input = self.node.input_status().map_err(|_| vec![Blocker::OwnerMissing])?;
-        if input.update_locked || input.update_suspended {
-            return Err(vec![Blocker::Locked]);
         }
         Ok(())
     }
@@ -265,15 +313,6 @@ impl Prepared {
                 generation: self.generation,
             });
         }
-    }
-    #[cfg(windows)]
-    fn refresh_health_input(&mut self) -> Result<(), Vec<Blocker>> {
-        let input = self.node.input_status().map_err(|_| vec![Blocker::OwnerMissing])?;
-        if input.update_held_input || input.update_locked || input.update_suspended {
-            return Err(vec![Blocker::HeldInput]);
-        }
-        self.input_generation = maintenance::process().input_generation();
-        Ok(())
     }
     pub fn shutdown(self) -> Result<(), Vec<Blocker>> {
         self.shutdown_with_ui(false)
@@ -297,7 +336,10 @@ impl Prepared {
 impl Drop for Prepared {
     fn drop(&mut self) {
         if !self.consumed {
-            maintenance::process().reopen(self.generation);
+            // Restore the provider before admitting new work after an abort.
+            #[cfg(target_os = "macos")]
+            drop(self.provider.take());
+            self.gate.reopen(self.generation);
             if let Ok(input) = self.node.input_thread() {
                 input.send(crate::threads::input::InputCommand::AbortUpdate {
                     generation: self.generation,
@@ -306,15 +348,17 @@ impl Drop for Prepared {
         }
     }
 }
+// The live Prepared value is the sole approval. It retains the input fence,
+// closed admission and provider suspension until replacement or an abort.
 #[cfg(not(windows))]
-static COMMITTED_GENERATION: AtomicU64 = AtomicU64::new(0);
-#[cfg(not(windows))]
-static INSTALL_AUTHORIZED: AtomicBool = AtomicBool::new(false);
+static APPROVED: std::sync::Mutex<Option<Prepared>> = std::sync::Mutex::new(None);
+#[cfg(target_os = "macos")]
+mod mac_provider;
 #[cfg(not(windows))]
 static TERMINATION_WAITING: AtomicBool = AtomicBool::new(false);
 #[cfg(not(windows))]
 pub(crate) fn installation_termination() -> bool {
-    INSTALL_AUTHORIZED.load(Ordering::Acquire)
+    APPROVED.lock().unwrap().is_some()
 }
 #[cfg(not(windows))]
 pub(crate) fn termination_waiting() -> bool {
@@ -343,94 +387,77 @@ pub(crate) fn attach(node: &Node) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(Duration::from_secs(1));
-            let Some(inner) = weak.upgrade() else {
+            let Some(_inner) = weak.upgrade() else {
                 break;
             };
-            let node = Node { inner };
             if QUIT_REQUESTED.load(Ordering::Acquire) {
                 crate::backend::on_main(try_quit);
                 continue;
             }
-            let (automatic, expected_build) = {
-                let state = lock(&node.inner.update);
-                if !state.ready || state.installing {
-                    continue;
-                }
-                if !state.install_requested
-                    && !state
-                        .status
-                        .candidate
-                        .as_ref()
-                        .is_some_and(|c| state.policy.may_download_automatically(c.build, now()))
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn install_failure(node: &Node, error: Error, blockers: Vec<Blocker>) {
+    let mut state = lock(&node.inner.update);
+    state.installing = false;
+    state.status.phase = Phase::Failed;
+    state.status.error = Some(error);
+    state.status.blockers = blockers;
+    let status = state.status.clone();
+    drop(state);
+    node.emit(ApiEvent::UpdateStatusChanged(status));
+}
+#[cfg(not(windows))]
+fn install_candidate(node: Node) {
+    let mut token = match node.prepare_for_update() {
+        Ok(token) => token,
+        Err(blockers) => {
+            install_failure(&node, Error::Busy, blockers);
+            return;
+        }
+    };
+    #[cfg(target_os = "macos")]
+    let parent = match std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_owned))
+    {
+        Some(parent) => parent,
+        None => {
+            install_failure(&node, Error::Storage, vec![Blocker::IntegrationUnavailable]);
+            return;
+        }
+    };
+    #[cfg(target_os = "macos")]
+    let provider = match close_mac_clients(&token, &parent) {
+        Ok(provider) => provider,
+        Err(error) => {
+            install_failure(&node, error, vec![Blocker::IntegrationUnavailable]);
+            return;
+        }
+    };
+    #[cfg(target_os = "macos")]
+    {
+        token.provider = Some(provider);
+    }
+    crate::backend::on_main(move || {
+        let node = token.node.clone();
+        if token.validate().is_ok() {
+            *APPROVED.lock().unwrap() = Some(token);
+            if native::install() {
+                if let Some(token) = APPROVED.lock().unwrap().as_ref()
+                    && let Ok(input) = token.node.input_thread()
                 {
-                    continue;
-                }
-                (
-                    !state.install_requested,
-                    state.status.candidate.as_ref().map(|c| c.build),
-                )
-            };
-            match node.prepare_for_update(automatic) {
-                Ok(mut token) => {
-                    {
-                        let mut state = lock(&node.inner.update);
-                        if !state.ready
-                            || state.status.candidate.as_ref().map(|c| c.build) != expected_build
-                            || (automatic
-                                && !state
-                                    .status
-                                    .candidate
-                                    .as_ref()
-                                    .is_some_and(|c| state.policy.may_download_automatically(c.build, now())))
-                            || (!automatic && !state.install_requested)
-                        {
-                            continue;
-                        }
-                        state.installing = true;
-                        state.status.phase = Phase::Installing;
-                        state.status.blockers.clear();
-                    }
-                    #[cfg(target_os = "macos")]
-                    if close_mac_clients(&token).is_err() {
-                        let mut state = lock(&node.inner.update);
-                        state.installing = false;
-                        state.status.phase = Phase::WaitingForIdle;
-                        state.status.blockers = vec![Blocker::OwnerMissing];
-                        drop(state);
-                        crate::backend::on_main(native::cancel);
-                        continue;
-                    }
-                    crate::backend::on_main(move || {
-                        if token.validate().is_ok() {
-                            COMMITTED_GENERATION.store(token.generation, Ordering::Release);
-                            INSTALL_AUTHORIZED.store(true, Ordering::Release);
-                            if native::install() && INSTALL_AUTHORIZED.load(Ordering::Acquire) {
-                                // Sparkle issues applicationShouldTerminate; hold the
-                                // lease through host shutdown and its completion reply.
-                                token.consumed = true;
-                                if let Ok(input) = token.node.input_thread() {
-                                    input.send(crate::threads::input::InputCommand::CommitUpdate {
-                                        generation: token.generation,
-                                    });
-                                }
-                                return;
-                            }
-                            INSTALL_AUTHORIZED.store(false, Ordering::Release);
-                            COMMITTED_GENERATION.store(0, Ordering::Release);
-                        }
-                        lock(&token.node.inner.update).installing = false;
+                    input.send(crate::threads::input::InputCommand::CommitUpdate {
+                        generation: token.generation,
                     });
                 }
-                Err(blockers) => {
-                    let mut state = lock(&node.inner.update);
-                    state.status.phase = Phase::WaitingForIdle;
-                    state.status.blockers = blockers;
-                    let status = state.status.clone();
-                    drop(state);
-                    node.emit(ApiEvent::UpdateStatusChanged(status));
-                }
+                return;
             }
+            installation_failed();
         }
+        install_failure(&node, Error::Busy, vec![Blocker::IntegrationUnavailable]);
     });
 }
 
@@ -480,7 +507,7 @@ fn try_quit() {
     }
     std::thread::spawn(|| {
         if let Ok(node) = crate::backend::node() {
-            match node.prepare_for_update(false) {
+            match node.prepare_for_update() {
                 Ok(token) => {
                     #[cfg(windows)]
                     let saved = windows::user_quit();
@@ -516,88 +543,160 @@ pub(crate) fn prepare_reopen(node: &Node) -> ApiResult<Prepared> {
     if wait.recv_timeout(Duration::from_secs(3)) != Ok(true) {
         return Err(api_error(Error::Busy));
     }
-    node.prepare_for_update(false).map_err(|_| api_error(Error::Busy))
+    node.prepare_for_update().map_err(|_| api_error(Error::Busy))
 }
 
-#[cfg(all(target_os = "macos", feature = "sparkle"))]
+#[cfg(not(windows))]
 fn installation_failed() {
-    INSTALL_AUTHORIZED.store(false, Ordering::Release);
-    let generation = COMMITTED_GENERATION.swap(0, Ordering::AcqRel);
-    if generation == 0 {
-        return;
+    if let Some(token) = APPROVED.lock().unwrap().take() {
+        // Drop may run the bounded provider reconnect. Keep it off AppKit;
+        // Prepared reopens admission and aborts the input fence afterwards.
+        std::thread::spawn(move || drop(token));
     }
-    std::thread::spawn(move || {
-        maintenance::process().reopen(generation);
-        if let Ok(node) = crate::backend::node() {
-            if let Ok(input) = node.input_thread() {
-                input.send(crate::threads::input::InputCommand::AbortUpdate { generation });
-            }
-        }
-    });
 }
 
 #[cfg(target_os = "macos")]
-fn close_mac_clients(token: &Prepared) -> Result<(), Error> {
+fn close_mac_clients(token: &Prepared, parent: &Path) -> Result<mac_provider::Suspension, Error> {
     token.validate().map_err(|_| Error::Busy)?;
+    // Unix mapped executables do not lock their containing app directory.
+    // Sparkle 2.9.6 SUPlainInstaller swaps/renames the bundle and waits for its
+    // target host itself. Other users, CLI commands and manager invocations are
+    // not replacement blockers. Close our UI by its existing event contract.
+    let provider = mac_provider::Suspension::prepare(parent.join("oink-file-provider"), token.expires, &|| {
+        token.validate().is_ok()
+    })?;
     token.node.emit(ApiEvent::ExitForUpdate);
-    let parent = std::env::current_exe()
-        .map_err(|_| Error::Storage)?
-        .parent()
-        .ok_or(Error::Storage)?
-        .to_owned();
-    let contents = parent.parent().ok_or(Error::Storage)?;
-    let images = [
-        contents.join("Helpers/Oink.app/Contents/MacOS/oink"),
-        parent.join("oink-agent"),
-        parent.join("oink-file-provider"),
-    ];
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        token.validate().map_err(|_| Error::Busy)?;
-        if !mac_clients_running(&images)? {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(Error::Busy);
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-#[cfg(target_os = "macos")]
-fn mac_clients_running(images: &[std::path::PathBuf]) -> Result<bool, Error> {
-    use std::os::unix::ffi::OsStrExt;
-    // SAFETY: a null buffer requests a count only. No process is stopped/signalled.
-    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-    if count <= 0 || count > 65536 {
-        return Err(Error::Busy);
-    }
-    let mut pids = vec![0i32; count as usize + 1024];
-    // SAFETY: storage covers exactly the supplied byte size; libproc copies PIDs.
-    let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), (pids.len() * 4) as i32) };
-    if count < 0 || count as usize >= pids.len() {
-        return Err(Error::Busy);
-    }
-    for pid in pids.into_iter().take(count as usize) {
-        if pid == std::process::id() as i32 {
-            continue;
-        }
-        let mut path = [0u8; 4096];
-        // SAFETY: bounded kernel-reported image path query; no caller-selected PID action.
-        let length = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
-        if length <= 0 {
-            continue;
-        } // Exited/unrelated inaccessible process.
-        let end = path.iter().position(|b| *b == 0).unwrap_or(path.len());
-        if images.iter().any(|image| image.as_os_str().as_bytes() == &path[..end]) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(provider)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn manual_check_clears_old_failure_and_joins_the_existing_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = Controller::load(dir.path());
+        controller.status.phase = Phase::Failed;
+        controller.status.error = Some(Error::Signature);
+        assert_eq!(controller.begin_check(), Ok(true));
+        assert_eq!(controller.status.phase, Phase::Checking);
+        assert_eq!(controller.status.error, None);
+        assert_eq!(controller.begin_check(), Ok(false));
+        for phase in [Phase::Available, Phase::Downloading, Phase::Verifying, Phase::Ready] {
+            controller.status.phase = phase;
+            assert_eq!(controller.begin_check(), Ok(false));
+            assert_eq!(controller.status.phase, phase);
+        }
+        controller.status.phase = Phase::Idle;
+        assert_eq!(controller.begin_check(), Ok(true));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn silent_native_dismissal_after_approval_ends_the_install_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = Controller::load(dir.path());
+        controller.installing = true;
+        controller.ready = true;
+        controller.status.phase = Phase::Installing;
+        controller.dismissed();
+        assert!(
+            !controller.installing,
+            "dismissal must release the attempt even without an error callback"
+        );
+        assert!(!controller.ready);
+        assert_eq!(controller.status.phase, Phase::Failed);
+        assert_eq!(controller.status.error, Some(Error::Transaction));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unrelated_bundle_cli_does_not_block_atomic_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("Oink.app/Contents/MacOS");
+        std::fs::create_dir_all(&parent).unwrap();
+        let parent = parent.canonicalize().unwrap();
+        let image = parent.join("oink-agent");
+        let source = directory.path().join("child.c");
+        std::fs::write(
+            &source,
+            "#include <unistd.h>\nint main(void) { write(1, \"ready\\n\", 6); sleep(10); }\n",
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("clang")
+                .arg(&source)
+                .arg("-o")
+                .arg(&image)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut child = Child(
+            std::process::Command::new(image)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut ready = [0; 6];
+        std::io::Read::read_exact(child.0.stdout.as_mut().unwrap(), &mut ready).unwrap();
+        assert_eq!(&ready, b"ready\n");
+        let started = Instant::now() + Duration::from_secs(1);
+        loop {
+            let mut path = [0u8; 4096];
+            // SAFETY: query only our live child into bounded storage.
+            if unsafe { libc::proc_pidpath(child.0.id() as i32, path.as_mut_ptr().cast(), path.len() as u32) } > 0 {
+                break;
+            }
+            assert!(Instant::now() < started, "test child did not start");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let manager = parent.join("oink-file-provider");
+        std::fs::write(&manager, "#!/bin/sh\necho '[]'\n").unwrap();
+        std::fs::set_permissions(&manager, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let node = runtime
+            .block_on(Node::start(crate::node::NodeOptions {
+                net: oink_test_support::network_config(directory.path().join("state"), "bundle-cli", 0),
+                input: Arc::new(oink_test_support::input::FakeInput::new()),
+                displays: vec![],
+                display_backend: None,
+                clipboard: None,
+                mode_switch_in_callback: true,
+                capture_reports_key_repeat: true,
+                cursor_trail: false,
+            }))
+            .unwrap();
+        let gate = maintenance::Gate::default();
+        gate.close_for_update(0).unwrap();
+        let token = Prepared {
+            node: node.clone(),
+            gate,
+            generation: 0,
+            expires: Instant::now() + PREPARATION_BUDGET,
+            consumed: false,
+            provider: None,
+        };
+        let result = close_mac_clients(&token, &parent);
+        assert!(
+            result.is_ok(),
+            "an open CLI image is not a Unix bundle replacement blocker"
+        );
+        drop(result);
+        drop(token);
+        runtime.block_on(node.shutdown());
+    }
 
     #[test]
     fn product_quit_reaches_ui_before_backend_shutdown_can_exit_the_process() {
@@ -656,12 +755,16 @@ mod tests {
             assert_eq!(envelope["stop"], true);
             assert!(before_shutdown, "backend could exit before delivering UI Quit");
         });
+        let gate = maintenance::Gate::default();
+        gate.close_for_update(0).unwrap();
         let token = Prepared {
             node: node.clone(),
+            gate,
             generation: 0,
-            input_generation: maintenance::process().input_generation(),
-            expires: Instant::now() + Duration::from_secs(25),
+            expires: Instant::now() + PREPARATION_BUDGET,
             consumed: false,
+            #[cfg(target_os = "macos")]
+            provider: None,
         };
         token.shutdown_with_ui(true).unwrap();
         ui.join().unwrap();
@@ -669,11 +772,48 @@ mod tests {
         runtime.block_on(node.shutdown());
     }
 
+    #[cfg(not(windows))]
     #[test]
-    fn beta_status_is_disabled_even_with_automatic_preferences() {
+    fn explicit_ready_install_starts_once_without_activity_or_idle_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = Controller::load(dir.path());
+        controller.ready = true;
+        controller.status.phase = Phase::Ready;
+        controller.status.error = None;
+        controller.status.candidate = Some(Candidate {
+            build: 31,
+            version: "0.1.1".into(),
+            size: 1,
+            published_at: None,
+            severity: oink_update::feed::Severity::Normal,
+            notes: serde_json::from_value(serde_json::json!({"en":"Fixes","zh-Hans":"修复"})).unwrap(),
+        });
+        controller.status.blockers = vec![Blocker::Audio, Blocker::RemoteInput, Blocker::Locked];
+        assert_eq!(controller.begin_install(32), Err(Error::Policy));
+        controller.begin_install(31).unwrap();
+        assert_eq!(controller.status.phase, Phase::Quiescing);
+        assert!(controller.status.blockers.is_empty());
+        assert_eq!(controller.begin_install(31), Err(Error::Transaction));
+        assert!(serde_json::to_value(&controller.status).unwrap().get("mode").is_none());
+    }
+
+    #[test]
+    fn stored_mode_is_invalid_and_never_rewritten_as_a_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut policy = serde_json::to_value(Policy::default()).unwrap();
+        policy["preferences"]["mode"] = "automatic".into();
+        let bytes = serde_json::to_vec(&policy).unwrap();
+        std::fs::write(dir.path().join("updates.json"), &bytes).unwrap();
+        let controller = Controller::load(dir.path());
+        assert_eq!(controller.status.error, Some(Error::Metadata));
+        assert_eq!(std::fs::read(dir.path().join("updates.json")).unwrap(), bytes);
+        assert!(!controller.status.checks_enabled);
+    }
+
+    #[test]
+    fn beta_status_is_disabled_even_with_enabled_checks() {
         let directory = tempfile::tempdir().unwrap();
         let mut policy = Policy::default();
-        policy.preferences.mode = Mode::Automatic;
         policy.preferences.checks_enabled = true;
         std::fs::write(
             directory.path().join("updates.json"),

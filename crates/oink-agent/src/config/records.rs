@@ -146,7 +146,8 @@ impl PresenceStore {
             dirty: false,
         })
     }
-    /// Call only for an authenticated logical endpoint, never an address hint.
+    /// Record this device's UTC wall clock when an authenticated logical link
+    /// becomes ready or goes offline, never a peer timestamp or address hint.
     pub fn observe(&mut self, group: GroupId, device: DeviceId, at_ms: u64) -> Result<(), StoreError> {
         let mut candidate = self.raw.clone();
         let RawValue::Array(entries) = candidate.get_mut(&2).expect("validated entries") else {

@@ -55,7 +55,10 @@ class ReleaseBuild(unittest.TestCase):
 
     def test_every_release_command_and_record_use_same_build(self):
         targets = ['x86_64-pc-windows-msvc', 'aarch64-apple-darwin']
-        for target, commit in [(target, commit) for target in targets for commit in (None, '0123abcd' * 5)]:
+        cases = [(target, commit, origin, fail_health) for target in targets for commit in (None, '0123abcd' * 5)
+                 for origin in ([None, 'http://127.0.0.1:8765'] if 'windows' in target else [None])
+                 for fail_health in ([False, True] if origin else [False])]
+        for target, commit, origin, fail_health in cases:
             with self.subTest(target=target, commit=commit), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 output = root / 'target' / target / 'release'
@@ -76,6 +79,10 @@ class ReleaseBuild(unittest.TestCase):
                 if commit:
                     argv += ['--source-commit', commit]
                 argv += [] if windows else ['--sparkle-cache', str(root / 'sparkle')]
+                if origin:
+                    argv += ['--windows-update-test-feed', origin]
+                if fail_health:
+                    argv += ['--windows-update-test-fail-health']
                 with patch.dict(os.environ, {'RELEASE_BUILD': '17', 'CARGO_HOME': str(root / 'cargo-home')}, clear=True), \
                         patch.object(sys, 'argv', argv), patch.object(B, 'ROOT', root), \
                         patch.object(B, 'source_tree_sha256', return_value='a' * 64), patch.object(B.platform, 'system', return_value='Windows' if windows else 'Darwin'), \
@@ -90,7 +97,7 @@ class ReleaseBuild(unittest.TestCase):
                 for call in [*calls, *read.call_args_list]:
                     self.assertEqual(call.kwargs['env']['OINK_RELEASE_BUILD'], '17')
                     self.assertEqual(call.kwargs['env']['RELEASE_BUILD'], '17')
-                    self.assertEqual(call.kwargs['env']['OINK_RELEASE_VERSION'], '0.1.0-beta.0123abcd' if commit else B.IDENTITY['version'])
+                    self.assertEqual(call.kwargs['env']['OINK_RELEASE_VERSION'], B.release_version(B.IDENTITY['version'], commit))
                     self.assertEqual(call.kwargs['env']['OINK_SOURCE_COMMIT'], commit or '')
                 self.assertEqual(calls[2].args[:2], ('cargo', 'clean'))
                 self.assertIn('--release', calls[2].args)
@@ -108,7 +115,8 @@ class ReleaseBuild(unittest.TestCase):
                 self.assertEqual(list(forwarded), expected_packages)
                 self.assertFalse(any(call.args[:2] == ('cargo', 'build') for call in calls))
                 features = calls[3].args[calls[3].args.index('--features') + 1]
-                self.assertEqual(features, 'custom-protocol' if windows else 'custom-protocol,oink-agent/sparkle')
+                expected_features = 'custom-protocol' if windows else 'custom-protocol,oink-agent/sparkle'
+                self.assertEqual(features, expected_features + (',oink-winsvc/test-feed' if origin else ''))
                 flags = calls[3].kwargs['env']['CARGO_ENCODED_RUSTFLAGS']
                 self.assertIn('--remap-path-prefix=', flags)
                 self.assertEqual(calls[3].kwargs['env']['CARGO_PROFILE_RELEASE_DEBUG'], '1')
@@ -125,8 +133,10 @@ class ReleaseBuild(unittest.TestCase):
                         B.IDENTITY['macos_minimum'])
                     self.assertEqual(calls[3].kwargs['env']['CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO'], 'packed')
                 record = json.loads((output / 'release-build.json').read_text())
-                self.assertEqual(record['version'], '0.1.0-beta.0123abcd' if commit else B.IDENTITY['version'])
+                self.assertEqual(record['version'], B.release_version(B.IDENTITY['version'], commit))
                 self.assertEqual(record['source_commit'], commit)
+                self.assertEqual(record['update_test_feed'], origin)
+                self.assertEqual(record['update_test_fail_health'], fail_health)
                 self.assertEqual(record['build'], 17)
                 self.assertIs(type(record['build']), int)
 

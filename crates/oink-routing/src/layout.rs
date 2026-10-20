@@ -73,6 +73,18 @@ pub trait LayoutQuery: Send + Sync {
     fn first_portal(&self, _from: &ScreenPos, _delta: (f64, f64)) -> Option<oink_display::layout::PortalExit> {
         None
     }
+    fn first_portal_from_source(
+        &self,
+        from: &ScreenPos,
+        delta: (f64, f64),
+        _source: DeviceId,
+    ) -> Option<oink_display::layout::PortalExit> {
+        self.first_portal(from, delta)
+    }
+    /// Extra target-only pointer multiplier, independent of source and scroll scales.
+    fn remote_pointer_gain(&self, _screen: &ScreenId, _source: DeviceId) -> f64 {
+        1.0
+    }
     /// Selected native exit, using the same conversion and corner/wall decision
     /// as exit_through_edge. Simple rectangular layouts have no portal metadata.
     fn first_portal_native(
@@ -100,6 +112,9 @@ pub trait LayoutQuery: Send + Sync {
     /// 指针从 `from` 出发移动 `delta`（「手部 plane」：源机位移 × 源屏 [`LayoutQuery::reference_per_native_unit`]）：
     /// 穿过传送门、被墙挡住（沿墙滑动），返回终点与途中进入过的屏幕。`from` 所在屏幕未知时原地不动。
     fn step(&self, from: &ScreenPos, delta: (f64, f64)) -> StepResult;
+    fn step_from_source(&self, from: &ScreenPos, delta: (f64, f64), _source: DeviceId) -> StepResult {
+        self.step(from, delta)
+    }
     /// 本机光标从 `from` 继续移动 `delta_local`（本机单位，系统已加速）时，是否会穿过传送门进入
     /// **另一块屏幕**；会则返回落点，停在本屏（含撞墙）时为 `None`。落点可能是其他设备的屏幕，
     /// 也可能是本机的另一块屏幕（调用方比较设备 ID）。

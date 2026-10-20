@@ -194,3 +194,39 @@ fn pair_objects_and_human_wait_contract_have_no_ttl_fields() {
     .unwrap();
     assert_eq!(problem.limit().unwrap(), Some(3));
 }
+
+#[test]
+fn notification_capability_is_optional_and_only_new_peers_enable_it() {
+    for new_peer in [false, true] {
+        let (mut a, mut b) = offers();
+        add_cap(&mut a, "oink.notify/1", 4);
+        if new_peer {
+            add_cap(&mut b, "oink.notify/1", 4);
+        }
+        let negotiated = admission::negotiate(&bytes(a), &bytes(b), registry::CAPABILITIES, false).unwrap();
+        let enabled = negotiated
+            .enabled()
+            .unwrap()
+            .0
+            .into_iter()
+            .map(|v| v.0)
+            .collect::<Vec<_>>();
+        let agreement = admission::Agreement::new(enabled).unwrap();
+        assert_eq!(agreement.contains("oink.notify/1"), new_peer);
+        // Released offers still negotiate baseline v1 successfully. Admission
+        // excludes the new message unless the optional feature was selected.
+        let context = admission::Context {
+            kind: 2,
+            transport: registry::Transport::Reliable,
+            phase: admission::Phase::Member,
+            agreement: &agreement,
+            direct: true,
+            old_member_lane: false,
+        };
+        let message = Message::NotifyDismiss(NotifyDismiss::from_raw([(1, 1u64.write())].into()).unwrap());
+        let encoded = frame::encode(&message, 16384).unwrap();
+        let result = context.decode(frame::OpaqueFrame::parse_exact(&encoded, 16384).unwrap());
+        assert_eq!(result.is_ok(), new_peer);
+    }
+    assert!(!registry::BASELINE.contains(&"oink.notify/1"));
+}

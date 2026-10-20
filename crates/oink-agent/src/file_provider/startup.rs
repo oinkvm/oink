@@ -210,7 +210,7 @@ fn prepare_native(data: &Path, state: LaunchState, current: &dyn Fn() -> bool) -
 }
 
 #[cfg(target_os = "macos")]
-fn run(
+pub(crate) fn run(
     program: &Path,
     args: &[&std::ffi::OsStr],
     deadline: std::time::Instant,

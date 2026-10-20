@@ -14,6 +14,7 @@
 pub mod aim;
 pub mod diagnostics;
 pub mod effect;
+pub mod notification;
 pub mod projection;
 
 #[cfg(target_os = "macos")]

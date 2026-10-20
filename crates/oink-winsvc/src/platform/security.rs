@@ -43,6 +43,17 @@ pub(super) fn sid_bytes(token: HANDLE) -> io::Result<Vec<u8>> {
         Ok(std::slice::from_raw_parts(sid.cast::<u8>(), GetLengthSid(sid) as usize).to_vec())
     }
 }
+pub(super) fn interactive_token(token: HANDLE) -> io::Result<bool> {
+    let mut session = 0u32;
+    let mut len = 0;
+    // SAFETY: owned query token, DWORD field and correctly sized output buffer.
+    check(unsafe { GetTokenInformation(token, TokenSessionId, ptr::addr_of_mut!(session).cast(), 4, &mut len) })?;
+    Ok(crate::token_policy::interactive_user(
+        session,
+        crate::token_policy::service_account(&sid_bytes(token)?),
+    ))
+}
+
 fn system_sid(sid: *mut c_void) -> bool {
     // SAFETY: caller supplies a valid SID obtained from a Windows token or ACL.
     unsafe { IsWellKnownSid(sid, WinLocalSystemSid) != 0 }
@@ -212,11 +223,18 @@ pub(super) fn pipe_security(id: u32) -> io::Result<Descriptor> {
     };
     // Exact FILE_GENERIC_READ + FILE_GENERIC_WRITE minus FILE_CREATE_PIPE_INSTANCE (0x4).
     // Never grant GENERIC_WRITE on a pipe: it includes creating a competing instance.
-    let sddl = wide(&format!("D:P(A;;GA;;;SY)(A;;0x12019b;;;{sid_text})"));
+    // Medium is a minimum, not a required caller IL: the same user's Medium
+    // and High tokens can connect; Low cannot read or write. The exact SID DACL still
+    // excludes other users and never grants competing pipe-instance rights.
+    let sddl = wide(&session_pipe_sddl(&sid_text));
     let mut sd = ptr::null_mut();
     // SAFETY: parser allocates the descriptor; Descriptor owns its lifetime.
     check(unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1, &mut sd, ptr::null_mut()) })?;
     Ok(Descriptor(sd))
+}
+
+pub(super) fn session_pipe_sddl(sid: &str) -> String {
+    format!("D:P(A;;GA;;;SY)(A;;0x12019b;;;{sid})S:(ML;;NWNR;;;ME)")
 }
 
 pub(super) fn service_pipe_security(pipe: HANDLE) -> io::Result<()> {
@@ -366,6 +384,9 @@ pub(super) fn peer_at(pipe: HANDLE, process_session: u32, id: u32, server: bool)
 
 pub(super) fn system_security() -> io::Result<Descriptor> {
     descriptor("D:P(A;;GA;;;SY)")
+}
+pub(super) fn staging_security() -> io::Result<Descriptor> {
+    descriptor("O:SYG:SYD:P(A;OICI;FA;;;SY)")
 }
 fn descriptor(sddl: &str) -> io::Result<Descriptor> {
     let mut sd = ptr::null_mut();

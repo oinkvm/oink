@@ -74422,6 +74422,423 @@
       "file": "datagram.hex",
       "flow": 7,
       "kind": "datagram"
+    },
+    {
+      "file": "dto-ScreenPreference-remote-gain.hex",
+      "kind": "dto",
+      "schema": "ScreenPreference",
+      "expected": {
+        "map": {
+          "1": {
+            "text": "screen"
+          },
+          "2": {
+            "f64_bits": "3ff0000000000000"
+          },
+          "3": {
+            "bool": true
+          },
+          "4": {
+            "f64_bits": "4000000000000000"
+          }
+        }
+      }
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.notify/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          },
+          "2": {
+            "text": "synthetic"
+          },
+          "3": {
+            "uint": "1"
+          },
+          "4": {
+            "text": "synthetic"
+          },
+          "5": {
+            "text": "synthetic"
+          },
+          "6": {
+            "bool": false
+          },
+          "7": {
+            "bool": false
+          },
+          "8": {
+            "uint": "1"
+          }
+        }
+      },
+      "file": "0d2c.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 2,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": "NotifyShow",
+      "type_id": 3372
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.notify/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          },
+          "2": {
+            "text": "synthetic"
+          },
+          "3": {
+            "uint": "1"
+          },
+          "4": {
+            "text": "synthetic"
+          },
+          "5": {
+            "text": "synthetic"
+          },
+          "6": {
+            "bool": false
+          },
+          "7": {
+            "bool": false
+          },
+          "8": {
+            "uint": "1"
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "0d2c-future.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 2,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": "NotifyShow",
+      "type_id": 3372
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.notify/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          },
+          "2": {
+            "bool": false
+          }
+        }
+      },
+      "file": "0d2d.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 2,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": "NotifyAction",
+      "type_id": 3373
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.notify/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          },
+          "2": {
+            "bool": false
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "0d2d-future.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 2,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": "NotifyAction",
+      "type_id": 3373
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.notify/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          }
+        }
+      },
+      "file": "0d2e.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 2,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": "NotifyDismiss",
+      "type_id": 3374
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.notify/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "0d2e-future.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 2,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": "NotifyDismiss",
+      "type_id": 3374
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          },
+          "2": {
+            "text": "synthetic"
+          },
+          "3": {
+            "uint": "1"
+          },
+          "4": {
+            "text": "synthetic"
+          },
+          "5": {
+            "text": "synthetic"
+          },
+          "6": {
+            "bool": false
+          },
+          "7": {
+            "bool": false
+          },
+          "8": {
+            "uint": "1"
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-NotifyShow.hex",
+      "kind": "dto",
+      "schema": "NotifyShow"
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          },
+          "2": {
+            "bool": false
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-NotifyAction.hex",
+      "kind": "dto",
+      "schema": "NotifyAction"
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-NotifyDismiss.hex",
+      "kind": "dto",
+      "schema": "NotifyDismiss"
     }
   ],
   "frozen": false,
@@ -74434,5 +74851,5 @@
     "reliable_frame": 16384
   },
   "revision": "2026-10-15-ui-freeze",
-  "schema_sha256": "9a42575d006ca300d3aed655da54783e0d243daca6295dff0099097295463043"
+  "schema_sha256": "c165a652d83267207c980c749d4e35d4f589991e4a9a3164f66752aa13ac73bb"
 }

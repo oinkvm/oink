@@ -42,7 +42,6 @@ export type AlertKind =
   | { type: "display_info_unavailable"; screen: ScreenKey }
   | { type: "permission_missing"; permissions: PermissionItem[] }
   | { type: "secure_input"; app: string | null }
-  | { type: "address_stale"; device: DeviceKey }
   | { type: "peer_offline"; device: DeviceKey }
   | { type: "new_screen"; screen: ScreenKey }
   | { type: "emergency_stop"; device: DeviceKey }
@@ -155,6 +154,7 @@ export interface Screen {
 
   origin: Point;
   gain: number;
+  remote_gain?: number;
   hidden: boolean;
   device_disabled: boolean;
 
@@ -603,7 +603,15 @@ export interface PeerQuality {
   p90_ms: number | null;
   p99_ms: number | null;
   max_ms: number | null;
-  average_jitter_ms: number | null;
-  max_jitter_ms: number | null;
 }
 export interface ConnectionQuality { revision: number; sampled_at_ms: number; peers: PeerQuality[] }
+
+/** Desktop notification, drawn by the backend even when the UI is closed. */
+export interface Notification {
+  level: 'notice' | 'info' | 'debug';
+  title: string;
+  description?: string;
+  screen?: ScreenKey;
+  persistent?: boolean;
+}
+export interface NotificationReceipt { id: string; screen: ScreenKey | null; remote: boolean }

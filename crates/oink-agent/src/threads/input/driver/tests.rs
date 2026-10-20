@@ -103,8 +103,8 @@ fn remote() -> Adapter {
 }
 // Session fixtures have geometry even when their display facts have not arrived.
 // An empty effective layout now intentionally has no focus targets.
-fn fixture_layout(local: DeviceId) -> oink_display::layout::Layout {
-    let display = oink_foundation::display::DisplayInfo {
+fn fixture_display() -> oink_foundation::display::DisplayInfo {
+    oink_foundation::display::DisplayInfo {
         key: "screen".into(),
         name: "screen".into(),
         bounds: oink_foundation::Rect::new(0., 0., 1000., 600.),
@@ -115,7 +115,11 @@ fn fixture_layout(local: DeviceId) -> oink_display::layout::Layout {
         is_primary: true,
         is_builtin: false,
         is_virtual: false,
-    };
+    }
+}
+
+fn fixture_layout(local: DeviceId) -> oink_display::layout::Layout {
+    let display = fixture_display();
     let devices = BTreeSet::from([local, DeviceId([1; 32]), peer()]);
     oink_display::layout::Layout::auto(
         &devices
@@ -164,7 +168,6 @@ impl Harness {
             backlog_requested: std::sync::atomic::AtomicBool::new(false),
             done: std::sync::Mutex::new(received),
             jitter: Arc::default(),
-            quality_jitter: Snapshot::default(),
         });
         let inject = super::super::super::inject::start_with_backend(backend, Box::new(|_| {})).unwrap();
         let (main, recv) = crate::threads::main_channel();
@@ -290,7 +293,7 @@ fn timed_forwarded_motion_stays_lossy_and_retains_original_clock() {
         }),
     };
     h.driver.input_time = Some(CaptureTime(u32::MAX));
-    h.driver.send(peer(), Message::Input(input.clone()));
+    h.driver.send_from(peer(), Message::Input(input.clone()), Some(peer()));
     let decoded = decode(&datagrams.take().unwrap().unwrap()).unwrap();
     assert_eq!(
         decoded,
@@ -303,6 +306,43 @@ fn timed_forwarded_motion_stays_lossy_and_retains_original_clock() {
     assert!(!valid_reliable(&decoded));
     assert!(read.take().unwrap().is_none());
     h.driver.input_time = None;
+}
+
+#[test]
+fn input_timestamps_never_cross_the_outgoing_origins_clock_domain() {
+    let mut h = Harness::new();
+    let (mut read, _) = h.outbound(1);
+    drain(&mut read);
+    let local_input = InputMsg::Key {
+        code: oink_foundation::input::KeyCode::LEFT_SHIFT,
+        pressed: true,
+    };
+    let forwarded = InputMsg::Forwarded {
+        origin: fixture_boot(peer()),
+        hops: 1,
+        msg: Box::new(local_input.clone()),
+    };
+    // A received event can trigger a local modifier snapshot or release. Its
+    // timestamp belongs to the remote source, not to this outgoing plain input.
+    h.driver.input_time = Some(CaptureTime(1_200_000_000));
+    h.driver
+        .send_from(peer(), Message::Input(local_input.clone()), Some(peer()));
+    // Conversely, a local capture can release another origin's forwarded key.
+    h.driver.send_from(peer(), Message::Input(forwarded.clone()), None);
+    // A genuine relay must preserve the matching remote source timestamp.
+    h.driver
+        .send_from(peer(), Message::Input(forwarded.clone()), Some(peer()));
+    assert_eq!(
+        drain(&mut read),
+        vec![
+            Message::Input(local_input),
+            Message::Input(forwarded.clone()),
+            Message::TimedInput {
+                time: CaptureTime(1_200_000_000),
+                input: forwarded
+            },
+        ]
+    );
 }
 
 #[test]
@@ -337,38 +377,11 @@ fn receiver_summarises_timed_sources_and_resets_on_connection_replacement() {
     let summary = h.driver.shared.jitter.take();
     assert_eq!(summary.reliable.ingress.count, 1);
     assert_eq!(summary.lossy.ingress.count, 1);
-    let quality = h.driver.shared.quality_jitter.load();
-    let now = crate::connection_quality::now_ms_at(Instant::now());
-    let moments = quality[&peer()].window(now);
-    assert_eq!(moments.count, 2);
-    assert_eq!(
-        moments.max_us,
-        summary.reliable.dispatch.max_us.max(summary.lossy.dispatch.max_us)
-    );
-    // Real input observations, including zero excess delay, must become a
-    // numeric average; only an empty/expired input window is unavailable.
-    let mut history = crate::connection_quality::History::default();
-    history.record(
-        now,
-        [(
-            peer(),
-            "Peer".into(),
-            crate::api::LinkKind::Direct,
-            Some(4.),
-            Some(quality[&peer()].clone()),
-        )],
-    );
-    assert_eq!(
-        history.view(now).peers[0].average_jitter_ms,
-        Some(moments.sum_us as f64 / moments.count as f64 / 1000.)
-    );
-    assert_eq!(history.view(now + 60_000).peers[0].average_jitter_ms, None);
     assert_eq!(h.driver.jitter_sources.len(), 2);
     h.driver.detach(DeviceId([9; 32]));
     assert_eq!(h.driver.jitter_sources.len(), 2);
     let _ = h.inbound(2);
     assert!(h.driver.jitter_sources.is_empty());
-    assert!(!h.driver.shared.quality_jitter.load().contains_key(&peer()));
 }
 
 #[test]
@@ -1482,13 +1495,11 @@ fn local_modes_publish_immediately_with_secure_input_and_keep_native_routes_inde
 }
 
 #[test]
-fn update_prepare_rejects_held_input_and_lock_without_pausing() {
+fn manual_update_interrupts_held_input_locked_and_secure_session() {
     use oink_foundation::input::{InputEvent, KeyCode};
-    use oink_update::barrier::Blocker;
     let mut h = Harness::new();
-    h.driver.command(InputCommand::SessionLocked(Some(false)));
     h.driver.command(InputCommand::Paused(false));
-    let event = CapturedEvent {
+    h.driver.event(&CapturedEvent {
         event: InputEvent::Key {
             code: KeyCode(4),
             pressed: true,
@@ -1497,26 +1508,127 @@ fn update_prepare_rejects_held_input_and_lock_without_pausing() {
         source: oink_foundation::input::SourceKind::Keyboard,
         time_us: 0,
         cursor: None,
-    };
-    h.driver.event(&event);
-    let (reply, wait) = mpsc::sync_channel(1);
-    h.driver.command(InputCommand::PrepareUpdate { generation: 1, reply });
-    assert!(wait.recv().unwrap().unwrap_err().contains(&Blocker::HeldInput));
-    assert!(h.driver.update_hold.is_none());
-    h.driver.event(&CapturedEvent {
-        event: InputEvent::Key {
-            code: KeyCode(4),
-            pressed: false,
-        },
-        physical: true,
-        source: oink_foundation::input::SourceKind::Keyboard,
-        time_us: 0,
-        cursor: None,
     });
     h.driver.command(InputCommand::SessionLocked(Some(true)));
+    h.driver.snapshots.environment.publish(Environment {
+        secure_input: true,
+        ..Default::default()
+    });
+    h.driver.refresh();
     let (reply, wait) = mpsc::sync_channel(1);
-    h.driver.command(InputCommand::PrepareUpdate { generation: 2, reply });
-    assert!(wait.recv().unwrap().unwrap_err().contains(&Blocker::Locked));
+    h.driver.command(InputCommand::PrepareUpdate { generation: 1, reply });
+    let fence = wait.recv().unwrap().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while fence.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(fence.load(Ordering::Acquire), 1);
+    assert!(h.driver.adapter.router().fully_paused());
+    assert!(!h.driver.adapter.router().update_input_held());
+    assert_eq!(h.driver.adapter.router().focus().holder, h.driver.local);
+    h.driver.command(InputCommand::AbortUpdate { generation: 1 });
+    assert!(h.driver.update_hold.is_none());
+}
+
+#[test]
+fn manual_update_interrupts_remote_control_and_fences_native_key_release() {
+    use oink_foundation::input::KeyCode;
+    let backend = Arc::new(oink_test_support::input::FakeInput::new());
+    let mut h = Harness::with_backend(backend.clone());
+    let (_reader, _datagrams) = h.outbound(1);
+    let (writer, _motion) = h.inbound(1);
+    opening(&writer, &remote(), true);
+    h.attach();
+    h.driver.message(
+        peer(),
+        Message::Control(ControlMsg::FocusEnter {
+            epoch: 2,
+            display: "screen".into(),
+            pos: oink_foundation::Point::new(5., 5.),
+            scope: Some(input_scope(&h.driver)),
+            pointer_source: Some(peer()),
+        }),
+    );
+    h.driver.message(
+        peer(),
+        Message::Input(InputMsg::Key {
+            code: KeyCode::keyboard(4),
+            pressed: true,
+        }),
+    );
+    let until = Instant::now() + Duration::from_secs(2);
+    let mut down = false;
+    while !down && Instant::now() < until {
+        down = backend
+            .take_injected()
+            .iter()
+            .any(|event| matches!(event, InjectEvent::Key { pressed: true, .. }));
+        std::thread::yield_now();
+    }
+    assert!(down);
+    assert!(h.driver.adapter.router().update_remote_control(h.driver.micros()));
+    let (reply, wait) = mpsc::sync_channel(1);
+    h.driver.command(InputCommand::PrepareUpdate { generation: 19, reply });
+    let fence = wait.recv().unwrap().unwrap();
+    let until = Instant::now() + Duration::from_secs(2);
+    while fence.load(Ordering::Acquire) == 0 && Instant::now() < until {
+        std::thread::yield_now();
+    }
+    assert_eq!(fence.load(Ordering::Acquire), 1);
+    assert!(
+        backend
+            .take_injected()
+            .iter()
+            .any(|event| matches!(event, InjectEvent::Key { pressed: false, .. }))
+    );
+    assert_eq!(h.driver.adapter.router().focus().holder, h.driver.local);
+    assert!(!h.driver.adapter.router().update_input_held());
+    h.driver.command(InputCommand::AbortUpdate { generation: 19 });
+}
+
+#[test]
+fn manual_update_interrupts_pending_native_drag_and_keeps_injection_dormant_until_abort() {
+    let backend = Arc::new(oink_test_support::input::FakeInput::new());
+    let mut h = Harness::with_backend(backend.clone());
+    h.driver.command(InputCommand::Paused(false));
+    h.driver.inject.push(InjectItem::Dnd {
+        command: oink_routing::DndCmd::Cancel {
+            id: oink_foundation::content::ClipId { origin: peer(), seq: 1 },
+            epoch: 1,
+            physical: false,
+        },
+        main: h.driver.main.clone(),
+    });
+    let pending = loop {
+        let command = h._main.recv_timeout(Duration::from_secs(2)).unwrap();
+        if matches!(command, MainCommand::Dnd { .. }) {
+            break command;
+        }
+    };
+    let (reply, wait) = mpsc::sync_channel(1);
+    h.driver.command(InputCommand::PrepareUpdate { generation: 23, reply });
+    let fence = wait.recv().unwrap().unwrap();
+    let until = Instant::now() + Duration::from_secs(2);
+    while fence.load(Ordering::Acquire) == 0 && Instant::now() < until {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        fence.load(Ordering::Acquire),
+        1,
+        "an interrupted drag cannot hold the install fence"
+    );
+    h.poll();
+    assert!(h.driver.inject.suspended());
+    assert!(!backend.injection_active());
+    // Even completion of old ordinary work cannot restart the old session.
+    drop(pending);
+    h.driver.command(InputCommand::AbortUpdate { generation: 23 });
+    let until = Instant::now() + Duration::from_secs(2);
+    while h.driver.inject.suspended() && Instant::now() < until {
+        h.poll();
+        std::thread::yield_now();
+    }
+    assert!(!h.driver.inject.suspended());
 }
 
 #[test]
@@ -1994,4 +2106,243 @@ fn migration_peer_facts_before_opening_preserve_caps_tap_mapping() {
             "late I0 attachment must not overwrite Windows DeviceFacts with the earlier unknown OS"
         );
     }
+}
+
+#[test]
+fn queued_capture_sample_cannot_borrow_the_new_focus_epoch() {
+    use oink_input::pointer_capture::CaptureSample;
+    for kind in 0..4 {
+        let mut h = Harness::new();
+        h.driver.command(InputCommand::LocalDisplays(vec![fixture_display()]));
+        let focus = h.driver.adapter.router().focus();
+        let current = Some((focus.epoch, focus.holder));
+        let sample = CaptureSample {
+            windows: None,
+            hidden: true,
+            application_hidden: Some(true),
+            confined: false,
+            position: oink_foundation::Point::new(400., 400.),
+            motion_serial: 0,
+            motion_observable: true,
+            foreground: 1,
+        };
+        // The observer sampled our frozen source in the preceding focus epoch.
+        // Delivery is delayed until the router has returned focus here. Replaying
+        // old evidence must never start the current holder's capture detector.
+        h.driver.command(InputCommand::PointerSample {
+            application: None,
+            scope: current,
+            sample: Some(CaptureSample {
+                hidden: false,
+                application_hidden: Some(false),
+                position: oink_foundation::Point::new(200., 400.),
+                ..sample
+            }),
+            hidden: false,
+        });
+        h.driver.now += Duration::from_millis(50);
+        // A hidden no-event warp is the macOS passive capture signature. The
+        // same signature from our old handoff must be rejected before detection.
+        let observed_scope = match kind {
+            0 => None,
+            1 => Some((focus.epoch.wrapping_sub(1), focus.holder)),
+            2 => Some((focus.epoch, peer())),
+            _ => current,
+        };
+        for _ in 0..2 {
+            h.driver.command(InputCommand::PointerSample {
+                application: None,
+                scope: observed_scope,
+                sample: Some(sample),
+                hidden: true,
+            });
+            h.driver.now += Duration::from_millis(400);
+        }
+        assert_eq!(
+            h.driver.adapter.router().game_mode().detected,
+            observed_scope == current
+        );
+        assert_eq!(h.driver.adapter.router().game_mode().active, observed_scope == current);
+    }
+}
+
+#[test]
+fn capture_transitions_reach_typed_recorder_with_native_tracing_disabled() {
+    use crate::diagnostics::{Reason, Recorder, capture::Application, input_trace::InputTrace};
+    use oink_input::pointer_capture::CaptureSample;
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::new();
+    h.driver.command(InputCommand::LocalDisplays(vec![fixture_display()]));
+    let focus = h.driver.adapter.router().focus();
+    let recorder = Recorder::start(dir.path().into(), focus.holder, None, true).unwrap();
+    recorder.wait_recovery();
+    let trace = InputTrace::for_recorder(&recorder);
+    h.driver.inject.trace = Some(trace.clone());
+    let mut sample = CaptureSample {
+        windows: None,
+        hidden: false,
+        application_hidden: Some(false),
+        confined: false,
+        position: oink_foundation::Point::new(200., 400.),
+        motion_serial: 0,
+        motion_observable: true,
+        foreground: 42,
+    };
+    let application = Application::new(42, "org.example.Game");
+    // This is the native owner's production subscriber policy. The regression
+    // must exercise Driver -> typed queue -> recorder, with no tracing fallback.
+    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+        let observe = |h: &mut Harness, sample| {
+            h.driver.command(InputCommand::PointerSample {
+                scope: Some((focus.epoch, focus.holder)),
+                application,
+                sample: Some(sample),
+                hidden: sample.hidden,
+            });
+            h.driver.outputs(None);
+        };
+        observe(&mut h, sample);
+        sample.hidden = true;
+        sample.application_hidden = Some(true);
+        sample.position.x = 400.;
+        h.driver.now += Duration::from_millis(50);
+        observe(&mut h, sample);
+        h.driver.now += Duration::from_millis(300);
+        observe(&mut h, sample);
+        assert!(h.driver.adapter.router().game_mode().active);
+        // Unchanged evidence must not turn this into a per-sample trace.
+        for _ in 0..10 {
+            h.driver.now += Duration::from_millis(50);
+            observe(&mut h, sample);
+        }
+        sample.hidden = false;
+        sample.application_hidden = Some(false);
+        observe(&mut h, sample);
+        h.driver.now += Duration::from_millis(200);
+        observe(&mut h, sample);
+        assert!(!h.driver.adapter.router().game_mode().active);
+    });
+    trace.drain(&recorder);
+    let bundle = recorder.save(Reason::Manual).unwrap();
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(bundle.path).unwrap()).unwrap();
+    let mut text = String::new();
+    zip.by_name("merged.ndjson").unwrap().read_to_string(&mut text).unwrap();
+    let rows: Vec<serde_json::Value> = text
+        .lines()
+        .map(|r| serde_json::from_str::<serde_json::Value>(r).unwrap())
+        .filter_map(|r| r["event"].get("Log").cloned())
+        .filter(|r| r["module"] == "oink_pointer_capture")
+        .collect();
+    assert_eq!(
+        rows.len(),
+        5,
+        "only evidence/enter/exit transitions are recorded: {rows:?}"
+    );
+    let entered = rows
+        .iter()
+        .find(|r| {
+            r["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f[0] == "active" && f[1] == 1.0)
+        })
+        .unwrap();
+    for name in [
+        "epoch",
+        "sample_epoch",
+        "hidden",
+        "application_hidden",
+        "locked",
+        "foreground_pid",
+        "warp_lock",
+        "stationary_us",
+        "movement_samples",
+    ] {
+        assert!(
+            entered["fields"].as_array().unwrap().iter().any(|f| f[0] == name),
+            "missing {name}"
+        );
+    }
+    for name in ["reason", "holder", "sample_holder", "screen", "foreground_bundle_id"] {
+        assert!(
+            entered["labels"].as_array().unwrap().iter().any(|l| l[0] == name),
+            "missing {name}"
+        );
+    }
+    assert!(
+        entered["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l[0] == "foreground_bundle_id" && l[1] == "org.example.Game")
+    );
+    assert!(
+        rows.last().unwrap()["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f[0] == "active" && f[1] == 0.0)
+    );
+    assert!(Application::new(42, "/private/window title").is_none());
+    assert!(Application::new(42, &"x".repeat(257)).is_none());
+}
+
+#[test]
+fn negative_display_entry_with_visible_blank_glyph_never_counts_as_capture() {
+    use oink_input::pointer_capture::CaptureSample;
+    let mut h = Harness::new();
+    let mut external = fixture_display();
+    external.key = "external".into();
+    external.bounds = oink_foundation::Rect::new(1560., -1080., 1920., 1080.);
+    h.driver
+        .command(InputCommand::LocalDisplays(vec![fixture_display(), external]));
+    let focus = h.driver.adapter.router().focus();
+    let mut sample = CaptureSample {
+        windows: None,
+        hidden: false,
+        application_hidden: Some(false),
+        confined: false,
+        position: oink_foundation::Point::new(2520.5, -0.02),
+        motion_serial: 0,
+        motion_observable: true,
+        foreground: 42,
+    };
+    for x in [3455.999995, 3114.112144, 2520.5] {
+        sample.position.x = x;
+        // Cover observed external entries and the subpoint boundary that used
+        // to break AppKit hit testing. macOS capture evidence has no glyph-image
+        // or NSCursor input: a rendered blank with a visible flag stays visible.
+        for y in [-4.683405, -8.028689, -0.02, -540.] {
+            sample.position.y = y;
+            for _ in 0..20 {
+                sample.motion_serial += 1;
+                h.driver.now += Duration::from_millis(50);
+                h.driver.command(InputCommand::PointerSample {
+                    scope: Some((focus.epoch, focus.holder)),
+                    application: None,
+                    sample: Some(sample),
+                    hidden: false,
+                });
+                assert!(!h.driver.adapter.router().game_mode().detected);
+                assert!(!h.driver.adapter.router().game_mode().active);
+            }
+        }
+    }
+    // Genuine hidden stationary movement can still enter on that display.
+    sample.hidden = true;
+    sample.application_hidden = Some(true);
+    sample.position = oink_foundation::Point::new(2520., -540.);
+    for _ in 0..20 {
+        sample.motion_serial += 1;
+        h.driver.now += Duration::from_millis(50);
+        h.driver.command(InputCommand::PointerSample {
+            scope: Some((focus.epoch, focus.holder)),
+            application: None,
+            sample: Some(sample),
+            hidden: true,
+        });
+    }
+    assert!(h.driver.adapter.router().game_mode().active);
 }

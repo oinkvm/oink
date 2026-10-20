@@ -156,7 +156,7 @@ impl Router {
         let locked = state.locked;
         tracing::info!(locked, holder = ?state.holder, revision = state.revision, "group focus lock changed");
         self.focus_lock = Some(state);
-        self.resistance = None;
+        self.reset_resistance();
         if locked {
             self.gap_cancel();
             self.enter_due = None;
@@ -173,6 +173,9 @@ impl Router {
             DecisionReason::UserRequest,
             None,
         );
+        self.out.push(Output::Status(StatusEvent::FocusLock {
+            holder: self.locked_device(),
+        }));
         self.push_focus_status();
     }
     pub(super) fn receive_focus_lock(&mut self, state: FocusLock) {

@@ -36,6 +36,7 @@ impl Node {
     fn system_appearance_changed(&self, dark: bool) {
         self.inner.system_dark.store(dark, Ordering::Release);
         self.apply_trail_appearance();
+        self.apply_notification_preferences();
     }
 
     pub(super) fn watch_trail_appearance(&self) {

@@ -199,9 +199,13 @@ impl Backend {
                 tracing::info!(key = first.panel.isKeyWindow(), "aim overlay keyboard focus");
             }
             UI.with(|ui| *ui.borrow_mut() = Some(Ui { generation, windows }));
-            let fps = NSScreen::mainScreen(mtm).map_or(60, |s| s.maximumFramesPerSecond());
-            let fps = if (30..=240).contains(&fps) { fps } else { 60 };
-            interval.store(1_000_000_000 / fps as u64, Ordering::Relaxed);
+            let fps = crate::macos::overlay_refresh_rate(
+                NSScreen::screens(mtm)
+                    .to_vec()
+                    .iter()
+                    .map(|s| s.maximumFramesPerSecond()),
+            );
+            interval.store(1_000_000_000 / fps, Ordering::Relaxed);
         });
         Some(Self {
             generation,

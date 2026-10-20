@@ -161,4 +161,7 @@ message_registry! {
     0x0d2a => ConfigEmergencyPause(EmergencyPause), [Route {kind:2, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.group/1"], Allow;
     0x0d2b => ConfigEmergencyPauseAck(EmergencyPauseAck), [Route {kind:2, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.group/1"], Allow;
     0x0333 => ContentFileVersion(ContentFileVersion), [Route {kind:4, transport:Transport::Low, extra_capabilities:&[]}], ["oink.clipboard/1", "oink.low/1"], Suspend;
+    0x0d2c => NotifyShow(NotifyShow), [Route {kind:2, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.group/1", "oink.notify/1"], Allow;
+    0x0d2d => NotifyAction(NotifyAction), [Route {kind:2, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.group/1", "oink.notify/1"], Allow;
+    0x0d2e => NotifyDismiss(NotifyDismiss), [Route {kind:2, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.group/1", "oink.notify/1"], Allow;
 }

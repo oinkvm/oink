@@ -143,6 +143,35 @@ impl Owner {
             return Err(internal("native group application pending"));
         }
         self.observe_links()?;
+        let links = self.links.links();
+        let ready: BTreeSet<_> = links
+            .links
+            .iter()
+            .filter(|link| {
+                link.state == oink_network::link::LinkState::Ready
+                    && self.sessions.get(&link.link).is_some_and(|session| session.ready)
+            })
+            .map(|link| link.peer)
+            .collect();
+        let previous = self.shared.members.load();
+        let previous_group = self.shared.applied.load().group;
+        let mut went_offline = false;
+        for member in &previous.members {
+            if !member.is_self
+                && member.online
+                && (previous_group != self.state.roster().anchor().group || !ready.contains(&member.device))
+            {
+                // Last seen is the end of our live logical link, measured by
+                // this device's wall clock, never the peer's clock or facts age.
+                self.presence
+                    .observe(previous_group, member.device, now_ms())
+                    .map_err(internal)?;
+                went_offline = true;
+            }
+        }
+        if went_offline && let Err(error) = self.presence.flush() {
+            tracing::warn!(%error, "could not persist last live link time; will retry");
+        }
         let register = self.state.layout().map_err(internal)?;
         let value = dto::LayoutValue::from_raw(register.value().map_err(internal)?).map_err(internal)?;
         let mut layout = layout_wire::from_wire(&value).map_err(internal)?;
@@ -206,12 +235,26 @@ impl Owner {
             previous.paused != paused || previous.emergency != emergency
         };
         self.shared.router.publish(router.clone());
+        // Retained owner preferences describe offline drawing only. The router
+        // above keeps its live-only owner baseline and readiness checks.
+        let mut drawing_owners = (*owners).clone();
+        for device in &members {
+            if !drawing_owners.contains_key(device)
+                && !self.facts.contains_key(device)
+                && let Some(facts) = self.cache.get(self.state.roster().anchor().group, *device)
+                && let Some(preferences) = facts.preferences().map_err(internal)?
+                && let Ok(owner) = layout_wire::owner_preferences(&preferences.0)
+            {
+                drawing_owners.insert(*device, owner);
+            }
+        }
+        let drawing_owners = Arc::new(drawing_owners);
         self.shared.applied.publish(AppliedState {
             group: self.state.roster().anchor().group,
             roster_digest: self.state.roster().digest().map_err(internal)?,
             members: members.clone(),
             layout: layout.clone(),
-            owners: owners.clone(),
+            owners: drawing_owners.clone(),
             layout_source: value.source().map_err(internal)?,
             version: version.clone(),
             paused,
@@ -220,7 +263,7 @@ impl Owner {
         self.shared.displays.publish(LocalDisplays {
             displays: self.displays.clone(),
             layout: layout.clone(),
-            owners: owners.clone(),
+            owners: drawing_owners,
         });
         let table: Vec<MemberInfo> = self
             .state
@@ -252,11 +295,7 @@ impl Owner {
                         .map(|n| n.0)
                         .or_else(|| member.os.clone())
                         .unwrap_or_default(),
-                    online: own
-                        || self
-                            .sessions
-                            .values()
-                            .any(|s| s.ready && s.peer_boot.device_id == member.device),
+                    online: own || ready.contains(&member.device),
                     facts,
                     added_by: Some(member.issuer),
                     added_at_ms: member.issued_ms,
@@ -379,7 +418,7 @@ impl Owner {
         self.publish_facts()
     }
     pub(crate) fn device_control(&mut self, peer: DeviceId, message: Message) -> ApiResult<()> {
-        if !(0x0d23..=0x0d2b).contains(&message.type_id()) {
+        if !(0x0d23..=0x0d2e).contains(&message.type_id()) {
             return Err(invalid("invalid device control message"));
         }
         let id = self
@@ -389,6 +428,13 @@ impl Owner {
                 (s.ready && s.peer_boot.device_id == peer && self.state.roster().contains(peer)).then_some(*id)
             })
             .ok_or_else(stopped)?;
+        if (0x0d2c..=0x0d2e).contains(&message.type_id())
+            && !self.links.links().links.iter().find(|l| l.link == id).is_some_and(|l| {
+                l.state == oink_network::link::LinkState::Ready && l.agreement.contains("oink.notify/1")
+            })
+        {
+            return Err(invalid("notification capability was not negotiated"));
+        }
         self.send(id, message).map_err(internal)
     }
     pub(crate) fn protocol_error(&mut self, link: LinkId, error: dto::ProtocolError) -> ApiResult<()> {

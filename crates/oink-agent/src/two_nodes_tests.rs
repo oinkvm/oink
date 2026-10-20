@@ -563,6 +563,22 @@ async fn pair_route_clipboard_layout_disconnect_scenario() {
     assert_eq!(bn.layout().1, version);
     assert_layout_files_equal(&an, &bn);
 
+    let target = screen.clone();
+    api(&a.node, move |node| node.set_screen_remote_gain(target, 2.0))
+        .await
+        .unwrap();
+    wait_for("remote screen gain reaches peer", 5.0, || {
+        AgentApi::layout(&bn)
+            .unwrap()
+            .geometry
+            .screens
+            .iter()
+            .any(|item| item.key == screen && item.remote_gain == 2.0 && item.gain == 1.5)
+    })
+    .await;
+    assert_eq!(an.layout().1, version);
+    assert_eq!(bn.layout().1, version);
+
     // Group gap mode travels through the settings API and the existing layout
     // publication path, in both directions, and is persisted identically.
     assert!(!an.input_settings().unwrap().gap_travel);

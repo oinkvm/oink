@@ -256,7 +256,9 @@ pub(super) fn restore_at(
     tracing::debug!(target: "oink_cursor_timing", "cursor latency: retire glyph begin");
     handoff_timing::native(TimingStage::GlyphRetireStarted, 0);
     let retired = owner::retire_blank();
-    handoff_timing::native(TimingStage::GlyphRetireCompleted, u32::from(!retired));
+    // Distinguish no owner/no blank from a changed destination cursor. A
+    // skipped retirement is not evidence that our transparent glyph survived.
+    handoff_timing::native(TimingStage::GlyphRetireCompleted, retired as u32);
     tracing::debug!(target: "oink_cursor_timing", "cursor latency: retire glyph end");
     let was = DISSOCIATED.load(Ordering::Acquire);
     restore();
@@ -305,11 +307,16 @@ pub(crate) fn restore() {
         TimingStage::ShowCompleted,
         (associate.unwrap_or(0) | show.unwrap_or(0) | flush.unwrap_or(0)) as u32 | (u32::from(show.is_none()) << 31),
     );
+    // Keep the existing post-Show visibility query in native typed evidence too:
+    // the realtime owner suppresses tracing, and API success is not visibility.
+    // SAFETY: Read-only query; visibility does not establish a nontransparent glyph.
+    let visible = unsafe { CGCursorIsVisible() } != 0;
     if associate.is_some() || show.is_some() {
         crate::native_lifecycle::emit_lifecycle(
             crate::native_lifecycle::Kind::Show,
             crate::native_lifecycle::Data {
                 hidden: Some(false),
+                cursor_showing: Some(visible),
                 success: Some(
                     associate.is_none_or(|v| v == 0) && show.is_none_or(|v| v == 0) && flush.is_none_or(|v| v == 0),
                 ),
@@ -326,8 +333,6 @@ pub(crate) fn restore() {
         flush_code = flush.unwrap_or(0),
         "restore cursor: native results"
     );
-    // SAFETY: Read-only query; visibility does not establish a nontransparent glyph.
-    let visible = unsafe { CGCursorIsVisible() } != 0;
     tracing::debug!(target: "oink_cursor_timing", visible, "cursor latency: show end");
 }
 

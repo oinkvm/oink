@@ -17,6 +17,7 @@ export class SpringRects {
     private items = new Map<string, Item>();
     private raf = 0;
     private last = 0;
+    private active = true;
     onFrame: () => void = () => { };
     // Followers run after every screen has advanced, before the frame is rendered.
     // Gesture growth uses wall time; spring followers use the scaled animation time.
@@ -47,8 +48,12 @@ export class SpringRects {
     }
     remove(id: string) { this.items.delete(id); }
     ids() { return [...this.items.keys()]; }
+    setActive(active: boolean) {
+        this.active = active;
+        if (active) this.wake(); else this.stop();
+    }
     wake() {
-        if (this.raf)
+        if (!this.active || this.raf)
             return;
         this.last = performance.now();
         this.raf = requestAnimationFrame(this.step);
@@ -98,7 +103,7 @@ export class SpringRects {
     };
     stop() { cancelAnimationFrame(this.raf); this.raf = 0; }
 }
-export function useSpringRects() {
+export function useSpringRects(active = true) {
     const ref = useRef<SpringRects | undefined>(undefined);
     if (!ref.current)
         ref.current = new SpringRects();
@@ -108,5 +113,6 @@ export function useSpringRects() {
         sys.onFrame = force;
         return () => sys.stop();
     }, []);
+    useEffect(() => { ref.current!.setActive(active); }, [active]);
     return ref.current;
 }

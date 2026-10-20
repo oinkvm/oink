@@ -28,6 +28,13 @@ pub fn create_private_new(path: &Path) -> io::Result<File> {
     }
 }
 
+/// Open a persistent Windows ownership lock with a user-only DACL and Medium
+/// minimum integrity. Keep the file in place: unlinking would split ownership.
+#[cfg(windows)]
+pub fn open_private_lock(path: &Path) -> io::Result<File> {
+    windows::open_private_lock(path)
+}
+
 /// Flush a private sibling, replace the destination atomically, and flush the
 /// containing directory on Unix. Failed writes remove only their own staging file.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {

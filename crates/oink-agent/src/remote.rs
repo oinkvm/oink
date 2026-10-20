@@ -566,6 +566,9 @@ impl AgentApi for RemoteApi {
     fn unblock(&self, operation_id: String, device: DeviceKey) -> ApiResult<crate::device_cards::BlockReply> {
         self.call(Request::Unblock { operation_id, device })
     }
+    fn notify(&self, notification: Notification) -> ApiResult<Option<NotificationReceipt>> {
+        self.call(Request::Notify { notification })
+    }
     fn ui_preferences(&self) -> ApiResult<UiPreferences> {
         self.call(Request::UiPreferences)
     }
@@ -644,6 +647,10 @@ impl AgentApi for RemoteApi {
     fn save_layout(&self, placements: Vec<Placement>) -> ApiResult<Layout> {
         self.call(Request::SaveLayout { placements })
     }
+    fn set_screen_remote_gain(&self, screen: ScreenKey, gain: f64) -> ApiResult<()> {
+        self.call(Request::SetScreenRemoteGain { screen, gain })
+    }
+
     fn set_screen_gain(&self, screen: ScreenKey, gain: f64) -> ApiResult<()> {
         self.call(Request::SetScreenGain { screen, gain })
     }

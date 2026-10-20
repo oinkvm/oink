@@ -63,7 +63,7 @@ export function usePreferences(): PrefsApi {
     if(busy.current)return;
     setPrefs(p=>{
       const next:Prefs={...p,
-        ...(local?{showInMenuBar:local.show_status_icon,confirmQuit:local.confirm_quit,language:local.ui_language,logLevel:local.log_level,logMaxMb:String(local.log_max_mb)}:{}),
+        ...(local?{notificationLevel:local.notification_level,showInMenuBar:local.show_status_icon,confirmQuit:local.confirm_quit,language:local.ui_language,logLevel:local.log_level,logMaxMb:String(local.log_max_mb)}:{}),
         upgradeHint:presentation.show_update_hint,
         ...(state.input?{pollLimit:state.input.event_frequency==='hz125'?'125':'none',keepAwake:state.input.wake_displays_on_input,pointerTrail:state.input.cursor_trail,touchpadInject:state.input.accept_contacts,pointerGain:state.input.device_gain,escStop:state.input.emergency_hold_ms!==0,
           shortcuts:{...p.shortcuts,...Object.fromEntries(state.input.hotkeys.filter(h=>h.action in actions).map(h=>[actions[h.action as keyof typeof actions],{on:h.enabled,keys:h.keys.map(k=>k==='Ctrl'?'Control':k).join('+')}]))}} as const:{}),
@@ -115,9 +115,9 @@ export function usePreferences(): PrefsApi {
         if(!current.audio)throw new Error('unavailable');
         await api.setAudioSettings({...(changed('keepLocalPlayback')?{keep_local_playback:next.keepLocalPlayback}:{}),...(changed('audioDevice')?{receive_output:next.audioDevice==='default'?null:next.audioDevice}:{})});
       }
-      if((['showInMenuBar','confirmQuit','language','logLevel','logMaxMb'] as const).some(changed)){
+      if((['showInMenuBar','confirmQuit','notificationLevel','language','logLevel','logMaxMb'] as const).some(changed)){
         if(!appliedLocal)throw new Error('unavailable');
-        await agent.query('localPreferences',()=>call<LocalPreferences>('set_ui_preferences',{settings:{...(changed('showInMenuBar')?{show_status_icon:next.showInMenuBar}:{}),...(changed('confirmQuit')?{confirm_quit:next.confirmQuit}:{}),...(changed('language')?{ui_language:next.language}:{}),...(changed('logLevel')?{log_level:next.logLevel}:{}),...(changed('logMaxMb')?{log_max_mb:Number(next.logMaxMb)}:{})}}));
+        await agent.query('localPreferences',()=>call<LocalPreferences>('set_ui_preferences',{settings:{...(changed('notificationLevel')?{notification_level:next.notificationLevel}:{}),...(changed('showInMenuBar')?{show_status_icon:next.showInMenuBar}:{}),...(changed('confirmQuit')?{confirm_quit:next.confirmQuit}:{}),...(changed('language')?{ui_language:next.language}:{}),...(changed('logLevel')?{log_level:next.logLevel}:{}),...(changed('logMaxMb')?{log_max_mb:Number(next.logMaxMb)}:{})}}));
       }
       if((['scrollInvert','keyPreset','keyCustom','capsSplit'] as const).some(changed)){
         if(!transform||!current.overview)throw new Error('unavailable');
@@ -136,7 +136,7 @@ export function usePreferences(): PrefsApi {
     finally{busy.current=false;setPending(false);const follow=queued.current;queued.current=null;if(follow)void save(follow);}
   };
   return{prefs,pending,launchStatus:state.launch,canEdit: key => {
-      if(['language','showInMenuBar','confirmQuit','logLevel','logMaxMb','theme','accent'].includes(key))return local!==null;
+      if(['language','showInMenuBar','confirmQuit','notificationLevel','logLevel','logMaxMb','theme','accent'].includes(key))return local!==null;
       if(['keymap','scrollInvert'].includes(key))return transform!==null;
       if(['pollLimit','pointerGain','keepAwake','pointerTrail','touchpadInject','escStop'].includes(key)||key.startsWith('sc-'))return state.input!==null;
       if(key.startsWith('clip'))return state.clipboard!==null;

@@ -2433,6 +2433,131 @@ mod connection_tests {
     }
 
     #[test]
+    fn upper_display_drag_push_bypasses_dock_damping_for_native_and_hosted_sources() {
+        use crate::ScreenId;
+        use oink_foundation::{
+            Rect,
+            display::DisplayInfo,
+            input::{EdgeResistanceRegion, ScreenEdge},
+        };
+        for remote in [false, true] {
+            for native in [false, true] {
+                let me = DeviceId([1; 32]);
+                let peer = DeviceId([2; 32]);
+                let primary = Rect::new(0., 0., 1728., 1117.);
+                let upper = Rect::new(1560., -1080., 1920., 1080.);
+                let target = Rect::new(0., 0., 1920., 1080.);
+                let mut layout = crate::SimpleLayout::new();
+                for (device, key, bounds, plane) in [
+                    (me, "primary", primary, primary),
+                    (me, "upper", upper, upper),
+                    (peer, "screen", target, Rect::new(1728., 0., 1920., 1080.)),
+                ] {
+                    layout.add_screen(
+                        ScreenId::new(device, key),
+                        bounds,
+                        Rect::new(plane.x / 686., plane.y / 686., plane.w / 686., plane.h / 686.),
+                    );
+                }
+                let mut cfg = RouterConfig::new(
+                    oink_foundation::session::Boot {
+                        device_id: me,
+                        nonce: [1; 16],
+                    },
+                    "local",
+                    Os::MacOS,
+                );
+                cfg.settings.damping.platform_profile = crate::damping::DampingProfile::DepthOnly { depth: 1000. };
+                cfg.settings.dnd_push_fraction = 0.005;
+                let mut r = Router::new(cfg, Arc::new(layout));
+                r.set_local_displays(
+                    [("primary", primary), ("upper", upper)]
+                        .into_iter()
+                        .map(|(key, bounds)| DisplayInfo {
+                            key: key.into(),
+                            name: key.into(),
+                            bounds,
+                            pixel_width: bounds.w as u32,
+                            pixel_height: bounds.h as u32,
+                            reference_extent: None,
+                            rotation_deg: 0,
+                            is_primary: key == "primary",
+                            is_builtin: key == "primary",
+                            is_virtual: false,
+                        })
+                        .collect(),
+                );
+                // Bottom Dock on both displays models Separate Spaces. An
+                // enormous ordinary damping threshold must not delay DnD.
+                r.set_edge_resistance_regions(
+                    ["primary", "upper"]
+                        .into_iter()
+                        .map(|display| EdgeResistanceRegion {
+                            display: display.into(),
+                            edges: vec![ScreenEdge::Bottom],
+                            corners: vec![],
+                        })
+                        .collect(),
+                );
+                r.set_dnd_available(true);
+                r.test_message(peer, Message::Dnd(DndMsg::Caps { enabled: true }), 1);
+                r.peers.get_mut(&peer).unwrap().focus_ready = true;
+                let input = if remote { peer } else { me };
+                let id = ClipId {
+                    origin: if native { me } else { peer },
+                    seq: DND_SEQ_BIT | 1,
+                };
+                if remote {
+                    r.held.entry(peer).or_default().buttons.insert(MouseButton::Left);
+                    r.button_refs.insert(MouseButton::Left, 1);
+                } else {
+                    r.buttons.insert(
+                        MouseButton::Left,
+                        if native { Target::Local } else { Target::LocalInjected },
+                    );
+                }
+                let at = Point::new(2577.319, -0.000005019685);
+                r.pointer = Some(ScreenPos::new(ScreenId::new(me, "upper"), at));
+                if !native {
+                    r.hold_button_silently(input, MouseButton::Left);
+                    r.dnd.state = State::Hosting {
+                        id,
+                        input,
+                        items: vec![ClipData::Text("drag".into())],
+                        push: None,
+                    };
+                }
+                let motion = |r: &mut Router, dy, now| {
+                    if remote {
+                        r.remote_motion(peer, 0., dy / 686., now);
+                    } else {
+                        r.local_motion(0., dy, Some(at), now);
+                    }
+                };
+                motion(&mut r, 1., 2);
+                assert!(r.resistance.is_none(), "ordinary damping must not own the drag");
+                if native {
+                    assert!(
+                        r.out
+                            .iter()
+                            .any(|o| matches!(o, Output::Dnd(DndCmd::Probe { at }) if at.y < 0.))
+                    );
+                    r.on_dnd_event(DndEvent::Detected {
+                        id,
+                        items: vec![ClipData::Text("drag".into())],
+                    });
+                }
+                motion(&mut r, 20., 3);
+                assert!(
+                    matches!(r.dnd.state, State::Leaving { native: got, .. } if got == native),
+                    "remote={remote}, native={native}: DnD push must cross despite Dock damping"
+                );
+                assert!(r.resistance.is_none());
+            }
+        }
+    }
+
+    #[test]
     fn pending_drag_survives_duplicate_active_but_is_cleared_on_session_revocation() {
         let me = DeviceId([1; 32]);
         let peer = DeviceId([2; 32]);

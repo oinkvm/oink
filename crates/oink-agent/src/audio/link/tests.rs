@@ -1301,3 +1301,64 @@ async fn permission_revocation_retires_active_capture_without_changing_playback_
     r.until(|r| r.owners[0].capture.is_some()).await;
     r.stop().await;
 }
+
+#[tokio::test]
+async fn manual_update_interrupts_open_silent_audio_and_abort_restores_preferences() {
+    let mut running = Running::start(false).await;
+    assert!(running.owners[0].capture.is_some());
+    assert_eq!(running.owners[0].sent.load(Ordering::Relaxed), 0);
+    let preferences: Vec<_> = running.owners.iter().map(|o| o.settings.clone()).collect();
+    let resolution = running.owners[0].resolution;
+    for owner in &mut running.owners {
+        owner.suspend_for_update().unwrap();
+        assert!(owner.capture.is_none() && owner.receivers.is_empty());
+        assert!(owner.playback.is_none() && owner.starting_playback.is_none());
+        assert!(owner.update_activity.is_none());
+    }
+    assert!(lock(&running.platforms[0].0).events.contains(&"restore"));
+    // Opening admission after an aborted replacement reconciles the same route;
+    // there is no persisted forwarding toggle or lost exit claim to restore.
+    running.until(Running::prepared_route_ready).await;
+    for (owner, original) in running.owners.iter().zip(preferences) {
+        assert_eq!(owner.settings, original);
+    }
+    assert_eq!(running.owners[0].resolution, resolution);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn manual_update_reports_native_audio_restore_failure_instead_of_waiting() {
+    let mut running = Running::start(false).await;
+    lock(&running.platforms[0].0).cleanup_error = Some("restore failed".into());
+    assert!(running.owners[0].suspend_for_update().is_err());
+    assert!(running.owners[0].capture.is_none());
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn manual_update_ignores_historical_cleanup_fault_but_checks_current_capture() {
+    let mut running = Running::start(false).await;
+    let owner = &mut running.owners[0];
+    owner.mute_cleanup_error = Some("historical restore error".into());
+    lock(&running.platforms[0].0).cleanup_failed = true;
+    assert!(owner.capture.is_some());
+    assert!(owner.suspend_for_update().is_ok(), "current capture cleanup succeeded");
+    // Keep the diagnostic/capture safety latch; only Install must ignore history.
+    assert!(owner.mute_cleanup_error.is_some());
+    assert!(owner.platform.capture_cleanup_failed());
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn manual_update_remembers_current_cleanup_failure_until_admission_reopens() {
+    let mut running = Running::start(false).await;
+    lock(&running.platforms[0].0).cleanup_error = Some("current restore error".into());
+    let owner = &mut running.owners[0];
+    assert!(owner.suspend_for_update().is_err());
+    assert!(owner.capture.is_none());
+    assert!(
+        owner.suspend_for_update().is_err(),
+        "a second request cannot erase this attempt's error"
+    );
+    running.stop().await;
+}

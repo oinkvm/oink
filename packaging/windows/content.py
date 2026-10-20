@@ -169,9 +169,8 @@ def verify_registration(tables, metadata, identity):
     if (len(cleanup) != 1 or int(cleanup[0][1]) != 3585 or cleanup[0][2:4] != ['InstallerCA', 'CleanupMaintenance'] or
             len(maintenance) != 1 or int(maintenance[0][3]) & 16 or
             conditions.get('CleanupMaintenance') != 'REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE' or
-            not sequence.get('StartServices', 0) < sequence.get('CommitMaintenance', 0) <
-                sequence.get('CleanupMaintenance', 0) < sequence['InstallFinalize']):
-        raise RuntimeError('MSI must clean maintenance only on committed standalone full uninstall, after lease release')
+            not sequence.get('StartServices', 0) < sequence.get('CleanupMaintenance', 0) < sequence['InstallFinalize']):
+        raise RuntimeError('MSI must clean maintenance only on committed standalone full uninstall, after service restart')
     cloud = [row for row in tables.get('CustomAction', []) if row[0] == 'CleanupCloudFiles']
     if (len(cloud) != 1 or int(cloud[0][1]) != 3073 or
             cloud[0][2:4] != ['InstallerCA', 'CleanupCloudFiles'] or

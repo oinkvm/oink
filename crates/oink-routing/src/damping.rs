@@ -145,6 +145,36 @@ pub struct DampingConfig {
 const BIN_US: u64 = 10_000;
 const DT: f64 = 0.01;
 
+/// Stillness releases damping for one continuous visit to a protected segment.
+/// A nonzero motion delta is movement even when the native cursor is clipped.
+/// Zero-delta samples do not restart the clock; the next push can observe the
+/// elapsed quiet interval without a periodic tick or a wall-clock timer.
+#[derive(Clone, Debug)]
+pub(crate) struct DampingStillness {
+    last_motion: u64,
+    released: bool,
+}
+
+impl DampingStillness {
+    pub(crate) fn new(now: u64) -> Self {
+        Self {
+            last_motion: now,
+            released: false,
+        }
+    }
+
+    pub(crate) fn observe(&mut self, delta: (f64, f64), now: u64) {
+        self.released |= now.saturating_sub(self.last_motion) >= 100_000;
+        if delta.0 != 0.0 || delta.1 != 0.0 {
+            self.last_motion = self.last_motion.max(now);
+        }
+    }
+
+    pub(crate) fn released(&self) -> bool {
+        self.released
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DampingMeter {
     depth: f64,
@@ -236,6 +266,27 @@ pub(crate) fn nonnegative(value: f64, default: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::config::RoutingSettings;
+
+    #[test]
+    fn stillness_uses_raw_motion_and_the_quiet_interval_before_the_next_push() {
+        let mut quiet = DampingStillness::new(0);
+        quiet.observe((0., 0.), 99_000);
+        assert!(!quiet.released());
+        quiet.observe((0., 1.), 100_000);
+        assert!(quiet.released());
+        quiet.observe((1., 0.), 100_001);
+        assert!(quiet.released(), "movement within the same edge visit keeps the bypass");
+
+        let mut pushing = DampingStillness::new(0);
+        for now in (10_000..=500_000).step_by(10_000) {
+            pushing.observe((0., 0.000001), now);
+            assert!(!pushing.released(), "a clamped cursor does not imply a stopped device");
+        }
+        pushing.observe((0., 0.), 599_999);
+        assert!(!pushing.released());
+        pushing.observe((0., 1.), 600_000);
+        assert!(pushing.released());
+    }
 
     #[test]
     fn accelerated_push_crosses_shallow_but_braking_does_not() {

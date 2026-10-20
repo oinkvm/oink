@@ -447,7 +447,7 @@ impl Router {
                 return None;
             }
             let source = t.screen(&id)?;
-            let gain = t.plane_gain(&id).unwrap();
+            let gain = t.pointer_gain(&id, origin).unwrap();
             let head = source.local_to_plane(from.local);
             (&source.placement, head, gain)
         };
@@ -465,7 +465,7 @@ impl Router {
             // first_portal also slides along walls; only the actual departure
             // point may select a zone for physical travel.
             self.layout
-                .first_portal(from, hand)
+                .first_portal_from_source(from, hand, origin)
                 .filter(|exit| {
                     exit.trigger_zone && {
                         let hit = source.local_to_plane(exit.from.local);
@@ -541,7 +541,7 @@ impl Router {
             gain,
             zone,
         });
-        self.resistance = None;
+        self.reset_resistance();
         self.pointer = Some(self.gap.as_ref().unwrap().position());
         if let Some(target) = target {
             let dst = screen_position(&target, head);

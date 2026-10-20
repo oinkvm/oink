@@ -57,6 +57,7 @@ export const SECTIONS: SectionMeta[] = [
                 desc: (p) => (p === 'mac' ? tr('关掉窗口后，也能从菜单栏的图标打开菜单和界面') : tr('关掉窗口后，也能从任务栏右侧的托盘图标打开菜单和界面')),
                 get keywords() { return tr('菜单栏 托盘 图标 tray'); },
             },
+            { id: 'notificationLevel', get label() { return tr('通知级别'); }, get desc() { return tr('选择本机显示的通知详细程度'); } },
             { id: 'confirmQuit', get label() {
                     return tr('退出前确认');
                 }, get desc() {
@@ -83,6 +84,7 @@ export const SECTIONS: SectionMeta[] = [
                 }, get desc() {
                     return tr('版本、项目主页、开源软件引用');
                 }, get keywords() { return tr('about 关于 版本 开源 许可 github'); } },
+            { id: 'updates', get label() { return tr('软件更新'); }, get keywords() { return tr('版本 更新 升级 检查'); } },
             { id: 'uninstall', only: 'mac', get label() { return tr('卸载 Oink'); }, get desc() { return tr('移除 Oink 及其数据、权限和系统组件'); }, get keywords() { return tr('卸载 移除 删除 废纸篓 清除 数据 权限 卸载 Oink…'); } },
         ],
     },
@@ -143,6 +145,7 @@ export const SECTIONS: SectionMeta[] = [
                 }, get desc() {
                     return tr('其他设备控制本机时，指针移动速度的倍率');
                 }, get keywords() { return tr('鼠标 速度 灵敏度 加速'); } },
+            { id: 'screenPointerGains', get label() { return tr('每屏远程指针速度'); }, get desc() { return tr('仅在其他设备控制这块屏幕时生效，与上方增益相乘；1 倍保持当前速度，不影响本机鼠标或触摸板'); }, get keywords() { return tr('鼠标 速度 灵敏度 加速'); } },
             { id: 'keepAwake', get label() {
                     return tr('其他设备活动时，保持屏幕常亮');
                 }, get desc() {

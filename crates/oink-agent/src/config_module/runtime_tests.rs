@@ -1252,3 +1252,457 @@ async fn network_endpoint_poll_refreshes_without_wake_or_display_events() {
     assert!(changed, "a network change must advance the facts sequence");
     assert!(unchanged, "unchanged interfaces must not churn facts sequences");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offline_presence_records_local_disconnect_time_and_survives_reload() {
+    for retire in [false, true] {
+        let nodes = start(same_group(2)).await;
+        assert!(until(|| ready(&nodes)).await);
+        let peer = nodes[1].identity.id();
+        let (before, observed, after, persisted) = nodes[0]
+            .group
+            .call(move |owner| {
+                let group = owner.state.roster().anchor().group;
+                // Model a long-lived quiet session without waiting or using peer clocks.
+                owner.presence.observe(group, peer, 1).unwrap();
+                let link = owner
+                    .sessions
+                    .iter()
+                    .find(|(_, s)| s.ready && s.peer_boot.device_id == peer)
+                    .unwrap()
+                    .0;
+                let before = now_ms();
+                let link = *link;
+                if retire {
+                    // A live transport returning to admission is offline too.
+                    owner.sessions.get_mut(&link).unwrap().ready = false;
+                    owner.links.retire(link);
+                    owner.publish()?;
+                } else {
+                    owner.close(link, Disconnect::HandshakeFailed);
+                }
+                let after = now_ms();
+                let observed = owner
+                    .shared
+                    .members
+                    .load()
+                    .members
+                    .iter()
+                    .find(|m| m.device == peer)
+                    .unwrap()
+                    .last_connected_ms;
+                let persisted = crate::config::records::PresenceStore::load(&owner.data_dir)
+                    .unwrap()
+                    .last_connected(group, peer);
+                owner.publish()?;
+                assert_eq!(
+                    owner.presence.last_connected(group, peer),
+                    observed,
+                    "publishing an already offline peer must not refresh last seen"
+                );
+                Ok((before, observed, after, persisted))
+            })
+            .unwrap();
+        stop(&nodes).await;
+        assert!(
+            observed.is_some_and(|time| (before..=after).contains(&time)),
+            "disconnect time: {observed:?}, expected {before}..={after}"
+        );
+        assert_eq!(persisted, observed);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offline_layout_retains_cached_visibility_without_routing_authority() {
+    let nodes = start(same_group(2)).await;
+    assert!(until(|| ready(&nodes)).await);
+    let peer = nodes[1].identity.id();
+    nodes[1].group.initialize_displays(vec![display("retained")]).unwrap();
+    assert!(
+        until(|| nodes[0]
+            .group
+            .call(move |owner| Ok(owner.facts.contains_key(&peer)
+                && owner
+                    .shared
+                    .applied
+                    .load()
+                    .layout
+                    .screens
+                    .iter()
+                    .any(|s| s.id.device == peer)))
+            .unwrap())
+        .await
+    );
+    let (hidden, disabled, router_has_owner, routable, reloaded_hidden) = nodes[0]
+        .group
+        .call(move |owner| {
+            let mut raw = owner.facts[&peer].raw().clone();
+            let mut preferences = owner.facts[&peer].preferences().unwrap().unwrap().0;
+            for preference in &mut preferences {
+                let mut fields = preference.raw().clone();
+                match preference.option().unwrap() {
+                    dto::LocalOption::ScreenShared => {
+                        fields.insert(3, false.write());
+                    }
+                    dto::LocalOption::ScreenPreferences => {
+                        fields.insert(
+                            3,
+                            dto::ScreenPreferencesValue::from_raw(
+                                [
+                                    (2, 1.0f64.write()),
+                                    (
+                                        1,
+                                        RawValue::Array(vec![
+                                            dto::ScreenPreference::from_raw(
+                                                [
+                                                    (1, RawValue::Text("retained".into())),
+                                                    (2, 1.0f64.write()),
+                                                    (3, false.write()),
+                                                ]
+                                                .into(),
+                                            )
+                                            .unwrap()
+                                            .write(),
+                                        ]),
+                                    ),
+                                ]
+                                .into(),
+                            )
+                            .unwrap()
+                            .write(),
+                        );
+                    }
+                    _ => {}
+                }
+                *preference = dto::DevicePreference::from_raw(fields).unwrap();
+            }
+            raw.insert(
+                18,
+                RawValue::Array(preferences.into_iter().map(|p| p.write()).collect()),
+            );
+            let facts = dto::DeviceFacts::from_raw(raw).unwrap();
+            owner.cache.observe(facts).unwrap();
+            owner.cache.flush().unwrap();
+            let links = owner
+                .sessions
+                .iter()
+                .filter(|(_, s)| s.peer_boot.device_id == peer)
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            for link in links {
+                owner.close(link, Disconnect::HandshakeFailed);
+            }
+            let applied = owner.shared.applied.load();
+            let geometry = crate::api::layout_geometry(
+                &applied.layout,
+                &applied.owners,
+                |_| false,
+                |_| {
+                    Some(crate::api::ScreenMeta {
+                        device_name: "Remote".into(),
+                        os: crate::api::Os::Windows,
+                        display: None,
+                    })
+                },
+            );
+            let screen = geometry.screens.iter().find(|s| s.key.device == peer.into()).unwrap();
+            assert!(screen.hidden && screen.device_disabled && !screen.online);
+            let retained = applied.owners.get(&peer);
+            let hidden = retained
+                .and_then(|o| o.screens.get("retained"))
+                .is_some_and(|s| !s.enabled);
+            let disabled = retained.is_some_and(|o| !o.screen_shared);
+            let router = owner.shared.router.load();
+            let router_has_owner = router.owners.contains_key(&peer);
+            let routable = router.devices.contains(&peer);
+            // Reload the existing schema-1 cache, as on a backend restart.
+            owner.cache = super::super::local_records::FactsCache::load(&owner.data_dir).unwrap();
+            owner.publish()?;
+            let reloaded_hidden = owner
+                .shared
+                .applied
+                .load()
+                .owners
+                .get(&peer)
+                .and_then(|o| o.screens.get("retained"))
+                .is_some_and(|s| !s.enabled);
+            Ok((hidden, disabled, router_has_owner, routable, reloaded_hidden))
+        })
+        .unwrap();
+    stop(&nodes).await;
+    assert!(
+        hidden,
+        "offline projection discarded the cached hidden screen preference"
+    );
+    assert!(disabled, "offline projection discarded screen sharing disabled");
+    assert!(
+        !router_has_owner && !routable,
+        "cached preferences granted live routing authority"
+    );
+    assert!(reloaded_hidden);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn member_timeouts_keep_next_attempt_within_five_seconds() {
+    let nodes = start(fresh(1)).await;
+    nodes[0]
+        .group
+        .call(|owner| {
+            let peer = DeviceId([99; 32]);
+            for attempt in 1..=20 {
+                owner.network(ConfigEvent::DialFailed {
+                    peer,
+                    reason: oink_network::link::DialFailure::Unreachable,
+                });
+                let wait = owner.dials[&peer]
+                    .after
+                    .unwrap()
+                    .saturating_duration_since(Instant::now());
+                assert!(
+                    wait <= Duration::from_secs(5),
+                    "timeout {attempt}: next attempt is {wait:?} away"
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+    stop(&nodes).await;
+}
+
+#[test]
+fn member_retry_clock_picks_up_reachability_within_five_seconds_after_many_timeouts() {
+    let mut dial = Dial::default();
+    let mut now = Instant::now();
+    let local = DeviceId([2; 32]);
+    let peer = DeviceId([1; 32]);
+    let expected = [500, 1000, 2000, 4000, 5000];
+    for attempt in 0..100 {
+        dial.failed(DialFailure::Unreachable, now);
+        let next = dial.after.unwrap();
+        assert_eq!(next - now, Duration::from_millis(expected[attempt.min(4)]));
+        // The peer returns just after the failed attempt. Drive the same gate
+        // used by tick with explicit time, without relying on wall-clock sleeps.
+        let reachable = now + Duration::from_nanos(1);
+        assert!(!dial.due(local, peer, reachable));
+        assert!(dial.due(local, peer, next));
+        assert!(next - reachable <= Duration::from_secs(5));
+        dial.active = true;
+        assert!(!dial.due(local, peer, next));
+        now = next + oink_network::link::DIAL_BUDGET;
+    }
+}
+
+#[test]
+fn larger_id_waits_only_on_its_initial_round_and_rejections_keep_slow_backoff() {
+    let now = Instant::now();
+    let smaller = DeviceId([1; 32]);
+    let larger = DeviceId([2; 32]);
+    assert!(Dial::default().due(smaller, larger, now));
+    let mut dial = Dial::default();
+    assert!(!dial.due(larger, smaller, now));
+    assert!(dial.due(larger, smaller, now + Duration::from_secs(1)));
+    dial.failed(DialFailure::Unreachable, now);
+    assert!(dial.due(larger, smaller, now + Duration::from_millis(500)));
+    for reason in [DialFailure::IdentityChanged, DialFailure::Refused, DialFailure::Stopped] {
+        let mut dial = Dial::default();
+        for expected in [5, 15, 60, 300, 300] {
+            dial.failed(reason, now);
+            assert_eq!(dial.after.unwrap() - now, Duration::from_secs(expected));
+        }
+        dial.reset(now);
+        assert_eq!(dial.failures, 0);
+        assert!(dial.due(larger, smaller, now));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_network_change_and_wake_reset_member_retry_immediately() {
+    let nodes = start(fresh(1)).await;
+    nodes[0]
+        .group
+        .call(|owner| {
+            let peer = DeviceId([99; 32]);
+            let fail = |owner: &mut Owner| {
+                for _ in 0..8 {
+                    owner.network(ConfigEvent::DialFailed {
+                        peer,
+                        reason: DialFailure::Refused,
+                    });
+                }
+                assert!(owner.dials[&peer].after.unwrap() > Instant::now() + Duration::from_secs(60));
+            };
+            fail(owner);
+            owner.network(ConfigEvent::Lost {
+                link: LinkId(u64::MAX),
+                peer,
+                path: LinkPath::Direct,
+                reason: oink_network::link::LinkLost::ConnectionLost,
+            });
+            assert_eq!(owner.dials[&peer].failures, 0);
+            assert!(
+                owner
+                    .dials
+                    .get_mut(&peer)
+                    .unwrap()
+                    .due(owner.identity.id(), peer, Instant::now())
+            );
+
+            fail(owner);
+            // Model changed interface facts; tick observes the actual loopback
+            // listener and must clear the old retry delay in this same turn.
+            owner
+                .local
+                .edit(|raw| {
+                    raw.insert(10, RawValue::Array(vec![]));
+                    Ok(())
+                })
+                .unwrap();
+            owner.network_checked = Instant::now() - Duration::from_secs(2);
+            owner.tick();
+            assert_eq!(owner.dials[&peer].failures, 0);
+            assert!(
+                owner
+                    .dials
+                    .get_mut(&peer)
+                    .unwrap()
+                    .due(owner.identity.id(), peer, Instant::now())
+            );
+
+            fail(owner);
+            owner.sleep();
+            owner.wake();
+            assert_eq!(owner.dials[&peer].failures, 0);
+            assert!(
+                owner
+                    .dials
+                    .get_mut(&peer)
+                    .unwrap()
+                    .due(owner.identity.id(), peer, Instant::now())
+            );
+            Ok(())
+        })
+        .unwrap();
+    stop(&nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_discovery_does_not_bypass_member_rejection_backoff() {
+    let nodes = start(same_group(2).into_iter().take(1).collect()).await;
+    nodes[0]
+        .group
+        .call(|owner| {
+            let peer = identities(2)[1].id();
+            let sighting = Sighting {
+                advert: Advert::local(
+                    peer,
+                    "synthetic".into(),
+                    owner.state.roster().anchor().group,
+                    2,
+                    47470,
+                    "test".into(),
+                ),
+                addrs: vec!["192.0.2.30:47470".parse().unwrap()],
+                source: oink_network::discovery::Source::Mdns,
+            };
+            owner.sighting(sighting.clone());
+            for _ in 0..8 {
+                owner.network(ConfigEvent::DialFailed {
+                    peer,
+                    reason: DialFailure::IdentityChanged,
+                });
+            }
+            let deadline = owner.dials[&peer].after;
+            owner.sighting(sighting.clone());
+            assert_eq!(owner.dials[&peer].after, deadline);
+            let mut changed = sighting;
+            changed.addrs = vec!["192.0.2.31:47470".parse().unwrap()];
+            owner.sighting(changed);
+            assert_eq!(owner.dials[&peer].failures, 0);
+            assert!(owner.dials[&peer].after.unwrap() <= Instant::now());
+            Ok(())
+        })
+        .unwrap();
+    stop(&nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reachable_member_recovers_on_its_own_retry_after_many_timeouts() {
+    let nodes = start(same_group(2)).await;
+    assert!(until(|| ready(&nodes)).await);
+    for node in &nodes {
+        node.group
+            .call(|owner| {
+                for dial in owner.dials.values_mut() {
+                    dial.after = None;
+                }
+                owner.sleep();
+                Ok(())
+            })
+            .unwrap();
+    }
+    assert!(
+        until(|| nodes.iter().all(|node| node.links.links().links.is_empty()
+            && node
+                .group
+                .call(|owner| Ok(
+                    owner.sessions.is_empty() && owner.dials.values().all(|dial| dial.after.is_some() && !dial.active)
+                ))
+                .unwrap()))
+        .await
+    );
+    let source = nodes[0].identity.id();
+    let target = nodes[1].identity.id();
+    nodes[1]
+        .group
+        .call(move |owner| {
+            // The returned peer can accept incoming connections, but cannot
+            // originate one. Recovery must come from the source's own retry.
+            owner.sleeping = false;
+            owner.dials.entry(source).or_default().active = true;
+            owner.network_checked = Instant::now() + Duration::from_secs(60);
+            Ok(())
+        })
+        .unwrap();
+    nodes[0]
+        .group
+        .call(move |owner| {
+            owner.network_checked = Instant::now() + Duration::from_secs(60);
+            for _ in 0..20 {
+                owner.network(ConfigEvent::DialFailed {
+                    peer: target,
+                    reason: DialFailure::Unreachable,
+                });
+            }
+            owner.sleeping = false;
+            let now = Instant::now();
+            assert!(owner.dials[&target].after.unwrap() <= now + Duration::from_secs(5));
+            assert!(owner.next_deadline() <= now + Duration::from_secs(5));
+            Ok(())
+        })
+        .unwrap();
+    let began = Instant::now();
+    // Five seconds for the idle retry, plus one second of loopback TLS/C0
+    // test allowance. The exact scheduling bound is checked without sleeps above.
+    let recovered = tokio::time::timeout(Duration::from_secs(6), async {
+        while !ready(&nodes) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_ok();
+    let elapsed = began.elapsed();
+    let outbound = nodes[0]
+        .group
+        .call(move |owner| {
+            Ok(owner
+                .sessions
+                .values()
+                .find(|link| link.peer_boot.device_id == target)
+                .map(|link| link.direction))
+        })
+        .unwrap();
+    stop(&nodes).await;
+    assert!(recovered, "the source's own retry did not recover in {elapsed:?}");
+    assert_eq!(outbound, Some(Direction::Outbound));
+    eprintln!("own retry after 20 timeouts reached Ready in {elapsed:?}");
+}

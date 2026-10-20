@@ -622,6 +622,61 @@ mod tests {
     }
 
     #[test]
+    fn dock_clearance_uses_the_external_displays_own_bottom_above_or_below_primary() {
+        for y in [-1080.0, 1117.0] {
+            let external = Rect::new(1560.0, y, 1920.0, 1080.0);
+            let displays = [Rect::new(0.0, 0.0, 1728.0, 1117.0), external];
+            let source = p(2520.0, external.bottom() - 0.02);
+            for frame_y in [external.bottom(), external.bottom() - 90.0] {
+                let dock = DockZone {
+                    side: DockSide::Bottom,
+                    frame: Rect::new(2200.0, frame_y, 640.0, 90.0),
+                    tile_pt: 63.0,
+                };
+                assert_eq!(
+                    clear_of_active_edge_zones(source, &displays, Some(dock), &[]),
+                    p(2520.0, external.bottom() - 103.0)
+                );
+            }
+            // A Dock observed on the primary display must not be applied to
+            // the external display, even when its bottom is at global y=0.
+            let primary_dock = DockZone {
+                side: DockSide::Bottom,
+                frame: Rect::new(500.0, 1027.0, 728.0, 90.0),
+                tile_pt: 63.0,
+            };
+            assert_eq!(
+                clear_of_active_edge_zones(source, &displays, Some(primary_dock), &[]),
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn external_dock_clears_both_axes_at_active_corners_but_preserves_internal_seams() {
+        let displays = [
+            Rect::new(0.0, 0.0, 1728.0, 1117.0),
+            Rect::new(1560.0, -1080.0, 1920.0, 1080.0),
+        ];
+        let dock = DockZone {
+            side: DockSide::Bottom,
+            frame: Rect::new(1560.0, -90.0, 1920.0, 90.0),
+            tile_pt: 128.0, // Magnified size already selected by the backend.
+        };
+        assert_eq!(
+            clear_of_active_edge_zones(
+                p(3479.98, -0.02),
+                &displays,
+                Some(dock),
+                &[oink_foundation::input::ScreenCorner::BottomRight]
+            ),
+            p(3477.0, -168.0)
+        );
+        let seam = p(1600.0, -0.02);
+        assert_eq!(clear_of_active_edge_zones(seam, &displays, Some(dock), &[]), seam);
+    }
+
+    #[test]
     fn untouched_without_warp() {
         let mut f = WarpDeltaFix::new();
         assert_eq!(f.motion((3.0, -4.0), p(100.0, 100.0), 10, true), (3.0, -4.0));

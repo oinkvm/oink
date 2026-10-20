@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import tempfile
 import xml.etree.ElementTree as ET
 import feed
 
@@ -42,13 +43,14 @@ def state_info(state):
     return reg
 
 
-def appcast(raw, config, channel, packages=False):
+def appcast(raw, config, channel, verify_signature=True):
     # Sparkle 2.9.6 signs the exact XML bytes before this terminal comment.
     match = re.search(rb'<!-- sparkle-signatures:\nedSignature: ([A-Za-z0-9+/=]+)\nlength: ([0-9]+)\n-->\n\Z', raw)
     feed.require(match is not None and len(raw) <= feed.MAX_FEED, 'appcast_signature')
     content = raw[:match.start()]
     feed.require(int(match[2]) == len(content), 'appcast_length')
-    feed.verify(content, match[1].decode(), config['mac']['public_key'])
+    if verify_signature:
+        feed.verify(content, match[1].decode(), config['mac']['public_key'])
     feed.require(b'<!DOCTYPE' not in content and b'<!ENTITY' not in content, 'appcast_xml')
     root = ET.fromstring(content)
     feed.require(root.tag == 'rss', 'appcast_xml')
@@ -67,18 +69,15 @@ def appcast(raw, config, channel, packages=False):
         feed.require(url.startswith(prefix) and re.fullmatch(r'v[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.(zip|dmg)', url[len(prefix):]) and
                      0 < length <= feed.MAX_PACKAGE, 'asset')
         signature = enclosure.get(f'{{{SPARKLE}}}edSignature', '')
-        entry = {'build': int(build), 'version': version, 'url': url, 'length': length}
-        if packages:
-            package = feed.download(url, length, True)
-            feed.require(len(package) == length, 'asset_length')
-            feed.verify(package, signature, config['mac']['public_key'])
-            entry['sha256'] = feed.digest(package)
+        sha256 = item.findtext(f'{{{OINK}}}sha256', '')
+        feed.require(re.fullmatch('[0-9a-f]{64}', sha256), 'asset_digest')
+        entry = {'build': int(build), 'version': version, 'url': url, 'length': length, 'sha256': sha256}
         entries.append(entry)
     feed.require(entries and len({e['build'] for e in entries}) == len(entries), 'appcast_catalog')
     return entries
 
 
-def verify_platform(state, platform, config, packages=False):
+def verify_platform(state, platform, config, packages=False, signatures=True, verified_files=None):
     reg = state_info(state)
     slot = reg['platforms'][platform]
     if not slot['enabled']:
@@ -101,21 +100,24 @@ def verify_platform(state, platform, config, packages=False):
             feed.verify_packages(state, config)
     else:
         feed.require(set(slot['catalog']) == set(actual), 'mac_catalog')
+        verified = set()
         for path, record in slot['catalog'].items():
             match = re.fullmatch(r'mac/v1/mac-2026-01/(stable|beta)/appcast.xml', path)
             feed.require(match and record['architecture'] == 'arm64' and
                          record['developer_id_verified'] is True and record['notarized'] is True and
                          record['qualified_build'] == record['build'], 'mac_qualification')
-            entries = appcast((state / 'site' / path).read_bytes(), config, match[1], packages)
+            raw = (state / 'site' / path).read_bytes()
+            entries = appcast(raw, config, match[1], signatures and actual[path] != (verified_files or {}).get(path) and raw not in verified)
+            verified.add(raw)
             latest = max(entries, key=lambda entry: entry['build'])
             feed.require(all(record[k] == v for k, v in latest.items()) and re.fullmatch('[0-9a-f]{64}', record['sha256']), 'mac_catalog')
 
 
-def verify_all(state, packages=False):
+def verify_all(state, packages=False, signatures=True, verified_mac_files=None):
     for platform in PLATFORMS:
         # An absent platform needs no keys and is never synthesized.
         if state_info(state)['platforms'][platform]['enabled']:
-            verify_platform(state, platform, feed.trust(platform), packages)
+            verify_platform(state, platform, feed.trust(platform), packages, signatures, verified_mac_files if platform == 'mac' else None)
 
 
 def candidate(state, platform, output, catalog=None):
@@ -125,8 +127,11 @@ def candidate(state, platform, output, catalog=None):
     slot['files'] = {platform + '/' + name: feed.digest(raw) for name, raw in files(state / 'site' / platform).items()}
     if platform == 'mac':
         slot['catalog'] = feed.read(catalog)
-        for record in slot['catalog'].values():
-            feed.require(str(record['qualified_build']) == os.environ.get('OINK_UPDATE_QUALIFIED_BUILD'), 'update_not_qualified')
+        previous = reg['platforms']['mac']
+        for path, record in slot['catalog'].items():
+            unchanged = (slot['files'].get(path) == previous['files'].get(path) and
+                         record == previous.get('catalog', {}).get(path))
+            feed.require(unchanged or str(record['qualified_build']) == os.environ.get('OINK_UPDATE_QUALIFIED_BUILD'), 'update_not_qualified')
     proposal = {'schema': 1, 'platform': platform, 'base_revision': slot['revision'], 'slot': slot}
     output.mkdir(parents=True, exist_ok=False)
     shutil.copytree(state / 'site' / platform, output / 'site' / platform)
@@ -139,7 +144,7 @@ def candidate(state, platform, output, catalog=None):
     other = next(p for p in PLATFORMS if p != platform)
     isolated['platforms'][other] = {'enabled': False, 'revision': 0, 'files': {}}
     feed.write(output / 'registry.json', isolated)
-    verify_platform(output, platform, feed.trust(platform), packages=True)
+    verify_platform(output, platform, feed.trust(platform), packages=True, signatures=platform != 'mac')
     (output / 'registry.json').unlink()
     feed.write(output / 'candidate.json', proposal)
 
@@ -164,6 +169,10 @@ def merge(state, proposal_dir, output, expected_revision):
                 feed.require(new['last_allocated'] == current['last_allocated'] and new['records'] == current['records'], 'reservation_changed')
     output.mkdir(parents=True, exist_ok=False)
     for directory in ('site', 'records'):
+        # Git cannot retain an empty records directory. A Mac-only first
+        # deployment has no Windows records yet, but deploy.commit copies the
+        # complete snapshot including that directory.
+        (output / directory).mkdir()
         for name, raw in files(state / directory).items():
             feed.write(output / directory / name, raw)
     for path, raw in files(proposal_dir / 'site').items():
@@ -189,7 +198,11 @@ def merge(state, proposal_dir, output, expected_revision):
     reg['platforms'][platform] = slot
     reg['revision'] += 1
     feed.write(output / 'registry.json', reg)
-    verify_all(output, packages=True)
+    # The new Mac archive was verified by the signer. Its hash is bound into
+    # the signed appcast. Verify that appcast once here, at the final write
+    # boundary; untouched platforms and HTTPS readback need only exact digests.
+    verify_all(output, packages=platform == 'windows', signatures=platform == 'mac',
+               verified_mac_files=old['files'] if platform == 'mac' else None)
     feed.write(output / 'site/CNAME', b'updates.oink.hachiwii.com\n')
     feed.write(output / 'site/heartbeat.json', {'schema': 1, 'revision': reg['revision'],
                'checked_at': feed.iso(int(feed.dt.datetime.now(feed.dt.timezone.utc).timestamp()))})
@@ -197,9 +210,9 @@ def merge(state, proposal_dir, output, expected_revision):
 
 def verify_public(state, platform=None):
     if platform is None:
-        verify_all(state)
+        verify_all(state, signatures=False)
     else:
-        verify_platform(state, platform, feed.trust(platform))
+        verify_platform(state, platform, feed.trust(platform), signatures=False)
     for path, raw in files(state / 'site').items():
         if platform is not None and not path.startswith(platform + '/'):
             continue
@@ -226,9 +239,38 @@ def verify_absent(reg, platforms=PLATFORMS):
                     raise ValueError('disabled_feed_present')
 
 
+def initialize(output):
+    """Prepare data locally; the user creates/pushes the data branch separately."""
+    output.mkdir(parents=True, exist_ok=False)
+    feed.write(output / 'registry.json', {
+        'schema': 1, 'revision': 0,
+        'platforms': {p: {'enabled': False, 'revision': 0, 'files': {}} for p in PLATFORMS},
+        'feeds': {'win-2026-01': {c: {'records': [], 'last_allocated': 0, 'manifest_sha256': None}
+                                 for c in ('stable', 'beta')}}})
+    feed.write(output / 'site/CNAME', b'updates.oink.hachiwii.com\n')
+    feed.write(output / 'site/index.html', b'<!doctype html><title>Oink updates</title><p>Oink update feeds.</p>\n')
+
+
+def bootstrap(state, output):
+    """Deploy only the original disabled landing site, before HTTPS readback works.
+
+    Normal publication requires HTTPS readback before committing its state. This
+    one-time landing deployment lets Pages provision the site without that
+    dependency; it cannot replace a live feed or advance the data branch.
+    """
+    with tempfile.TemporaryDirectory() as temp:
+        initial = Path(temp) / 'initial'
+        initialize(initial)
+        feed.require(feed.read(state / 'registry.json') == feed.read(initial / 'registry.json'),
+                     'bootstrap_noninitial_state')
+        feed.require(files(state / 'site') == files(initial / 'site') and not files(state / 'records'),
+                     'bootstrap_noninitial_site')
+        shutil.copytree(state / 'site', output)
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['candidate', 'merge', 'verify', 'verify-public', 'enabled'])
+    parser.add_argument('command', choices=['init', 'bootstrap', 'candidate', 'merge', 'verify', 'verify-public', 'enabled'])
     parser.add_argument('--platform', choices=PLATFORMS)
     parser.add_argument('--state', type=Path, default=Path('feed-state'))
     parser.add_argument('--candidate', type=Path, default=Path('candidate-state'))
@@ -238,7 +280,11 @@ def main():
     parser.add_argument('--require-catalog', action='store_true')
     parser.add_argument('--config-only', action='store_true')
     args = parser.parse_args()
-    if args.command == 'enabled':
+    if args.command == 'init':
+        initialize(args.output)
+    elif args.command == 'bootstrap':
+        bootstrap(args.state, args.output)
+    elif args.command == 'enabled':
         config = feed.trust(args.platform)
         enabled = config['mac']['enabled'] if args.platform == 'mac' else bool(config['windows'])
         if not args.config_only:

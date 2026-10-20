@@ -1,5 +1,6 @@
 //! Bounded, privacy-first diagnostic flight recorder. All disk/compression work is off input threads.
 mod buttons;
+pub(crate) mod capture;
 mod clock;
 pub(crate) mod collection;
 pub(crate) mod contacts;
@@ -385,7 +386,7 @@ impl Recorder {
         }
     }
     #[cfg(all(test, debug_assertions))]
-    fn wait_recovery(&self) {
+    pub(crate) fn wait_recovery(&self) {
         if let Some(handle) = lock(&self.inner.recovery_thread).take() {
             handle.join().unwrap();
         }

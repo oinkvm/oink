@@ -41,6 +41,16 @@ pub(crate) fn normalize(pixel: i32, origin: i32, extent: i32) -> i32 {
     n.clamp(0, 65535) as i32
 }
 
+pub(crate) fn drag_press_at(at: oink_foundation::Point, origin: (i32, i32), extent: (i32, i32)) -> INPUT {
+    // Match MoveTo's containing pixel. Rounding a half-open edge position such
+    // as y=-0.000001 to zero presses on the adjacent display instead of the
+    // source window; positive right/bottom edges have the same failure.
+    drag_press(
+        normalize(at.x.floor() as i32, origin.0, extent.0),
+        normalize(at.y.floor() as i32, origin.1, extent.1),
+    )
+}
+
 /// 滚动量 → WHEEL 单位（小数）。
 /// 滚轮格数 → WHEEL 单位（`ScrollUnit::Line` 注入）。
 pub(crate) fn notch_to_wheel(notches: f64) -> f64 {
@@ -300,6 +310,41 @@ mod tests {
             MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_LEFTDOWN
         );
         assert_eq!(mouse.dwExtraInfo, INJECT_TAG);
+    }
+
+    #[test]
+    fn source_press_keeps_fractional_edges_on_the_containing_display() {
+        use oink_foundation::{Point, Rect};
+        let screens = [
+            Rect::new(0., 0., 1920., 1080.),
+            Rect::new(1560., -1080., 1920., 1080.),
+            Rect::new(-1920., 0., 1920., 1080.),
+        ];
+        let (origin, extent) = ((-1920, -1080), (5400, 2160));
+        for (at, expected) in [
+            (Point::new(2500.25, -0.000001), (2500, -1)),
+            (Point::new(-0.000001, 500.25), (-1, 500)),
+            (Point::new(1919.999999, 500.25), (1919, 500)),
+            (Point::new(1000.25, 1079.999999), (1000, 1079)),
+            (Point::new(3479.999999, -500.25), (3479, -501)),
+        ] {
+            let input = drag_press_at(at, origin, extent);
+            // SAFETY: drag_press_at constructs INPUT_MOUSE without submitting it.
+            let mouse = unsafe { input.Anonymous.mi };
+            let pixel = (
+                denormalize(mouse.dx, origin.0, extent.0),
+                denormalize(mouse.dy, origin.1, extent.1),
+            );
+            assert_eq!(pixel, expected, "{at:?}");
+            let display = screens.iter().position(|b| b.contains(at));
+            assert_eq!(
+                screens
+                    .iter()
+                    .position(|b| b.contains(Point::new(pixel.0.into(), pixel.1.into()))),
+                display,
+                "a positioned DOWN must stay on the display selected by MoveTo"
+            );
+        }
     }
 
     #[test]

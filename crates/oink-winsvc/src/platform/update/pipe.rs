@@ -39,21 +39,45 @@ fn receive<T: serde::de::DeserializeOwned + serde::Serialize>(pipe: &Handle) -> 
     let count = operation.wait(5000)? as usize;
     ipc::decode(&bytes[..count]).map_err(io::Error::other)
 }
+fn connect(name: &[u16]) -> io::Result<Handle> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        // SAFETY: fixed local pipe; no inherited handles, remote servers or caller-defined security.
+        let opened = Handle::new(unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                FILE_READ_DATA | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | READ_CONTROL,
+                0,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                ptr::null_mut(),
+            )
+        });
+        let error = match opened {
+            Ok(pipe) => return Ok(pipe),
+            Err(error) => error,
+        };
+        if error.raw_os_error() != Some(ERROR_PIPE_BUSY as i32) {
+            return Err(error);
+        }
+        // A reply can arrive before the single server instance disconnects.
+        // Query followed immediately by Register otherwise loses registration
+        // with ERROR_PIPE_BUSY (reproduced on Windows 11). Wait for kernel pipe
+        // availability, bounded across competing clients; retry only the open,
+        // never a command. Reverse authentication still precedes every write.
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::from(io::ErrorKind::TimedOut));
+        }
+        let milliseconds = left.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+        // SAFETY: fixed NUL-terminated local pipe name and bounded timeout.
+        check(unsafe { WaitNamedPipeW(name.as_ptr(), milliseconds) })?;
+    }
+}
 pub(super) fn request(request: Request) -> Result<Reply, Error> {
     let id = session().map_err(|_| Error::Policy)?;
-    // SAFETY: fixed local pipe; no inherited handles, remote servers or caller-defined security.
-    let pipe = Handle::new(unsafe {
-        CreateFileW(
-            name(id).as_ptr(),
-            FILE_READ_DATA | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | READ_CONTROL,
-            0,
-            ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-            ptr::null_mut(),
-        )
-    })
-    .map_err(|_| Error::NotConfigured)?;
+    let pipe = connect(&name(id)).map_err(|_| Error::NotConfigured)?;
     let mode = PIPE_READMODE_MESSAGE | PIPE_WAIT;
     // SAFETY: connected owned pipe, valid mode.
     check(unsafe { SetNamedPipeHandleState(pipe.0, &mode, ptr::null(), ptr::null()) }).map_err(|_| Error::Policy)?;
@@ -161,7 +185,11 @@ fn peer(pipe: HANDLE, id: u32) -> io::Result<Handle> {
         return Err(denied());
     }
     let _image = protected::open(&path)?;
-    let actual = security::sid_bytes(token(process.0)?.0)?;
+    let caller = token(process.0)?;
+    if !security::interactive_token(caller.0)? {
+        return Err(denied());
+    }
+    let actual = security::sid_bytes(caller.0)?;
     if actual != security::user_sid(id)? {
         return Err(denied());
     }
@@ -180,6 +208,9 @@ fn peer(pipe: HANDLE, id: u32) -> io::Result<Handle> {
     }
     Ok(process)
 }
+// This authorizes machine-wide preferences, not launching Oink. Keep the real
+// elevation requirement: both Full and Default+elevated (UAC off) qualify, while
+// Limited and Default non-admin must never gain machine policy write access.
 pub(super) fn elevated(process: &Handle) -> bool {
     let Ok(token) = token(process.0) else {
         return false;
@@ -195,5 +226,69 @@ pub(super) fn elevated(process: &Handle) -> bool {
             &mut length,
         ) != 0
             && value.TokenIsElevated != 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::mpsc, time::Duration};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    #[test]
+    fn back_to_back_connections_wait_for_the_previous_pipe_instance() {
+        let name = wide(&format!(
+            r"\\.\pipe\Oink.Update.Test.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let server_name = name.clone();
+        let (ready, begin) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            // SAFETY: unique private test pipe; never contacts an installed service.
+            let pipe = Handle::new(unsafe {
+                CreateNamedPipeW(
+                    server_name.as_ptr(),
+                    PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                    PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                    1,
+                    128,
+                    128,
+                    0,
+                    ptr::null(),
+                )
+            })
+            .unwrap();
+            let mut operation = pipe_io::Operation::new(&pipe).unwrap();
+            operation.connect().unwrap();
+            ready.send(()).unwrap();
+            // SAFETY: operation retains its completion event through this wait.
+            assert_eq!(unsafe { WaitForSingleObject(operation.event(), 1000) }, WAIT_OBJECT_0);
+            operation.cancel();
+            drop(operation);
+            std::thread::sleep(Duration::from_millis(30));
+            // SAFETY: private pipe; force the ordinary disconnect/reconnect boundary.
+            check(unsafe { DisconnectNamedPipe(pipe.0) }).unwrap();
+            let mut operation = pipe_io::Operation::new(&pipe).unwrap();
+            operation.connect().unwrap();
+            // SAFETY: operation and its event remain live during the bounded wait.
+            let connected = unsafe { WaitForSingleObject(operation.event(), 1000) } == WAIT_OBJECT_0;
+            operation.cancel();
+            connected
+        });
+        begin.recv().unwrap();
+        let first = connect(&name).unwrap();
+        let second = connect(&name);
+        drop(first);
+        let accepted = server.join().unwrap();
+        assert!(
+            second.is_ok(),
+            "second request was lost at disconnect: {:?}",
+            second.err()
+        );
+        assert!(accepted);
     }
 }

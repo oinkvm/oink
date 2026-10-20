@@ -13,3 +13,6 @@ mod launch_recipe;
 
 #[cfg(test)]
 mod isolation_tests;
+
+#[cfg(any(windows, test))]
+mod token_policy;

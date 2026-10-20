@@ -16,30 +16,17 @@ impl Channel {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Mode {
-    #[default]
-    Notify,
-    Automatic,
-}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Preferences {
     pub checks_enabled: bool,
-    pub mode: Mode,
     pub channel: Channel,
 }
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             checks_enabled: true,
-            mode: Mode::Notify,
-            channel: if crate::RELEASE_VERSION.contains("-beta") {
-                Channel::Beta
-            } else {
-                Channel::Stable
-            },
+            channel: Channel::Stable,
         }
     }
 }
@@ -91,14 +78,6 @@ impl Policy {
         self.next_quit = choice == DeferChoice::NextQuit;
         self.indefinitely = choice == DeferChoice::Indefinitely;
     }
-    pub fn may_download_automatically(&self, build: u64, now: i64) -> bool {
-        self.preferences.checks_enabled
-            && self.preferences.mode == Mode::Automatic
-            && !self.indefinitely
-            && !self.next_quit
-            && self.deferred_until.is_none_or(|until| now >= until)
-            && self.skipped_build != Some(build)
-    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -109,7 +88,7 @@ pub enum Phase {
     Available,
     Downloading,
     Verifying,
-    WaitingForIdle,
+    Ready,
     Quiescing,
     Installing,
     AwaitingReboot,
@@ -139,7 +118,6 @@ pub struct UpdateStatus {
     pub current_build: u64,
     pub version: String,
     pub channel: Channel,
-    pub mode: Mode,
     pub checks_enabled: bool,
     pub phase: Phase,
     pub candidate: Option<Candidate>,
@@ -205,27 +183,34 @@ impl ReadyState {
 mod tests {
     use super::*;
     #[test]
-    fn default_and_off_never_auto_download() {
-        let mut p = Policy::default();
-        assert!(!p.may_download_automatically(2, 0));
-        p.preferences.mode = Mode::Automatic;
-        assert!(p.may_download_automatically(2, 0));
-        p.preferences.checks_enabled = false;
-        assert!(!p.may_download_automatically(2, 0));
+    fn production_preferences_have_checks_and_channel_only() {
+        let preferences = Preferences::default();
+        assert_eq!(preferences.channel, Channel::Stable);
+        assert!(preferences.checks_enabled);
+        assert_eq!(
+            serde_json::to_value(&preferences).unwrap(),
+            serde_json::json!({"checks_enabled":true,"channel":"stable"})
+        );
+        for mode in ["automatic", "notify"] {
+            assert!(
+                serde_json::from_value::<Preferences>(serde_json::json!({
+                    "checks_enabled":true,"channel":"stable","mode":mode
+                }))
+                .is_err()
+            );
+        }
+        assert!(serde_json::from_str::<Command>(r#"{"type":"automatic"}"#).is_err());
     }
     #[test]
     fn deferrals_and_skip_survive_serialization() {
-        let mut p = Policy::default();
-        p.preferences.mode = Mode::Automatic;
-        p.defer(DeferChoice::Hour, 5);
-        p.skipped_build = Some(2);
-        let p: Policy = serde_json::from_slice(&serde_json::to_vec(&p).unwrap()).unwrap();
-        assert!(!p.may_download_automatically(3, 3604));
-        assert!(p.may_download_automatically(3, 3605));
-        assert!(!p.may_download_automatically(2, 3605));
+        let mut policy = Policy::default();
+        policy.defer(DeferChoice::Hour, 5);
+        policy.skipped_build = Some(2);
+        let saved: Policy = serde_json::from_slice(&serde_json::to_vec(&policy).unwrap()).unwrap();
+        assert_eq!(saved, policy);
     }
     #[test]
-    fn mode_change_requires_cancel_ack_before_quit() {
+    fn cancelling_ready_candidate_requires_ack_before_quit() {
         let mut s = ReadyState::None;
         s.ready();
         assert!(!s.ordinary_quit_allowed());

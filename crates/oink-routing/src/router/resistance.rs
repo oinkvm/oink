@@ -1,6 +1,6 @@
 //! Edge selection and gesture lifetime; sampling/rules live in crate::damping.
 use super::*;
-use crate::damping::{DampingMeter, DampingProfile, nonnegative};
+use crate::damping::{DampingMeter, DampingProfile, DampingStillness, nonnegative};
 use oink_foundation::input::{EdgeResistanceRegion, ScreenCorner, ScreenEdge};
 
 #[derive(Clone, Debug)]
@@ -14,12 +14,40 @@ pub(super) struct Resistance {
     meter: DampingMeter,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct RestingEdge {
+    screen: ScreenId,
+    target: Option<ScreenId>,
+    origin: DeviceId,
+    normal: (f64, f64),
+    rule: Option<usize>,
+    stillness: DampingStillness,
+}
+
 impl Router {
+    pub(super) fn reset_resistance(&mut self) {
+        self.resistance = None;
+        self.resting_edges = Default::default();
+    }
+
+    /// Raw capture can precede the position-bearing event. It is still device
+    /// movement, including pressure which leaves the native cursor clamped.
+    pub(super) fn raw_resistance_motion(&mut self, origin: DeviceId, delta: (f64, f64), now: Micros) {
+        for edge in self
+            .resting_edges
+            .iter_mut()
+            .flatten()
+            .filter(|edge| edge.origin == origin)
+        {
+            edge.stillness.observe(delta, now);
+        }
+    }
+
     /// Replace the platform snapshot; a real change invalidates the current push gesture.
     pub fn set_edge_resistance_regions(&mut self, regions: Vec<EdgeResistanceRegion>) {
         if self.edge_regions != regions {
             self.edge_regions = regions;
-            self.resistance = None;
+            self.reset_resistance();
         }
     }
 
@@ -104,7 +132,8 @@ impl Router {
 
     /// Keep a gesture on the same active portal or protected gap edge segment.
     /// Tangential motion does not add energy.
-    pub(super) fn retain_resistance(&mut self, p: &ScreenPos, origin: DeviceId, delta: (f64, f64)) {
+    pub(super) fn retain_resistance(&mut self, p: &ScreenPos, origin: DeviceId, delta: (f64, f64), now: Micros) {
+        self.observe_edge_stillness(p, origin, delta, now);
         let Some(r) = &self.resistance else { return };
         let n = r.normal;
         let valid = p.screen == r.screen
@@ -138,6 +167,65 @@ impl Router {
             if r.meter.depth() <= 0.0 {
                 self.resistance = None;
             }
+        }
+    }
+
+    /// Track all protected boundaries at a corner, including arrival with no
+    /// outward pressure yet. Each entry belongs to one uninterrupted edge visit.
+    fn observe_edge_stillness(&mut self, p: &ScreenPos, origin: DeviceId, delta: (f64, f64), now: Micros) {
+        if self.leave_blocked() {
+            self.resting_edges = Default::default();
+            return;
+        }
+        let Some(bounds) = self
+            .displays
+            .iter()
+            .find(|d| d.key == p.screen.display)
+            .map(|d| d.bounds)
+        else {
+            self.resting_edges = Default::default();
+            return;
+        };
+        for (index, normal) in [(-1., 0.), (1., 0.), (0., -1.), (0., 1.)].into_iter().enumerate() {
+            let previous = self.resting_edges[index].take();
+            let distance = edge_distance(bounds, p.local, normal);
+            if !(0.0..=EDGE_UNITS).contains(&distance)
+                || self
+                    .displays
+                    .iter()
+                    .any(|d| d.key != p.screen.display && native_seam(bounds, d.bounds, p.local, normal))
+            {
+                continue;
+            }
+            let target = self
+                .layout
+                .exit_through_edge(p, (normal.0 * 2., normal.1 * 2.))
+                .map(|p| p.screen);
+            if target.as_ref().is_some_and(|target| target.device == self.me())
+                || (target.is_none() && !self.gap_allowed())
+            {
+                continue;
+            }
+            let Some((rule, _)) = self.damping_rule(p, normal, target.as_ref().map_or(self.me(), |p| p.device)) else {
+                continue;
+            };
+            let previous = previous.filter(|edge| {
+                edge.screen == p.screen
+                    && edge.target == target
+                    && edge.origin == origin
+                    && edge.normal == normal
+                    && edge.rule == rule
+            });
+            let mut edge = previous.unwrap_or_else(|| RestingEdge {
+                screen: p.screen.clone(),
+                target,
+                origin,
+                normal,
+                rule,
+                stillness: DampingStillness::new(now),
+            });
+            edge.stillness.observe(delta, now);
+            self.resting_edges[index] = Some(edge);
         }
     }
 
@@ -180,6 +268,7 @@ impl Router {
         delta: (f64, f64),
         now: Micros,
     ) -> bool {
+        self.observe_edge_stillness(at, origin, delta, now);
         let Some(normal) = self.exit_normal(at, delta) else {
             return true;
         };
@@ -191,15 +280,24 @@ impl Router {
             return true;
         };
         // An internal system seam cannot activate Dock/menu/hot corners.
-        let outside = Point::new(at.local.x + normal.0 * 2.0, at.local.y + normal.1 * 2.0);
         if self
             .displays
             .iter()
-            .any(|d| d.key != at.screen.display && d.bounds.contains(outside))
+            .any(|d| d.key != at.screen.display && native_seam(bounds, d.bounds, at.local, normal))
         {
             return true;
         }
         let target = dst.map(|p| p.screen.clone());
+        if self.resting_edges.iter().flatten().any(|edge| {
+            edge.screen == at.screen
+                && edge.origin == origin
+                && edge.normal == normal
+                && edge.rule == rule
+                && (dst.is_none() || edge.target == target)
+                && edge.stillness.released()
+        }) {
+            return true;
+        }
         let same = self.resistance.as_ref().is_some_and(|r| {
             r.screen == at.screen && r.target == target && r.origin == origin && r.normal == normal && r.rule == rule
         });
@@ -237,6 +335,46 @@ impl Router {
     }
 }
 
+/// Only touching facing boundaries form a native seam. Sampling a point beyond
+/// the edge can jump a small real gap and incorrectly exempt it from damping.
+/// Tangent intervals are half-open, like native display containment.
+fn native_seam(source: Rect, other: Rect, at: Point, normal: (f64, f64)) -> bool {
+    let (boundary, facing, tangent, start, end) = if normal.0 > 0.0 {
+        (
+            source.right(),
+            other.x,
+            at.y,
+            source.y.max(other.y),
+            source.bottom().min(other.bottom()),
+        )
+    } else if normal.0 < 0.0 {
+        (
+            source.x,
+            other.right(),
+            at.y,
+            source.y.max(other.y),
+            source.bottom().min(other.bottom()),
+        )
+    } else if normal.1 > 0.0 {
+        (
+            source.bottom(),
+            other.y,
+            at.x,
+            source.x.max(other.x),
+            source.right().min(other.right()),
+        )
+    } else {
+        (
+            source.y,
+            other.bottom(),
+            at.x,
+            source.x.max(other.x),
+            source.right().min(other.right()),
+        )
+    };
+    (boundary - facing).abs() <= 1e-6 && tangent >= start && tangent < end
+}
+
 fn edge_distance(b: Rect, p: Point, n: (f64, f64)) -> f64 {
     if n.0 > 0.0 {
         b.right() - p.x
@@ -255,5 +393,60 @@ fn screen_edge(n: (f64, f64)) -> ScreenEdge {
         (x, _) if x > 0.0 => ScreenEdge::Right,
         (_, y) if y < 0.0 => ScreenEdge::Top,
         _ => ScreenEdge::Bottom,
+    }
+}
+
+#[cfg(test)]
+mod seam_tests {
+    use super::*;
+
+    #[test]
+    fn native_seams_require_touching_boundaries_and_half_open_tangent_overlap() {
+        // Translate the same geometry across both axes, including fractional
+        // negative origins, and rotate the touching side through all four edges.
+        for origin in [Point::new(0., 0.), Point::new(-1920.25, -1080.5)] {
+            let source = Rect::new(origin.x, origin.y, 200., 100.);
+            for (normal, touching, first, last) in [
+                (
+                    (0., 1.),
+                    Rect::new(origin.x + 50., source.bottom(), 100., 80.),
+                    Point::new(origin.x + 50., source.bottom() - 0.02),
+                    Point::new(origin.x + 150., source.bottom() - 0.02),
+                ),
+                (
+                    (0., -1.),
+                    Rect::new(origin.x + 50., source.y - 80., 100., 80.),
+                    Point::new(origin.x + 50., source.y),
+                    Point::new(origin.x + 150., source.y),
+                ),
+                (
+                    (1., 0.),
+                    Rect::new(source.right(), origin.y + 25., 80., 50.),
+                    Point::new(source.right() - 0.02, origin.y + 25.),
+                    Point::new(source.right() - 0.02, origin.y + 75.),
+                ),
+                (
+                    (-1., 0.),
+                    Rect::new(source.x - 80., origin.y + 25., 80., 50.),
+                    Point::new(source.x, origin.y + 25.),
+                    Point::new(source.x, origin.y + 75.),
+                ),
+            ] {
+                assert!(native_seam(source, touching, first, normal));
+                assert!(!native_seam(source, touching, last, normal));
+                for gap in [0.25, 1., 1.5, 2.] {
+                    let other = Rect::new(
+                        touching.x + normal.0 * gap,
+                        touching.y + normal.1 * gap,
+                        touching.w,
+                        touching.h,
+                    );
+                    assert!(
+                        !native_seam(source, other, first, normal),
+                        "gap={gap}, normal={normal:?}"
+                    );
+                }
+            }
+        }
     }
 }

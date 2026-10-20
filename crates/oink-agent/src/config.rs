@@ -52,6 +52,7 @@ pub struct Settings {
     pub log_level: LogLevel,
     pub log_max_mb: LogMaxMb,
     pub ui_language: UiLanguage,
+    pub notification_level: crate::api::NotificationSetting,
     pub theme_mode: ThemeMode,
     pub theme_accent: ThemeAccent,
     pub show_status_icon: bool,
@@ -94,6 +95,7 @@ impl Default for Settings {
             log_level: LogLevel::Info,
             log_max_mb: LogMaxMb::default(),
             ui_language: UiLanguage::Auto,
+            notification_level: Default::default(),
             theme_mode: ThemeMode::System,
             theme_accent: ThemeAccent::default(),
             show_status_icon: true,
@@ -268,6 +270,7 @@ impl AgentConfig {
         for (display, is_virtual) in displays {
             if !preferences.iter().any(|screen| screen.display == display) {
                 preferences.push(ScreenPreference {
+                    remote_gain: 1.0,
                     display: display.to_owned(),
                     gain: 1.0,
                     enabled: !is_virtual,
@@ -799,6 +802,12 @@ mod tests {
         settings.routing.remote_scroll_speed = 2.0;
         settings.game_mode = GameModePreference::On;
         settings.screen_preferences.device_gain = 1.5;
+        settings.screen_preferences.screens.push(ScreenPreference {
+            display: "screen".into(),
+            gain: 1.0,
+            enabled: true,
+            remote_gain: 2.5,
+        });
         let preview = config.preview_preferences(&settings).unwrap();
         assert_eq!(config.settings, original.settings);
         assert_eq!(config.owner(), original.owner());

@@ -247,3 +247,43 @@ fn low_failure_strings_are_replaced_by_open_codes_in_the_existing_message() {
     raw.remove(&4);
     assert!(LowUnavailable::from_raw(raw).is_err());
 }
+
+#[test]
+fn remote_screen_gain_defaults_without_reinterpreting_old_gain_and_retains_facts() {
+    let mut old = support::sample_named("ScreenPreference");
+    old.remove(&4);
+    old.insert(2, V::F64(1.5));
+    let screen = ScreenPreference::from_raw(old.clone()).unwrap();
+    assert_eq!(screen.remote_gain().unwrap(), 1.0);
+    assert_eq!(screen.gain().unwrap(), 1.5);
+    assert!(
+        !screen.raw().contains_key(&4),
+        "reading a default must not rewrite old facts"
+    );
+    for gain in [0.1, 2.0, 5.0] {
+        let mut new = old.clone();
+        new.insert(4, V::F64(gain));
+        new.insert(900, support::synthetic_unknown());
+        let screen = ScreenPreference::from_raw(new.clone()).unwrap();
+        assert_eq!(screen.remote_gain().unwrap(), gain);
+        roundtrip("ScreenPreference", new.clone());
+        let mut facts = support::sample_named("DeviceFacts");
+        let mut preferences = support::future_preferences();
+        let V::Array(items) = &mut preferences else {
+            unreachable!()
+        };
+        for item in items {
+            let V::Map(item) = item else { unreachable!() };
+            if item.get(&1) == Some(&V::Uint(7)) {
+                item.insert(3, V::Map([(1, V::Array(vec![V::Map(new.clone())]))].into()));
+            }
+        }
+        facts.insert(18, preferences);
+        roundtrip("DeviceFacts", facts);
+    }
+    for gain in [0.0, 0.099, 5.001, -1.0] {
+        let mut invalid = old.clone();
+        invalid.insert(4, V::F64(gain));
+        assert!(ScreenPreference::from_raw(invalid).is_err());
+    }
+}

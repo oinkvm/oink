@@ -68,6 +68,7 @@ pub(super) struct Driver {
     settings: Arc<RoutingSettings>,
     environment: Arc<Environment>,
     capture_detector: ScopedCaptureDetector,
+    capture_diagnostics: crate::diagnostics::capture::State,
     capture_was_active: bool,
     relative_capture: bool,
     keyboard_remote: bool,
@@ -227,6 +228,7 @@ impl Driver {
             settings,
             environment,
             capture_detector: Default::default(),
+            capture_diagnostics: Default::default(),
             capture_was_active: false,
             relative_capture: false,
             keyboard_remote: false,
@@ -518,9 +520,6 @@ impl Driver {
         // Relayed origins share an upstream stream. Reset just that stream's
         // baselines; an unrelated peer disappearing must not hide a live stall.
         self.jitter_sources.retain(|(upstream, _, _), _| *upstream != peer);
-        let mut quality = (*self.shared.quality_jitter.load()).clone();
-        quality.remove(&peer);
-        self.shared.quality_jitter.publish(quality);
         let Some(pair) = self.pairs.get_mut(&peer) else {
             return;
         };
@@ -563,9 +562,6 @@ impl Driver {
         self.adapter.attach(admission, &state, pair.os.unwrap_or(Os::Other));
         if self.adapter.attached(peer) {
             self.pairs.get_mut(&peer).unwrap().attached = true;
-            let mut quality = (*self.shared.quality_jitter.load()).clone();
-            quality.insert(peer, Arc::default());
-            self.shared.quality_jitter.publish(quality);
             if let Some(trace) = &self.inject.trace {
                 trace.pair(peer, true);
             }
@@ -729,34 +725,18 @@ impl Driver {
             }
             InputCommand::PrepareUpdate { generation, reply } => {
                 use oink_update::barrier::Blocker;
-                let router = self.adapter.router();
-                let mut blockers = Vec::new();
-                if router.dnd_state_name() != "idle" {
-                    blockers.push(Blocker::Drag);
-                }
-                if router.update_input_held() {
-                    blockers.push(Blocker::HeldInput);
-                }
-                if router.update_remote_control(self.micros()) {
-                    blockers.push(Blocker::RemoteInput);
-                }
-                if self.pairs.values().any(|p| p.releasing) {
-                    blockers.push(Blocker::RouterTransition);
-                }
-                if self.session_locked != Some(false) || self.environment.secure_input {
-                    blockers.push(Blocker::Locked);
-                }
-                if self.environment.system_sleeping || self.environment.displays_asleep {
-                    blockers.push(Blocker::Suspended);
-                }
+                // Explicit Install interrupts held/remote input, native drag,
+                // locked/unknown sessions and sleep; those are not idle gates.
+                // The injection fence below still proves releases were applied.
                 if self.update_hold.is_some_and(|(old, _)| old != generation) {
-                    blockers.push(Blocker::OwnerMissing);
-                }
-                if !blockers.is_empty() {
-                    let _ = reply.send(Err(blockers));
+                    let _ = reply.send(Err(vec![Blocker::OwnerMissing]));
                     return;
                 }
                 self.update_hold = Some((generation, Instant::now() + Duration::from_secs(30)));
+                // Reuse the ordinary pause teardown out of band so a pending
+                // native drag/source continuation cannot hold the release fence.
+                self.inject.backend().set_input_paused(true);
+                self.inject.suspend();
                 for peer in self.pairs.keys().copied().collect::<Vec<_>>() {
                     self.detach(peer);
                 }
@@ -777,6 +757,7 @@ impl Driver {
                 if self.update_hold.is_some_and(|(old, _)| old == generation) {
                     self.update_hold = None;
                     self.update_committed = false;
+                    self.inject.backend().set_input_paused(self.paused);
                     self.adapter
                         .router_mut()
                         .set_fully_paused(self.paused || self.environment.system_sleeping);
@@ -804,7 +785,9 @@ impl Driver {
                     self.capture_detector = Default::default();
                 }
                 self.paused = paused;
-                self.inject.backend().set_input_paused(paused);
+                self.inject
+                    .backend()
+                    .set_input_paused(paused || self.update_hold.is_some());
                 if paused {
                     self.inject.suspend();
                 }
@@ -959,7 +942,12 @@ impl Driver {
                 }
             }
             InputCommand::EdgeResistance(regions) => self.adapter.router_mut().set_edge_resistance_regions(regions),
-            InputCommand::PointerSample { sample, hidden } => self.pointer_sample(sample, hidden),
+            InputCommand::PointerSample {
+                scope,
+                application,
+                sample,
+                hidden,
+            } => self.pointer_sample(scope, application, sample, hidden),
             InputCommand::VolumeExit(exit, keep) => {
                 self.adapter.router_mut().set_volume_exit_probe(Arc::new(move || {
                     exit.load()
@@ -1188,10 +1176,21 @@ impl Driver {
             .get(&peer)
             .is_some_and(|pair| pair.attached && pair.outbound.as_ref().is_some_and(|p| p.0.id() == stream))
     }
-    fn pointer_sample(&mut self, sample: Option<oink_input::pointer_capture::CaptureSample>, hidden: bool) {
+    fn pointer_sample(
+        &mut self,
+        scope: Option<(u64, DeviceId)>,
+        application: Option<crate::diagnostics::capture::Application>,
+        sample: Option<oink_input::pointer_capture::CaptureSample>,
+        hidden: bool,
+    ) {
         let now = self.micros();
         let router = self.adapter.router_mut();
         let focus = router.focus();
+        // The observer and native cursor owner run independently. An old
+        // source-freeze sample must not acquire the returning holder's epoch.
+        if scope != Some((focus.epoch, focus.holder)) {
+            return;
+        }
         let eligible = router.has_pointer_focus() && !router.paused();
         let suppressed = router.has_pointer_focus() && hidden;
         self.trail.suppress(suppressed);
@@ -1232,6 +1231,18 @@ impl Driver {
         {
             router.set_cursor(sample.position);
         }
+        self.capture_diagnostics.observe(
+            crate::diagnostics::capture::Raw::new(
+                &router.game_mode(),
+                sample,
+                application,
+                self.local,
+                router.local_displays(),
+                self.capture_detector.detector.evidence(now),
+                detected,
+            ),
+            self.inject.trace.as_deref(),
+        );
         self.capture_was_active = active && eligible;
         let relative_capture = active && !eligible && !router.paused() && !router.mouse_local();
         if self.relative_capture != relative_capture {
@@ -1394,11 +1405,6 @@ impl Driver {
             let ingress = ingress.observe(time, a);
             let dispatch = dispatch.observe(time, d);
             self.shared.jitter.record(lossy, ingress, dispatch);
-            // Reuse the input estimator observation, including scheduling and
-            // routing delay. This is not RTT variation or a second estimator.
-            if let Some(counters) = self.shared.quality_jitter.load().get(&peer) {
-                counters.record(crate::connection_quality::now_ms_at(dispatched), dispatch.delay_us);
-            }
         }
     }
     fn message(&mut self, peer: DeviceId, message: Message) {
@@ -1565,6 +1571,10 @@ impl Driver {
             }
         }
         for output in outputs {
+            if let Output::Status(StatusEvent::GameMode(status)) = &output {
+                self.capture_diagnostics
+                    .game(status, self.adapter.router().paused(), self.inject.trace.as_deref());
+            }
             if !immediate_modes && let Some(trace) = &self.inject.trace {
                 trace.output(&output, self.adapter.router().focus().epoch);
             }
@@ -1713,6 +1723,14 @@ impl Driver {
         self.send_from(peer, message, None);
     }
     fn send_from(&mut self, peer: DeviceId, message: Message, origin: Option<DeviceId>) {
+        // Router outputs can include local modifier snapshots/releases triggered
+        // by remote input, or another origin's forwarded release triggered locally.
+        // The ambient capture time belongs only to the triggering source. Attaching
+        // it to a different outgoing origin mixes unsynchronised device clocks and
+        // corrupts the receiver's delay baseline and marks healthy input as reordered.
+        let time = self.input_time.filter(|_| {
+            crate::diagnostics::keyboard::message_source(self.local, &message) == Some(origin.unwrap_or(self.local))
+        });
         if let Message::Control(ControlMsg::FocusEnter { epoch, .. }) = &message
             && let Some(pair) = self.pairs.get_mut(&peer)
         {
@@ -1786,7 +1804,7 @@ impl Driver {
                 self.budget.consume(self.now);
                 self.post(
                     peer,
-                    timed(Message::Input(InputMsg::Motion { seq, dx, dy }), self.input_time),
+                    timed(Message::Input(InputMsg::Motion { seq, dx, dy }), time),
                     false,
                 );
             } else {
@@ -1795,7 +1813,7 @@ impl Driver {
                         motion.crossing = crossing;
                     }
                     motion.sequence = seq;
-                    motion.time = self.input_time;
+                    motion.time = time;
                     if self.inject.trace.as_ref().is_some_and(|t| t.enabled()) {
                         if let Some(evidence) = &mut motion.evidence {
                             evidence.count += 1;
@@ -1824,7 +1842,7 @@ impl Driver {
                             }),
                         dx,
                         dy,
-                        time: self.input_time,
+                        time,
                     });
                 }
                 if due <= self.now {
@@ -1834,7 +1852,7 @@ impl Driver {
         } else {
             self.flush_motion_for(crate::diagnostics::handoff::FlushReason::OrderingBarrier, Some(peer));
             let datagram = valid_datagram(&message);
-            self.post(peer, timed(message, self.input_time), datagram);
+            self.post(peer, timed(message, time), datagram);
         }
     }
     fn flush_motion(&mut self) {
@@ -2203,7 +2221,7 @@ impl CaptureLoop for Driver {
                 .router_mut()
                 .set_paused(self.paused || self.environment.system_sleeping || !self.controllable);
         }
-        if !self.paused && !self.stopping && self.inject.suspended() {
+        if !self.paused && !self.stopping && self.update_hold.is_none() && self.inject.suspended() {
             match self.inject.resume() {
                 Ok(true) => {
                     // The old worker has joined and released every held input.

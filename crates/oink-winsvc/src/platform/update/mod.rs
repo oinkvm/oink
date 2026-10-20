@@ -1,4 +1,5 @@
 //! SYSTEM-owned update service and protected short-lived transaction worker.
+mod cabinet;
 mod msi;
 mod pipe;
 pub(super) mod protected;
@@ -48,7 +49,6 @@ struct Plan {
     previous_inventory: msi::Inventory,
     sessions: Vec<Session>,
     reboot_marker_armed: bool,
-    automatic: bool,
     lock_handle: String,
     worker_pid: u32,
     worker_created_filetime: String,

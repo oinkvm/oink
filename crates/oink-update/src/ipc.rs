@@ -39,7 +39,7 @@ pub enum Request {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reply {
     Status { status: UpdateStatus },
-    Prepare { transaction: String, automatic: bool },
+    Prepare { transaction: String },
     Abort { transaction: String },
     Shutdown { transaction: String },
     HealthCheck { transaction: String, build: u64 },
@@ -76,7 +76,13 @@ mod tests {
             br#"{"type":"command","command":{"type":"install","expected_build":2,"url":"https://example.com/x"}}"#
                 .as_slice(),
             br#"{"type":"query","path":"C:\\x"}"#,
+            br#"{"type":"command","command":{"type":"install","expected_build":2,"path":"C:\\Users\\Public\\evil.msi"}}"#,
+            br#"{"type":"command","command":{"type":"check","arguments":"/i evil.msi"}}"#,
+            br#"{"type":"command","command":{"type":"install","expected_build":2},"path":"evil.msi"}"#,
+            br#"{"type":"command","command":{"type":"install","expected_build":2,"public_key":"evil"}}"#,
             br#"{"type":"query","type":"register","build":2}"#,
+            br#"{"type":"command","command":{"type":"set_preferences","preferences":{"checks_enabled":true,"channel":"stable","mode":"automatic"}}}"#,
+            br#"{"type":"command","command":{"type":"automatic"}}"#,
         ] {
             assert!(decode::<Request>(bytes).is_err());
         }
@@ -84,5 +90,6 @@ mod tests {
             decode::<Request>(&encode(&Request::Query).unwrap()).unwrap(),
             Request::Query
         ));
+        assert!(decode::<Reply>(br#"{"type":"prepare","transaction":"t","automatic":true}"#).is_err());
     }
 }

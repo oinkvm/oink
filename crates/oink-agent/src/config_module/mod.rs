@@ -28,6 +28,15 @@ use std::{
 };
 pub const MAX_MEMBERS: usize = oink_network::roster::MAX_MEMBERS;
 pub const REDIAL_INTERVAL: Duration = Duration::from_secs(1);
+/// The config owner alone schedules retries of an unreachable paired member.
+pub const RECONNECT_BACKOFF: [Duration; 5] = [
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(5),
+];
+/// Authentication/selection rejection is not evidence of a transient outage.
 pub const HANDSHAKE_BACKOFF: [Duration; 4] = [
     Duration::from_secs(5),
     Duration::from_secs(15),
@@ -52,6 +61,7 @@ pub struct MemberInfo {
     pub facts: Option<Arc<dto::DeviceFacts>>,
     pub added_by: Option<DeviceId>,
     pub added_at_ms: u64,
+    /// Most recent local live-link observation, refreshed on the offline transition.
     pub last_connected_ms: Option<u64>,
     pub address_stale: bool,
     pub protocol_incompatible: bool,
@@ -66,6 +76,7 @@ pub struct AppliedState {
     pub roster_digest: [u8; 32],
     pub members: Vec<DeviceId>,
     pub layout: Arc<Layout>,
+    /// Drawing preferences include retained offline owners; routing uses RouterLayout.
     pub owners: Arc<BTreeMap<DeviceId, OwnerLayoutPreferences>>,
     pub layout_source: dto::LayoutSource,
     pub version: dto::ConfigVersion,
@@ -76,6 +87,7 @@ pub struct AppliedState {
 pub struct LocalDisplays {
     pub displays: Vec<DisplayInfo>,
     pub layout: Arc<Layout>,
+    /// Drawing preferences include retained offline owners; routing uses RouterLayout.
     pub owners: Arc<BTreeMap<DeviceId, OwnerLayoutPreferences>>,
 }
 #[derive(Clone)]

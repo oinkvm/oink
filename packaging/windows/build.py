@@ -116,6 +116,7 @@ def main():
     p.add_argument('--source-commit', help='Full source commit for a local commit-labelled version')
     p.add_argument('--build', type=int, required=True)
     p.add_argument('--source-tree-sha256', required=True)
+    p.add_argument('--windows-update-test-feed', help='Explicit matching qualification-build origin; never public')
     p.add_argument('--require-updater', action='store_true')
     p.add_argument('--require-collector', action='store_true')
     a = p.parse_args()
@@ -128,6 +129,11 @@ def main():
     except ValueError as error:
         p.error(str(error))
     provenance = verify(a.binaries, a.source_tree_sha256, a.version, 'x86_64-pc-windows-msvc', a.build, a.source_commit)
+    from update_qualification import origin as test_origin, verify_binaries
+    test_origin(a.windows_update_test_feed)
+    if provenance.get('update_test_feed') != a.windows_update_test_feed:
+        p.error('qualification origin must match the exact binary build')
+    verify_binaries([a.binaries / name for name in provenance['files']], a.windows_update_test_feed)
     has_worker = provenance.get('updater_included', False)
     if not has_worker or not provenance.get('collector_included'):
         p.error('the product MSI requires both the update worker and crash collector')
@@ -168,7 +174,8 @@ def main():
     record = dict(schema=1, product=I['name'], provenance='source-tree', source_tree_sha256=a.source_tree_sha256, version=a.version, source_commit=a.source_commit, build=a.build,
                   architecture='x64', minimum_os=I['windows_minimum'], minimumWindowsBuild=I['minimumWindowsBuild'], protocol_baseline=1,
                   upgrade_code=w['upgrade_code'], components=[b[r] + '.exe' for r in roles], updater_included=has_worker,
-                  collector_included=has_collector,
+                  collector_included=has_collector, update_test_feed=a.windows_update_test_feed,
+                  update_test_fail_health=provenance.get('update_test_fail_health', False),
                   update_policy='manual-only', signing='unsigned', report_manifest=report)
     notice_files = copy_notices(payload)
     (payload / I['metadata_file']).write_text(json.dumps(record, indent=2) + '\n')
@@ -199,8 +206,7 @@ def main():
         'UPDATE_WORKER': b['update_worker'] + '.exe',
         'CRASH_COLLECTOR': b['crash_collector'] + '.exe',
         'MAINTENANCE': w['maintenance_directory'], 'RUN_VALUE': w['run_value'], 'RECEIPT': w['receipt'],
-        'MAINTENANCE_LOCK': w['maintenance_lock'], 'COPIED_WORKER': w['copied_worker'],
-        'INSTALLER_EVENT_PREFIX': w['installer_event_prefix'], 'PRODUCT_CODE': product_code,
+        'MAINTENANCE_LOCK': w['maintenance_lock'], 'PRODUCT_CODE': product_code,
         'UPGRADE_CODE': '{' + w['upgrade_code'] + '}'}.items()) + '\n'
     (a.output / 'identity.h').write_text(header)
     # Use existing MSVC build tools only. /MT avoids a VC runtime prerequisite.

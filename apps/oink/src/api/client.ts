@@ -23,6 +23,7 @@ function requireInput(settings:T.InputSettings):T.InputSettings {
   return settings;
 }
 export const api = {
+  notify: (notification: T.Notification) => call<T.NotificationReceipt | null>("notify", { notification }),
   connectionQuality: () => call<T.ConnectionQuality>("connection_quality"),
   memberAddresses: (device: string) => call<string[]>('member_addresses', {device}),
   setMemberAddress: (device: string,address: string) => call<null>('set_member_address', {device,address}),
@@ -53,6 +54,7 @@ export const api = {
     call<null>('preview_layout_projection', { gesture, placements, affected, ended }),
   layout: () => call<T.Layout>("layout").then(requireLayout),
   saveLayout: (placements: T.Placement[]) => call<T.Layout>("save_layout", { placements }),
+  setScreenRemoteGain: (screen: T.ScreenKey, gain: number) => call<null>("set_screen_remote_gain", { screen, gain }),
   setScreenGain: (screen: T.ScreenKey, gain: number) => call<null>("set_screen_gain", { screen, gain }),
   setScreenHidden: (screen: T.ScreenKey, hidden: boolean) => call<null>("set_screen_hidden", { screen, hidden }),
   previewMoveScreen: (screen: T.ScreenKey, origin: T.Point) => call<T.LayoutGeometry | null>("preview_move_screen", { screen, origin }),

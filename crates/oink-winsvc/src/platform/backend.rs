@@ -16,6 +16,25 @@ pub fn uiaccess() -> io::Result<bool> {
     // SAFETY: own process pseudo-handle, query-only token.
     number(token(unsafe { GetCurrentProcess() })?.0, TokenUIAccess).map(|n| n != 0)
 }
+/// Validate the UI role without rejecting the user's administrator token.
+pub fn require_interactive_ui() -> io::Result<()> {
+    // SAFETY: query-only current-process pseudo handle.
+    let own = token(unsafe { GetCurrentProcess() })?;
+    let allowed = crate::token_policy::interactive_ui(
+        number(own.0, TokenUIAccess)?,
+        number(own.0, TokenSessionId)?,
+        crate::token_policy::service_account(&security::sid_bytes(own.0)?),
+    );
+    if allowed {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "UI requires an interactive user token without UIAccess (not SYSTEM or a service account)",
+        ))
+    }
+}
+
 fn number(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<u32> {
     let (mut value, mut len) = (0u32, 0);
     // SAFETY: all callers request DWORD token fields into a correctly sized buffer.
@@ -192,7 +211,11 @@ fn serve_session(id: u32) -> io::Result<()> {
             if super::update::pending() {
                 return Err(denied());
             }
-            let user = security::sid_bytes(token(_client.0)?.0)?;
+            let client_token = token(_client.0)?;
+            if !security::interactive_token(client_token.0)? {
+                return Err(denied());
+            }
+            let user = security::sid_bytes(client_token.0)?;
             crate::launch_recipe::dispatch(request, |environment, directory, target| {
                 spawn(id, &user, environment, directory, target)
             })
@@ -269,7 +292,14 @@ fn spawn_at(
     }
     // Windows manifest activation requires signing. The existing SYSTEM broker instead sets
     // UIAccess on a duplicate of the interactive user's primary token (unsigned run1 recipe).
-    // Never use the SYSTEM or linked elevated token: user, IL and session remain unchanged.
+    // Always use WTS's logon token, even when the requesting UI is elevated.
+    // A split-token administrator therefore keeps a non-elevated UIAccess backend
+    // compatible with ordinary applications; with UAC off the sole user token is
+    // naturally High. Never borrow SYSTEM or the caller's elevated token.
+    // UIPI still prevents elevated windows receiving drag/drop and some messages
+    // from non-elevated apps; cross-device drag involving those apps can fail when
+    // Oink runs elevated. Elevation improves injection into elevated windows;
+    // UIAccess on the normal backend provides that capability without elevation.
     let primary = crate::launch_recipe::uiaccess_token(
         || {
             let mut raw = ptr::null_mut();
@@ -302,6 +332,7 @@ fn spawn_at(
         |source, primary| {
             if number(primary.0, TokenUIAccess)? != u32::from(target.uiaccess())
                 || number(primary.0, TokenSessionId)? != id
+                || !security::interactive_token(source.0)?
                 || number(primary.0, TokenElevation)? != number(source.0, TokenElevation)?
                 || security::sid_bytes(primary.0)? != security::sid_bytes(source.0)?
                 || security::sid_bytes(source.0)? != user
@@ -381,6 +412,12 @@ fn integrity(token: HANDLE) -> io::Result<u32> {
 
 /// Worker-only recovery launch with the same user SID/session and fixed product entry.
 pub(super) fn spawn_update(id: u32, user: &[u8]) -> io::Result<u32> {
+    spawn_update_target(id, user, crate::launch_recipe::Target::Backend)
+}
+pub(super) fn spawn_update_ui(id: u32, user: &[u8]) -> io::Result<u32> {
+    spawn_update_target(id, user, crate::launch_recipe::Target::UpdateUi)
+}
+fn spawn_update_target(id: u32, user: &[u8], target: crate::launch_recipe::Target) -> io::Result<u32> {
     let mut raw = ptr::null_mut();
     // SAFETY: SYSTEM queries the authenticated original interactive session token.
     check(unsafe { WTSQueryUserToken(id, &mut raw) })?;
@@ -401,12 +438,5 @@ pub(super) fn spawn_update(id: u32, user: &[u8]) -> io::Result<u32> {
         block
     };
     let directory = wide(super::update::protected::root()?.to_str().ok_or_else(denied)?);
-    spawn_at(
-        id,
-        user,
-        &block,
-        &directory,
-        crate::launch_recipe::Target::Backend,
-        true,
-    )
+    spawn_at(id, user, &block, &directory, target, true)
 }

@@ -34,3 +34,18 @@ fn validate_position(point: &Point) -> Result<()> {
     }
     Ok(())
 }
+
+// Optional notification capability. Existing v1 messages and their keys are unchanged.
+wire_map!(NotifyShow,validate_notify,{
+    1=>id:u64=required;2=>display:Text<512>=required;3=>level:u8=required;
+    4=>title:Text<512>=required;5=>description:Text<2048>=required;
+    6=>persistent:bool=required;7=>undo:bool=required;8=>kind:u8=required;
+});
+wire_map!(NotifyAction,no_validation,{1=>id:u64=required;2=>undo:bool=required;});
+wire_map!(NotifyDismiss,no_validation,{1=>id:u64=required;});
+fn validate_notify(raw: &RawMap) -> Result<()> {
+    if required::<u8>(raw, 3)? > 2 || required::<u8>(raw, 8)? > 4 {
+        return Err(ErrorCode::UnsupportedValue.into());
+    }
+    Ok(())
+}

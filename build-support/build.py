@@ -12,6 +12,7 @@ from provenance import digest, source_tree_sha256
 from sparkle import prepare as prepare_sparkle
 from versioning import release_version
 from package_cache import configure_cache
+from update_qualification import origin as test_origin, verify_binaries
 
 ROOT = Path(__file__).resolve().parents[1]
 IDENTITY = json.loads((ROOT / 'packaging/identity.json').read_text())
@@ -47,9 +48,27 @@ def main():
     p.add_argument('--source-commit', help='Full source commit for a local commit-labelled version')
     p.add_argument('--build', required=True)
     p.add_argument('--sparkle-cache', type=Path)
+    p.add_argument('--windows-update-test-feed', help='TEST ONLY: compile a literal HTTP loopback feed and public TEST key')
     p.add_argument('--symbols-output', type=Path, help='Private symbols outside the source and package payload')
+    p.add_argument('--windows-update-test-fail-health', action='store_true', help='TEST ONLY: withhold candidate health proof for rollback qualification')
     a = p.parse_args()
     environment = os.environ.copy()
+    try:
+        test_origin(a.windows_update_test_feed)
+    except ValueError as error:
+        p.error(str(error))
+    if a.windows_update_test_feed and a.target != TARGETS[1]:
+        p.error('test update feeds are Windows-only')
+    if environment.get('OINK_WINDOWS_UPDATE_TEST_FEED') and environment['OINK_WINDOWS_UPDATE_TEST_FEED'] != a.windows_update_test_feed:
+        p.error('test feed environment requires the matching explicit build flag')
+    if a.windows_update_test_fail_health and not a.windows_update_test_feed:
+        p.error('test health failure requires a test feed')
+    if environment.get('OINK_WINDOWS_UPDATE_TEST_FAIL_HEALTH') and not a.windows_update_test_fail_health:
+        p.error('test health environment requires the matching explicit flag')
+    if a.windows_update_test_feed:
+        environment['OINK_WINDOWS_UPDATE_TEST_FEED'] = a.windows_update_test_feed
+    if a.windows_update_test_fail_health:
+        environment['OINK_WINDOWS_UPDATE_TEST_FAIL_HEALTH'] = '1'
     try:
         a.build = release_build(a.build, environment)
     except ValueError as error:
@@ -98,6 +117,8 @@ def main():
     environment['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join(flags)
     environment.pop('RUSTFLAGS', None)
     features = 'custom-protocol'
+    if a.windows_update_test_feed:
+        features += ',oink-winsvc/test-feed'
     macos = a.target == TARGETS[0]
     if macos:
         # rustc must gather native objects while its LTO temporary directories
@@ -152,9 +173,12 @@ def main():
         verify_imports([output / name for name in names], IDENTITY['macos_minimum'])
     if source_tree_sha256(ROOT, inventory) != a.source_tree_sha256:
         raise RuntimeError('Source tree changed during build; rebuild the recorded tree')
+    verify_binaries([output / name for name in names], a.windows_update_test_feed)
+    verify_binaries([path for path in (ROOT / 'apps/oink/dist').rglob('*') if path.is_file()], a.windows_update_test_feed)
     record = dict(schema=1, provenance='source-tree', source_tree_sha256=a.source_tree_sha256,
                   version=display_version, source_commit=a.source_commit, build=a.build, target=a.target, sparkle=macos,
                   updater_included=not macos, collector_included=True, worker_static_crt=not macos,
+                  update_test_feed=a.windows_update_test_feed, update_test_fail_health=a.windows_update_test_fail_health,
                   identity_sha256=digest(ROOT / 'packaging/identity.json'),
                   files={name: digest(output / name) for name in names})
     (output / 'release-build.json').write_text(json.dumps(record, indent=2) + '\n')

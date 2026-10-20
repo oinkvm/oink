@@ -45,7 +45,7 @@ int main() {
     assert(CreateDirectoryW(base.c_str(), nullptr));
     put(base + L"\\user-data");
     unsigned checks = 0;
-    for (const auto marker : {L"", L"pending.json", L"msi-authorization.json", L"installer-lease.json", L"worker-lock", L"hardlink"}) {
+    for (const auto marker : {L"", L"pending.json", L"msi-authorization.json", L"worker-lock", L"hardlink"}) {
         const auto root = base + L"\\product";
         const auto directory = root + L"\\maintenance";
         const auto lock_path = directory + L"\\maintenance.lock";
@@ -64,6 +64,9 @@ int main() {
             assert(DeleteFileW(lock_path.c_str()));
             assert(CreateHardLinkW(lock_path.c_str(), (base + L"\\user-data").c_str(), nullptr));
         } else if (!name.empty()) put(directory + L"\\" + name);
+        // A rollback's pending journal preserves Run/cloud registrations; an
+        // ordinary standalone uninstall removes them.
+        assert(cleanup::preserve_user_state(directory) == (name == L"pending.json"));
         const auto result = cleanup::after_uninstall(root, directory, L"maintenance.lock", regular_path, regular);
         if (name.empty()) {
             assert(result == cleanup::Result::removed && cleanup::absent(root));
@@ -73,6 +76,7 @@ int main() {
             if (worker != INVALID_HANDLE_VALUE) CloseHandle(worker);
             else if (name == L"hardlink") { assert(DeleteFileW(lock_path.c_str())); put(lock_path); }
             else assert(DeleteFileW((directory + L"\\" + name).c_str()));
+            assert(!cleanup::preserve_user_state(directory));
             assert(cleanup::after_uninstall(root, directory, L"maintenance.lock", regular_path, regular) == cleanup::Result::removed);
         }
         assert(retained(base + L"\\user-data"));

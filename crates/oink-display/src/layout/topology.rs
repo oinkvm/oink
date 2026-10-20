@@ -332,6 +332,17 @@ impl Topology {
         delta: (f64, f64),
         online: impl Fn(&DeviceId) -> bool,
     ) -> Option<StepResult> {
+        self.step_from_source_filtered(from, delta, None, online)
+    }
+
+    /// Mask already-compiled portals as walls without recompiling or bridging around them.
+    pub fn step_from_source_filtered(
+        &self,
+        from: &ScreenPos,
+        delta: (f64, f64),
+        source: Option<DeviceId>,
+        online: impl Fn(&DeviceId) -> bool,
+    ) -> Option<StepResult> {
         let &a = self.index.get(&from.screen)?;
         let s = &self.screens[a];
         let moving = delta.0.is_finite() && delta.1.is_finite() && (delta.0 != 0.0 || delta.1 != 0.0);
@@ -347,7 +358,7 @@ impl Topology {
                 blocked_y: false,
             });
         }
-        Some(self.walk(a, s.local_to_plane(from.local), delta, None, &online))
+        Some(self.walk(a, s.local_to_plane(from.local), delta, None, source, &online))
     }
 
     /// 本机光标在本机屏幕 `from` 上继续移动 `delta_local`（本机坐标单位，系统已处理过加速）时，
@@ -367,7 +378,14 @@ impl Topology {
         let &a = self.index.get(&from.screen)?;
         let s = &self.screens[a];
         let hand = self.native_motion(a, delta_local);
-        let r = self.walk(a, s.local_to_plane(from.local), hand, None, &online);
+        let r = self.walk(
+            a,
+            s.local_to_plane(from.local),
+            hand,
+            None,
+            Some(from.screen.device),
+            &online,
+        );
         (r.to.screen != from.screen).then_some(r.to)
     }
 
@@ -390,6 +408,21 @@ impl Topology {
         (delta.0 * sx / k, delta.1 * sy / k)
     }
 
+    /// The source-reference scale remains independent of this target-only factor.
+    pub fn pointer_gain(&self, screen: &ScreenId, source: DeviceId) -> Option<f64> {
+        Some(self.motion_gain(*self.index.get(screen)?, Some(source)))
+    }
+
+    fn motion_gain(&self, index: usize, source: Option<DeviceId>) -> f64 {
+        let screen = &self.screens[index];
+        self.scale[index]
+            * if source.is_some_and(|source| source != screen.id.device) {
+                screen.remote_gain
+            } else {
+                1.0
+            }
+    }
+
     /// Uses the same wall sliding, corner priority and portal selection as `step`.
     pub fn first_portal(&self, from: &ScreenPos, delta: (f64, f64)) -> Option<PortalExit> {
         self.first_portal_filtered(from, delta, |_| true)
@@ -402,6 +435,16 @@ impl Topology {
         delta: (f64, f64),
         online: impl Fn(&DeviceId) -> bool,
     ) -> Option<PortalExit> {
+        self.first_portal_from_source_filtered(from, delta, None, online)
+    }
+
+    pub fn first_portal_from_source_filtered(
+        &self,
+        from: &ScreenPos,
+        delta: (f64, f64),
+        source: Option<DeviceId>,
+        online: impl Fn(&DeviceId) -> bool,
+    ) -> Option<PortalExit> {
         let &a = self.index.get(&from.screen)?;
         let mut found = None;
         self.walk(
@@ -409,6 +452,7 @@ impl Topology {
             self.screens[a].local_to_plane(from.local),
             delta,
             Some(&mut found),
+            source,
             &online,
         );
         found
@@ -420,6 +464,7 @@ impl Topology {
         p0: Point,
         delta: (f64, f64),
         first: Option<&mut Option<PortalExit>>,
+        source: Option<DeviceId>,
         online: &dyn Fn(&DeviceId) -> bool,
     ) -> StepResult {
         let mut a = start;
@@ -437,7 +482,7 @@ impl Topology {
                 break;
             }
             let r = self.screens[a].rect;
-            let k = self.scale[a];
+            let k = self.motion_gain(a, source);
             let d = (rem.0 * k, rem.1 * k);
             // 离开半开矩形 [x, right) × [y, bottom) 的参数：正方向到达右/下边界即离开，
             // 负方向越过左/上边界才离开。

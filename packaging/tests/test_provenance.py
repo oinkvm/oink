@@ -38,7 +38,8 @@ class Provenance(unittest.TestCase):
             self.assertTrue(P.product_source(path), path)
         for path in ('.claude/agents/developer.md', 'AGENTS.md', 'CLAUDE.md',
                      'RELEASING.md', 'docs/release/packaging.md', 'docs/nested/example.md', 'docs/example.md', 'build-support/update/README.md',
-                     'crates/example/README.md', 'target/output', 'evidence/check.json'):
+                     'crates/example/README.md', 'scripts/dev.sh', 'tools/probe/main.swift',
+                     'target/output', 'evidence/check.json'):
             self.assertFalse(P.product_source(path), path)
 
     def test_archive_hash_survives_tauri_generated_ide_schemas(self):

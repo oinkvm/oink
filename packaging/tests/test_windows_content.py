@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('windows_content', ROOT / 'packaging/windows/content.py')
 C = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(C)
-IDENTITY = json.loads((ROOT / 'packaging/identity.json').read_text())
+IDENTITY = {**json.loads((ROOT / 'packaging/identity.json').read_text()), 'version': '0.1.0'}  # Historical receipt fixture.
 BUILDER_SPEC = importlib.util.spec_from_file_location('windows_packager', ROOT / 'packaging/windows/build.py')
 B = importlib.util.module_from_spec(BUILDER_SPEC)
 BUILDER_SPEC.loader.exec_module(B)
@@ -78,7 +78,7 @@ class MsiContent(unittest.TestCase):
                 ('WriteRegistryValues', 6101), ('InstallExecute', 6500),
                 ('RemoveExistingProducts', 6501), ('InstallFinalize', 6600), ('StartServices', 6502),
                 ('CheckProtectedState', 1502), ('StopServices', 1900), ('CheckQuiescence', 1901),
-                ('DeleteServices', 2000), ('RemoveFiles', 3500), ('CommitMaintenance', 6598)]],
+                ('DeleteServices', 2000), ('RemoveFiles', 3500)]],
             'Upgrade': [[upgrade, '', '0.0.1', '', '1', '', 'WIX_UPGRADE_DETECTED'],
                         [upgrade, '0.0.1', '', '', '2', '', 'WIX_DOWNGRADE_DETECTED']],
         })
@@ -256,7 +256,7 @@ class MsiContent(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'quiet-install default'):
                 C.verify_install_ui(changed)
 
-    def test_cleanup_is_commit_only_full_uninstall_after_guard_release(self):
+    def test_cleanup_is_commit_only_full_uninstall_after_service_restart(self):
         with tempfile.TemporaryDirectory() as temp:
             xml, extracted, tables = self.fixture(Path(temp))
             manifest = Path(temp) / 'decompiled.wxs'
@@ -276,7 +276,7 @@ class MsiContent(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     C.verify_msi(manifest, extracted, IDENTITY, changed)
             changed = copy.deepcopy(tables)
-            next(row for row in changed['InstallExecuteSequence'] if row[0] == 'CleanupMaintenance')[2] = '6597'
+            next(row for row in changed['InstallExecuteSequence'] if row[0] == 'CleanupMaintenance')[2] = '6501'
             with self.assertRaises(RuntimeError):
                 C.verify_msi(manifest, extracted, IDENTITY, changed)
 

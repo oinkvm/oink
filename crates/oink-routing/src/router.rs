@@ -56,7 +56,7 @@ pub use dnd::{
     DndCmd, DndEvent, DndIntegrity, DndPreparation, DndSourceEffect, DndTarget, IntegrityOutcome, NativeObservation,
     PhysicalObservation, RolePartition, SourcePhase,
 };
-use resistance::Resistance;
+use resistance::{Resistance, RestingEdge};
 pub use volume_diagnostics::{VolumeAction, VolumeDecision, VolumeDestination, VolumeOriginKind};
 
 /// 单调时钟，微秒。由调用方提供（服务进程用真实时钟，模拟器用虚拟时钟）。
@@ -115,6 +115,7 @@ pub enum TrailStage {
 }
 #[derive(Clone, Copy, Debug)]
 pub struct DepartureEvidence<'a> {
+    pub pointer_source: Option<DeviceId>,
     pub revision: u64,
     pub bounds: Option<Rect>,
     pub point: Option<&'a ScreenPos>,
@@ -265,6 +266,10 @@ pub enum StatusEvent {
     KeyboardReleased,
     ScreenLocalInput(bool),
     GameMode(GameModeStatus),
+    /// Ordered local observation; snapshots can coalesce rapid lock transitions.
+    FocusLock {
+        holder: Option<DeviceId>,
+    },
     Focus(FocusInfo),
     PeerTimedOut(DeviceId),
     PeerRecovered(DeviceId),
@@ -473,6 +478,7 @@ pub struct Router {
     ref_display: Option<String>,
     /// 当前外缘上的本机阻力累计（达标前焦点仍在本机）。
     resistance: Option<Resistance>,
+    resting_edges: [Option<RestingEdge>; 4],
     /// 本机所知的组内焦点：第 `epoch` 次移交后的焦点机。通常与 `holder` 相同；焦点机断线、
     /// 暂停、没有确认移交时本机只在本机收回焦点（「岛」），这时 `holder` 是本机而 `claim` 仍是它。
     /// 通告（`FocusState`）里发的是 `claim`，所以岛不会把焦点「抢」过来。
@@ -616,6 +622,7 @@ impl Router {
             last_pointer_source: None,
             ref_display: None,
             resistance: None,
+            resting_edges: Default::default(),
             edge_regions: Vec::new(),
             claim: me,
             unconfirmed_since: None,
@@ -692,7 +699,7 @@ impl Router {
     }
 
     pub fn set_settings(&mut self, settings: crate::config::RoutingSettings) {
-        self.resistance = None;
+        self.reset_resistance();
         let dnd_was = self.dnd_enabled();
         self.apply_source_modes(settings.mouse_mode, settings.keyboard_mode);
         self.set_accept_contacts(settings.accept_contacts);
@@ -722,7 +729,7 @@ impl Router {
     /// 使用调用方管理的布局（测试、模拟器）。之后路由不再维护布局数据。
     pub fn set_layout(&mut self, layout: Arc<dyn LayoutQuery>) {
         self.gap_cancel();
-        self.resistance = None;
+        self.reset_resistance();
         self.layout = layout;
         self.validate_focus_lock_layout();
         self.enforce_screen_policy();
@@ -731,7 +738,7 @@ impl Router {
 
     /// 本机显示器变化（启动时也调用一次）。会通告给已连接的设备。
     pub fn set_local_displays(&mut self, displays: Vec<DisplayInfo>) {
-        self.resistance = None;
+        self.reset_resistance();
         if self.diagnostics.as_ref().is_some_and(|d| d.enabled()) && self.displays != displays {
             self.display_revision += 1;
         }
@@ -819,6 +826,7 @@ impl Router {
     }
     fn departure_evidence(&self, from: &ScreenPos) -> DepartureEvidence<'_> {
         DepartureEvidence {
+            pointer_source: self.last_pointer_source,
             revision: self.display_revision,
             bounds: self
                 .displays
@@ -889,7 +897,7 @@ impl Router {
     /// 告诉路由本机光标当前位置（启动时，或平台实现发现光标被其他程序移动时）。
     pub fn set_cursor(&mut self, pos: Point) {
         let was_gap = self.gap.is_some();
-        self.resistance = None;
+        self.reset_resistance();
         if let Some((key, bounds)) = self.locate(pos) {
             self.pointer = Some(ScreenPos::new(ScreenId::new(self.me(), key), bounds.clamp(pos)));
             self.local_cursor = self.pointer.clone();
@@ -903,6 +911,9 @@ impl Router {
     /// Diagnostic only; this does not inspect or reconcile the platform's physical state.
     /// A native projection handle owns this gesture only; no persistent focus lock.
     pub fn set_projection_gesture(&mut self, active: bool) {
+        if self.projection_gesture != active {
+            self.reset_resistance();
+        }
         self.projection_gesture = active;
     }
 
@@ -980,7 +991,7 @@ impl Router {
     /// 其他设备（session admission），它们把本机当作离线。
     pub fn set_paused(&mut self, paused: bool) {
         self.gap_cancel();
-        self.resistance = None;
+        self.reset_resistance();
         if self.paused == paused {
             return;
         }
@@ -1083,7 +1094,7 @@ impl Router {
         if self.holder == self.me() {
             return;
         }
-        self.resistance = None;
+        self.reset_resistance();
         self.dnd_abort("pointer called back to this device");
         let at = self
             .primary_display_center()
@@ -1133,7 +1144,7 @@ impl Router {
         self.physical_keys.clear();
         self.escape_consumed = false;
         self.pause_all_consumed.clear();
-        self.resistance = None;
+        self.reset_resistance();
         if (own_source || self.pointer_in_gap()) && !self.locked() {
             self.return_pointer_home();
         }
@@ -1501,7 +1512,10 @@ impl Router {
         }
         let disposition = match ev.event {
             InputEvent::TouchpadSample(_) => Disposition::Pass,
-            InputEvent::RawPointerDelta { dx, dy } => self.raw_motion(dx, dy),
+            InputEvent::RawPointerDelta { dx, dy } => {
+                self.raw_resistance_motion(self.me(), (dx, dy), now);
+                self.raw_motion(dx, dy)
+            }
             InputEvent::PointerDelta { dx, dy } => {
                 if !self.mouse_local() {
                     self.trail_motion(dx, dy, now);
@@ -1679,11 +1693,11 @@ impl Router {
         // 事件挡不住光标（系统在截获之前已经移动了光标），所以这里从不靠「吞掉」拦光标：
         // 移交时立即切到 `Remote`（解耦 + 停靠），需要把光标放到别处时注入 `MoveTo`。
         let Some(c) = cursor else {
-            self.resistance = None;
+            self.reset_resistance();
             return Disposition::Pass;
         };
         let Some((key, bounds)) = self.locate(c) else {
-            self.resistance = None;
+            self.reset_resistance();
             return Disposition::Pass;
         };
         let prev = self.pointer.clone();
@@ -1696,11 +1710,11 @@ impl Router {
         // Keep OS cursor tracking above, including completed same-device moves;
         // held buttons and native drags still take the stitching path below.
         if self.gap_allowed() {
-            self.retain_resistance(&cur, me, (dx, dy));
+            self.retain_resistance(&cur, me, (dx, dy), now);
             self.dnd_off_edge();
             return Disposition::Pass;
         }
-        self.retain_resistance(&cur, me, (dx, dy));
+        self.retain_resistance(&cur, me, (dx, dy), now);
 
         // 1. 系统把光标移到了本机的另一块屏幕：按布局看这一步从原来的屏幕出发通往哪里。
         //    通往其他设备（布局里本机屏幕之间的排列与系统排列不同）→ 移交；否则尊重系统的跨屏。
@@ -1794,7 +1808,7 @@ impl Router {
         }
         if !self.input_ready(dst.screen.device) || self.leave_blocked() {
             self.diagnostic(DecisionKind::Refused, self.refusal_reason(), Some(&dst));
-            self.resistance = None;
+            self.reset_resistance();
             if self.handoff_blocked() {
                 // 拖动中推边：有系统拖拽就接住它交过去。
                 let at = cur.local;
@@ -1831,7 +1845,7 @@ impl Router {
     fn local_button(&mut self, button: MouseButton, pressed: bool) -> Disposition {
         tracing::debug!(?button, pressed, held_target = ?self.buttons.get(&button), current_target = ?self.current_target(), "button trace: local routing");
         if pressed && self.cfg.settings.button_handoff == ButtonHandoff::Block {
-            self.resistance = None;
+            self.reset_resistance();
         }
         if pressed {
             // 按钮没有自动重复：已按下的按钮再次按下，说明上一次的抬起丢了（截获中断期间）。
@@ -2878,23 +2892,24 @@ impl Router {
             .layout
             .reference_per_native_unit(&from.screen)
             .unwrap_or(self.reference_per_native_unit());
-        let delta = (dx / scale, dy / scale);
+        let gain = self.layout.remote_pointer_gain(&from.screen, origin);
+        let delta = (dx * gain / scale, dy * gain / scale);
         if let Some(disposition) = self.gap_motion(&from, (dx, dy), origin, now) {
             if disposition == Disposition::Pass {
                 let at = self.pointer.as_ref().unwrap();
-                self.out.push(Output::Inject(self.pushed_move(at, dx, dy)));
+                self.out.push(Output::Inject(self.pushed_move(at, dx, dy, origin)));
             }
             return;
         }
-        let r = self.layout.step(&from, (dx, dy));
+        let r = self.layout.step_from_source(&from, (dx, dy), origin);
         if r.to.screen.device == me {
             self.button_diagnostics.end_episode();
-            self.retain_resistance(&r.to, origin, delta);
+            self.retain_resistance(&r.to, origin, delta, now);
             self.pointer = Some(r.to.clone());
             let ev = if r.blocked_x || r.blocked_y || self.cfg.os == Os::Windows {
                 // Walls need the original delta (bug 8); Windows also uses it as
                 // capture motion evidence, even when an application clips the cursor.
-                self.pushed_move(&r.to, dx, dy)
+                self.pushed_move(&r.to, dx, dy, origin)
             } else {
                 InjectEvent::MoveTo { pos: r.to.local }
             };
@@ -2906,15 +2921,15 @@ impl Router {
         }
         if self.leave_blocked() || !self.input_ready(r.to.screen.device) {
             self.diagnostic(DecisionKind::Refused, self.refusal_reason(), Some(&r.to));
-            self.resistance = None;
+            self.reset_resistance();
             // 当作墙：留在当前屏幕内。
-            if let Some(p) = self.clamp_move(&from, dx, dy) {
-                self.out.push(Output::Inject(self.pushed_move(&p, dx, dy)));
+            if let Some(p) = self.clamp_move(&from, dx, dy, origin) {
+                self.out.push(Output::Inject(self.pushed_move(&p, dx, dy, origin)));
                 self.pointer = Some(p.clone());
                 if self.handoff_blocked() {
                     // 拖动中推边。
                     if let Some(scale) = self.layout.reference_per_native_unit(&from.screen) {
-                        self.dnd_push(origin, &from, r.to, (dx / scale, dy / scale), p.local);
+                        self.dnd_push(origin, &from, r.to, (dx * gain / scale, dy * gain / scale), p.local);
                     }
                 } else {
                     self.dnd_off_edge();
@@ -2922,11 +2937,11 @@ impl Router {
             }
             return;
         }
-        if let Some(p) = self.clamp_move(&from, dx, dy) {
-            self.retain_resistance(&p, origin, delta);
+        if let Some(p) = self.clamp_move(&from, dx, dy, origin) {
+            self.retain_resistance(&p, origin, delta, now);
             if !self.push_resistance(origin, &p, Some(&from), &r.to, delta, now) {
                 self.diagnostic(DecisionKind::Refused, DecisionReason::Resistance, Some(&r.to));
-                self.out.push(Output::Inject(self.pushed_move(&p, dx, dy)));
+                self.out.push(Output::Inject(self.pushed_move(&p, dx, dy, origin)));
                 self.pointer = Some(p);
                 return;
             }
@@ -3535,7 +3550,7 @@ impl Router {
         if same_holder && !was_holder && self.locked_device() == Some(holder) {
             self.keep_game_focus_epoch();
         }
-        self.resistance = None;
+        self.reset_resistance();
         self.unconfirmed_since = None;
         self.rejoin = false;
         self.enter_due = None;
@@ -3578,7 +3593,7 @@ impl Router {
         self.unconfirmed_since = None;
         self.rejoin = false;
         self.enter_due = None;
-        self.resistance = None;
+        self.reset_resistance();
         if !was_holder || was_gap {
             // 光标落点交给 backend 与模式切换一起原子地执行（先在隐藏状态下放到进入点、再切模式、再显示）：
             // 分开输出「注入 MoveTo」与「切模式」时，两者在不同的队列里执行，中间的物理移动会把光标拉回
@@ -4054,8 +4069,9 @@ impl Router {
     }
 
     /// 被墙挡住的一步：移到 `to`，同时给出这一步没被裁剪时的位移（手部 plane 换成 `to` 所在屏幕的本机单位）。
-    fn pushed_move(&self, to: &ScreenPos, dx: f64, dy: f64) -> InjectEvent {
-        let k = self.display_reference_per_native_unit(&to.screen.display);
+    fn pushed_move(&self, to: &ScreenPos, dx: f64, dy: f64, source: DeviceId) -> InjectEvent {
+        let k = self.display_reference_per_native_unit(&to.screen.display)
+            / self.layout.remote_pointer_gain(&to.screen, source);
         InjectEvent::MoveToWithDelta {
             pos: to.local,
             dx: dx / k,
@@ -4068,11 +4084,12 @@ impl Router {
     }
 
     /// 在当前屏幕内移动并裁剪到屏幕边缘（不能移交时用）。
-    fn clamp_move(&self, from: &ScreenPos, dx: f64, dy: f64) -> Option<ScreenPos> {
+    fn clamp_move(&self, from: &ScreenPos, dx: f64, dy: f64, source: DeviceId) -> Option<ScreenPos> {
+        let gain = self.layout.remote_pointer_gain(&from.screen, source);
         let plane = self.layout.to_plane(from)?;
         let local = self
             .layout
-            .from_plane(&from.screen, Point::new(plane.x + dx, plane.y + dy))?;
+            .from_plane(&from.screen, Point::new(plane.x + dx * gain, plane.y + dy * gain))?;
         let bounds = self.displays.iter().find(|d| d.key == from.screen.display)?.bounds;
         Some(ScreenPos::new(from.screen.clone(), bounds.clamp(local)))
     }
@@ -4149,7 +4166,14 @@ impl Router {
         } else {
             delta
         };
-        self.layout.first_portal(from, hand).is_some_and(|p| p.trigger_zone)
+        let source = if local {
+            self.me()
+        } else {
+            self.last_pointer_source.unwrap_or(self.me())
+        };
+        self.layout
+            .first_portal_from_source(from, hand, source)
+            .is_some_and(|p| p.trigger_zone)
     }
 }
 

@@ -7,12 +7,14 @@ import type { Platform } from '../window/DesktopWindow';
 import { ACCENT_SWATCHES, DEFAULT_ACCENT } from './appearance';
 import { api as backend, shell } from '../api/client';
 import { agent, useAgent } from '../api/store';
+import { ScreenPointerGains } from './ScreenPointerGains';
 import { KeyMapControl } from './KeyMap';
 import { LatencyChart } from './LatencyChart';
 import { PermissionRow } from '../permissions/PermissionRow';
 import { PermissionControl } from '../permissions/PermissionControl';
 import { useGrant } from './useGrant';
 import { UninstallControl } from './UninstallControl';
+import { UpdatePreferences, checkForUpdates } from './UpdatePreferences';
 import { SHORTCUTS, ShortcutRecorder, spokenKeys } from './Shortcuts';
 import type { ShortcutId } from './Shortcuts';
 import type { LogLevel, PermissionId, Prefs, PrefsApi } from './prefs';
@@ -120,7 +122,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
     const checkUpdate = async () => {
         setChecking(true);
         try {
-            await shell.openUrl('https://github.com/oinkvm/oink/releases');
+            await checkForUpdates(agentState.update);
         }
         catch {
             agent.fail('unavailable');
@@ -241,6 +243,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                     desc: <span className="setp__mono">v{version}</span>,
                     node: <Button size="sm" loading={checking} onClick={checkUpdate}>{tr('检查更新')}</Button>,
                 };
+            case 'updates': return { node: <UpdatePreferences status={agentState.update}/>, width: 'fill' };
             case 'about':
                 return { node: <Button size="sm" onClick={onAbout}>{tr('查看')}</Button> };
             case 'language':
@@ -291,6 +294,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                             } }]}/>),
                     stack: 'auto',
                 };
+            case 'screenPointerGains': return { node: <ScreenPointerGains/>, stack: true };
             case 'pointerGain':
                 return {
                     node: (<span className="setp__slider">
@@ -312,6 +316,11 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                         ]}/>),
                 };
             }
+            case 'notificationLevel':
+                return { node: <Select size="sm" aria-label={label} value={prefs.notificationLevel} onChange={v => set('notificationLevel', v as Prefs['notificationLevel'])} options={[
+                    {value:'disabled',label:tr('notifications|禁用')}, {value:'minimal',label:tr('notifications|精简')},
+                    {value:'default',label:tr('notifications|默认')}, {value:'verbose',label:tr('notifications|详细')},
+                ]}/> };
             case 'logLevel':
                 return {
                     node: (<Select size="sm" aria-label={label} value={prefs.logLevel} onChange={(v) => { set('logLevel', v as LogLevel); onLog(tr('日志级别 → {0}', v)); }} options={[

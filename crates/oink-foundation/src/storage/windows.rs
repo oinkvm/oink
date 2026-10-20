@@ -8,14 +8,14 @@ use std::os::windows::{
 use std::path::Path;
 use std::ptr::null_mut;
 
-use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
+use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
 };
 use windows_sys::Win32::Security::{GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FileRenameInfoEx, SetFileInformationByHandle,
+    FILE_SHARE_WRITE, FileRenameInfoEx, OPEN_ALWAYS, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_sys::Win32::System::WindowsProgramming::{
@@ -76,11 +76,30 @@ fn wide(path: &Path) -> io::Result<Vec<u16>> {
 }
 
 pub(super) fn create_private_new(path: &Path) -> io::Result<File> {
+    open_private(
+        path,
+        GENERIC_WRITE | DELETE,
+        FILE_SHARE_READ | FILE_SHARE_DELETE,
+        CREATE_NEW,
+    )
+}
+
+pub(super) fn open_private_lock(path: &Path) -> io::Result<File> {
+    open_private(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_ALWAYS)
+}
+
+fn open_private(path: &Path, access: u32, sharing: u32, disposition: u32) -> io::Result<File> {
     let path = wide(path)?;
     let sid = user_sid()?;
     // Protected DACL, one full-access ACE for the current user, no inherited
-    // grants. Passing it to CreateFileW avoids any wide-then-tighten interval.
-    let descriptor: Vec<u16> = format!("O:{sid}D:P(A;;FA;;;{sid})\0").encode_utf16().collect();
+    // grants. A Medium minimum admits the same user's Medium and High processes
+    // regardless of which created the file. No-read/write-up blocks Low callers
+    // from reading IPC secrets or modifying shared state. This is not an elevation
+    // grant: the exact user SID DACL still excludes other ordinary users.
+    // Passing it to CreateFileW avoids any wide-then-tighten interval.
+    let descriptor: Vec<u16> = format!("O:{sid}D:P(A;;FA;;;{sid})S:(ML;;NWNR;;;ME)\0")
+        .encode_utf16()
+        .collect();
     // SAFETY: UTF-16 strings are terminated; the descriptor and attributes outlive
     // CreateFileW, and the returned handle transfers exactly once to File.
     unsafe {
@@ -97,10 +116,10 @@ pub(super) fn create_private_new(path: &Path) -> io::Result<File> {
         };
         let handle = CreateFileW(
             path.as_ptr(),
-            GENERIC_WRITE | DELETE,
-            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            access,
+            sharing,
             &attributes,
-            CREATE_NEW,
+            disposition,
             FILE_ATTRIBUTE_NORMAL,
             null_mut(),
         );

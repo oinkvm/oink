@@ -168,7 +168,7 @@ impl FactsCache {
             dirty: false,
         })
     }
-    /// Cached facts may populate historical labels and address hints only.
+    /// Cached facts may populate historical labels, layout preferences and address hints only.
     pub fn get(&self, group: GroupId, device: DeviceId) -> Option<dto::DeviceFacts> {
         store::entries(&self.raw)
             .expect("validated facts")

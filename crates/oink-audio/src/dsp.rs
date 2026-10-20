@@ -570,6 +570,21 @@ impl Receiver {
             self.stats.late += 1;
             return false;
         }
+        if self.recovering
+            && self.next.is_none()
+            && self
+                .packets
+                .first_key_value()
+                .is_some_and(|(&first, _)| seq > first && seq - first >= maximum as u64)
+        {
+            // Refill has no playout cursor to advance its sequence window. If
+            // another outage strands less than the required reserve, retaining
+            // that old window rejects all future media forever. Start the refill
+            // at the new forward window; keep the decoded watermark (no replays)
+            // and jitter history (the outage still requires its learned reserve).
+            self.packets.0.clear();
+            self.first_packet = None;
+        }
         let first = self
             .next
             .or_else(|| self.packets.first_key_value().map(|(&seq, _)| seq));
@@ -2556,6 +2571,70 @@ mod wake_backlog_tests {
                     assert!(receiver.next.is_some());
                 }
             }
+        }
+    }
+    #[test]
+    fn starvation_refill_reanchors_after_a_second_packet_outage() {
+        for mut config in [
+            Config::low_latency_pcm(),
+            Config::low_latency_opus(),
+            Config::opus_10ms(),
+        ] {
+            config.jitter.adaptive = false;
+            let origin = Instant::now();
+            let mut encoder = Encoder::new_with_config(config).unwrap();
+            let payload = encoder.encode(&[0.2; FRAME_SAMPLES][..config.frame_samples()]).unwrap();
+            let mut receiver = Receiver::new_with_config(config).unwrap();
+            let mut output = [0.0; FRAME_SAMPLES];
+            assert!(receiver.push_slice_at(1, &payload, origin, None));
+            for tick in 0..40 {
+                receiver.render_into(
+                    origin + Duration::from_millis(tick * 10),
+                    config.frame_size(),
+                    &mut output[..config.frame_samples()],
+                    None,
+                );
+            }
+            assert!(receiver.recovering && receiver.next.is_none());
+            // One packet arrives during refill, then another loss interval carries
+            // the sender beyond this partial queue's entire sequence window.
+            let stranded = 100;
+            assert!(receiver.push_slice_at(stranded, &payload, origin + Duration::from_secs(1), None));
+            receiver.render_into(
+                origin + Duration::from_secs(1),
+                config.frame_size(),
+                &mut output[..config.frame_samples()],
+                None,
+            );
+            assert!(receiver.recovering && receiver.next.is_none());
+            let resumed = stranded + receiver.queue_capacity() as u64 * 2;
+            assert!(
+                receiver.push_slice_at(resumed, &payload, origin + Duration::from_secs(2), None),
+                "healthy media must replace a stranded refill window"
+            );
+            let required = receiver.adaptive.target + usize::from(!config.is_opus_10ms());
+            for offset in 1..required {
+                assert!(receiver.push_slice_at(
+                    resumed + offset as u64,
+                    &payload,
+                    origin + Duration::from_secs(2),
+                    None
+                ));
+            }
+            receiver.render_into(
+                origin + Duration::from_secs(2),
+                config.frame_size(),
+                &mut output[..config.frame_samples()],
+                None,
+            );
+            assert!(!receiver.recovering);
+            assert!(
+                output[..config.frame_samples()]
+                    .iter()
+                    .any(|sample| sample.abs() > 0.01)
+            );
+            assert!(receiver.last_decoded.is_some_and(|seq| seq >= resumed));
+            assert!(!receiver.push_slice_at(stranded, &payload, origin + Duration::from_secs(2), None));
         }
     }
     #[test]

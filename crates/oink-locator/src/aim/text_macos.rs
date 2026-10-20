@@ -91,15 +91,19 @@ fn cf_string(s: &str) -> Option<Owned> {
     Owned::new(unsafe { CFStringCreateWithBytes(std::ptr::null(), s.as_ptr(), s.len() as isize, UTF8, 0) })
 }
 
-fn font(bold: bool, size: f64, medium: bool) -> Option<Owned> {
+fn font(bold: bool, size: f64, medium: u8) -> Option<Owned> {
     let language = cf_string("zh-Hans")?;
     let kind = if bold { UI_EMPHASIZED } else { UI_SYSTEM };
     // SAFETY: 系统定义的界面字体类型；语言是有效的 CFString。
     let base = Owned::new(unsafe { CTFontCreateUIFontForLanguage(kind, size, language.0) })?;
-    if !medium || bold {
+    if medium == 0 || (bold && medium == 1) {
         return Some(base);
     }
-    let weight = 0.23_f64; // CoreText's system medium weight (CSS 500).
+    let weight = if medium == 2 {
+        if bold { 0.30_f64 } else { 0.11_f64 }
+    } else {
+        0.23_f64
+    }; // CSS 600/450 for toasts; 500 for annotations.
     // SAFETY: CFNumber copies the f64; nested dictionaries retain their CF values.
     unsafe {
         let weight = Owned::new(CFNumberCreate(std::ptr::null(), 6, &weight))?;
@@ -130,8 +134,8 @@ fn font(bold: bool, size: f64, medium: bool) -> Option<Owned> {
 }
 
 /// cap 高与字号的比例（按字重各算一次）。
-fn cap_ratio(bold: bool, medium: bool) -> Option<f64> {
-    static RATIO: [OnceLock<Option<f64>>; 4] = [const { OnceLock::new() }; 4];
+fn cap_ratio(bold: bool, medium: u8) -> Option<f64> {
+    static RATIO: [OnceLock<Option<f64>>; 6] = [const { OnceLock::new() }; 6];
     *RATIO[usize::from(bold) + usize::from(medium) * 2].get_or_init(|| {
         let f = font(bold, 100.0, medium)?;
         // SAFETY: 有效的 CTFont。
@@ -142,15 +146,18 @@ fn cap_ratio(bold: bool, medium: bool) -> Option<f64> {
 
 #[derive(Debug)]
 pub(super) struct SystemText {
-    medium: bool,
+    medium: u8,
 }
 
 impl SystemText {
+    pub(super) fn toast() -> Option<Self> {
+        (cap_ratio(false, 2).is_some() && cap_ratio(true, 2).is_some()).then_some(Self { medium: 2 })
+    }
     pub(super) fn medium() -> Option<Self> {
-        cap_ratio(false, true).map(|_| Self { medium: true })
+        cap_ratio(false, 1).map(|_| Self { medium: 1 })
     }
     pub(super) fn new() -> Option<Self> {
-        (cap_ratio(false, false).is_some() && cap_ratio(true, false).is_some()).then_some(Self { medium: false })
+        (cap_ratio(false, 0).is_some() && cap_ratio(true, 0).is_some()).then_some(Self { medium: 0 })
     }
 }
 
@@ -160,7 +167,7 @@ impl TextRaster for SystemText {
     }
 }
 
-fn render(text: &str, cap: f64, bold: bool, medium: bool) -> Option<Mask> {
+fn render(text: &str, cap: f64, bold: bool, medium: u8) -> Option<Mask> {
     let font = font(bold, cap.max(1.0) / cap_ratio(bold, medium)?, medium)?;
     let string = cf_string(text)?;
     // SAFETY: 两个系统定义的属性键；值分别是有效的 CTFont 与 kCFBooleanTrue。字典按 CF 类型的回调持有它们。

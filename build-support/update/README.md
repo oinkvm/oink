@@ -1,17 +1,131 @@
 # Platform update feeds
 
-Beta.1 is manual-only on both platforms. `packaging/update-trust.json` contains
-independent `mac.enabled` and `windows[].enabled` gates, all false, with null keys
-and no Authenticode pins. A configured key alone does not enable updates. A
-platform's release owner enables it only after its signed N→N+1 and rollback
-qualification (Mac also requires notarization; Windows requires SignPath).
-Missing trust on an enabled platform is an error, never a disabled fallback.
+Update trust is independent per platform in `packaging/update-trust.json`.
+A public key alone does not enable updates: `enabled` stays false until the
+release owner approves TEST-key N→N+1 and failure/rollback qualification (Mac
+also requires Developer ID signing and notarization). Missing trust on an
+enabled platform is an error. The first Mac-capable public release is intended
+to be v0.1.1; existing v0.1.0/manual-only installations need one manual upgrade.
+They cannot discover this capability retroactively.
 
 The fixed host is `https://updates.oink.hachiwii.com`. Mac owns `mac/`; Windows
 owns `windows/`. Client feeds use `v1/mac-2026-01/{stable,beta}/appcast.xml` and
 `v1/win-2026-01/{stable,beta}/manifest.json` under those prefixes. Both clients
 return `NotConfigured`, `phase: disabled`, and no active checks until enabled.
 Preferences and CLI commands cannot bypass this release gate.
+
+## One-time user setup: GitHub Pages and Cloudflare DNS
+
+Use **GitHub Pages**, preserving the existing full-snapshot/CAS/rollback code.
+No Cloudflare Worker, account, API token or website deployment is needed. The
+website and update host are independent exact hostnames.
+
+1. In `oinkvm/oink` Settings → Pages, choose **GitHub Actions** as the source;
+   set the custom domain to **updates.oink.hachiwii.com**. A checked-in CNAME
+   does not configure an Actions Pages site's custom domain. Verify ownership
+   under the owner's Pages settings using the TXT record GitHub supplies.
+2. In the Cloudflare `hachiwii.com` zone add **CNAME** name **updates.oink**,
+   target **oinkvm.github.io**, **DNS only** (grey cloud), TTL Auto. No scheme,
+   repository path, wildcard or Worker route. Leave the existing website alone.
+   Once GitHub's DNS check/certificate completes, enable **Enforce HTTPS**.
+3. User creates a fine-grained PAT, resource owner `oinkvm`, selected repository
+   `oink` only, **Contents read/write** (Metadata read is implicit). Set it as
+   repository Actions secret **UPDATE_FEED_WRITER_TOKEN**. It is not a signing
+   key; it only persists the data snapshot through the trusted workflow. A PAT
+   cannot itself be scoped to one branch; branch rules and workflow isolation
+   provide that boundary. Set an expiry and renew it before expiration.
+4. User initializes the data-only branch once (commands below). Protect it from
+   force-push and deletion; permit normal fast-forward automation commits. Do
+   not require PRs or signed commits on this data branch. Never execute its files.
+5. Environments **release**, **macos-update-publishing** and **github-pages**
+   must allow the default branch AND **v*** tags: release events have tag refs.
+   A main-only environment rule would block publication. Keep any configured
+   reviewer approval; approve only after package/update qualification. Pages uses
+   `pages:write`/OIDC, while the PAT only commits the data branch.
+
+Run from a reviewed default-branch checkout, with GitHub CLI already authorized:
+
+```sh
+state_dir="$(mktemp -d)/feed-state"
+python3 build-support/update/feed_site.py init --output "$state_dir"
+git -C "$state_dir" init --initial-branch=update-feed-state
+git -C "$state_dir" add registry.json site
+git -C "$state_dir" commit -m "Initialize disabled update feed state"
+git -C "$state_dir" remote add origin https://github.com/oinkvm/oink.git
+git -C "$state_dir" push origin HEAD:update-feed-state
+```
+
+These are **user** provisioning commands; agents do not run them. Existing
+branches are never reset/reinitialized. Initial state contains only a landing
+page and CNAME; both feed prefixes return 404 until independently published.
+GitHub Pages serves this custom domain from its root, not `/oink/`.
+See [GitHub's custom-domain setup](https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site/managing-a-custom-domain-for-your-github-pages-site)
+and [Actions publishing](https://docs.github.com/en/pages/getting-started-with-github-pages/configuring-a-publishing-source-for-your-github-pages-site).
+
+### First deployment and HTTPS readiness
+
+A configured CNAME is not a deployment or a certificate. After the reviewed
+release code reaches the public default branch, the user runs **Bootstrap
+disabled update site** (`bootstrap-update-site.yml`) from that branch. It reads
+the existing initial `update-feed-state` snapshot and deploys only its landing
+page and CNAME, using `github-pages`/OIDC. It needs no signing keys or writer
+PAT, never advances the data branch and refuses any changed/enabled snapshot.
+Do not reinitialize an existing state branch. Normal feed deployment deliberately
+requires HTTPS readback and cannot be used to bootstrap an unavailable site.
+
+In Settings → Pages, check the DNS validation for `updates.oink.hachiwii.com`
+and wait for GitHub's Let's Encrypt certificate to be issued. Then enable
+**Enforce HTTPS**. If issuance is still stuck after an hour, the user removes
+and re-adds the same custom domain and saves it to restart certificate
+provisioning; verify the DNS-only CNAME and any CAA records first (CAA must
+permit `letsencrypt.org`). Do not add a second hosting service or disable client
+TLS verification. The first deployment does not itself guarantee certificate
+issuance; the domain/DNS checks must succeed too.
+
+Before publishing a release, require all of these read-only checks to pass:
+
+```sh
+gh api repos/oinkvm/oink/pages --jq '{status,https_enforced,https_certificate}'
+curl --fail --show-error https://updates.oink.hachiwii.com/
+curl --head https://updates.oink.hachiwii.com/mac/v1/mac-2026-01/stable/appcast.xml
+curl --head https://updates.oink.hachiwii.com/windows/v1/win-2026-01/stable/manifest.json
+```
+
+The landing page must return 200 with a publicly trusted certificate;
+`https_enforced` must be true. Both feed URLs return 404 before the first feed
+publication. After the user publishes the v0.1.1 draft, the release controllers
+publish **v0.1.1 itself** to both stable feeds, verify the hosted bytes over HTTPS
+and commit the resulting snapshot. Existing v0.1.0 installations have updates
+disabled and need one manual install of v0.1.1; v0.1.1 then checks the same feed
+for later builds. Draft creation never changes the feeds.
+
+See [GitHub's HTTPS provisioning and troubleshooting](https://docs.github.com/en/pages/getting-started-with-github-pages/securing-your-github-pages-site-with-https).
+
+## Mac signing key: user only
+
+On the user's Mac, from the reviewed repository root, run exactly:
+
+```sh
+python3 build-support/update/setup-macos-key.py
+```
+
+The command downloads/verifies pinned Sparkle 2.9.6, uses its official
+`generate_keys --account Oink-mac-2026-01`, retains the private seed in the login
+Keychain, and sends it directly in memory to `gh secret set
+SPARKLE_ED25519_PRIVATE_KEY --repo oinkvm/oink --env release` via stdin. No
+private argv, terminal output, files, logs or evidence. Re-running reuses the
+same account; a differing existing public root is refused. GitHub CLI must
+already be signed in and able to manage environment secrets. Review/commit only
+`packaging/update-trust.json`'s public key; enablement is unchanged. There is no
+`SPARKLE_PUBLIC_ED_KEY` secret/variable. The same committed public root goes into
+the app's `SUPublicEDKey` and the feed verifier.
+
+Keep a recoverable encrypted backup of the login Keychain. An agent must never
+run this command, read/export the resulting production key, or put it in a
+qualification build. CI receives the private seed only in the `release`
+environment's signing step, through the official signer's `--ed-key-file -`
+stdin interface. This replaces the earlier offline-only CI policy by explicit
+user decision. The offline `mac-appcast.py` Keychain hook remains available.
 
 ## State and transaction
 
@@ -74,42 +188,130 @@ failure; it must be repaired from that prior snapshot before another publication
 A canceled runner or unavailable Pages service cannot guarantee remote rollback;
 the stored parent and previous-feed artifact remain recovery inputs.
 
-## Mac candidate
+## Mac release controller and candidate
 
-The offline signer uses only an existing Keychain account, default
-`Oink-mac-2026-01`, and the pinned Sparkle 2.9.6 distribution. It never creates a
-key. Run `mac-appcast.py` on approved arm64 ZIP/DMG archives with `--build`, `--tag`,
-`--notes` (required `en` and `zh-Hans` plain-text JSON), and `--channel`. It embeds
-bilingual notes before the final official Sparkle signature. Do not modify the
-signed bytes afterwards. No delta generation is enabled.
+`release.yml` workflow_dispatch builds/verifies both platforms and creates a
+**draft** containing the notarized DMG, MSI, the ZIP of the already-stapled app,
+`release.json`, `update.json` and `SHA256SUMS`. Fill `.github/update-notes.json`
+with reviewed `channel: stable`, `severity: normal|critical` and plain-text `en`
+and `zh-Hans` notes before building. Notes and ZIP hashes are bound into the
+release record and checksums. Private symbols are never release assets.
 
-The publisher artifact contains `site/mac/v1/mac-2026-01/<channel>/appcast.xml`
-and `catalog.json`, keyed by that complete relative path. Each catalog entry has
-`architecture: "arm64"`, integer `build`, `version`, `url`, integer `length`,
-`sha256`, `developer_id_verified: true`, `notarized: true`, and `qualified_build`
-equal to the build. The release controller supplies that build separately as
-`qualified_build`. The public verifier checks the signed XML, package signature,
-length/hash and catalog match; the protected qualification job supplies native
-Developer ID/notarization and N→N+1 evidence. Pass a full Mac prefix including
-any unchanged channel; publication does not implicitly delete channels.
+Only **release.published**, non-draft/non-prerelease, calls
+`publish-macos-feed.yml`. Disabled trust skips before accessing secrets or the
+data branch. It runs trusted default-branch code, fetches the tag as data,
+requires it to be an ancestor of that branch, and binds the release version,
+build, built commit, source-tree digest, archive bytes and bilingual notes.
+It never executes tag/data-branch code. Native Developer ID/team/ticket and the
+recorded 10-second signed smoke/notarization are checked before signing.
+The official pinned `sign_update` signs the exact ZIP and then the final appcast;
+both are independently verified with the committed public key. No delta builds.
+Old stable items are retained. Stable releases also reach beta subscribers;
+a newer beta prefix is retained byte-for-byte with its prior qualification. The signed
+candidate is a **same-run artifact** passed to the existing verifier/deployer;
+no artifact from a PR or unrelated run can select update bytes.
+
+The artifact contains `site/mac/v1/mac-2026-01/stable/appcast.xml` and
+`catalog.json`, keyed by the complete relative path. Catalogs bind arm64, build,
+version, URL, length, SHA-256, native identity/notarization and qualified build.
+Reviewed trust enablement records that the product's TEST-key qualification has
+passed; strings in an arbitrary download do not establish qualification. The
+publisher verifies public package bytes again and refuses non-increasing builds.
+A failed publication never silently replaces the prior feed; inspect the Pages
+rollback result before rerunning. Re-publishing an already committed build is
+rejected; no force-push or feed downgrade is a rollback mechanism.
+
+## Settings and qualification
+
+Default policy is **stable / automatic checks / notify**. Notify is the only
+production behavior, not a persisted mode: preferences contain checks_enabled
+and channel only. Checking never downloads or installs a candidate. The user
+explicitly downloads it, then clicks Install when its typed phase is Ready.
+Manual Check is never rate-limited: concurrent requests share the queued or
+active check and its status/events result; a completed check can be refreshed
+immediately. Only background checks use the daily scheduling interval.
+Install immediately interrupts input, audio (including silent open streams),
+drag/promises, clipboard/file transfer and other sharing work; it never waits
+for an idle interval, session unlock or activity completion. The backend closes
+new-work admission, releases held input through an injection fence, restores
+source mute while suspending audio, and temporarily suspends its provider before
+replacement/relaunch. Failed cleanup/integration or another installer produces
+a bounded explicit failure; no hidden retry or WaitingForIdle continuation.
+Aborted preparation reopens admission and reconciles audio without changing the
+user's forwarding preferences or exit selection.
+
+There is **no production automatic-install setting, IPC command or CLI option**.
+Qualification automation belongs only to the external TEST harness, which polls
+normal status and explicitly sends Check, Download and Install(expected_build)
+against the installed TEST build. It uses the same immediate Install path as a
+click, without synthetic input, an automatic-mode preference or a safety bypass.
+Stored policies with unknown fields (including a removed mode) are invalid under
+the existing strict parser; there is no migration for unreleased TEST state.
+
+Check-for-updates uses native update IPC when enabled; disabled versions open
+Releases. Mac settings are per-user; Windows settings are machine-wide and normal
+users see why administrator permission is needed. The package pipeline rejects
+the removed idle-install phase/policy in both executable and frontend content.
+
+Before enabling Mac trust, use **TEST** Ed25519 material and an external test
+source export with a compiled loopback feed, never the production root or feed.
+Sparkle 2.9.6 permits EdDSA-signed HTTP on local networks (SPUUpdater's security
+check explicitly warns rather than rejects). Qualification alone may add
+`NSAllowsLocalNetworking` in its TEST plist. Production content checks forbid
+ATS exceptions; no runtime URL/key override is added. Get approval of the real
+Mac/path first. An install owner installs test N; K1 drives the actual custom
+Sparkle bridge via IPC, verifies N→N+1 download/signature/interruption/fence/swap/relaunch,
+and verifies a rejected/corrupt update leaves the previous app usable, provider
+state connected, and input/admission restored. A rejection before replacement
+is distinct from post-install health rollback: Sparkle does not implement the
+Windows health journal. Record exactly which failure stage was qualified.
+Only the install owner restores the user's accepted build. No input injection,
+CA/root-trust changes or production endpoint publication. Stop the test server,
+unregister only test/staging bundles, and remove test archives/cache afterward.
+Never label pure tests or packaging smoke as real Sparkle qualification.
 
 ## Windows candidate
 
-The publisher takes the final SignPath-verified MSI, `release.json` and
-`update.json` (channel, severity, bilingual notes), plus source tree SHA-256,
-release tag, SignPath approval and qualified build. Receipt provenance is
-`source_tree_sha256` (64 lowercase hex); the signed manifest uses
-`sourceTreeSha256`. Public package signing checks exact artifact hash/length and
-provenance. Registration verifies immutable GitHub Release asset bytes again.
-The update signing secret is `WINDOWS_UPDATE_ED25519_PEM_WIN_2026_01`, restricted
-to the Windows signing environment. It is written only to a temporary 0600 file,
-never argv, workflow outputs or public artifacts. Authenticode roots are SHA-256
-of signer SubjectPublicKeyInfo, not certificate names.
+The Windows reusable publisher takes `release_tag`, fetches the final published
+`release.json`, MSI and `update.json`, and binds them to the fetched tag's commit
+and exact source-tree digest using trusted default-branch code. Native MSI
+inspection checks the embedded inventory. Ed25519 metadata/package signatures
+are mandatory; Authenticode/SignPath pins are additionally enforced when
+configured. An empty reviewed pin list permits unsigned Windows packages.
+No arbitrary path/URL/key/command line can enter the SYSTEM updater through IPC.
 
-The final package/native signature verifier belongs to the release pipeline.
-Both its successful result and this run's qualification result must be bound to
-the exact package before invoking the publisher; no publisher approves SignPath
-or performs an install. Source code is always the trusted workflow checkout.
+Windows package URLs in a verified manifest may use **any HTTPS host**, including
+R2 or another CDN; neither repository release paths nor redirect hosts are pinned
+in installed clients. Every redirect hop must remain HTTPS, contain no userinfo
+or credentials, and stay within five redirects. Query strings, object paths and
+HTTPS ports are allowed. The manifest itself remains on the fixed update host.
+The authority to install comes from the pinned Ed25519-signed manifest and the
+downloaded package's exact SHA-256 and size (plus its Ed25519 signature), checked
+before staging/use; HTTPS or a package host is never an independent trust root.
+A compromised package host can deny service but cannot substitute accepted bytes
+without the signing key. Optional Authenticode pins still add their own check.
+The Mac controller likewise delegates enclosure downloads to Sparkle without a
+package-host allowlist; its signed feed/archive checks remain authoritative.
+
+Windows treats administrators and SYSTEM as trusted. Ordinary users cannot write
+the maintenance directory or its records. Package verification occurs once after
+download, and MSI/cabinet inspection once before staging the protected plan. The
+worker checks manifest freshness immediately before MSI, holds the staged MSI
+read-only during use, and uses one product/hash/removal authorization record with
+the effective SYSTEM caller and maintenance lock. There are no worker identity,
+journal-hash or ancestor-ACL bindings, duplicated lock handles or guardian leases.
+MSI owns native rollback; the worker owns post-install health, rollback and its
+recovery task. See [the admission contract](../../docs/release/windows-msi-admission.md).
+
+The user-only command is `python3 build-support/update/setup-windows-key.py`.
+Its `WINDOWS_UPDATE_ED25519_PEM_WIN_2026_01` secret belongs to the **release**
+environment; only the public root is committed and enablement remains off until
+qualification approval. The publisher uses the existing protected stage/worker,
+signed records and sequence CAS. Registration verifies public immutable asset
+bytes again. Receipts use `source_tree_sha256`; signed manifests use
+`sourceTreeSha256`. Both bind the same 64 lowercase hexadecimal digest.
+Authenticode roots, when configured, are SHA-256 of SubjectPublicKeyInfo, never
+certificate holder names. Production signing material is never used for tests.
 
 ## Verification
 

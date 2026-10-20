@@ -26,7 +26,6 @@ pub enum Blocker {
     SessionChanged,
     OwnerMissing,
     Consent,
-    IdleInterval,
     IntegrationUnavailable,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -42,7 +41,6 @@ struct State {
     generation: u64,
     expires: Option<Instant>,
     shutdown: bool,
-    idle_since: Instant,
 }
 #[derive(Clone, Debug)]
 pub struct Barrier(Arc<Mutex<State>>);
@@ -57,7 +55,7 @@ pub struct Quiesced {
     generation: u64,
 }
 impl Barrier {
-    pub fn new(now: Instant) -> Self {
+    pub fn new(_now: Instant) -> Self {
         Self(Arc::new(Mutex::new(State {
             activities: BTreeMap::new(),
             owners: BTreeSet::new(),
@@ -66,7 +64,6 @@ impl Barrier {
             generation: 0,
             expires: None,
             shutdown: false,
-            idle_since: now,
         })))
     }
     pub fn register(&self, owner: Owner, now: Instant) {
@@ -81,18 +78,17 @@ impl Barrier {
             return Err(Error::Busy);
         }
         *s.activities.entry(reason).or_default() += 1;
-        s.idle_since = now;
         Ok(Activity {
             barrier: self.clone(),
             reason,
         })
     }
-    /// Called for local physical input, suspend, session changes and owner loss.
+    /// Called for session topology changes and owner loss.
     /// Invalidates all previously issued tokens, reopening admission unless shutdown began.
     pub fn invalidate(&self, now: Instant) {
         invalidate(&mut self.0.lock().unwrap(), now);
     }
-    pub fn begin(&self, tx: TransactionId, automatic: bool, now: Instant) -> Result<(), Vec<Blocker>> {
+    pub fn begin(&self, tx: TransactionId, now: Instant) -> Result<(), Vec<Blocker>> {
         let mut s = self.0.lock().unwrap();
         expire(&mut s, now);
         if s.shutdown || s.transaction.is_some_and(|active| active != tx) {
@@ -101,14 +97,8 @@ impl Barrier {
         if s.transaction == Some(tx) {
             return Ok(());
         }
-        let mut reasons: Vec<_> = s.activities.keys().copied().collect();
-        if automatic && now.saturating_duration_since(s.idle_since) < Duration::from_secs(60) {
-            reasons.push(Blocker::IdleInterval);
-        }
-        if !reasons.is_empty() {
-            return Err(reasons);
-        }
-        // Closing admission and checking activity counts happen under the same lock.
+        // Manual intent closes admission despite current activity. Owners ACK
+        // only after bounded interruption/release; activity counts never veto.
         s.transaction = Some(tx);
         s.acks.clear();
         s.expires = Some(now + Duration::from_secs(30));
@@ -154,9 +144,8 @@ impl Barrier {
         Ok(())
     }
 }
-fn invalidate(s: &mut State, now: Instant) {
+fn invalidate(s: &mut State, _now: Instant) {
     s.generation = s.generation.wrapping_add(1);
-    s.idle_since = now;
     if !s.shutdown {
         s.transaction = None;
         s.acks.clear();
@@ -177,7 +166,6 @@ impl Drop for Activity {
                 s.activities.remove(&self.reason);
             }
         }
-        s.idle_since = Instant::now();
     }
 }
 #[cfg(test)]
@@ -185,9 +173,8 @@ mod tests {
     use super::*;
     const TX: TransactionId = TransactionId([1; 16]);
     #[test]
-    fn active_work_cannot_be_interrupted() {
+    fn explicit_install_closes_admission_despite_all_activity_owners() {
         let now = Instant::now();
-        let b = Barrier::new(now);
         for reason in [
             Blocker::Drag,
             Blocker::Promise,
@@ -198,9 +185,17 @@ mod tests {
             Blocker::FileProvider,
             Blocker::ClipboardBulk,
             Blocker::Locked,
+            Blocker::Configuration,
+            Blocker::Suspended,
         ] {
+            let b = Barrier::new(now);
+            b.register(Owner(1), now);
             let active = b.enter(reason, now).unwrap();
-            assert_eq!(b.begin(TX, false, now), Err(vec![reason]));
+            b.begin(TX, now).unwrap();
+            assert!(b.enter(reason, now).is_err());
+            assert!(b.quiesced(TX, now).is_err());
+            b.acknowledge(TX, Owner(1), now).unwrap();
+            assert!(b.quiesced(TX, now).is_ok());
             drop(active);
         }
     }
@@ -209,7 +204,7 @@ mod tests {
         let now = Instant::now();
         let b = Barrier::new(now);
         b.register(Owner(1), now);
-        b.begin(TX, false, now).unwrap();
+        b.begin(TX, now).unwrap();
         assert!(b.enter(Blocker::Drag, now).is_err());
         assert!(b.quiesced(TX, now).is_err());
         b.acknowledge(TX, Owner(1), now).unwrap();
@@ -222,7 +217,7 @@ mod tests {
         for elapsed in [0, 31] {
             let now = Instant::now();
             let b = Barrier::new(now);
-            b.begin(TX, false, now).unwrap();
+            b.begin(TX, now).unwrap();
             let token = b.quiesced(TX, now).unwrap();
             if elapsed == 0 {
                 b.invalidate(now);
@@ -232,19 +227,17 @@ mod tests {
         }
         let now = Instant::now();
         let b = Barrier::new(now);
-        b.begin(TX, false, now).unwrap();
+        b.begin(TX, now).unwrap();
         b.abort(TX, now).unwrap();
         assert!(b.enter(Blocker::Audio, now).is_ok());
     }
     #[test]
-    fn automatic_waits_sixty_seconds_all_owners_ack() {
+    fn explicit_install_has_no_idle_timer_but_requires_every_owner_fence() {
         let now = Instant::now();
         let b = Barrier::new(now);
         b.register(Owner(1), now);
         b.register(Owner(2), now);
-        assert!(b.begin(TX, true, now + Duration::from_secs(59)).is_err());
-        let now = now + Duration::from_secs(60);
-        b.begin(TX, true, now).unwrap();
+        b.begin(TX, now).unwrap();
         b.acknowledge(TX, Owner(1), now).unwrap();
         assert!(b.quiesced(TX, now).is_err());
         b.acknowledge(TX, Owner(2), now).unwrap();

@@ -191,6 +191,7 @@ pub fn owner_preferences(
             .insert(
                 screen.display()?.0,
                 ScreenPreference {
+                    remote_gain: screen.remote_gain()?,
                     gain: screen.gain()?,
                     enabled: screen.enabled()?,
                 },
@@ -518,6 +519,7 @@ mod tests {
                 screens: std::collections::BTreeMap::from([(
                     "b".into(),
                     oink_display::layout::ScreenPreference {
+                        remote_gain: 1.0,
                         enabled: false,
                         gain: 1.0,
                     },

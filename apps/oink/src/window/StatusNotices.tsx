@@ -11,7 +11,6 @@ function alertText(kind:Exclude<AlertKind, {type:'permission_missing'}>):string 
     case 'secure_input':return tr('安全输入已启用，键盘共享暂不可用');
     case 'new_screen':return tr('检测到新屏幕，请检查排列');
     case 'group_state_unreadable':return tr('无法读取设备组状态');
-    case 'address_stale':return tr('设备地址已变化，请更新 IP');
     case 'peer_offline':return tr('设备已离线');
     case 'emergency_stop':return tr('已收到暂停设备组共享指令');
     default:return tr('共享状态需要注意');

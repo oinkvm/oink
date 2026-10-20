@@ -323,12 +323,19 @@ impl SourceState {
                 self.remaining = 0;
                 self.burst = packet.burst;
             }
+            let buffered_before = self.receiver.buffered_frames();
             let accepted = self.receiver.push_slice_at(
                 packet.sequence,
                 &packet.payload[..packet.len],
                 packet.arrived,
                 packet.source_emit,
             );
+            // Admission may replace a stranded refill window as well as reject
+            // this packet. Retire exactly the frames no longer owned by DSP;
+            // otherwise the handoff capacity and idle drain retain phantom PCM.
+            let retired =
+                (buffered_before + self.receiver.config().frame_size()).saturating_sub(self.receiver.buffered_frames());
+            self.status.occupied.fetch_sub(retired, Ordering::AcqRel);
             if accepted {
                 let highest = self
                     .status
@@ -343,10 +350,6 @@ impl SourceState {
                     Ordering::Release,
                 );
                 self.status.accepted.fetch_add(1, Ordering::Release);
-            } else {
-                self.status
-                    .occupied
-                    .fetch_sub(self.receiver.config().frame_size(), Ordering::AcqRel);
             }
             let outcome = Outcome {
                 sequence: packet.sequence,
@@ -702,6 +705,52 @@ mod tests {
             }
             true
         }
+    }
+    #[test]
+    fn refill_window_replacement_releases_retired_pcm_and_idle_drain_completes() {
+        let mut config = dsp::Config::low_latency_pcm();
+        config.jitter.adaptive = false;
+        let origin = Instant::now();
+        let (mut source, mut state) = SourceState::prepare(config, realtime::Signal::new().unwrap(), false).unwrap();
+        let registry = Registry::new();
+        registry.slots[0].store(&mut *state, Ordering::Release);
+        let mut encoder = dsp::Encoder::new_with_config(config).unwrap();
+        let payload = encoder.encode(&[0.2; 240]).unwrap();
+        let mut output = OutputProbe {
+            needed: 0,
+            frames: 0,
+            peak: 0.0,
+        };
+        assert!(source.push(1, &payload, origin, None, None));
+        for tick in 0..100 {
+            output.needed = config.frame_size();
+            registry.work(&mut output, origin + Duration::from_millis(tick * 10));
+        }
+        let restored = origin + Duration::from_secs(2);
+        assert!(source.push(100, &payload, restored, None, None));
+        output.needed = config.frame_size();
+        registry.work(&mut output, restored);
+        assert_eq!(source.status.occupied.load(Ordering::Acquire), config.frame_size());
+        // The new sequence window replaces this one-packet partial refill.
+        let sequence = 100 + state.receiver.packet_capacity() as u64 * 2;
+        for offset in 0..3 {
+            assert!(source.push(sequence + offset, &payload, restored, None, None));
+        }
+        output.peak = 0.0;
+        output.needed = config.frame_size();
+        registry.work(&mut output, restored);
+        assert!(output.peak > 0.1, "restored packets render in the same source/burst");
+        assert_eq!(
+            source.status.occupied.load(Ordering::Acquire),
+            state.receiver.buffered_frames()
+        );
+        registry.draining.store(true, Ordering::Release);
+        for tick in 0..10 {
+            output.needed = config.frame_size();
+            registry.work(&mut output, restored + Duration::from_millis(tick * 3));
+        }
+        assert!(registry.drained.load(Ordering::Acquire));
+        assert_eq!(source.status.occupied.load(Ordering::Acquire), 0);
     }
     #[test]
     fn direct_reader_runs_with_stalled_control_and_keeps_receiver_on_pause() {

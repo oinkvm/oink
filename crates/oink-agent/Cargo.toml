@@ -68,6 +68,7 @@ objc2-core-graphics = "0.3"
 oink-winsvc = { path = "../oink-winsvc" }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_NetworkManagement_WindowsFirewall",
     "Win32_System_Com",
     "Win32_System_Services",

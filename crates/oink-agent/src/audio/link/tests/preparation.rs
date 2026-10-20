@@ -2,6 +2,163 @@
 use super::*;
 
 #[tokio::test]
+async fn unresponsive_candidate_dial_does_not_block_live_media() {
+    let running = Running::start(false).await;
+    let source = &running.owners[0].links;
+    let exit = running.owners[1].links.id();
+    let link = source.links().by_peer(exit).unwrap().link;
+    let read = ForwardTable::sink_reader(running.owners[1].streams.forward_table(), source.id());
+    // A socket that never answers keeps the real QUIC candidate pending for its
+    // entire deadline. A different, authenticated peer must still carry M1.
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    source
+        .dial(
+            DeviceId([200; 32]),
+            vec![silent.local_addr().unwrap()],
+            oink_network::link::DialMode::PreferDirect,
+        )
+        .unwrap();
+    for _ in 0..16 {
+        running.supply(0, 0.2);
+        tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                if read().1.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("a pending dial must not block another peer's datagrams");
+    }
+    assert_eq!(source.links().by_peer(exit).unwrap().link, link);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn packet_outage_during_refill_resumes_on_the_same_live_quic_session() {
+    let running = Running::start(false).await;
+    let settings = running.owners[0].settings.clone();
+    let session = running.owners[0].source_session.prepared().unwrap().clone();
+    let read = ForwardTable::sink_reader(running.owners[1].streams.forward_table(), running.owners[0].links.id());
+    async fn receive(
+        running: &Running,
+        read: &dyn Fn() -> (bool, Option<oink_audio::sink::Packet>),
+    ) -> oink_audio::sink::Packet {
+        running.supply(0, 0.2);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(packet) = read().1 {
+                    return packet;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("real QUIC delivers the fake capture packet")
+    }
+    let mut config = session.profile.config();
+    config.jitter.adaptive = false;
+    let mut dsp = dsp::Receiver::new_with_config(config).unwrap();
+    let mut pcm = [0.0; dsp::FRAME_SAMPLES];
+    let origin = Instant::now();
+    let packet = receive(&running, &*read).await;
+    assert!(dsp.push_slice_at(
+        packet.sequence,
+        &packet.payload[..packet.len],
+        packet.arrived,
+        packet.source_emit
+    ));
+    // Render through the initial loss until the receiver enters refill.
+    for tick in 0..40 {
+        dsp.render_into(
+            origin + Duration::from_millis(tick * 10),
+            config.frame_size(),
+            &mut pcm[..config.frame_samples()],
+            None,
+        );
+    }
+    assert!(dsp.stats().rebufferings > 0);
+    for _ in 0..20 {
+        let _ = receive(&running, &*read).await;
+    }
+    let partial = receive(&running, &*read).await;
+    assert!(dsp.push_slice_at(
+        partial.sequence,
+        &partial.payload[..partial.len],
+        partial.arrived,
+        partial.source_emit
+    ));
+    // Drop media while the same authenticated link, claim and source are live.
+    // 300 packets exceeds every negotiated jitter window without a wall-clock wait.
+    for _ in 0..300 {
+        let _ = receive(&running, &*read).await;
+    }
+    let resumed = receive(&running, &*read).await;
+    assert!(
+        dsp.push_slice_at(
+            resumed.sequence,
+            &resumed.payload[..resumed.len],
+            resumed.arrived,
+            resumed.source_emit
+        ),
+        "restored media must unpin the partial refill window"
+    );
+    for _ in 0..config.jitter.initial_frames {
+        let packet = receive(&running, &*read).await;
+        assert!(dsp.push_slice_at(
+            packet.sequence,
+            &packet.payload[..packet.len],
+            packet.arrived,
+            packet.source_emit
+        ));
+    }
+    dsp.render_into(
+        origin + Duration::from_secs(2),
+        config.frame_size(),
+        &mut pcm[..config.frame_samples()],
+        None,
+    );
+    assert!(pcm[..config.frame_samples()].iter().any(|sample| sample.abs() > 0.1));
+    assert_eq!(running.owners[0].source_session.prepared(), Some(&session));
+    assert_eq!(running.owners[0].settings, settings);
+    assert_eq!(pauses(&running.platforms[0]), 0);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn link_loss_retires_source_offer_and_resumes_without_preference_changes() {
+    let mut running = Running::start(true).await;
+    let source = running.owners[0].links.clone();
+    let exit = running.owners[1].links.clone();
+    let old = running.owners[0].source_session.prepared().unwrap().clone();
+    let settings = running.owners[0].settings.clone();
+    let link = source.links().by_peer(exit.id()).unwrap().link;
+    oink_network::link::testing::set_direct_blocked(&source, exit.id(), true);
+    oink_network::link::testing::set_direct_blocked(&exit, source.id(), true);
+    source.disconnect(link, oink_network::link::Disconnect::ControlStreamFailed);
+    running
+        .until(|r| r.owners[0].capture.is_none() && r.owners[0].selected.is_none())
+        .await;
+    assert_eq!(running.owners[0].settings, settings);
+    assert!(
+        running.owners[0].source_session.offer().is_none(),
+        "a lost link must not retain an offer whose M0 opening was discarded"
+    );
+    oink_network::link::testing::set_direct_blocked(&source, exit.id(), false);
+    oink_network::link::testing::set_direct_blocked(&exit, source.id(), false);
+    running.until(Running::prepared_route_ready).await;
+    let current = running.owners[0].source_session.prepared().unwrap();
+    assert_ne!(current.session(), old.session());
+    assert_eq!(running.owners[0].settings, settings);
+    let sent = running.owners[0].sent.load(Ordering::Relaxed);
+    running.supply(0, 0.1);
+    assert!(running.owners[0].sent.load(Ordering::Relaxed) > sent);
+    assert_eq!(pauses(&running.platforms[0]), 0);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn prepared_ack_is_required_and_claim_retake_never_revives_old_session() {
     let mut running = Running::new().await;
     running.held_prepared_acks = Some(Vec::new());

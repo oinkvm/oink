@@ -46,41 +46,61 @@ fn acl(handle: HANDLE) -> io::Result<()> {
         if code != 0 {
             return Err(io::Error::from_raw_os_error(code as i32));
         }
-        let result = (|| {
-            if owner.is_null() || dacl.is_null() || !security::privileged_sid(owner) {
-                return Err(denied());
+        let result = acl_policy(owner, dacl);
+        LocalFree(descriptor);
+        result
+    }
+}
+// Pointers originate only from Windows-parsed security descriptors and remain
+// live through this call. The policy can be exercised without creating a tree.
+fn acl_policy(owner: windows_sys::Win32::Security::PSID, dacl: *mut ACL) -> io::Result<()> {
+    // SAFETY: caller retains the OS-validated descriptor containing both pointers.
+    unsafe {
+        if owner.is_null() || dacl.is_null() || !security::privileged_sid(owner) {
+            return Err(denied());
+        }
+        for index in 0..u32::from((*dacl).AceCount) {
+            let mut entry = ptr::null_mut();
+            check(GetAce(dacl, index, &mut entry))?;
+            let header = &*entry.cast::<ACE_HEADER>();
+            if header.AceFlags & INHERIT_ONLY_ACE as u8 != 0 {
+                continue;
             }
-            for index in 0..u32::from((*dacl).AceCount) {
-                let mut entry = ptr::null_mut();
-                check(GetAce(dacl, index, &mut entry))?;
-                let header = &*entry.cast::<ACE_HEADER>();
-                if header.AceFlags & INHERIT_ONLY_ACE as u8 != 0 {
-                    continue;
-                }
-                if header.AceType == 0 {
-                    let allowed = &*entry.cast::<ACCESS_ALLOWED_ACE>();
-                    let sid = ptr::addr_of!(allowed.SidStart).cast_mut().cast();
-                    let write = GENERIC_ALL
-                        | GENERIC_WRITE
-                        | DELETE
-                        | WRITE_DAC
-                        | WRITE_OWNER
-                        | FILE_WRITE_DATA
-                        | FILE_APPEND_DATA
-                        | FILE_WRITE_EA
-                        | FILE_WRITE_ATTRIBUTES
-                        | FILE_DELETE_CHILD;
-                    if allowed.Mask & write != 0 && !security::privileged_sid(sid) {
-                        return Err(denied());
+            let sid = match header.AceType {
+                0 | 9 => ptr::addr_of!((*entry.cast::<ACCESS_ALLOWED_ACE>()).SidStart)
+                    .cast_mut()
+                    .cast(),
+                5 | 11 => {
+                    let flags = ptr::addr_of!((*entry.cast::<ACCESS_ALLOWED_OBJECT_ACE>()).Flags).read();
+                    let mut offset = std::mem::offset_of!(ACCESS_ALLOWED_OBJECT_ACE, ObjectType);
+                    if flags & ACE_OBJECT_TYPE_PRESENT != 0 {
+                        offset += size_of::<windows_sys::core::GUID>();
                     }
-                } else if header.AceType != 1 {
+                    if flags & ACE_INHERITED_OBJECT_TYPE_PRESENT != 0 {
+                        offset += size_of::<windows_sys::core::GUID>();
+                    }
+                    entry.cast::<u8>().add(offset).cast()
+                }
+                _ => continue, // Deny/audit ACEs do not grant writes.
+            };
+            {
+                let allowed = &*entry.cast::<ACCESS_ALLOWED_ACE>();
+                let write = GENERIC_ALL
+                    | GENERIC_WRITE
+                    | DELETE
+                    | WRITE_DAC
+                    | WRITE_OWNER
+                    | FILE_WRITE_DATA
+                    | FILE_APPEND_DATA
+                    | FILE_WRITE_EA
+                    | FILE_WRITE_ATTRIBUTES
+                    | FILE_DELETE_CHILD;
+                if allowed.Mask & write != 0 && !security::privileged_sid(sid) {
                     return Err(denied());
                 }
             }
-            Ok(())
-        })();
-        LocalFree(descriptor);
-        result
+        }
+        Ok(())
     }
 }
 fn inspect(file: &File, directory: bool) -> io::Result<()> {
@@ -96,52 +116,36 @@ fn inspect(file: &File, directory: bool) -> io::Result<()> {
     acl(file.as_raw_handle())
 }
 fn open_one(path: &Path, directory: bool) -> io::Result<File> {
-    let file = std::fs::OpenOptions::new()
-        .access_mode(FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL)
-        .share_mode(FILE_SHARE_READ | if directory { FILE_SHARE_WRITE } else { 0 })
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | if directory { FILE_FLAG_BACKUP_SEMANTICS } else { 0 })
-        .open(path)?;
+    let file = open_raw(path, directory)?;
     inspect(&file, directory)?;
     Ok(file)
 }
-/// Open all ancestors without following reparses; pin them until the child opens.
+fn open_raw(path: &Path, directory: bool) -> io::Result<File> {
+    std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL)
+        .share_mode(FILE_SHARE_READ | if directory { FILE_SHARE_WRITE } else { 0 })
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | if directory { FILE_FLAG_BACKUP_SEMANTICS } else { 0 })
+        .open(path)
+}
 /// Only fixed paths beneath the OS installation root are accepted.
 pub(in crate::platform) fn open(path: &Path) -> io::Result<File> {
     let _parents = pin_parents(path, true)?;
     open_one(path, false)
 }
-fn pin_parents(path: &Path, product: bool) -> io::Result<Vec<File>> {
-    if (product && !path.starts_with(root()?))
-        || path.components().any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(denied());
-    }
-    let mut prefix = PathBuf::new();
-    let mut parents = Vec::new();
-    for component in path.parent().ok_or_else(denied)?.components() {
-        prefix.push(component);
-        if prefix.as_os_str().len() <= 3 {
-            continue;
-        }
-        parents.push(open_one(&prefix, true)?);
-    }
-    Ok(parents)
+/// Retains the protected maintenance directory and file until msiexec exits. FILE_SHARE_READ
+/// permits installation reads while denying content writes, deletion and rename.
+pub(super) struct PinnedFile {
+    pub file: File,
+    _parents: Vec<File>,
 }
-pub(super) fn directory(path: &Path) -> io::Result<()> {
-    let _parents = pin_parents(path, true)?;
-    if path.exists() {
-        return open_one(path, true).map(|_| ());
-    }
-    let parent = path.parent().ok_or_else(denied)?;
-    let _parent = open_one(parent, true)?;
-    let descriptor = security::system_security()?;
-    let attrs = descriptor.attrs();
-    // SAFETY: trusted fixed child path, explicit protected SYSTEM-only DACL.
-    check(unsafe { CreateDirectoryW(wide(path.to_str().ok_or_else(denied)?).as_ptr(), &attrs) })?;
-    open_one(path, true).map(|_| ())
+pub(super) fn pin(path: &Path) -> io::Result<PinnedFile> {
+    let parents = pin_parents(path, true)?;
+    Ok(PinnedFile {
+        file: open_one(path, false)?,
+        _parents: parents,
+    })
 }
-pub(super) fn read(path: &Path, max: u64) -> Result<Vec<u8>, Error> {
-    let file = open(path).map_err(|_| Error::Storage)?;
+pub(super) fn bytes(file: &mut File, max: u64) -> Result<Vec<u8>, Error> {
     if file.metadata().map_err(|_| Error::Storage)?.len() > max {
         return Err(Error::Limit);
     }
@@ -151,6 +155,37 @@ pub(super) fn read(path: &Path, max: u64) -> Result<Vec<u8>, Error> {
         return Err(Error::Limit);
     }
     Ok(bytes)
+}
+fn pin_parents(path: &Path, product: bool) -> io::Result<Vec<File>> {
+    if (product && !path.starts_with(root()?))
+        || path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(denied());
+    }
+    let maintenance = maintenance()?;
+    if path.starts_with(&maintenance) && path != maintenance {
+        // Administrators/SYSTEM are trusted. Check the maintenance boundary,
+        // not every ancestor of Program Files or every transaction directory.
+        return Ok(vec![open_one(&maintenance, true)?]);
+    }
+    Ok(Vec::new())
+}
+pub(super) fn directory(path: &Path) -> io::Result<()> {
+    let _parents = pin_parents(path, true)?;
+    if path.exists() {
+        return open_one(path, true).map(|_| ());
+    }
+    let parent = path.parent().ok_or_else(denied)?;
+    let _parent = open_one(parent, true)?;
+    let descriptor = security::staging_security()?;
+    let attrs = descriptor.attrs();
+    // SAFETY: trusted fixed child path, explicit protected SYSTEM-only DACL.
+    check(unsafe { CreateDirectoryW(wide(path.to_str().ok_or_else(denied)?).as_ptr(), &attrs) })?;
+    open_one(path, true).map(|_| ())
+}
+pub(super) fn read(path: &Path, max: u64) -> Result<Vec<u8>, Error> {
+    let mut pinned = pin(path).map_err(|_| Error::Storage)?;
+    bytes(&mut pinned.file, max)
 }
 pub(super) fn hash(path: &Path) -> Result<String, Error> {
     let mut file = open(path).map_err(|_| Error::Storage)?;
@@ -343,6 +378,58 @@ fn remove_tree(path: &Path) -> Result<(), Error> {
 mod tests {
     use super::*;
     #[test]
+    fn staging_acl_rejects_user_ownership_and_any_unprivileged_write_right() {
+        let inspect = |sddl: &str| -> io::Result<()> {
+            let mut descriptor = ptr::null_mut();
+            // SAFETY: in-memory descriptor parser, with no filesystem/security setting changes.
+            check(unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide(sddl).as_ptr(),
+                    1,
+                    &mut descriptor,
+                    ptr::null_mut(),
+                )
+            })?;
+            let result = (|| {
+                let (mut owner, mut dacl, mut present, mut defaulted) = (ptr::null_mut(), ptr::null_mut(), 0, 0);
+                // SAFETY: descriptor remains allocated through the complete policy check.
+                unsafe {
+                    check(GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted))?;
+                    check(GetSecurityDescriptorDacl(
+                        descriptor,
+                        &mut present,
+                        &mut dacl,
+                        &mut defaulted,
+                    ))?;
+                }
+                if present == 0 {
+                    return Err(denied());
+                }
+                acl_policy(owner, dacl)
+            })();
+            // SAFETY: free exactly the descriptor allocated by the parser.
+            unsafe {
+                LocalFree(descriptor);
+            }
+            result
+        };
+        assert!(inspect("O:SYG:SYD:P(A;OICI;FA;;;SY)").is_ok());
+        assert!(inspect("O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)").is_ok());
+        assert!(inspect("O:SYG:SYD:P(D;;FA;;;BU)(A;;FA;;;SY)").is_ok());
+        assert!(inspect("O:SYG:SYD:P(A;;FA;;;SY)(OA;;GR;;;AU)").is_ok());
+        assert!(inspect("O:SYG:SYD:P(A;;FA;;;SY)(OA;;GR;00000000-0000-0000-0000-000000000001;;AU)").is_ok());
+        for descriptor in [
+            "O:BUG:BUD:P(A;;FA;;;SY)",
+            "O:SYG:SYD:P(A;;FA;;;SY)(A;;GW;;;BU)",
+            "O:SYG:SYD:P(A;;FA;;;SY)(A;;WD;;;WD)",
+            "O:SYG:SYD:P(A;;FA;;;SY)(OA;;GW;;;AU)",
+            "O:SYG:SYD:P(A;;FA;;;SY)(OA;;GW;00000000-0000-0000-0000-000000000001;;AU)",
+            "O:SYG:SYD:NO_ACCESS_CONTROL",
+        ] {
+            assert!(inspect(descriptor).is_err(), "{descriptor}");
+        }
+    }
+    #[test]
     fn native_task_dacl_requires_system_only() {
         assert!(system_only_sddl("O:SYG:SYD:P(A;;GA;;;SY)").is_ok());
         for descriptor in [
@@ -352,6 +439,27 @@ mod tests {
         ] {
             assert!(system_only_sddl(descriptor).is_err());
         }
+    }
+    #[test]
+    fn staging_handle_denies_writes_rename_and_delete_but_allows_installer_reads() {
+        let directory = std::env::temp_dir().join(format!("oink-pin-unit-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("package.msi");
+        std::fs::write(&path, b"isolated bytes, never executed").unwrap();
+        // Same open flags as production, bypassing only its installation-root
+        // and privileged-owner policy for this isolated ordinary-user fixture.
+        let pinned = PinnedFile {
+            file: open_raw(&path, false).unwrap(),
+            _parents: vec![open_raw(&directory, true).unwrap()],
+        };
+        assert!(std::fs::read(&path).is_ok());
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+        assert!(std::fs::rename(&path, directory.join("replaced.msi")).is_err());
+        assert!(std::fs::remove_file(&path).is_err());
+        assert!(std::fs::rename(&directory, directory.with_extension("moved")).is_err());
+        drop(pinned);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
     #[test]
     fn actual_hardlink_and_untrusted_root_are_rejected_without_product_access() {

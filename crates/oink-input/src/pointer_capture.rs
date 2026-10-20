@@ -27,6 +27,17 @@ pub struct CaptureSample {
     pub foreground: u64,
 }
 
+/// Fixed-size diagnostic view. Export on the ordinary recorder consumer only.
+#[derive(Clone, Copy, Debug)]
+pub struct CaptureEvidence {
+    pub reason: &'static str,
+    pub stationary_us: u64,
+    pub movement_samples: u32,
+    pub warp_locked: bool,
+    pub enter_pending: bool,
+    pub exit_pending: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct CaptureDetector {
     windows: windows::Detector,
@@ -42,6 +53,17 @@ pub struct CaptureDetector {
 }
 
 impl CaptureDetector {
+    pub fn evidence(&self, now: u64) -> CaptureEvidence {
+        CaptureEvidence {
+            reason: self.diagnostic.map_or("sample_unavailable", |d| d.0),
+            stationary_us: now.saturating_sub(self.stationary_since),
+            movement_samples: self.movement_samples,
+            warp_locked: self.warp_lock,
+            enter_pending: self.enter_since.is_some() && !self.active,
+            exit_pending: self.exit_since.is_some() && self.active,
+        }
+    }
+
     pub fn update(&mut self, sample: Option<CaptureSample>, eligible: bool, interior: bool, now: u64) -> bool {
         let Some(s) = sample.filter(|_| eligible) else {
             self.reset();

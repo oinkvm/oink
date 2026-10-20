@@ -121,6 +121,22 @@ impl LayoutQuery for TopologyLayout {
         self.topo
             .first_portal_filtered(&to_dl_pos(from), delta, |d| self.online(d))
     }
+    fn first_portal_from_source(
+        &self,
+        from: &ScreenPos,
+        delta: (f64, f64),
+        source: DeviceId,
+    ) -> Option<dl::PortalExit> {
+        self.topo
+            .first_portal_from_source_filtered(&to_dl_pos(from), delta, Some(source), |d| self.online(d))
+    }
+    fn remote_pointer_gain(&self, screen: &ScreenId, source: DeviceId) -> f64 {
+        if source == screen.device {
+            1.0
+        } else {
+            self.topo.screen(&to_dl_id(screen)).map_or(1.0, |s| s.remote_gain)
+        }
+    }
     fn first_portal_native(&self, from: &ScreenPos, delta: (f64, f64)) -> Option<oink_display::layout::PortalExit> {
         self.topo
             .first_portal_native_filtered(&to_dl_pos(from), delta, |d| self.online(d))
@@ -143,6 +159,27 @@ impl LayoutQuery for TopologyLayout {
 
     fn step(&self, from: &ScreenPos, delta: (f64, f64)) -> StepResult {
         match self.topo.step_filtered(&to_dl_pos(from), delta, |d| self.online(d)) {
+            Some(r) => StepResult {
+                to: from_dl_pos(r.to),
+                crossed: r.crossed.into_iter().map(from_dl_id).collect(),
+                blocked_x: r.blocked_x,
+                blocked_y: r.blocked_y,
+            },
+            // 布局里还没有这块屏幕（布局与显示器列表不同步的瞬间）：原地不动。
+            None => StepResult {
+                to: from.clone(),
+                crossed: Vec::new(),
+                blocked_x: true,
+                blocked_y: true,
+            },
+        }
+    }
+
+    fn step_from_source(&self, from: &ScreenPos, delta: (f64, f64), source: DeviceId) -> StepResult {
+        match self
+            .topo
+            .step_from_source_filtered(&to_dl_pos(from), delta, Some(source), |d| self.online(d))
+        {
             Some(r) => StepResult {
                 to: from_dl_pos(r.to),
                 crossed: r.crossed.into_iter().map(from_dl_id).collect(),

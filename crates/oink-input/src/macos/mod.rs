@@ -246,38 +246,16 @@ impl InputBackend for MacInput {
         ))
     }
 
-    #[allow(deprecated)] // CGCursorIsVisible has no public replacement; heuristic evidence only.
     fn pointer_capture_sample(&self) -> Option<crate::pointer_capture::CaptureSample> {
-        use objc2_core_graphics::{CGCursorIsVisible, CGEventSource, CGEventSourceStateID, CGEventType};
-        let position = self.cursor_position().ok()?;
-        let motion_serial = [
-            CGEventType::MouseMoved,
-            CGEventType::LeftMouseDragged,
-            CGEventType::RightMouseDragged,
-            CGEventType::OtherMouseDragged,
-        ]
-        .into_iter()
-        .fold(0u32, |n, t| {
-            n.wrapping_add(CGEventSource::counter_for_event_type(
-                CGEventSourceStateID::CombinedSessionState,
-                t,
-            ))
-        });
-        // NSWorkspace's frontmostApplication is safe to read without activating anything.
-        let foreground = objc2_app_kit::NSWorkspace::sharedWorkspace()
-            .frontmostApplication()
-            .map_or(0, |a| a.processIdentifier() as u64);
-        let hidden = !CGCursorIsVisible();
-        Some(crate::pointer_capture::CaptureSample {
-            windows: None,
-            hidden,
-            application_hidden: cursor_visibility::application_hidden(),
-            confined: false,
-            position,
-            motion_serial,
-            motion_observable: true,
-            foreground,
-        })
+        self.observe_local_pointer(capture_sample).flatten()
+    }
+
+    fn foreground_bundle_id(&self, foreground: u64) -> Option<String> {
+        let app = objc2_app_kit::NSWorkspace::sharedWorkspace().frontmostApplication()?;
+        if app.processIdentifier() as u64 != foreground {
+            return None;
+        }
+        app.bundleIdentifier().map(|id| id.to_string())
     }
 
     fn cursor_position(&self) -> Result<Point, InputError> {
@@ -291,8 +269,11 @@ impl InputBackend for MacInput {
         eligible: bool,
         captured: bool,
     ) -> Option<crate::pointer_capture::CaptureSample> {
-        self.injector
-            .refresh_capture_visibility(sample, eligible, captured, || self.pointer_capture_sample())
+        self.observe_local_pointer(|| {
+            self.injector
+                .refresh_capture_visibility(sample, eligible, captured, capture_sample)
+        })
+        .flatten()
     }
 
     fn edge_resistance_regions(
@@ -323,4 +304,47 @@ impl Drop for MacInput {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+impl MacInput {
+    fn observe_local_pointer<T>(&self, read: impl FnOnce() -> T) -> Option<T> {
+        // Serialize mode requests with the sample as well as native cursor work.
+        let tap = self.tap.lock().unwrap_or_else(|e| e.into_inner());
+        tap.as_ref()?.observe_local_pointer(read)
+    }
+}
+
+#[allow(deprecated)] // CGCursorIsVisible has no public replacement; heuristic evidence only.
+fn capture_sample() -> Option<crate::pointer_capture::CaptureSample> {
+    use objc2_core_graphics::{CGCursorIsVisible, CGEventSource, CGEventSourceStateID, CGEventType};
+    let p = inject::current_location();
+    let position = Point::new(p.x, p.y);
+    let motion_serial = [
+        CGEventType::MouseMoved,
+        CGEventType::LeftMouseDragged,
+        CGEventType::RightMouseDragged,
+        CGEventType::OtherMouseDragged,
+    ]
+    .into_iter()
+    .fold(0u32, |n, t| {
+        n.wrapping_add(CGEventSource::counter_for_event_type(
+            CGEventSourceStateID::CombinedSessionState,
+            t,
+        ))
+    });
+    // NSWorkspace's frontmostApplication is safe to read without activating anything.
+    let foreground = objc2_app_kit::NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .map_or(0, |a| a.processIdentifier() as u64);
+    let hidden = !CGCursorIsVisible();
+    Some(crate::pointer_capture::CaptureSample {
+        windows: None,
+        hidden,
+        application_hidden: cursor_visibility::application_hidden(),
+        confined: false,
+        position,
+        motion_serial,
+        motion_observable: true,
+        foreground,
+    })
 }

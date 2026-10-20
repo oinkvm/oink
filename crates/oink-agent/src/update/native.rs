@@ -31,6 +31,11 @@ pub fn start(p: Preferences) {
             state.status.checks_enabled = oink_update_checks_enabled();
         }
         state.policy.preferences.checks_enabled = state.status.checks_enabled;
+        // Startup is asynchronous relative to the UI's bootstrap query. Publish
+        // enablement too, so a window opened early does not stay manual-only.
+        let status = state.status.clone();
+        drop(state);
+        node.emit(ApiEvent::UpdateStatusChanged(status));
     }
 }
 pub fn check() {
@@ -94,7 +99,6 @@ extern "C" fn event(kind: u32, build: u64, size: u64, progress: u32, version: *c
                 state.status.error = Some(Error::Metadata);
                 state.status.phase = Phase::Failed;
                 state.ready = false;
-                state.install_requested = false;
                 crate::backend::on_main(cancel);
                 let status = state.status.clone();
                 drop(state);
@@ -112,15 +116,13 @@ extern "C" fn event(kind: u32, build: u64, size: u64, progress: u32, version: *c
             state.status.phase = Phase::Available;
             state.status.error = None;
             state.status.checked_at = Some(now());
-            if state.policy.may_download_automatically(build, now()) {
-                crate::backend::on_main(download);
-            }
         }
         3 => state.status.phase = Phase::Downloading,
         4 => state.status.phase = Phase::Verifying,
         5 => {
             state.ready = true;
-            state.status.phase = Phase::WaitingForIdle;
+            state.status.phase = Phase::Ready;
+            state.status.blockers.clear();
         }
         6 => state.status.phase = Phase::Installing,
         7 => state.status.phase = Phase::Committed,
@@ -136,11 +138,10 @@ extern "C" fn event(kind: u32, build: u64, size: u64, progress: u32, version: *c
             });
         }
         9 => {
-            state.ready = false;
-            state.install_requested = false;
-            if !state.installing && state.status.phase != Phase::Failed {
-                state.status.phase = Phase::Idle;
-            }
+            // Sparkle dismisses on both abort and completion, with or without
+            // showUpdaterError. Always release our single approval token.
+            installation_failed();
+            state.dismissed();
         }
         _ => return,
     }

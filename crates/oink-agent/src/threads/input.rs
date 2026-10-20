@@ -88,6 +88,9 @@ pub enum InputCommand {
     },
     EdgeResistance(Vec<oink_foundation::input::EdgeResistanceRegion>),
     PointerSample {
+        /// Focus scope read before sampling; never relabel queued evidence at consumption.
+        scope: Option<(u64, DeviceId)>,
+        application: Option<crate::diagnostics::capture::Application>,
         sample: Option<oink_input::pointer_capture::CaptureSample>,
         hidden: bool,
     },
@@ -339,7 +342,6 @@ struct Shared {
     backlog_requested: std::sync::atomic::AtomicBool,
     done: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
     jitter: Arc<oink_input::jitter::Counters>,
-    quality_jitter: Snapshot<std::collections::HashMap<DeviceId, Arc<crate::connection_quality::JitterCounters>>>,
 }
 
 /// Handle to the native capture thread. Commands and snapshot reads never take the
@@ -399,7 +401,6 @@ impl InputThread {
             backlog_requested: std::sync::atomic::AtomicBool::new(false),
             done: std::sync::Mutex::new(received),
             jitter: Arc::default(),
-            quality_jitter: Snapshot::default(),
         });
         let notices = super::notices::Notices::new();
         let owner = driver::Driver::new(boot, snapshots, inject, main, shared.clone(), notices.clone(), done);
@@ -417,11 +418,6 @@ impl InputThread {
             },
             InputNotices(notices),
         ))
-    }
-    pub(crate) fn quality_jitter(
-        &self,
-    ) -> Arc<std::collections::HashMap<DeviceId, Arc<crate::connection_quality::JitterCounters>>> {
-        self.shared.quality_jitter.load()
     }
     pub fn send(&self, command: InputCommand) {
         if self.shared.stopped.load(std::sync::atomic::Ordering::Acquire) {

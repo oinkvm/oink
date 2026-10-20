@@ -8,6 +8,9 @@ license.workspace = true
 publish.workspace = true
 repository.workspace = true
 
+[features]
+test-feed = ["oink-update/test-feed"]
+
 [dependencies]
 oink-update = { path = "../oink-update" }
 serde.workspace = true
@@ -20,14 +23,16 @@ crossbeam-queue = "0.3"
 
 [dev-dependencies]
 oink-input = { path = "../oink-input" }
+cab = "0.6"
+tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 oink-foundation.workspace = true
 windows = { version = "0.62", features = ["Win32_System_TaskScheduler", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-cab = "0.6"
 getrandom = "0.3"
 windows-sys = { version = "0.61", features = [
+ "Win32_Devices_DeviceAndDriverInstallation",
  "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization",
  "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes",
  "Win32_System_Threading", "Win32_System_RemoteDesktop", "Win32_System_Services",

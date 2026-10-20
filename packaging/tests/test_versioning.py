@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'build-support'))
-from identity import windows_product_version
+from identity import IDENTITY, windows_product_version
 from provenance import verify, digest
 from versioning import release_version, local_source_commit, macos_version_fields
 from windows_version import display_version_resource, set_display_version
@@ -118,7 +118,7 @@ class LocalVersions(unittest.TestCase):
                     else:
                         self.assertEqual(command[command.index('--source-commit') + 1], COMMIT)
                 record = json.loads((Path(temp) / ('a' * 64) / 'windows-x64/build-environment.json').read_text())
-                self.assertEqual(record['version'], '0.1.0' if public else DISPLAY)
+                self.assertEqual(record['version'], IDENTITY['version'] if public else release_version(IDENTITY['version'], COMMIT))
 
 
 class WindowsResources(unittest.TestCase):

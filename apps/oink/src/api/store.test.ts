@@ -66,7 +66,7 @@ describe('authenticated presentation ordering', () => {
   });
   it('keeps applied preference events newer than a pending command reply',async()=>{
     const store=createAgentStore();
-    const before:import('./cards').UiPreferences={show_status_icon:true,confirm_quit:true,ui_language:'auto',theme_mode:'light',theme_accent:{light:'#2E7BFF',dark:'#2E7BFF'},log_level:'info',log_max_mb:1024};
+    const before:import('./cards').UiPreferences={notification_level:'default',show_status_icon:true,confirm_quit:true,ui_language:'auto',theme_mode:'light',theme_accent:{light:'#2E7BFF',dark:'#2E7BFF'},log_level:'info',log_max_mb:1024};
     let complete!:(value:typeof before)=>void;
     const command=store.query('localPreferences',()=>new Promise(resolve=>{complete=resolve;}));
     store.receive({type:'ui_preferences',data:{...before,theme_mode:'dark'}});

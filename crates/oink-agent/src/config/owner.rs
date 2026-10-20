@@ -520,7 +520,8 @@ fn patch_map(current: &mut RawValue, patch: &RawValue, shape: Shape) -> Result<(
         };
         let valid = match shape {
             ScreenPreferences | Target | Key | Caps | Forwarding => key <= 2,
-            Screen | Transform | Override | Keyboard => key <= 3,
+            Screen => key <= 4,
+            Transform | Override | Keyboard => key <= 3,
             Policy => key <= 6,
         };
         if key == 0 || !valid {
@@ -775,16 +776,29 @@ mod tests {
         assert_eq!(screen[&2], 2.0f64.write());
         assert_eq!(screen[&3], false.write());
         assert_eq!(screen[&100], u64::MAX.write());
+        let patch = map([(
+            1,
+            map([(
+                1,
+                RawValue::Array(vec![map([(1, RawValue::Text("screen".into())), (4, 2.5f64.write())])]),
+            )]),
+        )]);
+        let edited = owner.edit(option, 2, patch).unwrap();
+        let value = dto::ScreenPreferencesValue::read(&edited.value().unwrap()).unwrap();
+        let screen = &value.screens().unwrap().0[0];
+        assert_eq!(screen.remote_gain().unwrap(), 2.5);
+        assert_eq!(screen.gain().unwrap(), 2.0);
+        assert_eq!(screen.raw()[&100], u64::MAX.write());
         let before = owner.clone();
         assert_eq!(
-            owner.edit(option, 2, map([(2, 6.0f64.write())])),
+            owner.edit(option, 3, map([(2, 6.0f64.write())])),
             Err(ControlFailure::InvalidValue)
         );
         assert_eq!(owner, before);
         owner
             .edit(
                 option,
-                2,
+                3,
                 map([(1, map([(2, RawValue::Array(vec![RawValue::Text("screen".into())]))]))]),
             )
             .unwrap();
@@ -1056,6 +1070,7 @@ mod tests {
         let mut owner = fresh();
         let mut before = super::super::Settings::default();
         before.screen_preferences.screens.push(super::super::ScreenPreference {
+            remote_gain: 1.0,
             display: "screen".into(),
             gain: 1.0,
             enabled: false,

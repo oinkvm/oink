@@ -97,6 +97,7 @@ async fn changes() {
     );
     owner_settings(&nodes[1], |s| {
         s.screen_preferences.screens = vec![crate::config::ScreenPreference {
+            remote_gain: 1.0,
             display: "PRIVATE-SCREEN".into(),
             enabled: false,
             gain: 1.0,

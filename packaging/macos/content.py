@@ -22,6 +22,15 @@ def verify_tcc_policy(info, entitlements):
             raise RuntimeError(f'Unused TCC permission in Mac package: {entitlement}')
 
 
+def verify_update_transport(info):
+    # Local-network exceptions belong only in external qualification exports.
+    # Never ship a production app capable of relaxing URLSession's TLS policy.
+    if 'NSAppTransportSecurity' in info:
+        raise RuntimeError('ATS exceptions are forbidden in production Mac packages')
+    if 'SUFeedURL' in info and not info['SUFeedURL'].startswith('https://updates.oink.hachiwii.com/'):
+        raise RuntimeError('Unexpected Sparkle feed URL in production Mac package')
+
+
 def verify_audio_capture_host(info, entitlements, backend):
     # Grant executes in the responsible host, not its nested UI helper. Check
     # the purpose string and hardened-runtime audio entitlement on that bundle.
@@ -75,10 +84,10 @@ def verify_app(app, identity):
         minimum += re.findall(r'cmd LC_VERSION_MIN_MACOSX\n.*?version\s+(\S+)', commands, re.DOTALL)
         if arches != 'arm64' or minimum not in (['14.2'], ['14.2.0']):
             raise RuntimeError(f'Expected arm64 and macOS 14.2 deployment target: {binary.name}')
-        verify_signature(binary, mac['team_id'])
         components.append({'path': binary.relative_to(app).as_posix(), 'sha256': digest(binary),
                            'architecture': 'arm64', 'minimum_os': '14.2', 'signature_verified': True})
     for bundle, bundle_info in ((app, info), (helper, ui), (extension, ext_info)):
+        verify_update_transport(bundle_info)
         verify_localizations(bundle, bundle_info, permissions=bundle == app)
         result = private_run('codesign', '-d', '--entitlements', ':-', bundle)
         entitlements = plistlib.loads(result.stdout.encode()) if result.stdout.strip() else {}
@@ -88,8 +97,13 @@ def verify_app(app, identity):
         if bundle != helper and entitlements.get('com.apple.security.application-groups') != [group]:
             raise RuntimeError('Host/extension signed App Group mismatch')
     metadata = json.loads((app / 'Contents/Resources' / identity['metadata_file']).read_text())
-    if metadata['update_policy'] != 'manual-only' or len(metadata['source_tree_sha256']) != 64:
-        raise RuntimeError('Mac package provenance or manual-update policy mismatch')
+    from provenance import ROOT
+    trust = json.loads((ROOT / 'packaging/update-trust.json').read_bytes())['mac']
+    expected_policy = 'sparkle' if trust['enabled'] else 'manual-only'
+    if (metadata['update_policy'] != expected_policy or len(metadata['source_tree_sha256']) != 64 or
+            info.get('SUPublicEDKey') != trust['public_key'] or
+            (trust['enabled'] and not trust['public_key'])):
+        raise RuntimeError('Mac package provenance or update trust mismatch')
     if metadata['version'] != release_version(identity['version'], metadata.get('source_commit')):
         raise RuntimeError('Mac display version differs from the source commit')
     for bundle_info in (info, ui, ext_info):

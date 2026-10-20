@@ -13,7 +13,7 @@ use windows::{
             Input::KeyboardAndMouse::{HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey},
             WindowsAndMessaging::{
                 AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, FindWindowW, GetWindowThreadProcessId,
-                PostMessageW, RegisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_HOTKEY, WNDCLASSW,
+                RegisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_HOTKEY, WNDCLASSW,
             },
         },
     },
@@ -81,7 +81,9 @@ pub fn install(app: &AppHandle) {
 pub fn handoff(path: &Path) -> windows::core::Result<()> {
     // A manually launched second process holds launch-time foreground rights.
     // Grant to the UI's actual HWND owner, never the input backend or ASFW_ANY,
-    // BEFORE posting: an IPC/posted message cannot itself transfer those rights.
+    // BEFORE authenticated IPC: it cannot itself transfer those rights. IPC
+    // also permits a Medium second instance to open an existing High UI without
+    // admitting untrusted native messages through UIPI.
     // This also works before any WebView exists. Documented Windows 10/11 API;
     // interactive launch/remote-input verification is pending.
     // SAFETY: FindWindow returns a desktop HWND; no borrowed pointer is retained.
@@ -97,7 +99,10 @@ pub fn handoff(path: &Path) -> windows::core::Result<()> {
         }
         crate::shell_policy::handoff(
             || AllowSetForegroundWindow(pid),
-            || PostMessageW(Some(hwnd), OPEN, WPARAM(0), LPARAM(0)),
+            || {
+                oink_agent::ipc::UiControl::request_open(path)
+                    .map_err(|error| windows::core::Error::new(windows::Win32::Foundation::E_FAIL, error.to_string()))
+            },
         )
     }
 }
@@ -146,7 +151,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
 
 /// Keep the installer Finish helper's grant alive across its argument-free UI
 /// launch. Suspend before granting so a fast second instance cannot notify the
-/// running UI first. No synthetic input and no elevated-token launch path.
+/// running UI first. No synthetic input; the child keeps the interactive caller's token.
 pub fn launch_user_ui(exe: &Path) -> windows::core::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows::{

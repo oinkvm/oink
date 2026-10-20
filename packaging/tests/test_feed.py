@@ -182,6 +182,19 @@ class PublicationTests(FeedTests):
         with patch.dict(os.environ, context):
             release.sign_package(config, folder, self.state/'output.json')
             output = feed.read(self.state/'output.json')
+            feed.write(self.state / 'registry.json', {'schema': 1, 'feeds': {EPOCH['epoch']: {
+                c: {'records': [], 'last_allocated': 0, 'manifest_sha256': None} for c in EPOCH['channels']}}})
+            with patch.dict(os.environ, {'OINK_PUBLISHED_BUILD': '2'}), patch.object(feed, 'download', return_value=raw):
+                release.register(config, self.state, self.state/'output.json', NOW)
+                before = feed.registry(self.state)['feeds'][EPOCH['epoch']]['stable']
+                # Retry after the first durable reservation, before any manifest
+                # exists, consumes a new sequence and reuses the release record.
+                with patch.dict(os.environ, {'GITHUB_RUN_ID': '13'}):
+                    release.sign_package(config, folder, self.state/'retry.json')
+                release.register(config, self.state, self.state/'retry.json', NOW)
+                after = feed.registry(self.state)['feeds'][EPOCH['epoch']]['stable']
+                self.assertEqual(after['records'], before['records'])
+                self.assertEqual(after['last_allocated'], before['last_allocated'] + 1)
             self.assertFalse(output['published'])
             self.assertEqual(output['release']['notes'], {'zh-Hans': '测试更新', 'en': 'Test update'})
             feed.verify(raw, output['release']['package']['ed25519'], PUB)
@@ -195,4 +208,9 @@ class PublicationTests(FeedTests):
             (folder/'Oink-test.msi').write_bytes(raw)
             record['signing'] = 'unsigned'
             feed.write(folder/'release.json', record)
-            with self.assertRaises(ValueError): release.sign_package(config, folder, self.state/'output.json')
+            release.sign_package(config, folder, self.state/'output.json')
+            self.assertEqual(feed.read(self.state/'output.json')['signing_policy'], 'manifest-ed25519')
+            pinned = copy.deepcopy(config)
+            pinned['windows'][0]['authenticode_spki_sha256'] = ['a' * 64]
+            with self.assertRaisesRegex(ValueError, 'authenticode_required'):
+                release.sign_package(pinned, folder, self.state/'output.json')

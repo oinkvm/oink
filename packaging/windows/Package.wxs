@@ -27,7 +27,7 @@
     <WixVariable Id="WixUIDialogBmp" Value="$(var.DialogBmp)" />
     <WixVariable Id="WixUIBannerBmp" Value="$(var.BannerBmp)" />
     <SummaryInformation Description="$(var.ProductName) $(var.DisplayVersion)" />
-    <!-- Install under the maintenance lease, then remove the old product inside
+    <!-- Install under the maintenance lock, then remove the old product inside
          the same rollback transaction. Component GUIDs/paths must remain stable. -->
     <MajorUpgrade DowngradeErrorMessage="A newer build is already installed." Schedule="afterInstallExecute" />
     <MediaTemplate EmbedCab="yes" />
@@ -123,7 +123,7 @@
         <Directory Id="MAINTENANCEFOLDER" Name="$(var.MaintenanceDirectory)">
           <Component Id="MaintenanceRoot" Guid="$(var.MaintenanceGuid)">
             <!-- Stable component ownership retains state during major upgrades.
-                 Full-uninstall commit removes it after the lease closes; active
+                 Full-uninstall commit removes it after MSI completes; active
                  worker transactions retain their exclusive lock and state. -->
             <CreateFolder>
               <PermissionEx Sddl="O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
@@ -147,8 +147,6 @@
     <CustomAction Id="CheckInstallPath" BinaryRef="InstallerCA" DllEntry="CheckInstallPath" Execute="immediate" Return="check" />
     <CustomAction Id="CheckProtectedState" BinaryRef="InstallerCA" DllEntry="CheckProtectedState" Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="CheckQuiescence" BinaryRef="InstallerCA" DllEntry="CheckQuiescence" Execute="deferred" Impersonate="no" Return="check" />
-    <CustomAction Id="RollbackMaintenance" BinaryRef="InstallerCA" DllEntry="ReleaseMaintenance" Execute="rollback" Impersonate="no" Return="check" />
-    <CustomAction Id="CommitMaintenance" BinaryRef="InstallerCA" DllEntry="ReleaseMaintenance" Execute="commit" Impersonate="no" Return="check" />
     <CustomAction Id="CleanupCloudFiles" BinaryRef="InstallerCA" DllEntry="CleanupCloudFiles" Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="CleanupMaintenance" BinaryRef="InstallerCA" DllEntry="CleanupMaintenance" Execute="commit" Impersonate="no" Return="check" />
     <!-- Commit-only: a failed uninstall must not silently disable autostart. -->
@@ -174,13 +172,11 @@
            otherwise the old preflight sees the new service's interactive helper. -->
       <StartServices Sequence="6502" />
       <Custom Action="CheckInstallPath" Before="InstallInitialize" />
-      <Custom Action="RollbackMaintenance" After="InstallInitialize" />
-      <Custom Action="CheckProtectedState" After="RollbackMaintenance" />
+      <Custom Action="CheckProtectedState" After="InstallInitialize" />
       <Custom Action="CheckQuiescence" After="StopServices" />
       <!-- Unregister per-user cloud roots while backend quiescence is proven,
            before removing binaries. Busy caches abort uninstall for retry. -->
       <Custom Action="CleanupCloudFiles" After="CheckQuiescence" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
-      <Custom Action="CommitMaintenance" Before="CleanupMaintenance" />
       <Custom Action="CleanupMaintenance" Before="InstallFinalize" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="RemoveLoginEntry" Before="RemoveRegistryValues" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>

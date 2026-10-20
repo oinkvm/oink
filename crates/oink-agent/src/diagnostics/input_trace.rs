@@ -46,6 +46,7 @@ struct Dedup {
 #[allow(clippy::large_enum_variant)] // fixed bounded storage; producers cannot allocate boxes
 pub(super) enum Evidence {
     Timing(oink_foundation::handoff_timing::Event),
+    PointerCapture(super::capture::Raw),
     Volume(oink_routing::router::VolumeDecision),
     SourceRouting(oink_routing::router::SourceDecision),
     Dnd(super::dnd::Raw),
@@ -357,6 +358,7 @@ impl InputTrace {
             recorder.with_capture_stamp(stamped.stamp, || {
                 recorder.record(match stamped.record {
                     Evidence::Timing(record) => timing_event(record),
+                    Evidence::PointerCapture(record) => record.export(recorder),
                     Evidence::SourceRouting(record) => Event::SourceRouting(record),
                     Evidence::Volume(record) => Event::VolumeRouting(super::volume::export(recorder, record)),
                     Evidence::Dnd(raw) => raw.export(recorder),
@@ -457,6 +459,9 @@ impl InputTrace {
     #[cfg(all(test, debug_assertions))]
     pub(super) fn disable_for_test(&self) {
         self.enabled.store(false, Ordering::Relaxed);
+    }
+    pub(crate) fn pointer_capture(&self, record: super::capture::Raw) {
+        self.evidence(Evidence::PointerCapture(record));
     }
     pub(super) fn evidence(&self, record: Evidence) {
         if !self.enabled() {
@@ -898,6 +903,7 @@ mod handoff_tests {
             false,
             &ScreenPos::new(ScreenId::new(peer, "PRIVATE SCREEN"), Point::new(240., 12.)),
             oink_routing::router::DepartureEvidence {
+                pointer_source: None,
                 revision: 3,
                 bounds: Some(native.bounds),
                 point: Some(&at),

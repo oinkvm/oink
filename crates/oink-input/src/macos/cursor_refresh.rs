@@ -1,5 +1,5 @@
 //! Refresh ambiguous visibility only when automatic capture needs it.
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -93,6 +93,7 @@ impl RefreshGate {
 pub(super) struct Observer {
     start: std::sync::OnceLock<Instant>,
     revision: AtomicU64,
+    boundary_pending: AtomicBool,
     hint_revision: AtomicU64,
     moved: AtomicU64,
     serial: AtomicU32,
@@ -119,6 +120,11 @@ impl Observer {
         self.moved.store(0, Ordering::Relaxed);
         self.hint_revision.fetch_add(1, Ordering::Relaxed);
         self.revision.fetch_add(1, Ordering::Release);
+    }
+    pub fn boundary(&self) {
+        self.key();
+        // Requests never wait for the observer's potentially in-flight RPC.
+        self.boundary_pending.store(true, Ordering::Release);
     }
     pub fn changed(&self) {
         self.revision.fetch_add(2, Ordering::Release);
@@ -158,6 +164,13 @@ impl Observer {
             }
         };
         let mut state = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        if self.boundary_pending.swap(false, Ordering::AcqRel) {
+            // Withheld self-owned samples never visit RefreshGate::action.
+            // Revoke the old episode explicitly, preserving the RPC rate limit.
+            state.1.motion = None;
+            state.1.foreground = None;
+            state.1.verified = false;
+        }
         // Any injected event invalidates an in-flight visibility query, but only
         // a new motion/key hint may update RefreshGate. Reimporting an old move
         // after a button/scroll would authorize a typing-only hidden episode.
@@ -315,6 +328,38 @@ mod tests {
             motion_serial: 0,
             motion_observable: true,
         }
+    }
+
+    #[test]
+    fn focus_boundary_revokes_verified_hidden_episode_without_resetting_refresh_limit() {
+        let observer = Observer::default();
+        observer.initialize();
+        let at = Instant::now();
+        let hidden = sample(None, true, 1);
+        observer.motion(at, 3);
+        assert_eq!(
+            observer.observe_at(hidden, true, false, 3, at, || Some(hidden)),
+            Some(hidden)
+        );
+        observer.boundary();
+        assert_eq!(
+            observer.observe_at(hidden, true, false, 3, at + Duration::from_millis(10), || {
+                panic!("no fresh motion in the new context")
+            }),
+            None
+        );
+        observer.motion(at + Duration::from_millis(20), 3);
+        assert_eq!(
+            observer.observe_at(hidden, true, false, 3, at + Duration::from_millis(20), || {
+                panic!("boundary must preserve the refresh rate limit")
+            }),
+            None
+        );
+        observer.motion(at + Duration::from_millis(500), 3);
+        assert_eq!(
+            observer.observe_at(hidden, true, false, 3, at + Duration::from_millis(500), || Some(hidden)),
+            Some(hidden)
+        );
     }
 
     #[test]

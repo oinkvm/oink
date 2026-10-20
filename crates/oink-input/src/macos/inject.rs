@@ -297,7 +297,7 @@ impl Injector {
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = State::default();
         *self.gestures.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         self.physical_buttons.reset();
-        self.capture_refresh.key();
+        self.capture_refresh.boundary();
     }
 
     pub(crate) fn declare_user_activity(&self) -> Result<bool, InputError> {
@@ -305,6 +305,7 @@ impl Injector {
     }
 
     pub(crate) fn gesture_boundary(&self, reason: &'static str) {
+        self.capture_refresh.boundary();
         // Boundary formatting is ordinary work; never hold the ledger mutex
         // while a logging subscriber formats or queues this snapshot.
         let tracker = *self.gestures.lock().unwrap_or_else(|e| e.into_inner());

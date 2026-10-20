@@ -138,7 +138,7 @@ impl Owner {
             };
         }
         self.paused = self.group.applied().paused;
-        self.streams.pause_changed(self.paused);
+        self.streams.pause_changed(self.paused || self.update_suspended);
         let Some(group) = self.active_group else {
             self.transition(Resolution::Unknown);
             return Ok(());
@@ -245,7 +245,7 @@ impl Owner {
                 }
                 self.source_session.retire();
                 self.selected = None;
-                self.release_capture();
+                let _ = self.release_capture();
                 self.needs_generation = false;
             }
         }
@@ -377,7 +377,7 @@ impl Owner {
         if !self.settings.forwarding_enabled {
             self.stop_source();
         } else if capture_changed {
-            self.release_capture();
+            let _ = self.release_capture();
         }
         if output_changed || format_changed {
             self.retire_sessions();
@@ -927,6 +927,9 @@ impl Owner {
             )
     }
     pub(super) fn prepare_peer(&mut self, peer: DeviceId) {
+        if self.update_suspended {
+            return;
+        }
         let Some(current_boot) = self.current_boot(peer) else {
             return;
         };
@@ -1059,6 +1062,14 @@ impl Owner {
         let _ = self.streams.send(peer, &Message::AudioPreparedAck(ack), Instant::now());
     }
     pub(super) fn message(&mut self, peer: DeviceId, message: Message) {
+        if self.update_suspended {
+            // Admission may reopen between receiving a fresh offer and the next
+            // timer tick. Reconcile first so abort does not discard that offer.
+            self.tick();
+            if self.update_suspended {
+                return;
+            }
+        }
         let Some(current_boot) = self.current_boot(peer) else {
             return;
         };
@@ -1138,7 +1149,7 @@ impl Owner {
                             return;
                         }
                     } else if self.capture.is_some() {
-                        self.release_capture();
+                        let _ = self.release_capture();
                         self.needs_generation = false; // The exit just allocated this fresh stream.
                     }
                 }

@@ -123,23 +123,62 @@ fn window_api() -> Option<&'static WindowApi> {
 /// The seed check leaves a destination application's already-selected glyph alone. No AppKit
 /// cleanup handshake is needed. Normal calls hold cursor_lock after invalidating owner work;
 /// the exit path uses only these already-resolved native APIs and atomics.
-pub(crate) fn retire_blank() -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub(crate) enum GlyphRetirement {
+    Retired = 0,
+    NoOwner = 1,
+    NoBlank = 2,
+    OtherCursor = 3,
+    Unavailable = 4,
+}
+
+pub(crate) fn retire_blank() -> GlyphRetirement {
     let expected = BLANK_SEED.swap(-1, Ordering::AcqRel);
-    if WINDOW.load(Ordering::Acquire) == 0 || expected == -1 {
-        return false;
-    }
-    if let Some(Some(api)) = API.get() {
-        // SAFETY: CGSCursor.h signatures. Only our live connection's cursor is changed, and only
-        // if the global seed still identifies our blank glyph. Cursor ID 0 is the system arrow.
-        unsafe {
-            if (api.cursor_seed)() == expected {
-                let mut seed = 0;
-                (api.system_cursor)(CONNECTION.load(Ordering::Acquire), 0, &mut seed);
-                return true;
+    let window = WINDOW.load(Ordering::Acquire);
+    let api = API.get().and_then(Option::as_ref);
+    retire_blank_with(
+        window,
+        expected,
+        || {
+            api.map(|api| {
+                // SAFETY: Validated argument-free cursor-seed query; it changes no state.
+                unsafe { (api.cursor_seed)() }
+            })
+        },
+        || {
+            if let Some(api) = api {
+                // SAFETY: Only our live connection's matching blank cursor is
+                // reset. A destination application's newer glyph is preserved.
+                unsafe {
+                    let mut seed = 0;
+                    (api.system_cursor)(CONNECTION.load(Ordering::Acquire), 0, &mut seed);
+                }
             }
-        }
+        },
+    )
+}
+
+fn retire_blank_with(
+    window: u32,
+    expected: i32,
+    current: impl FnOnce() -> Option<i32>,
+    retire: impl FnOnce(),
+) -> GlyphRetirement {
+    if window == 0 {
+        return GlyphRetirement::NoOwner;
     }
-    false
+    if expected == -1 {
+        return GlyphRetirement::NoBlank;
+    }
+    let Some(current) = current() else {
+        return GlyphRetirement::Unavailable;
+    };
+    if current != expected {
+        return GlyphRetirement::OtherCursor;
+    }
+    retire();
+    GlyphRetirement::Retired
 }
 
 fn set_blank(cursor: &NSCursor) {
@@ -204,16 +243,22 @@ pub(crate) fn release() {
                     // Reset only our own stale application cursor over our own window. Never
                     // set a global arrow over another application's I-beam/resize cursor.
                     let mtm = old.panel.mtm();
-                    let hit =
-                        NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(NSEvent::mouseLocation(), 0, mtm);
-                    if local
+                    let eligible = local
                         && WINDOW.load(Ordering::Acquire) == 0
-                        && std::ptr::eq(&*NSCursor::currentCursor(), &*old.view.ivars().cursor)
-                        && let Some(window) = NSApplication::sharedApplication(mtm).windowWithWindowNumber(hit)
-                    {
-                        NSCursor::arrowCursor().set();
-                        window.resetCursorRects();
-                    }
+                        && std::ptr::eq(&*NSCursor::currentCursor(), &*old.view.ivars().cursor);
+                    cleanup_stale_blank(
+                        eligible,
+                        NSEvent::mouseLocation(),
+                        CGDisplayBounds(CGMainDisplayID()).size.height,
+                        |at| {
+                            let hit = NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(at, 0, mtm);
+                            NSApplication::sharedApplication(mtm).windowWithWindowNumber(hit)
+                        },
+                        |window| {
+                            NSCursor::arrowCursor().set();
+                            window.resetCursorRects();
+                        },
+                    );
                 });
             }
             tracing::debug!(target: "oink_cursor_timing", window, "cursor latency: AppKit cleanup end");
@@ -221,6 +266,20 @@ pub(crate) fn release() {
         });
         handoff_timing::native(TimingStage::CleanupCompleted, 0);
     });
+}
+
+/// Cleanup queries have the same negative-coordinate semantics as acquisition.
+/// Preserve the real entry point; floor only the point passed to the hit query.
+fn cleanup_stale_blank<T>(
+    eligible: bool,
+    cocoa: NSPoint,
+    primary_height: f64,
+    own_window: impl FnOnce(NSPoint) -> Option<T>,
+    reset: impl FnOnce(T),
+) {
+    if eligible && let Some(window) = own_window(owner_hit_point(cocoa, primary_height)) {
+        reset(window);
+    }
 }
 
 struct Ui {
@@ -322,8 +381,8 @@ fn finish_marked_move(shared: &'static Shared, generation: u64) {
             let Some(ui) = ui.as_ref().filter(|u| u.generation == generation && active(generation)) else {
                 return;
             };
-            let hit =
-                NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(NSEvent::mouseLocation(), 0, ui.panel.mtm());
+            let at = owner_hit_point(NSEvent::mouseLocation(), CGDisplayBounds(CGMainDisplayID()).size.height);
+            let hit = NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(at, 0, ui.panel.mtm());
             if hit != ui.panel.windowNumber() {
                 tracing::debug!(
                     generation,
@@ -343,6 +402,18 @@ fn finish_marked_move(shared: &'static Shared, generation: u64) {
             shared.owner_ready(generation, ivars.to);
         });
     });
+}
+
+/// AppKit's window hit query truncates fractional Quartz coordinates toward zero
+/// (observed on macOS 14.7). Just above an external display's bottom at y=0,
+/// y=-0.02 therefore hits the offscreen y=0 instead of our owner window. That
+/// prevents ownership and the posted move which makes an expanded Dock hide.
+/// Query the containing Quartz point before flipping to AppKit's coordinates.
+/// This changes only the query: the ownership marker, freeze move and HID delta
+/// correction retain their original subpixel positions. Floor AFTER the flip
+/// would select the wrong side of the same display boundary.
+fn owner_hit_point(cocoa: NSPoint, primary_height: f64) -> NSPoint {
+    NSPoint::new(cocoa.x.floor(), primary_height - (primary_height - cocoa.y).floor())
 }
 
 fn blank_cursor(_mtm: MainThreadMarker) -> Option<Retained<NSCursor>> {
@@ -517,7 +588,7 @@ fn wait_for_hit(shared: &'static Shared, generation: u64, started: Instant) {
                 return true;
             }
             let height = CGDisplayBounds(CGMainDisplayID()).size.height;
-            let at = NSPoint::new(ui.from.x, height - ui.from.y);
+            let at = owner_hit_point(NSPoint::new(ui.from.x, height - ui.from.y), height);
             let hit = NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(at, 0, ui.panel.mtm());
             if hit == ui.panel.windowNumber() {
                 let posted = shared.owner_post(generation, ui.from);
@@ -553,6 +624,102 @@ fn wait_for_hit(shared: &'static Shared, generation: u64, started: Instant) {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+    use oink_foundation::Rect;
+
+    #[test]
+    fn ownership_queries_stay_on_fractional_edges_above_and_left_of_primary() {
+        let primary_height = 1117.0;
+        for (display, source, expected) in [
+            (
+                Rect::new(1560.0, -1080.0, 1920.0, 1080.0),
+                Point::new(2520.5, -0.02),
+                Point::new(2520.0, -1.0),
+            ),
+            (
+                Rect::new(-1920.0, 0.0, 1920.0, 1080.0),
+                Point::new(-0.02, 540.5),
+                Point::new(-1.0, 540.0),
+            ),
+            (
+                Rect::new(-1920.0, -1080.0, 1920.0, 1080.0),
+                Point::new(-0.02, -0.02),
+                Point::new(-1.0, -1.0),
+            ),
+            (
+                Rect::new(0.0, 0.0, 1728.0, 1117.0),
+                Point::new(864.5, 1116.98),
+                Point::new(864.0, 1116.0),
+            ),
+            (
+                Rect::new(1560.0, 1117.0, 1920.0, 1080.0),
+                Point::new(2520.5, 2196.98),
+                Point::new(2520.0, 2196.0),
+            ),
+        ] {
+            let cocoa = NSPoint::new(source.x, primary_height - source.y);
+            let query = owner_hit_point(cocoa, primary_height);
+            let quartz = Point::new(query.x, primary_height - query.y);
+            assert_eq!(quartz, expected);
+            assert!(display.contains(quartz));
+            // Both the initial hit test and the acknowledgement must select our
+            // panel, otherwise neither the marker nor relocation can proceed.
+            if source.x < 0.0 && source.x > -1.0 || source.y < 0.0 && source.y > -1.0 {
+                assert!(!display.contains(Point::new(source.x.trunc(), source.y.trunc())));
+            }
+        }
+    }
+
+    #[test]
+    fn glyph_retirement_distinguishes_missing_ownership_and_preserves_other_apps() {
+        let no_query = || panic!("no blank glyph was installed");
+        let no_retire = || panic!("must preserve the destination cursor");
+        assert_eq!(retire_blank_with(0, 7, no_query, no_retire), GlyphRetirement::NoOwner);
+        assert_eq!(retire_blank_with(1, -1, no_query, no_retire), GlyphRetirement::NoBlank);
+        assert_eq!(
+            retire_blank_with(1, 7, || None, no_retire),
+            GlyphRetirement::Unavailable
+        );
+        assert_eq!(
+            retire_blank_with(1, 7, || Some(8), no_retire),
+            GlyphRetirement::OtherCursor
+        );
+        let retired = Cell::new(false);
+        assert_eq!(
+            retire_blank_with(1, 7, || Some(7), || retired.set(true)),
+            GlyphRetirement::Retired
+        );
+        assert!(retired.get());
+    }
+
+    #[test]
+    fn cleanup_hit_on_negative_display_can_reset_only_our_stale_blank_cursor() {
+        let primary_height = 1117.;
+        let display = Rect::new(1560., -1080., 1920., 1080.);
+        let entry = Point::new(2520.5, -0.02);
+        let cocoa = NSPoint::new(entry.x, primary_height - entry.y);
+        let reset = Cell::new(false);
+        cleanup_stale_blank(
+            true,
+            cocoa,
+            primary_height,
+            |at| {
+                // Model the native query's observed truncation in Quartz space.
+                let hit = Point::new(at.x.trunc(), (primary_height - at.y).trunc());
+                display.contains(hit).then_some(())
+            },
+            |()| reset.set(true),
+        );
+        assert!(reset.get(), "negative external entry must find our destination window");
+        cleanup_stale_blank(
+            false,
+            cocoa,
+            primary_height,
+            |_| panic!("new owner or another application's cursor must be preserved"),
+            |()| panic!("must not overwrite the destination application's glyph"),
+        );
+        assert_eq!(entry.y, -0.02, "hit testing must not relocate the entry");
+    }
+
     #[test]
     fn owner_event_tag_is_distinct_and_round_trips() {
         assert_eq!(event_generation(super::super::super::inject::MAGIC), None);

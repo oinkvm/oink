@@ -1250,6 +1250,7 @@ mod tests {
                 screens: BTreeMap::from([(
                     "virtual".into(),
                     oink_display::layout::ScreenPreference {
+                        remote_gain: 1.0,
                         enabled: false,
                         gain: 1.0,
                     },

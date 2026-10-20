@@ -17,6 +17,25 @@ pub const MAX_PACKAGE: u64 = 512 * 1024 * 1024;
 pub const MAX_UNPACKED: u64 = 1024 * 1024 * 1024;
 pub const MAX_NOTES: usize = 16 * 1024;
 
+pub fn manifest_url(channel: Channel) -> String {
+    format!(
+        "{}/windows/v1/{}/{}/manifest.json",
+        feed_origin(),
+        crate::WINDOWS_EPOCH,
+        channel.name()
+    )
+}
+fn feed_origin() -> &'static str {
+    #[cfg(feature = "test-feed")]
+    {
+        concat!(env!("OINK_WINDOWS_UPDATE_TEST_FEED"), "/oink-update-qualification")
+    }
+    #[cfg(not(feature = "test-feed"))]
+    {
+        "https://updates.oink.hachiwii.com"
+    }
+}
+
 /// Both translations travel together; consumers choose by system language and
 /// fall back to English. Text is never interpreted as HTML or Markdown.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,7 +146,6 @@ pub struct Package {
 pub struct Trust<'a> {
     pub epoch: &'a str,
     pub key: &'a [u8; 32],
-    pub repository: &'a str,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -262,7 +280,7 @@ pub fn verify_manifest(
         {
             return Err(Error::Metadata);
         }
-        validate_asset_url(&release.package.url, trust.repository, &release.tag)?;
+        validate_package_url(&release.package.url)?;
     }
     let watermark = Watermark {
         sequence: manifest.sequence,
@@ -283,6 +301,17 @@ pub fn verify_package(bytes: &[u8], package: &Package, trust: &Trust<'_>) -> Res
         return Err(Error::Signature);
     }
     verify_signature(bytes, &package.ed25519, trust.key)
+}
+/// Product build is the primary monotonic counter; a higher build must also
+/// retain or increase the human version. Build metadata has no precedence.
+pub fn verify_version(candidate: &str, installed: &str) -> Result<(), Error> {
+    let candidate = semver::Version::parse(candidate).map_err(|_| Error::Metadata)?;
+    let installed = semver::Version::parse(installed).map_err(|_| Error::Metadata)?;
+    if candidate.cmp_precedence(&installed).is_lt() {
+        Err(Error::Replay)
+    } else {
+        Ok(())
+    }
 }
 pub fn verify_signature(bytes: &[u8], signature: &str, key: &[u8; 32]) -> Result<(), Error> {
     let decoded = STANDARD.decode(signature).map_err(|_| Error::Signature)?;
@@ -305,41 +334,43 @@ fn is_hex(s: &str, len: usize) -> bool {
 }
 fn https_url(s: &str) -> Result<Url, Error> {
     let url = Url::parse(s).map_err(|_| Error::Url)?;
+    // Inspect raw authority too: URL normalization erases empty userinfo (@).
+    let authority = s
+        .get(8..)
+        .ok_or(Error::Url)?
+        .split(['/', '\\', '?', '#'])
+        .next()
+        .ok_or(Error::Url)?;
     if url.scheme() != "https"
+        || !s.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
-        || url.port().is_some()
-        || url.fragment().is_some()
+        || authority.contains('@')
     {
         return Err(Error::Url);
     }
     Ok(url)
 }
-pub fn validate_asset_url(s: &str, repository: &str, tag: &str) -> Result<(), Error> {
-    let url = https_url(s)?;
-    let safe = |s: &str| {
-        !s.is_empty() && s != "." && s != ".." && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-    };
-    let repo: Vec<_> = repository.split('/').collect();
-    let segments: Vec<_> = url.path().split('/').skip(1).collect();
-    if repo.len() != 2 || !repo.iter().all(|s| safe(s)) || !safe(tag) || url.host_str() != Some("github.com") || url.query().is_some()
-        || segments.len() != 6 || segments[..2] != repo[..] || segments[2..4] != ["releases", "download"] || segments[4] != tag || !safe(segments[5])
-        // Reject normalization tricks before parsing, including escaped dot segments.
-        || s.contains('%') || s.contains('\\') || s.contains("/../") || s.contains("/./")
+/// Package hosts/paths are selected by the signed manifest, not compiled pins.
+/// The exact downloaded bytes must still pass verify_package before staging/use.
+pub fn validate_package_url(s: &str) -> Result<(), Error> {
+    #[cfg(feature = "test-feed")]
     {
-        return Err(Error::Url);
+        let prefix = format!("{}/packages/", feed_origin());
+        if let Some(name) = s.strip_prefix(&prefix)
+            && name.ends_with(".msi")
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        {
+            return Ok(());
+        }
     }
-    Ok(())
+    https_url(s).map(|_| ())
 }
-/// Called on every redirect; the original GitHub URL must already be verified.
+/// Every redirect hop must retain HTTPS without userinfo, to any host.
 pub fn validate_redirect(s: &str, hop: usize) -> Result<(), Error> {
-    let url = https_url(s)?;
-    if hop > 5
-        || !matches!(
-            url.host_str(),
-            Some("release-assets.githubusercontent.com" | "objects.githubusercontent.com")
-        )
-    {
+    https_url(s)?;
+    if hop > 5 {
         return Err(Error::Url);
     }
     Ok(())

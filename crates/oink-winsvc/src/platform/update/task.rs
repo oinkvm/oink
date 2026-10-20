@@ -13,7 +13,7 @@ impl Drop for Apartment {
         }
     }
 }
-fn with_folder<T>(f: impl FnOnce(&ITaskFolder) -> Result<T, Error>) -> Result<T, Error> {
+fn with_service<T>(f: impl FnOnce(&ITaskService) -> Result<T, Error>) -> Result<T, Error> {
     // SAFETY: updater workers use a dedicated ordinary thread, no COM objects cross it.
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }.map_err(|_| Error::Storage)?;
     let _apartment = Apartment;
@@ -23,9 +23,23 @@ fn with_folder<T>(f: impl FnOnce(&ITaskFolder) -> Result<T, Error>) -> Result<T,
     let empty = VARIANT::default();
     // SAFETY: default variants mean local machine/current SYSTEM identity.
     unsafe { service.Connect(&empty, &empty, &empty, &empty) }.map_err(|_| Error::Storage)?;
-    // SAFETY: fixed local root folder, returns an owned interface.
-    let folder = unsafe { service.GetFolder(&BSTR::from("\\")) }.map_err(|_| Error::Storage)?;
-    f(&folder)
+    f(&service)
+}
+fn with_folder<T>(f: impl FnOnce(&ITaskFolder) -> Result<T, Error>) -> Result<T, Error> {
+    with_service(|service| {
+        // SAFETY: fixed local root folder, returns an owned interface.
+        let folder = unsafe { service.GetFolder(&BSTR::from("\\")) }.map_err(|_| Error::Storage)?;
+        f(&folder)
+    })
+}
+#[cfg(test)]
+pub(super) fn validate_definition(xml: &str) -> Result<(), Error> {
+    with_service(|service| {
+        // SAFETY: an in-memory definition only; no task is registered or run.
+        let definition = unsafe { service.NewTask(0) }.map_err(|_| Error::Storage)?;
+        // SAFETY: native scheduler parses the exact UTF-16 XML passed at registration.
+        unsafe { definition.SetXmlText(&BSTR::from(xml)) }.map_err(|_| Error::Storage)
+    })
 }
 pub(super) fn register(tx: &str, xml: &str) -> Result<(), Error> {
     if !super::valid_transaction(tx) {

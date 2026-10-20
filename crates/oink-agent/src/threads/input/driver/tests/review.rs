@@ -97,9 +97,12 @@ fn failed_post_to_one_peer_does_not_drop_output_for_another_peer() {
 fn main_command_backlog_is_bounded_while_its_ordinary_consumer_is_stalled() {
     let mut h = Harness::new();
     // Nobody drains `h._main`: the ordinary consumer is stalled.
+    let focus = h.driver.adapter.router().focus();
     for _ in 0..50_000 {
         // What the platform observer sends 20 times a second, forever.
         h.driver.command(InputCommand::PointerSample {
+            application: None,
+            scope: Some((focus.epoch, focus.holder)),
             sample: None,
             hidden: false,
         });

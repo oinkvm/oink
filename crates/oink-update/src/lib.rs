@@ -34,7 +34,7 @@ pub enum Error {
     Policy,
     #[error("update requires a compatible operating system")]
     OsUnsupported,
-    #[error("sharing is busy")]
+    #[error("update preparation or installer is unavailable")]
     Busy,
     #[error("transaction state rejected")]
     Transaction,

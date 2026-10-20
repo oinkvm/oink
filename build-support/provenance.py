@@ -22,7 +22,7 @@ def product_source(relative):
         # Tauri emits IDE permission schemas during compilation. Archives have
         # no Git ignore engine, so exclude this generated directory explicitly.
         return False
-    if path.parts[0] == 'docs':
+    if path.parts[0] in ('docs', 'scripts', 'tools'):
         return False
     if path.suffix.lower() == '.md' and path.parts[0] != 'licenses':
         return relative in PRODUCT_DOCUMENTS

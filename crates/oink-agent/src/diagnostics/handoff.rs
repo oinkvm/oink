@@ -70,7 +70,13 @@ pub(super) struct Screen {
     device: DeviceId,
 }
 impl Screen {
-    fn new(device: DeviceId, text: &str) -> Option<Self> {
+    pub(super) fn alias(&self, recorder: &Recorder) -> String {
+        recorder.anonymizer().screen(
+            self.device,
+            std::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or(""),
+        )
+    }
+    pub(super) fn new(device: DeviceId, text: &str) -> Option<Self> {
         if text.len() > 256 {
             return None;
         }
@@ -541,6 +547,11 @@ impl RoutingDiagnostics for input_trace::InputTrace {
             layout,
             topology_sequence: self.topology_sequence.load(Ordering::Relaxed),
             epoch,
+            pointer_source: if local {
+                Some(from.screen.device)
+            } else {
+                departure.pointer_source
+            },
             from_screen: Screen::new(from.screen.device, &from.screen.display),
             from: from.local,
             to_screen: Screen::new(to.screen.device, &to.screen.display),
@@ -658,6 +669,7 @@ pub struct DepartureClamp {
     pub display_revision: u64,
 }
 pub(super) struct RawCrossing {
+    pub pointer_source: Option<DeviceId>,
     pub layout: Arc<dyn oink_routing::layout::LayoutQuery>,
     pub topology_sequence: u64,
     pub epoch: u64,
@@ -684,7 +696,12 @@ impl RawCrossing {
             } else {
                 1.
             };
-            self.layout.first_portal(&from, (self.delta.x * k, self.delta.y * k))
+            let delta = (self.delta.x * k, self.delta.y * k);
+            if let Some(source) = self.pointer_source {
+                self.layout.first_portal_from_source(&from, delta, source)
+            } else {
+                self.layout.first_portal(&from, delta)
+            }
         });
         Event::Crossing(CrossingEvent {
             topology_sequence: self.topology_sequence,

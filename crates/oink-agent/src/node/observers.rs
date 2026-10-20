@@ -77,6 +77,7 @@ impl Node {
                 let mut last_capture = None;
                 let mut volume_probe_attached = false;
                 let mut last_pointer = None;
+                let mut last_capture_application = None;
                 let mut last_session = None;
                 let mut display_revision = 0;
                 let mut enumerated = None;
@@ -123,6 +124,7 @@ impl Node {
                                 }
                                 group.local_displays_changed(displays.clone());
                                 input.send(InputCommand::LocalDisplays(displays.clone()));
+                                node.update_notification_displays(&displays);
                                 if let Some(trail) = node.inner.cursor_trail.get() {
                                     trail.set_displays(displays);
                                 }
@@ -200,6 +202,7 @@ impl Node {
                         volume_probe_attached = true;
                     }
                     let status = input.status();
+                    let scope = status.focus_info.as_ref().map(|f| (f.epoch, f.holder));
                     let raw = backend.pointer_capture_sample();
                     let eligible = status.pointer_focus
                         && !status.paused
@@ -214,10 +217,26 @@ impl Node {
                     if let Some(windows) = comparable.as_mut().and_then(|s| s.windows.as_mut()) {
                         windows.sampled_at = 0;
                     }
-                    let observation = (comparable, hidden, eligible, status.game_mode);
+                    let observation = (scope, comparable, hidden, eligible, status.game_mode);
                     let detecting = eligible && sample.is_some_and(|s| s.hidden && s.application_hidden != Some(false));
                     if last_pointer != Some(observation) || detecting || status.game_mode {
-                        input.send(InputCommand::PointerSample { sample, hidden });
+                        let application = sample.and_then(|s| {
+                            if let Some((pid, application)) = last_capture_application
+                                && pid == s.foreground
+                            {
+                                return Some(application);
+                            }
+                            let bundle = backend.foreground_bundle_id(s.foreground)?;
+                            let application = crate::diagnostics::capture::Application::new(s.foreground, &bundle)?;
+                            last_capture_application = Some((s.foreground, application));
+                            Some(application)
+                        });
+                        input.send(InputCommand::PointerSample {
+                            scope,
+                            application,
+                            sample,
+                            hidden,
+                        });
                         last_pointer = Some(observation);
                     }
                     let capture = (backend.capture_active(), status.locked_device);
@@ -340,7 +359,6 @@ impl Node {
                 diagnostics.recorder.sample_links(&table);
                 diagnostics.recorder.sample_scheduler(&links.scheduler());
             }
-            let jitter = self.input_thread().ok().map(|input| input.quality_jitter());
             let now = crate::connection_quality::now_ms_at(sampled_at);
             let quality = {
                 let mut history = lock(&self.inner.quality);
@@ -358,7 +376,6 @@ impl Node {
                                 },
                             },
                             link.rtt.map(|rtt| rtt.as_secs_f64() * 1000.),
-                            jitter.as_ref().and_then(|j| j.get(&link.peer)).cloned(),
                         )
                     }),
                 );
@@ -504,10 +521,7 @@ fn statistics_stalls_record_only_the_current_bucket_without_backfill() {
     let peer = oink_foundation::DeviceId([2; 32]);
     let mut history = crate::connection_quality::History::default();
     for at_ms in [1000, sample.duration_since(start).as_millis() as u64] {
-        history.record(
-            at_ms,
-            [(peer, "Peer".into(), crate::api::LinkKind::Direct, Some(4.), None)],
-        );
+        history.record(at_ms, [(peer, "Peer".into(), crate::api::LinkKind::Direct, Some(4.))]);
     }
     let view = history.view(4200);
     assert_eq!(

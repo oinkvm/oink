@@ -57,6 +57,7 @@ enum Command {
     Configure(crate::api::PreferencePatch<Settings>, SyncSender<Result<(), String>>),
     Refresh,
     RefreshPermission,
+    PrepareUpdate(SyncSender<Result<(), String>>),
     Stop,
     #[cfg(all(test, debug_assertions))]
     HoldPeriodicReports(tokio::sync::oneshot::Sender<()>),
@@ -138,6 +139,14 @@ impl Handle {
         self.commands
             .send(Command::Refresh)
             .map_err(|_| "audio stopped".to_string())
+    }
+    pub fn prepare_update(&self, deadline: Instant) -> Result<(), String> {
+        let (reply, wait) = mpsc::sync_channel(1);
+        self.commands
+            .send(Command::PrepareUpdate(reply))
+            .map_err(|_| "audio owner unavailable")?;
+        wait.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| "audio cleanup timed out")?
     }
     pub fn stop(&self) {
         let _ = self.commands.send(Command::Stop);
@@ -261,6 +270,8 @@ type PublishedObservations = (
 );
 
 struct Owner {
+    update_suspended: bool,
+    update_cleanup: Option<(Option<u64>, Result<(), String>)>,
     update_activity: Option<oink_foundation::maintenance::Lease>,
     links: LinkLayer,
     group: ConfigModule,
@@ -441,6 +452,8 @@ impl Owner {
             CapturePermission::NotRequired
         };
         Self {
+            update_suspended: false,
+            update_cleanup: None,
             update_activity: None,
             links,
             group,
@@ -567,6 +580,7 @@ impl Owner {
                 },
                 command = commands.recv() => match command {
                     Some(Command::Stop) | None => break,
+                    Some(Command::PrepareUpdate(reply)) => { let result = self.suspend_for_update(); let _ = reply.send(result); },
                     Some(Command::RefreshPermission) => self.permission_observer.request(),
                     Some(Command::Refresh) => { self.platform.invalidate_devices(); self.discovery.changed(); },
                     Some(Command::Configure(settings, reply)) => self.configure(settings, reply),
@@ -611,7 +625,8 @@ impl Owner {
             self.stop_source();
         }
     }
-    fn release_capture(&mut self) {
+    fn release_capture(&mut self) -> Option<String> {
+        let mut cleanup = None;
         self.streams.set_forwarding(false, 1.0);
         self.needs_generation |= self.capture.is_some() && !self.provisional;
         if let Some(mut capture) = self.capture.take() {
@@ -619,32 +634,76 @@ impl Owner {
             // Joining already happens on Drop. Inspect its lease restoration
             // result on EVERY lifecycle path before discarding the handle.
             if let Some(error) = capture.finish() {
-                self.mute_cleanup_error = Some(error);
+                self.mute_cleanup_error = Some(error.clone());
+                cleanup = Some(error);
             }
         }
         self.encoded = None;
         self.capture_levels = None;
         self.capture_sent_base = self.sent.load(Ordering::Relaxed);
         self.provisional = false;
+        cleanup
     }
     fn stop_source(&mut self) {
+        let _ = self.stop_source_checked();
+    }
+    fn stop_source_checked(&mut self) -> Option<String> {
         self.exit_switch_deadline = None;
         self.streams.set_forwarding(false, 1.0);
         self.forwarding_pause.stop();
-        self.release_capture();
+        let cleanup = self.release_capture();
         self.forwarding_pause = self.platform.forwarding_pause();
         self.forwarding_pause
             .set_pause_allowed(matches!(self.resolution, Resolution::None { .. }));
         self.verified = false;
+        cleanup
     }
     fn fail_source(&mut self, error: String) {
         self.stop_source();
         self.error = Some(error);
         self.source_failed = true;
     }
+    fn suspend_for_update(&mut self) -> Result<(), String> {
+        let generation = oink_foundation::maintenance::process().generation();
+        if let Some((current, result)) = &self.update_cleanup
+            && *current == generation
+        {
+            return result.clone();
+        }
+        // Historical diagnostics still prevent unsafe capture reuse, but only
+        // this attempt's capture restoration can refuse an explicit Install.
+        // Tick and PrepareUpdate can reach the same attempt in either order.
+        self.update_suspended = true;
+        self.streams.pause_changed(true);
+        let result = self.stop_source_checked().map_or(Ok(()), Err);
+        self.retire_sessions();
+        self.update_activity = None;
+        self.update_cleanup = Some((generation, result.clone()));
+        self.publish(self.phase());
+        result
+    }
     fn tick(&mut self) {
         let gate = self.gate.clone();
         let _guard = lock(&gate);
+        if oink_foundation::maintenance::process().closed() {
+            let _ = self.suspend_for_update();
+            return;
+        }
+        if self.update_suspended {
+            self.update_suspended = false;
+            self.update_cleanup = None;
+            let _ = self.apply_locked();
+            for peer in self
+                .links
+                .links()
+                .links
+                .iter()
+                .map(|link| link.peer)
+                .collect::<Vec<_>>()
+            {
+                self.prepare_peer(peer);
+            }
+        }
         if self.update_activity.is_none() {
             self.update_activity =
                 oink_foundation::maintenance::process().enter(oink_foundation::maintenance::ActivityKind::Audio);
@@ -653,8 +712,8 @@ impl Owner {
             }
         }
         self.tick_running();
-        // A silent receiver remains a live stream, even after native playback
-        // enters its power-saving state. It still blocks an update.
+        // Keep the live-stream lease even when native playback is sleeping.
+        // Explicit Install interrupts it through suspend_for_update.
         if self.capture.is_none()
             && self.playback.is_none()
             && self.starting_playback.is_none()
@@ -918,7 +977,7 @@ impl Owner {
             // This is the same internal replacement as the native health
             // restart. Preserve the owner's logical ticket and player state;
             // only the old physical capture/queued media are retired.
-            self.release_capture();
+            let _ = self.release_capture();
         }
     }
     fn tick_exit(&mut self) {
@@ -1201,7 +1260,7 @@ impl Owner {
             // M0 may be reopening independently while the link stays ready. Restore
             // local sound. Player pause remains reserved for an explicit no-exit
             // barrier; a control-stream fault preserves the selected exit.
-            self.release_capture();
+            let _ = self.release_capture();
             return;
         }
         if self.platform.capture_cleanup_failed() {
@@ -1213,7 +1272,7 @@ impl Owner {
         }
         if let Some(reason) = self.capture.as_ref().and_then(|capture| capture.restart_reason()) {
             self.restart_reason = Some(reason);
-            self.release_capture();
+            let _ = self.release_capture();
         }
         if let Some(error) = self.capture.as_ref().and_then(|capture| capture.error()) {
             self.fail_source(error);
@@ -1337,7 +1396,7 @@ impl Owner {
             if output.has_signal() {
                 self.permission = CapturePermission::Authorized;
                 if self.provisional {
-                    self.release_capture();
+                    let _ = self.release_capture();
                     self.verified = true;
                 }
             }

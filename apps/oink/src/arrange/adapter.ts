@@ -75,3 +75,16 @@ export function replayPlacements(layout: Layout, stored: Placement[]): Placement
     stored.find(placement => placement.device === current.device) ?? current,
   );
 }
+
+/** Visibility is independent of connectivity and history placements. */
+export function visibleScreens(
+  screens: Screen[],
+  layout: Layout | null,
+  devices: ReadonlyArray<Pick<Device, 'id' | 'screenSharing' | 'screen'>>,
+): Screen[] {
+  return screens.filter(screen => {
+    const owner = devices.find(device => device.id === screen.device);
+    const backend = layout?.geometry.screens.find(item => `${item.key.device}:${item.key.display}` === screen.id);
+    return owner?.screenSharing !== false && owner?.screen !== 'disabled' && !backend?.hidden && !backend?.device_disabled;
+  });
+}

@@ -10,6 +10,17 @@ SPEC.loader.exec_module(S)
 
 
 class MacSigning(unittest.TestCase):
+    def test_published_app_uses_one_gatekeeper_assessment_and_one_team_read(self):
+        results = [subprocess.CompletedProcess([],0,'',''),
+                   subprocess.CompletedProcess([],0,'','TeamIdentifier=893V37X2CW\n')]
+        with patch.object(S, 'private_run', side_effect=results) as run:
+            S.verify_published_app(Path('Oink.app'), '893V37X2CW')
+            self.assertEqual(run.call_args_list, [
+                unittest.mock.call('spctl','-a','-t','exec',Path('Oink.app')),
+                unittest.mock.call('codesign','-dvv',Path('Oink.app'))])
+        with patch.object(S, 'private_run', return_value=subprocess.CompletedProcess([],0,'','TeamIdentifier=OTHER\n')):
+            with self.assertRaisesRegex(RuntimeError, 'Team ID'): S.verify_published_app(Path('Oink.app'), '893V37X2CW')
+
     def test_ticket_service_wait_preserves_stapled_app_and_rechecks_validation(self):
         results = [subprocess.CompletedProcess([], code, '', '') for code in [0, 68, 0]]
         with patch.object(S, 'private_run', side_effect=results) as run, patch.object(S.time, 'sleep') as sleep:
