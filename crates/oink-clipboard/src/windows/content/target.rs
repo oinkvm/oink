@@ -835,17 +835,17 @@ pub(crate) mod tests {
             (1, ObjectState::Replaced),
             (2, ObjectState::Replaced),
         ] {
-            let target = build(NativeSpec {
-                inventory: inventory.clone(),
-                contents: Arc::new(Failing {
+            let make_target = |inventory: Inventory| {
+                build(NativeSpec {
                     inventory: inventory.clone(),
-                    stage,
-                }),
-                files: vec![],
-                file_contents: None,
-                sensitivity: crate::Sensitivity::Normal,
-            })
-            .unwrap();
+                    contents: Arc::new(Failing { inventory, stage }),
+                    files: vec![],
+                    file_contents: None,
+                    sensitivity: crate::Sensitivity::Normal,
+                })
+                .unwrap()
+            };
+            let target = make_target(inventory.clone());
             let captured = Capture(Arc::new(Mutex::new(Vec::new())));
             let writer = captured.clone();
             let subscriber = tracing_subscriber::fmt()
@@ -853,12 +853,44 @@ pub(crate) mod tests {
                 .with_ansi(false)
                 .with_writer(move || writer.clone())
                 .finish();
+            // tracing-core's single-dispatch fast path computes new callsite
+            // interest using the registering thread's default subscriber. A
+            // parallel test without this scoped subscriber can therefore cache
+            // this WARN as never enabled. Keep two registered dispatches alive
+            // so interest is computed across subscribers, while capture stays
+            // local to this thread. Dispatch::none() does not register itself.
+            let _uncaptured = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new());
             let calls = std::cell::Cell::new(0);
             tracing::subscriber::with_default(subscriber, || {
                 let error = target
                     .get(&target.formats()[0], || {
                         let before = calls.get() == 0;
                         calls.set(calls.get() + 1);
+                        if !before {
+                            // Force a neighbouring test's first use of the WARN
+                            // callsite after this read's INFO boundaries, before
+                            // this thread emits its own failure diagnostic.
+                            std::thread::scope(|scope| {
+                                scope
+                                    .spawn(|| {
+                                        let neighbour = make_target(inventory.clone());
+                                        assert_eq!(
+                                            neighbour
+                                                .get(&neighbour.formats()[0], || Observation {
+                                                    object: 0,
+                                                    replacement: 0,
+                                                    state: ObjectState::Current,
+                                                })
+                                                .err()
+                                                .unwrap()
+                                                .code(),
+                                            STG_E_READFAULT
+                                        );
+                                    })
+                                    .join()
+                                    .unwrap();
+                            });
+                        }
                         Observation {
                             object: 7,
                             replacement: if before || end_state == ObjectState::Current {
@@ -875,6 +907,10 @@ pub(crate) mod tests {
             });
             assert_eq!(calls.get(), 2);
             let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                !log.contains("clipboard_object=0"),
+                "captured neighbouring thread: {log}"
+            );
             for field in [
                 "WARN",
                 "clipboard_object=7",

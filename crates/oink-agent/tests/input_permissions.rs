@@ -182,11 +182,39 @@ impl InputBackend for GatedInput {
     }
 }
 
+fn network_config(dir: std::path::PathBuf, name: &str, port: u16) -> oink_network::NetworkConfig {
+    // Permission scenarios use interactive QUIC, without bulk transfers. Keep
+    // port 0 until the live socket binds: probing and releasing an available
+    // port leaves a race with other processes on hosted runners.
+    oink_network::NetworkConfig {
+        data_dir: dir,
+        device_name: name.into(),
+        os: std::env::consts::OS.into(),
+        bind_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+        port,
+        bulk_port: 0,
+        bulk_pacing: true,
+        mdns: oink_network::MdnsMode::Off,
+        beacon: false,
+        beacon_ports: Vec::new(),
+    }
+}
+
+#[test]
+fn permission_fixture_binds_ephemeral_ports_atomically() {
+    let config = network_config("unused-permission-fixture".into(), "fixture", 0);
+    assert_eq!(
+        config.port, 0,
+        "the live socket must allocate its port, without a probe/drop/rebind gap"
+    );
+    assert_eq!(config.discovery_port(), 0);
+}
+
 async fn start(name: &str, port: u16, input: Arc<dyn InputBackend>) -> Node {
     let dir = std::env::temp_dir().join(format!("oink-input-perms-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     Node::start_with_fake_platform(NodeOptions {
-        net: oink_test_support::network_config(dir, name, port),
+        net: network_config(dir, name, port),
         input,
         displays: vec![display(name)],
         display_backend: None,
