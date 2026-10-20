@@ -55,6 +55,8 @@ pub(super) struct Shared {
     pub wake: Arc<Notify>,
     pub done: Notify,
     pub stopped: AtomicBool,
+    #[cfg(test)]
+    pub expired_service_budget: AtomicBool,
     pub links: ArcSwap<LinkTable>,
     pub scheduler: ArcSwap<SchedulerStatus>,
     pub counters: ArcSwap<Vec<StreamCounters>>,
@@ -120,6 +122,8 @@ impl LinkLayer {
             pool: OnceLock::new(),
             done: Notify::new(),
             stopped: AtomicBool::new(false),
+            #[cfg(test)]
+            expired_service_budget: AtomicBool::new(false),
             links: ArcSwap::from_pointee(LinkTable::default()),
             scheduler: ArcSwap::from_pointee(SchedulerStatus::default()),
             counters: ArcSwap::from_pointee(Vec::new()),
@@ -270,6 +274,8 @@ mod config_order_tests {
             wake: wake.clone(),
             done: Notify::new(),
             stopped: AtomicBool::new(false),
+            #[cfg(test)]
+            expired_service_budget: AtomicBool::new(false),
             links: ArcSwap::from_pointee(LinkTable::default()),
             scheduler: ArcSwap::from_pointee(SchedulerStatus::default()),
             counters: ArcSwap::from_pointee(Vec::new()),

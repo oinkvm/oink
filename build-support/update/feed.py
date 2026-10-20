@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import unicodedata
@@ -86,8 +87,16 @@ def iso(value):
 
 
 def openssl(args):
+    executable = shutil.which('openssl')
+    require(executable is not None, 'openssl_3_required: put the OpenSSL 3 bin directory on PATH')
+    version = subprocess.run([executable, 'version'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    # LibreSSL and OpenSSL 1.x may parse Ed25519 keys but cannot perform the
+    # pkeyutl -rawin operations used by feed signatures. Reject them before keys
+    # reach the tool, using the same resolved executable for the actual command.
+    require(version.returncode == 0 and version.stdout.startswith(b'OpenSSL 3.'),
+            'openssl_3_required: put the OpenSSL 3 bin directory on PATH')
     # Never forward tool stderr (it may contain key material or local paths).
-    result = subprocess.run(['openssl', *args], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    result = subprocess.run([executable, *args], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     require(result.returncode == 0, 'crypto')
     return result.stdout
 

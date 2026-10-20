@@ -6,6 +6,63 @@ mod frames;
 use tokio::time::{sleep, timeout};
 
 #[tokio::test]
+async fn freezing_config_delivers_accepted_prefix_before_fin() {
+    let credentials = crate::tls::Credentials::new(&Identity::generate()).unwrap();
+    let (server, client) = transport(&credentials).unwrap();
+    let endpoint = quinn::Endpoint::server(server, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut sender = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    sender.set_default_client_config(client);
+    let (outbound, inbound) = tokio::join!(sender.connect(endpoint.local_addr().unwrap(), "oink").unwrap(), async {
+        endpoint.accept().await.unwrap().await
+    });
+    let outbound = outbound.unwrap();
+    let inbound = inbound.unwrap();
+    let queue = queue::Queue::new(QueueSpec::reliable(StreamKind::Config).0);
+    let accepted = frames::control(7);
+    let later = frames::control(11);
+    queue.post(accepted.clone(), 65536).unwrap();
+    let header = StreamHeader {
+        route_tag: 0,
+        priority: Priority::Normal,
+        tag: StreamTag {
+            kind: StreamKind::Config,
+            ordinal: 1,
+        },
+        datagram_flow: 0,
+    };
+    let mut writer = wire::Writer::new(0, header, None, wire::Source::User(queue.clone()), None);
+    writer.freeze();
+    queue.post(later.clone(), 65536).unwrap();
+    let received = timeout(Duration::from_secs(2), async {
+        let send = std::future::poll_fn(|cx| {
+            while !writer.finished {
+                if !writer.step(&outbound, true, cx).unwrap() {
+                    return Poll::Pending;
+                }
+            }
+            Poll::Ready(())
+        });
+        let read = async { inbound.accept_uni().await.unwrap().read_to_end(65536).await.unwrap() };
+        tokio::join!(send, read).1
+    })
+    .await;
+    sender.close(0u32.into(), b"done");
+    endpoint.close(0u32.into(), b"done");
+    let mut expected = Vec::new();
+    header.encode(&mut expected);
+    expected.extend(accepted);
+    assert_eq!(
+        received.expect("accepted C0 prefix must precede migration FIN"),
+        expected
+    );
+    assert_eq!(
+        queue.take().unwrap(),
+        Some(later),
+        "post-freeze traffic belongs to the new path"
+    );
+}
+
+#[tokio::test]
 async fn manual_query_closed_udp_port_fails_without_waiting_for_quic_idle() {
     let (a, _, _) = node().await;
     let vacant = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -15,6 +72,23 @@ async fn manual_query_closed_udp_port_fails_without_waiting_for_quic_idle() {
     a.stop().await;
     assert_eq!(
         result.expect("ICMP port unreachable must fail immediately"),
+        Err(AddressProbeError::Refused)
+    );
+}
+
+#[tokio::test]
+async fn expired_service_budgets_still_process_queued_commands() {
+    let (a, _, _) = node().await;
+    let vacant = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = vacant.local_addr().unwrap();
+    drop(vacant);
+    // Model a descheduled owner resuming after all three absolute deadlines.
+    a.0.expired_service_budget.store(true, Ordering::Release);
+    let result = timeout(Duration::from_secs(1), a.probe_address(address)).await;
+    a.0.expired_service_budget.store(false, Ordering::Release);
+    a.stop().await;
+    assert_eq!(
+        result.expect("expired slices must still service queued commands"),
         Err(AddressProbeError::Refused)
     );
 }

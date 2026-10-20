@@ -264,9 +264,20 @@ pub(super) async fn run(
         network.probe_tick(began);
         network.retry_n1(began);
         network.effects();
-        let mut progress = network.service(0, began + OWN_BUDGET, &mut cx);
-        progress |= network.service(1, began + OWN_BUDGET + INTERACTIVE_BUDGET, &mut cx);
-        progress |= network.service(2, began + ROUND_BUDGET, &mut cx);
+        let budgets = [
+            began + OWN_BUDGET,
+            began + OWN_BUDGET + INTERACTIVE_BUDGET,
+            began + ROUND_BUDGET,
+        ];
+        #[cfg(test)]
+        let budgets = if shared.expired_service_budget.load(Ordering::Acquire) {
+            [began; 3]
+        } else {
+            budgets
+        };
+        let mut progress = network.service(0, budgets[0], &mut cx);
+        progress |= network.service(1, budgets[1], &mut cx);
+        progress |= network.service(2, budgets[2], &mut cx);
         network.check_drained();
         network.effects();
         let ended = Instant::now();
@@ -688,7 +699,8 @@ impl Network {
                 }
                 Effect::Freeze(link) => {
                     self.publish_low();
-                    for writer in self.writers.iter().filter(|w| w.id.is_some_and(|s| s.link == link)) {
+                    for writer in self.writers.iter_mut().filter(|w| w.id.is_some_and(|s| s.link == link)) {
+                        writer.freeze();
                         if let Some(queue) = &writer.datagram {
                             while queue.take().ok().flatten().is_some() {
                                 queue.dropped.fetch_add(1, Ordering::Relaxed);
@@ -1190,6 +1202,7 @@ impl Network {
     }
     fn service(&mut self, class: u8, until: Instant, cx: &mut Context<'_>) -> bool {
         let mut progressed = false;
+        let mut visited = false;
         // Carry an unfinished empty sweep across budget boundaries. With many
         // streams, requiring a complete sweep in one 100/250/150 us slice would
         // otherwise keep a wholly idle network awake forever.
@@ -1202,12 +1215,14 @@ impl Network {
                 .max(self.pipes.len())
                 .max(self.physical.len()));
         while empty < visits && !self.stop {
-            // Reuse the budget check's clock read for this polling iteration.
-            // Each iteration still checks its budget against a fresh instant.
+            // A descheduled owner or an earlier class can consume this slice
+            // before its first poll. Advance at least one bounded cursor slot
+            // per unfinished sweep so expired deadlines cannot starve a class.
             let now = Instant::now();
-            if now >= until {
+            if visited && now >= until {
                 break;
             }
+            visited = true;
             let cursor = self.cursors[class as usize];
             self.cursors[class as usize] = (cursor + 1) % 5;
             let work = match cursor {

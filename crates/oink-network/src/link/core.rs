@@ -629,6 +629,7 @@ impl Core {
     }
     pub fn set_ready(&mut self, id: LinkId) {
         let mut direct = None;
+        let mut relay = None;
         if let Some(link) = self.links.get_mut(&id)
             && link.state != LinkState::Ready
         {
@@ -664,11 +665,19 @@ impl Core {
             link.state = LinkState::Ready;
             if link.path() == LinkPath::Direct {
                 direct = Some(link.hop.connection_id);
+            } else {
+                relay = Some(link.peer.device_id);
             }
             self.effects.push_back(Effect::Ready(id));
         }
         if let Some(connection) = direct {
             self.relay_neighbor_ready(connection, Instant::now());
+        }
+        if let Some(peer) = relay
+            && self.arbiter(peer)
+            && let Some(connection) = self.selected_connection(peer)
+        {
+            self.begin_cutover(id, connection, Instant::now());
         }
     }
     pub fn inbound(&mut self, id: LinkId) -> Result<(), oink_protocol::frame::StreamCode> {
@@ -1245,6 +1254,11 @@ impl Core {
             return;
         }
         if link.wire.reservation.is_none() || link.cutover.is_some() {
+            return;
+        }
+        // C0 must finish admission before migration can freeze its writer.
+        // Half-open business readers wait for Ready and cannot drain yet.
+        if link.state != LinkState::Ready {
             return;
         }
         let to_revision = link.wire.route_revision.next().expect("route revision");

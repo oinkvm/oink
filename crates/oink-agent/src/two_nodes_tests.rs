@@ -319,7 +319,23 @@ async fn pair_route_clipboard_layout_disconnect_scenario() {
         bn.input_status().unwrap().focus_info.clone().unwrap().holder == bn.id()
     })
     .await;
-    assert!(matches!(a.input.mode(), Some(CaptureMode::Remote { .. })));
+    wait_for("A applies remote capture", 3.0, || {
+        matches!(a.input.mode(), Some(CaptureMode::Remote { .. }))
+    })
+    .await;
+    // The focus claim can precede FocusEnter and its native entry warp. An
+    // ordered key after the crossing flushes that motion before we take the
+    // displacement baseline; observing the holder alone can still see x=800.
+    let barrier = KeyCode::keyboard(0x68);
+    key(&a.input, barrier, true);
+    key(&a.input, barrier, false);
+    wait_for("B applies the entry and preceding motion", 3.0, || {
+        b.input
+            .injected()
+            .iter()
+            .any(|event| matches!(event, InjectEvent::Key { code, pressed: false } if *code == barrier))
+    })
+    .await;
     b.input.take_injected();
     let before = b.input.cursor_position().unwrap();
     for _ in 0..10 {

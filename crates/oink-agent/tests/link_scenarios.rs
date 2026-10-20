@@ -321,6 +321,7 @@ async fn cross(from: &Dev, to: &Dev, dir: f64) {
 /// checks that `to` injected exactly that sequence after `already` earlier key events.
 async fn type_and_check(from: &Dev, to: &Dev, count: u32, what: &str) {
     let already = keys(&to.input).len();
+    let before = (from.node.input_status(), to.node.input_status());
     let mut expected = Vec::new();
     for i in 0..count {
         let usage = 4 + (i % 26);
@@ -334,6 +335,15 @@ async fn type_and_check(from: &Dev, to: &Dev, count: u32, what: &str) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let got = keys(&to.input)[already..].to_vec();
+    if got != expected {
+        eprintln!(
+            "KEY_DELIVERY from={} to={} before={before:?} after={:?} links={:?}",
+            from.node.id(),
+            to.node.id(),
+            (from.node.input_status(), to.node.input_status()),
+            (from.node.links().map(|l| l.links()), to.node.links().map(|l| l.links()))
+        );
+    }
     assert_eq!(got, expected, "{what}: keys injected on {}", to.name);
 }
 

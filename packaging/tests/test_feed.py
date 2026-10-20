@@ -1,6 +1,7 @@
 import base64
 import copy
 import os
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -15,6 +16,43 @@ PUB = base64.b64encode(bytes.fromhex('d75a980182b10ab7d54bfed3c964073a0ee172f3da
 PEM = '-----BEGIN PRIVATE KEY-----\n' + base64.b64encode(bytes.fromhex('302e020100300506032b657004220420') + SEED).decode() + '\n-----END PRIVATE KEY-----\n'
 EPOCH = {'epoch': 'win-2026-01', 'public_key': PUB, 'channels': ['stable', 'beta']}
 NOW = 1800000000
+
+
+class OpenSSLToolTests(unittest.TestCase):
+    def test_missing_tool_fails_before_crypto(self):
+        with patch.object(feed.shutil, 'which', return_value=None), patch.object(feed.subprocess, 'run') as run:
+            with self.assertRaisesRegex(ValueError, 'openssl_3_required'):
+                feed.openssl(['pkeyutl', '-sign'])
+            run.assert_not_called()
+
+    def test_incompatible_or_failed_version_probe_never_receives_crypto_arguments(self):
+        for status, version in [(0, b'LibreSSL 3.3.6'), (0, b'OpenSSL 1.1.1w'),
+                                (0, b'OpenSSL 4.0.0'), (0, b''), (1, b'OpenSSL 3.0.0')]:
+            with self.subTest(status=status, version=version), \
+                    patch.object(feed.shutil, 'which', return_value='selected-openssl'), \
+                    patch.object(feed.subprocess, 'run', return_value=subprocess.CompletedProcess([], status, version)) as run:
+                with self.assertRaisesRegex(ValueError, 'openssl_3_required'):
+                    feed.openssl(['pkeyutl', '-sign', '-inkey', 'test-key.pem'])
+                run.assert_called_once_with(['selected-openssl', 'version'],
+                                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def test_version_check_and_crypto_use_the_same_resolved_tool(self):
+        with patch.object(feed.shutil, 'which', return_value='selected-openssl'), \
+                patch.object(feed.subprocess, 'run', side_effect=[
+                    subprocess.CompletedProcess([], 0, b'OpenSSL 3.0.0 7 Sep 2021'),
+                    subprocess.CompletedProcess([], 0, b'signature')]) as run:
+            self.assertEqual(feed.openssl(['pkeyutl', '-sign', '-rawin']), b'signature')
+            self.assertEqual([call.args[0] for call in run.call_args_list],
+                             [['selected-openssl', 'version'], ['selected-openssl', 'pkeyutl', '-sign', '-rawin']])
+
+    def test_crypto_failure_is_not_swallowed_or_disclosed(self):
+        with patch.object(feed.shutil, 'which', return_value='selected-openssl'), \
+                patch.object(feed.subprocess, 'run', side_effect=[
+                    subprocess.CompletedProcess([], 0, b'OpenSSL 3.6.0'),
+                    subprocess.CompletedProcess([], 1, b'', b'sensitive tool error')]) as run:
+            with self.assertRaisesRegex(ValueError, '^crypto$'):
+                feed.openssl(['pkeyutl', '-verify', '-rawin'])
+            self.assertEqual(run.call_args.kwargs['stderr'], subprocess.DEVNULL)
 
 
 class FeedTests(unittest.TestCase):

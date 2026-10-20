@@ -9,8 +9,13 @@ use oink_test_support::input::FakeInput;
 use std::{sync::Arc, time::Duration};
 
 async fn start(dir: &std::path::Path, input: &FakeInput) -> Node {
+    let mut net = oink_test_support::network_config(dir.to_path_buf(), "pause-test", 0);
+    // These single-node fixtures do not use peer discovery. Let each listener
+    // atomically bind an ephemeral port instead of releasing a probed port
+    // before asynchronous startup, when another process could acquire it.
+    net.port = 0;
     Node::start_with_fake_platform(NodeOptions {
-        net: oink_test_support::network_config(dir.to_path_buf(), "pause-test", 0),
+        net,
         input: Arc::new(input.clone()),
         displays: vec![],
         display_backend: None,

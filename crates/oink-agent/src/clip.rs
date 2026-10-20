@@ -659,7 +659,12 @@ impl Task {
             return;
         };
         self.fetch_requested = Some(id);
-        if self.native_write.as_ref().is_some_and(|write| write.id == id) {
+        // A previous publication can still own the native worker while this
+        // offer is queued. Preserve demand until this offer's provider result
+        // tells us whether download must also materialize the clipboard files.
+        if self.native_write.as_ref().is_some_and(|write| write.id == id)
+            || self.queued_write.as_ref().is_some_and(|(queued, _)| *queued == id)
+        {
             return;
         }
         self.cancelled = None;

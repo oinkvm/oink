@@ -410,6 +410,7 @@ fn old_n0_retirement_does_not_hide_cutover_failures() {
     for failure in 0..4 {
         let mut r = Rig::new(3);
         r.relay();
+        r.ready(0, 2);
         let a = r.link(0, 2);
         let old = r.nodes[0].links[&a].hop;
         let direct = r.connect(0, 2);
@@ -447,6 +448,7 @@ fn old_n0_retirement_does_not_hide_cutover_failures() {
 fn cutover_timeout_loses_link_and_new_connection() {
     let mut r = Rig::new(3);
     r.relay();
+    r.ready(0, 2);
     let id = r.link(0, 2);
     let direct = r.connect(0, 2);
     r.pump();
@@ -819,6 +821,31 @@ fn selection_watermark_survives_loss_in_the_same_boot() {
 }
 
 #[test]
+fn selected_direct_candidate_does_not_freeze_an_unfinished_config_handshake() {
+    let mut r = Rig::new(3);
+    r.relay();
+    let a = r.link(0, 2);
+    let b = r.link(2, 0);
+    r.nodes[0].set_half_open(a);
+    r.nodes[2].set_half_open(b);
+    r.connect(0, 2);
+    r.pump();
+    // Reply/Done still need the old C0 stream. Freezing now prevents admission
+    // from completing and can leave business readers waiting for Ready forever.
+    assert!(!r.nodes[0].links[&a].frozen());
+    assert!(!r.nodes[2].links[&b].frozen());
+    r.ready(0, 2);
+    r.pump();
+    assert!(r.nodes[0].links[&a].frozen());
+    assert!(r.nodes[2].links[&b].frozen());
+    r.nodes[0].drained(a);
+    r.nodes[2].drained(b);
+    r.pump();
+    assert_eq!(r.nodes[0].links[&a].path(), LinkPath::Direct);
+    assert_eq!(r.nodes[2].links[&b].path(), LinkPath::Direct);
+}
+
+#[test]
 fn selected_direct_candidate_waits_for_pending_relay_installation() {
     let mut r = Rig::new(3);
     r.connect(0, 1);
@@ -849,9 +876,11 @@ fn selected_direct_candidate_waits_for_pending_relay_installation() {
         r.nodes[n].effects.push_back(effect);
     }
     r.pump();
+    assert!(r.nodes[0].links[&a].cutover.is_none());
+    r.ready(0, 2);
     assert!(
         r.nodes[0].links[&a].cutover.is_some(),
-        "relay confirmation must reconcile the selected direct candidate"
+        "relay admission must reconcile the selected direct candidate"
     );
     r.nodes[0].drained(a);
     r.nodes[2].drained(b);

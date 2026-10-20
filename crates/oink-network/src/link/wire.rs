@@ -120,6 +120,7 @@ pub(super) struct Writer {
     stopping: Stopping,
     offset: usize,
     pub finished: bool,
+    config_drain: usize,
 }
 impl Writer {
     pub fn new(
@@ -145,11 +146,22 @@ impl Writer {
             stopping: Stopping::default(),
             offset: 0,
             finished: false,
+            config_drain: 0,
         }
     }
     pub fn private_post(&mut self, bytes: queue::Queued) {
         if let Source::Private(q) = &mut self.source {
             q.push_back(bytes);
+        }
+    }
+    pub fn freeze(&mut self) {
+        // Ready may be queued immediately after ConfigDone. Deliver the C0
+        // prefix already accepted before freeze so the peer can admit and
+        // drain its held business readers. Later traffic stays for the new path.
+        if self.header.tag.kind == StreamKind::Config
+            && let Source::User(queue) = &self.source
+        {
+            self.config_drain = queue.len();
         }
     }
     pub fn abort(&mut self, why: StreamCode) {
@@ -177,6 +189,7 @@ impl Writer {
         self.opening = Opening::default();
         self.stopping = Stopping::default();
         self.finished = false;
+        self.config_drain = 0;
         self.pending.clear();
         self.pending_age = None;
         self.timing = None;
@@ -205,7 +218,7 @@ impl Writer {
             self.check_stopped(cx)?;
             return Ok(false);
         }
-        if freeze && self.pending.is_empty() {
+        if freeze && self.config_drain == 0 && self.pending.is_empty() {
             self.check_stopped(cx)?;
             if let Some(stream) = &mut self.stream {
                 stream.finish().map_err(|_| StreamClosed::Local)?;
@@ -223,6 +236,7 @@ impl Writer {
                 self.check_stopped(cx)?;
                 return Ok(false);
             };
+            self.config_drain = self.config_drain.saturating_sub(1);
             self.pending_age = next.pending;
             self.timing = next.timing.zip(next.arrived);
             self.timing_started = false;

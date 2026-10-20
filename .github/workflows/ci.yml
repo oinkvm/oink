@@ -64,6 +64,19 @@ jobs:
           if [[ "$RUNNER_OS" == macOS ]]; then test "$(uname -m)" = arm64; fi
           if [[ "$RUNNER_OS" == Windows ]]; then test "$PROCESSOR_ARCHITECTURE" = AMD64; fi
           npm install --global npm@11.11.0
+      - name: Select OpenSSL 3 for macOS feed tests
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # Apple's LibreSSL cannot perform the Ed25519 pkeyutl -rawin calls.
+          openssl_bin="$(brew --prefix openssl@3)/bin"
+          export PATH="$openssl_bin:$PATH"
+          echo "$openssl_bin" >> "$GITHUB_PATH"
+          openssl version
+          if ! openssl version | grep -q '^OpenSSL 3\.'; then
+            echo '::error::OpenSSL 3.x is required for feed signature tests'
+            exit 1
+          fi
       - name: Frontend and attribution
         shell: bash
         run: |
@@ -85,6 +98,7 @@ jobs:
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == Windows ]]; then export PATH="/c/Program Files/Git/usr/bin:$PATH"; fi
+          openssl version
           python -m unittest discover -s packaging/tests -v
       - name: Compile and inspect Windows MSI without installation
         if: runner.os == 'Windows'
