@@ -206,6 +206,7 @@ struct Running {
     owners: Vec<Owner>,
     platforms: Vec<Arc<Platform>>,
     directories: Vec<std::path::PathBuf>,
+    held_prepared_acks: Option<Vec<(usize, DeviceId, Message)>>,
 }
 impl Running {
     async fn new() -> Self {
@@ -258,6 +259,7 @@ impl Running {
             owners,
             platforms,
             directories,
+            held_prepared_acks: None,
         };
         this.until(|r| r.owners.iter().all(|o| matches!(o.resolution, Resolution::None { .. })))
             .await;
@@ -266,12 +268,26 @@ impl Running {
     async fn start(forward: bool) -> Self {
         let mut this = Self::new().await;
         this.claim(1, true);
-        this.until(|r| r.owners[0].capture.is_some()).await;
+        this.until(Self::prepared_route_ready).await;
         if forward {
             this.supply(0, 0.1);
             assert!(this.owners[0].sent.load(Ordering::Relaxed) > 0);
         }
         this
+    }
+    fn prepared_route_ready(&self) -> bool {
+        let source = &self.owners[0];
+        let receiver = &self.owners[1];
+        // Sending PreparedAck admits capture at the source before the receiver
+        // consumes it. Require both ends of this exact preparation, not an old
+        // acknowledged stream or the native output (which may already be idle).
+        source.capture.is_some()
+            && source.source_session.prepared().is_some_and(|prepared| {
+                receiver
+                    .receive_sessions
+                    .get(&source.links.id())
+                    .is_some_and(|session| session.ready() && session.prepared() == prepared)
+            })
     }
     fn claim(&mut self, index: usize, claimed: bool) {
         let expected = lock(&self.owners[index].store)
@@ -324,7 +340,13 @@ impl Running {
             let owner = &mut self.owners[index];
             owner.apply();
             for (peer, message) in owner.streams.poll(Instant::now()) {
-                owner.message(peer, message);
+                if matches!(message, Message::AudioPreparedAck(_))
+                    && let Some(held) = &mut self.held_prepared_acks
+                {
+                    held.push((index, peer, message));
+                } else {
+                    owner.message(peer, message);
+                }
             }
             owner.tick();
         }

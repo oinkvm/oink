@@ -619,7 +619,7 @@ mod tests {
             .unwrap();
         // Let the fake sensor publish its initial unknown session before the
         // test supplies an unlocked session; otherwise those commands can race.
-        #[cfg(debug_assertions)]
+        // This ordering is required in both debug and release unit tests.
         runtime.block_on(node.hold_platform_sensor_clock());
         node.input_thread()
             .unwrap()

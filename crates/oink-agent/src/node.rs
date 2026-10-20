@@ -144,9 +144,9 @@ pub(crate) struct Inner {
     pub started: Instant,
     #[cfg(all(test, debug_assertions))]
     pub platform_ready: AtomicBool,
-    #[cfg(all(test, debug_assertions))]
+    #[cfg(test)]
     platform_hold: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    #[cfg(all(test, debug_assertions))]
+    #[cfg(test)]
     platform_clock_held: AtomicBool,
     pub rt: tokio::runtime::Handle,
     pub overlay: Mutex<Option<api::Overlay>>,
@@ -343,9 +343,9 @@ impl Node {
                 started: Instant::now(),
                 #[cfg(all(test, debug_assertions))]
                 platform_ready: AtomicBool::new(false),
-                #[cfg(all(test, debug_assertions))]
+                #[cfg(test)]
                 platform_hold: Mutex::new(None),
-                #[cfg(all(test, debug_assertions))]
+                #[cfg(test)]
                 platform_clock_held: AtomicBool::new(false),
                 rt: tokio::runtime::Handle::current(),
                 overlay: Mutex::new(None),

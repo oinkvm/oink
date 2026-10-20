@@ -24,7 +24,8 @@ impl Node {
         }
     }
 
-    #[cfg(all(test, debug_assertions))]
+    // Release-profile unit tests need the same sensor/input command ordering.
+    #[cfg(test)]
     pub(crate) async fn hold_platform_sensor_clock(&self) {
         let (parked, ready) = tokio::sync::oneshot::channel();
         *lock(&self.inner.platform_hold) = Some(parked);
@@ -228,18 +229,18 @@ impl Node {
                     }
                     #[cfg(all(test, debug_assertions))]
                     node.inner.platform_ready.store(true, Ordering::Release);
-                    #[cfg(all(test, debug_assertions))]
+                    #[cfg(test)]
                     if let Some(parked) = lock(&node.inner.platform_hold).take() {
                         node.inner.platform_clock_held.store(true, Ordering::Release);
                         let _ = parked.send(());
                     }
-                    #[cfg(all(test, debug_assertions))]
+                    #[cfg(test)]
                     let clock_held = node.inner.platform_clock_held.load(Ordering::Acquire);
                     // Drop the strong Node before sleeping; shutdown owns the thread join.
                     drop(node);
                     // Only unobservable platform sensors use this sampling period.
                     // Display callbacks unpark the owner immediately.
-                    #[cfg(all(test, debug_assertions))]
+                    #[cfg(test)]
                     if clock_held {
                         std::thread::park();
                         continue;

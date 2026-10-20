@@ -3,7 +3,26 @@ use super::*;
 
 #[tokio::test]
 async fn prepared_ack_is_required_and_claim_retake_never_revives_old_session() {
-    let mut running = Running::start(true).await;
+    let mut running = Running::new().await;
+    running.held_prepared_acks = Some(Vec::new());
+    running.claim(1, true);
+    running
+        .until(|r| r.owners[0].capture.is_some() && !r.held_prepared_acks.as_ref().unwrap().is_empty())
+        .await;
+    // Source capture follows sending the ACK, not its remote consumption.
+    // Keep the real M0 ACK pending to force the CI observation order.
+    let source = running.owners[0].links.id();
+    assert!(!running.owners[1].receive_sessions[&source].ready());
+    assert!(
+        !running.prepared_route_ready(),
+        "source capture alone cannot establish acknowledged receiver readiness"
+    );
+    for (index, peer, message) in running.held_prepared_acks.take().unwrap() {
+        running.owners[index].message(peer, message);
+    }
+    running.until(Running::prepared_route_ready).await;
+    running.supply(0, 0.1);
+    assert!(running.owners[0].sent.load(Ordering::Relaxed) > 0);
     let peer = running.owners[1].links.id();
     let old = running.owners[0].source_session.prepared().unwrap().wire.clone();
     assert!(
@@ -18,7 +37,7 @@ async fn prepared_ack_is_required_and_claim_retake_never_revives_old_session() {
         .await;
     assert!(running.owners[0].capture.is_none());
     running.claim(1, true);
-    running.until(|r| r.owners[0].capture.is_some()).await;
+    running.until(Running::prepared_route_ready).await;
     let current = running.owners[0].source_session.prepared().unwrap().clone();
     assert_ne!(current.session().exit_claim(), old.session().unwrap().exit_claim());
     running.owners[0].message(peer, Message::AudioPrepared(old));
@@ -63,7 +82,7 @@ async fn receiver_output_generation_changes_without_reusing_old_media() {
                 .source_session
                 .prepared()
                 .is_some_and(|current| current.stream_id() != old.stream_id())
-                && r.owners[0].capture.is_some()
+                && r.prepared_route_ready()
         })
         .await;
     let current = running.owners[0].source_session.prepared().unwrap();
