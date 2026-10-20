@@ -9,14 +9,14 @@ on:
       UPDATE_FEED_WRITER_TOKEN:
         required: true
       WINDOWS_UPDATE_ED25519_PEM_WIN_2026_01:
-        required: false
+        required: true
 permissions:
   contents: read
   pages: write
   id-token: write
 jobs:
   gate:
-    if: github.event_name == 'release' && github.event.action == 'published' && !github.event.release.draft && github.repository == 'oinkvm/oink'
+    if: github.repository == 'oinkvm/oink' && ((github.event_name == 'release' && github.event.action == 'published' && !github.event.release.draft && !github.event.release.prerelease) || (github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)))
     runs-on: ubuntu-latest
     outputs:
       enabled: ${{ steps.gate.outputs.enabled }}

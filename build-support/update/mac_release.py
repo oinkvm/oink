@@ -20,6 +20,7 @@ import xml.etree.ElementTree as ET
 
 import feed
 import feed_site
+import published_release
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from provenance import source_tree_sha256
 from sparkle import prepare
@@ -52,16 +53,7 @@ def tag_source(tag):
 
 
 def published(tag):
-    event = feed.read(Path(os.environ['GITHUB_EVENT_PATH']))
-    release = event.get('release', {})
-    feed.require(os.environ.get('GITHUB_EVENT_NAME') == 'release' and
-                 os.environ.get('GITHUB_REPOSITORY') == 'oinkvm/oink' and
-                 event.get('action') == 'published' and release.get('draft') is False and
-                 release.get('prerelease') is False and release.get('tag_name') == tag,
-                 'published_release_required')
-    current = feed.loads(command(['gh', 'api', 'repos/oinkvm/oink/releases/tags/' + tag]))
-    feed.require(current['id'] == release['id'] and current['tag_name'] == tag and
-                 current['draft'] is False and current['prerelease'] is False, 'release_changed')
+    return published_release.published(tag, request=lambda path: feed.loads(command(['gh', 'api', path])))
 
 
 def validate_release(record, annotations, tag, commit, tree):
@@ -93,7 +85,7 @@ def validate_release(record, annotations, tag, commit, tree):
 
 def sign(tool, path, public, *, xml=False):
     secret = os.environ.get(SECRET)
-    feed.require(secret is not None, 'sparkle_secret_unavailable')
+    feed.require(bool(secret), 'sparkle_secret_unavailable')
     # The official tool accepts '-' for the key, avoiding argv, Keychain setup
     # and private files. Capture ALL output, including errors, before checking.
     raw = command([tool, '--ed-key-file', '-', '-p', path], input=secret.encode())

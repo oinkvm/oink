@@ -50,10 +50,10 @@ class MacReleaseTests(unittest.TestCase):
     def test_release_event_must_still_be_published_when_queried(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'event.json'
-            release = dict(id=10, tag_name='v0.1.1',draft=False,prerelease=False)
+            release = dict(id=10, tag_name='v0.1.1',draft=False,prerelease=False,published_at='2026-10-20T20:04:19Z')
             event = dict(action='published', release=release)
             path.write_text(json.dumps(event))
-            env = dict(GITHUB_EVENT_PATH=str(path),GITHUB_EVENT_NAME='release',GITHUB_REPOSITORY='oinkvm/oink')
+            env = dict(GITHUB_ACTIONS='true',GITHUB_EVENT_PATH=str(path),GITHUB_EVENT_NAME='release',GITHUB_REPOSITORY='oinkvm/oink')
             with patch.dict(os.environ,env), patch.object(M,'command',return_value=json.dumps(release).encode()):
                 M.published('v0.1.1')
                 for draft, prerelease in [(True,False),(False,True)]:
@@ -61,7 +61,7 @@ class MacReleaseTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError,'published_release_required'): M.published('v0.1.1')
             path.write_text(json.dumps(event))
             with patch.dict(os.environ,env), patch.object(M,'command',return_value=json.dumps({**release,'draft':True}).encode()):
-                with self.assertRaisesRegex(ValueError,'release_changed'): M.published('v0.1.1')
+                with self.assertRaisesRegex(ValueError,'release_not_public'): M.published('v0.1.1')
 
     def test_new_item_preserves_older_notes_archive_and_has_no_beta_channel(self):
         with tempfile.TemporaryDirectory() as tmp:

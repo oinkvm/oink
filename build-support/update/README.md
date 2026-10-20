@@ -197,8 +197,15 @@ with reviewed `channel: stable`, `severity: normal|critical` and plain-text `en`
 and `zh-Hans` notes before building. Notes and ZIP hashes are bound into the
 release record and checksums. Private symbols are never release assets.
 
-Only **release.published**, non-draft/non-prerelease, calls
-`publish-macos-feed.yml`. Disabled trust skips before accessing secrets or the
+**release.published**, non-draft/non-prerelease, calls
+`publish-macos-feed.yml`. To recover a failed initial publication without rebuilding
+or retagging the release, dispatch **Seed published stable release feeds** on the
+default branch with `release_tag` (for example `v0.1.1`). The shared authorization
+checks the live GitHub API for a published, non-draft, non-prerelease stable
+release before either publisher proceeds. Both paths use the same native/source/
+hash/signature checks, monotonic catalog and transactional Pages publisher.
+An already-committed platform build remains protected against republication.
+Disabled trust skips before accessing secrets or the
 data branch. It runs trusted default-branch code, fetches the tag as data,
 requires it to be an ancestor of that branch, and binds the release version,
 build, built commit, source-tree digest, archive bytes and bilingual notes.
@@ -220,6 +227,15 @@ publisher verifies public package bytes again and refuses non-increasing builds.
 A failed publication never silently replaces the prior feed; inspect the Pages
 rollback result before rerunning. Re-publishing an already committed build is
 rejected; no force-push or feed downgrade is a rollback mechanism.
+
+Signing keys stay in the **release** environment. Every reusable-workflow caller
+must explicitly forward `SPARKLE_ED25519_PRIVATE_KEY` or
+`WINDOWS_UPDATE_ED25519_PEM_WIN_2026_01` by name, even though the key exists only
+in that environment. GitHub supplies the environment value to the sign job;
+an omitted name otherwise resolves empty. The reusable interfaces require the
+names, packaging tests check every caller, and signers reject empty values before
+invoking cryptographic tools. No private key belongs in repository secrets or
+source files for this purpose.
 
 ## Settings and qualification
 

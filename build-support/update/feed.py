@@ -121,7 +121,7 @@ def verify(raw, signature, key):
 
 def sign(raw, epoch, public_key):
     secret = os.environ.get(KEY_ENV[epoch])
-    require(secret is not None, 'secret_unavailable')
+    require(bool(secret), 'secret_unavailable')
     with tempfile.TemporaryDirectory() as directory:
         folder = Path(directory)
         key = folder / 'key.pem'

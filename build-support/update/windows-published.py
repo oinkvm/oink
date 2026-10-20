@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import feed
+import published_release
 
 sys.path.insert(0, str(feed.ROOT / 'build-support'))
 from provenance import source_tree_sha256
@@ -18,18 +19,8 @@ def gh_json(*arguments):
 
 
 def prepare(config, output):
-    event = feed.read(Path(os.environ['GITHUB_EVENT_PATH']))
-    release = event['release']
     tag = os.environ['OINK_RELEASE_TAG']
-    feed.require(os.environ.get('GITHUB_ACTIONS') == 'true' and
-                 os.environ.get('GITHUB_EVENT_NAME') == 'release' and event['action'] == 'published' and
-                 os.environ.get('GITHUB_REPOSITORY') == config['repository'] and
-                 release['draft'] is False and release['published_at'] and release['tag_name'] == tag and
-                 re.fullmatch('v[A-Za-z0-9_.-]+', tag), 'published_release_required')
-    # Re-read live status: an event snapshot alone must not publish a now-draft or
-    # deleted release. gh also authenticates access to repository metadata.
-    live = gh_json('api', f'repos/{config["repository"]}/releases/{release["id"]}')
-    feed.require(live['draft'] is False and live['published_at'] and live['tag_name'] == tag, 'release_not_public')
+    live = published_release.published(tag, request=lambda path: gh_json('api', path))
     assets = live['assets']
     def asset(name, limit):
         matches = [a for a in assets if a['name'] == name]

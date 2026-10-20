@@ -209,6 +209,7 @@ jobs:
       release_tag: ${{ github.event.release.tag_name }}
     secrets:
       UPDATE_FEED_WRITER_TOKEN: ${{ secrets.UPDATE_FEED_WRITER_TOKEN }}
+      SPARKLE_ED25519_PRIVATE_KEY: ${{ secrets.SPARKLE_ED25519_PRIVATE_KEY }}
   publish-windows-update:
     if: github.event_name == 'release' && github.event.action == 'published' && !github.event.release.draft && !github.event.release.prerelease && github.repository == 'oinkvm/oink'
     permissions:
@@ -221,3 +222,4 @@ jobs:
       release_tag: ${{ github.event.release.tag_name }}
     secrets:
       UPDATE_FEED_WRITER_TOKEN: ${{ secrets.UPDATE_FEED_WRITER_TOKEN }}
+      WINDOWS_UPDATE_ED25519_PEM_WIN_2026_01: ${{ secrets.WINDOWS_UPDATE_ED25519_PEM_WIN_2026_01 }}
