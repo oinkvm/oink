@@ -25,6 +25,7 @@ wire_map!(DeviceFacts, validate_facts, {
     19 => pause: Option<LocalPauseState> = optional;
     20 => audio_exit_claim: Option<AudioExitClaim> = optional;
     21 => audio_claim_watermark: Option<AudioExitClaim> = optional;
+    22 => native_arrangement_token: Option<Text<128>> = optional;
 });
 
 wire_map!(EndpointFact, validate_endpoint, {
@@ -268,7 +269,7 @@ wire_map!(VolumeRefused,no_validation,{
 });
 open_enum!(LocalOption {MouseMode=1,KeyboardMode=2,ClipboardEnabled=3,ForwardingEnabled=4,KeyboardDisabled=5,
     ScreenShared=6,ScreenPreferences=7,SpeedMode=8,CursorTrail=10,CursorTrailDuration=11,
-    RemoteScrollSpeed=12,InputTransform=13,SourceInputPolicy=14,ForwardingControls=15,DeviceName=16,GameModePreference=18,AcceptContacts=19,AudioExitClaim=20});
+    RemoteScrollSpeed=12,InputTransform=13,SourceInputPolicy=14,ForwardingControls=15,DeviceName=16,GameModePreference=18,AcceptContacts=19,AudioExitClaim=20,SyncSystemArrangement=21});
 open_enum!(ControlOutcome {Applied=0,NoChange=1,Refused=2,Failed=3});
 open_enum!(ControlFailure {None=0,Offline=1,Unsupported=2,StaleBoot=3,StaleRevision=4,NotMember=5,ResourceFault=6,InvalidValue=7,Busy=8,PersistenceFailed=9,ApplyFailed=10,LinkLost=11,OutcomeUnknown=12,NotExit=13,RouteChanged=14,OutputChanged=15,OutputUnavailable=16,VolumeUnsupported=17,PermissionDenied=18,Superseded=19,UnsupportedOption=20,StateConflict=21});
 open_enum!(ExitVolumeStatus {Ready=0,Unsupported=1,Unavailable=2,PermissionDenied=3,BackendFailed=4});

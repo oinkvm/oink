@@ -30,11 +30,21 @@ pub(super) fn values(settings: &Settings) -> Vec<(LocalOption, RawValue)> {
     vec![
         (
             MouseMode,
-            (if r.mouse_mode == InputMode::Shared { 0u32 } else { 1 }).write(),
+            (match r.mouse_mode {
+                InputMode::Shared => 0u32,
+                InputMode::Local => 1,
+                InputMode::Disabled => 2,
+            })
+            .write(),
         ),
         (
             KeyboardMode,
-            (if r.keyboard_mode == InputMode::Shared { 0u32 } else { 1 }).write(),
+            (match r.keyboard_mode {
+                InputMode::Shared => 0u32,
+                InputMode::Local => 1,
+                InputMode::Disabled => 2,
+            })
+            .write(),
         ),
         (ClipboardEnabled, settings.clipboard_enabled.write()),
         (ForwardingEnabled, a.forwarding_enabled.write()),
@@ -115,6 +125,7 @@ pub(super) fn values(settings: &Settings) -> Vec<(LocalOption, RawValue)> {
         ),
         (AcceptContacts, settings.accept_contacts.write()),
         (AudioExitClaim, RawValue::Null),
+        (SyncSystemArrangement, settings.sync_system_arrangement.write()),
     ]
 }
 fn keyboard(value: &input::KeyboardMapping) -> RawValue {
@@ -230,10 +241,10 @@ pub(super) fn apply(owner: &OwnerStore, settings: &mut Settings) -> Result<(), S
         validate_value(option, &value).map_err(|_| StoreError::Invalid)?;
         match option {
             MouseMode => {
-                settings.routing.mouse_mode = if value.as_u64()? == 0 {
-                    InputMode::Shared
-                } else {
-                    InputMode::Local
+                settings.routing.mouse_mode = match value.as_u64()? {
+                    0 => InputMode::Shared,
+                    1 => InputMode::Local,
+                    _ => InputMode::Disabled,
                 }
             }
             KeyboardMode => {
@@ -311,6 +322,7 @@ pub(super) fn apply(owner: &OwnerStore, settings: &mut Settings) -> Result<(), S
                 }
             }
             AcceptContacts => settings.accept_contacts = bool::read(&value)?,
+            SyncSystemArrangement => settings.sync_system_arrangement = bool::read(&value)?,
             AudioExitClaim => {}
             _ => return Err(StoreError::Invalid),
         }

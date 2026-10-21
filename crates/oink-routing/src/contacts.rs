@@ -48,9 +48,9 @@ impl Source {
     }
     pub fn reconfigure(&mut self, emit: impl FnMut(Frame)) {
         self.reset(emit);
-        if self.sample.len == 0 {
-            self.set(Mode::Ready);
-        }
+        // A local cached zero predates entry and says nothing about the
+        // navigation finger now down. Only a fresh capture observation can arm
+        // this boundary (the native provider may attest known idle at entry).
     }
     pub fn sample(&mut self, sample: Sample, mut emit: impl FnMut(Frame)) {
         if !sample.valid() {
@@ -134,6 +134,23 @@ mod tests {
             frames.iter().map(|f| f.phase).collect::<Vec<_>>(),
             [Phase::Begin, Phase::Cancel, Phase::Begin]
         );
+    }
+    #[test]
+    fn remote_entry_cannot_admit_from_a_cached_local_zero() {
+        let mut source = Source::default();
+        // Local nonempty geometry is not queued by the native provider. This
+        // cached zero predates the navigation finger going down locally.
+        source.ignore_sample(sample(1000, 0));
+        source.reconfigure(|_| panic!("no previous remote touch"));
+        assert_eq!(source.mode(), Mode::AwaitLift);
+        source.sample(sample(2000, 2), |_| panic!("navigation finger crossed focus"));
+        source.sample(sample(3000, 3), |_| panic!("partial touch crossed focus"));
+        source.sample(sample(4000, 0), |_| panic!("lift only arms admission"));
+        let mut frames = Vec::new();
+        source.sample(sample(5000, 2), |f| frames.push(f));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].phase, Phase::Begin);
+        assert_eq!(frames[0].time_us, 5000);
     }
     #[test]
     fn corrupt_frame_cancels_without_forwarding_partial_contacts() {

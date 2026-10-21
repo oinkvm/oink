@@ -47,6 +47,8 @@ struct Dedup {
 pub(super) enum Evidence {
     Timing(oink_foundation::handoff_timing::Event),
     PointerCapture(super::capture::Raw),
+    CursorClip(super::cursor_clip::Record),
+    CursorReconciliation(super::cursor_reconciliation::Record),
     Volume(oink_routing::router::VolumeDecision),
     SourceRouting(oink_routing::router::SourceDecision),
     Dnd(super::dnd::Raw),
@@ -359,6 +361,8 @@ impl InputTrace {
                 recorder.record(match stamped.record {
                     Evidence::Timing(record) => timing_event(record),
                     Evidence::PointerCapture(record) => record.export(recorder),
+                    Evidence::CursorClip(record) => record.export(recorder),
+                    Evidence::CursorReconciliation(record) => record.export(recorder),
                     Evidence::SourceRouting(record) => Event::SourceRouting(record),
                     Evidence::Volume(record) => Event::VolumeRouting(super::volume::export(recorder, record)),
                     Evidence::Dnd(raw) => raw.export(recorder),
@@ -459,6 +463,12 @@ impl InputTrace {
     #[cfg(all(test, debug_assertions))]
     pub(super) fn disable_for_test(&self) {
         self.enabled.store(false, Ordering::Relaxed);
+    }
+    pub(crate) fn cursor_reconciliation(&self, record: super::cursor_reconciliation::Record) {
+        self.evidence(Evidence::CursorReconciliation(record));
+    }
+    pub(crate) fn system_cursor_clip(&self, record: super::cursor_clip::Record) {
+        self.evidence(Evidence::CursorClip(record));
     }
     pub(crate) fn pointer_capture(&self, record: super::capture::Raw) {
         self.evidence(Evidence::PointerCapture(record));

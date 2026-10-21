@@ -251,6 +251,9 @@ pub struct PlaybackMetrics {
 #[derive(Default)]
 struct CallbackMetrics {
     zero_periods: AtomicUsize,
+    quality: std::sync::OnceLock<Arc<crate::sink::DropoutCounters>>,
+    quality_active: std::sync::atomic::AtomicBool,
+    quality_generation: AtomicU64,
     callbacks: AtomicU64,
     max_gap_us: AtomicU64,
     max_render_us: AtomicU64,
@@ -303,6 +306,8 @@ impl Playback {
         let metrics = Arc::new(CallbackMetrics::default());
         let mut render = Render {
             metrics: metrics.clone(),
+            quality: Default::default(),
+            quality_generation: 0,
             previous_callback: None,
             first_period: true,
             wake: wake.clone(),
@@ -407,7 +412,17 @@ impl Playback {
             queued_frames: self.queued_frames(),
         }
     }
+    pub fn set_quality_counters(&self, counters: Arc<crate::sink::DropoutCounters>) {
+        let _ = self.metrics.quality.set(counters);
+        self.metrics.quality_active.store(true, Ordering::Release);
+    }
+    pub fn cancel_idle_drain(&self) {
+        self.metrics.quality_generation.fetch_add(1, Ordering::Release);
+        self.metrics.quality_active.store(true, Ordering::Release);
+    }
     pub fn begin_idle_drain(&self) {
+        self.metrics.quality_generation.fetch_add(1, Ordering::Release);
+        self.metrics.quality_active.store(false, Ordering::Release);
         self.metrics.zero_periods.store(0, Ordering::Release);
     }
     pub fn idle_drained(&self) -> bool {
@@ -442,6 +457,8 @@ impl Playback {
 }
 
 struct Render {
+    quality: crate::sink::quality::Interruptions,
+    quality_generation: u64,
     metrics: Arc<CallbackMetrics>,
     previous_callback: Option<Instant>,
     first_period: bool,
@@ -483,6 +500,18 @@ impl Render {
             return;
         }
         let step = 48000.0 / f64::from(rate);
+        let counters = self
+            .metrics
+            .quality
+            .get()
+            .filter(|_| self.metrics.quality_active.load(Ordering::Acquire));
+        let generation = self.metrics.quality_generation.load(Ordering::Acquire);
+        if counters.is_none() || self.quality_generation != generation {
+            self.quality.reset();
+            self.quality_generation = generation;
+        }
+        let at_ms = (crate::diagnostics::monotonic_us(timing.callback_at).max(0) / 1000) as u64;
+        let mut missing = 0u64;
         for (offset, frame) in output.chunks_mut(channels).enumerate() {
             // A single future interpolation sample is optional. Never wait for
             // or conceal a whole next packet simply to obtain that sample.
@@ -500,6 +529,7 @@ impl Render {
                 self.pcm.extend(&packet.samples[..packet.len]);
             }
             let mut stereo = [0.0; 2];
+            let supplied = self.pcm.len() >= 2;
             if self.pcm.len() >= 2 {
                 if let Some(span) = self.spans.front_mut()
                     && !span.traced
@@ -573,6 +603,21 @@ impl Render {
                 self.phase = 0.0;
                 self.underrun_frames.fetch_add(1, Ordering::Relaxed);
             }
+            if let Some(counters) = counters {
+                let kind = if supplied {
+                    crate::sink::quality::OutputKind::Audio
+                } else {
+                    crate::sink::quality::OutputKind::Missing
+                };
+                missing += u64::from(!supplied && self.quality.established());
+                // Channel mapping can remove stereo discontinuities on a mono device.
+                let audible = if channels == 1 {
+                    [(stereo[0] + stereo[1]) * 0.5; 2]
+                } else {
+                    stereo
+                };
+                self.quality.frame(at_ms, rate, kind, audible, counters);
+            }
             for (channel, value) in frame.iter_mut().enumerate() {
                 *value = if channels == 1 {
                     (stereo[0] + stereo[1]) * 0.5
@@ -582,6 +627,13 @@ impl Render {
                     0.0
                 };
             }
+        }
+        if let Some(counters) = counters {
+            counters.record_quality(crate::sink::DropoutBucket {
+                at_ms,
+                missing_ns: missing * 1_000_000_000 / u64::from(rate),
+                ..Default::default()
+            });
         }
         if output.iter().all(|sample| *sample == 0.0) {
             self.metrics.zero_periods.fetch_add(1, Ordering::Release);
@@ -612,6 +664,8 @@ mod tests {
         let (traces, trace_rx) = handoff::channel(128, empty_trace());
         let render = Render {
             metrics: Arc::new(CallbackMetrics::default()),
+            quality: Default::default(),
+            quality_generation: 0,
             previous_callback: None,
             first_period: false,
             wake: realtime::Signal::new().unwrap(),
@@ -640,6 +694,42 @@ mod tests {
             underrun_frames: Arc::new(AtomicU64::new(0)),
         };
         (tx, render, trace_rx)
+    }
+    #[test]
+    fn native_underrun_is_output_wide_and_uses_device_rate_but_idle_drain_is_excluded() {
+        let (mut tx, mut render, _) = renderer();
+        let counters = Arc::new(crate::sink::DropoutCounters::default());
+        render.metrics.quality.set(counters.clone()).unwrap();
+        render.metrics.quality_active.store(true, Ordering::Release);
+        // 44.1 kHz device: 441 missing frames is 10 ms, regardless of input rate.
+        let timing = timing(44100);
+        let at = (crate::diagnostics::monotonic_us(timing.callback_at).max(0) / 1000) as u64;
+        send(&mut tx, &render, vec![0.0; 960], None);
+        render.fill(&mut [0.0; 882], timing);
+        render.fill(&mut [0.0; 880], timing);
+        assert_eq!(
+            counters
+                .snapshot(at)
+                .into_iter()
+                .flatten()
+                .map(|b| b.interruptions)
+                .sum::<u64>(),
+            0
+        );
+        render.fill(&mut [0.0; 4], timing);
+        assert_eq!(
+            counters
+                .snapshot(at)
+                .into_iter()
+                .flatten()
+                .map(|b| b.interruptions)
+                .sum::<u64>(),
+            1
+        );
+        render.metrics.quality_active.store(false, Ordering::Release);
+        let before = counters.snapshot(at);
+        render.fill(&mut [0.0; 882], timing);
+        assert_eq!(counters.snapshot(at), before);
     }
     fn send(tx: &mut handoff::Producer<QueuedFrame>, render: &Render, samples: Vec<f32>, sequence: Option<u64>) {
         render.queued_blocks.fetch_add(1, Ordering::Relaxed);
@@ -678,6 +768,12 @@ mod tests {
     fn feed_and_callback_do_no_heap_work_at_native_rates_or_on_overflow() {
         for rate in [8_000, 44_100, 48_000, 96_000, 192_000] {
             let (tx, mut render, mut traces) = renderer();
+            render
+                .metrics
+                .quality
+                .set(Arc::new(crate::sink::DropoutCounters::default()))
+                .unwrap();
+            render.metrics.quality_active.store(true, Ordering::Release);
             let mut feed = Feed {
                 tx,
                 queued_blocks: render.queued_blocks.clone(),

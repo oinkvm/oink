@@ -230,3 +230,86 @@ fn notification_capability_is_optional_and_only_new_peers_enable_it() {
     }
     assert!(!registry::BASELINE.contains(&"oink.notify/1"));
 }
+
+#[test]
+fn arrangement_preview_is_selected_per_peer_and_admitted_only_when_negotiated() {
+    for both in [false, true] {
+        let (mut a, mut b) = offers();
+        for offer in [&mut a, &mut b] {
+            add_cap(offer, "oink.layout.projection/1", 4);
+        }
+        add_cap(&mut a, "oink.layout.preview/1", 4);
+        if both {
+            add_cap(&mut b, "oink.layout.preview/1", 4);
+        }
+        let selected = admission::negotiate(&bytes(a), &bytes(b), registry::CAPABILITIES, false).unwrap();
+        let agreement = admission::Agreement::new(selected.enabled().unwrap().0.into_iter().map(|s| s.0)).unwrap();
+        assert_eq!(agreement.contains("oink.layout.preview/1"), both);
+        let m = Message::ArrangementPreview(
+            ArrangementPreview::from_raw(support::sample_named("ArrangementPreview")).unwrap(),
+        );
+        let bytes = frame::encode(&m, v1::limits::RELIABLE_FRAME).unwrap();
+        let context = admission::Context {
+            kind: 12,
+            transport: registry::Transport::Reliable,
+            phase: admission::Phase::Member,
+            agreement: &agreement,
+            direct: false,
+            old_member_lane: false,
+        };
+        let result = context.decode(frame::OpaqueFrame::parse_exact(&bytes, v1::limits::RELIABLE_FRAME).unwrap());
+        if both {
+            assert!(result.is_ok());
+        } else {
+            assert_eq!(result.unwrap_err().code, ErrorCode::UnnegotiatedCapability);
+        }
+    }
+    let mut raw = support::sample_named("ArrangementPreview");
+    raw.insert(1, V::Bool(false));
+    assert!(ArrangementPreview::from_raw(raw.clone()).is_err());
+    raw.insert(1, V::Bool(true));
+    raw.insert(3, V::Uint(2001));
+    assert!(ArrangementPreview::from_raw(raw).is_err());
+}
+
+#[test]
+fn profile_v2_catalog_is_gated_and_v1_keeps_its_eight_profile_bound() {
+    let mut catalog = support::sample_named("LayoutProfileCatalogV2");
+    let profile = V::Map(support::sample_named("LayoutProfile"));
+    catalog.insert(5, V::Array(vec![profile.clone(); 16]));
+    assert!(LayoutProfileCatalogV2::from_raw(catalog.clone()).is_ok());
+    assert!(LayoutProfileCatalog::from_raw(catalog.clone()).is_err());
+    catalog.insert(5, V::Array(vec![profile.clone(); 8]));
+    assert!(LayoutProfileCatalog::from_raw(catalog.clone()).is_ok());
+    catalog.insert(5, V::Array(vec![profile; 17]));
+    assert!(LayoutProfileCatalogV2::from_raw(catalog).is_err());
+    for both in [false, true] {
+        let (mut a, mut b) = offers();
+        add_cap(&mut a, "oink.layout.profiles/2", 4);
+        add_cap(&mut b, "oink.layout.profiles/1", 4);
+        if both {
+            add_cap(&mut b, "oink.layout.profiles/2", 4);
+        }
+        let selected = admission::negotiate(&bytes(a), &bytes(b), registry::CAPABILITIES, false).unwrap();
+        let agreement = admission::Agreement::new(selected.enabled().unwrap().0.into_iter().map(|s| s.0)).unwrap();
+        assert_eq!(agreement.contains("oink.layout.profiles/2"), both);
+        let message = Message::LayoutProfilesStateV2(
+            LayoutProfilesStateV2::from_raw(support::sample_named("LayoutProfilesStateV2")).unwrap(),
+        );
+        let encoded = frame::encode(&message, v1::limits::LOW_FRAME).unwrap();
+        let context = admission::Context {
+            kind: 14,
+            transport: registry::Transport::Low,
+            phase: admission::Phase::Member,
+            agreement: &agreement,
+            direct: false,
+            old_member_lane: false,
+        };
+        assert_eq!(
+            context
+                .decode(frame::OpaqueFrame::parse_exact(&encoded, v1::limits::LOW_FRAME).unwrap())
+                .is_ok(),
+            both
+        );
+    }
+}

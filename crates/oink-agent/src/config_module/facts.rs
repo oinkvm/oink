@@ -322,3 +322,79 @@ impl Facts {
         })
     }
 }
+
+/// The v1 baseline knows mouse modes 0/1 only. A disabled source is unknown to
+/// those peers, never falsely advertised as enabled/local. Keep unrelated facts.
+pub(super) fn for_mouse_capability(facts: dto::DeviceFacts, supported: bool) -> v1::Result<dto::DeviceFacts> {
+    if supported {
+        return Ok(facts);
+    }
+    let mut raw = facts.into_raw();
+    if let Some(RawValue::Array(preferences)) = raw.get_mut(&18) {
+        preferences.retain(|p| !matches!(p, RawValue::Map(v) if v.get(&1) == Some(&RawValue::Uint(1)) && v.get(&3) == Some(&RawValue::Uint(2))));
+    }
+    if let Some(RawValue::Map(resources)) = raw.get_mut(&16)
+        && resources.get(&2) == Some(&RawValue::Uint(2))
+    {
+        resources.remove(&2);
+    }
+    dto::DeviceFacts::from_raw(raw)
+}
+
+#[cfg(test)]
+mod mouse_mode_tests {
+    use super::*;
+    #[test]
+    fn disabled_mouse_facts_are_withheld_only_from_legacy_peers() {
+        let mut facts = Facts::new(
+            Boot {
+                device_id: oink_foundation::DeviceId([1; 32]),
+                nonce: [2; 16],
+            },
+            GroupId([3; 16]),
+            "source",
+            "test",
+            &OfferProfile::default(),
+        )
+        .unwrap();
+        facts
+            .edit(|raw| {
+                raw.insert(16, RawValue::Map([(2, 2u32.write()), (3, 0u32.write())].into()));
+                raw.insert(
+                    18,
+                    RawValue::Array(
+                        [1u32, 2]
+                            .into_iter()
+                            .map(|option| {
+                                RawValue::Map(
+                                    [
+                                        (1, option.write()),
+                                        (2, 1u64.write()),
+                                        (3, (if option == 1 { 2u32 } else { 0 }).write()),
+                                    ]
+                                    .into(),
+                                )
+                            })
+                            .collect(),
+                    ),
+                );
+                Ok(())
+            })
+            .unwrap();
+        let original = facts.value().clone();
+        assert_eq!(
+            for_mouse_capability(original.clone(), true).unwrap().raw(),
+            original.raw()
+        );
+        let legacy = for_mouse_capability(original.clone(), false).unwrap();
+        assert_eq!(legacy.resources().unwrap().unwrap().mouse_mode().unwrap(), None);
+        assert_eq!(
+            legacy.resources().unwrap().unwrap().keyboard_mode().unwrap(),
+            Some(dto::SharingMode::Shared)
+        );
+        let preferences = legacy.preferences().unwrap().unwrap();
+        assert_eq!(preferences.0.len(), 1);
+        assert_eq!(preferences.0[0].option().unwrap(), dto::LocalOption::KeyboardMode);
+        assert_eq!(legacy.fact_sequence().unwrap(), original.fact_sequence().unwrap());
+    }
+}

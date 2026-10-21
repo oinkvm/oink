@@ -15,6 +15,7 @@ pub(crate) enum Undo {
     GameOff,
     PointerUnlock,
     KeyboardUnlock,
+    MouseEnable,
 }
 #[derive(Clone, Debug)]
 struct Pending {
@@ -44,9 +45,11 @@ pub(super) struct Notifications {
     game: bool,
     pointer: bool,
     keyboard: bool,
+    mouse: bool,
     game_id: Option<u64>,
     pointer_id: Option<u64>,
     keyboard_id: Option<u64>,
+    mouse_id: Option<u64>,
 }
 impl Notifications {
     fn prune(&mut self, now: Instant) {
@@ -339,10 +342,12 @@ impl Node {
     fn perform_notification_action(&self, id: u64, undo: bool, from: DeviceId) {
         let owner_edit = {
             let state = lock(&self.inner.notifications);
-            undo && state
-                .pending
-                .get(&id)
-                .is_some_and(|pending| matches!(pending.action, Some(Undo::GameOff | Undo::KeyboardUnlock)))
+            undo && state.pending.get(&id).is_some_and(|pending| {
+                matches!(
+                    pending.action,
+                    Some(Undo::GameOff | Undo::KeyboardUnlock | Undo::MouseEnable)
+                )
+            })
         };
         if owner_edit {
             // Input transitions can raise a banner before the originating owner
@@ -372,6 +377,9 @@ impl Node {
             }
             Some(Undo::PointerUnlock) => self.set_focus_locked(false),
             Some(Undo::KeyboardUnlock) => self.set_keyboard_disabled(self.id().into(), false),
+            Some(Undo::MouseEnable) => {
+                self.edit_device_option(self.id().into(), dto::LocalOption::MouseMode, 0u32.write())
+            }
             None => Ok(()),
         };
         if let Err(error) = result {
@@ -517,6 +525,7 @@ impl Node {
             StatusEvent::GameMode(game) => (1, game.holder == self.id() && game.active),
             StatusEvent::FocusLock { holder } => (3, *holder == Some(self.id())),
             StatusEvent::KeyboardDisabled(disabled) => (4, *disabled),
+            StatusEvent::MouseDisabled(disabled) => (5, *disabled),
             _ => return,
         };
         let dismiss = {
@@ -527,30 +536,26 @@ impl Node {
             let current = match kind {
                 1 => &mut state.game,
                 3 => &mut state.pointer,
+                5 => &mut state.mouse,
                 _ => &mut state.keyboard,
             };
             if *current == on {
                 return;
             }
             *current = on;
-            let old = if !on {
+            // A state-caused banner lives only while that authoritative cause
+            // holds. Retire its pending action and native/remote surface together;
+            // keeping only a disabled Undo would leave a misleading stale banner.
+            if !on {
                 match kind {
                     1 => state.game_id.take(),
                     3 => state.pointer_id.take(),
+                    5 => state.mouse_id.take(),
                     _ => state.keyboard_id.take(),
                 }
             } else {
                 None
-            };
-            if kind != 1
-                && let Some(id) = old
-                && let Some(pending) = state.pending.get_mut(&id)
-            {
-                // A released lock's persistent banner still needs an explicit
-                // click, but cannot undo a later lock with a different notice.
-                pending.action = None;
             }
-            if kind == 1 { old } else { None }
         };
         if let Some(id) = dismiss {
             self.dismiss_notification(id);
@@ -563,6 +568,7 @@ impl Node {
             1 => Some(Undo::GameOff),
             3 => Some(Undo::PointerUnlock),
             4 => Some(Undo::KeyboardUnlock),
+            5 => Some(Undo::MouseEnable),
             _ => None,
         };
         let request = Notification {
@@ -580,6 +586,7 @@ impl Node {
                 1 => state.game_id = Some(id),
                 3 => state.pointer_id = Some(id),
                 4 => state.keyboard_id = Some(id),
+                5 => state.mouse_id = Some(id),
                 _ => {}
             }
         }
@@ -595,29 +602,39 @@ fn level_number(level: NotificationLevel) -> u8 {
 }
 fn copy(language: crate::config::UiLanguage, kind: u8) -> &'static str {
     use crate::config::UiLanguage::*;
-    let index = usize::from(kind.min(4));
+    let index = usize::from(kind.min(5));
     match language {
-        SimplifiedChinese => ["撤销", "已进入游戏模式", "已退出游戏模式", "已锁定指针", "已锁定键盘"][index],
+        SimplifiedChinese => [
+            "撤销",
+            "已进入游戏模式",
+            "已退出游戏模式",
+            "已锁定指针",
+            "已禁用键盘",
+            "已禁用鼠标",
+        ][index],
         Japanese => [
             "元に戻す",
             "ゲームモードが有効になりました",
             "ゲームモードが無効になりました",
             "ポインターをロックしました",
-            "キーボードをロックしました",
+            "キーボードを無効にしました",
+            "マウスを無効にしました",
         ][index],
         Korean => [
             "실행 취소",
             "게임 모드가 켜졌습니다",
             "게임 모드가 꺼졌습니다",
             "포인터가 잠겼습니다",
-            "키보드가 잠겼습니다",
+            "키보드가 비활성화되었습니다",
+            "마우스가 비활성화되었습니다",
         ][index],
         _ => [
             "Undo",
             "Entered game mode",
             "Left game mode",
             "Pointer locked",
-            "Keyboard locked",
+            "Keyboard disabled",
+            "Mouse disabled",
         ][index],
     }
 }
@@ -810,20 +827,123 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        until("retire old keyboard undo", || {
-            lock(&node.inner.notifications)
-                .pending
-                .get(&id)
-                .is_some_and(|p| p.action.is_none())
+        until("dismiss released keyboard banner", || {
+            let state = lock(&node.inner.notifications);
+            !state.pending.contains_key(&id) && !state.origins.contains_key(&surface)
         })
         .await;
-        assert!(lock(&node.inner.notifications).origins.contains_key(&surface));
         node.notification_click(Click {
             id: surface,
             undo: true,
         });
         assert!(!node.settings().keyboard_disabled);
         node.shutdown().await;
+    }
+    #[tokio::test]
+    async fn ordered_cause_release_dismisses_only_its_banner_and_stale_undo() {
+        let home = tempfile::tempdir().unwrap();
+        let node = Node::prepare(options(home.path())).unwrap();
+        let keyboard = StatusEvent::KeyboardDisabled(true);
+        let pointer = StatusEvent::FocusLock {
+            holder: Some(node.id()),
+        };
+        node.notification_status(&keyboard);
+        node.notification_status(&pointer);
+        let keyboard_id = lock(&node.inner.notifications).keyboard_id.unwrap();
+        let keyboard_surface = lock(&node.inner.notifications).pending[&keyboard_id].surface.unwrap();
+        let pointer_id = lock(&node.inner.notifications).pointer_id.unwrap();
+        node.notification_status(&StatusEvent::KeyboardDisabled(false));
+        {
+            let state = lock(&node.inner.notifications);
+            assert!(
+                !state.pending.contains_key(&keyboard_id),
+                "released cause removes pending banner"
+            );
+            assert!(
+                !state.origins.contains_key(&keyboard_surface),
+                "released cause removes visible origin"
+            );
+            assert!(state.pending.contains_key(&pointer_id), "unrelated cause stays visible");
+        }
+        node.notification_status(&keyboard);
+        let next = lock(&node.inner.notifications).keyboard_id.unwrap();
+        assert_ne!(next, keyboard_id);
+        node.notification_click(Click {
+            id: keyboard_surface,
+            undo: true,
+        });
+        assert!(lock(&node.inner.notifications).pending.contains_key(&next));
+        node.notification_status(&StatusEvent::FocusLock { holder: None });
+        assert!(!lock(&node.inner.notifications).pending.contains_key(&pointer_id));
+        node.notification_status(&StatusEvent::KeyboardDisabled(false));
+        assert!(lock(&node.inner.notifications).pending.is_empty());
+        assert!(lock(&node.inner.notifications).origins.is_empty());
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mouse_undo_restores_and_persists_shared_source_mode() {
+        use crate::snapshot_tests::until;
+        let home = tempfile::tempdir().unwrap();
+        let node = Node::start(options(home.path())).await.unwrap();
+        let n = node.clone();
+        tokio::task::spawn_blocking(move || {
+            n.edit_device_option(n.id().into(), dto::LocalOption::MouseMode, 2u32.write())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        until("mouse disabled notice", || {
+            lock(&node.inner.notifications).mouse_id.is_some()
+        })
+        .await;
+        let id = lock(&node.inner.notifications).mouse_id.unwrap();
+        let n = node.clone();
+        tokio::task::spawn_blocking(move || n.perform_notification_action(id, true, n.id()))
+            .await
+            .unwrap();
+        until("mouse enabled notice removed", || {
+            lock(&node.inner.notifications).mouse_id.is_none()
+        })
+        .await;
+        assert_eq!(
+            node.settings().routing.mouse_mode,
+            oink_foundation::input::InputMode::Shared
+        );
+        assert_eq!(
+            AgentConfig::load_from(home.path()).unwrap().settings.routing.mouse_mode,
+            oink_foundation::input::InputMode::Shared
+        );
+        node.shutdown().await;
+    }
+    #[tokio::test]
+    async fn mouse_cause_release_dismisses_banner_and_does_not_resurrect_stale_action() {
+        let home = tempfile::tempdir().unwrap();
+        let node = Node::prepare(options(home.path())).unwrap();
+        node.notification_status(&StatusEvent::MouseDisabled(true));
+        let (id, surface) = {
+            let state = lock(&node.inner.notifications);
+            assert_eq!(state.pending.len(), 1);
+            let (&id, pending) = state.pending.iter().next().unwrap();
+            (id, pending.surface.unwrap())
+        };
+        node.notification_status(&StatusEvent::MouseDisabled(true));
+        assert_eq!(lock(&node.inner.notifications).pending.len(), 1);
+        node.notification_status(&StatusEvent::KeyboardDisabled(true));
+        node.notification_status(&StatusEvent::MouseDisabled(false));
+        {
+            let state = lock(&node.inner.notifications);
+            assert!(!state.pending.contains_key(&id));
+            assert!(!state.origins.contains_key(&surface));
+            assert_eq!(state.pending.len(), 1);
+        }
+        node.notification_status(&StatusEvent::MouseDisabled(true));
+        node.notification_click(Click {
+            id: surface,
+            undo: true,
+        });
+        assert_eq!(lock(&node.inner.notifications).pending.len(), 2);
+        node.notification_status(&StatusEvent::MouseDisabled(false));
+        node.notification_status(&StatusEvent::KeyboardDisabled(false));
+        assert!(lock(&node.inner.notifications).pending.is_empty());
     }
     #[tokio::test]
     async fn unavailable_remote_falls_back_to_last_local_screen() {
@@ -922,7 +1042,7 @@ mod remote_tests {
                     .unwrap();
                 let request = Notification {
                     level: NotificationLevel::Notice,
-                    title: "Keyboard locked".into(),
+                    title: "Keyboard disabled".into(),
                     description: String::new(),
                     screen: Some(ScreenKey {
                         device: b.id().into(),

@@ -26,6 +26,9 @@ mod caps;
 #[cfg(test)]
 mod connection_tests;
 mod contacts;
+mod cursor_clip;
+#[cfg(test)]
+mod cursor_clip_tests;
 #[cfg(test)]
 mod entry_policy_tests;
 pub use contacts::ContactsPath;
@@ -35,6 +38,7 @@ pub use focus_lock::FocusLockError;
 mod fresh_join;
 mod game;
 mod game_capture;
+mod hidden;
 mod input_pair;
 pub(crate) mod keyboard;
 mod local_modes;
@@ -210,6 +214,8 @@ pub enum Output {
     Inject(InjectEvent),
     /// 切换本机截获模式（焦点离开本机时 `Remote`，回到本机且不知道光标落点时 `Local`）。
     SetMode(CaptureMode),
+    /// Ordered native confinement; None releases only our own lease.
+    ConstrainCursor(Option<Rect>),
     /// 焦点回到本机：切回 `Local`，光标出现在 `at`（`InputBackend::restore_local`，由 backend 原子地
     /// 「放光标、切模式、显示」）。与 `SetMode` 共用模式切换的顺序（执行方按产生顺序执行两者）。
     RestoreLocal {
@@ -263,6 +269,7 @@ pub enum StatusEvent {
     },
     LocalFactsChanged,
     KeyboardDisabled(bool),
+    MouseDisabled(bool),
     KeyboardReleased,
     ScreenLocalInput(bool),
     GameMode(GameModeStatus),
@@ -449,6 +456,7 @@ pub struct Router {
     capture_available: bool,
     keyboard: keyboard::Keyboard,
     screen_local: bool,
+    native_constraint: Option<Rect>,
     last_enabled_focus: Option<DeviceId>,
     displays: Vec<DisplayInfo>,
     display_revision: u64,
@@ -517,6 +525,7 @@ pub struct Router {
     keys: HashMap<KeyCode, Vec<Target>>,
     buttons: HashMap<MouseButton, Target>,
     button_diagnostics: button_diagnostics::State,
+    cursor_clip: cursor_clip::CursorClip,
     scroll_target: Option<ScrollRoute<Target>>,
     /// 一次触摸板手势（`InputEvent::Gesture`）从开始到结束锁定的目标。
     gesture_lock: Option<Target>,
@@ -605,6 +614,7 @@ impl Router {
             capture_available: true,
             keyboard: Default::default(),
             screen_local: false,
+            native_constraint: None,
             last_enabled_focus: None,
             displays: Vec::new(),
             display_revision: 0,
@@ -644,6 +654,7 @@ impl Router {
             keys: HashMap::new(),
             buttons: HashMap::new(),
             button_diagnostics: Default::default(),
+            cursor_clip: Default::default(),
             scroll_target: None,
             gesture_lock: None,
             source_gesture: None,
@@ -899,6 +910,8 @@ impl Router {
 
     /// 告诉路由本机光标当前位置（启动时，或平台实现发现光标被其他程序移动时）。
     pub fn set_cursor(&mut self, pos: Point) {
+        let pos = self.hidden_cursor_constraint().map_or(pos, |bounds| bounds.clamp(pos));
+        let pos = self.system_clip_position(pos).map_or(pos, |at| at.local);
         let was_gap = self.gap.is_some();
         self.resistance = None;
         if let Some((key, bounds)) = self.locate(pos) {
@@ -908,6 +921,50 @@ impl Router {
         if was_gap {
             self.gap_cancel();
         }
+    }
+
+    /// Adopt a fresh target readback without erasing fractional motion, gap
+    /// travel or edge pressure when the physical parked point has not changed.
+    /// Off-desktop / failed reads preserve the existing prediction.
+    pub fn reconcile_target_cursor(&mut self, pos: Point) -> bool {
+        if let Some(bounds) = self.hidden_cursor_constraint() {
+            if pos.x.is_finite()
+                && pos.y.is_finite()
+                && !bounds.contains(pos)
+                && let Some(pos) = self.constrained_local_cursor()
+            {
+                self.out.push(Output::Inject(InjectEvent::MoveTo { pos }));
+            }
+            return false;
+        }
+        if !self.has_pointer_focus()
+            || self.paused
+            || self.game_mode().active
+            || !pos.x.is_finite()
+            || !pos.y.is_finite()
+        {
+            return false;
+        }
+        let Some(display) = self.displays.iter().find(|d| d.bounds.contains(pos)) else {
+            return false;
+        };
+        if self.layout.gap_topology().is_some_and(|topology| {
+            !topology.is_active(&oink_display::layout::ScreenId::new(self.me(), display.key.clone()))
+        }) {
+            return false;
+        }
+        // pointer is the current physical parked point even during virtual gap
+        // travel. local_cursor is a saved restore point and may be much older.
+        if self.pointer.as_ref().is_some_and(|p| p.local == pos) {
+            return true;
+        }
+        if let Some(constrained) = self.target_readback_constrained_point(pos) {
+            self.pointer.as_mut().unwrap().local = constrained;
+            self.local_cursor = self.pointer.clone();
+            return true;
+        }
+        self.set_cursor(pos);
+        true
     }
 
     /// Whether the local source ledger still awaits a release, regardless of its target.
@@ -990,6 +1047,9 @@ impl Router {
     /// 暂停共享：本机自成一岛——焦点留在本机、不接受其他设备的焦点与输入（抬起除外），并通告
     /// 其他设备（session admission），它们把本机当作离线。
     pub fn set_paused(&mut self, paused: bool) {
+        if paused {
+            self.cancel_system_clip_motion();
+        }
         self.gap_cancel();
         self.resistance = None;
         if self.paused == paused {
@@ -1064,6 +1124,10 @@ impl Router {
             getrandom::fill(&mut self.session).expect("routing session entropy");
             self.out.retain(|out| !matches!(out, Output::Send { .. }));
         } else {
+            if self.keyboard_disabled() {
+                // Keys admitted during pause must be released before the saved guard resumes.
+                self.retire_source_keyboard();
+            }
             self.emergency = None;
         }
     }
@@ -1252,6 +1316,7 @@ impl Router {
     /// 紧急暂停在本机生效：释放发往别处的键和按钮、释放为其他设备注入的键和按钮、暂停共享、回到本机
     /// 并显示光标。只改本机状态（「岛」：组内焦点 `claim` 不变），不依赖网络。
     fn apply_emergency(&mut self, origin: DeviceId) {
+        self.cancel_system_clip_motion();
         self.cancel_source_contacts();
         self.cancel_local_gesture();
         self.retire_received_multifinger();
@@ -1376,6 +1441,8 @@ impl Router {
     pub fn drain_outputs(&mut self) -> Vec<Output> {
         // 任何入口都可能改变焦点、按钮、游戏模式或设置：交出输出前统一同步拖尾状态。
         self.gap_sync();
+        self.constrain_system_clip_outputs();
+        self.sync_hidden_constraint();
         self.trail_sync();
         std::mem::take(&mut self.out)
     }
@@ -1423,6 +1490,12 @@ impl Router {
         self.dnd.now = now;
         self.enforce_screen_policy();
         let decision_start = self.out.len();
+        // Block the source before any local-cursor reveal, portal, gesture or
+        // touch contact routing. Remote injected input never enters this gate.
+        if self.mouse_disabled() && !self.fully_paused && !matches!(ev.event, InputEvent::Key { .. }) {
+            self.source_decision(&ev.event, Disposition::Swallow, decision_start);
+            return Disposition::Swallow;
+        }
         let local_mouse_woke = self.reveal_local_mouse(ev);
         if self.observe_emergency_event(ev, now) {
             self.source_decision(&ev.event, Disposition::Swallow, decision_start);
@@ -1511,7 +1584,7 @@ impl Router {
             self.enter_due = None;
         }
         let disposition = match ev.event {
-            InputEvent::TouchpadSample(_) => Disposition::Pass,
+            InputEvent::TouchpadSample(_) | InputEvent::TouchpadBoundary => Disposition::Pass,
             InputEvent::RawPointerDelta { dx, dy } => self.raw_motion(dx, dy),
             InputEvent::PointerDelta { dx, dy } => {
                 if !self.mouse_local() {
@@ -1652,6 +1725,12 @@ impl Router {
     // ================= 本机事件（源端） =================
 
     fn local_motion(&mut self, dx: f64, dy: f64, cursor: Option<Point>, now: Micros) -> Disposition {
+        if let Some(disposition) = self.hidden_local_motion(dx, dy, now) {
+            return disposition;
+        }
+        self.local_motion_unconstrained(dx, dy, cursor, now)
+    }
+    fn local_motion_unconstrained(&mut self, dx: f64, dy: f64, cursor: Option<Point>, now: Micros) -> Disposition {
         if self.mouse_local() {
             if let Some(cursor) = cursor
                 && let Some((key, bounds)) = self.locate(cursor)
@@ -1680,6 +1759,12 @@ impl Router {
             let (mx, my) = (dx * s, dy * s);
             self.send_motion(mx, my);
             return Disposition::Swallow;
+        }
+        if self.defer_system_clip_motion(dx, dy, cursor, now) {
+            return Disposition::Pass;
+        }
+        if self.system_clip_local_motion(dx, dy, cursor) {
+            return Disposition::Pass;
         }
         if let Some(from) = self.pointer.clone()
             && let Some(disposition) = self.gap_local_motion(&from, (dx, dy), cursor, now)
@@ -2187,7 +2272,7 @@ impl Router {
                 self.diagnostic_log(line!(), "cursor latency: FocusEnter received", epoch);
                 tracing::debug!(target: "oink_cursor_timing", diagnostic = true, epoch, ?from, ?pos, "cursor latency: FocusEnter received");
                 let me = self.me();
-                if self.layout.source_requires_target(me) {
+                if self.layout.source_requires_target(me) || self.hidden_entry(me, &display) {
                     self.send_focus_state(from);
                     self.dnd_focus_enter_ignored(from, epoch, "target excluded by layout policy");
                     return;
@@ -2363,7 +2448,7 @@ impl Router {
 
     /// 对端通告的焦点（移交时、连接建立 / 恢复时、每 500 ms 一次）。
     fn on_focus_state(&mut self, from: DeviceId, epoch: u64, holder: DeviceId, scope: Option<FocusScope>, now: Micros) {
-        if self.layout.source_requires_target(holder) {
+        if self.layout.source_requires_target(holder) || (from != holder && self.hidden_device(holder)) {
             return;
         }
         let theirs = (epoch, holder);
@@ -2527,7 +2612,7 @@ impl Router {
             phase,
             ..
         } = &msg
-            && self.multifinger.get(&origin).is_some_and(|state| state.retired)
+            && self.retired_scroll(origin, *phase)
         {
             self.filter_multifinger(origin, contacts::MultiEvent::Scroll(*phase));
             return;
@@ -2891,6 +2976,9 @@ impl Router {
             .unwrap_or(self.reference_per_native_unit());
         let gain = self.layout.remote_pointer_gain(&from.screen, origin);
         let delta = (dx * gain / scale, dy * gain / scale);
+        if self.system_clip_remote_motion(&from, origin, dx, dy, delta) {
+            return;
+        }
         if let Some(disposition) = self.gap_motion(&from, (dx, dy), origin, now) {
             if disposition == Disposition::Pass {
                 let at = self.pointer.as_ref().unwrap();
@@ -3882,7 +3970,11 @@ impl Router {
 
     /// 通往其他设备的边是墙：拖动中（`handoff_blocked`）、锁定当前焦点、共享暂停。
     fn leave_blocked(&self) -> bool {
-        self.projection_gesture || self.focus_pinned() || self.paused || self.handoff_blocked()
+        self.projection_gesture
+            || self.focus_pinned()
+            || self.system_clip_active()
+            || self.paused
+            || self.handoff_blocked()
     }
 
     fn send(&mut self, to: DeviceId, msg: Message) {
@@ -4182,3 +4274,6 @@ mod local_modes_tests;
 
 #[cfg(test)]
 mod caps_tests;
+
+#[cfg(test)]
+mod target_cursor_sync_tests;

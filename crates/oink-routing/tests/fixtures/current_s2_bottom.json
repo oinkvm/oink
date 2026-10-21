@@ -1,0 +1,97 @@
+{
+  "revision": 204,
+  "settings": {
+    "gap_travel": false,
+    "endpoint_reach": 0.0,
+    "overlap_tolerance": 0.007288629737609329,
+    "minimum_portal": 0.014577259475218658,
+    "portal_snap": 0.011661807580174927,
+    "walls": true
+  },
+  "screens": [
+    {
+      "code": "A1",
+      "device": "A",
+      "local": {
+        "h": 2160.0,
+        "w": 3840.0,
+        "x": 0.0,
+        "y": 0.0
+      },
+      "rect": {
+        "x": 1.009506779953817,
+        "y": -0.592209041110381,
+        "w": 0.7460937499999998,
+        "h": 0.41967773437499983
+      },
+      "gain": 1.0,
+      "remote_gain": 1.0,
+      "hidden": true,
+      "disabled": true,
+      "online": true
+    },
+    {
+      "code": "S1",
+      "device": "S",
+      "local": {
+        "h": 1117.0,
+        "w": 1728.0,
+        "x": 0.0,
+        "y": 0.0
+      },
+      "rect": {
+        "x": 0.5473448887509809,
+        "y": 0.1411027135928952,
+        "w": 0.5018144325252422,
+        "h": 0.3243788895432266
+      },
+      "gain": 1.0,
+      "remote_gain": 1.0,
+      "hidden": false,
+      "disabled": false,
+      "online": true
+    },
+    {
+      "code": "S2",
+      "device": "S",
+      "local": {
+        "h": 1080.0,
+        "w": 1920.0,
+        "x": 1576.0,
+        "y": -1080.0
+      },
+      "rect": {
+        "x": 1.0050182369337248,
+        "y": -0.17253130673538117,
+        "w": 0.5575715916947135,
+        "h": 0.31363402032827636
+      },
+      "gain": 1.0,
+      "remote_gain": 0.8,
+      "hidden": false,
+      "disabled": false,
+      "online": true
+    },
+    {
+      "code": "C1",
+      "device": "C",
+      "local": {
+        "h": 1117.0,
+        "w": 1728.0,
+        "x": 0.0,
+        "y": 0.0
+      },
+      "rect": {
+        "x": 1.049159321276223,
+        "y": 0.16683809158945806,
+        "w": 0.5018144325252422,
+        "h": 0.3243788895432266
+      },
+      "gain": 1.0,
+      "remote_gain": 1.0,
+      "hidden": false,
+      "disabled": false,
+      "online": true
+    }
+  ]
+}

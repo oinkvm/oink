@@ -4,6 +4,7 @@ import type * as T from './types';
 import type { DeviceCardsView, DeviceControlCompleted, DeviceControlReply } from './cards';
 import { pairingApi } from './pairing';
 import type { PairingEvent, PairingSnapshot, NearbySnapshot } from './pairing';
+import type { LayoutProfilesState } from './layoutProfiles';
 export type DurablePairingEvent = Extract<PairingEvent,{type:'pairing_failed'|'pairing_completed'}>;
 
 export type { BlockedDevice, BlockedDevicesSnapshot } from './cards';
@@ -39,11 +40,13 @@ export interface AgentState {
   audio: T.AudioStatus | null;
   permissions: T.PermissionItem[];
   fileProvider: T.FileProviderStatus | null;
+  receivedFiles:T.ReceivedFilesUsage | null;
   wallpapers: Record<string, string>;
+  layoutProfiles: LayoutProfilesState | null;
   pending: PendingControl[];
   error: string | null;
 }
-const initial = (): AgentState => ({ launch: null, diagnostics: null, update: null, localPreferences: null, report:null, boot: null, cards: null, blocked: null, overview: null, layout: null, network: null, nearby: null, pairings: null, pairingEvents: [], input: null, clipboard: null, audio: null, permissions: [], fileProvider: null, wallpapers: {}, pending: [], error: null });
+const initial = (): AgentState => ({ launch: null, diagnostics: null, update: null, localPreferences: null, report:null, boot: null, cards: null, blocked: null, overview: null, layout: null, network: null, nearby: null, pairings: null, pairingEvents: [], input: null, clipboard: null, audio: null, permissions: [], fileProvider: null, receivedFiles:null, wallpapers: {}, layoutProfiles: null, pending: [], error: null });
 
 /** A stream belongs to one subscription; a late query cannot select another stream. */
 export function acceptSnapshot<T extends { stream: string; revision: string }>(current: T | null, incoming: T): T | null {
@@ -51,6 +54,13 @@ export function acceptSnapshot<T extends { stream: string; revision: string }>(c
   if (!current) return incoming;
   if (current.stream !== incoming.stream) return current;
   return BigInt(incoming.revision) > BigInt(current.revision) ? incoming : current;
+}
+
+/** Profile state is ordered by backend epoch/sequence, never by arrival time. A new
+ * epoch (backend restart) replaces the old stream wholesale: every view is complete. */
+export function newerProfiles(current: LayoutProfilesState | null, incoming: LayoutProfilesState): boolean {
+  if (!current || current.epoch !== incoming.epoch) return true;
+  return /^\d+$/.test(incoming.sequence) && BigInt(incoming.sequence) > BigInt(current.sequence);
 }
 
 export function createAgentStore() {
@@ -130,17 +140,22 @@ export function createAgentStore() {
       case 'clipboard_settings': return adopt('clipboard', event.data);
       case 'audio': return adopt('audio', event.data);
       case 'permissions': return adopt('permissions', event.data);
+      case 'received_files_usage': return adopt('receivedFiles',event.data);
       case 'file_provider_status': return adopt('fileProvider', event.data);
       case 'emergency_stop': return set({ pending: [], error: 'emergency_stop' });
+      case 'layout_profiles': return adoptProfiles(event.data);
+      case 'layout_profile_operation': return adoptProfiles(event.data.state);
 
     }
   };
+  const adoptProfiles = (next: LayoutProfilesState) => { if (newerProfiles(state.layoutProfiles, next)) adopt('layoutProfiles', next); };
   const query = async <K extends keyof AgentState>(key: K, fetch: () => Promise<AgentState[K]>) => {
     const sent = revisions.get(key) ?? 0, session = generation;
     const value = await fetch();
     if (generation !== session) return;
     if(key==='cards'&&value){receive({type:'device_cards',data:value as DeviceCardsView},false);return;}
     if(key==='blocked'&&value){adopt('blocked',acceptSnapshot(state.blocked,value as BlockedDevicesSnapshot));return;}
+    if(key==='layoutProfiles'&&value){adoptProfiles(value as LayoutProfilesState);return;}
     if (key==='pairings' && !state.pairings) {
       adopt(key,value); const events=initialPairEvents; initialPairEvents=[]; events.forEach(event=>receive(event,false)); return;
     }
@@ -152,7 +167,7 @@ export function createAgentStore() {
   return {
     get: () => state,
     subscribe: (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
-    receive, query, adopt,
+    receive, query, adopt, adoptProfiles,
     controlReply: (reply: DeviceControlReply) => { if (reply.type === 'device_control_completed') receive(reply); },
     onEvent: (listener:(event:ProductEvent)=>void) => {eventListeners.add(listener);return()=>{eventListeners.delete(listener);};},
     consumePairingEvent: (id:string) => set({pairingEvents:state.pairingEvents.filter(event=>event.data.event_id!==id)}),
@@ -190,6 +205,7 @@ export function start(view = 'main'): Promise<void> {
         agent.query('input', api.inputSettings),
         agent.query('clipboard', api.clipboardSettings), agent.query('audio', api.audioStatus),
         agent.query('permissions', api.permissions), agent.query('fileProvider', api.fileProviderStatus),
+        agent.query('layoutProfiles', api.layoutProfiles),
       ]);
 
     } catch { agent.fail('unavailable'); }

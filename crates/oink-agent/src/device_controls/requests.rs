@@ -37,6 +37,7 @@ fn option_value(edit: &CardOptionEdit) -> RawValue {
         CardOptionEdit::MouseMode(mode) | CardOptionEdit::KeyboardMode(mode) => match mode {
             SharingMode::Shared => 0u32,
             SharingMode::Local => 1u32,
+            SharingMode::Disabled => 2u32,
         }
         .write(),
         CardOptionEdit::ClipboardEnabled(v)

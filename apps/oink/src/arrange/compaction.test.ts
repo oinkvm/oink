@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { settleGroup, type Offset } from './compaction';
+import { compactAround, settleGroup, type Computer, type Offset } from './compaction';
 import { renderLayout } from './adapter';
 import { bounds, type Rect } from './geometry';
 import { edgeProjections, overlaps, sameProjections, tolerance } from './facing';
@@ -91,6 +91,85 @@ describe('edited-computer compaction', () => {
             const boxes = [...new Set(groups)].map(g => bounds(others.filter((_, j) => groups[j] === g)));
             const gapTo = (r: Rect) => Math.max(r.x - (placed.x + placed.w), placed.x - (r.x + r.w), r.y - (placed.y + placed.h), placed.y - (r.y + r.h));
             expect(Math.min(...[...others, ...boxes].map(gapTo)), `case ${i}`).toBeLessThanOrEqual(eps);
+        }
+    });
+});
+
+describe('one compaction pass when auto-compact is turned on', () => {
+    const box = (x: number, y: number, w = 100, h = 100): Rect => ({ x, y, w, h });
+    const shifted = (c: Computer, offsets: Map<string, Offset>) => moved(c.rects, offsets.get(c.device) ?? { dx: 0, dy: 0 });
+    /** The whole pass keeps every projection and never overlaps; the anchor never moves;
+     * passes are bounded by the computer count, and a second run moves nothing. */
+    function check(computers: Computer[], anchor: string | null) {
+        const result = compactAround(computers, anchor);
+        const before = computers.flatMap(c => c.rects), after = computers.flatMap(c => shifted(c, result.offsets)), eps = tolerance(before);
+        expect(sameProjections(edgeProjections(before, eps), edgeProjections(after, eps), eps)).toBe(true);
+        for (const [i, a] of after.entries()) for (const b of after.slice(i + 1)) expect(overlaps(a, b, eps)).toBe(false);
+        if (anchor) expect(result.offsets.has(anchor)).toBe(false);
+        expect(result.moves.length).toBeLessThanOrEqual(computers.length);
+        const settled = computers.map(c => ({ device: c.device, rects: shifted(c, result.offsets) }));
+        expect(compactAround(settled, anchor).offsets.size).toBe(0);
+        return result;
+    }
+
+    it('keeps this computer fixed and moves the others toward it, nearest first', () => {
+        const computers = [{ device: 'a', rects: [box(0, 0)] }, { device: 'c', rects: [box(300, 0)] }, { device: 'b', rects: [box(150, 0)] }];
+        const { offsets, moves } = check(computers, 'a');
+        expect(offsets.get('b')).toEqual({ dx: -50, dy: 0 });
+        expect(offsets.get('c')).toEqual({ dx: -100, dy: 0 });
+        expect(moves).toEqual([['b', 'c']]);
+    });
+
+    it('keeps the anchor fixed even when it is the computer apart from the others', () => {
+        const computers = [{ device: 'z', rects: [box(1000, 0)] }, { device: 'a', rects: [box(0, 0)] }, { device: 'b', rects: [box(300, 0)] }];
+        const { offsets, moves } = check(computers, 'z');
+        // b goes first (nearer to z) but, as in any compaction move, to its nearest computer;
+        // a then keeps its new contact with b. z itself never moves.
+        expect(offsets.get('b')).toEqual({ dx: -200, dy: 0 });
+        expect(offsets.has('a')).toBe(false);
+        expect(moves).toEqual([['b']]);
+    });
+
+    it('breaks distance ties by device ID', () => {
+        const computers = [{ device: 'anchor', rects: [box(0, 200)] }, { device: 'c', rects: [box(0, 400)] }, { device: 'b', rects: [box(0, 0)] }];
+        expect(check(computers, 'anchor').moves).toEqual([['b', 'c']]);
+    });
+
+    it('converges within the bound on a scattered staircase', () => {
+        const computers = [0, 1, 2, 3, 4, 5].map(i => ({ device: `d${i}`, rects: [box(i * 170, i * 130, 100 + i * 10, 80)] }));
+        expect(check(computers, 'd0').offsets.size).toBeGreaterThan(0);
+    });
+
+    it('moves nothing in an already compact layout', () => {
+        const computers = [{ device: 'a', rects: [box(0, 0)] }, { device: 'b', rects: [box(100, 0)] }, { device: 'c', rects: [box(0, 100)] }];
+        expect(check(computers, 'a')).toEqual({ offsets: new Map(), moves: [] });
+    });
+
+    it('works without a visible anchor, by device order alone', () => {
+        const computers = [{ device: 'b', rects: [box(150, 0)] }, { device: 'a', rects: [box(0, 0)] }];
+        expect(check(computers, null).offsets.size).toBe(1);
+    });
+
+    it('keeps every projection of the user layout, without its hidden Windows screen', () => {
+        const all = renderLayout(threeComputers, {});
+        const visible = all.filter((_, i) => !threeComputers.geometry.screens[i].hidden);
+        const computers = [...new Set(visible.map(s => s.device!))].map(device => ({ device, rects: visible.filter(s => s.device === device) }));
+        expect(computers.map(c => c.device)).not.toContain('a'.repeat(64));
+        // This Mac is the anchor; the other Mac keeps its stored corner gap (see above).
+        expect(check(computers, 'c'.repeat(64)).offsets.size).toBe(0);
+    });
+
+    it('never changes a projection, overlaps or moves the anchor in generated layouts', () => {
+        let seed = 0x7a11ed;
+        const random = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 2 ** 32; };
+        for (let i = 0; i < 120; i++) {
+            const computers: Computer[] = [];
+            for (let n = 2 + i % 4, tries = 0; computers.length < n && tries < 200; tries++) {
+                const first = box(Math.floor(random() * 12) * 100, Math.floor(random() * 12) * 100, 50 + Math.floor(random() * 4) * 50, 50 + Math.floor(random() * 4) * 50);
+                const rects = random() < .4 ? [first, { ...first, x: first.x + first.w, h: first.h / 2 }] : [first];
+                if (computers.every(c => c.rects.every(o => rects.every(r => !overlaps(o, r))))) computers.push({ device: `d${computers.length}`, rects });
+            }
+            check(computers, 'd0');
         }
     });
 });

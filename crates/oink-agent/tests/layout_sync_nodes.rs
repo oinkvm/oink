@@ -180,8 +180,13 @@ async fn three_nodes_manual_coordinates_offline_and_restart_scenario() {
     common::pair(&c, &a).await;
     let all = [&a, &b, &c];
     wait_for("all three online and in every layout", 15.0, || {
-        all.iter()
-            .all(|n| n.online_set().len() == 3 && n.layout().0.screens.len() == 3)
+        all.iter().all(|n| {
+            n.online_set().len() == 3 && n.layout().0.screens.len() == 3
+                // Layout registers and owner Facts travel independently. A
+                // manual auto-save must not invent missing visibility.
+                && AgentApi::layout_profile_command(*n, oink_agent::layout_profiles::types::Command::Query)
+                    .is_ok_and(|s| s.get("snapshot").is_some_and(|snapshot| !snapshot.is_null()))
+        })
     })
     .await;
     assert_eq!(

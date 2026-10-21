@@ -231,6 +231,7 @@ pub(super) struct Owner {
     pub(super) hold_facts: bool,
     last_state: Instant,
     displays: Vec<DisplayInfo>,
+    displays_observed: bool,
     detached: detached::DetachedScreens,
     discovery: Option<Arc<Discovery>>,
     advert: watch::Sender<Advert>,
@@ -443,6 +444,7 @@ impl Owner {
             hold_facts: false,
             last_state: Instant::now(),
             displays: vec![],
+            displays_observed: false,
             detached,
             discovery: None,
             advert,
@@ -770,6 +772,17 @@ impl Owner {
         self.flush(id);
     }
     fn send(&mut self, id: LinkId, message: Message) -> v1::Result<()> {
+        let message = if let Message::ConfigFacts(facts) = message {
+            let links = self.links.links();
+            let supports = self
+                .sessions
+                .get(&id)
+                .and_then(|session| links.by_peer(session.peer_boot.device_id))
+                .is_some_and(|link| link.agreement.contains("oink.input.mouse-disabled/1"));
+            Message::ConfigFacts(super::facts::for_mouse_capability(facts, supports)?)
+        } else {
+            message
+        };
         let bytes = v1::frame::encode(&message, v1::limits::CONFIG_FRAME)?;
         self.send_bytes(id, bytes);
         // Posting can synchronously retire a closed or over-budget C0. Its
@@ -1261,7 +1274,9 @@ impl Owner {
             | Message::ConfigEmergencyPauseAck(_)
             | Message::NotifyShow(_)
             | Message::NotifyAction(_)
-            | Message::NotifyDismiss(_) => {
+            | Message::NotifyDismiss(_)
+            | Message::LayoutArrangementRequest(_)
+            | Message::LayoutArrangementResult(_) => {
                 if !self.sessions[&id].ready || !self.state.roster().contains(peer.device_id) {
                     return Err(v1::ErrorCode::NotReady.into());
                 }

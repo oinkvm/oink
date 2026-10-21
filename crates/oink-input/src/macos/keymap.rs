@@ -213,6 +213,19 @@ const NX_HID_ONLY: &[(KeyCode, NxKey)] = &[
     (k(0x81), NX_KEYTYPE_SOUND_DOWN),
 ];
 
+/// Local-only brightness controls; deliberately absent from the forwarding table.
+/// NX constants come from IOKit/hidsystem/ev_keymap.h.
+pub fn local_brightness_key(nx: NxKey) -> Option<KeyCode> {
+    Some(c(match nx {
+        2 => 0x6F,  // NX_KEYTYPE_BRIGHTNESS_UP
+        3 => 0x70,  // NX_KEYTYPE_BRIGHTNESS_DOWN
+        21 => 0x79, // NX_KEYTYPE_ILLUMINATION_UP
+        22 => 0x7A, // NX_KEYTYPE_ILLUMINATION_DOWN
+        23 => 0x7C, // NX_KEYTYPE_ILLUMINATION_TOGGLE
+        _ => return None,
+    }))
+}
+
 /// 系统定义事件的键类型 → HID。不在转发之列的键为 `None`。
 pub fn nx_to_hid(nx: NxKey) -> Option<KeyCode> {
     NX_KEYS.iter().find(|(n, _)| *n == nx).map(|(_, h)| *h)
@@ -436,5 +449,31 @@ mod tests {
             assert!(is_mac_function(m), "{m:#x}");
         }
         assert!(!is_mac_function(0x00));
+    }
+}
+
+#[cfg(test)]
+mod brightness_tests {
+    use super::*;
+    #[test]
+    fn guard_brightness_aux_keys_are_local_for_down_repeat_and_up() {
+        for nx in [2, 3, 21, 22, 23] {
+            for (pressed, repeat) in [(true, false), (true, true), (false, false)] {
+                let key = AuxKey::parse(
+                    AuxKey {
+                        key: nx,
+                        pressed,
+                        repeat,
+                    }
+                    .data1(),
+                )
+                .unwrap();
+                assert!(local_brightness_key(key.key).unwrap().is_brightness());
+                assert_eq!(nx_to_hid(key.key), None, "must never enter forwarding map");
+            }
+        }
+        for nx in [0, 1, 4, 7, 14, 16, 17, 18, 19, 20, 24, 255] {
+            assert_eq!(local_brightness_key(nx), None);
+        }
     }
 }

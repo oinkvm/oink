@@ -1,5 +1,8 @@
 //! Small per-monitor layered toast windows. Never activate or capture input.
-use super::{Click, Frame, Surface};
+use super::{
+    Click, Feedback, Frame, Surface,
+    interaction::{HitState, Input},
+};
 use oink_foundation::{Point, Rect};
 use std::{cell::RefCell, collections::HashMap};
 use windows::{
@@ -7,12 +10,21 @@ use windows::{
         Foundation::*,
         Graphics::Gdi::*,
         System::LibraryLoader::GetModuleHandleW,
-        UI::{HiDpi::*, WindowsAndMessaging::*},
+        UI::{
+            Controls::WM_MOUSELEAVE,
+            HiDpi::*,
+            Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent},
+            WindowsAndMessaging::*,
+        },
     },
     core::{BOOL, w},
 };
-type Hit = (u64, Option<Rect>, bool);
-thread_local! {static HITS:RefCell<HashMap<usize,Hit>>=RefCell::new(HashMap::new());static CLICKS:RefCell<Vec<Click>>=const{RefCell::new(Vec::new())};}
+
+thread_local! {
+    static HITS: RefCell<HashMap<usize, HitState>> = RefCell::new(HashMap::new());
+    static CLICKS: RefCell<Vec<Click>> = const { RefCell::new(Vec::new()) };
+    static FEEDBACK: RefCell<Vec<Feedback>> = const { RefCell::new(Vec::new()) };
+}
 struct Dib {
     dc: HDC,
     bitmap: HBITMAP,
@@ -76,13 +88,25 @@ struct Window {
     hwnd: HWND,
     dib: Option<Dib>,
 }
+fn window_style(interactive: bool) -> WINDOW_EX_STYLE {
+    WS_EX_LAYERED
+        | WS_EX_NOACTIVATE
+        | WS_EX_TOOLWINDOW
+        | WS_EX_TOPMOST
+        | if interactive {
+            WINDOW_EX_STYLE(0)
+        } else {
+            WS_EX_TRANSPARENT
+        }
+}
+
 impl Window {
     fn new() -> Option<Self> {
         Self::create()
     }
     fn create() -> Option<Self> {
         // SAFETY: Registered process-local class; this renderer owns the HWND on
-        // its message-pumping thread. No focus, capture or cursor APIs are called.
+        // its message-pumping thread. The shared system cursor is not owned here.
         unsafe {
             let module = GetModuleHandleW(None).ok()?;
             let class = w!("OinkNotification");
@@ -91,16 +115,21 @@ impl Window {
                 lpfnWndProc: Some(proc_),
                 hInstance: module.into(),
                 lpszClassName: class,
+                // This toast is clickable (body dismissal / Undo), so it must
+                // supply its own cursor. A null class cursor leaves this input
+                // queue's cursor unset and can retain the busy/startup cursor;
+                // NOACTIVATE alone does not make a window hit-test transparent.
+                hCursor: LoadCursorW(None, IDC_ARROW).ok()?,
                 ..Default::default()
             };
             if RegisterClassExW(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS {
                 return None;
             }
             // TOOLWINDOW removes taskbar / Alt+Tab entries, NOACTIVATE prevents
-            // focus changes, TRANSPARENT gives complete click-through outside
-            // edit mode. Layered premultiplied alpha preserves the clipped ends.
+            // focus changes. Start click-through until the first frame installs
+            // its hit data. Layered alpha keeps empty corners click-through.
             let hwnd = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                window_style(false),
                 class,
                 w!("Oink notification"),
                 WS_POPUP,
@@ -120,8 +149,11 @@ impl Window {
     fn present(&mut self, f: Frame) {
         HITS.with(|h| {
             h.borrow_mut()
-                .insert(self.hwnd.0 as usize, (f.id, f.undo, f.interactive));
+                .entry(self.hwnd.0 as usize)
+                .or_default()
+                .update(f.id, f.undo, f.interactive);
         });
+        self.set_interactive(f.interactive);
         if self.dib.as_ref().is_none_or(|d| d.w != f.width || d.h != f.height) {
             self.dib = Dib::new(f.width, f.height);
         }
@@ -177,6 +209,20 @@ impl Window {
             );
         }
     }
+
+    fn set_interactive(&self, interactive: bool) {
+        // SAFETY: This thread owns the HWND. Only the extended input style is
+        // changed; layered rendering, z-order and activation policy stay intact.
+        unsafe {
+            let style = window_style(interactive).0 as isize;
+            if GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) != style {
+                // HTTRANSPARENT only searches windows on the same thread.
+                // LAYERED + TRANSPARENT also passes through to other processes,
+                // letting their cursor and clicks survive the exit animation.
+                SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, style);
+            }
+        }
+    }
 }
 impl Drop for Window {
     fn drop(&mut self) {
@@ -223,6 +269,9 @@ impl Surface for Backend {
         }
         CLICKS.with(|c| std::mem::take(&mut *c.borrow_mut()))
     }
+    fn feedback(&mut self) -> Vec<Feedback> {
+        FEEDBACK.with(|f| std::mem::take(&mut *f.borrow_mut()))
+    }
     fn reduced_motion(&self) -> bool {
         let mut animation = BOOL(0);
         // SAFETY: read-only SPI query writes one initialized BOOL; no setting is changed.
@@ -238,20 +287,41 @@ impl Surface for Backend {
     }
 }
 unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    if msg == WM_NCHITTEST && !HITS.with(|h| h.borrow().get(&(hwnd.0 as usize)).is_some_and(|h| h.interactive)) {
+        return LRESULT(HTTRANSPARENT as isize);
+    }
     if msg == WM_MOUSEACTIVATE {
         return LRESULT(MA_NOACTIVATE as isize);
     }
-    if msg == WM_LBUTTONUP {
+    if matches!(msg, WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP) {
+        if msg == WM_MOUSEMOVE {
+            // Track leave without taking capture or activating the toast. Without
+            // this, the last hovered button stays highlighted outside the HWND.
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            // SAFETY: Valid initialized structure and our current HWND.
+            unsafe {
+                let _ = TrackMouseEvent(&mut track);
+            }
+        }
+        let p = Point::new((l.0 as u16 as i16) as f64, ((l.0 >> 16) as u16 as i16) as f64);
+        let input = match msg {
+            WM_LBUTTONDOWN => Input::Down(p),
+            WM_LBUTTONUP => Input::Up(p),
+            WM_MOUSELEAVE => Input::Leave,
+            _ => Input::Move(p),
+        };
         HITS.with(|h| {
-            if let Some((id, undo, true)) = h.borrow().get(&(hwnd.0 as usize)) {
-                let x = (l.0 as u16 as i16) as f64;
-                let y = ((l.0 >> 16) as u16 as i16) as f64;
-                CLICKS.with(|c| {
-                    c.borrow_mut().push(Click {
-                        id: *id,
-                        undo: undo.is_some_and(|r| r.contains(Point::new(x, y))),
-                    })
-                });
+            if let Some(hit) = h.borrow_mut().get_mut(&(hwnd.0 as usize)) {
+                let (feedback, click) = hit.input(input);
+                FEEDBACK.with(|f| f.borrow_mut().push(feedback));
+                if let Some(click) = click {
+                    CLICKS.with(|c| c.borrow_mut().push(click));
+                }
             }
         });
         return LRESULT(0);
@@ -273,4 +343,113 @@ pub(super) fn scale_for(display: &oink_foundation::display::DisplayInfo) -> f64 
         let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut x, &mut y);
     }
     f64::from(x) / 96.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toast_cursor_and_hit_testing_follow_interactivity_without_activation() {
+        let window = Window::new().expect("create hidden toast");
+        // SAFETY: All messages target our hidden HWND on its owning test thread;
+        // no pointer movement, visible window or input injection is involved.
+        unsafe {
+            let arrow = LoadCursorW(None, IDC_ARROW).unwrap();
+            let wait = LoadCursorW(None, IDC_WAIT).unwrap();
+            let previous = SetCursor(Some(wait));
+            SendMessageW(
+                window.hwnd,
+                WM_SETCURSOR,
+                Some(WPARAM(window.hwnd.0 as usize)),
+                Some(LPARAM(HTCLIENT as isize)),
+            );
+            let actual = GetCursor();
+            SetCursor(Some(previous));
+            assert_eq!(actual, arrow, "toast must replace a stale busy cursor");
+            assert_eq!(GetClassLongPtrW(window.hwnd, GCLP_HCURSOR), arrow.0 as usize);
+
+            for interactive in [false, true, false, true] {
+                HITS.with(|h| {
+                    h.borrow_mut()
+                        .entry(window.hwnd.0 as usize)
+                        .or_default()
+                        .update(7, None, interactive)
+                });
+                window.set_interactive(interactive);
+                let style = WINDOW_EX_STYLE(GetWindowLongPtrW(window.hwnd, GWL_EXSTYLE) as u32);
+                assert!(style.contains(WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST));
+                assert_eq!(style.contains(WS_EX_TRANSPARENT), !interactive);
+                assert_eq!(
+                    SendMessageW(window.hwnd, WM_NCHITTEST, None, Some(LPARAM(0))).0,
+                    if interactive {
+                        HTCLIENT as isize
+                    } else {
+                        HTTRANSPARENT as isize
+                    },
+                );
+                assert_eq!(
+                    SendMessageW(window.hwnd, WM_MOUSEACTIVATE, None, None).0,
+                    MA_NOACTIVATE as isize,
+                );
+                SendMessageW(window.hwnd, WM_LBUTTONDOWN, None, Some(LPARAM(0)));
+                SendMessageW(window.hwnd, WM_LBUTTONUP, None, Some(LPARAM(0)));
+                let clicks = CLICKS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+                assert_eq!(
+                    clicks,
+                    if interactive {
+                        vec![Click { id: 7, undo: false }]
+                    } else {
+                        vec![]
+                    }
+                );
+            }
+            HITS.with(|h| {
+                h.borrow_mut().entry(window.hwnd.0 as usize).or_default().update(
+                    7,
+                    Some(Rect::new(0., 0., 10., 10.)),
+                    true,
+                )
+            });
+            FEEDBACK.with(|f| f.borrow_mut().clear());
+            SendMessageW(window.hwnd, WM_MOUSEMOVE, None, Some(LPARAM(0)));
+            assert_eq!(
+                FEEDBACK.with(|f| f.borrow_mut().pop()).unwrap(),
+                Feedback {
+                    id: 7,
+                    hovered: true,
+                    pressed: false
+                }
+            );
+            SendMessageW(window.hwnd, WM_LBUTTONDOWN, None, Some(LPARAM(0)));
+            assert_eq!(
+                FEEDBACK.with(|f| f.borrow_mut().pop()).unwrap(),
+                Feedback {
+                    id: 7,
+                    hovered: true,
+                    pressed: true
+                }
+            );
+            SendMessageW(window.hwnd, WM_MOUSELEAVE, None, None);
+            assert_eq!(
+                FEEDBACK.with(|f| f.borrow_mut().pop()).unwrap(),
+                Feedback {
+                    id: 7,
+                    hovered: false,
+                    pressed: false
+                }
+            );
+            SendMessageW(window.hwnd, WM_LBUTTONUP, None, Some(LPARAM(0)));
+            assert!(
+                CLICKS.with(|c| c.borrow().is_empty()),
+                "leaving cancels press without capture"
+            );
+            SendMessageW(window.hwnd, WM_LBUTTONDOWN, None, Some(LPARAM(0)));
+            SendMessageW(window.hwnd, WM_LBUTTONUP, None, Some(LPARAM(0)));
+            assert_eq!(
+                CLICKS.with(|c| std::mem::take(&mut *c.borrow_mut())),
+                vec![Click { id: 7, undo: true }],
+            );
+        }
+    }
 }

@@ -18,10 +18,11 @@ export function presentCards(view: DeviceCardsView | null, pending: PendingContr
             cursor: s?.cursor.icon ?? 'unknown',
             screenSharing: s?.screen.configuredMode == null ? null : s.screen.configuredMode === 'shared',
             screen: s?.screen.icon === 'fault' ? 'fault' : s?.screen.configuredMode === null || !s ? 'unknown' : s.screen.configuredMode === 'local' ? 'disabled' : 'shared',
-            mouse: icon(s?.mouse) as Device['mouse'], keyboard: icon(s?.keyboard) as Device['keyboard'], keyboardBeforeLock: s?.keyboard.disabled ? s.keyboard.configuredMode ?? undefined : undefined,
+            mouse: icon(s?.mouse) as Device['mouse'], keyboard: icon(s?.keyboard) as Device['keyboard'], keyboardBeforeLock: s?.keyboard.disabled ? s.keyboard.configuredMode === 'local' ? 'local' : 'shared' : undefined,
             clipboard: icon(s?.clipboard) as Device['clipboard'],
             speaker: { canMakeExit:s?.speaker.makeExitAction.kind==='invoke', waitingForExit:s?.speaker.activity==='waiting_for_exit' || (s?.speaker.configuredMode==='source' && s.speaker.activity==='idle' && !s.speaker.receiverDevice), selectedExitUnavailable:s?.speaker.activity==='waiting_for_exit' && !!s.speaker.receiverDevice, volumeKnown: exit ? exit.volumePercent !== null : forwarding !== null && forwarding !== undefined, mutedKnown: exit ? exit.muted !== null : forwarding !== null && forwarding !== undefined, canSetVolume: exit ? exit.canSet : !!s?.speaker.forwardingControlsToken, mode: icon(s?.speaker) as Device['speaker']['mode'], volume: exit?.volumePercent ?? forwarding?.volumePercent ?? 0, muted: exit?.muted ?? forwarding?.muted ?? false },
             gameMode: s?.game.preference ?? null, gameActive:s?.game.active ?? null, gameDetected: s?.game.detected ?? undefined,
+            canDisableMouse: s?.actions.mouseDisabled?.kind === 'invoke',
             canPause: card.pause?.action.kind === 'invoke', actionability: Object.fromEntries((['screen','mouse','keyboard','clipboard','speaker'] as const).map(k=>[k,s?.[k].action.kind??'unavailable'])), paused: card.pause?.paused, pauseReason: card.pause?.reason, unknown: s === null,
             faults: Object.fromEntries((['screen', 'mouse', 'keyboard', 'clipboard', 'speaker'] as const).map(k => [k, problemText(s?.[k].fault?.code ?? 'unrecognized')])),
         };
@@ -65,7 +66,7 @@ export function resourceAction(card: DeviceCard, resource: string, desired: stri
     switch (resource) {
         case 'game': return s.game.actions[desired as 'auto' | 'on' | 'off'];
         case 'screen': return desired === 'shared' ? a.screenShared : a.screenLocal;
-        case 'mouse': return desired === 'shared' ? a.mouseShared : a.mouseLocal;
+        case 'mouse': return desired === 'disabled' ? a.mouseDisabled : desired === 'shared' ? a.mouseShared : a.mouseLocal;
         case 'keyboard': return desired === 'disabled' ? a.keyboardDisabled : s.keyboard.disabled ? a.keyboardEnabled : desired === 'shared' ? a.keyboardShared : a.keyboardLocal;
         case 'clipboard': return desired === 'shared' ? a.clipboardShared : a.clipboardLocal;
         case 'speaker': return desired === 'exit' ? s.speaker.makeExitAction : desired === 'forwarding' ? a.forwardingEnabled : s.speaker.icon === 'exit' ? s.speaker.action : a.forwardingDisabled;

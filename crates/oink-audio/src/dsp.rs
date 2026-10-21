@@ -2,6 +2,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::sink::quality::OutputKind;
 use serde::{Deserialize, Serialize};
 
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -399,6 +400,7 @@ struct DecodedSpan {
     frames: usize,
     arrival: Option<Instant>,
     concealed: bool,
+    kind: OutputKind,
 }
 
 enum DecoderCodec {
@@ -429,6 +431,8 @@ pub struct LatePacket {
 pub struct Receiver {
     dropout_counters: Option<std::sync::Arc<crate::sink::DropoutCounters>>,
     dropout_ledger: crate::sink::DropoutLedger,
+    late_ledger: crate::sink::DropoutLedger,
+    output_kinds: [OutputKind; FRAME_SIZE],
     consumed: [Option<(u64, Instant)>; 512],
     late_packet: Option<LatePacket>,
     rejections: Rejections,
@@ -475,6 +479,8 @@ impl Receiver {
         Ok(Self {
             dropout_counters: None,
             dropout_ledger: Default::default(),
+            late_ledger: Default::default(),
+            output_kinds: [OutputKind::Intentional; FRAME_SIZE],
             config,
             decoder,
             packets: PacketQueue::new(packet_capacity(config)),
@@ -494,6 +500,7 @@ impl Receiver {
                 frames: 0,
                 arrival: None,
                 concealed: false,
+                kind: OutputKind::Audio,
             }),
             drift: DriftController::default(),
             adaptive: AdaptiveJitter::new(config),
@@ -588,6 +595,13 @@ impl Receiver {
                     .map(|(_, at)| at),
             });
             self.stats.late += 1;
+            if let Some(counters) = &self.dropout_counters {
+                counters.record_quality(crate::sink::DropoutBucket {
+                    at_ms: (crate::diagnostics::monotonic_us(arrival).max(0) / 1000) as u64,
+                    late_packets: self.late_ledger.insert(seq, seq),
+                    ..Default::default()
+                });
+            }
             self.dropout(seq, seq, arrival, true);
             return false;
         }
@@ -722,6 +736,11 @@ impl Receiver {
         mut trace: Option<&mut RenderTrace>,
     ) {
         output.fill(0.0);
+        self.output_kinds.fill(if self.recovering && !self.draining {
+            OutputKind::Missing
+        } else {
+            OutputKind::Intentional
+        });
         if output.len() != self.config.frame_samples() {
             return;
         }
@@ -880,6 +899,7 @@ impl Receiver {
                 }
             }
         }
+        self.classify_output(ppm, !fixed_profile || self.draining);
         let before = self.resampler.buffered_frames();
         let started = trace.as_ref().map(|_| Instant::now());
         let boundary_holds = self.resampler.render_into_impl(
@@ -905,6 +925,51 @@ impl Receiver {
         self.consume_spans(before - self.resampler.buffered_frames());
         if let Some(last) = output.as_chunks::<CHANNELS>().0.last() {
             self.last_output.copy_from_slice(last);
+        }
+    }
+    pub(crate) fn output_kinds(&self) -> &[OutputKind] {
+        &self.output_kinds[..self.config.frame_size()]
+    }
+    fn classify_output(&mut self, ppm: f64, hold_boundary: bool) {
+        let buffered = self.resampler.buffered_frames();
+        let mut phase = self.resampler.phase;
+        let step = DriftResampler::step(ppm);
+        let mut spans = self.spans.iter();
+        let mut span = spans.next();
+        let mut end = span.map_or(0, |s| s.frames);
+        let fallback = if self.draining {
+            OutputKind::Intentional
+        } else {
+            OutputKind::Missing
+        };
+        for kind in &mut self.output_kinds[..self.config.frame_size()] {
+            let raw_index = phase.floor() as usize;
+            let index = if hold_boundary && raw_index == buffered && buffered > 0 {
+                buffered - 1
+            } else {
+                raw_index
+            };
+            if index >= buffered || (!hold_boundary && phase.fract() > 0.0 && index + 1 >= buffered) {
+                *kind = fallback;
+                continue;
+            }
+            while index >= end {
+                span = spans.next();
+                if let Some(s) = span {
+                    end += s.frames;
+                } else {
+                    break;
+                }
+            }
+            *kind = span.map_or(fallback, |s| s.kind);
+            if raw_index == index
+                && phase.fract() > 0.0
+                && index + 1 == end
+                && let Some(next) = spans.clone().next()
+            {
+                *kind = (*kind).max(next.kind);
+            }
+            phase += step;
         }
     }
     fn decode_next(&mut self, now: Instant, trace: Option<&mut RenderTrace>) -> bool {
@@ -937,6 +1002,7 @@ impl Receiver {
             }
             (_, None) => false,
         };
+        let mut kind = OutputKind::Audio;
         if valid {
             self.consecutive_loss = 0;
             self.healthy_frames = (self.healthy_frames + self.config.frame_size()).min(SAMPLE_RATE as usize);
@@ -944,6 +1010,7 @@ impl Receiver {
                 self.empty_queue_loss = 0;
             }
         } else {
+            kind = OutputKind::Missing;
             self.healthy_frames = 0;
             self.stats.lost += 1;
             self.dropout(seq, seq, now, false);
@@ -965,6 +1032,8 @@ impl Receiver {
                 DecoderCodec::Opus(decoder) => {
                     if decoder.decode_float(&[], pcm, false).ok() != Some(self.config.frame_size()) {
                         pcm.fill(0.0);
+                    } else {
+                        kind = OutputKind::Concealed;
                     }
                 }
                 DecoderCodec::Pcm16 => {
@@ -989,6 +1058,7 @@ impl Receiver {
             frames: self.config.frame_size(),
             arrival,
             concealed: !valid,
+            kind,
         });
         self.consumed[seq as usize % self.consumed.len()] = Some((seq, now));
         self.last_decoded = Some(seq);
@@ -1019,6 +1089,7 @@ impl Receiver {
     /// New media burst, using the existing preallocated storage on the RT worker.
     pub fn reset_burst(&mut self) {
         self.dropout_ledger.clear();
+        self.late_ledger.clear();
         self.packets.0.clear();
         self.rebuffer_at(None);
         self.consumed.fill(None);
@@ -1038,6 +1109,11 @@ impl Receiver {
         self.draining = false;
     }
     fn rebuffer_at(&mut self, at: Option<Instant>) {
+        self.output_kinds.fill(if at.is_some() && !self.draining {
+            OutputKind::Missing
+        } else {
+            OutputKind::Intentional
+        });
         // Starvation can retire an already decoded partial packet. It really
         // loses queued audio; intentional burst boundaries do not count it.
         if let Some(at) = at {
@@ -1477,6 +1553,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn output_provenance_tracks_fractional_mixed_spans_and_bounded_boundary_holds() {
+        let mut r = Receiver::new_with_config(Config::low_latency_opus()).unwrap();
+        r.resampler.push(&[0.2; 480]);
+        r.resampler.phase = 0.5;
+        r.spans.push_back(DecodedSpan {
+            sequence: 1,
+            frames: 120,
+            arrival: None,
+            concealed: false,
+            kind: OutputKind::Audio,
+        });
+        r.spans.push_back(DecodedSpan {
+            sequence: 2,
+            frames: 120,
+            arrival: None,
+            concealed: true,
+            kind: OutputKind::Concealed,
+        });
+        r.classify_output(0.0, true);
+        assert!(r.output_kinds()[..119].iter().all(|k| *k == OutputKind::Audio));
+        // Interpolation at 119.5 includes concealed input from the next span.
+        assert!(r.output_kinds()[119..].iter().all(|k| *k == OutputKind::Concealed));
+        r.rebuffer_at(Some(Instant::now()));
+        assert!(r.output_kinds().iter().all(|k| *k == OutputKind::Missing));
+        r.reset_burst();
+        assert!(r.output_kinds().iter().all(|k| *k == OutputKind::Intentional));
+    }
     #[test]
     fn dropouts_deduplicate_concealment_late_and_replays_in_the_same_ring() {
         let mut config = Config::low_latency_pcm();

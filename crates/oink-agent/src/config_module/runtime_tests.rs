@@ -44,6 +44,50 @@ pub(crate) fn display(key: &str) -> DisplayInfo {
         is_virtual: false,
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_observation_is_visible_before_an_unrelated_publication() {
+    let nodes = start(fresh(1)).await;
+    // One actor turn forces the previously flaky ordering: native observation,
+    // profile Query's member read, then an unrelated startup publication. No
+    // timer or competing command can accidentally repair the member snapshot.
+    let (local, queried, later, sequence, repeated) = nodes[0]
+        .group
+        .call(|owner| {
+            let sequence = owner.publish_native_arrangement("observed-native".into())?;
+            let local = owner.shared.local_facts.load().native_arrangement_token().unwrap();
+            let queried = owner.shared.members.load().members[0]
+                .facts
+                .as_ref()
+                .unwrap()
+                .native_arrangement_token()
+                .unwrap();
+            owner.publish()?;
+            let later = owner.shared.members.load().members[0]
+                .facts
+                .as_ref()
+                .unwrap()
+                .native_arrangement_token()
+                .unwrap();
+            let repeated = owner.publish_native_arrangement("observed-native".into())?;
+            Ok((local, queried, later, sequence, repeated))
+        })
+        .unwrap();
+    stop(&nodes).await;
+    assert_eq!(local.as_ref().map(|t| t.0.as_str()), Some("observed-native"));
+    assert_eq!(
+        queried, later,
+        "an unrelated publication must not change the native token read by Query/Create"
+    );
+    assert_eq!(
+        queried, local,
+        "completed observations must be visible to profile queries"
+    );
+    assert_eq!(
+        sequence, repeated,
+        "unchanged native observations must remain idempotent"
+    );
+}
 fn identities(count: u8) -> Vec<Arc<Identity>> {
     (1..=count).map(|n| Arc::new(Identity::from_seed([n; 32]))).collect()
 }
@@ -650,6 +694,118 @@ async fn display_geometry_and_owner_facts_converge_without_replicating_pause() {
     assert!(!nodes[1].group.applied().paused);
     stop(&nodes).await;
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_owner_display_observations_survive_a_whole_layout_lww_winner() {
+    let nodes = start(same_group(2)).await;
+    assert!(until(|| ready(&nodes)).await);
+    let main = display("main");
+    let mut second = display("second");
+    second.is_primary = false;
+    second.bounds.x = 800.;
+    for (index, node) in nodes.iter().enumerate() {
+        node.group
+            .initialize_displays(vec![main.clone(), second.clone()])
+            .unwrap();
+        assert!(
+            until(|| nodes
+                .iter()
+                .all(|n| n.group.applied().layout.screens.len() == (index + 1) * 2))
+            .await
+        );
+    }
+    assert!(until(|| nodes[0].group.applied().version == nodes[1].group.applied().version).await);
+
+    // Hold both C0 actors inside their local observation command. Neither can
+    // process the other's publication until both have committed against the
+    // same old layout; this forces the ordering from the partial-Load failure.
+    let before = Arc::new(std::sync::Barrier::new(2));
+    let after = Arc::new(std::sync::Barrier::new(2));
+    let transforms = nodes
+        .iter()
+        .map(|n| {
+            let id = n.identity.id();
+            (id, nodes[0].group.applied().layout.device_transform(id))
+        })
+        .collect::<Vec<_>>();
+    second.bounds = oink_foundation::Rect::new(0., 600., 800., 600.);
+    let updates = nodes
+        .iter()
+        .map(|node| {
+            let group = node.group.clone();
+            let before = before.clone();
+            let after = after.clone();
+            let displays = vec![main.clone(), second.clone()];
+            tokio::task::spawn_blocking(move || {
+                group.call(move |owner| {
+                    before.wait();
+                    let result = owner.displays_changed(displays);
+                    after.wait();
+                    result
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    for update in updates {
+        update.await.unwrap().unwrap();
+    }
+    let converged = until(|| {
+        let a = nodes[0].group.applied();
+        let b = nodes[1].group.applied();
+        a.layout == b.layout
+            && a.version == b.version
+            && a.layout
+                .screens
+                .iter()
+                .filter(|s| s.id.display == "second")
+                .all(|s| s.local.y == 600.)
+    })
+    .await;
+    let actual = nodes
+        .iter()
+        .map(|n| n.group.applied().layout.clone())
+        .collect::<Vec<_>>();
+    let settled = nodes[0].group.applied().version.clone();
+    for node in &nodes {
+        node.group
+            .initialize_displays(vec![main.clone(), second.clone()])
+            .unwrap();
+    }
+    let stable = nodes.iter().all(|n| n.group.applied().version == settled);
+    let peer = nodes[1].identity.id();
+    let transform = actual[0].device_transform(nodes[0].identity.id()).unwrap();
+    nodes[1]
+        .group
+        .edit_layout(
+            Box::new(move |layout| {
+                assert!(layout.place_device(peer, transform.0, transform.1, true));
+            }),
+            dto::LayoutSource::Manual,
+        )
+        .unwrap();
+    let manual_preserved = until(|| {
+        let a = nodes[0].group.applied();
+        let b = nodes[1].group.applied();
+        a.version == b.version
+            && a.layout.device_transform(peer) == Some(transform)
+            && a.layout.device_transform(nodes[0].identity.id()) == Some(transform)
+    })
+    .await;
+    stop(&nodes).await;
+    assert!(converged, "an observed owner's native geometry was lost: {actual:#?}");
+    assert!(stable, "reconciliation must not keep bumping layout versions");
+    assert!(
+        manual_preserved,
+        "native reconciliation must not normalize an explicit canvas transform"
+    );
+    for (id, transform) in transforms {
+        assert_eq!(
+            actual[0].device_transform(id),
+            transform,
+            "preserve the shared device transform"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_submit_after_link_loss_is_closed_and_no_code_state_resumes() {
     let nodes = start(fresh(2)).await;

@@ -36,6 +36,28 @@ static HIDDEN: AtomicBool = AtomicBool::new(false);
 // Desired hidden state is separate from a successful native hide request. Never stack hides.
 static HIDE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static DISSOCIATED: AtomicBool = AtomicBool::new(false);
+static SOURCE_DISABLED: AtomicBool = AtomicBool::new(false);
+static CONFINED: AtomicBool = AtomicBool::new(false);
+
+/// Called under the capture cursor lock, outside native callbacks.
+pub(crate) fn constrain(active: bool) {
+    CONFINED.store(active, Ordering::Release);
+    source_disabled(SOURCE_DISABLED.load(Ordering::Acquire));
+}
+
+/// Capture-thread reconciliation, outside event callbacks. Disable physical
+/// motion without changing visibility/position or blocking tagged remote input.
+pub(crate) fn source_disabled(disabled: bool) {
+    SOURCE_DISABLED.store(disabled, Ordering::Release);
+    let dissociate = disabled || CONFINED.load(Ordering::Acquire) || HIDDEN.load(Ordering::Acquire);
+    if DISSOCIATED.load(Ordering::Acquire) != dissociate {
+        install_exit_hooks();
+        let result = CGAssociateMouseAndMouseCursorPosition(!dissociate);
+        if result.0 == 0 {
+            DISSOCIATED.store(dissociate, Ordering::Release);
+        }
+    }
+}
 /// 我们是否已解耦（本模块记录的状态；系统没有查询接口，别的程序改了关联我们不知道）。只用于日志。
 pub(crate) fn dissociated() -> bool {
     DISSOCIATED.load(Ordering::Acquire)
@@ -302,7 +324,8 @@ pub(crate) fn restore() {
     owner::release();
     tracing::debug!(target: "oink_cursor_timing", "cursor latency: owner release end");
     handoff_timing::native(TimingStage::ShowStarted, 0);
-    let (associate, show, flush) = restore_native();
+    let (associate, show, flush) =
+        restore_native_guarded(SOURCE_DISABLED.load(Ordering::Acquire) || CONFINED.load(Ordering::Acquire));
     handoff_timing::native(
         TimingStage::ShowCompleted,
         (associate.unwrap_or(0) | show.unwrap_or(0) | flush.unwrap_or(0)) as u32 | (u32::from(show.is_none()) << 31),
@@ -337,15 +360,19 @@ pub(crate) fn restore() {
 }
 
 fn restore_native() -> (Option<i32>, Option<i32>, Option<i32>) {
-    let associate = DISSOCIATED
-        .swap(false, Ordering::AcqRel)
-        .then(|| CGAssociateMouseAndMouseCursorPosition(true).0);
+    CONFINED.store(false, Ordering::Release);
+    SOURCE_DISABLED.store(false, Ordering::Release);
+    restore_native_guarded(false)
+}
+fn restore_native_guarded(disabled: bool) -> (Option<i32>, Option<i32>, Option<i32>) {
+    let associate = (DISSOCIATED.swap(disabled, Ordering::AcqRel) != disabled)
+        .then(|| CGAssociateMouseAndMouseCursorPosition(!disabled).0);
     HIDDEN.store(false, Ordering::Release);
     let (show, flush) = if HIDE_REQUESTED.swap(false, Ordering::AcqRel) {
         let show = CGDisplayShowCursor(CGMainDisplayID()).0;
         // As with hide(), flush the visibility change at the already-warped entry point.
         // A successful ShowCursor alone can leave the cursor hidden until the next move.
-        let flush = CGAssociateMouseAndMouseCursorPosition(true).0;
+        let flush = CGAssociateMouseAndMouseCursorPosition(!disabled).0;
         (Some(show), Some(flush))
     } else {
         (None, None)

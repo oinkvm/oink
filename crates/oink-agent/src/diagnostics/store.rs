@@ -9,6 +9,9 @@ const MAX_CRASH_PACKAGES: usize = 10;
 const EXPORT_BUFFER: usize = 256 * 1024;
 use std::path::Path;
 use zip::write::SimpleFileOptions;
+#[cfg(all(test, debug_assertions))]
+#[path = "export_bench.rs"]
+pub(super) mod export_bench;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -859,24 +862,52 @@ impl Store {
     /// Pin immutable segments under the store lock, then export this detached copy.
     /// Hard links do not copy 64 MiB or hold thousands of file descriptors. Pruning,
     /// disabling and recording can continue without invalidating the saved cutoff.
+    #[cfg(all(test, debug_assertions))]
     pub fn export_snapshot(&self) -> anyhow::Result<Self> {
+        self.export_snapshot_at(self.clock.now(), None)
+    }
+    pub(super) fn export_snapshot_for_save(&self, reason: Reason, last_minutes: Option<u32>) -> anyhow::Result<Self> {
+        let at = self.clock.now();
+        let range = Self::save_range(reason, last_minutes, at.utc_us);
+        self.export_snapshot_at(at, Some(range))
+    }
+    pub(super) fn export_snapshot_between(&self, start: i64, end: i64) -> anyhow::Result<Self> {
+        self.export_snapshot_at(self.clock.now(), Some((start, end)))
+    }
+    fn export_snapshot_at(&self, at: clock::Stamp, range: Option<(i64, i64)>) -> anyhow::Result<Self> {
         let dir = tempfile::Builder::new().prefix("export-").tempdir_in(&self.dir)?;
-        for meta in &self.segments {
+        let mut snapshot = self.clone();
+        if let Some((start, end)) = range {
+            // Local metadata is already validated. Do not hard-link and then
+            // unlink the rest of the retained history for a short save. Keep
+            // boundary segments for restrict_range's exact row filtering, and
+            // historical clock epochs for its all-history backstep rule.
+            // Peer bounds can still be refined by calibration, so retain them.
+            snapshot.segments.retain(|m| {
+                m.device != self.device
+                    || (start == i64::MIN && m.clock_id != at.clock_id)
+                    || (m.last_us >= start && m.first_us <= end)
+            });
+            snapshot.bytes = snapshot.segments.iter().map(|m| m.bytes).sum();
+        }
+        for meta in &snapshot.segments {
             self.check_cancelled()?;
             fs::hard_link(self.dir.join("buffer").join(meta.name()), dir.path().join(meta.name()))?;
         }
-        let mut snapshot = self.clone();
         snapshot.export_source = Some(Arc::new(dir));
-        snapshot.export_clock = Some(self.clock.now());
+        snapshot.export_clock = Some(at);
         Ok(snapshot)
     }
-    pub(super) fn prepare_range(&mut self, reason: Reason, last_minutes: Option<u32>) -> anyhow::Result<()> {
-        let end = self.export_clock().utc_us;
+    fn save_range(reason: Reason, last_minutes: Option<u32>, end: i64) -> (i64, i64) {
         let start = if reason != Reason::Manual {
             end.saturating_sub(AUTOMATIC_RANGE_US)
         } else {
             last_minutes.map_or(i64::MIN, |m| end.saturating_sub(i64::from(m) * 60 * 1_000_000))
         };
+        (start, end)
+    }
+    pub(super) fn prepare_range(&mut self, reason: Reason, last_minutes: Option<u32>) -> anyhow::Result<()> {
+        let (start, end) = Self::save_range(reason, last_minutes, self.export_clock().utc_us);
         self.requested_range = Some((start, end));
         self.evicted_by_device.insert(self.device.clone(), self.evicted);
         self.restrict_range(start, end)
@@ -1162,7 +1193,10 @@ impl Store {
             if let Some(end) = self.network_ends.get(device) {
                 use oink_protocol::v1::schema::WireDto;
                 zip.start_file(format!("devices/{alias}/collection-end.cbor"), options)?;
-                zip.write_all(&end.encode(oink_protocol::v1::limits::RELIABLE_FRAME)?)?;
+                // Retain the existing v1 Low message, including every coverage
+                // range from released peers. The 16 KiB reliable-channel bound
+                // is unrelated and rejects ordinary saves with many segments.
+                zip.write_all(&end.encode(oink_protocol::v1::limits::LOW_FRAME)?)?;
             }
             let remote = spool
                 .wire_snapshots

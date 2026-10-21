@@ -50,7 +50,10 @@ export interface Prefs {
     keepAwake: boolean;
     touchpadInject: boolean;
     macScrollFeel: boolean;
+    forwardInjectedInput: boolean;
     pointerTrail: boolean;
+    clipReceive: boolean;
+    clipSend: boolean;
     clipText: boolean;
     clipRich: boolean;
     clipImage: boolean;
@@ -83,7 +86,10 @@ export const DEFAULT_PREFS: Prefs = {
     keepAwake: true,
     touchpadInject: true,
     macScrollFeel: true,
+    forwardInjectedInput: false,
     pointerTrail: true,
+    clipReceive: true,
+    clipSend: true,
     clipText: true,
     clipRich: true,
     clipImage: true,

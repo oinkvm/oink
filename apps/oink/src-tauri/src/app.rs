@@ -4,8 +4,6 @@ use std::sync::{Arc, Mutex};
 use oink_agent::api::{self, AgentApi, ApiError, ApiEvent, Reply, Request};
 #[cfg(windows)]
 use tauri::tray::TrayIconBuilder;
-#[cfg(windows)]
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use oink_agent::remote::RemoteApi;
@@ -38,6 +36,21 @@ pub(crate) struct Backend {
 /// A duplicate never creates a second UI. Manual launches ask the existing
 /// UI to show its main window; login/background launches simply exit.
 fn hand_off_to_running_ui(api: &RemoteApi, launched_at_login: bool) -> bool {
+    #[cfg(windows)]
+    if let Some(id) = oink_agent::native_controls::launch_command(std::env::args().skip(1)) {
+        match oink_agent::native_controls::dispatch(api, &id) {
+            Ok(Some(oink_agent::native_controls::ShellAction::Quit)) => return api.request_stop().is_ok(),
+            Ok(Some(_)) => {}
+            Ok(None) => return true,
+            Err(error) => {
+                tracing::warn!(%error,"taskbar command refused");
+                return false;
+            }
+        }
+    } else if launched_at_login {
+        return true;
+    }
+    #[cfg(not(windows))]
     if launched_at_login {
         return true;
     }
@@ -315,11 +328,16 @@ pub fn run() {
             ))?;
             *handle.state::<Backend>().control.lock().unwrap() = Some(control);
             crate::app_icon::initialize(&handle);
+            app.on_menu_event(|app,event| {
+                if let Some(id) = event.id().as_ref().strip_prefix("native-") {
+                    crate::native_controls::invoke(app,id);
+                }
+            });
             // A login launch on Windows has no WebView at all. macOS only starts
             // this executable when its backend has a reason to show a window.
             let show_at_start = oink_agent::update::presentation::show_main(crate::shell_policy::shows_on_start(
                 oink_autostart::launched_at_login(),
-                std::env::args().any(|arg| arg == "--background"),
+                std::env::args().any(|arg| arg == "--background" || arg == oink_agent::native_controls::ARGUMENT),
             ), oink_agent::update::presentation::outcome(&oink_foundation::paths::data_dir(),
                 option_env!("OINK_RELEASE_BUILD").and_then(|s|s.parse().ok()).unwrap_or(0)));
             #[cfg(windows)]
@@ -328,6 +346,11 @@ pub fn run() {
                 setup_tray(&handle)?;
             }
             forward_events(&handle);
+            crate::native_controls::initialize(&handle);
+            #[cfg(windows)]
+            if let Some(id) = oink_agent::native_controls::launch_command(std::env::args().skip(1)) {
+                crate::native_controls::invoke(&handle,&id);
+            }
             if let Some(remote) = handle.state::<Backend>().remote.clone() {
                 let connected = handle.clone();
                 std::thread::spawn(move || {
@@ -498,29 +521,8 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
         .icon(icon)
         .tooltip("Oink")
         .show_menu_on_left_click(false)
-        .on_tray_icon_event(|tray, event| {
-            #[cfg(windows)]
-            match event {
-                TrayIconEvent::Click {
-                    button: MouseButton::Left | MouseButton::Right,
-                    button_state: MouseButtonState::Up,
-                    rect,
-                    ..
-                } => {
-                    if let Some(anchor) = crate::shell::tray_anchor(tray.app_handle(), rect) {
-                        crate::shell::toggle_panel(tray.app_handle(), anchor);
-                    }
-                }
-                TrayIconEvent::DoubleClick {
-                    button: MouseButton::Left,
-                    ..
-                } => show_main(tray.app_handle()),
-                _ => {}
-            }
-            #[cfg(not(windows))]
-            let _ = (tray, event);
-        })
         .build(app)?;
+    crate::tray_windows::install(app)?;
     crate::app_icon::tray_created(app);
     Ok(())
 }
@@ -533,9 +535,10 @@ fn forward_events(app: &AppHandle) {
     #[cfg(windows)]
     let data_dir = oink_foundation::paths::data_dir();
     api.subscribe(Arc::new(move |ev: &ApiEvent| {
-        #[cfg(windows)]
         if let ApiEvent::DeviceCards(view) = ev {
+            #[cfg(windows)]
             crate::app_icon::device_cards(&handle, view);
+            crate::native_controls::cards(&handle, view);
         }
         #[cfg(windows)]
         if let ApiEvent::InputSettings(settings) = ev {
@@ -543,6 +546,7 @@ fn forward_events(app: &AppHandle) {
         }
         if let ApiEvent::UiPreferences(preferences) = ev {
             crate::app_icon::preferences(&handle, preferences);
+            crate::native_controls::language(&handle, preferences.ui_language);
         }
         if let ApiEvent::ReportStatusChanged(status) = ev {
             apply_report_status(&handle, status);

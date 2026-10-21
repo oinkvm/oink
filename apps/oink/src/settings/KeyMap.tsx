@@ -93,9 +93,7 @@ export function KeyMapControl({ platform, api, capsIme, label, onLog }: {
       </DropdownMenu>);
     };
     const note = !custom
-        ? platform === 'mac' && preset === 'mac'
-            ? (capsIme ? tr('Caps Lock 跟随系统设置（用它切换输入法）：短按发送 Shift 切换中 / 英，长按开关大写锁定') : tr('Caps Lock 跟随系统设置：按原样发送 Caps Lock'))
-            : null
+        ? platform === 'mac' && preset === 'mac' && !capsIme ? tr('Caps Lock 跟随系统设置：按原样发送 Caps Lock') : null
         : tr('点按键修改它对应的键');
     return (<div className="kmap">
       <Segmented<KeyPreset> size="sm" aria-label={tr('{0}：预设', label)} value={preset} onChange={choosePreset} options={[{ value: 'mac', get label() {

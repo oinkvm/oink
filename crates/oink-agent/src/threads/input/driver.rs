@@ -1,4 +1,5 @@
 use super::*;
+mod cursor;
 use crate::streams::input::{Adapter, RouterAdapter, wire};
 use crate::threads::{MainCommand, inject::InjectItem, notices::Notices};
 use oink_foundation::handoff_timing::{self, Event as TimingEvent, Stage as TimingStage, Token as TimingToken};
@@ -13,6 +14,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModeDispatch {
+    Queued = 0,
+    Callback = 1,
+    ClipCheck = 2,
+}
 #[derive(Default)]
 struct Pair {
     first_motion_epoch: Option<u64>,
@@ -69,8 +76,12 @@ pub(super) struct Driver {
     environment: Arc<Environment>,
     capture_detector: ScopedCaptureDetector,
     capture_diagnostics: crate::diagnostics::capture::State,
-    capture_was_active: bool,
+    clip_poll_at: Instant,
+    clip_available: bool,
+    clip_diagnostics: crate::diagnostics::cursor_clip::State,
+    cursor: cursor::State,
     relative_capture: bool,
+    queued_cursor_constraints: bool,
     keyboard_remote: bool,
     source_modes_revision: u64,
     inject: InjectHandle,
@@ -128,6 +139,7 @@ impl Driver {
             }
         };
         include(self.motion.as_ref().map(|motion| motion.at), "capture coalescer");
+        include(self.cursor.pending.as_ref().map(|p| p.at), "target cursor readback");
         for pair in self.pairs.values() {
             if let Some((stream, motion)) = &pair.outbound {
                 include(stream.oldest_pending(), "capture reliable send");
@@ -188,6 +200,7 @@ impl Driver {
         config.capture_reports_key_repeat = snapshots.capture_reports_key_repeat;
         let online = BTreeSet::from([local]);
         let mut router = Router::new(config, Arc::new(layout.topology.with_online(online.clone())));
+        router.enable_system_clip_recheck(os == Os::Windows);
         router.set_volume_notifications_probe(Arc::new(oink_audio::device_notifications::recent_windows_notifications));
         router.set_settings((*settings).clone());
         let native = inject.backend();
@@ -229,8 +242,12 @@ impl Driver {
             environment,
             capture_detector: Default::default(),
             capture_diagnostics: Default::default(),
-            capture_was_active: false,
+            clip_poll_at: now,
+            clip_available: true,
+            clip_diagnostics: Default::default(),
+            cursor: Default::default(),
             relative_capture: false,
+            queued_cursor_constraints: false,
             keyboard_remote: false,
             source_modes_revision: 1,
             inject,
@@ -881,6 +898,9 @@ impl Driver {
                 }
             }
             InputCommand::SessionLocked(locked) => {
+                if self.session_locked != locked {
+                    self.cursor_invalidate();
+                }
                 self.session_locked = locked;
                 self.adapter.router_mut().keyboard_session_locked(locked);
             }
@@ -901,6 +921,7 @@ impl Driver {
                     if let Some(trace) = &self.inject.trace {
                         trace.displays(self.local, &displays);
                     }
+                    self.cursor_invalidate();
                     self.trail.displays(displays.clone());
                     self.adapter.router_mut().set_local_displays(displays);
                 }
@@ -1090,6 +1111,7 @@ impl Driver {
                 );
             }
             InputCommand::DndEvent(event) => {
+                self.refresh_system_cursor_clip();
                 if let Some(trace) = &self.inject.trace {
                     trace.dnd_event(&event);
                 }
@@ -1139,6 +1161,9 @@ impl Driver {
                 if self.current_inbound(peer, stream) {
                     if let Some(trace) = &self.inject.trace {
                         trace.dnd_message(peer, false, &message);
+                    }
+                    if clip_decision(&message) {
+                        self.refresh_system_cursor_clip();
                     }
                     self.adapter.inbound(peer, message);
                 }
@@ -1207,7 +1232,6 @@ impl Driver {
                     && sample.position.y < b.y + b.h - 8.
             })
         });
-        let before = router.game_mode().active;
         let detected = self.capture_detector.update(
             (focus.epoch, focus.holder),
             sample,
@@ -1226,7 +1250,7 @@ impl Driver {
         );
         let active = router.game_mode().active;
         if eligible
-            && (before || active || self.capture_was_active)
+            && active
             && let Some(sample) = sample
         {
             router.set_cursor(sample.position);
@@ -1243,7 +1267,6 @@ impl Driver {
             ),
             self.inject.trace.as_deref(),
         );
-        self.capture_was_active = active && eligible;
         let relative_capture = active && !eligible && !router.paused() && !router.mouse_local();
         if self.relative_capture != relative_capture {
             self.relative_capture = relative_capture;
@@ -1252,6 +1275,9 @@ impl Driver {
         }
     }
     fn read(&mut self) -> bool {
+        if self.cursor.pending.is_some() {
+            return false;
+        }
         let mut progressed = false;
         // Reuse the visit buffer: inbound motion polling must not allocate a
         // fresh peer vector on every activation. Growth occurs only on membership changes.
@@ -1261,7 +1287,7 @@ impl Driver {
         // Every round visits each peer once. Injection backpressure leaves I0 in its
         // receive queue, allowing QUIC's stream window to stop the writer naturally.
         for &peer in &peers {
-            if self.inject.available() < 4096 {
+            if self.cursor.pending.is_some() || self.inject.available() < 4096 {
                 break;
             }
             let received = self
@@ -1291,6 +1317,9 @@ impl Driver {
                 }
                 Some(Err(_)) => self.fault(peer, Which::Inbound, false, StreamCode::None),
                 _ => {}
+            }
+            if self.cursor.pending.is_some() {
+                break;
             }
             let mut bytes = [0u8; oink_protocol::v1::limits::DATAGRAM];
             let motion = self
@@ -1386,7 +1415,7 @@ impl Driver {
             None
         };
         if lossy {
-            self.adapter.inbound(peer, message);
+            self.cursor_inbound(peer, message, Some(source));
             self.outputs(Some(source));
         } else {
             self.message(peer, message);
@@ -1396,16 +1425,62 @@ impl Driver {
         if let Some(time) = time
             && measure
         {
-            let (ingress, dispatch) = self.jitter_sources.entry((peer, source, lossy)).or_default();
-            let a = arrived.saturating_duration_since(self.start).as_micros() as u64;
-            // Include receive scheduling, decode and routing/dispatch, rather
-            // than sampling before ordinary work could stall the input owner.
-            let dispatched = Instant::now();
-            let d = dispatched.saturating_duration_since(self.start).as_micros() as u64;
-            let ingress = ingress.observe(time, a);
-            let dispatch = dispatch.observe(time, d);
-            self.shared.jitter.record(lossy, ingress, dispatch);
+            if let Some(pending) = self.cursor.pending.as_mut() {
+                pending.arrival = Some((source, time, arrived, lossy));
+            } else {
+                self.record_jitter(peer, source, time, arrived, lossy);
+            }
         }
+    }
+    fn record_jitter(&mut self, peer: DeviceId, source: DeviceId, time: CaptureTime, arrived: Instant, lossy: bool) {
+        let (ingress, dispatch) = self.jitter_sources.entry((peer, source, lossy)).or_default();
+        let a = arrived.saturating_duration_since(self.start).as_micros() as u64;
+        // Include FIFO reconciliation wait in actual routing dispatch latency.
+        let d = Instant::now().saturating_duration_since(self.start).as_micros() as u64;
+        let ingress = ingress.observe(time, a);
+        let dispatch = dispatch.observe(time, d);
+        self.shared.jitter.record(lossy, ingress, dispatch);
+    }
+    // This runs only from queued work/network dispatch or poll(), never event().
+    // Reading before each remote motion makes clipping/release authoritative at
+    // the target decision, independent of the idle refresh period or Auto mode.
+    fn refresh_system_cursor_clip(&mut self) {
+        self.clip_poll_at = self.now + Duration::from_millis(100);
+        if self.paused || self.stopping || self.adapter.router().config().os != Os::Windows {
+            return;
+        }
+        let pending = self.adapter.router().system_clip_recheck_pending();
+        match self.inject.backend().system_cursor_clip() {
+            Ok(clip) => {
+                self.clip_available = true;
+                let before = self.adapter.router().system_cursor_clip_status().0;
+                self.adapter.router_mut().set_system_cursor_clip(clip);
+                if self.adapter.router().system_cursor_clip_status().0 != before {
+                    self.cursor.revision = self.cursor.revision.wrapping_add(1);
+                }
+                self.adapter.router_mut().resume_system_clip_motion();
+                if pending {
+                    // A deferred local edge still belongs to the capture owner.
+                    // Park before publishing FocusEnter even if an older worker
+                    // injection/restore is blocked. This is outside the LL hook.
+                    self.outputs_at(None, ModeDispatch::ClipCheck);
+                }
+            }
+            Err(_) => self.clip_available = false, // A failed query is not evidence of release.
+        }
+        let router = self.adapter.router();
+        let focus = router.focus();
+        let (rect, suppressed) = router.system_cursor_clip_status();
+        let record = crate::diagnostics::cursor_clip::Record {
+            holder: focus.holder,
+            epoch: focus.epoch,
+            rect,
+            suppressed,
+            active: rect.is_some() && router.has_pointer_focus() && !router.paused(),
+            available: self.clip_available,
+        };
+        self.clip_diagnostics
+            .observe(record, self.micros(), self.inject.trace.as_deref());
     }
     fn message(&mut self, peer: DeviceId, message: Message) {
         if self.update_hold.is_some() {
@@ -1454,7 +1529,7 @@ impl Driver {
                 let _ = self.main.send(MainCommand::IdentifyScreens(id));
             }
         } else {
-            self.adapter.inbound(peer, message);
+            self.cursor_inbound(peer, message, source);
         }
         if let Some(epoch) = incoming_epoch {
             let focus = self.adapter.router().focus();
@@ -1466,9 +1541,13 @@ impl Driver {
         self.attach(peer);
     }
     fn outputs(&mut self, from: Option<DeviceId>) {
-        self.outputs_at(from, false);
+        self.outputs_at(from, ModeDispatch::Queued);
     }
-    fn outputs_at(&mut self, from: Option<DeviceId>, in_callback: bool) {
+    fn outputs_at(&mut self, from: Option<DeviceId>, dispatch: ModeDispatch) {
+        self.cursor_scope();
+        if dispatch == ModeDispatch::Callback {
+            self.cursor.revision = self.cursor.revision.wrapping_add(1);
+        }
         if let Some(trace) = &self.inject.trace {
             let router = self.adapter.router();
             trace.dnd_state(router.dnd_state_name(), router.focus().epoch, router.local_pointer());
@@ -1480,6 +1559,9 @@ impl Driver {
             self.keyboard_remote = keyboard_remote;
         }
         let mut outputs = self.adapter.router_mut().drain_outputs();
+        if !outputs.is_empty() {
+            self.cursor.revision = self.cursor.revision.wrapping_add(1);
+        }
         let emergency = outputs
             .iter()
             .any(|output| matches!(output, Output::Status(StatusEvent::EmergencyStop { .. })));
@@ -1531,7 +1613,13 @@ impl Driver {
             self.adapter.router_mut().set_fully_paused(true);
             outputs.extend(self.adapter.router_mut().drain_outputs());
         }
-        let immediate_modes = in_callback && self.snapshots.mode_switch_in_callback;
+        // Once confinement has entered this session's native FIFO, subsequent
+        // mode switches use that FIFO too; a callback must not overtake a clip
+        // release/resize that is still waiting on the injection worker.
+        self.queued_cursor_constraints |= outputs.iter().any(|o| matches!(o, Output::ConstrainCursor(_)));
+        let immediate_modes = dispatch != ModeDispatch::Queued
+            && self.snapshots.mode_switch_in_callback
+            && !self.queued_cursor_constraints;
         // Record only mode boundaries. An ordinary motion does not read the trace switch.
         for output in &outputs {
             if immediate_modes && let Some(trace) = &self.inject.trace {
@@ -1557,7 +1645,7 @@ impl Driver {
                     oink_input::native_lifecycle::Data {
                         remote: Some(remote),
                         point: point.map(|p| [p.x.round() as i32, p.y.round() as i32]),
-                        reason: u32::from(in_callback),
+                        reason: dispatch as u32,
                         success: Some(immediate_modes),
                         ..Default::default()
                     },
@@ -1566,7 +1654,7 @@ impl Driver {
             }
             if immediate_modes {
                 // hand_off emits Send before SetMode. Apply the native transition before
-                // publishing FocusEnter and before returning from capture.
+                // publishing FocusEnter, on the capture owner (callback or clip recheck).
                 self.inject.mode_in_callback(self.input_safety, item);
             }
         }
@@ -1615,6 +1703,9 @@ impl Driver {
                     self.input_time,
                     self.input_report.take(),
                 ),
+                Output::ConstrainCursor(bounds) => self
+                    .inject
+                    .push_in_epoch(self.input_safety, InjectItem::ConstrainCursor(bounds)),
                 Output::SetMode(_) | Output::RestoreLocal { .. } if immediate_modes => {}
                 Output::SetMode(mode) => self.inject.push_in_epoch(self.input_safety, InjectItem::SetMode(mode)),
                 Output::RestoreLocal { at } => self
@@ -1914,6 +2005,18 @@ impl Driver {
             .map(|at| self.start + Duration::from_micros(at))
             .into_iter()
             .chain(self.projection_until)
+            .chain(
+                self.adapter
+                    .router()
+                    .system_clip_recheck_pending()
+                    .then_some(if self.clip_available {
+                        self.now
+                    } else {
+                        self.clip_poll_at
+                    }),
+            )
+            .chain(self.cursor.pending.as_ref().and_then(|p| p.retry))
+            .chain(self.cursor.pending.as_ref().map(|p| p.at + cursor::MAX_WAIT))
             .chain(self.motion.as_ref().map(|_| self.budget.ready_at(self.now)))
             .min()
     }
@@ -2046,11 +2149,24 @@ impl CaptureLoop for Driver {
         let router = self.adapter.router();
         Some(router.focus().holder != self.local && !router.keyboard_local() && !router.paused())
     }
+    fn constrained_cursor(&self) -> Option<oink_foundation::Point> {
+        (!self.paused)
+            .then(|| self.adapter.router().constrained_local_cursor())
+            .flatten()
+    }
+    fn mouse_disabled(&self) -> bool {
+        !self.paused && self.adapter.router().mouse_disabled()
+    }
     fn keyboard_disabled(&self) -> bool {
-        self.adapter.router().keyboard_disabled()
+        !self.paused && self.adapter.router().keyboard_disabled()
+    }
+    fn forward_injected_input(&self) -> bool {
+        self.snapshots.settings.load().forward_injected_input
     }
     fn keyboard_guard_suspended(&self) -> bool {
-        self.adapter.router().config().os == Os::Windows && self.session_locked == Some(true)
+        // A capturable lock curtain keeps the guard. Secure desktop input is
+        // outside the hook boundary and is passed through by Windows itself.
+        false
     }
     fn keyboard_pointer_modifiers(&self) -> Vec<oink_foundation::input::KeyCode> {
         self.adapter.router().keyboard_pointer_modifiers()
@@ -2075,7 +2191,7 @@ impl CaptureLoop for Driver {
         self.adapter.router_mut().set_capture_available(available);
         // Native attachment has completed; pause settling/tray state must not
         // wait for the platform sensor or statistics clock to notice it.
-        self.outputs_at(None, true);
+        self.outputs_at(None, ModeDispatch::Callback);
         self.publish();
         let _ = self.main.send(MainCommand::InputStatusChanged);
         self.wake_if_earlier();
@@ -2164,7 +2280,7 @@ impl CaptureLoop for Driver {
             );
         }
         self.input_time = Some(source_time);
-        self.outputs_at(None, true);
+        self.outputs_at(None, ModeDispatch::Callback);
         self.input_time = None;
         self.trail_pointer();
         self.publish();
@@ -2182,6 +2298,11 @@ impl CaptureLoop for Driver {
             self.scheduler.late_max = self.scheduler.late_max.max(now - due);
         }
         self.refresh();
+        if (self.cursor.pending.is_none() && now >= self.clip_poll_at)
+            || (self.clip_available && self.adapter.router().system_clip_recheck_pending())
+        {
+            self.refresh_system_cursor_clip();
+        }
         self.check_backlog(now);
         if let Some((generation, expires)) = self.update_hold {
             if now >= expires && !self.update_committed {
@@ -2224,6 +2345,7 @@ impl CaptureLoop for Driver {
         if !self.paused && !self.stopping && self.update_hold.is_none() && self.inject.suspended() {
             match self.inject.resume() {
                 Ok(true) => {
+                    self.cursor_invalidate();
                     // The old worker has joined and released every held input.
                     // A discarded release acknowledgment cannot keep a peer in
                     // the previous session's releasing state forever.
@@ -2243,6 +2365,8 @@ impl CaptureLoop for Driver {
             }
             self.attach(peer);
         }
+        self.cursor_resume();
+        self.cursor_diagnostics();
         let mut more = false;
         if !self.stopping {
             loop {
@@ -2287,6 +2411,10 @@ impl CaptureLoop for Driver {
             .into_iter()
             .chain(Some(self.read_back_at))
             .chain(Some(self.backlog_check))
+            .chain(
+                (!self.paused && self.cursor.pending.is_none() && self.adapter.router().config().os == Os::Windows)
+                    .then_some(self.clip_poll_at),
+            )
             .chain(more.then_some(now))
             .min();
         self.deadline
@@ -2372,4 +2500,9 @@ impl ScopedCaptureDetector {
         }
         self.detector.update(sample, eligible, interior, now)
     }
+}
+
+// Forwarded and timed motion must use the same target constraint as direct input.
+fn clip_decision(message: &Message) -> bool {
+    cursor::pointer_motion(message, true) || matches!(message, Message::Control(ControlMsg::FocusEnter { .. }))
 }

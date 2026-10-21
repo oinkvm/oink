@@ -393,6 +393,23 @@ impl RemoteApi {
 }
 
 impl AgentApi for RemoteApi {
+    fn layout_profile_command(&self, command: crate::layout_profiles::types::Command) -> ApiResult<serde_json::Value> {
+        use crate::layout_profiles::types::Command;
+        self.call(match command {
+            Command::Query => Request::LayoutProfiles,
+            Command::Create(v) => Request::CreateLayoutProfile(v),
+            Command::Rename(v) => Request::RenameLayoutProfile(v),
+            Command::Delete(v) => Request::DeleteLayoutProfile(v),
+            Command::Load(v) => Request::LoadLayoutProfile(v),
+            Command::Operation(v) => Request::LayoutProfileOperation(v),
+            Command::Setting(v) => Request::SetSyncSystemArrangement(v),
+            Command::Preview(v) => Request::PreviewSystemArrangement(v),
+            Command::Commit(v) => Request::CommitArrangement(v),
+            Command::Reset(v) => Request::ResetArrangement(v),
+            Command::Replay(v) => Request::ReplayArrangement(v),
+        })
+    }
+
     fn device_cards(&self) -> ApiResult<crate::device_cards::DeviceCardsView> {
         self.call(Request::DeviceCards)
     }
@@ -684,12 +701,14 @@ impl AgentApi for RemoteApi {
         placements: Vec<Placement>,
         affected: Vec<ScreenKey>,
         ended: bool,
+        arrangement: Option<Box<crate::layout_profiles::types::ArrangementSnapshot>>,
     ) -> ApiResult<()> {
         self.call(Request::PreviewLayoutProjection {
             gesture,
             placements,
             affected,
             ended,
+            arrangement,
         })
     }
     fn preview_move_screen(&self, screen: ScreenKey, origin: Point) -> ApiResult<Option<LayoutGeometry>> {
@@ -746,6 +765,15 @@ impl AgentApi for RemoteApi {
     }
     fn clear_cache(&self, device: Option<DeviceKey>) -> ApiResult<CacheDeviceClear> {
         self.call(Request::ClearCache { device })
+    }
+    fn received_files_usage(&self) -> ApiResult<ReceivedFilesUsage> {
+        self.call(Request::ReceivedFilesUsage)
+    }
+    fn set_received_files_cleanup(&self, cleanup: ReceivedFilesCleanup) -> ApiResult<()> {
+        self.call(Request::SetReceivedFilesCleanup { cleanup })
+    }
+    fn open_received_files(&self) -> ApiResult<()> {
+        self.call(Request::OpenReceivedFiles)
     }
     fn clipboard_settings(&self) -> ApiResult<ClipboardSettings> {
         self.call(Request::ClipboardSettings)

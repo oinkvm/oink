@@ -46,12 +46,13 @@ fn lines(text: &str, font: &dyn TextRaster, cap: f64, width: f64, bold: bool, ma
     }
     result
 }
-pub(super) fn paint(
+pub(super) fn paint_button(
     toast: &Toast,
     style: Style,
     width: f64,
     scale: f64,
     font: &dyn TextRaster,
+    button: (f64, f64),
 ) -> (Vec<u32>, usize, usize) {
     let logical_width = width / toast.scale.max(0.5);
     let available = (logical_width - 16. * 2. - 42. - if toast.undo.is_some() { 84. } else { 0. }).max(28.);
@@ -155,16 +156,20 @@ pub(super) fn paint(
         let x = (logical_width - 88.) * scale;
         // Toast actions use the button's circular pill corners, independently
         // of the surrounding card's superellipse corner shape.
+        let (hover, shrink) = button;
+        let center = x + 36. * scale;
+        let fill = rgb(if style.dark { [51, 50, 46] } else { [236, 236, 239] });
+        let hover_fill = rgb(if style.dark { [65, 63, 58] } else { [224, 224, 229] });
         c.capsule(
-            (x + 16.0 * scale, height * scale / 2.0),
-            (x + 56.0 * scale, height * scale / 2.0),
-            16.0 * scale,
-            rgb(if style.dark { [51, 50, 46] } else { [236, 236, 239] }),
+            (center - 20. * scale * shrink, height * scale / 2.),
+            (center + 20. * scale * shrink, height * scale / 2.),
+            16. * scale * shrink,
+            fill.mix(hover_fill, hover),
         );
         Pen::new(&mut c, font).centered(
-            x + 36. * scale,
-            (height / 2. - 4.7) * scale,
-            13. * 0.72 * scale,
+            center,
+            (height / 2. - 4.7 * shrink) * scale,
+            13. * 0.72 * scale * shrink,
             label,
             true,
             fg,

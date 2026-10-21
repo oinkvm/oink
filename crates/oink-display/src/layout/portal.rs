@@ -7,10 +7,10 @@
 //! 2. 每个子区间取间隙最小（最近）的候选，没有候选的部分是墙（大小屏并排时大屏多出的部分）；
 //! 3. 吸附（消除测量噪声）：边两端、或两个传送门之间短于 `portal_snap` 的墙并入传送门（中间的从中点劈开）；
 //! 4. 关闭墙（`walls = false`）时：有传送门的边上所有墙都分给最近的传送门；
-//! 5. 不越过参与的屏幕（第 1 步的候选里先去掉）：A 与候选 B 之间隔着另一块参与的屏幕 C 时，B 不是候选——
-//!    C 在法线方向上位于 A、B 的间隙里，且 C 沿边的范围与 A、B 相对的范围重叠超过 `overlap_tolerance`。
-//!    例如左屏比中屏高出一截，高出的那段不越过中屏通到右屏，而是墙（再按吸附、关闭墙处理）。离线或未启用的
-//!    屏幕不参与，也不挡路。
+//! 5. Like visual projections, nearer screens occlude only their covered intervals.
+//!    A visible but ineligible neighbour (for example, too little overlap) is a
+//!    wall on that interval; it cannot erase a farther neighbour elsewhere.
+//!    Occluded intervals cannot be reopened by wall snapping or endpoint reach.
 
 use super::{
     EffectiveSettings, ScreenId, Side,
@@ -53,6 +53,8 @@ pub(crate) struct Seg {
     pub to: f64,
     /// `(目标屏下标, 间隙)`；`None` 为墙。
     pub portal: Option<(usize, f64)>,
+    /// A nearer screen occupies this wall interval; snapping must not bypass it.
+    pub blocked: bool,
 }
 
 impl Seg {
@@ -61,7 +63,7 @@ impl Seg {
     }
     fn same_kind(&self, o: &Seg) -> bool {
         match (self.portal, o.portal) {
-            (None, None) => true,
+            (None, None) => self.blocked == o.blocked,
             (Some((a, _)), Some((b, _))) => a == b,
             _ => false,
         }
@@ -87,51 +89,22 @@ pub(crate) fn compute_side(
     st: &EffectiveSettings,
     minimum_overlap: impl Fn(usize) -> Option<f64>,
 ) -> Vec<Seg> {
-    let (at, a0, a1) = edge(&rects[a], side);
+    let (_, a0, a1) = edge(&rects[a], side);
     let eps = tolerance(rects);
-    // 候选：(下标, 间隙, 重叠起点, 重叠终点)
-    let mut cands: Vec<(usize, f64, f64, f64)> = Vec::new();
+    // Candidate: (index, gap, overlap start/end, entry eligible).
+    let mut cands: Vec<(usize, f64, f64, f64, bool)> = Vec::new();
     for (b, rb) in rects.iter().enumerate() {
         if b == a || !active[b] {
             continue;
         }
-        let Some(minimum_overlap) = minimum_overlap(b) else {
-            continue;
-        };
         let Some(f) = facing(rects[a], *rb, side, eps) else {
             continue;
         };
-        if f.to - f.from < minimum_overlap.max(0.0) {
-            continue;
-        }
-        cands.push((b, f.gap, f.from, f.to));
+        let eligible = minimum_overlap(b).is_some_and(|minimum| f.to - f.from >= minimum.max(0.0));
+        // Include every facing screen when selecting nearest visibility, even
+        // when that screen cannot itself be entered. Its occlusion is local.
+        cands.push((b, f.gap, f.from, f.to, eligible));
     }
-    // 不越过参与的屏幕：A 与 B 之间隔着 C（法线方向在间隙里，沿边与 A、B 相对的范围重叠）时去掉 B。
-    let tol = st.overlap_tolerance.max(0.0);
-    let far = |gap: f64| match side {
-        Side::Right | Side::Bottom => at + gap,
-        Side::Left | Side::Top => at - gap,
-    };
-    cands.retain(|&(b, gap, lo, hi)| {
-        let (g0, g1) = {
-            let (p, q) = (at, far(gap));
-            (p.min(q), p.max(q))
-        };
-        !rects.iter().enumerate().any(|(c, rc)| {
-            if c == a || c == b || !active[c] {
-                return false;
-            }
-            // 法线方向（左右边为 x，上下边为 y）与沿边方向的范围
-            let ((c0, c1), (d0, d1)) = if side.is_vertical() {
-                ((rc.x, rc.right()), (rc.y, rc.bottom()))
-            } else {
-                ((rc.y, rc.bottom()), (rc.x, rc.right()))
-            };
-            let between = c1.min(g1) - c0.max(g0) > eps;
-            let along = d1.min(hi) - d0.max(lo) > tol.max(eps);
-            between && along
-        })
-    });
 
     let mut cuts: Vec<f64> = vec![a0, a1];
     for c in &cands {
@@ -155,7 +128,8 @@ pub(crate) fn compute_side(
         let seg = Seg {
             from: u,
             to: v,
-            portal: best.map(|c| (c.0, c.1)),
+            portal: best.filter(|c| c.4).map(|c| (c.0, c.1)),
+            blocked: best.is_some_and(|c| !c.4),
         };
         match segs.last_mut() {
             Some(last) if last.same_kind(&seg) => last.to = v,
@@ -167,6 +141,7 @@ pub(crate) fn compute_side(
             from: a0,
             to: a1,
             portal: None,
+            blocked: false,
         }];
     }
     refine(&mut segs, st);
@@ -182,12 +157,12 @@ fn refine(segs: &mut Vec<Seg>, st: &EffectiveSettings) {
     let bridge = absorb_end;
 
     // 两端的墙。
-    if segs.len() >= 2 && segs[0].portal.is_none() && absorb_end(segs[0].len()) {
+    if segs.len() >= 2 && segs[0].portal.is_none() && !segs[0].blocked && absorb_end(segs[0].len()) {
         segs[1].from = segs[0].from;
         segs.remove(0);
     }
     let n = segs.len();
-    if n >= 2 && segs[n - 1].portal.is_none() && absorb_end(segs[n - 1].len()) {
+    if n >= 2 && segs[n - 1].portal.is_none() && !segs[n - 1].blocked && absorb_end(segs[n - 1].len()) {
         segs[n - 2].to = segs[n - 1].to;
         segs.pop();
     }
@@ -195,6 +170,7 @@ fn refine(segs: &mut Vec<Seg>, st: &EffectiveSettings) {
     let mut i = 1;
     while i + 1 < segs.len() {
         if segs[i].portal.is_none()
+            && !segs[i].blocked
             && segs[i - 1].portal.is_some()
             && segs[i + 1].portal.is_some()
             && bridge(segs[i].len())

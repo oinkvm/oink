@@ -3,11 +3,14 @@
 //! - [`DisplayBackend`]：枚举本机显示器、监听变化。平台实现在 `src/macos`、`src/windows`。
 //! - [`layout`]: native display groups expanded into a shared reference canvas.
 //!
-//! The backend only reads OS display arrangements; it has no display-write API.
+//! Native writes are explicit origin-only transactions gated by the agent's
+//! owner preference. Enumeration and ordinary layout synchronization never apply.
 
 use std::sync::Arc;
 
 pub use oink_foundation::display::DisplayInfo;
+
+pub mod arrangement;
 
 pub mod layout;
 #[cfg(target_os = "macos")]
@@ -23,12 +26,27 @@ pub enum DisplayError {
     Unsupported,
     #[error("系统调用失败：{0}")]
     Platform(String),
+    #[error(transparent)]
+    Arrangement(#[from] arrangement::ArrangementError),
 }
 
 /// 显示器配置变化（插拔、分辨率、缩放、排列、旋转）时的回调，可能在任意线程调用。
 pub type ChangeHandler = Arc<dyn Fn() + Send + Sync>;
 
 pub trait DisplayBackend: Send + Sync {
+    /// Full baseline including mirror followers and mode identity for stale-write fencing.
+    fn native_configuration(&self) -> Result<arrangement::NativeConfiguration, DisplayError> {
+        Err(DisplayError::Unsupported)
+    }
+    /// Origin-only, session-scoped write. The implementation revalidates expected
+    /// against a fresh native read, then returns the actual observed result.
+    fn apply_native_origins(
+        &self,
+        _expected: &arrangement::NativeConfiguration,
+        _origins: &[arrangement::NativeOrigin],
+    ) -> Result<arrangement::NativeConfiguration, DisplayError> {
+        Err(DisplayError::Unsupported)
+    }
     /// 当前所有显示器（含虚拟显示器，由 `is_virtual` 标出）。
     fn displays(&self) -> Result<Vec<DisplayInfo>, DisplayError>;
     /// 注册变化回调；实现可以合并短时间内的多次变化。

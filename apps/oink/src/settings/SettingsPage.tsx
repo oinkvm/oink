@@ -1,13 +1,15 @@
 import { LANGUAGES, secondaryName, tr } from '../i18n';
 import { useEffect, useId, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { Button, ColorSwatches, DropdownMenu, MenuItem, Group, Icon, Input, Row, Segmented, Select, Slider, Switch, toast, useOink } from 'oink-ui';
+import { Accordion, Button, ColorSwatches, DropdownMenu, MenuItem, Group, Icon, Input, Row, Segmented, Select, Switch, toast, useOink } from 'oink-ui';
 import type { MotionMode, ThemeMode } from 'oink-ui';
 import type { Platform } from '../window/DesktopWindow';
 import { ACCENT_SWATCHES, DEFAULT_ACCENT } from './appearance';
+import type { ReceivedFilesCleanup } from '../api/types';
 import { api as backend, shell } from '../api/client';
 import { agent, useAgent } from '../api/store';
 import { ScreenPointerGains } from './ScreenPointerGains';
+import { GainControl } from './GainControl';
 import { KeyMapControl } from './KeyMap';
 import { AudioQualityChart } from './AudioQualityChart';
 import { LatencyChart } from './LatencyChart';
@@ -15,11 +17,13 @@ import { PermissionRow } from '../permissions/PermissionRow';
 import { PermissionControl } from '../permissions/PermissionControl';
 import { useGrant } from './useGrant';
 import { UninstallControl } from './UninstallControl';
-import { UpdateCheck, UpdatePreferences } from './UpdatePreferences';
+import { UpdateCheck, UpdatePreferences, manualUpdates } from './UpdatePreferences';
 import { SHORTCUTS, ShortcutRecorder, spokenKeys } from './Shortcuts';
 import type { ShortcutId } from './Shortcuts';
 import type { LogLevel, PermissionId, Prefs, PrefsApi } from './prefs';
 import { searchSections, sectionsFor, text } from './schema';
+import { LayoutProfileFailure } from '../api/layoutProfiles';
+import { profileErrorText } from '../arrange/snapshot';
 import type { ItemMeta, SectionId } from './schema';
 export type PermState = 'granted' | 'denied' | 'not_granted' | 'not_determined' | 'unknown' | 'unsupported' | 'not_required' | 'restart_required';
 export interface SettingsJump {
@@ -46,7 +50,7 @@ const formatSize = (b: number) => {
     }
     return `${i === 0 ? v : v.toFixed(1)} ${units[i]}`;
 };
-export function SettingsPage({ open, platform, api, capsIme, query, jump, onActive, version, perms, onGrant, onOpenPermissionSettings, onLog, onAbout, onBlocklist, onOnboarding, }: {
+export function SettingsPage({ open, platform, api, capsIme, query, jump, onActive, version, perms, onGrant, onOpenPermissionSettings, onLog, onAbout, onBlocklist, layoutProfiles, onOnboarding, }: {
     open: boolean;
     platform: Platform;
     api: PrefsApi;
@@ -65,6 +69,8 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
     onLog: (text: string, tone?: 'neutral' | 'info' | 'success' | 'warning' | 'danger') => void;
     onAbout: () => void;
     onBlocklist: () => void;
+    /** Settings › Layout's profile list (create, rename, delete), owned by the app. */
+    layoutProfiles?: ReactNode;
     onOnboarding?: () => void;
 }) {
     const { prefs, set } = api;
@@ -74,7 +80,21 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
     const { theme, setTheme, accent, setAccent, motion, setMotion } = useOink();
     const scroller = useRef<HTMLDivElement | null>(null);
     const uid = useId();
-    const applicable = (item: ItemMeta) => (item.id !== 'perm-network' || perms.network !== 'not_required') && (!['touchpadInject','macScrollFeel'].includes(item.id) || agentState.input?.contacts_injection_available === true);
+    // This device's own system-arrangement preference; hidden where the owner cannot write it at all.
+    const arrangement = agentState.layoutProfiles?.devices.find(d => d.device === agentState.overview?.this_device.id);
+    const [syncPending, setSyncPending] = useState(false);
+    const applicable = (item: ItemMeta) => (item.id !== 'perm-network' || perms.network !== 'not_required') && (!['touchpadInject','macScrollFeel'].includes(item.id) || agentState.input?.contacts_injection_available === true)
+        && (item.id !== 'syncSystemArrangement' || arrangement?.availability !== 'unsupported');
+    const setSync = async (enabled: boolean, label: string) => {
+        if (!arrangement) return;
+        setSyncPending(true);
+        try {
+            agent.adoptProfiles(await backend.setSyncSystemArrangement({ request_id: crypto.randomUUID(), device: arrangement.device, expected_preference_token: arrangement.preference_token, enabled }));
+            onLog(`${label}：${enabled ? tr('开') : tr('关')}`);
+        } catch (e) {
+            toast.danger({ title: tr('无法更改「{0}」', label), description: e instanceof LayoutProfileFailure ? profileErrorText(e.problem) : tr('不可用') });
+        } finally { setSyncPending(false); }
+    };
     const sections = sectionsFor(platform).map(s => ({ ...s, items: s.items.filter(applicable) }));
     const found = searchSections(platform, query);
     const shown = sections.filter((s) => {
@@ -123,6 +143,23 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
             setFlash({ id: jump.item, n: jump.n });
     }, [jump?.n]);
     const grant = useGrant(onGrant, onOpenPermissionSettings);
+    useEffect(()=>{
+        if(!open) return;
+        let active=true;
+        const before=agentState.receivedFiles;
+        void backend.receivedFilesUsage().then(value=>{if(active && agent.get().receivedFiles===before) agent.adopt('receivedFiles',value);}).catch(()=>{});
+        return ()=>{active=false;};
+    },[open]);
+    const received=agentState.receivedFiles;
+    const [receivedSaving,setReceivedSaving]=useState(false);
+    const openReceived=()=>{void backend.openReceivedFiles().catch(()=>agent.fail('unavailable'));};
+    const setReceivedCleanup=async(value:ReceivedFilesCleanup)=>{
+        if(receivedSaving) return;
+        setReceivedSaving(true);
+        try {await backend.setReceivedFilesCleanup(value);agent.adopt('receivedFiles',await backend.receivedFilesUsage());}
+        catch {agent.fail('unavailable');}
+        finally {setReceivedSaving(false);}
+    };
     const [cacheBytes, setCacheBytes] = useState<number | null>(null);
     const [cacheNote, setCacheNote] = useState('');
     const [clearing, setClearing] = useState(false);
@@ -133,7 +170,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                 const usage = rows.find(row => row.device === self)?.usage;
                 if (usage) {
                     setCacheBytes(usage.total_bytes);
-                    setCacheNote(usage.incomplete ? tr('统计未完成') : '');
+                    setCacheNote('');
                 }
             }).catch(() => { });
     }, [open]);
@@ -142,7 +179,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
         try {
             const result = await backend.clearCache();
             setCacheBytes(result.result.usage.total_bytes);
-            setCacheNote(result.result.usage.incomplete ? tr('保留 {0}，统计未完成', formatSize(result.result.kept_bytes)) : tr('保留 {0}', formatSize(result.result.kept_bytes)));
+            setCacheNote(tr('保留 {0}', formatSize(result.result.kept_bytes)));
         }
         catch {
             agent.fail('unavailable');
@@ -167,10 +204,10 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
         setSaving(true);
         try {
             const result = await backend.exportDiagnostics(minutes);
-            toast({ title: result.cutoff_complete === false || (result.missing_device_count ?? 0) > 0 ? tr('诊断包已保存，部分设备缺失') : tr('诊断包已保存'), action: { label: tr('打开位置'), onClick: openDir } });
+            toast({ title: result.cutoff_complete === false || (result.missing_device_count ?? 0) > 0 ? tr('诊断包已保存，部分设备缺失') : tr('诊断包已保存'), action: { label: tr('打开'), onClick: openDir } });
         }
         catch {
-            agent.fail('unavailable');
+            toast.danger({ title: tr('诊断包保存失败'), action: { label: tr('打开'), onClick: openDir } });
         }
         finally {
             setSaving(false);
@@ -179,9 +216,10 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
     const toggle = (k: keyof Prefs, label: string) => (v: boolean) => { set(k, v as never); onLog(`${label}：${v ? tr('开') : tr('关')}`); };
     const control = (item: ItemMeta, label: string): {
         node: ReactNode;
-        stack?: boolean | 'auto';
-        width?: number | 'fill';
+        stack?: boolean;
         desc?: ReactNode;
+        /** Show the control inside a collapsed disclosure under the label. */
+        panel?: boolean;
     } => {
         const sw = (k: keyof Prefs) => ({ node: <Switch aria-label={label} checked={prefs[k] as boolean} onChange={toggle(k, label)}/> });
         switch (item.id) {
@@ -202,40 +240,60 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
             case 'escStop':
             case 'upgradeHint':
             case 'scrollInvert':
+            case 'forwardInjectedInput':
             case 'keepAwake':
             case 'touchpadInject':
             case 'pointerTrail':
             case 'keepLocalPlayback':
             case 'diagnostics':
+            case 'clipReceive':
+            case 'clipSend':
+                return sw(item.id);
             case 'clipText':
             case 'clipRich':
             case 'clipImage':
             case 'clipFiles':
             case 'clipPrivate':
-                return sw(item.id);
+                return { node: <Switch aria-label={label} checked={prefs[item.id]} onChange={toggle(item.id,label)} disabled={!prefs.clipSend}/> };
             case 'macScrollFeel': return { node: <Switch aria-label={label} checked={prefs.macScrollFeel} onChange={toggle('macScrollFeel',label)} disabled={!prefs.touchpadInject}/> };
             case 'hideSponsor': return { node: <Switch aria-label={label} checked={api.presentation?.hide_sponsor ?? false} onChange={v => api.savePresentation({ hide_sponsor: v })}/> };
             case 'onboarding': return { node: <Button size="sm" onClick={onOnboarding}>{tr('显示')}</Button> };
             case 'uninstall': return { node: <UninstallControl/> };
             case 'blocklist':
                 return { node: <Button size="sm" onClick={onBlocklist}>{tr('管理')}</Button> };
+            case 'syncSystemArrangement': {
+                const ready = agentState.layoutProfiles?.readiness === 'ready' && arrangement?.availability === 'ready';
+                return {
+                    desc: arrangement?.availability === 'unavailable' ? <>{text(item.desc, platform)} · {tr('暂时读不到系统屏幕排列')}</> : undefined,
+                    node: <Switch aria-label={label} checked={arrangement?.sync_system_arrangement ?? false} disabled={!ready || syncPending} onChange={v => { void setSync(v, label); }}/>,
+                };
+            }
+            case 'manageLayouts':
+                return { node: layoutProfiles ?? null, stack: true };
+            case 'receivedFiles': return {node:<>
+                <span className="setp__size">{received ? `${received.incomplete ? '≥ ' : ''}${formatSize(received.materialized_bytes)}` : '—'}</span>
+                <Button size="sm" aria-label={tr('打开收到的文件夹')} onClick={openReceived}><Icon name="folder"/></Button>
+                <Button size="sm" onClick={openReceived}>{tr('管理')}</Button>
+            </>};
+            case 'receivedCleanup': return {node:<Select size="sm" aria-label={label} value={received?.cleanup ?? 'never'} disabled={!received || receivedSaving} onChange={value=>{void setReceivedCleanup(value as ReceivedFilesCleanup);}} options={[
+                {value:'days7',label:received?.time_basis==='last_used' ? tr('7 天未使用') : tr('收到 7 天后')},
+                {value:'days30',label:received?.time_basis==='last_used' ? tr('30 天未使用') : tr('收到 30 天后')},
+                {value:'never',label:tr('从不')},
+            ]}/>};
             case 'cache':
                 return {
                     desc: cacheNote ? <>{text(item.desc, platform)} · {cacheNote}</> : undefined,
                     node: (<span className="setp__btns">
-              
               <span className="setp__size">{cacheBytes === null ? '—' : cacheBytes === 0 ? tr('没有缓存') : formatSize(cacheBytes)}</span>
-              <Button size="sm" leading={<Icon name="folder"/>} onClick={() => { void shell.openCacheFolder().catch(() => agent.fail('unavailable')); }}>{tr('打开目录')}</Button>
               <Button size="sm" loading={clearing} disabled={cacheBytes === 0} onClick={clearCache}>{tr('清空缓存')}</Button>
             </span>),
-                    stack: 'auto',
                 };
             case 'version':
                 return {
                     desc: <span className="setp__mono">v{version}</span>,
                     node: <UpdateCheck status={agentState.update} open={open}/>,
                 };
-            case 'updates': return { node: <UpdatePreferences status={agentState.update}/>, width: 'fill' };
+            case 'updates': return { desc: manualUpdates(agentState.update) ? tr('此版本需要手动下载并安装更新。') : undefined, node: <UpdatePreferences status={agentState.update} label={label}/> };
             case 'about':
                 return { node: <Button size="sm" onClick={onAbout}>{tr('查看')}</Button> };
             case 'language':
@@ -264,7 +322,6 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                                     return tr('深色');
                                 }, icon: <Icon name="moon"/> },
                         ]}/>),
-                    stack: 'auto',
                 };
             case 'motion':
                 return {
@@ -275,7 +332,6 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                             } }, { value: 'full', get label() {
                                 return tr('state|关闭');
                             } }]}/>),
-                    stack: 'auto',
                 };
             case 'keymap':
                 return { desc: api.hasOverrides ? tr('有按设备设置的覆盖') : undefined, node: <KeyMapControl platform={platform} api={api} capsIme={capsIme} label={label} onLog={onLog}/>, stack: true };
@@ -284,17 +340,10 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                     node: (<Segmented<Prefs['pollLimit']> size="sm" aria-label={label} value={prefs.pollLimit} onChange={(v) => { set('pollLimit', v); onLog(tr('指针事件频率上限 → {0}', v === '125' ? '125 Hz' : tr('不限制'))); }} options={[{ value: '125', label: '125 Hz' }, { value: 'none', get label() {
                                 return tr('不限制');
                             } }]}/>),
-                    stack: 'auto',
                 };
-            case 'screenPointerGains': return { node: <ScreenPointerGains/>, stack: true };
+            case 'screenPointerGains': return { node: <ScreenPointerGains/>, panel: true };
             case 'pointerGain':
-                return {
-                    node: (<span className="setp__slider">
-              <Slider aria-label={label} min={0.1} max={5} step={0.1} digits={1} value={prefs.pointerGain} format={(v) => `${v.toFixed(1)}x`} onChange={(v) => set('pointerGain', v)} onChangeEnd={(v) => onLog(tr('被控时指针速度增益 → {0}x', v.toFixed(1)))}/>
-              <span className="setp__val" aria-hidden>{prefs.pointerGain.toFixed(1)}x</span>
-            </span>),
-                    width: 240,
-                };
+                return { node: <GainControl label={label} value={prefs.pointerGain} onChange={(v) => set('pointerGain', v)} onCommit={(v) => onLog(tr('被控时指针速度增益 → {0}x', v.toFixed(2)))}/> };
             case 'audioDevice': {
                 const list = agentState.audio?.devices.find(d => d.device.map(v => v.toString(16).padStart(2, '0')).join('') === agentState.overview?.this_device.id)?.outputs ?? [];
                 return {
@@ -334,11 +383,11 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                         ]}/>),
                 };
             case 'logMaxMb':
-                return { node: <span className="setp__inline"><Input size="sm" aria-label={label} inputMode="numeric" suffix="MB" value={logDraft} invalid={!/^\d+$/.test(logDraft) || Number(logDraft) < 1} onChange={v => setLogDraft(v.replace(/\D/g,''))} onBlur={()=>{ if(/^\d+$/.test(logDraft) && Number(logDraft) >= 1) set('logMaxMb',logDraft); }}/></span> };
+                return { node: <Input size="sm" className="setp__mb" aria-label={label} inputMode="numeric" suffix="MB" value={logDraft} invalid={!/^\d+$/.test(logDraft) || Number(logDraft) < 1} onChange={v => setLogDraft(v.replace(/\D/g,''))} onBlur={()=>{ if(/^\d+$/.test(logDraft) && Number(logDraft) >= 1) set('logMaxMb',logDraft); }}/> };
             case 'bundle':
                 return {
-                    node: (<span className="setp__bundle">
-                      <Button size="sm" onClick={openDir}>{tr('打开')}</Button>
+                    node: (<span className="setp__btns">
+                      <Button size="sm" leading={<Icon name="folder"/>} onClick={openDir}>{tr('打开')}</Button>
                       <DropdownMenu placement="bottom-end" matchTriggerWidth={false}
                         trigger={<Button size="sm" loading={saving} disabled={saving} trailing={<Icon name="chevron-down"/>}>{tr('保存')}</Button>}>
                         <MenuItem onSelect={() => { void saveBundle(30); }}>{tr('最近 30 分钟')}</MenuItem>
@@ -346,7 +395,6 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                         <MenuItem onSelect={() => { void saveBundle(null); }}>{tr('全部')}</MenuItem>
                       </DropdownMenu>
                     </span>),
-                    stack: 'auto',
                 };
             case 'audioQuality':
                 return {node: <AudioQualityChart active={open}/>, stack:true};
@@ -392,9 +440,14 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                     const label = text(i.label, platform);
                     const c = control(i, label);
                     const desc = c.desc ?? (i.desc ? hl(text(i.desc, platform), query) : undefined);
+                    const node = api.canEdit(i.id) ? c.node : <span className="setp__note">{tr('不可用')}</span>;
+                    const marks = { 'data-item': i.id, 'data-flash': flash?.id === i.id ? flash.n : undefined, onAnimationEnd: () => setFlash(null) };
+                    if (c.panel)
+                        return (<Accordion key={i.id} {...marks} variant="plain" headingLevel={3} className="setp__row setp__acc" items={[{ value: i.id, content: node,
+                            title: <span className="ok-row__text"><span className="ok-row__label">{hl(label, query)}</span>{desc && <span className="ok-row__desc">{desc}</span>}</span> }]}/>);
                     const ItemRow = i.id.startsWith('perm-') ? PermissionRow : Row;
-                    return (<ItemRow key={i.id} data-item={i.id} data-flash={flash?.id === i.id ? flash.n : undefined} onAnimationEnd={() => setFlash(null)} className="setp__row" label={hl(label, query)} description={desc} stack={c.stack} controlWidth={c.width}>
-                      {api.canEdit(i.id) ? c.node : <span className="setp__note">{tr('不可用')}</span>}
+                    return (<ItemRow key={i.id} {...marks} className="setp__row" label={hl(label, query)} description={desc} stack={c.stack}>
+                      {node}
                     </ItemRow>);
                 })}
               </Group>

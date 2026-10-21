@@ -43,6 +43,21 @@ const fn gd(usage: u16, scancode: u16, vk: u16) -> KeyEntry {
     }
 }
 
+/// Conventional extended laptop brightness scan codes, when delivered to
+/// WH_KEYBOARD_LL. HID/ACPI/firmware-only controls never enter that hook.
+/// Ordinary F-keys and non-extended keypad codes are intentionally excluded.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn local_brightness_key(scancode: u16) -> Option<KeyCode> {
+    Some(KeyCode::new(
+        KeyCode::PAGE_CONSUMER,
+        match scancode {
+            0xE054 => 0x6F,
+            0xE04C => 0x70,
+            _ => return None,
+        },
+    ))
+}
+
 const VK_PAUSE: u16 = 0x13;
 
 /// 主表。同一个扫描码出现多次时，**靠前的条目**用于「扫描码 → HID」反查。
@@ -265,6 +280,20 @@ mod tests {
         for e in TABLE.iter().filter(|e| (e.hid >> 16) as u16 == KeyCode::PAGE_CONSUMER) {
             assert_ne!(e.vk, 0, "Consumer 0x{:X} 缺少虚拟键", e.hid & 0xFFFF);
             assert_eq!(e.scancode >> 8, 0xE0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod brightness_tests {
+    use super::*;
+    #[test]
+    fn guard_brightness_codes_exclude_function_and_keypad_keys() {
+        for sc in [0xE054, 0xE04C] {
+            assert!(local_brightness_key(sc).unwrap().is_brightness());
+        }
+        for sc in [0x54, 0x4C, 0x3B, 0x3C, 0xE030, 0xE02E, 0xE05E, 0] {
+            assert_eq!(local_brightness_key(sc), None);
         }
     }
 }

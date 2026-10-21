@@ -24,7 +24,7 @@ def main():
         run('xcrun', 'clang', '-O2', '-std=c11', '-target', f'arm64-apple-macos{I["macos_minimum"]}',
             '-c', ROOT / 'apps/file-provider/CrashCapture.c', '-o', tmp / 'crash-capture.o')
         if args.test:
-            for entry in ['Tests.swift', 'EnumeratorTests.swift', 'UninstallTests.swift']:
+            for entry in ['Tests.swift', 'EnumeratorTests.swift', 'UninstallTests.swift', 'ReceivedTests.swift']:
                 extension = [ROOT / 'apps/file-provider/Extension.swift', ROOT / 'apps/file-provider/ReportCapture.swift',
                              tmp / 'crash-capture.o'] if entry == 'EnumeratorTests.swift' else []
                 if entry == 'UninstallTests.swift':

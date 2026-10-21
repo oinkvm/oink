@@ -349,6 +349,9 @@ impl<'a> OwnerContext<'a> {
         match self.value(option)? {
             RawValue::Uint(0) => Some(SharingMode::Shared),
             RawValue::Uint(1) => Some(SharingMode::Local),
+            RawValue::Uint(2) if option == 1 && self.supports("oink.input.mouse-disabled/1") => {
+                Some(SharingMode::Disabled)
+            }
             _ => None,
         }
     }
@@ -374,6 +377,11 @@ impl<'a> OwnerContext<'a> {
     }
     fn action(&self, edit: CardOptionEdit) -> CardAction {
         let option = edit.number();
+        if matches!(edit, CardOptionEdit::MouseMode(SharingMode::Disabled))
+            && !self.supports("oink.input.mouse-disabled/1")
+        {
+            return CardAction::unavailable(CardActionUnavailable::Unsupported);
+        }
         if let Some(fault) = self.fault(option) {
             match fault.code {
                 ResourceFaultCode::None => {}
@@ -457,6 +465,7 @@ impl<'a> OwnerContext<'a> {
             match mode {
                 Some(SharingMode::Shared) => SharingIcon::Shared,
                 Some(SharingMode::Local) => SharingIcon::Local,
+                Some(SharingMode::Disabled) => SharingIcon::Disabled,
                 None => SharingIcon::Unknown,
             }
         };
@@ -577,6 +586,7 @@ impl<'a> OwnerContext<'a> {
                 screen_local: self.action(CardOptionEdit::ScreenShared(false)),
                 mouse_shared: self.action(CardOptionEdit::MouseMode(SharingMode::Shared)),
                 mouse_local: self.action(CardOptionEdit::MouseMode(SharingMode::Local)),
+                mouse_disabled: self.action(CardOptionEdit::MouseMode(SharingMode::Disabled)),
                 keyboard_shared: self.action(CardOptionEdit::KeyboardMode(SharingMode::Shared)),
                 keyboard_local: self.action(CardOptionEdit::KeyboardMode(SharingMode::Local)),
                 keyboard_disabled: self.action(CardOptionEdit::KeyboardDisabled(true)),

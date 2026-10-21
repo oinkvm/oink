@@ -179,28 +179,19 @@ fn excluded_focus_gossip_does_not_adopt_or_evacuate_the_excluded_claim() {
 }
 
 #[test]
-fn excluded_lock_record_and_local_pin_request_never_publish_a_locked_ui_state() {
-    for remote in [false, true] {
-        let mut r = router_with_input(false);
-        exclude(&mut r, ME);
-        let before = r.focus();
-        r.drain_outputs();
-        if remote {
-            let record = pin(&r, ME, 4, 1, true);
-            r.input_message(PEER, Message::Control(ControlMsg::FocusLock { state: record }), 20);
-        } else {
-            r.set_locked(true);
-        }
-        let out = r.drain_outputs();
-        assert!(
-            !out.iter().any(
-                |o| matches!(o,Output::Send {msg:Message::Control(ControlMsg::FocusLock {state}),..} if state.locked)
-            ),
-            "UI receives an invalid lock then an unlock: {out:?}"
-        );
-        assert_eq!(r.focus(), before);
-        assert!(!r.locked());
-    }
+fn hidden_current_screen_allows_local_lock_without_moving_the_pointer() {
+    let mut r = router_with_input(false);
+    exclude(&mut r, ME);
+    let before = r.focus();
+    r.drain_outputs();
+    r.set_locked(true);
+    let out = r.drain_outputs();
+    assert!(r.locked());
+    assert_eq!(r.focus().holder, before.holder);
+    assert!(!out.iter().any(|o| matches!(
+        o,
+        Output::RestoreLocal { .. } | Output::Inject(InjectEvent::MoveTo { .. })
+    )));
 }
 
 #[test]
@@ -391,4 +382,136 @@ fn known_display_facts_before_layout_sync_do_not_clear_the_owners_focus_lock() {
             |o| matches!(o,Output::Send {msg:Message::Control(ControlMsg::FocusLock {state}),..} if !state.locked)
         )
     );
+}
+
+#[test]
+fn hiding_current_screen_preserves_focus_position_and_native_cursor() {
+    let mut r = router();
+    r.set_cursor(Point::new(50., 60.));
+    let focus = r.focus();
+    let pointer = r.pointer.clone();
+    r.drain_outputs();
+    exclude(&mut r, ME);
+    assert_eq!(r.focus(), focus);
+    assert_eq!(r.pointer, pointer);
+    assert!(!r.drain_outputs().iter().any(|output| matches!(
+        output,
+        Output::RestoreLocal { .. } | Output::SetMode(_) | Output::Inject(InjectEvent::MoveTo { .. })
+    )));
+}
+
+#[test]
+fn hidden_native_seam_blocks_both_directions_in_shared_and_local_mouse_modes() {
+    use oink_display::layout::{OwnerLayoutPreferences, ScreenPreference};
+    use oink_foundation::input::InputMode;
+    for mode in [InputMode::Shared, InputMode::Local] {
+        for hidden in ["middle", "left"] {
+            let mut displays = Vec::new();
+            for (i, key) in ["left", "middle", "right"].into_iter().enumerate() {
+                let mut d = display();
+                d.key = key.into();
+                d.bounds.x = i as f64 * 1000.;
+                d.is_primary = i == 0;
+                displays.push(d);
+            }
+            let layout = Layout::auto(&[(ME, displays.clone())]);
+            let mut owners = std::collections::BTreeMap::new();
+            let mut owner = OwnerLayoutPreferences::default();
+            owner.screens.insert(
+                hidden.into(),
+                ScreenPreference {
+                    enabled: false,
+                    ..Default::default()
+                },
+            );
+            owners.insert(ME, owner);
+            for (from, at, dx, native) in [
+                ("left", Point::new(990., 30.), 20., Point::new(1010., 30.)),
+                ("middle", Point::new(1010., 30.), -20., Point::new(990., 30.)),
+            ] {
+                let mut r = router();
+                r.set_local_displays(displays.clone());
+                let mut settings = r.config().settings.clone();
+                settings.mouse_mode = mode;
+                r.set_settings(settings);
+                r.set_cursor(at);
+                r.set_layout(Arc::new(TopologyLayout::from_layout(&layout, &owners)));
+                r.drain_outputs();
+                let disposition = r.local_motion(dx, 0., Some(native), 100);
+                assert_eq!(disposition, Disposition::Swallow);
+                assert_eq!(r.local_cursor.as_ref().unwrap().screen.display, from);
+                let expected = if from == "left" { 999. } else { 1000. };
+                assert!((r.local_cursor.as_ref().unwrap().local.x - expected).abs() < 1.);
+            }
+        }
+    }
+}
+
+#[test]
+fn hidden_native_constraint_repairs_foreign_warps_and_releases_on_pause() {
+    let mut r = router();
+    r.set_cursor(Point::new(50., 60.));
+    exclude(&mut r, ME);
+    let out = r.drain_outputs();
+    assert!(out.iter().any(|o| matches!(o, Output::ConstrainCursor(Some(_)))));
+    assert!(!r.reconcile_target_cursor(Point::new(1200., 60.)));
+    assert!(r.drain_outputs().iter().any(|o| matches!(o,
+        Output::Inject(InjectEvent::MoveTo { pos }) if *pos == Point::new(50., 60.))));
+    r.set_paused(true);
+    assert!(
+        r.drain_outputs()
+            .iter()
+            .any(|o| matches!(o, Output::ConstrainCursor(None)))
+    );
+    assert_eq!(r.hidden_cursor_constraint(), None);
+}
+
+#[test]
+fn hidden_neighbor_does_not_lock_enabled_native_seams_and_constraint_precedes_move() {
+    use oink_display::layout::{OwnerLayoutPreferences, ScreenPreference};
+    let displays: Vec<_> = ["left", "middle", "right"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, key)| {
+            let mut d = display();
+            d.key = key.into();
+            d.bounds.x = i as f64 * 1000.;
+            d
+        })
+        .collect();
+    let layout = Layout::auto(&[(ME, displays.clone())]);
+    let mut owner = OwnerLayoutPreferences::default();
+    owner.screens.insert(
+        "right".into(),
+        ScreenPreference {
+            enabled: false,
+            ..Default::default()
+        },
+    );
+    let owners = [(ME, owner)].into_iter().collect();
+    let mut r = router();
+    r.set_local_displays(displays);
+    r.set_cursor(Point::new(990., 30.));
+    r.set_layout(Arc::new(TopologyLayout::from_layout(&layout, &owners)));
+    r.drain_outputs();
+    assert_eq!(
+        r.local_motion(20., 0., Some(Point::new(1010., 30.)), 100),
+        Disposition::Swallow
+    );
+    let out = r.drain_outputs();
+    assert_eq!(r.pointer.as_ref().unwrap().screen.display, "middle");
+    let bounds = out
+        .iter()
+        .position(|o| matches!(o,Output::ConstrainCursor(Some(rect)) if rect.x==1000.))
+        .unwrap();
+    let motion = out
+        .iter()
+        .position(|o| {
+            matches!(
+                o,
+                Output::Inject(InjectEvent::MoveToWithDelta { .. } | InjectEvent::MoveTo { .. })
+            )
+        })
+        .unwrap();
+    assert!(bounds < motion, "new native bounds must precede the crossing: {out:?}");
 }

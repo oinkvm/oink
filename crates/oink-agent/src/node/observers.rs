@@ -104,6 +104,7 @@ impl Node {
                         last_session = Some(session);
                     }
                     if dirty.swap(false, Ordering::AcqRel) {
+                        let _arrangement = lock(&node.inner.profiles.native.observation_gate);
                         match node.current_displays() {
                             Ok(displays) => {
                                 if let Err(reason) = node.seed_live_screen_preferences(&displays) {

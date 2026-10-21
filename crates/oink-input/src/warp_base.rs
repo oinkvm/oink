@@ -40,6 +40,14 @@ impl WarpBase {
     }
 
     pub fn register(&mut self, before: Point, target: Point) -> Registration {
+        self.sequence += 1;
+        // Snapshot before retirement: a later hook may reject this placement.
+        // Its rollback must restore the prior readback aliases as well as target.
+        let registration = Registration {
+            sequence: self.sequence,
+            target: self.target,
+            displaced: self.displaced.clone(),
+        };
         // A subsequent placement starts from this observed native position.
         // Keep the existing chain only when that placement itself sees an older
         // base. Ordinary readback during a held cursor must not do this: Windows
@@ -50,12 +58,6 @@ impl WarpBase {
         } else {
             self.sample(before);
         }
-        self.sequence += 1;
-        let registration = Registration {
-            sequence: self.sequence,
-            target: self.target,
-            displaced: self.displaced.clone(),
-        };
         if before != target || self.target.is_some_and(|p| p != target) {
             if let Some(previous) = self.target
                 && !self.displaced.contains(&previous)
@@ -68,6 +70,34 @@ impl WarpBase {
             self.target = Some(target);
         }
         registration
+    }
+
+    /// A failed native read cannot invent (0,0) as a displaced base. Use the
+    /// latest registered commit when known, otherwise establish only the target.
+    #[cfg(any(windows, all(test, debug_assertions)))]
+    pub(crate) fn register_unobserved(&mut self, target: Point) -> Registration {
+        self.sequence += 1;
+        let registration = Registration {
+            sequence: self.sequence,
+            target: self.target,
+            displaced: self.displaced.clone(),
+        };
+        // No readback confirmed that earlier aliases retired. In particular,
+        // do not call register(previous_target, target): that would falsely
+        // treat the previous commit as a freshly observed native position.
+        if let Some(previous) = self.target
+            && previous != target
+            && !self.displaced.contains(&previous)
+        {
+            self.displaced.push(previous);
+        }
+        self.target = Some(target);
+        registration
+    }
+
+    #[cfg(any(windows, all(test, debug_assertions)))]
+    pub(crate) fn registered_target(&self) -> Option<Point> {
+        self.target
     }
 
     /// A failed older operation must not cancel a newer native commit.
@@ -103,6 +133,46 @@ impl WarpBase {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_external_commit_keeps_previous_readback_aliases() {
+        let mut base = WarpBase::default();
+        let park = Point::new(1000., 600.);
+        let external = Point::new(300., 200.);
+        base.register(park, external);
+        let transaction = base.register(external, Point::new(10., 20.));
+        assert!(base.cancel(transaction));
+        assert_eq!(base.sample(park), external);
+        assert_eq!(base.displaced_base_for(Point::new(1001., 600.), external), Some(park));
+    }
+
+    #[test]
+    fn unavailable_readback_uses_known_commit_without_inventing_a_displacement() {
+        let mut base = WarpBase::default();
+        let first = Point::new(400., 500.);
+        let second = Point::new(-100., 200.);
+        base.register_unobserved(first);
+        assert_eq!(base.registered_target(), Some(first));
+        let token = base.register_unobserved(second);
+        assert_eq!(base.sample(first), second);
+        base.cancel(token);
+        assert_eq!(base.sample(first), first);
+    }
+
+    #[test]
+    fn unavailable_readback_keeps_all_known_displaced_aliases() {
+        let mut base = WarpBase::default();
+        let park = Point::new(1000., 600.);
+        let first = Point::new(400., 500.);
+        let second = Point::new(-100., 200.);
+        base.register(park, first);
+        let token = base.register_unobserved(second);
+        for readback in [park, first, second, park] {
+            assert_eq!(base.sample(readback), second);
+        }
+        assert!(base.cancel(token));
+        assert_eq!(base.sample(park), first);
+    }
 
     #[test]
     fn hook_targets_can_revisit_a_displaced_base_after_fresh_park_motion() {

@@ -106,3 +106,13 @@ it.each(['move','resize'] as const)('projects rigid group %s and every spring-ba
   expect(preview.mock.lastCall?.[0]).toBeNull();
   unmount();expect(preview.mock.lastCall?.[0]).toBeNull();
 });
+it('starts a native screen preview on press before any pointer motion',()=>{
+  const screens:Screen[]=[{id:'a',device:'local',name:'Local',x:0,y:0,w:700,h:500,wallpaper:0},{id:'b',device:'local',name:'Local',x:700,y:0,w:700,h:500,wallpaper:0}];
+  const move=vi.fn();
+  const {container}=render(<Arrangement screens={screens} onScreensChange={()=>{}} selectedId="a" onSelect={()=>{}}
+    screenEditable={()=>true} onScreenMove={move}
+    settings={{showHotZones:false,snapping:false,compact:false,padding:48,step:10}}/>);
+  for(let n=0;n<100&&frames.size;n++)tick();
+  fireEvent.pointerDown(container.querySelector('.scr')!,{button:0,clientX:200,clientY:200});
+  expect(move).toHaveBeenCalledWith({type:'drag',id:'a',desired:{x:0,y:0}});
+});

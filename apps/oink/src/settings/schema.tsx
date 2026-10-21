@@ -3,7 +3,7 @@ import { Icon } from 'oink-ui';
 import type { ReactNode } from 'react';
 import type { Platform } from '../window/DesktopWindow';
 import { SHORTCUTS } from './Shortcuts';
-export type SectionId = 'general' | 'appearance' | 'input' | 'clipboard' | 'audio' | 'shortcuts' | 'permissions' | 'diagnostics';
+export type SectionId = 'general' | 'appearance' | 'layout' | 'input' | 'clipboard' | 'audio' | 'shortcuts' | 'permissions' | 'diagnostics';
 type Text = string | ((p: Platform) => string);
 export interface ItemMeta {
     id: string;
@@ -73,9 +73,6 @@ export const SECTIONS: SectionMeta[] = [
                 }, get desc() {
                     return tr('名单里的设备发来的配对请求会被自动拒绝，也不会出现在附近设备里');
                 }, get keywords() { return tr('屏蔽 拉黑 黑名单 拒绝 配对 设备 移除'); } },
-            { id: 'cache', get label() {
-                    return tr('缓存文件');
-                }, get desc() { return tr('从其他设备接收的文件副本'); }, get keywords() { return tr('缓存 清理 空间 磁盘 cache 目录'); } },
             { id: 'version', get label() {
                     return tr('当前版本');
                 }, get keywords() { return tr('版本 更新 升级 检查'); } },
@@ -84,7 +81,7 @@ export const SECTIONS: SectionMeta[] = [
                 }, get desc() {
                     return tr('版本、项目主页、开源软件引用');
                 }, get keywords() { return tr('about 关于 版本 开源 许可 github'); } },
-            { id: 'updates', get label() { return tr('软件更新'); }, get keywords() { return tr('版本 更新 升级 检查'); } },
+            { id: 'updates', get label() { return tr('自动检查更新'); }, get desc() { return tr('在后台定时检查新版本并提示升级'); }, get keywords() { return tr('版本 更新 升级 检查 自动 后台 软件更新'); } },
             { id: 'uninstall', only: 'mac', get label() { return tr('卸载 Oink'); }, get desc() { return tr('移除 Oink 及其数据、权限和系统组件'); }, get keywords() { return tr('卸载 移除 删除 废纸篓 清除 数据 权限 卸载 Oink…'); } },
         ],
     },
@@ -119,6 +116,22 @@ export const SECTIONS: SectionMeta[] = [
         ],
     },
     {
+        id: 'layout',
+        get title() { return tr('布局'); },
+        icon: <Icon name="layout"/>,
+        items: [
+            { id: 'manageLayouts', get label() { return tr('保存的布局'); }, get desc() { return tr('调整排列会自动保存到当前布局；切换布局会恢复它保存的排列'); }, get keywords() { return tr('布局 保存 切换 新建 重命名 删除 方案 预设 profile'); } },
+            { id: 'syncSystemArrangement', get label() { return tr('允许修改本机系统屏幕排列'); }, get desc() { return tr('本机有多个屏幕时，在布局页进行的调整同步到系统屏幕排列'); }, get keywords() { return tr('显示器 屏幕 排列 系统设置 多屏 主屏 副屏 拼接 位置 允许 权限 同步调整系统屏幕排列 display arrangement'); } },
+            // Remote pointer speed: how fast other devices' pointers cross this computer's screens.
+            { id: 'pointerGain', get label() {
+                    return tr('被控时指针速度增益');
+                }, get desc() {
+                    return tr('其他设备控制本机时，指针移动速度的倍率');
+                }, get keywords() { return tr('鼠标 速度 灵敏度 加速'); } },
+            { id: 'screenPointerGains', get label() { return tr('每屏远程指针速度'); }, get desc() { return tr('仅在其他设备控制这块屏幕时生效，与上方增益相乘；1 倍保持当前速度，不影响本机鼠标或触摸板'); }, get keywords() { return tr('鼠标 速度 灵敏度 加速'); } },
+        ],
+    },
+    {
         id: 'input',
         get title() {
             return tr('键鼠');
@@ -130,6 +143,7 @@ export const SECTIONS: SectionMeta[] = [
                 desc: (p) => (p === 'mac' ? tr('用这台 Mac 的键盘控制 Windows 设备时，修饰键怎么对应') : tr('用这台电脑的键盘控制 Mac 时，修饰键怎么对应')),
                 get keywords() { return tr('键盘 修饰键 快捷键 command option control ctrl alt win caps lock 大写 中英 输入法 映射'); },
             },
+            { id: 'forwardInjectedInput', only: 'win', get label() { return tr('转发程序注入的输入'); }, get desc() { return tr('关闭时，用本机控制其它设备时，本机其它程序注入的输入不转发至被控设备'); }, get keywords() { return tr('程序 注入 输入 转发 模拟 自动化 宏 辅助功能 SendInput computer use'); } },
             { id: 'pollLimit', get label() {
                     return tr('指针事件频率上限');
                 }, get desc() {
@@ -140,12 +154,6 @@ export const SECTIONS: SectionMeta[] = [
                 }, get desc() {
                     return tr('在使用本机鼠标时，反转滚轮滚动方向');
                 }, get keywords() { return tr('滚动 方向 自然滚动'); } },
-            { id: 'pointerGain', get label() {
-                    return tr('被控时指针速度增益');
-                }, get desc() {
-                    return tr('其他设备控制本机时，指针移动速度的倍率');
-                }, get keywords() { return tr('鼠标 速度 灵敏度 加速'); } },
-            { id: 'screenPointerGains', get label() { return tr('每屏远程指针速度'); }, get desc() { return tr('仅在其他设备控制这块屏幕时生效，与上方增益相乘；1 倍保持当前速度，不影响本机鼠标或触摸板'); }, get keywords() { return tr('鼠标 速度 灵敏度 加速'); } },
             { id: 'keepAwake', get label() {
                     return tr('其他设备活动时，保持屏幕常亮');
                 }, get desc() {
@@ -171,6 +179,8 @@ export const SECTIONS: SectionMeta[] = [
         },
         icon: <ClipboardIcon />,
         items: [
+            { id: 'clipReceive', get label() { return tr('接收其它设备复制的内容'); }, get desc() { return tr('在其它设备上复制的内容，可以在本机粘贴'); } },
+            { id: 'clipSend', get label() { return tr('同步复制的内容给其它设备'); }, get desc() { return tr('本机复制的内容，可以在其它设备上粘贴'); } },
             { id: 'clipText', get label() {
                     return tr('同步文本');
                 }, get desc() {
@@ -196,6 +206,12 @@ export const SECTIONS: SectionMeta[] = [
                 }, get desc() {
                     return tr('第三方应用的自定义格式');
                 }, get keywords() { return tr('应用 自定义 格式 复制 粘贴 同步私有格式 同步应用专有格式'); } },
+            {id:'receivedFiles',get label(){return tr('收到的文件');},get desc(){return tr('从其它设备粘贴或拖拽到本机的文件');},get keywords(){return tr('收到 接收 文件 文件夹 粘贴 拖拽 管理 删除 空间 Finder Explorer');}},
+            {id:'receivedCleanup',get label(){return tr('自动清理收到的文件');},get desc(){return tr('节省磁盘空间，但未另存的文件可能丢失');},get keywords(){return tr('自动 清理 收到 文件 7天 30天 从不');}},
+            { id: 'cache', get label() {
+                    return tr('缓存文件');
+                }, get desc() { return tr('Oink 为传输临时保存的数据'); }, get keywords() { return tr('缓存 清理 空间 磁盘 cache 目录'); } },
+
         ],
     },
     {
@@ -297,7 +313,7 @@ export const SECTIONS: SectionMeta[] = [
                 }, get desc() {
                     return tr('每台在线设备的延迟');
                 }, get keywords() { return tr('延迟 网络 ping 图表 ms'); } },
-            { id: 'audioQuality', get label() { return tr('音频质量'); }, get desc() { return tr('最近 60 秒各来源的接收缓冲、码率和断音'); }, get keywords() { return tr('音频 缓冲 码率 断音 图表'); } },
+            { id: 'audioQuality', get label() { return tr('音频质量'); }, get desc() { return tr('最近 60 秒各来源的缓冲、播放断续、补音和迟到包'); }, get keywords() { return tr('音频 缓冲 码率 断音 图表'); } },
         ],
     },
 ];

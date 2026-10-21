@@ -193,6 +193,8 @@ export interface InputSettings {
   accept_contacts: boolean;
   contacts_injection_available: boolean;
   mac_scroll_feel: boolean;
+  /** Windows capture-local opt-in; false keeps other apps' injected input local. */
+  forward_injected_input: boolean;
   emergency_hold_ms: number;
   device_gain: number;
   scroll: ScrollSettings;
@@ -215,6 +217,7 @@ export interface CacheDevice { device: DeviceKey; usage: CacheUsage }
 export interface CacheDeviceClear { device: DeviceKey; result: { removed_bytes: number; kept_bytes: number; usage: CacheUsage } }
 
 export interface ClipboardSettings {
+  receive?: boolean; send?: boolean;
   text: boolean; rich_text: boolean; images: boolean; files: boolean; custom: boolean;
 }
 export type ClipKind = "text" | "html" | "rtf" | "image" | "files" | "custom";
@@ -327,6 +330,7 @@ export interface AimStatus {
 }
 
 export type ApiEvent =
+  | import('./layoutProfiles').LayoutProfilesEvent
   | { type: "connection_quality"; data: ConnectionQuality }
   | { type: "audio_quality"; data: AudioQuality }
   | { type: "diagnostics_status"; data: DiagnosticRecorderStatus }
@@ -347,6 +351,7 @@ export type ApiEvent =
   | { type: "layout"; data: Layout }
   | { type: "input_settings"; data: InputSettings }
   | { type: "cache_usage"; data: CacheDevice[] }
+  | { type: "received_files_usage"; data: ReceivedFilesUsage }
   | { type: "clipboard_settings"; data: ClipboardSettings }
   | { type: "clip_activity"; data: ClipActivity }
   | { type: "file_provider_status"; data: FileProviderStatus }
@@ -620,11 +625,15 @@ export interface Notification {
 }
 export interface NotificationReceipt { id: string; screen: ScreenKey | null; remote: boolean }
 
-export interface AudioDropoutBucket { at_ms: number; lost: number; late: number }
+export interface AudioDropoutBucket { at_ms: number; interruptions: number; concealed_ns: number; missing_ns: number; late_packets: number; silence_interruptions: number; concealment_interruptions: number; discontinuities: number }
 export interface AudioQualitySample { at_ms: number; buffer_ms: number | null }
 export interface AudioSourceQuality {
   device: DeviceKey; name: string; samples: AudioQualitySample[];
-  p50_ms: number | null; p90_ms: number | null; p99_ms: number | null;
-  bitrate_kbps: number; dropouts: number; glitches: AudioDropoutBucket[];
+  buffer_avg_ms: number | null;
+  bitrate_kbps: number; interruptions: number; concealed_ms: number; late_packets: number; glitches: AudioDropoutBucket[];
 }
-export interface AudioQuality { revision: number; sampled_at_ms: number; sources: AudioSourceQuality[] }
+export interface AudioOutputQuality { interruptions: number; missing_ms: number; glitches: AudioDropoutBucket[] }
+export interface AudioQuality { revision: number; sampled_at_ms: number; sources: AudioSourceQuality[]; output: AudioOutputQuality | null }
+
+export type ReceivedFilesCleanup = "never" | "days7" | "days30";
+export interface ReceivedFilesUsage { materialized_bytes:number; incomplete:boolean; time_basis:"received"|"last_used"; cleanup:ReceivedFilesCleanup }

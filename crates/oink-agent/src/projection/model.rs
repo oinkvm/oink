@@ -17,6 +17,12 @@ pub struct ScreenRect {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
+    Arrangement {
+        sequence: u64,
+        lease_ms: u32,
+        expires_ms: u64,
+        snapshot: Option<Box<crate::layout_profiles::types::ArrangementSnapshot>>,
+    },
     /// A full, latest-only preview. None clears this author's preview immediately.
     Preview {
         sequence: u64,
@@ -33,6 +39,12 @@ pub enum Action {
 impl Action {
     pub fn valid(&self) -> bool {
         match self {
+            Self::Arrangement { lease_ms, snapshot, .. } => {
+                (1..=2000).contains(lease_ms)
+                    && snapshot
+                        .as_ref()
+                        .is_none_or(|s| crate::layout_profiles::render::valid_preview(s))
+            }
             Self::Preview { screens, affected, .. } => {
                 affected.len() <= 64
                     && affected.iter().map(|(_, key)| key.len()).sum::<usize>()

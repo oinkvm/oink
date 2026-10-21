@@ -140,6 +140,7 @@ struct State {
     last_native_number: i16,
     last_pos: Option<CGPoint>,
     pending_position: Option<PendingPosition>,
+    last_move_native: bool,
     /// A failed absolute target cannot silently turn a subsequent DOWN into a
     /// click at an old cursor sample. Session changes abandon the old target.
     failed_position_context: Option<u64>,
@@ -695,6 +696,7 @@ impl Injector {
             && ty == CGEventType::MouseMoved
             && let Some(receipt) = self.motion.post_mouse(&ev, p)?
         {
+            st.last_move_native = true;
             st.pending_position = receipt.position.map(|at| PendingPosition {
                 before,
                 predecessor,
@@ -705,6 +707,7 @@ impl Injector {
             return receipt.wait();
         }
         let receipt = self.motion.submit_cg(&ev, CGEventTapLocation::HIDEventTap)?;
+        st.last_move_native = false;
         posted(Point::new(p.x, p.y));
         // Absolute drag delivery has the same cursor-commit lag as a native
         // move. Its immediately following UP must retain the accepted endpoint.
@@ -718,6 +721,17 @@ impl Injector {
         }
         st.last_pos = Some(p);
         receipt.wait()
+    }
+
+    pub(super) fn last_cursor_target(&self) -> Option<(Point, f64)> {
+        let st = self.state.lock().ok()?;
+        let p = st.pending_position.map(|p| p.at).or(st.last_pos)?;
+        let ulp = |v: f64| {
+            let f = v as f32;
+            f64::from(f.next_up() - f).abs()
+        };
+        let quantum: f64 = if st.last_move_native { 1. / 256. } else { 0. };
+        Some((Point::new(p.x, p.y), quantum.max(ulp(p.x)).max(ulp(p.y))))
     }
 
     fn next_location(&self, st: &mut State) -> CGPoint {
@@ -1020,6 +1034,15 @@ fn f32_floor(v: f64) -> f64 {
 }
 
 /// 当前光标位置（Quartz 全局坐标）。
+pub(crate) fn checked_location() -> Result<Point, InputError> {
+    let e = CGEvent::new(None).ok_or_else(|| InputError::Platform("cursor readback unavailable".into()))?;
+    let p = CGEvent::location(Some(&e));
+    if !p.x.is_finite() || !p.y.is_finite() {
+        return Err(InputError::Platform("cursor readback invalid".into()));
+    }
+    Ok(Point::new(p.x, p.y))
+}
+
 pub(crate) fn current_location() -> CGPoint {
     CGEvent::new(None)
         .map(|e| CGEvent::location(Some(&e)))

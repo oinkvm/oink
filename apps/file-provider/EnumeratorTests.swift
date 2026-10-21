@@ -110,8 +110,11 @@ private final class Observer: NSObject, NSFileProviderEnumerationObserver, NSFil
         let afterBeginning = Observer()
         Enumerator(.workingSet, rootURL: { root }).enumerateChanges(for: afterBeginning, from: fromBeginning.anchor!)
         precondition(afterBeginning.finished && afterBeginning.error == nil && afterBeginning.items.isEmpty)
+        let trash = try makeEnumerator(.trashContainer,rootURL:{root})
+        let trashObserver=Observer()
+        trash.enumerateItems(for:trashObserver,startingAt:NSFileProviderPage(NSFileProviderPage.initialPageSortedByName as Data))
+        precondition(trashObserver.finished && trashObserver.error == nil)
         for (scope, domain, code) in [
-            (NSFileProviderItemIdentifier.trashContainer, NSCocoaErrorDomain, CocoaError.featureUnsupported.rawValue),
             (NSFileProviderItemIdentifier("missing"), NSFileProviderErrorDomain, NSFileProviderError.noSuchItem.rawValue)
         ] {
             do {
@@ -253,7 +256,7 @@ private final class Observer: NSObject, NSFileProviderEnumerationObserver, NSFil
 
         // Writable export declarations must not create a remote mutation API. Exercise
         // the real callbacks without registering a system domain or touching a desktop.
-        let provider = OinkFileProvider(domain: NSFileProviderDomain(identifier: .init("unit-test"), displayName: "Unit Test"))
+        let provider = OinkFileProvider(domain: NSFileProviderDomain(identifier: .init("unit-test"), displayName: "Unit Test"),root:root)
         let request = NSFileProviderRequest()
         let exported = Item(file)
         var rejected = 0
@@ -262,11 +265,11 @@ private final class Observer: NSObject, NSFileProviderEnumerationObserver, NSFil
             rejected += 1
         }
         _ = provider.modifyItem(exported, baseVersion: exported.itemVersion, changedFields: [.contents, .filename, .parentItemIdentifier], contents: nil, options: [], request: request) { item, _, _, error in
-            precondition(item == nil && (error as NSError?)?.code == CocoaError.fileWriteNoPermission.rawValue)
+            precondition(item == nil && (error as NSError?)?.code == NSFileProviderError.noSuchItem.rawValue)
             rejected += 1
         }
         _ = provider.deleteItem(identifier: exported.itemIdentifier, baseVersion: exported.itemVersion, options: [], request: request) { error in
-            precondition((error as NSError?)?.code == CocoaError.fileWriteNoPermission.rawValue)
+            precondition(error == nil)
             rejected += 1
         }
         precondition(rejected == 3)

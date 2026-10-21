@@ -29,7 +29,8 @@ impl Contact {
         self.id != 0 && self.x >= 0 && self.y >= 0 && self.x <= surface.width as i32 && self.y <= surface.height as i32
     }
 }
-/// Local capture snapshot; only touching states (3/4 on macOS) appear here.
+/// Local capture snapshot; only eligible touching contacts appear here.
+/// macOS requires state 3/4 and a non-rejected finger identity (1..=5).
 /// `len = 255` reports capture corruption/overflow, never a partial frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sample {

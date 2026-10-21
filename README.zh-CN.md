@@ -13,7 +13,7 @@ Oink 是 Oink Is Not only a KVM 的缩写，是一款在多台 Windows 和 Mac �
 
 > Oink 是一个个人项目，代码完全由 AI 编写（感谢 Claude Code 和 Codex），人类负责项目管理、确定技术方向和鼓励 AI。项目没有在多样化环境内经过充分测试，尤其是：
 >
-> 1. 有多个显示器的计算机
+> 1. 有多个显示器的 Windows 计算机
 > 2. 带触摸板的 Windows 笔记本
 > 3. Windows 10 和未更新系统的 Mac
 >

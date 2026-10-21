@@ -13,6 +13,8 @@ pub enum InputMode {
     #[default]
     Shared,
     Local,
+    /// Mouse-only guard. Keyboard disable keeps its independent release lifecycle.
+    Disabled,
 }
 
 /// Source monotonic capture clock, in wrapping microseconds. This is interval
@@ -60,6 +62,12 @@ impl KeyCode {
     pub const fn is_volume(self) -> bool {
         (self.page() == Self::PAGE_CONSUMER && matches!(self.usage(), 0xE2 | 0xE9 | 0xEA))
             || (self.page() == Self::PAGE_KEYBOARD && matches!(self.usage(), 0x7F..=0x81))
+    }
+
+    /// Display brightness and keyboard backlight controls stay on the source
+    /// while its keyboard is disabled (HID Consumer usages).
+    pub const fn is_brightness(self) -> bool {
+        self.page() == Self::PAGE_CONSUMER && matches!(self.usage(), 0x6F | 0x70 | 0x79 | 0x7A | 0x7C)
     }
 
     pub const fn is_modifier(self) -> bool {
@@ -138,6 +146,8 @@ pub enum ScrollPhase {
 pub enum InputEvent {
     /// Local raw gesture observation, never paced as pointer motion.
     TouchpadSample(crate::contacts::Sample),
+    /// Local capture generation barrier, never sent over the release wire.
+    TouchpadBoundary,
     /// 指针相对位移。**已经过源系统的速度与加速处理**，单位为源机本地坐标单位。
     PointerDelta {
         dx: f64,

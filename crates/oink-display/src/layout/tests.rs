@@ -727,38 +727,38 @@ fn taller_sides(over: f64, dev: [DeviceId; 3]) -> Layout {
 }
 
 #[test]
-fn portal_does_not_pass_over_a_participating_screen() {
-    // 左屏比中屏高出 15/686 reference units：高出的那段不越过中屏通到右屏，是墙（15/686 reference units > 吸附 8/686 reference units）。
+fn portals_clip_only_the_intervals_occluded_by_a_nearer_screen() {
+    // The exposed strip above the middle screen routes directly to the far screen.
     let l = taller_sides(15.0 / 686.0, [A, X, B]);
     let t = l.topology(&Default::default());
     assert_eq!(
         portals(&t, &sid(A, "l"), Side::Right),
         vec![
-            (0.0, (15.0 / 686.0), None),
+            (0.0, (15.0 / 686.0), Some("r".into())),
             ((15.0 / 686.0), (315.0 / 686.0), Some("c".into()))
         ]
     );
     assert_eq!(
         portals(&t, &sid(B, "r"), Side::Left),
         vec![
-            (0.0, (15.0 / 686.0), None),
+            (0.0, (15.0 / 686.0), Some("l".into())),
             ((15.0 / 686.0), (315.0 / 686.0), Some("c".into()))
         ]
     );
-    // 指针在那段撞墙、沿墙滑动，不会跳到右屏
+    // Pointer motion through the exposed strip reaches the far screen.
     let r = t
         .step(
             &at(&t, &sid(A, "l"), Point::new(495.0 / 686.0, 5.0 / 686.0)),
             ((50.0 / 686.0), 0.0),
         )
         .unwrap();
-    assert_eq!(r.to.screen, sid(A, "l"));
-    assert!(r.blocked_x);
+    assert_eq!(r.to.screen, sid(B, "r"));
+    assert!(!r.blocked_x);
     let e = t.exit_through_edge(
         &at(&t, &sid(A, "l"), Point::new(499.0 / 686.0, 5.0 / 686.0)),
         (4.0, 0.0),
     );
-    assert!(e.is_none(), "{e:?}");
+    assert_eq!(e.unwrap().screen, sid(B, "r"));
 
     // 中屏离线：不挡路，整条边照常通到右屏（跳过 400/686 reference units）
     let t = l.topology_online(&Default::default(), |d| *d != X);
@@ -773,7 +773,7 @@ fn portal_does_not_pass_over_a_participating_screen() {
         )
         .unwrap();
     assert_eq!(r.to.screen, sid(B, "r"));
-    // 未启用的屏幕（虚拟显示器）同样不挡路
+    // 隐藏的在线屏幕仍挡住其覆盖区间，不能跳过它进入远处屏幕
     let dis = l.clone();
     let mut owners = BTreeMap::new();
     let mut owner = OwnerLayoutPreferences::default();
@@ -788,17 +788,23 @@ fn portal_does_not_pass_over_a_participating_screen() {
     owners.insert(X, owner);
     assert_eq!(
         portals(&dis.topology(&owners), &sid(A, "l"), Side::Right),
-        vec![(0.0, (315.0 / 686.0), Some("r".into()))]
+        vec![
+            (0.0, 15.0 / 686.0, Some("r".into())),
+            (15.0 / 686.0, 315.0 / 686.0, None)
+        ]
     );
 }
 
 #[test]
 fn passing_over_rule_with_snap_walls_off_and_local_screens() {
-    // 只高出 5/686 reference units（< 吸附 8/686 reference units）：那段墙并入中屏的传送门，落到中屏的上角
+    // A short exposed strip is a real far portal, so snapping cannot give it to the middle screen.
     let t = taller_sides(5.0 / 686.0, [A, X, B]).topology(&Default::default());
     assert_eq!(
         portals(&t, &sid(A, "l"), Side::Right),
-        vec![(0.0, (305.0 / 686.0), Some("c".into()))]
+        vec![
+            (0.0, (5.0 / 686.0), Some("r".into())),
+            ((5.0 / 686.0), (305.0 / 686.0), Some("c".into()))
+        ]
     );
     let r = t
         .step(
@@ -806,16 +812,19 @@ fn passing_over_rule_with_snap_walls_off_and_local_screens() {
             ((10.0 / 686.0), 0.0),
         )
         .unwrap();
-    assert_eq!(r.to.screen, sid(X, "c"));
-    assert!(close(plane(&t, &r.to).y, 5.0 / 686.0));
+    assert_eq!(r.to.screen, sid(B, "r"));
+    assert!(close(plane(&t, &r.to).y, 2.0 / 686.0));
 
-    // 关闭墙：15/686 reference units 那段也分给中屏（不是右屏）
+    // Turning walls off also preserves the exposed far portal.
     let mut l = taller_sides(15.0 / 686.0, [A, X, B]);
     l.settings.walls = false;
     let t = l.topology(&Default::default());
     assert_eq!(
         portals(&t, &sid(A, "l"), Side::Right),
-        vec![(0.0, (315.0 / 686.0), Some("c".into()))]
+        vec![
+            (0.0, (15.0 / 686.0), Some("r".into())),
+            ((15.0 / 686.0), (315.0 / 686.0), Some("c".into()))
+        ]
     );
     let r = t
         .step(
@@ -823,8 +832,8 @@ fn passing_over_rule_with_snap_walls_off_and_local_screens() {
             ((10.0 / 686.0), 0.0),
         )
         .unwrap();
-    assert_eq!(r.to.screen, sid(X, "c"));
-    assert!(close(plane(&t, &r.to).y, 15.0 / 686.0), "贴到中屏上角");
+    assert_eq!(r.to.screen, sid(B, "r"));
+    assert!(close(plane(&t, &r.to).y, 5.0 / 686.0));
 
     // 本机三块屏之间同一套规则
     let t = taller_sides(15.0 / 686.0, [A, A, A]).topology(&Default::default());
@@ -1634,8 +1643,7 @@ proptest! {
         }
     }
 
-    /// 每条边的切分覆盖整条边、按顺序、互不重叠；传送门的目标是另一块参与的屏幕，且不越过别的参与屏幕
-    /// （间隙里没有沿边与相对范围重叠超过 `overlap_tolerance` 的参与屏幕）。
+    /// Edge partitions cover the source, and each portal uses its nearest facing screen on that interval.
     #[test]
     fn segments_partition_edges(l in arb_layout(), offline in prop::sample::select(vec![None, Some(A), Some(X)])) {
         let t = l.topology_online(&Default::default(), |d| Some(*d) != offline);
@@ -1654,19 +1662,17 @@ proptest! {
                     prop_assert!(to != &e.screen);
                     prop_assert!(t.is_active(to) && t.is_active(&e.screen));
                     let rb = t.screen(to).unwrap().rect;
-                    let span = |r: &Rect| if e.side.is_vertical() { ((r.x, r.right()), (r.y, r.bottom())) } else { ((r.y, r.bottom()), (r.x, r.right())) };
-                    let ((b0, b1), (bl, bh)) = span(&rb);
-                    let far = match e.side { Side::Right | Side::Bottom => b0, _ => b1 };
-                    let (g0, g1) = (e.at.min(far), e.at.max(far));
-                    let (lo, hi) = (g.from.max(bl), g.to.min(bh));
+                    let eps = super::facing::tolerance(&[s.rect, rb]);
+                    let target_gap = super::facing::facing(s.rect, rb, e.side, eps).unwrap().gap;
                     for c in t.screens() {
                         if &c.id == to || c.id == e.screen || !t.is_active(&c.id) {
                             continue;
                         }
-                        let ((c0, c1), (d0, d1)) = span(&c.rect);
-                        let between = c1.min(g1) - c0.max(g0) > (1e-9 / 686.0);
-                        let along = d1.min(hi) - d0.max(lo) > l.settings.overlap_tolerance + (1e-9 / 686.0);
-                        prop_assert!(!(between && along), "{:?} {:?} 越过 {:?}", e.screen, to, c.id);
+                        // Only geometrically facing rectangles occlude visual
+                        // intervals. Real penetration is not a facing relation.
+                        let Some(near) = super::facing::facing(s.rect, c.rect, e.side, eps) else { continue };
+                        let covered = near.to.min(g.to) - near.from.max(g.from) > eps;
+                        prop_assert!(!(covered && near.gap + eps < target_gap), "{:?} {:?} crosses nearer {:?}", e.screen, to, c.id);
                     }
                 }
             }
@@ -1759,7 +1765,7 @@ fn owner_device_exclusion_keeps_shared_geometry_and_geometry_settings() {
 }
 
 #[test]
-fn effective_exclusion_matches_removing_a_rectangle_for_every_existing_portal_rule() {
+fn hidden_geometry_is_retained_for_every_existing_portal_rule() {
     for (x, y) in [
         ((210. / 686.0), 0.),
         ((630. / 686.0), 0.),
@@ -1784,22 +1790,21 @@ fn effective_exclusion_matches_removing_a_rectangle_for_every_existing_portal_ru
             let effective = saved.effective(&owners);
             assert_eq!(saved.screens, before.screens);
             assert_eq!(saved.view(&owners, |_| true).screens.len(), 3);
-            assert_eq!(effective.screens().len(), 2);
+            assert_eq!(effective.screens().len(), 3);
             assert!(!effective.contains_device(X));
             let t = effective.topology();
-            assert!(t.screen(&sid(X, "x")).is_none());
+            assert!(t.screen(&sid(X, "x")).is_some());
             assert!(
                 t.to_plane(&ScreenPos {
                     screen: sid(X, "x"),
                     local: Point::new(1., 1.)
                 })
-                .is_none()
+                .is_some()
             );
-            let mut removed = before.clone();
-            removed.screens.retain(|s| s.id.device != X);
-            assert_eq!(t.edges(), removed.topology(&Default::default()).edges());
-            assert_eq!(t.screens(), removed.topology(&Default::default()).screens());
-            // Target omission does not change the disabled device's source feel.
+            for side in Side::ALL {
+                assert!(portals(&t, &sid(X, "x"), side).iter().all(|p| p.2.is_none()));
+            }
+            // Hiding does not change the device's source scale or stored geometry.
             assert_eq!(
                 t.source_reference_per_native_unit(&sid(X, "x")),
                 before
@@ -1821,7 +1826,7 @@ fn effective_exclusion_matches_removing_a_rectangle_for_every_existing_portal_ru
 }
 
 #[test]
-fn source_redirection_is_explicit_and_not_inferred_from_missing_or_offline_geometry() {
+fn hidden_missing_and_offline_geometry_do_not_redirect_sources() {
     assert!(
         !Layout::default()
             .effective(&Default::default())
@@ -1844,15 +1849,15 @@ fn source_redirection_is_explicit_and_not_inferred_from_missing_or_offline_geome
     owners.entry(B).or_default().screen_shared = false;
     let effective = saved.effective(&owners);
     assert!(!effective.contains_device(B));
-    assert!(effective.source_requires_target(B));
-    assert!(effective.topology().source_requires_target(B));
+    assert!(!effective.source_requires_target(B));
+    assert!(!effective.topology().source_requires_target(B));
     assert_eq!(saved.screens.len(), 2);
     owners.entry(B).or_default().screen_shared = true;
     assert!(!saved.effective(&owners).source_requires_target(B));
 }
 
 #[test]
-fn exclusion_uses_existing_unbounded_gap_and_overlap_rules_without_new_walls() {
+fn hidden_screen_blocks_a_farther_target_even_across_unbounded_gaps() {
     let mut owners: BTreeMap<DeviceId, OwnerLayoutPreferences> = BTreeMap::new();
     let mut saved = layout(vec![
         screen(A, "a", Rect::new(0., 0., 200. / 686.0, 160. / 686.0), 1. * 686.0),
@@ -1873,7 +1878,7 @@ fn exclusion_uses_existing_unbounded_gap_and_overlap_rules_without_new_walls() {
     assert!(
         portals(&saved.topology(&owners), &sid(A, "a"), Side::Right)
             .iter()
-            .any(|p| p.2.is_some())
+            .all(|p| p.2.is_none())
     );
     saved.screens[2].rect.y = 170. / 686.0; // No along-edge overlap; only a corner/diagonal.
     assert!(
@@ -2008,4 +2013,48 @@ fn native_seams_ignore_cross_computer_wall_extension_and_minimum_portal() {
     let wall = at(&topology, &sid(A, "a"), Point::new(0.999, 0.59));
     assert!(topology.first_portal(&wall, (0.002, 0.0)).is_none());
     assert!(topology.trigger_zones().is_empty());
+}
+
+#[test]
+fn hidden_screens_keep_geometry_and_wall_both_directions_including_farther_targets() {
+    for same_device in [false, true] {
+        for hide_all in [false, true] {
+            let hidden_device = if same_device { A } else { X };
+            let saved = layout(vec![
+                screen(A, "left", Rect::new(0., 0., 1., 1.), 1000.),
+                screen(hidden_device, "hidden", Rect::new(1., 0., 1., 1.), 1000.),
+                screen(B, "far", Rect::new(2., 0., 1., 1.), 1000.),
+            ]);
+            let mut owners: BTreeMap<DeviceId, OwnerLayoutPreferences> = BTreeMap::new();
+            if hide_all {
+                owners.entry(hidden_device).or_default().screen_shared = false;
+            } else {
+                owners.entry(hidden_device).or_default().screens.insert(
+                    "hidden".into(),
+                    ScreenPreference {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                );
+            }
+            let topology = saved.topology(&owners);
+            let hidden_id = sid(hidden_device, "hidden");
+            assert!(topology.screen(&hidden_id).is_some(), "hidden geometry is retained");
+            for (id, point, delta) in [
+                (sid(A, "left"), Point::new(900., 500.), (2., 0.)),
+                (hidden_id.clone(), Point::new(1500., 500.), (-2., 0.)),
+                (hidden_id.clone(), Point::new(1500., 500.), (2., 0.)),
+                (sid(B, "far"), Point::new(2100., 500.), (-2., 0.)),
+            ] {
+                let from = ScreenPos {
+                    screen: id.clone(),
+                    local: point,
+                };
+                let step = topology.step(&from, delta).unwrap();
+                assert_eq!(step.to.screen, id);
+                assert!(step.crossed.is_empty());
+                assert!(step.blocked_x);
+            }
+        }
+    }
 }

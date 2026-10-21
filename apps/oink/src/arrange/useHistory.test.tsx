@@ -15,6 +15,21 @@ describe('arrangement command history', () => {
     expect(result.current.undoCount).toBe(1);
     expect(result.current.redoCount).toBe(0);
   });
+  it('keeps operation endpoints on a step through undo, redo, merges and settling', () => {
+    type Meta = { before: number; after: number };
+    const { result } = renderHook(() => useHistory<number, Meta>(() => 0, { mergeMeta: (a, b) => a && b ? { before: a.before, after: b.after } : b }));
+    act(() => result.current.commit(1, 'Nudge', 'key', { before: 0, after: 1 }));
+    act(() => result.current.commit(2, 'Nudge', 'key', { before: 1, after: 2 }));
+    act(() => result.current.settle(3, m => m && { ...m, after: 3 }));
+    expect(result.current.undoCount).toBe(1);
+    let move: ReturnType<typeof result.current.undo> = null;
+    act(() => { move = result.current.undo(); });
+    expect(move!.meta).toEqual({ before: 0, after: 3 });
+    act(() => { result.current.sync(-1); });
+    act(() => { move = result.current.redo(); });
+    expect(move!.meta).toEqual({ before: 0, after: 3 });
+    expect(result.current.value).toBe(3);
+  });
   it('makes a successful arrangement reset undoable', () => {
     const { result } = renderHook(() => useHistory(() => 3));
     act(() => result.current.commit(0, 'Reset'));

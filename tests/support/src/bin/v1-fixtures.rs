@@ -253,15 +253,15 @@ fn append_compatible() -> Result<(), Box<dyn std::error::Error>> {
     let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("manifest.json"))?)?;
     let previous: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("schema.json"))?)?;
     let schema = support::schema_json();
-    // This append mode permits new messages/DTOs only. It never rewrites an
-    // existing contract, hex vector or cryptographic fixture after release.
+    // Append new allocations and optional fields while preserving every frozen
+    // field/route/capability and every existing hex or cryptographic fixture.
     for (table, key) in [("messages", "id"), ("schemas", "name"), ("streams", "kind")] {
         for entry in previous[table].as_array().ok_or("missing table")? {
             if !schema[table]
                 .as_array()
                 .ok_or("missing table")?
                 .iter()
-                .any(|candidate| candidate[key] == entry[key] && candidate == entry)
+                .any(|candidate| candidate[key] == entry[key] && compatible_entry(table, entry, candidate))
             {
                 return Err(format!("changed existing {table} entry").into());
             }
@@ -330,6 +330,36 @@ fn append_compatible() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap()
             .push(json!({"file":file,"kind":"dto","schema":entry.name,"expected":support::describe(&value)}));
     }
+    for (name, values) in registry::ENUMS {
+        for (id, _) in *values {
+            let file = format!("enum-{name}-{id}.hex");
+            if directory.join(&file).exists() {
+                continue;
+            }
+            let value = RawValue::Uint(u64::from(*id));
+            append_value(&directory, &mut manifest, &file, "enum", name, value)?;
+        }
+    }
+    // Explicit forward-compatibility witness: the released retaining Facts
+    // decoder must preserve both the new token and the new owner option.
+    let file = "dto-DeviceFacts-layout-profiles.hex";
+    if !directory.join(file).exists() {
+        let mut facts = support::sample_named("DeviceFacts");
+        facts.insert(22, RawValue::Text("synthetic-native-token".into()));
+        let mut preference = support::sample_named("DevicePreference");
+        preference.insert(1, RawValue::Uint(21));
+        preference.insert(3, RawValue::Bool(true));
+        facts.insert(18, RawValue::Array(vec![RawValue::Map(preference)]));
+        registry::validate_schema("DeviceFacts", &facts)?;
+        append_value(
+            &directory,
+            &mut manifest,
+            file,
+            "dto",
+            "DeviceFacts",
+            RawValue::Map(facts),
+        )?;
+    }
     manifest["schema_sha256"] = support::schema_hash().into();
     std::fs::write(
         directory.join("schema.json"),
@@ -340,4 +370,79 @@ fn append_compatible() -> Result<(), Box<dyn std::error::Error>> {
         format!("{}\n", serde_json::to_string_pretty(&manifest)?),
     )?;
     Ok(())
+}
+
+fn compatible_entry(table: &str, old: &serde_json::Value, new: &serde_json::Value) -> bool {
+    let mut projected = new.clone();
+    let (before, after) = match table {
+        "messages" => (&old["schema"], &mut projected["schema"]),
+        "schemas" => (old, &mut projected),
+        _ => return old == new,
+    };
+    let (Some(a), Some(b)) = (before["fields"].as_array(), after["fields"].as_array()) else {
+        return false;
+    };
+    let max = a.iter().filter_map(|f| f["key"].as_u64()).max().unwrap_or(0);
+    let mut seen = std::collections::BTreeSet::new();
+    for field in b {
+        let Some(key) = field["key"].as_u64() else { return false };
+        if !seen.insert(key) {
+            return false;
+        }
+        match a.iter().find(|f| f["key"] == key) {
+            Some(previous) if previous == field => {}
+            None if key > max && field["absence"] != "required" => {}
+            _ => return false,
+        }
+    }
+    if a.iter().any(|f| !b.contains(f)) {
+        return false;
+    }
+    after["fields"] = before["fields"].clone();
+    &projected == old
+}
+
+fn append_value(
+    directory: &std::path::Path,
+    manifest: &mut serde_json::Value,
+    file: &str,
+    kind: &str,
+    schema: &str,
+    value: RawValue,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(directory.join(file))?;
+    writeln!(output, "{}", support::hex(&value.encode(v1::limits::LOW_FRAME)?))?;
+    manifest["fixtures"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"file":file,"kind":kind,"schema":schema,"expected":support::describe(&value)}));
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn optional_appends_preserve_frozen_fields_and_message_admission() {
+        let old = json!({"name":"Example","fields":[{"key":1,"name":"first","shape":"u64","absence":"required"}]});
+        let mut next = old.clone();
+        next["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"key":2,"name":"extra","shape":"Option<u64>","absence":"optional"}));
+        assert!(compatible_entry("schemas", &old, &next));
+        next["fields"][1]["absence"] = "required".into();
+        assert!(!compatible_entry("schemas", &old, &next));
+        next = old.clone();
+        next["fields"][0]["shape"] = "u32".into();
+        assert!(!compatible_entry("schemas", &old, &next));
+        let old = json!({"id":1,"schema":old,"capabilities":["original"],"routes":[2]});
+        let mut next = old.clone();
+        next["routes"] = json!([0]);
+        assert!(!compatible_entry("messages", &old, &next));
+    }
 }

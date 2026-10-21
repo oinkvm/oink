@@ -121,6 +121,85 @@ fn publish_facts_barrier(owner: &mut Owner) -> ApiResult<u64> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arrangement_result_fences_only_facts_sent_before_its_ack() {
+    let nodes = start(same_group(2)).await;
+    assert!(until(|| ready(&nodes)).await);
+    for node in &nodes {
+        node.group.hold_periodic_facts();
+    }
+    let origin = nodes[0].identity.id();
+    let peer = nodes[1].identity.id();
+    let published = nodes[0].group.call(publish_facts_barrier).unwrap();
+    assert!(
+        until(|| nodes[1].group.members().members.iter().any(|m| {
+            m.device == origin
+                && m.facts
+                    .as_ref()
+                    .is_some_and(|f| f.fact_sequence().is_ok_and(|s| s >= published))
+        }))
+        .await
+    );
+    // A local projection can observe a newer RTT/route and advance Facts without
+    // broadcasting. Force that gap; no periodic send may accidentally repair it.
+    nodes[0]
+        .group
+        .call(|owner| {
+            let next = owner.local.value().fact_sequence().map_err(internal)? + 1;
+            owner
+                .local
+                .edit(|raw| {
+                    raw.insert(2, next.write());
+                    Ok(())
+                })
+                .map_err(internal)?;
+            owner.publish()
+        })
+        .unwrap();
+    let mut changes = nodes[1].group.subscribe();
+    let result = dto::LayoutArrangementResult::from_raw(
+        [
+            (1, RawValue::Bytes(vec![19; 16])),
+            (2, wire::boot(nodes[0].links.boot()).write()),
+            (3, crate::layout_profiles::native::FAILED.write()),
+            (5, RawValue::from("os_apply_failed")),
+            (6, RawValue::Array(Vec::new())),
+        ]
+        .into(),
+    )
+    .unwrap();
+    let result = nodes[0].group.fence_arrangement_result(result).unwrap();
+    let fenced = result.fact_sequence().unwrap().unwrap();
+    assert!(fenced > published);
+    nodes[0]
+        .group
+        .send_device_control(peer, Message::LayoutArrangementResult(result))
+        .unwrap();
+    // Real C0 delivery of the ack is the barrier. Periodic publication is held
+    // and this fixture sends no more Facts; no sleep can repair the missing send.
+    let received = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(ConfigChange::DeviceControl {
+                message: Message::LayoutArrangementResult(_),
+                ..
+            }) = changes.next().await
+            {
+                return nodes[1]
+                    .group
+                    .call(move |owner| Ok(owner.facts.get(&origin).unwrap().fact_sequence().unwrap()))
+                    .unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    stop(&nodes).await;
+    assert!(
+        received >= fenced,
+        "ack fenced unpublished Facts: received={received}, fenced={fenced}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admitted_member_can_repeat_signed_history_while_readmission_is_pending() {
     repeat_signed_history(false).await;
 }

@@ -2650,6 +2650,44 @@ fn transfer_local_target_is_excluded_and_bundle_projection_excludes_file_identit
 }
 
 #[test]
+fn external_input_counters_reject_content_and_identity_even_as_numeric_fields() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let temp = tempfile::tempdir().unwrap();
+    let r = isolated(temp.path().into(), DeviceId([81; 32]), Some(GroupId([82; 16])), true).unwrap();
+    r.wait_recovery();
+    let subscriber = tracing_subscriber::registry().with(trace::scoped(&r));
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::info!(target: "oink_windows_external_input", move_count=3_u64, key_down=2_u64,
+            button_up=1_u64, local=6_u64, lower_il=0_u64, remote=true, raw_clip_active=false,
+            vk=987654321_u64, scan=987654321_u64, extra=987654321_u64, x=987654321_u64,
+            kind="SECRET-EXTERNAL-INPUT", name="SECRET-EXTERNAL-INPUT", reason="SECRET-EXTERNAL-INPUT",
+            private_debug=?"SECRET-EXTERNAL-INPUT", "SECRET-EXTERNAL-INPUT");
+    });
+    let bundle = r.save(Reason::Manual).unwrap();
+    let rows = timeline(&bundle.path, "merged.ndjson");
+    let log = rows
+        .iter()
+        .filter_map(|row| row["event"].get("Log"))
+        .find(|log| log["module"] == "oink_windows_external_input")
+        .unwrap();
+    let text = log.to_string();
+    assert!(text.contains("move_count"));
+    assert!(text.contains("key_down"));
+    assert!(text.contains("button_up"));
+    assert!(text.contains("raw_clip_active"));
+    assert!(!text.contains("987654321"));
+    assert!(!text.contains("SECRET-EXTERNAL-INPUT"));
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&bundle.path).unwrap()).unwrap();
+    for i in 0..zip.len() {
+        let mut text = String::new();
+        zip.by_index(i).unwrap().read_to_string(&mut text).unwrap();
+        assert!(!text.contains("987654321"));
+        assert!(!text.contains("SECRET-EXTERNAL-INPUT"));
+    }
+    r.shutdown();
+}
+
+#[test]
 fn recorder_control_changes_notify_without_a_statistics_tick() {
     let temp = tempfile::tempdir().unwrap();
     let recorder = Recorder::start(temp.path().into(), DeviceId([91; 32]), None, true).unwrap();

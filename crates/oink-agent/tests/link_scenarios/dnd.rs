@@ -30,6 +30,33 @@ struct Drag {
     dropped: Arc<std::sync::atomic::AtomicU64>,
     critical_us: Arc<Mutex<Vec<u64>>>,
     start_gate: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+    begin_return: Arc<Mutex<Option<BoundaryGate>>>,
+    resume_return: Arc<Mutex<Option<BoundaryGate>>>,
+    unprobe_return: Arc<Mutex<Option<BoundaryGate>>>,
+}
+struct BoundaryGate {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+fn stop_at_boundary(slot: &Mutex<Option<BoundaryGate>>) {
+    if let Some(gate) = slot.lock().unwrap().take() {
+        gate.entered.send(()).unwrap();
+        let _ = gate.release.recv();
+    }
+}
+fn boundary(slot: &Mutex<Option<BoundaryGate>>) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered, reached) = std::sync::mpsc::channel();
+    let (release, waiting) = std::sync::mpsc::channel();
+    *slot.lock().unwrap() = Some(BoundaryGate {
+        entered,
+        release: waiting,
+    });
+    (reached, release)
+}
+async fn reached(receiver: std::sync::mpsc::Receiver<()>) {
+    tokio::task::spawn_blocking(move || receiver.recv().unwrap())
+        .await
+        .unwrap();
 }
 impl DndBackend for Drag {
     fn source_image(&self) -> Option<oink_foundation::dnd::DragImage> {
@@ -95,6 +122,7 @@ impl DndBackend for Drag {
     }
     fn unprobe(&self) {
         self.probing.store(false, std::sync::atomic::Ordering::Release);
+        stop_at_boundary(&self.unprobe_return);
         *self.probe_operation.lock().unwrap() = None;
     }
     fn unprobe_source(&self, operation: DragOperation) {
@@ -121,6 +149,7 @@ impl DndBackend for Drag {
         self.unprobe();
         self.calls.lock().unwrap().push("resume");
         *self.offer.lock().unwrap() = Some(self.native_items.lock().unwrap().clone());
+        stop_at_boundary(&self.resume_return);
         true
     }
     fn finish_source(
@@ -191,6 +220,7 @@ impl DndBackend for Drag {
             return Err(ClipboardError::Platform("source press missed 48px window".into()));
         }
         *self.began.lock().unwrap() = Some(spec);
+        stop_at_boundary(&self.begin_return);
         Ok(())
     }
     fn cancel(&self) -> bool {
@@ -612,7 +642,9 @@ async fn fast_motion_between_start_window_and_press_cannot_lose_drag_scenario() 
         .unwrap();
     let next = events[down + 1..].iter().find_map(InjectEvent::move_target).unwrap();
     assert!(
-        (next.x - (at.x + 125.)).abs() < 0.01,
+        // The 120 units sent during SourceStart were discarded, including in
+        // Router prediction. Only this post-press 5-unit motion may advance it.
+        (next.x - (at.x + 5.)).abs() < 0.01,
         "first absolute motion landed at {next:?}"
     );
     a.node.shutdown().await;
@@ -680,7 +712,33 @@ fn file_recross_after_abandoned_probe_with_target_input_releases_current_host() 
     );
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecrossBoundary {
+    Begin,
+    Resume,
+    Unprobe,
+}
+#[test]
+fn recross_before_native_boundary_completion_preserves_next_probe() {
+    common::watchdog::run(
+        module_path!(),
+        "recross_before_native_boundary_completion_preserves_next_probe",
+        Some(10),
+        async {
+            for gate in [
+                RecrossBoundary::Begin,
+                RecrossBoundary::Resume,
+                RecrossBoundary::Unprobe,
+            ] {
+                file_recross_with_boundary(true, true, Some(gate)).await;
+            }
+        },
+    );
+}
 async fn file_recross_preserves_current_capture(target_input: bool, abandon_probe: bool) {
+    file_recross_with_boundary(target_input, abandon_probe, None).await;
+}
+async fn file_recross_with_boundary(target_input: bool, abandon_probe: bool, gate: Option<RecrossBoundary>) {
     let root = tempfile::tempdir().unwrap();
     let (c, a, source, target) = drag_pair(root.path()).await;
     let placements = [&c, &a]
@@ -715,24 +773,83 @@ async fn file_recross_preserves_current_capture(target_input: bool, abandon_prob
         local_path: Some(path),
     }])]);
     button(&input.input, true);
+    let mut next_cross_issued = false;
     for crossing in 0..3 {
+        if gate.is_some() {
+            for device in [&c, &a] {
+                let cards = device.node.device_cards().unwrap();
+                assert_eq!(
+                    cards
+                        .cards
+                        .iter()
+                        .find(|card| card.is_self)
+                        .unwrap()
+                        .status
+                        .as_ref()
+                        .unwrap()
+                        .mouse
+                        .configured_mode,
+                    Some(oink_agent::device_cards::SharingMode::Shared)
+                );
+                assert!(
+                    device
+                        .node
+                        .link_config()
+                        .unwrap()
+                        .router_layout()
+                        .load()
+                        .topology
+                        .topology()
+                        .screens()
+                        .iter()
+                        .all(|s| s.enabled)
+                );
+            }
+        }
+        let begin_gate =
+            (crossing == 0 && gate == Some(RecrossBoundary::Begin)).then(|| boundary(&target.begin_return));
+        let mut return_issued = false;
         // Real routing, glue, action queue and network; the native model gives
         // each catcher re-entry a fresh operation, as AppKit/OLE do after resume.
-        os_move_xy(&input.input, 0., -5000.);
-        common::watchdog::until("recross Begin or native hold failure", || {
-            target.began.lock().unwrap().is_some() || source.calls.lock().unwrap().contains(&"hold_failed")
-        })
-        .await;
-        assert!(
-            target.began.lock().unwrap().is_some(),
-            "crossing {crossing}: old capture cleanup removed the new catcher"
-        );
+        common::phase(&format!("recross {crossing} {gate:?}: edge push"));
+        if !std::mem::take(&mut next_cross_issued) {
+            os_move_xy(&input.input, 0., -5000.);
+        }
+        if let Some((entered, release)) = begin_gate {
+            reached(entered).await;
+            assert!(target.began.lock().unwrap().is_some());
+            os_move_xy(&input.input, 0., 5000.);
+            return_issued = true;
+            release.send(()).unwrap();
+        }
+        if !return_issued {
+            common::watchdog::until(
+                &format!("recross {crossing} {gate:?}: Begin or native hold failure"),
+                || target.began.lock().unwrap().is_some() || source.calls.lock().unwrap().contains(&"hold_failed"),
+            )
+            .await;
+            assert!(
+                target.began.lock().unwrap().is_some(),
+                "crossing {crossing}: old capture cleanup removed the new catcher"
+            );
+        }
         assert!(
             source.began.lock().unwrap().is_none(),
             "source must resume its original native drag"
         );
         if crossing < 2 {
-            os_move_xy(&input.input, 0., 5000.);
+            let resume_gate =
+                (crossing == 0 && gate == Some(RecrossBoundary::Resume)).then(|| boundary(&source.resume_return));
+            if !return_issued {
+                os_move_xy(&input.input, 0., 5000.);
+            }
+            let mut early_probe = None;
+            if let Some((entered, release)) = resume_gate {
+                reached(entered).await;
+                early_probe = Some(source.offer.lock().unwrap().take().unwrap());
+                os_move_xy(&input.input, 0., -5000.);
+                release.send(()).unwrap();
+            }
             common::watchdog::until("original native drag resumed", || {
                 source.calls.lock().unwrap().iter().filter(|&&c| c == "resume").count() == crossing + 1
             })
@@ -742,20 +859,38 @@ async fn file_recross_preserves_current_capture(target_input: bool, abandon_prob
             if abandon_probe {
                 // Model moving away before the native catcher reports a new
                 // capture. The original drag and physical DOWN remain live.
-                let items = source.offer.lock().unwrap().take().unwrap();
-                os_move_xy(&input.input, 0., -5000.);
+                let items = if let Some(items) = early_probe {
+                    items
+                } else {
+                    let items = source.offer.lock().unwrap().take().unwrap();
+                    os_move_xy(&input.input, 0., -5000.);
+                    items
+                };
                 common::watchdog::until("probe awaiting native detection", || {
                     source.probing.load(std::sync::atomic::Ordering::Acquire)
                 })
                 .await;
+                let unprobe_gate =
+                    (crossing == 0 && gate == Some(RecrossBoundary::Unprobe)).then(|| boundary(&source.unprobe_return));
                 os_move_xy(&input.input, 0., 120.);
-                common::watchdog::until("probe abandoned before detection", || {
-                    !source.probing.load(std::sync::atomic::Ordering::Acquire)
-                })
-                .await;
-                assert!(source.native.lock().unwrap().is_some());
-                assert!(target.began.lock().unwrap().is_none());
-                *source.offer.lock().unwrap() = Some(items);
+                let mut restored = false;
+                if let Some((entered, release)) = unprobe_gate {
+                    reached(entered).await;
+                    *source.offer.lock().unwrap() = Some(items.clone());
+                    restored = true;
+                    os_move_xy(&input.input, 0., -5000.);
+                    next_cross_issued = true;
+                    release.send(()).unwrap();
+                }
+                if !restored {
+                    common::watchdog::until("probe abandoned before detection", || {
+                        !source.probing.load(std::sync::atomic::Ordering::Acquire)
+                    })
+                    .await;
+                    assert!(source.native.lock().unwrap().is_some());
+                    assert!(target.began.lock().unwrap().is_none());
+                    *source.offer.lock().unwrap() = Some(items);
+                }
             }
         }
     }

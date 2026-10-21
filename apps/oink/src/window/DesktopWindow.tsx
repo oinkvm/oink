@@ -26,6 +26,7 @@ export interface DesktopWindowProps {
     onActivate: () => void;
     navOpen: boolean;
     onToggleNav: () => void;
+    onSideBlank?: () => void;
     nav: (collapsed: boolean) => ReactNode;
     onSideAction?: (action: SideAction) => void;
     pages?: Partial<Record<SideAction, boolean>>;
@@ -80,7 +81,7 @@ function useNavCollapse(open: boolean) {
     };
     return { collapsed, onTransitionEnd };
 }
-export const DesktopWindow = forwardRef<HTMLDivElement, DesktopWindowProps>(function DesktopWindow({ platform, state, active, title, onMinimize, onToggleMaximize, onClose, onActivate, navOpen, onToggleNav, nav, onSideAction, pages = {}, navBack, sideExtra, version, titleCenter, titleEnd, cover, covered = false, coverBar, children }, ref) {
+export const DesktopWindow = forwardRef<HTMLDivElement, DesktopWindowProps>(function DesktopWindow({ platform, state, active, title, onMinimize, onToggleMaximize, onClose, onActivate, navOpen, onToggleNav, onSideBlank, nav, onSideAction, pages = {}, navBack, sideExtra, version, titleCenter, titleEnd, cover, covered = false, coverBar, children }, ref) {
     const navState = useNavCollapse(navOpen);
     const [expanding, setExpanding] = useState(false);
     const wasOpen = useRef(navOpen);
@@ -127,7 +128,7 @@ export const DesktopWindow = forwardRef<HTMLDivElement, DesktopWindowProps>(func
             : <WinTitlebar state={state} onMinimize={onMinimize} onToggleMaximize={onToggleMaximize} onClose={onClose} extra={navBack ? backBar(navBack) : <>{navToggle}<Lockup /></>} center={center} end={titleEnd} coverBar={coverBar}/>}
       <div className="win__body" inert={covered}>
         
-        <aside id="win-nav" className="win__side" data-open={navOpen ? '' : undefined} data-expanding={expanding ? '' : undefined} onTransitionEnd={(e) => { navState.onTransitionEnd(e); if (navOpen && e.propertyName === 'width' && e.target === e.currentTarget)
+        <aside id="win-nav" className="win__side" onClick={e => { if (!(e.target as Element).closest('button, a, input, label, [role="slider"], [role="radio"], [data-ctx]')) onSideBlank?.(); }} data-open={navOpen ? '' : undefined} data-expanding={expanding ? '' : undefined} onTransitionEnd={(e) => { navState.onTransitionEnd(e); if (navOpen && e.propertyName === 'width' && e.target === e.currentTarget)
         setExpanding(false); }}>
           <div className="win__side-scroll">
             

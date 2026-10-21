@@ -52,6 +52,9 @@ pub enum StreamKind {
     Cache = 11,
     /// P0: ephemeral layout previews and non-activating physical edit handles.
     Projection = 12,
+    /// Capability-gated companion layout-profile configuration snapshots.
+    LayoutProfiles = 13,
+    LayoutProfilesV2 = 14,
 }
 
 impl StreamKind {
@@ -69,6 +72,8 @@ impl StreamKind {
             10 => Self::Dnd,
             11 => Self::Cache,
             12 => Self::Projection,
+            13 => Self::LayoutProfiles,
+            14 => Self::LayoutProfilesV2,
             _ => return None,
         })
     }

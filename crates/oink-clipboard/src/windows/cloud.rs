@@ -24,6 +24,10 @@ use windows_sys::Win32::{
     System::LibraryLoader::*,
 };
 
+mod received;
+pub(crate) use received::{open_received, received_usage};
+type Pin = unsafe extern "system" fn(HANDLE, i32, i32, *mut windows_sys::Win32::System::IO::OVERLAPPED) -> i32;
+type Info = unsafe extern "system" fn(HANDLE, i32, *mut c_void, u32, *mut u32) -> i32;
 type Register = unsafe extern "system" fn(*const u16, *const CF_SYNC_REGISTRATION, *const CF_SYNC_POLICIES, i32) -> i32;
 type Connect = unsafe extern "system" fn(
     *const u16,
@@ -42,7 +46,10 @@ struct Api {
     register: Register,
     connect: Connect,
     disconnect: Disconnect,
+    #[allow(dead_code)]
     unregister: Unregister,
+    pin: Pin,
+    info: Info,
     create: Create,
     execute: Execute,
     progress: Progress,
@@ -93,6 +100,8 @@ impl Api {
                 return Err(code & 0xffff);
             }
             Ok(Arc::new(Api {
+                pin: function!("CfSetPinState", Pin),
+                info: function!("CfGetPlaceholderInfo", Info),
                 register: function!("CfRegisterSyncRoot", Register),
                 connect: function!("CfConnectSyncRoot", Connect),
                 disconnect: function!("CfDisconnectSyncRoot", Disconnect),
@@ -246,6 +255,7 @@ impl Offer {
 }
 
 struct Delivery {
+    id: u64,
     path: PathBuf,
     roots: Vec<PathBuf>,
     entries: Vec<FileEntry>,
@@ -263,12 +273,13 @@ impl Delivery {
     fn file_path(&self, index: usize) -> PathBuf {
         self.path.join(super::files::descriptor_path(&self.entries[index].path))
     }
-    fn remove_withdrawn(&self) {
+    fn remove_withdrawn(&self, service: &Service) {
         // An application's handle may deny deletion until its failed read closes.
         // Keep the tombstone and retry cleanup without allowing another fetch.
         for (index, deleted) in self.deleted.iter().enumerate() {
-            if deleted.load(Ordering::Acquire) {
-                let _ = std::fs::remove_file(self.file_path(index));
+            let path = self.file_path(index);
+            if deleted.load(Ordering::Acquire) && service.native_identity_matches(&path, self.id, index) {
+                let _ = std::fs::remove_file(path);
             }
         }
     }
@@ -320,6 +331,8 @@ struct Work {
     request: Arc<Request>,
 }
 pub(super) struct Service {
+    received: Mutex<received::Journal>,
+    reader_classes: HashMap<String, crate::received::Reader>,
     api: Arc<Api>,
     root: PathBuf,
     owners: AtomicUsize,
@@ -368,27 +381,12 @@ impl Service {
         if String::from_utf16_lossy(&filesystem[..filesystem.iter().position(|u| *u == 0).unwrap_or(0)]) != "NTFS" {
             return Err(io::Error::from_raw_os_error(ERROR_NOT_SUPPORTED as i32));
         }
-        if root.exists() {
-            if crate::cache::is_link(&std::fs::symlink_metadata(&root)?) {
-                return Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
-            }
-            // A previous backend may have crashed. Unregister first: unhydrated
-            // placeholders are removed and hydrated ones become ordinary files.
-            // SAFETY: the owned path is terminated and lives through this call.
-            let code = unsafe { (api.unregister)(wide(&root).as_ptr()) };
-            if code < 0
-                && ![
-                    ERROR_NOT_A_CLOUD_SYNC_ROOT,
-                    ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT,
-                    ERROR_NOT_A_CLOUD_FILE,
-                ]
-                .contains(&((code & 0xffff) as u32))
-            {
-                hr(code)?;
-            }
-            std::fs::remove_dir_all(&root)?;
+        let existed = root.exists();
+        if existed && !received::valid_root(&root)? {
+            return Err(io::ErrorKind::PermissionDenied.into());
         }
-        std::fs::create_dir(&root)?;
+        std::fs::create_dir_all(&root)?;
+        let journal = received::Journal::load(&root)?;
         let provider = wide("Oink");
         let version = wide("1");
         let registration = CF_SYNC_REGISTRATION {
@@ -414,9 +412,22 @@ impl Service {
             ..Default::default()
         };
         // SAFETY: registration, policies and their UTF-16 strings remain live.
-        hr(unsafe { (api.register)(wide(&root).as_ptr(), &registration, &policies, CF_REGISTER_FLAG_NONE) })?;
+        hr(unsafe {
+            (api.register)(
+                wide(&root).as_ptr(),
+                &registration,
+                &policies,
+                if existed {
+                    CF_REGISTER_FLAG_UPDATE
+                } else {
+                    CF_REGISTER_FLAG_NONE
+                },
+            )
+        })?;
         let (jobs, receiver) = mpsc::channel::<Work>();
         let service = Arc::new_cyclic(|weak| Self {
+            received: Mutex::new(journal),
+            reader_classes: received::reader_classes(),
             api,
             root,
             owners: AtomicUsize::new(1),
@@ -447,6 +458,22 @@ impl Service {
                 Callback: Some(closed),
             },
             CF_CALLBACK_REGISTRATION {
+                Type: CF_CALLBACK_TYPE_NOTIFY_RENAME,
+                Callback: Some(received::renaming),
+            },
+            CF_CALLBACK_REGISTRATION {
+                Type: CF_CALLBACK_TYPE_NOTIFY_RENAME_COMPLETION,
+                Callback: Some(received::renamed),
+            },
+            CF_CALLBACK_REGISTRATION {
+                Type: CF_CALLBACK_TYPE_NOTIFY_DELETE,
+                Callback: Some(deleting),
+            },
+            CF_CALLBACK_REGISTRATION {
+                Type: CF_CALLBACK_TYPE_NOTIFY_DELETE_COMPLETION,
+                Callback: Some(deleted),
+            },
+            CF_CALLBACK_REGISTRATION {
                 Type: CF_CALLBACK_TYPE_NONE,
                 Callback: None,
             },
@@ -466,6 +493,7 @@ impl Service {
             )
         })?;
         *service.connection.lock().unwrap() = Some(key);
+        service.recover_received()?;
         let receiver = Arc::new(Mutex::new(receiver));
         for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()) {
             let receiver = receiver.clone();
@@ -510,7 +538,30 @@ impl Service {
         let mut random = [0u8; 8];
         getrandom::fill(&mut random).map_err(|error| io::Error::other(error.to_string()))?;
         let id = u64::from_le_bytes(random);
-        let path = self.root.join(format!("{id:016x}"));
+        let origin = contents
+            .namespace()
+            .and_then(|n| n.origin())
+            .unwrap_or(oink_foundation::DeviceId([0; 32]));
+        let name = crate::received::source_folder(
+            self.root.parent().unwrap(),
+            origin,
+            &crate::received::source_name(origin),
+        )?;
+        let source = self.root.join(name);
+        let source_id = u64::from_le_bytes(origin.0[..8].try_into().unwrap());
+        if !source.exists() {
+            match self.create_container(&source, source_id) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if !cfg!(test) && !self.owned_container(&source, source_id)? {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        let path = crate::received::allocate_batch_with(&source, &crate::received::local_stamp(), |path| {
+            self.create_container(path, id)
+        })?;
         let mut names = HashSet::new();
         let mut roots = Vec::new();
         for entry in &entries {
@@ -526,7 +577,7 @@ impl Service {
                 roots.push(path.join(name));
             }
         }
-        std::fs::create_dir(&path)?;
+
         let result = (|| {
             // Parent directories precede their children even for flat providers
             // whose descriptor table is not in traversal order.
@@ -614,6 +665,7 @@ impl Service {
             })
             .collect();
         let delivery = Arc::new(Delivery {
+            id,
             selected,
             opens,
             deleted,
@@ -625,6 +677,39 @@ impl Service {
             created,
             readers: AtomicUsize::new(0),
         });
+        {
+            let mut journal = self.received.lock().unwrap();
+            journal.deliveries.insert(
+                id,
+                delivery
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| received::Node {
+                        path: delivery.file_path(i).strip_prefix(&self.root).unwrap().into(),
+                        life: crate::received::Item::new(crate::received::now()),
+                        directory: e.is_dir,
+                        deleted: false,
+                        handed_off: e.size == 0,
+                        length: e.size,
+                    })
+                    .collect(),
+            );
+            if journal.pending_gaps.remove(&id) {
+                for node in journal.deliveries.get_mut(&id).unwrap() {
+                    node.life.gap(crate::received::now());
+                }
+            }
+            journal.save(&self.root)?;
+        }
+        for (index, entry) in delivery
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.is_dir && e.size == 0)
+        {
+            self.native_complete(id, index, entry.size);
+        }
         self.deliveries.lock().unwrap().insert(id, delivery.clone());
         tracing::info!(target: "oink_file_diagnostics", file_stage = 1_u8,
             count = delivery.entries.len(), "cloud file placeholders published");
@@ -662,6 +747,7 @@ impl Service {
                 }
             }
         }
+        self.received_sweep();
         self.sweep(Instant::now());
     }
     fn sweep(&self, now: Instant) {
@@ -673,8 +759,26 @@ impl Service {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => false,
                 Err(_) => true,
             });
+        let protected: std::collections::HashSet<_> = self
+            .received
+            .lock()
+            .unwrap()
+            .deliveries
+            .iter()
+            .filter(|(_, nodes)| {
+                nodes
+                    .iter()
+                    .any(|n| !n.directory && !n.deleted && (n.handed_off || n.life.materialized))
+            })
+            .map(|(id, _)| *id)
+            .collect();
         self.deliveries.lock().unwrap().retain(|_, delivery| {
-            delivery.remove_withdrawn();
+            delivery.remove_withdrawn(self);
+            // User OS copies survive transfer expiry. Native deletion and the
+            // received policy operate per file before empty tree retirement.
+            if protected.contains(&delivery.id) {
+                return !delivery.expired() || delivery.active_reads() > 0;
+            }
             let remove = cloud_files::retire(
                 if delivery.expired() {
                     cloud_files::RETENTION_SECS
@@ -688,14 +792,10 @@ impl Service {
             if !remove {
                 return true;
             }
-            match std::fs::remove_dir_all(&delivery.path) {
-                Ok(()) => false,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-                Err(error) => {
-                    tracing::debug!(code = error.raw_os_error(), "cloud file cleanup deferred");
-                    true
-                }
-            }
+            // Retire only the transfer owner. The independent journal checks
+            // each OS identity, removes stale placeholders and prunes empty
+            // directories; never recursively delete a user-visible batch.
+            false
         });
     }
 }
@@ -716,24 +816,12 @@ impl Service {
                 tracing::warn!(code = code as u32, "cloud file disconnect failed");
             }
         }
-        // Backend ownership, not retained native objects or blocked network
-        // workers, determines shutdown. The boxed callback context stays alive
-        // until all those references finish; stale workers cannot unregister a
-        // later provider because this transition runs only once.
-        // SAFETY: native callbacks are disconnected and this is our live path.
-        let code = unsafe { (self.api.unregister)(wide(&self.root).as_ptr()) };
-        if code >= 0 {
-            if let Err(error) = std::fs::remove_dir_all(&self.root)
-                && error.kind() != io::ErrorKind::NotFound
-            {
-                tracing::warn!(
-                    code = error.raw_os_error(),
-                    "cloud file shutdown cleanup deferred until startup"
-                );
-            }
-        } else {
-            tracing::warn!(code = code as u32, "cloud file unregister failed");
+        // Registration and fully hydrated pinned files outlive this backend.
+        let mut journal = self.received.lock().unwrap();
+        for node in journal.deliveries.values_mut().flatten() {
+            node.life.gap(crate::received::now());
         }
+        let _ = journal.save(&self.root);
     }
 }
 impl Drop for Service {
@@ -862,8 +950,8 @@ unsafe fn observed_handle(info: &CF_CALLBACK_INFO, open: bool, deleted: bool) {
     // our own metadata/cleanup handles as consumers or log process identities.
     // SAFETY: process info and context belong to this registered callback.
     unsafe {
-        if info.ProcessInfo.is_null()
-            || (*info.ProcessInfo).ProcessId == windows::Win32::System::Threading::GetCurrentProcessId()
+        if !info.ProcessInfo.is_null()
+            && (*info.ProcessInfo).ProcessId == windows::Win32::System::Threading::GetCurrentProcessId()
         {
             return;
         }
@@ -876,6 +964,31 @@ unsafe fn observed_handle(info: &CF_CALLBACK_INFO, open: bool, deleted: bool) {
         let bytes = std::slice::from_raw_parts(info.FileIdentity.cast::<u8>(), 16);
         let id = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         let index = u64::from_le_bytes(bytes[8..].try_into().unwrap()) as usize;
+        // Stable source/batch containers are not content readers. Their delete
+        // and rename completions are handled separately by path.
+        if index == usize::MAX {
+            return;
+        }
+        let reader = if info.ProcessInfo.is_null() || (*info.ProcessInfo).ImagePath.is_null() {
+            crate::received::Reader::Unknown
+        } else {
+            let pointer = (*info.ProcessInfo).ImagePath;
+            let mut length = 0;
+            while length < 32768 && *pointer.add(length) != 0 {
+                length += 1;
+            }
+            let image = String::from_utf16_lossy(std::slice::from_raw_parts(pointer, length)).to_lowercase();
+            service
+                .reader_classes
+                .get(&image)
+                .copied()
+                .unwrap_or(if image == "unknown" {
+                    crate::received::Reader::Unknown
+                } else {
+                    crate::received::Reader::App
+                })
+        };
+        service.received_observe(id, index, reader, open, deleted);
         let deliveries = service.deliveries.lock().unwrap();
         let Some(delivery) = deliveries
             .get(&id)
@@ -894,6 +1007,35 @@ unsafe fn observed_handle(info: &CF_CALLBACK_INFO, open: bool, deleted: bool) {
                 delivery.deleted[index].store(true, Ordering::Release);
             }
         }
+    }
+}
+unsafe extern "system" fn deleting(info: *const CF_CALLBACK_INFO, _: *const CF_CALLBACK_PARAMETERS) {
+    // SAFETY: callback pointers and context are owned by cfapi for this call.
+    unsafe {
+        let i = &*info;
+        let Some(service) = (&*i.CallbackContext.cast::<Weak<Service>>()).upgrade() else {
+            return;
+        };
+        let mut op = operation(i.ConnectionKey, i.TransferKey, i.RequestKey);
+        op.Type = CF_OPERATION_TYPE_ACK_DELETE;
+        let mut params = CF_OPERATION_PARAMETERS {
+            ParamSize: (offset_of!(CF_OPERATION_PARAMETERS, Anonymous) + size_of::<CF_OPERATION_PARAMETERS_0_7>())
+                as u32,
+            Anonymous: CF_OPERATION_PARAMETERS_0 {
+                AckDelete: CF_OPERATION_PARAMETERS_0_7 {
+                    Flags: CF_OPERATION_ACK_DELETE_FLAG_NONE,
+                    CompletionStatus: STATUS_SUCCESS,
+                },
+            },
+        };
+        let _ = (service.api.execute)(&op, &mut params);
+    }
+}
+unsafe extern "system" fn deleted(info: *const CF_CALLBACK_INFO, _: *const CF_CALLBACK_PARAMETERS) {
+    // SAFETY: native completion is for the identity provided during publication.
+    unsafe {
+        received::deleted_path(info);
+        observed_handle(&*info, false, true);
     }
 }
 unsafe extern "system" fn cancel(info: *const CF_CALLBACK_INFO, _: *const CF_CALLBACK_PARAMETERS) {
@@ -948,7 +1090,7 @@ impl Work {
                 );
                 if crate::content::reason(&error) == crate::model::Unavailable::NoSuchItem {
                     self.delivery.deleted[self.index].store(true, Ordering::Release);
-                    self.delivery.remove_withdrawn();
+                    self.delivery.remove_withdrawn(&self.service);
                 }
                 tracing::warn!(target: "oink_file_diagnostics", file_stage = 11_u8,
                     file_request = self.id, file_index = self.index,
@@ -1096,6 +1238,8 @@ impl Work {
             offset += count as u64;
             self.request.progress.store(offset, Ordering::Relaxed);
         }
+        self.service
+            .native_complete(self.delivery.id, self.index, metadata.size);
         tracing::info!(target: "oink_file_diagnostics", file_stage = 10_u8,
             file_request = self.id, file_index = self.index, bytes = offset,
             "cloud file hydration completed");
@@ -1138,6 +1282,11 @@ mod tests {
         unsafe {
             let info = &mut *info;
             let path = PathBuf::from(string(parent)).join(string(info.RelativeFileName));
+            if path.exists() {
+                info.Result = 0x800700b7u32 as i32;
+                *count = 0;
+                return info.Result;
+            }
             if info.FsMetadata.BasicInfo.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
                 std::fs::create_dir(path).unwrap();
             } else {
@@ -1205,12 +1354,25 @@ mod tests {
         }
         0
     }
+    unsafe extern "system" fn fake_pin(
+        _: HANDLE,
+        _: i32,
+        _: i32,
+        _: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+    ) -> i32 {
+        0
+    }
+    unsafe extern "system" fn fake_info(_: HANDLE, _: i32, _: *mut c_void, _: u32, _: *mut u32) -> i32 {
+        0x80070178u32 as i32
+    }
     fn fake(root: PathBuf) -> (Arc<Service>, mpsc::Receiver<Work>) {
         FAIL_AFTER.store(-1, Ordering::Relaxed);
         TRANSFERS.lock().unwrap().clear();
         UPDATES.lock().unwrap().clear();
         std::fs::create_dir(&root).unwrap();
         let api = Arc::new(Api {
+            pin: fake_pin,
+            info: fake_info,
             register,
             connect,
             disconnect,
@@ -1222,6 +1384,8 @@ mod tests {
         let (jobs, receiver) = mpsc::channel();
         (
             Arc::new_cyclic(|weak| Service {
+                received: Mutex::default(),
+                reader_classes: HashMap::new(),
                 api,
                 root,
                 owners: AtomicUsize::new(1),
@@ -1353,7 +1517,11 @@ mod tests {
             .publish(vec![entry("file", 10, false)], source.clone(), Instant::now())
             .unwrap();
         request(&service, &delivery, &receiver, 0, false);
-        assert!(!delivery.path.join("file").exists());
+        assert!(delivery.deleted[0].load(Ordering::Acquire));
+        assert!(
+            delivery.path.join("file").exists(),
+            "a native identity query failure preserves the path"
+        );
         assert!(delivery.deleted[0].load(Ordering::Acquire));
         assert!(
             !request(&service, &delivery, &receiver, 0, false),
@@ -1648,6 +1816,68 @@ mod tests {
         }
     }
     #[test]
+    fn materialized_received_policy_survives_expiry_stop_and_reload_without_backing() {
+        let _serial = SERIAL.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (service, _) = fake(temp.path().join("CloudFiles"));
+        let data = Bytes::new(3);
+        let delivery = service
+            .publish(vec![entry("media.bin", 3, false)], data, Instant::now())
+            .unwrap();
+        {
+            let mut journal = service.received.lock().unwrap();
+            let node = &mut journal.deliveries.get_mut(&delivery.id).unwrap()[0];
+            node.life.materialized = true;
+            node.handed_off = true;
+            node.life.observe(crate::received::Reader::App, crate::received::now());
+        }
+        service.sweep(Instant::now() + Duration::from_secs(cloud_files::RETENTION_SECS + 1));
+        assert!(delivery.file_path(0).exists());
+        service.stop();
+        assert!(delivery.file_path(0).exists());
+        let recovered = received::Journal::load(&service.root).unwrap();
+        let node = &recovered.deliveries[&delivery.id][0];
+        assert!(node.life.materialized && node.life.observation_gap);
+        assert!(!node.life.shell_only());
+    }
+    #[test]
+    fn unknown_reader_disqualifies_the_whole_batch_and_system_does_not_renew_usage() {
+        let _serial = SERIAL.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (service, _) = fake(temp.path().join("CloudFiles"));
+        let data = Bytes::new(1);
+        let delivery = service
+            .publish(vec![entry("a", 1, false), entry("b", 1, false)], data, Instant::now())
+            .unwrap();
+        service.received_observe(delivery.id, 0, crate::received::Reader::Unknown, true, false);
+        assert!(
+            service.received.lock().unwrap().deliveries[&delivery.id]
+                .iter()
+                .all(|n| n.life.observation_gap)
+        );
+    }
+    #[test]
+    fn unpaired_close_and_prepublication_reads_create_batch_observation_gaps() {
+        let _serial = SERIAL.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (service, _) = fake(temp.path().join("CloudFiles"));
+        service.received_observe(123, 0, crate::received::Reader::App, true, false);
+        assert!(service.received.lock().unwrap().pending_gaps.contains(&123));
+        let delivery = service
+            .publish(
+                vec![entry("one", 1, false), entry("two", 1, false)],
+                Bytes::new(1),
+                Instant::now(),
+            )
+            .unwrap();
+        service.received_observe(delivery.id, 0, crate::received::Reader::Shell, false, false);
+        assert!(
+            service.received.lock().unwrap().deliveries[&delivery.id]
+                .iter()
+                .all(|n| n.life.observation_gap)
+        );
+    }
+    #[test]
     fn placeholders_are_lazy_hydration_uses_whole_verified_stream_and_consumed_cleanup() {
         let _serial = SERIAL.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -1692,7 +1922,14 @@ mod tests {
         notify(&service, 0, true, false);
         notify(&service, 0, false, true);
         service.maintain();
-        assert!(!path.exists(), "confirmed removed paths retire their catalogue");
+        assert!(
+            service.deliveries.lock().unwrap().is_empty(),
+            "deleted items release their transfer owner"
+        );
+        assert!(
+            path.exists(),
+            "the fake callback does not physically delete native files"
+        );
     }
     #[test]
     fn cancelled_fetch_returns_cloud_error_without_opening_source() {
@@ -1714,7 +1951,7 @@ mod tests {
         );
     }
     #[test]
-    fn creation_failure_rolls_back_and_absolute_retention_ignores_idle_native_owner() {
+    fn creation_failure_keeps_only_source_folder_and_expiry_releases_transfer_owner() {
         let _serial = SERIAL.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let (service, _) = fake(temp.path().join("CloudFiles"));
@@ -1729,7 +1966,12 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(std::fs::read_dir(&service.root).unwrap().count(), 0);
+        let sources: Vec<_> = std::fs::read_dir(&service.root).unwrap().collect();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            std::fs::read_dir(sources[0].as_ref().unwrap().path()).unwrap().count(),
+            0
+        );
         FAIL_AFTER.store(-1, Ordering::Relaxed);
         let delivery = service
             .publish(vec![entry("one", 1, false)], bytes, Instant::now())
@@ -1739,7 +1981,11 @@ mod tests {
         assert!(delivery.path.exists());
         delivery.readers.store(0, Ordering::Release);
         service.sweep(delivery.created + Duration::from_secs(cloud_files::RETENTION_SECS));
-        assert!(!delivery.path.exists());
+        assert!(service.deliveries.lock().unwrap().is_empty());
+        assert!(
+            delivery.path.exists(),
+            "without native identity evidence, never recursively delete received files"
+        );
     }
     #[test]
     fn empty_placeholders_verify_eof_before_publication() {
@@ -1805,7 +2051,7 @@ mod tests {
         let root = service.root.clone();
         drop(owner);
         assert!(service.connection.lock().unwrap().is_none());
-        assert!(!root.exists());
+        assert!(root.exists(), "backend exit retains the registered received root");
         assert!(offer.hdrop().is_err());
         assert_eq!(contents.opens.load(Ordering::Relaxed), 0);
         assert!(receiver.try_recv().is_err());
@@ -2005,7 +2251,19 @@ mod tests {
             }
         }
         drop(service);
-        assert!(!root.exists(), "native version probe must unregister and clean up");
+        assert!(root.exists(), "backend exit preserves received files");
+        cleanup_native_test_root(&root);
+    }
+    // Test domains now require explicit cleanup: production owner shutdown
+    // deliberately preserves registration and received content.
+    fn cleanup_native_test_root(root: &Path) {
+        assert!(root.is_absolute() && root.starts_with(std::env::temp_dir()));
+        assert_eq!(root.file_name().unwrap(), "CloudFiles");
+        let api = Api::load().unwrap();
+        // SAFETY: only this test's dedicated temporary sync root is unregistered.
+        hr(unsafe { (api.unregister)(wide(root).as_ptr()) }).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(!root.exists());
     }
     #[test]
     #[ignore = "requires a standard interactive Windows desktop session"]
@@ -2043,11 +2301,12 @@ mod tests {
         drop(offer);
         let root = service.root.clone();
         drop(service);
-        assert!(!root.exists());
+        assert!(root.exists());
+        cleanup_native_test_root(&root);
     }
     #[test]
     #[ignore = "requires a standard interactive Windows desktop session"]
-    fn native_placeholder_hydrates_in_another_process_and_unregisters() {
+    fn native_placeholder_hydrates_and_survives_owner_restart() {
         let temp = tempfile::tempdir().unwrap();
         let abandoned = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -2062,7 +2321,17 @@ mod tests {
         assert!(abandoned.success());
         assert!(temp.path().join("CloudFiles").exists());
         let service = initialize(temp.path().to_owned()).unwrap();
-        assert_eq!(std::fs::read_dir(&service.root).unwrap().count(), 0);
+        assert!(
+            service
+                .received
+                .lock()
+                .unwrap()
+                .deliveries
+                .values()
+                .flatten()
+                .all(|n| n.directory || n.deleted),
+            "restart removes only the abandoned never-hydrated files"
+        );
         let contents = Bytes::new(131073);
         let root = service.root.clone();
         let offer = Offer::new(vec![entry("file.bin", 131073, false)], contents.clone(), None).unwrap();
@@ -2129,21 +2398,16 @@ mod tests {
             .unwrap();
         assert!(again.success());
         assert_eq!(contents.opens.load(Ordering::Relaxed), 1, "reopen uses hydrated bytes");
-        for _ in 0..50 {
-            service.sweep(Instant::now() + Duration::from_secs(cloud_files::RETENTION_SECS));
-            if !paths[0].exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(!paths[0].exists(), "closed consumers permit deadline cleanup");
+        service.sweep(Instant::now() + Duration::from_secs(cloud_files::RETENTION_SECS));
+        assert!(
+            paths[0].exists(),
+            "application-read materialized files survive cache expiry"
+        );
         drop(service);
-        for _ in 0..50 {
-            if !root.exists() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        panic!("provider root remains after disconnect/unregister");
+        assert!(root.exists(), "normal shutdown preserves the native root");
+        let restarted = initialize(temp.path().to_owned()).unwrap();
+        assert_eq!(std::fs::read(&paths[0]).unwrap().len(), contents.bytes.len());
+        drop(restarted);
+        cleanup_native_test_root(&root);
     }
 }

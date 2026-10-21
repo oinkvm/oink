@@ -50,6 +50,248 @@ async fn start_with_input(dir: &std::path::Path, input: FakeInput) -> Node {
 }
 
 #[test]
+fn layout_profiles_use_the_ui_dispatch_path_over_ipc() {
+    use oink_agent::api::{Request, dispatch};
+    use oink_agent::layout_profiles::types::{Create, LayoutProfilesState};
+    let _scenario = test_watchdog::Scenario::new(module_path!(), "layout_profiles_use_the_ui_dispatch_path_over_ipc");
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let node = rt.block_on(start(dir.path()));
+    let server = rt.block_on(Server::start_on(node.clone(), 0)).unwrap();
+    let remote = RemoteApi::new(dir.path());
+    // Tauri dispatches through RemoteApi; the generic CLI calls Client directly.
+    let query = serde_json::to_value(dispatch(&remote, Request::LayoutProfiles).unwrap()).unwrap();
+    let state: LayoutProfilesState = serde_json::from_value(query.clone())
+        .unwrap_or_else(|error| panic!("UI profile query failed: {error}; reply={query}"));
+    assert!(state.create_enabled);
+    let saved = dispatch(
+        &remote,
+        Request::CreateLayoutProfile(Create {
+            request_id: "ui-save-as".into(),
+            expected_token: state.token,
+            name: "Desk".into(),
+        }),
+    )
+    .unwrap();
+    let saved: LayoutProfilesState = serde_json::from_value(serde_json::to_value(saved).unwrap()).unwrap();
+    assert_eq!(saved.profiles.len(), 2);
+    let direct: LayoutProfilesState = serde_json::from_value(
+        Client::connect(dir.path())
+            .unwrap()
+            .call(Request::LayoutProfiles)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved, direct);
+    rt.block_on(server.close());
+    rt.block_on(node.shutdown());
+    rt.shutdown_timeout(Duration::from_millis(200));
+}
+
+#[derive(Debug)]
+struct RigidDisplays {
+    native_supported: bool,
+    writes: std::sync::atomic::AtomicUsize,
+}
+impl oink_display::DisplayBackend for RigidDisplays {
+    fn displays(&self) -> Result<Vec<DisplayInfo>, oink_display::DisplayError> {
+        Ok(vec![display()])
+    }
+    fn watch(&self, _: oink_display::ChangeHandler) -> Result<(), oink_display::DisplayError> {
+        Ok(())
+    }
+    fn native_configuration(
+        &self,
+    ) -> Result<oink_display::arrangement::NativeConfiguration, oink_display::DisplayError> {
+        if !self.native_supported {
+            return Err(oink_display::DisplayError::Unsupported);
+        }
+        Ok(oink_display::arrangement::NativeConfiguration {
+            displays: vec![oink_display::arrangement::NativeDisplay {
+                key: "main".into(),
+                bounds: display().bounds,
+                primary: true,
+                mirror_of: None,
+                mode: "fixed".into(),
+            }],
+        })
+    }
+    fn apply_native_origins(
+        &self,
+        _: &oink_display::arrangement::NativeConfiguration,
+        _: &[oink_display::arrangement::NativeOrigin],
+    ) -> Result<oink_display::arrangement::NativeConfiguration, oink_display::DisplayError> {
+        self.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(oink_display::DisplayError::Unsupported)
+    }
+}
+
+fn rigid_ui_edit(native_supported: bool) {
+    use oink_agent::api::{Request, dispatch};
+    use oink_agent::layout_profiles::types::*;
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let displays = Arc::new(RigidDisplays {
+        native_supported,
+        writes: Default::default(),
+    });
+    let node = rt
+        .block_on(Node::start_with_fake_platform(NodeOptions {
+            net: oink_test_support::network_config(dir.path().into(), "rigid", 0),
+            input: Arc::new(FakeInput::new()),
+            displays: vec![display()],
+            display_backend: Some(displays.clone()),
+            clipboard: None,
+            mode_switch_in_callback: true,
+            capture_reports_key_repeat: true,
+            cursor_trail: false,
+        }))
+        .unwrap();
+    let server = rt.block_on(Server::start_on(node.clone(), 0)).unwrap();
+    let client = Client::connect(dir.path()).unwrap();
+    let query =
+        || -> LayoutProfilesState { serde_json::from_value(client.call(Request::LayoutProfiles).unwrap()).unwrap() };
+    let state = query();
+    assert!(!state.devices[0].sync_system_arrangement);
+    if !native_supported {
+        assert_eq!(state.devices[0].availability, Availability::Unavailable);
+        // Even an enabled preference cannot turn a rigid edit into a native write.
+        client
+            .call(Request::SetSyncSystemArrangement(SettingRequest {
+                request_id: "enable-unsupported".into(),
+                device: node.id().into(),
+                expected_preference_token: state.devices[0].preference_token.clone(),
+                enabled: true,
+            }))
+            .unwrap();
+    }
+    let state = query();
+    assert_eq!(state.devices[0].sync_system_arrangement, !native_supported);
+    let before = state.snapshot.unwrap();
+    let mut placements = before.placements.clone();
+    placements[0].origin.x += 0.2;
+    let remote = RemoteApi::new(dir.path());
+    // Isolate Commit from the startup query: obtain the token via the CLI path,
+    // then dispatch the edit exactly as Tauri does.
+    let reply = serde_json::to_value(
+        dispatch(
+            &remote,
+            Request::CommitArrangement(CommitRequest {
+                screen_shared: Vec::new(),
+                request_id: "rigid-edit".into(),
+                expected_token: state.token,
+                placements: placements.clone(),
+                native_plan_tokens: vec![],
+                disabled: vec![],
+            }),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let accepted: OperationReply =
+        serde_json::from_value(reply.clone()).unwrap_or_else(|e| panic!("rigid UI commit refused: {e}; {reply}"));
+    let mut settled = None;
+    wait("rigid edit terminal result", || {
+        let value = query();
+        if value
+            .operation
+            .as_ref()
+            .is_some_and(|op| op.id == accepted.operation_id && op.status != OperationStatus::Running)
+        {
+            settled = value.operation;
+            true
+        } else {
+            false
+        }
+    });
+    let op = settled.unwrap();
+    assert_eq!(op.status, OperationStatus::Applied);
+    assert!(op.owners.is_empty());
+    assert!(op.native_restore_devices.is_empty());
+    let after = op.after.unwrap();
+    assert_eq!(after.placements, placements);
+    assert_eq!(after.native.len(), before.native.len());
+    for (actual, original) in after.native.iter().zip(&before.native) {
+        // The background observer may publish its first read-only token during
+        // the edit; origins, primary selection and sizes must remain identical.
+        assert_eq!(actual.device, original.device);
+        assert_eq!(actual.primary, original.primary);
+        assert_eq!(actual.screens, original.screens);
+    }
+    assert_eq!(displays.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    rt.block_on(server.close());
+    rt.block_on(node.shutdown());
+    rt.shutdown_timeout(Duration::from_millis(200));
+}
+
+#[test]
+fn rigid_ui_edit_with_system_arrangement_setting_off() {
+    rigid_ui_edit(true);
+}
+#[test]
+fn rigid_ui_edit_with_unsupported_system_arrangement_writes() {
+    rigid_ui_edit(false);
+}
+
+#[test]
+fn all_layout_profile_requests_preserve_params_and_replies_over_ui_ipc() {
+    use oink_agent::api::{Request, dispatch};
+    use serde_json::{Value, json};
+    use std::io::{BufRead, Write};
+    let device = "01".repeat(32);
+    let screen = json!({"device":device,"display":"main"});
+    let snapshot = json!({"placements":[],"disabled":[],"native":[],"active_profile_id":"profile",
+        "topology":{"gap_travel":false,"overlap_tolerance":0.0,"minimum_portal":0.0,
+            "portal_snap":0.0,"walls":true,"endpoint_reach":0.0}});
+    let requests = vec![
+        json!({"method":"layout_profiles"}),
+        json!({"method":"create_layout_profile","params":{"request_id":"as","expected_token":"state","name":"Desk"}}),
+        json!({"method":"rename_layout_profile","params":{"request_id":"rename","expected_catalog_token":"catalog","profile_id":"profile","name":"Office"}}),
+        json!({"method":"delete_layout_profile","params":{"request_id":"delete","expected_catalog_token":"catalog","profile_id":"profile"}}),
+        json!({"method":"load_layout_profile","params":{"request_id":"load","expected_token":"state","profile_id":"profile"}}),
+        json!({"method":"layout_profile_operation","params":{"request_id":"load"}}),
+        json!({"method":"set_sync_system_arrangement","params":{"request_id":"setting","device":device,"expected_preference_token":"preference","enabled":true}}),
+        json!({"method":"preview_system_arrangement","params":{"sequence":"18446744073709551615","expected_token":"state","device":device,"moved_screen":screen,"desired_canvas_origin":{"x":1.25,"y":-2.5}}}),
+        json!({"method":"commit_arrangement","params":{"request_id":"commit","expected_token":"state","placements":[{"device":device,"origin":{"x":1.0,"y":2.0},"scale":0.01}],"native_plan_tokens":["plan"],"disabled":[{"screen":screen,"disabled":true}]}}),
+        json!({"method":"reset_arrangement","params":{"request_id":"reset","expected_token":"state"}}),
+        json!({"method":"commit_arrangement","params":{"request_id":"visibility","expected_token":"state","placements":[],"native_plan_tokens":[],"disabled":[],"screen_shared":[{"device":device,"shared":false}]}}),
+        json!({"method":"replay_arrangement","params":{"request_id":"replay","expected_token":"state","from":snapshot,"target":snapshot,"native_restore_devices":[device],"direction":"undo","original_kind":"load"}}),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    std::fs::write(
+        dir.path().join("ipc.json"),
+        serde_json::to_vec(&json!({
+            "port":listener.local_addr().unwrap().port(), "token":"profile-ipc-test"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let count = requests.len();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut reader = std::io::BufReader::new(stream);
+        for _ in 0..count {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let envelope: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(envelope["token"], "profile-ipc-test");
+            // Echo the wire request as the payload, so every method and field
+            // must survive both dispatch layers and the real TCP connection.
+            writeln!(reader.get_mut(), "{}", json!({"ok":envelope["call"]})).unwrap();
+        }
+    });
+    let remote = RemoteApi::new(dir.path());
+    for expected in requests {
+        let request: Request = serde_json::from_value(expected.clone()).unwrap();
+        let reply = dispatch(&remote, request).unwrap();
+        assert_eq!(serde_json::to_value(reply).unwrap(), expected);
+    }
+    server.join().unwrap();
+}
+
+#[test]
 fn partial_preference_commands_persist_only_explicit_local_choices() {
     let _scenario = test_watchdog::Scenario::new(
         module_path!(),
@@ -190,8 +432,8 @@ async fn tolerant_settings_startup_preserves_files_and_reports_local_issues_scen
             .get("layout_projection_enabled")
             .is_none()
     );
-    node.preview_layout_projection(1, vec![], vec![], false).unwrap();
-    node.preview_layout_projection(1, vec![], vec![], true).unwrap();
+    node.preview_layout_projection(1, vec![], vec![], false, None).unwrap();
+    node.preview_layout_projection(1, vec![], vec![], true, None).unwrap();
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()["local"],
         serde_json::from_str::<serde_json::Value>(&original).unwrap()["local"]

@@ -213,7 +213,7 @@ pub(crate) fn start_link_runtime(
                 keep_local.store(owner.settings.keep_local_playback, Ordering::Release);
                 owner.keep_local = keep_local;
                 let quality_node = weak.clone();
-                owner.on_quality = Some(Arc::new(move |at_ms, observations, final_bucket| {
+                owner.on_quality = Some(Arc::new(move |at_ms, observations, output, final_bucket| {
                     if let Some(inner) = quality_node.upgrade() {
                         let node = Node { inner };
                         let view = {
@@ -223,6 +223,9 @@ pub(crate) fn start_link_runtime(
                                 history.flush(at_ms, observations);
                             } else {
                                 history.record(at_ms, observations);
+                            }
+                            if let Some(output) = output {
+                                history.record_output(output);
                             }
                             history.view(at_ms)
                         };
@@ -253,7 +256,11 @@ pub(crate) fn start_link_runtime(
     Ok((handle, task))
 }
 
-type QualityCallback = Arc<dyn Fn(u64, Vec<crate::audio_quality::Observation>, bool) + Send + Sync>;
+type QualityCallback = Arc<
+    dyn Fn(u64, Vec<crate::audio_quality::Observation>, Option<[Option<oink_audio::sink::DropoutBucket>; 60]>, bool)
+        + Send
+        + Sync,
+>;
 
 struct Receiver {
     quality_callback: Option<QualityCallback>,
@@ -295,6 +302,7 @@ impl Drop for Receiver {
             callback(
                 (oink_audio::diagnostics::monotonic_us(now).max(0) / 1000) as u64,
                 vec![self.quality_observation(now, true)],
+                None,
                 true,
             );
         }
@@ -338,6 +346,7 @@ struct Owner {
     on_statistics: Option<Arc<dyn Fn(crate::api::AudioStatistics) + Send + Sync>>,
     published_state: Option<Status>,
     quality_at: Instant,
+    output_quality: Arc<oink_audio::sink::DropoutCounters>,
     on_quality: Option<QualityCallback>,
     volume: Arc<oink_foundation::snapshot::Snapshot<Option<Arc<dto::AudioSessionContext>>>>,
     keep_local: Arc<AtomicBool>,
@@ -521,6 +530,7 @@ impl Owner {
             on_status: None,
             on_statistics: None,
             quality_at: Instant::now(),
+            output_quality: Default::default(),
             on_quality: None,
             published_state: None,
             volume,
@@ -1045,6 +1055,7 @@ impl Owner {
         if self.playback.is_none() && !self.playback_idle && self.starting_playback.is_none() && !self.paused {
             match self.platform.playback(self.bound_output.as_deref().unwrap()) {
                 Ok(playback) => {
+                    playback.set_output_quality_counters(self.output_quality.clone());
                     self.playback = Some(playback);
                     self.error = None;
                 }
@@ -1180,6 +1191,7 @@ impl Owner {
                                 "audio output woke"
                             );
                         }
+                        playback.set_output_quality_counters(self.output_quality.clone());
                         self.playback = Some(playback);
                         self.starting_playback = None;
                         self.playback_idle = false;
@@ -1509,6 +1521,10 @@ impl Owner {
                 on_quality(
                     (oink_audio::diagnostics::monotonic_us(now).max(0) / 1000) as u64,
                     observations,
+                    Some(
+                        self.output_quality
+                            .snapshot((oink_audio::diagnostics::monotonic_us(now).max(0) / 1000) as u64),
+                    ),
                     false,
                 );
             }

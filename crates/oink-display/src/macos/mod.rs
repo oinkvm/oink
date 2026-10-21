@@ -10,6 +10,7 @@
 //!   不存在时降级），其中有 `DisplayProductName`、`kCGDisplayIsVirtualDevice`、`kCGDisplayIsAirPlay`。
 //! - 镜像：镜像组里只保留主显示器（被镜像的那块），其余跳过。
 
+mod arrangement;
 mod info;
 mod wallpaper;
 mod watch;
@@ -37,6 +38,16 @@ struct MacDisplays {
 }
 
 impl DisplayBackend for MacDisplays {
+    fn native_configuration(&self) -> Result<crate::arrangement::NativeConfiguration, DisplayError> {
+        arrangement::configuration()
+    }
+    fn apply_native_origins(
+        &self,
+        expected: &crate::arrangement::NativeConfiguration,
+        origins: &[crate::arrangement::NativeOrigin],
+    ) -> Result<crate::arrangement::NativeConfiguration, DisplayError> {
+        arrangement::apply(expected, origins)
+    }
     fn displays(&self) -> Result<Vec<DisplayInfo>, DisplayError> {
         enumerate()
     }

@@ -2381,6 +2381,463 @@
       ],
       "copyright": [],
       "ownership": "first-party"
+    },
+    {
+      "id": "asset:lucide-fold-horizontal@1.31.0",
+      "name": "Lucide fold-horizontal icon (adapted)",
+      "version": "1.31.0",
+      "ecosystem": "asset",
+      "repository": "https://github.com/lucide-icons/lucide",
+      "source": {
+        "url": "https://github.com/lucide-icons/lucide/blob/main/icons/fold-horizontal.svg",
+        "integrity": "sha256:101126e8916881448e9720a1b7ff4467d16dbe9cd9d966009cd64319006225b1"
+      },
+      "path": "apps/oink/src/arrange/CompactIcon.tsx",
+      "sha256": "101126e8916881448e9720a1b7ff4467d16dbe9cd9d966009cd64319006225b1",
+      "licenseExpression": "ISC",
+      "selectedLicense": "ISC",
+      "modified": true,
+      "modificationNotice": "Scaled from the 24px grid to the 20px oink-ui icon grid with a 1.8 stroke; line ends snapped to the grid.",
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/native/Lucide-1.31.0-LICENSE.txt",
+          "sha256": "b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57"
+        }
+      ],
+      "copyright": [
+        "Copyright (c) 2026 Lucide Icons and Contributors"
+      ],
+      "ownership": "third-party"
+    },
+    {
+      "id": "asset:oink-menu-audio@99177878f30d",
+      "name": "Oink native menu audio icon",
+      "version": "99177878f30d7c0311d3c2540bef525ef96ab87b023b8c97e5a19cad9d5f3483",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink",
+      "source": {
+        "url": "https://github.com/oinkvm/oink/tree/10aebb9c815aa7425fb09a3924df55e52053e237/apps/oink/src",
+        "integrity": "sha256:99177878f30d7c0311d3c2540bef525ef96ab87b023b8c97e5a19cad9d5f3483"
+      },
+      "path": "apps/oink/src-tauri/icons/menu/audio.svg",
+      "sha256": "99177878f30d7c0311d3c2540bef525ef96ab87b023b8c97e5a19cad9d5f3483",
+      "licenseExpression": "GPL-3.0-only",
+      "selectedLicense": "GPL-3.0-only",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "LICENSE",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "path": "LICENSE-ADDITIONAL-TERMS.md",
+          "sha256": "c69f265a607a09f13de139896a182f61fae5c650d6d45269313297c07606286e"
+        }
+      ],
+      "copyright": [],
+      "ownership": "first-party",
+      "provenance": "Rendered snapshot; per-icon source review in apps/oink/src-tauri/icons/menu/README.md."
+    },
+    {
+      "id": "asset:oink-menu-game@051580f22370",
+      "name": "Oink native menu game icon",
+      "version": "051580f2237066b681edd846a756d763a3e1ddc99219dafa6b22e83f27355ed5",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink",
+      "source": {
+        "url": "https://github.com/oinkvm/oink/tree/10aebb9c815aa7425fb09a3924df55e52053e237/apps/oink/src",
+        "integrity": "sha256:051580f2237066b681edd846a756d763a3e1ddc99219dafa6b22e83f27355ed5"
+      },
+      "path": "apps/oink/src-tauri/icons/menu/game.svg",
+      "sha256": "051580f2237066b681edd846a756d763a3e1ddc99219dafa6b22e83f27355ed5",
+      "licenseExpression": "GPL-3.0-only",
+      "selectedLicense": "GPL-3.0-only",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "LICENSE",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "path": "LICENSE-ADDITIONAL-TERMS.md",
+          "sha256": "c69f265a607a09f13de139896a182f61fae5c650d6d45269313297c07606286e"
+        }
+      ],
+      "copyright": [],
+      "ownership": "first-party",
+      "provenance": "Rendered snapshot; per-icon source review in apps/oink/src-tauri/icons/menu/README.md."
+    },
+    {
+      "id": "asset:oink-menu-hide-screens@8a625a3301df",
+      "name": "Oink native menu hide-screens icon",
+      "version": "8a625a3301dfe580f5d77562bccf48f000796eb4e526bfaad60540636da23642",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink",
+      "source": {
+        "url": "https://github.com/oinkvm/oink/tree/10aebb9c815aa7425fb09a3924df55e52053e237/apps/oink/src",
+        "integrity": "sha256:8a625a3301dfe580f5d77562bccf48f000796eb4e526bfaad60540636da23642"
+      },
+      "path": "apps/oink/src-tauri/icons/menu/hide-screens.svg",
+      "sha256": "8a625a3301dfe580f5d77562bccf48f000796eb4e526bfaad60540636da23642",
+      "licenseExpression": "GPL-3.0-only",
+      "selectedLicense": "GPL-3.0-only",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "LICENSE",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "path": "LICENSE-ADDITIONAL-TERMS.md",
+          "sha256": "c69f265a607a09f13de139896a182f61fae5c650d6d45269313297c07606286e"
+        }
+      ],
+      "copyright": [],
+      "ownership": "first-party",
+      "provenance": "Rendered snapshot; per-icon source review in apps/oink/src-tauri/icons/menu/README.md."
+    },
+    {
+      "id": "asset:oink-menu-keyboard@facd38692503",
+      "name": "Oink native menu keyboard icon",
+      "version": "facd3869250326dda9fd0866b943a9147cc316f0ad2caaadc5dae1d4c4678811",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink",
+      "source": {
+        "url": "https://github.com/oinkvm/oink/tree/10aebb9c815aa7425fb09a3924df55e52053e237/apps/oink/src",
+        "integrity": "sha256:facd3869250326dda9fd0866b943a9147cc316f0ad2caaadc5dae1d4c4678811"
+      },
+      "path": "apps/oink/src-tauri/icons/menu/keyboard.svg",
+      "sha256": "facd3869250326dda9fd0866b943a9147cc316f0ad2caaadc5dae1d4c4678811",
+      "licenseExpression": "GPL-3.0-only",
+      "selectedLicense": "GPL-3.0-only",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "LICENSE",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "path": "LICENSE-ADDITIONAL-TERMS.md",
+          "sha256": "c69f265a607a09f13de139896a182f61fae5c650d6d45269313297c07606286e"
+        }
+      ],
+      "copyright": [],
+      "ownership": "first-party",
+      "provenance": "Rendered snapshot; per-icon source review in apps/oink/src-tauri/icons/menu/README.md."
+    },
+    {
+      "id": "asset:oink-menu-lock@940b680fec17",
+      "name": "Oink native menu lock icon",
+      "version": "940b680fec17050fce888882bf679fd16609dd02ef80b427646a59fb11d6cb80",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink-ui",
+      "source": {
+        "url": "https://registry.npmjs.org/oink-ui/-/oink-ui-1.0.5.tgz",
+        "integrity": "sha512-I7e1UtaBU3vsDJ0oZ6ofoCYyOaNc29NCSDWq7N9UY/vPvVg6irWpebB03b/7GbTiRKFq3YXq6Bbtwv2nKXD0/A=="
+      },
+      "path": "apps/oink/src-tauri/icons/menu/lock.svg",
+      "sha256": "940b680fec17050fce888882bf679fd16609dd02ef80b427646a59fb11d6cb80",
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": true,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/native/oink-ui-1.0.5-LICENSE.txt",
+          "sha256": "8b61d0a08992a88429c51bd40e944339a96a55e9f33ad737ee5e06a0e1ca011d"
+        }
+      ],
+      "copyright": [
+        "Copyright (c) 2026 Hachiwii"
+      ],
+      "ownership": "third-party",
+      "provenance": "Rendered snapshot; per-icon source review in apps/oink/src-tauri/icons/menu/README.md.",
+      "modificationNotice": "Exported oink-ui 1.0.5 ICONS.lock through its Icon component; CSS presentation attributes inlined and SVG serialized for native rasterization. Geometry unchanged."
+    },
+    {
+      "id": "asset:oink-menu-mouse@8a2524ed479e",
+      "name": "Oink native menu mouse icon",
+      "version": "8a2524ed479ed033315bbbc19360736acd925181ab0744d5391e88d46636987f",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink",
+      "source": {
+        "url": "https://github.com/oinkvm/oink/tree/10aebb9c815aa7425fb09a3924df55e52053e237/apps/oink/src",
+        "integrity": "sha256:8a2524ed479ed033315bbbc19360736acd925181ab0744d5391e88d46636987f"
+      },
+      "path": "apps/oink/src-tauri/icons/menu/mouse.svg",
+      "sha256": "8a2524ed479ed033315bbbc19360736acd925181ab0744d5391e88d46636987f",
+      "licenseExpression": "GPL-3.0-only",
+      "selectedLicense": "GPL-3.0-only",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "LICENSE",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "path": "LICENSE-ADDITIONAL-TERMS.md",
+          "sha256": "c69f265a607a09f13de139896a182f61fae5c650d6d45269313297c07606286e"
+        }
+      ],
+      "copyright": [],
+      "ownership": "first-party",
+      "provenance": "Rendered snapshot; per-icon source review in apps/oink/src-tauri/icons/menu/README.md."
+    },
+    {
+      "id": "asset:oink-menu-pause@2fe6c29ef7a4",
+      "name": "Oink native menu pause icon",
+      "version": "2fe6c29ef7a4abb9bb2f2761896cf487400d26b58ce784f61100d935f6b63966",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink",
+      "source": {
+        "url": "https://github.com/oinkvm/oink/tree/10aebb9c815aa7425fb09a3924df55e52053e237/apps/oink/src",
+        "integrity": "sha256:2fe6c29ef7a4abb9bb2f2761896cf487400d26b58ce784f61100d935f6b63966"
+      },
+      "path": "apps/oink/src-tauri/icons/menu/pause.svg",
+      "sha256": "2fe6c29ef7a4abb9bb2f2761896cf487400d26b58ce784f61100d935f6b63966",
+      "licenseExpression": "GPL-3.0-only",
+      "selectedLicense": "GPL-3.0-only",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "LICENSE",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "path": "LICENSE-ADDITIONAL-TERMS.md",
+          "sha256": "c69f265a607a09f13de139896a182f61fae5c650d6d45269313297c07606286e"
+        }
+      ],
+      "copyright": [],
+      "ownership": "first-party",
+      "provenance": "Rendered snapshot; per-icon source review in apps/oink/src-tauri/icons/menu/README.md."
+    },
+    {
+      "id": "asset:oink-menu-quit@07af83c212b7",
+      "name": "Oink native menu quit icon",
+      "version": "07af83c212b7da8193b56a67633bc29cf1c621a8e1fb8d6bdd729f15183184a9",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink",
+      "source": {
+        "url": "https://github.com/oinkvm/oink/tree/10aebb9c815aa7425fb09a3924df55e52053e237/apps/oink/src",
+        "integrity": "sha256:07af83c212b7da8193b56a67633bc29cf1c621a8e1fb8d6bdd729f15183184a9"
+      },
+      "path": "apps/oink/src-tauri/icons/menu/quit.svg",
+      "sha256": "07af83c212b7da8193b56a67633bc29cf1c621a8e1fb8d6bdd729f15183184a9",
+      "licenseExpression": "GPL-3.0-only",
+      "selectedLicense": "GPL-3.0-only",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "LICENSE",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "path": "LICENSE-ADDITIONAL-TERMS.md",
+          "sha256": "c69f265a607a09f13de139896a182f61fae5c650d6d45269313297c07606286e"
+        }
+      ],
+      "copyright": [],
+      "ownership": "first-party",
+      "provenance": "Rendered snapshot; per-icon source review in apps/oink/src-tauri/icons/menu/README.md."
+    },
+    {
+      "id": "asset:oink-menu-resume@c39b5f1f7fb9",
+      "name": "Oink native menu resume icon",
+      "version": "c39b5f1f7fb9d729ab02762cf4adbea6359684fab41ec009cc4f9fb6c7f6c4fe",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink-ui",
+      "source": {
+        "url": "https://registry.npmjs.org/oink-ui/-/oink-ui-1.0.5.tgz",
+        "integrity": "sha512-I7e1UtaBU3vsDJ0oZ6ofoCYyOaNc29NCSDWq7N9UY/vPvVg6irWpebB03b/7GbTiRKFq3YXq6Bbtwv2nKXD0/A=="
+      },
+      "path": "apps/oink/src-tauri/icons/menu/resume.svg",
+      "sha256": "c39b5f1f7fb9d729ab02762cf4adbea6359684fab41ec009cc4f9fb6c7f6c4fe",
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": true,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/native/oink-ui-1.0.5-LICENSE.txt",
+          "sha256": "8b61d0a08992a88429c51bd40e944339a96a55e9f33ad737ee5e06a0e1ca011d"
+        }
+      ],
+      "copyright": [
+        "Copyright (c) 2026 Hachiwii"
+      ],
+      "ownership": "third-party",
+      "provenance": "Rendered snapshot; per-icon source review in apps/oink/src-tauri/icons/menu/README.md.",
+      "modificationNotice": "Exported oink-ui 1.0.5 ICONS.play through its Icon component; CSS presentation attributes inlined and SVG serialized for native rasterization. Geometry unchanged."
+    },
+    {
+      "id": "asset:oink-menu-show-screens@d080900f64d8",
+      "name": "Oink native menu show-screens icon",
+      "version": "d080900f64d875438afc4e738de8f1857cb9d68749b951028a7f67cb02a5fbe7",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink-ui",
+      "source": {
+        "url": "https://registry.npmjs.org/oink-ui/-/oink-ui-1.0.5.tgz",
+        "integrity": "sha512-I7e1UtaBU3vsDJ0oZ6ofoCYyOaNc29NCSDWq7N9UY/vPvVg6irWpebB03b/7GbTiRKFq3YXq6Bbtwv2nKXD0/A=="
+      },
+      "path": "apps/oink/src-tauri/icons/menu/show-screens.svg",
+      "sha256": "d080900f64d875438afc4e738de8f1857cb9d68749b951028a7f67cb02a5fbe7",
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": true,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/native/oink-ui-1.0.5-LICENSE.txt",
+          "sha256": "8b61d0a08992a88429c51bd40e944339a96a55e9f33ad737ee5e06a0e1ca011d"
+        }
+      ],
+      "copyright": [
+        "Copyright (c) 2026 Hachiwii"
+      ],
+      "ownership": "third-party",
+      "provenance": "Rendered snapshot; per-icon source review in apps/oink/src-tauri/icons/menu/README.md.",
+      "modificationNotice": "Exported oink-ui 1.0.5 ICONS.eye through its Icon component; CSS presentation attributes inlined and SVG serialized for native rasterization. Geometry unchanged."
+    },
+    {
+      "id": "asset:oink-menu-show@0344769a2347",
+      "name": "Oink native menu show icon",
+      "version": "0344769a23479f5b51c324ed122ee41767ae17719bfee902926ad723e451a79d",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink-ui",
+      "source": {
+        "url": "https://registry.npmjs.org/oink-ui/-/oink-ui-1.0.5.tgz",
+        "integrity": "sha512-I7e1UtaBU3vsDJ0oZ6ofoCYyOaNc29NCSDWq7N9UY/vPvVg6irWpebB03b/7GbTiRKFq3YXq6Bbtwv2nKXD0/A=="
+      },
+      "path": "apps/oink/src-tauri/icons/menu/show.svg",
+      "sha256": "0344769a23479f5b51c324ed122ee41767ae17719bfee902926ad723e451a79d",
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": true,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/native/oink-ui-1.0.5-LICENSE.txt",
+          "sha256": "8b61d0a08992a88429c51bd40e944339a96a55e9f33ad737ee5e06a0e1ca011d"
+        }
+      ],
+      "copyright": [
+        "Copyright (c) 2026 Hachiwii"
+      ],
+      "ownership": "third-party",
+      "provenance": "Rendered snapshot; per-icon source review in apps/oink/src-tauri/icons/menu/README.md.",
+      "modificationNotice": "Exported oink-ui 1.0.5 ICONS.external through its Icon component; CSS presentation attributes inlined and SVG serialized for native rasterization. Geometry unchanged."
+    },
+    {
+      "id": "asset:oink-menu-unlock@facc97809bbe",
+      "name": "Oink native menu unlock icon",
+      "version": "facc97809bbe9eb6b5168f6ca04aed3071b9ca5b3b9ac5479db79e6738c1b2c8",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink",
+      "source": {
+        "url": "https://github.com/oinkvm/oink/tree/10aebb9c815aa7425fb09a3924df55e52053e237/apps/oink/src",
+        "integrity": "sha256:facc97809bbe9eb6b5168f6ca04aed3071b9ca5b3b9ac5479db79e6738c1b2c8"
+      },
+      "path": "apps/oink/src-tauri/icons/menu/unlock.svg",
+      "sha256": "facc97809bbe9eb6b5168f6ca04aed3071b9ca5b3b9ac5479db79e6738c1b2c8",
+      "licenseExpression": "GPL-3.0-only AND MIT",
+      "selectedLicense": "GPL-3.0-only AND MIT",
+      "modified": true,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "LICENSE",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "path": "LICENSE-ADDITIONAL-TERMS.md",
+          "sha256": "c69f265a607a09f13de139896a182f61fae5c650d6d45269313297c07606286e"
+        },
+        {
+          "path": "licenses/native/oink-ui-1.0.5-LICENSE.txt",
+          "sha256": "8b61d0a08992a88429c51bd40e944339a96a55e9f33ad737ee5e06a0e1ca011d"
+        }
+      ],
+      "copyright": [
+        "Copyright (c) 2026 Hachiwii"
+      ],
+      "ownership": "third-party",
+      "provenance": "Rendered snapshot; per-icon source review in apps/oink/src-tauri/icons/menu/README.md.",
+      "modificationNotice": "Oink DeviceMenu UnlockIcon retains the oink-ui lock body rectangle (x=4.5, y=9, width=11, height=7.5, rx=2) and replaces the shackle with the Oink open-lock path; Icon CSS presentation attributes inlined."
     }
   ],
   "systemComponents": [

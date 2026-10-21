@@ -141,7 +141,13 @@ async fn changes() {
     );
     let saved_peer = current.saved.iter().find(|s| s.device == anon.device(peer)).unwrap();
     assert!(!saved_peer.enabled);
-    assert!(!current.compiled.screens.iter().any(|s| s.device == anon.device(peer)));
+    assert!(
+        current
+            .compiled
+            .screens
+            .iter()
+            .any(|s| s.device == anon.device(peer) && !s.enabled)
+    );
     assert!(
         current
             .compiled
@@ -154,7 +160,7 @@ async fn changes() {
             .compiled
             .source_devices
             .iter()
-            .any(|d| d.device == anon.device(peer) && d.requires_target)
+            .any(|d| d.device == anon.device(peer) && !d.requires_target)
     );
     assert_eq!(current.compiled.input_online, Some(vec![anon.device(me)]));
     assert!(!current.compiled.edges.is_empty());

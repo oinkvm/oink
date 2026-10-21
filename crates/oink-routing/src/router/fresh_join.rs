@@ -77,6 +77,7 @@ impl Router {
             || self.epoch == 0
             || !self.input_ready(self.claim)
             || self.layout.source_requires_target(self.claim)
+            || (self.claim != self.holder && self.hidden_device(self.claim))
         {
             return;
         }
@@ -110,7 +111,7 @@ impl Router {
             InputEvent::Key { pressed, .. } | InputEvent::Button { pressed, .. } => *pressed,
             InputEvent::Scroll { dx, dy, .. } => *dx != 0.0 || *dy != 0.0,
             InputEvent::Gesture(g) => !g.ends(),
-            InputEvent::TouchpadSample(_) => false,
+            InputEvent::TouchpadSample(_) | InputEvent::TouchpadBoundary => false,
         }
     }
 
@@ -121,6 +122,7 @@ impl Router {
             self.peers.get(&from).and_then(|p| p.session)
         };
         if self.paused || self.layout.source_requires_target(holder)
+            || (holder != self.holder && self.hidden_device(holder))
             || self.locked_device().is_some_and(|d| d != holder) || (epoch, holder) != (self.epoch, self.claim)
             || !sender.is_some_and(|s| scope.members.contains(&(from, s)))
             || !self.scope_allows(Some(&scope), holder)

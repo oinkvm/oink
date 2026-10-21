@@ -18,7 +18,7 @@ beforeAll(()=>{
 });
 beforeEach(()=>{vi.clearAllMocks();setLanguage('en');mock.query.mockImplementation((_key:string,action:()=>unknown)=>action());mock.update.mockResolvedValue(status);});
 afterEach(cleanup);
-const show=(s:UpdateStatus)=>render(<OinkProvider defaultMotion="reduced"><UpdatePreferences status={s}/></OinkProvider>);
+const show=(s:UpdateStatus)=>render(<OinkProvider defaultMotion="reduced"><UpdatePreferences status={s} label="Automatically check for updates"/></OinkProvider>);
 
 // Mirrors the agent store: the check reply becomes the current status, and
 // backend events replace it later. `open` is the Settings page's own state.
@@ -116,7 +116,6 @@ it('shows a rejected check command inline',async()=>{
 });
 it('keeps a manual download route for disabled versions',async()=>{
   show({...status,phase:'disabled'});
-  expect(screen.getByText('Download and install updates manually for this version.')).toBeTruthy();
   expect(screen.queryByRole('switch')).toBeNull();
   cleanup();
   mock.openUrl.mockResolvedValue(undefined);
@@ -138,11 +137,10 @@ it('disables unauthorized machine policy changes',()=>{
   fireEvent.click(screen.getByRole('switch'));
   expect(mock.update).not.toHaveBeenCalled();
 });
-it('shows only the automatic-check switch row',()=>{
-  show(status);
+it('shows only the automatic-check switch without its own label',()=>{
+  const {container}=show(status);
   expect(screen.getByRole('switch',{name:'Automatically check for updates'})).toBeTruthy();
   expect(screen.queryByRole('combobox')).toBeNull();
   expect(screen.queryByText('Install automatically when idle')).toBeNull();
-  expect(document.querySelector('.setp__update')?.textContent).toBe('Automatically check for updates ');
-  expect(document.querySelector('.setp__update')?.children).toHaveLength(1);
+  expect(container.textContent).toBe('');
 });

@@ -1,7 +1,6 @@
 import {
     membersOf,
     sameComputer,
-    groupScreen,
     transformGroup,
     freeGroup,
     groupOverlaps,
@@ -14,15 +13,16 @@ import { tr } from '../i18n';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, RefObject } from 'react';
 import { Icon, ICONS, Kbd, VisuallyHidden } from 'oink-ui';
-import { CORNERS, fitArrangement, bounds, clampMove, facingGap, cornerPoint, cornerClearance, pickRect, resizeAroundCenter, resizeFromCorner, sameRect, } from './geometry';
+import { CORNERS, fitArrangement, bounds, clampMove, facingGap, cornerPoint, cornerClearance, pickRect, resizeAroundCenter, resizeFromCorner, sameRect, snap, } from './geometry';
 import type { Camera, Corner, Rect, Screen, SnapEdges } from './geometry';
 import { useSpringRects } from './springs';
 import { useVisible } from '../window/useVisible';
-import { cornerArcPath, useCornerShape } from './cornerShape';
+import { cornerArcPath, ringBandPath, useCornerShape } from './cornerShape';
+import type { CornerKs } from 'oink-ui';
 import { cameraStore } from './cameraStore';
 import { growArrangementView, SpringCamera, visibleArrangement } from './camera';
 import { SnapFeedback } from './haptics';
-import { settleGroup } from './compaction';
+import { settleGroup, type Offset } from './compaction';
 import { projectScreenRect } from './renderGeometry';
 export interface ArrangementSettings {
     showHotZones: boolean;
@@ -36,16 +36,24 @@ export interface ScreensChange {
     label: string;
     merge?: string;
 }
+/** One native screen moved inside its computer (system arrangement on). `drag`
+ * reports the desired top-left; `end` hands over the release compaction, which the
+ * owner of the backend preview applies to the snapped rectangles of the computer. */
+export type ScreenMove =
+    | { type: 'drag'; id: string; desired: { x: number; y: number } }
+    | { type: 'end'; id: string; cancelled: true }
+    | { type: 'end'; id: string; cancelled: false; label: string; compact: (rects: Rect[]) => Offset };
 export interface ArrangementProps {
     screens: Screen[];
     platform?: 'mac' | 'win';
     /** Complete retained geometry, including hidden members used at release. */
     geometryScreens?: Screen[];
-    onProjection?: (screens: Screen[] | null) => void;
+    onProjection?: (screens: Screen[] | null, held?: boolean) => void;
     onScreensChange: (screens: Screen[], change: ScreensChange) => void;
     selectedId: string | null;
     selectedGroup?: ReadonlySet<string>;
-    onSelect: (id: string | null) => void;
+    /** `toggle` is Cmd/Ctrl+click, `device` a double-click; the owner applies the selection model. */
+    onSelect: (id: string | null, mode?: 'toggle' | 'device') => void;
     settings: ArrangementSettings;
     onLog?: (text: string, tone?: LogTone) => void;
     keyScope?: RefObject<HTMLElement | null>;
@@ -54,15 +62,31 @@ export interface ArrangementProps {
         text: string;
     };
     contextFor?: (s: Screen) => string | undefined;
+    /** Screens whose computer writes the system arrangement: one selected screen
+     * moves on its own, with snapped previews from `screenPreview`. */
+    screenEditable?: (s: Screen) => boolean;
+    screenPreview?: Readonly<Record<string, Rect>> | null;
+    onScreenMove?: (move: ScreenMove) => void;
 }
 const SCREEN_R = 12;
+/** The selection ring: a canvas-coloured gap band, then the accent band (px outside the edge). */
+const RING_GAP = 2.5, RING_OUT = 4.5;
+/** A selection ring drawn as one SVG: exact corners from the first frame on every engine
+ * (see ringBandPath for why it is not a spread box-shadow). */
+function SelectionRing({ w, h, radii, ks }: { w: number; h: number; radii: [number, number, number, number]; ks: CornerKs }) {
+    const m = Math.ceil(RING_OUT) + 1;
+    return <svg className="scr__ring" aria-hidden width={w + 2 * m} height={h + 2 * m} viewBox={`${-m} ${-m} ${w + 2 * m} ${h + 2 * m}`} style={{ left: -m, top: -m }}>
+      <path className="scr__ring-gap" d={ringBandPath(w, h, radii, ks, 0, RING_GAP)}/>
+      <path className="scr__ring-accent" d={ringBandPath(w, h, radii, ks, RING_GAP, RING_OUT)}/>
+    </svg>;
+}
 const HANDLE_GAP = 7;
 const DRAG_SLOP = 3;
 interface Interaction {
     id: string;
     group: Screen[];
     snapSuppressed: boolean;
-    mode: 'move' | 'resize';
+    mode: 'move' | 'resize' | 'screen';
     corner?: Corner;
     pointerId: number;
     origin: Rect;
@@ -81,12 +105,14 @@ interface Interaction {
         y: number;
     };
     wasSelected: boolean;
+    /** Pressed inside a multi-computer group: a click without a move selects just this. */
+    collapse?: boolean;
     view: Rect;
 }
 const fmt = (n: number) => String(Math.round(n)).replace('-', '−');
 /** Parenthesised notes after a log sentence, e.g. "(snapped to edge)". */
 const noteSuffix = (notes: string[]) => notes.length ? tr('（{0}）', notes.join(tr('；'))) : '';
-export function Arrangement({ screens, platform = 'mac', geometryScreens = screens, onScreensChange, selectedId, selectedGroup, onSelect, settings, onLog, keyScope, hintId, notice, contextFor, onProjection }: ArrangementProps) {
+export function Arrangement({ screens, platform = 'mac', geometryScreens = screens, onScreensChange, selectedId, selectedGroup, onSelect, settings, onLog, keyScope, hintId, notice, contextFor, onProjection, screenEditable, screenPreview, onScreenMove }: ArrangementProps) {
     const root = useRef<HTMLDivElement>(null);
     const visible = useVisible(root);
     const springs = useSpringRects(visible);
@@ -98,7 +124,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
     const [pixelRatio, setPixelRatio] = useState(() => globalThis.devicePixelRatio || 1);
     const [active, setActive] = useState<{
         id: string;
-        mode: 'move' | 'resize';
+        mode: 'move' | 'resize' | 'screen';
         corner?: Corner;
         overlap: boolean;
     } | null>(null);
@@ -141,11 +167,13 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
         };
     }, [feedback, springs]);
     useEffect(() => {
-        const show = visible && (pressed || lingering
+        // Native previews use the same wire arrangement DTO, but their geometry
+        // comes from App's snapped backend reply rather than these rigid springs.
+        const show = visible && !screenPreview && drag.current?.mode !== 'screen' && (pressed || lingering
             || (projectionShown.current && screens.some(s => springs.isMoving(s.id))));
         projectionShown.current = show;
         projectionCallback.current?.(show
-            ? screens.map(s => ({ ...s, ...(springs.get(s.id) ?? s) })) : null);
+            ? screens.map(s => ({ ...s, ...(springs.get(s.id) ?? s) })) : null, pressed || !!drag.current);
     });
     const log = (text: string, tone: LogTone = 'neutral') => {
         onLog?.(text, tone);
@@ -168,7 +196,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
     useLayoutEffect(() => {
         const interaction = drag.current;
         if (interaction) {
-            const current = membersOf(screens, interaction.id);
+            const current = members(interaction.id);
             if (current.length !== interaction.group.length || current.some(s => {
                 const initial = interaction.group.find(m => m.id === s.id);
                 return !initial || !sameRect(s, initial);
@@ -187,15 +215,21 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
             if (!id.startsWith('__') && !ids.has(id.replace(/^r:/, '')))
                 springs.remove(id);
         for (const s of screens) {
-            if (drag.current?.moved && membersOf(screens, drag.current.id).some(m => m.id === s.id))
+            const d = drag.current;
+            if (d?.moved && d.mode !== 'screen' && members(d.id).some(m => m.id === s.id))
                 continue;
-            const r = pickRect(s);
+            // A dragged native screen follows the pointer until the first snapped
+            // preview arrives; a preview holds until the committed geometry replaces it.
+            const preview = screenPreview?.[s.id];
+            if (d?.moved && d.mode === 'screen' && d.id === s.id && !preview)
+                continue;
+            const r = preview ?? pickRect(s);
             if (first)
                 springs.jump(s.id, r);
             else if (!springs.has(s.id))
                 springs.to(s.id, r, 'spring', { x: s.x + s.w / 2, y: s.y + s.h / 2, w: 0, h: 0 });
             else if (!sameRect(springs.target(s.id)!, r))
-                springs.to(s.id, r, 'soft');
+                springs.to(s.id, r, preview ? 'snappy' : 'soft');
         }
         const dragging = !!drag.current?.moved;
         for (const s of screens) {
@@ -242,9 +276,20 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
         const r = root.current!.getBoundingClientRect();
         return { x: (clientX - r.left - ox) / zoom, y: (clientY - r.top - oy) / zoom };
     };
-    const members = (id: string) => membersOf(screens, id);
+    /** A selection spanning several computers edits as one rigid unit; anything else
+     * edits its own computer. The owner keeps groups made of whole computers. */
+    const grouped = !!selectedGroup && new Set(screens.filter(s => selectedGroup.has(s.id)).map(s => s.device ?? s.id)).size > 1;
+    const members = (id: string) => grouped && selectedGroup!.has(id) ? screens.filter(s => selectedGroup!.has(s.id)) : membersOf(screens, id);
     const others = (id: string) => screens.filter(s => !members(id).some(m => m.id === s.id));
-    const byId = (id: string) => groupScreen(screens, id);
+    /** The edited unit's bounding rectangle, carrying the pressed screen's identity. */
+    const byId = (id: string): Screen | undefined => {
+        const unit = members(id);
+        if (!unit.length) return undefined;
+        const r = bounds(unit);
+        return { ...unit.find(s => s.id === id)!, ...r, minimumWidth: r.w * Math.max(...unit.map(s => (s.minimumWidth ?? 640) / s.w)) };
+    };
+    const unitName = (id: string) => grouped && selectedGroup!.has(id) ? tr('所选屏幕') : screens.find(s => s.id === id)?.name ?? id;
+    const pointerFocus = useRef(false);
     const animate = (id: string, r: Rect, preset: 'snappy' | 'soft' | 'jump') => {
         const group = members(id);
         const from = bounds(group);
@@ -267,6 +312,21 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
         const next = mergeVisibleGroups(geometryScreens, screens.map(s => transformed.find(n => n.id === s.id) ?? s));
         return { next, final, compacted: dx !== 0 || dy !== 0 };
     };
+    /** Release handling for a native screen edit: collision repair and compaction
+     * translate the whole computer, from its snapped (visible) screen rectangles. */
+    const compactScreens = (id: string, rects: Rect[]): Offset => {
+        if (!rects.length) return { dx: 0, dy: 0 };
+        const rest = others(id), from = bounds(rects);
+        const free = freeGroup(rects, from, from, rest);
+        const { dx, dy } = settings.compact
+            ? settleGroup(transformGroup(rects, from, free), rest, rest.map(s => s.device ?? s.id)) : { dx: 0, dy: 0 };
+        return { dx: free.x - from.x + dx, dy: free.y - from.y + dy };
+    };
+    /** Single-screen computers have no independent native arrangement to edit. */
+    const editingScreen = (s: Screen) => !selectedGroup && !!onScreenMove && !!screenEditable?.(s) && membersOf(screens, s.id).length > 1;
+    /** Shown selected: the single screen of a system-arranged computer, else whole units. */
+    const isSelected = (s: Screen) => screenSelection && sameComputer(s, screenSelection) ? s.id === selectedId
+        : (!!selectedId && members(selectedId).some(m => m.id === s.id)) || !!selectedGroup?.has(s.id);
     /** Commit a keyboard edit of one computer, including its compaction, as one change. */
     const commit = (id: string, r: Rect, change: ScreensChange) => {
         const { next, final, compacted } = settle(id, r);
@@ -282,9 +342,39 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
         if (e.button !== 0 || drag.current || zoom <= 0)
             return;
         e.stopPropagation();
+        // The press focuses the screen; that focus must not re-select it plainly.
+        pointerFocus.current = true;
+        if (mode === 'move' && (platform === 'mac' ? e.metaKey : e.ctrlKey)) {
+            onSelect(s.id, 'toggle');
+            return;
+        }
+        if (mode === 'move' && !selectedGroup?.has(s.id) && !!onScreenMove && !!screenEditable?.(s) && membersOf(screens, s.id).length > 1) {
+            // A plain press on a system-arranged computer's screen selects that screen
+            // alone and moves it on its own; snapping is the backend's.
+            const wasSelected = !!screenSelection && selectedId === s.id;
+            if (!wasSelected) onSelect(s.id);
+            // The selected screen of a system-arranged computer moves on its own;
+            // its computer's other screens stay, and snapping is the backend's.
+            const own = pickRect(screens.find(m => m.id === s.id)!), shown = springs.get(s.id) ?? own;
+            const p = toVirtual(e.clientX, e.clientY);
+            camera.jump({ zoom, ox, oy });
+            feedback.reset();
+            drag.current = {
+                id: s.id, group: members(s.id), mode: 'screen', pointerId: e.pointerId, origin: own, snapSuppressed: false,
+                grab: { x: p.x - shown.x, y: p.y - shown.y }, start: { x: e.clientX, y: e.clientY }, moved: false, live: own,
+                pointer: { x: e.clientX, y: e.clientY }, wasSelected, view: visibleArrangement({ zoom, ox, oy }, size, settings.padding),
+            };
+            clearTimeout(projectionTimer.current);
+            setPressed(true);
+            onScreenMove?.({ type: 'drag', id: s.id, desired: { x: own.x, y: own.y } });
+            (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+            return;
+        }
+        // Pressing inside a multi-computer group keeps it, so the group can be dragged.
+        const collapse = mode === 'move' && grouped && !!selectedGroup?.has(s.id);
+        const wasSelected = mode === 'move' && isSelected(s);
+        if (!collapse && mode === 'move') onSelect(s.id);
         s = byId(s.id)!;
-        const wasSelected = members(s.id).some(m => m.id === selectedId);
-        onSelect(s.id);
         const p = toVirtual(e.clientX, e.clientY);
         const shown = bounds(members(s.id).map(m => springs.get(m.id) ?? m));
         const ref = mode === 'move' ? { x: shown.x, y: shown.y } : cornerPoint(s, corner!);
@@ -301,7 +391,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
             id: s.id, group: members(s.id), mode, corner, pointerId: e.pointerId, origin: pickRect(s),
             snapSuppressed: e.shiftKey,
             grab: { x: p.x - ref.x, y: p.y - ref.y }, start: { x: e.clientX, y: e.clientY }, moved: false, live: pickRect(s),
-            pointer: { x: e.clientX, y: e.clientY }, wasSelected,
+            pointer: { x: e.clientX, y: e.clientY }, wasSelected, collapse,
             view: visibleArrangement({ zoom, ox, oy }, size, settings.padding),
         };
         clearTimeout(projectionTimer.current);
@@ -320,6 +410,12 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
         const snapping = settings.snapping && !d.snapSuppressed;
         const box = root.current!.getBoundingClientRect();
         const p = { x: (d.pointer.x - box.left - cam.ox) / cam.zoom, y: (d.pointer.y - box.top - cam.oy) / cam.zoom };
+        if (d.mode === 'screen') {
+            // One native screen snaps to every other screen's edges, its siblings
+            // included; the backend preview then keeps the computer edge-connected.
+            const r = { ...d.origin, x: p.x - d.grab.x, y: p.y - d.grab.y };
+            return snapping ? snap(r, screens.filter(s => s.id !== d.id), 10 / cam.zoom, edges) : r;
+        }
         if (d.mode === 'resize') {
             const minimumWidth = byId(d.id)?.minimumWidth;
             const r = resizeFromCorner(d.origin, d.corner!, { x: p.x - d.grab.x, y: p.y - d.grab.y }, minimumWidth);
@@ -356,6 +452,16 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
             live = liveAt(d, cam, edges);
         }
         feedback.update(edges);
+        if (d.mode === 'screen') {
+            if (!sameRect(live, d.live)) {
+                d.live = live;
+                onScreenMove?.({ type: 'drag', id: d.id, desired: { x: live.x, y: live.y } });
+            }
+            if (!screenPreview?.[d.id])
+                springs.jump(d.id, live);
+            setActive((a) => (a && a.id === d.id && a.mode === 'screen' ? a : { id: d.id, mode: 'screen', overlap: false }));
+            return growing;
+        }
         if (!sameRect(live, d.live) || !springs.has(d.id)) {
             d.live = live;
             animate(d.id, live, 'jump');
@@ -385,6 +491,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
         springs.wake();
     };
     const end = (e: ReactPointerEvent, cancelled = false) => {
+        pointerFocus.current = false;
         const d = drag.current;
         if (!d || e.pointerId !== d.pointerId)
             return;
@@ -395,12 +502,25 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
         springs.wake();
         lingerProjection();
         if (!d.moved) {
-            if (!cancelled && d.mode === 'move' && d.wasSelected)
-                onSelect(null);
+            if (d.mode === 'screen') onScreenMove?.({ type: 'end', id: d.id, cancelled: true });
+            // A click: inside a group it narrows the selection to this screen's unit;
+            // on what was already selected it clears the selection.
+            if (!cancelled && d.mode !== 'resize') {
+                if (d.collapse) onSelect(d.id);
+                else if (d.wasSelected) onSelect(null);
+            }
             return;
         }
-        const s = byId(d.id);
-        const name = s?.name ?? d.id;
+        const name = unitName(d.id);
+        if (d.mode === 'screen') {
+            if (cancelled || sameRect(d.live, d.origin)) {
+                onScreenMove?.({ type: 'end', id: d.id, cancelled: true });
+                springs.to(d.id, d.origin, 'snappy');
+                return;
+            }
+            onScreenMove?.({ type: 'end', id: d.id, cancelled: false, label: tr('移动 {0}', name), compact: rects => compactScreens(d.id, rects) });
+            return;
+        }
         if (cancelled || sameRect(d.live, d.origin)) {
             animate(d.id, d.origin, 'snappy');
             return;
@@ -437,9 +557,11 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
                 return;
             if (drag.current)
                 return;
-            const s = groupScreen(screens, selectedId);
-            if (!s)
+            const unit = byId(selectedId);
+            if (!unit)
                 return;
+            // Log and label with the unit's name: a computer, or the selected group.
+            const s = { ...unit, name: unitName(unit.id) };
             if (e.key === 'Escape') {
                 e.preventDefault();
                 onSelect(null);
@@ -466,6 +588,15 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
             const axis = e.key === 'ArrowLeft' || e.key === 'ArrowRight' ? 'x' : 'y';
             const dir = e.key === 'ArrowRight' || e.key === 'ArrowDown' ? 1 : -1;
             const want = dir * settings.step * (e.shiftKey ? 1 : 10);
+            const own = screens.find(m => m.id === selectedId);
+            if (own && editingScreen(own)) {
+                // Same preview/commit path as a drag: the backend snaps the native screen.
+                const at = springs.target(own.id) ?? own;
+                onScreenMove?.({ type: 'drag', id: own.id, desired: { x: at.x + (axis === 'x' ? want : 0), y: at.y + (axis === 'y' ? want : 0) } });
+                onScreenMove?.({ type: 'end', id: own.id, cancelled: false, label: tr('移动 {0}', own.name), compact: rects => compactScreens(own.id, rects) });
+                lingerProjection();
+                return;
+            }
             const got = members(s.id).reduce((got, m) => {
                 const allowed = clampMove(m, rest, axis, want);
                 return Math.abs(allowed) < Math.abs(got) ? allowed : got;
@@ -514,7 +645,13 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
         return r.y - M - 8 < 38 && r.y + r.h + M + 8 > 10
             ? Math.min(width, Math.max(0, r.x - M - 8 - 12)) : width;
     }, Math.max(0, (toolbar ? toolbar.left - paintOrigin.x - 8 : size.w - 12) - 12));
-    const showHints = screens.some(s => s.id === selectedId) && !pressed && hintWidth >= 180 && size.h >= 48;
+    // Yield to an actual move/resize gesture (`active`), not to every press: a
+    // click that switches the selection must keep the same hint mounted.
+    const showHints = screens.some(s => s.id === selectedId) && !active && hintWidth >= 180 && size.h >= 48;
+    // A selected screen of a system-arranged computer is selected on its own:
+    // solid ring on the screen, dashed bounding rectangle for its computer.
+    const selectedScreen = screens.find(m => m.id === selectedId);
+    const screenSelection = selectedScreen && editingScreen(selectedScreen) ? selectedScreen : undefined;
     return (<div ref={root} className="arr" data-hotzones={settings.showHotZones ? '' : undefined} data-interacting={active ? active.mode : undefined} data-corner={active?.corner} onPointerDown={onRootPointerDown}>
       {screens.map((s) => {
             const r = springs.get(s.id) ?? s;
@@ -524,10 +661,12 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
             const painted = projectScreenRect(r, { zoom, ox, oy }, pixelRatio, paintOrigin);
             const W = painted.w;
             const H = painted.h;
-            const isActive = !!active && members(active.id).some(m => m.id === s.id);
-            const selected = (!!selectedId && members(selectedId).some(m => m.id === s.id))
-                || !!selectedGroup?.has(s.id);
-            const multi = (s.groupSize ?? members(s.id).length) > 1;
+            const isActive = !!active && (active.mode === 'screen' ? active.id === s.id : members(active.id).some(m => m.id === s.id));
+            const alone = !!screenSelection && sameComputer(s, screenSelection);
+            const selected = isSelected(s);
+            // Group members are outlined and resized only by the group's rectangle.
+            const inGroup = grouped && !!selectedGroup?.has(s.id);
+            const multi = (s.groupSize ?? membersOf(screens, s.id).length) > 1 || inGroup;
             const style = {
                 transform: `translate(${painted.x}px, ${painted.y}px)`,
                 width: W, height: H,
@@ -536,8 +675,8 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
             const hz = Math.max(14, Math.min(R * 1.2, W / 3, H / 3));
             const out = gap + 8;
             const label = tr('{0}，{1} × {2}，位置 {3}, {4}', s.name, fmt(s.w), fmt(s.h), fmt(s.x), fmt(s.y));
-            return (<div key={s.id} className="scr" style={style} role="button" tabIndex={0} aria-pressed={selected} aria-label={s.offline ? tr('{0}，离线', label) : label} aria-describedby={hintId} data-selected={selected && !multi ? '' : undefined} data-active={isActive ? active!.mode : undefined} data-corner={isActive ? active!.corner : undefined} data-overlap={isActive && active!.overlap ? '' : undefined} data-ctx={contextFor?.(s)} onContextMenu={() => { if (contextFor?.(s))
-                onSelect(s.id); }} onFocus={() => onSelect(s.id)} onKeyDown={(e) => onScreenKeyDown(e, s)} onPointerDown={(e) => begin(e, s, 'move')} onPointerMove={move} onPointerUp={(e) => end(e)} onPointerCancel={(e) => end(e, true)} onLostPointerCapture={(e) => end(e)}>
+            return (<div key={s.id} className="scr" style={style} role="button" tabIndex={0} aria-pressed={selected} aria-label={s.offline ? tr('{0}，离线', label) : label} aria-describedby={hintId} data-selected={selected && (!multi || alone) ? '' : undefined} data-active={isActive ? active!.mode : undefined} data-corner={isActive ? active!.corner : undefined} data-overlap={isActive && active!.overlap ? '' : undefined} data-ctx={contextFor?.(s)} onContextMenu={() => { if (contextFor?.(s))
+                onSelect(s.id); }} onFocus={() => { if (!pointerFocus.current) onSelect(s.id); }} onDoubleClick={() => onSelect(s.id, 'device')} onKeyDown={(e) => onScreenKeyDown(e, s)} onPointerDown={(e) => begin(e, s, 'move')} onPointerMove={move} onPointerUp={(e) => end(e)} onPointerCancel={(e) => end(e, true)} onLostPointerCapture={(e) => end(e)}>
             {/* Write radii on the painted node: the WebKit fallback rereads its
                 geometry on style mutations, including animated contact corners. */}
             <div className="scr__body" data-offline={s.offline ? '' : undefined} style={{
@@ -561,6 +700,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
                         [c[1] === 'e' ? 'right' : 'left']: -out,
                         [c[0] === 's' ? 'bottom' : 'top']: -out,
                     } as CSSProperties} onPointerDown={(e) => begin(e, s, 'resize', c)}/>))}
+            {selected && (!multi || alone) && <SelectionRing w={W} h={H} radii={[rc.nw, rc.ne, rc.se, rc.sw]} ks={shape.ks}/>}
             {!multi && <svg className="scr__arcs" aria-hidden width={W + 2 * M} height={H + 2 * M} viewBox={`${-M} ${-M} ${W + 2 * M} ${H + 2 * M}`} style={{ left: -M, top: -M }}>
               {CORNERS.map((c) => {
                     const d = cornerArcPath(c, W, H, gap, rc[c] + gap, shape.n);
@@ -569,25 +709,26 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
             </svg>}
           </div>);
         })}
-      {screens.filter((s, i) =>
+      {(grouped ? screens.filter(s => selectedGroup!.has(s.id)).slice(0, 1) : screens.filter((s, i) =>
             (s.groupSize ?? members(s.id).length) > 1
             && screens.findIndex(m => sameComputer(s, m)) === i
             && members(s.id).some(m => m.id === selectedId || selectedGroup?.has(m.id)),
-        ).map(s => {
+        )).map(s => {
             const r = bounds(members(s.id).map(m => springs.get(m.id) ?? m));
             const painted = projectScreenRect(r, { zoom, ox, oy }, pixelRatio, paintOrigin);
             const W = painted.w;
             const H = painted.h;
             const out = gap + 8;
             const hz = 14;
-            const activeScreen = active ? screens.find(m => m.id === active.id) : undefined;
-            const isActive = !!activeScreen && sameComputer(s, activeScreen);
+            const activeScreen = active && active.mode !== 'screen' ? screens.find(m => m.id === active.id) : undefined;
+            const isActive = !!activeScreen && members(s.id).some(m => m.id === activeScreen.id);
             return (
                 <div
-                    key={`group:${s.device}`}
+                    key={grouped ? 'group:selection' : `group:${s.device}`}
                     className="scr scr--group"
                     data-selected=""
-                    data-group={s.device}
+                    data-group={grouped ? 'selection' : s.device}
+                    data-screen-selected={screenSelection && sameComputer(s, screenSelection) ? '' : undefined}
                     data-active={isActive ? active!.mode : undefined}
                     data-corner={isActive ? active!.corner : undefined}
                     style={{
@@ -601,7 +742,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
                     onPointerCancel={e => end(e, true)}
                     onLostPointerCapture={e => end(e)}
                 >
-                    <div className="scr__group-border" />
+                    <div className="scr__group-border">{!(screenSelection && sameComputer(s, screenSelection)) && <SelectionRing w={W} h={H} radii={[R, R, R, R]} ks={shape.ks}/>}</div>
                     {CORNERS.map(c => (
                         <div
                             key={c}
@@ -637,6 +778,17 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
                     </svg>
                 </div>
             );
+        })}
+      {/* Inside a multi-computer group, each member gets a dashed accent outline: per
+          screen where the computer writes its system arrangement, otherwise one around
+          the computer's bounds, which edits as one big screen. */}
+      {grouped && [...new Set(screens.filter(s => selectedGroup!.has(s.id)).map(s => s.device ?? s.id))].flatMap(device => {
+            const own = screens.filter(s => (s.device ?? s.id) === device);
+            return screenEditable?.(own[0]) && own.length > 1 ? own.map(s => ({ key: s.id, rects: [s] })) : [{ key: device, rects: own }];
+        }).map(({ key, rects }) => {
+            const painted = projectScreenRect(bounds(rects.map(m => springs.get(m.id) ?? m)), { zoom, ox, oy }, pixelRatio, paintOrigin);
+            return <div key={`outline:${key}`} className="scr-outline" data-outline={key} aria-hidden
+                style={{ transform: `translate(${painted.x}px,${painted.y}px)`, width: painted.w, height: painted.h }}/>;
         })}
       {showHints && <div className="arr__keys" style={{ width: hintWidth }} role="group" aria-label={tr('排列快捷键')}>
         <div className="arr__keys-row">

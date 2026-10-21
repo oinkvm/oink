@@ -5,6 +5,7 @@
 //!
 //! The queue from the input thread is a hand-over between two realtime threads inside
 //! the process; it is not a stream.
+pub(crate) mod cursor;
 use oink_foundation::handoff_timing::{self, Stage, Token};
 use oink_foundation::{
     DeviceId, Point,
@@ -15,6 +16,11 @@ use oink_foundation::{
 /// is skipped if a newer mode was already applied inside a capture callback.
 #[derive(Clone, Debug)]
 pub enum InjectItem {
+    /// Native FIFO read barrier. Failure is a readback fallback, not an input fault.
+    CursorRead {
+        scope: u64,
+        reply: std::sync::mpsc::SyncSender<cursor::Snapshot>,
+    },
     /// Update ACK follows all preceding releases and native mode operations.
     UpdateFence(std::sync::Arc<std::sync::atomic::AtomicU8>),
     OwnerBegin(std::sync::Arc<std::sync::atomic::AtomicU64>),
@@ -30,6 +36,7 @@ pub enum InjectItem {
     },
     /// Non-callback mode switches keep their order relative to injected events.
     SetMode(CaptureMode),
+    ConstrainCursor(Option<oink_foundation::Rect>),
     SetRelativeCapture(bool),
     RestoreLocal {
         at: Point,
@@ -125,6 +132,7 @@ pub struct InjectHandle {
     timing: std::sync::Arc<oink_input::timing::InjectionTiming>,
     handoff_epoch: std::sync::atomic::AtomicU64,
     first_motion_epoch: std::sync::atomic::AtomicU64,
+    pointer_scope: std::sync::atomic::AtomicU64,
 }
 impl std::fmt::Debug for InjectHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -141,6 +149,8 @@ fn session_sensitive(item: &InjectItem) -> bool {
     matches!(
         item,
         InjectItem::Inject { .. }
+            | InjectItem::CursorRead { .. }
+            | InjectItem::ConstrainCursor(Some(_))
             | InjectItem::SetMode(_)
             | InjectItem::RestoreLocal { .. }
             | InjectItem::SetRelativeCapture(true)
@@ -155,6 +165,7 @@ fn session_sensitive(item: &InjectItem) -> bool {
     )
 }
 struct Queued {
+    pointer_scope: u64,
     safety: oink_input::session_gate::InputSafety,
     crossing: Option<Token>,
     first_motion: bool,
@@ -172,6 +183,15 @@ impl Drop for Posting<'_> {
     }
 }
 impl InjectHandle {
+    pub(crate) fn pointer_scope(&self, scope: u64) {
+        self.pointer_scope.store(scope, std::sync::atomic::Ordering::Release);
+    }
+    pub(crate) fn read_cursor(&self, scope: u64) -> std::sync::mpsc::Receiver<cursor::Snapshot> {
+        let (reply, receive) = std::sync::mpsc::sync_channel(1);
+        self.push(InjectItem::CursorRead { scope, reply });
+        receive
+    }
+
     pub(crate) fn detached(&self) -> bool {
         self.stopped() && self.join.as_ref().is_none_or(|join| join.is_finished())
     }
@@ -472,6 +492,7 @@ impl InjectHandle {
         assert!(
             self.queue
                 .push(Queued {
+                    pointer_scope: self.pointer_scope.load(std::sync::atomic::Ordering::Acquire),
                     safety,
                     crossing: (epoch != 0).then_some(Token { epoch, sequence: 0 }),
                     first_motion: first_motion.is_some(),
@@ -726,6 +747,7 @@ pub(crate) fn start_with_trace(
             scheduling.publish(status.clone());
             let mut read_back_at = std::time::Instant::now() + oink_foundation::realtime::READBACK_INTERVAL;
             let mut held = Held::default();
+            let mut cursor = cursor::Ledger::default();
             let mut dnd_pending: Option<(std::sync::Arc<std::sync::atomic::AtomicBool>, bool)> = None;
             let mut deferred: Option<Queued> = None;
             let mut source_pending: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
@@ -809,6 +831,7 @@ pub(crate) fn start_with_trace(
                     .is_some_and(|ready| ready.load(std::sync::atomic::Ordering::Acquire))
                 {
                     source_pending = None;
+                    cursor.clear();
                     rebase_motion = true;
                 }
                 if source_pending.is_none()
@@ -902,7 +925,7 @@ pub(crate) fn start_with_trace(
                             InjectItem::Inject {
                                 event: InjectEvent::MoveTo { .. } | InjectEvent::MoveToWithDelta { .. },
                                 ..
-                            }
+                            } | InjectItem::CursorRead { .. }
                         ))
                 {
                     deferred = Some(queued);
@@ -920,6 +943,12 @@ pub(crate) fn start_with_trace(
                 }
                 let _scope = handoff_timing::enter_scope(queued.crossing);
                 match queued.item {
+                    InjectItem::CursorRead { scope, reply } => {
+                        let _ = reply.try_send(cursor.sample(native.as_ref(), scope));
+                        if let Some(wake) = input_wake.get() {
+                            wake();
+                        }
+                    }
                     InjectItem::Inject { mut event, from } => {
                         if queued.first_motion {
                             handoff_timing::native(Stage::FirstMotionStarted, 0);
@@ -951,6 +980,10 @@ pub(crate) fn start_with_trace(
                             // Relative injection already starts at the native cursor on
                             // both platforms; discarded events never reach its accumulator.
                         }
+                        let cursor_before =
+                            matches!(event, InjectEvent::MoveTo { .. } | InjectEvent::MoveToWithDelta { .. })
+                                .then(|| native.cursor_position().ok())
+                                .flatten();
                         let result = oink_input::source_time::with_injection_source(source, || {
                             if matches!(event, InjectEvent::Gesture(_))
                                 && input_trace.as_ref().is_some_and(|t| t.enabled())
@@ -961,6 +994,7 @@ pub(crate) fn start_with_trace(
                             }
                         });
                         let success = result.is_ok();
+                        cursor.posted(native.as_ref(), queued.pointer_scope, &event, cursor_before, success);
                         if queued.first_motion {
                             handoff_timing::native(Stage::FirstMotionCompleted, u32::from(!success));
                         }
@@ -996,6 +1030,7 @@ pub(crate) fn start_with_trace(
                         }
                     }
                     item @ (InjectItem::SetMode(_) | InjectItem::RestoreLocal { .. }) => {
+                        cursor.clear();
                         let mut applied = applied_mode.lock().unwrap_or_else(|e| e.into_inner());
                         trace_mode_route(&item, queued.mode_sequence, 3, None);
                         let called = std::time::Instant::now();
@@ -1016,7 +1051,20 @@ pub(crate) fn start_with_trace(
                         }
                         measured.native_end(oink_input::timing::CallClass::Mode, called.elapsed().as_micros() as u64);
                     }
+                    InjectItem::ConstrainCursor(bounds) => {
+                        cursor.clear();
+                        let result = native.set_cursor_constraint(bounds);
+                        if result.is_err() {
+                            failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if native_faults.mouse(super::input::faults::native_result(&result))
+                            && let Some(wake) = input_wake.get()
+                        {
+                            wake();
+                        }
+                    }
                     InjectItem::SetRelativeCapture(active) => {
+                        cursor.clear();
                         let called = std::time::Instant::now();
                         measured.native_begin(oink_input::timing::CallClass::Mode, called);
                         let result = native.set_relative_capture(active);
@@ -1042,6 +1090,7 @@ pub(crate) fn start_with_trace(
                         (released.lock().unwrap_or_else(|e| e.into_inner()))(peer);
                     }
                     InjectItem::Dnd { command, main } => {
+                        cursor.clear();
                         if let (Some(stamp), Some(p)) = (queued.report, crate::telemetry::producer().as_ref()) {
                             p.interval(stamp, oink_telemetry::Metric::DragQueueWait, started);
                         }
@@ -1169,6 +1218,7 @@ pub(crate) fn start_with_trace(
         timing,
         handoff_epoch: std::sync::atomic::AtomicU64::new(0),
         first_motion_epoch: std::sync::atomic::AtomicU64::new(0),
+        pointer_scope: std::sync::atomic::AtomicU64::new(0),
     })
 }
 
@@ -1624,6 +1674,7 @@ mod tests {
             },
             main,
         });
+        let read_before_motion = handle.read_cursor(0);
         let plain = InjectEvent::MoveTo {
             pos: Point::new(1., 0.),
         };
@@ -1662,9 +1713,14 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let during_begin = backend.injected();
+        let read_during_begin = read_before_motion.try_recv();
         // Release before asserting so a broken motion filter cannot strand teardown.
         drop(begin);
         finish.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+        assert!(
+            read_during_begin.is_ok(),
+            "readback may not block motion behind a Begin fence"
+        );
         assert_eq!(
             during_begin,
             vec![plain.clone(), with_delta.clone()],

@@ -62,6 +62,7 @@ impl Node {
         let aim_port = links.register(crate::streams::aim::KINDS);
         let projection_port = links.register(crate::streams::projection::KINDS);
         let wallpaper_port = links.register(crate::streams::wallpaper::KINDS);
+        let profiles_port = links.register(&[oink_protocol::frame::StreamKind::LayoutProfilesV2]);
         let cache_port = links.register(&[oink_protocol::frame::StreamKind::Cache]);
         let diagnostics_port = links.register(crate::streams::diagnostics::KINDS);
         let dnd_port = links.register(crate::streams::dnd::KINDS);
@@ -182,6 +183,7 @@ impl Node {
             self.inner.native_surfaces,
         )?);
         tasks.push(crate::wallpaper::start_link_runtime(self.clone(), wallpaper_port)?);
+        tasks.push(crate::layout_profiles::sync::start(self.clone(), profiles_port));
         let (diagnostics, diagnostics_task) =
             crate::diagnostics::collection::start_link_runtime(self.clone(), diagnostics_port, recorder)?;
         self.inner
@@ -278,10 +280,14 @@ fn application_profile() -> oink_network::negotiation::OfferProfile {
                 "oink.input.edge-trigger/1",
                 "oink.device-resources/1",
                 "oink.device-options/1",
+                "oink.input.mouse-disabled/1",
                 "oink.aim/1",
                 "oink.notify/1",
                 "oink.wallpaper/1",
                 "oink.layout.projection/1",
+                "oink.layout.profiles/2",
+                "oink.layout.arrangement/1",
+                "oink.layout.preview/1",
                 "oink.diagnostics.collect/1",
                 "oink.diagnostics.layout/1",
             ])

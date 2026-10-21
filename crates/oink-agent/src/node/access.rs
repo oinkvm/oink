@@ -148,6 +148,7 @@ impl Node {
             match mode {
                 oink_foundation::input::InputMode::Shared => dto::SharingMode::Shared,
                 oink_foundation::input::InputMode::Local => dto::SharingMode::Local,
+                oink_foundation::input::InputMode::Disabled => dto::SharingMode::Unknown(2),
             }
         }
         fn fault(code: Option<dto::ResourceFaultCode>) -> Option<dto::ResourceFault> {

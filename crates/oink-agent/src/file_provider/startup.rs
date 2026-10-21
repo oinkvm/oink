@@ -5,6 +5,7 @@ const MARKER: &str = "file-provider-launch.json";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum LaunchAction {
+    Suspend,
     Register,
     Reset,
     Recover,
@@ -72,8 +73,14 @@ fn finish_launch(
     mut state: LaunchState,
     mut run: impl FnMut(LaunchAction) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    // An installer may already have reconnected the replaced bundle. Quiesce
+    // that domain before changing LS/PlugInKit registrations: macOS 26 can
+    // otherwise open both extension generations against the same database.
+    run(LaunchAction::Suspend)?;
     run(LaunchAction::Register)?;
     run(state.pending.expect("planned launch action"))?;
+    // Recover includes namespace stabilization, not just reconnect's ACK. A
+    // timeout must leave this intent durable so the same build retries on launch.
     state.pending = None;
     oink_foundation::storage::atomic_write(&data.join(MARKER), &serde_json::to_vec(&state)?)?;
     Ok(())
@@ -174,6 +181,21 @@ fn prepare_native(data: &Path, state: LaunchState, current: &dyn Fn() -> bool) -
     finish_launch(data, state, |action| {
         tracing::info!(?action, "File Provider launch preparation");
         match action {
+            LaunchAction::Suspend => {
+                let (status, _) = run(
+                    &installed.join("oink-file-provider"),
+                    &["prepare-update".as_ref()],
+                    std::time::Instant::now() + std::time::Duration::from_secs(15),
+                    current,
+                )?;
+                // A fresh, not-yet-registered extension has no live domain to
+                // suspend. Other failures must not authorize registration.
+                anyhow::ensure!(
+                    status.success() || status.code() == Some(6),
+                    "File Provider suspension failed ({status})"
+                );
+                Ok(())
+            }
             LaunchAction::Register => register_provider(
                 app,
                 std::time::Instant::now() + std::time::Duration::from_secs(20),
@@ -304,18 +326,19 @@ fn register_provider_with(
     // LaunchServices and PlugInKit also settle asynchronously after a move, and
     // a mounted copy of this same extension can win provider selection. Register
     // the running installed bundle, remove ONLY other registrations of Oink's
-    // exact extension ID, then verify selection before touching its domain. Do
+    // exact extension ID, then verify selection before reconnecting its domain. Do
     // not elect "use": that would override the user's disabled extension. The
     // disconnect/reconnect is separate and preserves domain identity/content.
     // The triggering throttle was observed on macOS 26; macOS 14/26 installed
     // manual-update acceptance is required for this launch workaround.
-    checked(
-        Path::new(
-            "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
-        ),
-        &["-f".as_ref(), app.as_os_str()],
-    )?;
-    checked(plugin, &["-a".as_ref(), own.as_os_str()])?;
+    let selected_args = [
+        "-m".as_ref(),
+        "-v".as_ref(),
+        "-i".as_ref(),
+        "com.hachiwii.oink.fileprovider".as_ref(),
+    ];
+    let own_selected =
+        registration_paths(&checked(plugin, &selected_args)?) == std::collections::BTreeSet::from([own.clone()]);
     let all = checked(
         plugin,
         &[
@@ -327,22 +350,31 @@ fn register_provider_with(
             "com.hachiwii.oink.fileprovider".as_ref(),
         ],
     )?;
-    for path in registration_paths(&all) {
+    let paths = registration_paths(&all);
+    // Bundle replacement/installer registration may already have selected us.
+    // Re-registering that exact selection invalidates the live extension again;
+    // on macOS 26 overlapping database generations can remain permanently busy.
+    if own_selected && paths == std::collections::BTreeSet::from([own.clone()]) {
+        return Ok(());
+    }
+    for path in paths {
         if path != own {
             checked(plugin, &["-r".as_ref(), path.as_os_str()])?;
         }
     }
-    loop {
-        checked(plugin, &["-a".as_ref(), own.as_os_str()])?;
-        let selected = checked(
-            plugin,
-            &[
-                "-m".as_ref(),
-                "-v".as_ref(),
-                "-i".as_ref(),
-                "com.hachiwii.oink.fileprovider".as_ref(),
-            ],
+    if !own_selected {
+        checked(
+            Path::new(
+                "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
+            ),
+            &["-f".as_ref(), app.as_os_str()],
         )?;
+        checked(plugin, &["-a".as_ref(), own.as_os_str()])?;
+    }
+    loop {
+        // Query while asynchronous registration settles; repeatedly adding the
+        // same extension restarts the very transition we are waiting to finish.
+        let selected = checked(plugin, &selected_args)?;
         if registration_paths(&selected) == std::collections::BTreeSet::from([own.clone()]) {
             return Ok(());
         }
@@ -353,6 +385,35 @@ fn register_provider_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn already_selected_installed_provider_is_not_registered_again() {
+        let app = Path::new("/Applications/Oink.app");
+        let own = app.join("Contents/PlugIns/OinkFileProvider.appex");
+        let mut mutations = vec![];
+        register_provider_with(
+            app,
+            |program, args| {
+                if args.first() == Some(&std::ffi::OsStr::new("-m")) {
+                    return Ok(format!(
+                        " com.hachiwii.oink.fileprovider(0.2.0)\tUUID\tDATE\t{}\n",
+                        own.display()
+                    ));
+                }
+                mutations.push((
+                    program.to_owned(),
+                    args.iter().map(|s| s.to_os_string()).collect::<Vec<_>>(),
+                ));
+                Ok(String::new())
+            },
+            || panic!("selected registration is already current"),
+        )
+        .unwrap();
+        assert!(
+            mutations.is_empty(),
+            "re-registering a live selected extension can invalidate its database: {mutations:?}"
+        );
+    }
 
     #[test]
     fn host_exit_cancels_and_reaps_an_inflight_launch_tool() {
@@ -428,7 +489,7 @@ mod tests {
                 }
                 if args.first().map(String::as_str) == Some("-m") {
                     selected_queries += 1;
-                    return Ok(if selected_queries == 1 {
+                    return Ok(if selected_queries <= 2 {
                         row(duplicate)
                     } else {
                         row(own.to_str().unwrap())
@@ -450,7 +511,13 @@ mod tests {
         assert_eq!(removals.len(), 1);
         assert_eq!(removals[0].1, ["-r", duplicate]);
         assert!(calls.iter().all(|(_, args)| !args.contains(&"-e".into())));
-        assert_eq!(calls.first().unwrap().1, ["-f", "/Applications/Oink.app"]);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(_, args)| args.first().map(String::as_str) == Some("-a"))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -484,33 +551,59 @@ mod tests {
         std::fs::write(dir.path().join("device.key"), [0; 32]).unwrap();
         let mut calls = vec![];
         launch(dir.path(), "18", &mut calls, None).unwrap();
-        assert_eq!(calls, [LaunchAction::Register, LaunchAction::Recover]);
+        assert_eq!(
+            calls,
+            [LaunchAction::Suspend, LaunchAction::Register, LaunchAction::Recover]
+        );
         calls.clear();
         launch(dir.path(), "18", &mut calls, None).unwrap();
         assert!(calls.is_empty());
         launch(dir.path(), "19", &mut calls, None).unwrap();
-        assert_eq!(calls, [LaunchAction::Register, LaunchAction::Recover]);
+        assert_eq!(
+            calls,
+            [LaunchAction::Suspend, LaunchAction::Register, LaunchAction::Recover]
+        );
         calls.clear();
         prepare_launch(dir.path(), "0.1.0", "19", |action| {
             calls.push(action);
             Ok(())
         })
         .unwrap();
-        assert_eq!(calls, [LaunchAction::Register, LaunchAction::Recover]);
+        assert_eq!(
+            calls,
+            [LaunchAction::Suspend, LaunchAction::Register, LaunchAction::Recover]
+        );
     }
 
     #[test]
-    fn recovery_failure_stays_retryable_and_registration_precedes_domain_access() {
-        for failure in [LaunchAction::Register, LaunchAction::Recover] {
+    fn suspension_precedes_registration_and_failures_stay_retryable() {
+        for failure in [LaunchAction::Suspend, LaunchAction::Register, LaunchAction::Recover] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("device.key"), [0; 32]).unwrap();
             let mut calls = vec![];
             assert!(launch(dir.path(), "19", &mut calls, Some(failure)).is_err());
             assert_eq!(calls.last(), Some(&failure));
-            assert_eq!(calls.len(), if failure == LaunchAction::Register { 1 } else { 2 });
+            let pending: LaunchState =
+                serde_json::from_slice(&std::fs::read(dir.path().join(MARKER)).unwrap()).unwrap();
+            assert_eq!(
+                pending.pending,
+                Some(LaunchAction::Recover),
+                "failed namespace recovery must remain retryable in the same build"
+            );
+            assert_eq!(
+                calls.len(),
+                match failure {
+                    LaunchAction::Suspend => 1,
+                    LaunchAction::Register => 2,
+                    _ => 3,
+                }
+            );
             calls.clear();
             launch(dir.path(), "19", &mut calls, None).unwrap();
-            assert_eq!(calls, [LaunchAction::Register, LaunchAction::Recover]);
+            assert_eq!(
+                calls,
+                [LaunchAction::Suspend, LaunchAction::Register, LaunchAction::Recover]
+            );
             calls.clear();
             launch(dir.path(), "19", &mut calls, None).unwrap();
             assert!(calls.is_empty());
@@ -531,7 +624,10 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(calls, [LaunchAction::Register, LaunchAction::Reset]);
+        assert_eq!(
+            calls,
+            [LaunchAction::Suspend, LaunchAction::Register, LaunchAction::Reset]
+        );
         assert!(plan_launch(dir.path(), "0.1.0-beta.1", "19").unwrap().is_none());
     }
 
@@ -540,12 +636,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut calls = vec![];
         assert!(launch(dir.path(), "19", &mut calls, Some(LaunchAction::Reset)).is_err());
-        assert_eq!(calls, [LaunchAction::Register, LaunchAction::Reset]);
+        assert_eq!(
+            calls,
+            [LaunchAction::Suspend, LaunchAction::Register, LaunchAction::Reset]
+        );
         // The rest of the app can start; the pending reset must survive it.
         std::fs::write(dir.path().join("device.key"), [0; 32]).unwrap();
         calls.clear();
         launch(dir.path(), "19", &mut calls, None).unwrap();
-        assert_eq!(calls, [LaunchAction::Register, LaunchAction::Reset]);
+        assert_eq!(
+            calls,
+            [LaunchAction::Suspend, LaunchAction::Register, LaunchAction::Reset]
+        );
     }
 
     #[test]

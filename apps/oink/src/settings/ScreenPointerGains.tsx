@@ -1,9 +1,10 @@
 import { useState } from 'react';
-import { Row, Slider } from 'oink-ui';
+import { Row } from 'oink-ui';
 import { api } from '../api/client';
 import { agent, useAgent } from '../api/store';
 import type { Screen } from '../api/types';
 import { tr } from '../i18n';
+import { GainControl } from './GainControl';
 
 export function ScreenPointerGains() {
   const { layout, overview } = useAgent();
@@ -24,15 +25,10 @@ export function ScreenPointerGains() {
   if (!screens.length) return <span className="setp__note">{tr('不可用')}</span>;
   return <div aria-busy={pending}>{screens.map(screen => {
     const value = drafts[screen.key.display] ?? screen.remote_gain ?? 1;
-    const label = tr('{0}的远程指针速度', screen.display.name);
-    return <Row key={screen.key.display} label={screen.display.name} controlWidth={240}>
-      <span className="setp__slider">
-        <Slider aria-label={label} min={0.1} max={5} step={0.1} digits={1} value={value} disabled={pending}
-          format={v => `${v.toFixed(1)}x`}
-          onChange={gain => setDrafts(current => ({...current, [screen.key.display]: gain}))}
-          onChangeEnd={gain => { void save(screen, gain); }}/>
-        <span className="setp__val" aria-hidden>{value.toFixed(1)}x</span>
-      </span>
+    return <Row key={screen.key.display} label={screen.display.name}>
+      <GainControl label={tr('{0}的远程指针速度', screen.display.name)} value={value} disabled={pending}
+        onChange={gain => setDrafts(current => ({...current, [screen.key.display]: gain}))}
+        onCommit={gain => { void save(screen, gain); }}/>
     </Row>;
   })}</div>;
 }

@@ -86,6 +86,7 @@ struct Shared {
     links: Arc<crate::streams::clipboard::files::FileLinks>,
     settings: Mutex<ClipboardSettings>,
     policy: oink_clipboard::policy::SharingPolicy,
+    receive_policy: oink_clipboard::policy::SharingPolicy,
     enabled: AtomicBool,
     paused: AtomicBool,
     activity: Mutex<VecDeque<ClipActivity>>,
@@ -128,7 +129,9 @@ impl ClipHandle {
     }
     fn reconfigure(&self) {
         let active = self.shared.enabled.load(Ordering::Acquire) && !self.shared.paused.load(Ordering::Acquire);
-        self.shared.policy.update(active, self.settings());
+        let settings = self.settings();
+        self.shared.policy.update(active && settings.send, settings);
+        self.shared.receive_policy.update(active && settings.receive, settings);
         self.shared.native.cancel_all();
         if let Some((_, remote)) = self.shared.native_target.lock().unwrap().take() {
             remote.cancel();
@@ -209,10 +212,16 @@ struct Task {
 }
 impl Task {
     fn active(&self) -> bool {
-        self.shared.policy.enabled()
+        self.shared.enabled.load(Ordering::Acquire) && !self.shared.paused.load(Ordering::Acquire)
+    }
+    fn sending(&self) -> bool {
+        self.active() && self.shared.policy.enabled()
+    }
+    fn receiving(&self) -> bool {
+        self.active() && self.shared.receive_policy.enabled()
     }
     fn capture(&mut self) {
-        if !self.active() {
+        if !self.sending() {
             return;
         }
         if self.capture.is_some() {
@@ -249,6 +258,9 @@ impl Task {
         self.remote_scope = None;
         self.cancelled = None;
         self.ordering.local_change(count, Instant::now());
+        if !self.sending() {
+            self.ordering.revoke_local();
+        }
         self.streams.set_offer(None);
         self.set_transfer(None);
     }
@@ -258,6 +270,9 @@ impl Task {
         }
         self.fault = Some(dto::ResourceFaultCode::BackendFailed);
         self.shared.policy.update(false, *self.shared.settings.lock().unwrap());
+        self.shared
+            .receive_policy
+            .update(false, *self.shared.settings.lock().unwrap());
         self.shared.native.cancel_all();
         if let Some((_, remote)) = self.shared.native_target.lock().unwrap().take() {
             remote.cancel();
@@ -276,7 +291,7 @@ impl Task {
         result: Result<oink_clipboard::CapturedClipboard, oink_clipboard::ClipboardError>,
     ) {
         self.capture = None;
-        if !self.active() {
+        if !self.sending() {
             return;
         }
         if std::mem::take(&mut self.capture_again) {
@@ -345,6 +360,9 @@ impl Task {
             Ok(offer) => offer,
             Err(_) => {
                 self.shared.policy.update(false, *self.shared.settings.lock().unwrap());
+                self.shared
+                    .receive_policy
+                    .update(false, *self.shared.settings.lock().unwrap());
                 self.shared.native.cancel_all();
                 self.streams.set_offer(None);
                 return;
@@ -383,7 +401,7 @@ impl Task {
     }
     fn may_write(&mut self, id: ClipId) -> bool {
         self.observe(self.backend.change_count());
-        self.active()
+        self.receiving()
             && self.cancelled != Some(id)
             && self.current_id() == Some(id)
             && self.remote_scope.is_some_and(|(current, peer, stream)| {
@@ -436,7 +454,7 @@ impl Task {
             *self.shared.native_target.lock().unwrap() = Some((id.clip, remote.clone()));
             (remote, true)
         };
-        let provider = self.shared.policy.provider(Arc::new(remote.clone()));
+        let provider = self.shared.receive_policy.provider(Arc::new(remote.clone()));
         let inventory = provider.inventory();
         if inventory.wanted(target).next().is_none() && inventory.roots.is_empty() {
             return Err(E::Unsupported);
@@ -489,6 +507,7 @@ impl Task {
                 }
             });
         }
+        oink_clipboard::received::remember_source(id.clip.origin, (self.name_of)(id.clip.origin));
         remote.automatic_pull();
         Ok(oink_clipboard::NativeSpec {
             inventory,
@@ -556,7 +575,7 @@ impl Task {
         });
         let backend = self.backend.clone();
         let before = backend.change_count();
-        let policy = self.shared.policy.publication_guard();
+        let policy = self.shared.receive_policy.publication_guard();
         let tx = self.tx.clone();
         tokio::task::spawn_blocking(move || {
             let check = ticket.clone();

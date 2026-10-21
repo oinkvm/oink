@@ -323,6 +323,7 @@ fn physical_input_driving_a_peer_declares_local_activity_with_group_wake_disable
             time_us: 0,
             cursor: Some(oink_foundation::Point::new(999., 500.)),
         });
+        h.settle_clip_check();
         if h.driver.adapter.focus().holder == peer() {
             break;
         }

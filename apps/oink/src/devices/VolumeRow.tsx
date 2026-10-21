@@ -10,6 +10,10 @@ export type SpeakerAction = {
 } | {
     type: 'mute';
 };
+export const hasVolume = (d: Device) =>
+    (d.speaker.mode === 'forwarding' || d.speaker.mode === 'exit') &&
+    d.speaker.volumeKnown !== false && d.speaker.mutedKnown !== false &&
+    Number.isFinite(d.speaker.volume);
 export const speakerMax = (d: Device) => (d.speaker.mode === 'exit' ? 100 : 200);
 export function VolumeRow({ d, open, tabbable, disabled = false, onSpeaker }: {
     d: Device;
@@ -29,6 +33,7 @@ export function VolumeRow({ d, open, tabbable, disabled = false, onSpeaker }: {
         const t = window.setTimeout(() => setArmed(true), 50);
         return () => { cancelAnimationFrame(r); window.clearTimeout(t); };
     }, []);
+    if (!hasVolume(d)) return null;
     const shown = open && live && armed;
     return (<div className="dev__vol" data-open={shown ? '' : undefined} aria-hidden={!shown || undefined} ref={(el) => { if (el)
         el.inert = !shown; }}>
@@ -43,7 +48,7 @@ export function VolumeRow({ d, open, tabbable, disabled = false, onSpeaker }: {
               </span>
             </Button>
           </Tooltip>
-          {sp.volumeKnown === false ? <span className="vol__meter" aria-label={tr("不可用")}>—</span> : <VolumeMeter value={Math.min(sp.volume, max)} max={max} muted={sp.muted} tabbable={tabbable} disabled={disabled} onChange={(value) => onSpeaker({ type: 'volume', value })}/>}
+          {<VolumeMeter value={Math.min(sp.volume, max)} max={max} muted={sp.muted} tabbable={tabbable} disabled={disabled} onChange={(value) => onSpeaker({ type: 'volume', value })}/>}
         </div>
       </div>
     </div>);

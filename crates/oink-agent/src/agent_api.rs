@@ -735,6 +735,7 @@ pub(crate) fn input_settings(node: &Node) -> InputSettings {
         accept_contacts: s.accept_contacts && contacts_injection_available,
         contacts_injection_available,
         mac_scroll_feel: s.routing.mac_scroll_feel,
+        forward_injected_input: s.routing.forward_injected_input,
         emergency_hold_ms: s.emergency_hold_ms.get(),
         device_gain: s.screen_preferences.device_gain,
         scroll: ScrollSettings {
@@ -777,6 +778,9 @@ fn check_size(s: Size) -> ApiResult<()> {
 }
 
 impl AgentApi for Node {
+    fn layout_profile_command(&self, command: crate::layout_profiles::types::Command) -> ApiResult<serde_json::Value> {
+        Ok(Node::layout_profile_command(self, command))
+    }
     fn device_cards(&self) -> ApiResult<crate::device_cards::DeviceCardsView> {
         self.device_cards_snapshot()
     }
@@ -1050,7 +1054,9 @@ impl AgentApi for Node {
         Ok(self.game_status().into())
     }
     fn set_screen_disabled(&self, device: DeviceKey, disabled: bool) -> ApiResult<()> {
-        self.edit_device_option(device, dto::LocalOption::ScreenShared, (!disabled).write())
+        self.commit_manual_visibility(device, None, disabled, || {
+            self.edit_device_option(device, dto::LocalOption::ScreenShared, (!disabled).write())
+        })
     }
     fn set_input_transform(&self, device: DeviceKey, settings: InputTransform) -> ApiResult<()> {
         self.edit_device_option_with(device, dto::LocalOption::InputTransform, |current| {
@@ -1210,11 +1216,13 @@ impl AgentApi for Node {
         if Node::layout(self).0.screen(&id).is_none() {
             return Err(not_found("没有这块屏幕"));
         }
-        self.edit_device_option(
-            screen.device,
-            dto::LocalOption::ScreenPreferences,
-            screen_preference_patch(screen.display, 3, (!hidden).write()),
-        )
+        self.commit_manual_visibility(screen.device, Some(&screen.display), hidden, || {
+            self.edit_device_option(
+                screen.device,
+                dto::LocalOption::ScreenPreferences,
+                screen_preference_patch(screen.display.clone(), 3, (!hidden).write()),
+            )
+        })
     }
 
     fn layout_projection(&self) -> ApiResult<ProjectionStatus> {
@@ -1229,8 +1237,9 @@ impl AgentApi for Node {
         placements: Vec<Placement>,
         affected: Vec<ScreenKey>,
         ended: bool,
+        arrangement: Option<Box<crate::layout_profiles::types::ArrangementSnapshot>>,
     ) -> ApiResult<()> {
-        crate::projection::preview_ui(self, gesture, placements, affected, ended)
+        crate::projection::preview_ui_arrangement(self, gesture, placements, affected, ended, arrangement)
     }
 
     fn preview_move_screen(&self, screen: ScreenKey, origin: Point) -> ApiResult<Option<LayoutGeometry>> {
@@ -1333,12 +1342,19 @@ impl AgentApi for Node {
         // InputSettings is flat; explicit local overrides use the durable routing path.
         // Preserve an explicit choice equal to the default without pinning siblings.
         let mut local_patch = patch.value();
-        if let Some(value) = local_patch.as_object_mut().and_then(|p| p.remove("mac_scroll_feel")) {
-            local_patch["routing"] = serde_json::json!({"mac_scroll_feel": value});
+        let mut routing_patch = serde_json::Map::new();
+        for name in ["mac_scroll_feel", "forward_injected_input"] {
+            if let Some(value) = local_patch.as_object_mut().and_then(|p| p.remove(name)) {
+                routing_patch.insert(name.into(), value);
+            }
+        }
+        if !routing_patch.is_empty() {
+            local_patch["routing"] = routing_patch.into();
         }
         self.edit_local_input_settings(&local_patch, |candidate| {
             let routing = &mut candidate.routing;
             routing.mac_scroll_feel = s.mac_scroll_feel;
+            routing.forward_injected_input = s.forward_injected_input;
             routing.remote_scroll_speed = s.scroll.speed;
             routing.fixed_reference_display = match s.pointer.reference {
                 PointerReference::Fixed { display } => Some(display),
@@ -1389,6 +1405,36 @@ impl AgentApi for Node {
                 result: result.expect("clear result"),
             })
         })
+    }
+    fn received_files_usage(&self) -> ApiResult<ReceivedFilesUsage> {
+        let observed = self.native_services_enabled().then(oink_clipboard::received::usage);
+        let mut usage = observed.and_then(Result::ok).unwrap_or_else(|| ReceivedFilesUsage {
+            incomplete: self.native_services_enabled(),
+            time_basis: if cfg!(windows) {
+                oink_clipboard::received::Basis::LastUsed
+            } else {
+                oink_clipboard::received::Basis::Received
+            },
+            ..Default::default()
+        });
+        usage.cleanup = self.settings().received_files_cleanup;
+        Ok(usage)
+    }
+    fn set_received_files_cleanup(&self, cleanup: ReceivedFilesCleanup) -> ApiResult<()> {
+        let _gate = self.owner_gate();
+        lock(&self.inner.config)
+            .update_local(&serde_json::json!({"received_files_cleanup":cleanup}), |settings| {
+                settings.received_files_cleanup = cleanup
+            })
+            .map_err(|e| unavailable(e.to_string()))?;
+        if self.native_services_enabled() {
+            oink_clipboard::received::configure(cleanup);
+        }
+        self.emit(ApiEvent::ReceivedFilesUsage(self.received_files_usage()?));
+        Ok(())
+    }
+    fn open_received_files(&self) -> ApiResult<()> {
+        oink_clipboard::received::open().map_err(|e| unavailable(e.to_string()))
     }
     fn clipboard_settings(&self) -> ApiResult<ClipboardSettings> {
         Ok(match self.clipboard() {

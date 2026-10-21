@@ -35,7 +35,11 @@ pub(super) fn compile(segs: &[Seg], size: f64) -> Vec<Zone> {
     if size == 0. {
         return zones;
     }
-    for (i, wall) in segs.iter().enumerate().filter(|(_, s)| s.portal.is_none()) {
+    for (i, wall) in segs
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.portal.is_none() && !s.blocked)
+    {
         let left = i.checked_sub(1).map(|i| &segs[i]).filter(|s| s.portal.is_some());
         let right = segs.get(i + 1).filter(|s| s.portal.is_some());
         let mid = (wall.from + wall.to) / 2.;

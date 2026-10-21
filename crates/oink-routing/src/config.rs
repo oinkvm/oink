@@ -96,6 +96,8 @@ pub struct RoutingSettings {
     /// Retired test_mac_scroll is intentionally ignored by local settings readers:
     /// the promoted preference defaults on, independently of the old experiment.
     pub mac_scroll_feel: bool,
+    /// Windows capture-local opt-in to legacy forwarding of other apps' injected input.
+    pub forward_injected_input: bool,
     /// Runtime projection of this device owner's persistent game preference.
     #[serde(skip)]
     pub game_mode_preference: crate::GameMode,
@@ -140,6 +142,7 @@ impl Default for RoutingSettings {
             forward_gestures: true,
             accept_contacts: true,
             mac_scroll_feel: true,
+            forward_injected_input: false,
             game_mode_preference: crate::GameMode::Auto,
             return_pointer_on_display_sleep: true,
             wake_displays_on_input: true,

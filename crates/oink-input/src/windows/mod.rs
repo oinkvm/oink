@@ -17,6 +17,7 @@ mod dpi;
 mod hook;
 mod inject;
 use crate::win_keymap as keymap;
+mod cursor_clip;
 mod loop_timer;
 mod pointer_capture;
 pub mod raw_capture;
@@ -41,7 +42,7 @@ use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromPoint};
 use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, INPUT, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW};
+use windows::Win32::UI::Input::KeyboardAndMouse::INPUT;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
@@ -69,6 +70,7 @@ struct WinInput {
     /// 映射为快捷键、仍按着的 Mac 系统功能键：重复的按下不再触发。
     shortcut_keys: Mutex<HashSet<KeyCode>>,
     lock_chord: Mutex<crate::win_lock::LockChord>,
+    confinement: Mutex<raw_capture::Confinement>,
 }
 
 /// 执行 Mac 手势 / 系统功能键映射出的动作（`win_actions`）。
@@ -102,6 +104,7 @@ impl WinInput {
 
 impl Drop for WinInput {
     fn drop(&mut self) {
+        let _ = self.set_cursor_constraint(None);
         oink_winsvc::client::release_if_connected();
         if let Some(h) = self.take_hook() {
             h.stop();
@@ -144,6 +147,7 @@ impl InputBackend for WinInput {
         service::initialize()
     }
     fn stop_injection_session(&self) {
+        let _ = self.set_cursor_constraint(None);
         oink_winsvc::client::suspend();
         *self.scroll_acc.lock().unwrap_or_else(|e| e.into_inner()) = (0., 0.);
         *self.relative_acc.lock().unwrap_or_else(|e| e.into_inner()) = (0., 0.);
@@ -174,22 +178,7 @@ impl InputBackend for WinInput {
         if session_locked() == Some(true) {
             return Vec::new();
         }
-        (8..=255u16)
-            .filter_map(|vk| {
-                // The OS bitmap includes injected keys. The router excludes keys owned
-                // by remote sources and never uses this snapshot to arm the chord.
-                // SAFETY: read-only key state and scan-code table lookups.
-                let scan = unsafe {
-                    if GetAsyncKeyState(i32::from(vk)) & i16::MIN == 0 {
-                        return None;
-                    }
-                    MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) as u16
-                };
-                keymap::scancode_to_hid(scan)
-            })
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect()
+        hook::physical_keys()
     }
     fn session_locked(&self) -> Option<bool> {
         session_locked()
@@ -243,6 +232,7 @@ impl InputBackend for WinInput {
     }
 
     fn stop(&self) {
+        let _ = self.set_cursor_constraint(None);
         oink_winsvc::client::release_if_connected();
         // 先取出句柄再等待线程退出：回调里若调用 set_mode，不会因为这把锁死锁
         if let Some(h) = self.take_hook() {
@@ -250,6 +240,16 @@ impl InputBackend for WinInput {
         }
     }
 
+    fn set_cursor_constraint(&self, bounds: Option<oink_foundation::Rect>) -> Result<(), InputError> {
+        let hook = self
+            .hook
+            .lock()
+            .map_err(|_| InputError::Platform("capture lock poisoned".into()))?;
+        self.confinement
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set(bounds, hook.as_ref())
+    }
     fn set_mode(&self, mode: CaptureMode) -> Result<(), InputError> {
         let mode = if self.input_safety().active() {
             mode
@@ -571,8 +571,8 @@ impl InputBackend for WinInput {
             InjectEvent::Gesture(g) => {
                 let actions = self.gestures.lock().map_err(|_| InputError::Platform("锁已损坏".into()))?
                     // Only native injection uses this mapper. No ordinary observer
-                    // owns its mutex, including during the UIAutomation query.
-                    .map_with_task_view_query(g, task_view::showing);
+                    // owns its mutex, including during the foreground Shell query.
+                    .map_with_foreground_query(g, task_view::sample);
                 if actions.is_empty() {
                     tracing::debug!("mac gesture: no Windows action");
                 }
@@ -581,8 +581,28 @@ impl InputBackend for WinInput {
         }
     }
 
+    fn system_cursor_clip(&self) -> Result<Option<oink_foundation::Rect>, InputError> {
+        cursor_clip::application().map_err(|e| InputError::Platform(e.to_string()))
+    }
     fn pointer_capture_sample(&self) -> Option<crate::pointer_capture::CaptureSample> {
         pointer_capture::sample()
+    }
+
+    fn cursor_injection_target(&self, event: &InjectEvent) -> Option<(Point, f64)> {
+        let (InjectEvent::MoveTo { pos } | InjectEvent::MoveToWithDelta { pos, .. }) = event else {
+            return None;
+        };
+        let _dpi = dpi::ThreadDpiGuard::per_monitor_v2();
+        // SAFETY: read-only virtual-desktop metrics, no handles or borrowed memory.
+        let (x, y, w, h) = unsafe {
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            )
+        };
+        Some((inject::absolute_target(*pos, (x, y), (w, h)), 0.))
     }
 
     fn cursor_position(&self) -> Result<Point, InputError> {

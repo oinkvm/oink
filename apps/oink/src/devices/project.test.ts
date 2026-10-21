@@ -21,6 +21,14 @@ const card = (): DeviceCard => ({
 });
 const view = (device:DeviceCard):DeviceCardsView => ({schema:1,stream:'test',revision:'1',group:null,generatedAtMs:0,exitVolume:null,emergencyDelivery:null,cards:[device]});
 describe('owner card presentation',()=>{
+  it('offers mouse disable only when the owner supplies an invokable action',()=>{
+    const device=card();
+    expect(presentCards(view(device),[])[0].canDisableMouse).toBe(false);
+    device.status!.actions.mouseDisabled=unavailable;
+    expect(presentCards(view(device),[])[0].canDisableMouse).toBe(false);
+    device.status!.actions.mouseDisabled={kind:'invoke',command:'set_local_option',token:'mouse-disable'};
+    expect(presentCards(view(device),[])[0].canDisableMouse).toBe(true);
+  });
   it.each(['shared','disabled'] as const)('reconciles Locked to %s after owner completion and focus facts in either order',desired=>{
     for (const completionFirst of [true,false]) {
       const store=createAgentStore(), original=card();
@@ -89,7 +97,7 @@ describe('unavailable resource presentation',()=>{
     setLanguage(language);
     const missing=card();missing.status=null;
     const state=indicators(presentCards(view(missing),[])[0]);
-    expect(state).toHaveLength(4);
+    expect(state).toHaveLength(3);
     for(const indicator of state) {
       expect(indicator.tone).toBe('warn');
       expect(indicator.badge).toBe('warning');

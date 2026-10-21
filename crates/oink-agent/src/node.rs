@@ -93,7 +93,7 @@ pub(crate) struct Inner {
     startup: tokio::sync::Mutex<()>,
     pub(crate) group_unreadable: Mutex<Option<String>>,
     clipboard_backend: Option<Arc<dyn ClipboardBackend>>,
-    display_backend: Option<Arc<dyn DisplayBackend>>,
+    pub(crate) display_backend: Option<Arc<dyn DisplayBackend>>,
     initial_displays: Vec<DisplayInfo>,
     pub(crate) input_settings: Arc<Snapshot<oink_routing::RoutingSettings>>,
     input_environment: Arc<Snapshot<Environment>>,
@@ -125,6 +125,7 @@ pub(crate) struct Inner {
     pub(crate) owner_gate: Arc<Mutex<()>>,
     pub(crate) cards: Mutex<crate::device_cards::Projector>,
     pub(crate) controls: Mutex<crate::device_controls::runtime::State>,
+    pub(crate) profiles: crate::layout_profiles::state::State,
     input_observation: Mutex<Option<access::InputObservation>>,
 
     sinks: Mutex<Vec<crate::event_delivery::Subscriber>>,
@@ -279,6 +280,9 @@ impl Node {
                 .err()
                 .map(|error| error.to_string());
         let settings = config.settings.clone();
+        if native_services {
+            oink_clipboard::received::configure(settings.received_files_cleanup);
+        }
         let native = opts.cursor_trail;
         let node = Self {
             inner: Arc::new(Inner {
@@ -327,6 +331,7 @@ impl Node {
                     crate::device_cards::Projector::new().map_err(|error| anyhow::anyhow!(error.to_string()))?,
                 ),
                 controls: Mutex::default(),
+                profiles: Default::default(),
                 input_observation: Mutex::default(),
                 sinks: Mutex::new(Vec::new()),
                 next_sink: AtomicU64::new(0),
@@ -363,6 +368,9 @@ impl Node {
                 stop: tokio::sync::watch::channel(false).0,
             }),
         };
+        // Persist the profile feature boundary before discovery can commit a
+        // new merge. Storage errors stay local to profile queries/operations.
+        let _ = node.initialize_profile_store();
         Ok(node)
     }
     pub fn id(&self) -> DeviceId {
@@ -820,6 +828,14 @@ impl Node {
             .unwrap_or_default()
     }
     pub(crate) async fn edit_layout(&self, source: Source, edit: impl FnOnce(&mut Layout)) -> Result<(), String> {
+        if source == Source::Manual {
+            return self
+                .commit_manual_layout(|layout| {
+                    edit(layout);
+                    Ok(())
+                })
+                .map_err(|e| e.to_string());
+        }
         let group = self.link_config().map_err(|e| e.to_string())?;
         let mut layout = (*group.applied().layout).clone();
         edit(&mut layout);
@@ -838,12 +854,16 @@ impl Node {
         source: Source,
         edit: impl FnOnce(&mut Layout) -> api::ApiResult<()>,
     ) -> api::ApiResult<()> {
+        if source == Source::Manual {
+            return self.commit_manual_layout(edit);
+        }
         let group = self.link_config()?;
         let mut layout = (*group.applied().layout).clone();
         edit(&mut layout)?;
         group.edit_layout(Box::new(move |current| *current = layout), source.into())
     }
     pub(crate) fn emit_layout(&self) {
+        self.refresh_layout_profiles();
         if lock(&self.inner.sinks).is_empty() {
             return;
         }

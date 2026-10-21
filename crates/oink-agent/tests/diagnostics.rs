@@ -327,7 +327,27 @@ async fn local_recording_three_member_save_offline_pause_emergency_and_privacy_s
     common::pair(&a, &b).await;
     common::pair(&a, &c).await;
     common::active(&[&a, &b, &c]).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Pairing now starts capability-gated profile catalog transfers as well as
+    // the existing Low modules. Establish an idle baseline before attributing
+    // any new Low operation to local diagnostic recording.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    let mut previous = [&a, &b, &c].map(low_operations);
+    let mut unchanged_since = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let current = [&a, &b, &c].map(low_operations);
+        if current != previous {
+            previous = current;
+            unchanged_since = tokio::time::Instant::now();
+        }
+        if unchanged_since.elapsed() >= Duration::from_secs(3) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "initial Low synchronization did not settle"
+        );
+    }
     let before = [&a, &b, &c].map(low_operations);
     for (input, code) in [(&ai, 4), (&bi, 5), (&ci, 6)] {
         feed(input, KeyCode::keyboard(code), true);

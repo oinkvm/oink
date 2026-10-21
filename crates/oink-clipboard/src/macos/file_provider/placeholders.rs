@@ -245,19 +245,24 @@ pub(super) fn bind(key: &str, state: &mut CatalogState) -> io::Result<()> {
         let node = record.node.ok_or(io::ErrorKind::InvalidData)?;
         state.aliases.insert(NodeId(node), record.id.clone());
     }
-    hide_parent(key, &mut state.catalog);
+    if !state.catalog.records[0].parent.starts_with("source") {
+        hide_parent(key, &mut state.catalog);
+    }
     Ok(())
 }
 pub(super) fn restore_bindings(key: &str, previous: &Catalog, state: &mut CatalogState) -> io::Result<()> {
     let root_id = format!("{key}-root");
-    let Some(root) = previous
-        .records
-        .iter()
-        .find(|record| record.id == root_id && record.hidden == Some(true))
-    else {
+    let Some(root) = previous.records.iter().find(|record| record.id == root_id) else {
         return Ok(());
     };
-    if root.name != parent_name(key) {
+    if !previous
+        .records
+        .iter()
+        .any(|r| r.id.starts_with(&format!("{key}-slot-")))
+    {
+        return Ok(());
+    }
+    if root.hidden == Some(true) && root.name != parent_name(key) {
         return Err(io::ErrorKind::InvalidData.into());
     }
     let mut used = std::collections::HashSet::new();
@@ -280,7 +285,9 @@ pub(super) fn restore_bindings(key: &str, previous: &Catalog, state: &mut Catalo
             .aliases
             .insert(NodeId(new.node.ok_or(io::ErrorKind::InvalidData)?), new.id.clone());
     }
-    hide_parent(key, &mut state.catalog);
+    if root.hidden == Some(true) {
+        hide_parent(key, &mut state.catalog);
+    }
     Ok(())
 }
 
@@ -596,6 +603,40 @@ mod tests {
         assert_eq!(record.id, "batch-73");
     }
     #[test]
+    fn received_typed_batch_exposes_timestamp_and_restores_slot_identity() {
+        let entries = [FileEntry {
+            path: "file.txt".into(),
+            is_dir: false,
+            size: 4,
+            modified_ms: None,
+            local_path: None,
+        }];
+        let make = || {
+            prepare_batch(
+                Flat::new(&entries, Arc::new(EmptyContents)).unwrap(),
+                "batch",
+                "token".into(),
+                1,
+                PathBuf::new(),
+            )
+            .unwrap()
+            .0
+        };
+        let batch = make();
+        let mut state = batch.state.lock().unwrap();
+        state.catalog.records[0].parent = "source0123".into();
+        state.catalog.records[0].name = "20261021-234512-123".into();
+        bind("batch", &mut state).unwrap();
+        assert_eq!(state.catalog.records[0].name, "20261021-234512-123");
+        assert!(state.catalog.records[0].hidden.is_none());
+        let previous = state.catalog.clone();
+        drop(state);
+        let recovered = make();
+        let mut state = recovered.state.lock().unwrap();
+        restore_bindings("batch", &previous, &mut state).unwrap();
+        assert_eq!(state.catalog.records[1].id, "batch-slot-file-0");
+    }
+    #[test]
     fn completed_restart_preserves_slot_urls_and_remote_node_identity() {
         let data = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -603,9 +644,11 @@ mod tests {
         let local = crate::content::Completed::restore(data.path(), owned.id()).unwrap();
         let path = root.path().join("batch.json");
         let (batch, _) = prepare_batch(Arc::new(local), "batch", "old".into(), 1, path.clone()).unwrap();
+        let original;
         {
             let mut state = batch.state.lock().unwrap();
             bind("batch", &mut state).unwrap();
+            original = state.catalog.records[0].clone();
             state.catalog.urls = vec![root.path().join("final.txt")];
             save_catalog(&path, &state.catalog).unwrap();
         }
@@ -614,7 +657,9 @@ mod tests {
         let state = restored.state.lock().unwrap();
         assert_eq!(state.catalog.records[1].id, "batch-slot-file-0");
         assert_eq!(state.catalog.records[1].node, Some(1));
-        assert_eq!(state.catalog.records[0].name, parent_name("batch"));
-        assert_eq!(state.catalog.records[0].hidden, Some(true));
+        assert_eq!(state.catalog.records[0].name, original.name);
+        assert_eq!(state.catalog.records[0].parent, original.parent);
+        assert!(state.catalog.records[0].parent.starts_with("source"));
+        assert!(state.catalog.records[0].hidden.is_none());
     }
 }

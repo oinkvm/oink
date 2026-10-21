@@ -57,10 +57,12 @@ impl Accounting {
         (registration, previous)
     }
 
-    fn cancel(&mut self, (registration, previous): (Registration, StaleSteps)) {
+    fn cancel(&mut self, (registration, previous): (Registration, StaleSteps)) -> bool {
         if self.base.cancel(registration) {
             self.stale = previous;
+            return true;
         }
+        false
     }
 }
 
@@ -82,8 +84,27 @@ pub(super) fn accepted(before: POINT, target: POINT) -> Acceptance {
     Acceptance(BASE.with_borrow_mut(|base| base.register(before, target)))
 }
 
-pub(super) fn rejected(acceptance: Acceptance) {
-    BASE.with_borrow_mut(|base| base.cancel(acceptance.0));
+pub(super) fn accepted_external(before: Option<POINT>, target: POINT) -> Acceptance {
+    if let Some(before) = before {
+        return accepted(before, target);
+    }
+    Acceptance(BASE.with_borrow_mut(|accounting| {
+        let previous = accounting.stale;
+        let before = accounting.base.registered_target();
+        let registration = accounting.base.register_unobserved(point(target));
+        if let Some(before) = before.filter(|before| *before != point(target)) {
+            accounting
+                .stale
+                .switched(before, super::hook::time_us(std::time::Instant::now()));
+        } else if before.is_none() {
+            accounting.stale.clear();
+        }
+        (registration, previous)
+    }))
+}
+
+pub(super) fn rejected(acceptance: Acceptance) -> bool {
+    BASE.with_borrow_mut(|base| base.cancel(acceptance.0))
 }
 
 pub(super) fn sample(observed: POINT) -> POINT {
@@ -211,6 +232,36 @@ pub(super) fn reset() {
 mod tests {
     use super::super::cursor::test_native as native;
     use super::*;
+
+    #[test]
+    fn external_commits_realign_base_without_forwarding_the_absolute_displacement() {
+        let park = POINT { x: 1000, y: 600 };
+        let external = POINT { x: 300, y: 200 };
+        let _native = native::Guard::at(park);
+        accepted(park, external);
+        let target = POINT { x: 303, y: 198 };
+        for readback in [park, external, park] {
+            let current = sample(readback);
+            let base = stale_base_for(target, current).unwrap_or(current);
+            assert_eq!((target.x - base.x, target.y - base.y), (3, -2));
+        }
+        // Re-parking is a different commit; the old external-based step stays small.
+        accepted(external, park);
+        assert_eq!(stale_base_for(target, sample(park)), Some(external));
+    }
+
+    #[test]
+    fn rejected_external_move_restores_exact_previous_ledger_and_stale_candidates() {
+        let park = POINT { x: 1000, y: 600 };
+        let entry = POINT { x: 300, y: 200 };
+        let _native = native::Guard::at(park);
+        accepted(park, entry);
+        let rejected_move = accepted(entry, POINT { x: 50, y: 60 });
+        rejected(rejected_move);
+        // In particular, registration must snapshot BEFORE retiring an observed target.
+        assert_eq!(sample(park), entry);
+        assert_eq!(stale_base_for(POINT { x: 1001, y: 600 }, entry), Some(park));
+    }
 
     #[test]
     fn clip_never_performs_an_untagged_cursor_relocation() {

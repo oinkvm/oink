@@ -72,8 +72,9 @@ export function Onboarding({ platform, pairing, perms, onGrant, onOpenSettings, 
   const connectedRef = useRef(connected);
   connectedRef.current = connected;
 
+  // Windows has no permissions to grant; launch at login lives in Settings only.
   const nextOf = (s: OnboardingStep): OnboardingStep =>
-    s === 'welcome' ? 'perms' : s === 'telemetry' ? 'connect' : 'telemetry';
+    s === 'welcome' ? (platform === 'mac' ? 'perms' : 'telemetry') : s === 'telemetry' ? 'connect' : 'telemetry';
   const next = () => {
     if (exiting) return;
     const to = nextOf(step);
@@ -94,7 +95,7 @@ export function Onboarding({ platform, pairing, perms, onGrant, onOpenSettings, 
   return (
     <div className="ob" data-platform={platform} data-step={step} data-leaving={leaving ? '' : undefined} role="region" aria-label={tr('欢迎使用 Oink')}>
       {step === 'welcome' && <Welcome leaving={exiting} version={version} preferences={preferences} onNext={next} />}
-      {step === 'perms' && <OnboardingPermissions platform={platform} preferences={preferences} perms={perms} onGrant={onGrant} onOpenSettings={onOpenSettings} container={container} leaving={exiting} onDone={next} />}
+      {step === 'perms' && <OnboardingPermissions preferences={preferences} perms={perms} onGrant={onGrant} onOpenSettings={onOpenSettings} container={container} leaving={exiting} onDone={next} />}
       {step === 'telemetry' && <Telemetry leaving={exiting} preferences={preferences} onNext={next} />}
       {step === 'connect' && <Connect pairing={pairing} ready={connectReady} leaving={exiting} onSkip={onSkip} onFinish={onFinish} />}
     </div>

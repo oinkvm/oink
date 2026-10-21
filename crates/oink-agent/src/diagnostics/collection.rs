@@ -4,6 +4,9 @@
 mod recovery_wait_tests;
 use super::wire_values::{Value, dto};
 #[cfg(all(test, debug_assertions))]
+#[path = "peer_bench.rs"]
+mod peer_bench;
+#[cfg(all(test, debug_assertions))]
 #[path = "collection_wire_tests.rs"]
 mod wire_tests;
 use super::*;
@@ -20,6 +23,7 @@ use oink_protocol::{
         schema::{WireDto, WireValue},
     },
 };
+use std::collections::VecDeque;
 const FORMAT: &str = "oink.diag-cbor/1";
 const NONE: &str = "none";
 const DEFLATE: &str = "deflate-raw";
@@ -56,6 +60,23 @@ pub(super) struct CollectionTrace {
     bytes: u64,
     segment_work: Duration,
     complete: bool,
+    work: CollectionWork,
+}
+#[derive(Default)]
+struct CollectionWork {
+    snapshot: Duration,
+    read: Duration,
+    decode: Duration,
+    encode: Duration,
+    compression: Duration,
+    transport: Duration,
+    write: Duration,
+    end: Duration,
+    setup: Duration,
+    source_bytes: u64,
+    raw_bytes: u64,
+    segments: u64,
+    messages: u64,
 }
 impl CollectionTrace {
     fn received(&mut self, bytes: usize) -> anyhow::Result<()> {
@@ -80,6 +101,7 @@ impl CollectionTrace {
             bytes: 0,
             segment_work: Duration::ZERO,
             complete: false,
+            work: CollectionWork::default(),
         };
         trace.stage("start");
         trace
@@ -108,6 +130,19 @@ impl Drop for CollectionTrace {
             duration_ms=self.started.elapsed().as_secs_f64()*1000.0,
             limited_ms=(self.role == "sender").then_some(self.limited.as_secs_f64()*1000.0),
             segment_work_ms=self.segment_work.as_secs_f64()*1000.0, success=self.complete,
+            // Development subscribers can inspect these processing counters.
+            // They are deliberately outside the exported field allowlist.
+            profile_snapshot_ms=self.work.snapshot.as_secs_f64()*1000.0,
+            profile_read_ms=self.work.read.as_secs_f64()*1000.0,
+            profile_decode_ms=self.work.decode.as_secs_f64()*1000.0,
+            profile_encode_ms=self.work.encode.as_secs_f64()*1000.0,
+            profile_compression_ms=self.work.compression.as_secs_f64()*1000.0,
+            profile_transport_ms=self.work.transport.as_secs_f64()*1000.0,
+            profile_write_ms=self.work.write.as_secs_f64()*1000.0,
+            profile_end_ms=self.work.end.as_secs_f64()*1000.0,
+            profile_setup_ms=self.work.setup.as_secs_f64()*1000.0,
+            profile_source_bytes=self.work.source_bytes, profile_raw_bytes=self.work.raw_bytes,
+            profile_segments=self.work.segments, profile_messages=self.work.messages,
             "diagnostics collection finished");
     }
 }
@@ -122,6 +157,10 @@ pub(crate) struct Context {
     deadline_gate: Option<tokio::sync::watch::Receiver<bool>>,
     #[cfg(all(test, debug_assertions))]
     recovery_wait_entered: Option<tokio::sync::watch::Sender<Option<i64>>>,
+    #[cfg(all(test, debug_assertions))]
+    legacy_coverage: bool,
+    #[cfg(all(test, debug_assertions))]
+    legacy_sender: bool,
     node: Option<Weak<crate::node::Inner>>,
 }
 impl Context {
@@ -135,6 +174,10 @@ impl Context {
             deadline_gate: None,
             #[cfg(all(test, debug_assertions))]
             recovery_wait_entered: None,
+            #[cfg(all(test, debug_assertions))]
+            legacy_coverage: false,
+            #[cfg(all(test, debug_assertions))]
+            legacy_sender: false,
             node: Some(Arc::downgrade(&node.inner)),
         })
     }
@@ -432,6 +475,8 @@ impl Context {
                 && store::token_ok(&response.instance()?.0),
         )?;
         let instance = response.instance()?.0;
+        trace.work.setup = trace.started.elapsed();
+        trace.work.messages = 1;
         let t4 = lock(&snapshot).current_stamp();
         {
             let mut store = lock(&snapshot);
@@ -455,10 +500,13 @@ impl Context {
         let mut environment = false;
         let mut segment_id = 0u64;
         loop {
+            let receiving = Instant::now();
             let message = self
                 .receive(&mut stream, &mut changes, id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("missing diagnostic end"))?;
+            trace.work.transport += receiving.elapsed();
+            trace.work.messages += 1;
             anyhow::ensure!(
                 (valid)() && self.config.members().members.iter().any(|m| m.device == peer),
                 "collection revoked"
@@ -527,19 +575,30 @@ impl Context {
                     let device = device.to_owned();
                     let rich = self.rich(peer);
                     let raw_length = e.raw_length()? as usize;
-                    let work = tokio::task::spawn_blocking(move || -> anyhow::Result<Duration> {
+                    let work = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                         let started = Instant::now();
                         anyhow::ensure!((validity)(), "collection revoked");
                         let raw = expand(&bytes, &compression, raw_length)?;
+                        let expanded = started.elapsed();
+                        let decoding = Instant::now();
                         let segment = store::wire::segment(&raw)?;
                         anyhow::ensure!(rich || baseline(&segment)?, "unnegotiated diagnostic layout");
                         anyhow::ensure!((validity)(), "collection revoked");
+                        let decoded = decoding.elapsed();
+                        let writing = Instant::now();
                         lock(&destination).add_network(&device, &raw, &segment)?;
-                        Ok(started.elapsed())
+                        Ok((started.elapsed(), expanded, decoded, writing.elapsed()))
                     })
                     .await?;
                     match work {
-                        Ok(work) => trace.segment_work += work,
+                        Ok((work, expanded, decoded, written)) => {
+                            trace.segment_work += work;
+                            trace.work.compression += expanded;
+                            trace.work.decode += decoded;
+                            trace.work.write += written;
+                            trace.work.raw_bytes += raw_length as u64;
+                            trace.work.segments += 1;
+                        }
                         Err(error) => {
                             crate::streams::wire::report_low_payload(
                                 &self.links,
@@ -554,7 +613,12 @@ impl Context {
                     segment_id += 1;
                 }
                 Message::DiagnosticsEnd(e) => {
-                    let partial = e.partial()? || e.coverage()?.0.iter().any(|c| !c.complete().unwrap_or(false));
+                    let ending = Instant::now();
+                    // Decode the retained list once. Accessors construct owned,
+                    // recursively validated DTO trees; reading this list per
+                    // segment made end-of-transfer validation quadratic.
+                    let ranges = e.coverage()?.0;
+                    let partial = e.partial()? || ranges.iter().any(|c| !c.complete().unwrap_or(false));
                     self.check(
                         link,
                         0x0a06,
@@ -563,21 +627,33 @@ impl Context {
                             && e.request_id()? == request_id
                             && e.evicted_segments()? >= response.evicted_segments()?,
                     )?;
-                    for coverage in e.coverage()?.0 {
+                    let mut complete_ranges = Vec::new();
+                    for coverage in ranges {
                         self.check(link, 0x0a06, coverage.start_us()? <= coverage.end_us()?)?;
+                        if coverage.complete()? {
+                            complete_ranges.push((coverage.start_us()?, coverage.end_us()?));
+                        }
                     }
                     if !partial {
+                        let index = CoverageIndex::new(complete_ranges);
                         let covered = {
                             let store = lock(&snapshot);
-                            store.segments.iter().filter(|m| m.device == device).all(|m| {
-                                e.coverage().is_ok_and(|ranges| {
-                                    ranges.0.iter().any(|r| {
-                                        r.complete() == Ok(true)
-                                            && r.start_us().is_ok_and(|s| s <= m.first_us)
-                                            && r.end_us().is_ok_and(|e| e >= m.last_us)
-                                    })
-                                })
-                            })
+                            let check = || {
+                                store
+                                    .segments
+                                    .iter()
+                                    .filter(|m| m.device == device)
+                                    .all(|m| index.contains(m.first_us, m.last_us))
+                            };
+                            #[cfg(all(test, debug_assertions))]
+                            let covered = if self.legacy_coverage {
+                                peer_bench::legacy_contains(&e, &store, device)
+                            } else {
+                                check()
+                            };
+                            #[cfg(not(all(test, debug_assertions)))]
+                            let covered = check();
+                            covered
                         };
                         self.check(link, 0x0a06, covered)?;
                     }
@@ -586,6 +662,7 @@ impl Context {
                         store.evicted_by_device.insert(device.into(), e.evicted_segments()?);
                         store.network_ends.insert(device.into(), e);
                     }
+                    trace.work.end += ending.elapsed();
                     stream.finish();
                     self.check(link, 0x0a06, self.progress(stream.recv()).await?.is_none())?;
                     if partial {
@@ -709,6 +786,15 @@ impl Collector {
                 .check(link, 0x0a02, self.context.progress(stream.recv()).await?.is_none())?;
             return Ok(());
         }
+        let t1 = stamp(&request.t1()?)?;
+        let shift = t2.utc_us.saturating_sub(t1.utc_us);
+        let start = if request.start_us()? == i64::MIN {
+            i64::MIN
+        } else {
+            request.start_us()?.saturating_add(shift)
+        };
+        let end = request.end_us()?.saturating_add(shift);
+        let staging = Instant::now();
         let recorder = self.recorder.clone();
         let context = self.context.clone();
         let mut source = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -719,18 +805,11 @@ impl Collector {
                 recorder.drain(&mut store)?;
             }
             store.prune()?;
-            store.export_snapshot()
+            store.export_snapshot_between(start, end)
         })
         .await??;
-        let t1 = stamp(&request.t1()?)?;
-        let shift = t2.utc_us.saturating_sub(t1.utc_us);
-        let start = if request.start_us()? == i64::MIN {
-            i64::MIN
-        } else {
-            request.start_us()?.saturating_add(shift)
-        };
-        let end = request.end_us()?.saturating_add(shift);
         source.restrict_range(start, end)?;
+        trace.work.snapshot = staging.elapsed();
         let rich = self.context.rich(peer);
         self.context
             .progress(
@@ -780,30 +859,43 @@ impl Collector {
             )
             .await?;
         let mut raw_total = size as u64;
+        trace.work.setup = trace.started.elapsed();
+        trace.work.messages = 2;
         let mut coverage = Vec::new();
         let mut partial = false;
-        for (segment_id, meta) in source.segments.iter().enumerate() {
+        #[cfg(all(test, debug_assertions))]
+        let width = if self.context.legacy_sender { 0 } else { ENCODERS };
+        #[cfg(not(all(test, debug_assertions)))]
+        let width = ENCODERS;
+        let mut encoding = SegmentEncoder::new(source, rich, compression, width);
+        while let Some(encoded) = encoding.next().await {
             anyhow::ensure!(
                 (valid)()
                     && self.recorder.inner.enabled.load(Ordering::Acquire)
                     && self.context.config.members().members.iter().any(|m| m.device == peer),
                 "collection revoked"
             );
-            let work_started = Instant::now();
-            let bytes = (|| -> anyhow::Result<_> {
-                let segment = store::decode(&source.read(meta)?)?;
-                let raw = wire_values::segment(&segment, rich)?.encode(MAX_SEGMENT_RAW)?;
-                let bytes = compress(&raw, compression)?;
-                Ok((raw.len(), bytes))
-            })();
-            trace.segment_work += work_started.elapsed();
-            let (raw_len, bytes) = match bytes {
-                Ok(v) => v,
+            let encoded = match encoded {
+                Ok(value) => value,
                 Err(_) => {
                     partial = true;
                     break;
                 }
             };
+            let EncodedSegment {
+                segment_id,
+                first_us,
+                last_us,
+                raw_len,
+                bytes,
+                work,
+            } = encoded;
+            trace.segment_work += work.read + work.decode + work.encode + work.compression;
+            trace.work.read += work.read;
+            trace.work.decode += work.decode;
+            trace.work.encode += work.encode;
+            trace.work.compression += work.compression;
+            trace.work.source_bytes += work.source_bytes;
             if segment_id >= 4096
                 || trace.bytes + bytes.len() as u64 > v1::limits::DIAGNOSTIC_COLLECTION as u64
                 || raw_total + raw_len as u64 > v1::limits::DIAGNOSTIC_COLLECTION as u64
@@ -812,6 +904,9 @@ impl Collector {
                 break;
             }
             raw_total += raw_len as u64;
+            trace.work.raw_bytes += raw_len as u64;
+            trace.work.segments += 1;
+            let sending = Instant::now();
             for (offset, chunk) in bytes.chunks(CHUNK).enumerate() {
                 anyhow::ensure!(
                     (valid)() && self.recorder.inner.enabled.load(Ordering::Acquire),
@@ -826,6 +921,7 @@ impl Collector {
                     ])?)))
                     .await?;
                 trace.received(chunk.len())?;
+                trace.work.messages += 1;
                 trace.sample(&stream);
             }
             let digest = dto::<w::Digest>([
@@ -843,10 +939,12 @@ impl Collector {
                     ])?)),
                 )
                 .await?;
+            trace.work.messages += 1;
+            trace.work.transport += sending.elapsed();
             coverage.push(
                 dto::<w::Coverage>([
-                    ("start_us", meta.first_us.wire()?),
-                    ("end_us", meta.last_us.wire()?),
+                    ("start_us", first_us.wire()?),
+                    ("end_us", last_us.wire()?),
                     ("complete", true.wire()?),
                 ])?
                 .write(),
@@ -863,19 +961,138 @@ impl Collector {
                 .write(),
             );
         }
+        let ending = Instant::now();
         self.context
             .progress(stream.send(&Message::DiagnosticsEnd(dto::<w::DiagnosticsEnd>([
                 ("request_id", request_id.write()),
                 ("coverage", RawValue::Array(coverage)),
                 ("partial", partial.wire()?),
-                ("evicted_segments", source.evicted.wire()?),
+                ("evicted_segments", encoding.source.evicted.wire()?),
             ])?)))
             .await?;
+        trace.work.messages += 1;
         stream.finish();
         self.context
             .check(link, 0x0a02, self.context.progress(stream.recv()).await?.is_none())?;
+        trace.work.end = ending.elapsed();
         trace.complete = !partial;
         Ok(())
+    }
+}
+// Bound blocking work and retained payloads per collection. Retire segments in
+// source order, preserving every frame, validation and collection budget.
+const ENCODERS: usize = 4;
+struct EncodedSegment {
+    segment_id: usize,
+    first_us: i64,
+    last_us: i64,
+    raw_len: usize,
+    bytes: Vec<u8>,
+    work: CollectionWork,
+}
+fn encode_segment(
+    source: &store::Store,
+    segment_id: usize,
+    rich: bool,
+    compression: &str,
+) -> anyhow::Result<EncodedSegment> {
+    let meta = &source.segments[segment_id];
+    let mut work = CollectionWork::default();
+    let reading = Instant::now();
+    let input = source.read(meta)?;
+    work.read = reading.elapsed();
+    work.source_bytes = input.len() as u64;
+    let decoding = Instant::now();
+    let segment = store::decode(&input)?;
+    work.decode = decoding.elapsed();
+    let encoding = Instant::now();
+    let raw = wire_values::segment(&segment, rich)?.encode(MAX_SEGMENT_RAW)?;
+    work.encode = encoding.elapsed();
+    let compressing = Instant::now();
+    let bytes = compress(&raw, compression)?;
+    work.compression = compressing.elapsed();
+    Ok(EncodedSegment {
+        segment_id,
+        first_us: meta.first_us,
+        last_us: meta.last_us,
+        raw_len: raw.len(),
+        bytes,
+        work,
+    })
+}
+struct SegmentEncoder {
+    source: Arc<store::Store>,
+    rich: bool,
+    compression: &'static str,
+    next: usize,
+    width: usize,
+    pending: VecDeque<tokio::task::JoinHandle<anyhow::Result<EncodedSegment>>>,
+}
+impl SegmentEncoder {
+    fn new(source: store::Store, rich: bool, compression: &'static str, width: usize) -> Self {
+        let mut encoder = Self {
+            source: Arc::new(source),
+            rich,
+            compression,
+            next: 0,
+            width,
+            pending: VecDeque::new(),
+        };
+        encoder.fill();
+        encoder
+    }
+    fn fill(&mut self) {
+        // The old loop encoded the first rejected segment before checking its
+        // count budget. Keep that partial/error behavior with bounded work.
+        while self.pending.len() < self.width && self.next < self.source.segments.len().min(4097) {
+            let (source, rich, compression, id) = (self.source.clone(), self.rich, self.compression, self.next);
+            self.next += 1;
+            self.pending.push_back(tokio::task::spawn_blocking(move || {
+                encode_segment(&source, id, rich, compression)
+            }));
+        }
+    }
+    async fn next(&mut self) -> Option<anyhow::Result<EncodedSegment>> {
+        if self.width == 0 {
+            // Serial control for the opt-in benchmark, using the same encoder.
+            let id = self.next;
+            if id >= self.source.segments.len().min(4097) {
+                return None;
+            }
+            self.next += 1;
+            return Some(encode_segment(&self.source, id, self.rich, self.compression));
+        }
+        let job = self.pending.pop_front()?;
+        let result = job.await.map_err(anyhow::Error::from).and_then(|r| r);
+        self.fill();
+        Some(result)
+    }
+}
+impl Drop for SegmentEncoder {
+    fn drop(&mut self) {
+        // Already-running work keeps the immutable staging directory alive.
+        for job in &self.pending {
+            job.abort();
+        }
+    }
+}
+/// Prefix maxima answer whether ONE complete source interval contains a whole
+/// segment. Adjacent/overlapping intervals are not unioned: the received v1 end
+/// and its per-segment coverage remain byte-for-byte untouched for the archive.
+struct CoverageIndex(Vec<(i64, i64)>);
+impl CoverageIndex {
+    fn new(mut ranges: Vec<(i64, i64)>) -> Self {
+        ranges.sort_unstable();
+        let mut end = i64::MIN;
+        for (_, last) in &mut ranges {
+            end = end.max(*last);
+            *last = end;
+        }
+        Self(ranges)
+    }
+    fn contains(&self, first: i64, last: i64) -> bool {
+        let before = self.0.partition_point(|(start, _)| *start <= first);
+        before > 0 && self.0[before - 1].1 >= last
     }
 }
 fn validate_request(request: &w::DiagnosticsRequest) -> anyhow::Result<()> {
@@ -1061,6 +1278,8 @@ mod tests {
             deadline_gate: None,
             #[cfg(all(test, debug_assertions))]
             recovery_wait_entered: None,
+            legacy_coverage: false,
+            legacy_sender: false,
             node: None,
         }
     }

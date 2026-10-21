@@ -336,6 +336,42 @@ fn secure_desktop_does_not_steal_another_devices_focus() {
 }
 
 #[test]
+fn native_contacts_keep_desktop_and_start_gestures_out_of_the_shortcut_mapper() {
+    use oink_foundation::input::{Gesture, GesturePhase, SwipeAxis};
+    let (mut source, mut target) = pair_target(Os::Windows);
+    source.set_peer_touchpad_contacts(target.device(), Some(5));
+    target.set_touchpad_contacts(Some(5));
+    target.set_peer_os(source.device(), Os::MacOS, 0);
+    target.set_accept_contacts(true);
+    for axis in [SwipeAxis::Vertical, SwipeAxis::Pinch] {
+        for progress in [-0.2, 0.2] {
+            for phase in [GesturePhase::Began, GesturePhase::Ended] {
+                source.on_local_event(
+                    &event(InputEvent::Gesture(Gesture::DockSwipe {
+                        axis,
+                        phase,
+                        progress,
+                        velocity: 0.,
+                    })),
+                    0,
+                );
+                for out in source.drain_outputs() {
+                    if let Output::Send { msg, .. } = out {
+                        target.input_message(source.device(), msg, 0);
+                    }
+                }
+                assert!(
+                    !target
+                        .drain_outputs()
+                        .iter()
+                        .any(|out| matches!(out, Output::Inject(InjectEvent::Gesture(_))))
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn target_contacts_off_reaches_windows_shortcut_mapper() {
     use oink_foundation::input::{Gesture, GesturePhase, SwipeAxis};
     use oink_input::win_actions::{GestureMapper, WinAction};
@@ -374,7 +410,12 @@ fn target_contacts_off_reaches_windows_shortcut_mapper() {
             }
             for out in target.drain_outputs() {
                 if let Output::Inject(InjectEvent::Gesture(g)) = out {
-                    actions.extend(mapper.map_with_task_view_query(&g, || true));
+                    actions.extend(mapper.map_with_foreground_query(&g, |_| {
+                        oink_input::win_actions::ForegroundState {
+                            task_view_showing: true,
+                            ..Default::default()
+                        }
+                    }));
                 }
             }
         }

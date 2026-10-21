@@ -188,7 +188,13 @@ async fn row(devs: &[&Dev]) {
         })
         .collect::<Vec<_>>();
     let end = Instant::now() + Duration::from_secs(15);
-    while !devs.iter().all(|d| d.node.layout().0.screens.len() == devs.len()) {
+    // Auto-save also needs owner visibility. The retained layout can arrive
+    // before those Facts; input sharing alone is not this command's readiness.
+    while !devs.iter().all(|d| {
+        d.node.layout().0.screens.len() == devs.len()
+            && AgentApi::layout_profile_command(&d.node, oink_agent::layout_profiles::types::Command::Query)
+                .is_ok_and(|s| s.get("snapshot").is_some_and(|snapshot| !snapshot.is_null()))
+    }) {
         assert!(
             Instant::now() < end,
             "timed out waiting for all screens in the shared layout; per device (layout version, screens): {:?}{}",

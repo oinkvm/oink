@@ -47,7 +47,8 @@ pub(crate) fn start_link_runtime(
         native_target: Mutex::default(),
         links,
         settings: Mutex::new(settings),
-        policy: oink_clipboard::policy::SharingPolicy::new(enabled && !paused, settings),
+        policy: oink_clipboard::policy::SharingPolicy::new(enabled && !paused && settings.send, settings),
+        receive_policy: oink_clipboard::policy::SharingPolicy::new(enabled && !paused && settings.receive, settings),
         enabled: AtomicBool::new(enabled),
         paused: AtomicBool::new(paused),
         activity: Mutex::default(),
@@ -156,7 +157,7 @@ impl Task {
                 .streams
                 .deadline()
                 .into_iter()
-                .chain(self.active().then(|| self.ordering.deadline()).flatten())
+                .chain(self.sending().then(|| self.ordering.deadline()).flatten())
                 .min()
                 .unwrap_or(Instant::now() + Duration::from_millis(500));
             tokio::select! {
@@ -194,7 +195,7 @@ impl Task {
                             if self.backend.change_count()==before {
                                 match result {
                                     Ok(spec) if self.may_write(id)=>self.enqueue_native_write(id,spec),
-                                    Ok(spec) if self.active()&&self.cancelled!=Some(id)
+                                    Ok(spec) if self.receiving()&&self.cancelled!=Some(id)
                                         &&self.current_id().is_none_or(|current|current==id)
                                         &&self.shared.links.offer_current(id.origin,id)=>{
                                         if let Some((_,old))=self.queued_write.take(){old.contents.cancel();}
@@ -228,7 +229,7 @@ impl Task {
                 let Message::ClipboardOffer(offer) = message else {
                     continue;
                 };
-                if !self.active() {
+                if !self.receiving() {
                     continue;
                 }
                 self.observe(self.backend.change_count());
@@ -258,7 +259,7 @@ impl Task {
                     handle.serve_link(operation).await;
                 });
             }
-            if self.active() && self.ordering.capture_due(Instant::now()) {
+            if self.sending() && self.ordering.capture_due(Instant::now()) {
                 self.capture();
             }
         }

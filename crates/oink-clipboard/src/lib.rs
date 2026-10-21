@@ -10,6 +10,7 @@ pub mod content;
 pub mod model;
 pub mod negotiation;
 pub mod policy;
+pub mod received;
 
 pub mod provider_preparation;
 use std::sync::Arc;

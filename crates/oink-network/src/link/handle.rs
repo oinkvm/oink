@@ -1,6 +1,8 @@
 //! Ordinary-thread command handle and whole-snapshot publication.
 use super::*;
 use arc_swap::ArcSwap;
+#[cfg(any(test, feature = "test-support"))]
+use arc_swap::ArcSwapOption;
 use std::{
     collections::HashSet,
     sync::{
@@ -57,6 +59,12 @@ pub(super) struct Shared {
     pub stopped: AtomicBool,
     #[cfg(test)]
     pub expired_service_budget: AtomicBool,
+    #[cfg(any(test, feature = "test-support"))]
+    pub hold_input_peer: ArcSwapOption<DeviceId>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub input_header_held: Notify,
+    #[cfg(any(test, feature = "test-support"))]
+    pub cutover_finished: Notify,
     pub links: ArcSwap<LinkTable>,
     pub scheduler: ArcSwap<SchedulerStatus>,
     pub counters: ArcSwap<Vec<StreamCounters>>,
@@ -124,6 +132,12 @@ impl LinkLayer {
             stopped: AtomicBool::new(false),
             #[cfg(test)]
             expired_service_budget: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-support"))]
+            hold_input_peer: ArcSwapOption::empty(),
+            #[cfg(any(test, feature = "test-support"))]
+            input_header_held: Notify::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            cutover_finished: Notify::new(),
             links: ArcSwap::from_pointee(LinkTable::default()),
             scheduler: ArcSwap::from_pointee(SchedulerStatus::default()),
             counters: ArcSwap::from_pointee(Vec::new()),
@@ -276,6 +290,12 @@ mod config_order_tests {
             stopped: AtomicBool::new(false),
             #[cfg(test)]
             expired_service_budget: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-support"))]
+            hold_input_peer: ArcSwapOption::empty(),
+            #[cfg(any(test, feature = "test-support"))]
+            input_header_held: Notify::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            cutover_finished: Notify::new(),
             links: ArcSwap::from_pointee(LinkTable::default()),
             scheduler: ArcSwap::from_pointee(SchedulerStatus::default()),
             counters: ArcSwap::from_pointee(Vec::new()),

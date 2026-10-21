@@ -382,6 +382,8 @@ impl Tap {
             .unwrap_or_else(|e| e.into_inner())
             .boundary("captured", "set_mode");
         tracing::debug!(?mode, "gesture lifecycle: capture mode requested");
+        // Linearize the contact entry before callbacks can see Remote=true.
+        super::contacts::boundary();
         s.restore_pending.store(false, Ordering::Release);
         let changed = match mode {
             CaptureMode::Local => {
@@ -407,6 +409,12 @@ impl Tap {
             s.motion.reset_position_context();
         }
         self.schedule_apply();
+    }
+
+    pub(crate) fn set_cursor_constraint(&self, active: bool) {
+        let s = self.shared;
+        let _guard = s.cursor_lock.lock().unwrap_or_else(|e| e.into_inner());
+        cursor::constrain(active && s.capture_permitted());
     }
 
     pub(crate) fn set_keyboard_remote(&self, remote: bool) {
@@ -605,6 +613,8 @@ fn apply_mode_locked(s: &'static Shared, hidden: &mut HiddenCursor) {
         s.owner_generation.store(0, Ordering::Release);
         s.owner_posts.lock().unwrap_or_else(|e| e.into_inner()).count = 0;
         *hidden = HiddenCursor::Shown;
+        cursor::constrain(false);
+        cursor::source_disabled(false);
         cursor::restore();
         return;
     }
@@ -670,6 +680,10 @@ fn apply_mode_locked(s: &'static Shared, hidden: &mut HiddenCursor) {
     } else {
         s.owner_generation.store(0, Ordering::Release);
         *hidden = HiddenCursor::Shown;
+        if stop {
+            cursor::constrain(false);
+            cursor::source_disabled(false);
+        }
         cursor::restore();
         s.hold_motion.store(false, Ordering::Release);
     }
@@ -1078,6 +1092,10 @@ fn run(
             observed.poll(s);
             drain_contacts(s);
             let (due, stopped) = crate::capture_loop::poll(Instant::now());
+            {
+                let _guard = s.cursor_lock.lock().unwrap_or_else(|e| e.into_inner());
+                cursor::source_disabled(!stopped && s.capture_permitted() && crate::capture_loop::mouse_disabled());
+            }
             if stopped {
                 break;
             }
@@ -1235,6 +1253,8 @@ fn run(
     CFMachPort::invalidate(&port);
     let _g = s.cursor_lock.lock().unwrap_or_else(|e| e.into_inner());
     *s.hidden.lock().unwrap_or_else(|e| e.into_inner()) = HiddenCursor::Shown;
+    cursor::constrain(false);
+    cursor::source_disabled(false);
     cursor::restore();
     tracing::debug!("事件 tap 已停止");
 }
@@ -1392,6 +1412,15 @@ fn run_owned(
         drain_contacts(s);
         let now = Instant::now();
         let (mut due, stopped) = crate::capture_loop::poll(now);
+        {
+            let _guard = s.cursor_lock.lock().unwrap_or_else(|e| e.into_inner());
+            cursor::source_disabled(
+                !stopped
+                    && s.capture_permitted()
+                    && crate::capture_loop::capture_requested()
+                    && crate::capture_loop::mouse_disabled(),
+            );
+        }
         if stopped {
             break;
         }
@@ -1434,6 +1463,8 @@ fn run_owned(
     s.caps_guard.leave_remote();
     let _guard = s.cursor_lock.lock().unwrap_or_else(|e| e.into_inner());
     *s.hidden.lock().unwrap_or_else(|e| e.into_inner()) = HiddenCursor::Shown;
+    cursor::constrain(false);
+    cursor::source_disabled(false);
     cursor::restore();
 }
 
@@ -1635,6 +1666,12 @@ fn call_handler(s: &Shared, ev: &CapturedEvent) -> Disposition {
 
 // Keyboard side effects must never infer their destination from cursor hiding:
 // mouse-local/keyboard-shared and mouse-shared/keyboard-local are both valid.
+fn local_brightness_event(ty: CGEventType, ev: &CGEvent, disabled: bool) -> bool {
+    disabled
+        && ty.0 == sysevent::TYPE_SYSDEFINED
+        && sysevent::read_aux_key(ev).is_some_and(|key| keymap::local_brightness_key(key.key).is_some())
+}
+
 fn native_swallow(blocked: bool, routed: bool, native_caps: bool, caps_flags: bool, keyboard_remote: bool) -> bool {
     blocked || (routed && !native_caps) || (keyboard_remote && caps_flags)
 }
@@ -2069,6 +2106,11 @@ unsafe extern "C-unwind" fn callback(
         };
         call_handler(s, &raw);
     }
+    if local_brightness_event(ty, ev, crate::capture_loop::keyboard_disabled()) {
+        // All transitions, including repeats, remain native; never call the
+        // router/forwarder or turn these NX controls into unknown guarded keys.
+        return pass;
+    }
     if t.event.is_none() && crate::capture_loop::keyboard_disabled() {
         let key = if matches!(ty, CGEventType::KeyDown | CGEventType::KeyUp) {
             let mac = CGEvent::integer_value_field(Some(ev), CGEventField::KeyboardEventKeycode) as u16;
@@ -2126,7 +2168,16 @@ unsafe extern "C-unwind" fn callback(
         Disposition::Pass
     };
 
-    let routed_swallow = (remote && t.pointer) || disposition == Disposition::Swallow;
+    if !remote
+        && t.pointer
+        && let Some(at) = crate::capture_loop::constrained_cursor()
+    {
+        // A visible but dissociated local pointer uses the routing prediction
+        // for clicks/scrolls too, not the hardware event's stale location.
+        CGEvent::set_location(Some(ev), objc2_core_foundation::CGPoint::new(at.x, at.y));
+    }
+    let routed_swallow =
+        ((remote || crate::capture_loop::mouse_disabled()) && t.pointer) || disposition == Disposition::Swallow;
     // Keep the existing local HIToolbox path and LocalGuard behavior. Only the
     // capture source changes: forwarding NX Caps must not also forward FlagsChanged.
     let native_caps = ty.0 == sysevent::TYPE_SYSDEFINED && sysevent::read_aux_key(ev).is_some_and(|key| key.key == 4);
@@ -2436,8 +2487,8 @@ fn drain_contacts(s: &Shared) {
         let Some(event) = event else {
             break;
         };
-        // Provider sample times already use uptime raw; a pending sample drained
-        // inside another CG callback must not borrow that event's capture time.
+        // MT's source clock is independent of CG uptime. Preserve its timestamp
+        // for contact ordering; queue age is measured separately at receipt.
         let _source_time =
             crate::source_time::CaptureScope::new(crate::source_time::CaptureTime::from_micros(event.time_us));
         call_handler(s, &event);
@@ -3387,6 +3438,35 @@ mod tests {
         ));
         track_keys(translated.event.as_ref().unwrap(), translated.disp_key);
         translated
+    }
+
+    #[test]
+    fn disabled_brightness_aux_events_bypass_native_guard_for_every_transition() {
+        for nx in [2, 3, 21, 22, 23] {
+            for (pressed, repeat) in [(true, false), (true, true), (false, false)] {
+                let ev = caps_aux(pressed);
+                CGEvent::set_integer_value_field(
+                    Some(&ev),
+                    CGEventField(149),
+                    keymap::AuxKey {
+                        key: nx,
+                        pressed,
+                        repeat,
+                    }
+                    .data1(),
+                );
+                let ty = CGEventType(sysevent::TYPE_SYSDEFINED);
+                assert!(local_brightness_event(ty, &ev, true));
+                assert!(!local_brightness_event(ty, &ev, false));
+                CGEvent::set_integer_value_field(Some(&ev), CGEventField(83), 0);
+                assert!(!local_brightness_event(ty, &ev, true));
+            }
+        }
+        assert!(!local_brightness_event(
+            CGEventType(sysevent::TYPE_SYSDEFINED),
+            &caps_aux(true),
+            true
+        ));
     }
 
     #[test]

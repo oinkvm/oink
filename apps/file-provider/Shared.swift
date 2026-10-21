@@ -114,13 +114,14 @@ struct Catalog: Codable {
     let records: [Record]
     let batch: [UInt8]?
     let urls: [String]
-    init(token: String, port: UInt16, records: [Record], batch: [UInt8]? = nil, urls: [String] = []) {
+    let received_at: Double?
+    init(token: String, port: UInt16, records: [Record], batch: [UInt8]? = nil, urls: [String] = [], received_at: Double? = nil) {
         self.schema = 1
-        self.token = token; self.port = port; self.records = records; self.batch = batch; self.urls = urls
+        self.token = token; self.port = port; self.records = records; self.batch = batch; self.urls = urls; self.received_at = received_at
     }
-    enum CodingKeys: String, CodingKey { case schema, token, port, records, batch, urls }
+    enum CodingKeys: String, CodingKey { case schema, token, port, records, batch, urls, received_at }
     init(from decoder: Decoder) throws {
-        try validateLocalKeys(decoder, allowed: ["schema", "token", "port", "records", "batch", "urls"], schema: true)
+        try validateLocalKeys(decoder, allowed: ["schema", "token", "port", "records", "batch", "urls", "received_at"], schema: true)
         let values = try decoder.container(keyedBy: CodingKeys.self)
         schema = try values.decode(UInt8.self, forKey: .schema)
         token = try values.decode(String.self, forKey: .token)
@@ -128,6 +129,7 @@ struct Catalog: Codable {
         records = try values.decode([Record].self, forKey: .records)
         batch = try values.decodeIfPresent([UInt8].self, forKey: .batch)
         urls = try values.decode([String].self, forKey: .urls)
+        received_at = try values.decodeIfPresent(Double.self, forKey: .received_at)
     }
 }
 struct DirectoryCursor: Codable, Equatable {
@@ -225,10 +227,20 @@ func container() throws -> URL {
     return result
 }
 func catalogs() throws -> [Catalog] { try catalogs(in: container()) }
+private func rawCatalogs(in root:URL) throws -> [Catalog] {
+    try FileManager.default.contentsOfDirectory(at:root,includingPropertiesForKeys:nil)
+        .filter {$0.pathExtension=="json"}.map {try JSONDecoder().decode(Catalog.self,from:Data(contentsOf:$0))}
+}
 func catalogs(in root: URL) throws -> [Catalog] {
-    return try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
-        .filter { $0.pathExtension == "json" }
-        .map { try JSONDecoder().decode(Catalog.self, from: Data(contentsOf: $0)) }
+    let raw=try rawCatalogs(in:root)
+    return try withReceived(in:root) {
+        let entries=try receivedEntries(raw.flatMap {$0.records},in:root)
+        let records=raw.flatMap {$0.records}.map {entries[$0.id]?.record ?? $0}
+        var deleted=Set(entries.filter {$0.value.deleted}.map {$0.key})
+        var previous=0
+        while previous != deleted.count {previous=deleted.count;for record in records where deleted.contains(record.parent) {deleted.insert(record.id)}}
+        return raw.map {c in Catalog(token:c.token,port:c.port,records:c.records.compactMap {r in deleted.contains(r.id) ? nil : (entries[r.id]?.record ?? r)},batch:c.batch,urls:c.urls,received_at:c.received_at)}
+    }
 }
 final class Item: NSObject, NSFileProviderItem {
     let record: Record
@@ -244,9 +256,11 @@ final class Item: NSObject, NSFileProviderItem {
     // on macOS 14 and 26 when capabilities only allow reading; Finder carries it to copies.
     // Declare ordinary operations too, including rename/move, which an immutable item forbids.
     // Reading/writing alias content enumeration/adding children on directories. The extension
-    // still rejects every mutation callback: these declarations never authorize remote writes.
+    // accepts local mutations only; it never writes changes back to the source.
     var capabilities: NSFileProviderItemCapabilities {
-        [.allowsReading, .allowsWriting, .allowsRenaming, .allowsReparenting, .allowsTrashing, .allowsDeleting]
+        var value:NSFileProviderItemCapabilities=[.allowsReading,.allowsWriting,.allowsTrashing,.allowsDeleting]
+        if record.node != nil {value.formUnion([.allowsRenaming,.allowsReparenting])}
+        return value
     }
     var fileSystemFlags: NSFileProviderFileSystemFlags {
         var flags: NSFileProviderFileSystemFlags = record.directory ? [.userReadable, .userWritable, .userExecutable] : [.userReadable, .userWritable]
@@ -257,7 +271,7 @@ final class Item: NSObject, NSFileProviderItem {
         let size = record.size.map(String.init) ?? "unknown"
         let modified = record.modified.map(String.init) ?? "unknown"
         let content = "\(record.version)-\(size)-\(modified)"
-        var metadata = "\(content)-\(record.children.map(String.init) ?? "unknown")"
+        var metadata = "\(content)-\(record.children.map(String.init) ?? "unknown")-\(record.parent)-\(record.name)"
         // A reused provider identity must signal the rename and clear UF_HIDDEN
         // even when the real directory still has unknown size and version 1.
         // Generic -> final is metadata; never convert a file identity to folder.
@@ -280,10 +294,7 @@ struct CatalogSnapshot {
 
     static func capture(in root: URL) throws -> CatalogSnapshot {
         lock.lock(); defer { lock.unlock() }
-        let records = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
-            .filter { $0.pathExtension == "json" }
-            .flatMap { try JSONDecoder().decode(Catalog.self, from: Data(contentsOf: $0)).records }
-            .sorted { $0.id < $1.id }
+        let records = try catalogs(in:root).flatMap { $0.records }.sorted { $0.id < $1.id }
         guard Set(records.map(\.id)).count == records.count else { throw CocoaError(.fileReadCorruptFile) }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -597,11 +608,16 @@ enum ProviderUpdateAction: String {
 // This recovery shape still needs signed manual-update acceptance on macOS 14/26.
 func recoverProviderLaunch(hidden: Bool, enabled: Bool, disconnected: Bool,
                            disconnect: (NSFileProviderManager.DisconnectionOptions) async throws -> Void,
-                           reconnect: () async throws -> Void) async throws {
+                           reconnect: () async throws -> Void,
+                           stabilize: () async throws -> Void) async throws {
     guard hidden else { throw CocoaError(.fileReadUnknown) }
     guard enabled else { return }
     if !disconnected { try await disconnect([.temporary]) }
     try await reconnect()
+    // On macOS 26 reconnect can acknowledge a domain whose old and new
+    // extension databases are still overlapping. In that state every item URL
+    // request hangs. Do not release the host's startup gate on the ACK alone.
+    try await stabilize()
 }
 
 enum ProviderRemovalError: Error {
@@ -633,4 +649,181 @@ enum ProviderRemovalAction: String {
         guard try await remaining().isEmpty else { throw ProviderRemovalError.domainsRemain }
         return "removed"
     }
+}
+
+// Cross-process mutation overlay: Rust owns the source catalog; the extension
+// owns received-file mutations. A stale bridge write cannot resurrect a deletion.
+struct ReceivedEntry: Codable {
+    var record: Record
+    var received_at: Double
+    var handed_off: Bool
+    var materialized: Bool
+    var deleted: Bool
+    var fetching:Int? = nil
+    var modified_locally:Bool? = nil
+    var original_parent:String? = nil
+}
+private func receivedKey(_ id: String) -> String { String(id.split(separator:"-").first ?? "") }
+private func receivedFile(_ key:String, in root:URL) -> URL { root.appendingPathComponent(key).appendingPathExtension("received") }
+func withReceived<T>(in root:URL, _ operation:() throws -> T) throws -> T {
+    let fd=Darwin.open(root.appendingPathComponent("received.lock").path,O_CREAT|O_RDWR,0o600)
+    guard fd >= 0 else { throw CocoaError(.fileWriteUnknown) }
+    defer { close(fd) }
+    guard flock(fd,LOCK_EX)==0 else { throw CocoaError(.fileWriteUnknown) }
+    defer { flock(fd,LOCK_UN) }
+    return try operation()
+}
+func readReceived(_ key:String,in root:URL) throws -> [String:ReceivedEntry] {
+    let file=receivedFile(key,in:root)
+    guard FileManager.default.fileExists(atPath:file.path) else { return [:] }
+    return try JSONDecoder().decode([String:ReceivedEntry].self,from:Data(contentsOf:file))
+}
+private func writeReceived(_ key:String,_ entries:[String:ReceivedEntry],in root:URL) throws {
+    try JSONEncoder().encode(entries).write(to:receivedFile(key,in:root),options:.atomic)
+}
+func receivedProtected(_ key:String,in root:URL) throws -> Bool {
+    let catalogURL=root.appendingPathComponent(key).appendingPathExtension("json")
+    if let catalog=try? JSONDecoder().decode(Catalog.self,from:Data(contentsOf:catalogURL)),catalog.received_at==nil {return false}
+    return try withReceived(in:root) { try readReceived(key,in:root).values.contains { !$0.deleted && ($0.handed_off || $0.materialized || ($0.fetching ?? 0)>0) } }
+}
+// Caller holds received.lock. Read each overlay once, including source-folder
+// tombstones; a late directory page cannot revive a deleted ancestor.
+private func receivedEntries(_ records:[Record],in root:URL) throws -> [String:ReceivedEntry] {
+    var result:[String:ReceivedEntry]=[:]
+    for key in Set(records.map {receivedKey($0.id)}) {result.merge(try readReceived(key,in:root),uniquingKeysWith: {_,new in new})}
+    return result
+}
+private func receivedDeleted(_ record:Record,in root:URL) throws -> Bool {
+    let raw=try rawCatalogs(in:root).flatMap {$0.records}
+    let entries=try receivedEntries(raw+[record],in:root)
+    let records=Dictionary(raw.map {($0.id,$0)},uniquingKeysWith: {_,new in new})
+    var id=record.id;var visited=Set<String>()
+    while visited.insert(id).inserted {
+        if entries[id]?.deleted==true {return true}
+        guard let current=entries[id]?.record ?? records[id] ?? (id==record.id ? record : nil) else {break}
+        id=current.parent
+    }
+    return false
+}
+func receivedOverlay(_ record:Record,in root:URL) throws -> Record? {
+    try withReceived(in:root) {
+        if try receivedDeleted(record,in:root) {return nil}
+        return try readReceived(receivedKey(record.id),in:root)[record.id]?.record ?? record
+    }
+}
+private func receivedTime(_ id:String,in root:URL,fallback:Date=Date()) -> Double {
+    let path=root.appendingPathComponent(receivedKey(id)).appendingPathExtension("json")
+    return (try? JSONDecoder().decode(Catalog.self,from:Data(contentsOf:path)).received_at) ?? fallback.timeIntervalSince1970*1000
+}
+func receivedHandoff(_ record:Record,in root:URL,at date:Date=Date()) throws {
+    try withReceived(in:root) {
+        let key=receivedKey(record.id)
+        var entries=try readReceived(key,in:root)
+        if try receivedDeleted(record,in:root) { throw NSFileProviderError(.noSuchItem) }
+        var entry=entries[record.id] ?? ReceivedEntry(record:record,received_at:receivedTime(record.id,in:root,fallback:date),handed_off:false,materialized:false,deleted:false)
+        entry.record=record;entry.handed_off=true;entry.fetching=max(0,(entry.fetching ?? 0)-1);entries[record.id]=entry
+        try writeReceived(key,entries,in:root)
+    }
+}
+func receivedDelete(_ ids:[String],in root:URL) throws {
+    try withReceived(in:root) {
+        let raw=try FileManager.default.contentsOfDirectory(at:root,includingPropertiesForKeys:nil)
+            .filter {$0.pathExtension=="json"}.flatMap { try JSONDecoder().decode(Catalog.self,from:Data(contentsOf:$0)).records }
+        for (key,group) in Dictionary(grouping:ids,by:receivedKey) {
+            var entries=try readReceived(key,in:root)
+            for id in group {
+                if var entry=entries[id] { entry.deleted=true;entries[id]=entry }
+                else if let record=raw.first(where:{$0.id==id}) { entries[id]=ReceivedEntry(record:record,received_at:receivedTime(id,in:root),handed_off:false,materialized:false,deleted:true) }
+            }
+            try writeReceived(key,entries,in:root)
+        }
+    }
+}
+func receivedModify(_ item:NSFileProviderItem,fields:NSFileProviderItemFields,contents:URL?,in root:URL) throws -> Record {
+    let id=item.itemIdentifier.rawValue
+    guard let old=try catalogs(in:root).flatMap({$0.records}).first(where:{$0.id==id}) else {throw NSFileProviderError(.noSuchItem)}
+    let parent=fields.contains(.parentItemIdentifier) ? item.parentItemIdentifier.rawValue : old.parent
+    let trash=NSFileProviderItemIdentifier.trashContainer.rawValue
+    let saved=try readReceived(receivedKey(id),in:root)[id]
+    let restoring=old.parent==trash && saved?.original_parent==parent
+    let structural=fields.contains(.filename) || fields.contains(.parentItemIdentifier)
+    guard !structural || old.node != nil || parent==trash || restoring else {throw CocoaError(.fileWriteNoPermission)}
+    guard parent==trash || restoring || receivedKey(parent)==receivedKey(id),parent != id else {throw CocoaError(.fileWriteNoPermission)}
+    let records=try catalogs(in:root).flatMap({$0.records})
+    guard parent==trash || restoring || records.contains(where:{$0.id==parent && $0.directory}) else {throw CocoaError(.fileWriteNoPermission)}
+    var cursor=parent
+    var seen=Set<String>()
+    while let ancestor=records.first(where:{$0.id==cursor}) { guard ancestor.id != id,seen.insert(cursor).inserted else {throw CocoaError(.fileWriteInvalidFileName)};cursor=ancestor.parent }
+    let name=fields.contains(.filename) ? item.filename : old.name
+    guard !name.isEmpty,name != ".",name != "..",!name.contains("/"),!name.contains("\0"),
+          !records.contains(where:{$0.id != id && $0.parent==parent && $0.name.caseInsensitiveCompare(name) == .orderedSame}) else {throw CocoaError(.fileWriteInvalidFileName)}
+    let changedContents=fields.contains(.contents)
+    let localSize=contents.flatMap {try? $0.resourceValues(forKeys:[.fileSizeKey]).fileSize}.map(UInt64.init)
+    let size=changedContents ? ((item.documentSize ?? nil)?.uint64Value ?? localSize ?? old.size) : old.size
+    let record=Record(id:id,parent:parent,name:name,directory:old.directory,size:size,modified:old.modified,node:old.node,version:old.version+(changedContents ? 1:0),children:old.children,hidden:old.hidden)
+    try withReceived(in:root) {
+        let key=receivedKey(id);var entries=try readReceived(key,in:root)
+        if try receivedDeleted(old,in:root) {throw NSFileProviderError(.noSuchItem)}
+        var entry=entries[id] ?? ReceivedEntry(record:record,received_at:receivedTime(id,in:root),handed_off:false,materialized:false,deleted:false)
+        if parent==trash && old.parent != trash {entry.original_parent=old.parent}
+        entry.record=record
+        if changedContents {entry.handed_off=true;entry.materialized=true;entry.modified_locally=true}
+        entries[id]=entry;try writeReceived(key,entries,in:root)
+    }
+    return record
+}
+
+// Enumerating/statting metadata must never read a dataless file's contents.
+func receivedUsage(manager:NSFileProviderManager,root:URL,days:UInt64,clear:Bool) async throws -> [String:Any] {
+    let observer=MaterializedObserver(manager.enumeratorForMaterializedItems())
+    defer {observer.enumerator.invalidate()}
+    let items=try await observer.read()
+    var bytes:UInt64=0;var incomplete=false;var removed=0
+    let records=try catalogs(in:root).flatMap {$0.records}
+    for item in items {
+        let id=item.itemIdentifier.rawValue
+        guard let record=records.first(where:{$0.id==id}) else {continue}
+        let entry=try readReceived(receivedKey(id),in:root)[id] ?? ReceivedEntry(record:record,received_at:receivedTime(id,in:root),handed_off:false,materialized:false,deleted:false)
+        guard !entry.deleted else {continue}
+        do {
+            let url=try await manager.getUserVisibleURL(for:item.itemIdentifier)
+            var meta=stat();guard lstat(url.path,&meta)==0 else {throw CocoaError(.fileReadUnknown)}
+            guard meta.st_flags & UInt32(SF_DATALESS)==0 else {continue}
+            if !entry.record.directory {guard meta.st_mode & S_IFMT == S_IFREG,UInt64(max(0,meta.st_size))==entry.record.size else {incomplete=true;continue}}
+            try withReceived(in:root) {
+                let key=receivedKey(id);var values=try readReceived(key,in:root)
+                var current=values[id] ?? entry
+                if !current.deleted && !current.materialized {current.materialized=true;values[id]=current;try writeReceived(key,values,in:root)}
+            }
+            let size=entry.record.directory ? 0 : UInt64(max(0,meta.st_blocks))*512
+            let due=days>0 && Date().timeIntervalSince1970*1000-entry.received_at >= Double(days)*86_400_000
+            if clear && due && (entry.fetching ?? 0)==0 {
+                // Coordinate deletion rather than unlinking the system-managed path.
+                var coordinationError:NSError?;var deletionError:Error?
+                NSFileCoordinator().coordinate(writingItemAt:url,options:.forDeleting,error:&coordinationError) { coordinated in
+                    do {
+                        if entry.record.directory {guard rmdir(coordinated.path)==0 else {throw CocoaError(.fileWriteUnknown)}}
+                        else {try FileManager.default.removeItem(at:coordinated)}
+                    } catch {deletionError=error}
+                }
+                if let error=coordinationError {throw error};if let error=deletionError {throw error}
+                try receivedDelete([id],in:root);removed+=1
+            } else {bytes+=size}
+        } catch {incomplete=true}
+    }
+    if removed>0 {try await manager.signalEnumerator(for:.workingSet)}
+    anchorLog.notice("operation=received-maintain materialized_bytes=\(bytes) removed=\(removed) incomplete=\(incomplete)")
+    return ["materialized_bytes":bytes,"incomplete":incomplete,"time_basis":"received"]
+}
+
+func receivedBegin(_ record:Record,in root:URL) throws {
+    try withReceived(in:root) {
+        let key=receivedKey(record.id);var entries=try readReceived(key,in:root)
+        if try receivedDeleted(record,in:root) {throw NSFileProviderError(.noSuchItem)}
+        var entry=entries[record.id] ?? ReceivedEntry(record:record,received_at:receivedTime(record.id,in:root),handed_off:false,materialized:false,deleted:false)
+        entry.fetching=(entry.fetching ?? 0)+1;entries[record.id]=entry;try writeReceived(key,entries,in:root)
+    }
+}
+func receivedFetchFailed(_ id:String,in root:URL) throws {
+    try withReceived(in:root) {let key=receivedKey(id);var entries=try readReceived(key,in:root);if var entry=entries[id] {entry.fetching=max(0,(entry.fetching ?? 0)-1);entries[id]=entry;try writeReceived(key,entries,in:root)}}
 }

@@ -23,6 +23,7 @@ pub mod host;
 mod hotkeys;
 pub mod instance;
 pub mod ipc;
+pub mod layout_profiles;
 pub mod layout_sync;
 pub mod logs;
 
@@ -53,4 +54,5 @@ use snapshot_tests::common::watchdog as test_watchdog;
 
 pub mod update;
 
+pub mod native_controls;
 pub mod tray;

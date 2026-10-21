@@ -750,6 +750,8 @@ impl Network {
                     let path = LinkPath::Direct;
                     let _ = self.events.send(ConfigEvent::PathChanged { link, path });
                     self.module_all(|| ModuleEvent::PathChanged { link, path });
+                    #[cfg(any(test, feature = "test-support"))]
+                    self.shared.cutover_finished.notify_one();
                 }
                 Effect::CloseTransit(path) => {
                     self.pipes.retain(|p| p.path != path);
@@ -1293,6 +1295,16 @@ impl Network {
             return false;
         };
         let mut reader = self.readers.remove(index).expect("reader");
+        #[cfg(any(test, feature = "test-support"))]
+        if reader.id.is_none() && reader.header.is_some_and(|h| h.tag.kind == StreamKind::Input) {
+            if self.hold_input_header(reader.uid, reader.header.unwrap()) {
+                self.readers.push_back(reader);
+                return false;
+            }
+            let header = reader.header.unwrap().to_wire();
+            self.header(reader, header);
+            return true;
+        }
         if reader.pending_admission {
             let ready = reader
                 .id
@@ -1418,6 +1430,16 @@ impl Network {
             self.core.path_internal_closed(connection, header.route_tag);
         }
     }
+    #[cfg(any(test, feature = "test-support"))]
+    fn hold_input_header(&self, uid: usize, header: StreamHeader) -> bool {
+        header.tag.kind == StreamKind::Input
+            && self
+                .physical
+                .get(&uid)
+                .and_then(|p| self.core.route(p.id?, header.route_tag))
+                .and_then(|id| self.core.links.get(&id))
+                .is_some_and(|link| self.shared.hold_input_peer.load().as_deref() == Some(&link.peer.device_id))
+    }
     fn header(&mut self, mut reader: Box<Reader>, raw_header: v1::frame::StreamHeader) {
         let Some(physical) = self.physical.get(&reader.uid) else {
             return;
@@ -1454,6 +1476,12 @@ impl Network {
             return;
         };
         reader.header = Some(header);
+        #[cfg(any(test, feature = "test-support"))]
+        if self.hold_input_header(reader.uid, header) {
+            self.shared.input_header_held.notify_one();
+            self.readers.push_back(reader);
+            return;
+        }
         if self
             .admission(reader.uid, header)
             .is_none_or(|context| context.admit_stream(&header.to_wire()).is_err())

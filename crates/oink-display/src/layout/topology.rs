@@ -71,7 +71,6 @@ pub struct Topology {
     settings: EffectiveSettings,
     source_origins: HashMap<DeviceId, Point>,
     source_scales: HashMap<ScreenId, f64>,
-    remote_sources: std::collections::HashSet<DeviceId>,
 }
 
 impl Topology {
@@ -93,13 +92,22 @@ impl Topology {
     pub fn from_effective(layout: &EffectiveLayout, online: impl Fn(&DeviceId) -> bool) -> Self {
         let screens: Vec<_> = layout.screens().iter().filter(|s| s.is_valid()).cloned().collect();
         let rects: Vec<Rect> = screens.iter().map(|s| s.rect).collect();
-        let active: Vec<bool> = screens.iter().map(|s| s.enabled && online(&s.id.device)).collect();
+        let occupied: Vec<bool> = screens.iter().map(|s| online(&s.id.device)).collect();
+        let active: Vec<bool> = screens
+            .iter()
+            .zip(&occupied)
+            .map(|(s, online)| s.enabled && *online)
+            .collect();
         let st = layout.settings();
         let edges: Vec<[Vec<Seg>; 4]> = (0..screens.len())
             .map(|i| {
                 Side::ALL.map(|side| {
                     if active[i] {
-                        let segments = compute_side(&rects, &active, i, side, st, |b| {
+                        let segments = compute_side(&rects, &occupied, i, side, st, |b| {
+                            // Hidden online geometry is an opaque wall, including native seams.
+                            if !active[b] {
+                                return None;
+                            }
                             if screens[i].id.device != screens[b].id.device {
                                 return Some(st.minimum_portal);
                             }
@@ -132,6 +140,7 @@ impl Topology {
                                         from: segment.from,
                                         to: from,
                                         portal: None,
+                                        blocked: false,
                                     });
                                 }
                                 if from < to {
@@ -139,6 +148,7 @@ impl Topology {
                                         from,
                                         to,
                                         portal: segment.portal,
+                                        blocked: segment.blocked,
                                     });
                                 }
                                 if to < segment.to {
@@ -146,6 +156,7 @@ impl Topology {
                                         from: to,
                                         to: segment.to,
                                         portal: None,
+                                        blocked: false,
                                     });
                                 }
                                 pieces
@@ -157,6 +168,7 @@ impl Topology {
                             from: lo,
                             to: hi,
                             portal: None,
+                            blocked: false,
                         }]
                     }
                 })
@@ -185,7 +197,6 @@ impl Topology {
             settings: st.clone(),
             source_origins: layout.source_origins.clone(),
             source_scales: layout.source_scales.clone(),
-            remote_sources: layout.remote_sources.clone(),
         }
     }
 
@@ -212,9 +223,9 @@ impl Topology {
             .zip(&self.active)
             .any(|(s, active)| *active && s.id.device == device)
     }
-    /// Source redirection is an explicit setting, independent of target geometry.
-    pub fn source_requires_target(&self, device: DeviceId) -> bool {
-        self.remote_sources.contains(&device)
+    /// Hidden screens retain their focus until an explicit focus command.
+    pub fn source_requires_target(&self, _device: DeviceId) -> bool {
+        false
     }
     /// Stored anchor used only to choose a destination for an input source.
     pub fn source_origin(&self, device: DeviceId) -> Option<Point> {

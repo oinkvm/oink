@@ -76,7 +76,10 @@ impl ProjectionStreams {
     fn valid(message: &Message) -> bool {
         matches!(
             message,
-            Message::ProjectionPreview(_) | Message::ProjectionMode(_) | Message::ProjectionGesture(_)
+            Message::ProjectionPreview(_)
+                | Message::ProjectionMode(_)
+                | Message::ProjectionGesture(_)
+                | Message::ArrangementPreview(_)
         )
     }
 
@@ -135,7 +138,13 @@ impl ProjectionStreams {
     }
 
     fn post(&mut self, peer: DeviceId, message: &Message, now: Instant) -> Result<(), PostError> {
-        if !Self::valid(message) {
+        if !Self::valid(message)
+            || matches!(message, Message::ArrangementPreview(_))
+                && !self
+                    .config
+                    .peer_agreement(peer)
+                    .is_some_and(|a| a.contains("oink.layout.preview/1"))
+        {
             return Err(PostError::TooLarge);
         }
         let bytes = v1::frame::encode(message, v1::limits::RELIABLE_FRAME).map_err(|_| PostError::TooLarge)?;

@@ -146,8 +146,9 @@ struct Tests {
             let flags: NSFileProviderFileSystemFlags = record.directory
                 ? [.userReadable, .userWritable, .userExecutable] : [.userReadable, .userWritable]
             precondition(exported.fileSystemFlags == flags)
-            precondition(exported.capabilities == [.allowsReading, .allowsWriting, .allowsRenaming,
-                                                   .allowsReparenting, .allowsTrashing, .allowsDeleting])
+            var expected:NSFileProviderItemCapabilities=[.allowsReading,.allowsWriting,.allowsTrashing,.allowsDeleting]
+            if record.node != nil {expected.formUnion([.allowsRenaming,.allowsReparenting])}
+            precondition(exported.capabilities == expected)
             if record.directory {
                 precondition(exported.capabilities!.contains([.allowsContentEnumerating, .allowsAddingSubItems]))
             }
@@ -283,19 +284,31 @@ struct Tests {
                 try await recoverProviderLaunch(hidden: true, enabled: enabled, disconnected: disconnected,
                     disconnect: { options in
                         precondition(options == [.temporary]); calls.append("disconnect")
-                    }, reconnect: { calls.append("reconnect") })
-                precondition(calls == (!enabled ? [] : disconnected ? ["reconnect"] : ["disconnect", "reconnect"]))
+                    }, reconnect: { calls.append("reconnect") },
+                    stabilize: { calls.append("namespace-ready") })
+                precondition(calls == (!enabled ? [] : disconnected ? ["reconnect", "namespace-ready"] : ["disconnect", "reconnect", "namespace-ready"]),
+                             "reconnect acknowledgement must not bypass namespace readiness")
             }
         }
         do {
             try await recoverProviderLaunch(hidden: true, enabled: true, disconnected: false,
                 disconnect: { _ in throw CocoaError(.fileWriteNoPermission) },
-                reconnect: { preconditionFailure("reconnected after failed disconnect") })
+                reconnect: { preconditionFailure("reconnected after failed disconnect") },
+                stabilize: { preconditionFailure("stabilized after failed disconnect") })
             preconditionFailure("recovery failure acknowledged")
         } catch {}
+        var ready = false
+        do {
+            try await recoverProviderLaunch(hidden: true, enabled: true, disconnected: true,
+                disconnect: { _ in preconditionFailure("already suspended") }, reconnect: {},
+                stabilize: { throw CocoaError(.fileReadUnknown) })
+            ready = true
+        } catch {}
+        precondition(!ready, "a wedged namespace must leave launch recovery pending")
         do {
             try await recoverProviderLaunch(hidden: true, enabled: true, disconnected: false,
-                disconnect: { _ in }, reconnect: { throw CocoaError(.fileWriteNoPermission) })
+                disconnect: { _ in }, reconnect: { throw CocoaError(.fileWriteNoPermission) },
+                stabilize: { preconditionFailure("stabilized after failed reconnect") })
             preconditionFailure("failed reconnect acknowledged")
         } catch {}
         print("File Provider launch recovery ordering, disabled domains, interrupted reconnect and failures passed")

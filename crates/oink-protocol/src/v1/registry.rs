@@ -100,8 +100,13 @@ pub const CAPABILITIES: &[&str] = &[
     "oink.input.edge-trigger/1",
     "oink.device-resources/1",
     "oink.device-options/1",
+    "oink.input.mouse-disabled/1",
     "oink.audio.exit-volume/1",
     "oink.notify/1",
+    "oink.layout.profiles/1",
+    "oink.layout.arrangement/1",
+    "oink.layout.preview/1",
+    "oink.layout.profiles/2",
 ];
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Stream {
@@ -139,6 +144,24 @@ pub const STREAMS: &[Stream] = &[
     stream!(10, "Dnd", 1, &["oink.drag/1"], false, false, true),
     stream!(11, "Cache", 1, &["oink.cache/1"], false, false, true),
     stream!(12, "P0", 1, &["oink.layout.projection/1"], true, false, false),
+    stream!(
+        13,
+        "LayoutProfiles",
+        1,
+        &["oink.group/1", "oink.layout.profiles/1"],
+        false,
+        false,
+        true
+    ),
+    stream!(
+        14,
+        "LayoutProfilesV2",
+        1,
+        &["oink.group/1", "oink.layout.profiles/2"],
+        false,
+        false,
+        true
+    ),
 ];
 pub fn stream(kind: u16) -> Option<&'static Stream> {
     STREAMS.iter().find(|s| s.kind == kind)

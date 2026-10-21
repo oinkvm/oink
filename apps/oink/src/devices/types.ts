@@ -29,7 +29,7 @@ export interface Device {
     cursor: CursorState;
     screen: ScreenState;
     screenSharing?: boolean | null;
-    mouse: ShareState;
+    mouse: ShareState | 'disabled';
     keyboard: KeyboardState;
     keyboardBeforeLock?: 'shared' | 'local';
     clipboard: ShareState;
@@ -42,6 +42,7 @@ export interface Device {
     pending?: boolean;
     unknown?: boolean;
     canPause?: boolean;
+    canDisableMouse?: boolean;
     actionability?: Partial<Record<'screen'|'mouse'|'keyboard'|'clipboard'|'speaker', 'invoke'|'open_permissions'|'unavailable'>>;
     faults?: Partial<Record<'screen' | 'mouse' | 'keyboard' | 'clipboard' | 'speaker', string>>;
 }

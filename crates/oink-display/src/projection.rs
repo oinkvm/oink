@@ -3,7 +3,8 @@
 
 use oink_foundation::{DeviceId, Point, Rect};
 
-use crate::layout::{EffectiveLayout, Layout, ScreenId, Side};
+use crate::layout::{EffectiveLayout, Layout, OwnerLayoutPreferences, ScreenId, Side};
+use std::collections::BTreeMap;
 
 /// A shallow slice of the neighbouring rectangle is translated across the seam.
 pub const DEPTH: f64 = 14.0 / 686.0;
@@ -42,7 +43,7 @@ pub struct EdgeSpan {
 /// Orthogonal projection of the nearest rectangle at each point on an edge.
 /// Gaps are allowed. A nearer rectangle occludes only its covered interval;
 /// corner contact and rectangles overlapping the host are not candidates.
-/// Same-computer screens participate in occlusion, even though they need no label.
+/// Same-computer screens use the same visibility and annotation geometry.
 pub fn edge_spans(host: Rect, others: &[(ScreenId, Rect)]) -> Vec<EdgeSpan> {
     use crate::layout::facing::{SIDES, source_projections, tolerance};
     let rects: Vec<_> = std::iter::once(host).chain(others.iter().map(|(_, r)| *r)).collect();
@@ -93,9 +94,7 @@ pub fn compute(
             .collect::<Vec<_>>();
         let (sx, sy) = host.physical_scale();
         for span in edge_spans(host.rect, &others) {
-            if span.neighbour.device == device
-                || affected.is_some_and(|ids| !ids.contains(&host.id) && !ids.contains(&span.neighbour))
-            {
+            if affected.is_some_and(|ids| !ids.contains(&host.id) && !ids.contains(&span.neighbour)) {
                 continue;
             }
             let neighbour = screens
@@ -155,6 +154,11 @@ impl Projection {
     /// three native units stay click-through so native edge crossing / hot corners
     /// retain their existing path. A clipped-away end has no resize handle.
     pub fn handles(&self) -> Vec<HitRegion> {
+        // Native same-computer travel stays entirely with the OS. Its labels
+        // must never create an input window or a layout-edit gesture.
+        if self.host.device == self.neighbour.device {
+            return vec![];
+        }
         let v = self.visible;
         let vertical = self.side.is_vertical();
         let (lo, hi, full_lo, full_hi) = if vertical {
@@ -205,21 +209,39 @@ impl Projection {
     /// rounded frames. End resize keeps the opposite end and facing seam fixed,
     /// preserves aspect ratio, and has the editor's Manual size semantics.
     pub fn edit(&self, initial: &Layout, handle: Handle, delta_units: f64) -> Option<Layout> {
-        if !delta_units.is_finite() {
+        self.edit_with_preferences(initial, &BTreeMap::new(), handle, delta_units)
+    }
+
+    /// Visibility controls collision and size constraints, while every member
+    /// (including hidden screens) follows the resulting rigid group transform.
+    pub fn edit_with_preferences(
+        &self,
+        initial: &Layout,
+        owners: &BTreeMap<DeviceId, OwnerLayoutPreferences>,
+        handle: Handle,
+        delta_units: f64,
+    ) -> Option<Layout> {
+        if self.host.device == self.neighbour.device || !delta_units.is_finite() {
             return None;
         }
         let mut next = initial.clone();
         let source = initial.screen(&self.neighbour)?;
+        let enabled = |s: &crate::layout::ScreenPlacement| {
+            owners.get(&s.id.device).cloned().unwrap_or_default().screen(s).enabled
+        };
+        if !enabled(source) {
+            return None;
+        }
         let min = initial
             .screens
             .iter()
-            .filter(|s| s.id.device == source.id.device)
+            .filter(|s| s.id.device == source.id.device && enabled(s))
             .map(|s| s.rect.w.min(s.rect.h))
             .fold(f64::INFINITY, f64::min);
         let max = initial
             .screens
             .iter()
-            .filter(|s| s.id.device == source.id.device)
+            .filter(|s| s.id.device == source.id.device && enabled(s))
             .map(|s| s.rect.w.max(s.rect.h))
             .fold(0.0, f64::max);
         if !source.is_valid() || MIN_SIZE / min > MAX_SIZE / max {
@@ -233,13 +255,13 @@ impl Projection {
         let others: Vec<_> = initial
             .screens
             .iter()
-            .filter(|s| s.id.device != source.id.device && s.is_valid())
+            .filter(|s| s.id.device != source.id.device && s.is_valid() && enabled(s))
             .map(|s| s.rect)
             .collect();
         let group = initial
             .screens
             .iter()
-            .filter(|s| s.id.device == source.id.device)
+            .filter(|s| s.id.device == source.id.device && enabled(s))
             .collect::<Vec<_>>();
         let fits = |rect: Rect| {
             let k = rect.w / r.w;
@@ -304,27 +326,32 @@ impl Projection {
                 };
                 Rect::new(x, y, w, h)
             };
-            if k > 1.0 && !fits(anchored(k)) {
+            // Every member's four bounds are affine in scale. A remote
+            // member can hit an obstacle and later move past it, so endpoint
+            // fit is not monotonic. Intersect the four strict overlap
+            // inequalities over the complete path, and stop at its first hit.
+            let wanted = anchored(k);
+            let mut fraction = 1.0_f64;
+            for member in &group {
+                let end = Rect::new(
+                    wanted.x + (member.rect.x - r.x) * k,
+                    wanted.y + (member.rect.y - r.y) * k,
+                    member.rect.w * k,
+                    member.rect.h * k,
+                );
+                for obstacle in &others {
+                    if let Some(hit) = first_overlap_fraction(member.rect, end, *obstacle) {
+                        fraction = fraction.min(hit);
+                    }
+                }
+            }
+            if fraction < 1.0 {
                 if !fits(r) {
                     return None;
                 }
-                // Growth about the fixed corner contains the initial rectangle,
-                // so fit is monotonic. Clamp scale; never normalize away the
-                // opposite real edge / facing seam or move an unrelated screen.
-                let (mut lo, mut hi) = (1.0, k);
-                for _ in 0..48 {
-                    let mid = (lo + hi) / 2.0;
-                    if fits(anchored(mid)) {
-                        lo = mid;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                if lo < minimum {
-                    return Some(initial.clone());
-                }
-                k = lo;
+                k = 1.0 + (k - 1.0) * fraction;
             }
+
             let rect = anchored(k);
             if (rect.w - r.w).abs() < 1e-8 / 686.0 && (rect.h - r.h).abs() < 1e-8 / 686.0 {
                 return Some(initial.clone());
@@ -339,6 +366,37 @@ impl Projection {
         }
         Some(next)
     }
+}
+
+/// First contact on an affine rectangle path. The overlap interval is the
+/// intersection of four linear inequalities; checking only either endpoint
+/// misses an obstacle that a translated/scaled group member passes through.
+fn first_overlap_fraction(from: Rect, to: Rect, obstacle: Rect) -> Option<f64> {
+    // Stop at geometric contact. A tolerance derived from the requested end
+    // scale could permit penetration at the smaller, actual stopping scale.
+    let eps = 0.0;
+    let (mut enter, mut leave) = (0.0_f64, 1.0_f64);
+    for (start, end) in [
+        (from.right() - obstacle.x, to.right() - obstacle.x),
+        (obstacle.right() - from.x, obstacle.right() - to.x),
+        (from.bottom() - obstacle.y, to.bottom() - obstacle.y),
+        (obstacle.bottom() - from.y, obstacle.bottom() - to.y),
+    ] {
+        let slope = end - start;
+        if slope == 0.0 {
+            if start <= eps {
+                return None;
+            }
+        } else {
+            let contact = (eps - start) / slope;
+            if slope > 0.0 {
+                enter = enter.max(contact);
+            } else {
+                leave = leave.min(contact);
+            }
+        }
+    }
+    (enter < leave).then_some(enter)
 }
 
 #[cfg(test)]
@@ -514,10 +572,46 @@ mod tests {
         );
         l.screens[1].id.device = DeviceId([1; 32]);
         let p = compute(&l.effective(&Default::default()), DeviceId([1; 32]), |_| true, None);
+        assert_eq!(p.len(), 2, "both native screens annotate their neighbour");
+        for p in p {
+            assert_eq!(p.host.device, p.neighbour.device);
+            assert!(
+                p.handles().is_empty(),
+                "same-machine annotations cannot intercept native crossing"
+            );
+            assert_eq!(p.hit_test(p.visible.center()), None);
+            assert_eq!(p.edit(&l, Handle::Middle, 10.), None);
+        }
+    }
+    #[test]
+    fn hidden_local_screens_are_absent_and_do_not_occlude_remote_projections() {
+        let mut l = fixture(Side::Right);
+        let mut local = l.screens[1].clone();
+        local.id = ScreenId::new(l.screens[0].id.device, "local-second");
+        local.rect.x += 50. / 686.;
+        l.screens[1].rect.x += 300. / 686.;
+        local.primary = false;
+        l.screens.push(local);
+        let enabled = compute(&l.effective(&Default::default()), DeviceId([1; 32]), |_| true, None);
+        assert!(enabled.iter().any(|p| p.neighbour.display == "local-second"));
         assert!(
-            p.is_empty(),
-            "Native desktops use their own seamless screens; projections are cross-computer only"
+            !enabled
+                .iter()
+                .any(|p| p.host.display == "host" && p.neighbour.display == "peer")
         );
+        let mut owner = OwnerLayoutPreferences::default();
+        owner.screens.insert(
+            "local-second".into(),
+            crate::layout::ScreenPreference {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        let owners = BTreeMap::from([(DeviceId([1; 32]), owner)]);
+        let hidden = compute(&l.effective(&owners), DeviceId([1; 32]), |_| true, None);
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(hidden[0].host.display, "host");
+        assert_eq!(hidden[0].neighbour.display, "peer");
     }
     #[test]
     fn no_corner_projection_and_gain_does_not_change_geometry() {

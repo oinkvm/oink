@@ -1,6 +1,7 @@
 """Local display labels are commit-derived; ordering always uses release builds."""
 import re
 import subprocess
+from identity import IDENTITY
 from provenance import ROOT, product_source
 
 SHORT_COMMIT_LENGTH = 8
@@ -13,7 +14,10 @@ def release_version(base, source_commit=None):
         raise ValueError('source commit must be the full lowercase 40-character Git commit')
     if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-beta\.[0-9]+)?', base):
         raise ValueError('local commit versions require a stable or beta.N base version')
-    return base.split('-')[0] + '-beta.' + source_commit[:SHORT_COMMIT_LENGTH]
+    inhouse = IDENTITY['inhouse_version']
+    if not isinstance(inhouse, str) or not re.fullmatch(r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)', inhouse):
+        raise ValueError('inhouse_version must be a numeric major.minor.patch version')
+    return f'{inhouse}-inhouse.{source_commit[:SHORT_COMMIT_LENGTH]}'
 
 
 def local_source_commit(explicit=None, root=ROOT):

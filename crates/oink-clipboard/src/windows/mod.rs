@@ -20,7 +20,7 @@
 //! - 写入：带 `local_path` 的 `ClipData::Files` 写成 `CF_HDROP`（只写顶层条目）+ `Preferred DropEffect` = 复制；
 //! - 虚拟文件：[`ClipboardBackend::write_virtual_files`]，`OleSetClipboard` + 自定义 `IDataObject`。
 
-mod cloud;
+pub(crate) mod cloud;
 mod content;
 pub(crate) mod dnd;
 mod drag_image;

@@ -216,6 +216,67 @@ impl Store {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+    fn archive_collection_end(ranges: usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut local = Store::open(dir.path().into(), "a".repeat(24), true).unwrap();
+        local.recover_for_test().unwrap();
+        let mut local = local.export_snapshot().unwrap();
+        let peer = peer_segment();
+        local
+            .add_network(&"b".repeat(24), &peer.encode(MAX_SEGMENT_RAW).unwrap(), &peer)
+            .unwrap();
+        let coverage = (0..ranges)
+            .map(|i| {
+                let start = 1_792_551_885_000_000 + i as u64 * 1_000_000;
+                w::Coverage::from_raw(
+                    [
+                        (1, RawValue::Uint(start)),
+                        (2, RawValue::Uint(start + 500_000)),
+                        (3, RawValue::Bool(true)),
+                    ]
+                    .into(),
+                )
+                .unwrap()
+                .write()
+            })
+            .collect();
+        // These are the existing v1 fields emitted by released peers. A Low
+        // transfer's end can exceed the unrelated reliable-channel ceiling.
+        let end = w::DiagnosticsEnd::from_raw(
+            [
+                (1, RawValue::Bytes(vec![1; 16])),
+                (2, RawValue::Array(coverage)),
+                (3, RawValue::Bool(false)),
+                (4, RawValue::Uint(0)),
+            ]
+            .into(),
+        )
+        .unwrap();
+        let expected = end.encode(v1::limits::LOW_FRAME).unwrap();
+        assert!(expected.len() > v1::limits::RELIABLE_FRAME);
+        local.network_ends.insert("b".repeat(24), end);
+        let bundle = local.export(Reason::Manual, 0, 0).unwrap();
+        let mut zip = zip::ZipArchive::new(File::open(bundle.path).unwrap()).unwrap();
+        let mut bytes = Vec::new();
+        zip.by_name("devices/device-B/collection-end.cbor")
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(
+            bytes, expected,
+            "retain the peer's complete coverage without coalescing"
+        );
+        let retained = w::DiagnosticsEnd::decode(&bytes, v1::limits::LOW_FRAME).unwrap();
+        assert_eq!(retained.coverage().unwrap().0.len(), ranges);
+    }
+    #[test]
+    fn collection_end_with_1024_ranges_survives_archive() {
+        archive_collection_end(1024);
+    }
+    #[test]
+    fn collection_end_with_1586_ranges_survives_archive() {
+        archive_collection_end(1586);
+    }
     fn peer_segment() -> w::DiagnosticSegment {
         let mut snapshot = Snapshot::current_build();
         snapshot.version = "retained-build".into();

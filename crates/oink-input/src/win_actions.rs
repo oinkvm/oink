@@ -3,14 +3,15 @@
 //!
 //! | 来自 Mac | Windows |
 //! |---|---|
-//! | 调度中心（上轻扫 Ended 且绝对进度峰值 ≥ 0.05；或调度中心键） | 任务视图 Win+Tab |
-//! | 下轻扫 Ended 且绝对进度峰值 ≥ 0.05，任务视图在前台 | Esc 收起任务视图 |
+//! | 上轻扫 Ended 且绝对进度峰值 ≥ 0.05 | 桌面前台时 Win+D 恢复窗口，否则任务视图 Win+Tab |
+//! | 下轻扫 Ended 且绝对进度峰值 ≥ 0.05 | 任务视图前台 Esc；桌面前台不操作；其他 Win+D 显示桌面 |
+//! | Dock Pinch（同样 Ended + 峰值门限） | 收拢且 Start/搜索未开 → Win；张开且已开 → Esc；其余不操作 |
 //! | 左右轻扫 Ended 且绝对进度峰值 ≥ 0.05 | 切换虚拟桌面 Ctrl+Win+← / → |
 //! | 捏合缩放 | Ctrl+滚轮（放大量每累计 [`MAGNIFY_PER_NOTCH`] 一格） |
 //! | 聚焦搜索键 | 浏览器搜索键（`VK_BROWSER_SEARCH`，Windows 打开搜索；见 `windows/keymap.rs`） |
 //! | 听写键 | 语音输入 Win+H |
 //! | 启动台 / Apps 键 | 开始菜单（单按 Win） |
-//! | 其余（App Exposé、捏合打开 Apps、旋转、智能缩放、勿扰键） | 丢弃（debug 日志） |
+//! | 其余（旋转、智能缩放、勿扰键） | 丢弃（debug 日志） |
 
 use oink_foundation::input::{Gesture, GesturePhase, KeyCode, SwipeAxis};
 
@@ -39,6 +40,7 @@ const TAB: KeyCode = KeyCode::keyboard(0x2B);
 const ESC: KeyCode = KeyCode::keyboard(0x29);
 const LEFT: KeyCode = KeyCode::keyboard(0x50);
 const RIGHT: KeyCode = KeyCode::keyboard(0x4F);
+const D: KeyCode = KeyCode::keyboard(0x07);
 const H: KeyCode = KeyCode::keyboard(0x0B);
 
 /// Mac 的系统功能键（`keymap` 里新款键盘的键）在 Windows 上的快捷键。`None`：没有自然对应（丢弃）或不是这类键。
@@ -59,6 +61,15 @@ pub fn key_dropped(code: KeyCode) -> bool {
     )
 }
 
+/// One decision-time foreground sample supplied only by the injection backend.
+/// Query failures use the default (none of these Shell surfaces is showing).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ForegroundState {
+    pub task_view_showing: bool,
+    pub desktop_showing: bool,
+    pub start_open: bool,
+}
+
 /// 手势 → Windows 动作的状态机（每个接收端一个）。
 #[derive(Debug, Default)]
 pub struct GestureMapper {
@@ -69,16 +80,22 @@ pub struct GestureMapper {
     trace: crate::gesture_trace::Tracker,
     /// Foreground sample at this frame's committed swipe; None means not queried.
     task_view_showing: Option<bool>,
+    desktop_showing: Option<bool>,
+    start_open: Option<bool>,
 }
 
 impl GestureMapper {
     pub fn map(&mut self, g: &Gesture) -> Vec<WinAction> {
-        self.map_with_task_view_query(g, || false)
+        self.map_with_foreground_query(g, |_| ForegroundState::default())
     }
     /// The Windows injection caller supplies a desktop query, evaluated only after
     /// Ended + the progress floor. Capture/routing and pure callers make no syscalls.
-    pub fn map_with_task_view_query(&mut self, g: &Gesture, query: impl FnOnce() -> bool) -> Vec<WinAction> {
-        let actions = self.map_actions_with_task_view_query(g, query);
+    pub fn map_with_foreground_query(
+        &mut self,
+        g: &Gesture,
+        query: impl FnOnce(SwipeAxis) -> ForegroundState,
+    ) -> Vec<WinAction> {
+        let actions = self.map_actions_with_foreground_query(g, query);
         if crate::native_lifecycle::lifecycle_enabled() {
             let stamp = crate::native_lifecycle::capture_stamp();
             let source = crate::gesture_trace::source();
@@ -104,10 +121,16 @@ impl GestureMapper {
     // Observations consume the returned actions.
     #[cfg(all(test, debug_assertions))]
     fn map_actions(&mut self, g: &Gesture) -> Vec<WinAction> {
-        self.map_actions_with_task_view_query(g, || false)
+        self.map_actions_with_foreground_query(g, |_| ForegroundState::default())
     }
-    fn map_actions_with_task_view_query(&mut self, g: &Gesture, query: impl FnOnce() -> bool) -> Vec<WinAction> {
+    fn map_actions_with_foreground_query(
+        &mut self,
+        g: &Gesture,
+        query: impl FnOnce(SwipeAxis) -> ForegroundState,
+    ) -> Vec<WinAction> {
         self.task_view_showing = None;
+        self.desktop_showing = None;
+        self.start_open = None;
         match *g {
             Gesture::DockSwipe {
                 axis, phase, progress, ..
@@ -128,17 +151,18 @@ impl GestureMapper {
                     // 结束帧的符号决定方向；峰值只过滤碎片。中途接管时使用已见到的进度。
                     let peak_abs_progress = self.swipe_peak(axis, progress);
                     self.swipe = None;
-                    if peak_abs_progress >= SWIPE_PROGRESS_FLOOR && axis != SwipeAxis::Pinch {
-                        self.task_view_showing = Some(query());
+                    if peak_abs_progress >= SWIPE_PROGRESS_FLOOR {
+                        let foreground = query(axis);
+                        if axis == SwipeAxis::Pinch {
+                            self.start_open = Some(foreground.start_open);
+                        } else {
+                            self.task_view_showing = Some(foreground.task_view_showing);
+                            self.desktop_showing = Some(foreground.desktop_showing);
+                        }
                     }
-                    swipe_action(
-                        axis,
-                        progress,
-                        peak_abs_progress,
-                        self.task_view_showing.unwrap_or(false),
-                    )
-                    .into_iter()
-                    .collect()
+                    swipe_action(axis, progress, peak_abs_progress, self.foreground())
+                        .into_iter()
+                        .collect()
                 }
             },
             Gesture::Magnify { phase, amount } => {
@@ -158,6 +182,13 @@ impl GestureMapper {
                 }
             }
             Gesture::Rotate { .. } | Gesture::SmartMagnify => Vec::new(),
+        }
+    }
+    fn foreground(&self) -> ForegroundState {
+        ForegroundState {
+            task_view_showing: self.task_view_showing.unwrap_or(false),
+            desktop_showing: self.desktop_showing.unwrap_or(false),
+            start_open: self.start_open.unwrap_or(false),
         }
     }
     fn swipe_peak(&self, axis: SwipeAxis, progress: f64) -> f64 {
@@ -182,18 +213,12 @@ impl GestureMapper {
                     Decision::Cancelled
                 } else if phase != GesturePhase::Ended {
                     Decision::Pending
-                } else if !actions.is_empty() {
-                    match axis {
-                        SwipeAxis::Vertical if progress > 0. => Decision::TaskViewClose,
-                        SwipeAxis::Vertical => Decision::TaskView,
-                        SwipeAxis::Pinch => Decision::WrongDirection,
-                        SwipeAxis::Horizontal if (progress > 0.) == HORIZONTAL_POSITIVE_GOES_RIGHT => {
-                            Decision::DesktopRight
-                        }
-                        SwipeAxis::Horizontal => Decision::DesktopLeft,
-                    }
+                } else if self.task_view_showing.is_none() && self.start_open.is_none() {
+                    Decision::BelowThreshold
                 } else {
-                    Decision::WrongDirection
+                    // Sampling proves the mapper passed its peak gate, even if
+                    // recording began later and its tracker missed that peak.
+                    swipe_decision(axis, progress, self.foreground())
                 },
                 Some(SWIPE_PROGRESS_FLOOR),
             ),
@@ -227,18 +252,8 @@ impl GestureMapper {
         );
         if let Some(row) = &mut row {
             row.task_view_showing = self.task_view_showing;
-        }
-        if matches!(
-            g,
-            Gesture::DockSwipe {
-                phase: GesturePhase::Ended,
-                ..
-            }
-        ) && actions.is_empty()
-            && let Some(row) = &mut row
-            && row.peak_abs_progress < SWIPE_PROGRESS_FLOOR
-        {
-            row.decision = Decision::BelowThreshold;
+            row.desktop_showing = self.desktop_showing;
+            row.start_open = self.start_open;
         }
         // Cancellation does not undo Ctrl+wheel actions already generated, and the
         // existing mapper may generate more from the final Cancelled amount.
@@ -259,21 +274,42 @@ impl GestureMapper {
     }
 }
 
-fn swipe_action(axis: SwipeAxis, progress: f64, peak_abs_progress: f64, task_view_showing: bool) -> Option<WinAction> {
+fn swipe_decision(axis: SwipeAxis, progress: f64, foreground: ForegroundState) -> crate::gesture_trace::Decision {
+    use crate::gesture_trace::Decision::*;
+    match axis {
+        // Task View keeps its existing Win+Tab toggle on up, Esc on down.
+        SwipeAxis::Vertical if progress < 0.0 && foreground.desktop_showing => RestoreDesktop,
+        SwipeAxis::Vertical if progress < 0.0 => TaskView,
+        SwipeAxis::Vertical if progress > 0.0 && foreground.task_view_showing => TaskViewClose,
+        SwipeAxis::Vertical if progress > 0.0 && foreground.desktop_showing => DesktopNoop,
+        SwipeAxis::Vertical if progress > 0.0 => ShowDesktop,
+        SwipeAxis::Pinch if progress < 0.0 && !foreground.start_open => StartOpen,
+        SwipeAxis::Pinch if progress > 0.0 && foreground.start_open => StartClose,
+        SwipeAxis::Pinch if progress != 0.0 => StartNoop,
+        SwipeAxis::Horizontal if (progress > 0.0) == HORIZONTAL_POSITIVE_GOES_RIGHT => DesktopRight,
+        SwipeAxis::Horizontal => DesktopLeft,
+        _ => WrongDirection,
+    }
+}
+
+fn swipe_action(
+    axis: SwipeAxis,
+    progress: f64,
+    peak_abs_progress: f64,
+    foreground: ForegroundState,
+) -> Option<WinAction> {
+    use crate::gesture_trace::Decision::*;
     if peak_abs_progress < SWIPE_PROGRESS_FLOOR {
         return None;
     }
-    let keys = match axis {
-        SwipeAxis::Vertical if progress < 0.0 => vec![WIN, TAB],
-        // Esc dismisses without Win+Tab's toggle/reopen side effect. Up keeps the
-        // existing Win+Tab behavior even when Task View is already open (toggles).
-        SwipeAxis::Vertical if progress > 0.0 && task_view_showing => vec![ESC],
-        SwipeAxis::Vertical => return None, // App Exposé：没有自然对应
-        SwipeAxis::Horizontal => {
-            let right = (progress > 0.0) == HORIZONTAL_POSITIVE_GOES_RIGHT;
-            vec![CTRL, WIN, if right { RIGHT } else { LEFT }]
-        }
-        SwipeAxis::Pinch => return None, // Contacts fallback supports only desktop/scroll/zoom/Task View.
+    let keys = match swipe_decision(axis, progress, foreground) {
+        TaskView => vec![WIN, TAB],
+        TaskViewClose | StartClose => vec![ESC],
+        ShowDesktop | RestoreDesktop => vec![WIN, D],
+        StartOpen => vec![WIN],
+        DesktopRight => vec![CTRL, WIN, RIGHT],
+        DesktopLeft => vec![CTRL, WIN, LEFT],
+        _ => return None,
     };
     Some(WinAction::Shortcut(keys))
 }
@@ -283,23 +319,197 @@ mod tests {
     use super::*;
 
     #[test]
-    fn swipe_direction_and_task_view_state_decide_only_the_reverse_action() {
+    fn desktop_swipe_decision_table_uses_the_committed_foreground_sample() {
+        use crate::gesture_trace::Decision::*;
+        for (state, down_keys, down, up_keys, up) in [
+            (
+                Some(ForegroundState {
+                    task_view_showing: true,
+                    ..Default::default()
+                }),
+                Some(vec![ESC]),
+                TaskViewClose,
+                vec![WIN, TAB],
+                TaskView,
+            ),
+            (
+                Some(ForegroundState {
+                    desktop_showing: true,
+                    ..Default::default()
+                }),
+                None,
+                DesktopNoop,
+                vec![WIN, D],
+                RestoreDesktop,
+            ),
+            (
+                Some(ForegroundState::default()),
+                Some(vec![WIN, D]),
+                ShowDesktop,
+                vec![WIN, TAB],
+                TaskView,
+            ),
+            (None, Some(vec![WIN, D]), ShowDesktop, vec![WIN, TAB], TaskView),
+        ] {
+            for (progress, keys, decision) in [(0.1, down_keys, down), (-0.1, Some(up_keys), up)] {
+                let mut mapper = GestureMapper::default();
+                let gesture = swipe(SwipeAxis::Vertical, GesturePhase::Ended, progress);
+                let actions = mapper.map_with_foreground_query(&gesture, |axis| {
+                    assert_eq!(axis, SwipeAxis::Vertical);
+                    state.unwrap_or_default() // Query failure is the not-shown sample.
+                });
+                assert_eq!(actions, keys.map(WinAction::Shortcut).into_iter().collect::<Vec<_>>());
+                let row = mapper.observe(&gesture, &actions, 100, 1, None).unwrap();
+                assert_eq!(row.decision, decision);
+                assert_eq!(row.task_view_showing, Some(state.unwrap_or_default().task_view_showing));
+                assert_eq!(row.desktop_showing, Some(state.unwrap_or_default().desktop_showing));
+                assert_eq!(row.start_open, None);
+            }
+        }
+    }
+
+    #[test]
+    fn dock_pinch_start_decision_table_is_idempotent_and_failure_means_closed() {
+        use crate::gesture_trace::Decision::*;
+        for (start_open, close_keys, close, open_keys, open) in [
+            (Some(true), None, StartNoop, Some(vec![ESC]), StartClose),
+            (Some(false), Some(vec![WIN]), StartOpen, None, StartNoop),
+            (None, Some(vec![WIN]), StartOpen, None, StartNoop),
+        ] {
+            for (progress, keys, decision) in [(-0.1, close_keys, close), (0.1, open_keys, open)] {
+                let mut mapper = GestureMapper::default();
+                let gesture = swipe(SwipeAxis::Pinch, GesturePhase::Ended, progress);
+                let actions = mapper.map_with_foreground_query(&gesture, |axis| {
+                    assert_eq!(axis, SwipeAxis::Pinch);
+                    ForegroundState {
+                        start_open: start_open.unwrap_or(false),
+                        ..Default::default()
+                    }
+                });
+                assert_eq!(actions, keys.map(WinAction::Shortcut).into_iter().collect::<Vec<_>>());
+                let row = mapper.observe(&gesture, &actions, 100, 1, None).unwrap();
+                assert_eq!(row.decision, decision);
+                assert_eq!(row.start_open, Some(start_open.unwrap_or(false)));
+                assert_eq!(row.task_view_showing, None);
+                assert_eq!(row.desktop_showing, None);
+            }
+        }
+    }
+
+    #[test]
+    fn all_swipe_axes_preserve_cancel_floor_and_decision_time_query_gates() {
+        for axis in [SwipeAxis::Vertical, SwipeAxis::Horizontal, SwipeAxis::Pinch] {
+            for progress in [-0.1, 0.1] {
+                for phase in [GesturePhase::Began, GesturePhase::Changed, GesturePhase::Cancelled] {
+                    let mut mapper = GestureMapper::default();
+                    assert!(
+                        mapper
+                            .map_with_foreground_query(&swipe(axis, phase, progress), |_| panic!("not committed"))
+                            .is_empty()
+                    );
+                }
+                let mut mapper = GestureMapper::default();
+                assert!(
+                    mapper
+                        .map_with_foreground_query(
+                            &swipe(axis, GesturePhase::Ended, progress.signum() * 0.014),
+                            |_| panic!("below floor")
+                        )
+                        .is_empty()
+                );
+                for end in [0.05, 0.014] {
+                    let mut mapper = GestureMapper::default();
+                    mapper.map_with_foreground_query(
+                        &swipe(axis, GesturePhase::Changed, progress.signum() * 0.05),
+                        |_| panic!("changed"),
+                    );
+                    let gesture = swipe(axis, GesturePhase::Ended, progress.signum() * end);
+                    let actions = mapper.map_with_foreground_query(&gesture, |_| ForegroundState::default());
+                    // Pinch-open is a deliberate no-op when Start is closed.
+                    assert_eq!(actions.is_empty(), axis == SwipeAxis::Pinch && progress > 0.);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn committed_noop_stays_a_noop_when_recording_starts_after_peak_progress() {
+        for (axis, state, decision) in [
+            (
+                SwipeAxis::Vertical,
+                ForegroundState {
+                    desktop_showing: true,
+                    ..Default::default()
+                },
+                crate::gesture_trace::Decision::DesktopNoop,
+            ),
+            (
+                SwipeAxis::Pinch,
+                ForegroundState::default(),
+                crate::gesture_trace::Decision::StartNoop,
+            ),
+        ] {
+            let mut mapper = GestureMapper::default();
+            mapper.map_with_foreground_query(&swipe(axis, GesturePhase::Changed, 0.1), |_| panic!("not committed"));
+            let gesture = swipe(axis, GesturePhase::Ended, 0.014);
+            let actions = mapper.map_with_foreground_query(&gesture, |_| state);
+            assert!(actions.is_empty());
+            let row = mapper.observe(&gesture, &actions, 100, 1, None).unwrap();
+            assert!(row.missing_begin);
+            assert_eq!(row.decision, decision);
+        }
+    }
+
+    #[test]
+    fn down_shows_desktop_when_foreground_query_reports_nothing() {
+        let mut mapper = GestureMapper::default();
+        assert_eq!(
+            mapper.map(&swipe(SwipeAxis::Vertical, GesturePhase::Ended, 0.1)),
+            vec![WinAction::Shortcut(vec![WIN, KeyCode::keyboard(0x07)])]
+        );
+    }
+
+    #[test]
+    fn swipe_direction_and_task_view_state_preserve_other_shortcuts() {
         for showing in [false, true] {
             for (axis, progress, expected) in [
                 (SwipeAxis::Vertical, -0.1, Some(vec![WIN, TAB])),
-                (SwipeAxis::Vertical, 0.1, showing.then(|| vec![ESC])),
+                (
+                    SwipeAxis::Vertical,
+                    0.1,
+                    Some(if showing { vec![ESC] } else { vec![WIN, D] }),
+                ),
                 (SwipeAxis::Vertical, 0., None),
                 (SwipeAxis::Horizontal, -0.1, Some(vec![CTRL, WIN, LEFT])),
                 (SwipeAxis::Horizontal, 0.1, Some(vec![CTRL, WIN, RIGHT])),
-                (SwipeAxis::Pinch, -0.1, None),
+                (SwipeAxis::Pinch, -0.1, Some(vec![WIN])),
                 (SwipeAxis::Pinch, 0.1, None),
             ] {
                 assert_eq!(
-                    swipe_action(axis, progress, SWIPE_PROGRESS_FLOOR, showing),
+                    swipe_action(
+                        axis,
+                        progress,
+                        SWIPE_PROGRESS_FLOOR,
+                        ForegroundState {
+                            task_view_showing: showing,
+                            ..Default::default()
+                        }
+                    ),
                     expected.map(WinAction::Shortcut),
                     "{axis:?}, {progress}, showing={showing}"
                 );
-                assert_eq!(swipe_action(axis, progress, 0.014, showing), None);
+                assert_eq!(
+                    swipe_action(
+                        axis,
+                        progress,
+                        0.014,
+                        ForegroundState {
+                            task_view_showing: showing,
+                            ..Default::default()
+                        }
+                    ),
+                    None
+                );
             }
         }
     }
@@ -314,7 +524,7 @@ mod tests {
             (SwipeAxis::Vertical, GesturePhase::Changed, 0.1, false, None),
             (SwipeAxis::Vertical, GesturePhase::Cancelled, 0.1, false, None),
             (SwipeAxis::Vertical, GesturePhase::Ended, 0.014, false, None),
-            (SwipeAxis::Pinch, GesturePhase::Ended, 0.1, false, None),
+            (SwipeAxis::Pinch, GesturePhase::Ended, 0.1, true, None),
             (
                 SwipeAxis::Horizontal,
                 GesturePhase::Ended,
@@ -329,35 +539,44 @@ mod tests {
         ] {
             let before = queries.get();
             let g = swipe(axis, phase, progress);
-            let actions = m.map_with_task_view_query(&g, || {
+            let actions = m.map_with_foreground_query(&g, |_| {
                 queries.set(queries.get() + 1);
-                true
+                ForegroundState {
+                    task_view_showing: true,
+                    ..Default::default()
+                }
             });
             assert_eq!(queries.get() - before, usize::from(queried));
-            assert_eq!(m.task_view_showing, queried.then_some(true));
+            assert_eq!(
+                m.task_view_showing,
+                (queried && axis != SwipeAxis::Pinch).then_some(true)
+            );
             assert_eq!(actions, keys.map(WinAction::Shortcut).into_iter().collect::<Vec<_>>());
             let row = m.observe(&g, &actions, 100, 1, None);
             if let Some(row) = row {
-                assert_eq!(row.task_view_showing, queried.then_some(true));
+                assert_eq!(
+                    row.task_view_showing,
+                    (queried && axis != SwipeAxis::Pinch).then_some(true)
+                );
                 if actions == vec![WinAction::Shortcut(vec![ESC])] {
                     assert_eq!(row.decision, crate::gesture_trace::Decision::TaskViewClose);
                 }
             }
         }
-        assert_eq!(queries.get(), 2);
+        assert_eq!(queries.get(), 3);
         // The next gesture must not inherit a stale showing=true sample.
         let g = swipe(SwipeAxis::Vertical, GesturePhase::Ended, 0.1);
-        let actions = m.map_with_task_view_query(&g, || false);
-        assert!(actions.is_empty());
+        let actions = m.map_with_foreground_query(&g, |_| ForegroundState::default());
+        assert_eq!(actions, vec![WinAction::Shortcut(vec![WIN, D])]);
         let row = m.observe(&g, &actions, 200, 1, None).unwrap();
         assert_eq!(row.task_view_showing, Some(false));
-        assert_eq!(row.decision, crate::gesture_trace::Decision::WrongDirection);
-        m.map_with_task_view_query(
+        assert_eq!(row.decision, crate::gesture_trace::Decision::ShowDesktop);
+        m.map_with_foreground_query(
             &Gesture::Magnify {
                 phase: GesturePhase::Changed,
                 amount: 0.2,
             },
-            || panic!("magnify must not query the foreground"),
+            |_| panic!("magnify must not query the foreground"),
         );
         assert_eq!(m.task_view_showing, None);
     }
@@ -378,7 +597,7 @@ mod tests {
                 0.1,
                 0.1,
                 GesturePhase::Ended,
-                Decision::WrongDirection,
+                Decision::ShowDesktop,
             ),
             (SwipeAxis::Vertical, -0.1, 0.1, GesturePhase::Ended, Decision::TaskView),
             (
@@ -402,20 +621,8 @@ mod tests {
                 GesturePhase::Ended,
                 Decision::DesktopLeft,
             ),
-            (
-                SwipeAxis::Pinch,
-                0.1,
-                0.1,
-                GesturePhase::Ended,
-                Decision::WrongDirection,
-            ),
-            (
-                SwipeAxis::Pinch,
-                -0.1,
-                0.1,
-                GesturePhase::Ended,
-                Decision::WrongDirection,
-            ),
+            (SwipeAxis::Pinch, 0.1, 0.1, GesturePhase::Ended, Decision::StartNoop),
+            (SwipeAxis::Pinch, -0.1, 0.1, GesturePhase::Ended, Decision::StartOpen),
             (
                 SwipeAxis::Vertical,
                 -0.4,
@@ -602,8 +809,11 @@ mod tests {
             run(&mut m, SwipeAxis::Vertical, -0.8, GesturePhase::Ended),
             vec![WinAction::Shortcut(vec![WIN, TAB])]
         );
-        // 向下（App Exposé）、不过阈值、取消：什么都不做。
-        assert!(run(&mut m, SwipeAxis::Vertical, 0.8, GesturePhase::Ended).is_empty());
+        assert_eq!(
+            run(&mut m, SwipeAxis::Vertical, 0.8, GesturePhase::Ended),
+            vec![WinAction::Shortcut(vec![WIN, D])]
+        );
+        // 不过阈值、取消：什么都不做。
         assert!(run(&mut m, SwipeAxis::Vertical, -0.014, GesturePhase::Ended).is_empty());
         assert!(run(&mut m, SwipeAxis::Vertical, -0.9, GesturePhase::Cancelled).is_empty());
     }
@@ -622,10 +832,13 @@ mod tests {
     }
 
     #[test]
-    fn spread_and_pinch_shortcuts_are_dropped() {
+    fn pinch_opens_start_while_spread_is_a_noop_when_start_is_closed() {
         let mut m = GestureMapper::default();
         assert!(run(&mut m, SwipeAxis::Pinch, 0.7, GesturePhase::Ended).is_empty());
-        assert!(run(&mut m, SwipeAxis::Pinch, -0.7, GesturePhase::Ended).is_empty());
+        assert_eq!(
+            run(&mut m, SwipeAxis::Pinch, -0.7, GesturePhase::Ended),
+            vec![WinAction::Shortcut(vec![WIN])]
+        );
     }
 
     #[test]

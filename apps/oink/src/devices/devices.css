@@ -286,14 +286,16 @@
 
 
 .side-ctx { display: contents; }
-.ok-menu.devmenu { min-width: 260px; padding: 6px; }
+.ok-menu.devmenu { min-width: 200px; }
+.devmenu__inputs { display: grid; padding: 2px 0; }
 
 .devmenu__row {
   display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 16px;
-  min-height: 46px; padding: 0 10px;
+  min-height: 44px; padding: 0 6px 0 10px;
 }
 .devmenu__label { display: flex; align-items: center; gap: 8px; font: 500 14px/1.2 var(--ok-font); color: var(--ok-text); white-space: nowrap; }
-.devmenu__glyph { flex: none; display: block; width: 16px; height: 16px; color: var(--ok-text-2); line-height: 0; }
+.devmenu__label .devmenu__glyph { color: var(--ok-text-2); }
+.devmenu__glyph { flex: none; display: block; width: 16px; height: 16px; line-height: 0; }
 .devmenu__glyph svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
 .devmenu__glyph svg .fill { fill: currentColor; stroke: none; }
 .devmenu__seg { justify-self: end; }
@@ -336,3 +338,8 @@
 
 
 .devmenu__na { justify-self: end; max-width: 168px; padding: 0 4px; font: 500 12.5px/1.35 var(--ok-font); color: var(--ok-text-3); text-align: right; }
+
+.dev__title { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.dev__name { min-width: 0; }
+.dev__hidden { flex: none; display: block; width: 14px; height: 14px; color: var(--ok-text-3); line-height: 0; pointer-events: auto; }
+.dev__hidden svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }

@@ -9,7 +9,10 @@ export function useVisible(element: RefObject<HTMLElement | null>, active = true
     let intersecting = typeof IntersectionObserver === 'undefined';
     const update = () => setVisible(intersecting && !document.hidden);
     const observer = typeof IntersectionObserver === 'undefined' ? undefined : new IntersectionObserver(([entry]) => {
-      intersecting = entry.isIntersecting && entry.intersectionRatio > 0;
+      // With the default threshold (0), edge contact is already intersecting.
+      // Requiring a positive ratio can latch false: entering further does not
+      // cross another threshold, so the observer need not notify again.
+      intersecting = entry.isIntersecting;
       update();
     });
     observer?.observe(element.current);

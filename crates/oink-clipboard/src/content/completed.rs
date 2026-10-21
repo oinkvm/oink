@@ -296,6 +296,9 @@ impl Provider for Completed {
     }
 }
 impl namespace::Namespace for Completed {
+    fn origin(&self) -> Option<oink_foundation::DeviceId> {
+        Some(self.0.inventory.id.clip.origin)
+    }
     fn roots(&self) -> Vec<FileNode> {
         self.0
             .inventory

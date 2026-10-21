@@ -31,29 +31,41 @@ describe('device-owned game badges',()=>{
   });
 });
 describe('unavailable device row',()=>{
-  it('allows an explicit exit selection while historical ordering is unknown',()=>{
-    setLanguage('en');
-    const toggle=vi.fn();
-    const d={...device,unknown:false,speaker:{...device.speaker,canMakeExit:true}};
-    render(<OinkProvider><DeviceItem d={d} now={0} selected={false} collapsed={false} onSelect={()=>{}} onToggle={toggle}/></OinkProvider>);
-    const output=screen.getByRole('button',{name:/Double-click to set as group output/});
+  it('selects the device through audio without changing its audio route',()=>{
+    const toggle=vi.fn(), select=vi.fn();
+    render(<OinkProvider><DeviceItem d={device} now={0} selected={false} collapsed={false} onSelect={select} onToggle={toggle}/></OinkProvider>);
+    const output=screen.getByRole('button',{name:/Audio output/});
     fireEvent.click(output,{detail:1});
-    expect(toggle).not.toHaveBeenCalled();
     fireEvent.click(output,{detail:2});
-    expect(toggle).toHaveBeenCalledWith('speaker','double');
+    expect(select).toHaveBeenCalledTimes(1);
+    expect(toggle).not.toHaveBeenCalled();
+  });
+  it('never disables an input through double click or shift-enter',()=>{
+    const toggle=vi.fn();
+    render(<OinkProvider><DeviceItem d={{...device,unknown:false,keyboard:'shared'}} now={0} selected={false} collapsed={false} onSelect={()=>{}} onToggle={toggle}/></OinkProvider>);
+    const key=screen.getByRole('button',{name:/Keyboard/});
+    fireEvent.click(key,{detail:1});
+    fireEvent.click(key,{detail:2});
+    fireEvent.keyDown(key,{key:'Enter',shiftKey:true});
+    expect(toggle.mock.calls).toEqual([['keyboard','single']]);
+  });
+  it('does not show a selected device while collapsed',()=>{
+    const {container}=render(<OinkProvider><DeviceItem d={device} now={0} selected collapsed onSelect={()=>{}}/></OinkProvider>);
+    expect(container.querySelector('[data-current]')).toBeNull();
+    expect(container.querySelector('[aria-current]')).toBeNull();
   });
   it.each(['en','zh-Hans'] as const)('renders warning resources and concise labels in %s',language=>{
     setLanguage(language);
     const {container}=render(<OinkProvider><DeviceItem d={device} now={0} selected={false} collapsed={false} onSelect={()=>{}}/></OinkProvider>);
     const icons=container.querySelectorAll('.dev-ico');
-    expect(icons).toHaveLength(4);
+    expect(icons).toHaveLength(3);
     for(const icon of icons) {
       expect(icon.getAttribute('aria-label')).toContain(language==='en'?'unavailable':'不可用');
       expect(icon.getAttribute('data-tone')).toBe('warn');
       expect(icon.querySelector('[data-badge="warning"]')).not.toBeNull();
       expect(icon.getAttribute('aria-label')).not.toMatch(/state|状态/);
     }
-    expect(container.querySelectorAll('.dev-ico--btn')).toHaveLength(0);
+    expect(container.querySelectorAll('.dev-ico--btn')).toHaveLength(1);
   });
 });
 
@@ -70,7 +82,7 @@ describe('offline device row', () => {
     expect(container.querySelector('.dev__seen')?.textContent).toBe(language === 'en' ? 'Last seen Unknown' : '上次在线 未知');
   });
 
-  it.each(['en', 'zh-Hans'] as const)('uses the same last-seen spacing in the context menu in %s', async language => {
+  it.each(['en', 'zh-Hans'] as const)('offers only edit IP and removal for an offline device in %s', async language => {
     setLanguage(language);
     const now = new Date(2026, 5, 15, 12).getTime();
     vi.spyOn(Date, 'now').mockReturnValue(now);
@@ -78,10 +90,25 @@ describe('offline device row', () => {
     render(<OinkProvider defaultMotion="reduced"><SideContextMenu
       devices={[{...device, group:'offline', lastSeen:now - 3_600_000}]} requests={[]} nearby={[]}
       onShare={noop} onGameMode={noop} onPause={noop} onLeave={noop} onEditAddress={noop}
-      onShowWindow={noop} onAbout={noop} onQuit={noop} onSpeaker={noop}
+      onShowWindow={noop} onAbout={noop} onQuit={noop} onSpeaker={noop} onHideScreen={noop} onScreensHidden={noop}
       onAccept={noop} onReject={noop} onPair={noop} onBlock={noop}
     ><button data-ctx="device:remote">Open device menu</button></SideContextMenu></OinkProvider>);
     fireEvent.contextMenu(screen.getByRole('button', {name:'Open device menu'}));
-    expect(await screen.findByText(language === 'en' ? 'Last seen 1 hour ago' : '上次在线 1 小时前')).toBeTruthy();
+    expect(await screen.findByRole('menuitem', {name:language === 'en' ? 'Edit IP' : '编辑 IP'})).toBeTruthy();
+    expect(screen.getAllByRole('menuitem')).toHaveLength(2);
+    expect(screen.queryByText(language === 'en' ? 'Last seen 1 hour ago' : '上次在线 1 小时前')).toBeNull();
+  });
+});
+
+describe('hidden screens mark', () => {
+  it.each(['en', 'zh-Hans'] as const)('marks a device with hidden screens next to its name in %s', language => {
+    setLanguage(language);
+    const row = (hiddenScreens: number, group: Device['group'] = 'online') => <OinkProvider><DeviceItem d={{...device, unknown:false, group, screen:'shared'}} hiddenScreens={hiddenScreens} now={0} selected={false} collapsed={false} onSelect={()=>{}}/></OinkProvider>;
+    const {container, rerender} = render(row(0));
+    expect(container.querySelector('.dev__hidden')).toBeNull();
+    rerender(row(1));
+    expect(container.querySelector('.dev__title .dev__hidden')?.getAttribute('aria-label')).toBe(language === 'en' ? '1 screen hidden' : '1 块屏幕已隐藏');
+    rerender(row(2, 'offline'));
+    expect(container.querySelector('.dev__title .dev__hidden')?.getAttribute('aria-label')).toBe(language === 'en' ? '2 screens hidden' : '2 块屏幕已隐藏');
   });
 });

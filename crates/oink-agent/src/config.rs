@@ -49,6 +49,7 @@ pub struct Settings {
     pub hotkeys: Option<Vec<crate::api::Hotkey>>,
     pub clipboard: Option<crate::api::ClipboardSettings>,
     pub file_provider_placeholder_pool: bool,
+    pub received_files_cleanup: crate::api::ReceivedFilesCleanup,
     pub log_level: LogLevel,
     pub log_max_mb: LogMaxMb,
     pub ui_language: UiLanguage,
@@ -76,6 +77,8 @@ pub struct Settings {
     pub game_mode: GameModePreference,
     #[serde(skip)]
     pub accept_contacts: bool,
+    #[serde(skip)]
+    pub sync_system_arrangement: bool,
 }
 
 impl Default for Settings {
@@ -92,6 +95,7 @@ impl Default for Settings {
             hotkeys: Some(crate::agent_api::default_hotkeys()),
             clipboard: Some(crate::clip::default_settings()),
             file_provider_placeholder_pool: true,
+            received_files_cleanup: Default::default(),
             log_level: LogLevel::Info,
             log_max_mb: LogMaxMb::default(),
             ui_language: UiLanguage::Auto,
@@ -110,6 +114,7 @@ impl Default for Settings {
             input_transform: oink_foundation::input_transform::InputTransform::initial(std::env::consts::OS),
             game_mode: GameModePreference::Auto,
             accept_contacts: true,
+            sync_system_arrangement: false,
         }
     }
 }
@@ -146,7 +151,7 @@ impl AgentConfig {
             Err(error) => return Err(error.into()),
         };
         let mut reader = read::Reader::default();
-        let (envelope, mut settings, owner) = if let Some(bytes) = bytes {
+        let (envelope, mut settings, mut owner) = if let Some(bytes) = bytes {
             let envelope: serde_json::Value = serde_json::from_slice(&bytes)?;
             anyhow::ensure!(
                 envelope.get("schema").and_then(serde_json::Value::as_u64) == Some(1),
@@ -171,20 +176,28 @@ impl AgentConfig {
             let owner = owner::OwnerStore::new(projection::values(&settings))?;
             (serde_json::json!({"schema":1,"local":{}}), settings, owner)
         };
+        let extended = owner.ensure_option(
+            oink_protocol::v1::dto::LocalOption::SyncSystemArrangement,
+            oink_protocol::v1::RawValue::Bool(false),
+        )?;
         projection::apply(&owner, &mut settings)?;
         for issue in &reader.issues {
             if issue.kind != SettingsIssueKind::UnknownKey {
                 tracing::warn!(path = %issue.path, kind = ?issue.kind, "local setting was not understood");
             }
         }
-        Ok(Self {
+        let mut config = Self {
             data_dir: dir.to_owned(),
             baseline: settings.clone(),
             settings,
             settings_issues: reader.issues,
             owner,
             envelope,
-        })
+        };
+        if extended {
+            config.save()?;
+        }
+        Ok(config)
     }
     pub fn settings_path(&self) -> PathBuf {
         self.data_dir.join(SETTINGS_FILE)
@@ -364,6 +377,28 @@ mod tests {
         dto::{ControlFailure, LocalOption},
         schema::WireDto,
     };
+    #[test]
+    fn received_cleanup_is_local_never_by_default_and_survives_restart() {
+        use crate::api::ReceivedFilesCleanup as C;
+        let home = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::load_from(home.path()).unwrap();
+        assert_eq!(config.settings.received_files_cleanup, C::Never);
+        let owner = config.owner().clone();
+        config
+            .update_local(&serde_json::json!({"received_files_cleanup":C::Days7}), |settings| {
+                settings.received_files_cleanup = C::Days7
+            })
+            .unwrap();
+        assert_eq!(config.owner(), &owner);
+        assert_eq!(
+            AgentConfig::load_from(home.path())
+                .unwrap()
+                .settings
+                .received_files_cleanup,
+            C::Days7
+        );
+        assert_eq!(stored(home.path())["local"]["received_files_cleanup"], "days7");
+    }
     fn stored(dir: &Path) -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(dir.join(SETTINGS_FILE)).unwrap()).unwrap()
     }
@@ -479,6 +514,32 @@ mod tests {
                 .unwrap();
             let reloaded = AgentConfig::load_from(dir.path()).unwrap();
             assert!(!reloaded.settings.routing.mac_scroll_feel);
+        }
+    }
+
+    #[test]
+    fn injected_input_forwarding_defaults_off_and_persists_only_locally() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::load_from(dir.path()).unwrap();
+        assert!(!config.settings.routing.forward_injected_input);
+        for forward in [true, false] {
+            config
+                .update_local(
+                    &serde_json::json!({"routing":{"forward_injected_input":forward}}),
+                    |s| {
+                        s.routing.forward_injected_input = forward;
+                    },
+                )
+                .unwrap();
+            let reloaded = AgentConfig::load_from(dir.path()).unwrap();
+            assert_eq!(reloaded.settings.routing.forward_injected_input, forward);
+            assert_eq!(
+                stored(dir.path())["local"]["routing"]["forward_injected_input"],
+                forward
+            );
+            let mut raw = stored(dir.path());
+            raw.as_object_mut().unwrap().remove("local");
+            assert!(!raw.to_string().contains("forward_injected_input"));
         }
     }
 

@@ -138,6 +138,7 @@ fn prepare_metadata(
     let metadata = (|| {
         check_publication(started + MANAGER_TIMEOUT, current)?;
         let admission = Admission::new(roots).map_err(error)?;
+        *admission.origin.lock().unwrap() = Some(key.offer.clip.origin);
         let mut names = Names::new(crate::sync::files::TargetOs::MacOs);
         let entries = admission
             .roots
@@ -278,6 +279,7 @@ enum State {
     Retired,
 }
 pub(super) struct Admission {
+    origin: Mutex<Option<oink_foundation::DeviceId>>,
     roots: Vec<FileNode>,
     state: Mutex<State>,
 }
@@ -294,6 +296,7 @@ impl Admission {
             return Err(io::ErrorKind::InvalidData.into());
         }
         Ok(Arc::new(Self {
+            origin: Mutex::new(None),
             roots,
             state: Mutex::new(State::Prepared),
         }))
@@ -372,6 +375,9 @@ impl Admission {
     }
 }
 impl Namespace for Admission {
+    fn origin(&self) -> Option<oink_foundation::DeviceId> {
+        *self.origin.lock().unwrap()
+    }
     fn roots(&self) -> Vec<FileNode> {
         self.roots.clone()
     }

@@ -17,6 +17,32 @@ beforeAll(() => {
   vi.spyOn(backend, 'cacheUsage').mockResolvedValue([]);
 });
 afterEach(cleanup);
+it.each(['en','ja','ko','zh-Hans'])('shows default-off external forwarding only on Windows and searches it in %s', language => {
+  setLanguage(language);
+  const set=vi.fn();
+  const {container,unmount}=render(view(initial,'',vi.fn(),undefined,'win',{...prefs,set}));
+  const row=container.querySelector<HTMLElement>('[data-item="forwardInjectedInput"]')!;
+  expect(row).not.toBeNull();
+  expect(row.classList.contains('ok-row--stack')).toBe(false);
+  const control=within(row).getByRole('switch') as HTMLInputElement;
+  expect(control.checked).toBe(false);
+  fireEvent.click(control);
+  expect(set).toHaveBeenCalledWith('forwardInjectedInput',true);
+  const item=sectionsFor('win').flatMap(section=>section.items).find(item=>item.id==='forwardInjectedInput')!;
+  if(language==='en') {
+    expect(item.label).toBe('Forward injected input');
+    expect(item.desc).toBe('When off, input that other apps on this computer inject stays here while you control another device');
+  } else if(language==='zh-Hans') {
+    expect(item.label).toBe('转发程序注入的输入');
+    expect(item.desc).toBe('关闭时，用本机控制其它设备时，本机其它程序注入的输入不转发至被控设备');
+  } else expect(item.label).not.toBe('转发程序注入的输入');
+  const found=searchSections('win','SendInput').get('input');
+  expect(found==='all'||found?.has('forwardInjectedInput')).toBe(true);
+  unmount();
+  const mac=render(view());
+  expect(mac.container.querySelector('[data-item="forwardInjectedInput"]')).toBeNull();
+  expect(sectionsFor('mac').flatMap(section=>section.items).some(item=>item.id==='forwardInjectedInput')).toBe(false);
+});
 const prefs = { prefs: DEFAULT_PREFS, set() {}, canEdit: () => true } as unknown as PrefsApi;
 const initial: Record<PermissionId, PermState> = { accessibility: 'not_granted', input: 'not_granted', network: 'not_required', files: 'unknown', audio: 'not_determined' };
 function view(perms = initial, query = '', onGrant = vi.fn(), onOpenPermissionSettings?: (id: PermissionId) => void, platform: Platform = 'mac', settings = prefs) {
@@ -228,4 +254,18 @@ it.each(['en','ja','ko','zh-Hans'])('finds the localized Mac scroll setting thro
   }
   const found=searchSections('win','macOS').get('input');
   expect(found==='all'||found?.has('macScrollFeel')).toBe(true);
+});
+
+it('disables only clipboard format rows when sending is off', () => {
+  setLanguage('en');
+  const settings = {...prefs,prefs:{...DEFAULT_PREFS,clipSend:false}};
+  const {container}=render(view(initial,'',vi.fn(),undefined,'mac',settings));
+  for (const key of ['clipText','clipRich','clipImage','clipFiles','clipPrivate']) {
+    const row=container.querySelector<HTMLElement>(`[data-item="${key}"]`)!;
+    expect((within(row).getByRole('switch') as HTMLInputElement).disabled).toBe(true);
+  }
+  for (const key of ['clipReceive','clipSend']) {
+    const row=container.querySelector<HTMLElement>(`[data-item="${key}"]`)!;
+    expect((within(row).getByRole('switch') as HTMLInputElement).disabled).toBe(false);
+  }
 });

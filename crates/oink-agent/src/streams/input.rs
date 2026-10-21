@@ -30,6 +30,10 @@ pub const KINDS: &[StreamKind] = &[StreamKind::Input];
 /// 4 `ControlMsg::GameMode`, 5 `DndMsg::Caps`.
 pub const OPENING_MESSAGES: usize = 5;
 
+// C0 authentication is already complete; allow three seconds for the small I0
+// opening under load, then recover before a stuck link becomes a lasting outage.
+const OPENING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// What the inbound I0 has told about its writer. Lives and dies with that stream: cleared
 /// when it closes or is replaced, kept while only the outbound stream is reopened. Between
 /// attaches (and while this device is paused) state messages update it without reaching
@@ -284,7 +288,19 @@ impl InputStreams {
     ) {
         let mut diagnostics_at = Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let due = self.peers.values().filter_map(|p| p.machine.deadline()).min();
+            let due = self
+                .peers
+                .values()
+                .flat_map(|p| {
+                    [
+                        p.machine.deadline(),
+                        (!p.wait_reported)
+                            .then(|| p.wait_since.map(|at| at + OPENING_TIMEOUT))
+                            .flatten(),
+                    ]
+                })
+                .flatten()
+                .min();
             tokio::select! {
                 event = port.next() => match event {
                     Some(ModuleEvent::LinkReady { link, peer }) => self.link_ready(link, peer),
@@ -342,14 +358,43 @@ impl InputStreams {
     }
     fn report_waits(&mut self, now: Instant) {
         let status = self.input.status();
+        let members = self.config.members();
         for (peer, p) in &mut self.peers {
+            let was_reported = p.wait_reported;
+            // Either endpoint can intentionally close its writer while paused.
+            // Retained Facts from an older Boot must not suppress a live wait.
+            let remote_paused = members
+                .members
+                .iter()
+                .find(|m| m.device == *peer)
+                .and_then(|m| m.facts.as_ref())
+                .is_some_and(|facts| {
+                    facts
+                        .boot()
+                        .ok()
+                        .and_then(|boot| oink_network::wire_identity::read_boot(&boot).ok())
+                        == Some(p.boot)
+                        && facts
+                            .pause()
+                            .ok()
+                            .flatten()
+                            .is_some_and(|pause| pause.paused() == Ok(true))
+                });
             Self::observe_wait(
                 *peer,
                 p,
                 status.peers.iter().find(|s| s.peer == *peer),
-                self.paused,
+                self.paused || remote_paused,
                 now,
             );
+            if p.wait_reported && !was_reported {
+                // Relay-to-direct cutover can overtake an unparsed I0 header.
+                // Its old opening is then lost while both links remain Ready.
+                // Retire this exact link so normal C0 admission and reconnect
+                // rebuild both streams, rather than waiting forever for I0.
+                self.links
+                    .disconnect(p.link, oink_network::link::Disconnect::InputOpeningTimeout);
+            }
         }
     }
     fn observe_wait(
@@ -359,23 +404,25 @@ impl InputStreams {
         paused: bool,
         now: Instant,
     ) {
-        if paused || observed.is_some_and(|s| s.attached) {
+        // The input owner may still publish the previously attached pair while
+        // a replacement command is queued. Only this exact pair clears its wait.
+        if paused || observed.is_some_and(|s| s.attached && s.inbound == p.inbound && s.outbound == p.outbound) {
             InputStreams::wait_end(peer, p, if paused { "paused" } else { "attached" }, now);
             p.wait_since = None;
             p.wait_reported = false;
             return;
         }
         let since = p.wait_since.get_or_insert(now);
-        if !p.wait_reported && now.saturating_duration_since(*since) >= std::time::Duration::from_secs(3) {
+        if !p.wait_reported && now.saturating_duration_since(*since) >= OPENING_TIMEOUT {
             p.wait_reported = true;
             tracing::info!(target: "oink_link_diagnostics", kind = "input_wait", peer_id = peer.to_hex().as_str(),
-                    stage = "input_opening", result = "long", reason = "opening_incomplete",
+                    stage = "input_opening", result = "failed", reason = "input_opening_timeout", link_id = p.link.0,
                     elapsed_ms = now.saturating_duration_since(*since).as_secs_f64() * 1000.,
                     wait_outbound = observed.is_none_or(|s| s.outbound.is_none()),
                     wait_inbound = observed.is_none_or(|s| s.inbound.is_none()),
                     opening_received = observed.map_or(0, |s| s.opening_received),
                     wait_release = observed.is_some_and(|s| s.releasing),
-                    "Input opening long wait");
+                    "Input opening timed out; reconnecting link");
         }
     }
     fn refresh_contacts(&mut self) {
@@ -411,7 +458,9 @@ impl InputStreams {
             .unwrap_or(oink_routing::Os::Other)
     }
     fn poll(&mut self) {
-        let now = Instant::now();
+        self.poll_at(Instant::now());
+    }
+    fn poll_at(&mut self, now: Instant) {
         for peer in self.peers.keys().copied().collect::<Vec<_>>() {
             let step = self.peers.get_mut(&peer).unwrap().machine.poll(!self.paused, true, now);
             self.step(peer, step);
@@ -425,6 +474,7 @@ impl InputStreams {
             Step::Reopen { close, open } => (Some(close), Some(open)),
         };
         let p = self.peers.get_mut(&peer).unwrap();
+        p.wait_since.get_or_insert_with(Instant::now);
         if let Some(tag) = close {
             if let Some(stream) = p.outbound.take().filter(|s| s.tag == tag) {
                 self.links.close_stream(stream, StreamCode::None);
@@ -504,6 +554,7 @@ impl InputStreams {
                     Which::Inbound if p.inbound == Some(stream) => {
                         self.links.close_stream(stream, code);
                         p.inbound = None;
+                        p.wait_since.get_or_insert_with(Instant::now);
                     }
                     _ => {}
                 }
@@ -571,6 +622,7 @@ impl StreamModule for InputStreams {
             stream.reject(StreamCode::NotReady);
             return;
         };
+        p.wait_since.get_or_insert_with(Instant::now);
         let relative = self
             .config
             .peer_agreement(peer)
@@ -615,6 +667,7 @@ impl StreamModule for InputStreams {
         };
         let p = self.peers.get_mut(&peer).unwrap();
         if p.inbound == Some(stream) {
+            p.wait_since.get_or_insert_with(Instant::now);
             p.inbound = None;
             self.input.send(InputCommand::InboundGone { peer, stream });
         } else if p.outbound == Some(stream) {
@@ -1012,6 +1065,63 @@ mod os_tests {
 mod wait_tests {
     use super::*;
     #[test]
+    fn an_attached_snapshot_of_the_old_stream_pair_cannot_cancel_the_new_deadline() {
+        use oink_network::link::StreamDir;
+        use oink_protocol::frame::StreamTag;
+        let now = Instant::now();
+        let peer = DeviceId([1; 32]);
+        let stream = |ordinal| StreamId {
+            link: LinkId(1),
+            dir: StreamDir::Out,
+            tag: StreamTag {
+                kind: StreamKind::Input,
+                ordinal,
+            },
+        };
+        let inbound = Some(StreamId {
+            dir: StreamDir::In,
+            ..stream(1)
+        });
+        let mut p = PeerStreams {
+            boot: super::tests::boot(peer),
+            link: LinkId(1),
+            machine: StreamMachine::new(StreamKind::Input),
+            ordinal: InboundOrdinal::default(),
+            outbound: Some(stream(2)),
+            inbound,
+            wait_since: Some(now),
+            wait_reported: false,
+        };
+        let mut observed = crate::threads::input::PeerInput {
+            peer,
+            inbound,
+            outbound: Some(stream(1)),
+            opening_received: 5,
+            releasing: false,
+            attached: true,
+            online: true,
+            touchpad_contacts: None,
+            feel: None,
+        };
+        InputStreams::observe_wait(
+            peer,
+            &mut p,
+            Some(&observed),
+            false,
+            now + OPENING_TIMEOUT - std::time::Duration::from_nanos(1),
+        );
+        assert_eq!(p.wait_since, Some(now));
+        assert!(!p.wait_reported);
+        // The same stale status must still cause recovery at the boundary.
+        InputStreams::observe_wait(peer, &mut p, Some(&observed), false, now + OPENING_TIMEOUT);
+        assert!(p.wait_reported);
+        observed.outbound = p.outbound;
+        InputStreams::observe_wait(peer, &mut p, Some(&observed), false, now + OPENING_TIMEOUT);
+        assert!(p.wait_since.is_none());
+        assert!(!p.wait_reported);
+    }
+
+    #[test]
     fn long_wait_reports_once_and_resets_on_attach_pause_or_loss() {
         let now = Instant::now();
         let peer = DeviceId([1; 32]);
@@ -1059,3 +1169,6 @@ mod wait_tests {
         assert!(!p.wait_reported);
     }
 }
+
+#[cfg(all(test, debug_assertions))]
+mod recovery_tests;

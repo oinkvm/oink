@@ -305,6 +305,33 @@ impl ConfigModule {
     ) -> ApiResult<u64> {
         self.call(move |owner| owner.publish_input(mouse, keyboard, faults, options, game))
     }
+    pub(crate) fn layout_profile_merges(&self) -> ApiResult<Vec<dto::MergeTransferBundle>> {
+        self.call(|owner| owner.layout_profile_merges())
+    }
+    pub(crate) fn publish_native_arrangement(&self, token: String) -> ApiResult<u64> {
+        self.call(move |owner| owner.publish_native_arrangement(token))
+    }
+    pub(crate) fn fence_arrangement_result(
+        &self,
+        mut result: dto::LayoutArrangementResult,
+    ) -> ApiResult<dto::LayoutArrangementResult> {
+        use oink_protocol::v1::schema::WireValue;
+        let shared = self.shared.clone();
+        self.call(move |owner| {
+            // Local projection (including a new RTT) can advance Facts without
+            // broadcasting. Fence the sequence actually queued for peers, in
+            // the same actor turn, before a completed owner receipt is sent.
+            let sequence = owner.publish_facts()?;
+            let version = shared.applied.load().version.clone();
+            result
+                .edit(|raw| {
+                    raw.insert(7, version.write());
+                    raw.insert(8, sequence.write());
+                })
+                .map_err(runtime::internal)?;
+            Ok(result)
+        })
+    }
     pub fn publish_local_claim(&self, claim: dto::AudioExitClaim) -> ApiResult<u64> {
         self.call(move |owner| owner.publish_claim(claim))
     }

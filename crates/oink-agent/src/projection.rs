@@ -15,6 +15,7 @@ use oink_network::link::{ModuleEvent, ModulePort};
 use oink_protocol::v1;
 pub(crate) mod model;
 pub(crate) mod wire;
+use crate::layout_profiles::{render as arrangement, types::ArrangementSnapshot};
 use model::{Action, ModeId, ScreenRect};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
@@ -51,6 +52,7 @@ struct Control {
 }
 struct Preview {
     layout: Layout,
+    arrangement: Option<Box<ArrangementSnapshot>>,
     affected: Vec<ScreenId>,
     expires: Instant,
 }
@@ -147,22 +149,26 @@ fn clear_locked(c: &mut Control) {
     });
     c.local = None;
 }
-fn preview_locked(c: &mut Control, layout: Layout, affected: Vec<ScreenId>, now: Instant) {
+fn preview_locked(
+    node: &Node,
+    c: &mut Control,
+    layout: Layout,
+    snapshot: Option<Box<ArrangementSnapshot>>,
+    affected: Vec<ScreenId>,
+    now: Instant,
+) {
+    let snapshot = snapshot.unwrap_or_else(|| {
+        Box::new(arrangement::capture(
+            &layout,
+            &node.link_config().expect("started config").applied().owners,
+        ))
+    });
     c.sequence += 1;
-    let message = Action::Preview {
+    let message = Action::Arrangement {
         sequence: c.sequence,
-        screens: Some(
-            layout
-                .screens
-                .iter()
-                .map(|s| ScreenRect {
-                    device: s.id.device,
-                    display: s.id.display.clone(),
-                    rect: s.rect,
-                })
-                .collect(),
-        ),
-        affected: affected.iter().map(|id| (id.device, id.display.clone())).collect(),
+        lease_ms: LEASE.as_millis() as u32,
+        expires_ms: crate::layout_sync::now_ms() + LEASE.as_millis() as u64,
+        snapshot: Some(snapshot.clone()),
     };
     if !message.valid() {
         return;
@@ -170,17 +176,29 @@ fn preview_locked(c: &mut Control, layout: Layout, affected: Vec<ScreenId>, now:
     c.pending.push(message);
     c.local = Some(Preview {
         layout,
+        arrangement: Some(snapshot),
         affected,
         expires: now + LEASE,
     });
 }
 
+#[cfg(test)]
 pub(crate) fn preview_ui(
     node: &Node,
     gesture: u64,
     placements: Vec<api::Placement>,
     affected: Vec<api::ScreenKey>,
     ended: bool,
+) -> api::ApiResult<()> {
+    preview_ui_arrangement(node, gesture, placements, affected, ended, None)
+}
+pub(crate) fn preview_ui_arrangement(
+    node: &Node,
+    gesture: u64,
+    placements: Vec<api::Placement>,
+    affected: Vec<api::ScreenKey>,
+    ended: bool,
+    snapshot: Option<Box<ArrangementSnapshot>>,
 ) -> api::ApiResult<()> {
     let mut c = lock(&node.inner.projection.control);
     if gesture < c.ui_latest || gesture <= c.ui_closed {
@@ -205,9 +223,17 @@ pub(crate) fn preview_ui(
                 });
             }
         }
+        if let Some(snapshot) = &snapshot {
+            let owners = node.link_config().expect("started config").applied().owners.clone();
+            layout = arrangement::render(snapshot, &layout, &owners)
+                .map_err(|e| api::ApiError::InvalidArgument { message: e.to_string() })?
+                .0;
+        }
         preview_locked(
+            node,
             &mut c,
             layout,
+            snapshot,
             affected
                 .into_iter()
                 .map(|id| ScreenId::new(id.device.0, id.display))
@@ -228,6 +254,37 @@ fn receive(node: &Node, peer: DeviceId, msg: Action, now: Instant) {
     let mut c = lock(&node.inner.projection.control);
     let was_editing = c.mode.is_some();
     match msg {
+        Action::Arrangement {
+            sequence,
+            lease_ms,
+            expires_ms,
+            snapshot,
+        } => {
+            let wall_now = crate::layout_sync::now_ms();
+            if expires_ms <= wall_now
+                || expires_ms > wall_now.saturating_add(u64::from(lease_ms) + 250)
+                || c.seen.get(&peer).is_some_and(|old| *old >= sequence)
+            {
+                return;
+            }
+            c.seen.insert(peer, sequence);
+            c.remote.remove(&peer);
+            if let Some(snapshot) = snapshot {
+                let applied = node.link_config().expect("started config").applied();
+                let Ok((layout, _)) = arrangement::render(&snapshot, &applied.layout, &applied.owners) else {
+                    return;
+                };
+                c.remote.insert(
+                    peer,
+                    Preview {
+                        layout,
+                        arrangement: Some(snapshot),
+                        affected: vec![],
+                        expires: now + Duration::from_millis((expires_ms - wall_now).min(u64::from(lease_ms))),
+                    },
+                );
+            }
+        }
         Action::Preview {
             sequence,
             screens,
@@ -254,6 +311,7 @@ fn receive(node: &Node, peer: DeviceId, msg: Action, now: Instant) {
                     peer,
                     Preview {
                         layout,
+                        arrangement: None,
                         affected: affected
                             .into_iter()
                             .map(|(device, display)| ScreenId::new(device, display))
@@ -342,7 +400,11 @@ async fn native_event(node: &Node, event: Event, now: Instant) {
             c.immediate.push(Action::Gesture { id, active: true });
         }
         let Some(gesture) = &c.gesture else { return };
-        let Some(next) = gesture.projection.edit(&gesture.initial, gesture.handle, delta) else {
+        let owners = visible_owners(node, &node.link_config().expect("started config").applied().owners);
+        let Some(next) = gesture
+            .projection
+            .edit_with_preferences(&gesture.initial, &owners, gesture.handle, delta)
+        else {
             if phase == DragPhase::End {
                 c.gesture = None;
                 let id = c.mode.expect("active mode").0;
@@ -358,7 +420,7 @@ async fn native_event(node: &Node, event: Event, now: Instant) {
             .map(|s| s.id.clone())
             .collect();
         if phase != DragPhase::End {
-            preview_locked(&mut c, next, affected, now);
+            preview_locked(node, &mut c, next, None, affected, now);
             return;
         }
         let initial = c.gesture.take().expect("gesture present").initial;
@@ -370,23 +432,18 @@ async fn native_event(node: &Node, event: Event, now: Instant) {
     if initial == next {
         return;
     }
-    if let Ok(group) = node.link_config() {
-        // The config owner performs the comparison inside its normal transaction;
-        // a concurrent UI/C0 change cancels this gesture rather than overwriting it.
-        let result = tokio::task::spawn_blocking(move || {
-            group.edit_layout(
-                Box::new(move |current| {
-                    if *current == initial {
-                        *current = next;
-                    }
-                }),
-                v1::dto::LayoutSource::Manual,
-            )
+    let node = node.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        node.commit_manual_layout_exact(move |current| {
+            if *current == initial {
+                *current = next;
+            }
+            Ok(())
         })
-        .await;
-        if !matches!(result, Ok(Ok(()))) {
-            tracing::warn!(?result, "projection edit commit failed");
-        }
+    })
+    .await;
+    if !matches!(result, Ok(Ok(()))) {
+        tracing::warn!(?result, "projection edit commit failed");
     }
 }
 
@@ -421,15 +478,19 @@ fn tick(node: &Node, now: Instant, heartbeat: bool) -> Vec<Action> {
         c.immediate.push(Action::Gesture { id, active: true });
     }
     if heartbeat && let Some(local) = c.local.as_ref() {
-        let (layout, affected) = (local.layout.clone(), local.affected.clone());
+        let (layout, affected, snapshot) = (local.layout.clone(), local.affected.clone(), local.arrangement.clone());
         // Native held gestures renew themselves; UI previews require the UI's
         // explicit lease renewal so a closed/crashed editor cannot leave overlays.
         let expiry = local.expires;
-        preview_locked(&mut c, layout, affected, lease_now);
+        preview_locked(node, &mut c, layout, snapshot, affected, lease_now);
         if c.gesture.is_none()
             && let Some(p) = c.local.as_mut()
         {
             p.expires = expiry;
+            if let Some(Action::Arrangement { expires_ms, .. }) = c.pending.pending.as_mut() {
+                *expires_ms =
+                    crate::layout_sync::now_ms() + expiry.saturating_duration_since(lease_now).as_millis() as u64;
+            }
         }
     }
     let active_gesture = c.gesture.is_some() || !c.gestures.is_empty();
@@ -457,6 +518,45 @@ fn draw(node: &Node, online: &BTreeSet<DeviceId>) {
     surface.update(view(node, online));
 }
 
+// Pause is runtime state, not a stored arrangement preference. Apply it after
+// rendering any preview, so stale snapshots cannot make paused screens visible.
+fn visible_owners(node: &Node, owners: &arrangement::Owners) -> arrangement::Owners {
+    let mut visible = owners.clone();
+    if let Ok(config) = node.link_config() {
+        for member in &config.members().members {
+            if member.facts.as_ref().is_some_and(|facts| {
+                facts
+                    .pause()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|pause| pause.paused() == Ok(true))
+            }) {
+                visible.entry(member.device).or_default().screen_shared = false;
+            }
+        }
+    }
+    visible
+}
+
+// Label selection is local rendering over the already synchronized inventory.
+fn projection_name(layout: &Layout, screen: &ScreenId, computer_name: String) -> String {
+    // Use the complete retained inventory, so hiding a display or moving a
+    // preview cannot change another screen's number on any rendering device.
+    let mut screens = layout
+        .screens
+        .iter()
+        .filter(|s| s.id.device == screen.device)
+        .collect::<Vec<_>>();
+    if screens.len() <= 1 {
+        return computer_name;
+    }
+    screens.sort_by(|a, b| (!a.primary, &a.id.display).cmp(&(!b.primary, &b.id.display)));
+    match screens.iter().position(|s| s.id == *screen) {
+        Some(index) => format!("{computer_name} {}", index + 1),
+        None => computer_name,
+    }
+}
+
 fn view(node: &Node, online: &BTreeSet<DeviceId>) -> View {
     let c = lock(&node.inner.projection.control);
     let editing = c.mode.is_some();
@@ -468,27 +568,35 @@ fn view(node: &Node, online: &BTreeSet<DeviceId>) -> View {
     let applied = group.applied();
     let current = &*applied.layout;
     let layout = preview.map_or(current, |p| &p.layout);
+    let snapshot = preview
+        .and_then(|p| p.arrangement.as_deref())
+        .cloned()
+        .unwrap_or_else(|| arrangement::capture(layout, &applied.owners));
+    let Ok((layout, owners)) = arrangement::render(&snapshot, current, &applied.owners) else {
+        return View::default();
+    };
+    let owners = visible_owners(node, &owners);
     let displays = group.local_displays();
-    let projections = oink_display::projection::compute(
-        &layout.effective(&applied.owners),
-        node.id(),
-        |d| online.contains(d),
-        None,
-    )
-    .into_iter()
-    .filter_map(|geometry| {
-        let d = displays
-            .displays
-            .iter()
-            .find(|d| d.key == geometry.host.display && !d.is_virtual)?;
-        Some(NamedProjection {
-            name: node.device_name(geometry.neighbour.device),
-            geometry,
-            pixels_per_unit: d.pixels_per_unit(),
-            screen: d.bounds,
-        })
-    })
-    .collect();
+    let projections =
+        oink_display::projection::compute(&layout.effective(&owners), node.id(), |d| online.contains(d), None)
+            .into_iter()
+            .filter_map(|geometry| {
+                let d = displays
+                    .displays
+                    .iter()
+                    .find(|d| d.key == geometry.host.display && !d.is_virtual)?;
+                Some(NamedProjection {
+                    name: projection_name(
+                        &layout,
+                        &geometry.neighbour,
+                        node.device_name(geometry.neighbour.device),
+                    ),
+                    geometry,
+                    pixels_per_unit: d.pixels_per_unit(),
+                    screen: d.bounds,
+                })
+            })
+            .collect();
     let accent = node.resolved_accent();
     View {
         projections,
@@ -562,9 +670,9 @@ pub(crate) fn start(node: Node, mut port: ModulePort, native: bool) -> anyhow::R
                     // Reopen seeds are snapshots only; no edit/commit history.
                     let opening = current_messages(&node)
                         .iter()
-                        .map(wire::encode)
+                        .filter_map(|action| encode_for_peer(&node, peer, action).transpose())
                         .collect::<v1::Result<Vec<_>>>();
-                    let (Ok(opening), Ok(message)) = (opening, wire::encode(message)) else {
+                    let (Ok(opening), Ok(Some(message))) = (opening, encode_for_peer(&node, peer, message)) else {
                         tracing::warn!("invalid local projection state");
                         continue;
                     };
@@ -605,23 +713,91 @@ fn current_messages(node: &Node) -> Vec<Action> {
         messages.push(Action::Mode { id, enabled: true });
     }
     if let Some(p) = &c.local {
-        messages.push(Action::Preview {
+        messages.push(Action::Arrangement {
             sequence: c.sequence,
-            screens: Some(
-                p.layout
-                    .screens
-                    .iter()
-                    .map(|s| ScreenRect {
-                        device: s.id.device,
-                        display: s.id.display.clone(),
-                        rect: s.rect,
-                    })
-                    .collect(),
-            ),
-            affected: p.affected.iter().map(|s| (s.device, s.display.clone())).collect(),
+            lease_ms: LEASE.as_millis() as u32,
+            expires_ms: crate::layout_sync::now_ms()
+                + p.expires
+                    .saturating_duration_since(lease_now(node, Instant::now()))
+                    .as_millis() as u64,
+            snapshot: p.arrangement.clone(),
         });
     }
     messages
+}
+
+fn encode_for_peer(node: &Node, peer: DeviceId, action: &Action) -> v1::Result<Option<v1::Message>> {
+    let config = node.link_config().expect("started config");
+    let capable = config
+        .peer_agreement(peer)
+        .is_some_and(|a| a.contains("oink.layout.preview/1"));
+    let applied = config.applied();
+    encode_selected(action, capable, &applied.layout, &applied.owners)
+}
+fn encode_selected(
+    action: &Action,
+    capable: bool,
+    live: &Layout,
+    owners: &arrangement::Owners,
+) -> v1::Result<Option<v1::Message>> {
+    match action {
+        Action::Arrangement { sequence, snapshot, .. } if !capable => {
+            let screens = if let Some(snapshot) = snapshot {
+                let current = arrangement::capture(live, owners);
+                // Legacy P0 carries only rigid rectangles. Native or visibility
+                // changes wait for the ordinary owner/layout publication on commit.
+                if snapshot.native.iter().any(|n| {
+                    !current
+                        .native
+                        .iter()
+                        .any(|c| crate::layout_profiles::model::same_native(n, c))
+                }) || snapshot.disabled.len() != current.disabled.len()
+                    || snapshot.disabled.iter().any(|b| !current.disabled.contains(b))
+                    || current.placements.iter().any(|p| {
+                        crate::layout_profiles::model::screen_shared(snapshot, p.device)
+                            != crate::layout_profiles::model::screen_shared(&current, p.device)
+                    })
+                    || snapshot.topology != current.topology
+                {
+                    return Ok(None);
+                }
+                let Ok((layout, _)) = arrangement::render(snapshot, live, owners) else {
+                    return Ok(None);
+                };
+                Some(
+                    layout
+                        .screens
+                        .into_iter()
+                        .map(|s| ScreenRect {
+                            device: s.id.device,
+                            display: s.id.display,
+                            rect: s.rect,
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            };
+            wire::encode(&Action::Preview {
+                sequence: *sequence,
+                screens,
+                affected: vec![],
+            })
+            .map(Some)
+        }
+        Action::Preview {
+            sequence,
+            screens: None,
+            ..
+        } if capable => wire::encode(&Action::Arrangement {
+            sequence: *sequence,
+            lease_ms: LEASE.as_millis() as u32,
+            expires_ms: crate::layout_sync::now_ms() + LEASE.as_millis() as u64,
+            snapshot: None,
+        })
+        .map(Some),
+        _ => wire::encode(action).map(Some),
+    }
 }
 
 #[cfg(all(test, debug_assertions))]
@@ -630,12 +806,20 @@ mod tests {
     #[test]
     fn abandoned_previews_expire_without_renewing_the_ui_lease() {
         let now = Instant::now();
-        let mut c = Control::default();
-        preview_locked(&mut c, Layout::default(), vec![], now);
+        let mut c = Control {
+            local: Some(Preview {
+                layout: Layout::default(),
+                arrangement: None,
+                affected: vec![],
+                expires: now + LEASE,
+            }),
+            ..Control::default()
+        };
         c.remote.insert(
             DeviceId([2; 32]),
             Preview {
                 layout: Layout::default(),
+                arrangement: None,
                 affected: vec![],
                 expires: now + LEASE,
             },
@@ -667,11 +851,430 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+    use oink_display::layout::{ScreenPlacement, SizeSource};
+    use oink_foundation::Rect;
+
+    fn inventory(keys: &[(&str, bool)]) -> Layout {
+        Layout {
+            screens: keys
+                .iter()
+                .enumerate()
+                .map(|(i, (key, primary))| ScreenPlacement {
+                    id: ScreenId::new(DeviceId([1; 32]), *key),
+                    name: key.to_string(),
+                    rect: Rect::new(i as f64, 0., 1., 1.),
+                    local: Rect::new(i as f64 * 100., 0., 100., 100.),
+                    primary: *primary,
+                    builtin: false,
+                    size_source: SizeSource::Reported,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+    fn label(l: &Layout, key: &str) -> String {
+        projection_name(l, &ScreenId::new(DeviceId([1; 32]), key), "Computer".into())
+    }
+    #[test]
+    fn primary_first_identity_order_is_stable_across_preview_and_inventory_order() {
+        let mut l = inventory(&[("z-primary", true), ("b", false), ("a", false)]);
+        for _ in 0..3 {
+            assert_eq!(label(&l, "z-primary"), "Computer 1");
+            assert_eq!(label(&l, "a"), "Computer 2");
+            assert_eq!(label(&l, "b"), "Computer 3");
+            l.screens.rotate_left(1);
+            for s in &mut l.screens {
+                s.rect.x = -s.rect.x - 1.;
+            }
+        }
+    }
+    #[test]
+    fn a_single_screen_has_no_suffix() {
+        assert_eq!(label(&inventory(&[("only", true)]), "only"), "Computer");
+    }
+    #[test]
+    fn absent_or_duplicate_primary_flags_have_a_stable_identity_tie_break() {
+        for primary in [false, true] {
+            let l = inventory(&[("b", primary), ("a", primary)]);
+            assert_eq!(label(&l, "a"), "Computer 1");
+            assert_eq!(label(&l, "b"), "Computer 2");
+        }
+    }
+}
+
 #[cfg(all(test, debug_assertions))]
 mod integration_tests {
     use super::*;
     use crate::api::AgentApi;
     use crate::snapshot_tests::{Displays, common, start_with_clip};
+    use oink_protocol::v1::schema::WireDto;
+
+    #[test]
+    fn same_machine_projections_have_shared_numbers_and_remain_informational() {
+        crate::test_watchdog::run(module_path!(), "same-machine projection labels", Some(10), async {
+            use oink_foundation::{Rect, Size};
+            use std::sync::Arc;
+            let ad = tempfile::tempdir().unwrap();
+            let bd = tempfile::tempdir().unwrap();
+            let mut primary = Displays::new("z-primary").info();
+            primary.bounds = Rect::new(0., 0., 100., 100.);
+            primary.reference_extent = Some(Size::new(1., 1.));
+            let mut second = primary.clone();
+            second.key = "a-second".into();
+            second.bounds.x = 100.;
+            second.is_primary = false;
+            let a = Node::start(crate::node::NodeOptions {
+                net: oink_test_support::network_config(ad.path().into(), "labels-a", 0),
+                input: Arc::new(oink_test_support::input::FakeInput::new()),
+                displays: vec![second, primary],
+                display_backend: None,
+                clipboard: None,
+                mode_switch_in_callback: true,
+                capture_reports_key_repeat: false,
+                cursor_trail: false,
+            })
+            .await
+            .unwrap();
+            let b = start_with_clip(
+                &oink_test_support::network_config(bd.path().into(), "labels-b", 0),
+                &Displays::new("single"),
+                None,
+            )
+            .await;
+            common::pair(&a, &b).await;
+            common::until("shared numbered inventory", || {
+                a.layout().0 == b.layout().0 && a.layout().0.screens.len() == 3
+            })
+            .await;
+            set_mode(&a, true);
+            set_mode(&b, true);
+            let online = BTreeSet::from([a.id(), b.id()]);
+            let av = view(&a, &online);
+            let bv = view(&b, &online);
+            let remote = bv
+                .projections
+                .iter()
+                .find(|p| p.geometry.neighbour.device == a.id())
+                .unwrap();
+            let number = if remote.geometry.neighbour.display == "z-primary" {
+                1
+            } else {
+                2
+            };
+            assert_eq!(remote.name, format!("{} {number}", b.device_name(a.id())));
+            for (key, number) in [("z-primary", 1), ("a-second", 2)] {
+                let local = av
+                    .projections
+                    .iter()
+                    .find(|p| p.geometry.neighbour.device == a.id() && p.geometry.neighbour.display == key)
+                    .unwrap();
+                assert_eq!(local.name, format!("{} {number}", a.device_name(a.id())));
+                assert!(local.geometry.handles().is_empty());
+            }
+            let single = av
+                .projections
+                .iter()
+                .find(|p| p.geometry.neighbour.device == b.id())
+                .unwrap();
+            assert_eq!(single.name, a.device_name(b.id()));
+            let stored = a.layout().0;
+            a.set_local_paused(crate::device_controls::runtime::fresh_request_id(), true)
+                .unwrap();
+            common::until("paused local inventory has no annotations", || {
+                view(&a, &online).projections.is_empty()
+            })
+            .await;
+            common::until("paused peer inventory has no annotations", || {
+                view(&b, &online).projections.is_empty()
+            })
+            .await;
+            assert_eq!(a.layout().0, stored);
+            a.set_local_paused(crate::device_controls::runtime::fresh_request_id(), false)
+                .unwrap();
+            common::until("resumed local annotations retain their numbers", || {
+                view(&a, &online).projections.iter().any(|p| {
+                    p.geometry.neighbour.display == "a-second" && p.name == format!("{} 2", a.device_name(a.id()))
+                })
+            })
+            .await;
+            assert_eq!(a.layout().0, stored);
+            a.shutdown().await;
+            b.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn paused_screens_vanish_from_native_projections_and_resume_in_place() {
+        crate::test_watchdog::run(module_path!(), "paused projection visibility", Some(10), async {
+            let ad = tempfile::tempdir().unwrap();
+            let bd = tempfile::tempdir().unwrap();
+            let a = start_with_clip(
+                &oink_test_support::network_config(ad.path().into(), "projection-a", 0),
+                &Displays::new("a"),
+                None,
+            )
+            .await;
+            let b = start_with_clip(
+                &oink_test_support::network_config(bd.path().into(), "projection-b", 0),
+                &Displays::new("b"),
+                None,
+            )
+            .await;
+            common::pair(&a, &b).await;
+            common::until("same projection layout", || {
+                a.layout().0 == b.layout().0 && a.layout().0.screens.len() == 2
+            })
+            .await;
+            set_mode(&a, true);
+            let online = BTreeSet::from([a.id(), b.id()]);
+            let stored = a.layout().0;
+            assert!(!view(&a, &online).projections.is_empty());
+            for paused in [true, false] {
+                b.set_local_paused(crate::device_controls::runtime::fresh_request_id(), paused)
+                    .unwrap();
+                common::until("pause facts reach projection owner", || {
+                    a.link_config()
+                        .unwrap()
+                        .members()
+                        .members
+                        .iter()
+                        .find(|m| m.device == b.id())
+                        .and_then(|m| m.facts.as_ref())
+                        .is_some_and(|f| f.pause().ok().flatten().is_some_and(|p| p.paused() == Ok(paused)))
+                })
+                .await;
+                assert_eq!(view(&a, &online).projections.is_empty(), paused);
+                assert_eq!(a.layout().0, stored, "pause must never rewrite stored positions");
+            }
+            a.shutdown().await;
+            b.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn general_preview_native_group_visibility_and_shared_dto_are_ephemeral() {
+        crate::test_watchdog::run(module_path!(), "general arrangement preview", Some(6), async {
+            use oink_foundation::{Point, Rect, Size};
+            use std::sync::Arc;
+            let ad = tempfile::tempdir().unwrap();
+            let bd = tempfile::tempdir().unwrap();
+            let mut main = Displays::new("main").info();
+            main.bounds = Rect::new(0., 0., 100., 100.);
+            main.reference_extent = Some(Size::new(1., 1.));
+            let mut second = main.clone();
+            second.key = "second".into();
+            second.bounds.x = 100.;
+            second.is_primary = false;
+            let a = Node::start(crate::node::NodeOptions {
+                net: oink_test_support::network_config(ad.path().into(), "general-a", 0),
+                input: Arc::new(oink_test_support::input::FakeInput::new()),
+                displays: vec![main, second],
+                display_backend: None,
+                clipboard: None,
+                mode_switch_in_callback: true,
+                capture_reports_key_repeat: false,
+                cursor_trail: false,
+            })
+            .await
+            .unwrap();
+            let b = start_with_clip(
+                &oink_test_support::network_config(bd.path().into(), "general-b", 0),
+                &Displays::new("b"),
+                None,
+            )
+            .await;
+            common::pair(&a, &b).await;
+            common::until("three retained screens", || {
+                a.layout().0.screens.len() == 3 && a.layout().0 == b.layout().0
+            })
+            .await;
+            let config = a.link_config().unwrap();
+            assert!(config.peer_agreement(b.id()).unwrap().contains("oink.layout.preview/1"));
+            let live = a.layout().0;
+            let owners = config.applied().owners.clone();
+            let mut snapshot = arrangement::capture(&live, &owners);
+            for p in &mut snapshot.placements {
+                p.origin = Point::new(if p.device.0 == a.id() { 0.25 } else { 1.25 }, 0.);
+                p.scale = if p.device.0 == a.id() { 0.01 } else { 1.0 / 1728.0 };
+            }
+            // Every capable peer uses the shared DTO even for a whole-group rigid drag.
+            let action = |snapshot: ArrangementSnapshot, sequence| Action::Arrangement {
+                sequence,
+                lease_ms: 2000,
+                expires_ms: crate::layout_sync::now_ms() + 2000,
+                snapshot: Some(Box::new(snapshot)),
+            };
+            let rigid = action(snapshot.clone(), 1);
+            let modern = encode_selected(&rigid, true, &live, &owners).unwrap().unwrap();
+            assert!(matches!(modern, v1::Message::ArrangementPreview(_)));
+            let legacy = encode_selected(&rigid, false, &live, &owners).unwrap().unwrap();
+            assert!(matches!(legacy, v1::Message::ProjectionPreview(_)));
+            if let Action::Preview {
+                screens: Some(screens), ..
+            } = wire::decode(legacy).unwrap()
+            {
+                assert_eq!(screens.len(), 3);
+                assert!(
+                    screens
+                        .iter()
+                        .any(|s| s.device == a.id() && s.display == "main" && s.rect.x == 0.25)
+                );
+            } else {
+                panic!("rigid legacy fallback missing")
+            }
+            let n = snapshot.native.iter_mut().find(|n| n.device.0 == a.id()).unwrap();
+            n.screens
+                .iter_mut()
+                .find(|s| s.screen.display == "second")
+                .unwrap()
+                .origin = Point::new(0., 100.);
+            let native = action(snapshot.clone(), 2);
+            assert!(encode_selected(&native, false, &live, &owners).unwrap().is_none());
+            let message = encode_selected(&native, true, &live, &owners).unwrap().unwrap();
+            if let v1::Message::ArrangementPreview(m) = &message {
+                assert_eq!(
+                    m.arrangement().unwrap().unwrap().raw(),
+                    &match crate::layout_profiles::wire::snapshot(&snapshot).unwrap() {
+                        v1::RawValue::Map(m) => m,
+                        _ => unreachable!(),
+                    }
+                );
+            }
+            let bytes = v1::frame::encode(&message, v1::limits::RELIABLE_FRAME).unwrap();
+            assert_eq!(
+                wire::decode(
+                    v1::frame::OpaqueFrame::parse_exact(&bytes, v1::limits::RELIABLE_FRAME)
+                        .unwrap()
+                        .decode()
+                        .unwrap()
+                )
+                .unwrap(),
+                native
+            );
+            let versions = [a.layout().1.revision, b.layout().1.revision];
+            let paths = [ad.path(), bd.path()]
+                .into_iter()
+                .map(|d| d.join(crate::config_module::group_store::STATE_FILE))
+                .collect::<Vec<_>>();
+            let saved = paths.iter().map(|p| std::fs::read(p).unwrap()).collect::<Vec<_>>();
+            preview_ui_arrangement(
+                &a,
+                1,
+                snapshot.placements.clone(),
+                vec![],
+                false,
+                Some(Box::new(snapshot.clone())),
+            )
+            .unwrap();
+            common::until("native preview arrives", || {
+                lock(&b.inner.projection.control)
+                    .remote
+                    .get(&a.id())
+                    .is_some_and(|p| p.layout.screen(&ScreenId::new(a.id(), "second")).unwrap().local.y == 100.)
+            })
+            .await;
+            let online = BTreeSet::from([a.id(), b.id()]);
+            assert!(!view(&a, &online).projections.is_empty());
+            assert!(!view(&b, &online).projections.is_empty());
+            // The same render adapter applies hidden/device-disabled flags.
+            let mut hidden = snapshot.clone();
+            crate::layout_profiles::model::set_screen_shared(&mut hidden, b.id().into(), false);
+            receive(&b, a.id(), action(hidden, 1000), Instant::now());
+            assert!(view(&b, &online).projections.is_empty());
+            receive(
+                &b,
+                a.id(),
+                Action::Arrangement {
+                    sequence: 1001,
+                    lease_ms: 2000,
+                    expires_ms: crate::layout_sync::now_ms() - 1,
+                    snapshot: Some(Box::new(snapshot.clone())),
+                },
+                Instant::now(),
+            );
+            assert!(
+                view(&b, &online).projections.is_empty(),
+                "expired input cannot replace the preview"
+            );
+            preview_ui(&a, 1, vec![], vec![], true).unwrap();
+            // Directly fence the artificial high sequence used above.
+            receive(
+                &b,
+                a.id(),
+                Action::Arrangement {
+                    sequence: 1002,
+                    lease_ms: 2000,
+                    expires_ms: crate::layout_sync::now_ms() + 2000,
+                    snapshot: None,
+                },
+                Instant::now(),
+            );
+            assert_eq!(view(&b, &online), View::default());
+            receive(&b, a.id(), native, Instant::now());
+            assert_eq!(
+                view(&b, &online),
+                View::default(),
+                "late frame cannot revive a closed lease"
+            );
+            assert_eq!([a.layout().1.revision, b.layout().1.revision], versions);
+            assert_eq!(a.layout().0, live);
+            assert_eq!(b.layout().0, live);
+            assert_eq!(
+                paths.iter().map(|p| std::fs::read(p).unwrap()).collect::<Vec<_>>(),
+                saved
+            );
+            // Release does not clear before the commit arrives. While delivery
+            // is delayed the receiver still renders the last preview, never its
+            // old durable arrangement. Simulate the owner's observed OS result.
+            receive(&b, a.id(), action(snapshot.clone(), 1003), Instant::now());
+            let released = view(&b, &online);
+            assert!(!released.projections.is_empty());
+            assert_eq!(b.layout().0, live);
+            let mut observed_displays = a.link_config().unwrap().local_displays().displays.clone();
+            observed_displays.iter_mut().find(|s| s.key == "second").unwrap().bounds = Rect::new(0., 100., 100., 100.);
+            let author = a.clone();
+            let placements = snapshot.placements.clone();
+            let commit = tokio::task::spawn_blocking(move || {
+                author
+                    .link_config()
+                    .unwrap()
+                    .initialize_displays(observed_displays)
+                    .unwrap();
+                author.save_layout(placements).unwrap();
+            });
+            while !commit.is_finished() {
+                assert_eq!(view(&b, &online), released);
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            commit.await.unwrap();
+            common::until("committed arrangement reaches receiver without a flash", || {
+                assert_eq!(view(&b, &online), released);
+                b.layout().0 == a.layout().0 && b.layout().1.revision > versions[1]
+            })
+            .await;
+            receive(
+                &b,
+                a.id(),
+                Action::Arrangement {
+                    sequence: 1004,
+                    lease_ms: 2000,
+                    expires_ms: crate::layout_sync::now_ms() + 2000,
+                    snapshot: None,
+                },
+                Instant::now(),
+            );
+            assert_eq!(view(&b, &online), View::default());
+            assert_eq!(
+                b.layout().0.screen(&ScreenId::new(a.id(), "second")).unwrap().local.y,
+                100.
+            );
+            a.shutdown().await;
+            b.shutdown().await;
+        });
+    }
 
     #[test]
     fn screenshot_short_seam_projects_during_preview_and_hides_afterward() {

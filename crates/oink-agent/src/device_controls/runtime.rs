@@ -171,6 +171,9 @@ fn uuid(id: [u8; 16]) -> String {
 impl Node {
     pub(crate) fn receive_device_control(&self, peer: DeviceKey, message: Message) {
         match message {
+            Message::LayoutArrangementRequest(_) | Message::LayoutArrangementResult(_) => {
+                self.receive_arrangement(peer, message)
+            }
             Message::ConfigSetLocalOption(_) | Message::ConfigPauseDevice(_) | Message::ConfigSetExitVolume(_) => {
                 self.receive_owner_request(peer, message)
             }
@@ -506,7 +509,14 @@ impl Node {
             return Err(Failure::StaleBoot);
         }
         if binding.owner.device.0 != self.id() {
-            let capability = if matches!(binding.operation, TokenOperation::ExitVolume { .. }) {
+            let capability = if matches!(
+                binding.operation,
+                TokenOperation::Option {
+                    edit: crate::device_cards::CardOptionEdit::MouseMode(crate::device_cards::SharingMode::Disabled)
+                }
+            ) {
+                "oink.input.mouse-disabled/1"
+            } else if matches!(binding.operation, TokenOperation::ExitVolume { .. }) {
                 "oink.audio.exit-volume/1"
             } else {
                 "oink.device-options/1"
@@ -594,7 +604,10 @@ impl Node {
             {
                 return Err(Failure::StaleBoot);
             }
-            let capability = if matches!(request, Message::ConfigSetExitVolume(_)) {
+            let capability = if matches!(request, Message::ConfigSetLocalOption(edit) if edit.option().ok() == Some(oink_protocol::v1::dto::LocalOption::MouseMode) && (edit.value().ok().is_some_and(|v| v == oink_protocol::v1::RawValue::Uint(2)) || self.settings().routing.mouse_mode == oink_foundation::input::InputMode::Disabled))
+            {
+                "oink.input.mouse-disabled/1"
+            } else if matches!(request, Message::ConfigSetExitVolume(_)) {
                 "oink.audio.exit-volume/1"
             } else {
                 "oink.device-options/1"

@@ -164,4 +164,11 @@ message_registry! {
     0x0d2c => NotifyShow(NotifyShow), [Route {kind:2, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.group/1", "oink.notify/1"], Allow;
     0x0d2d => NotifyAction(NotifyAction), [Route {kind:2, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.group/1", "oink.notify/1"], Allow;
     0x0d2e => NotifyDismiss(NotifyDismiss), [Route {kind:2, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.group/1", "oink.notify/1"], Allow;
+    0x1200 => LayoutProfilesState(LayoutProfilesState), [Route {kind:13, transport:Transport::Low, extra_capabilities:&[]}], ["oink.group/1", "oink.layout.profiles/1", "oink.low/1"], Allow;
+    0x1201 => LayoutProfilesReceipt(LayoutProfilesReceipt), [Route {kind:13, transport:Transport::Low, extra_capabilities:&[]}], ["oink.group/1", "oink.layout.profiles/1", "oink.low/1"], Allow;
+    0x0d2f => LayoutArrangementRequest(LayoutArrangementRequest), [Route {kind:2, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.group/1", "oink.layout.arrangement/1"], Allow;
+    0x0d30 => LayoutArrangementResult(LayoutArrangementResult), [Route {kind:2, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.group/1", "oink.layout.arrangement/1"], Allow;
+    0x1103 => ArrangementPreview(ArrangementPreview), [Route {kind:12, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.layout.projection/1", "oink.layout.preview/1"], Allow;
+    0x1210 => LayoutProfilesStateV2(LayoutProfilesStateV2), [Route {kind:14, transport:Transport::Low, extra_capabilities:&[]}], ["oink.group/1", "oink.layout.profiles/2", "oink.low/1"], Allow;
+    0x1211 => LayoutProfilesReceiptV2(LayoutProfilesReceipt), [Route {kind:14, transport:Transport::Low, extra_capabilities:&[]}], ["oink.group/1", "oink.layout.profiles/2", "oink.low/1"], Allow;
 }

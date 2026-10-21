@@ -28,6 +28,7 @@ describe('native Caps mapping presentation', () => {
     setLanguage('en');
     const { container } = render(<Mapping observed={observed} />);
     expect(container.querySelector('[data-key="caps"] .kmap__to')?.textContent).toBe(observed ? 'Shift / Caps Lock' : 'Caps Lock');
+    expect(!!container.querySelector('.kmap__note')).toBe(!observed);
   });
   it('seeds custom tap and hold from the displayed fallback, including stale custom data', () => {
     setLanguage('en');

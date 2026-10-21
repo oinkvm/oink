@@ -32,6 +32,9 @@ struct State {
     keyboard_remote: bool,
     drag_anchor: Option<oink_foundation::dnd::DragAnchor>,
     cursor: Point,
+    system_clip: Option<oink_foundation::Rect>,
+    system_clip_failed: bool,
+    system_clip_reads: u64,
     injected: Vec<InjectEvent>,
     timed_injections: Option<Vec<(std::time::Instant, InjectEvent)>>,
     injection_sources: Option<Vec<Option<oink_input::source_time::InjectionSource>>>,
@@ -96,6 +99,18 @@ impl std::fmt::Debug for FakeInput {
 }
 
 impl FakeInput {
+    pub fn set_system_clip(&self, clip: Option<oink_foundation::Rect>) {
+        let mut state = self.state.lock().unwrap();
+        state.system_clip = clip;
+        state.system_clip_failed = false;
+    }
+    pub fn fail_system_clip(&self) {
+        self.state.lock().unwrap().system_clip_failed = true;
+    }
+    pub fn system_clip_reads(&self) -> u64 {
+        self.state.lock().unwrap().system_clip_reads
+    }
+
     pub fn set_touchpad_contacts(&self, capacity: Option<u8>) {
         self.state.lock().unwrap().touchpad_contacts = capacity;
     }
@@ -481,6 +496,14 @@ impl InputBackend for FakeInput {
         Ok(())
     }
 
+    fn system_cursor_clip(&self) -> Result<Option<oink_foundation::Rect>, InputError> {
+        let mut state = self.state.lock().unwrap();
+        state.system_clip_reads += 1;
+        if state.system_clip_failed {
+            return Err(InputError::Platform("clip query unavailable".into()));
+        }
+        Ok(state.system_clip)
+    }
     fn cursor_position(&self) -> Result<Point, InputError> {
         Ok(self.state.lock().unwrap().cursor)
     }

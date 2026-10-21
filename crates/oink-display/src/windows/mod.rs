@@ -10,6 +10,7 @@
 //!   或是软件枚举（ROOT\、SWD\）适配器上的间接显示器。
 //! - 镜像组视为一块屏幕（GDI 只有一个 HMONITOR）。
 
+mod arrangement;
 mod dpi;
 mod edid;
 mod enumerate;
@@ -42,6 +43,16 @@ impl std::fmt::Debug for WinDisplay {
 }
 
 impl DisplayBackend for WinDisplay {
+    fn native_configuration(&self) -> Result<crate::arrangement::NativeConfiguration, DisplayError> {
+        arrangement::configuration()
+    }
+    fn apply_native_origins(
+        &self,
+        expected: &crate::arrangement::NativeConfiguration,
+        origins: &[crate::arrangement::NativeOrigin],
+    ) -> Result<crate::arrangement::NativeConfiguration, DisplayError> {
+        arrangement::apply(expected, origins)
+    }
     fn wallpapers(&self) -> Option<Vec<crate::wallpaper::DisplayWallpaper>> {
         wallpaper::read_all()
     }

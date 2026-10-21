@@ -40,7 +40,7 @@ it('persists only the selected screen and refreshes the owner snapshot', async (
   setLanguage('en');
   const result = render(view());
   fireEvent.keyDown(result.getByRole('slider', {name: 'Remote pointer speed on One'}), {key: 'ArrowRight'});
-  await waitFor(() => expect(mocks.save).toHaveBeenCalledExactlyOnceWith({device: 'self', display: 'one'}, 2.1));
+  await waitFor(() => expect(mocks.save).toHaveBeenCalledExactlyOnceWith({device: 'self', display: 'one'}, 2.05));
   await waitFor(() => expect(mocks.query).toHaveBeenCalledWith('layout', mocks.layout));
 });
 it('restores the saved value after a rejected edit', async () => {
@@ -50,7 +50,12 @@ it('restores the saved value after a rejected edit', async () => {
   await waitFor(() => expect(mocks.fail).toHaveBeenCalledWith('unavailable'));
   expect(result.getAllByRole('slider')[0].getAttribute('aria-valuenow')).toBe('2');
 });
-it('finds the per-screen setting through Settings search', () => {
+it.each(['mac', 'win'] as const)('finds both pointer speed settings under Layout through Settings search on %s', platform => {
   setLanguage('en');
-  expect(searchSections('mac', 'Remote pointer speed per screen').get('input')).toContain('screenPointerGains');
+  expect(searchSections(platform, 'Remote pointer speed per screen').get('layout')).toContain('screenPointerGains');
+  expect(searchSections(platform, 'Pointer gain when controlled').get('layout')).toContain('pointerGain');
+  expect(searchSections(platform, 'Remote pointer speed per screen').has('input')).toBe(false);
+  // Their keywords moved with them.
+  setLanguage('zh-Hans');
+  expect(searchSections(platform, '灵敏度').get('layout')).toEqual(new Set(['pointerGain', 'screenPointerGains']));
 });

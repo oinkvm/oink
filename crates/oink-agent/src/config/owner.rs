@@ -60,6 +60,22 @@ impl OwnerStore {
             .into(),
         )
     }
+    /// New optional device settings acquire an owner-authored baseline on
+    /// upgrade. Existing (including unknown) owner values are never replaced.
+    pub(crate) fn ensure_option(&mut self, option: LocalOption, value: RawValue) -> Result<bool, StoreError> {
+        if self.item(option).is_some() {
+            return Ok(false);
+        }
+        validate_value(option, &value).map_err(|_| StoreError::Invalid)?;
+        let mut items = self.preferences();
+        items.push(DevicePreference::from_raw(
+            [(1, option.write()), (2, 1u64.write()), (3, value)].into(),
+        )?);
+        items.sort_by_key(|item| item.option().expect("validated option").number());
+        self.raw
+            .insert(2, RawValue::Array(items.iter().map(WireValue::write).collect()));
+        Ok(true)
+    }
     pub fn decode(bytes: &[u8]) -> Result<Self, StoreError> {
         Self::from_raw(oink_protocol::v1::cbor::decode_map(bytes, MAX_OWNER_BYTES)?)
     }
@@ -379,7 +395,12 @@ pub fn validate_value(option: LocalOption, value: &RawValue) -> Result<(), Contr
     use LocalOption::*;
     let bad = ControlFailure::InvalidValue;
     match option {
-        MouseMode | KeyboardMode | SpeedMode => {
+        MouseMode => {
+            if value.as_u64().map_err(invalid)? > 2 {
+                return Err(bad);
+            }
+        }
+        KeyboardMode | SpeedMode => {
             if value.as_u64().map_err(invalid)? > 1 {
                 return Err(bad);
             }
@@ -389,7 +410,13 @@ pub fn validate_value(option: LocalOption, value: &RawValue) -> Result<(), Contr
                 return Err(bad);
             }
         }
-        ClipboardEnabled | ForwardingEnabled | KeyboardDisabled | ScreenShared | CursorTrail | AcceptContacts => {
+        ClipboardEnabled
+        | ForwardingEnabled
+        | KeyboardDisabled
+        | ScreenShared
+        | CursorTrail
+        | AcceptContacts
+        | SyncSystemArrangement => {
             bool::read(value).map_err(invalid)?;
         }
         CursorTrailDuration => {

@@ -14,6 +14,10 @@ body { margin: 0; background: var(--ok-bg); color: var(--ok-text); font-family: 
   --ok-font-display: ui-rounded, "SF Pro Rounded", "Nunito", "Inter", -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Segoe UI", "Malgun Gothic", system-ui, sans-serif;
 }
 
+/* Menu and listbox items (dropdown menus, context menus, select options) use
+   the controls' regular weight, also when selected or being measured. */
+.ok-menu__item, .ok-menu__item[aria-selected=true], .ok-menu[data-measuring] .ok-menu__item, .ok-menu__meta { font-weight: 400; }
+
 .page {
   box-sizing: border-box;
   display: grid;
@@ -197,7 +201,7 @@ body { margin: 0; background: var(--ok-bg); color: var(--ok-text); font-family: 
   --side-dur: var(--ok-spring-soft-dur); --side-ease: var(--ok-spring-soft);
   transition: width var(--side-dur) var(--side-ease);
 }
-.win__side[data-open] { width: 288px; }
+.win__side[data-open] { width: 272px; }
 
 .win__side:not([data-open]) {
   --side-dur: calc(440ms * var(--ok-ms));
@@ -210,7 +214,7 @@ body { margin: 0; background: var(--ok-bg); color: var(--ok-text); font-family: 
 .win__side-clip::-webkit-scrollbar { display: none; }
 .win__side:not([data-open]) .win__side-clip { overflow: hidden; }   
 
-.win__side-inner { width: 272px; }
+.win__side-inner { width: 256px; }
 .win__side-inner[data-collapsed] { width: 44px; }
 .win[data-platform="mac"] .win__titlebar .win__nav-toggle { margin-left: 14px; }
 .win:not([data-active]) .win__nav-toggle { color: var(--ok-text-3); }
@@ -472,10 +476,12 @@ body { margin: 0; background: var(--ok-bg); color: var(--ok-text); font-family: 
      would double up along shared edges and split a continuous desktop. */
   background: var(--ok-card) center / cover;
   container-type: size;
-  transition: box-shadow var(--ok-dur-2) var(--ok-ease-out);
 }
 
-.scr[data-selected] .scr__body { box-shadow: 0 0 0 2.5px var(--ok-well), 0 0 0 4.5px var(--ok-accent); }
+.scr__ring { position: absolute; pointer-events: none; overflow: visible; animation: scr-ring-in var(--ok-dur-2) var(--ok-ease-out); }
+.scr__ring-gap { fill: var(--ok-well); }
+.scr__ring-accent { fill: var(--ok-accent); }
+@keyframes scr-ring-in { from { opacity: 0; } }
 
 /* Offline screen surface. Light mode keeps a near-black "switched-off" fill.
    In dark mode that fill matches the --ok-well canvas, so it takes the
@@ -677,7 +683,7 @@ body:has(.oink-app:is([data-view="main"], [data-view="panel"])) { background: tr
 /* A selected computer uses the same two-ring selection tokens as a screen. */
 .scr--group { pointer-events: none; }
 .scr--group .scr__hz { pointer-events: auto; }
-.scr__group-border { position: absolute; inset: 0; border-radius: calc(12px * var(--ok-rk)); corner-shape: var(--ok-corner); --ok-shape: var(--ok-corner); box-shadow: 0 0 0 2.5px var(--ok-well), 0 0 0 4.5px var(--ok-accent); }
+.scr__group-border { position: absolute; inset: 0; border-radius: calc(12px * var(--ok-rk)); }
 
 /* Keep native window controls and the language menu above the welcome cover. */
 .win[data-covered] .win__titlebar { z-index: 5; }
@@ -687,6 +693,56 @@ body:has(.oink-app:is([data-view="main"], [data-view="panel"])) { background: tr
 .win[data-platform="mac"] .win__cover-bar { right: 12px; }
 .win[data-platform="win"] .win__cover-bar { right: 150px; }
 .win__promo .ok-btn.win__promo-sponsor { font-weight: 400; padding-inline: 8px 10px; }
-.setp__update{display:grid;gap:10px;min-width:0}
-.setp__update label{display:flex;align-items:center;justify-content:space-between;gap:12px}
-.setp__update p{margin:0;font-size:12px;color:var(--ok-text-2)}
+
+/* Layout profiles in the canvas toolbar: the current profile's menu and `+`. */
+.canvas-tools__group { display: flex; align-items: center; gap: 2px; }
+.canvas-tools__chevron.ok-icon { width: 12px; height: 12px; flex: none; }
+.canvas-tools__anchor { display: inline-flex; }
+/* A fixed width, shorter than the 32-character name limit: long names end in an
+   ellipsis here and show in full in the menu's tooltips. Ghost, so at rest it
+   blends into the toolbar. */
+.lp-current.ok-btn { width: 132px; padding-inline: 10px 6px; font-weight: 400; }
+.lp-current .ok-btn__label { flex: 1; min-width: 0; justify-content: space-between; gap: 4px; }
+.lp-current__name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: start; }
+.lp-menu__name { display: block; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* A selected screen of a system-arranged computer is selected on its own: the screen
+   keeps the solid two-ring selection, its computer's bounds are dashed and set
+   outside that ring so the two never overlap. */
+/* Dashed outlines keep plain round corners (corner-shape and --ok-shape round). On
+   WebKit, which has no corner-shape, oink-ui's corner fallback repaints a squircle
+   element's outline as a border-image patch beside the native one; it has no dash
+   style, so each dashed outline was drawn twice, offset, with solid corners. Round
+   corners leave the outline to the engine alone, once, on WebKit and Chromium. */
+.scr--group[data-screen-selected] .scr__group-border { box-shadow: none; outline: 1.5px dashed var(--ok-accent); outline-offset: 7px; corner-shape: round; --ok-shape: round; }
+/* A member of a multi-computer group: dashed accent just inside its own edge, so it
+   never meets the group's solid ring or a neighbouring member's outline. */
+.scr-outline { position: absolute; top: 0; left: 0; z-index: 4; pointer-events: none; border-radius: calc(12px * var(--ok-rk)); corner-shape: round; --ok-shape: round; outline: 1.5px dashed var(--ok-accent); outline-offset: -4px; }
+
+.lpm {
+  box-sizing: border-box; display: flex; flex-direction: column; gap: 2px;
+  max-height: 340px; margin: 0; padding: 4px; list-style: none; overflow-y: auto; overscroll-behavior: contain;
+  border-radius: calc(12px * var(--ok-rk)); corner-shape: var(--ok-corner); --ok-shape: var(--ok-corner);
+  box-shadow: inset 0 0 0 1px var(--ok-line);
+}
+.lpm__item { flex: none; display: flex; align-items: center; gap: 4px; min-height: 48px; padding: 4px 6px 4px 12px; border-radius: calc(10px * var(--ok-rk)); corner-shape: var(--ok-corner); --ok-shape: var(--ok-corner); }
+@media (hover: hover) { .lpm__item:hover { background: var(--ok-hover); } }
+.lpm__text { flex: 1; min-width: 0; display: grid; gap: 3px; margin-right: 8px; }
+.lpm__name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 400 14px/1.3 var(--ok-font); color: var(--ok-text); }
+.lpm__note { font: 400 12px/1.2 var(--ok-font); color: var(--ok-text-2); }
+.lpm__edit { flex: 1; min-width: 0; display: flex; align-items: flex-start; gap: 6px; padding: 2px 0; }
+.lpm__field { flex: 1; min-width: 0; }
+.lpm__edit .ok-btn { flex: none; font-weight: 400; }
+/* Settings › Layout: the list, then Create under it on the left. */
+.lpm-panel { display: grid; gap: 10px; justify-items: start; width: 100%; }
+.lpm-panel > .lpm { width: 100%; }
+.lpm__create.ok-btn { font-weight: 400; }
+
+/* Windows sliders: oink-ui's 42×28 pill thumb reads as an oversized white pill
+   among Windows' denser controls (user report, 2026-10-21). Every slider in the
+   Windows build uses a compact thumb and a thinner track, scaled through the
+   component's own --tw/--th variables so fill, ticks and thumb stay aligned. */
+.oink-app[data-platform="win"] .ok-slider { --tw: 26px; --th: 18px; }
+.oink-app[data-platform="win"] .ok-slider__track { height: 4px; border-radius: 4px; }
+.oink-app[data-platform="win"] .ok-slider__ticks { height: 4px; }
+.oink-app[data-platform="win"] .ok-slider__ticks i { top: .5px; }

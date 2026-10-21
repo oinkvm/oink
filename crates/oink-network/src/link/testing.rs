@@ -63,3 +63,20 @@ pub fn datagram_pair(link: LinkId, tag: StreamTag, queue: QueueSpec) -> (Datagra
 pub fn set_direct_blocked(links: &super::LinkLayer, peer: oink_foundation::DeviceId, blocked: bool) {
     links.0.send(super::handle::Command::BlockDirect(peer, blocked));
 }
+
+/// Hold one peer's I0 header before assigning its logical reader identity, while
+/// allowing QUIC and N0 migration to proceed. Releasing resumes normal dispatch.
+pub fn hold_input_header(links: &super::LinkLayer, peer: Option<oink_foundation::DeviceId>) {
+    links.0.hold_input_peer.store(peer.map(Arc::new));
+    links.0.wake.notify_one();
+}
+pub async fn input_header_held(links: &super::LinkLayer) {
+    links.0.input_header_held.notified().await;
+}
+pub async fn cutover_finished(links: &super::LinkLayer) {
+    links.0.cutover_finished.notified().await;
+}
+/// Fence commands already submitted by an ordinary owner; never waits for traffic.
+pub fn flush_commands(links: &super::LinkLayer) {
+    links.config_phase_applied();
+}

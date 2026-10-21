@@ -1,5 +1,10 @@
 use super::*;
 impl Owner {
+    pub(crate) fn layout_profile_merges(&self) -> ApiResult<Vec<dto::MergeTransferBundle>> {
+        self.journal
+            .committed_into(self.state.roster().anchor())
+            .map_err(internal)
+    }
     pub(crate) fn receive_revocation(&mut self, candidate: State) -> v1::Result<()> {
         self.commit(candidate).map_err(|_| v1::ErrorCode::StateConflict)?;
         let links = self.sessions.keys().copied().collect::<Vec<_>>();
@@ -88,7 +93,68 @@ impl Owner {
         self.shared.emit(ConfigChange::State {
             items: vec![Item::Members, Item::Layout],
         });
+        if let Err(error) = self.reconcile_observed_displays() {
+            self.needs_apply = true;
+            return Err(error);
+        }
         Ok(())
+    }
+    fn reconcile_observed_displays(&mut self) -> ApiResult<()> {
+        // A whole-layout LWW winner can contain this owner's old native bounds
+        // when two owners observe displays concurrently. No new OS callback will
+        // follow: the actual displays already changed. Re-publish our observed
+        // native geometry against the winning register, preserving its device
+        // transforms and other owners. The second commit is stable, so this does
+        // not create a publication loop or issue any native display write.
+        // An unenumerated startup is not an observation of zero displays, and a
+        // signed merge projection must remain exact until its journal is settled.
+        if !self.displays_observed
+            || !self.state.roster().contains(self.identity.id())
+            || self.journal.pending_projection().map_err(internal)?.is_some()
+        {
+            return Ok(());
+        }
+        let register = self.state.layout().map_err(internal)?;
+        let layout = dto::LayoutValue::from_raw(register.value().map_err(internal)?).map_err(internal)?;
+        let update =
+            layout_wire::sync_local_displays(&layout, self.identity.id(), &self.displays, &self.detached, now_ms())
+                .map_err(internal)?;
+        let Some(local) = update
+            .layout
+            .devices()
+            .map_err(internal)?
+            .0
+            .into_iter()
+            .find(|d| d.device().and_then(|id| wire::read_device(&id)) == Ok(self.identity.id()))
+        else {
+            return Ok(());
+        };
+        // The ordinary display-change path may repair collisions. This path is
+        // only restoring lost owner facts: never normalize a remote canvas edit
+        // or move another computer while correcting native geometry.
+        let mut groups = layout.devices().map_err(internal)?.0;
+        if let Some(group) = groups.iter_mut().find(|g| g.device() == local.device()) {
+            let mut retained = group.raw().clone();
+            retained.insert(4, local.screens().map_err(internal)?.write());
+            *group = dto::DevicePlacement::from_raw(retained).map_err(internal)?;
+        } else {
+            groups.push(local);
+        }
+        let mut raw = layout.raw().clone();
+        raw.insert(1, RawValue::Array(groups.iter().map(WireValue::write).collect()));
+        if &raw == layout.raw() {
+            return Ok(());
+        }
+        detached::save(&self.data_dir.join(detached::DETACHED_FILE), &update.detached).map_err(internal)?;
+        self.detached = update.detached;
+        let mut stored = self.stored.clone();
+        stored
+            .edit_layout(&register.version().map_err(internal)?, |value| {
+                *value = raw;
+                Ok(())
+            })
+            .map_err(internal)?;
+        self.commit(State::verify(stored.state, self.state.roster().anchor()).map_err(internal)?)
     }
     pub(crate) fn project_decision(&mut self) -> ApiResult<bool> {
         let Some(wire) = self.journal.pending_projection().map_err(internal)? else {
@@ -408,6 +474,30 @@ impl Owner {
         self.publish()?;
         self.publish_facts()
     }
+    pub(crate) fn publish_native_arrangement(&mut self, token: String) -> ApiResult<u64> {
+        if self
+            .local
+            .value()
+            .native_arrangement_token()
+            .map_err(internal)?
+            .as_ref()
+            .map(|t| t.0.as_str())
+            == Some(token.as_str())
+        {
+            return self.local.value().fact_sequence().map_err(internal);
+        }
+        self.local
+            .edit(|raw| {
+                raw.insert(22, RawValue::Text(token));
+                Ok(())
+            })
+            .map_err(internal)?;
+        // Profile queries read the member table, not local_facts. Publish the
+        // completed observation there before returning; otherwise an unrelated
+        // startup publication exposes this token later and invalidates Create.
+        self.publish()?;
+        self.publish_facts()
+    }
     pub(crate) fn publish_claim(&mut self, claim: dto::AudioExitClaim) -> ApiResult<u64> {
         self.local
             .edit(|raw| {
@@ -418,7 +508,7 @@ impl Owner {
         self.publish_facts()
     }
     pub(crate) fn device_control(&mut self, peer: DeviceId, message: Message) -> ApiResult<()> {
-        if !(0x0d23..=0x0d2e).contains(&message.type_id()) {
+        if !(0x0d23..=0x0d30).contains(&message.type_id()) {
             return Err(invalid("invalid device control message"));
         }
         let id = self
@@ -434,6 +524,17 @@ impl Owner {
             })
         {
             return Err(invalid("notification capability was not negotiated"));
+        }
+        if (0x0d2f..=0x0d30).contains(&message.type_id())
+            && !self
+                .links
+                .links()
+                .links
+                .iter()
+                .find(|l| l.link == id)
+                .is_some_and(|l| l.agreement.contains("oink.layout.arrangement/1"))
+        {
+            return Err(invalid("arrangement capability was not negotiated"));
         }
         self.send(id, message).map_err(internal)
     }
@@ -464,6 +565,7 @@ impl Owner {
         self.commit(candidate)
     }
     pub(crate) fn displays_changed(&mut self, displays: Vec<DisplayInfo>) -> ApiResult<()> {
+        self.displays_observed = true;
         self.displays = displays.clone();
         self.observe_display_facts()?;
         let _ = self.refresh_diagnostics();

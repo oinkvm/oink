@@ -263,7 +263,27 @@ fn allowed(name: &str) -> bool {
 }
 impl Scalars {
     fn add(&mut self, f: &Field, v: f64) {
-        let permitted = if self.2 == "oink_overlay_diagnostics" {
+        let permitted = if self.2 == "oink_windows_external_input" {
+            matches!(
+                f.name(),
+                "move_count"
+                    | "button_down"
+                    | "button_up"
+                    | "wheel_vertical"
+                    | "wheel_horizontal"
+                    | "key_down"
+                    | "key_up"
+                    | "other"
+                    | "lower_il"
+                    | "local"
+                    | "downstream_rejected"
+                    | "base_registered"
+                    | "base_rollback"
+                    | "position_read_failed"
+                    | "remote"
+                    | "raw_clip_active"
+            )
+        } else if self.2 == "oink_overlay_diagnostics" {
             matches!(
                 f.name(),
                 "overlay_object"
@@ -374,6 +394,9 @@ impl Scalars {
 }
 impl Visit for Scalars {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if self.2 == "oink_windows_external_input" {
+            return;
+        }
         // Only these audited Option<bool>/Option<u32>/CGError callsite fields use Debug.
         // Do not format any other Debug value: it can be an input event, a PID, path or payload.
         if field.name() == "message" && self.2.starts_with("oink_routing::router") {
@@ -392,7 +415,7 @@ impl Visit for Scalars {
         }
     }
     fn record_str(&mut self, field: &Field, value: &str) {
-        if self.2 == "oink_overlay_diagnostics" {
+        if matches!(self.2, "oink_overlay_diagnostics" | "oink_windows_external_input") {
             return;
         }
         if clipboard_numeric_field(field.name())
@@ -582,6 +605,7 @@ impl Visit for Scalars {
                         | "paused"
                         | "link_lost"
                         | "opening_incomplete"
+                        | "input_opening_timeout"
                 ),
                 _ => false,
             };
@@ -741,6 +765,7 @@ pub(crate) fn bundle_only_target(target: &str) -> bool {
             | "oink_collection_diagnostics"
             | "oink_audio_diagnostics"
             | "oink_overlay_diagnostics"
+            | "oink_windows_external_input"
     )
 }
 fn safe_os_version(module: &str, value: &str) -> bool {
@@ -1339,6 +1364,9 @@ mod tests {
                 operation = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", stage = "selection", result = "received", reason = "stale_counter",
                 waiting = "connection_select", waiting_on = "peer", arbiter = "peer", choice_counter = 1u64, choice_watermark = 6u64,
                 local_boot = "cccccccccccccccccccccccccccccccc", peer_boot = "dddddddddddddddddddddddddddddddd");
+            tracing::info!(target: "oink_link_diagnostics", kind = "input_wait", peer_id = peer.to_hex().as_str(),
+                stage = "input_opening", result = "failed", reason = "input_opening_timeout",
+                opening_received = 0u64, wait_inbound = true, elapsed_ms = 3000.);
             tracing::warn!(target: "oink_link_diagnostics", kind = "udp_send", stage = "kernel",
                 result = "dropped", reason = "host_unreachable", os_error = 65i32, os_error_known = true,
                 destination = "203.0.113.7:47470", src_ip = "203.0.113.8", error = "PRIVATE ERROR /PRIVATE/PATH");
@@ -1372,6 +1400,13 @@ mod tests {
         for field in ["kernel", "dropped", "host_unreachable", "os_error", "65"] {
             assert!(text.contains(field), "missing {field}");
         }
+        assert!(
+            rows.iter().any(|row| matches!(&row.event, Event::Log { labels, .. }
+            if labels.contains(&("kind".into(), "input_wait".into()))
+                && labels.contains(&("result".into(), "failed".into()))
+                && labels.contains(&("reason".into(), "input_opening_timeout".into())))),
+            "opening recovery detection survives diagnostic projection"
+        );
         recorder.shutdown();
         let mut store = store::Store::open(temp.path().join("store"), "a".repeat(24), true).unwrap();
         store.recover_for_test().unwrap();

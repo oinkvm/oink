@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { Layout, Placement, Rect, Screen } from '../api/types';
-import { layoutPlacements, presentScreens, renderLayout, replayPlacements, visibleScreens } from './adapter';
+import { layoutPlacements, presentScreens, renderLayout, visibleScreens } from './adapter';
 import { cornerPoint, opposite, resizeFromCorner } from './geometry';
 import { edgeProjections, sameProjections, tolerance } from './facing';
 import { presentCards } from '../devices/project';
@@ -81,27 +81,6 @@ describe('group placement adapter and history projection', () => {
     });
 });
 
-it('replays exact stored transforms without a lossy screen-rectangle round trip', () => {
-    const value = layout([
-        screen('left', { x: -800, y: 100, w: 1000, h: 600 }),
-        screen('a', { x: 0, y: 0, w: 800, h: 500 }),
-    ]);
-    const stored: Placement = { device: 'computer', origin: { x: .1, y: .2 }, scale: .001 };
-    // The previous replay path really does change these floating point values.
-    expect(layoutPlacements(value, renderLayout(value, {}, [stored]))).not.toEqual([stored]);
-    const replayed = replayPlacements(value, [stored]);
-    expect(replayed).toEqual([stored]);
-    expect(replayed[0]).toBe(stored);
-});
-
-it('omits unplugged devices while retaining current placement for newly attached devices', () => {
-    const current = layout([screen('a', { x: 0, y: 0, w: 1000, h: 600 })]);
-    const absent: Placement = { device: 'unplugged', origin: { x: 100, y: 100 }, scale: 1 };
-    expect(replayPlacements(current, [absent])).toEqual(layoutPlacements(current, []));
-    expect(replayPlacements(layout([]), [placement])).toEqual([]);
-});
-
-
 it('keeps resized native geometry and facing intervals through the frozen placement adapter', () => {
     const native = [{ w: 3840, h: 2160 }, { w: 1728, h: 1117 }, { w: 1728, h: 1117 }];
     const starts = [{ x: 493, y: 0, w: 741 }, { x: 0, y: 416.8125, w: 604 }, { x: 604, y: 472.8125, w: 604 }];
@@ -144,3 +123,17 @@ it.each(['disconnected', 'connecting', 'address_stale'] as const)(
         expect(visibleScreens(presentScreens(history,reconnected),value,reconnected).map(s=>s.id)).toEqual(['computer:a']);
     },
 );
+
+it('hides every paused computer screen and restores exact stored geometry after resume', () => {
+    const value = layout([
+        screen('a', {x:0,y:0,w:1000,h:600}),
+        screen('b', {x:1000,y:-200,w:800,h:500}),
+    ]);
+    const shown = renderLayout(value, {}, [placement]);
+    const devices = [{id:'computer',screenSharing:true,screen:'shared' as const,paused:true}];
+    expect(visibleScreens(shown,value,devices)).toEqual([]);
+    expect(value.geometry.screens.every(s=>!s.hidden && !s.device_disabled)).toBe(true);
+    const resumed = visibleScreens(shown,value,[{...devices[0],paused:false}]);
+    expect(resumed).toEqual(shown);
+    expect(layoutPlacements(value,resumed)).toEqual([placement]);
+});

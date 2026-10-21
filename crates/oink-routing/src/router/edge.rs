@@ -37,6 +37,59 @@ impl ExitEdge {
     }
 }
 impl Router {
+    /// Preserve the virtual parked point when macOS reports the same outer
+    /// edge with a different inward clamp. Otherwise set_cursor would retire
+    /// the portal's resistance on every remote batch, so it never accumulates.
+    pub(super) fn target_readback_constrained_point(&self, actual: Point) -> Option<Point> {
+        // Windows receipts already floor + normalize + decode SendInput's
+        // exact pixel (including right/bottom -1 and negative-display edges),
+        // so their OS edge clamp is Expected before reaching this path. macOS
+        // can instead return an inward fractional/last-pixel clamp different
+        // from its submitted HID/CG endpoint. Do not widen Windows warp matching.
+        if self.cfg.os != Os::MacOS || self.system_clip_active() {
+            return None;
+        }
+        let from = self.pointer.as_ref()?;
+        let display = self.displays.iter().find(|d| d.key == from.screen.display)?;
+        let b = display.bounds;
+        if !b.contains(actual) || !b.contains(from.local) {
+            return None;
+        }
+        // Match confinement per axis: preserve the parked normal, but adopt the
+        // observed tangent. Sliding along an edge must not reset its pressure.
+        const QUANTUM: f64 = 1. / 256.;
+        for (normal, expected_distance, actual_distance) in [
+            ((-1., 0.), from.local.x - b.x, actual.x - b.x),
+            ((1., 0.), b.right() - from.local.x, b.right() - actual.x),
+            ((0., -1.), from.local.y - b.y, actual.y - b.y),
+            ((0., 1.), b.bottom() - from.local.y, b.bottom() - actual.y),
+        ] {
+            if expected_distance > QUANTUM || actual_distance > EDGE_UNITS {
+                continue;
+            }
+            let constrained = Point::new(
+                if normal.0 != 0. { from.local.x } else { actual.x },
+                if normal.1 != 0. { from.local.y } else { actual.y },
+            );
+            let at = ScreenPos::new(from.screen.clone(), constrained);
+            if self
+                .displays
+                .iter()
+                .any(|d| d.key != display.key && resistance::native_seam(b, d.bounds, constrained, normal))
+            {
+                continue;
+            }
+            if self
+                .layout
+                .first_portal_native(&at, normal)
+                .is_some_and(|p| p.to.screen.device != self.me())
+            {
+                return Some(constrained);
+            }
+        }
+        None
+    }
+
     pub(super) fn exit_edge(&self, from: &ScreenPos, delta: (f64, f64)) -> Option<ExitEdge> {
         if let Some(portal) = self.layout.first_portal_native(from, delta) {
             use oink_display::layout::Side;

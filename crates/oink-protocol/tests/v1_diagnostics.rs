@@ -124,3 +124,33 @@ fn standalone_decode_checks_budget_complete_input_and_nested_limits() {
         v1::ErrorCode::LimitExceeded
     );
 }
+
+#[test]
+fn gesture_foreground_observations_are_optional_and_new_decisions_roundtrip() {
+    let mut baseline = support::sample_named("DiagGestureSummary");
+    baseline.remove(&18);
+    baseline.remove(&19);
+    let old = DiagGestureSummary::from_raw(baseline.clone()).unwrap();
+    assert_eq!(old.desktop_showing().unwrap(), None);
+    assert_eq!(old.start_open().unwrap(), None);
+    for decision in [
+        DiagGestureDecision::ShowDesktop,
+        DiagGestureDecision::RestoreDesktop,
+        DiagGestureDecision::DesktopNoop,
+        DiagGestureDecision::StartOpen,
+        DiagGestureDecision::StartClose,
+        DiagGestureDecision::StartNoop,
+    ] {
+        let mut row = baseline.clone();
+        row.insert(15, oink_protocol::v1::schema::WireValue::write(&decision));
+        row.insert(18, V::Bool(true));
+        row.insert(19, V::Bool(false));
+        row.insert(900, support::synthetic_unknown());
+        let summary = DiagGestureSummary::from_raw(row.clone()).unwrap();
+        assert_eq!(summary.decision().unwrap(), decision);
+        assert_eq!(summary.desktop_showing().unwrap(), Some(true));
+        assert_eq!(summary.start_open().unwrap(), Some(false));
+        let bytes = summary.encode(v1::limits::DIAGNOSTIC_SEGMENT).unwrap();
+        assert_eq!(v1::cbor::decode(&bytes, bytes.len()).unwrap(), V::Map(row));
+    }
+}

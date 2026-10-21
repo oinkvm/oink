@@ -9,7 +9,7 @@ export type DeviceKey = string; // existing full public-key hex
 export type GroupId = string; // group identifier, never a shared cryptographic key
 export type DecimalU64 = string;
 export type UtcMs = number; // integer, 0..Number.MAX_SAFE_INTEGER
-export type SharingMode = "shared" | "local";
+export type SharingMode = "shared" | "local" | "disabled";
 export type CardOs = "macos" | "windows" | "linux" | "other";
 export type CardLogo = "macos" | "windows10" | "linux" | "generic";
 export type OfflineKind = "disconnected" | "connecting" | "address_stale" | "protocol_incompatible";
@@ -98,6 +98,7 @@ export interface DeviceCardActions {
   screenLocal: CardAction;
   mouseShared: CardAction;
   mouseLocal: CardAction;
+  mouseDisabled?: CardAction;
   keyboardShared: CardAction;
   keyboardLocal: CardAction;
   keyboardDisabled: CardAction;

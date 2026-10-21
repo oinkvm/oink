@@ -338,6 +338,8 @@ pub(crate) fn start(node: Node, mut port: ModulePort) -> tokio::task::JoinHandle
                     if relevant {
                         while changes.try_recv().is_ok() {}
                         let _ = local(&node, false,None).await;
+                        let snapshot_node=node.clone();
+                        if let Ok(Ok(usage))=tokio::task::spawn_blocking(move || {use crate::api::AgentApi;snapshot_node.received_files_usage()}).await {node.emit(ApiEvent::ReceivedFilesUsage(usage));}
                     }
                 },
                 _ = jobs.join_next(), if !jobs.is_empty() => {},

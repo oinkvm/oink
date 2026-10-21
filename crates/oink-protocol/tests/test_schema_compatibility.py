@@ -33,13 +33,14 @@ class FrozenSchemaTests(unittest.TestCase):
         schema["fields"].append({"key":999,"name":"future","shape":"Option<u32>","absence":"optional"})
         check(self.old,self.new)
     def test_changed_type(self):
-        self.new["schemas"][0]["fields"][0]["shape"]="u32"
+        field=self.new["schemas"][0]["fields"][0]
+        field["shape"]="u64" if field["shape"]=="u32" else "u32"
         with self.assertRaises(ValueError):check(self.old,self.new)
     def test_required_addition(self):
         self.new["schemas"][0]["fields"].append({"key":999,"name":"future","shape":"u32","absence":"required"})
         with self.assertRaises(ValueError):check(self.old,self.new)
     def test_message_needs_new_capability(self):
-        row=copy.deepcopy(self.new["messages"][0]);row["id"]=0x1200;row["name"]="Future"
+        row=copy.deepcopy(self.new["messages"][0]);row["id"]=max(r["id"] for r in self.new["messages"])+1;row["name"]="Future"
         self.new["messages"].append(row)
         with self.assertRaises(ValueError):check(self.old,self.new)
         row["capabilities"].append("oink.future/1");self.new["capabilities"].append("oink.future/1")

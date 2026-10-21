@@ -1,4 +1,8 @@
-//! Receiver-classified, source-local dropout buckets. Not wire data.
+//! Local packet diagnostics and measured output quality in fixed one-second buckets.
+//! `lost`/`late` retain legacy sequence accounting for diagnostics only; the UI
+//! uses `interruptions`, rendered `concealed_ns`, and independently deduplicated
+//! `late_packets`. Neither transport timing nor buffer adjustment creates an
+//! interruption. One RT writer per source (or native output), ordinary readers.
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -8,8 +12,53 @@ pub struct DropoutBucket {
     pub at_ms: u64,
     pub lost: u64,
     pub late: u64,
+    pub interruptions: u64,
+    pub concealed_ns: u64,
+    pub missing_ns: u64,
+    pub late_packets: u64,
+    pub silence_interruptions: u64,
+    pub concealment_interruptions: u64,
+    pub discontinuities: u64,
 }
 impl DropoutBucket {
+    pub fn is_empty(&self) -> bool {
+        self.count() == 0
+            && self.interruptions == 0
+            && self.concealed_ns == 0
+            && self.missing_ns == 0
+            && self.late_packets == 0
+            && self.silence_interruptions == 0
+            && self.concealment_interruptions == 0
+            && self.discontinuities == 0
+    }
+    pub fn difference(&self, old: Self) -> Self {
+        Self {
+            at_ms: self.at_ms,
+            lost: self.lost.saturating_sub(old.lost),
+            late: self.late.saturating_sub(old.late),
+            interruptions: self.interruptions.saturating_sub(old.interruptions),
+            concealed_ns: self.concealed_ns.saturating_sub(old.concealed_ns),
+            missing_ns: self.missing_ns.saturating_sub(old.missing_ns),
+            late_packets: self.late_packets.saturating_sub(old.late_packets),
+            silence_interruptions: self.silence_interruptions.saturating_sub(old.silence_interruptions),
+            concealment_interruptions: self
+                .concealment_interruptions
+                .saturating_sub(old.concealment_interruptions),
+            discontinuities: self.discontinuities.saturating_sub(old.discontinuities),
+        }
+    }
+    pub fn add(&mut self, delta: Self) {
+        self.lost += delta.lost;
+        self.late += delta.late;
+        self.interruptions += delta.interruptions;
+        self.concealed_ns += delta.concealed_ns;
+        self.missing_ns += delta.missing_ns;
+        self.late_packets += delta.late_packets;
+        self.silence_interruptions += delta.silence_interruptions;
+        self.concealment_interruptions += delta.concealment_interruptions;
+        self.discontinuities += delta.discontinuities;
+    }
+
     pub fn count(&self) -> u64 {
         self.lost + self.late
     }
@@ -19,6 +68,13 @@ struct Slot {
     stamp: AtomicU64,
     lost: AtomicU64,
     late: AtomicU64,
+    interruptions: AtomicU64,
+    concealed_ns: AtomicU64,
+    missing_ns: AtomicU64,
+    late_packets: AtomicU64,
+    silence_interruptions: AtomicU64,
+    concealment_interruptions: AtomicU64,
+    discontinuities: AtomicU64,
 }
 /// One receiver/render writer, ordinary-thread readers. Storage is fixed.
 #[derive(Debug)]
@@ -34,7 +90,16 @@ impl Default for DropoutCounters {
 }
 impl DropoutCounters {
     pub(crate) fn record(&self, at_ms: u64, lost: u64, late: u64) {
-        if lost == 0 && late == 0 {
+        self.record_quality(DropoutBucket {
+            at_ms,
+            lost,
+            late,
+            ..Default::default()
+        });
+    }
+    pub(crate) fn record_quality(&self, delta: DropoutBucket) {
+        let DropoutBucket { at_ms, lost, late, .. } = delta;
+        if delta.is_empty() {
             return;
         }
         let second = at_ms / 1000;
@@ -48,10 +113,27 @@ impl DropoutCounters {
             slot.stamp.store(u64::MAX, Ordering::SeqCst);
             slot.lost.store(0, Ordering::SeqCst);
             slot.late.store(0, Ordering::SeqCst);
+            slot.interruptions.store(0, Ordering::SeqCst);
+            slot.concealed_ns.store(0, Ordering::SeqCst);
+            slot.missing_ns.store(0, Ordering::SeqCst);
+            slot.late_packets.store(0, Ordering::SeqCst);
+            slot.silence_interruptions.store(0, Ordering::SeqCst);
+            slot.concealment_interruptions.store(0, Ordering::SeqCst);
+            slot.discontinuities.store(0, Ordering::SeqCst);
+
             slot.stamp.store(stamp, Ordering::SeqCst);
         }
         slot.lost.fetch_add(lost, Ordering::SeqCst);
         slot.late.fetch_add(late, Ordering::SeqCst);
+        slot.interruptions.fetch_add(delta.interruptions, Ordering::SeqCst);
+        slot.concealed_ns.fetch_add(delta.concealed_ns, Ordering::SeqCst);
+        slot.missing_ns.fetch_add(delta.missing_ns, Ordering::SeqCst);
+        slot.late_packets.fetch_add(delta.late_packets, Ordering::SeqCst);
+        slot.silence_interruptions
+            .fetch_add(delta.silence_interruptions, Ordering::SeqCst);
+        slot.concealment_interruptions
+            .fetch_add(delta.concealment_interruptions, Ordering::SeqCst);
+        slot.discontinuities.fetch_add(delta.discontinuities, Ordering::SeqCst);
     }
     pub fn snapshot(&self, at_ms: u64) -> [Option<DropoutBucket>; SECONDS] {
         let second = at_ms / 1000;
@@ -69,8 +151,15 @@ impl DropoutCounters {
                 at_ms: bucket_second * 1000,
                 lost: slot.lost.load(Ordering::SeqCst),
                 late: slot.late.load(Ordering::SeqCst),
+                interruptions: slot.interruptions.load(Ordering::SeqCst),
+                concealed_ns: slot.concealed_ns.load(Ordering::SeqCst),
+                missing_ns: slot.missing_ns.load(Ordering::SeqCst),
+                late_packets: slot.late_packets.load(Ordering::SeqCst),
+                silence_interruptions: slot.silence_interruptions.load(Ordering::SeqCst),
+                concealment_interruptions: slot.concealment_interruptions.load(Ordering::SeqCst),
+                discontinuities: slot.discontinuities.load(Ordering::SeqCst),
             };
-            (slot.stamp.load(Ordering::SeqCst) == stamp && bucket.count() > 0).then_some(bucket)
+            (slot.stamp.load(Ordering::SeqCst) == stamp && !bucket.is_empty()).then_some(bucket)
         })
     }
 }
@@ -90,7 +179,8 @@ mod tests {
             Some(DropoutBucket {
                 at_ms: 0,
                 lost: 2,
-                late: 0
+                late: 0,
+                ..Default::default()
             })
         );
         assert_eq!(
@@ -98,7 +188,8 @@ mod tests {
             Some(DropoutBucket {
                 at_ms: 1000,
                 lost: 1,
-                late: 1
+                late: 1,
+                ..Default::default()
             })
         );
         assert!(c.snapshot(59999)[0].is_some());

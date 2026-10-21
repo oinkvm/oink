@@ -57,15 +57,25 @@
 .setp__sec { display: grid; gap: 10px; min-width: 0; scroll-margin-top: 8px; }
 .setp__title { margin: 0 0 0 4px; font: 500 15px/1.3 var(--ok-font); color: var(--ok-text); }
 .setp__lead { margin: -4px 0 2px 4px; font: 450 13px/1.45 var(--ok-font); color: var(--ok-text-2); }
-.setp__card { --ok-row-wrap-at: 15rem; }
-.setp__card .ok-row { font-size: 14px; font-weight: 400; }   
-.setp__card .ok-row__desc { font-size: 12.5px; font-weight: 300; }   
+.setp__card .ok-row { font-size: 14px; font-weight: 400; }
+.setp__card .ok-row__desc { font-size: 12.5px; font-weight: 300; }
 
-.setp .ok-btn, .setp .ok-select__trigger, [role="listbox"] [role="option"] { font-weight: 400; }
+/* Every control's text uses the buttons' regular weight. */
+.setp :is(.ok-btn, .ok-select__trigger, .ok-seg__item, .ok-input input, .ok-input__affix) { font-weight: 400; }
 
-/* Segments keep their label widths; rows wrap when the translated controls need room. */
+/* In every language the controls keep their natural width on the right of the
+   row, on one line; long labels and descriptions wrap instead. Stacked rows
+   (key mapping, charts) lay out their own. */
+.setp__card .ok-row:not(.ok-row--stack) > :not(.ok-row__text, .ok-row__leading) { flex: none; }
 .setp .ok-seg { flex: none; width: max-content; box-sizing: border-box; }
-.setp .ok-row__control:has(> .ok-seg) { flex: 0 0 auto; min-width: max-content; }
+
+/* A row whose content stays collapsed until opened: the head reads as a row. */
+.setp__card > .setp__acc { --_inset: inherit; }
+.setp__card > .ok-row + .setp__acc, .setp__card > .setp__acc + .ok-row { border-top: 1px solid var(--ok-line); }
+.setp__acc .ok-accordion__head { gap: var(--ok-s-4); min-height: 56px; padding: var(--_row) var(--_inset); border-radius: 0; font: 400 14px/1.3 var(--ok-font); }
+.setp__acc .ok-accordion__content { padding: 0; font: inherit; color: inherit; }
+.setp__acc .ok-accordion__content > .setp__note { padding: 0 var(--_inset) var(--_row); }
+.setp__acc .ok-accordion__content .ok-row { border-top: 1px solid var(--ok-line); }
 .setp__none { margin: 0; padding: 14px var(--_inset); font: 450 13px/1.4 var(--ok-font); color: var(--ok-text-3); }
 mark.setp__hit { background: var(--ok-accent-tint); color: inherit; border-radius: 3px; box-shadow: 0 0 0 1.5px var(--ok-accent-tint); }
 
@@ -82,23 +92,26 @@ mark.setp__hit { background: var(--ok-accent-tint); color: inherit; border-radiu
 .setp__note { display: inline-flex; align-items: center; gap: 4px; color: var(--ok-success-text); }
 .setp__note .ok-icon { width: 14px; height: 14px; }
 .setp__note--new { color: var(--ok-accent-text); }
-.setp__granted { display: inline-flex; align-items: center; gap: 6px; font: 500 13px/1 var(--ok-font); color: var(--ok-success-text); white-space: nowrap; }
+.setp__granted { display: inline-flex; align-items: center; gap: 6px; font: 400 13px/1 var(--ok-font); color: var(--ok-success-text); white-space: nowrap; }
 .setp__granted .ok-icon { width: 16px; height: 16px; }
 
-.setp__slider { display: flex; align-items: center; gap: 12px; width: 100%; }
-.setp__slider .ok-slider { flex: 1; min-width: 0; }
-.setp__val { flex: none; min-width: 3.2em; text-align: right; font: 500 13px/1 var(--ok-font); font-variant-numeric: tabular-nums; color: var(--ok-text-2); }
+.setp__gain { display: flex; align-items: center; gap: 12px; }
+.setp__gain .ok-slider { flex: none; width: 149px; }
+.setp__gain-input.ok-input { flex: none; width: 76px; }
+.setp__gain-input input { font-variant-numeric: tabular-nums; }
 
 
 .setp__sc { display: flex; align-items: center; gap: 12px; }
 .setp__hotkey { min-width: 132px; }
+/* Keycaps in Settings read one step lighter than oink-ui's 600. */
+.setp .ok-kbd { font-weight: 500; }
 .setp__hotkey[aria-invalid] { box-shadow: inset 0 0 0 1.5px var(--ok-danger); }
 .setp__sc-err { display: inline-flex; align-items: center; gap: 4px; color: var(--ok-danger-text); }
 .setp__sc-err .ok-icon { width: 14px; height: 14px; flex: none; }
-.setp__btns { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
-.setp__size { margin-right: 4px; font: 500 13px/1 var(--ok-font); font-variant-numeric: tabular-nums; color: var(--ok-text-2); white-space: nowrap; }
-.setp__bundle { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
-.setp__inline { display: inline-flex; align-items: center; gap: 6px; font: 450 13px/1 var(--ok-font); color: var(--ok-text-2); white-space: nowrap; }
+.setp__btns { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.setp__size { margin-right: 4px; font: 400 13px/1 var(--ok-font); font-variant-numeric: tabular-nums; color: var(--ok-text-2); white-space: nowrap; }
+/* About as wide as the page's selects. */
+.setp__mb.ok-input { width: 128px; }
 
 .setp__empty { display: grid; justify-items: center; gap: 8px; padding: 64px 0; color: var(--ok-text-3); font: 450 13px/1.4 var(--ok-font); }
 .setp__empty p { margin: 0; }
@@ -145,7 +158,7 @@ mark.setp__hit { background: var(--ok-accent-tint); color: inherit; border-radiu
 
 .kmap__key.ok-focusable:focus-visible { outline-offset: -3px; }
 .kmap__note { margin: -2px 0 0 2px; font: 450 12.5px/1.45 var(--ok-font); color: var(--ok-text-2); }
-.kmap__split { display: flex; align-items: center; justify-content: space-between; gap: 12px; justify-self: stretch; font: 450 13px/1.3 var(--ok-font); color: var(--ok-text); }
+.kmap__split { display: flex; align-items: center; justify-content: space-between; gap: 12px; justify-self: stretch; font: 400 13px/1.3 var(--ok-font); color: var(--ok-text); }
 
 
 .lat { display: grid; gap: 10px; min-width: 0; }

@@ -721,3 +721,140 @@ fn first_local_wheel_after_departure_keeps_local_transform_and_never_forwards() 
         assert_eq!(r.local_rewrite(), None);
     }
 }
+
+#[test]
+fn paused_keyboard_guard_allows_physical_keys_and_returns_on_resume() {
+    let mut r = router(false);
+    r.set_keyboard_disabled(true);
+    r.set_fully_paused(true);
+    assert!(r.keyboard_disabled(), "pause retains the preference");
+    assert!(!r.keyboard_key_blocked(None));
+    assert_eq!(
+        event(&mut r, InputEvent::Key { code: A, pressed: true }),
+        Disposition::Pass
+    );
+    assert_eq!(
+        event(
+            &mut r,
+            InputEvent::Key {
+                code: A,
+                pressed: false
+            }
+        ),
+        Disposition::Pass
+    );
+    r.set_fully_paused(false);
+    assert!(r.keyboard_disabled());
+    assert_eq!(
+        event(&mut r, InputEvent::Key { code: A, pressed: true }),
+        Disposition::Swallow
+    );
+}
+
+#[test]
+fn locking_does_not_release_keyboard_guard() {
+    let mut r = router(false);
+    r.set_keyboard_disabled(true);
+    r.out.clear();
+    r.keyboard_session_locked(Some(true));
+    r.keyboard_session_locked(Some(false));
+    assert!(r.keyboard_disabled());
+    assert!(
+        !r.out
+            .iter()
+            .any(|o| matches!(o, Output::Status(StatusEvent::KeyboardReleased)))
+    );
+    assert_eq!(
+        event(&mut r, InputEvent::Key { code: A, pressed: true }),
+        Disposition::Swallow
+    );
+}
+
+#[test]
+fn mouse_disabled_consumes_source_input_without_revealing_or_forwarding() {
+    for remote in [false, true] {
+        let mut r = router(remote);
+        let mut settings = serde_json::to_value(&r.config().settings).unwrap();
+        settings["mouse_mode"] = "disabled".into();
+        r.set_settings(serde_json::from_value(settings).expect("disabled mouse mode"));
+        r.drain_outputs();
+        let focus = r.focus().clone();
+        for e in [
+            InputEvent::PointerDelta { dx: 80., dy: 0. },
+            InputEvent::RawPointerDelta { dx: 80., dy: 0. },
+            InputEvent::Button {
+                button: MouseButton::Left,
+                pressed: true,
+            },
+            InputEvent::Button {
+                button: MouseButton::Left,
+                pressed: false,
+            },
+            InputEvent::Scroll {
+                dx: 0.,
+                dy: 1.,
+                unit: ScrollUnit::Line,
+                phase: ScrollPhase::None,
+            },
+            InputEvent::Gesture(Gesture::SmartMagnify),
+        ] {
+            assert_eq!(event(&mut r, e), Disposition::Swallow);
+            assert!(inputs(&r).is_empty());
+            assert!(
+                !r.out
+                    .iter()
+                    .any(|o| matches!(o, Output::RestoreLocal { .. } | Output::SetMode(CaptureMode::Local)))
+            );
+        }
+        assert_eq!(r.focus().holder, focus.holder);
+        r.set_fully_paused(true);
+        r.drain_outputs();
+        assert_eq!(
+            event(
+                &mut r,
+                InputEvent::Button {
+                    button: MouseButton::Left,
+                    pressed: true
+                }
+            ),
+            Disposition::Pass
+        );
+    }
+}
+
+#[test]
+fn disabling_mouse_preserves_local_cursor_visibility_while_focus_is_remote() {
+    let mut r = router(true);
+    modes(&mut r, InputMode::Local, InputMode::Shared);
+    let cursor = r.local_cursor.clone();
+    r.drain_outputs();
+    modes(&mut r, InputMode::Disabled, InputMode::Shared);
+    assert_eq!(r.local_cursor, cursor);
+    assert!(
+        !r.out
+            .iter()
+            .any(|o| matches!(o, Output::SetMode(_) | Output::RestoreLocal { .. }))
+    );
+    assert_eq!(
+        r.out
+            .iter()
+            .filter(|o| matches!(o, Output::Status(StatusEvent::MouseDisabled(true))))
+            .count(),
+        1
+    );
+    r.drain_outputs();
+    modes(&mut r, InputMode::Disabled, InputMode::Local);
+    assert!(
+        !r.out
+            .iter()
+            .any(|o| matches!(o, Output::Status(StatusEvent::MouseDisabled(_))))
+    );
+    modes(&mut r, InputMode::Shared, InputMode::Local);
+    assert_eq!(
+        r.out
+            .iter()
+            .filter(|o| matches!(o, Output::Status(StatusEvent::MouseDisabled(false))))
+            .count(),
+        1
+    );
+}

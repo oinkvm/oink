@@ -27,6 +27,11 @@ pub enum Decision {
     DesktopLeft,
     DesktopRight,
     ShowDesktop,
+    RestoreDesktop,
+    DesktopNoop,
+    StartOpen,
+    StartClose,
+    StartNoop,
     BelowThreshold,
     WrongDirection,
     Cancelled,
@@ -60,6 +65,12 @@ pub struct Summary {
     /// Windows fallback's foreground sample at a committed swipe. None = not queried.
     #[serde(default)]
     pub task_view_showing: Option<bool>,
+    /// Same foreground class sample; None if this frame did not query classes.
+    #[serde(default)]
+    pub desktop_showing: Option<bool>,
+    /// Foreground process sample at a committed Dock Pinch; None = not queried.
+    #[serde(default)]
+    pub start_open: Option<bool>,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Observation {
@@ -149,6 +160,8 @@ impl Tracker {
                 decision,
                 threshold,
                 task_view_showing: None,
+                desktop_showing: None,
+                start_open: None,
             },
         });
         let row = &mut active.summary;

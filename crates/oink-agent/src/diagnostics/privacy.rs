@@ -144,7 +144,7 @@ pub enum SafeInput {
 impl SafeInput {
     pub fn capture(ev: &InputEvent) -> Self {
         match *ev {
-            InputEvent::TouchpadSample(_) => Self::ContactsOmitted,
+            InputEvent::TouchpadSample(_) | InputEvent::TouchpadBoundary => Self::ContactsOmitted,
             InputEvent::PointerDelta { dx, dy } => Self::Motion { dx, dy, raw: false },
             InputEvent::RawPointerDelta { dx, dy } => Self::Motion { dx, dy, raw: true },
             InputEvent::Button { button, pressed } => Self::Button { button, pressed },

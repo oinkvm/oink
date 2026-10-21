@@ -1086,7 +1086,12 @@ impl Router {
         delta_units: (f64, f64),
         at: Point,
     ) {
-        if !self.dnd_enabled() || self.focus_pinned() || self.paused || self.dnd.pending.is_some() {
+        if !self.dnd_enabled()
+            || self.focus_pinned()
+            || self.system_clip_active()
+            || self.paused
+            || self.dnd.pending.is_some()
+        {
             return;
         }
         let to = dst.screen.device;
@@ -1843,6 +1848,8 @@ impl Router {
             Some("the left button was released meanwhile")
         } else if self.holder != me || self.epoch != epoch {
             Some("focus already left this device")
+        } else if self.system_clip_active() {
+            Some("system cursor clip prevents crossing")
         } else if self.layout.reference_per_native_unit(&dst.screen).is_none()
             || !self.input_ready(to)
             || !self.dnd.peers.contains(&to)

@@ -41,3 +41,20 @@ test('generator retains every third-party native component and asset', () => {
   }
   assert.ok(inventory.components.some(component => component.name === 'oink-ui'));
 });
+
+test('native menu SVGs are inventoried with their reviewed shape ownership', () => {
+  const menu = 'apps/oink/src-tauri/icons/menu/';
+  const library = new Set(['lock.svg', 'resume.svg', 'show.svg', 'show-screens.svg']);
+  for (const name of readdirSync(new URL(`../${menu}`, import.meta.url)).filter(name => name.endsWith('.svg'))) {
+    const asset = native.assets.find(asset => asset.path === menu + name);
+    assert.ok(asset, menu + name);
+    const expression = name === 'unlock.svg' ? 'GPL-3.0-only AND MIT' : library.has(name) ? 'MIT' : 'GPL-3.0-only';
+    assert.equal(asset.licenseExpression, expression, name);
+    assert.equal(asset.ownership, expression === 'GPL-3.0-only' ? 'first-party' : 'third-party', name);
+    assert.deepEqual(asset.platforms, ['windows-x64'], name);
+    assert.deepEqual(asset.scope, ['runtime'], name);
+    if (expression.includes('MIT')) {
+      assert.ok(asset.licenseFiles.some(file => file.path === 'licenses/native/oink-ui-1.0.5-LICENSE.txt'), name);
+    }
+  }
+});

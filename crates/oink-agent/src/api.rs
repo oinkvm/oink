@@ -970,6 +970,9 @@ pub struct InputSettings {
     /// Receiver-local Windows scroll feel; retained while contact acceptance is off.
     #[serde(default = "default_true")]
     pub mac_scroll_feel: bool,
+    /// Windows source-local preference. Never replicated to peers.
+    #[serde(default)]
+    pub forward_injected_input: bool,
     /// Read-only live native injector availability; absent means unavailable.
     #[serde(default)]
     pub contacts_injection_available: bool,
@@ -1024,6 +1027,7 @@ pub struct CacheDeviceClear {
 
 /// Five local clipboard format filters; the device owner controls the master switch.
 pub use oink_clipboard::policy::FormatFilters as ClipboardSettings;
+pub use oink_clipboard::received::{Cleanup as ReceivedFilesCleanup, Usage as ReceivedFilesUsage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1233,11 +1237,11 @@ pub struct AudioSourceQuality {
     pub device: DeviceKey,
     pub name: String,
     pub samples: Vec<AudioQualitySample>,
-    pub p50_ms: Option<f64>,
-    pub p90_ms: Option<f64>,
-    pub p99_ms: Option<f64>,
+    pub buffer_avg_ms: Option<f64>,
     pub bitrate_kbps: f64,
-    pub dropouts: u64,
+    pub interruptions: u64,
+    pub concealed_ms: f64,
+    pub late_packets: u64,
     pub glitches: Vec<oink_audio::sink::DropoutBucket>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1245,6 +1249,15 @@ pub struct AudioQuality {
     pub revision: u64,
     pub sampled_at_ms: u64,
     pub sources: Vec<AudioSourceQuality>,
+    pub output: Option<AudioOutputQuality>,
+}
+
+/// Shared native output FIFO; never attributed to any particular source.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AudioOutputQuality {
+    pub interruptions: u64,
+    pub missing_ms: f64,
+    pub glitches: Vec<oink_audio::sink::DropoutBucket>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1578,6 +1591,8 @@ pub struct AimResult {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)] // 只用于传递与序列化，装箱没有收益
 pub enum ApiEvent {
+    LayoutProfiles(crate::layout_profiles::types::LayoutProfilesState),
+    LayoutProfileOperation(crate::layout_profiles::types::OperationEvent),
     ConnectionQuality(ConnectionQuality),
     AudioQuality(AudioQuality),
     NearbyChanged {
@@ -1663,6 +1678,7 @@ pub enum ApiEvent {
     InputSettings(InputSettings),
     /// core
     CacheUsage(Vec<CacheDevice>),
+    ReceivedFilesUsage(ReceivedFilesUsage),
     ClipboardSettings(ClipboardSettings),
     /// net
     ClipActivity(ClipActivity),
@@ -1715,6 +1731,8 @@ pub struct SubscriptionId(pub u64);
 /// 界面调用服务进程的接口。实现必须线程安全；命令可能阻塞（例如 `connect_by_ip` 等待网络），
 /// 界面在后台线程调用。
 pub trait AgentApi: Send + Sync {
+    fn layout_profile_command(&self, command: crate::layout_profiles::types::Command) -> ApiResult<serde_json::Value>;
+
     fn device_cards(&self) -> ApiResult<crate::device_cards::DeviceCardsView>;
     fn invoke_device_card_action(
         &self,
@@ -1874,6 +1892,7 @@ pub trait AgentApi: Send + Sync {
         placements: Vec<Placement>,
         affected: Vec<ScreenKey>,
         ended: bool,
+        arrangement: Option<Box<crate::layout_profiles::types::ArrangementSnapshot>>,
     ) -> ApiResult<()>;
 
     // Layout editing delegates to the corresponding layout geometry operations.
@@ -1916,6 +1935,21 @@ pub trait AgentApi: Send + Sync {
     fn set_audio_settings(&self, _settings: PreferencePatch<oink_audio::Settings>) -> ApiResult<()>;
     fn cache_usage(&self, _device: Option<DeviceKey>) -> ApiResult<Vec<CacheDevice>>;
     fn clear_cache(&self, _device: Option<DeviceKey>) -> ApiResult<CacheDeviceClear>;
+    fn received_files_usage(&self) -> ApiResult<ReceivedFilesUsage> {
+        Err(ApiError::Unsupported {
+            message: "received files".into(),
+        })
+    }
+    fn set_received_files_cleanup(&self, _cleanup: ReceivedFilesCleanup) -> ApiResult<()> {
+        Err(ApiError::Unsupported {
+            message: "received files".into(),
+        })
+    }
+    fn open_received_files(&self) -> ApiResult<()> {
+        Err(ApiError::Unsupported {
+            message: "received files".into(),
+        })
+    }
     fn clipboard_settings(&self) -> ApiResult<ClipboardSettings>;
     fn set_clipboard_settings(&self, settings: PreferencePatch<ClipboardSettings>) -> ApiResult<()>;
     /// 最近的同步记录（新的在前，最多 50 条）。
@@ -1987,6 +2021,18 @@ pub trait AgentApi: Send + Sync {
 #[serde(tag = "method", content = "params", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 pub enum Request {
+    LayoutProfiles,
+    CreateLayoutProfile(crate::layout_profiles::types::Create),
+    RenameLayoutProfile(crate::layout_profiles::types::Rename),
+    DeleteLayoutProfile(crate::layout_profiles::types::Delete),
+    LoadLayoutProfile(crate::layout_profiles::types::Load),
+    LayoutProfileOperation(crate::layout_profiles::types::OperationRequest),
+    SetSyncSystemArrangement(crate::layout_profiles::types::SettingRequest),
+    PreviewSystemArrangement(crate::layout_profiles::types::PreviewRequest),
+    CommitArrangement(crate::layout_profiles::types::CommitRequest),
+    ResetArrangement(crate::layout_profiles::types::Mutation),
+    ReplayArrangement(crate::layout_profiles::types::ReplayRequest),
+
     ConnectionQuality,
     AudioQuality,
     DeviceCards,
@@ -2184,6 +2230,8 @@ pub enum Request {
         placements: Vec<Placement>,
         affected: Vec<ScreenKey>,
         ended: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arrangement: Option<Box<crate::layout_profiles::types::ArrangementSnapshot>>,
     },
     PreviewMoveScreen {
         screen: ScreenKey,
@@ -2215,6 +2263,11 @@ pub enum Request {
     ClearCache {
         device: Option<DeviceKey>,
     },
+    ReceivedFilesUsage,
+    SetReceivedFilesCleanup {
+        cleanup: ReceivedFilesCleanup,
+    },
+    OpenReceivedFiles,
     ClipboardSettings,
     SetClipboardSettings {
         settings: PreferencePatch<ClipboardSettings>,
@@ -2274,6 +2327,7 @@ pub enum Request {
 #[serde(untagged)]
 #[allow(clippy::large_enum_variant)]
 pub enum Reply {
+    LayoutProfile(serde_json::Value),
     ConnectionQuality(ConnectionQuality),
     AudioQuality(AudioQuality),
     DeviceCards(crate::device_cards::DeviceCardsView),
@@ -2306,6 +2360,7 @@ pub enum Reply {
     Layout(Layout),
     InputSettings(InputSettings),
     CacheUsage(Vec<CacheDevice>),
+    ReceivedFilesUsage(ReceivedFilesUsage),
     CacheClear(CacheDeviceClear),
     ClipboardSettings(ClipboardSettings),
     ClipboardActivity(Vec<ClipActivity>),
@@ -2334,6 +2389,40 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
     use Request as R;
     let unit = |r: ApiResult<()>| r.map(|()| Reply::Unit);
     match req {
+        R::LayoutProfiles => api
+            .layout_profile_command(crate::layout_profiles::types::Command::Query)
+            .map(Reply::LayoutProfile),
+        R::CreateLayoutProfile(v) => api
+            .layout_profile_command(crate::layout_profiles::types::Command::Create(v))
+            .map(Reply::LayoutProfile),
+        R::RenameLayoutProfile(v) => api
+            .layout_profile_command(crate::layout_profiles::types::Command::Rename(v))
+            .map(Reply::LayoutProfile),
+        R::DeleteLayoutProfile(v) => api
+            .layout_profile_command(crate::layout_profiles::types::Command::Delete(v))
+            .map(Reply::LayoutProfile),
+        R::LoadLayoutProfile(v) => api
+            .layout_profile_command(crate::layout_profiles::types::Command::Load(v))
+            .map(Reply::LayoutProfile),
+        R::LayoutProfileOperation(v) => api
+            .layout_profile_command(crate::layout_profiles::types::Command::Operation(v))
+            .map(Reply::LayoutProfile),
+        R::SetSyncSystemArrangement(v) => api
+            .layout_profile_command(crate::layout_profiles::types::Command::Setting(v))
+            .map(Reply::LayoutProfile),
+        R::PreviewSystemArrangement(v) => api
+            .layout_profile_command(crate::layout_profiles::types::Command::Preview(v))
+            .map(Reply::LayoutProfile),
+        R::ResetArrangement(v) => api
+            .layout_profile_command(crate::layout_profiles::types::Command::Reset(v))
+            .map(Reply::LayoutProfile),
+        R::CommitArrangement(v) => api
+            .layout_profile_command(crate::layout_profiles::types::Command::Commit(v))
+            .map(Reply::LayoutProfile),
+        R::ReplayArrangement(v) => api
+            .layout_profile_command(crate::layout_profiles::types::Command::Replay(v))
+            .map(Reply::LayoutProfile),
+
         R::DeviceCards => api.device_cards().map(Reply::DeviceCards),
         R::InvokeDeviceCardAction { request_id, token } => api
             .invoke_device_card_action(request_id, token)
@@ -2453,7 +2542,8 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
             placements,
             affected,
             ended,
-        } => unit(api.preview_layout_projection(gesture, placements, affected, ended)),
+            arrangement,
+        } => unit(api.preview_layout_projection(gesture, placements, affected, ended, arrangement)),
         R::PreviewMoveScreen { screen, origin } => api.preview_move_screen(screen, origin).map(Reply::GeometryOpt),
         R::PreviewMoveDevice { device, delta } => api.preview_move_device(device, delta).map(Reply::GeometryOpt),
         R::MoveScreen { screen, origin } => api.move_screen(screen, origin).map(Reply::Layout),
@@ -2474,6 +2564,9 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
         R::SetInputSettings { settings } => unit(api.set_input_settings(settings)),
         R::CacheUsage { device } => api.cache_usage(device).map(Reply::CacheUsage),
         R::ClearCache { device } => api.clear_cache(device).map(Reply::CacheClear),
+        R::ReceivedFilesUsage => api.received_files_usage().map(Reply::ReceivedFilesUsage),
+        R::SetReceivedFilesCleanup { cleanup } => unit(api.set_received_files_cleanup(cleanup)),
+        R::OpenReceivedFiles => unit(api.open_received_files()),
         R::ClipboardSettings => api.clipboard_settings().map(Reply::ClipboardSettings),
         R::SetClipboardSettings { settings } => unit(api.set_clipboard_settings(settings)),
         R::ClipboardActivity => api.clipboard_activity().map(Reply::ClipboardActivity),
@@ -2871,6 +2964,7 @@ fn test_input_settings() -> InputSettings {
         accept_contacts: true,
         contacts_injection_available: true,
         mac_scroll_feel: true,
+        forward_injected_input: false,
         emergency_hold_ms: 5000,
         device_gain: 1.,
         scroll: ScrollSettings { speed: 1. },

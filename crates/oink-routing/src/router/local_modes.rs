@@ -34,6 +34,9 @@ impl Router {
     pub fn mouse_local(&self) -> bool {
         self.cfg.settings.mouse_mode == InputMode::Local
     }
+    pub fn mouse_disabled(&self) -> bool {
+        self.cfg.settings.mouse_mode == InputMode::Disabled
+    }
     pub fn keyboard_local(&self) -> bool {
         self.cfg.settings.keyboard_mode == InputMode::Local
     }
@@ -126,7 +129,7 @@ impl Router {
             InputEvent::Key { .. } => SourceInput::Keyboard,
             InputEvent::Scroll { .. } => SourceInput::Scroll,
             InputEvent::Gesture(_) => SourceInput::Gesture,
-            InputEvent::TouchpadSample(_) => SourceInput::Contacts,
+            InputEvent::TouchpadSample(_) | InputEvent::TouchpadBoundary => SourceInput::Contacts,
         };
         let forwarded = self.out[start..].iter().any(|o| {
             matches!(
@@ -166,7 +169,11 @@ impl Router {
             self.retire_source_keyboard();
         }
         if mouse != self.cfg.settings.mouse_mode {
-            self.local_mouse_hidden = false;
+            self.out
+                .push(Output::Status(StatusEvent::MouseDisabled(mouse == InputMode::Disabled)));
+            if mouse != InputMode::Disabled {
+                self.local_mouse_hidden = false;
+            }
             // End only drags controlled by this physical source. A different
             // source's drag hosted on this device remains independent.
             self.dnd_retire_physical_mouse();
@@ -198,7 +205,7 @@ impl Router {
                     } else {
                         self.out.push(Output::SetMode(CaptureMode::Local));
                     }
-                } else {
+                } else if mouse == InputMode::Shared {
                     self.exit_point = self.local_cursor.clone();
                     self.out.push(Output::SetMode(CaptureMode::Remote {
                         park: self.park_point(),

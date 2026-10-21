@@ -126,6 +126,7 @@ impl CaptureStream for Capture {
     }
 }
 trait PlaybackStream: Send {
+    fn set_output_quality_counters(&self, _: Arc<oink_audio::sink::DropoutCounters>) {}
     fn begin_idle_drain(&self) {}
     fn cancel_idle_drain(&self) {}
     fn idle_drained(&self) -> bool {
@@ -146,6 +147,9 @@ trait PlaybackStream: Send {
     fn error(&self) -> Option<String>;
 }
 impl PlaybackStream for oink_audio::sink::Sink {
+    fn set_output_quality_counters(&self, counters: Arc<oink_audio::sink::DropoutCounters>) {
+        self.set_output_quality_counters(counters);
+    }
     fn begin_idle_drain(&self) {
         self.begin_idle_drain();
     }

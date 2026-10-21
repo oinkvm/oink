@@ -56,7 +56,20 @@ fn decode(bytes: &[u8]) -> oink_protocol::v1::Result<Message> {
 struct Harness {
     // Close the ordinary queue before joining injection, including unconsumed DnD fences.
     _main: crate::threads::MainReceiver,
+    _target_outbound: Option<oink_network::link::RecvStream>,
     driver: Driver,
+}
+
+#[test]
+fn external_forwarding_reads_the_latest_local_snapshot_without_restart_or_poll() {
+    let h = Harness::new();
+    assert!(!h.driver.forward_injected_input());
+    for enabled in [true, false, true] {
+        let mut settings = (*h.driver.snapshots.settings.load()).clone();
+        settings.forward_injected_input = enabled;
+        h.driver.snapshots.settings.publish(settings);
+        assert_eq!(h.driver.forward_injected_input(), enabled);
+    }
 }
 fn input_scope(driver: &Driver) -> oink_routing::control::FocusScope {
     let Some(ControlMsg::FocusState {
@@ -174,7 +187,11 @@ impl Harness {
         let notices = super::super::super::notices::Notices::new();
         let mut driver = Driver::new(boot, snapshots, inject, main, shared, notices, done);
         driver.set_wake(Arc::new(|| {}));
-        Self { driver, _main: recv }
+        Self {
+            driver,
+            _main: recv,
+            _target_outbound: None,
+        }
     }
     fn outbound(&mut self, ordinal: u32) -> (oink_network::link::RecvStream, oink_network::link::DatagramRecv) {
         let (input, read) = reliable_pair(LinkId(1), tag(ordinal), QueueSpec::reliable(StreamKind::Input).0);
@@ -200,6 +217,11 @@ impl Harness {
             peer_os: Os::Windows,
         });
         (write, motion)
+    }
+    fn settle_clip_check(&mut self) {
+        if self.driver.adapter.router().system_clip_recheck_pending() {
+            self.poll();
+        }
     }
     fn poll(&mut self) {
         self.driver.poll(Instant::now());
@@ -1269,6 +1291,7 @@ fn config_geometry_and_input_pair_availability_commute() {
                     time_us: 0,
                     cursor: Some(Point::new(999., 500.)),
                 });
+                h.settle_clip_check();
                 if h.driver.adapter.router().focus().holder == peer() {
                     break;
                 }
@@ -1462,15 +1485,14 @@ fn keyboard_guard_releases_old_keys_when_active_and_detaches_during_full_pause()
     assert!(h.driver.adapter.router().next_deadline().is_none());
     h.driver.command(InputCommand::SessionLocked(Some(true)));
     assert!(h.driver.adapter.router().keyboard_disabled());
-    assert_eq!(
-        h.driver.keyboard_guard_suspended(),
-        h.driver.adapter.router().config().os == Os::Windows
-    );
+    assert!(!h.driver.keyboard_guard_suspended());
     h.driver.command(InputCommand::SessionLocked(Some(false)));
     assert!(h.driver.adapter.router().keyboard_disabled());
     assert!(!h.driver.keyboard_guard_suspended());
     h.driver.command(InputCommand::Paused(true));
     assert!(!h.driver.capture_requested());
+    assert!(!h.driver.keyboard_disabled());
+    assert!(h.driver.adapter.router().keyboard_disabled());
 }
 
 #[test]
@@ -2345,4 +2367,538 @@ fn negative_display_entry_with_visible_blank_glyph_never_counts_as_capture() {
         });
     }
     assert!(h.driver.adapter.router().game_mode().active);
+}
+
+#[test]
+fn cursor_clip_queries_on_remote_decision_and_release_without_waiting_for_poll() {
+    use oink_foundation::{Point, Rect};
+    let backend = Arc::new(oink_test_support::input::FakeInput::new());
+    let mut h = Harness::with_backend(backend.clone());
+    let mut config = h.driver.adapter.router().config().clone();
+    config.os = Os::Windows;
+    let mut router = Router::new(config, Arc::new(h.driver.layout.topology.clone()));
+    router.set_local_displays(vec![fixture_display()]);
+    router.set_game_mode(oink_routing::GameMode::Off);
+    h.driver.adapter = Adapter::new(router);
+    let (_reader, _datagrams) = h.outbound(1);
+    let (writer, _motion) = h.inbound(1);
+    opening(&writer, &remote(), true);
+    h.attach();
+    let clip = Rect::new(200., 100., 200., 200.);
+    backend.set_system_clip(Some(clip));
+    h.driver.message(
+        peer(),
+        Message::Control(ControlMsg::FocusEnter {
+            epoch: 2,
+            display: "screen".into(),
+            pos: Point::new(900., 400.),
+            scope: Some(input_scope(&h.driver)),
+            pointer_source: Some(peer()),
+        }),
+    );
+    assert_eq!(h.driver.adapter.router().local_pointer(), Some(Point::new(399., 299.)));
+    let reads = backend.system_clip_reads();
+    h.driver.clip_poll_at = Instant::now() + Duration::from_secs(100);
+    h.driver.message(
+        peer(),
+        Message::Input(InputMsg::Motion {
+            seq: 1,
+            dx: 10.,
+            dy: 0.,
+        }),
+    );
+    target_cursor_complete_native_read(&mut h);
+    assert_eq!(backend.system_clip_reads(), reads + 1);
+    assert_eq!(h.driver.adapter.router().system_cursor_clip_status().0, Some(clip));
+    backend.fail_system_clip();
+    h.driver.message(
+        peer(),
+        Message::Input(InputMsg::Motion {
+            seq: 2,
+            dx: 10.,
+            dy: 0.,
+        }),
+    );
+    target_cursor_complete_native_read(&mut h);
+    assert_eq!(h.driver.adapter.router().system_cursor_clip_status().0, Some(clip));
+    backend.set_system_clip(None);
+    h.driver.message(
+        peer(),
+        Message::Input(InputMsg::Motion {
+            seq: 3,
+            dx: 10.,
+            dy: 0.,
+        }),
+    );
+    target_cursor_complete_native_read(&mut h);
+    assert_eq!(h.driver.adapter.router().system_cursor_clip_status().0, None);
+    assert_eq!(
+        h.driver.adapter.router().focus().holder,
+        peer(),
+        "release permits the very next crossing"
+    );
+    // A native callback may consume the cache but never perform the OS query.
+    let reads = backend.system_clip_reads();
+    h.driver.event(&CapturedEvent {
+        physical: true,
+        time_us: 1,
+        source: oink_foundation::input::SourceKind::Mouse,
+        cursor: Some(Point::new(500., 300.)),
+        event: oink_foundation::input::InputEvent::PointerDelta { dx: 1., dy: 0. },
+    });
+    assert_eq!(backend.system_clip_reads(), reads);
+}
+
+#[test]
+fn cursor_clip_refresh_classifies_all_motion_carriers() {
+    let input = InputMsg::Forwarded {
+        origin: fixture_boot(peer()),
+        hops: 1,
+        msg: Box::new(InputMsg::Motion { seq: 1, dx: 2., dy: 3. }),
+    };
+    assert!(clip_decision(&Message::Input(input.clone())));
+    assert!(clip_decision(&Message::TimedInput {
+        time: CaptureTime(1),
+        input
+    }));
+    assert!(clip_decision(&Message::Input(InputMsg::RelativeMotion {
+        epoch: 1,
+        generation: 1,
+        seq: 1,
+        x: 1.,
+        y: 2.
+    })));
+    assert!(!clip_decision(&Message::Control(ControlMsg::UserActivity)));
+}
+
+#[test]
+fn cursor_clip_local_callback_defers_native_query_and_retries_without_spinning() {
+    use oink_foundation::{
+        Point, Rect,
+        input::{InputEvent, SourceKind},
+    };
+    let backend = Arc::new(oink_test_support::input::FakeInput::new());
+    let mut h = Harness::with_backend(backend.clone());
+    h.poll();
+    let mut config = h.driver.adapter.router().config().clone();
+    config.os = Os::Windows;
+    let mut router = Router::new(config, Arc::new(h.driver.layout.topology.clone()));
+    router.set_local_displays(vec![fixture_display()]);
+    router.set_cursor(Point::new(999., 300.));
+    router.enable_system_clip_recheck(true);
+    h.driver.adapter = Adapter::new(router);
+    let reads = backend.system_clip_reads();
+    h.driver.event(&CapturedEvent {
+        physical: true,
+        time_us: 1,
+        source: SourceKind::Mouse,
+        cursor: Some(Point::new(999., 300.)),
+        event: InputEvent::PointerDelta { dx: 3., dy: 0. },
+    });
+    assert_eq!(
+        backend.system_clip_reads(),
+        reads,
+        "low-level event must not query ClipCursor"
+    );
+    assert!(h.driver.adapter.router().system_clip_recheck_pending());
+    backend.fail_system_clip();
+    h.driver.refresh_system_cursor_clip();
+    assert!(h.driver.adapter.router().system_clip_recheck_pending());
+    assert!(h.driver.input_deadline().unwrap() > h.driver.now);
+    backend.set_system_clip(Some(Rect::new(200., 100., 400., 300.)));
+    h.driver.refresh_system_cursor_clip();
+    assert_eq!(backend.system_clip_reads(), reads + 2);
+    assert!(!h.driver.adapter.router().system_clip_recheck_pending());
+    assert_eq!(h.driver.adapter.router().local_pointer(), Some(Point::new(599., 300.)));
+}
+
+// Driver integration tests below use native FIFO completions with a fake
+// backend; they neither invoke OS APIs nor claim desktop acceptance.
+fn target_cursor_fixture() -> (
+    Harness,
+    Arc<oink_test_support::input::FakeInput>,
+    oink_network::link::SendStream,
+) {
+    let backend = Arc::new(oink_test_support::input::FakeInput::new());
+    let mut h = Harness::with_backend(backend.clone());
+    h.driver.command(InputCommand::LocalDisplays(vec![fixture_display()]));
+    h.driver.adapter.router_mut().set_game_mode(GameMode::Off);
+    let (reader, _) = h.outbound(1);
+    h._target_outbound = Some(reader);
+    let (writer, _) = h.inbound(1);
+    opening(&writer, &remote(), true);
+    h.attach();
+    h.driver.message(
+        peer(),
+        Message::Control(ControlMsg::FocusEnter {
+            epoch: 2,
+            display: "screen".into(),
+            pos: oink_foundation::Point::new(100., 100.),
+            scope: Some(input_scope(&h.driver)),
+            pointer_source: Some(peer()),
+        }),
+    );
+    h.driver
+        .inject
+        .read_cursor(0)
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    backend.take_injected();
+    (h, backend, writer)
+}
+fn target_cursor_step(h: &Harness) -> f64 {
+    use oink_routing::LayoutQuery;
+    let screen = h.driver.adapter.router().focus().pointer.unwrap().screen;
+    let layout = &h.driver.layout.topology;
+    0.001 * layout.remote_pointer_gain(&screen, peer()) / layout.reference_per_native_unit(&screen).unwrap()
+}
+fn target_cursor_move(h: &mut Harness, seq: u64) {
+    h.driver
+        .message(peer(), Message::Input(InputMsg::Motion { seq, dx: 0.001, dy: 0. }));
+    assert!(h.driver.cursor.pending.is_some());
+}
+fn target_cursor_replace_read(h: &mut Harness) -> mpsc::SyncSender<crate::threads::inject::cursor::Snapshot> {
+    let (tx, rx) = mpsc::sync_channel(1);
+    h.driver.cursor.pending.as_mut().unwrap().read = rx;
+    tx
+}
+fn target_cursor_sample(h: &Harness, x: f64) -> crate::threads::inject::cursor::Snapshot {
+    crate::threads::inject::cursor::Snapshot {
+        observation: oink_input::cursor_reconciliation::Observation {
+            scope: h.driver.cursor.pending.as_ref().unwrap().scope,
+            sequence: 99,
+            position: Some(oink_foundation::Point::new(x, 100.)),
+            expected: None,
+        },
+        clip: Some(None),
+        read_us: 1,
+    }
+}
+#[test]
+fn source_press_discard_cannot_advance_virtual_motion_even_if_readback_times_out() {
+    use oink_input::InputBackend;
+    // The real SourceStart gate blocks the fake native worker deterministically.
+    for carrier in 0..5 {
+        let pending_before_press = carrier == 0;
+        let (mut h, backend, _) = target_cursor_fixture();
+        let initial = h.driver.adapter.router().local_pointer().unwrap();
+        if pending_before_press {
+            target_cursor_move(&mut h, 1);
+        }
+        let start = h.driver.inject.source_start();
+        let (entered, active) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            start(&mut || {
+                entered.send(()).unwrap();
+                held.recv().unwrap();
+            })
+            .unwrap()
+        });
+        active.recv_timeout(Duration::from_secs(2)).unwrap();
+        if !pending_before_press {
+            let input = if carrier >= 3 {
+                InputMsg::RelativeMotion {
+                    epoch: 1,
+                    generation: 1,
+                    seq: 1,
+                    x: 2.,
+                    y: 0.,
+                }
+            } else {
+                InputMsg::Motion {
+                    seq: 1,
+                    dx: 0.001,
+                    dy: 0.,
+                }
+            };
+            let message = if carrier == 2 || carrier == 4 {
+                Message::TimedInput {
+                    time: CaptureTime(1),
+                    input: InputMsg::Forwarded {
+                        origin: fixture_boot(peer()),
+                        hops: 1,
+                        msg: Box::new(input),
+                    },
+                }
+            } else {
+                Message::Input(input)
+            };
+            h.driver.message(peer(), message);
+        }
+        if let Some(pending) = h.driver.cursor.pending.as_ref() {
+            h.driver.now = pending.at + cursor::MAX_WAIT;
+            h.driver.cursor_resume();
+        }
+        let virtual_during = h.driver.adapter.router().local_pointer();
+        let physical_during = backend.cursor_position().unwrap();
+        release.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), 1);
+        assert_eq!(physical_during, initial);
+        assert_eq!(
+            virtual_during,
+            Some(initial),
+            "discard before Router advances, not only before native injection"
+        );
+        h.driver
+            .inject
+            .read_cursor(0)
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        // Lose the next readback: no discarded delta may remain in prediction.
+        target_cursor_move(&mut h, 2);
+        h.driver.now = h.driver.cursor.pending.as_ref().unwrap().at + cursor::MAX_WAIT;
+        h.driver.cursor_resume();
+        assert!(
+            (h.driver.adapter.router().local_pointer().unwrap().x - initial.x - target_cursor_step(&h)).abs() < 1e-9
+        );
+    }
+}
+
+#[test]
+fn target_cursor_sync_normal_sample_should_rebase_router() {
+    let (mut h, backend, _) = target_cursor_fixture();
+    backend.set_cursor(oink_foundation::Point::new(400., 100.));
+    target_cursor_move(&mut h, 1);
+    let tx = target_cursor_replace_read(&mut h);
+    tx.send(target_cursor_sample(&h, 400.)).unwrap();
+    h.driver.cursor_resume();
+    let p = h.driver.adapter.router().local_pointer().unwrap();
+    assert!(p.x > 400. && p.x < 410., "{p:?}");
+    assert!(h.driver.cursor.pending.is_none());
+}
+#[test]
+fn target_cursor_timeout_preserves_prediction_and_button_order() {
+    use oink_foundation::input::MouseButton;
+    let (mut h, backend, writer) = target_cursor_fixture();
+    target_cursor_move(&mut h, 1);
+    let _delayed = target_cursor_replace_read(&mut h);
+    writer
+        .post(
+            encode(&Message::Input(InputMsg::Button {
+                button: MouseButton::Left,
+                pressed: true,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(!h.driver.read(), "button must remain behind pending motion");
+    let at = h.driver.cursor.pending.as_ref().unwrap().at;
+    h.driver.now = at + Duration::from_millis(3);
+    h.driver.cursor_resume();
+    assert!(h.driver.cursor.pending.is_none(), "readback has a hard 3 ms bound");
+    let p = h.driver.adapter.router().local_pointer().unwrap();
+    assert!(p.x > 100. && p.x < 110., "{p:?}");
+    assert!(h.driver.read());
+    h.driver
+        .inject
+        .read_cursor(0)
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    let events = backend.take_injected();
+    let movement = events
+        .iter()
+        .position(|e| matches!(e, InjectEvent::MoveTo { .. } | InjectEvent::MoveToWithDelta { .. }))
+        .unwrap();
+    let button = events
+        .iter()
+        .position(|e| matches!(e, InjectEvent::Button { pressed: true, .. }))
+        .unwrap();
+    assert!(movement < button);
+}
+#[test]
+fn target_cursor_late_read_cannot_replay_sent_motion_and_next_batch_revalidates() {
+    let (mut h, _, _) = target_cursor_fixture();
+    target_cursor_move(&mut h, 1);
+    let delayed = target_cursor_replace_read(&mut h);
+    let old_sample = target_cursor_sample(&h, 400.);
+    h.driver.now = h.driver.cursor.pending.as_ref().unwrap().at + Duration::from_millis(3);
+    h.driver.cursor_resume();
+    let sent = h.driver.adapter.router().local_pointer();
+    delayed.send(old_sample).unwrap();
+    h.driver.cursor_resume();
+    assert_eq!(h.driver.adapter.router().local_pointer(), sent);
+    target_cursor_move(&mut h, 2);
+    let fresh = target_cursor_replace_read(&mut h);
+    fresh.send(target_cursor_sample(&h, 500.)).unwrap();
+    h.driver.cursor_resume();
+    let p = h.driver.adapter.router().local_pointer().unwrap();
+    assert!(
+        p.x > 500. && p.x < 510.,
+        "new FIFO sample, never the pre-timeout 400: {p:?}"
+    );
+}
+
+fn target_cursor_complete_native_read(h: &mut Harness) {
+    let sample = h
+        .driver
+        .cursor
+        .pending
+        .as_ref()
+        .unwrap()
+        .read
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    let tx = target_cursor_replace_read(h);
+    tx.send(sample).unwrap();
+    h.driver.cursor_resume();
+}
+#[test]
+fn target_cursor_native_fifo_rebases_first_move_and_never_replays_accepted_delta() {
+    let (mut h, backend, _) = target_cursor_fixture();
+    for (seq, x) in [(1, 400.), (2, 500.)] {
+        backend.set_cursor(oink_foundation::Point::new(x, 100.));
+        target_cursor_move(&mut h, seq);
+        target_cursor_complete_native_read(&mut h);
+        h.driver
+            .inject
+            .read_cursor(0)
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let moves: Vec<_> = backend
+            .take_injected()
+            .into_iter()
+            .filter_map(|e| e.move_target())
+            .collect();
+        assert_eq!(moves.len(), 1, "one raw delta has one native submission");
+        assert!((moves[0].x - (x + target_cursor_step(&h))).abs() < 1e-9, "{moves:?}");
+    }
+}
+#[test]
+fn target_cursor_failed_and_invalid_reads_continue_prediction_without_pause() {
+    for point in [
+        None,
+        Some(oink_foundation::Point::new(f64::NAN, 100.)),
+        Some(oink_foundation::Point::new(-900., 100.)),
+    ] {
+        let (mut h, _, _) = target_cursor_fixture();
+        target_cursor_move(&mut h, 1);
+        let tx = target_cursor_replace_read(&mut h);
+        let mut sample = target_cursor_sample(&h, 400.);
+        sample.observation.position = point;
+        tx.send(sample).unwrap();
+        h.driver.cursor_resume();
+        assert!(!h.driver.paused);
+        assert!(!h.driver.adapter.router().paused());
+        assert!((h.driver.adapter.router().local_pointer().unwrap().x - (100. + target_cursor_step(&h))).abs() < 1e-9);
+    }
+}
+#[test]
+fn target_cursor_local_revision_requires_fresh_read_without_consuming_delta_twice() {
+    let (mut h, _, _) = target_cursor_fixture();
+    target_cursor_move(&mut h, 1);
+    let tx = target_cursor_replace_read(&mut h);
+    tx.send(target_cursor_sample(&h, 400.)).unwrap();
+    h.driver
+        .adapter
+        .router_mut()
+        .set_cursor(oink_foundation::Point::new(300., 100.));
+    h.driver.cursor.revision += 1;
+    h.driver.cursor_resume();
+    assert_eq!(h.driver.adapter.router().local_pointer().unwrap().x, 300.);
+    assert!(h.driver.cursor.pending.is_some());
+    let fresh = target_cursor_replace_read(&mut h);
+    fresh.send(target_cursor_sample(&h, 300.)).unwrap();
+    h.driver.cursor_resume();
+    assert!((h.driver.adapter.router().local_pointer().unwrap().x - (300. + target_cursor_step(&h))).abs() < 1e-9);
+}
+#[test]
+fn target_cursor_game_roundtrip_discards_old_batch_even_with_same_focus() {
+    let (mut h, _, _) = target_cursor_fixture();
+    target_cursor_move(&mut h, 1);
+    let tx = target_cursor_replace_read(&mut h);
+    tx.send(target_cursor_sample(&h, 400.)).unwrap();
+    let focus = h.driver.adapter.router().focus();
+    h.driver.command(InputCommand::GameMode(GameMode::On));
+    h.driver.command(InputCommand::GameMode(GameMode::Off));
+    h.driver.cursor_resume();
+    assert!(h.driver.cursor.pending.is_none());
+    assert_eq!(h.driver.adapter.router().focus(), focus);
+    target_cursor_move(&mut h, 2);
+    let tx = target_cursor_replace_read(&mut h);
+    tx.send(target_cursor_sample(&h, 500.)).unwrap();
+    h.driver.cursor_resume();
+    assert!((h.driver.adapter.router().local_pointer().unwrap().x - (500. + target_cursor_step(&h))).abs() < 1e-9);
+}
+#[test]
+fn target_cursor_own_lag_wait_preserves_fractional_prediction_when_commit_arrives() {
+    let (mut h, _, _) = target_cursor_fixture();
+    h.driver
+        .adapter
+        .router_mut()
+        .set_cursor(oink_foundation::Point::new(110.25, 100.));
+    target_cursor_move(&mut h, 1);
+    let mut sample = target_cursor_sample(&h, 100.);
+    sample.observation.expected = Some(oink_input::cursor_reconciliation::Expected {
+        scope: sample.observation.scope,
+        sequence: sample.observation.sequence,
+        before: Some(oink_foundation::Point::new(100., 100.)),
+        target: oink_foundation::Point::new(110., 100.),
+        tolerance: 0.,
+    });
+    target_cursor_replace_read(&mut h).send(sample).unwrap();
+    h.driver.cursor_resume();
+    assert_eq!(h.driver.adapter.router().local_pointer().unwrap().x, 110.25);
+    let due = h.driver.cursor.pending.as_ref().unwrap().retry.unwrap();
+    h.driver.now = due;
+    // First resume enqueues the next native read; replace it with a controlled
+    // post-commit completion. No simulated receipt is treated as OS evidence.
+    h.driver.cursor_resume();
+    sample.observation.position = Some(oink_foundation::Point::new(110., 100.));
+    target_cursor_replace_read(&mut h).send(sample).unwrap();
+    h.driver.cursor_resume();
+    assert!((h.driver.adapter.router().local_pointer().unwrap().x - (110.25 + target_cursor_step(&h))).abs() < 1e-9);
+}
+#[test]
+fn target_cursor_no_reconciliation_for_game_relative_motion() {
+    let (mut h, _, _) = target_cursor_fixture();
+    h.driver.command(InputCommand::GameMode(GameMode::On));
+    h.driver
+        .message(peer(), Message::Input(InputMsg::Motion { seq: 1, dx: 1., dy: 0. }));
+    assert!(h.driver.cursor.pending.is_none());
+    assert!(!cursor::motion(&Message::Input(InputMsg::RelativeMotion {
+        epoch: 2,
+        generation: 1,
+        seq: 1,
+        x: 1.,
+        y: 0.
+    })));
+}
+
+#[test]
+fn target_cursor_actual_edge_drives_handoff_instead_of_the_old_interior_prediction() {
+    let (mut h, _, _) = target_cursor_fixture();
+    h.driver.message(
+        peer(),
+        Message::Input(InputMsg::Motion {
+            seq: 1,
+            dx: 0.05,
+            dy: 0.,
+        }),
+    );
+    let tx = target_cursor_replace_read(&mut h);
+    tx.send(target_cursor_sample(&h, 999.)).unwrap();
+    h.driver.cursor_resume();
+    assert_eq!(h.driver.adapter.router().focus().holder, peer());
+    assert!(h.driver.cursor.pending.is_none());
+}
+#[cfg(windows)]
+#[test]
+fn target_cursor_clip_touching_actual_edge_blocks_handoff_after_rebase() {
+    let (mut h, _, _) = target_cursor_fixture();
+    h.driver.message(
+        peer(),
+        Message::Input(InputMsg::Motion {
+            seq: 1,
+            dx: 0.05,
+            dy: 0.,
+        }),
+    );
+    let tx = target_cursor_replace_read(&mut h);
+    let mut sample = target_cursor_sample(&h, 999.);
+    sample.clip = Some(Some(oink_foundation::Rect::new(200., 50., 800., 200.)));
+    tx.send(sample).unwrap();
+    h.driver.cursor_resume();
+    assert_eq!(h.driver.adapter.router().focus().holder, h.driver.local);
+    assert_eq!(h.driver.adapter.router().local_pointer().unwrap().x, 999.);
 }

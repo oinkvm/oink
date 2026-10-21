@@ -198,6 +198,8 @@ struct Catalog {
     records: Vec<Record>,
     batch: Option<crate::store::BatchId>,
     urls: Vec<PathBuf>,
+    #[serde(default)]
+    received_at: Option<u64>,
 }
 struct CatalogState {
     catalog: Catalog,
@@ -974,6 +976,7 @@ fn retire_publication(bridge: &Bridge, key: &str, batch: &Arc<Batch>) {
 /// when the corresponding delivery expires, even if a native URL owner survives.
 pub(crate) fn retire_unavailable(data: &std::path::Path, now: u64) {
     let Some(Ok(bridge)) = BRIDGE.get() else { return };
+    let _ = received_usage(true);
     retire_unavailable_in(bridge, data, now);
 }
 
@@ -985,12 +988,79 @@ fn retire_unavailable_in(bridge: &Bridge, data: &std::path::Path, now: u64) {
         .iter()
         .filter_map(|(key, batch)| {
             let id = batch.state.lock().unwrap().catalog.batch?;
-            (!crate::store::publication_available(data, id, now)).then(|| (key.clone(), batch.clone()))
+            let all_deleted = (|| -> Option<bool> {
+                let overlay: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(batch.catalog.with_extension("received")).ok()?).ok()?;
+                let state = batch.state.lock().unwrap();
+                let leaves: Vec<_> = state.catalog.records.iter().filter(|r| !r.directory).collect();
+                Some(if leaves.is_empty() {
+                    !state.catalog.records.is_empty()
+                        && state.catalog.records.iter().all(|r| overlay[&r.id]["deleted"] == true)
+                } else {
+                    leaves.iter().all(|r| overlay[&r.id]["deleted"] == true)
+                })
+            })()
+            .unwrap_or(false);
+            (all_deleted || !crate::store::publication_available(data, id, now)).then(|| (key.clone(), batch.clone()))
         })
         .collect();
     for (key, batch) in unavailable {
         retire_publication(bridge, &key, &batch);
     }
+}
+/// A trashed device folder keeps its identity and children. A later delivery
+/// creates a fresh active folder, rather than silently restoring the user's trash.
+fn received_source_catalog(
+    root: &std::path::Path,
+    origin: oink_foundation::DeviceId,
+    name: String,
+) -> io::Result<String> {
+    let base = format!("source{}", origin.to_hex());
+    let path = root.join(format!("{base}.json"));
+    let mut catalog: Catalog = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Catalog {
+            schema: 1,
+            token: String::new(),
+            port: 0,
+            records: Vec::new(),
+            batch: None,
+            urls: Vec::new(),
+            received_at: None,
+        },
+        Err(e) => return Err(e),
+    };
+    for record in catalog.records.iter().rev() {
+        let overlay: serde_json::Value = match std::fs::read(root.join(format!("{}.received", record.id))) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => serde_json::Value::Null,
+            Err(e) => return Err(e),
+        };
+        let entry = &overlay[&record.id];
+        let parent = entry["record"]["parent"].as_str().unwrap_or(&record.parent);
+        if entry["deleted"] != true && parent == "NSFileProviderRootContainerItemIdentifier" {
+            return Ok(record.id.clone());
+        }
+    }
+    let id = if catalog.records.is_empty() {
+        base
+    } else {
+        format!("{base}g{}", random()?)
+    };
+    catalog.records.push(Record {
+        id: id.clone(),
+        parent: "NSFileProviderRootContainerItemIdentifier".into(),
+        name,
+        directory: true,
+        size: None,
+        modified: None,
+        node: None,
+        version: 1,
+        children: None,
+        hidden: None,
+    });
+    save_catalog(&path, &catalog)?;
+    Ok(id)
 }
 fn prepare_batch(
     contents: Arc<dyn Namespace>,
@@ -999,12 +1069,52 @@ fn prepare_batch(
     port: u16,
     catalog: PathBuf,
 ) -> io::Result<(Arc<Batch>, Vec<FileEntry>)> {
+    prepare_batch_with_root(contents, id, token, port, catalog, None)
+}
+fn prepare_batch_with_root(
+    contents: Arc<dyn Namespace>,
+    id: &str,
+    token: String,
+    port: u16,
+    catalog: PathBuf,
+    previous_root: Option<&Record>,
+) -> io::Result<(Arc<Batch>, Vec<FileEntry>)> {
     let roots = contents.roots();
+    let received_at = contents.origin().map(|_| crate::received::now());
+    let mut source_parent = "NSFileProviderRootContainerItemIdentifier".to_owned();
+    let mut delivery_name = id.to_owned();
+    if let Some(previous) = previous_root {
+        source_parent = previous.parent.clone();
+        delivery_name = previous.name.clone();
+    } else if let Some(origin) = contents.origin() {
+        let root = catalog.parent().ok_or(io::ErrorKind::InvalidInput)?;
+        let name = crate::received::source_folder(root, origin, &crate::received::source_name(origin))?;
+        source_parent = received_source_catalog(root, origin, name)?;
+        delivery_name = crate::received::local_stamp();
+        let existing: Vec<Catalog> = std::fs::read_dir(root)?
+            .flatten()
+            .filter_map(|e| {
+                std::fs::read(e.path())
+                    .ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok())
+            })
+            .collect();
+        let base = delivery_name.clone();
+        let mut suffix = 2;
+        while existing.iter().any(|c| {
+            c.records
+                .iter()
+                .any(|r| r.parent == source_parent && r.name == delivery_name && r.id != format!("{id}-root"))
+        }) {
+            delivery_name = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+    }
     let mut names = Names::new(crate::sync::files::TargetOs::MacOs);
     let mut records = vec![Record {
         id: format!("{id}-root"),
-        parent: "NSFileProviderRootContainerItemIdentifier".into(),
-        name: id.into(),
+        parent: source_parent,
+        name: delivery_name,
         directory: true,
         size: None,
         modified: None,
@@ -1032,6 +1142,7 @@ fn prepare_batch(
                     records,
                     batch: local_batch,
                     urls: Vec::new(),
+                    received_at,
                 },
                 names,
                 aliases: HashMap::new(),
@@ -1053,10 +1164,22 @@ fn restore_catalog(data: &std::path::Path, path: &std::path::Path, key: &str, po
     let id = previous.batch.ok_or(io::ErrorKind::InvalidData)?;
     let local = crate::content::Completed::restore(data, id)?;
     let token = random()?;
-    let (batch, _) = prepare_batch(Arc::new(local.clone()), key, token, port, path.to_owned())?;
+    let (batch, _) = prepare_batch_with_root(
+        Arc::new(local.clone()),
+        key,
+        token,
+        port,
+        path.to_owned(),
+        previous.records.first(),
+    )?;
+    batch.state.lock().unwrap().catalog.received_at = previous.received_at;
     {
         let mut state = batch.state.lock().unwrap();
         placeholders::restore_bindings(key, &previous, &mut state)?;
+        if let (Some(old), Some(new)) = (previous.records.first(), state.catalog.records.first_mut()) {
+            new.parent = old.parent.clone();
+            new.name = old.name.clone();
+        }
         for node in local.nodes().iter().filter(|n| n.parent.is_some()) {
             let CatalogState { names, aliases, .. } = &mut *state;
             let record = node_record_with_aliases(key, node, names, aliases)?;
@@ -1531,9 +1654,98 @@ fn remove_catalog(path: &std::path::Path) {
     let Some(root) = CONTAINER.get() else { return };
     remove_catalog_in(root, path);
 }
+fn received_catalog_protected(path: &std::path::Path) -> bool {
+    if path.extension().is_some_and(|e| e == "json") {
+        match std::fs::read(path).map(|b| serde_json::from_slice::<Catalog>(&b)) {
+            Ok(Ok(catalog)) if catalog.received_at.is_none() => return false, // legacy layouts expire
+            Ok(Err(_)) => return true, // uncertain metadata must not delete an adopted item
+            _ => {}
+        }
+    }
+    let sidecar = path.with_extension("received");
+    match std::fs::read(sidecar) {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .is_none_or(|entries| {
+                entries.values().any(|v| {
+                    v["deleted"] != true
+                        && (v["handed_off"] == true
+                            || v["materialized"] == true
+                            || v["fetching"].as_u64().unwrap_or(0) > 0)
+                })
+            }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Catalog>(&b).ok())
+            .is_some_and(|c| c.received_at.is_some() && c.records.iter().any(|r| !r.directory && r.size == Some(0))),
+        Err(_) => true,
+    }
+}
+pub fn received_usage(maintain: bool) -> io::Result<crate::received::Usage> {
+    let value = manager(
+        &[
+            if maintain {
+                "received-maintain"
+            } else {
+                "received-usage"
+            },
+            &crate::received::setting().days().to_string(),
+        ],
+        Instant::now() + MANAGER_TIMEOUT,
+    )
+    .map_err(io::Error::other)?;
+    let mut usage: crate::received::Usage = serde_json::from_str(&value)?;
+    usage.cleanup = crate::received::setting();
+    Ok(usage)
+}
+pub fn open_received() -> io::Result<()> {
+    manager(&["open-received"], Instant::now() + MANAGER_TIMEOUT)
+        .map(|_| ())
+        .map_err(io::Error::other)
+}
 fn remove_catalog_in(root: &std::path::Path, path: &std::path::Path) {
     assert_eq!(path.parent(), Some(root), "catalog removal escaped Oink storage");
     if std::fs::symlink_metadata(root).is_ok_and(|m| !crate::cache::is_link(&m)) {
+        if received_catalog_protected(path) {
+            // Only retained children and their ancestor chain survive detachment;
+            // never-read siblings lose their expired backing and disappear.
+            let retained = (|| -> io::Result<()> {
+                let mut catalog: Catalog = serde_json::from_slice(&std::fs::read(path)?)?;
+                let overlay: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(path.with_extension("received"))?)?;
+                let mut keep: std::collections::HashSet<String> = overlay
+                    .as_object()
+                    .ok_or(io::ErrorKind::InvalidData)?
+                    .iter()
+                    .filter(|(_, v)| {
+                        v["deleted"] != true
+                            && (v["handed_off"] == true
+                                || v["materialized"] == true
+                                || v["fetching"].as_u64().unwrap_or(0) > 0)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                let mut previous = 0;
+                while previous != keep.len() {
+                    previous = keep.len();
+                    for record in &catalog.records {
+                        if keep.contains(&record.id) {
+                            keep.insert(record.parent.clone());
+                        }
+                    }
+                }
+                catalog.records.retain(|r| keep.contains(&r.id));
+                save_catalog(path, &catalog)
+            })();
+            if retained.is_err() {
+                tracing::warn!(
+                    reason = "received_catalog_detach",
+                    "received files conservatively retained"
+                );
+            }
+            return;
+        }
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(path.with_extension("enumerated"));
         crate::cache::changed(root);
@@ -1668,6 +1880,9 @@ pub fn cache_usage(clear: bool) -> (Vec<crate::cache::CacheSize>, u64, bool, Vec
                     continue;
                 }
                 let path = entry.path();
+                if received_cache_excluded(&path) {
+                    continue;
+                }
                 let n = match crate::cache::tree_bytes(&path) {
                     Ok(n) => n,
                     Err(_) => {
@@ -1740,10 +1955,19 @@ pub fn is_cache_root(root: &std::path::Path) -> bool {
     CONTAINER.get().is_some_and(|r| r == root)
 }
 
+fn received_cache_excluded(path: &std::path::Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e == "received" || e == "sources" || e == "lock")
+        || path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.starts_with("source") && s.len() == 70)
+        || received_catalog_protected(path)
+}
 fn catalog_bytes(root: &std::path::Path) -> io::Result<u64> {
     std::fs::read_dir(root)?.try_fold(0u64, |sum, e| {
         let e = e?;
-        if e.file_name() == "temporary" {
+        if e.file_name() == "temporary" || received_cache_excluded(&e.path()) {
             Ok(sum)
         } else {
             Ok(sum.saturating_add(crate::cache::tree_bytes(&e.path())?))
@@ -1911,6 +2135,80 @@ mod tests {
         retire_catalog(&batch, &|| remove_catalog_in(root.path(), &path));
         assert!(!path.exists());
         retained_reader.state.lock().unwrap().persist(&path).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_new_delivery_does_not_restore_a_trashed_source_folder_or_move_its_old_batches() {
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let owned = crate::content::Completed::test_single_file(data.path());
+        let local = crate::content::Completed::restore(data.path(), owned.id()).unwrap();
+        let first_path = root.path().join("first.json");
+        let (first, _) = prepare_batch(Arc::new(local.clone()), "first", "a".into(), 1, first_path.clone()).unwrap();
+        let first_catalog = first.state.lock().unwrap().catalog.clone();
+        save_catalog(&first_path, &first_catalog).unwrap();
+        let old_parent = first_catalog.records[0].parent.clone();
+        let source_path = root.path().join(format!("{old_parent}.json"));
+        let mut source: Catalog = serde_json::from_slice(&std::fs::read(&source_path).unwrap()).unwrap();
+        source.records[0].parent = "NSFileProviderTrashContainerItemIdentifier".into();
+        std::fs::write(root.path().join(format!("{old_parent}.received")),serde_json::to_vec(&serde_json::json!({&old_parent:{"record":source.records[0],"received_at":1,"handed_off":false,"materialized":false,"deleted":false}})).unwrap()).unwrap();
+        let (next, _) = prepare_batch(Arc::new(local), "next", "b".into(), 2, root.path().join("next.json")).unwrap();
+        let new_parent = next.state.lock().unwrap().catalog.records[0].parent.clone();
+        assert_ne!(old_parent, new_parent);
+        let restored = restore_catalog(data.path(), &first_path, "first", 3).unwrap();
+        assert_eq!(restored.state.lock().unwrap().catalog.records[0].parent, old_parent);
+        let source: Catalog = serde_json::from_slice(&std::fs::read(source_path).unwrap()).unwrap();
+        assert_eq!(source.records.len(), 2);
+        assert_eq!(source.records[0].name, source.records[1].name);
+    }
+    #[test]
+    fn materialized_catalog_survives_restart_without_backing_and_trims_stale_siblings() {
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let key = "a".repeat(64);
+        let path = root.path().join(format!("{key}.json"));
+        let entries: Vec<_> = ["kept", "stale"]
+            .into_iter()
+            .map(|name| FileEntry {
+                path: name.into(),
+                is_dir: false,
+                size: 1,
+                modified_ms: None,
+                local_path: None,
+            })
+            .collect();
+        let (batch, _) = prepare_batch(
+            Flat::new(&entries, Arc::new(EmptyContents)).unwrap(),
+            &key,
+            "token".into(),
+            1,
+            path.clone(),
+        )
+        .unwrap();
+        let mut catalog = batch.state.lock().unwrap().catalog.clone();
+        catalog.received_at = Some(crate::received::now());
+        save_catalog(&path, &catalog).unwrap();
+        let kept = catalog.records.iter().find(|r| r.name == "kept").unwrap();
+        std::fs::write(
+            path.with_extension("received"),
+            serde_json::to_vec(&serde_json::json!({&kept.id:{"materialized":true,"deleted":false}})).unwrap(),
+        )
+        .unwrap();
+        assert!(recover_catalogs(data.path(), root.path(), 2).unwrap().is_empty());
+        let restored: Catalog = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restored.records.len(), 2);
+        assert!(restored.records.iter().any(|r| r.id == kept.id));
+        assert!(!restored.records.iter().any(|r| r.name == "stale"));
+        std::fs::write(path.with_extension("received"), b"corrupt").unwrap();
+        remove_catalog_in(root.path(), &path);
+        assert!(path.exists(), "uncertain metadata is retained");
+        std::fs::write(
+            path.with_extension("received"),
+            serde_json::to_vec(&serde_json::json!({&kept.id:{"materialized":true,"deleted":true}})).unwrap(),
+        )
+        .unwrap();
+        remove_catalog_in(root.path(), &path);
         assert!(!path.exists());
     }
 
@@ -2089,6 +2387,7 @@ mod tests {
                 records: vec![],
                 batch: Some(owned.id()),
                 urls: vec![],
+                received_at: None,
             },
         )
         .unwrap();

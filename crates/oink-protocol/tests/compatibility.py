@@ -89,16 +89,32 @@ def main():
         raise RuntimeError("baseline source provenance is missing or equals HEAD")
     if not args.development_smoke and not old["frozen"]:
         raise RuntimeError("release compatibility requires the archived frozen v1 baseline")
-    check_schema(json.loads(subprocess.check_output([str(args.baseline),"--schema"],text=True)),
-                 json.loads(subprocess.check_output([str(args.head),"--schema"],text=True)))
+    old_schema = json.loads(subprocess.check_output([str(args.baseline),"--schema"],text=True))
+    new_schema = json.loads(subprocess.check_output([str(args.head),"--schema"],text=True))
+    check_schema(old_schema, new_schema)
     fixtures=pathlib.Path(__file__).parent/"fixtures"/"v1"
     manifest=json.loads((fixtures/"manifest.json").read_text())
     requests=[]
+    extensions=[]
+    old_messages={entry["id"] for entry in old_schema["messages"]}
+    old_dtos={entry["name"] for entry in old_schema["schemas"]}
     for item in manifest["fixtures"]:
         request={"kind":item["kind"],"hex":(fixtures/item["file"]).read_text().strip()}
         if "schema" in item:
             request["schema"]=item["schema"]
-        requests.append(request)
+        if (item["kind"] == "frame" and item["type_id"] not in old_messages) or (item["kind"] == "dto" and item["schema"] not in old_dtos):
+            extensions.append(request)
+        else:
+            requests.append(request)
+    # Capability-only allocations must decode on the new endpoint and must not
+    # be sent to an old endpoint. Verify the old decoder rejects their frames;
+    # all shared/frozen fixtures still traverse both actual codec binaries.
+    replies=run(args.head, extensions)
+    if any(not reply.get("ok") or reply["hex"] != request["hex"] for request,reply in zip(extensions,replies)):
+        raise RuntimeError("new capability fixture failed")
+    extension_frames=[r for r in extensions if r["kind"] == "frame"]
+    if any(reply.get("ok") for reply in run(args.baseline, extension_frames)):
+        raise RuntimeError("old endpoint unexpectedly recognizes a new message allocation")
     for sender,receiver in [(args.head,args.baseline),(args.baseline,args.head)]:
         encoded=run(sender,requests)
         if any(not reply.get("ok") for reply in encoded):
@@ -132,7 +148,7 @@ def main():
     negotiations = negotiation_matrix(args.baseline, args.head)
     print(json.dumps({"mode":"development-smoke" if args.development_smoke else "frozen-release-gate",
         "baseline_revision":old["revision"],"baseline_sha256":args.baseline_sha256,
-        "head_schema_sha256":new["schema_sha256"],"vectors":len(requests),"directions":2,"malformed":len(expected),"negotiations":negotiations},sort_keys=True))
+        "head_schema_sha256":new["schema_sha256"],"vectors":len(requests),"capability_extension_vectors":len(extensions),"old_rejected_extension_frames":len(extension_frames),"directions":2,"malformed":len(expected),"negotiations":negotiations},sort_keys=True))
 
 if __name__=="__main__":
     main()

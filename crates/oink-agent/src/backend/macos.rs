@@ -1,5 +1,5 @@
 //! AppKit is owned by the backend main thread. No WebView is created here.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
@@ -47,6 +47,23 @@ pub(super) fn update_status_icon(view: &crate::device_cards::DeviceCardsView) {
     });
 }
 
+// Only a native double-click on this status button opens the main window;
+// double-clicking a menu row or another application's window must not do so.
+fn status_double_click(event: &NSEvent, button: &objc2_app_kit::NSStatusBarButton) -> bool {
+    if !matches!(event.r#type(), NSEventType::LeftMouseDown | NSEventType::LeftMouseUp) || event.clickCount() < 2 {
+        return false;
+    }
+    let Some(window) = button.window() else { return false };
+    let point = if event.windowNumber() == window.windowNumber() {
+        event.locationInWindow()
+    } else if let Some(event_window) = event.window(MainThreadMarker::new().expect("status click on AppKit thread")) {
+        window.convertPointFromScreen(event_window.convertPointToScreen(event.locationInWindow()))
+    } else {
+        return false;
+    };
+    objc2_foundation::NSPointInRect(button.convertPoint_fromView(point, None), button.bounds())
+}
+
 struct LaunchState {
     launch: Launch,
     smoke: bool,
@@ -82,7 +99,11 @@ struct Menu {
     status_item: Retained<NSStatusItem>,
     presentation: crate::tray::TrayPresentation,
 }
-thread_local! { static MENU: RefCell<Option<Menu>> = const { RefCell::new(None) }; }
+thread_local! {
+    static MENU: RefCell<Option<Menu>> = const { RefCell::new(None) };
+    static TRACKED_MENU: RefCell<Option<Retained<objc2_app_kit::NSMenu>>> = const { RefCell::new(None) };
+    static SHOW_AFTER_MENU: Cell<bool> = const { Cell::new(false) };
+}
 
 define_class!(
     // SAFETY: NSObject has no subclass invariants; all AppKit access is main-thread-only.
@@ -164,34 +185,58 @@ define_class!(
     }
     impl Delegate {
         #[unsafe(method(statusClick:))]
-        fn status_click(&self, _sender: &objc2_app_kit::NSStatusBarButton) {
+        fn status_click(&self, sender: &objc2_app_kit::NSStatusBarButton) {
             let mtm = MainThreadMarker::new().expect("AppKit main thread");
-            if NSApplication::sharedApplication(mtm).currentEvent().is_some_and(|event| event.clickCount() > 1) {
-                std::thread::spawn(|| { let _ = super::show_ui(); });
+            let app = NSApplication::sharedApplication(mtm);
+            let Some(event) = app.currentEvent() else { return };
+            if status_double_click(&event, sender) {
+                let tracked = TRACKED_MENU.with(|slot| slot.borrow().clone());
+                if let Some(menu) = tracked {
+                    // A reentrant button action must finish native tracking
+                    // before handing activation to the separate UI process.
+                    SHOW_AFTER_MENU.set(true);
+                    menu.cancelTrackingWithoutAnimation();
+                } else {
+                    request_window();
+                }
                 return;
             }
-            let anchor = MENU.with(|slot| {
-                let menu = slot.borrow();
-                let button = menu.as_ref()?.status_item.button(mtm)?;
-                let window = button.window()?;
-                let screen = window.screen()?;
-                let primary = objc2_app_kit::NSScreen::screens(mtm).firstObject()?;
-                let top = primary.frame().origin.y + primary.frame().size.height;
-                let rect = window.convertRectToScreen(button.convertRect_toView(button.bounds(), None));
-                let convert = |r: objc2_foundation::NSRect| super::PanelRect {
-                    x: r.origin.x,
-                    y: top - r.origin.y - r.size.height,
-                    width: r.size.width,
-                    height: r.size.height,
-                };
-                Some(super::PanelAnchor { rect: convert(rect), work_area: convert(screen.visibleFrame()), scale_factor: 1.0 })
-            });
-            if let Some(anchor) = anchor {
-                std::thread::spawn(move || {
-                    if let Err(error) = super::deliver_ui(crate::api::ApiEvent::TogglePanel(anchor)) {
-                        tracing::error!(%error, "could not show status panel");
-                    }
-                });
+            if let Ok(node) = super::node()
+                && let Ok(view) = node.device_cards() {
+                let system = objc2_foundation::NSLocale::preferredLanguages().firstObject().map_or_else(String::new, |s|s.to_string());
+                let language = node.ui_preferences().map(|p|p.ui_language).unwrap_or(crate::config::UiLanguage::Auto).resolve(&system);
+                let model = crate::native_controls::model(&view, language);
+                let menu = crate::native_controls::macos::Menu::new(&model, |id| {
+                    let id = id.to_owned();
+                    std::thread::spawn(move || {
+                        let result = super::node().and_then(|node| crate::native_controls::dispatch(&node, &id));
+                        match result {
+                            Ok(Some(crate::native_controls::ShellAction::Quit)) => crate::update::request_quit(),
+                            Ok(Some(_)) => on_main(request_window),
+                            Ok(None) => {},
+                            Err(error) => tracing::warn!(%error, "native status command failed"),
+                        }
+                    });
+                }, mtm);
+                // Both button actions enter the same native menu immediately;
+                // waiting for doubleClickInterval would delay every single click.
+                // Track the owned menu below the status button. The context-menu
+                // convenience popup keeps its own tracking session and can
+                // consume the second status-button click without dismissing.
+                TRACKED_MENU.with(|slot| *slot.borrow_mut() = Some(menu.menu.clone()));
+                menu.menu.popUpMenuPositioningItem_atLocation_inView(
+                    None, NSPoint::new(0.0, sender.bounds().origin.y), Some(sender));
+                // NSMenu's nested tracking loop can consume the second mouse
+                // down while dismissing the menu, without sending a button
+                // action (or a local NSEvent-monitor callback). Inspect the
+                // native closing event as well, after tracking has ended, so
+                // opening the main window cannot leave this menu tracking.
+                TRACKED_MENU.with(|slot| slot.borrow_mut().take());
+                let closing_double = app.currentEvent().is_some_and(|closing|
+                    closing.timestamp() > event.timestamp() && status_double_click(&closing, sender));
+                if SHOW_AFTER_MENU.replace(false) || closing_double {
+                    request_window();
+                }
             }
         }
 
@@ -220,8 +265,9 @@ impl Delegate {
         if let Some(button) = status_item.button(mtm) {
             button.setImage(Some(&status_icon(crate::tray::TrayLook::default())));
             button.sendActionOn(NSEventMask::LeftMouseUp | NSEventMask::RightMouseUp);
-            // The status item belongs to the nonactivating backend. Only the UI
-            // process presents the Web panel; clicking never activates this app.
+            // Keep actions on the button instead of assigning status_item.menu:
+            // AppKit bypasses actions for an attached menu, including our
+            // double-click path to the main window.
             // SAFETY: delegate outlives the status item; selector matches sender.
             unsafe {
                 button.setTarget(Some(self));

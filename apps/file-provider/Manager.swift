@@ -63,7 +63,8 @@ import Darwin
                     try await recoverProviderLaunch(hidden: domain.isHidden, enabled: domain.userEnabled,
                         disconnected: domain.isDisconnected, disconnect: { options in
                             try await manager.disconnect(reason: "Updating Oink", options: options)
-                        }, reconnect: { try await manager.reconnect() })
+                        }, reconnect: { try await manager.reconnect() },
+                        stabilize: { try await manager.waitForStabilization() })
                     print("connected"); exit(0)
                 }
                 if let action = ProviderUpdateAction(rawValue: command) {
@@ -94,6 +95,13 @@ import Darwin
                     try await NSFileProviderManager.add(domain)
                     domains = try await NSFileProviderManager.domains()
                 }
+                if command == "open-received" || command == "received-usage" || command == "received-maintain" {
+                    guard let domain=domains.first(where:{$0.identifier==id}),let manager=NSFileProviderManager(for:domain) else {throw CocoaError(.fileNoSuchFile)}
+                    if command == "open-received" {let url=try await manager.getUserVisibleURL(for:.rootContainer);guard NSWorkspace.shared.open(url) else {throw CocoaError(.fileReadUnknown)};print("opened");exit(0)}
+                    let days=CommandLine.arguments.count>2 ? UInt64(CommandLine.arguments[2]) ?? 0 : 0
+                    let value=try await receivedUsage(manager:manager,root:container(),days:days,clear:command == "received-maintain")
+                    print(String(data:try JSONSerialization.data(withJSONObject:value,options:[.sortedKeys]),encoding:.utf8)!);exit(0)
+                }
                 if command == "cache" || command == "cache-clear" {
                     let clear = command == "cache-clear"
                     let protection = try JSONDecoder().decode(CacheProtection.self, from: FileHandle.standardInput.readDataToEndOfFile())
@@ -119,6 +127,11 @@ import Darwin
                             let url = try await manager.getUserVisibleURL(for: item.itemIdentifier)
                             var metadata = stat()
                             guard lstat(url.path, &metadata) == 0 else { throw CocoaError(.fileReadUnknown) }
+                            // Received OS copies have an independent user lifecycle.
+                            if try receivedProtected(String(item.itemIdentifier.rawValue.split(separator:"-").first ?? ""),in:container()) {
+                                if metadata.st_flags & UInt32(SF_DATALESS)==0,item.contentType?.conforms(to:.folder) != true,UInt64(max(0,metadata.st_size))==(item.documentSize ?? nil)?.uint64Value {evicted.insert(item.itemIdentifier.rawValue)}
+                                continue
+                            }
                             let protected = protection.items.contains(item.itemIdentifier.rawValue) || sourceProtects(url,paths:protection.paths)
                             if protected, let key=item.itemIdentifier.rawValue.split(separator:"-").first {protectedBatches.insert(String(key))}
                             guard item.contentType != .folder else {continue}

@@ -1,11 +1,15 @@
 //! One nonactivating panel per toast, confined to its own hit rectangle. AppKit
 //! operations are dispatched to the main queue; backend activation policy stays
 //! Accessory. No normal window, key status, application activation or TCC APIs.
-use super::{Click, Frame, Surface};
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained};
+use super::{
+    Click, Feedback, Frame, Surface,
+    interaction::{HitState, Input},
+};
+use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSColor, NSEvent, NSPanel, NSPopUpMenuWindowLevel, NSScreen, NSView,
-    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSApplication, NSBackingStoreType, NSColor, NSEvent, NSPanel, NSPopUpMenuWindowLevel, NSScreen, NSTrackingArea,
+    NSTrackingAreaOptions, NSView, NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSWorkspace,
 };
 use objc2_core_foundation::{CFData, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
@@ -14,9 +18,9 @@ use objc2_core_graphics::{
 };
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize};
 use objc2_quartz_core::{CALayer, CATransaction};
-use oink_foundation::{Point, Rect};
+use oink_foundation::Point;
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     ffi::c_void,
     sync::{
         Arc, Mutex,
@@ -24,25 +28,52 @@ use std::{
     },
 };
 type Clicks = Arc<Mutex<Vec<Click>>>;
+type Feedbacks = Arc<Mutex<Vec<Feedback>>>;
 struct Hit {
-    id: Cell<u64>,
-    undo: Cell<Option<Rect>>,
-    interactive: Cell<bool>,
+    state: RefCell<HitState>,
     clicks: Clicks,
+    feedback: Feedbacks,
 }
 define_class!(
     #[unsafe(super(NSView))] #[thread_kind=MainThreadOnly] #[name="OinkNotificationView"] #[ivars=Hit]
     struct ToastView;
     impl ToastView {
         #[unsafe(method(acceptsFirstMouse:))] fn first_mouse(&self,_event:Option<&NSEvent>)->bool {true}
-        #[unsafe(method(mouseUp:))] fn mouse_up(&self,event:&NSEvent) {
-            let h=self.ivars();if !h.interactive.get(){return;}
-            let p=event.locationInWindow();let p=Point::new(p.x,self.frame().size.height-p.y);
-            h.clicks.lock().unwrap_or_else(|e|e.into_inner()).push(Click{id:h.id.get(),undo:h.undo.get().is_some_and(|r|r.contains(p))});
-        }
+        #[unsafe(method(mouseEntered:))] fn entered(&self,event:&NSEvent) { self.pointer(event, Input::Move); }
+        #[unsafe(method(mouseMoved:))] fn moved(&self,event:&NSEvent) { self.pointer(event, Input::Move); }
+        #[unsafe(method(mouseDragged:))] fn dragged(&self,event:&NSEvent) { self.pointer(event, Input::Move); }
+        #[unsafe(method(mouseExited:))] fn exited(&self,_event:&NSEvent) { self.input(Input::Leave); }
+        #[unsafe(method(mouseDown:))] fn down(&self,event:&NSEvent) { self.pointer(event, Input::Down); }
+        #[unsafe(method(mouseUp:))] fn up(&self,event:&NSEvent) { self.pointer(event, Input::Up); }
     }
     unsafe impl NSObjectProtocol for ToastView {}
 );
+impl ToastView {
+    fn input(&self, input: Input) {
+        let (feedback, click) = self.ivars().state.borrow_mut().input(input);
+        self.ivars()
+            .feedback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(feedback);
+        if let Some(click) = click {
+            self.ivars()
+                .clicks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(click);
+        }
+    }
+    fn pointer(&self, event: &NSEvent, input: fn(Point) -> Input) {
+        let p = self.convertPoint_fromView(event.locationInWindow(), None);
+        if p.x < 0. || p.y < 0. || p.x >= self.bounds().size.width || p.y >= self.bounds().size.height {
+            self.input(Input::Leave);
+            return;
+        }
+        let p = Point::new(p.x, self.bounds().size.height - p.y);
+        self.input(input(p));
+    }
+}
 define_class!(
     #[unsafe(super(NSPanel))] #[thread_kind=MainThreadOnly] #[name="OinkNotificationPanel"]
     struct Panel;
@@ -66,6 +97,7 @@ impl Drop for Window {
 thread_local! {static WINDOWS:RefCell<Vec<Window>>=const{RefCell::new(Vec::new())};}
 pub(super) struct Backend {
     clicks: Clicks,
+    feedback: Feedbacks,
     reduced: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
     pending: Arc<Mutex<Option<Vec<Frame>>>>,
@@ -77,6 +109,7 @@ impl Backend {
         let ready = Arc::new(AtomicBool::new(false));
         Some(Self {
             clicks: Arc::default(),
+            feedback: Arc::default(),
             reduced,
             ready,
             pending: Arc::default(),
@@ -106,10 +139,11 @@ impl Surface for Backend {
         if self.posted.swap(true, Ordering::AcqRel) {
             return;
         }
-        let (pending, posted, clicks, reduced) = (
+        let (pending, posted, clicks, feedback, reduced) = (
             self.pending.clone(),
             self.posted.clone(),
             self.clicks.clone(),
+            self.feedback.clone(),
             self.reduced.clone(),
         );
         on_main(move || {
@@ -122,17 +156,20 @@ impl Surface for Backend {
             let value: bool =
                 unsafe { msg_send![&*NSWorkspace::sharedWorkspace(), accessibilityDisplayShouldReduceMotion] };
             reduced.store(value, Ordering::Release);
-            apply(mtm, frames, clicks);
+            apply(mtm, frames, clicks, feedback);
         });
     }
     fn clicks(&mut self) -> Vec<Click> {
         std::mem::take(&mut *self.clicks.lock().unwrap_or_else(|e| e.into_inner()))
     }
+    fn feedback(&mut self) -> Vec<Feedback> {
+        std::mem::take(&mut *self.feedback.lock().unwrap_or_else(|e| e.into_inner()))
+    }
     fn reduced_motion(&self) -> bool {
         self.reduced.load(Ordering::Acquire)
     }
 }
-fn make_window(mtm: MainThreadMarker, clicks: Clicks) -> Window {
+fn make_window(mtm: MainThreadMarker, clicks: Clicks, feedback: Feedbacks) -> Window {
     // SAFETY: designated NSPanel initializer on its main-thread-only subclass.
     let panel: Retained<Panel> = unsafe {
         msg_send![Panel::alloc(mtm),initWithContentRect:NSRect::new(NSPoint::ZERO,NSSize::new(1.,1.)),styleMask:NSWindowStyleMask::Borderless|NSWindowStyleMask::NonactivatingPanel,backing:NSBackingStoreType::Buffered,defer:false]
@@ -155,21 +192,38 @@ fn make_window(mtm: MainThreadMarker, clicks: Clicks) -> Window {
     // SAFETY: Window retains the panel until after close/orderOut in Drop.
     unsafe { panel.setReleasedWhenClosed(false) };
     let view = ToastView::alloc(mtm).set_ivars(Hit {
-        id: Cell::new(0),
-        undo: Cell::new(None),
-        interactive: Cell::new(false),
+        state: RefCell::new(HitState::default()),
         clicks,
+        feedback,
     });
     // SAFETY: designated NSView initializer; ivars were installed on allocation.
     let view: Retained<ToastView> =
         unsafe { msg_send![super(view),initWithFrame:NSRect::new(NSPoint::ZERO,NSSize::new(1.,1.))] };
+    // ActiveAlways is required: these panels deliberately never become key and
+    // the backend is usually inactive. InVisibleRect tracks animated resizing;
+    // no global monitor, input capture, activation or TCC permission is needed.
+    // SAFETY: The view owns the tracking area and implements its owner callbacks.
+    let tracking = unsafe {
+        NSTrackingArea::initWithRect_options_owner_userInfo(
+            NSTrackingArea::alloc(),
+            NSRect::ZERO,
+            NSTrackingAreaOptions::MouseEnteredAndExited
+                | NSTrackingAreaOptions::MouseMoved
+                | NSTrackingAreaOptions::ActiveAlways
+                | NSTrackingAreaOptions::InVisibleRect
+                | NSTrackingAreaOptions::EnabledDuringMouseDrag,
+            Some(&view),
+            None,
+        )
+    };
+    view.addTrackingArea(&tracking);
     let layer = CALayer::new();
     view.setLayer(Some(&layer));
     view.setWantsLayer(true);
     panel.setContentView(Some(&view));
     Window { panel, layer, view }
 }
-fn apply(mtm: MainThreadMarker, frames: Vec<Frame>, clicks: Clicks) {
+fn apply(mtm: MainThreadMarker, frames: Vec<Frame>, clicks: Clicks, feedback: Feedbacks) {
     let _ = NSApplication::sharedApplication(mtm);
     let primary_h = NSScreen::screens(mtm)
         .firstObject()
@@ -178,7 +232,7 @@ fn apply(mtm: MainThreadMarker, frames: Vec<Frame>, clicks: Clicks) {
         let mut windows = slot.borrow_mut();
         windows.truncate(frames.len());
         while windows.len() < frames.len() {
-            windows.push(make_window(mtm, clicks.clone()));
+            windows.push(make_window(mtm, clicks.clone(), feedback.clone()));
         }
         // SAFETY: process-lifetime immutable CoreGraphics color-space constant.
         let Some(space) = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB })) else {
@@ -224,9 +278,7 @@ fn apply(mtm: MainThreadMarker, frames: Vec<Frame>, clicks: Clicks) {
             };
             w.layer
                 .setFrame(CGRect::new(CGPoint::new(0., 0.), CGSize::new(b.w, b.h)));
-            w.view.ivars().id.set(f.id);
-            w.view.ivars().undo.set(f.undo);
-            w.view.ivars().interactive.set(f.interactive);
+            w.view.ivars().state.borrow_mut().update(f.id, f.undo, f.interactive);
             w.panel.setIgnoresMouseEvents(!f.interactive);
             w.panel.orderFrontRegardless();
         }

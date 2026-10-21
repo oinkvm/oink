@@ -74424,9 +74424,6 @@
       "kind": "datagram"
     },
     {
-      "file": "dto-ScreenPreference-remote-gain.hex",
-      "kind": "dto",
-      "schema": "ScreenPreference",
       "expected": {
         "map": {
           "1": {
@@ -74442,7 +74439,10 @@
             "f64_bits": "4000000000000000"
           }
         }
-      }
+      },
+      "file": "dto-ScreenPreference-remote-gain.hex",
+      "kind": "dto",
+      "schema": "ScreenPreference"
     },
     {
       "capabilities": [
@@ -74839,6 +74839,1868 @@
       "file": "dto-NotifyDismiss.hex",
       "kind": "dto",
       "schema": "NotifyDismiss"
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.layout.profiles/1",
+        "oink.low/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "bytes": "00000000000000000000000000000000"
+          },
+          "2": {
+            "map": {
+              "1": {
+                "uint": "1"
+              },
+              "2": {
+                "bytes": "00000000000000000000000000000000"
+              },
+              "3": {
+                "map": {
+                  "1": {
+                    "uint": "1"
+                  },
+                  "3": {
+                    "map": {
+                      "1": {
+                        "text": "ed25519"
+                      },
+                      "2": {
+                        "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+                      }
+                    }
+                  }
+                }
+              },
+              "4": {
+                "bytes": "00000000000000000000000000000000"
+              },
+              "5": {
+                "list": []
+              },
+              "6": {
+                "list": []
+              }
+            }
+          }
+        }
+      },
+      "file": "1200.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 13,
+          "transport": "Low"
+        }
+      ],
+      "schema": "LayoutProfilesState",
+      "type_id": 4608
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.layout.profiles/1",
+        "oink.low/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "bytes": "00000000000000000000000000000000"
+          },
+          "2": {
+            "map": {
+              "1": {
+                "uint": "1"
+              },
+              "2": {
+                "bytes": "00000000000000000000000000000000"
+              },
+              "3": {
+                "map": {
+                  "1": {
+                    "uint": "1"
+                  },
+                  "3": {
+                    "map": {
+                      "1": {
+                        "text": "ed25519"
+                      },
+                      "2": {
+                        "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+                      }
+                    }
+                  }
+                }
+              },
+              "4": {
+                "bytes": "00000000000000000000000000000000"
+              },
+              "5": {
+                "list": []
+              },
+              "6": {
+                "list": []
+              }
+            }
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "1200-future.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 13,
+          "transport": "Low"
+        }
+      ],
+      "schema": "LayoutProfilesState",
+      "type_id": 4608
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.layout.profiles/1",
+        "oink.low/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "bytes": "00000000000000000000000000000000"
+          },
+          "2": {
+            "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          "3": {
+            "bool": false
+          }
+        }
+      },
+      "file": "1201.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 13,
+          "transport": "Low"
+        }
+      ],
+      "schema": "LayoutProfilesReceipt",
+      "type_id": 4609
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.layout.profiles/1",
+        "oink.low/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "bytes": "00000000000000000000000000000000"
+          },
+          "2": {
+            "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          "3": {
+            "bool": false
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "1201-future.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 13,
+          "transport": "Low"
+        }
+      ],
+      "schema": "LayoutProfilesReceipt",
+      "type_id": 4609
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.layout.arrangement/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "bytes": "00000000000000000000000000000000"
+          },
+          "2": {
+            "map": {
+              "1": {
+                "map": {
+                  "1": {
+                    "text": "ed25519"
+                  },
+                  "2": {
+                    "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+                  }
+                }
+              },
+              "2": {
+                "bytes": "00000000000000000000000000000000"
+              }
+            }
+          }
+        }
+      },
+      "file": "0d2f.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 2,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": "LayoutArrangementRequest",
+      "type_id": 3375
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.layout.arrangement/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "bytes": "00000000000000000000000000000000"
+          },
+          "2": {
+            "map": {
+              "1": {
+                "map": {
+                  "1": {
+                    "text": "ed25519"
+                  },
+                  "2": {
+                    "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+                  }
+                }
+              },
+              "2": {
+                "bytes": "00000000000000000000000000000000"
+              }
+            }
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "0d2f-future.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 2,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": "LayoutArrangementRequest",
+      "type_id": 3375
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.layout.arrangement/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "bytes": "00000000000000000000000000000000"
+          },
+          "2": {
+            "map": {
+              "1": {
+                "map": {
+                  "1": {
+                    "text": "ed25519"
+                  },
+                  "2": {
+                    "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+                  }
+                }
+              },
+              "2": {
+                "bytes": "00000000000000000000000000000000"
+              }
+            }
+          },
+          "3": {
+            "uint": "1"
+          }
+        }
+      },
+      "file": "0d30.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 2,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": "LayoutArrangementResult",
+      "type_id": 3376
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.layout.arrangement/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "bytes": "00000000000000000000000000000000"
+          },
+          "2": {
+            "map": {
+              "1": {
+                "map": {
+                  "1": {
+                    "text": "ed25519"
+                  },
+                  "2": {
+                    "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+                  }
+                }
+              },
+              "2": {
+                "bytes": "00000000000000000000000000000000"
+              }
+            }
+          },
+          "3": {
+            "uint": "1"
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "0d30-future.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 2,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": "LayoutArrangementResult",
+      "type_id": 3376
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          },
+          "2": {
+            "bytes": "00000000000000000000000000000000"
+          },
+          "3": {
+            "map": {
+              "1": {
+                "uint": "1"
+              },
+              "3": {
+                "map": {
+                  "1": {
+                    "text": "ed25519"
+                  },
+                  "2": {
+                    "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+                  }
+                }
+              }
+            }
+          },
+          "4": {
+            "bytes": "00000000000000000000000000000000"
+          },
+          "5": {
+            "list": []
+          },
+          "6": {
+            "list": []
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-LayoutProfileCatalog.hex",
+      "kind": "dto",
+      "schema": "LayoutProfileCatalog"
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "bytes": "00000000000000000000000000000000"
+          },
+          "3": {
+            "map": {
+              "1": {
+                "uint": "1"
+              },
+              "3": {
+                "map": {
+                  "1": {
+                    "text": "ed25519"
+                  },
+                  "2": {
+                    "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+                  }
+                }
+              }
+            }
+          },
+          "4": {
+            "map": {
+              "1": {
+                "uint": "1"
+              },
+              "2": {
+                "map": {
+                  "1": {
+                    "text": "ed25519"
+                  },
+                  "2": {
+                    "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+                  }
+                }
+              },
+              "3": {
+                "uint": "1"
+              }
+            }
+          },
+          "5": {
+            "map": {
+              "1": {
+                "list": []
+              },
+              "2": {
+                "list": []
+              },
+              "3": {
+                "list": []
+              },
+              "4": {
+                "map": {
+                  "10": {
+                    "bool": true
+                  },
+                  "12": {
+                    "f64_bits": "0000000000000000"
+                  },
+                  "6": {
+                    "bool": false
+                  },
+                  "7": {
+                    "f64_bits": "3f7ddaaea5b0e2e4"
+                  },
+                  "8": {
+                    "f64_bits": "3f8ddaaea5b0e2e4"
+                  },
+                  "9": {
+                    "f64_bits": "3f87e225515a4f1d"
+                  }
+                }
+              }
+            }
+          },
+          "6": {
+            "map": {
+              "1": {
+                "list": []
+              },
+              "2": {
+                "list": []
+              }
+            }
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-LayoutProfile.hex",
+      "kind": "dto",
+      "schema": "LayoutProfile"
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          },
+          "2": {
+            "map": {
+              "1": {
+                "text": "ed25519"
+              },
+              "2": {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+              }
+            }
+          },
+          "3": {
+            "uint": "1"
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-LayoutProfileRecency.hex",
+      "kind": "dto",
+      "schema": "LayoutProfileRecency"
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "list": []
+          },
+          "2": {
+            "list": []
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-LayoutProfileDeviceState.hex",
+      "kind": "dto",
+      "schema": "LayoutProfileDeviceState"
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "map": {
+              "1": {
+                "text": "ed25519"
+              },
+              "2": {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+              }
+            }
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-LayoutProfileScreens.hex",
+      "kind": "dto",
+      "schema": "LayoutProfileScreens"
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "list": []
+          },
+          "2": {
+            "list": []
+          },
+          "3": {
+            "list": []
+          },
+          "4": {
+            "map": {
+              "10": {
+                "bool": true
+              },
+              "12": {
+                "f64_bits": "0000000000000000"
+              },
+              "6": {
+                "bool": false
+              },
+              "7": {
+                "f64_bits": "3f7ddaaea5b0e2e4"
+              },
+              "8": {
+                "f64_bits": "3f8ddaaea5b0e2e4"
+              },
+              "9": {
+                "f64_bits": "3f87e225515a4f1d"
+              }
+            }
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-LayoutProfileSnapshot.hex",
+      "kind": "dto",
+      "schema": "LayoutProfileSnapshot"
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "map": {
+              "1": {
+                "text": "ed25519"
+              },
+              "2": {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+              }
+            }
+          },
+          "2": {
+            "map": {
+              "1": {
+                "f64_bits": "3ff0000000000000"
+              },
+              "2": {
+                "f64_bits": "3ff0000000000000"
+              }
+            }
+          },
+          "3": {
+            "f64_bits": "3ff0000000000000"
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-LayoutProfilePlacement.hex",
+      "kind": "dto",
+      "schema": "LayoutProfilePlacement"
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "map": {
+              "1": {
+                "map": {
+                  "1": {
+                    "text": "ed25519"
+                  },
+                  "2": {
+                    "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+                  }
+                }
+              },
+              "2": {
+                "text": "synthetic"
+              }
+            }
+          },
+          "2": {
+            "bool": false
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-LayoutProfileDisabled.hex",
+      "kind": "dto",
+      "schema": "LayoutProfileDisabled"
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "map": {
+              "1": {
+                "text": "ed25519"
+              },
+              "2": {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+              }
+            }
+          },
+          "2": {
+            "map": {
+              "1": {
+                "map": {
+                  "1": {
+                    "text": "ed25519"
+                  },
+                  "2": {
+                    "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+                  }
+                }
+              },
+              "2": {
+                "text": "synthetic"
+              }
+            }
+          },
+          "3": {
+            "list": []
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-LayoutProfileNative.hex",
+      "kind": "dto",
+      "schema": "LayoutProfileNative"
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "map": {
+              "1": {
+                "map": {
+                  "1": {
+                    "text": "ed25519"
+                  },
+                  "2": {
+                    "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+                  }
+                }
+              },
+              "2": {
+                "text": "synthetic"
+              }
+            }
+          },
+          "2": {
+            "map": {
+              "1": {
+                "f64_bits": "3ff0000000000000"
+              },
+              "2": {
+                "f64_bits": "3ff0000000000000"
+              }
+            }
+          },
+          "3": {
+            "map": {
+              "1": {
+                "f64_bits": "3ff0000000000000"
+              },
+              "2": {
+                "f64_bits": "3ff0000000000000"
+              }
+            }
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-LayoutProfileScreen.hex",
+      "kind": "dto",
+      "schema": "LayoutProfileScreen"
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "text": "synthetic"
+          },
+          "2": {
+            "map": {
+              "1": {
+                "f64_bits": "3ff0000000000000"
+              },
+              "2": {
+                "f64_bits": "3ff0000000000000"
+              }
+            }
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-LayoutNativeOrigin.hex",
+      "kind": "dto",
+      "schema": "LayoutNativeOrigin"
+    },
+    {
+      "expected": {
+        "uint": "21"
+      },
+      "file": "enum-LocalOption-21.hex",
+      "kind": "enum",
+      "schema": "LocalOption"
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "map": {
+              "1": {
+                "map": {
+                  "1": {
+                    "text": "ed25519"
+                  },
+                  "2": {
+                    "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+                  }
+                }
+              },
+              "2": {
+                "bytes": "00000000000000000000000000000000"
+              }
+            }
+          },
+          "10": {
+            "list": []
+          },
+          "11": {
+            "map": {
+              "1": {
+                "bool": false
+              },
+              "2": {
+                "uint": "0"
+              },
+              "4": {
+                "uint": "1"
+              },
+              "6": {
+                "list": [
+                  {
+                    "map": {
+                      "1": {
+                        "uint": "0"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "12": {
+            "list": []
+          },
+          "13": {
+            "map": {
+              "1": {
+                "list": []
+              },
+              "2": {
+                "uint": "0"
+              },
+              "3": {
+                "list": []
+              },
+              "4": {
+                "list": []
+              }
+            }
+          },
+          "14": {
+            "map": {
+              "1": {
+                "bool": false
+              },
+              "2": {
+                "bool": false
+              },
+              "3": {
+                "f32_bits": "3f800000"
+              },
+              "4": {
+                "bool": false
+              },
+              "5": {
+                "bool": false
+              },
+              "6": {
+                "bool": false
+              }
+            }
+          },
+          "15": {
+            "list": []
+          },
+          "18": {
+            "list": [
+              {
+                "map": {
+                  "1": {
+                    "uint": "21"
+                  },
+                  "2": {
+                    "uint": "1"
+                  },
+                  "3": {
+                    "bool": true
+                  }
+                }
+              }
+            ]
+          },
+          "2": {
+            "uint": "1"
+          },
+          "22": {
+            "text": "synthetic-native-token"
+          },
+          "3": {
+            "map": {
+              "1": {
+                "uint": "1"
+              },
+              "2": {
+                "uint": "0"
+              }
+            }
+          },
+          "4": {
+            "text": "synthetic"
+          },
+          "5": {
+            "bytes": "00000000000000000000000000000000"
+          },
+          "6": {
+            "text": "synthetic"
+          },
+          "7": {
+            "text": "synthetic"
+          },
+          "8": {
+            "text": "synthetic"
+          },
+          "9": {
+            "text": "synthetic"
+          }
+        }
+      },
+      "file": "dto-DeviceFacts-layout-profiles.hex",
+      "kind": "dto",
+      "schema": "DeviceFacts"
+    },
+    {
+      "capabilities": [
+        "oink.layout.projection/1",
+        "oink.layout.preview/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "bool": true
+          },
+          "2": {
+            "uint": "1"
+          },
+          "3": {
+            "uint": "2000"
+          },
+          "4": {
+            "uint": "1"
+          }
+        }
+      },
+      "file": "1103.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 12,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": "ArrangementPreview",
+      "type_id": 4355
+    },
+    {
+      "capabilities": [
+        "oink.layout.projection/1",
+        "oink.layout.preview/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "bool": true
+          },
+          "2": {
+            "uint": "1"
+          },
+          "3": {
+            "uint": "2000"
+          },
+          "4": {
+            "uint": "1"
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "1103-future.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 12,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": "ArrangementPreview",
+      "type_id": 4355
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "bool": true
+          },
+          "2": {
+            "uint": "1"
+          },
+          "3": {
+            "uint": "2000"
+          },
+          "4": {
+            "uint": "1"
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-ArrangementPreview.hex",
+      "kind": "dto",
+      "schema": "ArrangementPreview"
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "map": {
+              "1": {
+                "text": "ed25519"
+              },
+              "2": {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+              }
+            }
+          },
+          "2": {
+            "bool": false
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-LayoutProfileSharing.hex",
+      "kind": "dto",
+      "schema": "LayoutProfileSharing"
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.layout.profiles/2",
+        "oink.low/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "bytes": "00000000000000000000000000000000"
+          },
+          "2": {
+            "map": {
+              "1": {
+                "uint": "1"
+              },
+              "2": {
+                "bytes": "00000000000000000000000000000000"
+              },
+              "3": {
+                "map": {
+                  "1": {
+                    "uint": "1"
+                  },
+                  "3": {
+                    "map": {
+                      "1": {
+                        "text": "ed25519"
+                      },
+                      "2": {
+                        "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+                      }
+                    }
+                  }
+                }
+              },
+              "4": {
+                "bytes": "00000000000000000000000000000000"
+              },
+              "5": {
+                "list": []
+              },
+              "6": {
+                "list": []
+              }
+            }
+          }
+        }
+      },
+      "file": "1210.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 14,
+          "transport": "Low"
+        }
+      ],
+      "schema": "LayoutProfilesStateV2",
+      "type_id": 4624
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.layout.profiles/2",
+        "oink.low/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "bytes": "00000000000000000000000000000000"
+          },
+          "2": {
+            "map": {
+              "1": {
+                "uint": "1"
+              },
+              "2": {
+                "bytes": "00000000000000000000000000000000"
+              },
+              "3": {
+                "map": {
+                  "1": {
+                    "uint": "1"
+                  },
+                  "3": {
+                    "map": {
+                      "1": {
+                        "text": "ed25519"
+                      },
+                      "2": {
+                        "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+                      }
+                    }
+                  }
+                }
+              },
+              "4": {
+                "bytes": "00000000000000000000000000000000"
+              },
+              "5": {
+                "list": []
+              },
+              "6": {
+                "list": []
+              }
+            }
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "1210-future.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 14,
+          "transport": "Low"
+        }
+      ],
+      "schema": "LayoutProfilesStateV2",
+      "type_id": 4624
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.layout.profiles/2",
+        "oink.low/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "bytes": "00000000000000000000000000000000"
+          },
+          "2": {
+            "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          "3": {
+            "bool": false
+          }
+        }
+      },
+      "file": "1211.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 14,
+          "transport": "Low"
+        }
+      ],
+      "schema": "LayoutProfilesReceipt",
+      "type_id": 4625
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.layout.profiles/2",
+        "oink.low/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "bytes": "00000000000000000000000000000000"
+          },
+          "2": {
+            "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          "3": {
+            "bool": false
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "1211-future.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 14,
+          "transport": "Low"
+        }
+      ],
+      "schema": "LayoutProfilesReceipt",
+      "type_id": 4625
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "bytes": "00000000000000000000000000000000"
+          },
+          "2": {
+            "map": {
+              "1": {
+                "uint": "1"
+              },
+              "2": {
+                "bytes": "00000000000000000000000000000000"
+              },
+              "3": {
+                "map": {
+                  "1": {
+                    "uint": "1"
+                  },
+                  "3": {
+                    "map": {
+                      "1": {
+                        "text": "ed25519"
+                      },
+                      "2": {
+                        "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+                      }
+                    }
+                  }
+                }
+              },
+              "4": {
+                "bytes": "00000000000000000000000000000000"
+              },
+              "5": {
+                "list": []
+              },
+              "6": {
+                "list": []
+              }
+            }
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-LayoutProfilesStateV2.hex",
+      "kind": "dto",
+      "schema": "LayoutProfilesStateV2"
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          },
+          "2": {
+            "bytes": "00000000000000000000000000000000"
+          },
+          "3": {
+            "map": {
+              "1": {
+                "uint": "1"
+              },
+              "3": {
+                "map": {
+                  "1": {
+                    "text": "ed25519"
+                  },
+                  "2": {
+                    "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+                  }
+                }
+              }
+            }
+          },
+          "4": {
+            "bytes": "00000000000000000000000000000000"
+          },
+          "5": {
+            "list": []
+          },
+          "6": {
+            "list": []
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-LayoutProfileCatalogV2.hex",
+      "kind": "dto",
+      "schema": "LayoutProfileCatalogV2"
+    },
+    {
+      "expected": {
+        "uint": "15"
+      },
+      "file": "enum-DiagGestureDecision-15.hex",
+      "kind": "enum",
+      "schema": "DiagGestureDecision"
+    },
+    {
+      "expected": {
+        "uint": "16"
+      },
+      "file": "enum-DiagGestureDecision-16.hex",
+      "kind": "enum",
+      "schema": "DiagGestureDecision"
+    },
+    {
+      "expected": {
+        "uint": "17"
+      },
+      "file": "enum-DiagGestureDecision-17.hex",
+      "kind": "enum",
+      "schema": "DiagGestureDecision"
+    },
+    {
+      "expected": {
+        "uint": "18"
+      },
+      "file": "enum-DiagGestureDecision-18.hex",
+      "kind": "enum",
+      "schema": "DiagGestureDecision"
+    },
+    {
+      "expected": {
+        "uint": "19"
+      },
+      "file": "enum-DiagGestureDecision-19.hex",
+      "kind": "enum",
+      "schema": "DiagGestureDecision"
     }
   ],
   "frozen": false,
@@ -74851,5 +76713,5 @@
     "reliable_frame": 16384
   },
   "revision": "2026-10-15-ui-freeze",
-  "schema_sha256": "c165a652d83267207c980c749d4e35d4f589991e4a9a3164f66752aa13ac73bb"
+  "schema_sha256": "381b2da59d526b43394861912ec2cc7ed60303c89786683b25f77aa7e41461ce"
 }

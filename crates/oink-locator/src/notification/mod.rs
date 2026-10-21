@@ -5,6 +5,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 mod color;
+mod interaction;
+pub use interaction::Feedback;
 #[cfg(target_os = "macos")]
 mod macos;
 mod raster;
@@ -72,6 +74,7 @@ struct Entry {
     toast: Toast,
     born: Instant,
     leaving: Option<Instant>,
+    button: interaction::ButtonAnimation,
 }
 #[derive(Debug, Default)]
 pub struct Queue {
@@ -86,6 +89,7 @@ impl Queue {
             toast,
             born: now,
             leaving: None,
+            button: interaction::ButtonAnimation::default(),
         });
         self.next
     }
@@ -122,6 +126,12 @@ impl Queue {
             ..click
         })
     }
+    fn feedback(&mut self, feedback: Feedback, now: Instant, reduced: bool) -> bool {
+        self.entries
+            .iter_mut()
+            .find(|e| e.id == feedback.id && e.leaving.is_none())
+            .is_some_and(|e| e.button.set(feedback.hovered, feedback.pressed, now, reduced))
+    }
     pub fn clear(&mut self) {
         self.entries.clear();
     }
@@ -150,7 +160,14 @@ impl Queue {
                 let d = &e.toast.display;
                 let scale = e.toast.scale.max(0.5);
                 let width = (360.0 * scale).min((d.bounds.w - 32.0 * scale).max(1.0));
-                let (mut pixels, w, h) = raster::paint(&e.toast, style, width, scale * d.pixels_per_unit(), text);
+                let (mut pixels, w, h) = raster::paint_button(
+                    &e.toast,
+                    style,
+                    width,
+                    scale * d.pixels_per_unit(),
+                    text,
+                    e.button.sample(now, reduced),
+                );
                 let height = h as f64 / d.pixels_per_unit();
                 let offset = offsets.entry(d.key.clone()).or_insert(INSET * scale);
                 let y = d.bounds.y + *offset;
@@ -247,6 +264,10 @@ pub trait Surface {
     fn present(&mut self, frames: Vec<Frame>);
     fn clicks(&mut self) -> Vec<Click>;
     fn reduced_motion(&self) -> bool;
+    /// Drain native hover/press changes. Headless surfaces need no input source.
+    fn feedback(&mut self) -> Vec<Feedback> {
+        Vec::new()
+    }
 }
 #[derive(Debug, Default)]
 struct State {
@@ -293,10 +314,12 @@ impl NotificationOverlay {
                 let text = crate::aim::text::system_toast();
                 let mut last_revision = u64::MAX;
                 let mut last_reduced = None;
+                let mut was_animated = false;
                 let mut preference_revision = u64::MAX;
                 loop {
                     let (m, cv) = &*shared;
                     let events = surface.clicks();
+                    let feedback = surface.feedback();
                     let mut state = m.lock().unwrap_or_else(|e| e.into_inner());
                     if state.stop {
                         surface.present(Vec::new());
@@ -318,14 +341,22 @@ impl NotificationOverlay {
                     let events: Vec<_> = events.into_iter().filter_map(|e| state.queue.click(e, now)).collect();
                     let old = state.queue.entries.len();
                     state.queue.tick(now, reduced);
-                    let changed = old != state.queue.entries.len() || last_reduced != Some(reduced);
+                    let mut changed = old != state.queue.entries.len() || last_reduced != Some(reduced);
+                    for feedback in feedback {
+                        changed |= state.queue.feedback(feedback, now, reduced);
+                    }
                     last_reduced = Some(reduced);
                     let animated = !reduced
                         && state.queue.entries.iter().any(|e| {
-                            e.leaving.is_some() || now.saturating_duration_since(e.born).as_secs_f64() < 0.662
+                            e.leaving.is_some()
+                                || e.button.active(now)
+                                || now.saturating_duration_since(e.born).as_secs_f64() < 0.662
                         });
+                    // Draw the settled endpoint once even if the worker wakes
+                    // after a transition's deadline (including a delayed frame).
                     let frames = if changed
                         || animated
+                        || was_animated
                         || state.revision != last_revision
                         || !events.is_empty()
                         || state.queue.entries.iter().any(|e| e.leaving.is_some())
@@ -334,6 +365,7 @@ impl NotificationOverlay {
                     } else {
                         None
                     };
+                    was_animated = animated;
                     // Expiry/removal can change the frame even without a caller update.
                     last_revision = state.revision;
                     let empty = state.queue.entries.is_empty();
@@ -416,6 +448,76 @@ mod tests {
             display: display("left", -1000.),
             scale: 1.0,
         }
+    }
+    #[test]
+    fn button_feedback_repaints_only_button_and_preserves_hit_geometry() {
+        let now = Instant::now();
+        let mut q = Queue::default();
+        let id = q.push(toast(true), now);
+        let font = crate::aim::text::StrokeText;
+        for dark in [false, true] {
+            let style = Style {
+                dark,
+                ..Style::default()
+            };
+            q.feedback(
+                Feedback {
+                    id,
+                    hovered: false,
+                    pressed: false,
+                },
+                now,
+                true,
+            );
+            let idle = q.frames(now, style, true, &font).remove(0);
+            assert!(q.feedback(
+                Feedback {
+                    id,
+                    hovered: true,
+                    pressed: false
+                },
+                now,
+                true
+            ));
+            let hover = q.frames(now, style, true, &font).remove(0);
+            assert_ne!(idle.pixels, hover.pixels);
+            assert_eq!(idle.undo, hover.undo);
+            assert_eq!(idle.bounds, hover.bounds);
+            let hit = idle.undo.unwrap();
+            for y in 0..idle.height {
+                for x in 0..idle.width {
+                    if !hit.contains(Point::new(x as f64, y as f64)) {
+                        assert_eq!(idle.pixels[y * idle.width + x], hover.pixels[y * idle.width + x]);
+                    }
+                }
+            }
+            q.feedback(
+                Feedback {
+                    id,
+                    hovered: true,
+                    pressed: true,
+                },
+                now,
+                true,
+            );
+            let pressed = q.frames(now, style, true, &font).remove(0);
+            assert_ne!(pressed.pixels, hover.pixels);
+            assert_eq!(
+                pressed.undo, idle.undo,
+                "visual press scaling must not shrink the hit target"
+            );
+        }
+        q.dismiss(id, now);
+        assert!(!q.feedback(
+            Feedback {
+                id,
+                hovered: true,
+                pressed: true
+            },
+            now,
+            true
+        ));
+        assert!(!q.frames(now, Style::default(), true, &font)[0].interactive);
     }
     #[test]
     fn negative_subpoint_and_nearest_selection() {

@@ -86,6 +86,7 @@ struct MacInput {
 
 impl InputBackend for MacInput {
     fn stop_injection_session(&self) {
+        let _ = self.set_cursor_constraint(None);
         self.injector.stop_session();
     }
     fn set_input_paused(&self, paused: bool) {
@@ -157,6 +158,17 @@ impl InputBackend for MacInput {
         Ok(())
     }
 
+    fn set_cursor_constraint(&self, bounds: Option<oink_foundation::Rect>) -> Result<(), InputError> {
+        let tap = self.tap.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(tap) = tap.as_ref() {
+            tap.set_cursor_constraint(bounds.is_some());
+        } else if bounds.is_none() {
+            cursor::constrain(false);
+        } else {
+            return Err(InputError::NotStarted);
+        }
+        Ok(())
+    }
     fn set_mode(&self, mode: CaptureMode) -> Result<(), InputError> {
         self.injector.gesture_boundary("set_mode");
         let t = self.tap.lock().unwrap_or_else(|e| e.into_inner());
@@ -259,8 +271,14 @@ impl InputBackend for MacInput {
     }
 
     fn cursor_position(&self) -> Result<Point, InputError> {
-        let p = inject::current_location();
-        Ok(Point::new(p.x, p.y))
+        inject::checked_location()
+    }
+
+    fn cursor_injection_target(&self, event: &InjectEvent) -> Option<(Point, f64)> {
+        if !matches!(event, InjectEvent::MoveTo { .. } | InjectEvent::MoveToWithDelta { .. }) {
+            return None;
+        }
+        self.injector.last_cursor_target()
     }
 
     fn refresh_pointer_capture_sample(

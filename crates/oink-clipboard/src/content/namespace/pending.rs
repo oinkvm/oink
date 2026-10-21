@@ -50,6 +50,9 @@ impl Pending {
     }
 }
 impl Namespace for Pending {
+    fn origin(&self) -> Option<oink_foundation::DeviceId> {
+        self.inner.origin()
+    }
     fn roots(&self) -> Vec<FileNode> {
         self.inner
             .roots()

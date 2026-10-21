@@ -102,7 +102,7 @@ pub enum Direction {
     Inbound,
 }
 
-/// Reason given by the config module to `LinkLayer::disconnect`. Carried to the log and
+/// Reason given by an ordinary owner to `LinkLayer::disconnect`. Carried to the log and
 /// to `LinkLost::Local`; the peer only sees the link go away.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Disconnect {
@@ -114,6 +114,8 @@ pub enum Disconnect {
     HandshakeTimeout,
     /// C0 was closed by the peer or carried invalid content after ready.
     ControlStreamFailed,
+    /// A ready link did not attach its input stream pair before its opening deadline.
+    InputOpeningTimeout,
 }
 
 /// Why an established link is gone.

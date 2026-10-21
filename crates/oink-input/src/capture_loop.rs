@@ -38,7 +38,18 @@ pub trait CaptureLoop: Send {
     fn keyboard_remote(&self) -> Option<bool> {
         None
     }
+    /// Source mouse guard includes untranslated native pointer/gesture events.
+    fn constrained_cursor(&self) -> Option<oink_foundation::Point> {
+        None
+    }
+    fn mouse_disabled(&self) -> bool {
+        false
+    }
     fn keyboard_disabled(&self) -> bool {
+        false
+    }
+    /// Windows-local opt-in. Other backends retain their existing source policy.
+    fn forward_injected_input(&self) -> bool {
         false
     }
     /// Guard-specific pass-through for the Windows capturable lock curtain.
@@ -117,8 +128,26 @@ pub(crate) fn keyboard_remote() -> Option<bool> {
     OWNER.with(|slot| slot.try_borrow().ok()?.as_ref()?.keyboard_remote())
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn constrained_cursor() -> Option<oink_foundation::Point> {
+    OWNER.with(|slot| slot.borrow().as_ref().and_then(|owner| owner.constrained_cursor()))
+}
+pub(crate) fn mouse_disabled() -> bool {
+    OWNER.with(|slot| slot.borrow().as_ref().is_some_and(|owner| owner.mouse_disabled()))
+}
 pub(crate) fn keyboard_disabled() -> bool {
     OWNER.with(|slot| slot.borrow().as_ref().is_some_and(|owner| owner.keyboard_disabled()))
+}
+
+#[cfg(windows)]
+pub(crate) fn forward_injected_input() -> Option<bool> {
+    // A downstream hook may pump a native callback while the owner is borrowed.
+    // The hook keeps the most recent requested value for that reentry only.
+    OWNER.with(|slot| {
+        slot.try_borrow()
+            .ok()
+            .map(|owner| owner.as_ref().is_some_and(|owner| owner.forward_injected_input()))
+    })
 }
 
 #[cfg(windows)]

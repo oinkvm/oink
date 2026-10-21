@@ -20,15 +20,7 @@ fn current() -> Option<RECT> {
     Some(rect)
 }
 fn restore(previous: RECT, owned: RECT) {
-    // Do not overwrite a later clip established by another application.
-    if current() == Some(owned) {
-        // SAFETY: a saved physical rectangle, valid for this call.
-        let result = super::warp::clip(previous);
-        super::trace::clip_action(previous, 0, result.is_ok());
-        if let Err(e) = result {
-            tracing::warn!(%e, "restoring game-mode cursor clip failed");
-        }
-    }
+    super::cursor_clip::restore(previous, owned);
 }
 
 /// Call before initializing the GUI, logger, input backend or CLI parser.
@@ -76,6 +68,7 @@ pub fn dispatch_guard() -> Option<ExitCode> {
     Some(ExitCode::SUCCESS)
 }
 
+#[derive(Debug)]
 struct Lease {
     armed: bool,
     previous: RECT,
@@ -176,7 +169,7 @@ impl RawCapture {
                     {
                         lease.armed = true;
                         // SAFETY: a one-pixel rectangle at the existing covered park point.
-                        let result = super::warp::clip(lease.owned);
+                        let result = super::cursor_clip::acquire(lease.owned);
                         super::trace::clip_action(lease.owned, 1, result.is_ok());
                         if result.is_ok() {
                             tracing::info!(active = true, "remote game raw capture ready");
@@ -215,5 +208,81 @@ impl RawCapture {
     }
     pub fn allows_move(&self) -> bool {
         self.lease.as_ref().is_some_and(|l| current() == Some(l.owned))
+    }
+}
+
+/// Visible screen confinement uses the same crash guard and explicit ownership
+/// ledger as raw capture, while retaining any preexisting application clip.
+#[derive(Debug, Default)]
+pub(super) struct Confinement {
+    requested: Option<oink_foundation::Rect>,
+    lease: Option<Lease>,
+}
+impl Confinement {
+    pub(super) fn set(
+        &mut self,
+        bounds: Option<oink_foundation::Rect>,
+        hook: Option<&super::hook::HookHandle>,
+    ) -> Result<(), crate::InputError> {
+        let _dpi = ThreadDpiGuard::per_monitor_v2();
+        if self.requested == bounds
+            && (bounds.is_none() || self.lease.as_ref().is_some_and(|l| current() == Some(l.owned)))
+        {
+            return Ok(());
+        }
+        if let Some(lease) = self.lease.as_mut()
+            && let Some(hook) = hook
+        {
+            hook.cursor_constraint(lease.owned, lease.previous, false)?;
+            lease.armed = false;
+        }
+        // With no hook left, Drop's conditional restore is the terminal
+        // cleanup; no live hook thread-local baseline remains to update.
+        self.lease = None;
+        self.requested = None;
+        let Some(bounds) = bounds else {
+            return Ok(());
+        };
+        let hook = hook.ok_or(crate::InputError::NotStarted)?;
+        let previous = current().ok_or_else(|| crate::InputError::Platform("cannot read cursor confinement".into()))?;
+        let owned = RECT {
+            left: (bounds.x.ceil() as i32).max(previous.left),
+            top: (bounds.y.ceil() as i32).max(previous.top),
+            right: (bounds.right().floor() as i32).min(previous.right),
+            bottom: (bounds.bottom().floor() as i32).min(previous.bottom),
+        };
+        if owned.right <= owned.left || owned.bottom <= owned.top {
+            // An application clip on another monitor wins; acquiring this clip
+            // would move the cursor as a side effect of hiding a screen.
+            return Err(crate::InputError::Platform(
+                "screen and application cursor constraints do not intersect".into(),
+            ));
+        }
+        let mut lease = Lease::spawn(previous, owned).map_err(|e| crate::InputError::Platform(e.to_string()))?;
+        if current() != Some(previous) {
+            return Err(crate::InputError::Platform(
+                "application cursor constraint changed during acquisition".into(),
+            ));
+        }
+        lease
+            .pipe
+            .as_mut()
+            .ok_or_else(|| crate::InputError::Platform("cursor guard closed".into()))?
+            .write_all(b"A")
+            .map_err(|e| crate::InputError::Platform(e.to_string()))?;
+        lease.armed = true;
+        if let Err(error) = hook.cursor_constraint(owned, previous, true) {
+            // Acquisition may have failed after dispatch. Keep an armed guard
+            // until a hook-owner restore has acknowledged the owned rectangle.
+            if hook.cursor_constraint(owned, previous, false).is_ok() {
+                lease.armed = false;
+            } else {
+                self.lease = Some(lease);
+            }
+            return Err(error);
+        }
+        self.requested = Some(bounds);
+        self.lease = Some(lease);
+        Ok(())
     }
 }

@@ -710,6 +710,33 @@ impl Journal {
             .into_iter()
             .any(|node| terminal(node, &graph, &mut BTreeSet::new(), &mut cache).is_none()))
     }
+    /// Retained, non-conflicting certificates ending at this group. Optional
+    /// companion config can import its own archive after the signed transition
+    /// without changing the frozen expected_result_registers in the plan.
+    pub fn committed_into(&self, target: Anchor) -> Result<Vec<dto::MergeTransferBundle>> {
+        let mut bundles = Vec::new();
+        for value in array(&self.raw, 3)? {
+            let row = value.as_map()?;
+            if !matches!(get::<u8>(row, 6)?, 1 | 4) {
+                continue;
+            }
+            let bundle = get::<dto::MergeTransferBundle>(row, 8)?;
+            let intent = bundle.certificate()?.intent()?;
+            if group_merge::anchor(&intent.target()?)? != target || self.history_conflict(&bundle)? {
+                continue;
+            }
+            group_merge::verify_bundle(&bundle, group_merge::anchor(&intent.source()?)?)?;
+            bundles.push(bundle);
+        }
+        bundles.sort_by_key(|b| {
+            b.certificate()
+                .and_then(|c| c.intent())
+                .and_then(|i| i.merge_id())
+                .expect("verified merge")
+                .0
+        });
+        Ok(bundles)
+    }
     pub fn lookup(
         &self,
         requester: DeviceId,

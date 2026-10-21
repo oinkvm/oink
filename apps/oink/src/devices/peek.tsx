@@ -132,7 +132,7 @@ function usePeek(collapsed: boolean, suspended = false) {
     });
     return { target, open, presence, handlers, keep: clear, leave, close };
 }
-const PEEK_W = 272;
+const PEEK_W = 256;
 const FILLET = { x: 4, y: 4 };
 function quarter(cx: number, cy: number, rx: number, ry: number, a: [
     number,

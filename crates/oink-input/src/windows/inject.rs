@@ -41,6 +41,18 @@ pub(crate) fn normalize(pixel: i32, origin: i32, extent: i32) -> i32 {
     n.clamp(0, 65535) as i32
 }
 
+/// Decode the exact absolute SendInput pixel used by the injection receipt.
+pub(crate) fn absolute_target(
+    at: oink_foundation::Point,
+    origin: (i32, i32),
+    extent: (i32, i32),
+) -> oink_foundation::Point {
+    let decode = |p: f64, o: i32, n: i32| {
+        f64::from(o) + (i64::from(normalize(p.floor() as i32, o, n)) * i64::from(n) / 65536) as f64
+    };
+    oink_foundation::Point::new(decode(at.x, origin.0, extent.0), decode(at.y, origin.1, extent.1))
+}
+
 pub(crate) fn drag_press_at(at: oink_foundation::Point, origin: (i32, i32), extent: (i32, i32)) -> INPUT {
     // Match MoveTo's containing pixel. Rounding a half-open edge position such
     // as y=-0.000001 to zero presses on the adjacent display instead of the
@@ -206,6 +218,52 @@ pub(crate) fn key(code: KeyCode, pressed: bool) -> Option<INPUT> {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portal_edge_clamp_readback_matches_the_submitted_windows_pixel() {
+        use crate::cursor_reconciliation::{Decision, Expected, Observation, Reconciler};
+        use oink_foundation::{Point, Rect};
+        // Pure event/receipt construction, not a claim of desktop acceptance.
+        // Include negative secondary-display coordinates as well as a display's
+        // top/right edges. Floor, normalize and inverse conversion are the
+        // production receipt path, not an unquantized routing prediction.
+        for (bounds, origin, extent) in [
+            (Rect::new(0., 0., 3840., 2160.), (0, 0), (3840, 2160)),
+            (Rect::new(1576., -1080., 1920., 1080.), (0, -1080), (3496, 2197)),
+        ] {
+            for requested in [
+                Point::new(bounds.x - 10., bounds.y + 100.25),
+                Point::new(bounds.right() + 10., bounds.y + 100.25),
+                Point::new(bounds.x + 100.25, bounds.y - 10.),
+                Point::new(bounds.x + 100.25, bounds.bottom() + 10.),
+            ] {
+                let submitted = bounds.clamp(requested);
+                let actual = Point::new(submitted.x.floor(), submitted.y.floor());
+                let target = absolute_target(submitted, origin, extent);
+                assert_eq!(target, actual);
+                assert_eq!(
+                    Reconciler::default().observe(
+                        7,
+                        Observation {
+                            scope: 7,
+                            sequence: 1,
+                            position: Some(actual),
+                            expected: Some(Expected {
+                                scope: 7,
+                                sequence: 1,
+                                before: Some(actual),
+                                target,
+                                tolerance: 0.
+                            }),
+                        },
+                        0
+                    ),
+                    Decision::Expected,
+                    "normal OS edge clamp must retain virtual pressure: {submitted:?}"
+                );
+            }
+        }
+    }
 
     /// 系统的反算公式。
     fn denormalize(n: i32, origin: i32, extent: i32) -> i32 {

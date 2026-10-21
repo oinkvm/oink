@@ -235,8 +235,8 @@ pub struct LayoutSettings {
     /// Extra near-miss reach along channel ends, in plane plane (0 disables; maximum 50).
     #[serde(deserialize_with = "deserialize_endpoint_reach")]
     pub endpoint_reach: f64,
-    /// Along-edge blocker tolerance for routing; facing geometry itself only
-    /// tolerates floating-point roundoff, shared with native projections.
+    /// Retained topology parameter. Nearest-facing occlusion no longer uses a
+    /// blocker threshold; facing tolerates only shared floating-point roundoff.
     pub overlap_tolerance: f64,
     /// 形成传送门所需的最小沿边重叠长度；不用于移动布局中的屏幕。
     pub minimum_portal: f64,
@@ -366,7 +366,6 @@ pub struct EffectiveLayout {
     pub(crate) settings: EffectiveSettings,
     source_origins: std::collections::HashMap<DeviceId, Point>,
     source_scales: std::collections::HashMap<ScreenId, f64>,
-    remote_sources: std::collections::HashSet<DeviceId>,
 }
 impl EffectiveLayout {
     pub fn screens(&self) -> &[EffectiveScreen] {
@@ -378,9 +377,9 @@ impl EffectiveLayout {
     pub fn contains_device(&self, device: DeviceId) -> bool {
         self.screens.iter().any(|s| s.enabled && s.id.device == device)
     }
-    /// Source policy only: missing geometry is not a request to redirect input.
-    pub fn source_requires_target(&self, device: DeviceId) -> bool {
-        self.remote_sources.contains(&device)
+    /// Hiding a screen never redirects its current input focus.
+    pub fn source_requires_target(&self, _device: DeviceId) -> bool {
+        false
     }
     pub fn topology(&self) -> Topology {
         Topology::from_effective(self, |_| true)
@@ -425,19 +424,13 @@ impl Layout {
             }
             let (sx, sy) = s.physical_scale();
             source_scales.insert(s.id.clone(), (sx * sy).sqrt() / plane_gain(&s));
-            if owner.screen_shared {
-                screens.push(s);
-            }
+            screens.push(s);
         }
         EffectiveLayout {
             screens,
             settings: self.settings.clone(),
             source_origins,
             source_scales,
-            remote_sources: owners
-                .iter()
-                .filter_map(|(id, owner)| (!owner.screen_shared).then_some(*id))
-                .collect(),
         }
     }
 

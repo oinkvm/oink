@@ -45,9 +45,13 @@ export function UpdateCheck({status,open}:{status:UpdateStatus|null;open:boolean
   </span>;
 }
 
-export function UpdatePreferences({status}:{status:UpdateStatus|null}) {
+/** Builds without in-app updates: the row explains the manual route instead of a switch. */
+export const manualUpdates = (status:UpdateStatus|null) => !status || status.phase === 'disabled';
+
+/** Settings → Automatically check for updates: the row's switch. */
+export function UpdatePreferences({status,label}:{status:UpdateStatus|null;label:string}) {
   const [pending,setPending] = useState(false);
-  if (!status || status.phase === 'disabled') return <span>{tr('此版本需要手动下载并安装更新。')}</span>;
+  if (!status || manualUpdates(status)) return null;
   const disabled = pending || !status.can_change_policy;
   const save = async (patch:Partial<Preferences>) => {
     if (disabled) return;
@@ -59,7 +63,5 @@ export function UpdatePreferences({status}:{status:UpdateStatus|null}) {
     } catch { agent.fail('unavailable'); }
     finally { setPending(false); }
   };
-  return <div className="setp__update">
-    <label>{tr('自动检查更新')} <Switch aria-label={tr('自动检查更新')} checked={status.checks_enabled} disabled={disabled} onChange={checks_enabled=>{void save({checks_enabled});}}/></label>
-  </div>;
+  return <Switch aria-label={label} checked={status.checks_enabled} disabled={disabled} onChange={checks_enabled=>{void save({checks_enabled});}}/>;
 }

@@ -71,6 +71,10 @@ pub fn sample(schema: Schema) -> RawMap {
         .collect();
     use RawValue as V;
     match schema.name {
+        "ArrangementPreview" => {
+            raw.insert(1, V::Bool(true));
+            raw.insert(3, V::Uint(2000));
+        }
         "InputTouchpadContacts" => {
             raw.insert(3, V::Uint(1));
         }

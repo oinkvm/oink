@@ -577,6 +577,9 @@ impl Remote {
     }
 }
 impl Namespace for Remote {
+    fn origin(&self) -> Option<oink_foundation::DeviceId> {
+        Some(self.0.inventory.id.clip.origin)
+    }
     fn roots(&self) -> Vec<FileNode> {
         self.0.inventory.roots.clone()
     }

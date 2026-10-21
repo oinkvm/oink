@@ -17,6 +17,7 @@ pub(crate) struct Observation {
 pub(crate) struct History {
     sources: HashMap<DeviceId, Source>,
     revision: u64,
+    output: Vec<oink_audio::sink::DropoutBucket>,
 }
 #[derive(Default)]
 struct Source {
@@ -26,6 +27,9 @@ struct Source {
     previous: Option<(u64, Observation)>,
 }
 impl History {
+    pub fn record_output(&mut self, buckets: [Option<oink_audio::sink::DropoutBucket>; 60]) {
+        self.output = buckets.into_iter().flatten().collect();
+    }
     pub fn record(&mut self, at_ms: u64, observations: impl IntoIterator<Item = (String, Observation)>) {
         self.update(at_ms, observations, true);
     }
@@ -55,20 +59,14 @@ impl History {
                     .filter(|(_, old)| old.session == observation.session)
                     .and_then(|(_, old)| old.glitches.into_iter().flatten().find(|b| b.at_ms == bucket.at_ms))
                     .unwrap_or_default();
-                let lost = bucket.lost.saturating_sub(old.lost);
-                let late = bucket.late.saturating_sub(old.late);
-                if lost + late == 0 {
+                let delta = bucket.difference(old);
+                if delta.is_empty() {
                     continue;
                 }
                 if let Some(existing) = source.glitches.iter_mut().find(|b| b.at_ms == bucket.at_ms) {
-                    existing.lost += lost;
-                    existing.late += late;
+                    existing.add(delta);
                 } else {
-                    source.glitches.push_back(oink_audio::sink::DropoutBucket {
-                        at_ms: bucket.at_ms,
-                        lost,
-                        late,
-                    });
+                    source.glitches.push_back(delta);
                 }
             }
             source.glitches.make_contiguous().sort_by_key(|b| b.at_ms);
@@ -125,31 +123,41 @@ impl History {
             if window.is_empty() && glitches.is_empty() {
                 continue;
             }
-            let mut values: Vec<_> = window
+            let values: Vec<_> = window
                 .iter()
                 .filter_map(|(s, _)| s.buffer_ms)
                 .filter(|v| v.is_finite() && *v >= 0.)
                 .collect();
-            values.sort_by(f64::total_cmp);
-            let percentile = |p: usize| values.get((values.len() * p).div_ceil(100).saturating_sub(1)).copied();
+
             sources.push(AudioSourceQuality {
                 device: (*device).into(),
                 name: source.name.clone(),
                 samples: window.iter().map(|(s, _)| s.clone()).collect(),
-                p50_ms: percentile(50),
-                p90_ms: percentile(90),
-                p99_ms: percentile(99),
+                buffer_avg_ms: (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64),
                 // Always the complete trailing 60 s, including inactive time.
                 bitrate_kbps: window.iter().map(|(_, bytes)| *bytes as f64).sum::<f64>() * 8. / 60_000.,
-                dropouts: glitches.iter().map(|b| b.count()).sum(),
+                interruptions: glitches.iter().map(|b| b.interruptions).sum(),
+                concealed_ms: glitches.iter().map(|b| b.concealed_ns as f64 / 1_000_000.0).sum(),
+                late_packets: glitches.iter().map(|b| b.late_packets).sum(),
                 glitches,
             });
         }
         sources.sort_by_key(|s| s.device.0);
+        let output: Vec<_> = self
+            .output
+            .iter()
+            .filter(|b| at_ms / 1000 >= b.at_ms / 1000 && at_ms / 1000 - b.at_ms / 1000 < 60)
+            .copied()
+            .collect();
         AudioQuality {
             revision: self.revision,
             sampled_at_ms: at_ms,
             sources,
+            output: (!output.is_empty()).then(|| crate::api::AudioOutputQuality {
+                interruptions: output.iter().map(|b| b.interruptions).sum(),
+                missing_ms: output.iter().map(|b| b.missing_ns as f64 / 1_000_000.0).sum(),
+                glitches: output,
+            }),
         }
     }
 }
@@ -169,7 +177,9 @@ mod tests {
                     b[0] = Some(oink_audio::sink::DropoutBucket {
                         at_ms: 0,
                         lost: 0,
-                        late: value,
+                        late_packets: value,
+                        interruptions: value,
+                        ..Default::default()
                     });
                     b
                 },
@@ -178,7 +188,7 @@ mod tests {
         )
     }
     #[test]
-    fn window_percentiles_payload_bitrate_and_late_deltas_are_bounded() {
+    fn window_average_payload_bitrate_and_late_deltas_are_bounded() {
         let mut h = History::default();
         for tick in 1..=480 {
             h.record(tick * 250, [input(tick)]);
@@ -186,9 +196,9 @@ mod tests {
         let v = h.view(120_000);
         let s = &v.sources[0];
         assert_eq!(s.samples.len(), 240);
-        assert_eq!((s.p50_ms, s.p90_ms, s.p99_ms), (Some(360.), Some(456.), Some(478.)));
+        assert_eq!(s.buffer_avg_ms, Some(360.5));
         assert_eq!(s.bitrate_kbps, 32.);
-        assert_eq!(s.dropouts, s.glitches.iter().map(|b| b.count()).sum::<u64>());
+        assert_eq!(s.interruptions, s.glitches.iter().map(|b| b.interruptions).sum::<u64>());
         h.record(120_250, []);
         assert_eq!(h.view(120_250).sources[0].samples.len(), 239);
         assert!(h.view(180_000).sources.is_empty());
@@ -203,7 +213,7 @@ mod tests {
         h.record(750, [(name, next)]);
         let v = h.view(750);
         assert_eq!(v.sources[0].samples.len(), 2);
-        assert_eq!(v.sources[0].dropouts, 4);
+        assert_eq!(v.sources[0].interruptions, 4);
         assert_eq!(v.sources[0].bitrate_kbps, 4000. * 8. / 60000.);
     }
     #[test]
@@ -222,11 +232,13 @@ mod tests {
             at_ms: 62000,
             lost: 1,
             late: 0,
+            interruptions: 1,
+            ..Default::default()
         });
         h.record(62750, [(name, resumed)]);
         let s = &h.view(62750).sources[0];
-        assert_eq!(s.dropouts, 1);
-        assert_eq!(s.p50_ms, Some(3.));
+        assert_eq!(s.interruptions, 1);
+        assert_eq!(s.buffer_avg_ms, Some(3.));
         assert_eq!(s.bitrate_kbps, 1000. * 8. / 60000.);
     }
     #[test]
@@ -238,8 +250,8 @@ mod tests {
         h.flush(299, [(name, end)]);
         let s = &h.view(300).sources[0];
         assert_eq!(s.samples.len(), 1);
-        assert_eq!(s.dropouts, 2);
-        assert_eq!(s.p50_ms, Some(1.));
+        assert_eq!(s.interruptions, 2);
+        assert_eq!(s.buffer_avg_ms, Some(1.));
     }
     #[test]
     fn source_seconds_merge_sessions_deduplicate_snapshots_and_expire_at_boundary() {
@@ -249,18 +261,22 @@ mod tests {
             at_ms: 0,
             lost: 1,
             late: 1,
+            interruptions: 2,
+            ..Default::default()
         });
         h.record(999, [(name.clone(), o)]);
         h.record(1000, [(name.clone(), o)]);
-        assert_eq!(h.view(1000).sources[0].dropouts, 2);
+        assert_eq!(h.view(1000).sources[0].interruptions, 2);
         o.glitches[1] = Some(oink_audio::sink::DropoutBucket {
             at_ms: 1000,
             lost: 2,
             late: 0,
+            interruptions: 2,
+            ..Default::default()
         });
         h.record(1250, [(name.clone(), o)]);
-        assert_eq!(h.view(59999).sources[0].dropouts, 4);
-        assert_eq!(h.view(60000).sources[0].dropouts, 2);
+        assert_eq!(h.view(59999).sources[0].interruptions, 4);
+        assert_eq!(h.view(60000).sources[0].interruptions, 2);
         assert!(h.view(61000).sources[0].glitches.is_empty());
         o.session = 2;
         o.glitches = [None; 60];
@@ -268,11 +284,48 @@ mod tests {
             at_ms: 1000,
             lost: 1,
             late: 0,
+            interruptions: 1,
+            ..Default::default()
         });
         h.flush(1500, [(name, o)]);
         let s = &h.view(1500).sources[0];
-        assert_eq!(s.dropouts, 5);
+        assert_eq!(s.interruptions, 5);
         assert_eq!(s.glitches.len(), 2);
+    }
+    #[test]
+    fn concealed_duration_and_late_packets_do_not_become_interruptions_across_sessions() {
+        let mut h = History::default();
+        let (name, mut o) = input(0);
+        o.glitches[0] = Some(oink_audio::sink::DropoutBucket {
+            at_ms: 1000,
+            lost: 13,
+            concealed_ns: 60_000_000,
+            late_packets: 12,
+            ..Default::default()
+        });
+        h.record(1250, [(name.clone(), o)]);
+        h.flush(1299, [(name.clone(), o)]);
+        o.session = 2;
+        o.glitches = [None; 60];
+        h.record(1500, [(name.clone(), o)]);
+        h.record(1750, [(name, o)]);
+        let view = h.view(1750);
+        assert_eq!(view.sources[0].interruptions, 0);
+        assert_eq!(view.sources[0].concealed_ms, 60.0);
+        assert_eq!(view.sources[0].late_packets, 12);
+        assert!(view.output.is_none());
+        let mut output = [None; 60];
+        output[1] = Some(oink_audio::sink::DropoutBucket {
+            at_ms: 1000,
+            interruptions: 1,
+            missing_ns: 10_000_000,
+            ..Default::default()
+        });
+        h.record_output(output);
+        h.record_output(output); // snapshots, not deltas
+        assert_eq!(h.view(1750).output.unwrap().interruptions, 1);
+        assert_eq!(h.view(1750).sources[0].interruptions, 0);
+        assert!(h.view(61000).output.is_none());
     }
     #[test]
     fn local_api_shape_has_only_receive_window_data() {
@@ -286,12 +339,9 @@ mod tests {
         assert_eq!(event["type"], "audio_quality");
         let json = serde_json::to_value(h.view(250)).unwrap();
         assert_eq!(json["sources"][0]["samples"][0]["buffer_ms"], 1.);
-        assert_eq!(json["sources"][0]["dropouts"], 1);
-        assert_eq!(
-            json["sources"][0]["glitches"][0],
-            serde_json::json!({"at_ms":0,"lost":0,"late":1})
-        );
-        assert!(json["sources"][0].get("late_packets").is_none());
+        assert_eq!(json["sources"][0]["interruptions"], 1);
+        assert_eq!(json["sources"][0]["glitches"][0]["interruptions"], 1);
+        assert_eq!(json["sources"][0]["late_packets"], 1);
         assert_eq!(json["sources"][0]["name"], "Source");
         assert_eq!(serde_json::from_value::<AudioQuality>(json).unwrap(), h.view(250));
     }

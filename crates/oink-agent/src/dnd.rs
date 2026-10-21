@@ -437,6 +437,9 @@ impl DndGlue {
                     .flatten()
                     .cloned()
                     .collect();
+                if let Some(inner) = self.input_node.upgrade() {
+                    oink_clipboard::received::remember_source(id.origin, (Node { inner }).device_name(id.origin));
+                }
                 Some(oink_clipboard::NativeSpec {
                     inventory,
                     contents: Arc::new(remote),

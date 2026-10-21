@@ -36,7 +36,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["std", 
 
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_CloudFilters", "Win32_Storage_FileSystem", "Win32_System_CorrelationVector", "Win32_System_LibraryLoader", "Win32_Foundation", "Win32_Security"] }
+windows-sys = { version = "0.61", features = ["Win32_Globalization", "Win32_Storage_CloudFilters", "Win32_Storage_FileSystem", "Win32_System_SystemInformation", "Win32_System_CorrelationVector", "Win32_System_LibraryLoader", "Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography_Catalog", "Win32_Security_Cryptography_Sip", "Win32_Security_WinTrust", "Win32_Security_Cryptography", "Win32_System_IO"] }
 png = "0.18"
 image = { version = "0.25", default-features = false, features = ["bmp", "jpeg"] }
 # `#[implement]` 生成的代码引用 `::windows_core`
@@ -73,7 +73,7 @@ tracing-subscriber.workspace = true
 [target.'cfg(windows)'.dev-dependencies]
 anyhow.workspace = true
 # examples/windows_dnd.rs：注入鼠标事件
-windows = { version = "0.62", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Accessibility", "Win32_System_Variant", "Win32_System_Com", "Win32_System_StationsAndDesktops", "Win32_Security"] }
+windows = { version = "0.62", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Accessibility", "Win32_System_Variant", "Win32_System_Com", "Win32_System_StationsAndDesktops", "Win32_Security", "Win32_Security_Cryptography_Catalog", "Win32_Security_Cryptography_Sip", "Win32_Security_WinTrust", "Win32_Security_Cryptography", "Win32_System_IO"] }
 
 # examples/mac_dnd.rs：注入鼠标事件、找 Finder 窗口
 [target.'cfg(target_os = "macos")'.dev-dependencies]

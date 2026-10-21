@@ -3,6 +3,8 @@ use super::*;
 use std::path::Path;
 fn context(links: LinkLayer, config: crate::config_module::ConfigModule) -> Context {
     Context {
+        legacy_coverage: false,
+        legacy_sender: false,
         links,
         config,
         runtime: tokio::runtime::Handle::current(),

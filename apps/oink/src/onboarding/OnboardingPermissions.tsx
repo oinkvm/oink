@@ -12,7 +12,6 @@ import { PermissionControl } from '../permissions/PermissionControl';
 import type { PermissionId, PrefsApi } from '../settings/prefs';
 import type { PermState } from '../settings/SettingsPage';
 import { useGrant } from '../settings/useGrant';
-import type { Platform } from '../window/DesktopWindow';
 
 const PERMS: Array<{ id: PermissionId; label: MessageKey; desc: MessageKey }> = [
   { id: 'accessibility', label: '辅助功能', desc: '如不授权，本机无法被其他设备控制' },
@@ -22,14 +21,14 @@ const PERMS: Array<{ id: PermissionId; label: MessageKey; desc: MessageKey }> = 
   { id: 'audio', label: '系统音频录制', desc: '默认在本机播放；此权限仅允许你手动开启音频转发' },
 ];
 
-function initialLaunch(platform: Platform, status: LaunchAtLoginStatus | null): boolean | null {
+// macOS only: Windows onboarding has no permissions page, launch at login is in Settings.
+function initialLaunch(status: LaunchAtLoginStatus | null): boolean | null {
   if (!status) return null;
-  if (platform === 'mac' && !status.configured && status.state === 'disabled' && !status.problem) return true;
+  if (!status.configured && status.state === 'disabled' && !status.problem) return true;
   return status.state === 'enabled' || status.state === 'requires_approval';
 }
 
-export function OnboardingPermissions({ platform, preferences, perms, onGrant, onOpenSettings, container, leaving, onDone }: {
-  platform: Platform;
+export function OnboardingPermissions({ preferences, perms, onGrant, onOpenSettings, container, leaving, onDone }: {
   preferences: PrefsApi;
   perms: Record<PermissionId, PermState>;
   onGrant: (id: PermissionId) => void | Promise<void>;
@@ -41,13 +40,13 @@ export function OnboardingPermissions({ platform, preferences, perms, onGrant, o
   const grant = useGrant(onGrant, onOpenSettings);
   const done = PERMS.every(p => ['granted', 'not_required', 'unsupported'].includes(perms[p.id]));
   const [ask, setAsk] = useState(false);
-  const [launch, setLaunch] = useState(() => initialLaunch(platform, preferences.launchStatus));
+  const [launch, setLaunch] = useState(() => initialLaunch(preferences.launchStatus));
   const touched = useRef(false);
   const [saving, setSaving] = useState(false);
   const busy = useRef(false);
   useEffect(() => {
-    if (!touched.current) setLaunch(initialLaunch(platform, preferences.launchStatus));
-  }, [platform, preferences.launchStatus]);
+    if (!touched.current) setLaunch(initialLaunch(preferences.launchStatus));
+  }, [preferences.launchStatus]);
 
   // The forward action confirms the displayed value even without a switch edit.
   // Keep the latest draft in the automatic grant-completion callback as well.
@@ -59,7 +58,7 @@ export function OnboardingPermissions({ platform, preferences, perms, onGrant, o
       const status = preferences.launchStatus ?? await api.launchAtLoginStatus();
       if (status.state === 'unavailable' && status.problem === 'system_unavailable') throw new Error('unavailable');
       if (status.state !== 'unavailable') {
-        await preferences.confirmLaunchAtLogin(launch ?? initialLaunch(platform, status)!);
+        await preferences.confirmLaunchAtLogin(launch ?? initialLaunch(status)!);
       }
       onDone();
     } catch {
@@ -71,27 +70,25 @@ export function OnboardingPermissions({ platform, preferences, perms, onGrant, o
   const proceedRef = useRef(proceed);
   proceedRef.current = proceed;
   useEffect(() => {
-    if (platform !== 'mac' || !done) return;
+    if (!done) return;
     const timer = window.setTimeout(() => { void proceedRef.current(); }, 900 * Math.max(speed(), 0.2));
     return () => window.clearTimeout(timer);
-  }, [platform, done]);
+  }, [done]);
   const containedProps = { contained: true } as Partial<DialogProps>;
 
   return (
     <section className="ob-page ob-perms" data-leaving={leaving ? '' : undefined}>
       <div className="ob-main ok-scroll">
         <div className="ob-col">
-          {platform === 'mac' && <>
-            <h1 className="ob-title ob-in">{tr('授予必要的系统权限')}</h1>
-            <p className="ob-sub ob-in" style={{ '--d': '.05s' } as CSSProperties}>
-              {tr('Oink 需要依靠系统权限来实现共享功能，缺少权限会影响部分功能可用性。')}
-            </p>
-          </>}
+          <h1 className="ob-title ob-in">{tr('授予必要的系统权限')}</h1>
+          <p className="ob-sub ob-in" style={{ '--d': '.05s' } as CSSProperties}>
+            {tr('Oink 需要依靠系统权限来实现共享功能，缺少权限会影响部分功能可用性。')}
+          </p>
           <Group className="ob-perms__card ob-in" style={{ '--d': '.1s' } as CSSProperties}>
             <PermissionRow className="ob-perms__row" label={tr('开机自动启动')} description={tr('若关闭，重新启动后需要手动打开 Oink 才可恢复共享')}>
               <Switch aria-label={tr('开机自动启动')} checked={launch ?? false} disabled={launch === null || saving || preferences.launchStatus?.state === 'unavailable'} onChange={value => { touched.current = true; setLaunch(value); }} />
             </PermissionRow>
-            {platform === 'mac' && PERMS.filter(p => perms[p.id] !== 'not_required').map(p => (
+            {PERMS.filter(p => perms[p.id] !== 'not_required').map(p => (
               <PermissionRow key={p.id} className="ob-perms__row" label={tr(p.label)} description={tr(p.desc)}>
                 <PermissionControl id={p.id} state={perms[p.id]} grant={grant}/>
               </PermissionRow>
@@ -100,10 +97,10 @@ export function OnboardingPermissions({ platform, preferences, perms, onGrant, o
         </div>
       </div>
       <footer className="ob-foot ob-in" style={{ '--d': '.15s' } as CSSProperties}>
-        {platform === 'mac' && !done
+        {!done
           ? <Button variant="ghost" size="sm" className="ob-link" disabled={saving} onClick={() => setAsk(true)}>{tr('跳过')}</Button>
           : <>
-            {platform === 'mac' && <p className="ob-done" role="status"><Icon name="check-circle" />{tr('全部授权完成')}</p>}
+            <p className="ob-done" role="status"><Icon name="check-circle" />{tr('全部授权完成')}</p>
             <Button variant="accent" className="ob-next" loading={saving} trailing={<Icon name="arrow-right" />} onClick={() => { void proceed(); }}>{tr('下一步')}</Button>
           </>}
       </footer>

@@ -1,0 +1,97 @@
+{
+  "revision": 110,
+  "settings": {
+    "gap_travel": false,
+    "overlap_tolerance": 0.007288629737609329,
+    "minimum_portal": 0.014577259475218658,
+    "portal_snap": 0.011661807580174927,
+    "walls": true,
+    "endpoint_reach": 0.0
+  },
+  "screens": [
+    {
+      "code": "A1",
+      "device": "A",
+      "local": {
+        "h": 2160.0,
+        "w": 3840.0,
+        "x": 0.0,
+        "y": 0.0
+      },
+      "rect": {
+        "x": 1.0594638698158139,
+        "y": -0.469023176010887,
+        "w": 0.7460937499999998,
+        "h": 0.41967773437499983
+      },
+      "hidden": false,
+      "disabled": false,
+      "online": true,
+      "gain": 1.0,
+      "remote_gain": 1.0
+    },
+    {
+      "code": "S1",
+      "device": "S",
+      "local": {
+        "h": 1117.0,
+        "w": 1728.0,
+        "x": 0.0,
+        "y": 0.0
+      },
+      "rect": {
+        "x": 0.663244198602886,
+        "y": 0.2642885786923892,
+        "w": 0.5018144325252422,
+        "h": 0.3243788895432266
+      },
+      "hidden": false,
+      "disabled": false,
+      "online": true,
+      "gain": 1.0,
+      "remote_gain": 1.0
+    },
+    {
+      "code": "S2",
+      "device": "S",
+      "local": {
+        "h": 1080.0,
+        "w": 1920.0,
+        "x": 1560.0,
+        "y": -1080.0
+      },
+      "rect": {
+        "x": 1.1162711168548407,
+        "y": -0.049345441635887166,
+        "w": 0.5575715916947135,
+        "h": 0.31363402032827636
+      },
+      "hidden": false,
+      "disabled": false,
+      "online": true,
+      "gain": 1.0,
+      "remote_gain": 0.8
+    },
+    {
+      "code": "C1",
+      "device": "C",
+      "local": {
+        "h": 1117.0,
+        "w": 1728.0,
+        "x": 0.0,
+        "y": 0.0
+      },
+      "rect": {
+        "x": 1.2982745608625585,
+        "y": 0.2749065536726199,
+        "w": 0.5018144325252422,
+        "h": 0.3243788895432266
+      },
+      "hidden": false,
+      "disabled": false,
+      "online": true,
+      "gain": 1.0,
+      "remote_gain": 1.0
+    }
+  ]
+}

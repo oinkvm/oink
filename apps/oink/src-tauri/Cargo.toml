@@ -44,7 +44,7 @@ tauri-build = { version = "~2.7.3", features = [] }
 block2 = "0.6"
 objc2 = "0.6"
 objc2-foundation = "0.3"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSWindow", "NSButton", "NSControl", "NSPanel", "NSView", "NSEvent", "NSGraphics", "NSScreen", "NSColor", "NSImage", "NSAppearance", "NSHapticFeedback"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSMenu", "NSMenuItem", "NSResponder", "NSWindow", "NSButton", "NSControl", "NSPanel", "NSView", "NSEvent", "NSGraphics", "NSScreen", "NSColor", "NSImage", "NSAppearance", "NSHapticFeedback"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -61,7 +61,7 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 oink-winsvc = { path = "../../../crates/oink-winsvc" }
-windows = { version = "0.62", features = ["Win32_Globalization", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
+windows = { version = "0.62", features = ["Win32_Globalization", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_UI_Controls", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Storage_EnhancedStorage", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
 
 [lints]
 workspace = true

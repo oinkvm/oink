@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, renderHook } from '@testing-library/react';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { useState } from 'react';
 import { Arrangement } from './Arrangement';
 import { cameraStore } from './cameraStore';
 import type { Screen } from './geometry';
@@ -428,6 +429,8 @@ describe('canvas key hints', () => {
     const { container, rerender } = render(<Arrangement {...props} selectedId="one"/>);
     expect(container.querySelector('.arr__keys')).not.toBeNull();
     fireEvent.pointerDown(container.querySelector('.scr')!, { button: 0, clientX: 300, clientY: 300 });
+    expect(container.querySelector('.arr__keys')).not.toBeNull();
+    fireEvent.pointerMove(container.querySelector('.scr')!, { clientX: 330, clientY: 300 });
     expect(container.querySelector('.arr__keys')).toBeNull();
     fireEvent.pointerUp(container.querySelector('.scr')!);
     expect(container.querySelector('.arr__keys')).not.toBeNull();
@@ -436,6 +439,36 @@ describe('canvas key hints', () => {
     viewport = { width: 600, height: 400 };
     act(() => resize([{contentRect: viewport}] as ResizeObserverEntry[], {} as ResizeObserver));
     expect(container.querySelector('.arr__keys')).toBeNull();
+  });
+
+  it('keeps the same hint mounted while a click switches the selection', () => {
+    setLanguage('en');
+    const pair: Screen[] = [screens[0], { ...screens[0], id: 'two', name: 'Second', x: 1000 }];
+    function Host() {
+      const [selected, setSelected] = useState<string | null>('one');
+      return <Arrangement {...props} screens={pair} selectedId={selected} onSelect={setSelected}/>;
+    }
+    const { container } = render(<Host/>);
+    const hints = container.querySelector('.arr__keys')!;
+    const text = hints.textContent;
+    expect(text).toBe('↑↓←→Move·⌘Resize·⇧Fine');
+    const added: Node[] = [], removed: Node[] = [];
+    const observer = new MutationObserver(records => records.forEach(r => {
+      added.push(...r.addedNodes);
+      removed.push(...r.removedNodes);
+    }));
+    observer.observe(container, { childList: true, subtree: true });
+    const second = container.querySelectorAll('.scr')[1];
+    fireEvent.pointerDown(second, { button: 0, clientX: 650, clientY: 350 });
+    // A press that has not moved is a click, not a projection gesture.
+    expect(container.querySelector('.arr__keys')).toBe(hints);
+    fireEvent.pointerUp(second, { clientX: 650, clientY: 350 });
+    observer.takeRecords().forEach(r => { added.push(...r.addedNodes); removed.push(...r.removedNodes); });
+    observer.disconnect();
+    expect(second.getAttribute('aria-pressed')).toBe('true');
+    expect(container.querySelector('.arr__keys')).toBe(hints);
+    expect(hints.textContent).toBe(text);
+    expect([...added, ...removed].filter(n => n === hints || n.contains(hints) || hints.contains(n))).toEqual([]);
   });
 
   it.each([['ArrowRight', 100, 0], ['ArrowDown', 0, 100], ['ArrowLeft', -100, 0], ['ArrowUp', 0, -100]])(

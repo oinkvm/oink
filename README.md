@@ -13,7 +13,7 @@ Oink, short for "Oink Is Not only a KVM", is modern software that builds a peer-
 
 > Oink is a personal project. All of its code was written by AI (thanks to Claude Code and Codex); the human manages the project, sets the technical direction and encourages the AI. The project has not been thoroughly tested in diverse environments, especially:
 >
-> 1. computers with multiple displays
+> 1. Windows computers with multiple displays
 > 2. Windows laptops with touchpads
 > 3. Windows 10, and Macs that are not on an up-to-date macOS
 >

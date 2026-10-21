@@ -451,14 +451,16 @@ mod tests {
                             velocity: if phase.is_end() { canonical * 6.0 } else { 0.0 }
                         })
                     );
-                    if phase == GesturePhase::Ended {
-                        use crate::win_actions::GestureMapper;
-                        let actions = GestureMapper::default().map(&g.unwrap());
-                        assert!(
-                            actions.is_empty(),
-                            "Dock pinch is outside the four Windows fallback mappings"
-                        );
-                    }
+                    use crate::win_actions::{GestureMapper, WinAction};
+                    let actions = GestureMapper::default().map(&g.unwrap());
+                    let expected = if phase == GesturePhase::Ended && canonical < 0.0 {
+                        vec![WinAction::Shortcut(vec![oink_foundation::input::KeyCode::LEFT_GUI])]
+                    } else {
+                        // With no foreground Start/search surface, opening the
+                        // pinch is a no-op. Non-ended phases never commit.
+                        Vec::new()
+                    };
+                    assert_eq!(actions, expected);
                 }
             }
         }

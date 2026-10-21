@@ -239,7 +239,7 @@ impl Router {
 /// Only touching facing boundaries form a native seam. Sampling a point beyond
 /// the edge can jump a small real gap and incorrectly exempt it from damping.
 /// Tangent intervals are half-open, like native display containment.
-fn native_seam(source: Rect, other: Rect, at: Point, normal: (f64, f64)) -> bool {
+pub(super) fn native_seam(source: Rect, other: Rect, at: Point, normal: (f64, f64)) -> bool {
     let (boundary, facing, tangent, start, end) = if normal.0 > 0.0 {
         (
             source.right(),

@@ -1,8 +1,5 @@
 //! Event-driven capture availability. Never switches desktops or reads secure input.
-use crate::{
-    KeyCode,
-    native_lifecycle::{self, Data, Kind},
-};
+use crate::native_lifecycle::{self, Data, Kind};
 use std::cell::Cell;
 use windows::Win32::{
     Foundation::{HANDLE, HWND, LPARAM, WPARAM},
@@ -15,7 +12,6 @@ use windows::Win32::{
     },
     UI::{
         Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
-        Input::KeyboardAndMouse::{GetAsyncKeyState, MAPVK_VSC_TO_VK_EX, MapVirtualKeyW},
         WindowsAndMessaging::{EVENT_SYSTEM_DESKTOPSWITCH, PostMessageW, WINEVENT_OUTOFCONTEXT, WM_APP},
     },
 };
@@ -117,21 +113,6 @@ pub(super) fn default_desktop_active() -> bool {
         .is_ok();
         let _ = CloseDesktop(desktop);
         result && name[..8] == [68, 101, 102, 97, 117, 108, 116, 0] // Default; never recorded
-    }
-}
-pub(super) fn key_down(code: KeyCode) -> bool {
-    let Some(entry) = super::super::keymap::lookup_hid(code) else {
-        return false;
-    };
-    // SAFETY: called only after the default input desktop becomes accessible again.
-    // Use the high bit: the low "pressed since query" bit is not reliable.
-    unsafe {
-        let vk = if entry.vk != 0 {
-            u32::from(entry.vk)
-        } else {
-            MapVirtualKeyW(u32::from(entry.scancode), MAPVK_VSC_TO_VK_EX)
-        };
-        vk != 0 && GetAsyncKeyState(vk as i32) < 0
     }
 }
 

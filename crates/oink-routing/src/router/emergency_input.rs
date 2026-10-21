@@ -100,6 +100,47 @@ mod tests {
     }
 
     #[test]
+    fn disabled_keyboard_brightness_is_local_only_with_local_or_remote_focus() {
+        for remote in [false, true] {
+            let mut r = router();
+            r.set_keyboard_disabled(true);
+            if remote {
+                r.holder = DeviceId([2; 32]);
+                r.claim = r.holder;
+            }
+            r.drain_outputs();
+            for usage in [0x6F, 0x70, 0x79, 0x7A, 0x7C] {
+                let code = KeyCode::new(KeyCode::PAGE_CONSUMER, usage);
+                assert!(!r.keyboard_key_blocked(Some(code)));
+                for pressed in [true, true, false] {
+                    assert_eq!(
+                        r.on_local_event(
+                            &CapturedEvent {
+                                time_us: 1,
+                                physical: true,
+                                source: SourceKind::Keyboard,
+                                cursor: None,
+                                event: InputEvent::Key { code, pressed },
+                            },
+                            1
+                        ),
+                        Disposition::Pass
+                    );
+                    assert!(
+                        !r.drain_outputs()
+                            .iter()
+                            .any(|o| matches!(o, Output::Send { .. } | Output::Inject(_)))
+                    );
+                }
+            }
+            for code in [KeyCode::keyboard(0x3A), KeyCode::new(KeyCode::PAGE_CONSUMER, 0xE9)] {
+                assert!(r.keyboard_key_blocked(Some(code)));
+            }
+            assert!(r.keyboard_disabled());
+        }
+    }
+
+    #[test]
     fn physical_escape_pauses_once_per_press_even_while_paused_or_guarded() {
         for paused in [false, true] {
             for guarded in [false, true] {

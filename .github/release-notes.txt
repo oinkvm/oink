@@ -1,13 +1,29 @@
-Oink 0.1.4 adds Mac-style scrolling on Windows, refines auto-compact and fixes a drag-and-drop issue.
+Oink 0.2.0 adds saved layouts, received-file management, screen hiding and mouse disabling, redesigns the device menu and tray menu, and fixes a number of pointer and trackpad issues.
 
 ## New
 
-- New Windows setting "Emulate Mac trackpad scrolling": when a Mac trackpad controls the PC, two-finger scrolling feels like it does on the Mac.
-- Auto-compact now moves only the computer you just adjusted and stops where it touches another computer; hidden screens no longer affect the layout.
+- Saved layouts: save multiple screen layouts and switch between them at any time.
+- Received-file management: files copied or dragged from other computers are saved in folders by source computer and time. In Settings you can see how much space they use, open the folder, and set up automatic cleanup.
+- Hide individual screens: you can hide a single screen. A hidden screen isn't connected to other screens, and the pointer can't enter or leave it across its edges.
+- Disable the mouse: you can disable a device's mouse, both for controlling the device itself and for controlling other devices.
+- Redesigned device menu and sidebar: UI improvements.
+- Native tray menu: the menu opened by clicking or right-clicking the menu bar or tray icon is now a native system menu, for better performance.
+- Clipboard: new Receive and Sync master switches.
+- Windows: new setting "Forward input injected by other apps"; added shortcuts mapped from Mac trackpad gestures (when native contact injection is off); Oink no longer moves the pointer out when a game or another app confines it to a window.
+- Layout page: improved screen projections and a better experience on devices with multiple displays.
+- Audio diagnostics: improved display of audio diagnostics.
 
 ## Fixes
 
-- Fixed files not dragging to another computer from the bottom edge of a Mac's external display.
+- Fixed the pointer sometimes not entering the adjacent computer when moving down from the edge of a Mac's external display.
+- Fixed an occasional extra "ghost finger" when controlling Windows with a Mac trackpad.
+- Fixed copied files that couldn't be pasted after updating on a Mac.
+- Fixed input in one direction occasionally never working after two computers connect.
+- Fixed pointer motion being repeated at the start of a drag.
+- Fixed doubled and flickering selection and dashed outlines on Mac.
+- The full-screen notice on Windows no longer shows a busy cursor on hover.
+- Devices without usable audio no longer show a volume slider.
+- Saving a diagnostics package is faster.
 
 ## Downloads
 

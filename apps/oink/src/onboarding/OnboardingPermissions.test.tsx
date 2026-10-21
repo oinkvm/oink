@@ -22,9 +22,9 @@ afterEach(() => { cleanup(); vi.useRealTimers(); });
 const disabled: LaunchAtLoginStatus = { state: 'disabled', problem: null, configured: false };
 const missing = { accessibility: 'not_granted', input: 'not_granted', network: 'not_required', files: 'unsupported', audio: 'not_required' } as const;
 const granted = { ...missing, accessibility: 'granted', input: 'granted' } as const;
-function fixture(platform: 'mac'|'win' = 'mac', status: LaunchAtLoginStatus|null = disabled) {
+function fixture(status: LaunchAtLoginStatus|null = disabled) {
   const preferences = { launchStatus: status, confirmLaunchAtLogin: vi.fn().mockResolvedValue(undefined) } as unknown as PrefsApi;
-  const props = { platform, preferences, perms: missing as Record<PermissionId, PermState>, onGrant: vi.fn(), onDone: vi.fn(), container: null, leaving: false };
+  const props = { preferences, perms: missing as Record<PermissionId, PermState>, onGrant: vi.fn(), onDone: vi.fn(), container: null, leaving: false };
   const view = () => <OinkProvider defaultMotion="reduced"><OnboardingPermissions {...props}/></OinkProvider>;
   return { props, view, save: vi.mocked(preferences.confirmLaunchAtLogin) };
 }
@@ -76,42 +76,19 @@ it('does not apply a draft when the page is closed', () => {
 });
 
 it('keeps a user draft when a refreshed system snapshot arrives', async () => {
-  const {view,props,save}=fixture('win',{...disabled,state:'enabled'});
+  const {view,props,save}=fixture({...disabled,state:'enabled'});
   const {rerender}=render(view());
   fireEvent.click(screen.getByRole('switch'));
   props.preferences={...props.preferences,launchStatus:{...disabled,state:'enabled',configured:true}};
   rerender(view());
   expect((screen.getByRole('switch') as HTMLInputElement).checked).toBe(false);
-  fireEvent.click(screen.getByRole('button',{name:'Next'}));
+  await skip();
   await waitFor(()=>expect(save).toHaveBeenCalledExactlyOnceWith(false));
 });
 
 it('preserves a previously confirmed macOS off choice', () => {
-  const {view} = fixture('mac', {...disabled, configured:true}); render(view());
+  const {view} = fixture({...disabled, configured:true}); render(view());
   expect((screen.getByRole('switch') as HTMLInputElement).checked).toBe(false);
-});
-
-it.each([false,true])('shows the MSI/current Windows state=%s and applies on Next', async enabled => {
-  const {view, props, save} = fixture('win', {...disabled,state:enabled?'enabled':'disabled'}); render(view());
-  expect((screen.getByRole('switch') as HTMLInputElement).checked).toBe(enabled);
-  const rows = document.querySelectorAll('.ob-perms__card > .permission-row');
-  expect(document.querySelectorAll('.ob-perms__card')).toHaveLength(1);
-  expect(rows).toHaveLength(1);
-  expect(rows[0].contains(screen.getByRole('switch'))).toBe(true);
-  expect(screen.queryByRole('button',{name:'Grant permission'})).toBeNull();
-  expect(screen.queryByRole('button',{name:'Skip'})).toBeNull();
-  fireEvent.click(screen.getByRole('switch'));
-  expect(save).not.toHaveBeenCalled();
-  fireEvent.click(screen.getByRole('button',{name:'Next'}));
-  await waitFor(() => expect(save).toHaveBeenCalledExactlyOnceWith(!enabled));
-  expect(props.onDone).toHaveBeenCalledTimes(1);
-});
-
-it('keeps Windows on the page until Next even with no required permissions', async () => {
-  vi.useFakeTimers();
-  const {view, props, save} = fixture('win'); props.perms = granted; render(view());
-  await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
-  expect(save).not.toHaveBeenCalled(); expect(props.onDone).not.toHaveBeenCalled();
 });
 
 it.each([false,true])('excludes the first login row (on=%s) from grant completion and preserves auto-advance timing', async enabled => {
@@ -131,20 +108,20 @@ it.each([false,true])('excludes the first login row (on=%s) from grant completio
 });
 
 it('waits for applying the value and permits retry after failure', async () => {
-  const {view, props, save} = fixture('win'); save.mockRejectedValueOnce(new Error('offline'));
-  render(view()); fireEvent.click(screen.getByRole('button',{name:'Next'}));
+  const {view, props, save} = fixture(); save.mockRejectedValueOnce(new Error('offline'));
+  render(view()); await skip();
   await waitFor(() => expect(agent.fail).toHaveBeenCalledWith('unavailable'));
   expect(props.onDone).not.toHaveBeenCalled();
   let finish!: () => void;
   save.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
-  fireEvent.click(screen.getByRole('button',{name:'Next'}));
+  await skip();
   expect(props.onDone).not.toHaveBeenCalled();
   await act(async () => { finish(); });
   expect(props.onDone).toHaveBeenCalledTimes(1);
 });
 
 it('lets an unavailable development process continue without registering', async () => {
-  const {view,props,save}=fixture('mac',{state:'unavailable',problem:'main_app_required',configured:false});
+  const {view,props,save}=fixture({state:'unavailable',problem:'main_app_required',configured:false});
   render(view());
   expect((screen.getByRole('switch') as HTMLInputElement).disabled).toBe(true);
   await skip();
@@ -153,8 +130,8 @@ it('lets an unavailable development process continue without registering', async
 });
 
 it('does not treat a failed OS query as a confirmed choice', async () => {
-  const {view,props,save}=fixture('win',{state:'unavailable',problem:'system_unavailable',configured:false});
-  render(view()); fireEvent.click(screen.getByRole('button',{name:'Next'}));
+  const {view,props,save}=fixture({state:'unavailable',problem:'system_unavailable',configured:false});
+  render(view()); await skip();
   await waitFor(()=>expect(agent.fail).toHaveBeenCalledWith('unavailable'));
   expect(props.onDone).not.toHaveBeenCalled(); expect(save).not.toHaveBeenCalled();
 });
@@ -168,11 +145,11 @@ it('confirms only once when Next races the automatic permission-completion timer
   expect(props.onDone).toHaveBeenCalledTimes(1);
 });
 
-it('reads the actual Windows state if the initial status has not arrived', async () => {
+it('reads the actual state if the initial status has not arrived', async () => {
   const read = vi.spyOn(api,'launchAtLoginStatus').mockResolvedValue({...disabled,state:'enabled'});
-  const {view, save} = fixture('win',null); render(view());
+  const {view, save} = fixture(null); render(view());
   expect((screen.getByRole('switch') as HTMLInputElement).disabled).toBe(true);
-  fireEvent.click(screen.getByRole('button',{name:'Next'}));
+  await skip();
   await waitFor(() => expect(save).toHaveBeenCalledWith(true));
   read.mockRestore();
 });

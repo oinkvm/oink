@@ -23,6 +23,92 @@ fn manifest(bundle: &BundleInfo) -> serde_json::Value {
     let mut zip = zip::ZipArchive::new(std::fs::File::open(&bundle.path).unwrap()).unwrap();
     serde_json::from_reader(zip.by_name("manifest.json").unwrap()).unwrap()
 }
+fn archive_contents(bundle: &BundleInfo) -> std::collections::BTreeMap<String, Vec<u8>> {
+    use std::io::Read;
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&bundle.path).unwrap()).unwrap();
+    (0..zip.len())
+        .map(|index| {
+            let mut entry = zip.by_index(index).unwrap();
+            let name = entry.name().unwrap().into_owned();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            if name == "manifest.json" {
+                let mut manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                // Existing boundary clipping creates fresh receipt metadata
+                // using the real clock, independently of the frozen cutoff.
+                // Every other manifest field and every entry byte must match.
+                for meta in manifest["coverage"].as_array_mut().unwrap() {
+                    meta.as_object_mut().unwrap().remove("received_us");
+                }
+                bytes = serde_json::to_vec(&manifest).unwrap();
+            }
+            (name, bytes)
+        })
+        .collect()
+}
+#[test]
+fn range_snapshot_avoids_excluded_links_and_preserves_archive_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let end = 10 * 24 * 60 * 60 * 1_000_000;
+    let minute = 60 * 1_000_000;
+    let mut source = store::Store::open_with_clock(
+        dir.path().into(),
+        "a".repeat(24),
+        true,
+        clock::Clock::new(Arc::new(Frozen(end))),
+    )
+    .unwrap();
+    for times in [
+        vec![end - 31 * minute],
+        vec![end - 31 * minute, end - 29 * minute],
+        vec![end - minute],
+        vec![end - 1, end + 1],
+        vec![end + minute],
+    ] {
+        source
+            .append(
+                times
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, time)| row(time, i as u64))
+                    .collect(),
+                0,
+            )
+            .unwrap();
+    }
+    // All-history saves retain earlier clock epochs even if their wall time
+    // appears later than the current cutoff after a backstep.
+    let mut historical = row(end + 2 * minute, 0);
+    historical.clock_id = 42;
+    source.append(vec![historical], 0).unwrap();
+    for (reason, minutes) in [
+        (Reason::Manual, Some(30)),
+        (Reason::Manual, None),
+        (Reason::Manual, Some(1)),
+        (Reason::Emergency, None),
+    ] {
+        let mut original = source.export_snapshot().unwrap();
+        original.prepare_range(reason, minutes).unwrap();
+        let mut selected = source.export_snapshot_for_save(reason, minutes).unwrap();
+        selected.prepare_range(reason, minutes).unwrap();
+        let before = original.export(reason, 0, 0).unwrap();
+        let after = selected.export(reason, 0, 0).unwrap();
+        let expected = archive_contents(&before);
+        assert_eq!(expected, archive_contents(&after));
+        let (start, end) = original.requested_range.unwrap();
+        let mut peer = source.export_snapshot_between(start, end).unwrap();
+        peer.prepare_range(reason, minutes).unwrap();
+        let served = peer.export(reason, 0, 0).unwrap();
+        assert_eq!(expected, archive_contents(&served));
+    }
+    // A segment excluded by metadata need not even be present on disk. This
+    // checks the avoided filesystem operation without a wall-clock assertion.
+    let old = &source.segments[0];
+    let old_name = format!("{}-{}-{}.dseg", old.device, old.instance, old.seq);
+    std::fs::remove_file(dir.path().join("buffer").join(old_name)).unwrap();
+    assert!(source.export_snapshot_for_save(Reason::Manual, Some(30)).is_ok());
+    assert!(source.export_snapshot_between(end - 30 * minute, end).is_ok());
+}
 #[test]
 fn named_segments_split_at_the_expansion_limit_without_losing_rows_or_multiplying_drops() {
     let dir = tempfile::tempdir().unwrap();

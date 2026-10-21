@@ -37,7 +37,7 @@ function fixture(extras: Partial<OnboardingProps> = {}) {
   return { props, actions, view };
 }
 async function next() { fireEvent.click(screen.getByRole('button', { name: 'Next' })); }
-async function telemetry() { await next(); await screen.findByRole('switch', {name:'Launch at login'}); await next(); await screen.findByText('Help us improve Oink'); }
+async function telemetry() { await next(); await screen.findByText('Help us improve Oink'); }
 async function connect() { await telemetry(); await next(); await screen.findByText('Connect your other devices'); }
 
 it('persists only explicit accent and appearance edits from the welcome page', async () => {
@@ -54,8 +54,6 @@ it.each(['en', 'zh-Hans'] as const)('shows only the crash-report row and opens p
   setLanguage(language); const open = vi.spyOn(shell, 'openUrl').mockResolvedValue();
   const { props, view } = fixture(); render(view());
   fireEvent.click(screen.getByRole('button', { name: language === 'en' ? 'Next' : '下一步' }));
-  await screen.findByRole('switch', {name: language === 'en' ? 'Launch at login' : '开机自动启动'});
-  fireEvent.click(screen.getByRole('button', { name: language === 'en' ? 'Next' : '下一步' }));
   const privacy = await screen.findByRole('link', { name: language === 'en' ? 'View privacy policy' : '查看隐私政策' });
   expect(document.querySelectorAll('.ob-telemetry__card .ok-row')).toHaveLength(1);
   expect(screen.queryByText(language === 'en' ? 'Support Oink development' : '赞助 Oink 的开发')).toBeNull();
@@ -69,6 +67,15 @@ it.each(['en', 'zh-Hans'] as const)('shows only the crash-report row and opens p
   expect(props.preferences.chooseReport).not.toHaveBeenCalled();
   fireEvent.click(screen.getByRole('button', { name: language === 'en' ? 'Next' : '下一步' }));
   await waitFor(() => expect(props.preferences.chooseReport).toHaveBeenCalledWith(false));
+});
+
+it('goes from welcome straight to crash reports on Windows, leaving launch at login to Settings', async () => {
+  const { props, view } = fixture({ platform: 'win' }); render(view());
+  await next();
+  await screen.findByText('Help us improve Oink');
+  expect(screen.queryByRole('switch', { name: 'Launch at login' })).toBeNull();
+  expect(document.querySelector('.ob')?.getAttribute('data-step')).toBe('telemetry');
+  expect(props.preferences.confirmLaunchAtLogin).not.toHaveBeenCalled();
 });
 
 it('waits for consent persistence before continuing, and lets a failed save be retried', async () => {

@@ -15,6 +15,7 @@ use std::{
 };
 
 mod dropouts;
+pub(crate) mod quality;
 pub(crate) use dropouts::Ledger as DropoutLedger;
 pub use dropouts::{DropoutBucket, DropoutCounters};
 
@@ -222,6 +223,7 @@ struct SourceState {
     remaining: usize,
     rejections: dsp::Rejections,
     burst: u64,
+    quality: quality::Interruptions,
 }
 impl SourceState {
     fn prepare(config: dsp::Config, wake: realtime::Signal, observe: bool) -> Result<(Source, Box<Self>), String> {
@@ -279,6 +281,7 @@ impl SourceState {
             remaining: 0,
             rejections: dsp::Rejections::default(),
             burst: 0,
+            quality: Default::default(),
         });
         let source = Source {
             rendered: rendered_rx,
@@ -306,6 +309,7 @@ impl SourceState {
                 let (playing, packet) = read();
                 self.status.playing.store(playing, Ordering::Release);
                 if !playing {
+                    self.quality.reset();
                     continue;
                 }
                 if packet.is_some() {
@@ -329,6 +333,7 @@ impl SourceState {
             if packet.burst != self.burst {
                 let buffered = self.receiver.buffered_frames();
                 self.receiver.reset_burst();
+                self.quality.reset();
                 self.status.occupied.fetch_sub(buffered, Ordering::AcqRel);
                 self.offset = 0;
                 self.remaining = 0;
@@ -392,6 +397,14 @@ impl SourceState {
             self.remaining = samples;
         }
         out.copy_from_slice(&self.pcm[self.offset..self.offset + MIX_SAMPLES]);
+        if let Some(counters) = self.status.dropout_counters.get() {
+            self.quality.block(
+                (crate::diagnostics::monotonic_us(now).max(0) / 1000) as u64,
+                &self.receiver.output_kinds()[self.offset / 2..(self.offset + MIX_SAMPLES) / 2],
+                out,
+                counters,
+            );
+        }
         if let Some(rendered) = &mut self.rendered
             && rendered.push(Some(Rendered { samples: *out, at: now })).is_err()
         {
@@ -659,6 +672,9 @@ impl Sink {
             self.playback.error()
         }
     }
+    pub fn set_output_quality_counters(&self, counters: Arc<DropoutCounters>) {
+        self.playback.set_quality_counters(counters);
+    }
     pub fn begin_idle_drain(&self) {
         self.registry.drained.store(false, Ordering::Release);
         self.registry.draining.store(true, Ordering::Release);
@@ -666,6 +682,7 @@ impl Sink {
         self.wake.notify();
     }
     pub fn cancel_idle_drain(&self) {
+        self.playback.cancel_idle_drain();
         self.registry.draining.store(false, Ordering::Release);
         self.registry.drained.store(false, Ordering::Release);
         self.wake.notify();
@@ -716,6 +733,38 @@ mod tests {
             }
             true
         }
+    }
+    #[test]
+    fn short_opus_concealment_is_measured_when_rendered_and_late_packets_are_separate() {
+        let mut config = dsp::Config::low_latency_opus();
+        config.jitter.adaptive = false;
+        let origin = Instant::now();
+        let (mut source, mut state) = SourceState::prepare(config, realtime::Signal::new().unwrap(), false).unwrap();
+        let counter = Arc::new(DropoutCounters::default());
+        source.set_dropout_counters(counter.clone());
+        let mut encoder = dsp::Encoder::new_with_config(config).unwrap();
+        let payload = encoder.encode(&[0.2; 480]).unwrap();
+        for seq in [0, 1, 3, 4, 5, 6] {
+            assert!(source.push(seq, &payload, origin, None, None));
+        }
+        state.receive(origin);
+        let mut output = [0.0; MIX_SAMPLES];
+        for tick in 0..6 {
+            state.render(origin + Duration::from_millis(100 + tick * 3), 120, &mut output);
+        }
+        let at = (crate::diagnostics::monotonic_us(origin + Duration::from_millis(200)).max(0) / 1000) as u64;
+        let before: Vec<_> = counter.snapshot(at).into_iter().flatten().collect();
+        let concealed = before.iter().map(|b| b.concealed_ns).sum::<u64>();
+        assert!((4_900_000..=5_100_000).contains(&concealed), "{concealed}");
+        assert_eq!(before.iter().map(|b| b.interruptions).sum::<u64>(), 0);
+        assert!(source.push(2, &payload, origin + Duration::from_millis(150), None, None));
+        state.receive(origin + Duration::from_millis(150));
+        assert!(source.push(2, &payload, origin + Duration::from_millis(160), None, None));
+        state.receive(origin + Duration::from_millis(160));
+        let after: Vec<_> = counter.snapshot(at).into_iter().flatten().collect();
+        assert_eq!(after.iter().map(|b| b.late_packets).sum::<u64>(), 1);
+        assert_eq!(after.iter().map(|b| b.interruptions).sum::<u64>(), 0);
+        assert_eq!(after.iter().map(|b| b.concealed_ns).sum::<u64>(), concealed);
     }
     #[test]
     fn local_dropout_counter_uses_receiver_classification_and_survives_bursts() {

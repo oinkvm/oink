@@ -85,7 +85,9 @@ pub enum Kind {
     ParkInputHookChainRejected,
     ParkInputReadbackMismatch,
     ParkInputCompletionUnavailable,
-    /// message: 0=subscription started, 1=fault. Fault reason: 1=frame shape,
+    /// message: 0=subscription started, 1=fault, 2=known-idle entry attestation,
+    /// 3=local capture generation barrier (never a native fault).
+    /// Fault reason: 1=frame shape,
     /// 2=state, 3=contact geometry/count, 4=duplicate ID, 5=queue overflow.
     /// No coordinates or contact IDs are recorded.
     ContactCapture,
@@ -157,6 +159,7 @@ pub struct Record {
     pub pointer: Option<crate::pointer_transition::Observation>,
     pub button: Option<crate::button_diagnostics::Transition>,
     pub contacts: Option<crate::contact_trace::Observation>,
+    pub mt_contacts: Option<crate::mt_trace::Observation>,
 }
 
 /// Runtime only; allocation happens here on the API thread, never in a callback.
@@ -198,6 +201,7 @@ pub fn emit_gesture(stamp: Option<(u64, i64, i64)>, gesture: crate::gesture_trac
         pointer: None,
         button: None,
         contacts: None,
+        mt_contacts: None,
     };
     buffer.push(record);
     notify();
@@ -216,6 +220,7 @@ pub(crate) fn emit_button(button: crate::button_diagnostics::Transition) {
         pointer: None,
         button: Some(button),
         contacts: None,
+        mt_contacts: None,
     };
     buffer.push(record);
     notify();
@@ -237,6 +242,7 @@ pub fn emit_pointer_transition(pointer: crate::pointer_transition::Observation) 
         pointer: Some(pointer),
         button: None,
         contacts: None,
+        mt_contacts: None,
     };
     buffer.push(record);
     notify();
@@ -283,6 +289,7 @@ fn emit_record(kind: Kind, data: Data, sequence: u64, focus: Option<(DeviceId, u
         pointer: None,
         button: None,
         contacts: None,
+        mt_contacts: None,
     };
     buffer.push(record);
     notify();
@@ -306,6 +313,29 @@ pub(crate) fn emit_contacts(contacts: crate::contact_trace::Observation) {
         pointer: None,
         button: None,
         contacts: Some(contacts),
+        mt_contacts: None,
+    });
+    notify();
+}
+/// Bounded, sampled MT metadata; never geometry or raw device addresses.
+#[cfg(target_os = "macos")]
+pub(crate) fn emit_mt_contacts(mt_contacts: crate::mt_trace::Observation) {
+    if !lifecycle_enabled() {
+        return;
+    }
+    let Some(buffer) = BUFFER.get() else { return };
+    buffer.push(Record {
+        stamp: capture_stamp(),
+        at_us: timestamp(),
+        sequence: buffer.sequence.fetch_add(1, Ordering::Relaxed),
+        kind: Kind::ContactCapture,
+        data: Data::default(),
+        focus: None,
+        gesture: None,
+        pointer: None,
+        button: None,
+        contacts: None,
+        mt_contacts: Some(mt_contacts),
     });
     notify();
 }
@@ -364,6 +394,7 @@ mod tests {
             pointer: None,
             button: None,
             contacts: None,
+            mt_contacts: None,
         };
         for _ in 0..4100 {
             buffer.push(record);

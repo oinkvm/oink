@@ -5,6 +5,8 @@ mod clock;
 pub(crate) mod collection;
 pub(crate) mod contacts;
 mod crash_report;
+pub(crate) mod cursor_clip;
+pub(crate) mod cursor_reconciliation;
 pub(crate) mod dnd;
 mod gesture;
 pub(crate) mod handoff;
@@ -685,7 +687,7 @@ impl Recorder {
             if self.enabled() || !self.inner.queue.load().is_empty() {
                 self.drain(&mut s)?;
             }
-            s.export_snapshot()?
+            s.export_snapshot_for_save(reason, last_minutes)?
         };
         #[cfg(all(test, debug_assertions))]
         if let Some(hook) = lock(&self.inner.export_hook).clone() {

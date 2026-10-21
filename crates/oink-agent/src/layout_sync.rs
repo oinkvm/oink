@@ -81,7 +81,7 @@ impl crate::node::Node {
         }
         let mut initial = oink_display::layout::Layout::auto(&devices);
         initial.settings = current.settings;
-        self.edit_layout(crate::layout_sync::Source::Default, |layout| *layout = initial)
+        self.edit_layout(crate::layout_sync::Source::Manual, |layout| *layout = initial)
             .await
             .map_err(|message| crate::api::ApiError::Unavailable { message })?;
         crate::agent_api::layout_api(self)

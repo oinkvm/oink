@@ -43,7 +43,12 @@ pub struct StreamRule {
     pub opens: OpenWhen,
 }
 
-pub const RULES: [StreamRule; 8] = [
+pub const RULES: [StreamRule; 9] = [
+    StreamRule {
+        kind: StreamKind::LayoutProfilesV2,
+        obeys_pause: false,
+        opens: OpenWhen::PerSend,
+    },
     StreamRule {
         kind: StreamKind::Projection,
         obeys_pause: false,

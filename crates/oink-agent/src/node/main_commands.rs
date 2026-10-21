@@ -58,6 +58,14 @@ impl Node {
     pub(crate) fn drain_input_trace(&self) {
         let diagnostics = self.inner.diagnostics.get();
         let dropped = oink_input::native_lifecycle::drain(|record| {
+            if let Some(observation) = record.mt_contacts {
+                if let Some(diagnostics) = diagnostics {
+                    diagnostics
+                        .recorder
+                        .record_native(record.stamp, crate::diagnostics::contacts::mt_event(observation));
+                }
+                return;
+            }
             if let Some(observation) = record.contacts {
                 if let Some(diagnostics) = diagnostics {
                     diagnostics
@@ -444,7 +452,7 @@ impl Node {
                 self.emit_group();
             }
             StatusEvent::PeerTimedOut(_) | StatusEvent::PeerRecovered(_) => self.emit_group(),
-            StatusEvent::ScreenLocalInput(_) | StatusEvent::KeyboardDisabled(_) => {
+            StatusEvent::ScreenLocalInput(_) | StatusEvent::KeyboardDisabled(_) | StatusEvent::MouseDisabled(_) => {
                 self.publish_local_options();
                 self.emit_group();
             }

@@ -41,7 +41,12 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod desktop_trace;
+mod external;
+#[cfg(all(test, debug_assertions))]
+mod external_tests;
 mod observations;
+
+pub(crate) use external::physical_keys;
 
 static CAPTURE_THREADS: AtomicUsize = AtomicUsize::new(0);
 static CAPTURE_HOOKS: AtomicUsize = AtomicUsize::new(0);
@@ -101,6 +106,12 @@ const SLOW_HANDLER: Duration = Duration::from_millis(50);
 pub(crate) enum Command {
     DragAnchor(Option<oink_foundation::dnd::DragAnchor>, mpsc::SyncSender<bool>),
     RelativeCapture(bool),
+    CursorConstraint {
+        owned: windows::Win32::Foundation::RECT,
+        previous: windows::Win32::Foundation::RECT,
+        acquire: bool,
+        reply: mpsc::SyncSender<Result<(), InputError>>,
+    },
     SetMode(CaptureMode, mpsc::SyncSender<Option<Marker>>),
     RestoreLocal(Point, mpsc::SyncSender<Option<Marker>>),
     Touchpad(
@@ -556,6 +567,26 @@ impl HookHandle {
             .map_err(|e| InputError::Platform(format!("PostThreadMessageW: {e}")))
     }
 
+    /// Confinement's helper handshake runs on the injection worker, while the
+    /// cursor mutation and thread-local warp accounting stay on the hook owner.
+    pub(crate) fn cursor_constraint(
+        &self,
+        owned: windows::Win32::Foundation::RECT,
+        previous: windows::Win32::Foundation::RECT,
+        acquire: bool,
+    ) -> Result<(), InputError> {
+        let (reply, received) = mpsc::sync_channel(1);
+        self.post(Command::CursorConstraint {
+            owned,
+            previous,
+            acquire,
+            reply,
+        })?;
+        received
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_| InputError::Platform("cursor confinement owner did not acknowledge".into()))?
+    }
+
     pub(crate) fn set_mode(&self, mode: CaptureMode) -> Result<(), InputError> {
         let (tx, rx) = mpsc::sync_channel(1);
         self.post(Command::SetMode(mode, tx))?;
@@ -794,6 +825,7 @@ fn run(
                             st.uninstall_hooks();
                             rawinput::unregister();
                             st.keys.clear();
+                            external::gap();
                         }
                     }
                     (st.capture_enabled, st.continuity.available())
@@ -862,6 +894,7 @@ fn run(
             );
             drop(st);
         }
+        external::gap();
         rawinput::unregister();
         let _ = DestroyWindow(hwnd);
     }
@@ -900,6 +933,22 @@ fn process_commands() {
                     st.relative_requested = enabled;
                     st.update_raw_capture();
                 });
+            }
+            Some(Command::CursorConstraint {
+                owned,
+                previous,
+                acquire,
+                reply,
+            }) => {
+                let result = if acquire {
+                    super::cursor_clip::acquire_confinement(owned, previous)
+                        .map_err(|e| InputError::Platform(e.to_string()))
+                } else if super::cursor_clip::restore(previous, owned) {
+                    Ok(())
+                } else {
+                    Err(InputError::Platform("cursor confinement restore failed".into()))
+                };
+                let _ = reply.send(result);
             }
             Some(Command::SetMode(mode, reply)) => {
                 let marker = with_state(|st| st.request(Transition::of_mode(mode))).flatten();
@@ -1123,6 +1172,10 @@ impl State {
     }
 
     fn watchdog(&mut self) {
+        external::report(
+            matches!(self.mode, CaptureMode::Remote { .. }),
+            self.raw_capture.allows_move(),
+        );
         if !self.capture_enabled {
             return;
         }
@@ -1640,11 +1693,16 @@ impl State {
         let remote = matches!(self.mode, CaptureMode::Remote { .. });
         // Swallowing here also suppresses WM_INPUT. Raw game capture instead
         // confines the pointer under our cursor-cover window and allows only
-        // physical MOVE. Buttons, keys and synthetic movement retain normal routing.
-        if remote && msg == WM_MOUSEMOVE && info.flags & LLMHF_INJECTED == 0 && self.raw_capture.allows_move() {
+        // physical MOVE. External synthetic input was classified before this path;
+        // only the explicit forwarding opt-in reaches routed translation.
+        if remote
+            && msg == WM_MOUSEMOVE
+            && external::mouse_origin(info) == crate::windows_external_input::Origin::Physical
+            && self.raw_capture.allows_move()
+        {
             return Prepared::Pass;
         }
-        let source = if info.flags & LLMHF_INJECTED != 0 {
+        let source = if external::mouse_origin(info) == crate::windows_external_input::Origin::External {
             SourceKind::Unknown
         } else if self.raw.touch_active(now) {
             SourceKind::Touchpad
@@ -1664,7 +1722,7 @@ impl State {
                     tracing::debug!(pt = ?(pt.x, pt.y), base = ?(base.x, base.y), cur = ?(cur.x, cur.y), remote, "mouse step computed from the position before the mode switch");
                     return Prepared::Event {
                         event: CapturedEvent {
-                            physical: info.flags & LLMHF_INJECTED == 0,
+                            physical: external::mouse_origin(info) == crate::windows_external_input::Origin::Physical,
                             event: InputEvent::PointerDelta {
                                 dx: f64::from(pt.x - base.x),
                                 dy: f64::from(pt.y - base.y),
@@ -1728,7 +1786,7 @@ impl State {
         };
         Prepared::Event {
             event: CapturedEvent {
-                physical: info.flags & LLMHF_INJECTED == 0,
+                physical: external::mouse_origin(info) == crate::windows_external_input::Origin::Physical,
                 event,
                 source,
                 time_us: time_us(now),
@@ -1757,8 +1815,7 @@ impl State {
             sc = unsafe { MapVirtualKeyW(info.vkCode, MAPVK_VK_TO_VSC_EX) } as u16;
         }
         let Some(code) = keymap::scancode_to_hid(sc).or_else(|| {
-            (info.flags.0 & LLKHF_INJECTED.0 == 0 && crate::capture_loop::keyboard_disabled())
-                .then_some(KeyCode::new(0xFFAB, sc))
+            (physical_keyboard(info) && crate::capture_loop::keyboard_disabled()).then_some(KeyCode::new(0xFFAB, sc))
         }) else {
             tracing::debug!(remote, pressed, mapped = false, "keyboard hook translation");
             return if remote { Prepared::Swallow } else { Prepared::Pass };
@@ -1773,13 +1830,13 @@ impl State {
             repeat = pressed && self.keys.contains_key(&code.0),
             "keyboard hook translation"
         );
-        let source = if info.flags.0 & LLKHF_INJECTED.0 != 0 {
+        let source = if external::key_origin(info) == crate::windows_external_input::Origin::External {
             SourceKind::Unknown
         } else {
             SourceKind::Keyboard
         };
         let event = CapturedEvent {
-            physical: info.flags.0 & LLKHF_INJECTED.0 == 0,
+            physical: physical_keyboard(info),
             event: InputEvent::Key { code, pressed },
             source,
             time_us: time_us(now),
@@ -2044,11 +2101,12 @@ fn capture_availability_changed(desktop_changed: bool) {
         }
         st.touchpad.cancel_all();
         st.keys.clear();
+        external::gap();
         let now = time_us(Instant::now());
         let events = if desktop_changed {
-            st.continuity.desktop_changed(available, desktop_trace::key_down, now)
+            st.continuity.desktop_changed(available, |_| false, now)
         } else {
-            st.continuity.transition(available, desktop_trace::key_down, now)
+            st.continuity.transition(available, |_| false, now)
         };
         Some((st.handler.clone(), events, available))
     })
@@ -2172,17 +2230,30 @@ pub(super) fn suppress_native_wheel(
     // suppress real mouse or third-party remap input.
     matches!(msg, WM_MOUSEWHEEL | WM_MOUSEHWHEEL)
         && owns_native
-        // Third-party SendInput is source input, even while our touchpad is
-        // active. Device-less OS promotion without INJECTED remains ambiguous.
-        && info.flags & LLMHF_INJECTED == 0
+        // Only non-injected promotion participates in native wheel ownership.
+        // External SendInput either bypasses capture or uses opt-in routing.
+        && external::mouse_origin(info) == crate::windows_external_input::Origin::Physical
         && origin != super::wheel_origin::Origin::PhysicalMouse
 }
 
 fn mouse_proc_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    mouse_proc_with_next(code, wparam, lparam, || {
+        // SAFETY: forward the unchanged native hook arguments.
+        unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    })
+}
+
+fn mouse_proc_with_next(code: i32, wparam: WPARAM, lparam: LPARAM, next: impl FnOnce() -> LRESULT) -> LRESULT {
     if code >= 0 {
         // SAFETY: HC_ACTION 时 lparam 指向系统提供的 MSLLHOOKSTRUCT，回调期间有效。
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-        if info.flags & LLMHF_INJECTED == 0 {
+        let origin_kind = external::mouse_origin(info);
+        if origin_kind == crate::windows_external_input::Origin::External
+            && external::mouse_local(wparam.0 as u32, info)
+        {
+            return external::pass_mouse(wparam.0 as u32, info, next);
+        }
+        if origin_kind == crate::windows_external_input::Origin::Physical {
             // OS event times are wrapping milliseconds; this is callback queue delay, not hardware latency.
             // SAFETY: read-only system millisecond counter, no handles or pointers.
             crate::timing::CaptureTimer::os_wait(
@@ -2194,8 +2265,15 @@ fn mouse_proc_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         // Read before borrowing State: PeekMessage can dispatch sent messages.
         let origin = super::wheel_origin::hook(wparam.0 as u32, info, owns_wheel);
         let _in_hook = InHook::enter();
-        observe_button(wparam.0 as u32, info);
+        if origin_kind != crate::windows_external_input::Origin::External {
+            observe_button(wparam.0 as u32, info);
+        }
         account_own_mouse(wparam.0 as u32, info);
+        // Check before raw-capture MOVE and native touchpad wheel bypasses.
+        // Own injections/markers and external applications retain their paths.
+        if origin_kind == crate::windows_external_input::Origin::Physical && crate::capture_loop::mouse_disabled() {
+            return LRESULT(1);
+        }
         let prepared = with_state(|st| {
             st.last_mouse_hook = now;
             st.pipeline.mouse_callbacks += 1;
@@ -2273,7 +2351,7 @@ fn mouse_proc_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         None
     };
     // SAFETY: 交给钩子链中的下一个。
-    let result = unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    let result = next();
     if result.0 != 0
         && let Some(acceptance) = acceptance
     {
@@ -2289,7 +2367,7 @@ fn mouse_proc_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if result.0 == 0 && code >= 0 && wparam.0 as u32 == WM_MOUSEMOVE {
         // SAFETY: the hook's input remains valid until this callback returns.
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-        if info.flags & LLMHF_INJECTED == 0 {
+        if external::mouse_origin(info) == crate::windows_external_input::Origin::Physical {
             super::warp::passed(info.pt);
         }
     }
@@ -2334,7 +2412,7 @@ fn observe_button(msg: u32, info: &MSLLHOOKSTRUCT) {
         event_timestamp: u64::from(info.time),
         timestamp_unit: TimestampUnit::Milliseconds,
         source_state: None,
-        physical: info.flags & LLMHF_INJECTED == 0,
+        physical: external::mouse_origin(info) == crate::windows_external_input::Origin::Physical,
         own: info.dwExtraInfo == INJECT_TAG || is_marker(info.dwExtraInfo),
         system: evidence::system_state(button),
     });
@@ -2350,7 +2428,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
 }
 
 fn physical_keyboard(info: &KBDLLHOOKSTRUCT) -> bool {
-    info.dwExtraInfo != INJECT_TAG && info.flags.0 & LLKHF_INJECTED.0 == 0
+    external::key_origin(info) == crate::windows_external_input::Origin::Physical
 }
 
 fn guard_passes_lock_input(info: &KBDLLHOOKSTRUCT, disabled: bool, locked: bool) -> bool {
@@ -2358,9 +2436,23 @@ fn guard_passes_lock_input(info: &KBDLLHOOKSTRUCT, disabled: bool, locked: bool)
 }
 
 fn keyboard_proc_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    keyboard_proc_with_next(code, wparam, lparam, || {
+        // SAFETY: forward the unchanged native hook arguments.
+        unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    })
+}
+
+fn keyboard_proc_with_next(code: i32, wparam: WPARAM, lparam: LPARAM, next: impl FnOnce() -> LRESULT) -> LRESULT {
     if code >= 0 {
         // SAFETY: HC_ACTION 时 lparam 指向系统提供的 KBDLLHOOKSTRUCT，回调期间有效。
         let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        use crate::windows_external_input::Origin;
+        match external::key_origin(info) {
+            Origin::Own | Origin::Marker => return next(),
+            Origin::External if external::key_local(wparam.0 as u32, info) => return external::pass_key(next),
+            Origin::Physical => external::observe_physical_key(wparam.0 as u32, info),
+            _ => {}
+        }
         if physical_keyboard(info) {
             // SAFETY: read-only system millisecond counter, no handles or pointers.
             crate::timing::CaptureTimer::os_wait(
@@ -2377,7 +2469,18 @@ fn keyboard_proc_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             crate::capture_loop::keyboard_guard_suspended(),
         ) {
             // SAFETY: unchanged native event is passed to the next desktop-local hook.
-            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+            return next();
+        }
+        let sc = (info.scanCode & 0xFF) as u16
+            | if info.flags.0 & LLKHF_EXTENDED.0 != 0 {
+                0xE000
+            } else {
+                0
+            };
+        if crate::capture_loop::keyboard_disabled() && keymap::local_brightness_key(sc).is_some() {
+            // Before both routing and the native guard override: down/repeat/up
+            // remain local even when keyboard focus is on another device.
+            return next();
         }
         let now = Instant::now();
         let _in_hook = InHook::enter();
@@ -2430,7 +2533,7 @@ fn keyboard_proc_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         }
     }
     // SAFETY: 交给钩子链中的下一个。
-    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    next()
 }
 
 /// Remote 模式下交给了本机的按下（检测计数）。
@@ -2468,6 +2571,50 @@ mod tests {
         }
         crate::capture_loop::clear();
         assert_eq!(*observed.lock().unwrap(), [true, false, false, true]);
+    }
+
+    #[test]
+    fn disabled_brightness_hook_passes_down_repeat_up_without_routing() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_KEYUP;
+        struct Owner;
+        impl crate::capture_loop::CaptureLoop for Owner {
+            fn set_wake(&mut self, _: crate::capture_loop::Wake) {}
+            fn event(&mut self, _: &CapturedEvent) -> Disposition {
+                panic!("brightness must stay native")
+            }
+            fn poll(&mut self, _: Instant) -> Option<Instant> {
+                None
+            }
+            fn stopped(&self) -> bool {
+                false
+            }
+            fn keyboard_disabled(&self) -> bool {
+                true
+            }
+            fn keyboard_remote(&self) -> Option<bool> {
+                Some(true)
+            }
+        }
+        crate::capture_loop::install(Box::new(Owner), std::sync::Arc::new(|| {}));
+        for scan in [0x54, 0x4C] {
+            let info = KBDLLHOOKSTRUCT {
+                scanCode: scan,
+                flags: LLKHF_EXTENDED,
+                ..Default::default()
+            };
+            for msg in [WM_KEYDOWN, WM_KEYDOWN, WM_KEYUP] {
+                assert_eq!(
+                    keyboard_proc_with_next(
+                        0,
+                        WPARAM(msg as usize),
+                        LPARAM((&info as *const KBDLLHOOKSTRUCT) as isize),
+                        || LRESULT(42)
+                    ),
+                    LRESULT(42)
+                );
+            }
+        }
+        crate::capture_loop::clear();
     }
 
     #[test]
@@ -2527,7 +2674,7 @@ mod tests {
     }
 
     #[test]
-    fn hook_classification_excludes_only_our_marker() {
+    fn opt_in_translation_preserves_legacy_external_source_routing() {
         use windows::Win32::UI::WindowsAndMessaging::{KBDLLHOOKSTRUCT_FLAGS, WM_KEYUP};
         let mut state = remote_state();
         for extra in [0, 0x1234, INJECT_TAG] {
@@ -2590,7 +2737,7 @@ mod tests {
     }
 
     /// No hook, native window or cursor cover is installed by these state-machine tests.
-    fn remote_state() -> State {
+    pub(super) fn remote_state() -> State {
         let now = Instant::now();
         State {
             touchpad: super::super::touchpad::Touchpad::unavailable(),
@@ -2659,9 +2806,9 @@ mod tests {
         assert!(!physical_keyboard(&tagged_without_flag));
     }
 
-    struct TestCursor;
+    pub(super) struct TestCursor;
     impl TestCursor {
-        fn at(p: POINT) -> Self {
+        pub(super) fn at(p: POINT) -> Self {
             super::super::warp::reset();
             TEST_CURSOR.with(|c| c.set(Some(p)));
             Self

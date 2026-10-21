@@ -1,26 +1,33 @@
 import { LayoutProjectionPreview } from './arrange/projection';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import { Button, Confirmer, Icon, OinkProvider, Toaster, Tooltip, VisuallyHidden, mergeRefs, speed } from 'oink-ui';
+import { Button, Confirmer, Icon, OinkProvider, Toaster, Tooltip, VisuallyHidden, mergeRefs, speed, toast } from 'oink-ui';
 import { ApiFailure, api, shell } from './api/client';
 import { agent, start, useAgent } from './api/store';
 import { inTauri } from './api/transport';
 import { presentCards, resourceAction } from './devices/project';
-import { DeviceItem, DeviceList, hasExit } from './devices/DeviceList';
+import { DeviceList } from './devices/DeviceList';
 import { PauseGlyph } from './devices/icons';
-import { PeekScope } from './devices/peek';
 import { SideContextMenu, type SideContextMenuProps } from './devices/DeviceMenu';
-import { toggleShare, toggleThird } from './devices/data';
+import { toggleShare } from './devices/data';
 import type { ShareKind, ShareValue } from './devices/data';
-import type { Device } from './devices/types';
 import type { SpeakerAction } from './devices/VolumeRow';
 import { mergeVisibleGroups } from './arrange/groups';
-import { Arrangement } from './arrange/Arrangement';
-import type { Placement } from './api/types';
+import { Arrangement, type ScreenMove } from './arrange/Arrangement';
+import type { DeviceKey, Rect } from './api/types';
 import type { Screen } from './arrange/geometry';
 import { useHistory } from './arrange/useHistory';
-import { renderLayout, layoutPlacements, presentScreens, replayPlacements, visibleScreens } from './arrange/adapter';
+import { RENDER_SCALE, renderLayout, layoutPlacements, presentScreens, visibleScreens } from './arrange/adapter';
+import { LayoutProfileFailure, type ArrangementSnapshot, type CommitRequest, type LayoutOperation, type OperationReply, type PreviewReply, type ProfileSummary } from './api/layoutProfiles';
+import { nativeLayout, profileErrorText, profileName, sameArrangement } from './arrange/snapshot';
+import { runOperation } from './arrange/operations';
+import { compactAround } from './arrange/compaction';
+import { CompactIcon } from './arrange/CompactIcon';
+import { nextSelection, type SelectMode } from './arrange/selection';
+import { ScreenPreview } from './arrange/screenPreview';
+import { CreateProfileDialog, ProfileList, ProfileTools } from './arrange/LayoutProfiles';
 import { DesktopWindow } from './window/DesktopWindow';
 import { ResizeEdges } from './window/ResizeEdges';
+import { FileProviderDialog, useFileProviderExplainer } from './permissions/FileProviderDialog';
 import { QuitDialog } from './window/QuitDialog';
 import { AboutWindow } from './window/AboutWindow';
 import { UpgradeButton, UpgradeDialog } from './window/Upgrade';
@@ -32,7 +39,7 @@ import { Onboarding, OnboardingLanguage } from './onboarding/Onboarding';
 import { LeaveDialog } from './devices/LeaveDialog';
 import { AddressDialog } from './devices/AddressDialog';
 import { useAddressEditor } from './devices/useAddressEditor';
-import { AddHead, AddPanel, RequestRow, RequestsGroup, SelfInfo, fromRequestPeekId } from './pairing/AddPanel';
+import { AddHead, AddPanel, RequestsGroup, SelfInfo } from './pairing/AddPanel';
 import { PairDialog } from './pairing/PairDialog';
 import { usePairing } from './pairing/usePairing';
 import { SettingsNav } from './settings/SettingsNav';
@@ -52,7 +59,11 @@ async function windowAction(action: 'minimize' | 'toggleMaximize' | 'close') {
     const { getCurrentWindow } = await import('@tauri-apps/api/window');
     await getCurrentWindow()[action]();
 }
-const samePlacements = (a: Placement[], b: Placement[]) => JSON.stringify(a) === JSON.stringify(b);
+/** A history step's immutable operation endpoints. Rigid edits restore no native origins. */
+interface StepMeta { before: ArrangementSnapshot; after: ArrangementSnapshot; native_restore_devices: DeviceKey[]; original_kind: 'load' | 'edit' | 'reset' }
+const mergeMeta = (a: StepMeta | undefined, b: StepMeta | undefined): StepMeta | undefined => a && b
+    ? { before: a.before, after: b.after, original_kind: a.original_kind, native_restore_devices: [...new Set([...a.native_restore_devices, ...b.native_restore_devices])] } : b ?? a;
+const UNKNOWN_TOAST = 'layout-operation-unknown';
 export function App() {
     const state = useAgent();
     const language = useLanguage();
@@ -69,13 +80,13 @@ export function App() {
     const [navSwitched,setNavSwitched] = useState(false);
     const [settingsMounted,setSettingsMounted] = useState(false);
     const [screenOnly,setScreenOnly] = useState(false);
-    const [peekId,setPeekId] = useState<string|null>(null);
-    const [growIds,setGrowIds] = useState<ReadonlySet<string>>(new Set());
     const [query, setQuery] = useState('');
     const [section, setSection] = useState<SectionId>('general');
     const [jump, setJump] = useState<SettingsJump | null>(null);
     const [selectedDevice, setSelectedDevice] = useState<string | null>(null);
     const [selected, setSelected] = useState<string | null>(null);
+    // The canvas selection (whole computers, or one system-arranged screen); see selection.ts.
+    const [selection, setSelection] = useState<string[]>([]);
     const [quitAsk, setQuitAsk] = useState(false);
     const [onboard, setOnboard] = useState<'on' | 'leaving' | 'off' | null>(null);
     const [onboardKey, setOnboardKey] = useState(0);
@@ -109,13 +120,20 @@ export function App() {
     const [blockError, setBlockError] = useState<string | null>(null);
     const [leaveId, setLeaveId] = useState<string | null>(null);
     const address = useAddressEditor();
-    const [contextOpen, setContextOpen] = useState(false);
     const [winEl, setWinEl] = useState<HTMLDivElement | null>(null);
-    const [savingLayout, setSavingLayout] = useState(false);
     const canvas = useRef<HTMLDivElement>(null);
     const hint = useId();
-    const history = useHistory<Placement[]>(() => [], { equals: samePlacements });
-    const screens = presentScreens(state.layout ? renderLayout(state.layout,state.wallpapers,history.value) : [], devices);
+    // History holds complete arrangement snapshots (placements, visibility, native
+    // origins, active profile). Every edit, Load and replay is a backend operation.
+    const history = useHistory<ArrangementSnapshot | null, StepMeta>(() => null, { equals: sameArrangement, mergeMeta });
+    const profiles = state.layoutProfiles;
+    const [operating, setOperating] = useState(false);
+    const operatingRef = useRef(false);
+    const savingLayout = operating || profiles?.operation?.status === 'running' || profiles?.operation?.status === 'outcome_unknown';
+    const [createOpen, setCreateOpen] = useState(false);
+    const [screenPreview, setScreenPreview] = useState<Record<string, Rect> | null>(null);
+    const geometry = state.layout ? nativeLayout(state.layout, history.value?.native, history.value) : null;
+    const screens = presentScreens(geometry ? renderLayout(geometry,state.wallpapers,history.value?.placements) : [], devices);
     // A device-local editing preference; only manual canvas edits compact.
     const compactLayout = prefs.presentation.compact_layout;
     const setNavMode = (mode: typeof navMode) => {
@@ -124,20 +142,29 @@ export function App() {
         setNavSwitched(true); setNavModeState(mode);
         winEl?.querySelector('.win__side-clip')?.scrollTo({top:0});
     };
+    const clearSelection = () => { setSelectedDevice(null); setSelected(null); setSelection([]); };
     const selectDevice = (id: string) => {
-        if (selectedDevice === id) { setSelectedDevice(null); setSelected(null); return; }
+        if (navOpen && selectedDevice === id) { setSelectedDevice(null); setSelected(null); setSelection([]); return; }
         if (devices.find(d => d.id === id)?.group === 'offline') return;
         setSelectedDevice(id); setScreenOnly(false);
         setSelected(screens.find(s => s.device === id)?.id ?? null);
+        setSelection(screens.filter(s => s.device === id).map(s => s.id));
     };
-    const selectScreen = (id: string | null) => {
-        setSelected(id); setScreenOnly(true);
-        const screen = screens.find(s => s.id === id);
+    const selectScreen = (id: string | null, mode?: Exclude<SelectMode, 'plain'>) => {
+        // Only a multi-screen computer writing its system arrangement has single screens.
+        const single = (screen: string) => {
+            const device = visible.find(s => s.id === screen)?.device;
+            return !!device && editable.has(device) && visible.filter(s => s.device === device).length > 1;
+        };
+        const next = id ? nextSelection(selection, visible, id, mode ?? 'plain', single) : [];
+        const primary = id && next.includes(id) ? id : next[0] ?? null;
+        setSelected(primary); setSelection(next); setScreenOnly(true);
+        const screen = screens.find(s => s.id === primary);
         const device = devices.find(d => d.id === screen?.device);
         setSelectedDevice(device && device.group !== 'offline' ? device.id : null);
     };
     const selectedGone = !!selectedDevice && !devices.some(d => d.id === selectedDevice && d.group !== 'offline');
-    useEffect(() => { if (selectedGone) { setSelectedDevice(null); setSelected(null); } }, [selectedGone]);
+    useEffect(() => { if (selectedGone) { setSelectedDevice(null); setSelected(null); setSelection([]); } }, [selectedGone]);
 
     useEffect(() => { void start(view); }, []);
     useEffect(() => view !== 'panel' && inTauri ? revealWhenPainted(() => { void shell.ready().catch(() => agent.fail('unavailable')); }) : undefined, [view]);
@@ -157,11 +184,11 @@ export function App() {
         return()=>{stopped=true;stops.forEach(stop=>stop());};
     },[state.boot?.platform]);
 
+    // Authoritative state replaces the present value, except while an operation runs:
+    // its own echoes must not overwrite the checkpoint it may still restore.
     useEffect(() => {
-        if (!state.layout)
-            return;
-        history.sync(layoutPlacements(state.layout,[]));
-    }, [state.layout]);
+        if (!operatingRef.current && profiles?.snapshot) history.sync(profiles.snapshot);
+    }, [profiles, operating]);
     useEffect(() => {
         if (view !== 'panel' || !winEl || !self || !prefs.local) return;
         return observePanel(winEl);
@@ -174,9 +201,7 @@ export function App() {
     useEffect(() => {void shell.liveViews({stats:false,group_quality:view==='main'||view==='panel',audio_quality:view==='main'&&navMode==='settings'&&(section==='diagnostics'||query.trim().length>0),diagnostics:false}).catch(()=>agent.fail('unavailable'));},[view,navMode,section,query]);
     const fail = (e: unknown) => agent.fail(e instanceof ApiFailure ? e.problem.code : 'unavailable');
     const permissionPage = () => { setNavMode('settings'); setNavOpen(true); setJump({ section: 'permissions', n: Date.now() }); };
-    const clicks = useRef(new Map<string, { timer: ReturnType<typeof setTimeout>; requestId: string }>());
-    useEffect(() => () => { for (const click of clicks.current.values()) clearTimeout(click.timer); }, []);
-    const invoke = async (id: string, resource: string, desired: string | boolean | number, delaySingle = false) => {
+    const invoke = async (id: string, resource: string, desired: string | boolean | number) => {
         const card = state.cards?.cards.find(c => c.device === id);
         if (resource === 'screen' && desired === 'locked') {
             try {
@@ -198,41 +223,33 @@ export function App() {
             agent.fail(action?.kind === 'unavailable' ? action.reason : 'unsupported');
             return;
         }
-        const key = `${id}:${resource}`;
-        const scheduled = clicks.current.get(key);
-        if (scheduled) { clearTimeout(scheduled.timer); clicks.current.delete(key); agent.reject(scheduled.requestId, ''); }
+        if (resource === 'screen' && (desired === 'shared' || desired === 'disabled')
+            && !(desired === 'shared' && card.status?.screen.configuredMode === 'shared' && card.status?.cursor.lockedDevice === id)) {
+            const present = history.value;
+            if (!present || savingLayout) return;
+            const patch = { device: id, shared: desired === 'shared' };
+            const screen_shared = [...(present.screen_shared ?? []).filter(d => d.device !== id), patch];
+            await commitEdit({ ...present, screen_shared }, tr('屏幕'), undefined,
+                { placements: present.placements, native_plan_tokens: [], disabled: [], screen_shared: [patch] }, []);
+            return;
+        }
         const requestId = crypto.randomUUID();
         if (!agent.pending({ requestId, device: id, resource, desired })) return;
         const send = async () => {
-            clicks.current.delete(key);
             try {
                 const result = await api.invokeCard(requestId, action.token);
                 agent.controlReply(result);
             } catch { agent.reject(requestId, 'outcome_unknown'); void agent.query('cards', api.deviceCards).catch(fail); }
         };
-        // Preserve instant feedback while coalescing a double click into one absolute owner command.
-        if (delaySingle) clicks.current.set(key, { timer: setTimeout(() => { void send(); }, 600), requestId });
-        else await send();
+        await send();
     };
     const changeShare = (id: string, kind: ShareKind, desired: ShareValue) => { void invoke(id, kind, desired); };
-    const single = useRef<{
-        id: string;
-        kind: ShareKind;
-        before: Device[];
-        at: number;
-    } | null>(null);
-    const toggle = (id: string, kind: ShareKind, mode: 'single' | 'double') => {
-        const before = devices;
-        const d = before.find(d => d.id === id);
-        if (!d)
-            return;
-        const next = mode === 'double' ? toggleThird(single.current?.id === id && single.current.kind === kind && Date.now() - single.current.at < 600 ? single.current.before : before, id, kind)?.find(d => d.id === id) : toggleShare(d, kind);
-        single.current = { id, kind, before, at: Date.now() };
-        if (!next) {
-            permissionPage();
-            return;
-        }
-        void invoke(id, kind, (kind === 'speaker' ? next.speaker.mode : next[kind]) as ShareValue, mode === 'single' && (kind === 'keyboard' || kind === 'speaker'));
+    const toggle = (id: string, kind: ShareKind) => {
+        const d = devices.find(d => d.id === id);
+        if (!d) return;
+        const next = toggleShare(d, kind);
+        if (!next) { permissionPage(); return; }
+        void invoke(id, kind, (kind === 'speaker' ? next.speaker.mode : next[kind]) as ShareValue);
     };
     const speaker = async (id: string, action: SpeakerAction) => {
         const exit = state.cards?.exitVolume;
@@ -259,22 +276,46 @@ export function App() {
             void agent.query('cards', api.deviceCards).catch(fail);
         }
     };
-    const persistPlacements = async (placements: Placement[], checkpoint = history.checkpoint()) => {
-        setSavingLayout(true);
+    const deviceName = (device: DeviceKey) => devices.find(d => d.id === device)?.name ?? device.slice(0, 8);
+    /** Owner refusals of an operation, one line per computer. */
+    const ownerProblems = (op: LayoutOperation) => {
+        const lines = op.owners.filter(o => o.error).map(o => tr('{0}：{1}', deviceName(o.device), profileErrorText(o.error!)));
+        return lines.length ? lines.join('\n') : op.error ? profileErrorText(op.error) : undefined;
+    };
+    const failureText = (e: unknown) => e instanceof LayoutProfileFailure ? profileErrorText(e.problem) : problemText(e instanceof ApiFailure ? e.problem.code : 'unavailable');
+    /** One accepted operation at a time; its echoes stay buffered until it ends. */
+    const operate = async (start: (requestId: string) => Promise<OperationReply>) => {
+        operatingRef.current = true; setOperating(true);
         try {
-            await agent.query('layout', () => api.saveLayout(placements));
+            return await runOperation(start, () => toast.info({ id: UNKNOWN_TOAST, title: tr('正在确认排列结果'), description: tr('与设备的连接中断了，确认后会更新'), duration: 0 }));
+        } finally { toast.dismiss(UNKNOWN_TOAST); operatingRef.current = false; setOperating(false); }
+    };
+    const token = () => agent.get().layoutProfiles?.token ?? '';
+    const isBusy = () => operatingRef.current || ['running', 'outcome_unknown'].includes(agent.get().layoutProfiles?.operation?.status ?? '');
+    /** An edit is recorded at once and settled to the owners' observed result. */
+    const commitEdit = async (after: ArrangementSnapshot, label: string, merge: string | undefined, request: Omit<CommitRequest, 'request_id' | 'expected_token'>, nativeDevices: DeviceKey[]) => {
+        const checkpoint = history.checkpoint(), before = checkpoint.present;
+        if (!before || isBusy()) return;
+        history.commit(after, label, merge, { before, after, native_restore_devices: nativeDevices, original_kind: 'edit' });
+        try {
+            const op = await operate(request_id => api.commitArrangement({ request_id, expected_token: token(), ...request }));
+            if (op.status !== 'failed' && op.after && op.history_required) {
+                const observed = op.after;
+                history.settle(observed, m => m && { ...m, after: observed, native_restore_devices: [...new Set([...m.native_restore_devices, ...op.native_restore_devices])] });
+            }
+            else history.restore(checkpoint);
+            if (op.status === 'partial') toast.warning({ title: tr('排列只应用到了部分设备'), description: ownerProblems(op) });
+            else if (op.status === 'failed') toast.danger({ title: tr('无法应用排列'), description: ownerProblems(op) });
         }
         catch (e) {
             history.restore(checkpoint);
-            fail(e);
-        }
-        finally {
-            setSavingLayout(false);
+            toast.danger({ title: tr('无法应用排列'), description: failureText(e) });
         }
     };
     const [projection] = useState(() => new LayoutProjectionPreview(api.previewLayoutProjection));
     useEffect(() => () => projection.close(), [projection]);
-    const previewScreens = (next: Screen[] | null) => {
+    const previewScreens = (next: Screen[] | null, held = false) => {
+        if (previewer.active || (projection.lingering && !held)) return;
         if (!state.layout || !next) {
             projection.end();
             return;
@@ -282,35 +323,160 @@ export function App() {
         projection.update(layoutPlacements(state.layout, mergeVisibleGroups(screens, next)));
     };
     const saveScreens = (next: Screen[], label: string, merge?: string) => {
-        if (!state.layout || savingLayout) return;
-        const checkpoint = history.checkpoint();
-        const placements = layoutPlacements(state.layout, next);
-        history.commit(placements, label, merge);
-        return persistPlacements(placements, checkpoint);
+        const present = history.value;
+        if (!geometry || !present || savingLayout) return;
+        const moved = layoutPlacements(geometry, next);
+        const placements = present.placements.map(p => moved.find(m => m.device === p.device) ?? p);
+        return commitEdit({ ...present, placements }, label, merge, { placements, native_plan_tokens: [], disabled: [] }, []);
     };
-    const travel = (direction: 'undo' | 'redo') => {
-        if (savingLayout || !state.layout) return;
+    const travel = async (direction: 'undo' | 'redo') => {
+        if (savingLayout || !history.value) return;
         const checkpoint = history.checkpoint();
         const move = history[direction]();
-        // The history transition already happened. Recommitting a rendered
-        // round trip could round an origin and discard the redo stack.
-        if (move) void persistPlacements(replayPlacements(state.layout, move.value), checkpoint);
-    };
-    const resetLayout = async () => {
-        if (savingLayout) return;
-        const checkpoint = history.checkpoint(); setSavingLayout(true);
+        const meta = move?.meta;
+        if (!move) return;
+        if (!meta) { history.restore(checkpoint); return; }
+        // Replay the entry's immutable endpoints, never a source rebuilt from echoes.
+        const [from, target] = direction === 'undo' ? [meta.after, meta.before] : [meta.before, meta.after];
         try {
-            const layout = await api.resetInitialLayout();
-            history.commit(layoutPlacements(layout,[]), tr('重置排列'));
-            agent.adopt('layout',layout);
-        } catch (e) { history.restore(checkpoint); fail(e); }
-        finally { setSavingLayout(false); }
+            // `original_kind` tells a switch (selection replays too) from a manual change
+            // (the current profile stays and receives the replayed delta).
+            const op = await operate(request_id => api.replayArrangement({ request_id, expected_token: token(), from, target, native_restore_devices: meta.native_restore_devices, direction, original_kind: meta.original_kind }));
+            // The history transition already happened; the observed state only
+            // replaces the present value, keeping the redo stack.
+            if (op.status !== 'failed' && op.after) history.sync(op.after);
+            else history.restore(checkpoint);
+            if (op.status === 'partial') toast.warning({ title: tr('排列只恢复了部分设备'), description: ownerProblems(op) });
+            else if (op.status === 'failed') toast.danger({ title: direction === 'undo' ? tr('无法撤销') : tr('无法重做'), description: ownerProblems(op) });
+        }
+        catch (e) {
+            history.restore(checkpoint);
+            toast.danger({ title: direction === 'undo' ? tr('无法撤销') : tr('无法重做'), description: failureText(e) });
+        }
+    };
+    // Reset is one history entry from the operation's own endpoints, like Load:
+    // no compaction and no native restore.
+    const resetLayout = async () => {
+        const current = agent.get().layoutProfiles;
+        if (savingLayout || !current || canvas.current?.querySelector('[data-interacting]')) return;
+        const checkpoint = history.checkpoint();
+        try {
+            const op = await operate(request_id => api.resetArrangement({ request_id, expected_token: current.token }));
+            if (op.status !== 'failed' && op.after) {
+                if (op.history_required) {
+                    history.sync(op.before);
+                    history.commit(op.after, tr('重置排列'), undefined, { before: op.before, after: op.after, native_restore_devices: op.native_restore_devices, original_kind: 'reset' });
+                } else history.sync(op.after);
+            } else history.restore(checkpoint);
+            if (op.status === 'partial') toast.warning({ title: tr('排列只应用到了部分设备'), description: ownerProblems(op) });
+            else if (op.status === 'failed') toast.danger({ title: tr('无法重置排列'), description: ownerProblems(op) });
+        }
+        catch (e) {
+            history.restore(checkpoint);
+            toast.danger({ title: tr('无法重置排列'), description: failureText(e) });
+        }
+    };
+    // A profile switch is one history entry with the operation's own endpoints (History contract).
+    const loadProfile = async (profile: ProfileSummary) => {
+        const current = agent.get().layoutProfiles;
+        if (savingLayout || !current || canvas.current?.querySelector('[data-interacting]')) return;
+        const checkpoint = history.checkpoint(), name = profileName(profile.name);
+        try {
+            const op = await operate(request_id => api.loadLayoutProfile({ request_id, expected_token: current.token, profile_id: profile.id }));
+            if (op.status !== 'failed' && op.after) {
+                if (op.history_required) {
+                    history.sync(op.before);
+                    history.commit(op.after, tr('切换到布局「{0}」', name), undefined, { before: op.before, after: op.after, native_restore_devices: op.native_restore_devices, original_kind: 'load' });
+                } else history.sync(op.after);
+            } else history.restore(checkpoint);
+            if (op.status === 'partial') toast.warning({ title: tr('「{0}」只应用到了部分设备', name), description: ownerProblems(op) });
+            else if (op.status === 'failed') toast.danger({ title: tr('无法切换到「{0}」', name), description: ownerProblems(op) });
+        }
+        catch (e) {
+            history.restore(checkpoint);
+            toast.danger({ title: tr('无法切换到「{0}」', name), description: failureText(e) });
+        }
+    };
+    /** Create snapshots the live layout into a new current profile; not a canvas history
+     * step. A refusal (including stale_state) keeps the dialog and its name for resubmission. */
+    const createProfile = async (name: string) => {
+        const current = agent.get().layoutProfiles;
+        if (!current) return problemText('unavailable');
+        try {
+            agent.adoptProfiles(await api.createLayoutProfile({ request_id: crypto.randomUUID(), expected_token: current.token, name }));
+            return null;
+        } catch (e) { return failureText(e); }
+    };
+    const manageProfiles = () => { setNavMode('settings'); setNavOpen(true); setJump({ section: 'layout', item: 'manageLayouts', n: Date.now() }); };
+    const renameProfile = async (profile: ProfileSummary, name: string) => {
+        const current = agent.get().layoutProfiles;
+        if (!current) return problemText('unavailable');
+        try {
+            agent.adoptProfiles(await api.renameLayoutProfile({ request_id: crypto.randomUUID(), expected_catalog_token: current.catalog_token, profile_id: profile.id, name }));
+            return null;
+        } catch (e) { return failureText(e); }
+    };
+    const deleteProfile = async (profile: ProfileSummary) => {
+        const current = agent.get().layoutProfiles;
+        if (!current) return;
+        try {
+            agent.adoptProfiles(await api.deleteLayoutProfile({ request_id: crypto.randomUUID(), expected_catalog_token: current.catalog_token, profile_id: profile.id }));
+        } catch (e) { toast.danger({ title: tr('无法删除「{0}」', profileName(profile.name)), description: failureText(e) }); }
+    };
+    // One native screen dragged inside a system-arranged computer: coalesced backend
+    // previews while moving, one commit with the final plan token on release.
+    const editable = new Set((profiles?.devices ?? []).filter(d => d.sync_system_arrangement && d.can_edit_screens).map(d => d.device));
+    const previewRects = (reply: PreviewReply) => {
+        const placement = reply.placements.find(p => p.device === reply.native.device);
+        if (!placement) return {};
+        return Object.fromEntries(reply.native.screens.map(s => [`${s.screen.device}:${s.screen.display}`, {
+            x: (placement.origin.x + s.origin.x * placement.scale) * RENDER_SCALE, y: (placement.origin.y + s.origin.y * placement.scale) * RENDER_SCALE,
+            w: s.size.w * placement.scale * RENDER_SCALE, h: s.size.h * placement.scale * RENDER_SCALE,
+        }]));
+    };
+    const [previewer] = useState(() => new ScreenPreview(api.previewSystemArrangement, token, reply => {
+        setScreenPreview(previewRects(reply));
+        const current = agent.get().layoutProfiles?.snapshot;
+        if (current) projection.update(reply.placements, { ...current, placements: reply.placements,
+            native: current.native.map(n => n.device === reply.native.device ? reply.native : n) });
+    }));
+    const moveScreen = async (move: ScreenMove) => {
+        const screen = screens.find(s => s.id === move.id), key = state.layout?.geometry.screens.find(s => `${s.key.device}:${s.key.display}` === move.id)?.key;
+        if (!screen || !key) return;
+        if (move.type === 'drag') {
+            if (savingLayout && !previewer.active) return;
+            if (!previewer.active) previewer.begin(key);
+            previewer.update({ x: move.desired.x / RENDER_SCALE, y: move.desired.y / RENDER_SCALE });
+            return;
+        }
+        if (move.cancelled || !previewer.active) { previewer.cancel(); projection.close(); setScreenPreview(null); return; }
+        let reply: PreviewReply;
+        try { reply = await previewer.finish(); }
+        catch (e) {
+            previewer.cancel(); projection.close(); setScreenPreview(null);
+            if (e instanceof LayoutProfileFailure || e instanceof ApiFailure) toast.danger({ title: tr('无法移动屏幕'), description: failureText(e) });
+            return;
+        }
+        previewer.end();
+        projection.linger();
+        const present = history.checkpoint().present;
+        if (!present) { setScreenPreview(null); return; }
+        const rects = previewRects(reply), visibleIds = new Set(visible.map(s => s.id));
+        const { dx, dy } = move.compact(Object.entries(rects).filter(([id]) => visibleIds.has(id)).map(([, r]) => r));
+        const placements = present.placements.map(p => {
+            const snapped = reply.placements.find(r => r.device === p.device && r.device === reply.native.device);
+            return snapped ? { ...snapped, origin: { x: snapped.origin.x + dx / RENDER_SCALE, y: snapped.origin.y + dy / RENDER_SCALE } } : p;
+        });
+        const native = present.native.map(n => n.device === reply.native.device ? reply.native : n);
+        const done = commitEdit({ ...present, placements, native }, move.label, undefined, { placements, native_plan_tokens: [reply.plan_token], disabled: [] }, [reply.native.device]);
+        setScreenPreview(null);
+        await done;
     };
     useEffect(() => {
         const key = (event: KeyboardEvent) => {
-            if (onboarding || event.defaultPrevented || event.isComposing || navMode === 'settings' || pairing.dialog.open || quitAsk || blockedOpen || leaveId || address.device || canvas.current?.querySelector('[data-interacting]') || !(event.metaKey || event.ctrlKey) || event.altKey || (event.target instanceof HTMLElement && event.target.closest('input,textarea,[contenteditable=true]'))) return;
-            if (event.key.toLowerCase() === 'z') { event.preventDefault(); travel(event.shiftKey ? 'redo' : 'undo'); }
-            else if (event.ctrlKey && event.key.toLowerCase() === 'y') { event.preventDefault(); travel('redo'); }
+            if (onboarding || event.defaultPrevented || event.isComposing || navMode === 'settings' || pairing.dialog.open || quitAsk || blockedOpen || createOpen || leaveId || address.device || canvas.current?.querySelector('[data-interacting]') || !(event.metaKey || event.ctrlKey) || event.altKey || (event.target instanceof HTMLElement && event.target.closest('input,textarea,[contenteditable=true]'))) return;
+            if (event.key.toLowerCase() === 'z') { event.preventDefault(); void travel(event.shiftKey ? 'redo' : 'undo'); }
+            else if (event.ctrlKey && event.key.toLowerCase() === 'y') { event.preventDefault(); void travel('redo'); }
         };
         document.addEventListener('keydown', key); return () => document.removeEventListener('keydown', key);
     });
@@ -323,20 +489,58 @@ export function App() {
         document.addEventListener('visibilitychange', refresh);
         return () => { window.removeEventListener('focus', refresh); document.removeEventListener('visibilitychange', refresh); };
     }, [view, navMode, windowActive]);
+    // Enabling the File Provider is explained first; only OK opens Finder.
+    const fileProvider = useFileProviderExplainer();
+    const enableFileProvider = async () => { if (await fileProvider.ask()) await api.openFileProviderEnable(); };
     const grant = async (id: PermissionId) => {
         if (id === 'files')
-            await api.openFileProviderEnable();
+            await enableFileProvider();
         else if (id === 'audio')
             await api.requestPermission('audio_capture');
         else
             await api.requestPermission(id === 'input' ? 'input_monitoring' : id === 'network' ? 'local_network' : id);
     };
     const openPermissionSettings = async (id: PermissionId) => {
-        if (id === 'files') await api.openFileProviderEnable();
+        if (id === 'files') await enableFileProvider();
         else await api.openPermissionSettings(id === 'input' ? 'input_monitoring' : id === 'network' ? 'local_network' : id === 'audio' ? 'audio_capture' : 'accessibility');
     };
+    // A screen is hidden by its own bit or by its device's screen sharing being off.
+    const menuScreens = (geometry?.geometry.screens ?? []).map(s => {
+        const sharing = history.value?.screen_shared?.find(d => d.device === s.key.device);
+        const own = history.value?.disabled.find(d => d.screen.device === s.key.device && d.screen.display === s.key.display)?.disabled ?? s.hidden;
+        return { id: `${s.key.device}:${s.key.display}`, key: s.key, device: s.key.device, name: s.display.name, hidden: own || (sharing ? !sharing.shared : s.device_disabled) };
+    });
+    const hiddenScreens = new Map<string, number>();
+    for (const s of menuScreens) if (s.hidden) hiddenScreens.set(s.device, (hiddenScreens.get(s.device) ?? 0) + 1);
     const menu: Omit<SideContextMenuProps, 'children'> = {
-        devices, requests: pairing.requests, nearby: pairing.nearby, onShare: changeShare,
+        devices, screens: menuScreens,
+        screenEditPending: savingLayout,
+        onHideScreen: id => {
+            const present = history.value;
+            const key = menuScreens.find(s => s.id === id)?.key;
+            if (!present || !key || savingLayout) return;
+            const patch = { screen: key, disabled: true };
+            const disabled = [...present.disabled.filter(d => d.screen.device !== key.device || d.screen.display !== key.display), patch];
+            void commitEdit({ ...present, disabled }, tr('隐藏此屏幕'), undefined,
+                { placements: present.placements, native_plan_tokens: [], disabled: [patch] }, []);
+        },
+        // Hiding all turns the device's screen sharing off; showing all turns it back on and
+        // clears every per-screen hidden bit of the device, as one undoable edit.
+        onScreensHidden: (id, hidden) => {
+            if (hidden) { changeShare(id, 'screen', 'disabled'); return; }
+            const present = history.value;
+            if (!present || savingLayout) return;
+            const patches = present.disabled.filter(d => d.screen.device === id && d.disabled).map(d => ({ screen: d.screen, disabled: false }));
+            const sharedNow = present.screen_shared?.find(d => d.device === id)?.shared;
+            const off = sharedNow === false || (sharedNow === undefined && devices.find(d => d.id === id)?.screen === 'disabled');
+            if (!patches.length && !off) return;
+            const sharing = off ? [{ device: id, shared: true }] : [];
+            const disabled = present.disabled.map(d => d.screen.device === id ? { ...d, disabled: false } : d);
+            const screen_shared = off ? [...(present.screen_shared ?? []).filter(d => d.device !== id), ...sharing] : present.screen_shared;
+            void commitEdit({ ...present, disabled, ...(screen_shared ? { screen_shared } : {}) }, tr('显示全部屏幕'), undefined,
+                { placements: present.placements, native_plan_tokens: [], disabled: patches, ...(off ? { screen_shared: sharing } : {}) }, []);
+        },
+        requests: pairing.requests, nearby: pairing.nearby, onShare: changeShare,
         onGameMode: (id, mode) => { void invoke(id, 'game', mode); }, onSpeaker: (id, action) => { void speaker(id, action); },
         onPause: (id, paused) => { void invoke(id, 'pause', paused); }, onLeave: setLeaveId,
         onEditAddress: id => { const device=devices.find(d=>d.id===id); if(device)void address.open(device); },
@@ -344,15 +548,24 @@ export function App() {
         onQuit: () => { void shell.quit().catch(fail); },
         onAccept: req => { if(view==='panel')void shell.open('main').then(()=>pairing.actions.accept(req)).catch(fail);else pairing.actions.accept(req); }, onReject: req => { void pairing.actions.reject(req).catch(fail); },
         onPair: p => { void pairing.actions.connect(p).catch(fail); }, onBlock: p => { void pairing.actions.block(p).catch(fail); },
-        onOpenChange: setContextOpen,
     };
-    useEffect(()=>{
-        if(!peekId)return;const list=(['self','online','offline'] as const).flatMap(group=>devices.filter(d=>d.group===group).map(d=>d.id));
-        const rank=(id:string)=>fromRequestPeekId(id)?-1:list.indexOf(id);
-        setGrowIds(previous=>{const next=new Set([...previous].filter(id=>rank(id)<=rank(peekId)));if(peekId===selectedDevice)next.add(peekId);return next.size===previous.size&&[...next].every(id=>previous.has(id))?previous:next;});
-    },[peekId,selectedDevice]);
-    const visible = useMemo(()=>visibleScreens(screens, state.layout, devices),[screens,state.cards,state.pending,state.layout]);
-    useEffect(()=>{if(selected&&!visible.some(s=>s.id===selected))setSelected(null);},[visible,selected]);
+    const visible = useMemo(()=>visibleScreens(screens, geometry, devices.map(d => {
+        const sharing = history.value?.screen_shared?.find(s => s.device === d.id);
+        return sharing ? { ...d, screenSharing: sharing.shared, screen: sharing.shared ? 'shared' : 'disabled' } : d;
+    })),[screens,geometry,devices,history.value]);
+    // Turning auto-compact on compacts once around this device, as one undoable edit of
+    // whole-computer translations (no native writes). Turning it off changes nothing.
+    const toggleCompact = () => {
+        const on = !compactLayout;
+        prefs.savePresentation({ compact_layout: on });
+        if (!on || savingLayout) return;
+        const computers = [...new Set(visible.map(s => s.device ?? s.id))].map(device => ({ device, rects: visible.filter(s => (s.device ?? s.id) === device) }));
+        const { offsets } = compactAround(computers, self?.id ?? null);
+        if (!offsets.size) return;
+        const next = visible.map(s => { const o = offsets.get(s.device ?? s.id); return o ? { ...s, x: s.x + o.dx, y: s.y + o.dy } : s; });
+        void saveScreens(mergeVisibleGroups(screens, next), tr('自动靠拢'));
+    };
+    useEffect(()=>{if(selected&&!visible.some(s=>s.id===selected)){setSelected(null);setSelection([]);}},[visible,selected]);
     const permissions: Record<PermissionId, PermState> = {
         accessibility: 'unknown', input: 'unknown', network: 'unknown', files: 'unknown', audio: 'unknown',
     };
@@ -377,7 +590,7 @@ export function App() {
                     : <SideContextMenu {...menu}>
       <DesktopWindow ref={mergeRefs(setWinEl)} platform={platform} covered={onboarding && onboard !== 'leaving'} coverBar={onboarding && <OnboardingLanguage value={prefs.prefs.language} leaving={onboard === 'leaving'} onChange={v => prefs.set('language', v)}/>}
         cover={onboarding && <Onboarding key={onboardKey} platform={platform} pairing={pairing} perms={permissions} onGrant={grant} onOpenSettings={openPermissionSettings} preferences={prefs} container={winEl} leaving={onboard === 'leaving'} version={state.boot?.version ?? version} connected={devices.some(d => d.group === 'online')} onSkip={finishOnboarding} onFinish={finishOnboarding}/>}
-        state={{ maximized, minimized: false, closed: false }} active={windowActive} title={tr('显示器排列')} onMinimize={() => { void windowAction('minimize'); }} onToggleMaximize={() => { void windowAction('toggleMaximize'); }} onClose={() => { void windowAction('close'); }} onActivate={() => { }} navOpen={navOpen} onToggleNav={() => { setNavOpen(!navOpen); if (navMode !== 'devices')
+        state={{ maximized, minimized: false, closed: false }} active={windowActive} title={tr('显示器排列')} onMinimize={() => { void windowAction('minimize'); }} onToggleMaximize={() => { void windowAction('toggleMaximize'); }} onClose={() => { void windowAction('close'); }} onActivate={() => { }} navOpen={navOpen} onSideBlank={clearSelection} onToggleNav={() => { if (navOpen) clearSelection(); setNavOpen(!navOpen); if (navMode !== 'devices')
                         setNavMode('devices'); }} pages={{ add: navMode === 'add', settings: navMode === 'settings' }} onSideAction={action => { if (action === 'quit') {
                         if (prefs.prefs.confirmQuit)
                             setQuitAsk(true);
@@ -387,27 +600,30 @@ export function App() {
                     else {
                         setNavOpen(true);
                         setNavMode(navMode === action ? 'devices' : action);
-                    } }} version={state.boot?.version ?? version} sideExtra={navMode === 'add' ? <SelfInfo container={winEl}/> : null} titleEnd={<>{prefs.prefs.upgradeHint && state.update?.candidate && state.update.phase !== 'disabled' && <UpgradeButton/>}<PromoArea sponsor={!prefs.presentation.hide_sponsor} container={winEl}/></>} titleCenter={self?.paused ? <span className="win__paused"><PauseGlyph/>{tr('共享已暂停')}</span> : null} navBack={platform === 'win' && navMode !== 'devices' ? { title: navMode === 'add' ? tr('添加设备') : tr('设置'), label: tr('返回设备列表'), onBack: () => setNavMode('devices') } : null} nav={collapsed => <PeekScope collapsed={collapsed} suspended={contextOpen} onTarget={id=>{setPeekId(id);if(!id)setGrowIds(previous=>previous.size?new Set():previous);}} render={id => { const requestId=fromRequestPeekId(id);if(requestId){const request=pairing.requests.find(r=>r.id===requestId);return request?<RequestRow key={request.id} req={request} collapsed={false} inPeek onExpand={()=>setNavOpen(true)} onAccept={()=>menu.onAccept(request)} onReject={()=>menu.onReject(request)}/>:null;} const d = devices.find(d => d.id === id); return d ? <DeviceItem key={id} inPeek volumeOpen={selectedDevice===id} d={d} selected={selectedDevice === id} collapsed={false} onSelect={() => selectDevice(id)} onToggle={(kind, mode) => toggle(id, kind, mode)} onPause={paused => { void invoke(id, 'pause', paused); }} onSpeaker={action => { void speaker(id, action); }} now={Date.now()} noExit={!hasExit(devices)}/> : null; }}>
-          <div className="nav-stack"><AddHead open={navMode !== 'devices' && platform === 'mac'} title={navMode === 'add' ? tr('添加设备') : tr('设置')} onBack={() => setNavMode('devices')}/>
-            <RequestsGroup pairing={pairing} collapsed={collapsed} onExpand={() => setNavOpen(true)} hidden={navMode === 'settings'}/>
-            <div className="nav-view" key={navMode} data-view={navMode} data-anim={navSwitched ? '' : undefined}>{navMode === 'add' ? <AddPanel pairing={pairing}/> : navMode === 'settings' ? <SettingsNav platform={platform} query={query} onQuery={setQuery} active={section} onJump={id => setJump({ section: id, n: Date.now() })}/> : <DeviceList growIds={growIds} devices={devices} selectedId={selectedDevice} onSelect={selectDevice} onToggle={toggle} onPause={menu.onPause} onSpeaker={menu.onSpeaker} collapsed={collapsed} now={Date.now()}/>}</div>
+                    } }} version={state.boot?.version ?? version} sideExtra={navMode === 'add' ? <SelfInfo container={winEl}/> : null} titleEnd={<>{prefs.prefs.upgradeHint && state.update?.candidate && state.update.phase !== 'disabled' && <UpgradeButton/>}<PromoArea sponsor={!prefs.presentation.hide_sponsor} container={winEl}/></>} titleCenter={self?.paused ? <span className="win__paused"><PauseGlyph/>{tr('共享已暂停')}</span> : null} navBack={platform === 'win' && navMode !== 'devices' ? { title: navMode === 'add' ? tr('添加设备') : tr('设置'), label: tr('返回设备列表'), onBack: () => setNavMode('devices') } : null} nav={collapsed => <>
+          <div className="nav-stack">
+            {platform === 'win' && <RequestsGroup pairing={pairing} collapsed={collapsed} onExpand={() => setNavOpen(true)} hidden={navMode === 'settings'}/>}
+            <div className="nav-view" key={navMode} data-view={navMode} data-anim={navSwitched ? '' : undefined}>{platform === 'mac' && <><AddHead open={navMode !== 'devices'} title={navMode === 'add' ? tr('添加设备') : tr('设置')} onBack={() => setNavMode('devices')}/><RequestsGroup pairing={pairing} collapsed={collapsed} onExpand={() => setNavOpen(true)} hidden={navMode === 'settings'}/></>}{navMode === 'add' ? <AddPanel pairing={pairing}/> : navMode === 'settings' ? <SettingsNav platform={platform} query={query} onQuery={setQuery} active={section} onJump={id => setJump({ section: id, n: Date.now() })}/> : <DeviceList devices={devices} selectedId={selectedDevice} onSelect={id => { setNavOpen(true); selectDevice(id); }} onToggle={toggle} onPause={menu.onPause} onSpeaker={menu.onSpeaker} hiddenScreens={hiddenScreens} collapsed={collapsed} now={Date.now()}/>}</div>
           </div>
-        </PeekScope>}>
+        </>}>
         <div className="disp" data-hidden={navMode === 'settings' ? '' : undefined} aria-hidden={navMode === 'settings' || undefined} inert={navMode === 'settings'}>
           <VisuallyHidden id={hint}>{tr('方向键移动位置；Command 或 Ctrl 加方向键缩放；Shift 微调按键、拖动或缩放时按住可关闭吸附；Esc 取消选中')}</VisuallyHidden>
           <div className="disp__canvas" ref={canvas} aria-busy={savingLayout}>
             <div className="canvas-tools" role="toolbar" aria-label={tr('排列操作')}>
-              {/* Two screens with arrows closing their gap: compaction after a manual edit. */}
-              <Tooltip interactive={false} placement="bottom" content={tr('自动靠拢')}><Button variant="ghost" size="sm" iconOnly aria-label={tr('自动靠拢')} aria-pressed={compactLayout} onClick={() => prefs.savePresentation({ compact_layout: !compactLayout })}><Icon><path d="M2 5.5h6M6 3.5l2 2-2 2M18 5.5h-6M14 3.5l-2 2 2 2"/><rect x="2" y="10" width="7" height="5.5" rx="1.6"/><rect x="11" y="10" width="7" height="5.5" rx="1.6"/></Icon></Button></Tooltip>
+              <ProfileTools state={profiles} busy={savingLayout} onLoad={p => { void loadProfile(p); }} onCreate={() => setCreateOpen(true)} onManage={manageProfiles}/>
               <span className="canvas-tools__sep"/>
-              <Tooltip interactive={false} content={`${tr('撤销')}|${platform === 'mac' ? '⌘Z' : 'Ctrl+Z'}`} placement="bottom"><Button variant="ghost" size="sm" iconOnly aria-label={tr('撤销')} aria-keyshortcuts={platform === 'mac' ? 'Meta+Z' : 'Control+Z'} disabled={savingLayout || history.undoCount === 0} onClick={() => travel('undo')}><Icon><path d="M7.2 4.6 3.8 8l3.4 3.4M4.3 8h7.2a4.2 4.2 0 0 1 0 8.4H9.2"/></Icon></Button></Tooltip>
-              <Tooltip interactive={false} content={`${tr('重做')}|${platform === 'mac' ? '⇧⌘Z' : 'Ctrl+Y'}`} placement="bottom"><Button variant="ghost" size="sm" iconOnly aria-label={tr('重做')} aria-keyshortcuts={platform === 'mac' ? 'Shift+Meta+Z' : 'Control+Y'} disabled={savingLayout || history.redoCount === 0} onClick={() => travel('redo')}><Icon><path d="M12.8 4.6 16.2 8l-3.4 3.4M15.7 8H8.5a4.2 4.2 0 0 0 0 8.4h2.3"/></Icon></Button></Tooltip>
+              {/* Two screens with arrows closing their gap: compaction after a manual edit. */}
+              <Tooltip interactive={false} placement="bottom" content={tr('自动靠拢')}><Button variant="ghost" size="sm" iconOnly aria-label={tr('自动靠拢')} aria-pressed={compactLayout} onClick={toggleCompact}><CompactIcon/></Button></Tooltip>
+              <span className="canvas-tools__sep"/>
+
+              <Tooltip interactive={false} content={`${tr('撤销')}|${platform === 'mac' ? '⌘Z' : 'Ctrl+Z'}`} placement="bottom"><Button variant="ghost" size="sm" iconOnly aria-label={tr('撤销')} aria-keyshortcuts={platform === 'mac' ? 'Meta+Z' : 'Control+Z'} disabled={savingLayout || history.undoCount === 0} onClick={() => { void travel('undo'); }}><Icon><path d="M7.2 4.6 3.8 8l3.4 3.4M4.3 8h7.2a4.2 4.2 0 0 1 0 8.4H9.2"/></Icon></Button></Tooltip>
+              <Tooltip interactive={false} content={`${tr('重做')}|${platform === 'mac' ? '⇧⌘Z' : 'Ctrl+Y'}`} placement="bottom"><Button variant="ghost" size="sm" iconOnly aria-label={tr('重做')} aria-keyshortcuts={platform === 'mac' ? 'Shift+Meta+Z' : 'Control+Y'} disabled={savingLayout || history.redoCount === 0} onClick={() => { void travel('redo'); }}><Icon><path d="M12.8 4.6 16.2 8l-3.4 3.4M15.7 8H8.5a4.2 4.2 0 0 0 0 8.4h2.3"/></Icon></Button></Tooltip>
               <span className="canvas-tools__sep"/><Tooltip interactive={false} placement="bottom" content={tr('重置排列')}><Button variant="ghost" size="sm" iconOnly aria-label={tr('重置排列')} disabled={savingLayout} onClick={() => { void resetLayout(); }}><Icon name="replay"/></Button></Tooltip>
             </div>
-            <Arrangement platform={platform} screens={visible} geometryScreens={screens} onProjection={previewScreens} onScreensChange={(next, change) => { void saveScreens(mergeVisibleGroups(screens,next), change.label, change.merge); }} selectedId={selected} onSelect={selectScreen} settings={{ showHotZones: false, snapping: true, compact: compactLayout, padding: navOpen ? 24 : 48, step: 10 }} keyScope={canvas} hintId={hint} selectedGroup={!screenOnly && selectedDevice ? new Set(screens.filter(s => s.device === selectedDevice).map(s => s.id)) : undefined} contextFor={s => `device:${s.device}`}/>
+            <Arrangement platform={platform} screens={visible} geometryScreens={screens} onProjection={previewScreens} onScreensChange={(next, change) => { void saveScreens(mergeVisibleGroups(screens,next), change.label, change.merge); }} selectedId={selected} onSelect={selectScreen} settings={{ showHotZones: false, snapping: true, compact: compactLayout, padding: navOpen ? 24 : 48, step: 10 }} keyScope={canvas} hintId={hint} selectedGroup={!screenOnly && selectedDevice ? new Set(screens.filter(s => s.device === selectedDevice).map(s => s.id)) : selection.length > 1 ? new Set(selection) : undefined} contextFor={s => `screen:${s.id}`} screenEditable={s => !!s.device && editable.has(s.device)} screenPreview={screenPreview} onScreenMove={move => { void moveScreen(move); }}/>
           </div>
         </div>
-        {settingsMounted && <SettingsPage open={navMode === 'settings'} platform={platform} api={prefs} capsIme={state.input?.mac_caps_switches_input_source ?? null} query={query} jump={jump} onActive={setSection} version={state.boot?.version ?? version} upgrade={{ available: false, next: '' }} perms={permissions} onGrant={grant} onOpenPermissionSettings={openPermissionSettings} onLog={() => { }} onAbout={menu.onAbout} onBlocklist={() => setBlockedOpen(true)} onOnboarding={replayOnboarding}/>}
+        {settingsMounted && <SettingsPage open={navMode === 'settings'} platform={platform} api={prefs} capsIme={state.input?.mac_caps_switches_input_source ?? null} query={query} jump={jump} onActive={setSection} version={state.boot?.version ?? version} upgrade={{ available: false, next: '' }} perms={permissions} onGrant={grant} onOpenPermissionSettings={openPermissionSettings} onLog={() => { }} onAbout={menu.onAbout} onBlocklist={() => setBlockedOpen(true)} layoutProfiles={<ProfileList state={profiles} onCreate={() => setCreateOpen(true)} onRename={renameProfile} onDelete={deleteProfile}/>} onOnboarding={replayOnboarding}/>}
       </DesktopWindow>
     </SideContextMenu>;
     // oink-ui ships built-in component strings (default aria labels, key names)
@@ -419,6 +635,8 @@ export function App() {
       {(view==='main'||view==='panel') && state.error && <div role="alert" className="backend-notice"><Icon name="alert"/>{problemText(state.error)}<Button size="sm" variant="ghost" onClick={() => agent.fail('')}>{tr('关闭')}</Button></div>}
       {winEl && <>{!onboarding && <PairDialog pairing={pairing} container={winEl}/>}<BlockListDialog loading={state.blocked === null && !state.error} pending={unblocking} error={blockError ?? (!state.blocked && state.error ? problemText(state.error) : null)} open={blockedOpen} blocked={pairing.blocked} container={winEl} onClose={() => setBlockedOpen(false)} onRemove={p => { setBlockError(null); setUnblocking(ids => [...ids,p.id]); void pairing.actions.unblock(p).catch(() => setBlockError(problemText('unavailable'))).finally(() => setUnblocking(ids => ids.filter(id => id !== p.id))); }}/>
         {view === 'main' && <UpgradeDialog container={winEl}/>}
+        {view === 'main' && <CreateProfileDialog open={createOpen} state={profiles} container={winEl} onClose={() => setCreateOpen(false)} onSubmit={createProfile}/>}
+        <FileProviderDialog {...fileProvider.dialog} container={winEl}/>
         <QuitDialog pendingOperations={state.pending.length} open={quitAsk} container={winEl} onCancel={() => setQuitAsk(false)} onQuit={() => { void shell.quit().catch(fail); }}/>
         <LeaveDialog device={devices.find(d => d.id === leaveId) ?? null} container={winEl} onCancel={() => setLeaveId(null)} onConfirm={() => { const d = devices.find(d => d.id === leaveId); if (d)
             void (d.group === 'self' ? api.leaveGroup() : api.removeMember(d.id)).then(() => setLeaveId(null)).catch(fail); }}/>

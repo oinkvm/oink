@@ -32,9 +32,19 @@ export function settleGroup(moving: Rect[], others: Rect[], groups: string[]): O
     const boxes = [...new Set(groups)].map(g => bounds(others.filter((_, i) => groups[i] === g)));
     const at = (o: Offset) => moving.map(r => ({ ...r, x: r.x + o.dx, y: r.y + o.dy }));
     const before = edgeProjections([...moving, ...others], eps);
+    /** The facing pairs between the edited computer and every other screen, as source-
+     * relative intervals: the only pairs a translation can change. Comparing these first
+     * rejects most candidates in O(moving × others) before the full projection set, which
+     * also covers which interval is visible, is rebuilt. */
+    const pairs = (placed: Rect[]) => placed.flatMap(m => others.flatMap(r => [0, 1, 2, 3].flatMap(side => {
+        const lo = (a: Rect) => side < 2 ? a.y : a.x, f = facing(m, r, side, eps), g = facing(r, m, side, eps);
+        return [f ? 1 : 0, f ? f.from - lo(m) : 0, f ? f.to - lo(m) : 0, g ? 1 : 0, g ? g.from - lo(r) : 0, g ? g.to - lo(r) : 0];
+    })));
+    const pairsBefore = pairs(moving);
     const valid = (o: Offset) => {
         const placed = at(o);
         return placed.every(m => others.every(r => !overlaps(m, r, eps)))
+            && pairs(placed).every((v, k) => Math.abs(v - pairsBefore[k]) <= eps)
             && sameProjections(before, edgeProjections([...placed, ...others], eps), eps);
     };
     /** Real screens it shares an edge with, and bounding rectangles it touches, corners included. */
@@ -43,6 +53,18 @@ export function settleGroup(moving: Rect[], others: Rect[], groups: string[]): O
         others.forEach((r, j) => { if (placed.some(m => edgeContact(m, r, eps))) keys.add(`s${j}`); });
         boxes.forEach((r, j) => { if (placed.some(m => touching(m, r, eps))) keys.add(`b${j}`); });
         return keys;
+    };
+    /** Whether a move keeps every contact in `kept` and adds one, i.e. `touches(o)` is a
+     * strict superset of `kept`. Equivalent to comparing the sets, but returns at the
+     * first lost or new contact: almost every candidate translation fails one of the two. */
+    const gains = (o: Offset, kept: Set<string>) => {
+        const placed = at(o);
+        const holds = (key: string) => {
+            const j = Number(key.slice(1));
+            return key[0] === 's' ? placed.some(m => edgeContact(m, others[j], eps)) : placed.some(m => touching(m, boxes[j], eps));
+        };
+        for (const key of kept) if (!holds(key)) return false;
+        return others.some((_, j) => !kept.has(`s${j}`) && holds(`s${j}`)) || boxes.some((_, j) => !kept.has(`b${j}`) && holds(`b${j}`));
     };
 
     const targets = [...others, ...boxes];
@@ -53,7 +75,8 @@ export function settleGroup(moving: Rect[], others: Rect[], groups: string[]): O
         // corner apart on the other, so these per-axis translations cover them all.
         const shifts = (axis: 'x' | 'y') => {
             const size = axis === 'x' ? 'w' : 'h';
-            return [0, ...placed.flatMap(m => targets.flatMap(t => [t[axis] + t[size] - m[axis], t[axis] - (m[axis] + m[size])]))];
+            // Aligned screens repeat the same translation; test each value once, first occurrence kept.
+            return [...new Set([0, ...placed.flatMap(m => targets.flatMap(t => [t[axis] + t[size] - m[axis], t[axis] - (m[axis] + m[size])]))])];
         };
         let best: Offset | undefined, cost = Infinity;
         for (const dx of shifts('x'))
@@ -61,8 +84,7 @@ export function settleGroup(moving: Rect[], others: Rect[], groups: string[]): O
                 const d = Math.hypot(dx, dy);
                 if (d <= eps || d >= cost - eps) continue;
                 const reached = { dx: offset.dx + dx, dy: offset.dy + dy };
-                const now = touches(reached);
-                if (now.size > kept.size && [...kept].every(k => now.has(k)) && valid(reached)
+                if (gains(reached, kept) && valid(reached)
                     && pathFree(moving, others, offset, reached, eps)) {
                     best = reached;
                     cost = d;
@@ -72,6 +94,51 @@ export function settleGroup(moving: Rect[], others: Rect[], groups: string[]): O
         offset = best;
     }
     return Math.abs(offset.dx) <= eps && Math.abs(offset.dy) <= eps ? NONE : offset;
+}
+
+/** One computer's visible screens; hidden or disabled screens are left out by the caller. */
+export interface Computer { device: string; rects: Rect[] }
+
+/**
+ * The single pass run when auto-compact is turned on (user decision 2026-10-21).
+ *
+ * There is no edited computer, so `anchor` (this device) stays fixed and every other
+ * computer gets one `settleGroup` move per pass, with all of its rules, nearest to the
+ * anchor first (bounding-rectangle distance, ties by device ID). Passes repeat while
+ * something moves, at most once per computer; each move only closes gaps, so this is a
+ * bound, not a cutoff. Without a visible anchor the order is by device ID alone.
+ * Returns each moved computer's total translation and, per pass, who moved.
+ */
+export function compactAround(computers: Computer[], anchor: string | null): { offsets: Map<string, Offset>; moves: string[][] } {
+    const offsets = new Map<string, Offset>(), moves: string[][] = [];
+    const placed = (c: Computer) => {
+        const o = offsets.get(c.device) ?? NONE;
+        return c.rects.map(r => ({ ...r, x: r.x + o.dx, y: r.y + o.dy }));
+    };
+    const fixed = computers.find(c => c.device === anchor && c.rects.length);
+    const distance = (c: Computer) => {
+        if (!fixed) return 0;
+        const a = bounds(placed(fixed)), b = bounds(placed(c));
+        return Math.hypot(Math.max(0, b.x - (a.x + a.w), a.x - (b.x + b.w)), Math.max(0, b.y - (a.y + a.h), a.y - (b.y + b.h)));
+    };
+    const movable = computers.filter(c => c.device !== anchor && c.rects.length);
+    for (let pass = 0; pass < computers.length; pass++) {
+        const order = movable.map(c => ({ c, d: distance(c) }))
+            .sort((x, y) => x.d - y.d || (x.c.device < y.c.device ? -1 : x.c.device > y.c.device ? 1 : 0)).map(x => x.c);
+        const moved: string[] = [];
+        for (const c of order) {
+            const rest = computers.filter(o => o !== c);
+            const others = rest.flatMap(placed), groups = rest.flatMap(o => o.rects.map(() => o.device));
+            const { dx, dy } = settleGroup(placed(c), others, groups);
+            if (dx === 0 && dy === 0) continue;
+            const o = offsets.get(c.device) ?? NONE;
+            offsets.set(c.device, { dx: o.dx + dx, dy: o.dy + dy });
+            moved.push(c.device);
+        }
+        if (!moved.length) break;
+        moves.push(moved);
+    }
+    return { offsets, moves };
 }
 
 /** A shared edge with a positive span; a corner alone does not join two screens. */

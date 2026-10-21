@@ -212,3 +212,41 @@ fn content_and_superseded_capture_errors_leave_clipboard_usable() {
         },
     );
 }
+
+#[test]
+fn directional_masters_revoke_native_publications_independently() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "directional_masters_revoke_native_publications_independently",
+        Some(4),
+        async {
+            let root = tempfile::tempdir().unwrap();
+            let node = start_with_clip(
+                &oink_test_support::network_config(root.path().join("owner"), "owner", 0),
+                &Displays::new("owner"),
+                Some(Arc::new(FakeClipboard::new())),
+            )
+            .await;
+            let clip = node.clipboard().unwrap();
+            for (send, receive) in [(true, false), (false, true), (false, false), (true, true)] {
+                let old_outbound = clip.shared.policy.publication_guard();
+                let old_inbound = clip.shared.receive_policy.publication_guard();
+                let mut settings = clip.settings();
+                settings.send = send;
+                settings.receive = receive;
+                clip.set_settings(settings);
+                assert!(old_outbound().is_err(), "old sources cannot survive a policy change");
+                assert!(old_inbound().is_err(), "queued writes cannot survive a policy change");
+                assert_eq!(clip.shared.policy.publication_guard()().is_ok(), send);
+                assert_eq!(clip.shared.receive_policy.publication_guard()().is_ok(), receive);
+                clip.set_paused(true);
+                assert!(!clip.shared.policy.enabled());
+                assert!(!clip.shared.receive_policy.enabled());
+                clip.set_paused(false);
+                assert_eq!(clip.shared.policy.enabled(), send);
+                assert_eq!(clip.shared.receive_policy.enabled(), receive);
+            }
+            node.shutdown().await;
+        },
+    );
+}

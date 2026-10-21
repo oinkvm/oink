@@ -17,6 +17,14 @@ beforeEach(()=>{
   mocks.call.mockResolvedValue(mocks.state.localPreferences);
 });
 afterEach(cleanup);
+it('defaults external input forwarding off and persists only its local input patch', async()=>{
+  const {result}=renderHook(usePreferences);
+  expect(result.current.prefs.forwardInjectedInput).toBe(false);
+  expect(result.current.canEdit('forwardInjectedInput')).toBe(true);
+  await act(async()=>result.current.set('forwardInjectedInput',true));
+  expect(mocks.input).toHaveBeenCalledExactlyOnceWith({forward_injected_input:true});
+  expect(localStorage.getItem('oink:prefs')).toBeNull();
+});
 it.each([false,true])('Settings reflects the onboarding-confirmed login=%s and can edit it afterwards',async enabled=>{
   mocks.state.launch={state:'disabled',problem:null,configured:false};
   mocks.login.mockImplementation(async on=>({state:on?'enabled':'disabled',problem:null,configured:true}));
@@ -101,4 +109,11 @@ it('does not overwrite the child preference when disabling contacts',async()=>{
   await act(async()=>result.current.set('touchpadInject',false));
   expect(mocks.input).toHaveBeenCalledExactlyOnceWith({accept_contacts:false});
   expect(result.current.prefs.macScrollFeel).toBe(true);
+});
+
+it.each([['clipReceive','receive'],['clipSend','send']] as const)('persists the independent %s clipboard master',async(key,field)=>{
+  const {result}=renderHook(usePreferences);
+  expect(result.current.prefs[key]).toBe(true);
+  await act(async()=>result.current.set(key,false));
+  expect(mocks.clipboard).toHaveBeenCalledExactlyOnceWith({[field]:false});
 });

@@ -21,15 +21,25 @@ use std::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FormatFilters {
+    /// Device-local direction switches; omitted by pre-0.2 settings.
+    #[serde(default = "enabled_by_default")]
+    pub receive: bool,
+    #[serde(default = "enabled_by_default")]
+    pub send: bool,
     pub text: bool,
     pub rich_text: bool,
     pub images: bool,
     pub files: bool,
     pub custom: bool,
 }
+fn enabled_by_default() -> bool {
+    true
+}
 impl Default for FormatFilters {
     fn default() -> Self {
         Self {
+            receive: true,
+            send: true,
             text: true,
             rich_text: true,
             images: true,
@@ -300,6 +310,20 @@ impl Namespace for FilteredFiles {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clipboard_masters_default_on_for_existing_config_and_are_independent() {
+        let old = r#"{"text":true,"rich_text":true,"images":true,"files":true,"custom":true}"#;
+        let settings: super::FormatFilters = serde_json::from_str(old).unwrap();
+        let mut value = serde_json::to_value(settings).unwrap();
+        assert_eq!(value["receive"], true);
+        assert_eq!(value["send"], true);
+        value["send"] = false.into();
+        let decoded: super::FormatFilters = serde_json::from_value(value).unwrap();
+        let value = serde_json::to_value(decoded).unwrap();
+        assert_eq!(value["receive"], true);
+        assert_eq!(value["send"], false);
+    }
+
     use super::*;
     use oink_foundation::content::ClipId;
     use oink_foundation::{DeviceId, clipboard::ClipPlatform};

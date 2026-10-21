@@ -94,17 +94,26 @@ export const DiagnosticsChart = memo(function DiagnosticsChart({ active, audio =
         return d;
     };
     // Mark every affected source, including a series hidden by its legend.
-    const glitchSeconds = new Map<number, Series[]>();
+    const output = audio ? quality.snapshot?.output : null;
+    const glitchSeconds = new Map<number, Pick<Series, 'id' | 'name' | 'color'>[]>();
     if (audio) for (const source of series) {
         if (!('glitches' in source.statistics)) continue;
         for (const bucket of source.statistics.glitches) {
-            if (bucket.lost + bucket.late === 0) continue;
+            if (bucket.interruptions === 0) continue;
             const second = Math.floor(bucket.at_ms / 1000) * 1000;
             if (snapshot!.sampled_at_ms / 1000 - second / 1000 >= 60 || second > snapshot!.sampled_at_ms) continue;
             const devices = glitchSeconds.get(second) ?? [];
             if (!devices.some(s => s.id === source.id)) devices.push(source);
             glitchSeconds.set(second, devices);
         }
+    }
+    if (output) for (const bucket of output.glitches) {
+        if (bucket.interruptions === 0) continue;
+        const second = Math.floor(bucket.at_ms / 1000) * 1000;
+        if (snapshot!.sampled_at_ms / 1000 - second / 1000 >= 60 || second > snapshot!.sampled_at_ms) continue;
+        const devices = glitchSeconds.get(second) ?? [];
+        devices.push({id:'output', name:tr('音频输出（所有来源）'), color:'var(--ok-danger)'});
+        glitchSeconds.set(second, devices);
     }
     const glitchX = (second: number) => PAD.l + (1 - (snapshot!.sampled_at_ms - second) / 60000) * plotW;
     const [glitchHover, setGlitchHover] = useState<number | null>(null);
@@ -161,11 +170,11 @@ export const DiagnosticsChart = memo(function DiagnosticsChart({ active, audio =
         {visible.length === 0 && <p className="lat__empty">{empty}</p>}
       </div>
       {failed && <p role="status">{audio ? tr('无法读取音频质量') : tr('无法读取连接质量')}</p>}
-      {series.length > 0 && <div className="lat__table-scroll">
+      {(series.length > 0 || output) && <div className="lat__table-scroll ok-scroll">
         <table className={audio ? "lat__table lat__table--audio" : "lat__table"} aria-label={audio ? tr('音频质量') : tr('连接质量')}>
           <thead><tr>
             <th scope="col">{tr('设备名称')}</th>
-            {audio ? <><th scope="col">{tr('缓冲 P50')}</th><th scope="col">{tr('缓冲 P90')}</th><th scope="col">{tr('缓冲 P99')}</th><th scope="col">{tr('平均码率')}</th><th scope="col">{tr('断音')}</th></> : <><th scope="col">{tr('当前延迟')}</th><th scope="col">P50</th><th scope="col">{tr('P90')}</th><th scope="col">P99</th><th scope="col">{tr('路径')}</th></>}
+            {audio ? <><th scope="col">{tr('平均缓冲')}</th><th scope="col">{tr('平均码率')}</th><th scope="col">{tr('中断')}</th><th scope="col">{tr('补音时长')}</th><th scope="col">{tr('迟到包')}</th></> : <><th scope="col">{tr('当前延迟')}</th><th scope="col">P50</th><th scope="col">{tr('P90')}</th><th scope="col">P99</th><th scope="col">{tr('路径')}</th></>}
           </tr></thead>
           <tbody>{series.map(s => <tr key={s.id}>
             <td><span className="lat__device">
@@ -177,14 +186,18 @@ export const DiagnosticsChart = memo(function DiagnosticsChart({ active, audio =
               <button type="button" className="lat__name" aria-pressed={visibleIds == null || visibleIds.has(s.id)} aria-label={visibleIds == null || visibleIds.has(s.id) ? tr('隐藏 {0} 的曲线', s.name) : tr('显示 {0} 的曲线', s.name)} onClick={() => toggle(s.id)}>{s.name}</button>
             </span></td>
             {'bitrate_kbps' in s.statistics ? <>
-              {[s.statistics.p50_ms,s.statistics.p90_ms,s.statistics.p99_ms].map((v,i)=><td key={i}>{format(v)}</td>)}
-              <td>{s.statistics.bitrate_kbps.toFixed(2)} kbps</td><td>{s.statistics.dropouts}</td>
+              <td>{format(s.statistics.buffer_avg_ms)}</td>
+              <td>{s.statistics.bitrate_kbps.toFixed(2)} kbps</td><td>{s.statistics.interruptions}</td>
+              <td>{s.statistics.concealed_ms.toFixed(2)} ms</td><td>{s.statistics.late_packets}</td>
             </> : <>
               {[s.statistics.current_ms,s.statistics.p50_ms,s.statistics.p90_ms,s.statistics.p99_ms].map((value,index) => <td key={index}>{format(value)}</td>)}
               <td>{s.statistics.path.type === 'relay' ? tr('经 {0} 中转', s.statistics.path.via_name) : tr('直连')}</td>
             </>}
 
-          </tr>)}</tbody>
+          </tr>)}{output && <tr>
+            <td><Tooltip interactive={false} content={tr('输出设备的共享队列缺音 {0} 毫秒，不归属某个来源。', output.missing_ms.toFixed(2))}><span>{tr('音频输出（所有来源）')}</span></Tooltip></td>
+            <td>—</td><td>—</td><td>{output.interruptions}</td><td>—</td><td>—</td>
+          </tr>}</tbody>
         </table>
       </div>}
     </div>);

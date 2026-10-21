@@ -70,7 +70,7 @@ impl InputBackend for RecordingInput {
 }
 
 #[test]
-fn handoff_parks_in_capture_callback_and_older_queued_restore_cannot_uncover_it() {
+fn handoff_parks_on_capture_owner_and_older_queued_restore_cannot_uncover_it() {
     handoff(true, false);
 }
 
@@ -84,7 +84,16 @@ fn incoming_shared_mouse_hides_a_mouse_local_receiver_and_own_motion_restores_on
     handoff(true, true);
 }
 
+#[test]
+fn incoming_shared_mouse_handoff_does_not_require_twenty_polls_to_take_three_milliseconds() {
+    handoff_scheduled(true, true, true);
+}
+
 fn handoff(immediate: bool, local_mouse: bool) {
+    handoff_scheduled(immediate, local_mouse, false);
+}
+
+fn handoff_scheduled(immediate: bool, local_mouse: bool, freeze_poll_clock: bool) {
     let (release, blocked) = mpsc::channel();
     let (entered, entered_rx) = mpsc::channel();
     let backend = Arc::new(RecordingInput {
@@ -162,12 +171,31 @@ fn handoff(immediate: bool, local_mouse: bool) {
     });
     backend.fake.set_cursor(Point::new(995., 500.));
     h.driver.adapter.router_mut().set_cursor(Point::new(995., 500.));
+    let poll_at = h.driver.now;
     for seq in 0..20 {
         if local_mouse {
             write
                 .post(encode(&Message::Input(InputMsg::Motion { seq, dx: 30., dy: 0. })).unwrap())
                 .unwrap();
-            h.poll();
+            if freeze_poll_clock {
+                h.driver.poll(poll_at);
+            } else {
+                h.poll();
+            }
+            // The injection worker is deliberately blocked above, including
+            // the FIFO cursor read. Poll count is not elapsed time: drive the
+            // owner's read deadline explicitly, without sleeping or retrying.
+            let pending = h
+                .driver
+                .cursor
+                .pending
+                .as_ref()
+                .expect("cursor read waits behind injection");
+            let deadline = pending.at + super::super::cursor::MAX_WAIT;
+            h.driver.poll(deadline - Duration::from_nanos(1));
+            assert!(h.driver.cursor.pending.is_some());
+            assert_eq!(h.driver.adapter.router().focus().holder, local);
+            h.driver.poll(deadline);
         } else {
             h.driver.event(&CapturedEvent {
                 physical: true,
@@ -176,6 +204,8 @@ fn handoff(immediate: bool, local_mouse: bool) {
                 time_us: 0,
                 cursor: Some(Point::new(999., 500.)),
             });
+            // Windows resolves the edge with a fresh clip on the ordinary owner turn.
+            h.settle_clip_check();
         }
         if h.driver.adapter.router().focus().holder == peer() {
             break;
@@ -192,7 +222,7 @@ fn handoff(immediate: bool, local_mouse: bool) {
     if immediate && !local_mouse {
         assert!(
             matches!(mode, Some(CaptureMode::Remote { .. })),
-            "FocusEnter was posted and capture returned, but native mode is {mode:?}"
+            "FocusEnter was posted after the owner decision, but native mode is {mode:?}"
         );
         assert_eq!(changes.len(), 1);
         assert_eq!(
@@ -317,4 +347,17 @@ fn owner_apply_ack_waits_for_native_work_and_publishes_owner_preference() {
         assert!(Instant::now() < until);
         std::thread::yield_now();
     }
+}
+
+#[test]
+fn native_mouse_guard_tracks_owner_mode_and_pause_without_erasing_preference() {
+    let mut h = Harness::new();
+    let mut settings = h.driver.adapter.router().config().settings.clone();
+    settings.mouse_mode = oink_foundation::input::InputMode::Disabled;
+    h.driver.adapter.router_mut().set_settings(settings);
+    assert!(CaptureLoop::mouse_disabled(&h.driver));
+    h.driver.paused = true;
+    assert!(!CaptureLoop::mouse_disabled(&h.driver));
+    h.driver.paused = false;
+    assert!(CaptureLoop::mouse_disabled(&h.driver));
 }

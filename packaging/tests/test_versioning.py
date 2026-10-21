@@ -17,17 +17,18 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'build-support'))
 from identity import IDENTITY, windows_product_version
 from provenance import verify, digest
+import versioning
 from versioning import release_version, local_source_commit, macos_version_fields
 from windows_version import display_version_resource, set_display_version
 
 COMMIT = '0123abcd' * 5
-DISPLAY = '0.1.0-beta.0123abcd'
+DISPLAY = '0.2.0-inhouse.0123abcd'
 
 
 class LocalVersions(unittest.TestCase):
     def test_commit_label_including_numeric_leading_zero_hash(self):
         self.assertEqual(release_version('0.1.0-beta.1', COMMIT), DISPLAY)
-        self.assertEqual(release_version('0.1.0-beta.1', '01234567' * 5), '0.1.0-beta.01234567')
+        self.assertEqual(release_version('0.1.0-beta.1', '01234567' * 5), '0.2.0-inhouse.01234567')
         self.assertEqual(release_version('0.1.0-beta.2'), '0.1.0-beta.2')
         for commit in ('0123abcd', 'A' * 40, 'z' * 40, 'a' * 39, 'a' * 41, ''):
             with self.assertRaises(ValueError):
@@ -35,9 +36,25 @@ class LocalVersions(unittest.TestCase):
         self.assertEqual(release_version('0.1.0', COMMIT), DISPLAY)
         self.assertEqual(release_version('0.1.0'), '0.1.0')
 
+    def test_inhouse_uses_the_configured_version_and_public_versions_stay_exact(self):
+        self.assertEqual(IDENTITY['inhouse_version'], '0.2.0')
+        for public in ('0.1.4', '0.1.5', '1.2.9'):
+            self.assertEqual(release_version(public, COMMIT), DISPLAY)
+        with patch.dict(versioning.IDENTITY, inhouse_version='0.3.0'):
+            self.assertEqual(release_version('0.1.5', COMMIT), '0.3.0-inhouse.0123abcd')
+        for public in ('0.1.4', '0.1.5', '0.2.0-beta.1'):
+            self.assertEqual(release_version(public), public)
+
+    def test_inhouse_configuration_is_numeric_and_does_not_affect_public_builds(self):
+        for invalid in (None, '', '0.2', '0.2.0-beta.1', '01.2.0', 7):
+            with self.subTest(invalid=invalid), patch.dict(versioning.IDENTITY, inhouse_version=invalid):
+                with self.assertRaisesRegex(ValueError, 'inhouse_version'):
+                    release_version('0.1.5', COMMIT)
+                self.assertEqual(release_version('0.1.5'), '0.1.5')
+
     def test_numeric_bundle_fields_and_msi_order_ignore_the_commit(self):
         self.assertEqual(macos_version_fields(DISPLAY, 17), dict(
-            CFBundleShortVersionString='0.1.0', CFBundleVersion='17', CFBundleGetInfoString=DISPLAY))
+            CFBundleShortVersionString='0.2.0', CFBundleVersion='17', CFBundleGetInfoString=DISPLAY))
         builds = (17, 18, 65535, 65536, 16777216, 2147483647)
         versions = [tuple(map(int, windows_product_version(build).split('.'))) for build in builds]
         self.assertEqual(versions, sorted(set(versions)))

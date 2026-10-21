@@ -237,7 +237,17 @@ impl Value for SafeInput {
 }
 
 unit!(oink_foundation::input::SourceKind=>w::DiagSourceKind{Mouse=>Mouse,Touchpad=>Touchpad,Keyboard=>Keyboard,Unknown=>Indeterminate});
-unit!(oink_foundation::input::InputMode=>w::DiagInputMode{Shared=>Shared,Local=>Local});
+impl Value for oink_foundation::input::InputMode {
+    fn wire(&self) -> v1::Result<RawValue> {
+        use oink_foundation::input::InputMode;
+        Ok(match self {
+            InputMode::Shared => w::DiagInputMode::Shared,
+            InputMode::Local => w::DiagInputMode::Local,
+            InputMode::Disabled => w::DiagInputMode::Unknown(2),
+        }
+        .write())
+    }
+}
 unit!(super::handoff::HandoffAction=>w::DiagHandoffAction{FocusEnterSent=>FocusEnterSent,FocusEnterReceived=>FocusEnterReceived,FocusStateSent=>FocusStateSent,FocusStateReceived=>FocusStateReceived,FocusResumeSent=>FocusResumeSent,FocusResumeReceived=>FocusResumeReceived,RoutingDecision=>RoutingDecision,PairAttached=>PairAttached,PairDetached=>PairDetached,ModeRequested=>ModeRequested,ModeStarted=>ModeStarted,ModeCompleted=>ModeCompleted,RestoreStarted=>RestoreStarted,RestoreCompleted=>RestoreCompleted,MotionFlush=>MotionFlush,TrailActive=>TrailActive,TrailDepart=>TrailDepart,TrailResume=>TrailResume,TrailSent=>TrailSent,TrailReceived=>TrailReceived});
 unit!(super::handoff::FlushReason=>w::DiagFlushReason{Due=>Due,OrderingBarrier=>OrderingBarrier,TargetChanged=>TargetChanged,FrequencyChanged=>FrequencyChanged,AttachmentBarrier=>AttachmentBarrier});
 unit!(oink_routing::router::DecisionKind=>w::DiagDecisionKind{Handoff=>Handoff,Refused=>Refused,Lock=>Lock,Unlock=>Unlock,ReturnHome=>ReturnHome,FocusAccepted=>FocusAccepted,GapDepart=>GapDepart,GapReturn=>GapReturn});
@@ -245,7 +255,7 @@ unit!(oink_routing::router::DecisionReason=>w::DiagDecisionReason{EdgeCrossed=>E
 unit!(super::handoff::TrailStage=>w::DiagTrailStage{Source=>Source,Converted=>Converted,Received=>Received,Resume=>Resume});
 unit!(oink_input::gesture_trace::Stage=>w::DiagGestureStage{Capture=>Capture,WindowsMapper=>WindowsMapper,MacSynth=>MacSynth});
 unit!(oink_input::gesture_trace::GestureKind=>w::DiagObservedGestureKind{Vertical=>Vertical,Horizontal=>Horizontal,Pinch=>Pinch,Magnify=>Magnify});
-unit!(oink_input::gesture_trace::Decision=>w::DiagGestureDecision{Observed=>Observed,Pending=>Pending,TaskView=>TaskView,TaskViewClose=>TaskViewClose,DesktopLeft=>DesktopLeft,DesktopRight=>DesktopRight,ShowDesktop=>ShowDesktop,BelowThreshold=>BelowThreshold,WrongDirection=>WrongDirection,Cancelled=>Cancelled,CtrlWheel=>CtrlWheel,NativeDockControl=>NativeDockControl,NativeMagnify=>NativeMagnify,NativeCancel=>NativeCancel,SubmissionFailed=>SubmissionFailed});
+unit!(oink_input::gesture_trace::Decision=>w::DiagGestureDecision{Observed=>Observed,Pending=>Pending,TaskView=>TaskView,TaskViewClose=>TaskViewClose,DesktopLeft=>DesktopLeft,DesktopRight=>DesktopRight,ShowDesktop=>ShowDesktop,RestoreDesktop=>RestoreDesktop,DesktopNoop=>DesktopNoop,StartOpen=>StartOpen,StartClose=>StartClose,StartNoop=>StartNoop,BelowThreshold=>BelowThreshold,WrongDirection=>WrongDirection,Cancelled=>Cancelled,CtrlWheel=>CtrlWheel,NativeDockControl=>NativeDockControl,NativeMagnify=>NativeMagnify,NativeCancel=>NativeCancel,SubmissionFailed=>SubmissionFailed});
 unit!(oink_routing::router::ContactsPath=>w::DiagContactsPath{NativeContacts=>NativeContacts,CaptureUnavailable=>CaptureUnavailable,AwaitLift=>AwaitLift,Local=>Local});
 unit!(oink_routing::router::VolumeAction=>w::DiagVolumeAction{VolumeUp=>VolumeUp,VolumeDown=>VolumeDown,Mute=>Mute,GainUp=>GainUp,GainDown=>GainDown,ForwardMute=>ForwardMute});
 unit!(oink_routing::router::VolumeOriginKind=>w::DiagVolumeOriginKind{Physical=>Physical,Synthetic=>Synthetic,Unknown=>Indeterminate});
@@ -301,7 +311,7 @@ structure!(super::handoff::DisplayBounds=>w::DiagDisplayBounds{screen,bounds,pix
 structure!(super::handoff::DisplaysEvent=>w::DiagDisplays{phase,revision,device,topology_sequence,screens,truncated});
 structure!(super::handoff::PositionEvidence=>w::DiagPositionEvidence{screen,at,native_bounds,compiled_bounds});
 structure!(super::handoff::RouterStateEvent=>w::DiagRouterState{phase,epoch,display_revision,topology_sequence,pointer,exit,reference});
-structure!(oink_input::gesture_trace::Summary=>w::DiagGestureSummary{kind,phase,identity,begin_identity,missing_begin,replaced,progress,velocity,peak_abs_progress,total_amount,duration_us,changed_events,ctrl_wheel_notches,ctrl_wheel_balance,decision,threshold,task_view_showing});
+structure!(oink_input::gesture_trace::Summary=>w::DiagGestureSummary{kind,phase,identity,begin_identity,missing_begin,replaced,progress,velocity,peak_abs_progress,total_amount,duration_us,changed_events,ctrl_wheel_notches,ctrl_wheel_balance,decision,threshold,task_view_showing,desktop_showing,start_open});
 structure!(super::gesture::GestureEvent=>w::DiagGestureEvent{stage,source,summary,contacts_path,disposition});
 structure!(super::volume::VolumeRoutingEvent=>w::DiagVolumeRouting{action,key_origin,source_kind,source,focus,decided_target,target_device,reason,focus_forwards,focus_keep_local_playback,source_keep_local_playback,windows_context,recent_default_endpoint_change,default_endpoint_age_ms,recent_audio_arrival_removal,arrival_removal_age_ms});
 structure!(oink_clipboard::provider_preparation::PlaceholderTiming=>w::DiagPlaceholderTiming{enabled,used,ready_parents,preparing,prepared_files,prepared_folders,used_files,used_folders,preparation_us,final_urls_us,fallback,failure,cleanup_pending});

@@ -39,6 +39,25 @@ pub(super) fn encode(action: &Action) -> v1::Result<Message> {
         return Err(v1::ErrorCode::UnsupportedValue.into());
     }
     Ok(match action {
+        Action::Arrangement {
+            sequence,
+            lease_ms,
+            expires_ms,
+            snapshot,
+        } => {
+            let mut raw = [
+                (1, V::Bool(true)),
+                (2, sequence.write()),
+                (3, lease_ms.write()),
+                (4, expires_ms.write()),
+            ]
+            .into_iter()
+            .collect::<v1::RawMap>();
+            if let Some(s) = snapshot {
+                raw.insert(5, crate::layout_profiles::wire::snapshot(s)?);
+            }
+            Message::ArrangementPreview(dto::ArrangementPreview::from_raw(raw)?)
+        }
         Action::Mode { id, enabled } => Message::ProjectionMode(dto::ProjectionMode::from_raw(
             [(1, mode(*id)?.write()), (2, enabled.write())].into(),
         )?),
@@ -83,6 +102,15 @@ pub(super) fn encode(action: &Action) -> v1::Result<Message> {
 }
 pub(crate) fn decode(message: Message) -> v1::Result<Action> {
     let value = match message {
+        Message::ArrangementPreview(m) => Action::Arrangement {
+            sequence: m.sequence()?,
+            lease_ms: m.lease_ms()?,
+            expires_ms: m.expires_ms()?,
+            snapshot: m
+                .arrangement()?
+                .map(|s| crate::layout_profiles::wire::read_snapshot(s, "").map(Box::new))
+                .transpose()?,
+        },
         Message::ProjectionMode(m) => Action::Mode {
             id: read_mode(m.id()?)?,
             enabled: m.enabled()?,

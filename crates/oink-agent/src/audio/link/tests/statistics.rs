@@ -30,7 +30,10 @@ async fn local_audio_quality_samples_without_a_ui_and_flushes_on_receiver_retire
     let mut running = Running::new().await;
     let history = Arc::new(Mutex::new(crate::audio_quality::History::default()));
     let captured = history.clone();
-    running.owners[1].on_quality = Some(Arc::new(move |at, observations, final_bucket| {
+    running.owners[1].on_quality = Some(Arc::new(move |at, observations, output, final_bucket| {
+        if let Some(output) = output {
+            lock(&captured).record_output(output);
+        }
         let named = observations.into_iter().map(|o| ("Source".into(), o));
         if final_bucket {
             lock(&captured).flush(at, named);

@@ -44,6 +44,9 @@ impl DndGlue {
             }
             let mut preparations = self.preparations.lock().unwrap();
             let source = token.key.drag.offer.clip.origin;
+            if let Some(inner) = self.input_node.upgrade() {
+                oink_clipboard::received::remember_source(source, (crate::node::Node { inner }).device_name(source));
+            }
             if preparations.get(&source).is_some_and(|slot| slot.token == token) {
                 return;
             }

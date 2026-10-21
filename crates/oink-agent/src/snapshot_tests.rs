@@ -865,6 +865,40 @@ fn local_contacts_capability_and_effective_preference_recover() {
         }
         assert!(a.input_settings().unwrap().mac_scroll_feel);
         assert!(b.input_settings().unwrap().mac_scroll_feel);
+        assert!(!a.input_settings().unwrap().forward_injected_input);
+        assert!(!b.input_settings().unwrap().forward_injected_input);
+        for enabled in [true, false] {
+            let node = a.clone();
+            tokio::task::spawn_blocking(move || {
+                node.set_input_settings(
+                    serde_json::from_value(serde_json::json!({"forward_injected_input": enabled})).unwrap(),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(a.input_settings().unwrap().forward_injected_input, enabled);
+            assert_eq!(
+                a.inner.input_settings.load().forward_injected_input,
+                enabled,
+                "live capture snapshot"
+            );
+            assert_eq!(
+                crate::config::AgentConfig::load_from(&configs[0].data_dir)
+                    .unwrap()
+                    .settings
+                    .routing
+                    .forward_injected_input,
+                enabled
+            );
+            let stored: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(configs[0].data_dir.join("settings.json")).unwrap()).unwrap();
+            assert_eq!(stored["local"]["routing"]["forward_injected_input"], enabled);
+            assert!(
+                !b.input_settings().unwrap().forward_injected_input,
+                "capture preference must not propagate to peer"
+            );
+        }
         for enabled in [false, true] {
             let node = a.clone();
             tokio::task::spawn_blocking(move || {

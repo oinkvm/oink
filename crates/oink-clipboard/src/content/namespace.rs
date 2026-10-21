@@ -19,6 +19,9 @@ pub(crate) use files::Flat;
 pub(crate) use files::Names;
 
 pub trait Namespace: Send + Sync + 'static {
+    fn origin(&self) -> Option<oink_foundation::DeviceId> {
+        None
+    }
     /// Real clipboard paths survive replacement of the system slot. Promise,
     /// virtual and Drop namespaces retain their existing authority rules.
     fn real_clipboard_files(&self) -> bool {
@@ -105,6 +108,9 @@ impl Restricted {
     }
 }
 impl Namespace for Restricted {
+    fn origin(&self) -> Option<oink_foundation::DeviceId> {
+        self.inner.origin()
+    }
     fn real_clipboard_files(&self) -> bool {
         self.inner.real_clipboard_files()
     }

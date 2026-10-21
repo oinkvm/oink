@@ -24,8 +24,8 @@ func makeEnumerator(_ identifier: NSFileProviderItemIdentifier, rootURL: @escapi
         // NSFileProviderReplicatedExtension.h explicitly requires this Cocoa
         // error when trashing is unsupported. Returning an empty enumerator
         // incorrectly advertises trash support during an expired-anchor scan.
-        if identifier == .trashContainer { throw CocoaError(.featureUnsupported) }
-        if identifier != .rootContainer && identifier != .workingSet {
+        // Received items support the native trash container.
+        if identifier != .rootContainer && identifier != .workingSet && identifier != .trashContainer {
             guard try catalogs(in: rootURL()).contains(where: { $0.records.contains { $0.id == identifier.rawValue } }) else {
                 throw NSFileProviderError(.noSuchItem)
             }
@@ -84,6 +84,7 @@ final class Enumerator: NSObject, NSFileProviderEnumerator {
                         let listing = try self.directory(catalog, record, cursor)
                         guard !self.lock.withLock({ self.invalidated }) else { throw CocoaError(.userCancelled) }
                         let next = try listing.next.map { NSFileProviderPage(try JSONEncoder().encode(DirectoryPageToken(directory: self.identifier.rawValue, cursor: $0))) }
+                        if listing.next == nil {try receivedHandoff(record,in:self.rootURL())}
                         observer.didEnumerate(listing.records.map(Item.init))
                         enumerationResult("items-finished", scope: enumerationScope(self.identifier), count: listing.records.count)
                         observer.finishEnumerating(upTo: next)
@@ -167,18 +168,26 @@ final class Enumerator: NSObject, NSFileProviderEnumerator {
 @objc(OinkFileProvider)
 final class OinkFileProvider: NSObject, NSFileProviderReplicatedExtension {
     private let domain: NSFileProviderDomain
+    private var catalogRoot:() throws -> URL = container
+    private var receivedSignals=true
+    #if DEBUG
+    convenience init(domain:NSFileProviderDomain,root:URL) {self.init(domain:domain);catalogRoot={root};receivedSignals=false}
+    #endif
     required init(domain: NSFileProviderDomain) { self.domain = domain; super.init(); ReportCapture.refresh() }
     func invalidate() {}
     func item(for identifier: NSFileProviderItemIdentifier, request: NSFileProviderRequest, completionHandler: @escaping (NSFileProviderItem?, Error?) -> Void) -> Progress {
         do {
             if identifier == .rootContainer { completionHandler(rootItem(), nil) }
-            else if let record = try catalogs().flatMap({ $0.records }).first(where: { $0.id == identifier.rawValue }) { completionHandler(Item(record), nil) }
+            else if identifier == .trashContainer { completionHandler(Item(Record(id:identifier.rawValue,parent:NSFileProviderItemIdentifier.rootContainer.rawValue,name:"Trash",directory:true,size:nil,modified:nil,node:nil)),nil) }
+            else if let record = try catalogs(in:catalogRoot()).flatMap({ $0.records }).first(where: { $0.id == identifier.rawValue }) { completionHandler(Item(record), nil) }
             else { completionHandler(nil, NSFileProviderError(.noSuchItem)) }
         } catch { completionHandler(nil, error) }
         return Progress(totalUnitCount: 0)
     }
     func fetchContents(for identifier: NSFileProviderItemIdentifier, version requestedVersion: NSFileProviderItemVersion?, request: NSFileProviderRequest, completionHandler: @escaping (URL?, NSFileProviderItem?, Error?) -> Void) -> Progress {
-        fetchContents(for: identifier, progress: downloadProgress(), catalogRoot: container,
+        let outcome=request.isSystemRequest ? 0 : request.isFileViewerRequest ? 1 : request.requestingExecutable == nil ? 3 : 2
+        enumerationLog.notice("operation=received-reader classification=\(outcome) count=1")
+        return fetchContents(for: identifier, progress: downloadProgress(), catalogRoot: catalogRoot,
                       temporaryRoot: contentTemporaryDirectory, completionHandler: completionHandler)
     }
     // Keep the actual streaming path testable with private fixture roots, without
@@ -191,6 +200,8 @@ final class OinkFileProvider: NSObject, NSFileProviderReplicatedExtension {
             do {
                 guard let catalog = try catalogs(in: catalogRoot()).first(where: { $0.records.contains { $0.id == identifier.rawValue } }),
                       let record = catalog.records.first(where: { $0.id == identifier.rawValue }), !record.directory, !isPreparedPlaceholder(record) else { throw NSFileProviderError(.noSuchItem) }
+                if try readReceived(String(record.id.split(separator:"-").first ?? ""),in:catalogRoot())[record.id]?.modified_locally == true {throw NSFileProviderError(.versionNoLongerAvailable)}
+                try receivedBegin(record,in:catalogRoot())
                 progress.totalUnitCount = record.size.map { Int64(clamping: $0) } ?? -1
                 let staging = try temporaryRoot()
                 var stagingLease: TemporaryRootLease? = try TemporaryRootLease(staging)
@@ -288,9 +299,11 @@ final class OinkFileProvider: NSObject, NSFileProviderReplicatedExtension {
                 try output.close()
                 progress.totalUnitCount = progress.completedUnitCount
                 progress.fileCompletedCount = 1
+                try receivedHandoff(current,in:catalogRoot())
                 completionHandler(url, Item(current), nil)
             } catch {
                 if let temporary { try? FileManager.default.removeItem(at: temporary) }
+                if let root=try? catalogRoot() {try? receivedFetchFailed(identifier.rawValue,in:root)}
                 completionHandler(nil, nil, error)
             }
         }
@@ -300,10 +313,24 @@ final class OinkFileProvider: NSObject, NSFileProviderReplicatedExtension {
         completionHandler(nil, [], false, CocoaError(.fileWriteNoPermission)); return Progress(totalUnitCount: 0)
     }
     func modifyItem(_ item: NSFileProviderItem, baseVersion version: NSFileProviderItemVersion, changedFields: NSFileProviderItemFields, contents: URL?, options: NSFileProviderModifyItemOptions, request: NSFileProviderRequest, completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void) -> Progress {
-        completionHandler(nil, [], false, CocoaError(.fileWriteNoPermission)); return Progress(totalUnitCount: 0)
+        do {
+            let record=try receivedModify(item,fields:changedFields,contents:contents,in:catalogRoot())
+            completionHandler(Item(record),[],false,nil);signalReceived()
+        } catch {completionHandler(nil,[],false,error)}
+        return Progress(totalUnitCount:0)
     }
     func deleteItem(identifier: NSFileProviderItemIdentifier, baseVersion version: NSFileProviderItemVersion, options: NSFileProviderDeleteItemOptions, request: NSFileProviderRequest, completionHandler: @escaping (Error?) -> Void) -> Progress {
-        completionHandler(CocoaError(.fileWriteNoPermission)); return Progress(totalUnitCount: 0)
+        do {
+            let root=try catalogRoot();let records=try catalogs(in:root).flatMap {$0.records}
+            var ids=Set([identifier.rawValue]);var previous=0
+            while previous != ids.count {previous=ids.count;for record in records where ids.contains(record.parent) {ids.insert(record.id)}}
+            try receivedDelete(Array(ids),in:root);completionHandler(nil);signalReceived()
+        } catch {completionHandler(error)}
+        return Progress(totalUnitCount:0)
+    }
+    private func signalReceived() {
+        guard receivedSignals,let manager=NSFileProviderManager(for:domain) else {return}
+        Task {try? await manager.signalEnumerator(for:.workingSet)}
     }
     func enumerator(for containerItemIdentifier: NSFileProviderItemIdentifier, request: NSFileProviderRequest) throws -> NSFileProviderEnumerator {
         try makeEnumerator(containerItemIdentifier, signal: { [domain] in

@@ -160,6 +160,60 @@ mod tests {
         recorder.shutdown();
     }
     #[test]
+    fn foreground_decisions_survive_the_existing_gesture_record_codec() {
+        use super::super::wire_values::Value;
+        use oink_protocol::v1::{dto::DiagGestureSummary, schema::WireDto};
+        for (decision, desktop, start) in [
+            (Decision::ShowDesktop, Some(false), None),
+            (Decision::RestoreDesktop, Some(true), None),
+            (Decision::DesktopNoop, Some(true), None),
+            (Decision::StartOpen, None, Some(false)),
+            (Decision::StartClose, None, Some(true)),
+            (Decision::StartNoop, None, Some(true)),
+        ] {
+            let mut tracker = oink_input::gesture_trace::Tracker::default();
+            let mut summary = tracker
+                .observe(
+                    Gesture::DockSwipe {
+                        axis: SwipeAxis::Vertical,
+                        phase: GesturePhase::Ended,
+                        progress: 0.1,
+                        velocity: 0.,
+                    },
+                    10,
+                    1,
+                    None,
+                    Outcome {
+                        decision,
+                        threshold: Some(0.05),
+                        notches: 0,
+                    },
+                )
+                .unwrap();
+            summary.desktop_showing = desktop;
+            summary.start_open = start;
+            let raw = summary.wire().unwrap();
+            let encoded = DiagGestureSummary::from_raw(raw.as_map().unwrap().clone()).unwrap();
+            assert_eq!(encoded.desktop_showing().unwrap(), desktop);
+            assert_eq!(encoded.start_open().unwrap(), start);
+            assert_eq!(
+                encoded.decision().unwrap().number(),
+                match decision {
+                    Decision::ShowDesktop => 6,
+                    Decision::RestoreDesktop => 15,
+                    Decision::DesktopNoop => 16,
+                    Decision::StartOpen => 17,
+                    Decision::StartClose => 18,
+                    Decision::StartNoop => 19,
+                    _ => unreachable!(),
+                }
+            );
+            let json = serde_json::to_value(summary).unwrap();
+            assert_eq!(json["decision"], serde_json::to_value(decision).unwrap());
+        }
+    }
+
+    #[test]
     fn capture_record_distinguishes_contacts_disabled_from_unsupported() {
         use oink_routing::router::ContactsPath;
         let dir = tempfile::tempdir().unwrap();

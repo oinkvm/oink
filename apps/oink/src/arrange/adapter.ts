@@ -3,9 +3,9 @@ import type { Screen } from './geometry';
 import type { Device } from '../devices/types';
 
 // A fixed renderer scale keeps drag arithmetic precise; API values remain in the ratio plane.
-const RENDER_SCALE = 4096;
+export const RENDER_SCALE = 4096;
 
-/** History stores device transforms. Native geometry always comes from the live backend. */
+/** Draws device transforms over native geometry (live, or a history snapshot's via nativeLayout). */
 export function renderLayout(
   layout: Layout,
   wallpapers: Record<string, string>,
@@ -69,22 +69,15 @@ export function layoutPlacements(layout: Layout, screens: Screen[]): Placement[]
   });
 }
 
-/** Replay only current devices, keeping stored floating point transforms exact. */
-export function replayPlacements(layout: Layout, stored: Placement[]): Placement[] {
-  return layoutPlacements(layout, []).map(current =>
-    stored.find(placement => placement.device === current.device) ?? current,
-  );
-}
-
 /** Visibility is independent of connectivity and history placements. */
 export function visibleScreens(
   screens: Screen[],
   layout: Layout | null,
-  devices: ReadonlyArray<Pick<Device, 'id' | 'screenSharing' | 'screen'>>,
+  devices: ReadonlyArray<Pick<Device, 'id' | 'screenSharing' | 'screen' | 'paused'>>,
 ): Screen[] {
   return screens.filter(screen => {
     const owner = devices.find(device => device.id === screen.device);
     const backend = layout?.geometry.screens.find(item => `${item.key.device}:${item.key.display}` === screen.id);
-    return owner?.screenSharing !== false && owner?.screen !== 'disabled' && !backend?.hidden && !backend?.device_disabled;
+    return !owner?.paused && owner?.screenSharing !== false && owner?.screen !== 'disabled' && !backend?.hidden && !backend?.device_disabled;
   });
 }

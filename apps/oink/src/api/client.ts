@@ -1,6 +1,7 @@
 
 import { toFailure, transport } from "./transport";
 import type * as T from "./types";
+import { createLayoutProfilesApi } from './layoutProfiles';
 
 export { ApiFailure } from "./transport";
 
@@ -23,6 +24,7 @@ function requireInput(settings:T.InputSettings):T.InputSettings {
   return settings;
 }
 export const api = {
+  ...createLayoutProfilesApi(call),
   notify: (notification: T.Notification) => call<T.NotificationReceipt | null>("notify", { notification }),
   audioQuality: () => call<T.AudioQuality>("audio_quality"),
   connectionQuality: () => call<T.ConnectionQuality>("connection_quality"),
@@ -51,8 +53,8 @@ export const api = {
   leaveGroup: () => call<null>("leave_group"),
   networkInfo: () => call<T.NetworkInfo>("network_info"),
 
-  previewLayoutProjection: (gesture: number, placements: T.Placement[], affected: T.ScreenKey[], ended: boolean) =>
-    call<null>('preview_layout_projection', { gesture, placements, affected, ended }),
+  previewLayoutProjection: (gesture: number, placements: T.Placement[], affected: T.ScreenKey[], ended: boolean, arrangement?: import('./layoutProfiles').ArrangementSnapshot) =>
+    call<null>('preview_layout_projection', { gesture, placements, affected, ended, arrangement }),
   layout: () => call<T.Layout>("layout").then(requireLayout),
   saveLayout: (placements: T.Placement[]) => call<T.Layout>("save_layout", { placements }),
   setScreenRemoteGain: (screen: T.ScreenKey, gain: number) => call<null>("set_screen_remote_gain", { screen, gain }),
@@ -71,11 +73,12 @@ export const api = {
   aimStart: () => call<T.AimStatus>("aim_start"),
   aimStop: () => call<null>("aim_stop"),
 
-  resetInitialLayout: () => call<T.Layout>("reset_initial_layout"),
-
   inputSettings: () => call<T.InputSettings>("input_settings").then(requireInput),
   setInputSettings: (settings: Partial<T.InputSettings>) => call<null>("set_input_settings", { settings }),
 
+  receivedFilesUsage: () => call<T.ReceivedFilesUsage>("received_files_usage"),
+  setReceivedFilesCleanup: (cleanup:T.ReceivedFilesCleanup) => call<null>("set_received_files_cleanup",{cleanup}),
+  openReceivedFiles: () => call<null>("open_received_files"),
   cacheUsage: (device: T.DeviceKey | null = null) => call<T.CacheDevice[]>("cache_usage", { device }),
   clearCache: (device: T.DeviceKey | null = null) => call<T.CacheDeviceClear>("clear_cache", { device }),
   clipboardSettings: () => call<T.ClipboardSettings>("clipboard_settings"),

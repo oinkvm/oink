@@ -79,7 +79,10 @@ impl Router {
         self.keyboard.disabled
     }
     pub fn keyboard_key_blocked(&self, code: Option<KeyCode>) -> bool {
-        self.keyboard.disabled || code.is_some_and(|k| self.keyboard.suppressed.contains(&k))
+        if code.is_some_and(KeyCode::is_brightness) {
+            return false;
+        }
+        (!self.fully_paused && self.keyboard.disabled) || code.is_some_and(|k| self.keyboard.suppressed.contains(&k))
     }
 
     pub fn release_session_keys(&mut self, keys: &[KeyCode]) {
@@ -189,6 +192,10 @@ impl Router {
         let InputEvent::Key { code, pressed } = ev.event else {
             return None;
         };
+        if self.keyboard.disabled && ev.physical && code.is_brightness() {
+            // Return Pass here, before suppression, transforms and forwarding.
+            return Some(Disposition::Pass);
+        }
         if ev.physical {
             if pressed {
                 self.keyboard.down.insert(code);
@@ -203,7 +210,7 @@ impl Router {
         if !pressed {
             self.keyboard.suppressed.remove(&code);
         }
-        if self.keyboard.disabled && ev.physical {
+        if self.keyboard.disabled && !self.fully_paused && ev.physical {
             if pressed {
                 self.keyboard.suppressed.insert(code);
             }

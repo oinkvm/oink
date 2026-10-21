@@ -12,10 +12,14 @@ mod foreground_windows;
 mod icon_render;
 #[cfg(any(windows, test))]
 pub mod installer_finish;
+#[cfg(any(windows, test))]
+mod menu_icons_windows;
 pub mod service;
 pub mod shell_policy;
 #[cfg(any(target_os = "macos", windows, test))]
 mod sponsor;
+#[cfg(any(windows, test))]
+mod tray_windows;
 #[cfg(any(target_os = "macos", test))]
 mod uninstall;
 mod update_window;
@@ -25,9 +29,15 @@ mod windows_hotkey;
 #[cfg(any(target_os = "macos", windows))]
 mod commands;
 #[cfg(target_os = "macos")]
+mod dock_controls;
+#[cfg(windows)]
+mod jump_controls;
+#[cfg(target_os = "macos")]
 mod main_window_macos;
 #[cfg(windows)]
 mod main_window_windows;
+#[cfg(any(target_os = "macos", windows))]
+mod native_controls;
 #[cfg(any(target_os = "macos", windows))]
 mod native_menu;
 #[cfg(target_os = "macos")]

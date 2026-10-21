@@ -29,3 +29,21 @@ it('renews a stationary gesture and stops heartbeats on unmount', async () => {
   expect(send).toHaveBeenCalledTimes(5);
   expect(send.mock.lastCall?.[3]).toBe(true);
 });
+it('holds the released native preview across commit delivery, bounded by the existing linger', async () => {
+  vi.useFakeTimers();
+  const send = vi.fn().mockResolvedValue(null);
+  const preview = new LayoutProjectionPreview(send);
+  preview.update(frame(2));
+  await Promise.resolve();
+  preview.linger();
+  // Canvas clears its transient state while the durable commit is in flight.
+  preview.end();
+  await vi.advanceTimersByTimeAsync(600);
+  expect(send.mock.calls.every(c => c[3] === false)).toBe(true);
+  // The receiver has applied the matching committed geometry. There was no
+  // intervening end/old-layout frame; the last snapshot is still frame(2).
+  expect(send.mock.lastCall?.[1]).toEqual(frame(2));
+  await vi.advanceTimersByTimeAsync(600);
+  expect(send.mock.lastCall?.[3]).toBe(true);
+  preview.close();
+});

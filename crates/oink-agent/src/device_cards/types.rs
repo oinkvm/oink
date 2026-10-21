@@ -42,7 +42,11 @@ codes!(SignalColour {
     Red,
     Grey
 });
-codes!(SharingMode { Shared, Local });
+codes!(SharingMode {
+    Shared,
+    Local,
+    Disabled
+});
 codes!(UserFacingCode {
     Unspecified,
     PermissionRequired,
@@ -403,6 +407,7 @@ pub struct DeviceCardActions {
     pub screen_local: CardAction,
     pub mouse_shared: CardAction,
     pub mouse_local: CardAction,
+    pub mouse_disabled: CardAction,
     pub keyboard_shared: CardAction,
     pub keyboard_local: CardAction,
     pub keyboard_disabled: CardAction,

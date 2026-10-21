@@ -713,6 +713,7 @@ impl Core {
                 Disconnect::HandshakeFailed => "handshake_failed",
                 Disconnect::HandshakeTimeout => "handshake_timeout",
                 Disconnect::ControlStreamFailed => "control_stream_failed",
+                Disconnect::InputOpeningTimeout => "input_opening_timeout",
             },
         };
         if !link.installed || link.state != LinkState::Ready {

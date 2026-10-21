@@ -557,64 +557,6 @@ pub fn shutdown(app: &AppHandle) {
 }
 
 #[cfg(windows)]
-pub fn tray_anchor(app: &AppHandle, rect: tauri::Rect) -> Option<PanelAnchor> {
-    use oink_agent::backend::PanelRect;
-    use windows::Win32::Foundation::POINT;
-    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint};
-    let position = rect.position.to_physical::<f64>(1.0);
-    let size = rect.size.to_physical::<f64>(1.0);
-    // Tray callbacks report physical coordinates. Query the monitor work area so
-    // panels avoid taskbars on any edge, including mixed-DPI secondary screens.
-    // SAFETY: monitor lookup accepts a value point and returns a borrowed handle.
-    let monitor = unsafe {
-        MonitorFromPoint(
-            POINT {
-                x: position.x as i32,
-                y: position.y as i32,
-            },
-            MONITOR_DEFAULTTONEAREST,
-        )
-    };
-    let mut info = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: valid monitor handle and correctly sized writable MONITORINFO.
-    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-        return None;
-    }
-    let scale_factor = app
-        .available_monitors()
-        .ok()?
-        .into_iter()
-        .find(|m| {
-            let p = m.position();
-            let s = m.size();
-            position.x >= p.x as f64
-                && position.x < p.x as f64 + s.width as f64
-                && position.y >= p.y as f64
-                && position.y < p.y as f64 + s.height as f64
-        })
-        .map_or(1.0, |m| m.scale_factor());
-    let r = info.rcWork;
-    Some(PanelAnchor {
-        rect: PanelRect {
-            x: position.x,
-            y: position.y,
-            width: size.width,
-            height: size.height,
-        },
-        work_area: PanelRect {
-            x: r.left as f64,
-            y: r.top as f64,
-            width: (r.right - r.left) as f64,
-            height: (r.bottom - r.top) as f64,
-        },
-        scale_factor,
-    })
-}
-
-#[cfg(windows)]
 pub fn panel_lost_focus(app: &AppHandle) {
     use windows::Win32::{Foundation::POINT, UI::WindowsAndMessaging::GetCursorPos};
     let mut point = POINT::default();
