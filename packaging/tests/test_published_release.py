@@ -16,8 +16,34 @@ import mac_release
 
 
 class PublishedFeedContract(unittest.TestCase):
+    def test_release_event_dispatches_publishers_on_the_default_branch(self):
+        workflow = (ROOT / '.github/workflows/release.yml').read_text()
+        self.assertNotIn('uses: ./.github/workflows/publish-', workflow)
+        self.assertIn('gh workflow run seed-update-feeds.yml', workflow)
+        self.assertIn('actions: write', workflow)
+        self.assertIn('--ref "$DEFAULT_BRANCH"', workflow)
+        self.assertIn('-f release_tag="$RELEASE_TAG" -f platform=both', workflow)
+        self.assertIn('python3 build-support/update/published_release.py', workflow)
+        # Pages can report the previous deployment as successful when several
+        # artifacts share a release-event SHA (actions/deploy-pages#383).
+        # A dispatch is the single publication path; never retry inline.
+        self.assertIn("github.event.action == 'published'", workflow)
+        self.assertIn('!github.event.release.draft && !github.event.release.prerelease', workflow)
+
+    def test_recovery_can_publish_only_the_uncommitted_platform(self):
+        workflow = (ROOT / '.github/workflows/seed-update-feeds.yml').read_text()
+        self.assertIn('default: both', workflow)
+        self.assertIn('options: [both, mac, windows]', workflow)
+        self.assertIn('case "$PLATFORM" in both|mac|windows)', workflow)
+        for platform, excluded in [('macos', 'windows'), ('windows', 'mac')]:
+            job = re.search(r'^  ' + platform + r':\n((?:    .*\n)+)', workflow, re.M)[1]
+            self.assertIn('needs: published', job)
+            self.assertIn("if: inputs.platform != '" + excluded + "'", job)
+
     def test_platform_deployments_do_not_collide_in_same_run_artifacts(self):
         workflow = (ROOT / '.github/workflows/deploy-feed.yml').read_text()
+        self.assertIn("github.event_name != 'release'", workflow)
+        self.assertNotIn("github.event_name == 'workflow_dispatch'", workflow)
         for prefix in ('previous-feed', 'next-feed'):
             self.assertIn('name: ' + prefix + '-${{ inputs.platform }}', workflow)
             self.assertIn('artifact_name: ' + prefix + '-${{ inputs.platform }}', workflow)
@@ -36,8 +62,7 @@ class PublishedFeedContract(unittest.TestCase):
                     if f'uses: ./.github/workflows/{target}' in job:
                         callers.append(path.name)
                         self.assertIn(key + ': ${{ secrets.' + key + ' }}', job, path.name)
-            self.assertIn('release.yml', callers)
-            self.assertIn('seed-update-feeds.yml', callers)
+            self.assertEqual(callers, ['seed-update-feeds.yml'])
 
     def test_empty_environment_keys_fail_before_invoking_crypto(self):
         with patch.dict(os.environ, {mac_release.SECRET: ''}), patch.object(mac_release, 'command') as command:

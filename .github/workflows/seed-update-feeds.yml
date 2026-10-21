@@ -6,6 +6,12 @@ on:
         description: Already-published stable release tag (for example v0.1.1)
         required: true
         type: string
+      platform:
+        description: Platforms to publish; select one only to recover an uncommitted feed
+        required: true
+        type: choice
+        default: both
+        options: [both, mac, windows]
 permissions:
   contents: read
   pages: write
@@ -25,9 +31,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
-        run: python3 build-support/update/published_release.py --release-tag "$RELEASE_TAG"
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          case "$PLATFORM" in both|mac|windows) ;; *) echo 'Invalid platform'; exit 1 ;; esac
+          python3 build-support/update/published_release.py --release-tag "$RELEASE_TAG"
   macos:
     needs: published
+    if: inputs.platform != 'windows'
     uses: ./.github/workflows/publish-macos-feed.yml
     with:
       release_tag: ${{ inputs.release_tag }}
@@ -36,6 +46,7 @@ jobs:
       SPARKLE_ED25519_PRIVATE_KEY: ${{ secrets.SPARKLE_ED25519_PRIVATE_KEY }}
   windows:
     needs: published
+    if: inputs.platform != 'mac'
     uses: ./.github/workflows/publish-windows-feed.yml
     with:
       release_tag: ${{ inputs.release_tag }}

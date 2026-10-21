@@ -219,10 +219,21 @@ schema, dual writing or compatibility projection is introduced. Notes and ZIP
 hashes remain bound into the release record and checksums. Private symbols
 are never release assets.
 
-**release.published**, non-draft/non-prerelease, calls
-`publish-macos-feed.yml`. To recover a failed initial publication without rebuilding
+**release.published**, non-draft/non-prerelease, verifies the live release and
+dispatches **Seed published stable release feeds** on the trusted default branch.
+That dispatch is the single release publication path for both platforms. Pages
+can report success without serving a new artifact when several deployments run
+under a release event; see [actions/deploy-pages#383](https://github.com/actions/deploy-pages/issues/383).
+Using the supported dispatch event avoids that server-side behavior without
+changing deployment IDs, adding delays or retrying a failed deployment. The
+dispatcher needs only `contents: read` and job-scoped `actions: write`; no new
+secret or signing access is needed. Drafts and prereleases do not dispatch.
+
+To recover a failed initial publication without rebuilding
 or retagging the release, dispatch **Seed published stable release feeds** on the
-default branch with `release_tag` (for example `v0.1.1`). The shared authorization
+default branch with `release_tag` and `platform=mac`, `windows` or `both` (default).
+Select only the platform that has not committed, preserving the other platform's
+catalog and sequence. The shared authorization
 checks the live GitHub API for a published, non-draft, non-prerelease stable
 release before either publisher proceeds. Both paths use the same native/source/
 hash/signature checks, monotonic catalog and transactional Pages publisher.
@@ -230,7 +241,7 @@ An already-committed platform build remains protected against republication.
 Disabled trust skips before accessing secrets or the
 data branch. It runs trusted default-branch code, fetches the tag as data,
 requires it to be an ancestor of that branch, and binds the release version,
-build, built commit, source-tree digest, archive bytes and bilingual notes.
+build, built commit, source-tree digest, archive bytes and reviewed language-map notes.
 It never executes tag/data-branch code. Native Developer ID/team/ticket and the
 recorded 10-second signed smoke/notarization are checked before signing.
 The official pinned `sign_update` signs the exact ZIP and then the final appcast;
