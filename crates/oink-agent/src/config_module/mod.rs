@@ -480,5 +480,5 @@ impl ConfigModule {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, debug_assertions))]
 pub(crate) use runtime::tests as runtime_tests;

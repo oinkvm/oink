@@ -509,7 +509,8 @@ mod launch_tests {
     }
 }
 
-#[cfg(test)]
+// The live-node fixture uses debug-only test controls; parser tests above run in both profiles.
+#[cfg(all(test, debug_assertions))]
 mod dispatch_tests {
     use super::*;
     use crate::{

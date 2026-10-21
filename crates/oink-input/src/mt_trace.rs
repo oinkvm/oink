@@ -35,7 +35,7 @@ pub struct Observation {
     pub contacts: [Contact; 16],
 }
 
-#[cfg(any(target_os = "macos", all(test, debug_assertions)))]
+#[cfg(any(target_os = "macos", test))]
 #[derive(Default)]
 pub(crate) struct Tracker {
     previous: Option<Observation>,
@@ -47,7 +47,7 @@ pub(crate) struct Tracker {
     received_gap_max_us: u64,
     source_backwards: u32,
 }
-#[cfg(any(target_os = "macos", all(test, debug_assertions)))]
+#[cfg(any(target_os = "macos", test))]
 impl Tracker {
     /// At most 16 observations/second, including topology changes; at least a
     /// periodic observation during steady input. Gap fields still track *every*

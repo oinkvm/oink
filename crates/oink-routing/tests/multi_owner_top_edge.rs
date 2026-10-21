@@ -18,7 +18,7 @@ fn rect(v: &Value) -> Rect {
     )
 }
 fn fixture() -> (Layout, BTreeMap<DeviceId, OwnerLayoutPreferences>) {
-    let v: Value = serde_json::from_str(include_str!("fixtures/current_c_aqua.json")).unwrap();
+    let v: Value = serde_json::from_str(include_str!("fixtures/multi_owner_top_edge.json")).unwrap();
     assert_eq!(v["revision"], 110);
     let mut layout = Layout {
         screens: vec![],
@@ -63,7 +63,7 @@ fn code(t: &TopologyLayout, p: ScreenPos, d: (f64, f64)) -> Option<String> {
     t.first_portal_native(&p, d).map(|e| e.to.screen.display)
 }
 #[test]
-fn current_layout_routes_unoccluded_top_edge_directly_to_aqua() {
+fn unoccluded_top_edge_reaches_the_visible_remote_owner() {
     let (layout, owners) = fixture();
     let route = TopologyLayout::from_layout(&layout, &owners);
     let host = layout.screens.iter().find(|s| s.id.device == C).unwrap();
