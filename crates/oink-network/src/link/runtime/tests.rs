@@ -3,6 +3,8 @@ use crate::negotiation as oink_network_profile;
 use crate::{LowOptions, identity::Identity};
 #[path = "../../../tests/support/frames.rs"]
 mod frames;
+#[path = "../../../../../tests/support/src/ports.rs"]
+mod ports;
 use tokio::time::{sleep, timeout};
 
 #[tokio::test]
@@ -121,7 +123,7 @@ async fn node() -> (LinkLayer, ConfigPort, ModulePort) {
         profile: frames::profile(),
         identity,
         boot,
-        bind: "127.0.0.1:0".parse().unwrap(),
+        bind: (std::net::Ipv4Addr::LOCALHOST, ports::test_port_pair()).into(),
         tier: Tier::Elevated,
     })
     .await
@@ -129,6 +131,24 @@ async fn node() -> (LinkLayer, ConfigPort, ModulePort) {
     let module = network.register(&[StreamKind::Diagnostics]);
     (network, config, module)
 }
+#[tokio::test]
+async fn loopback_fixture_uses_ports_available_to_both_udp_and_tcp() {
+    let (network, _, _) = node().await;
+    let address = network.local_addr();
+    let tcp = std::net::TcpListener::bind(address);
+    let discovery = std::net::UdpSocket::bind((address.ip(), address.port() + 1));
+    network.stop().await;
+    // The fixtures share a QUIC/TCP port and the next UDP port is discovery.
+    // OS-assigned UDP ports can be excluded for TCP on Windows. Use the
+    // explicitly probed fixture range, below all supported OS ephemeral ranges.
+    assert!(
+        address.port() < 32768,
+        "fixture selected an OS ephemeral UDP port: {address}"
+    );
+    assert!(tcp.is_ok(), "fixture TCP port unavailable: {tcp:?}");
+    assert!(discovery.is_ok(), "fixture discovery port unavailable: {discovery:?}");
+}
+
 async fn connected(config: &mut ConfigPort) -> Box<LinkConnected> {
     match timeout(Duration::from_secs(4), config.next()).await.unwrap().unwrap() {
         ConfigEvent::Connected(link) => link,

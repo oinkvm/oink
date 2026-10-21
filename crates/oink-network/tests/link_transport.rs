@@ -13,6 +13,8 @@ use std::{sync::Arc, time::Duration};
 use tokio::time::{sleep, timeout};
 #[path = "support/frames.rs"]
 mod frames;
+#[path = "../../../tests/support/src/ports.rs"]
+mod ports;
 
 struct Node {
     network: LinkLayer,
@@ -35,7 +37,7 @@ impl Node {
             profile: frames::profile(),
             identity,
             boot,
-            bind: "127.0.0.1:0".parse().unwrap(),
+            bind: (std::net::Ipv4Addr::LOCALHOST, ports::test_port_pair()).into(),
             tier,
         })
         .await
