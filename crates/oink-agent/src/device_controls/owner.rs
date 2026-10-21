@@ -215,6 +215,12 @@ impl Node {
         let option = field(request.option())?;
         let expected = field(request.expected_revision())?;
         let patch = field(request.value())?;
+        if option == dto::LocalOption::AcceptContacts
+            && bool::read(&patch).map_err(|_| Failure::InvalidValue)?
+            && !self.contacts_injection_available()
+        {
+            return Err(Failure::UnsupportedOption);
+        }
         let (item, outcome, reason, sequence, persisted) = if matches!(
             option,
             dto::LocalOption::ForwardingEnabled

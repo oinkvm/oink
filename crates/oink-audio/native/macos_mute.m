@@ -220,4 +220,9 @@ int oink_audio_mute_lock(void) {
     }
     return fd;
 }
-void oink_audio_mute_unlock(int fd) { close(fd); }
+void oink_audio_mute_unlock(int fd) {
+    // A forked child can retain this open file description until exec/exit,
+    // even with O_CLOEXEC. End our lock ownership before closing our reference.
+    flock(fd, LOCK_UN);
+    close(fd);
+}

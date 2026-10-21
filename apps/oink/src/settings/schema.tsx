@@ -291,6 +291,7 @@ export const SECTIONS: SectionMeta[] = [
                 }, get desc() {
                     return tr('发生崩溃或卡顿时发送技术信息，帮助改进 Oink；不包含屏幕内容、输入的文字和文件');
                 }, get keywords() { return tr('崩溃 隐私 上报 统计'); } },
+            { id: 'audioQuality', get label() { return tr('音频质量'); }, get desc() { return tr('最近 60 秒各来源的接收缓冲、码率和断音'); }, get keywords() { return tr('音频 缓冲 码率 断音 图表'); } },
             { id: 'latency', get label() {
                     return tr('连接质量');
                 }, get desc() {

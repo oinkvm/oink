@@ -23,7 +23,7 @@ import { DesktopWindow } from './window/DesktopWindow';
 import { ResizeEdges } from './window/ResizeEdges';
 import { QuitDialog } from './window/QuitDialog';
 import { AboutWindow } from './window/AboutWindow';
-import { UpgradeButton } from './window/Upgrade';
+import { UpgradeButton, UpgradeDialog } from './window/Upgrade';
 import { PromoArea } from './window/PromoArea';
 import { StatusNotices } from './window/StatusNotices';
 import { observePanel } from './window/panel';
@@ -116,6 +116,8 @@ export function App() {
     const hint = useId();
     const history = useHistory<Placement[]>(() => [], { equals: samePlacements });
     const screens = presentScreens(state.layout ? renderLayout(state.layout,state.wallpapers,history.value) : [], devices);
+    // A device-local editing preference; only manual canvas edits compact.
+    const compactLayout = prefs.presentation.compact_layout;
     const setNavMode = (mode: typeof navMode) => {
         if (mode === navMode) return;
         if (mode === 'settings') setSettingsMounted(true);
@@ -169,7 +171,7 @@ export function App() {
     }, [state.boot?.platform,prefs.local?.show_status_icon]);
     useEffect(() => {if(prefs.local)void shell.setLogLevel(prefs.local.log_level).catch(()=>agent.fail('unavailable'));},[prefs.local?.log_level]);
     useEffect(() => {if(prefs.local)void shell.setLanguage(prefs.local.ui_language).catch(()=>agent.fail('unavailable'));},[prefs.local?.ui_language]);
-    useEffect(() => {void shell.liveViews({stats:false,group_quality:view==='main'||view==='panel',audio_quality:false,diagnostics:false}).catch(()=>agent.fail('unavailable'));},[view]);
+    useEffect(() => {void shell.liveViews({stats:false,group_quality:view==='main'||view==='panel',audio_quality:view==='main'&&navMode==='settings'&&(section==='diagnostics'||query.trim().length>0),diagnostics:false}).catch(()=>agent.fail('unavailable'));},[view,navMode,section,query]);
     const fail = (e: unknown) => agent.fail(e instanceof ApiFailure ? e.problem.code : 'unavailable');
     const permissionPage = () => { setNavMode('settings'); setNavOpen(true); setJump({ section: 'permissions', n: Date.now() }); };
     const clicks = useRef(new Map<string, { timer: ReturnType<typeof setTimeout>; requestId: string }>());
@@ -370,8 +372,7 @@ export function App() {
     const capturePermission = state.audio?.capture_permission;
     if (capturePermission) permissions.audio = capturePermission === 'authorized' ? 'granted' : capturePermission === 'not_required' ? 'not_required' : capturePermission === 'not_requested' ? 'not_determined' : capturePermission === 'unknown' ? 'unknown' : 'denied';
     const body = view === 'about' ? <AboutWindow platform={platform} open front build={state.boot?.build} version={state.boot?.version ?? version} stage={{ w: 360, h: 500 }} onFront={() => { }} onClose={() => { void shell.close(); }}/>
-        : view === 'upgrade' ? <UpgradeButton container={null} standalone/>
-            : view === 'quit' ? <QuitDialog open container={null} onCancel={() => { void shell.close(); }} onQuit={() => { void shell.quit().catch(fail); }}/>
+        : view === 'quit' ? <QuitDialog open container={null} onCancel={() => { void shell.close(); }} onQuit={() => { void shell.quit().catch(fail); }}/>
                 : view === 'panel' ? <div className="native-panel" ref={setWinEl}><SideContextMenu {...menu} standalone>{null}</SideContextMenu></div>
                     : <SideContextMenu {...menu}>
       <DesktopWindow ref={mergeRefs(setWinEl)} platform={platform} covered={onboarding && onboard !== 'leaving'} coverBar={onboarding && <OnboardingLanguage value={prefs.prefs.language} leaving={onboard === 'leaving'} onChange={v => prefs.set('language', v)}/>}
@@ -386,7 +387,7 @@ export function App() {
                     else {
                         setNavOpen(true);
                         setNavMode(navMode === action ? 'devices' : action);
-                    } }} version={state.boot?.version ?? version} sideExtra={navMode === 'add' ? <SelfInfo container={winEl}/> : null} titleEnd={<>{prefs.prefs.upgradeHint && state.update?.candidate && state.update.phase !== 'disabled' && <UpgradeButton container={winEl}/>}<PromoArea sponsor={!prefs.presentation.hide_sponsor} container={winEl}/></>} titleCenter={self?.paused ? <span className="win__paused"><PauseGlyph/>{tr('共享已暂停')}</span> : null} navBack={platform === 'win' && navMode !== 'devices' ? { title: navMode === 'add' ? tr('添加设备') : tr('设置'), label: tr('返回设备列表'), onBack: () => setNavMode('devices') } : null} nav={collapsed => <PeekScope collapsed={collapsed} suspended={contextOpen} onTarget={id=>{setPeekId(id);if(!id)setGrowIds(previous=>previous.size?new Set():previous);}} render={id => { const requestId=fromRequestPeekId(id);if(requestId){const request=pairing.requests.find(r=>r.id===requestId);return request?<RequestRow key={request.id} req={request} collapsed={false} inPeek onExpand={()=>setNavOpen(true)} onAccept={()=>menu.onAccept(request)} onReject={()=>menu.onReject(request)}/>:null;} const d = devices.find(d => d.id === id); return d ? <DeviceItem key={id} inPeek volumeOpen={selectedDevice===id} d={d} selected={selectedDevice === id} collapsed={false} onSelect={() => selectDevice(id)} onToggle={(kind, mode) => toggle(id, kind, mode)} onPause={paused => { void invoke(id, 'pause', paused); }} onSpeaker={action => { void speaker(id, action); }} now={Date.now()} noExit={!hasExit(devices)}/> : null; }}>
+                    } }} version={state.boot?.version ?? version} sideExtra={navMode === 'add' ? <SelfInfo container={winEl}/> : null} titleEnd={<>{prefs.prefs.upgradeHint && state.update?.candidate && state.update.phase !== 'disabled' && <UpgradeButton/>}<PromoArea sponsor={!prefs.presentation.hide_sponsor} container={winEl}/></>} titleCenter={self?.paused ? <span className="win__paused"><PauseGlyph/>{tr('共享已暂停')}</span> : null} navBack={platform === 'win' && navMode !== 'devices' ? { title: navMode === 'add' ? tr('添加设备') : tr('设置'), label: tr('返回设备列表'), onBack: () => setNavMode('devices') } : null} nav={collapsed => <PeekScope collapsed={collapsed} suspended={contextOpen} onTarget={id=>{setPeekId(id);if(!id)setGrowIds(previous=>previous.size?new Set():previous);}} render={id => { const requestId=fromRequestPeekId(id);if(requestId){const request=pairing.requests.find(r=>r.id===requestId);return request?<RequestRow key={request.id} req={request} collapsed={false} inPeek onExpand={()=>setNavOpen(true)} onAccept={()=>menu.onAccept(request)} onReject={()=>menu.onReject(request)}/>:null;} const d = devices.find(d => d.id === id); return d ? <DeviceItem key={id} inPeek volumeOpen={selectedDevice===id} d={d} selected={selectedDevice === id} collapsed={false} onSelect={() => selectDevice(id)} onToggle={(kind, mode) => toggle(id, kind, mode)} onPause={paused => { void invoke(id, 'pause', paused); }} onSpeaker={action => { void speaker(id, action); }} now={Date.now()} noExit={!hasExit(devices)}/> : null; }}>
           <div className="nav-stack"><AddHead open={navMode !== 'devices' && platform === 'mac'} title={navMode === 'add' ? tr('添加设备') : tr('设置')} onBack={() => setNavMode('devices')}/>
             <RequestsGroup pairing={pairing} collapsed={collapsed} onExpand={() => setNavOpen(true)} hidden={navMode === 'settings'}/>
             <div className="nav-view" key={navMode} data-view={navMode} data-anim={navSwitched ? '' : undefined}>{navMode === 'add' ? <AddPanel pairing={pairing}/> : navMode === 'settings' ? <SettingsNav platform={platform} query={query} onQuery={setQuery} active={section} onJump={id => setJump({ section: id, n: Date.now() })}/> : <DeviceList growIds={growIds} devices={devices} selectedId={selectedDevice} onSelect={selectDevice} onToggle={toggle} onPause={menu.onPause} onSpeaker={menu.onSpeaker} collapsed={collapsed} now={Date.now()}/>}</div>
@@ -396,11 +397,14 @@ export function App() {
           <VisuallyHidden id={hint}>{tr('方向键移动位置；Command 或 Ctrl 加方向键缩放；Shift 微调按键、拖动或缩放时按住可关闭吸附；Esc 取消选中')}</VisuallyHidden>
           <div className="disp__canvas" ref={canvas} aria-busy={savingLayout}>
             <div className="canvas-tools" role="toolbar" aria-label={tr('排列操作')}>
+              {/* Two screens with arrows closing their gap: compaction after a manual edit. */}
+              <Tooltip interactive={false} placement="bottom" content={tr('自动靠拢')}><Button variant="ghost" size="sm" iconOnly aria-label={tr('自动靠拢')} aria-pressed={compactLayout} onClick={() => prefs.savePresentation({ compact_layout: !compactLayout })}><Icon><path d="M2 5.5h6M6 3.5l2 2-2 2M18 5.5h-6M14 3.5l-2 2 2 2"/><rect x="2" y="10" width="7" height="5.5" rx="1.6"/><rect x="11" y="10" width="7" height="5.5" rx="1.6"/></Icon></Button></Tooltip>
+              <span className="canvas-tools__sep"/>
               <Tooltip interactive={false} content={`${tr('撤销')}|${platform === 'mac' ? '⌘Z' : 'Ctrl+Z'}`} placement="bottom"><Button variant="ghost" size="sm" iconOnly aria-label={tr('撤销')} aria-keyshortcuts={platform === 'mac' ? 'Meta+Z' : 'Control+Z'} disabled={savingLayout || history.undoCount === 0} onClick={() => travel('undo')}><Icon><path d="M7.2 4.6 3.8 8l3.4 3.4M4.3 8h7.2a4.2 4.2 0 0 1 0 8.4H9.2"/></Icon></Button></Tooltip>
               <Tooltip interactive={false} content={`${tr('重做')}|${platform === 'mac' ? '⇧⌘Z' : 'Ctrl+Y'}`} placement="bottom"><Button variant="ghost" size="sm" iconOnly aria-label={tr('重做')} aria-keyshortcuts={platform === 'mac' ? 'Shift+Meta+Z' : 'Control+Y'} disabled={savingLayout || history.redoCount === 0} onClick={() => travel('redo')}><Icon><path d="M12.8 4.6 16.2 8l-3.4 3.4M15.7 8H8.5a4.2 4.2 0 0 0 0 8.4h2.3"/></Icon></Button></Tooltip>
               <span className="canvas-tools__sep"/><Tooltip interactive={false} placement="bottom" content={tr('重置排列')}><Button variant="ghost" size="sm" iconOnly aria-label={tr('重置排列')} disabled={savingLayout} onClick={() => { void resetLayout(); }}><Icon name="replay"/></Button></Tooltip>
             </div>
-            <Arrangement platform={platform} screens={visible} geometryScreens={screens} onProjection={previewScreens} onScreensChange={(next, change) => { void saveScreens(mergeVisibleGroups(screens,next), change.label, change.merge); }} selectedId={selected} onSelect={selectScreen} settings={{ showHotZones: false, snapping: true, compact: true, padding: navOpen ? 24 : 48, step: 10 }} keyScope={canvas} hintId={hint} selectedGroup={!screenOnly && selectedDevice ? new Set(screens.filter(s => s.device === selectedDevice).map(s => s.id)) : undefined} contextFor={s => `device:${s.device}`}/>
+            <Arrangement platform={platform} screens={visible} geometryScreens={screens} onProjection={previewScreens} onScreensChange={(next, change) => { void saveScreens(mergeVisibleGroups(screens,next), change.label, change.merge); }} selectedId={selected} onSelect={selectScreen} settings={{ showHotZones: false, snapping: true, compact: compactLayout, padding: navOpen ? 24 : 48, step: 10 }} keyScope={canvas} hintId={hint} selectedGroup={!screenOnly && selectedDevice ? new Set(screens.filter(s => s.device === selectedDevice).map(s => s.id)) : undefined} contextFor={s => `device:${s.device}`}/>
           </div>
         </div>
         {settingsMounted && <SettingsPage open={navMode === 'settings'} platform={platform} api={prefs} capsIme={state.input?.mac_caps_switches_input_source ?? null} query={query} jump={jump} onActive={setSection} version={state.boot?.version ?? version} upgrade={{ available: false, next: '' }} perms={permissions} onGrant={grant} onOpenPermissionSettings={openPermissionSettings} onLog={() => { }} onAbout={menu.onAbout} onBlocklist={() => setBlockedOpen(true)} onOnboarding={replayOnboarding}/>}
@@ -414,6 +418,7 @@ export function App() {
       {body}{view === 'main' && !maximized && <ResizeEdges platform={platform}/>}{(view==='main'||view==='panel')&&<StatusNotices/>}
       {(view==='main'||view==='panel') && state.error && <div role="alert" className="backend-notice"><Icon name="alert"/>{problemText(state.error)}<Button size="sm" variant="ghost" onClick={() => agent.fail('')}>{tr('关闭')}</Button></div>}
       {winEl && <>{!onboarding && <PairDialog pairing={pairing} container={winEl}/>}<BlockListDialog loading={state.blocked === null && !state.error} pending={unblocking} error={blockError ?? (!state.blocked && state.error ? problemText(state.error) : null)} open={blockedOpen} blocked={pairing.blocked} container={winEl} onClose={() => setBlockedOpen(false)} onRemove={p => { setBlockError(null); setUnblocking(ids => [...ids,p.id]); void pairing.actions.unblock(p).catch(() => setBlockError(problemText('unavailable'))).finally(() => setUnblocking(ids => ids.filter(id => id !== p.id))); }}/>
+        {view === 'main' && <UpgradeDialog container={winEl}/>}
         <QuitDialog pendingOperations={state.pending.length} open={quitAsk} container={winEl} onCancel={() => setQuitAsk(false)} onQuit={() => { void shell.quit().catch(fail); }}/>
         <LeaveDialog device={devices.find(d => d.id === leaveId) ?? null} container={winEl} onCancel={() => setLeaveId(null)} onConfirm={() => { const d = devices.find(d => d.id === leaveId); if (d)
             void (d.group === 'self' ? api.leaveGroup() : api.removeMember(d.id)).then(() => setLeaveId(null)).catch(fail); }}/>

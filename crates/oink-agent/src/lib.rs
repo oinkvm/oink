@@ -6,6 +6,7 @@ mod aim;
 pub mod api;
 pub mod appearance;
 mod attachment;
+mod audio_quality;
 mod cache;
 pub mod clip;
 pub mod config;

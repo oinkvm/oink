@@ -6,21 +6,24 @@ import { setLanguage } from '../i18n';
 import { DEFAULT_PREFS, presetMap, type Prefs, type PrefsApi, type KeyMap } from './prefs';
 
 export type LocalPreferences = import('../api/cards').UiPreferences;
-export interface PresentationPreferences { motion: 'auto' | 'reduced' | 'full'; show_update_hint: boolean; hide_sponsor: boolean }
+/** Device-local UI preferences kept by this webview only (not backend or group data). */
+export interface PresentationPreferences { motion: 'auto' | 'reduced' | 'full'; show_update_hint: boolean; hide_sponsor: boolean; compact_layout: boolean }
 export interface ReportStatus { configured:boolean;delivery_disabled:boolean;consent: {choice:'unasked'|'denied'|'granted';policy_version:number;generation:number} }
 const actions = {return_pointer_home:'recall',lock_focus:'lock',toggle_sharing:'pauseSelf',pause_all:'pauseAll',toggle_game_mode:'game'} as const;
 const hid = (usage:number) => (7 << 16) | usage;
 const usage: Record<string,number> = {control:hid(224),ctrl:hid(224),shift:hid(225),option:hid(226),alt:hid(226),command:hid(227),win:hid(227),caps:hid(57)};
 const keyCode = (key:string) => usage[key] ?? Number(key.replace(/^hid:/,''));
-function storePresentation(patch: Partial<PresentationPreferences>): PresentationPreferences {
+function storePresentation(current: PresentationPreferences, patch: Partial<PresentationPreferences>): PresentationPreferences {
   let stored: Partial<PresentationPreferences> = {};
   try { stored = JSON.parse(localStorage.getItem('oink:prefs') ?? '{}'); } catch { /* Start with no explicit overrides. */ }
-  localStorage.setItem('oink:prefs', JSON.stringify({...stored,...patch}));
+  const next = {...stored,...patch};
+  try { localStorage.setItem('oink:prefs', JSON.stringify(next)); }
+  catch { return {...current,...patch}; } // Unavailable storage keeps the edit for this session only.
   return readPresentation();
 }
 function readPresentation(): PresentationPreferences {
-  try { const stored = JSON.parse(localStorage.getItem('oink:prefs') ?? '{}'); return { motion: ['auto','reduced','full'].includes(stored.motion) ? stored.motion : 'auto', show_update_hint: stored.show_update_hint !== false, hide_sponsor: stored.hide_sponsor === true }; }
-  catch { return {motion:'auto',show_update_hint:true,hide_sponsor:false}; }
+  try { const stored = JSON.parse(localStorage.getItem('oink:prefs') ?? '{}'); return { motion: ['auto','reduced','full'].includes(stored.motion) ? stored.motion : 'auto', show_update_hint: stored.show_update_hint !== false, hide_sponsor: stored.hide_sponsor === true, compact_layout: stored.compact_layout !== false }; }
+  catch { return {motion:'auto',show_update_hint:true,hide_sponsor:false,compact_layout:true}; }
 }
 export function editTransform(current: InputTransform, platform: 'mac'|'win', prefs: Prefs, reverseWheel?: boolean): InputTransform {
   const target = platform === 'mac' ? 'windows' : 'macos';
@@ -129,7 +132,7 @@ export function usePreferences(): PrefsApi {
         await agent.query('report',()=>call<ReportStatus>('report_status'));
       }
       if(changed('upgradeHint')){
-        setPresentation(storePresentation({show_update_hint:next.upgradeHint}));
+        setPresentation(storePresentation(presentation,{show_update_hint:next.upgradeHint}));
       }
       committed.current=next;setPrefs(queued.current??next);
     }catch{setPrefs(previous);queued.current=null;agent.fail('unavailable');}
@@ -148,7 +151,7 @@ export function usePreferences(): PrefsApi {
     },chooseReport: async allow => { if(!report) throw new Error('unavailable'); await call<null>('set_report_consent',{expected_generation:report.consent.generation,choice:allow?'granted':'denied',policy_version:report.consent.policy_version}); await agent.query('report',()=>call<ReportStatus>('report_status')); },ready:local!==null,local,presentation,report,hasOverrides:(transform?.overrides.length??0)>0,
     confirmLaunchAtLogin:async enabled=>{await agent.query('launch',()=>api.setLaunchAtLogin(enabled));},
     saveLocal:async patch=>{const current=agent.get().localPreferences;if(!current)throw new Error('unavailable');await agent.query('localPreferences',()=>call<LocalPreferences>('set_ui_preferences',{settings:patch}));},
-    savePresentation:patch=>{setPresentation(storePresentation(patch));},
+    savePresentation:patch=>{setPresentation(storePresentation(presentation,patch));},
     set:(key,value)=>{void save({...latest.current,[key]:value});},setPrefs:update=>{void save(update(latest.current));},
   };
 }

@@ -120,11 +120,11 @@ fn duplicate_keys_rejected_even_when_signed() {
 }
 
 #[test]
-fn bilingual_notes_are_required_bounded_and_preserved_in_candidates() {
+fn release_notes_are_bounded_and_preserved_in_candidates() {
     let manifest = check(&payload(), &Watermark::default(), NOW).unwrap();
     let notes = &manifest.manifest().releases[0].notes;
     assert_eq!(notes.for_language("zh-Hans-CN"), "修复问题。");
-    assert_eq!(notes.for_language("zh_CN"), "修复问题。");
+    assert_eq!(notes.for_language("zh_CN"), "Fix a problem.");
     for language in ["en-US", "fr", "zh-Hant", "", "unknown"] {
         assert_eq!(notes.for_language(language), "Fix a problem.");
     }
@@ -145,10 +145,9 @@ fn bilingual_notes_are_required_bounded_and_preserved_in_candidates() {
 
     for invalid in [
         json!("one language"),
-        json!({"en":"English only"}),
         json!({"zh-Hans":"仅中文"}),
         json!({"zh-Hans":"中文","en":null}),
-        json!({"zh-Hans":"中文","en":"English","fr":"extra"}),
+        json!({"zh-Hans":"中文","en":"English","fr_X":"invalid tag"}),
         json!({"zh-Hans":"中文","en":" "}),
         json!({"zh-Hans":"中\u{0085}文","en":"English"}),
         json!({"zh-Hans":"中文","en":"bad\rtext"}),
@@ -162,10 +161,13 @@ fn bilingual_notes_are_required_bounded_and_preserved_in_candidates() {
             Error::Metadata
         );
     }
-    let notes = ReleaseNotes {
-        zh_hans: "中".repeat(MAX_NOTES / 3),
-        en: "x".repeat(MAX_NOTES - 2) + "\n\t",
-    };
+    let notes = ReleaseNotes::from_json(
+        &serde_json::to_vec(&json!({
+            "zh-Hans":"中".repeat(MAX_NOTES / 3), "en":"x".repeat(MAX_NOTES - 2) + "\n\t"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     notes.validate().unwrap();
     assert_eq!(
         ReleaseNotes::from_json(&serde_json::to_vec(&notes).unwrap()).unwrap(),
@@ -378,4 +380,68 @@ fn health_fault_is_compiled_only_into_explicit_test_candidate() {
     );
     #[cfg(not(feature = "test-feed"))]
     assert!(oink_update::trust::health_ready(true));
+}
+
+#[test]
+fn notes_accept_future_languages_and_use_parent_then_english() {
+    let mut p = payload();
+    p["releases"][0]["notes"] = json!({"en":"English", "zh-Hans":"中文", "ja":"日本語", "ko":"한국어", "es":"Español", "es-MX":"México", "zh":"中文基础"});
+    let manifest = check(&p, &Watermark::default(), NOW).unwrap();
+    let notes = &manifest.manifest().releases[0].notes;
+    for (language, expected) in [
+        ("ja-JP", "日本語"),
+        ("KO-kr", "한국어"),
+        ("es-MX", "México"),
+        ("es-AR", "Español"),
+        ("zh-Hant-TW", "中文基础"),
+        ("de-DE", "English"),
+    ] {
+        assert_eq!(notes.for_language(language), expected);
+    }
+    for language in ["x", "en_US", "en-", "en-a", "../ja"] {
+        p["releases"][0]["notes"][language] = json!("invalid");
+        assert!(check(&p, &Watermark::default(), NOW).is_err());
+        p["releases"][0]["notes"].as_object_mut().unwrap().remove(language);
+    }
+}
+
+#[test]
+fn client_requires_english_and_accepts_an_english_only_future_release() {
+    assert!(ReleaseNotes::from_json(br#"{"en":"English only"}"#).is_ok());
+    assert!(ReleaseNotes::from_json(br#"{"ja":"missing English"}"#).is_err());
+    assert!(ReleaseNotes::from_json(br#"{"en":"English","EN":"ambiguous"}"#).is_err());
+    let mut notes = json!({"en":"English"});
+    for i in 0..32 {
+        notes[format!("zz-{i:02}")] = json!("test");
+    }
+    assert!(ReleaseNotes::from_json(&serde_json::to_vec(&notes).unwrap()).is_err());
+}
+
+#[test]
+fn release_013_notes_parse_with_the_shipped_012_strict_type() {
+    // Frozen shipped 0.1.2 type; future languages intentionally fail this type.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ShippedNotes {
+        #[serde(rename = "zh-Hans")]
+        zh_hans: String,
+        en: String,
+    }
+    let bytes = include_bytes!("fixtures/release-notes-0.1.3.json");
+    let old: ShippedNotes = serde_json::from_slice(bytes).unwrap();
+    let current = ReleaseNotes::from_json(bytes).unwrap();
+    assert_eq!(old.en, current.for_language("en"));
+    assert_eq!(old.zh_hans, current.for_language("zh-Hans"));
+    let mut later: Value = serde_json::from_slice(bytes).unwrap();
+    later["ja"] = json!("future TEST translation");
+    let bytes = serde_json::to_vec(&later).unwrap();
+    assert!(serde_json::from_slice::<ShippedNotes>(&bytes).is_err());
+    assert!(ReleaseNotes::from_json(&bytes).is_ok());
+}
+
+#[test]
+fn notes_require_english_during_typed_deserialization_too() {
+    assert!(serde_json::from_str::<ReleaseNotes>(r#"{"en":"first","en":"second"}"#).is_err());
+    assert!(serde_json::from_str::<ReleaseNotes>(r#"{"ja":"missing English"}"#).is_err());
+    assert!(serde_json::from_str::<ReleaseNotes>(r#"{"en":"English","EN":"ambiguous"}"#).is_err());
 }

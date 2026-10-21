@@ -450,3 +450,66 @@ it('keeps fractional world coordinates through a pointer move and commit', () =>
   expect(next.x).toBeCloseTo(source.x + 10, 10);
   expect(next.y).toBeCloseTo(source.y, 10);
 });
+
+describe('auto-compaction follows manual edits only', () => {
+  // Two independent computers with a closable 100-unit gap.
+  const gap: Screen[] = [
+    { id: 'a', device: 'a', name: 'A', x: 0, y: 0, w: 1000, h: 600, wallpaper: 0 },
+    { id: 'b', device: 'b', name: 'B', x: 1100, y: 0, w: 1000, h: 600, wallpaper: 1 },
+  ];
+  const opening = (next: Screen[]) => next[1].x - (next[0].x + next[0].w);
+  const compact = { ...settings, compact: true };
+  beforeEach(() => setLanguage('en'));
+
+  it('does not compact when screens are added, removed, hidden, go offline or arrive from another device', () => {
+    const changed = vi.fn();
+    const props = { onScreensChange: changed, selectedId: null, onSelect: vi.fn(), settings: compact };
+    const { rerender } = render(<Arrangement {...props} screens={gap}/>);
+    const plugged: Screen = { id: 'c', device: 'c', name: 'C', x: 2300, y: 0, w: 800, h: 500, wallpaper: 2 };
+    // Hotplug: a new screen with its own gap, then an unplugged screen.
+    rerender(<Arrangement {...props} screens={[...gap, plugged]}/>);
+    rerender(<Arrangement {...props} screens={[gap[0]]}/>);
+    // A hidden or disabled screen keeps only its retained geometry.
+    rerender(<Arrangement {...props} screens={[gap[0]]} geometryScreens={gap}/>);
+    rerender(<Arrangement {...props} screens={gap}/>);
+    // Connectivity changes and a remote layout that opens a wider gap.
+    rerender(<Arrangement {...props} screens={[gap[0], { ...gap[1], offline: true }]}/>);
+    rerender(<Arrangement {...props} screens={[gap[0], { ...gap[1], x: 1400 }]}/>);
+    rerender(<Arrangement {...props} screens={gap}/>);
+    expect(changed).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('a keyboard move compacts the whole layout only when compaction=%s', on => {
+    const changed = vi.fn();
+    render(<Arrangement screens={gap} selectedId="b" onSelect={vi.fn()} onScreensChange={changed}
+      settings={{ ...settings, compact: on }}/>);
+    fireEvent.keyDown(document.body, { key: 'ArrowRight' });
+    const next = changed.mock.lastCall![0] as Screen[];
+    expect(opening(next)).toBeCloseTo(on ? 0 : 200);
+    expect(changed.mock.lastCall![1]).toEqual({ label: 'Move B', merge: 'key-move:b' });
+  });
+
+  it.each([true, false])('a keyboard resize compacts only when compaction=%s', on => {
+    const changed = vi.fn();
+    render(<Arrangement screens={gap} selectedId="a" onSelect={vi.fn()} onScreensChange={changed}
+      settings={{ ...settings, compact: on }}/>);
+    fireEvent.keyDown(document.body, { key: 'ArrowLeft', metaKey: true });
+    const next = changed.mock.lastCall![0] as Screen[];
+    expect(next[0].w).toBeCloseTo(1000 / 1.1);
+    expect(opening(next) > 1).toBe(!on);
+  });
+
+  it('a pointer release keeps the gap when compaction is off', () => {
+    const changed = vi.fn();
+    const { container } = render(<Arrangement screens={gap} selectedId="b" onSelect={vi.fn()}
+      onScreensChange={changed} settings={settings}/>);
+    const display = container.querySelectorAll('.scr')[1];
+    const zoom = cameraStore.get()!.zoom;
+    fireEvent.pointerDown(display, { button: 0, clientX: 600, clientY: 300 });
+    fireEvent.pointerMove(display, { clientX: 600 + 20 * zoom, clientY: 300 });
+    fireEvent.pointerUp(display);
+    const next = changed.mock.lastCall![0] as Screen[];
+    expect(next[0]).toEqual(gap[0]);
+    expect(next[1].x).toBeCloseTo(1120);
+  });
+});

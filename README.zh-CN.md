@@ -1,15 +1,15 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset=".github/assets/banner-zh-CN-dark.png">
-    <img alt="Oink — Oink Is Not a KVM。你的电脑，合而为一" src=".github/assets/banner-zh-CN-light.png" width="860">
+    <img alt="Oink — Oink Is Not only a KVM。你的电脑，合而为一" src=".github/assets/banner-zh-CN-light.png" width="860">
   </picture>
 </p>
 
-# Oink — Oink Is Not a KVM
+# Oink — Oink Is Not only a KVM
 
 [English](README.md) | **简体中文** | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-Oink 是 Oink Is Not a KVM 的缩写，是一款在多台 Windows 和 Mac 设备间建立对等共享网络的现代软件。同时使用任何设备的键盘、鼠标、触摸板操控任意邻近设备，保持统一、原生的操作手感；将多台设备的音频通过连接至一台设备的扬声器或耳机播放；支持剪贴板共享和跨设备拖拽；支持局域网设备自动发现；默认加密传输。
+Oink 是 Oink Is Not only a KVM 的缩写，是一款在多台 Windows 和 Mac 设备间建立对等共享网络的现代软件。同时使用任何设备的键盘、鼠标、触摸板操控任意邻近设备，保持统一、原生的操作手感；将多台设备的音频通过连接至一台设备的扬声器或耳机播放；支持剪贴板共享和跨设备拖拽；支持局域网设备自动发现；默认加密传输。
 
 > Oink 是一个个人项目，代码完全由 AI 编写（感谢 Claude Code 和 Codex），人类负责项目管理、确定技术方向和鼓励 AI。项目没有在多样化环境内经过充分测试，尤其是：
 >

@@ -82,7 +82,7 @@ mod tests {
             if view == self.outer {
                 // Model the native constructor's message pump delivering a tray
                 // callback and further IPC/menu requests on that same UI thread.
-                for nested in [View::Main, View::Panel, View::About, View::Upgrade, View::Quit] {
+                for nested in [View::Main, View::Panel, View::About, View::Quit] {
                     if nested != self.outer {
                         self.request(nested);
                     }
@@ -95,7 +95,7 @@ mod tests {
 
     #[test]
     fn native_pump_reentry_queues_panel_and_every_normal_view_without_relocking_context() {
-        for outer in [View::Main, View::Panel, View::About, View::Upgrade, View::Quit] {
+        for outer in [View::Main, View::Panel, View::About, View::Quit] {
             let (send, receive) = mpsc::channel();
             std::thread::spawn(move || {
                 let pump = Pump {
@@ -109,7 +109,7 @@ mod tests {
             });
             let mut expected = vec![outer];
             expected.extend(
-                [View::Main, View::Panel, View::About, View::Upgrade, View::Quit]
+                [View::Main, View::Panel, View::About, View::Quit]
                     .into_iter()
                     .filter(|v| *v != outer),
             );

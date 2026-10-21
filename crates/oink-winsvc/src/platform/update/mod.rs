@@ -23,6 +23,14 @@ struct MachinePolicy {
     watermarks: BTreeMap<String, Watermark>,
     quarantine: BTreeSet<u64>,
 }
+impl MachinePolicy {
+    fn record_success(&mut self, build: u64) {
+        self.successful_build = self.successful_build.max(build);
+        // Selection already rejects these builds by the successful high-water
+        // mark. Keep only failures that could still otherwise be offered.
+        self.quarantine.retain(|failed| *failed > self.successful_build);
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Session {
@@ -121,4 +129,23 @@ pub(super) fn input_allowed() -> bool {
             .exists())
     };
     check().unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn successful_update_discards_only_obsolete_quarantine_history() {
+        let mut policy = MachinePolicy {
+            successful_build: 31,
+            quarantine: BTreeSet::from([30, 32, 34]),
+            ..Default::default()
+        };
+        policy.record_success(33);
+        assert_eq!(policy.successful_build, 33);
+        assert_eq!(policy.quarantine, BTreeSet::from([34]));
+        policy.record_success(31); // The successful high-water mark never falls.
+        assert_eq!(policy.successful_build, 33);
+        assert_eq!(policy.quarantine, BTreeSet::from([34]));
+    }
 }

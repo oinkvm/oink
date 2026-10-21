@@ -427,6 +427,8 @@ pub struct LatePacket {
 }
 
 pub struct Receiver {
+    dropout_counters: Option<std::sync::Arc<crate::sink::DropoutCounters>>,
+    dropout_ledger: crate::sink::DropoutLedger,
     consumed: [Option<(u64, Instant)>; 512],
     late_packet: Option<LatePacket>,
     rejections: Rejections,
@@ -463,6 +465,7 @@ impl std::fmt::Debug for Receiver {
 impl Receiver {
     pub fn new_with_config(config: Config) -> Result<Self, String> {
         config.validate()?;
+        let _ = crate::diagnostics::monotonic_us(Instant::now());
         let decoder = match config.codec {
             Codec::Opus => {
                 DecoderCodec::Opus(opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo).map_err(|e| e.to_string())?)
@@ -470,6 +473,8 @@ impl Receiver {
             Codec::Pcm16 => DecoderCodec::Pcm16,
         };
         Ok(Self {
+            dropout_counters: None,
+            dropout_ledger: Default::default(),
             config,
             decoder,
             packets: PacketQueue::new(packet_capacity(config)),
@@ -525,6 +530,21 @@ impl Receiver {
     ) -> bool {
         self.push_slice_at(seq, &payload, arrival, Some(source_emit_ns))
     }
+    pub(crate) fn set_dropout_counters(&mut self, counters: Option<&std::sync::Arc<crate::sink::DropoutCounters>>) {
+        if self.dropout_counters.is_none() {
+            self.dropout_counters = counters.cloned();
+        }
+    }
+    fn dropout(&mut self, first: u64, last: u64, at: Instant, late: bool) {
+        if let Some(counters) = &self.dropout_counters {
+            let count = self.dropout_ledger.insert(first, last);
+            counters.record(
+                (crate::diagnostics::monotonic_us(at).max(0) / 1000) as u64,
+                if late { 0 } else { count },
+                if late { count } else { 0 },
+            );
+        }
+    }
     pub fn push_slice_at(&mut self, seq: u64, payload: &[u8], arrival: Instant, source_emit_ns: Option<u64>) -> bool {
         self.late_packet = None;
         let valid = valid_payload(self.config, payload);
@@ -568,6 +588,7 @@ impl Receiver {
                     .map(|(_, at)| at),
             });
             self.stats.late += 1;
+            self.dropout(seq, seq, arrival, true);
             return false;
         }
         if self.recovering
@@ -748,7 +769,13 @@ impl Receiver {
                 .unwrap_or_default()
                 .as_secs_f64()
                 * 1000.0;
-            self.next = self.packets.first_key_value().map(|(&seq, _)| seq);
+            let first = self.packets.first_key_value().map(|(&seq, _)| seq);
+            if let (Some(last), Some(first)) = (self.last_decoded, first)
+                && first > last.saturating_add(1)
+            {
+                self.dropout(last + 1, first - 1, now, false);
+            }
+            self.next = first;
             self.prefill_ticks = 0;
             self.recovering = false;
             // Re-prefill can overshoot when old and new packets arrive in one
@@ -816,7 +843,7 @@ impl Receiver {
                 && (self.consecutive_loss >= self.config.jitter.max_plc_frames
                     || (self.packets.is_empty() && self.empty_queue_loss >= self.config.jitter.max_plc_frames))
             {
-                self.rebuffer();
+                self.rebuffer_at(Some(now));
                 return;
             }
             if !self.decode_next(now, trace.as_deref_mut()) {
@@ -919,6 +946,7 @@ impl Receiver {
         } else {
             self.healthy_frames = 0;
             self.stats.lost += 1;
+            self.dropout(seq, seq, now, false);
             if self.packets.is_empty() {
                 self.stats.empty_queue_plc_frames += 1;
                 // Successful frames interleaved with empty-queue PLC must not
@@ -930,7 +958,7 @@ impl Receiver {
             }
             self.consecutive_loss += 1;
             if self.consecutive_loss > self.config.jitter.max_plc_frames {
-                self.rebuffer();
+                self.rebuffer_at(Some(now));
                 return false;
             }
             match &mut self.decoder {
@@ -990,8 +1018,9 @@ impl Receiver {
     }
     /// New media burst, using the existing preallocated storage on the RT worker.
     pub fn reset_burst(&mut self) {
+        self.dropout_ledger.clear();
         self.packets.0.clear();
-        self.rebuffer();
+        self.rebuffer_at(None);
         self.consumed.fill(None);
         self.late_packet = None;
         self.last_decoded = None;
@@ -1008,7 +1037,15 @@ impl Receiver {
         self.recovering = false;
         self.draining = false;
     }
-    fn rebuffer(&mut self) {
+    fn rebuffer_at(&mut self, at: Option<Instant>) {
+        // Starvation can retire an already decoded partial packet. It really
+        // loses queued audio; intentional burst boundaries do not count it.
+        if let Some(at) = at {
+            for index in 0..self.spans.len() {
+                let sequence = self.spans[index].sequence;
+                self.dropout(sequence, sequence, at, false);
+            }
+        }
         self.next = None;
         self.prefill_ticks = 0;
         self.first_packet = self.packets.values().map(|packet| packet.arrival).min();
@@ -1440,6 +1477,108 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dropouts_deduplicate_concealment_late_and_replays_in_the_same_ring() {
+        let mut config = Config::low_latency_pcm();
+        config.jitter.adaptive = false;
+        let payload = pcm_packet(config, 0.2);
+        let now = Instant::now();
+        let counters = std::sync::Arc::new(crate::sink::DropoutCounters::default());
+        let mut receiver = Receiver::new_with_config(config).unwrap();
+        receiver.set_dropout_counters(Some(&counters));
+        for seq in [0, 1, 3, 4, 5] {
+            assert!(receiver.push_at(seq, payload.clone(), now));
+        }
+        for tick in 0..8 {
+            receiver.render_at(now + Duration::from_millis(1000 + tick * 3));
+        }
+        assert!(receiver.stats().lost > 0);
+        let at = (crate::diagnostics::monotonic_us(now + Duration::from_millis(1500)).max(0) / 1000) as u64;
+        let total = || {
+            counters
+                .snapshot(at)
+                .into_iter()
+                .flatten()
+                .map(|b| b.count())
+                .sum::<u64>()
+        };
+        let before = total();
+        for seq in [2, 2] {
+            assert!(!receiver.push_at(seq, payload.clone(), now + Duration::from_millis(1400)));
+        }
+        assert_eq!(total(), before, "concealed then late is one dropout");
+        for seq in [0, 0] {
+            assert!(!receiver.push_at(seq, payload.clone(), now + Duration::from_millis(1400)));
+        }
+        assert_eq!(
+            total(),
+            before + 1,
+            "receiver-classified late replays count at most once"
+        );
+        receiver.reset_burst();
+        assert_eq!(total(), before + 1);
+    }
+    #[test]
+    fn starvation_discard_of_decoded_audio_counts_but_burst_reset_does_not() {
+        let config = Config::low_latency_pcm();
+        let now = Instant::now();
+        let c = std::sync::Arc::new(crate::sink::DropoutCounters::default());
+        let mut r = Receiver::new_with_config(config).unwrap();
+        r.set_dropout_counters(Some(&c));
+        let payload = pcm_packet(config, 0.2);
+        assert!(r.push_at(99, payload.clone(), now));
+        r.next = Some(99);
+        assert!(r.decode_next(now, None));
+        assert!(r.resampler.buffered_frames() > 0);
+        let at = (crate::diagnostics::monotonic_us(now).max(0) / 1000) as u64;
+        assert!(c.snapshot(at).iter().all(Option::is_none));
+        r.rebuffer_at(Some(now));
+        assert_eq!(c.snapshot(at).into_iter().flatten().map(|b| b.count()).sum::<u64>(), 1);
+        assert!(!r.push_at(99, payload.clone(), now));
+        assert_eq!(c.snapshot(at).into_iter().flatten().map(|b| b.count()).sum::<u64>(), 1);
+        r.reset_burst();
+        assert!(r.push_at(100, payload, now));
+        r.next = Some(100);
+        assert!(r.decode_next(now, None));
+        r.reset_burst();
+        assert_eq!(c.snapshot(at).into_iter().flatten().map(|b| b.count()).sum::<u64>(), 1);
+    }
+    #[test]
+    fn recovery_skips_count_only_on_playout_and_later_arrivals_do_not_count_again() {
+        let mut config = Config::low_latency_pcm();
+        config.jitter.adaptive = false;
+        let payload = pcm_packet(config, 0.2);
+        let now = Instant::now();
+        let c = std::sync::Arc::new(crate::sink::DropoutCounters::default());
+        let mut r = Receiver::new_with_config(config).unwrap();
+        r.set_dropout_counters(Some(&c));
+        for seq in 0..4 {
+            assert!(r.push_at(seq, payload.clone(), now));
+        }
+        // Admission/window rejection alone does not assert an audible gap.
+        assert!(!r.push_at(1000000, payload.clone(), now));
+        assert!(
+            c.snapshot((crate::diagnostics::monotonic_us(now).max(0) / 1000) as u64)
+                .iter()
+                .all(Option::is_none)
+        );
+        for tick in 0..24 {
+            r.render_at(now + Duration::from_millis(1000 + tick * 3));
+        }
+        assert!(r.next.is_none());
+        let last = r.last_decoded.unwrap();
+        let at = (crate::diagnostics::monotonic_us(now + Duration::from_millis(2000)).max(0) / 1000) as u64;
+        let total = || c.snapshot(at).into_iter().flatten().map(|b| b.count()).sum::<u64>();
+        let before = total();
+        let first = last + 50;
+        for seq in first..first + 4 {
+            assert!(r.push_at(seq, payload.clone(), now + Duration::from_millis(1500)));
+        }
+        r.render_at(now + Duration::from_millis(1600));
+        assert_eq!(total(), before + 49);
+        assert!(!r.push_at(first - 1, payload, now + Duration::from_millis(1700)));
+        assert_eq!(total(), before + 49);
+    }
     #[test]
     fn late_diagnostics_use_consumption_clock_and_do_not_change_rendering() {
         let packets = packets(8);

@@ -3,9 +3,11 @@ use crate::{
     *,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(not(windows))]
+use std::io::Write;
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -88,14 +90,24 @@ pub struct QueueStatus {
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().ok_or(Error::Io)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(|_| Error::Io)?;
-    tmp.write_all(bytes).map_err(|_| Error::Io)?;
-    tmp.as_file().sync_all().map_err(|_| Error::Io)?;
-    tmp.persist(path).map_err(|_| Error::Io)?;
-    #[cfg(unix)]
-    File::open(parent).and_then(|f| f.sync_all()).map_err(|_| Error::Io)?;
-    Ok(())
+    #[cfg(windows)]
+    {
+        // NamedTempFile.persist uses MoveFileExW and shares the same scanner
+        // exposure. Use the original-handle publication and its bounded policy;
+        // never retry checkpoint writes, flushes or the whole store transaction.
+        oink_foundation::storage::atomic_write(path, bytes).map_err(|_| Error::Io)
+    }
+    #[cfg(not(windows))]
+    {
+        let parent = path.parent().ok_or(Error::Io)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(|_| Error::Io)?;
+        tmp.write_all(bytes).map_err(|_| Error::Io)?;
+        tmp.as_file().sync_all().map_err(|_| Error::Io)?;
+        tmp.persist(path).map_err(|_| Error::Io)?;
+        #[cfg(unix)]
+        File::open(parent).and_then(|f| f.sync_all()).map_err(|_| Error::Io)?;
+        Ok(())
+    }
 }
 impl Store {
     pub fn open(dir: &Path, consent: ReportConsent, now: u64) -> Result<Self> {
@@ -499,6 +511,20 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn checkpoint_replacement_preserves_an_open_readers_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("checkpoint.json");
+        atomic_write(&path, b"before").unwrap();
+        let mut reader = File::open(&path).unwrap();
+        atomic_write(&path, b"after").unwrap();
+        let mut previous = Vec::new();
+        reader.read_to_end(&mut previous).unwrap();
+        assert_eq!(previous, b"before");
+        assert_eq!(std::fs::read(&path).unwrap(), b"after");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
     fn consent() -> ReportConsent {
         ReportConsent {
             choice: Choice::Granted,

@@ -5,9 +5,10 @@ import { OinkProvider } from 'oink-ui';
 import { UpdatePreferences, checkForUpdates } from './UpdatePreferences';
 import type { UpdateStatus } from '../api/update';
 import { setLanguage } from '../i18n';
-const mock = vi.hoisted(()=>({update:vi.fn(),open:vi.fn(),openUrl:vi.fn(),fail:vi.fn(),query:vi.fn()}));
+const mock = vi.hoisted(()=>({update:vi.fn(),open:vi.fn(),openUrl:vi.fn(),fail:vi.fn(),query:vi.fn(),openDialog:vi.fn()}));
 vi.mock('../api/client',()=>({api:{update:mock.update},shell:{open:mock.open,openUrl:mock.openUrl}}));
 vi.mock('../api/store',()=>({agent:{query:mock.query,fail:mock.fail}}));
+vi.mock('../window/Upgrade',()=>({openUpdateDialog:mock.openDialog}));
 const status:UpdateStatus = {current_build:30,version:'0.1.1',channel:'stable',checks_enabled:true,
   phase:'idle',candidate:null,checked_at:null,next_check:null,deferred_until:null,blockers:[],progress:null,error:null,scope:'user',can_change_policy:true};
 beforeAll(()=>{
@@ -18,14 +19,15 @@ beforeEach(()=>{vi.clearAllMocks();setLanguage('en');mock.query.mockImplementati
 afterEach(cleanup);
 const show=(s:UpdateStatus)=>render(<OinkProvider defaultMotion="reduced"><UpdatePreferences status={s}/></OinkProvider>);
 
-it('uses native check and opens update details only after acknowledgement',async()=>{
+it('uses native check and opens the in-window update dialog only after acknowledgement',async()=>{
   await checkForUpdates(status);
   expect(mock.update).toHaveBeenCalledWith({type:'check'});
-  expect(mock.open).toHaveBeenCalledWith('upgrade');
-  expect(mock.openUrl).not.toHaveBeenCalled();
-  mock.open.mockClear();mock.update.mockRejectedValueOnce(new Error('network'));
-  await expect(checkForUpdates(status)).rejects.toThrow('network');
+  expect(mock.openDialog).toHaveBeenCalledOnce();
   expect(mock.open).not.toHaveBeenCalled();
+  expect(mock.openUrl).not.toHaveBeenCalled();
+  mock.openDialog.mockClear();mock.update.mockRejectedValueOnce(new Error('network'));
+  await expect(checkForUpdates(status)).rejects.toThrow('network');
+  expect(mock.openDialog).not.toHaveBeenCalled();
 });
 it('keeps a manual download route for disabled versions',async()=>{
   show({...status,phase:'disabled'});

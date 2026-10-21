@@ -17,7 +17,7 @@ PUBLIC = base64.b64encode(bytes.fromhex('d75a980182b10ab7d54bfed3c964073a0ee172f
 SEED = base64.b64encode(bytes.fromhex('9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60')).decode()
 COMMIT = 'a' * 40
 TREE = 'b' * 64
-NOTES = {'en':'Test update', 'zh-Hans':'测试更新'}
+NOTES = {'en':'Test update', 'zh-Hans':'测试更新', 'ja':'テスト', 'ko':'테스트', 'es-MX':'Prueba'}
 
 
 class MacReleaseTests(unittest.TestCase):

@@ -162,12 +162,49 @@ impl Router {
             }
             return;
         }
-        if !self.filter_multifinger(origin, MultiEvent::Contacts(frame.phase)) {
+        let allow = self.filter_multifinger(origin, MultiEvent::Contacts(frame.phase));
+        if self
+            .multifinger
+            .get(&origin)
+            .is_some_and(|s| s.path == MultiPath::Pending && !s.retired)
+            || self.pending_contacts.origin == Some(origin)
+        {
+            let pending = &mut self.pending_contacts;
+            if pending.origin.is_some_and(|p| p != origin) {
+                return;
+            }
+            pending.origin = Some(origin);
+            if frame.phase.ends() || pending.len == pending.frames.len() {
+                pending.clear();
+                if let Some(state) = self.multifinger.get_mut(&origin) {
+                    state.path = MultiPath::Suppressed;
+                }
+                return;
+            }
+            for change in frame.changes() {
+                match change.phase {
+                    Phase::Begin => pending.active += 1,
+                    Phase::End | Phase::Cancel => pending.active = pending.active.saturating_sub(1),
+                    Phase::Move => {}
+                }
+            }
+            pending.frames[pending.len] = frame;
+            pending.len += 1;
+            if pending.active >= 3 {
+                self.multifinger.get_mut(&origin).expect("pending sequence").path = MultiPath::Native;
+                self.resolve_pending_contacts(origin, MultiPath::Native);
+            }
             return;
         }
+        if !allow {
+            return;
+        }
+        self.inject_received_contact(origin, frame);
+    }
+    fn inject_received_contact(&mut self, origin: DeviceId, frame: Frame) {
         if self.touchpad_contacts.is_none() {
-            // Windows with native contacts selected must report the unavailable
-            // injector; system gestures cannot silently become a fallback.
+            // Runtime capability changes retire the old sequence. New sequences
+            // select the system gesture path while injection is unavailable.
             return;
         }
         if frame.phase == Phase::Begin {
@@ -190,11 +227,45 @@ impl Router {
 /// Retired segments still consume their ends but never inject a surviving tail.
 #[derive(Debug)]
 pub(super) struct MultiFinger {
-    native: bool,
+    path: MultiPath,
     pub(super) retired: bool,
     contacts: bool,
     gesture: bool,
     scroll: Option<ScrollRoute<()>>,
+}
+/// Evidence-based target experiment: no native side effect before system
+/// Scroll/Gesture evidence (or three active contacts) selects a whole sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MultiPath {
+    Native,
+    Gestures,
+    Pending,
+    Scroll,
+    Suppressed,
+}
+const CLASSIFY_FRAMES: usize = 256;
+pub(super) struct PendingContacts {
+    pub(super) origin: Option<DeviceId>,
+    frames: Box<[Frame; CLASSIFY_FRAMES]>,
+    len: usize,
+    active: usize,
+}
+impl Default for PendingContacts {
+    fn default() -> Self {
+        Self {
+            origin: None,
+            frames: Box::new([Frame::default(); CLASSIFY_FRAMES]),
+            len: 0,
+            active: 0,
+        }
+    }
+}
+impl PendingContacts {
+    pub(super) fn clear(&mut self) {
+        self.origin = None;
+        self.len = 0;
+        self.active = 0;
+    }
 }
 #[derive(Clone, Copy)]
 pub(super) enum MultiEvent {
@@ -203,6 +274,18 @@ pub(super) enum MultiEvent {
     Scroll(ScrollPhase),
 }
 impl Router {
+    fn resolve_pending_contacts(&mut self, origin: DeviceId, path: MultiPath) {
+        if self.pending_contacts.origin != Some(origin) {
+            return;
+        }
+        let len = self.pending_contacts.len;
+        self.pending_contacts.clear();
+        if path == MultiPath::Native {
+            for i in 0..len {
+                self.inject_received_contact(origin, self.pending_contacts.frames[i]);
+            }
+        }
+    }
     pub(super) fn filter_multifinger(&mut self, origin: DeviceId, event: MultiEvent) -> bool {
         let starts = match event {
             MultiEvent::Contacts(p) => p == Phase::Begin,
@@ -210,8 +293,23 @@ impl Router {
             MultiEvent::Scroll(p) => matches!(p, ScrollPhase::Began | ScrollPhase::None),
         };
         if starts {
+            let native = self.cfg.os == Os::Windows && self.accept_contacts && self.touchpad_contacts.is_some();
+            let classify = native
+                && self.cfg.settings.test_mac_scroll
+                && self.peers.get(&origin).is_some_and(|p| p.os == Os::MacOS);
+            let path = if !native {
+                MultiPath::Gestures
+            } else if classify {
+                match event {
+                    MultiEvent::Contacts(_) => MultiPath::Pending,
+                    MultiEvent::Scroll(_) => MultiPath::Scroll,
+                    MultiEvent::Gesture(_) => MultiPath::Native,
+                }
+            } else {
+                MultiPath::Native
+            };
             self.multifinger.entry(origin).or_insert(MultiFinger {
-                native: self.cfg.os == Os::Windows && self.accept_contacts,
+                path,
                 retired: false,
                 contacts: false,
                 gesture: false,
@@ -221,6 +319,14 @@ impl Router {
         let Some(state) = self.multifinger.get_mut(&origin) else {
             return false;
         };
+        if state.path == MultiPath::Pending && !state.retired && starts {
+            state.path = match event {
+                MultiEvent::Scroll(_) => MultiPath::Scroll,
+                MultiEvent::Gesture(_) => MultiPath::Native,
+                _ => MultiPath::Pending,
+            };
+        }
+        let path = state.path;
         let live = match event {
             MultiEvent::Contacts(p) => {
                 let live = starts || state.contacts;
@@ -247,15 +353,24 @@ impl Router {
                 live
             }
         };
-        let native = matches!(event, MultiEvent::Contacts(_));
-        let allow = live && !state.retired && native == state.native;
+        let selected = match path {
+            MultiPath::Native => matches!(event, MultiEvent::Contacts(_)),
+            MultiPath::Gestures => !matches!(event, MultiEvent::Contacts(_)),
+            MultiPath::Scroll => matches!(event, MultiEvent::Scroll(_)),
+            MultiPath::Pending | MultiPath::Suppressed => false,
+        };
+        let allow = live && !state.retired && selected;
         if !state.contacts && !state.gesture && state.scroll.is_none() {
             self.multifinger.remove(&origin);
+        }
+        if path != MultiPath::Pending {
+            self.resolve_pending_contacts(origin, path);
         }
         allow
     }
     pub(super) fn retire_received_multifinger(&mut self) {
         self.cancel_received_contacts();
+        self.pending_contacts.clear();
         let mut cancel_scroll = false;
         for state in self.multifinger.values_mut() {
             // macOS may finish a short scroll with Ended and no momentum at all
@@ -268,7 +383,9 @@ impl Router {
             if state.scroll.is_some_and(|r| !r.fingers && !r.momentum) {
                 state.scroll = None;
             }
-            cancel_scroll |= !state.native && !state.retired && state.scroll.is_some();
+            cancel_scroll |= matches!(state.path, MultiPath::Gestures | MultiPath::Scroll)
+                && !state.retired
+                && state.scroll.is_some();
             state.retired = true;
         }
         self.multifinger
@@ -820,20 +937,214 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_native_injector_never_falls_back_to_gestures() {
+    fn target_uses_gestures_when_injector_unavailable_and_contacts_when_available() {
+        let origin = DeviceId([2; 32]);
+        for capacity in [None, Some(5)] {
+            let mut r = router();
+            r.set_touchpad_contacts(capacity);
+            assert!(r.accept_contacts, "stored preference remains enabled");
+            r.out.clear();
+            r.receive_contacts(origin, Frame::between(None, &sample(0, 2, 1000)));
+            for phase in [GesturePhase::Began, GesturePhase::Ended] {
+                let gesture = Gesture::Magnify { phase, amount: 0.1 };
+                r.remote_gesture(
+                    origin,
+                    0,
+                    gesture,
+                    InputMsg::Gesture {
+                        source: SourceKind::Touchpad,
+                        gesture,
+                    },
+                );
+            }
+            assert_eq!(
+                r.out
+                    .iter()
+                    .filter(|o| matches!(o, Output::Inject(InjectEvent::TouchpadContacts(_))))
+                    .count(),
+                usize::from(capacity.is_some())
+            );
+            assert_eq!(
+                r.out
+                    .iter()
+                    .filter(|o| matches!(o, Output::Inject(InjectEvent::Gesture(_))))
+                    .count(),
+                if capacity.is_none() { 2 } else { 0 }
+            );
+            assert!(
+                r.out.iter().all(|o| matches!(o, Output::Inject(_))),
+                "no unavailable fault or stop"
+            );
+        }
+    }
+    fn experiment(enabled: bool, capacity: Option<u8>) -> (Router, DeviceId) {
         let origin = DeviceId([2; 32]);
         let mut r = router();
-        r.set_touchpad_contacts(None);
+        r.test_connect(origin, 0);
+        r.peers.get_mut(&origin).unwrap().os = Os::MacOS;
+        r.set_touchpad_contacts(capacity);
+        let mut settings = r.cfg.settings.clone();
+        settings.test_mac_scroll = enabled;
+        r.set_settings(settings);
         r.out.clear();
-        r.receive_contacts(origin, Frame::between(None, &sample(0, 2, 1000)));
-        assert!(!r.filter_multifinger(
-            origin,
-            MultiEvent::Gesture(Gesture::Magnify {
-                phase: GesturePhase::Began,
-                amount: 0.1,
-            })
-        ));
-        assert!(r.out.is_empty());
+        (r, origin)
+    }
+    fn magnify(phase: GesturePhase) -> MultiEvent {
+        MultiEvent::Gesture(Gesture::Magnify { phase, amount: 0.1 })
+    }
+    #[test]
+    fn test_mac_scroll_selects_exactly_one_owner_with_option_off_on_and_unavailable() {
+        for enabled in [false, true] {
+            for capacity in [None, Some(5)] {
+                let (mut r, origin) = experiment(enabled, capacity);
+                r.receive_contacts(origin, Frame::between(None, &sample(0, 2, 1000)));
+                let native = capacity.is_some() && !enabled;
+                assert_eq!(
+                    r.out
+                        .iter()
+                        .any(|o| matches!(o, Output::Inject(InjectEvent::TouchpadContacts(_)))),
+                    native
+                );
+                assert_eq!(
+                    r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Began)),
+                    !native
+                );
+                r.receive_contacts(
+                    origin,
+                    Frame::between(Some(&sample(0, 2, 1000)), &sample(8000, 3, 1200)),
+                );
+                assert_eq!(
+                    r.filter_multifinger(origin, magnify(GesturePhase::Began)),
+                    capacity.is_none()
+                );
+                assert_eq!(
+                    r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Ended)),
+                    !native
+                );
+                assert_eq!(
+                    r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::MomentumBegan)),
+                    !native
+                );
+                if enabled && capacity.is_some() {
+                    assert!(
+                        r.out.is_empty(),
+                        "scroll→pinch and scroll 2→3 cannot inject raw contacts"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn test_mac_scroll_replays_native_pinch_and_three_finger_frames_in_source_order() {
+        for start_fingers in [2, 3] {
+            let (mut r, origin) = experiment(true, Some(5));
+            r.receive_contacts(origin, Frame::between(None, &sample(0, start_fingers, 1000)));
+            if start_fingers == 2 {
+                assert!(r.out.is_empty());
+                r.receive_contacts(
+                    origin,
+                    Frame::between(Some(&sample(0, 2, 1000)), &sample(8000, 2, 1200)),
+                );
+                assert!(r.out.is_empty());
+            }
+            assert!(!r.filter_multifinger(origin, magnify(GesturePhase::Began)));
+            let frames: Vec<_> = r
+                .out
+                .iter()
+                .filter_map(|o| match o {
+                    Output::Inject(InjectEvent::TouchpadContacts(f)) => Some(*f),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(frames.len(), if start_fingers == 2 { 2 } else { 1 });
+            assert_eq!(frames[0].time_us, 0);
+            assert_eq!(frames[0].phase, Phase::Begin);
+            if start_fingers == 2 {
+                assert_eq!(frames[1].time_us, 8000);
+            }
+            assert!(!r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Began)));
+        }
+    }
+    #[test]
+    fn test_mac_scroll_pending_count_changes_lifts_overflow_and_boundaries_are_safe() {
+        for boundary in 0..6 {
+            let (mut r, origin) = experiment(true, Some(5));
+            r.receive_contacts(origin, Frame::between(None, &sample(0, 2, 1000)));
+            assert!(r.out.is_empty());
+            match boundary {
+                0 => {
+                    r.receive_contacts(
+                        origin,
+                        Frame::between(Some(&sample(0, 2, 1000)), &sample(8000, 3, 1200)),
+                    );
+                    assert_eq!(
+                        r.out
+                            .iter()
+                            .filter(|o| matches!(o, Output::Inject(InjectEvent::TouchpadContacts(_))))
+                            .count(),
+                        2
+                    );
+                    assert!(!r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Began)));
+                }
+                1 => {
+                    r.receive_contacts(origin, Frame::between(Some(&sample(0, 2, 1000)), &sample(8000, 0, 0)));
+                    assert!(r.out.is_empty());
+                    assert!(r.multifinger.is_empty());
+                }
+                2 => {
+                    for i in 1..=CLASSIFY_FRAMES {
+                        r.receive_contacts(
+                            origin,
+                            Frame::between(Some(&sample(0, 2, 1000)), &sample(i as u64 * 8000, 2, 1200)),
+                        );
+                    }
+                    assert!(r.out.is_empty());
+                    assert!(!r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Began)));
+                    assert_eq!(r.multifinger[&origin].path, MultiPath::Suppressed);
+                }
+                3 | 4 => {
+                    if boundary == 3 {
+                        let mut settings = r.cfg.settings.clone();
+                        settings.test_mac_scroll = false;
+                        r.set_settings(settings);
+                    } else {
+                        r.set_paused(true);
+                    }
+                    assert!(!r.out.iter().any(|o| matches!(o, Output::Inject(_))));
+                    assert!(!r.filter_multifinger(origin, magnify(GesturePhase::Began)));
+                }
+                _ => {
+                    r.release_origin(origin);
+                    assert!(r.pending_contacts.origin.is_none());
+                }
+            }
+        }
+    }
+    #[test]
+    fn test_mac_scroll_policy_switch_cancels_chosen_owner_and_never_injects_tails() {
+        for native in [false, true] {
+            let (mut r, origin) = experiment(true, Some(5));
+            r.receive_contacts(origin, Frame::between(None, &sample(0, 2, 1000)));
+            if native {
+                r.filter_multifinger(origin, magnify(GesturePhase::Began));
+            } else {
+                assert!(r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Began)));
+            }
+            r.out.clear();
+            let mut settings = r.cfg.settings.clone();
+            settings.test_mac_scroll = false;
+            r.set_settings(settings);
+            assert_eq!(cancels(&r), usize::from(native));
+            if !native {
+                assert!(r.out.iter().any(|o| matches!(o, Output::Inject(InjectEvent::TouchpadScroll { wheel, .. }) if wheel.phase == ScrollPhase::Cancelled)));
+            }
+            r.out.clear();
+            assert!(!r.filter_multifinger(origin, MultiEvent::Contacts(Phase::End)));
+            assert!(!r.filter_multifinger(origin, magnify(GesturePhase::Ended)));
+            assert!(!r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Ended)));
+            assert!(!r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::MomentumBegan)));
+            assert!(r.out.is_empty());
+        }
     }
     #[test]
     fn source_master_cancels_contacts_and_scroll_without_affecting_wheel() {

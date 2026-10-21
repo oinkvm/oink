@@ -175,6 +175,8 @@ impl Node {
                 }
                 Command::Install { expected_build } => {
                     state.begin_install(expected_build).map_err(api_error)?;
+                    #[cfg(target_os = "macos")]
+                    native::install_clicked();
                 }
                 Command::SetPreferences { preferences } => {
                     let previous = state.policy.clone();
@@ -440,6 +442,7 @@ fn install_candidate(node: Node) {
     #[cfg(target_os = "macos")]
     {
         token.provider = Some(provider);
+        native::quiesce_done();
     }
     crate::backend::on_main(move || {
         let node = token.node.clone();
@@ -478,6 +481,10 @@ mod native {
     pub fn install() -> bool {
         false
     }
+    #[cfg(target_os = "macos")]
+    pub fn install_clicked() {}
+    #[cfg(target_os = "macos")]
+    pub fn quiesce_done() {}
     #[cfg(not(windows))]
     pub fn preferences(_: Preferences) {}
     pub fn quit_allowed() -> bool {

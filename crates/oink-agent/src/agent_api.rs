@@ -727,11 +727,13 @@ pub(crate) fn input_settings(node: &Node) -> InputSettings {
     let r = &s.routing;
     let layout_settings = node.layout().0.settings;
     let speed_mode = s.speed_mode;
+    let contacts_injection_available = node.contacts_injection_available();
     InputSettings {
         mac_caps_switches_input_source: node.input_backend().caps_lock_switches_input_source(),
         key_support: KeySupport::default(),
         event_frequency: s.event_frequency,
-        accept_contacts: s.accept_contacts,
+        accept_contacts: s.accept_contacts && contacts_injection_available,
+        contacts_injection_available,
         emergency_hold_ms: s.emergency_hold_ms.get(),
         device_gain: s.screen_preferences.device_gain,
         scroll: ScrollSettings {
@@ -1164,7 +1166,10 @@ impl AgentApi for Node {
             for p in placements {
                 layout.place_device(p.device.0, p.origin, p.scale, true);
             }
-            layout.normalize();
+            // Adopt the submitted gaps. Contact compaction is part of the
+            // editor's manual edit and follows its local auto-compact toggle;
+            // undo/redo replays exact history values through this call too.
+            layout.repair_overlaps();
         })?;
         layout_api(self)
     }
@@ -1302,6 +1307,18 @@ impl AgentApi for Node {
         Ok(())
     }
 
+    fn test_mac_scroll(&self, enabled: Option<bool>) -> ApiResult<bool> {
+        let _gate = self.owner_gate();
+        if let Some(enabled) = enabled {
+            self.edit_local_input_settings(
+                &serde_json::json!({"routing":{"test_mac_scroll":enabled}}),
+                |settings| {
+                    settings.routing.test_mac_scroll = enabled;
+                },
+            )?;
+        }
+        Ok(self.settings().routing.test_mac_scroll)
+    }
     fn input_settings(&self) -> ApiResult<InputSettings> {
         Ok(input_settings(self))
     }
@@ -1309,6 +1326,10 @@ impl AgentApi for Node {
     fn set_input_settings(&self, patch: PreferencePatch<InputSettings>) -> ApiResult<()> {
         let _gate = self.owner_gate();
         let s = patch.apply(&input_settings(self))?;
+        let edits_contacts = patch.value().get("accept_contacts").is_some();
+        if edits_contacts && s.accept_contacts && !self.contacts_injection_available() {
+            return Err(invalid("Native contact injection is unavailable"));
+        }
         if !(0.1..=10.0).contains(&s.scroll.speed) {
             return Err(invalid("Scroll speed must be within 0.1–10"));
         }
@@ -1339,7 +1360,9 @@ impl AgentApi for Node {
             candidate.cursor_trail_duration_ms = s.cursor_trail_duration_ms;
             candidate.event_frequency = s.event_frequency;
             candidate.emergency_hold_ms = emergency_hold;
-            candidate.accept_contacts = s.accept_contacts;
+            if edits_contacts {
+                candidate.accept_contacts = s.accept_contacts;
+            }
             candidate.screen_preferences.device_gain = s.device_gain;
             candidate.speed_mode = match s.pointer.scaling {
                 PointerScaling::Physical => SpeedMode::Physical,
@@ -1476,6 +1499,10 @@ impl AgentApi for Node {
     }
     fn update_command(&self, command: UpdateCommand) -> ApiResult<UpdateStatus> {
         self.execute_update_command(command)
+    }
+    fn audio_quality(&self) -> ApiResult<AudioQuality> {
+        Ok(lock(&self.inner.audio_quality)
+            .view((oink_audio::diagnostics::monotonic_us(std::time::Instant::now()).max(0) / 1000) as u64))
     }
     fn connection_quality(&self) -> ApiResult<ConnectionQuality> {
         Ok(
@@ -1748,7 +1775,7 @@ pub(crate) fn status_view(node: &Node) -> ApiResult<StatusView> {
         backend_lifetime: crate::backend::launch::lifetime().status.into(),
         backend_uiaccess: crate::backend::launch::lifetime().uiaccess,
         contact_injection: node.input_backend().contact_injection_status(),
-        accept_contacts,
+        accept_contacts: accept_contacts && node.contacts_injection_available(),
         service: o.service,
         version: env!("OINK_RELEASE_VERSION").to_string(),
         uptime_s: node.inner.started.elapsed().as_secs(),

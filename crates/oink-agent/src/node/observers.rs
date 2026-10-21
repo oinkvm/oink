@@ -71,7 +71,7 @@ impl Node {
                 drop(inner);
                 let mut last_preferences = None;
                 let mut last_permissions = None;
-                let mut last_caps = None;
+                let mut last_input_capabilities = None;
                 let mut last_feel = None;
                 let mut last_edges = None;
                 let mut last_capture = None;
@@ -161,9 +161,12 @@ impl Node {
                         || last_preferences.is_none_or(|at: Instant| at.elapsed() >= Duration::from_secs(2))
                     {
                         last_preferences = Some(Instant::now());
-                        let caps = backend.caps_lock_switches_input_source();
-                        if last_caps != Some(caps) {
-                            last_caps = Some(caps);
+                        let capabilities = (
+                            backend.caps_lock_switches_input_source(),
+                            node.contacts_injection_available(),
+                        );
+                        if last_input_capabilities != Some(capabilities) {
+                            last_input_capabilities = Some(capabilities);
                             node.emit(ApiEvent::InputSettings(crate::agent_api::input_settings(&node)));
                         }
                         let permissions = backend.permissions();

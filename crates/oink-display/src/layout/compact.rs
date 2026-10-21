@@ -255,6 +255,20 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_computer_keeps_the_remaining_gaps() {
+        // Compaction belongs to a manual edit. A computer leaving the group is
+        // not one, so the gap it leaves and unrelated gaps stay as they are.
+        let mut l = layout(&[
+            (1, Rect::new(0., 0., 100., 100.)),
+            (2, Rect::new(100., 0., 100., 100.)),
+            (3, Rect::new(260., 0., 100., 100.)),
+        ]);
+        let before = l.clone();
+        l.remove_device(DeviceId([2; 32]));
+        assert_eq!(l.screens, [before.screens[0].clone(), before.screens[2].clone()]);
+    }
+
+    #[test]
     fn desktop_holes_and_existing_contact_do_not_pull_or_slide() {
         let mut hole = layout(&[
             (1, Rect::new(0., 0., 100., 100.)),
@@ -326,7 +340,7 @@ mod tests {
             );
             assert_eq!(l, before, "the lower gap is intentional at scale {scale}");
             if scale < 1. {
-                // Backend saves repair collisions before compacting. Native-scale
+                // `normalize` repairs collisions before compacting. Native-scale
                 // roundoff is below collision area tolerance and must still retain
                 // the complete contact projection during that normalization path.
                 l.normalize();

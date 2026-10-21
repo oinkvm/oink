@@ -6,6 +6,18 @@ import type { Message } from '../catalog';
  * uses each message.
  */
 export const en = {
+  "音频质量": "Audio quality",
+  "最近 60 秒各来源的接收缓冲、码率和断音": "Receive buffers, bitrate and dropouts by source over the last 60 seconds",
+  "音频 缓冲 码率 断音 图表": "audio buffer bitrate dropouts chart",
+  "尚未接收音频": "No audio received",
+  "音频缓冲：{0}": "Audio buffer: {0}",
+  "无法读取音频质量": "Could not read audio quality",
+  "缓冲 P50": "Buffer P50",
+  "缓冲 P90": "Buffer P90",
+  "缓冲 P99": "Buffer P99",
+  "平均码率": "Average bitrate",
+  "断音": "Dropouts",
+
   "更新下载完成后，点击安装会立即中断共享并重启 Oink。": "After downloading, click Install to interrupt sharing and restart Oink immediately.",
   "准备安装": "Ready to install",
   "安装会立即中断输入、音频和文件共享，并重启 Oink。": "Installation immediately interrupts input, audio and file sharing, then restarts Oink.",
@@ -65,6 +77,7 @@ export const en = {
   "排列操作": "Arrangement actions",
   "撤销": "Undo",
   "重做": "Redo",
+  "自动靠拢": "Auto-compact",
   "关闭": "Close",
   // arrange/Arrangement.tsx
   "（{0}）": " ({0})",
@@ -622,6 +635,8 @@ export const en = {
   "下载更新": "Download update",
   "重启升级": "Restart to update",
   "取消下载": "Cancel download",
+  "隐藏": "Hide",
+  "校验中": "Verifying",
   "此测试版需要手动下载并安装更新。": "Download and install updates manually for this beta.",
   "无法完成更新，请重试或前往发布页面下载安装。": "Could not complete the update. Retry or install from the releases page.",
   // onboarding/Onboarding.tsx (permissions)

@@ -192,10 +192,10 @@ async fn three_nodes_manual_coordinates_offline_and_restart_scenario() {
 
     assert_eq!(c.input_settings().unwrap().event_frequency, c_frequency);
 
-    // An API client can submit an un-compacted layout without using the canvas.
-    // The upper computer must meet the nearer of two staggered lower computers;
-    // the complete normalized register then converges without receiver rewrites.
-    let compact_placements = [
+    // Compaction belongs to the editor's manual edit, behind its local toggle.
+    // A save adopts the submitted gaps exactly (only collisions are repaired),
+    // and the register converges without receiver rewrites.
+    let gap_placements = [
         (a.id(), Point::new(0.9, 0.0), 1.6 / 1600.0),
         (b.id(), Point::new(0.0, 1.08), 1.0 / 1600.0),
         (c.id(), Point::new(1.3, 1.12), 1.04 / 1600.0),
@@ -206,12 +206,12 @@ async fn three_nodes_manual_coordinates_offline_and_restart_scenario() {
         scale,
     })
     .to_vec();
-    api(&b, move |n| n.save_layout(compact_placements)).await.unwrap();
-    wait_for("backend-compacted layout reaches all three nodes", 10.0, || {
-        identical(&a, &b) && identical(&a, &c)
+    api(&b, move |n| n.save_layout(gap_placements)).await.unwrap();
+    wait_for("saved gaps reach all three nodes", 10.0, || {
+        identical(&a, &b) && identical(&a, &c) && rect_of(&a, a.id()).y == 0.0
     })
     .await;
-    assert!((rect_of(&a, a.id()).y - 0.08).abs() < 1e-10);
+    assert_eq!(rect_of(&a, a.id()).y, 0.0);
     assert_eq!(rect_of(&a, b.id()).y, 1.08);
     assert_eq!(rect_of(&a, c.id()).y, 1.12);
 

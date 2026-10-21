@@ -1,15 +1,15 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset=".github/assets/banner-ko-dark.png">
-    <img alt="Oink — Oink Is Not a KVM. 당신의 컴퓨터를, 하나로." src=".github/assets/banner-ko-light.png" width="860">
+    <img alt="Oink — Oink Is Not only a KVM. 당신의 컴퓨터를, 하나로." src=".github/assets/banner-ko-light.png" width="860">
   </picture>
 </p>
 
-# Oink — Oink Is Not a KVM
+# Oink — Oink Is Not only a KVM
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | **한국어**
 
-Oink는 "Oink Is Not a KVM"의 약자로, 여러 대의 Windows와 Mac 사이에 P2P 공유 네트워크를 구축하는 최신 소프트웨어입니다. 어느 기기의 키보드, 마우스, 트랙패드로든 가까운 다른 기기를 조작할 수 있으며, 어디서나 통일된 네이티브 조작감을 유지합니다. 여러 기기의 오디오를 한 기기에 연결된 스피커나 헤드폰으로 재생할 수 있고, 클립보드 공유와 기기 간 드래그 앤 드롭, 로컬 네트워크 기기 자동 검색을 지원하며, 모든 통신은 기본적으로 암호화됩니다.
+Oink는 "Oink Is Not only a KVM"의 약자로, 여러 대의 Windows와 Mac 사이에 P2P 공유 네트워크를 구축하는 최신 소프트웨어입니다. 어느 기기의 키보드, 마우스, 트랙패드로든 가까운 다른 기기를 조작할 수 있으며, 어디서나 통일된 네이티브 조작감을 유지합니다. 여러 기기의 오디오를 한 기기에 연결된 스피커나 헤드폰으로 재생할 수 있고, 클립보드 공유와 기기 간 드래그 앤 드롭, 로컬 네트워크 기기 자동 검색을 지원하며, 모든 통신은 기본적으로 암호화됩니다.
 
 > Oink는 개인 프로젝트입니다. 코드는 모두 AI가 작성했으며(Claude Code와 Codex에 감사드립니다), 사람은 프로젝트 관리, 기술 방향 결정, 그리고 AI를 격려하는 일을 맡고 있습니다. 다양한 환경에서 충분히 테스트되지 않았으며, 특히 다음 환경은 검증되지 않았습니다.
 >

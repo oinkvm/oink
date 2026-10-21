@@ -549,6 +549,7 @@ pub struct Router {
     touchpad_contacts: Option<u8>,
     accept_contacts: bool,
     multifinger: HashMap<DeviceId, contacts::MultiFinger>,
+    pending_contacts: contacts::PendingContacts,
     contacts: crate::contacts::Source,
     contacts_target: Option<DeviceId>,
     contacts_received: Option<(DeviceId, u32)>,
@@ -665,6 +666,7 @@ impl Router {
             touchpad_contacts: None,
             accept_contacts: true,
             multifinger: HashMap::new(),
+            pending_contacts: contacts::PendingContacts::default(),
             contacts: Default::default(),
             contacts_target: None,
             contacts_received: None,
@@ -701,6 +703,9 @@ impl Router {
         let dnd_was = self.dnd_enabled();
         self.apply_source_modes(settings.mouse_mode, settings.keyboard_mode);
         self.set_accept_contacts(settings.accept_contacts);
+        if self.cfg.settings.test_mac_scroll != settings.test_mac_scroll {
+            self.retire_received_multifinger();
+        }
         if self.cfg.settings.forward_gestures && !settings.forward_gestures {
             self.cancel_source_contacts();
             self.cancel_local_gesture();
@@ -3287,6 +3292,9 @@ impl Router {
     fn release_origin(&mut self, origin: DeviceId) {
         self.button_diagnostics.release_origin(origin);
         self.multifinger.remove(&origin);
+        if self.pending_contacts.origin == Some(origin) {
+            self.pending_contacts.clear();
+        }
         if self.contacts_received.is_some_and(|(peer, _)| peer == origin) {
             self.cancel_received_contacts();
         }

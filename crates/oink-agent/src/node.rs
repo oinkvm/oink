@@ -143,6 +143,7 @@ pub(crate) struct Inner {
     last_input: Mutex<Option<api::InputSettings>>,
     pub(crate) current_alerts: Mutex<Vec<api::Alert>>,
     pub(crate) quality: Mutex<crate::connection_quality::History>,
+    pub(crate) audio_quality: Mutex<crate::audio_quality::History>,
     pub started: Instant,
     #[cfg(all(test, debug_assertions))]
     pub platform_ready: AtomicBool,
@@ -343,6 +344,7 @@ impl Node {
                 last_input: Mutex::new(None),
                 current_alerts: Mutex::new(Vec::new()),
                 quality: Mutex::default(),
+                audio_quality: Mutex::default(),
                 started: Instant::now(),
                 #[cfg(all(test, debug_assertions))]
                 platform_ready: AtomicBool::new(false),

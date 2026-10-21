@@ -133,6 +133,11 @@ impl Node {
                 cursor_hiding_cause_available: None,
             })
     }
+    pub(crate) fn contacts_injection_available(&self) -> bool {
+        self.input_backend()
+            .touchpad_contacts()
+            .is_some_and(|n| (2..=5).contains(&n))
+    }
     pub(crate) fn publish_local_options(&self) {
         let Some(group) = self.inner.group.get() else { return };
         // Serialize sensor publications and read after admission to this gate,

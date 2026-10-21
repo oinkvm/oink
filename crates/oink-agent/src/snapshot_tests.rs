@@ -417,7 +417,6 @@ fn replacement_stream_receives_current_large_clipboard_offer() {
 }
 
 async fn replacement_stream_receives_current_large_clipboard_offer_scenario() {
-    crate::logs::init();
     for source_is_coordinator in [true, false] {
         replacement_clipboard_from_either_session_role(source_is_coordinator).await;
     }
@@ -768,6 +767,119 @@ fn trail_preferences_remain_local_and_survive_restart() {
 }
 
 #[test]
+fn unavailable_contacts_are_effectively_disabled_without_rewriting_preference() {
+    crate::test_watchdog::run(module_path!(), "unavailable contacts settings", Some(4), async {
+        let dir = tempfile::tempdir().unwrap();
+        let config = oink_test_support::network_config(dir.path().join("a"), "a", 0);
+        let node = start_with_clip(&config, &Displays::new("a"), None).await;
+        assert!(node.settings().accept_contacts);
+        let settings = serde_json::to_value(node.input_settings().unwrap()).unwrap();
+        assert_eq!(settings["accept_contacts"], false);
+        assert_eq!(settings["contacts_injection_available"], false);
+        assert!(!node.status().unwrap().accept_contacts);
+        assert!(
+            node.set_input_settings(serde_json::from_value(serde_json::json!({"accept_contacts":true})).unwrap())
+                .is_err()
+        );
+        node.set_input_settings(serde_json::from_value(serde_json::json!({"event_frequency":"hz125"})).unwrap())
+            .unwrap();
+        assert!(
+            node.settings().accept_contacts,
+            "unrelated patch must preserve stored true"
+        );
+        node.shutdown().await;
+    });
+}
+
+#[test]
+fn local_contacts_capability_and_effective_preference_recover() {
+    crate::test_watchdog::run(module_path!(), "contacts capability facts", Some(4), async {
+        let dir = tempfile::tempdir().unwrap();
+        let configs = [
+            oink_test_support::network_config(dir.path().join("a"), "a", 0),
+            oink_test_support::network_config(dir.path().join("b"), "b", 0),
+        ];
+        let input = Arc::new(FakeInput::new());
+        input.set_touchpad_contacts(Some(5));
+        let a = Node::start(NodeOptions {
+            net: configs[0].clone(),
+            input: input.clone(),
+            displays: vec![],
+            display_backend: Some(Displays::new("a")),
+            clipboard: None,
+            mode_switch_in_callback: true,
+            capture_reports_key_repeat: false,
+            cursor_trail: false,
+        })
+        .await
+        .unwrap();
+        let b = start_with_clip(&configs[1], &Displays::new("b"), None).await;
+        pair(&a, &b).await;
+        let (send, receive) = std::sync::mpsc::channel();
+        let subscription = a.subscribe(Arc::new(move |event| {
+            if let crate::api::ApiEvent::InputSettings(settings) = event {
+                let _ = send.send((settings.accept_contacts, settings.contacts_injection_available));
+            }
+        }));
+        receive.try_iter().for_each(drop);
+        for available in [false, true, false] {
+            input.set_touchpad_contacts(available.then_some(5));
+            a.publish_local_options();
+            until("local settings view follows injector changes", || {
+                receive.try_iter().any(|v| v == (available, available))
+            })
+            .await;
+            assert_eq!(a.input_settings().unwrap().accept_contacts, available);
+            assert!(a.settings().accept_contacts);
+            if !available {
+                let requester = b.clone();
+                let target = a.id();
+                let result = tokio::task::spawn_blocking(move || {
+                    requester.edit_device_option(
+                        target.into(),
+                        oink_protocol::v1::dto::LocalOption::AcceptContacts,
+                        oink_protocol::v1::RawValue::Bool(true),
+                    )
+                })
+                .await
+                .unwrap();
+                assert!(
+                    result.is_err(),
+                    "remote owner command cannot enable an unavailable injector"
+                );
+                assert!(a.settings().accept_contacts);
+            }
+            // Existing owner facts retain the stored preference; runtime
+            // injector availability stays local to this receiver/UI API.
+            let preference = b
+                .device_facts(a.id())
+                .unwrap()
+                .preferences()
+                .unwrap()
+                .unwrap()
+                .0
+                .into_iter()
+                .find(|p| p.option() == Ok(oink_protocol::v1::dto::LocalOption::AcceptContacts))
+                .unwrap();
+            assert_eq!(preference.value().unwrap(), oink_protocol::v1::RawValue::Bool(true));
+        }
+        assert!(!a.test_mac_scroll(None).unwrap());
+        a.test_mac_scroll(Some(true)).unwrap();
+        assert!(
+            crate::config::AgentConfig::load_from(&configs[0].data_dir)
+                .unwrap()
+                .settings
+                .routing
+                .test_mac_scroll
+        );
+        assert!(!b.test_mac_scroll(None).unwrap());
+        a.unsubscribe(subscription);
+        a.shutdown().await;
+        b.shutdown().await;
+    });
+}
+
+#[test]
 fn contact_acceptance_is_owned_by_the_receiver_and_survives_restart() {
     crate::test_watchdog::run(
         module_path!(),
@@ -786,7 +898,8 @@ fn contact_acceptance_is_owned_by_the_receiver_and_survives_restart() {
             let mut settings = a.input_settings().unwrap();
             settings.accept_contacts = false;
             input_preferences(&a, settings).await;
-            assert!(b.input_settings().unwrap().accept_contacts);
+            assert!(!b.input_settings().unwrap().accept_contacts);
+            assert!(b.settings().accept_contacts);
             assert_eq!(a.layout().1, version);
             until("receiver preference reaches peer facts", || {
                 b.device_facts(a.id())

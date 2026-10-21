@@ -334,12 +334,33 @@ pub(super) fn cached_msi(path: &Path, installer: &Path) -> io::Result<File> {
 /// maintenance lock and establishing that no transaction is pending.
 pub(super) fn prune(current_build: u64) -> Result<(), Error> {
     let maintenance = maintenance().map_err(|_| Error::Storage)?;
+    prune_at(&maintenance, Some(current_build), open_one).map(|_| ())
+}
+/// Called under the maintenance lock before the service admits any requests.
+/// A pending transaction owns its files, including reboot/recovery state.
+pub(super) fn prune_completed() -> Result<bool, Error> {
+    let maintenance = maintenance().map_err(|_| Error::Storage)?;
+    prune_at(&maintenance, None, open_one)
+}
+fn prune_at(
+    maintenance: &Path,
+    before_install: Option<u64>,
+    mut open: impl FnMut(&Path, bool) -> io::Result<File>,
+) -> Result<bool, Error> {
+    if maintenance.join("pending.json").exists() {
+        return Ok(false);
+    }
     for (name, transactions) in [("transactions", true), ("cache", false)] {
+        // At startup retain both current and prior rollback packages. At the
+        // next install only the then-current package is needed as its rollback.
+        if !transactions && before_install.is_none() {
+            continue;
+        }
         let root = maintenance.join(name);
         if !root.exists() {
             continue;
         }
-        let _root = open_one(&root, true).map_err(|_| Error::Storage)?;
+        let _root = open(&root, true).map_err(|_| Error::Storage)?;
         for child in std::fs::read_dir(&root).map_err(|_| Error::Storage)? {
             let child = child.map_err(|_| Error::Storage)?;
             let Some(name) = child.file_name().to_str().map(str::to_owned) else {
@@ -349,23 +370,40 @@ pub(super) fn prune(current_build: u64) -> Result<(), Error> {
                 super::valid_transaction(&name)
             } else {
                 name.parse::<u64>()
-                    .is_ok_and(|build| build != current_build && build.to_string() == name)
+                    .is_ok_and(|build| Some(build) != before_install && build.to_string() == name)
             };
             if obsolete {
-                remove_tree(&child.path())?;
+                remove_tree(&child.path(), &mut open)?;
             }
         }
     }
-    Ok(())
+    if before_install.is_none() {
+        // No Ready selection survives a service restart. Reclaim the fixed
+        // download slot (including an interrupted atomic write) and orphaned
+        // authorization only after ruling out a pending transaction.
+        for name in [
+            "downloads/candidate.msi",
+            "downloads/candidate.new",
+            "msi-authorization.json",
+        ] {
+            let path = maintenance.join(name);
+            if path.exists() {
+                let file = open(&path, false).map_err(|_| Error::Storage)?;
+                drop(file);
+                std::fs::remove_file(path).map_err(|_| Error::Storage)?;
+            }
+        }
+    }
+    Ok(true)
 }
-fn remove_tree(path: &Path) -> Result<(), Error> {
-    let directory = open_one(path, true).map_err(|_| Error::Storage)?;
+fn remove_tree(path: &Path, open: &mut impl FnMut(&Path, bool) -> io::Result<File>) -> Result<(), Error> {
+    let directory = open(path, true).map_err(|_| Error::Storage)?;
     for child in std::fs::read_dir(path).map_err(|_| Error::Storage)? {
         let child = child.map_err(|_| Error::Storage)?;
         if child.file_type().map_err(|_| Error::Storage)?.is_dir() {
-            remove_tree(&child.path())?;
+            remove_tree(&child.path(), open)?;
         } else {
-            let file = open(&child.path()).map_err(|_| Error::Storage)?;
+            let file = open(&child.path(), false).map_err(|_| Error::Storage)?;
             drop(file);
             std::fs::remove_file(child.path()).map_err(|_| Error::Storage)?;
         }
@@ -377,6 +415,61 @@ fn remove_tree(path: &Path) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn staging_retention_is_bounded_across_updates_and_restart_preserves_rollback_cache() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        for directory in ["cache/31", "transactions", "downloads"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        std::fs::write(root.join("cache/31/package.msi"), b"prior package").unwrap();
+        std::fs::write(root.join("last-result.json"), b"result").unwrap();
+        std::fs::write(root.join("policy.json"), b"policy").unwrap();
+        // Same traversal/sharing behavior, with only the privileged ACL check
+        // replaced for an isolated ordinary-user filesystem fixture.
+        for current in 31..35 {
+            assert!(prune_at(root, Some(current), open_raw).unwrap());
+            assert_eq!(std::fs::read_dir(root.join("cache")).unwrap().count(), 1);
+            assert_eq!(std::fs::read_dir(root.join("transactions")).unwrap().count(), 0);
+            let next = current + 1;
+            let cache = root.join(format!("cache/{next}"));
+            std::fs::create_dir(&cache).unwrap();
+            std::fs::write(cache.join("package.msi"), b"new package").unwrap();
+            let tx = root.join(format!("transactions/{next:032x}/candidate-check"));
+            std::fs::create_dir_all(&tx).unwrap();
+            std::fs::write(tx.join("unpacked.bin"), b"inventory fixture").unwrap();
+            std::fs::write(root.join("downloads/candidate.msi"), b"download").unwrap();
+        }
+        assert_eq!(std::fs::read_dir(root.join("cache")).unwrap().count(), 2);
+        assert_eq!(std::fs::read_dir(root.join("transactions")).unwrap().count(), 1);
+        std::fs::write(root.join("downloads/candidate.new"), b"interrupted write").unwrap();
+        std::fs::write(root.join("msi-authorization.json"), b"orphan").unwrap();
+        assert!(prune_at(root, None, open_raw).unwrap());
+        assert!(prune_at(root, None, open_raw).unwrap()); // Idempotent restart.
+        assert_eq!(std::fs::read_dir(root.join("transactions")).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(root.join("downloads")).unwrap().count(), 0);
+        assert!(!root.join("msi-authorization.json").exists());
+        for file in [
+            "cache/34/package.msi",
+            "cache/35/package.msi",
+            "last-result.json",
+            "policy.json",
+        ] {
+            assert!(root.join(file).exists(), "{file}");
+        }
+    }
+    #[test]
+    fn startup_cleanup_preserves_everything_while_recovery_is_pending() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let tx = root.join("transactions/0123456789abcdef0123456789abcdef");
+        std::fs::create_dir_all(&tx).unwrap();
+        std::fs::write(tx.join("worker.exe"), b"never executed").unwrap();
+        std::fs::write(root.join("pending.json"), b"recovery owns this tree").unwrap();
+        assert!(!prune_at(root, None, |_, _| panic!("must not open pending trees")).unwrap());
+        assert!(tx.join("worker.exe").exists());
+        assert!(root.join("pending.json").exists());
+    }
     #[test]
     fn staging_acl_rejects_user_ownership_and_any_unprivileged_write_right() {
         let inspect = |sddl: &str| -> io::Result<()> {

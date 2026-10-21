@@ -600,6 +600,9 @@ impl Drop for AudioStreams {
 /// Ownership changes only after the realtime reader has left its short read section.
 /// The dormant owner keeps these same admission facts and consumes from the same M1.
 pub struct MediaReader {
+    pub quality_id: u64,
+    pub dropouts: std::sync::Arc<oink_audio::sink::DropoutCounters>,
+    payload_bytes: std::sync::atomic::AtomicU64,
     table: std::sync::Arc<oink_foundation::snapshot::Snapshot<ForwardTable>>,
     peer: DeviceId,
     identity: Option<(StreamId, u64, StreamFormat)>,
@@ -614,6 +617,7 @@ impl MediaReader {
         peer: DeviceId,
         activity: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     ) -> Self {
+        static NEXT_QUALITY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let identity = table
             .load()
             .from
@@ -621,6 +625,9 @@ impl MediaReader {
             .find(|source| source.peer == peer)
             .map(|source| (source.packets.follows(), source.stream_id, source.format));
         Self {
+            quality_id: NEXT_QUALITY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            dropouts: Default::default(),
+            payload_bytes: Default::default(),
             table,
             peer,
             identity,
@@ -628,6 +635,9 @@ impl MediaReader {
             bursts: Default::default(),
             owner: std::sync::atomic::AtomicU8::new(0),
         }
+    }
+    pub fn payload_bytes(&self) -> u64 {
+        self.payload_bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn take_control(&self) -> bool {
         use std::sync::atomic::Ordering;
@@ -682,6 +692,8 @@ impl MediaReader {
                     payload,
                     silent,
                 }) => {
+                    self.payload_bytes
+                        .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     if !self.bursts.media(burst, sequence, arrived) {
                         continue;
                     }
@@ -905,6 +917,11 @@ mod direct_media_tests {
         assert!(write(&media));
         assert!(reader.read().1.is_some());
         assert_eq!(reader.bursts.generation(), 3);
+        assert_eq!(
+            reader.payload_bytes(),
+            960,
+            "payload only; no M1 headers, sleep messages or malformed media"
+        );
     }
     #[test]
     fn reader_handover_cannot_steal_an_inflight_realtime_read() {

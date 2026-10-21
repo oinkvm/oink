@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Select, Switch } from 'oink-ui';
 import { api, shell } from '../api/client';
+import { openUpdateDialog } from '../window/Upgrade';
 import { agent } from '../api/store';
 import type { UpdatePreferences as Preferences, UpdateStatus } from '../api/update';
 import { tr } from '../i18n';
@@ -10,7 +11,7 @@ export async function checkForUpdates(status:UpdateStatus|null) {
     await shell.openUrl('https://github.com/oinkvm/oink/releases');
   } else {
     await agent.query('update',()=>api.update({type:'check'}));
-    await shell.open('upgrade');
+    openUpdateDialog();
   }
 }
 

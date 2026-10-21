@@ -212,6 +212,23 @@ pub(crate) fn start_link_runtime(
                 );
                 keep_local.store(owner.settings.keep_local_playback, Ordering::Release);
                 owner.keep_local = keep_local;
+                let quality_node = weak.clone();
+                owner.on_quality = Some(Arc::new(move |at_ms, observations, final_bucket| {
+                    if let Some(inner) = quality_node.upgrade() {
+                        let node = Node { inner };
+                        let view = {
+                            let mut history = lock(&node.inner.audio_quality);
+                            let observations = observations.into_iter().map(|o| (node.device_name(o.device), o));
+                            if final_bucket {
+                                history.flush(at_ms, observations);
+                            } else {
+                                history.record(at_ms, observations);
+                            }
+                            history.view(at_ms)
+                        };
+                        node.emit(crate::api::ApiEvent::AudioQuality(view));
+                    }
+                }));
                 let statistics_node = weak.clone();
                 owner.on_statistics = Some(Arc::new(move |statistics| {
                     if let Some(inner) = statistics_node.upgrade() {
@@ -236,7 +253,11 @@ pub(crate) fn start_link_runtime(
     Ok((handle, task))
 }
 
+type QualityCallback = Arc<dyn Fn(u64, Vec<crate::audio_quality::Observation>, bool) + Send + Sync>;
+
 struct Receiver {
+    quality_callback: Option<QualityCallback>,
+    peer: DeviceId,
     stream: oink_network::link::StreamId,
     format: Negotiated,
     source: Option<oink_audio::sink::Source>,
@@ -248,6 +269,36 @@ struct Receiver {
     observed_sleep: bool,
     observed_burst: u64,
     events: timing::ReceiveEvents,
+}
+impl Receiver {
+    fn quality_observation(&self, now: Instant, retiring: bool) -> crate::audio_quality::Observation {
+        crate::audio_quality::Observation {
+            device: self.peer,
+            buffer_ms: (!retiring && !self.reader.bursts.asleep(now))
+                .then(|| self.source.as_ref().map_or(0., |s| s.stats().buffered_ms)),
+            bytes: self.reader.payload_bytes(),
+            glitches: self
+                .reader
+                .dropouts
+                .snapshot((oink_audio::diagnostics::monotonic_us(now).max(0) / 1000) as u64),
+            session: self.reader.quality_id,
+        }
+    }
+}
+impl Drop for Receiver {
+    fn drop(&mut self) {
+        if self.reader.payload_bytes() > 0
+            && let Some(callback) = &self.quality_callback
+        {
+            let now = Instant::now();
+            // Flush the final partial counter bucket before losing this session.
+            callback(
+                (oink_audio::diagnostics::monotonic_us(now).max(0) / 1000) as u64,
+                vec![self.quality_observation(now, true)],
+                true,
+            );
+        }
+    }
 }
 struct StartingPlayback {
     result: mpsc::Receiver<Result<Box<dyn PlaybackStream>, String>>,
@@ -286,6 +337,8 @@ struct Owner {
     on_status: Option<Arc<dyn Fn(Status) + Send + Sync>>,
     on_statistics: Option<Arc<dyn Fn(crate::api::AudioStatistics) + Send + Sync>>,
     published_state: Option<Status>,
+    quality_at: Instant,
+    on_quality: Option<QualityCallback>,
     volume: Arc<oink_foundation::snapshot::Snapshot<Option<Arc<dto::AudioSessionContext>>>>,
     keep_local: Arc<AtomicBool>,
     store: Arc<Mutex<AgentConfig>>,
@@ -467,6 +520,8 @@ impl Owner {
             state,
             on_status: None,
             on_statistics: None,
+            quality_at: Instant::now(),
+            on_quality: None,
             published_state: None,
             volume,
             store,
@@ -1028,6 +1083,8 @@ impl Owner {
             self.receivers.entry(source.peer).or_insert_with(|| {
                 let links = self.links.clone();
                 Receiver {
+                    quality_callback: self.on_quality.clone(),
+                    peer: source.peer,
                     stream: source.packets.follows(),
                     format: Negotiated {
                         generation: source.stream_id,
@@ -1146,6 +1203,7 @@ impl Owner {
                 }
                 match playback.realtime_source(dsp_config(receiver.format.format)) {
                     Ok(Some(mut port)) => {
+                        port.set_dropout_counters(receiver.reader.dropouts.clone());
                         while let Some(packet) = receiver.backlog.pop_front() {
                             if !port.push_packet(packet) {
                                 self.fail_playback("audio wake receiver capacity exceeded".into());
@@ -1435,6 +1493,23 @@ impl Owner {
                     outcome.source_emit,
                     outcome.accepted,
                     outcome.late,
+                );
+            }
+        }
+        if now.saturating_duration_since(self.quality_at) >= Duration::from_millis(250) {
+            self.quality_at +=
+                Duration::from_millis((now.saturating_duration_since(self.quality_at).as_millis() / 250) as u64 * 250);
+            if let Some(on_quality) = &self.on_quality {
+                let observations = self
+                    .receivers
+                    .iter()
+                    .filter(|(_, r)| r.reader.payload_bytes() > 0)
+                    .map(|(_, r)| r.quality_observation(now, false))
+                    .collect();
+                on_quality(
+                    (oink_audio::diagnostics::monotonic_us(now).max(0) / 1000) as u64,
+                    observations,
+                    false,
                 );
             }
         }

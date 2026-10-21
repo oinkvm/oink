@@ -1,15 +1,15 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset=".github/assets/banner-ja-dark.png">
-    <img alt="Oink — Oink Is Not a KVM。あなたのパソコンを、ひとつに。" src=".github/assets/banner-ja-light.png" width="860">
+    <img alt="Oink — Oink Is Not only a KVM。あなたのパソコンを、ひとつに。" src=".github/assets/banner-ja-light.png" width="860">
   </picture>
 </p>
 
-# Oink — Oink Is Not a KVM
+# Oink — Oink Is Not only a KVM
 
 [English](README.md) | [简体中文](README.zh-CN.md) | **日本語** | [한국어](README.ko.md)
 
-Oink は「Oink Is Not a KVM」の略で、複数の Windows と Mac のあいだにピアツーピアの共有ネットワークを構築するモダンなソフトウェアです。どのデバイスのキーボード・マウス・トラックパッドでも近くの任意のデバイスを操作でき、どこでも統一されたネイティブな操作感を保ちます。複数のデバイスの音声を 1 台のデバイスにつないだスピーカーやヘッドホンで再生でき、クリップボードの共有とデバイス間のドラッグ＆ドロップ、ローカルネットワーク上のデバイスの自動検出に対応し、通信はデフォルトで暗号化されます。
+Oink は「Oink Is Not only a KVM」の略で、複数の Windows と Mac のあいだにピアツーピアの共有ネットワークを構築するモダンなソフトウェアです。どのデバイスのキーボード・マウス・トラックパッドでも近くの任意のデバイスを操作でき、どこでも統一されたネイティブな操作感を保ちます。複数のデバイスの音声を 1 台のデバイスにつないだスピーカーやヘッドホンで再生でき、クリップボードの共有とデバイス間のドラッグ＆ドロップ、ローカルネットワーク上のデバイスの自動検出に対応し、通信はデフォルトで暗号化されます。
 
 > Oink は個人プロジェクトです。コードはすべて AI が書いており（Claude Code と Codex に感謝します）、人間はプロジェクト管理、技術的な方向性の決定、そして AI を励ますことを担当しています。多様な環境では十分にテストされておらず、特に次の環境は未検証です：
 >

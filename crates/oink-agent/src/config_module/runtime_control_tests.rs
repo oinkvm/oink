@@ -79,6 +79,48 @@ async fn unreceipted_commit_after_peer_reset_keeps_the_link_available_for_pairin
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn facts_drain_barrier_requires_a_new_publication() {
+    // No peer/RTT changes can accidentally advance these retained Facts.
+    // A receiver may already hold this sequence while another copy is queued.
+    let nodes = start(fresh(1)).await;
+    let (observed, marker) = nodes[0]
+        .group
+        .call(|owner| {
+            owner.publish_facts()?;
+            let observed = owner.local.value().fact_sequence().map_err(internal)?;
+            let marker = publish_facts_barrier(owner)?;
+            Ok((observed, marker))
+        })
+        .unwrap();
+    stop(&nodes).await;
+    assert!(
+        marker > observed,
+        "an already observed Facts sequence cannot acknowledge queued frames: observed={observed}, marker={marker}"
+    );
+}
+
+fn publish_facts_barrier(owner: &mut Owner) -> ApiResult<u64> {
+    // Unchanged Facts retain their sequence. A receiver can already have that
+    // value while another copy is still queued on C0. Give the drain marker a
+    // fresh sequence before publishing so an earlier observation cannot pass.
+    let next = owner
+        .local
+        .value()
+        .fact_sequence()
+        .map_err(internal)?
+        .checked_add(1)
+        .unwrap();
+    owner
+        .local
+        .edit(|raw| {
+            raw.insert(2, next.write());
+            Ok(())
+        })
+        .map_err(internal)?;
+    owner.publish_facts()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admitted_member_can_repeat_signed_history_while_readmission_is_pending() {
     let nodes = start(fresh(3)).await;
     let first = request(&nodes[0], &nodes[1], [8; 16]).await;
@@ -129,7 +171,7 @@ async fn admitted_member_can_repeat_signed_history_while_readmission_is_pending(
         node.group.hold_periodic_facts();
     }
     let origin = nodes[0].identity.id();
-    let sequence = nodes[0].group.call(|owner| owner.publish_facts()).unwrap();
+    let sequence = nodes[0].group.call(publish_facts_barrier).unwrap();
     assert!(
         until(|| nodes[1]
             .group

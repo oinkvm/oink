@@ -191,6 +191,7 @@ export interface InputSettings {
   /** Local normal pointer-motion rate; persisted by the settings owner. */
   event_frequency: EventFrequency;
   accept_contacts: boolean;
+  contacts_injection_available: boolean;
   emergency_hold_ms: number;
   device_gain: number;
   scroll: ScrollSettings;
@@ -326,6 +327,7 @@ export interface AimStatus {
 
 export type ApiEvent =
   | { type: "connection_quality"; data: ConnectionQuality }
+  | { type: "audio_quality"; data: AudioQuality }
   | { type: "diagnostics_status"; data: DiagnosticRecorderStatus }
   | { type: "launch_at_login"; data: LaunchAtLoginStatus }
   | { type: "audio"; data: AudioStatus }
@@ -615,3 +617,12 @@ export interface Notification {
   persistent?: boolean;
 }
 export interface NotificationReceipt { id: string; screen: ScreenKey | null; remote: boolean }
+
+export interface AudioDropoutBucket { at_ms: number; lost: number; late: number }
+export interface AudioQualitySample { at_ms: number; buffer_ms: number | null }
+export interface AudioSourceQuality {
+  device: DeviceKey; name: string; samples: AudioQualitySample[];
+  p50_ms: number | null; p90_ms: number | null; p99_ms: number | null;
+  bitrate_kbps: number; dropouts: number; glitches: AudioDropoutBucket[];
+}
+export interface AudioQuality { revision: number; sampled_at_ms: number; sources: AudioSourceQuality[] }

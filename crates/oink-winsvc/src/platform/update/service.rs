@@ -378,6 +378,14 @@ pub(super) fn serve() {
     if protected::system().is_err() {
         return;
     }
+    // The running transaction worker cannot delete its own mapped image.
+    // Reclaim ended copies at the next start, before any download can begin.
+    // An active worker owns the lock; its files must survive this startup.
+    if let Err(error) = worker::cleanup_completed()
+        && error != Error::Busy
+    {
+        tracing::warn!(%error, "could not prune completed update staging");
+    }
     let Ok(initial) = State::new() else {
         return;
     };
@@ -875,5 +883,73 @@ mod tests {
         }
         assert!(!command_admitted(&Command::Install { expected_build: 2 }, true, true));
         assert!(command_admitted(&Command::Check, false, false));
+    }
+}
+
+#[cfg(all(test, feature = "test-feed"))]
+#[test]
+fn loopback_check_verifies_the_signed_map_and_selects_ui_language() {
+    use std::io::{Read, Write};
+    let body = include_bytes!("notes-loopback-test.json");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut request = [0u8; 4096];
+        let received = stream.read(&mut request).unwrap();
+        assert!(received > 0);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
+    });
+    let bytes = http(
+        &format!("http://{address}/windows/v1/win-2026-01/stable/manifest.json"),
+        feed::MAX_FEED as u64,
+        false,
+    )
+    .unwrap();
+    server.join().unwrap();
+    let key = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+    )
+    .unwrap();
+    let key: [u8; 32] = key.try_into().unwrap();
+    let manifest = feed::verify_manifest(
+        &bytes,
+        &feed::Trust {
+            epoch: oink_update::WINDOWS_EPOCH,
+            key: &key,
+        },
+        Channel::Stable,
+        &feed::Watermark::default(),
+        feed::timestamp("2026-10-20T00:00:00Z").unwrap(),
+    )
+    .unwrap();
+    let quarantine = Default::default();
+    let release = manifest
+        .select(&Selection {
+            channel: Channel::Stable,
+            windows_build: 22000,
+            architecture: "x64",
+            installed_build: 32,
+            successful_build: 32,
+            quarantine: &quarantine,
+        })
+        .unwrap()
+        .unwrap();
+    for (language, expected) in [
+        ("ja-JP", "テスト日本語"),
+        ("ko-KR", "테스트 한국어"),
+        ("es-MX", "Prueba"),
+        ("de-DE", "TEST English"),
+    ] {
+        assert_eq!(release.notes.for_language(language), expected);
+        eprintln!("loopback Check {language}: {expected}");
     }
 }

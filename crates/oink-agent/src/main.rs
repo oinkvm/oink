@@ -75,6 +75,11 @@ enum Cmd {
         #[arg(value_enum)]
         frequency: Option<MotionFrequency>,
     },
+    /// TEST ONLY: use source Mac scroll on this receiver (default: off).
+    TestMacScroll {
+        #[arg(value_enum)]
+        state: Option<OnOff>,
+    },
     /// Show or set native contact acceptance on this device (default: on).
     AcceptContacts {
         #[arg(value_enum)]
@@ -402,6 +407,12 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 })?;
             }
             print(&settings.event_frequency)?;
+        }
+        Cmd::TestMacScroll { state } => {
+            let c = client()?;
+            print(&c.call(Request::TestMacScroll {
+                enabled: state.map(|s| matches!(s, OnOff::On)),
+            })?)?;
         }
         Cmd::AcceptContacts { state } => {
             let c = client()?;
@@ -939,6 +950,19 @@ mod tests {
         assert!(Cli::try_parse_from(["oink-agent", "file-provider", "placeholder-pool", "maybe"]).is_err());
     }
 
+    #[test]
+    fn test_mac_scroll_cli_is_explicit_and_supports_query_on_off() {
+        assert!(matches!(
+            Cli::parse_from(["oink-agent", "test-mac-scroll"]).cmd,
+            Cmd::TestMacScroll { state: None }
+        ));
+        for state in ["on", "off"] {
+            assert!(matches!(
+                Cli::parse_from(["oink-agent", "test-mac-scroll", state]).cmd,
+                Cmd::TestMacScroll { state: Some(_) }
+            ));
+        }
+    }
     #[test]
     fn accept_contacts_cli_parses_query_and_on_off() {
         assert!(matches!(

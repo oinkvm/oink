@@ -33,8 +33,12 @@ def require(ok, code):
 
 
 def validate_notes(notes):
-    require(type(notes) is dict and set(notes) == {'zh-Hans', 'en'}, 'notes_languages')
-    for text in notes.values():
+    require(type(notes) is dict and {'en', 'zh-Hans'}.issubset(notes) and 2 <= len(notes) <= 32, 'notes_languages')
+    seen = set()
+    for tag, text in notes.items():
+        require(isinstance(tag, str) and re.fullmatch(r'[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*', tag) and
+                tag.lower() not in seen, 'notes_language_tag')
+        seen.add(tag.lower())
         require(isinstance(text, str) and bool(text.strip()) and len(text.encode('utf-8')) <= MAX_NOTES and
                 not any(unicodedata.category(c) == 'Cc' and c not in '\n\t' for c in text), 'notes_text')
     return notes

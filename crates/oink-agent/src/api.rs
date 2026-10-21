@@ -967,6 +967,9 @@ pub struct InputSettings {
     #[serde(default)]
     pub event_frequency: EventFrequency,
     pub accept_contacts: bool,
+    /// Read-only live native injector availability; absent means unavailable.
+    #[serde(default)]
+    pub contacts_injection_available: bool,
     pub emergency_hold_ms: u32,
     pub device_gain: f64,
     pub scroll: ScrollSettings,
@@ -1214,6 +1217,31 @@ pub struct ConnectionQuality {
     pub revision: u64,
     pub sampled_at_ms: u64,
     pub peers: Vec<PeerQuality>,
+}
+
+/// Local receive history; never part of audio wire messages or Facts.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AudioQualitySample {
+    pub at_ms: u64,
+    pub buffer_ms: Option<f64>,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AudioSourceQuality {
+    pub device: DeviceKey,
+    pub name: String,
+    pub samples: Vec<AudioQualitySample>,
+    pub p50_ms: Option<f64>,
+    pub p90_ms: Option<f64>,
+    pub p99_ms: Option<f64>,
+    pub bitrate_kbps: f64,
+    pub dropouts: u64,
+    pub glitches: Vec<oink_audio::sink::DropoutBucket>,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AudioQuality {
+    pub revision: u64,
+    pub sampled_at_ms: u64,
+    pub sources: Vec<AudioSourceQuality>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1548,6 +1576,7 @@ pub struct AimResult {
 #[allow(clippy::large_enum_variant)] // 只用于传递与序列化，装箱没有收益
 pub enum ApiEvent {
     ConnectionQuality(ConnectionQuality),
+    AudioQuality(AudioQuality),
     NearbyChanged {
         revision: crate::device_cards::DecimalU64,
         upserts: Vec<pairing::NearbyRow>,
@@ -1872,6 +1901,7 @@ pub trait AgentApi: Send + Sync {
         _choice: oink_telemetry::Choice,
         _policy_version: u16,
     ) -> ApiResult<()>;
+    fn test_mac_scroll(&self, enabled: Option<bool>) -> ApiResult<bool>;
     fn input_settings(&self) -> ApiResult<InputSettings>;
     fn set_input_settings(&self, settings: PreferencePatch<InputSettings>) -> ApiResult<()>;
 
@@ -1902,6 +1932,7 @@ pub trait AgentApi: Send + Sync {
     fn update_status(&self) -> ApiResult<UpdateStatus>;
     fn update_command(&self, _command: UpdateCommand) -> ApiResult<UpdateStatus>;
     fn connection_quality(&self) -> ApiResult<ConnectionQuality>;
+    fn audio_quality(&self) -> ApiResult<AudioQuality>;
     fn status(&self) -> ApiResult<StatusView>;
     /// 序号大于 `after` 的日志，最多 `limit` 条（取最新的）。
     fn logs(&self, after: Option<u64>, limit: u32) -> ApiResult<Vec<LogLine>>;
@@ -1955,6 +1986,7 @@ pub trait AgentApi: Send + Sync {
 #[allow(clippy::large_enum_variant)]
 pub enum Request {
     ConnectionQuality,
+    AudioQuality,
     DeviceCards,
     #[serde(rename_all = "camelCase")]
     InvokeDeviceCardAction {
@@ -2172,6 +2204,10 @@ pub enum Request {
         size: Size,
     },
     InputSettings,
+    /// CLI-only receiver experiment; never an owner/group option.
+    TestMacScroll {
+        enabled: Option<bool>,
+    },
     SetInputSettings {
         settings: PreferencePatch<InputSettings>,
     },
@@ -2240,7 +2276,9 @@ pub enum Request {
 #[serde(untagged)]
 #[allow(clippy::large_enum_variant)]
 pub enum Reply {
+    TestMacScroll(bool),
     ConnectionQuality(ConnectionQuality),
+    AudioQuality(AudioQuality),
     DeviceCards(crate::device_cards::DeviceCardsView),
     InvokeDeviceCardAction(crate::device_cards::DeviceControlReply),
     PauseAll(crate::device_cards::PauseAllAccepted),
@@ -2435,6 +2473,7 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
             choice,
             policy_version,
         } => unit(api.set_report_consent(expected_generation, choice, policy_version)),
+        R::TestMacScroll { enabled } => api.test_mac_scroll(enabled).map(Reply::TestMacScroll),
         R::InputSettings => api.input_settings().map(Reply::InputSettings),
         R::SetInputSettings { settings } => unit(api.set_input_settings(settings)),
         R::CacheUsage { device } => api.cache_usage(device).map(Reply::CacheUsage),
@@ -2454,6 +2493,7 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
         R::QueryUpdateStatus => api.update_status().map(Reply::UpdateStatus),
         R::Update { command } => api.update_command(command).map(Reply::UpdateStatus),
         R::ConnectionQuality => api.connection_quality().map(Reply::ConnectionQuality),
+        R::AudioQuality => api.audio_quality().map(Reply::AudioQuality),
         R::Status => api.status().map(Reply::Status),
         R::Logs { after, limit } => api.logs(after, limit).map(Reply::Logs),
         R::ExportDiagnostics { last_minutes } => api.export_diagnostics_range(last_minutes).map(Reply::Diagnostics),
@@ -2833,6 +2873,7 @@ fn test_input_settings() -> InputSettings {
         key_support: Default::default(),
         event_frequency: Default::default(),
         accept_contacts: true,
+        contacts_injection_available: true,
         emergency_hold_ms: 5000,
         device_gain: 1.,
         scroll: ScrollSettings { speed: 1. },

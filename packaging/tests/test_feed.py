@@ -99,8 +99,8 @@ class FeedTests(unittest.TestCase):
         with self.assertRaises(ValueError): feed.loads(b'{"x":1,"x":2}')
         with self.assertRaises(ValueError): feed.sign(b'data', EPOCH['epoch'], base64.b64encode(bytes(32)).decode())
 
-    def test_bilingual_notes_signed_and_each_translation_tamper_rejected(self):
-        notes = {'zh-Hans': '修复问题。\n安全更新 & <文字>', 'en': 'Fix a problem.\nSecurity update & <text>'}
+    def test_language_map_signed_and_each_translation_tamper_rejected(self):
+        notes = {'zh-Hans': '修复问题。\n安全更新 & <文字>', 'en': 'Fix a problem.\nSecurity update & <text>', 'ja':'テスト', 'ko':'테스트', 'es-MX':'Prueba'}
         obj = self.payload()
         obj['releases'] = [{'notes': notes}]
         raw = self.envelope(obj)
@@ -118,7 +118,7 @@ class FeedTests(unittest.TestCase):
                       {'en': 'English', 'zh-Hans': '中\u0085文'}, {'en': '\r', 'zh-Hans': '中文'},
                       {'en': 'English', 'zh-Hans': '中' * (feed.MAX_NOTES // 3 + 1)},
                       {'en': 'x' * (feed.MAX_NOTES + 1), 'zh-Hans': '中文'},
-                      {'en': 'English', 'zh-Hans': '中文', 'fr': 'extra'}]:
+                      {'en': 'English', 'zh-Hans': '中文', 'fr_X': 'invalid tag'}]:
             obj = self.payload()
             obj['releases'] = [{'notes': notes}]
             with self.subTest(notes=type(notes)):

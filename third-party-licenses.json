@@ -9196,14 +9196,14 @@
       ]
     },
     {
-      "id": "cargo:rustls-webpki@0.103.15",
+      "id": "cargo:rustls-webpki@0.103.16",
       "name": "rustls-webpki",
-      "version": "0.103.15",
+      "version": "0.103.16",
       "ecosystem": "cargo",
       "repository": "https://github.com/rustls/webpki",
       "source": {
-        "url": "https://crates.io/api/v1/crates/rustls-webpki/0.103.15/download",
-        "integrity": "sha256:f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+        "url": "https://crates.io/api/v1/crates/rustls-webpki/0.103.16/download",
+        "integrity": "sha256:4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
       },
       "licenseExpression": "ISC",
       "selectedLicense": "ISC",
@@ -13387,14 +13387,14 @@
       ]
     },
     {
-      "id": "cargo:webpki-roots@1.0.9",
+      "id": "cargo:webpki-roots@1.0.10",
       "name": "webpki-roots",
-      "version": "1.0.9",
+      "version": "1.0.10",
       "ecosystem": "cargo",
       "repository": "https://github.com/rustls/webpki-roots",
       "source": {
-        "url": "https://crates.io/api/v1/crates/webpki-roots/1.0.9/download",
-        "integrity": "sha256:7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+        "url": "https://crates.io/api/v1/crates/webpki-roots/1.0.10/download",
+        "integrity": "sha256:1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
       },
       "licenseExpression": "CDLA-Permissive-2.0",
       "selectedLicense": "CDLA-Permissive-2.0",

@@ -2,6 +2,8 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
 import { OinkProvider } from 'oink-ui';
+import { agent } from '../api/store';
+import type { InputSettings } from '../api/types';
 import { api as backend, shell } from '../api/client';
 import { setLanguage } from '../i18n';
 import { SettingsPage, type PermState } from './SettingsPage';
@@ -20,6 +22,16 @@ const initial: Record<PermissionId, PermState> = { accessibility: 'not_granted',
 function view(perms = initial, query = '', onGrant = vi.fn(), onOpenPermissionSettings?: (id: PermissionId) => void, platform: Platform = 'mac') {
   return <OinkProvider defaultMotion="reduced"><SettingsPage open platform={platform} api={prefs} capsIme={false} query={query} jump={null} onActive={() => {}} version="test" upgrade={{available:false,next:''}} perms={perms} onGrant={onGrant} onOpenPermissionSettings={onOpenPermissionSettings} onLog={() => {}} onAbout={() => {}} onBlocklist={() => {}}/></OinkProvider>;
 }
+it.each(['en','ja','ko','zh-Hans'])('hides contacts settings without an injector in %s', language => {
+  setLanguage(language);
+  for (const available of [false,true]) {
+    agent.adopt('input', {contacts_injection_available:available} as unknown as InputSettings);
+    const {container,unmount}=render(view(initial,'',vi.fn(),undefined,'win'));
+    expect(!!container.querySelector('[data-item="touchpadInject"]')).toBe(available);
+    unmount();
+  }
+  agent.adopt('input', null);
+});
 describe('applicable independent permission rows', () => {
   it.each(['en', 'zh-Hans'] as const)('shows the file recovery fault with a restart instruction in %s', language => {
     setLanguage(language);

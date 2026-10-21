@@ -199,9 +199,25 @@ the stored parent and previous-feed artifact remain recovery inputs.
 `release.yml` workflow_dispatch builds/verifies both platforms and creates a
 **draft** containing the notarized DMG, MSI, the ZIP of the already-stapled app,
 `release.json`, `update.json` and `SHA256SUMS`. Fill `.github/update-notes.json`
-with reviewed `channel: stable`, `severity: normal|critical` and plain-text `en`
-and `zh-Hans` notes before building. Notes and ZIP hashes are bound into the
-release record and checksums. Private symbols are never release assets.
+with `channel: stable`, `severity: normal|critical` and plain-text `en` and
+`zh-Hans` notes. Before tagging or building a release, the user must approve
+English and Simplified Chinese text in `.github/update-notes.json` and
+`.github/release-notes.txt`; subsequent changes to those texts need approval.
+Other translations do not need user review. Each newline separates a bullet.
+Include user-visible changes only; the unsigned-MSI limitation belongs only
+in release-notes.txt under Known limitations.
+
+Notes are an extensible language map on the existing feeds and signing schema.
+Clients require English; the publisher requires English and Simplified Chinese,
+at most 32 case-insensitively unique tags matching
+`[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*`, and existing 16 KiB/control-character limits
+per translation. Lookup uses exact UI language, progressively shorter parents,
+then English. 0.1.3 publishes only the approved `en` and `zh-Hans` entries so
+strict 0.1.1/0.1.2 clients can reach it. From 0.1.4 onward, adding languages is
+an accepted hard cut: those older clients reject the feed. No new URLs, v2
+schema, dual writing or compatibility projection is introduced. Notes and ZIP
+hashes remain bound into the release record and checksums. Private symbols
+are never release assets.
 
 **release.published**, non-draft/non-prerelease, calls
 `publish-macos-feed.yml`. To recover a failed initial publication without rebuilding

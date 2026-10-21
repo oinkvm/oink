@@ -64,7 +64,7 @@ impl Subscriber {
             }
             ApiEvent::ConnectionQuality(_) => self.views.group_quality,
             ApiEvent::Stats(_) | ApiEvent::InputStats(_) => self.views.stats || self.views.group_quality,
-            ApiEvent::AudioStats(_) => self.views.audio_quality,
+            ApiEvent::AudioStats(_) | ApiEvent::AudioQuality(_) => self.views.audio_quality,
             ApiEvent::DiagnosticsStats(_) => self.views.diagnostics,
             ApiEvent::Permissions(value) => changed(&mut self.permissions, value.clone()),
             ApiEvent::Group(value) => changed(&mut self.group, group_state(value)),
@@ -181,6 +181,9 @@ mod tests {
         let quality = ApiEvent::ConnectionQuality(crate::connection_quality::History::default().view(0));
         assert!(!hidden.accepts(&quality));
         assert!(visible.accepts(&quality));
+        let audio_quality = ApiEvent::AudioQuality(crate::audio_quality::History::default().view(0));
+        assert!(!hidden.accepts(&audio_quality));
+        assert!(visible.accepts(&audio_quality));
         assert!(!hidden.accepts(&ApiEvent::Stats(Vec::new())));
         assert!(visible.accepts(&ApiEvent::Stats(Vec::new())));
         let mut status = crate::api::DiagnosticRecorderStatus::default();

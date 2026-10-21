@@ -47,11 +47,11 @@ def embed_notes(path, build, notes):
     for child in list(item):
         if child.tag in ('description', f'{{{SPARKLE}}}releaseNotesLink', f'{{{OINK}}}releaseNotes'):
             item.remove(child)
-    for language in ('en', 'zh-Hans'):
+    for language in sorted(notes):
         ET.SubElement(item, 'description', {f'{{{XML}}}lang': language,
                       f'{{{SPARKLE}}}format': 'plain-text'}).text = notes[language]
     # One element prevents Sparkle's per-element locale selection from removing
-    # either required translation before the custom driver receives the item.
+    # any translation before the custom driver receives the item.
     ET.SubElement(item, f'{{{OINK}}}releaseNotes').text = feed.encode(notes).decode('utf-8')
     for retained in root.findall('./channel/item'):
         encoded = retained.findtext(f'{{{OINK}}}releaseNotes')
@@ -112,7 +112,7 @@ def main():
         subprocess.run([*command, str(folder)], check=True)
         embed_archive_hash(folder / 'appcast.xml', args.build, folder)
         embed_notes(folder / 'appcast.xml', args.build, notes)
-        # Re-sign after the final bilingual fields have been embedded. Only the
+        # Re-sign after the final localized fields have been embedded. Only the
         # official tool writes the signature; no changes follow verification.
         subprocess.run([str(tools / 'bin/sign_update'), '--account', args.account,
                         str(folder / 'appcast.xml')], check=True)

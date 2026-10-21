@@ -8,7 +8,10 @@ use serde::{
     de::{self, MapAccess, SeqAccess, Visitor},
 };
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeSet, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
 
@@ -36,19 +39,52 @@ fn feed_origin() -> &'static str {
     }
 }
 
-/// Both translations travel together; consumers choose by system language and
-/// fall back to English. Text is never interpreted as HTML or Markdown.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReleaseNotes {
-    #[serde(rename = "zh-Hans")]
-    pub zh_hans: String,
-    pub en: String,
+/// Extensible plain-text notes. Language matching is case-insensitive RFC-style
+/// lookup: exact tag, progressively shorter parent tags, then English.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ReleaseNotes(BTreeMap<String, String>);
+
+pub const MAX_LANGUAGES: usize = 32;
+
+impl<'de> Deserialize<'de> for ReleaseNotes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Notes;
+        impl<'de> Visitor<'de> for Notes {
+            type Value = ReleaseNotes;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a validated release-note language map")
+            }
+            fn visit_map<M: MapAccess<'de>>(self, mut input: M) -> Result<Self::Value, M::Error> {
+                let mut map = BTreeMap::new();
+                while let Some((tag, text)) = input.next_entry::<String, String>()? {
+                    if map.insert(tag, text).is_some() || map.len() > MAX_LANGUAGES {
+                        return Err(de::Error::custom("duplicate or excessive release-note languages"));
+                    }
+                }
+                let notes = ReleaseNotes(map);
+                notes.validate().map_err(de::Error::custom)?;
+                Ok(notes)
+            }
+        }
+        deserializer.deserialize_map(Notes)
+    }
 }
+
 impl ReleaseNotes {
     pub fn validate(&self) -> Result<(), Error> {
-        for text in [&self.zh_hans, &self.en] {
-            if text.trim().is_empty()
+        if !(1..=MAX_LANGUAGES).contains(&self.0.len()) || !self.0.contains_key("en") {
+            return Err(Error::Metadata);
+        }
+        let mut seen = BTreeSet::new();
+        for (tag, text) in &self.0 {
+            let mut parts = tag.split('-');
+            let language = parts.next().unwrap_or_default();
+            if !(2..=3).contains(&language.len())
+                || !language.bytes().all(|b| b.is_ascii_alphabetic())
+                || !parts.all(|part| (2..=8).contains(&part.len()) && part.bytes().all(|b| b.is_ascii_alphanumeric()))
+                || !seen.insert(tag.to_ascii_lowercase())
+                || text.trim().is_empty()
                 || text.len() > MAX_NOTES
                 || text.chars().any(|c| c.is_control() && c != '\n' && c != '\t')
             {
@@ -57,29 +93,24 @@ impl ReleaseNotes {
         }
         Ok(())
     }
-
     pub fn from_json(bytes: &[u8]) -> Result<Self, Error> {
-        // JSON may escape every text byte as six ASCII bytes. Bound the parse
-        // itself before checking each decoded UTF-8 translation's own limit.
-        if bytes.len() > 12 * MAX_NOTES + 64 {
+        if bytes.len() > MAX_FEED {
             return Err(Error::Limit);
         }
-        let notes: Self = strict_json(bytes)?;
-        notes.validate()?;
-        Ok(notes)
+        strict_json(bytes)
     }
-
     pub fn for_language(&self, language: &str) -> &str {
-        let language = language.replace('_', "-").to_ascii_lowercase();
-        if language == "zh"
-            || language == "zh-hans"
-            || language.starts_with("zh-hans-")
-            || matches!(language.as_str(), "zh-cn" | "zh-sg")
-        {
-            &self.zh_hans
-        } else {
-            &self.en
+        let mut language = language.replace('_', "-");
+        loop {
+            if let Some((_, text)) = self.0.iter().find(|(tag, _)| tag.eq_ignore_ascii_case(&language)) {
+                return text;
+            }
+            match language.rfind('-') {
+                Some(i) => language.truncate(i),
+                None => break,
+            }
         }
+        &self.0["en"]
     }
 }
 
@@ -267,7 +298,6 @@ pub fn verify_manifest(
             || !builds.insert(release.build)
             || release.version.is_empty()
             || release.version.len() > 128
-            || release.notes.validate().is_err()
             || !is_hex(&release.source_tree_sha256, 64)
             || release.package.key_id != trust.epoch
             || release.package.length == 0

@@ -435,6 +435,13 @@ fn remote_api_calls_subscribes_and_sees_stop() {
     let server = rt.block_on(Server::start_on(node.clone(), 0)).unwrap();
 
     let remote = RemoteApi::new(&dir);
+    // Receive history is an authenticated local query, independent of UI demand.
+    let quality = remote.audio_quality().unwrap();
+    assert!(quality.sources.is_empty());
+    let shape = serde_json::to_value(quality).unwrap();
+    assert!(shape["revision"].is_u64());
+    assert!(shape["sampled_at_ms"].is_u64());
+    assert_eq!(shape["sources"], serde_json::json!([]));
     // 调用：与服务进程内的结果相同。
     let local = node.overview().unwrap();
     let over = remote.overview().unwrap();

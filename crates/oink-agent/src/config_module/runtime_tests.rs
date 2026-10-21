@@ -1626,16 +1626,49 @@ async fn repeated_discovery_does_not_bypass_member_rejection_backoff() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redial_fixture_preserves_retry_when_loss_precedes_sleep() {
+    let nodes = start(same_group(2).into_iter().take(1).collect()).await;
+    let peer = identities(2)[1].id();
+    nodes[0]
+        .group
+        .call(move |owner| {
+            // The other member's sleep may deliver Lost before this member's
+            // setup command. Keep both steps in one owner turn to force that
+            // ordering without depending on network or executor scheduling.
+            owner.network(ConfigEvent::Lost {
+                link: LinkId(u64::MAX),
+                peer,
+                path: LinkPath::Direct,
+                reason: oink_network::link::LinkLost::ConnectionLost,
+            });
+            let retry = owner.dials[&peer].after;
+            assert!(retry.is_some());
+            sleep_for_redial_test(owner);
+            assert_eq!(
+                owner.dials[&peer].after, retry,
+                "fixture must preserve the processed loss"
+            );
+            Ok(())
+        })
+        .unwrap();
+    stop(&nodes).await;
+}
+
+fn sleep_for_redial_test(owner: &mut Owner) {
+    // Lost may precede this member's setup command after the other member
+    // sleeps. Preserve its retry: an already retired link produces no further
+    // Lost to restore an erased deadline, and sleeping suppresses redial ticks.
+    owner.sleep();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reachable_member_recovers_on_its_own_retry_after_many_timeouts() {
     let nodes = start(same_group(2)).await;
     assert!(until(|| ready(&nodes)).await);
     for node in &nodes {
         node.group
             .call(|owner| {
-                for dial in owner.dials.values_mut() {
-                    dial.after = None;
-                }
-                owner.sleep();
+                sleep_for_redial_test(owner);
                 Ok(())
             })
             .unwrap();

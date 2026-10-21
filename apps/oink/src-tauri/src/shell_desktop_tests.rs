@@ -77,7 +77,7 @@ fn secondary_windows_open_from_webview_ipc() {
                         const invoke = window.__TAURI_INTERNALS__.invoke;
                         const delay = () => new Promise(resolve => setTimeout(resolve, 2500));
                         try {
-                            for (const view of ['main', 'about', 'upgrade', 'quit']) {
+                            for (const view of ['main', 'about', 'quit']) {
                                 await Promise.all([invoke('shell_open', {view}), invoke('shell_open', {view})]);
                                 await delay();
                                 const original = await invoke('inspect_window', {view, hide: true});

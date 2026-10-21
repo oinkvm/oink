@@ -16,6 +16,7 @@ use oink_input::{EventHandler, InputBackend, InputError};
 
 #[derive(Default)]
 struct State {
+    touchpad_contacts: Option<u8>,
     injection_active: bool,
     injection_sessions: u64,
     resume_hotkey: Option<oink_input::capture_loop::ResumeHotkey>,
@@ -94,6 +95,9 @@ impl std::fmt::Debug for FakeInput {
 }
 
 impl FakeInput {
+    pub fn set_touchpad_contacts(&self, capacity: Option<u8>) {
+        self.state.lock().unwrap().touchpad_contacts = capacity;
+    }
     pub fn injection_active(&self) -> bool {
         self.state.lock().unwrap().injection_active
     }
@@ -352,6 +356,9 @@ impl oink_input::display_power::Observation for DisplayPower {
 }
 
 impl InputBackend for FakeInput {
+    fn touchpad_contacts(&self) -> Option<u8> {
+        self.state.lock().unwrap().touchpad_contacts
+    }
     fn start_injection_session(&self) -> Result<(), InputError> {
         let mut state = self.state.lock().unwrap();
         state.injection_active = true;

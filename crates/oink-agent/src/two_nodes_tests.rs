@@ -95,6 +95,35 @@ async fn api<T: Send + 'static>(n: &Node, f: impl FnOnce(&Node) -> T + Send + 's
 }
 
 #[test]
+fn node_scenarios_do_not_install_a_global_log_subscriber() {
+    const CHILD: &str = "OINK_LOG_ISOLATION_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        // Exercise a real node scenario in a clean process: a global logger
+        // would synchronously format every other fixture's network traffic and
+        // fan it out to every node's log listener for the rest of the suite.
+        focus_lock_api_and_overview_events_name_the_remote_target_on_both_members();
+        tracing::dispatcher::get_default(|dispatch| {
+            assert!(
+                dispatch.is::<tracing::subscriber::NoSubscriber>(),
+                "a node fixture must not enable process-wide logging for unrelated tests"
+            );
+        });
+        return;
+    }
+    let _watchdog = crate::test_watchdog::Scenario::new(module_path!(), "log isolation subprocess");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "two_nodes_tests::node_scenarios_do_not_install_a_global_log_subscriber",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
 fn input_transform_is_owned_locally_and_persists_without_a_layout_edit() {
     crate::test_watchdog::run(
         module_path!(),
@@ -201,7 +230,6 @@ fn pair_route_clipboard_layout_disconnect() {
 }
 
 async fn pair_route_clipboard_layout_disconnect_scenario() {
-    crate::logs::init();
     let a = start("alpha", 0).await;
     let b = start("beta", 0).await;
 
@@ -944,7 +972,6 @@ fn focus_lock_api_and_overview_events_name_the_remote_target_on_both_members() {
 async fn focus_lock_api_and_overview_events_name_the_remote_target_on_both_members_scenario() {
     use crate::api::{ApiEvent, DeviceKey, LiveViews};
     use std::sync::Mutex;
-    crate::logs::init();
     let a = start("lka", 0).await;
     let b = start("lkb", 0).await;
     common::pair(&a.node, &b.node).await;

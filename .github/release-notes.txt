@@ -1,12 +1,19 @@
-Oink 0.1.2 improves reconnection reliability and restores the original edge-resistance behavior.
+Oink 0.1.3 improves screen arrangement, in-app updates and audio diagnostics.
+
+## New
+
+- Gaps between screens now close up only after you move or resize a screen yourself; a new toolbar button turns this off.
+- Updates now open as a dialog in the main window, with download progress in the title bar and on the Cancel download button.
+- Diagnostics has a new audio quality chart showing buffer, bitrate and dropouts per device over the last minute, with each dropout marked on the chart.
+- On Windows without native touchpad input support, multi-finger gestures fall back to standard shortcuts and the touchpad setting is hidden.
 
 ## Fixes
 
-- Fixed devices sometimes being unable to reconnect until Oink restarts, after a relayed connection switches to direct.
-
-## Changes
-
-- Removed the edge-resistance release after the mouse stays still for 100 ms. Edge resistance now always applies as in 0.1.0.
+- Fixed offline screens being hard to see in dark mode.
+- Fixed the settings page background and content appearing at different times.
+- Fixed pairing on Windows sometimes failing to finish when the computer is busy.
+- Fixed a rare case where audio forwarding could fail to start or restore muting.
+- Windows updates now clean up their downloaded files after installing.
 
 ## Downloads
 
@@ -18,5 +25,3 @@ Verify downloads against `SHA256SUMS`.
 ## Known limitations
 
 - The Windows MSI is not code-signed in this release. SmartScreen may say "Windows protected your PC": choose **More info → Run anyway**. UAC shows an unknown publisher.
-
-Please report problems in [Issues](https://github.com/oinkvm/oink/issues) with your environment, diagnostic data and steps to reproduce.

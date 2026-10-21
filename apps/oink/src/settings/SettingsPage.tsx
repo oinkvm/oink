@@ -9,6 +9,7 @@ import { api as backend, shell } from '../api/client';
 import { agent, useAgent } from '../api/store';
 import { ScreenPointerGains } from './ScreenPointerGains';
 import { KeyMapControl } from './KeyMap';
+import { AudioQualityChart } from './AudioQualityChart';
 import { LatencyChart } from './LatencyChart';
 import { PermissionRow } from '../permissions/PermissionRow';
 import { PermissionControl } from '../permissions/PermissionControl';
@@ -73,7 +74,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
     const { theme, setTheme, accent, setAccent, motion, setMotion } = useOink();
     const scroller = useRef<HTMLDivElement | null>(null);
     const uid = useId();
-    const applicable = (item: ItemMeta) => item.id !== 'perm-network' || perms.network !== 'not_required';
+    const applicable = (item: ItemMeta) => (item.id !== 'perm-network' || perms.network !== 'not_required') && (item.id !== 'touchpadInject' || agentState.input?.contacts_injection_available === true);
     const sections = sectionsFor(platform).map(s => ({ ...s, items: s.items.filter(applicable) }));
     const found = searchSections(platform, query);
     const shown = sections.filter((s) => {
@@ -111,7 +112,10 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
         if (!target)
             return;
         const smooth = open;
-        const y = target.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop - (jump.item ? 48 : 0);
+        // Measure from the rows' own box: it carries the entry rise, so a
+        // jump that opens the page lands where the row settles.
+        const inner = target.closest<HTMLElement>('.setp__inner')!;
+        const y = target.getBoundingClientRect().top - inner.getBoundingClientRect().top + inner.offsetTop - (jump.item ? 48 : 0);
         lockUntil.current = performance.now() + (smooth ? 900 : 0);
         el.scrollTo({ top: Math.max(0, y), behavior: smooth ? 'smooth' : 'auto' });
         onActive(jump.section);
@@ -356,6 +360,8 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                     </span>),
                     stack: 'auto',
                 };
+            case 'audioQuality':
+                return {node: <AudioQualityChart active={open}/>, stack:true};
             case 'latency':
                 return { node: <LatencyChart active={open}/>, stack: true };
         }

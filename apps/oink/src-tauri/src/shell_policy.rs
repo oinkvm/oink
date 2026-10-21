@@ -13,7 +13,6 @@ pub enum View {
     Main,
     Panel,
     About,
-    Upgrade,
     Quit,
 }
 
@@ -23,7 +22,6 @@ impl View {
             Self::Main => "main",
             Self::Panel => "panel",
             Self::About => "about",
-            Self::Upgrade => "upgrade",
             Self::Quit => "quit",
         }
     }
@@ -33,7 +31,7 @@ impl View {
     }
 
     pub fn from_label(label: &str) -> Option<Self> {
-        [Self::Main, Self::Panel, Self::About, Self::Upgrade, Self::Quit]
+        [Self::Main, Self::Panel, Self::About, Self::Quit]
             .into_iter()
             .find(|view| view.label() == label)
     }
@@ -190,11 +188,18 @@ mod tests {
     #[test]
     fn panel_never_requests_regular_activation() {
         assert!(!View::Panel.normal());
-        for view in [View::Main, View::About, View::Upgrade, View::Quit] {
+        for view in [View::Main, View::About, View::Quit] {
             assert!(view.normal());
             assert_eq!(View::from_label(view.label()), Some(view));
         }
         assert_eq!(View::from_label("untrusted"), None);
+    }
+
+    #[test]
+    fn update_flow_has_no_window_of_its_own() {
+        // The update dialog is a modal inside the main window.
+        assert_eq!(View::from_label("upgrade"), None);
+        assert!(serde_json::from_str::<View>("\"upgrade\"").is_err());
     }
 
     #[test]

@@ -3,6 +3,20 @@
 #import "update.m"
 #include <assert.h>
 static NSString *candidateNotes;
+static NSMutableArray<NSArray<NSNumber *> *> *timingRecords;
+static void captureTiming(uint32_t boundary,uint64_t now,uint64_t elapsed,uint64_t previous,uint64_t bytes) {
+    [timingRecords addObject:@[@(boundary),@(now),@(elapsed),@(previous),@(bytes)]];
+}
+@interface TestUpdateTiming : OinkUpdateTiming
+@property uint64_t clock;
+@end
+@implementation TestUpdateTiming
+- (uint64_t)now {return _clock+=10;}
+@end
+static uint32_t failureCategory;
+static void captureFailure(uint32_t event,uint64_t build,uint64_t size,uint32_t progress,const char *version,const char *notes) {
+    if (event==8) failureCategory=progress;
+}
 static void captureCandidate(uint32_t event,uint64_t build,uint64_t size,uint32_t progress,const char *version,const char *notes) {
     if (event==2) {
         assert(build==2);
@@ -34,9 +48,28 @@ static void mainQueueTurn(void) {
 }
 int main(void) {
     @autoreleasepool {
+        // Sparkle wraps URLSession failures in SUDownloadError before showing
+        // them to our driver. A TLS failure must stay Network across the bridge.
+        owner=[OinkUpdateDriver new];owner.callback=captureFailure;
+        NSError *tls=[NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorSecureConnectionFailed userInfo:nil];
+        NSError *download=[NSError errorWithDomain:SUSparkleErrorDomain code:SUDownloadError userInfo:@{NSUnderlyingErrorKey:tls}];
+        __block BOOL errorAcknowledged=NO;
+        [owner showUpdaterError:download acknowledgement:^{errorAcknowledged=YES;}];
+        assert(errorAcknowledged && failureCategory==1);
+        [owner showUpdaterError:tls acknowledgement:^{}];
+        assert(failureCategory==1);
+        NSError *signature=[NSError errorWithDomain:SUSparkleErrorDomain code:SUValidationError userInfo:nil];
+        [owner showUpdaterError:signature acknowledgement:^{}];
+        assert(failureCategory==2);
+        NSError *invalidDownload=[NSError errorWithDomain:SUSparkleErrorDomain code:SUDownloadError userInfo:@{NSUnderlyingErrorKey:signature}];
+        [owner showUpdaterError:invalidDownload acknowledgement:^{}];
+        assert(failureCategory==2); // A download wrapper alone is not Network.
+        [owner showUpdaterError:[NSError errorWithDomain:SUSparkleErrorDomain code:SUDownloadError userInfo:nil] acknowledgement:^{}];
+        assert(failureCategory==2);
+
         // Public legacy initializer is sufficient for an isolated parsed-item
         // fixture; no updater or application state resolver starts here.
-        NSDictionary *notes=@{@"zh-Hans":@"修复问题。",@"en":@"Fix a problem."};
+        NSDictionary *notes=@{@"zh-Hans":@"修复问题。",@"en":@"Fix a problem.",@"ja":@"テスト",@"ko":@"테스트",@"es-MX":@"Prueba"};
         NSString *json=[[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:notes options:0 error:NULL] encoding:NSUTF8StringEncoding];
         NSMutableDictionary *properties=[@{@"sparkle:version":@"2",@"sparkle:shortVersionString":@"1.0.1",
             @"enclosure":@{@"url":@"https://example.test/update.dmg",@"length":@"2"},
@@ -47,6 +80,48 @@ int main(void) {
         SUAppcastItem *item=[[SUAppcastItem alloc] initWithDictionary:properties];
 #pragma clang diagnostic pop
         assert(item);
+        // Fake Sparkle callbacks and a deterministic monotonic clock exercise
+        // the production logger, without an updater, download or real install.
+        TestUpdater *timingUpdater=[TestUpdater new];
+        timingRecords=[NSMutableArray new];
+        owner=[OinkUpdateDriver new];owner.timing=[TestUpdateTiming new];owner.timing.callback=captureTiming;
+        [owner showDownloadInitiatedWithCancellation:^{}];
+        [owner.timing boundary:OinkDownloadStarted bytes:0];
+        [owner showDownloadDidReceiveExpectedContentLength:100]; // Log received bytes, not the estimate.
+        [owner showDownloadDidReceiveDataOfLength:12];
+        [owner showDownloadDidReceiveDataOfLength:8];
+        for (int repeat=0;repeat<2;repeat++) [owner updater:(SPUUpdater *)timingUpdater didDownloadUpdate:item];
+        for (int repeat=0;repeat<2;repeat++) [owner updater:(SPUUpdater *)timingUpdater willExtractUpdate:item];
+        for (int repeat=0;repeat<2;repeat++) [owner showDownloadDidStartExtractingUpdate];
+        for (int repeat=0;repeat<2;repeat++) [owner updater:(SPUUpdater *)timingUpdater didExtractUpdate:item];
+        [owner showExtractionReceivedProgress:0.5];
+        [owner showExtractionReceivedProgress:1.0];
+        [owner showExtractionReceivedProgress:1.0];
+        [owner showExtractionReceivedProgress:1.1];
+        __block BOOL installed=NO;
+        for (int repeat=0;repeat<2;repeat++) [owner showReadyToInstallAndRelaunch:^(SPUUserUpdateChoice choice) {installed=choice==SPUUserUpdateChoiceInstall;}];
+        for (int repeat=0;repeat<2;repeat++) oink_update_timing(OinkInstallClicked);
+        for (int repeat=0;repeat<2;repeat++) oink_update_timing(OinkQuiesceDone);
+        assert(oink_update_install() && installed);
+        assert(!oink_update_install());
+        for (int repeat=0;repeat<2;repeat++) [owner updater:(SPUUpdater *)timingUpdater willInstallUpdate:item];
+        for (int repeat=0;repeat<2;repeat++) [owner updaterWillRelaunchApplication:(SPUUpdater *)timingUpdater];
+        NSArray *boundaries=@[@1,@2,@9,@3,@10,@4,@5,@6,@7,@8,@11,@12];
+        assert(timingRecords.count==boundaries.count);
+        for (NSUInteger i=0;i<boundaries.count;i++) {
+            NSArray<NSNumber *> *record=timingRecords[i];
+            assert([record[0] isEqual:boundaries[i]]);
+            assert(record[1].unsignedLongLongValue==(i+1)*10);
+            assert(record[2].unsignedLongLongValue==i*10);
+            assert(record[3].unsignedLongLongValue==(i==0?0:10));
+            assert(record[4].unsignedLongLongValue==(i==1?20:0));
+        }
+        [owner showDownloadInitiatedWithCancellation:^{}]; // New attempt resets dedup and elapsed.
+        assert(timingRecords.lastObject[2].unsignedLongLongValue==0);
+        [owner.timing reset];
+        [owner showReadyToInstallAndRelaunch:^(SPUUserUpdateChoice choice) {}];
+        assert(timingRecords.lastObject[2].unsignedLongLongValue==UINT64_MAX); // Cached resume has no start.
+
         owner=[OinkUpdateDriver new];owner.callback=captureCandidate;
         [owner showUpdateFoundWithAppcastItem:item state:(SPUUserUpdateState *)[TestUpdateState new] reply:^(SPUUserUpdateChoice choice) {}];
         assert([[NSJSONSerialization JSONObjectWithData:[candidateNotes dataUsingEncoding:NSUTF8StringEncoding] options:0 error:NULL] isEqual:notes]);
@@ -56,7 +131,7 @@ int main(void) {
         item=[[SUAppcastItem alloc] initWithDictionary:properties];
 #pragma clang diagnostic pop
         [owner showUpdateFoundWithAppcastItem:item state:(SPUUserUpdateState *)[TestUpdateState new] reply:^(SPUUserUpdateChoice choice) {}];
-        assert([candidateNotes isEqualToString:@""]); // Rust rejects missing bilingual metadata; no localized fallback.
+        assert([candidateNotes isEqualToString:@""]); // Rust rejects missing notes metadata; no localized fallback.
 
         owner=[OinkUpdateDriver new];
         assert(oink_update_quit_allowed());

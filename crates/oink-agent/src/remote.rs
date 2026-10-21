@@ -735,6 +735,9 @@ impl AgentApi for RemoteApi {
             policy_version,
         })
     }
+    fn test_mac_scroll(&self, enabled: Option<bool>) -> ApiResult<bool> {
+        self.call(Request::TestMacScroll { enabled })
+    }
     fn input_settings(&self) -> ApiResult<InputSettings> {
         self.call(Request::InputSettings)
     }
@@ -783,6 +786,9 @@ impl AgentApi for RemoteApi {
     }
     fn update_command(&self, command: UpdateCommand) -> ApiResult<UpdateStatus> {
         self.call(Request::Update { command })
+    }
+    fn audio_quality(&self) -> ApiResult<AudioQuality> {
+        self.call(Request::AudioQuality)
     }
     fn connection_quality(&self) -> ApiResult<ConnectionQuality> {
         self.call(Request::ConnectionQuality)

@@ -24,6 +24,7 @@ function requireInput(settings:T.InputSettings):T.InputSettings {
 }
 export const api = {
   notify: (notification: T.Notification) => call<T.NotificationReceipt | null>("notify", { notification }),
+  audioQuality: () => call<T.AudioQuality>("audio_quality"),
   connectionQuality: () => call<T.ConnectionQuality>("connection_quality"),
   memberAddresses: (device: string) => call<string[]>('member_addresses', {device}),
   setMemberAddress: (device: string,address: string) => call<null>('set_member_address', {device,address}),
@@ -116,7 +117,7 @@ export const api = {
 
 export const shell = {
   uninstall: (messages: {title:string;failure:string;done:string;processes:string;privacy:string;data:string;trash:string}) => transport.shell<void>('shell_uninstall', {messages}),
-  open: (view: 'main' | 'panel' | 'about' | 'upgrade' | 'quit') => transport.shell<void>('shell_open', { view }),
+  open: (view: 'main' | 'panel' | 'about' | 'quit') => transport.shell<void>('shell_open', { view }),
   close: () => transport.shell<void>('shell_close'),
   ready: () => transport.shell<void>('shell_ready'),
   titlebarCenter: () => transport.shell<number | null>('shell_titlebar_center'),

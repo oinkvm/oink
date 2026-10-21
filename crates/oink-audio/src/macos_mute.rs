@@ -48,6 +48,7 @@ impl Drop for SystemLock {
         unsafe { oink_audio_mute_unlock(self.0) };
     }
 }
+
 struct Observer {
     raw: *mut c_void,
     uid: String,
@@ -190,5 +191,39 @@ impl MuteLease {
     }
     pub(crate) fn finish(&mut self) -> Result<(), String> {
         self.lease.finish()
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    use std::{fs::OpenOptions, os::fd::IntoRawFd};
+
+    #[test]
+    fn inherited_descriptor_does_not_extend_native_mute_lock_ownership() {
+        // Exercise the production release function on an isolated file, never
+        // the machine-wide mute lock or a native audio endpoint.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synthetic.lock");
+        let open = || {
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap()
+        };
+        let file = open();
+        fs2::FileExt::try_lock_exclusive(&file).unwrap();
+        let inherited = file.try_clone().unwrap();
+        let owner = SystemLock(file.into_raw_fd());
+        assert!(fs2::FileExt::try_lock_exclusive(&open()).is_err());
+        drop(owner);
+        let replacement = open();
+        fs2::FileExt::try_lock_exclusive(&replacement)
+            .expect("native lock ownership ends before an inherited descriptor closes");
+        drop(inherited);
+        assert!(fs2::FileExt::try_lock_exclusive(&open()).is_err());
     }
 }

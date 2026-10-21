@@ -126,9 +126,21 @@ pub trait EndpointBackend {
 /// This type deliberately does not restore in Drop: only the platform lease can
 /// safely stop IO, consult notification ownership, and perform a tagged write.
 pub struct Journal {
-    _lock: File,
+    _lock: JournalLock,
     path: PathBuf,
     record: Record,
+}
+
+struct JournalLock(File);
+
+impl Drop for JournalLock {
+    fn drop(&mut self) {
+        // Closing only our descriptor can leave the lock owned by a forked
+        // child's inherited reference until exec/exit. CLOEXEC does not cover
+        // that interval. End this acquired lock's ownership explicitly, also
+        // when opening/validating the record returns an error.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
 }
 impl std::fmt::Debug for Journal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -151,6 +163,7 @@ impl Journal {
             .map_err(|e| format!("open audio recovery lock: {e}"))?;
         fs2::FileExt::try_lock_exclusive(&lock)
             .map_err(|e| format!("audio recovery is already owned by another process or lock unavailable: {e}"))?;
+        let lock = JournalLock(lock);
         let path = dir.join(JOURNAL_NAME);
         let record: Record = match std::fs::read(&path) {
             Ok(bytes) => {
@@ -641,6 +654,25 @@ mod tests {
         let (dir, journal, _backend, _before) = setup();
         assert!(Journal::open(dir.path()).is_err());
         drop(journal);
+        assert!(Journal::open(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn dropped_journal_releases_lock_while_inherited_descriptor_is_alive() {
+        let (dir, journal, _backend, _before) = setup();
+        // dup shares the open file description just like a descriptor inherited
+        // by a forked child before exec. Keep that reference alive across Drop.
+        let inherited = journal._lock.0.try_clone().unwrap();
+        assert!(Journal::open(dir.path()).is_err(), "a live journal owns the lock");
+        drop(journal);
+        let replacement =
+            Journal::open(dir.path()).expect("an inherited descriptor must not prolong journal ownership");
+        drop(inherited);
+        assert!(
+            Journal::open(dir.path()).is_err(),
+            "the replacement still owns the lock"
+        );
+        drop(replacement);
         assert!(Journal::open(dir.path()).is_ok());
     }
 }

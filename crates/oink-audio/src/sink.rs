@@ -14,6 +14,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod dropouts;
+pub(crate) use dropouts::Ledger as DropoutLedger;
+pub use dropouts::{DropoutBucket, DropoutCounters};
+
 const MAX_SOURCES: usize = 16;
 const MIX_SAMPLES: usize = 240;
 const INPUT_BATCH: usize = 8;
@@ -57,6 +61,7 @@ struct Status {
     // There is no second jitter reserve in front of Receiver.
     occupied: AtomicUsize,
     accepted: AtomicU64,
+    dropout_counters: std::sync::OnceLock<Arc<DropoutCounters>>,
     highest_accepted: AtomicU64,
     accepted_at_ns: AtomicU64,
     epoch: Instant,
@@ -184,6 +189,10 @@ impl Source {
         let at = self.status.epoch + Duration::from_nanos(self.status.accepted_at_ns.load(Ordering::Acquire));
         Some((self.status.highest_accepted.load(Ordering::Acquire), at))
     }
+    /// Optional local diagnostics counter, retained across port/burst resets by the owner.
+    pub fn set_dropout_counters(&self, counter: Arc<DropoutCounters>) {
+        let _ = self.status.dropout_counters.set(counter);
+    }
     pub fn stats(&self) -> dsp::Stats {
         dsp::Stats {
             rejected: self.stats.rejected + self.local_rejected,
@@ -224,6 +233,7 @@ impl SourceState {
             active: AtomicBool::new(true),
             occupied: AtomicUsize::new(0),
             accepted: AtomicU64::new(0),
+            dropout_counters: Default::default(),
             highest_accepted: AtomicU64::new(0),
             accepted_at_ns: AtomicU64::new(0),
             epoch: Instant::now(),
@@ -288,6 +298,7 @@ impl SourceState {
     }
 
     fn receive(&mut self, now: Instant) {
+        self.receiver.set_dropout_counters(self.status.dropout_counters.get());
         for _ in 0..INPUT_BATCH {
             let packet = if let Some(packet) = self.packets.pop() {
                 Some(packet)
@@ -705,6 +716,46 @@ mod tests {
             }
             true
         }
+    }
+    #[test]
+    fn local_dropout_counter_uses_receiver_classification_and_survives_bursts() {
+        let config = dsp::Config::low_latency_pcm();
+        let origin = Instant::now();
+        let (mut source, mut state) = SourceState::prepare(config, realtime::Signal::new().unwrap(), false).unwrap();
+        let counter = Arc::new(DropoutCounters::default());
+        source.set_dropout_counters(counter.clone());
+        let at = (crate::diagnostics::monotonic_us(origin).max(0) / 1000) as u64;
+        let total = || {
+            counter
+                .snapshot(at)
+                .into_iter()
+                .flatten()
+                .map(|b| b.count())
+                .sum::<u64>()
+        };
+        let mut encoder = dsp::Encoder::new_with_config(config).unwrap();
+        let payload = encoder.encode(&[0.2; 240]).unwrap();
+        for seq in 0..4 {
+            assert!(source.push(seq, &payload, origin, None, None));
+        }
+        state.receive(origin);
+        let (_, trace) = state.receiver.render_with_trace(origin + Duration::from_secs(1));
+        let decoded = trace
+            .decoded_first_sequence
+            .expect("prefilled media must decode before testing late arrivals");
+        assert!(source.push(decoded, &payload, origin, None, None));
+        state.receive(origin);
+        assert_eq!(total(), state.receiver.stats().late);
+        assert_eq!(total(), 1);
+        // Admission rejection and queued duplicate do not establish a new gap.
+        assert!(!source.push(20, &[], origin, None, None));
+        assert!(source.push(20, &payload, origin, None, None));
+        assert!(source.push(20, &payload, origin, None, None));
+        state.receive(origin);
+        assert_eq!(total(), 1);
+        state.receiver.reset_burst();
+        assert_eq!(state.receiver.stats().late, 0);
+        assert_eq!(total(), 1);
     }
     #[test]
     fn refill_window_replacement_releases_retired_pcm_and_idle_drain_completes() {

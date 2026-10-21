@@ -282,15 +282,21 @@ body { margin: 0; background: var(--ok-bg); color: var(--ok-text); font-family: 
 
 .ok-btn.upgrade--pill { --_h: 26px; min-width: 64px; padding: 0 var(--ok-s-3); font-size: 12.5px; }   
 .upgrade--bar {
-  position: relative; display: block; width: 64px; height: 26px; overflow: hidden; outline: none;
+  position: relative; display: inline-flex; align-items: center; justify-content: center; min-width: 64px; height: 26px; padding: 0 var(--ok-s-3);
+  overflow: hidden; outline: none; appearance: none; border: 0; cursor: pointer;
   border-radius: var(--ok-r-full); corner-shape: round; --ok-shape: round; background: var(--ok-well);
+  color: var(--ok-text); font: 600 12.5px/1 var(--ok-font); font-variant-numeric: tabular-nums; white-space: nowrap;
 }
 .upgrade--bar:focus-visible { box-shadow: 0 0 0 2px var(--ok-surface), 0 0 0 4px var(--ok-accent); }
 
-.upgrade__fill {
-  position: absolute; left: 0; top: 0; bottom: 0;
-  background: var(--ok-accent-fill);
-  transition: width 200ms linear;
+/* Progress drawn as the control's own background: an accent layer clipped to
+   the progress width repeats the label in the on-accent colour, so the text
+   reads over the filled and unfilled parts alike. */
+.upgrade-progress {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  background: var(--ok-accent-fill); color: var(--ok-on-accent); pointer-events: none;
+  clip-path: inset(0 calc(100% - var(--upgrade-progress)) 0 0);
+  transition: clip-path 200ms linear;
 }
 
 .upgrade-notes { display: grid; gap: 8px; margin: 0; padding-left: 1.2em; font: 450 14px/1.55 var(--ok-font); color: var(--ok-text-2); }
@@ -423,6 +429,11 @@ body { margin: 0; background: var(--ok-bg); color: var(--ok-text); font-family: 
   background: var(--ok-raised); box-shadow: inset 0 0 0 1px var(--ok-line);
 }
 .canvas-tools__sep { width: 1px; height: 16px; margin: 0 3px; background: var(--ok-line-2); }
+/* Neutral pressed toggle. The library's well-2 pill is indistinguishable from
+   the raised toolbar in dark mode (#383632 on #3E3C38); the translucent line-2
+   ink (the separator colour) darkens in light and lightens in dark, and differs
+   from the ghost hover fill in both. The icon keeps the normal foreground. */
+.canvas-tools .ok-btn[aria-pressed="true"] { --_bg: var(--ok-line-2); --_bg-hover: var(--ok-line-2); --_fg: var(--ok-text); }
 .disp__canvas {
   
   --canvas-r: max(calc(4px * var(--ok-rk)), calc(var(--win-r) - var(--pad) * var(--ok-rk)));
@@ -466,9 +477,16 @@ body { margin: 0; background: var(--ok-bg); color: var(--ok-text); font-family: 
 
 .scr[data-selected] .scr__body { box-shadow: 0 0 0 2.5px var(--ok-well), 0 0 0 4.5px var(--ok-accent); }
 
-.scr__body[data-offline] { background-color: #171717; }
+/* Offline screen surface. Light mode keeps a near-black "switched-off" fill.
+   In dark mode that fill matches the --ok-well canvas, so it takes the
+   interface background instead: the main window's --ok-surface, a quiet
+   neutral step above the canvas, never the accent. The glyph keeps the kit's
+   muted text tier. */
+.scr__body { --scr-offline-bg: #171717; --scr-offline-ink: #7B7B7B; }
+:root[data-theme="dark"] .scr__body { --scr-offline-bg: var(--ok-surface); --scr-offline-ink: var(--ok-text-3); }
+.scr__body[data-offline] { background-color: var(--scr-offline-bg); }
 .scr__content { display: flex; flex-direction: column; align-items: center; gap: 8px; max-width: calc(100% - 16px); pointer-events: none; }
-.scr__offline { flex: none; color: #7B7B7B; }
+.scr__offline { flex: none; color: var(--scr-offline-ink); }
 .scr__label {
   display: flex; flex-direction: column; align-items: center; gap: 1px;
   max-width: 100%; box-sizing: border-box;

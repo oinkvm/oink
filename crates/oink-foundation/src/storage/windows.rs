@@ -8,7 +8,9 @@ use std::os::windows::{
 use std::path::Path;
 use std::ptr::null_mut;
 
-use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GENERIC_READ, GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE, LocalFree,
+};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
 };
@@ -137,9 +139,10 @@ pub(super) fn replace(file: &File, destination: &Path) -> io::Result<()> {
     // DELETE at creation and rename on that same handle. Read sharing keeps the
     // published path readable before the writer closes, while DELETE ownership
     // requires any admitted reader to permit rename. Verified on Windows 11.
-    let destination = wide(&std::path::absolute(destination)?)?;
-    let bytes = (destination.len() - 1) * size_of::<u16>();
-    let length = std::mem::offset_of!(FILE_RENAME_INFO, FileName) + destination.len() * size_of::<u16>();
+    let destination_path = std::path::absolute(destination)?;
+    let destination_name = wide(&destination_path)?;
+    let bytes = (destination_name.len() - 1) * size_of::<u16>();
+    let length = std::mem::offset_of!(FILE_RENAME_INFO, FileName) + destination_name.len() * size_of::<u16>();
     let mut buffer = vec![0usize; length.div_ceil(size_of::<usize>())];
     // MoveFileEx replacement fails with ERROR_ACCESS_DENIED while an ordinary
     // reader holds the destination, even with FILE_SHARE_DELETE. Windows 10's
@@ -147,18 +150,108 @@ pub(super) fn replace(file: &File, destination: &Path) -> io::Result<()> {
     // the already-flushed private file, including its owner-only DACL.
     // SAFETY: usize storage aligns FILE_RENAME_INFO and includes the complete
     // variable-length UTF-16 tail. The file handle and buffer outlive the call.
-    let renamed = unsafe {
+    unsafe {
         let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
         (*info).Anonymous.Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
         (*info).RootDirectory = null_mut();
         (*info).FileNameLength = bytes as u32;
-        std::ptr::copy_nonoverlapping(destination.as_ptr(), (*info).FileName.as_mut_ptr(), destination.len());
-        SetFileInformationByHandle(file.as_raw_handle(), FileRenameInfoEx, info.cast(), length as u32)
-    };
-    if renamed == 0 {
-        return Err(io::Error::last_os_error());
+        std::ptr::copy_nonoverlapping(
+            destination_name.as_ptr(),
+            (*info).FileName.as_mut_ptr(),
+            destination_name.len(),
+        );
     }
+    // Windows 11 Defender (MsMpEng) can retain the previous published FILE_OBJECT
+    // after our writer closes: zero-loss ETW observed FSCTL_SET_PURGE_FAILURE_MODE
+    // on it and replace-over-target STATUS_ACCESS_DENIED until final release.
+    // Keep this original DELETE-capable staging handle and retry ONLY that native
+    // rename with both STATUS_ACCESS_DENIED and ERROR_ACCESS_DENIED. Observed
+    // holds were ~1.3–1.4 s; a 5 s total budget leaves scheduling headroom without
+    // waiting indefinitely. 10 ms doubling to 250 ms handles short scans promptly
+    // without busy polling. Creation, writes and flushes are never retried.
+    // MoveFileExW failed 8/8 live cases; ReplaceFileW needed the staging handle
+    // closed and exposed 18,247 missing-target reads in 2,000 replacements, as
+    // well as copying the old target ACL. Neither is a fallback. This preserves
+    // atomic reader snapshots, private DACLs and the single-file layout; Unix is
+    // unchanged. Rationale, ACL-check limits and evidence: see
+    // docs/design/windows-atomic-publication.md. Verified on Windows 11.
+    let started = std::time::Instant::now();
+    let outcome = super::windows_retry::publish(
+        || {
+            // SAFETY: the aligned rename buffer and original file remain alive
+            // and unchanged across all synchronous calls.
+            let renamed = unsafe {
+                SetFileInformationByHandle(
+                    file.as_raw_handle(),
+                    FileRenameInfoEx,
+                    buffer.as_ptr().cast(),
+                    length as u32,
+                )
+            };
+            if renamed != 0 {
+                return Ok(());
+            }
+            // SAFETY: read both thread-local error values immediately after the
+            // failed native publication, before any other filesystem operation.
+            let (code, status) = unsafe { (GetLastError(), RtlGetLastNtStatus()) };
+            Err(super::windows_retry::RenameError {
+                error: io::Error::from_raw_os_error(code as i32),
+                status,
+            })
+        },
+        || retry_allowed(&destination_path),
+        || started.elapsed(),
+        std::thread::sleep,
+    );
+    if outcome.attempts > 1 {
+        tracing::warn!(
+            role = publication_role(destination),
+            attempts = outcome.attempts,
+            elapsed_ms = outcome.elapsed.as_millis() as u64,
+            renamed = outcome.result.is_ok(),
+            "Windows atomic publication retried"
+        );
+    }
+    outcome.result?;
     file.sync_all()
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    // Win32 also maps other statuses (such as delete-pending) to AccessDenied.
+    // Read the thread's native status to exclude them; issue no new NT operation.
+    fn RtlGetLastNtStatus() -> i32;
+}
+
+fn retry_allowed(destination: &Path) -> bool {
+    // A readonly target or directory cannot be replaced by this file rename.
+    // Do not treat a failed DELETE-open as proof of ACL denial: pending scanner
+    // objects can return the same AccessDenied. A reliable ACL decision also
+    // needs the parent's DELETE_CHILD grant, effective token and integrity rules;
+    // a path DACL check alone is insufficient. Unknown ACL denials therefore
+    // consume at most this retry budget. Our private app-data DACL normally
+    // grants the current user full access; real ACL denial is unexpected.
+    match std::fs::metadata(destination) {
+        Ok(metadata) => !metadata.is_dir() && !metadata.permissions().readonly(),
+        Err(_) => true,
+    }
+}
+
+fn publication_role(destination: &Path) -> &'static str {
+    // Only allowlisted role names enter the log, never caller-supplied paths or
+    // filenames (crash/report names can contain per-instance identifiers).
+    match destination.file_name().and_then(|name| name.to_str()) {
+        Some("settings.json") => "settings",
+        Some("device.key") => "identity",
+        Some("pairing-recovery.cbor") => "pairing_recovery",
+        Some("group-state.json") => "group_state",
+        Some("addresses.json") => "addresses",
+        Some("metadata-cache.cbor") => "facts_cache",
+        Some("clock.json") => "clipboard_clock",
+        Some("checkpoint.json") => "telemetry_checkpoint",
+        Some("ipc.json") => "ipc_endpoint",
+        _ => "local_state",
+    }
 }
 
 #[cfg(test)]
@@ -170,6 +263,24 @@ mod tests {
         ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetSecurityDescriptorControl,
         OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
     };
+
+    #[test]
+    fn readonly_and_directory_targets_are_known_permanent_denials() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(!retry_allowed(directory.path()));
+        let target = directory.path().join("settings.json");
+        super::super::atomic_write(&target, b"before").unwrap();
+        let permissions = std::fs::metadata(&target).unwrap().permissions();
+        let mut readonly = permissions.clone();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(&target, readonly).unwrap();
+        assert!(!retry_allowed(&target));
+        let result = super::super::atomic_write(&target, b"after");
+        std::fs::set_permissions(&target, permissions).unwrap();
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(5));
+        assert_eq!(std::fs::read(&target).unwrap(), b"before");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn original_private_writer_can_publish_without_reopening() {

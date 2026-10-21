@@ -686,7 +686,7 @@ impl Platform for Worker {
         )?;
         protected::write(&destination.join("release.json"), &json(&self.plan.candidate)?)?;
         let mut machine = policy()?;
-        machine.successful_build = machine.successful_build.max(self.plan.candidate.build);
+        machine.record_success(self.plan.candidate.build);
         save_policy(&machine)
     }
     fn restore_previous_components_and_metadata(&mut self) -> Result<InstallOutcome, Error> {
@@ -723,14 +723,8 @@ impl Platform for Worker {
         let maintenance = protected::maintenance().map_err(|_| Error::Storage)?;
         let journal = protected::read(&maintenance.join("pending.json"), 65536)?;
         protected::write(&maintenance.join("last-result.json"), &journal)?;
-        for name in ["msi-authorization.json", "pending.json"] {
-            let path = maintenance.join(name);
-            if path.exists() {
-                let verified = protected::open(&path).map_err(|_| Error::Storage)?;
-                drop(verified);
-                std::fs::remove_file(path).map_err(|_| Error::Storage)?;
-            }
-        }
+        clear_boot_markers(HKEY_LOCAL_MACHINE, r"Software\Oink")?;
+        remove_completed_files(&maintenance, protected::open)?;
         // Only after health commit/rollback and pending removal: ordinary UI
         // activation follows the same entry as the installer's Launch Oink.
         if self.directory.join("drained.json").exists() {
@@ -757,6 +751,65 @@ impl Platform for Worker {
         }
         Ok(())
     }
+}
+fn remove_completed_files(
+    maintenance: &Path,
+    mut open: impl FnMut(&Path) -> std::io::Result<std::fs::File>,
+) -> Result<(), Error> {
+    // Keep pending until all other cleanup is durable. A crash before its
+    // removal resumes the terminal cleanup, without repeating installation.
+    for name in [
+        "downloads/candidate.msi",
+        "downloads/candidate.new",
+        "msi-authorization.json",
+        "pending.json",
+    ] {
+        let path = maintenance.join(name);
+        if path.exists() {
+            let verified = open(&path).map_err(|_| Error::Storage)?;
+            drop(verified);
+            std::fs::remove_file(path).map_err(|_| Error::Storage)?;
+        }
+    }
+    Ok(())
+}
+pub(super) fn cleanup_completed() -> Result<(), Error> {
+    let _lock = protected::lock()?;
+    if protected::prune_completed()? {
+        clear_boot_markers(HKEY_LOCAL_MACHINE, r"Software\Oink")?;
+    }
+    Ok(())
+}
+fn clear_boot_markers(hive: HKEY, parent: &str) -> Result<(), Error> {
+    let mut key = ptr::null_mut();
+    // SAFETY: fixed updater-owned registry parent in production; the native
+    // regression supplies only a private HKCU fixture. Caller holds the lock.
+    let code = unsafe {
+        RegOpenKeyExW(
+            hive,
+            wide(parent).as_ptr(),
+            0,
+            KEY_READ | KEY_WRITE | DELETE | KEY_WOW64_64KEY,
+            &mut key,
+        )
+    };
+    if code == ERROR_FILE_NOT_FOUND {
+        return Ok(());
+    }
+    if code != 0 {
+        return Err(Error::Storage);
+    }
+    // SAFETY: owned handle with the delete/enumerate/query rights required by
+    // RegDeleteTreeW. No pending transaction needs any marker at this point.
+    let code = unsafe {
+        let code = RegDeleteTreeW(key, wide("UpdateBoot").as_ptr());
+        RegCloseKey(key);
+        code
+    };
+    if code != 0 && code != ERROR_FILE_NOT_FOUND {
+        return Err(Error::Storage);
+    }
+    Ok(())
 }
 pub(super) fn process_current(session: &Session) -> Result<bool, Error> {
     // SAFETY: query-only process open; no exit/termination privilege requested.
@@ -1213,6 +1266,116 @@ pub(super) fn resume_pending() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn completed_cleanup_reclaims_all_boot_markers_without_touching_other_registry_state() {
+        let fixture = tempfile::tempdir().unwrap();
+        let parent = format!(
+            r"Software\OinkUpdateRetentionTest-{}",
+            fixture.path().file_name().unwrap().to_str().unwrap()
+        );
+        let create = |suffix: &str| {
+            let mut key = ptr::null_mut();
+            // SAFETY: private HKCU test fixture only; no product/system keys.
+            let code = unsafe {
+                RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    wide(&format!(r"{parent}\{suffix}")).as_ptr(),
+                    0,
+                    ptr::null(),
+                    REG_OPTION_VOLATILE,
+                    KEY_ALL_ACCESS,
+                    ptr::null(),
+                    &mut key,
+                    ptr::null_mut(),
+                )
+            };
+            assert_eq!(code, 0);
+            // SAFETY: owned fixture handle.
+            unsafe {
+                RegCloseKey(key);
+            }
+        };
+        create("Unrelated");
+        create(r"UpdateBoot\0123456789abcdef0123456789abcdef");
+        create(r"UpdateBoot\fedcba9876543210fedcba9876543210");
+        clear_boot_markers(HKEY_CURRENT_USER, &parent).unwrap();
+        clear_boot_markers(HKEY_CURRENT_USER, &parent).unwrap();
+        let mut key = ptr::null_mut();
+        // SAFETY: read-only queries of this test's own registry keys.
+        unsafe {
+            assert_eq!(
+                RegOpenKeyExW(
+                    HKEY_CURRENT_USER,
+                    wide(&format!(r"{parent}\UpdateBoot")).as_ptr(),
+                    0,
+                    KEY_READ,
+                    &mut key
+                ),
+                ERROR_FILE_NOT_FOUND
+            );
+            assert_eq!(
+                RegOpenKeyExW(
+                    HKEY_CURRENT_USER,
+                    wide(&format!(r"{parent}\Unrelated")).as_ptr(),
+                    0,
+                    KEY_READ,
+                    &mut key
+                ),
+                0
+            );
+            RegCloseKey(key);
+            assert_eq!(RegDeleteTreeW(HKEY_CURRENT_USER, wide(&parent).as_ptr()), 0);
+        }
+    }
+    #[test]
+    fn completed_cleanup_removes_download_duplicate_and_preserves_cached_rollback_and_result() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        for directory in ["downloads", "cache/31", "cache/32"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        for file in [
+            "downloads/candidate.msi",
+            "downloads/candidate.new",
+            "cache/31/package.msi",
+            "cache/32/package.msi",
+            "last-result.json",
+            "policy.json",
+            "msi-authorization.json",
+            "pending.json",
+        ] {
+            std::fs::write(root.join(file), b"isolated fixture, never installed").unwrap();
+        }
+        // Exercise production deletion, replacing only its fixed-root/ACL open
+        // with an ordinary fixture read. No installed files are accessed.
+        remove_completed_files(root, |path| std::fs::File::open(path)).unwrap();
+        assert!(!root.join("downloads/candidate.msi").exists());
+        assert!(!root.join("downloads/candidate.new").exists());
+        assert!(!root.join("pending.json").exists());
+        assert!(!root.join("msi-authorization.json").exists());
+        for file in [
+            "cache/31/package.msi",
+            "cache/32/package.msi",
+            "last-result.json",
+            "policy.json",
+        ] {
+            assert!(root.join(file).exists(), "{file}");
+        }
+        remove_completed_files(root, |path| std::fs::File::open(path)).unwrap();
+    }
+    #[test]
+    fn cleanup_keeps_pending_recovery_if_the_download_cannot_be_removed() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        std::fs::create_dir(root.join("downloads")).unwrap();
+        std::fs::write(root.join("downloads/candidate.msi"), b"download").unwrap();
+        std::fs::write(root.join("pending.json"), b"terminal recovery").unwrap();
+        assert_eq!(
+            remove_completed_files(root, |_| Err(std::io::ErrorKind::PermissionDenied.into())),
+            Err(Error::Storage)
+        );
+        assert!(root.join("pending.json").exists());
+    }
     #[test]
     fn recovery_task_definition_is_accepted_by_native_scheduler() {
         let directory = Path::new(r"C:\Program Files\Oink\maintenance\transactions\0123456789abcdef0123456789abcdef");

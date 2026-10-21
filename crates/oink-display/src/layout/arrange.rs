@@ -145,9 +145,9 @@ impl Layout {
     }
 
     /// 移除一台设备的所有屏幕（设备离开设备组时，不是暂时离线）。不保留在 `detached` 中，
-    /// 只删除屏幕，保留空位。
+    /// 只删除屏幕，保留空位。Removing screens cannot create a collision, and
+    /// compaction only follows a manual edit, so no other computer moves.
     pub fn remove_device(&mut self, device: DeviceId) {
         self.screens.retain(|s| s.id.device != device);
-        self.normalize();
     }
 }

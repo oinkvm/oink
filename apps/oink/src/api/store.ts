@@ -175,7 +175,7 @@ export function start(view = 'main'): Promise<void> {
       stopped = await onAgentEvent(agent.receive);
       const boot = await shell.bootInfo();
       agent.adopt('boot', boot);
-      if(view!=='main'&&view!=='panel'){await agent.query('localPreferences',()=>call<import('../settings/model').LocalPreferences>('ui_preferences'));if(view==='upgrade')await agent.query('update',api.updateStatus);return;}
+      if(view!=='main'&&view!=='panel'){await agent.query('localPreferences',()=>call<import('../settings/model').LocalPreferences>('ui_preferences'));return;}
       const settle = (queries: Promise<void>[]) => Promise.allSettled(queries.map(p => p.catch(error => agent.fail(error instanceof ApiFailure ? error.problem.code : 'unavailable'))));
       // These snapshots do not decide the initial route or its layout. In
       // particular, wallpaper extraction must not hold onboarding at alpha zero.

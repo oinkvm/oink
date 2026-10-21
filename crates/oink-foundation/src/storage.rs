@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(windows)]
 mod windows;
+#[cfg(any(windows, test))]
+mod windows_retry;
 
 /// Create a new owner-only file. Existing paths are never opened or truncated.
 pub fn create_private_new(path: &Path) -> io::Result<File> {

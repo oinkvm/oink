@@ -1,4 +1,4 @@
-Oink — Oink Is Not a KVM
+Oink — Oink Is Not only a KVM
 Project: https://github.com/oinkvm/oink
 Contact: builder@hachiwii.com
 
@@ -1339,7 +1339,7 @@ Copyright 2023 Dirkjan Ochtman
 Full terms: licenses/texts/45fd05c4865e7c350b98ad7ac50e1b15462d49af4a91e9b0c9dd933dc9a69742.txt
 Full terms: licenses/texts/9117d922e667125508dde62b02c1f57ed22f5ad21eb536aa2e2d99e1c796e639.txt
 
-rustls-webpki 0.103.15 (ISC)
+rustls-webpki 0.103.16 (ISC)
 Copyright 2015 Brian Smith.
 Full terms: licenses/texts/5b698ca13897be3afdb7174256fa1574f8c6892b8bea1a66dd6469d3fe27885a.txt
 
@@ -1925,7 +1925,7 @@ Copyright (c) 2014 The html5ever Project Developers
 Full terms: licenses/texts/86dd7f026f916daf7511e39951ad8ea8cf55a8db67ae64060dacf829761c18f3.txt
 Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
 
-webpki-roots 1.0.9 (CDLA-Permissive-2.0)
+webpki-roots 1.0.10 (CDLA-Permissive-2.0)
 Full terms: licenses/texts/e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8.txt
 
 webview2-com-macros 0.8.1 (MIT)

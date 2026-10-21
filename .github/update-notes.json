@@ -2,7 +2,7 @@
   "channel": "stable",
   "severity": "normal",
   "notes": {
-    "en": "Fixed devices sometimes being unable to reconnect until Oink restarts, after a relayed connection switches to direct. Removed the edge-resistance release after the mouse stays still for 100 ms; edge resistance now always applies as in 0.1.0. The Windows MSI remains unsigned.",
-    "zh-Hans": "修复中继连接切换为直连后，设备有时必须重启 Oink 才能重新连接的问题。移除鼠标在边缘静止 100 毫秒后释放阻力的行为；边缘阻力现在与 0.1.0 一样始终生效。Windows MSI 仍未签名。"
+    "en": "Gaps between screens now close up only after you move or resize a screen yourself; a new toolbar button turns this off.\nUpdates now open as a dialog in the main window, with download progress in the title bar and on the Cancel download button.\nDiagnostics has a new audio quality chart showing buffer, bitrate and dropouts per device over the last minute, with each dropout marked on the chart.\nOn Windows without native touchpad input support, multi-finger gestures fall back to standard shortcuts and the touchpad setting is hidden.\nFixed offline screens being hard to see in dark mode.\nFixed the settings page background and content appearing at different times.\nFixed pairing on Windows sometimes failing to finish when the computer is busy.\nFixed a rare case where audio forwarding could fail to start or restore muting.\nWindows updates now clean up their downloaded files after installing.",
+    "zh-Hans": "屏幕之间的缝隙现在只会在你手动移动或调整屏幕后自动收拢，工具栏新增按钮可以关闭这个功能。\n更新改为在主窗口中以对话框显示，下载进度显示在标题栏和\"取消下载\"按钮上。\n诊断页新增音频质量图表，显示最近一分钟内每台设备的缓冲、码率和断音情况，并在图上标出每次断音。\n不支持原生触控板输入的 Windows 电脑上，多指手势改用标准快捷键，并隐藏触控板设置。\n修复深色模式下离线屏幕难以看清的问题。\n修复设置页背景和内容出现时间不一致的问题。\n修复 Windows 电脑繁忙时配对有时无法完成的问题。\n修复音频转发偶尔无法启动或无法恢复静音的问题。\nWindows 更新安装完成后会清理下载的文件。"
   }
 }

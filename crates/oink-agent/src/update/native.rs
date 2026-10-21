@@ -3,6 +3,7 @@ use std::ffi::{CStr, c_char};
 unsafe extern "C" {
     fn oink_update_start(
         callback: extern "C" fn(u32, u64, u64, u32, *const c_char, *const c_char),
+        timing: extern "C" fn(u32, u64, u64, u64, u64),
         beta: bool,
         checks: bool,
     ) -> bool;
@@ -14,13 +15,14 @@ unsafe extern "C" {
     fn oink_update_preferences(checks: bool, beta: bool);
     fn oink_update_checks_enabled() -> bool;
     fn oink_update_current_build() -> u64;
+    fn oink_update_timing(boundary: u32);
 }
 pub fn start(p: Preferences) {
     if !oink_update::trust::mac_enabled() {
         return;
     }
     // SAFETY: backend main-thread dispatch; callback has static lifetime.
-    let configured = unsafe { oink_update_start(event, p.channel == Channel::Beta, p.checks_enabled) };
+    let configured = unsafe { oink_update_start(event, timing, p.channel == Channel::Beta, p.checks_enabled) };
     if configured && let Ok(node) = crate::backend::node() {
         let mut state = lock(&node.inner.update);
         state.status.error = None;
@@ -59,6 +61,35 @@ pub fn cancel() {
 pub fn install() -> bool {
     // SAFETY: caller validated the backend drain lease.
     unsafe { oink_update_install() }
+}
+pub fn install_clicked() {
+    // SAFETY: only the native synchronized logger is accessed, not the updater.
+    unsafe { oink_update_timing(6) }
+}
+pub fn quiesce_done() {
+    // SAFETY: only the native synchronized logger is accessed, not the updater.
+    unsafe { oink_update_timing(7) }
+}
+extern "C" fn timing(boundary: u32, monotonic_us: u64, elapsed_us: u64, previous_elapsed_us: u64, bytes: u64) {
+    let phase = match boundary {
+        1 => "download_started",
+        2 => "download_finished",
+        3 => "extraction_started",
+        4 => "extraction_input_complete",
+        5 => "ready_to_install",
+        6 => "install_clicked",
+        7 => "quiesce_done",
+        8 => "sparkle_reply",
+        9 => "sparkle_will_extract",
+        10 => "sparkle_did_extract",
+        11 => "sparkle_will_install",
+        12 => "sparkle_will_relaunch",
+        _ => return,
+    };
+    // A resumed cached installer has no observable download start in this
+    // process. Preserve that absence rather than inventing a download duration.
+    let download_elapsed_us = (elapsed_us != u64::MAX).then_some(elapsed_us);
+    tracing::info!(target: "oink_update_timing", phase, monotonic_us, ?download_elapsed_us, previous_elapsed_us, bytes, "Mac update boundary");
 }
 pub fn quit_allowed() -> bool {
     // SAFETY: called from AppKit main thread.

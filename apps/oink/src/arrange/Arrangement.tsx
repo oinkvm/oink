@@ -255,9 +255,24 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
                 springs.to(next.id, next, preset);
         }
     };
+    /** A manual edit is the only compaction trigger. New props (hotplug, hidden
+     * screens, connectivity, remote layouts) only retarget the springs above. */
+    const settle = (edited: Screen[]) => {
+        const released = mergeVisibleGroups(geometryScreens, edited);
+        const next = settings.compact ? compactGroups(released) : released;
+        return { next, compacted: next.some((s, i) => !sameRect(s, released[i])) };
+    };
+    /** Commit a keyboard edit of one computer, including its compaction, as one change. */
     const commit = (id: string, r: Rect, change: ScreensChange) => {
         const transformed = transformGroup(members(id), bounds(members(id)), r);
-        onScreensChange(screens.map(s => transformed.find(n => n.id === s.id) ?? s), change);
+        const { next, compacted } = settle(screens.map(s => transformed.find(n => n.id === s.id) ?? s));
+        for (const screen of next) {
+            if (screens.some(s => s.id === screen.id) && !sameRect(springs.target(screen.id) ?? screen, screen))
+                springs.to(screen.id, pickRect(screen), 'snappy');
+        }
+        if (!next.every((s, i) => sameRect(s, geometryScreens[i])))
+            onScreensChange(next, change);
+        return { final: bounds(membersOf(next, id)), compacted };
     };
     const begin = (e: ReactPointerEvent, s: Screen, mode: 'move' | 'resize', corner?: Corner) => {
         if (e.button !== 0 || drag.current || zoom <= 0)
@@ -389,8 +404,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
         const rest = geometryScreens.filter(s => !sameComputer(s, byId(d.id)!));
         const free = freeGroup(membersOf(geometryScreens, d.id), d.origin, d.live, rest);
         const transformed = transformGroup(members(d.id), d.origin, free);
-        const released = mergeVisibleGroups(geometryScreens, screens.map(s => transformed.find(next => next.id === s.id) ?? s));
-        const next = settings.compact ? compactGroups(released) : released;
+        const { next, compacted } = settle(screens.map(s => transformed.find(next => next.id === s.id) ?? s));
         for (const screen of next) {
             if (screens.some(s => s.id === screen.id) && !sameRect(springs.target(screen.id) ?? screen, screen))
                 springs.to(screen.id, pickRect(screen), 'soft');
@@ -399,7 +413,6 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
             return;
         onScreensChange(next, { label: d.mode === 'move' ? tr('移动 {0}', name) : tr('缩放 {0}', name) });
         const final = bounds(membersOf(next, d.id));
-        const compacted = next.some((s, i) => !sameRect(s, released[i]));
         const notes = [!sameRect(free, d.live) && tr('重叠，已弹到最近的空位'), compacted && tr('已靠拢')].filter((note): note is string => !!note);
         const where = noteSuffix(notes);
         log(d.mode === 'move'
@@ -444,9 +457,8 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
                     return;
                 }
                 lingerProjection();
-                animate(s.id, r, 'snappy');
-                commit(s.id, r, { label: tr('缩放 {0}', s.name), merge: `key-resize:${s.id}` });
-                log(tr('{0} 缩放到 {1} × {2}', s.name, r.w, r.h));
+                const { compacted } = commit(s.id, r, { label: tr('缩放 {0}', s.name), merge: `key-resize:${s.id}` });
+                log(compacted ? tr('{0} 缩放到 {1} × {2}{3}', s.name, r.w, r.h, noteSuffix([tr('已靠拢')])) : tr('{0} 缩放到 {1} × {2}', s.name, r.w, r.h));
                 return;
             }
             const axis = e.key === 'ArrowLeft' || e.key === 'ArrowRight' ? 'x' : 'y';
@@ -464,9 +476,9 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
             if (settings.snapping && facingGap(r, rest, axis, dir) === 0)
                 feedback.pulse();
             lingerProjection();
-            animate(s.id, r, 'snappy');
-            commit(s.id, r, { label: tr('移动 {0}', s.name), merge: `key-move:${s.id}` });
-            log(tr('{0} 移到 ({1}, {2}){3}', s.name, fmt(r.x), fmt(r.y), noteSuffix(got !== want ? [tr('已贴边')] : [])));
+            const { final, compacted } = commit(s.id, r, { label: tr('移动 {0}', s.name), merge: `key-move:${s.id}` });
+            const notes = [got !== want && tr('已贴边'), compacted && tr('已靠拢')].filter((note): note is string => !!note);
+            log(tr('{0} 移到 ({1}, {2}){3}', s.name, fmt(final.x), fmt(final.y), noteSuffix(notes)));
         };
         document.addEventListener('keydown', onKey);
         return () => document.removeEventListener('keydown', onKey);

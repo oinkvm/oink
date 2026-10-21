@@ -311,7 +311,6 @@ fn create_normal(app: &AppHandle, view: View) -> tauri::Result<()> {
         let (width, height) = match view {
             View::Main => (1040.0, 680.0),
             View::About => (360.0, 500.0),
-            View::Upgrade => (540.0, 480.0),
             View::Quit => (480.0, 320.0),
             View::Panel => unreachable!(),
         };
