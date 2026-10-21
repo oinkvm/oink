@@ -1750,7 +1750,7 @@ async fn own_retry_recovery(peer_owner_delay: Duration) {
     // This fixture has drained prior dials and the next direct loopback round
     // succeeds: allow its TLS, bootstrap/selection, route installation, C0
     // greeting and signed admission budgets. There is no old failed round or
-    // relay search to add (unlike the arbitrary-reachability bound in network.md).
+    // relay search to add: this fixture starts from a drained idle state.
     // Exact backoff/due behavior remains checked with synthetic Instants in
     // member_retry_clock_picks_up_reachability_within_five_seconds_after_many_timeouts.
     let recovery_budget = *RECONNECT_BACKOFF.iter().max().unwrap()
