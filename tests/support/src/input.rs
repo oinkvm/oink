@@ -19,6 +19,7 @@ struct State {
     touchpad_contacts: Option<u8>,
     injection_active: bool,
     injection_sessions: u64,
+    injection_start: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     resume_hotkey: Option<oink_input::capture_loop::ResumeHotkey>,
     resume_requested: bool,
     capture_sessions: u64,
@@ -103,6 +104,16 @@ impl FakeInput {
     }
     pub fn injection_sessions(&self) -> u64 {
         self.state.lock().unwrap().injection_sessions
+    }
+    /// Hold the next fake worker before its native-start observation. Dropping
+    /// the release sender also unblocks it during test cleanup/unwind.
+    pub fn block_next_injection_start(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, entering) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let mut state = self.state.lock().unwrap();
+        assert!(state.injection_start.is_none());
+        state.injection_start = Some((entered, released));
+        (entering, release)
     }
     pub fn paused_hotkey(&self) -> Option<oink_input::capture_loop::ResumeHotkey> {
         self.state.lock().unwrap().resume_hotkey
@@ -360,6 +371,11 @@ impl InputBackend for FakeInput {
         self.state.lock().unwrap().touchpad_contacts
     }
     fn start_injection_session(&self) -> Result<(), InputError> {
+        let blocked = self.state.lock().unwrap().injection_start.take();
+        if let Some((entered, released)) = blocked {
+            let _ = entered.send(());
+            let _ = released.recv();
+        }
         let mut state = self.state.lock().unwrap();
         state.injection_active = true;
         state.injection_sessions += 1;

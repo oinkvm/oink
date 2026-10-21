@@ -114,8 +114,21 @@ fn wait(mut predicate: impl FnMut() -> bool) {
 }
 #[test]
 fn paused_capture_registers_only_resume_hotkey_and_resume_starts_fresh_session() {
+    pause_resume_injection(false);
+}
+
+#[test]
+fn paused_capture_with_delayed_initial_injection_counts_only_one_resumed_session() {
+    pause_resume_injection(true);
+}
+
+fn pause_resume_injection(delay_initial_injection: bool) {
     let fake = Arc::new(oink_test_support::input::FakeInput::new());
+    let startup = delay_initial_injection.then(|| fake.block_next_injection_start());
     let inject = super::super::super::super::inject::start_with_backend(fake.clone(), Box::new(|_| {})).unwrap();
+    if let Some((entered, _)) = &startup {
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+    }
     let layout = oink_display::layout::Layout::default();
     let snapshots = InputSnapshots {
         mode_switch_in_callback: true,
@@ -133,6 +146,8 @@ fn paused_capture_registers_only_resume_hotkey_and_resume_starts_fresh_session()
     };
     let (main, receive_main) = crate::threads::main_channel();
     let (input, _notices) = InputThread::start(fixture_boot(DeviceId([1; 32])), snapshots, inject, main).unwrap();
+    // Drop the release channel before the worker-owning handles on unwind too.
+    let initial_injection_start = startup;
     // Startup waits for the initial owner pause command before requesting capture.
     assert_eq!(fake.capture_active(), Some(false));
     input.send(InputCommand::Paused(false));
@@ -157,7 +172,9 @@ fn paused_capture_registers_only_resume_hotkey_and_resume_starts_fresh_session()
     wait(|| input.status().peers.iter().any(|p| p.attached));
     let old_epoch = fake.input_safety().epoch;
     let old_session = fake.capture_sessions();
-    let old_inject = fake.injection_sessions();
+    // Capture/admission is deliberately allowed to progress while the native
+    // injection worker has not started. Release before asking it to stop.
+    drop(initial_injection_start);
     input.send(InputCommand::Hotkeys(vec![oink_routing::HotkeyBinding {
         action: "toggle_sharing".into(),
         chord: oink_routing::Chord::parse(&["Ctrl", "Alt", "S"]).unwrap(),
@@ -167,6 +184,10 @@ fn paused_capture_registers_only_resume_hotkey_and_resume_starts_fresh_session()
     wait(|| fake.capture_active() == Some(false) && fake.paused_hotkey().is_some());
     wait(|| input.status().injection_detached);
     assert!(!fake.injection_active());
+    // Peer attachment/capture readiness does not fence native injection startup.
+    // Count the old worker only after pause has finished it, so a delayed first
+    // start cannot be mistaken for an extra session created by resume.
+    let old_inject = fake.injection_sessions();
     let paused = fake.input_safety();
     assert!(paused.paused);
     assert_eq!(paused.epoch, old_epoch + 1);

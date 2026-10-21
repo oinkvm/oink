@@ -36,8 +36,6 @@ If this project helps you, consider sponsoring some of my AI subscription costs.
 
 <a href="https://ko-fi.com/hachiwii"><img alt="Ko-fi" src="https://ko-fi.com/img/githubbutton_sm.svg" height="36"></a>
 
-<img alt="WeChat Pay" src=".github/assets/wechat-pay.png" width="200">
-
 ## Contributing
 
 This project does not accept pull requests without context, because there is no one to review the code. Please use [Issues](https://github.com/oinkvm/oink/issues) for all bug reports and feature requests. When you report a problem, please include your device environment, diagnostic data, steps to reproduce and your AI-assisted investigation's conclusions. Using Oink in real environments and sending feedback is the biggest contribution to this project.

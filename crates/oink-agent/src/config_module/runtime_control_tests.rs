@@ -122,6 +122,15 @@ fn publish_facts_barrier(owner: &mut Owner) -> ApiResult<u64> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admitted_member_can_repeat_signed_history_while_readmission_is_pending() {
+    repeat_signed_history(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_history_fixture_preserves_queued_current_state() {
+    repeat_signed_history(true).await;
+}
+
+async fn repeat_signed_history(queue_current_state: bool) {
     let nodes = start(fresh(3)).await;
     let first = request(&nodes[0], &nodes[1], [8; 16]).await;
     let code = accept(&nodes[0], &nodes[1], &first).await;
@@ -163,25 +172,6 @@ async fn admitted_member_can_repeat_signed_history_while_readmission_is_pending(
     );
     let target = nodes[0].group.applied().group;
     let peer = nodes[1].identity.id();
-    // The pending-admission state below is injected, not a real transition.
-    // Ordinary periodic Facts would correctly close this deliberately unready
-    // C0. Freeze that unrelated producer and drain its earlier ordered frames
-    // before testing only the admitted history-proof lane.
-    for node in &nodes {
-        node.group.hold_periodic_facts();
-    }
-    let origin = nodes[0].identity.id();
-    let sequence = nodes[0].group.call(publish_facts_barrier).unwrap();
-    assert!(
-        until(|| nodes[1]
-            .group
-            .call(move |owner| Ok(owner
-                .facts
-                .get(&origin)
-                .is_some_and(|facts| facts.fact_sequence() == Ok(sequence))))
-            .unwrap())
-        .await
-    );
     let bundle = nodes[0]
         .group
         .call(move |owner| Ok(owner.journal.lookup(peer, old, None).unwrap().unwrap()))
@@ -200,62 +190,101 @@ async fn admitted_member_can_repeat_signed_history_while_readmission_is_pending(
     let (reference, messages) =
         oink_network::pair_objects::transfer(context, dto::ObjectKind::Transfer, bundle.raw()).unwrap();
     let digest = reference.digest().unwrap().0;
-    let outgoing = nodes[0].links.links().by_peer(peer).unwrap().link;
     let incoming = nodes[1].links.links().by_peer(nodes[0].identity.id()).unwrap().link;
-    nodes[1]
-        .group
-        .call(move |owner| {
-            let session = owner.sessions.get_mut(&incoming).unwrap();
-            assert!(session.admitted_anchor.is_some());
-            session.ready = false;
-            owner.links.retire(incoming);
-            Ok(())
-        })
-        .unwrap();
-    nodes[0]
-        .group
-        .call(move |owner| {
-            owner
-                .send(
-                    outgoing,
-                    Message::ConfigMergeTransfer(
-                        dto::MergeTransfer::from_raw([(1, reference.write())].into()).unwrap(),
-                    ),
+    let header = Message::ConfigMergeTransfer(dto::MergeTransfer::from_raw([(1, reference.write())].into()).unwrap());
+    let frames = std::iter::once(header)
+        .chain(messages)
+        .map(|message| v1::frame::encode(&message, v1::limits::CONFIG_FRAME).unwrap())
+        .collect::<Vec<_>>();
+    let queued = queue_current_state.then(|| {
+        nodes[0]
+            .group
+            .call(|owner| {
+                v1::frame::encode(
+                    &Message::ConfigState(owner.state.wire().clone()),
+                    v1::limits::CONFIG_FRAME,
                 )
                 .map_err(internal)
-        })
-        .unwrap();
-    assert!(
-        until(|| nodes[1]
-            .group
-            .call(move |owner| Ok(owner.proof_expected.contains_key(&(incoming, digest))))
-            .unwrap())
-        .await
-    );
-    nodes[0]
+            })
+            .unwrap()
+    });
+    let (observation, processed) = nodes[1]
         .group
         .call(move |owner| {
-            for message in messages {
-                owner.send(outgoing, message).map_err(internal)?;
+            let session = owner
+                .sessions
+                .get_mut(&incoming)
+                .ok_or_else(|| invalid("fixture C0 missing"))?;
+            let admitted = session.admitted_anchor.is_some();
+            let was_ready = session.ready;
+            // This is an injected owner state, not a real readmission. Keep
+            // the proof and its observations in one owner turn: live current-
+            // group State/Facts would correctly reject this artificial phase.
+            // Freezing periodic Facts or observing a prior marker cannot fence
+            // later admission/state traffic from the other live peers.
+            session.ready = false;
+            let replay = (|| {
+                owner.control(incoming, &frames[0]).map_err(internal)?;
+                let expected = owner.proof_expected.contains_key(&(incoming, digest));
+                for frame in &frames[1..] {
+                    owner.control(incoming, frame).map_err(internal)?;
+                }
+                let session = owner
+                    .sessions
+                    .get(&incoming)
+                    .ok_or_else(|| invalid("proof retired fixture C0"))?;
+                Ok((
+                    admitted,
+                    was_ready,
+                    expected,
+                    owner.proof_expected.contains_key(&(incoming, digest)),
+                    session.ready,
+                    owner.state.roster().anchor().group,
+                ))
+            })();
+            // Force a current-state frame to arrive after proof processing but
+            // before inspecting the synthetic phase. The actor must not consume
+            // it until the fixture has restored the live admission state.
+            let processed = queued.map(|bytes| {
+                let (ack, processed) = tokio::sync::oneshot::channel();
+                owner
+                    .incoming_tx
+                    .send(Incoming::Control(incoming, Ok(bytes), ack))
+                    .unwrap();
+                processed
+            });
+            if let Some(session) = owner.sessions.get_mut(&incoming) {
+                session.ready = was_ready;
             }
-            Ok(())
+            replay.map(|observation| (observation, processed))
         })
         .unwrap();
+    // Assertions belong on the test thread; a fixture failure must not panic
+    // the ordinary config owner and obscure its cause as NetworkStopped.
+    let (admitted, was_ready, expected, still_expected, became_ready, group) = observation;
+    assert!(admitted && was_ready);
+    assert!(expected, "signed history header was not correlated");
+    assert!(!still_expected, "signed history object did not finish");
+    assert!(!became_ready, "repeated history must not complete pending admission");
+    assert_eq!(group, target);
+    if let Some(processed) = processed {
+        processed.await.unwrap();
+    }
+    // Also verify the original live C0 remains usable after queued traffic,
+    // through its real TLS reader. A newer Facts sequence acknowledges this
+    // fresh marker too because the C0 controls are ordered.
+    let origin = nodes[0].identity.id();
+    let sequence = nodes[0].group.call(publish_facts_barrier).unwrap();
     assert!(
         until(|| nodes[1]
             .group
-            .call(move |owner| Ok(!owner.proof_expected.contains_key(&(incoming, digest))))
+            .call(move |owner| Ok(owner
+                .facts
+                .get(&origin)
+                .is_some_and(|facts| facts.fact_sequence().is_ok_and(|seen| seen >= sequence))))
             .unwrap())
         .await
     );
-    nodes[1]
-        .group
-        .call(move |owner| {
-            assert!(!owner.sessions[&incoming].ready);
-            assert_eq!(owner.state.roster().anchor().group, target);
-            Ok(())
-        })
-        .unwrap();
     assert_eq!(
         nodes[1].links.links().by_peer(nodes[0].identity.id()).unwrap().link,
         incoming
