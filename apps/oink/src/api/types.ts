@@ -192,6 +192,7 @@ export interface InputSettings {
   event_frequency: EventFrequency;
   accept_contacts: boolean;
   contacts_injection_available: boolean;
+  mac_scroll_feel: boolean;
   emergency_hold_ms: number;
   device_gain: number;
   scroll: ScrollSettings;
@@ -387,6 +388,7 @@ export interface LaunchAtLoginStatus {
 }
 
 export interface BootInfo {
+  open_update_failure?: boolean;
   build: string | null;
   /** "agent": connected to the backend; "none": backend unavailable. */
   backend: "agent" | "none";

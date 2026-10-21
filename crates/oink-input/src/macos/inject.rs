@@ -15,6 +15,8 @@
 //!   （右、下边界不属于屏幕）。光标于是画在屏幕外（底边闪烁），自动隐藏的 Dock、全屏时的菜单栏也认为指针
 //!   不在边上而不出现或反复收起（bug 8 的后续）。向下取到 float32 后，同一个 `CGEventPost` 的推边在
 //!   macOS 26 / 14 上都能让 Dock 约 0.3 s 出现，不再需要 IOHIDSystem 的第二条通道。
+//! - 定位拖动事件另外向下取到整数 Quartz point，避免负边界的小数在原生目标查找时落到屏外；
+//!   raw delta 和普通移动精度不变。原地刷新拖影保持当前坐标，不重新定位。
 //! - 点击计数按系统双击间隔与 4 pt 距离自己计算（`kCGMouseEventClickState`）。
 //! - 滚动：线上 `dy > 0` 表示视图向文档顶部移动，与 CGEvent 滚动增量的符号含义一致（应用把正增量理解为
 //!   「向上滚」），所以原样注入。小数部分按轴累积，阶段结束时清零。
@@ -666,9 +668,11 @@ impl Injector {
         buttons: u32,
         posted: &dyn Fn(Point),
     ) -> Result<(), InputError> {
-        let p = quartz_point(pos);
         let (ty, button, num) = drag_type(buttons);
-        let ev = motion_event(self.src(), ty, p, button)?;
+        let ev = motion_event(self.src(), ty, quartz_point(pos), button)?;
+        // Track the actual posted drag endpoint, including native lookup
+        // normalization, in the ordinary delta and pending-position ledgers.
+        let p = CGEvent::location(Some(&ev));
         let raw = delta.unwrap_or_else(|| {
             let last = st.last_pos.unwrap_or_else(current_location);
             (p.x - last.x, p.y - last.y)
@@ -744,7 +748,7 @@ impl Injector {
         let epoch = self.motion.position_epoch();
         let predecessor = st.pending_position.map_or(before, |p| p.resolve(before, epoch));
         let p = if let Some(at) = at {
-            quartz_point(at)
+            quartz_drag_point(at)
         } else if tap == CGEventTapLocation::SessionEventTap {
             before
         } else {
@@ -994,6 +998,17 @@ pub(crate) fn quartz_point(p: Point) -> CGPoint {
     }
 }
 
+/// macOS 14 native capture misses the negative edge even with the corrected
+/// catcher frame and a float32-safe cursor position. The explicit AppKit window
+/// query truncates negative fractions toward zero; native drag lookup is opaque.
+/// Submit the containing integer Quartz point, as the clipboard hit query
+/// already does, rather than depending on fractional native destination lookup.
+/// Ordinary motion's subpoint coordinates and routed/raw deltas stay unchanged.
+/// Installed negative-edge acceptance is checked separately from geometry tests.
+pub(crate) fn quartz_drag_point(p: Point) -> CGPoint {
+    quartz_point(Point::new(p.x.floor(), p.y.floor()))
+}
+
 /// 不大于 `v` 的最大 float32（以 f64 表示）。非有限值原样返回。
 fn f32_floor(v: f64) -> f64 {
     let f = v as f32;
@@ -1070,7 +1085,10 @@ pub(super) fn image_nudge_event(
         1 => (CGEventType::RightMouseDragged, CGMouseButton::Right),
         _ => (CGEventType::OtherMouseDragged, CGMouseButton::Center),
     };
-    let event = motion_event(source, ty, quartz_point(at), cg_button)?;
+    // This refresh is stationary, including for a physical source whose native
+    // anchor has subpoint precision. Only positioned drag motion is normalized;
+    // do not move the anchor or its frozen-cursor ledger to refresh an image.
+    let event = marked_mouse_event(source, ty, quartz_point(at), cg_button)?;
     CGEvent::set_integer_value_field(Some(&event), CGEventField::MouseEventButtonNumber, i64::from(number));
     CGEvent::set_integer_value_field(Some(&event), CGEventField::MouseEventDeltaX, 0);
     CGEvent::set_integer_value_field(Some(&event), CGEventField::MouseEventDeltaY, 0);
@@ -1079,6 +1097,23 @@ pub(super) fn image_nudge_event(
 }
 
 fn motion_event(
+    source: Option<&CGEventSource>,
+    ty: CGEventType,
+    at: CGPoint,
+    button: CGMouseButton,
+) -> Result<objc2_core_foundation::CFRetained<CGEvent>, InputError> {
+    let at = if matches!(
+        ty,
+        CGEventType::LeftMouseDragged | CGEventType::RightMouseDragged | CGEventType::OtherMouseDragged
+    ) {
+        quartz_drag_point(Point::new(at.x, at.y))
+    } else {
+        at
+    };
+    marked_mouse_event(source, ty, at, button)
+}
+
+fn marked_mouse_event(
     source: Option<&CGEventSource>,
     ty: CGEventType,
     at: CGPoint,
@@ -1234,15 +1269,15 @@ mod tests {
             MAGIC
         );
         let delivered = CGEvent::location(Some(&event));
-        assert_eq!(delivered, at);
+        assert_eq!(delivered, quartz_drag_point(Point::new(at.x, at.y)));
         let mut ledger = crate::warp_delta::WarpDeltaFix::new();
         ledger.motion((0., 0.), Point::new(720., 596.), 10, true);
         ledger.enter_remote();
         // Same registration used by the tap's MAGIC branch, with the delivered
         // coordinate (not the unquantized requested coordinate).
         ledger.posted_absolute_motion(Point::new(delivered.x, delivered.y), 20);
-        assert_eq!(ledger.motion((-719., -36.5), Point::new(1., 559.5), 30, true), (0., 1.));
-        assert_eq!(ledger.motion((0., 2.), Point::new(1., 561.5), 40, true), (0., 2.));
+        assert_eq!(ledger.motion((-719., -37.), Point::new(1., 559.), 30, true), (0., 1.));
+        assert_eq!(ledger.motion((0., 2.), Point::new(1., 561.), 40, true), (0., 2.));
         assert_eq!(ledger.take_leak(), None);
     }
 
@@ -1508,6 +1543,49 @@ mod tests {
         let mut rem = (0.0, 0.0);
         assert_eq!(take_delta(&mut rem, (0.0, 3.2)), (0, 3));
         assert_eq!(take_delta(&mut rem, (f64::NAN, 0.0)).0, 0);
+    }
+
+    #[test]
+    fn drag_event_endpoint_stays_inside_its_display_after_native_integer_lookup() {
+        // AppKit's negative-edge lookup must see the containing point, even
+        // when routing parks just inside an exclusive right/bottom boundary.
+        for (bounds, at) in [
+            (
+                oink_foundation::Rect::new(1600., -1080., 1920., 1080.),
+                Point::new(2500.25, -0.000_005),
+            ),
+            (
+                oink_foundation::Rect::new(-1920., 0., 1920., 1080.),
+                Point::new(-0.000_005, 600.75),
+            ),
+            (
+                oink_foundation::Rect::new(-1920., -1080., 1920., 1080.),
+                Point::new(-0.000_005, -0.000_005),
+            ),
+            (
+                oink_foundation::Rect::new(0., 0., 1728., 1117.),
+                Point::new(1_727.999_999, 1_116.999_999),
+            ),
+        ] {
+            assert!(bounds.contains(at));
+            for ty in [
+                CGEventType::LeftMouseDragged,
+                CGEventType::RightMouseDragged,
+                CGEventType::OtherMouseDragged,
+            ] {
+                let event = motion_event(None, ty, quartz_point(at), CGMouseButton::Left).unwrap();
+                let posted = CGEvent::location(Some(&event));
+                let lookup = Point::new(posted.x.trunc(), posted.y.trunc());
+                assert!(
+                    bounds.contains(lookup),
+                    "{at:?} posted as {posted:?}, native lookup {lookup:?}"
+                );
+            }
+        }
+        // Ordinary pointer motion retains its existing subpoint precision.
+        let at = CGPoint::new(-12.25, -0.25);
+        let event = motion_event(None, CGEventType::MouseMoved, at, CGMouseButton::Left).unwrap();
+        assert_eq!(CGEvent::location(Some(&event)), at);
     }
 
     #[test]

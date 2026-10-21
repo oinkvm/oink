@@ -54,7 +54,6 @@ typedef NS_ENUM(uint32_t, OinkUpdateBoundary) {
 @property(nonatomic, strong) SPUUpdater *updater;
 @property(nonatomic, strong) OinkUpdateTiming *timing;
 @property UpdateEvent callback;
-@property BOOL beta;
 @property BOOL cancelled;
 @property BOOL armed;
 @property BOOL checkPending;
@@ -110,9 +109,9 @@ static char updateReadinessContext;
     if (_callback) _callback(event,_build,_expected,progress,"","");
 }
 - (NSString *)feedURLStringForUpdater:(SPUUpdater *)updater {
-    return [NSString stringWithFormat:@"https://updates.oink.hachiwii.com/mac/v1/mac-2026-01/%@/appcast.xml",_beta?@"beta":@"stable"];
+    return @"https://updates.oink.hachiwii.com/mac/v1/mac-2026-01/stable/appcast.xml";
 }
-- (NSSet<NSString *> *)allowedChannelsForUpdater:(SPUUpdater *)updater {return _beta?[NSSet setWithObject:@"beta"]:[NSSet set];}
+- (NSSet<NSString *> *)allowedChannelsForUpdater:(SPUUpdater *)updater {return [NSSet set];}
 - (void)showUpdatePermissionRequest:(SPUUpdatePermissionRequest *)request reply:(void (^)(SUUpdatePermissionResponse *))reply {
     reply([[SUUpdatePermissionResponse alloc] initWithAutomaticUpdateChecks:NO sendSystemProfile:NO]);
 }
@@ -199,13 +198,13 @@ static char updateReadinessContext;
     // application alive until dismissUpdateInstallation confirms abort.
 }
 @end
-bool oink_update_start(UpdateEvent callback,UpdateTiming timing,bool beta,bool checks) {
+bool oink_update_start(UpdateEvent callback,UpdateTiming timing,bool checks) {
     NSCAssert(NSThread.isMainThread,@"main thread");
     NSBundle *bundle=NSBundle.mainBundle;
     // Bundle policy/public-key fields are sealed and checked by packaging;
     // Sparkle validates its own configuration when startUpdater runs.
     if (owner) return true;
-    owner=[OinkUpdateDriver new];owner.callback=callback;owner.timing.callback=timing;owner.beta=beta;
+    owner=[OinkUpdateDriver new];owner.callback=callback;owner.timing.callback=timing;
     owner.updater=[[SPUUpdater alloc] initWithHostBundle:bundle applicationBundle:bundle userDriver:owner delegate:owner];
     // The custom driver owns download/install intent; Sparkle only schedules checks.
     owner.updater.automaticallyDownloadsUpdates=NO;
@@ -233,8 +232,8 @@ void oink_update_timing(uint32_t boundary) {[owner.timing boundary:boundary byte
 void oink_update_cancel(void) {[owner cancel];}
 bool oink_update_quit_allowed(void) {return !owner.armed;}
 bool oink_update_checks_enabled(void) {return owner.updater.automaticallyChecksForUpdates;}
-void oink_update_preferences(bool checks,bool beta) {
-    [owner cancel];owner.beta=beta;owner.updater.automaticallyChecksForUpdates=checks;
+void oink_update_preferences(bool checks) {
+    [owner cancel];owner.updater.automaticallyChecksForUpdates=checks;
     [owner.updater resetUpdateCycle];
 }
 

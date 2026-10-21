@@ -68,7 +68,7 @@ export function usePreferences(): PrefsApi {
       const next:Prefs={...p,
         ...(local?{notificationLevel:local.notification_level,showInMenuBar:local.show_status_icon,confirmQuit:local.confirm_quit,language:local.ui_language,logLevel:local.log_level,logMaxMb:String(local.log_max_mb)}:{}),
         upgradeHint:presentation.show_update_hint,
-        ...(state.input?{pollLimit:state.input.event_frequency==='hz125'?'125':'none',keepAwake:state.input.wake_displays_on_input,pointerTrail:state.input.cursor_trail,touchpadInject:state.input.accept_contacts,pointerGain:state.input.device_gain,escStop:state.input.emergency_hold_ms!==0,
+        ...(state.input?{pollLimit:state.input.event_frequency==='hz125'?'125':'none',keepAwake:state.input.wake_displays_on_input,pointerTrail:state.input.cursor_trail,touchpadInject:state.input.accept_contacts,macScrollFeel:state.input.mac_scroll_feel,pointerGain:state.input.device_gain,escStop:state.input.emergency_hold_ms!==0,
           shortcuts:{...p.shortcuts,...Object.fromEntries(state.input.hotkeys.filter(h=>h.action in actions).map(h=>[actions[h.action as keyof typeof actions],{on:h.enabled,keys:h.keys.map(k=>k==='Ctrl'?'Control':k).join('+')}]))}} as const:{}),
         ...(state.clipboard?{clipText:state.clipboard.text,clipRich:state.clipboard.rich_text,clipImage:state.clipboard.images,clipFiles:state.clipboard.files,clipPrivate:state.clipboard.custom}:{}),
         ...(state.audio?{keepLocalPlayback:state.audio.settings.keep_local_playback,audioDevice:state.audio.settings.receive_output??'default'}:{}),
@@ -98,13 +98,14 @@ export function usePreferences(): PrefsApi {
       const current=agent.get(), appliedLocal=current.localPreferences;
       if(changed('launchAtLogin')){await agent.query('launch',()=>api.setLaunchAtLogin(next.launchAtLogin));next={...next,launchAtLogin:['enabled','requires_approval'].includes(agent.get().launch?.state??'')};}
       if(changed('diagnostics'))await api.setDiagnosticsEnabled(next.diagnostics);
-      if((['pollLimit','keepAwake','pointerTrail','touchpadInject','escStop','pointerGain','shortcuts'] as const).some(changed)){
+      if((['pollLimit','keepAwake','pointerTrail','touchpadInject','macScrollFeel','escStop','pointerGain','shortcuts'] as const).some(changed)){
         if(!current.input)throw new Error('unavailable');
         await api.setInputSettings({
           ...(changed('pollLimit')?{event_frequency:next.pollLimit==='125'?'hz125':'unlimited'}:{}),
           ...(changed('keepAwake')?{wake_displays_on_input:next.keepAwake}:{}),
           ...(changed('pointerTrail')?{cursor_trail:next.pointerTrail}:{}),
           ...(changed('touchpadInject')?{accept_contacts:next.touchpadInject}:{}),
+          ...(changed('macScrollFeel')?{mac_scroll_feel:next.macScrollFeel}:{}),
           ...(changed('escStop')?{emergency_hold_ms:next.escStop?5000:0}:{}),
           ...(changed('pointerGain')?{device_gain:next.pointerGain}:{}),
           ...(changed('shortcuts')?{hotkeys:current.input.hotkeys.map(h=>{const key=actions[h.action as keyof typeof actions],shortcut=key?next.shortcuts[key]:null;return shortcut?{...h,enabled:shortcut.on,keys:shortcut.keys.split('+').map(k=>k==='Control'?'Ctrl':k)}:h;})}:{}),
@@ -141,7 +142,7 @@ export function usePreferences(): PrefsApi {
   return{prefs,pending,launchStatus:state.launch,canEdit: key => {
       if(['language','showInMenuBar','confirmQuit','notificationLevel','logLevel','logMaxMb','theme','accent'].includes(key))return local!==null;
       if(['keymap','scrollInvert'].includes(key))return transform!==null;
-      if(['pollLimit','pointerGain','keepAwake','pointerTrail','touchpadInject','escStop'].includes(key)||key.startsWith('sc-'))return state.input!==null;
+      if(['pollLimit','pointerGain','keepAwake','pointerTrail','touchpadInject','macScrollFeel','escStop'].includes(key)||key.startsWith('sc-'))return state.input!==null;
       if(key.startsWith('clip'))return state.clipboard!==null;
       if(['audioDevice','keepLocalPlayback'].includes(key))return state.audio!==null;
       if(key==='launchAtLogin')return state.launch!==null;

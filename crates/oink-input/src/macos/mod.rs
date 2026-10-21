@@ -181,7 +181,7 @@ impl InputBackend for MacInput {
     }
 
     fn move_held_drag_observed(&self, generation: u64, at: Point, posted: &dyn Fn(Point)) -> Result<(), InputError> {
-        let q = inject::quartz_point(at);
+        let q = inject::quartz_drag_point(at);
         let at = Point::new(q.x, q.y);
         let tap = self.tap.lock().unwrap_or_else(|e| e.into_inner());
         tap.as_ref()

@@ -1,6 +1,6 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signer, SigningKey};
-use oink_update::{Error, PRODUCT, WINDOWS_EPOCH, feed::*, policy::Channel};
+use oink_update::{Error, PRODUCT, WINDOWS_EPOCH, feed::*};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 const NOW: i64 = 1791936000; // 2026-10-14 UTC
@@ -29,7 +29,6 @@ fn check(p: &Value, seen: &Watermark, now: i64) -> Result<VerifiedManifest, Erro
             epoch: WINDOWS_EPOCH,
             key: &key().verifying_key().to_bytes(),
         },
-        Channel::Stable,
         seen,
         now,
     )
@@ -39,7 +38,6 @@ fn good_signature_selects_highest_compatible_build_without_downgrade() {
     let m = check(&payload(), &Watermark::default(), NOW).unwrap();
     let quarantine = BTreeSet::new();
     let mut s = Selection {
-        channel: Channel::Stable,
         windows_build: 19045,
         architecture: "x86_64",
         installed_build: 19,
@@ -74,14 +72,7 @@ fn tamper_every_payload_byte_wrong_key_and_invalid_signature() {
         let mut e = env.clone();
         e["payload"] = json!(STANDARD.encode(changed));
         assert_eq!(
-            verify_manifest(
-                &serde_json::to_vec(&e).unwrap(),
-                &trust,
-                Channel::Stable,
-                &Watermark::default(),
-                NOW
-            )
-            .unwrap_err(),
+            verify_manifest(&serde_json::to_vec(&e).unwrap(), &trust, &Watermark::default(), NOW).unwrap_err(),
             Error::Signature
         );
     }
@@ -90,7 +81,6 @@ fn tamper_every_payload_byte_wrong_key_and_invalid_signature() {
         verify_manifest(
             &envelope(&payload()),
             &Trust { key: &wrong, ..trust },
-            Channel::Stable,
             &Watermark::default(),
             NOW
         )
@@ -110,7 +100,6 @@ fn duplicate_keys_rejected_even_when_signed() {
                 epoch: WINDOWS_EPOCH,
                 key: &key().verifying_key().to_bytes(),
             },
-            Channel::Stable,
             &Watermark::default(),
             NOW
         )
@@ -210,48 +199,20 @@ fn product_epoch_channel_schema_and_fractional_build_rejected() {
     assert!(check(&p, &Watermark::default(), NOW).is_err());
 }
 #[test]
-fn stable_rejects_beta_beta_can_select_stable_and_returning_stable_waits() {
+fn only_stable_feed_and_release_metadata_is_accepted() {
+    for channel in ["beta", "nightly"] {
+        let mut p = payload();
+        p["releases"][0]["channel"] = json!(channel);
+        assert!(check(&p, &Watermark::default(), NOW).is_err());
+        p["releases"][0]["channel"] = json!("stable");
+        p["channel"] = json!(channel);
+        assert!(check(&p, &Watermark::default(), NOW).is_err());
+    }
     let mut p = payload();
-    p["releases"][0]["channel"] = json!("beta");
-    assert!(check(&p, &Watermark::default(), NOW).is_err());
-    p["channel"] = json!("beta");
-    let mut stable = p["releases"][0].clone();
-    stable["channel"] = json!("stable");
-    stable["build"] = json!(21);
-    p["releases"].as_array_mut().unwrap().push(stable);
-    let public = key().verifying_key().to_bytes();
-    let m = verify_manifest(
-        &envelope(&p),
-        &Trust {
-            epoch: WINDOWS_EPOCH,
-            key: &public,
-        },
-        Channel::Beta,
-        &Watermark::default(),
-        NOW,
-    )
-    .unwrap();
-    let q = BTreeSet::new();
-    let s = Selection {
-        channel: Channel::Beta,
-        windows_build: 19045,
-        architecture: "x86_64",
-        installed_build: 19,
-        successful_build: 19,
-        quarantine: &q,
-    };
-    assert_eq!(m.select(&s).unwrap().unwrap().build, 21);
-    let stable = check(&payload(), &Watermark::default(), NOW).unwrap();
-    assert!(
-        stable
-            .select(&Selection {
-                channel: Channel::Stable,
-                installed_build: 21,
-                ..s
-            })
-            .unwrap()
-            .is_none()
-    );
+    p["releases"][0]["channel"] = json!("stable");
+    let manifest = check(&p, &Watermark::default(), NOW).unwrap();
+    assert_eq!(manifest.manifest().channel, Channel::Stable);
+    assert_eq!(manifest.manifest().releases[0].channel, Channel::Stable);
 }
 #[test]
 fn package_signatures_and_lengths_bind_final_bytes() {
@@ -340,7 +301,7 @@ fn compiled_feed_origin_has_no_runtime_override_and_test_assets_stay_loopback() 
     #[cfg(not(feature = "test-feed"))]
     {
         assert_eq!(
-            manifest_url(Channel::Stable),
+            manifest_url(),
             "https://updates.oink.hachiwii.com/windows/v1/win-2026-01/stable/manifest.json"
         );
         assert!(
@@ -351,7 +312,7 @@ fn compiled_feed_origin_has_no_runtime_override_and_test_assets_stay_loopback() 
     {
         let origin = env!("OINK_WINDOWS_UPDATE_TEST_FEED");
         assert_eq!(
-            manifest_url(Channel::Stable),
+            manifest_url(),
             format!("{origin}/oink-update-qualification/windows/v1/win-2026-01/stable/manifest.json")
         );
         assert!(validate_package_url(&format!("{origin}/oink-update-qualification/packages/candidate.msi")).is_ok());

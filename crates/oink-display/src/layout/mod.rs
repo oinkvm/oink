@@ -1,8 +1,9 @@
 //! Shared screen geometry in a fixed reference plane. One unit is the frozen
 //! reference diagonal; native pointer coordinates remain OS points or pixels.
 //!
-//! Editing resolves overlap and closes projection-preserving gaps. Effective geometry
-//! applies owner preferences before topology compiles portals and walls.
+//! Native refresh and API resizes resolve overlap; auto-compaction belongs to the
+//! canvas editor's manual edits. Effective geometry applies owner preferences
+//! before topology compiles portals and walls.
 
 use oink_foundation::display::DisplayInfo;
 use oink_foundation::{DeviceId, Point, Rect};
@@ -10,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 mod arrange;
-mod compact;
 mod edit;
 pub mod facing;
 mod portal;

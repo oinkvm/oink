@@ -41,6 +41,7 @@ pub(super) struct State {
     prepared_at: Option<Instant>,
     last_check: Option<Instant>,
     revision: u64,
+    wake: Option<std::sync::mpsc::SyncSender<()>>,
 }
 impl State {
     fn request_check(&mut self) {
@@ -60,7 +61,6 @@ impl State {
         let status = UpdateStatus {
             current_build: receipt.build,
             version: receipt.version,
-            channel: policy.policy.preferences.channel,
             checks_enabled: configured && policy.policy.preferences.checks_enabled,
             phase: if configured { Phase::Idle } else { Phase::Disabled },
             candidate: None,
@@ -83,6 +83,7 @@ impl State {
             prepared_at: None,
             last_check: None,
             revision: 0,
+            wake: None,
         })
     }
 }
@@ -108,6 +109,7 @@ fn journal_status(name: &str) -> Result<(Phase, Option<Error>), Error> {
 }
 pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, request: Request) -> Reply {
     let mut state = state.lock().unwrap();
+    let wake = !matches!(&request, Request::Poll { .. } | Request::Query);
     if pending() {
         let (phase, error) =
             journal_status("pending.json").unwrap_or((Phase::RepairRequired, Some(Error::RepairRequired)));
@@ -294,7 +296,6 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
                             state.policy = old;
                             return Err(e);
                         }
-                        state.status.channel = preferences.channel;
                         state.status.checks_enabled = preferences.checks_enabled;
                         state.status.candidate = None;
                         state.queued = preferences.checks_enabled.then_some(Command::Check);
@@ -343,6 +344,9 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
         status.can_change_policy = super::pipe::elevated(process);
         Ok(Reply::Status { status })
     })();
+    if wake && let Some(send) = &state.wake {
+        let _ = send.try_send(());
+    }
     result.unwrap_or_else(|error| Reply::Error { error })
 }
 fn abort(state: &mut State) -> Result<(), Error> {
@@ -378,20 +382,14 @@ pub(super) fn serve() {
     if protected::system().is_err() {
         return;
     }
-    // The running transaction worker cannot delete its own mapped image.
-    // Reclaim ended copies at the next start, before any download can begin.
-    // An active worker owns the lock; its files must survive this startup.
-    if let Err(error) = worker::cleanup_completed()
-        && error != Error::Busy
-    {
-        tracing::warn!(%error, "could not prune completed update staging");
-    }
-    let Ok(initial) = State::new() else {
+    let Ok(mut initial) = State::new() else {
         return;
     };
+    let (wake, receive) = std::sync::mpsc::sync_channel(1);
+    initial.wake = Some(wake);
     let state = Arc::new(Mutex::new(initial));
     let engine_state = state.clone();
-    let engine = std::thread::spawn(move || engine(engine_state));
+    let engine = std::thread::spawn(move || engine(engine_state, receive));
     let mut workers = BTreeMap::<u32, std::thread::JoinHandle<()>>::new();
     while !super::super::broker::STOP.load(Ordering::Acquire) {
         if let Ok(sessions) = super::pipe::sessions() {
@@ -453,7 +451,7 @@ struct Selected {
     manifest: VerifiedManifest,
     envelope: Vec<u8>,
     release: Release,
-    verified_package: bool,
+    prepared: Option<worker::PreparedPackage>,
 }
 fn check_feed(state: &Arc<Mutex<State>>, roots: &Roots) -> Result<Option<Selected>, Error> {
     let (policy, installed, revision) = {
@@ -462,14 +460,12 @@ fn check_feed(state: &Arc<Mutex<State>>, roots: &Roots) -> Result<Option<Selecte
         state.last_check = Some(Instant::now());
         (state.policy.clone(), state.status.current_build, state.revision)
     };
-    let channel = policy.policy.preferences.channel;
-    let envelope = http(&feed::manifest_url(channel), feed::MAX_FEED as u64, false)?;
-    let seen = policy.watermarks.get(channel.name()).cloned().unwrap_or_default();
-    let manifest = feed::verify_manifest(&envelope, &roots.feed(), channel, &seen, now())?;
+    let envelope = http(&feed::manifest_url(), feed::MAX_FEED as u64, false)?;
+    let seen = policy.watermarks.get("stable").cloned().unwrap_or_default();
+    let manifest = feed::verify_manifest(&envelope, &roots.feed(), &seen, now())?;
     let os_build = worker::windows_build()?;
     let release = manifest
         .select(&Selection {
-            channel,
             windows_build: os_build,
             architecture: "x64",
             installed_build: installed,
@@ -487,7 +483,7 @@ fn check_feed(state: &Arc<Mutex<State>>, roots: &Roots) -> Result<Option<Selecte
     state
         .policy
         .watermarks
-        .insert(channel.name().into(), manifest.watermark().clone());
+        .insert("stable".into(), manifest.watermark().clone());
     save_policy(&state.policy)?;
     state.status.checked_at = Some(now());
     state.status.next_check = Some(now() + 24 * 3600);
@@ -520,10 +516,10 @@ fn check_feed(state: &Arc<Mutex<State>>, roots: &Roots) -> Result<Option<Selecte
         manifest,
         envelope,
         release,
-        verified_package: false,
+        prepared: None,
     }))
 }
-fn download(selected: &mut Selected, roots: &Roots) -> Result<(), Error> {
+fn download(selected: &mut Selected, roots: &Roots, state: &Arc<Mutex<State>>) -> Result<(), Error> {
     selected.manifest.ensure_fresh(now())?;
     let package = &selected.release.package;
     let bytes = http(&package.url, package.length, true)?;
@@ -531,10 +527,24 @@ fn download(selected: &mut Selected, roots: &Roots) -> Result<(), Error> {
     let directory = protected::maintenance().map_err(|_| Error::Storage)?.join("downloads");
     protected::directory(&directory).map_err(|_| Error::Storage)?;
     protected::write(&directory.join("candidate.msi"), &bytes)?;
-    selected.verified_package = true;
+    state.lock().unwrap().status.phase = Phase::Verifying;
+    let installed = state.lock().unwrap().status.current_build;
+    let previous = selected
+        .manifest
+        .manifest()
+        .releases
+        .iter()
+        .find(|r| r.build == installed)
+        .cloned();
+    selected.prepared = Some(worker::prepare_package(
+        selected.release.clone(),
+        previous,
+        &selected.envelope,
+        roots,
+    )?);
     Ok(())
 }
-fn engine(state: Arc<Mutex<State>>) {
+fn engine(state: Arc<Mutex<State>>, wake: std::sync::mpsc::Receiver<()>) {
     let roots = match oink_update::trust::compiled() {
         Ok(roots) => roots,
         Err(error) => {
@@ -547,6 +557,8 @@ fn engine(state: Arc<Mutex<State>>) {
     };
     let mut selected: Option<Selected> = None;
     let mut was_pending = pending();
+    let mut housekeeping: Option<std::thread::JoinHandle<Result<(), Error>>> = None;
+    let mut cleanup_needed = true;
     while !super::super::broker::STOP.load(Ordering::Acquire) {
         let is_pending = pending();
         if is_pending {
@@ -564,6 +576,10 @@ fn engine(state: Arc<Mutex<State>>) {
             state.status.phase = phase;
             state.status.candidate = None;
             state.status.error = error;
+            // Preserve the durable install outcome for the relaunched UI;
+            // an automatic check must not immediately replace it with Idle.
+            state.last_check = Some(Instant::now());
+            cleanup_needed = true;
             selected = None;
         }
         was_pending = is_pending;
@@ -593,20 +609,25 @@ fn engine(state: Arc<Mutex<State>>) {
                     }
                     Command::Download => {
                         let candidate = selected.as_mut().ok_or(Error::Policy)?;
-                        if !candidate.verified_package {
+                        if candidate.prepared.is_none() {
+                            // Only this engine starts staging. Join any background
+                            // collection before touching a new artifact, without
+                            // holding State or delaying UI/status requests.
+                            let _ = finish_housekeeping(&mut housekeeping);
                             state.lock().unwrap().status.phase = Phase::Downloading;
-                            download(candidate, &roots)?;
+                            download(candidate, &roots, &state)?;
                         }
                         state.lock().unwrap().status.phase = Phase::Ready;
                     }
                     Command::Install { expected_build } => {
                         let candidate = selected.as_ref().ok_or(Error::Policy)?;
-                        if !candidate.verified_package || candidate.release.build != expected_build {
+                        if candidate.prepared.is_none() || candidate.release.build != expected_build {
                             return Err(Error::Policy);
                         }
-                        prepare(&state, candidate, &roots, revision)?;
+                        prepare(&state, candidate, revision)?;
                     }
                     Command::Cancel => {
+                        cleanup_needed = true;
                         selected = None;
                         let mut state = state.lock().unwrap();
                         state.status.phase = Phase::Idle;
@@ -624,10 +645,38 @@ fn engine(state: Arc<Mutex<State>>) {
             state.status.error = Some(error);
             state.status.phase = Phase::Failed;
         }
-        std::thread::sleep(Duration::from_secs(1));
+        if housekeeping.as_ref().is_some_and(|task| task.is_finished()) {
+            cleanup_needed = finish_housekeeping(&mut housekeeping) == Some(Err(Error::Busy));
+        }
+        if cleanup_needed
+            && housekeeping.is_none()
+            && !pending()
+            && selected.as_ref().is_none_or(|candidate| candidate.prepared.is_none())
+        {
+            housekeeping = Some(std::thread::spawn(worker::cleanup_completed));
+        }
+        let preparing = {
+            let state = state.lock().unwrap();
+            state.transaction.is_some() && !state.shutdown
+        };
+        let _ = wake.recv_timeout(if preparing {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_secs(1)
+        });
     }
+    let _ = finish_housekeeping(&mut housekeeping);
 }
-fn prepare(state: &Arc<Mutex<State>>, selected: &Selected, roots: &Roots, expected_revision: u64) -> Result<(), Error> {
+fn finish_housekeeping(task: &mut Option<std::thread::JoinHandle<Result<(), Error>>>) -> Option<Result<(), Error>> {
+    let result = task.take()?.join().unwrap_or(Err(Error::Storage));
+    if let Err(error) = result
+        && error != Error::Busy
+    {
+        tracing::warn!(%error, "background update cleanup failed");
+    }
+    Some(result)
+}
+fn prepare(state: &Arc<Mutex<State>>, selected: &Selected, expected_revision: u64) -> Result<(), Error> {
     selected.manifest.ensure_fresh(now())?;
     let sessions = super::pipe::sessions().map_err(|_| Error::Busy)?;
     let (registrations, revision) = {
@@ -640,21 +689,7 @@ fn prepare(state: &Arc<Mutex<State>>, selected: &Selected, roots: &Roots, expect
         let registrations = registered_sessions(&state.registrations, &sessions, worker::process_current)?;
         (registrations, state.revision)
     };
-    let previous_build = state.lock().unwrap().status.current_build;
-    let previous = selected
-        .manifest
-        .manifest()
-        .releases
-        .iter()
-        .find(|r| r.build == previous_build)
-        .cloned();
-    let transaction = worker::stage(
-        selected.release.clone(),
-        previous,
-        &selected.envelope,
-        registrations,
-        roots,
-    )?;
+    let transaction = worker::stage(selected.prepared.as_ref().ok_or(Error::Policy)?, registrations)?;
     let mut state = state.lock().unwrap();
     if state.revision != revision {
         protected::write(&transaction_dir(&transaction)?.join("abort.json"), b"{\"schema\":1}")?;
@@ -738,7 +773,6 @@ mod tests {
             status: UpdateStatus {
                 current_build: 1,
                 version: "0.1.1".into(),
-                channel: Channel::Stable,
                 checks_enabled: true,
                 phase: Phase::Idle,
                 candidate: None,
@@ -759,6 +793,7 @@ mod tests {
             prepared_at: None,
             last_check: None,
             revision: 0,
+            wake: None,
         }
     }
     #[test]
@@ -926,7 +961,6 @@ fn loopback_check_verifies_the_signed_map_and_selects_ui_language() {
             epoch: oink_update::WINDOWS_EPOCH,
             key: &key,
         },
-        Channel::Stable,
         &feed::Watermark::default(),
         feed::timestamp("2026-10-20T00:00:00Z").unwrap(),
     )
@@ -934,7 +968,6 @@ fn loopback_check_verifies_the_signed_map_and_selects_ui_language() {
     let quarantine = Default::default();
     let release = manifest
         .select(&Selection {
-            channel: Channel::Stable,
             windows_build: 22000,
             architecture: "x64",
             installed_build: 32,

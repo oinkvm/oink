@@ -11,12 +11,7 @@ import {
     type Screen,
     type SnapEdges,
 } from './geometry';
-import { compactRectangles } from './compaction';
 import { tolerance } from './facing';
-
-export function compactGroups(screens: Screen[]): Screen[] {
-    return compactRectangles(screens, screens.map(s => s.device ?? s.id));
-}
 
 /** Missing device IDs describe independent screens in standalone editor fixtures. */
 export const sameComputer = (a: Screen, b: Screen) => a.id === b.id || !!a.device && a.device === b.device;

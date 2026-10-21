@@ -15,7 +15,7 @@ import { PermissionRow } from '../permissions/PermissionRow';
 import { PermissionControl } from '../permissions/PermissionControl';
 import { useGrant } from './useGrant';
 import { UninstallControl } from './UninstallControl';
-import { UpdatePreferences, checkForUpdates } from './UpdatePreferences';
+import { UpdateCheck, UpdatePreferences } from './UpdatePreferences';
 import { SHORTCUTS, ShortcutRecorder, spokenKeys } from './Shortcuts';
 import type { ShortcutId } from './Shortcuts';
 import type { LogLevel, PermissionId, Prefs, PrefsApi } from './prefs';
@@ -74,7 +74,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
     const { theme, setTheme, accent, setAccent, motion, setMotion } = useOink();
     const scroller = useRef<HTMLDivElement | null>(null);
     const uid = useId();
-    const applicable = (item: ItemMeta) => (item.id !== 'perm-network' || perms.network !== 'not_required') && (item.id !== 'touchpadInject' || agentState.input?.contacts_injection_available === true);
+    const applicable = (item: ItemMeta) => (item.id !== 'perm-network' || perms.network !== 'not_required') && (!['touchpadInject','macScrollFeel'].includes(item.id) || agentState.input?.contacts_injection_available === true);
     const sections = sectionsFor(platform).map(s => ({ ...s, items: s.items.filter(applicable) }));
     const found = searchSections(platform, query);
     const shown = sections.filter((s) => {
@@ -122,19 +122,6 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
         if (jump.item)
             setFlash({ id: jump.item, n: jump.n });
     }, [jump?.n]);
-    const [checking, setChecking] = useState(false);
-    const checkUpdate = async () => {
-        setChecking(true);
-        try {
-            await checkForUpdates(agentState.update);
-        }
-        catch {
-            agent.fail('unavailable');
-        }
-        finally {
-            setChecking(false);
-        }
-    };
     const grant = useGrant(onGrant, onOpenPermissionSettings);
     const [cacheBytes, setCacheBytes] = useState<number | null>(null);
     const [cacheNote, setCacheNote] = useState('');
@@ -226,6 +213,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
             case 'clipFiles':
             case 'clipPrivate':
                 return sw(item.id);
+            case 'macScrollFeel': return { node: <Switch aria-label={label} checked={prefs.macScrollFeel} onChange={toggle('macScrollFeel',label)} disabled={!prefs.touchpadInject}/> };
             case 'hideSponsor': return { node: <Switch aria-label={label} checked={api.presentation?.hide_sponsor ?? false} onChange={v => api.savePresentation({ hide_sponsor: v })}/> };
             case 'onboarding': return { node: <Button size="sm" onClick={onOnboarding}>{tr('显示')}</Button> };
             case 'uninstall': return { node: <UninstallControl/> };
@@ -245,7 +233,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
             case 'version':
                 return {
                     desc: <span className="setp__mono">v{version}</span>,
-                    node: <Button size="sm" loading={checking} onClick={checkUpdate}>{tr('检查更新')}</Button>,
+                    node: <UpdateCheck status={agentState.update} open={open}/>,
                 };
             case 'updates': return { node: <UpdatePreferences status={agentState.update}/>, width: 'fill' };
             case 'about':

@@ -1,5 +1,4 @@
 //! Verify the exact signed bytes before interpreting any selection metadata.
-use crate::policy::Channel;
 use crate::{Error, PRODUCT, SCHEMA};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -20,12 +19,19 @@ pub const MAX_PACKAGE: u64 = 512 * 1024 * 1024;
 pub const MAX_UNPACKED: u64 = 1024 * 1024 * 1024;
 pub const MAX_NOTES: usize = 16 * 1024;
 
-pub fn manifest_url(channel: Channel) -> String {
+// Preserve the published feed schema while accepting only stable metadata.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Channel {
+    #[default]
+    Stable,
+}
+
+pub fn manifest_url() -> String {
     format!(
-        "{}/windows/v1/{}/{}/manifest.json",
+        "{}/windows/v1/{}/stable/manifest.json",
         feed_origin(),
-        crate::WINDOWS_EPOCH,
-        channel.name()
+        crate::WINDOWS_EPOCH
     )
 }
 fn feed_origin() -> &'static str {
@@ -187,7 +193,6 @@ pub struct Watermark {
 }
 #[derive(Debug)]
 pub struct Selection<'a> {
-    pub channel: Channel,
     pub windows_build: u32,
     pub architecture: &'a str,
     pub installed_build: u64,
@@ -218,9 +223,6 @@ impl VerifiedManifest {
         Ok(())
     }
     pub fn select(&self, selection: &Selection<'_>) -> Result<Option<&Release>, Error> {
-        if selection.channel != self.manifest.channel {
-            return Err(Error::Policy);
-        }
         Ok(self
             .manifest
             .releases
@@ -232,19 +234,12 @@ impl VerifiedManifest {
                     && r.minimum_windows_build <= selection.windows_build
                     && r.minimum_updater_schema <= SCHEMA
                     && r.protocol_baseline == 1
-                    && (selection.channel == Channel::Beta || r.channel == Channel::Stable)
             })
             .max_by_key(|r| r.build))
     }
 }
 
-pub fn verify_manifest(
-    bytes: &[u8],
-    trust: &Trust<'_>,
-    channel: Channel,
-    seen: &Watermark,
-    now: i64,
-) -> Result<VerifiedManifest, Error> {
+pub fn verify_manifest(bytes: &[u8], trust: &Trust<'_>, seen: &Watermark, now: i64) -> Result<VerifiedManifest, Error> {
     if bytes.len() > MAX_FEED {
         return Err(Error::Limit);
     }
@@ -269,7 +264,6 @@ pub fn verify_manifest(
     if manifest.schema != SCHEMA
         || manifest.product != PRODUCT
         || manifest.key_epoch != trust.epoch
-        || manifest.channel != channel
         || manifest.sequence == 0
     {
         return Err(Error::Policy);
@@ -306,7 +300,6 @@ pub fn verify_manifest(
             || STANDARD
                 .decode(&release.package.ed25519)
                 .map_or(true, |s| s.len() != 64)
-            || (channel == Channel::Stable && release.channel != Channel::Stable)
         {
             return Err(Error::Metadata);
         }

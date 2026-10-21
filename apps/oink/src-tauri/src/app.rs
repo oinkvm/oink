@@ -27,6 +27,7 @@ pub(crate) struct Backend {
     pub(crate) uninstalling: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) api: Option<Arc<dyn AgentApi>>,
     boot: BootInfo,
+    update_window: Arc<crate::update_window::Owner>,
     startup_error: Option<String>,
     pub(crate) remote: Option<RemoteApi>,
     capture: Mutex<Option<oink_agent::telemetry::UiCapture>>,
@@ -79,8 +80,21 @@ fn quit_app(app: &AppHandle) {
 }
 
 #[tauri::command]
-fn boot_info(state: State<'_, Backend>) -> BootInfo {
-    state.boot.clone()
+fn boot_info(window: tauri::WebviewWindow, state: State<'_, Backend>) -> BootInfo {
+    let mut boot = state.boot.clone();
+    if window.label() == "main" {
+        let directory = oink_foundation::paths::data_dir();
+        let outcome = oink_agent::update::presentation::outcome(
+            &directory,
+            boot.build.as_ref().and_then(|s| s.parse().ok()).unwrap_or(0),
+        );
+        boot.open_update_failure =
+            state.update_window.take_failure() || outcome == Some(oink_agent::update::presentation::Outcome::Failed);
+        if outcome.is_some() {
+            oink_agent::update::presentation::clear(&directory);
+        }
+    }
+    boot
 }
 
 /// 执行一次 API 调用。放到阻塞线程池里：部分命令（如 `connect_by_ip`）会等待网络。
@@ -101,9 +115,42 @@ async fn api_call(
             .clone()
             .unwrap_or_else(|| "服务尚未启动，请退出 Oink 后重新打开。".into()),
     })?;
-    tauri::async_runtime::spawn_blocking(move || api::dispatch(api.as_ref(), request))
-        .await
-        .map_err(|e| ApiError::Internal { message: e.to_string() })?
+    let installing = matches!(
+        &request,
+        Request::Update {
+            command: oink_agent::api::UpdateCommand::Install { .. }
+        }
+    );
+    let owner = state.update_window.clone();
+    let close = window.app_handle().clone();
+    let recover = close.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::update_window::dispatch(
+            installing,
+            || {
+                owner.begin();
+                let (done, wait) = std::sync::mpsc::sync_channel(1);
+                on_main(&close, move |app| {
+                    let result = app.get_webview_window("main").map_or(Ok(()), |window| window.hide());
+                    tracing::info!(target:"oink_update_timing",phase="main_window_hidden", "update window boundary");
+                    let _ = done.send(result.map_err(|error| ApiError::Internal {
+                        message: error.to_string(),
+                    }));
+                });
+                wait.recv().map_err(|error| ApiError::Internal {
+                    message: error.to_string(),
+                })?
+            },
+            || api::dispatch(api.as_ref(), request),
+            || {
+                if owner.failure() {
+                    show_main(&recover);
+                }
+            },
+        )
+    })
+    .await
+    .map_err(|e| ApiError::Internal { message: e.to_string() })?
 }
 
 /// The backend creates/returns its local store folder; only this UI shell
@@ -206,6 +253,7 @@ pub fn run() {
             uninstalling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             api,
             boot,
+            update_window: Arc::new(crate::update_window::Owner::default()),
             startup_error,
             remote: remote_api,
             capture: Mutex::new(Some(oink_agent::telemetry::UiCapture::new(
@@ -269,10 +317,11 @@ pub fn run() {
             crate::app_icon::initialize(&handle);
             // A login launch on Windows has no WebView at all. macOS only starts
             // this executable when its backend has a reason to show a window.
-            let show_at_start = crate::shell_policy::shows_on_start(
+            let show_at_start = oink_agent::update::presentation::show_main(crate::shell_policy::shows_on_start(
                 oink_autostart::launched_at_login(),
                 std::env::args().any(|arg| arg == "--background"),
-            );
+            ), oink_agent::update::presentation::outcome(&oink_foundation::paths::data_dir(),
+                option_env!("OINK_RELEASE_BUILD").and_then(|s|s.parse().ok()).unwrap_or(0)));
             #[cfg(windows)]
             {
                 crate::foreground_windows::install(&handle);
@@ -500,6 +549,19 @@ fn forward_events(app: &AppHandle) {
         }
         if !matches!(ev, ApiEvent::Stats(_)) || crate::live_views::stats_enabled(&handle) {
             let _ = handle.emit(EVENT, ev);
+        }
+        if let ApiEvent::UpdateStatusChanged(status) = ev
+            && matches!(
+                status.phase,
+                oink_agent::update::Phase::Failed
+                    | oink_agent::update::Phase::RolledBack
+                    | oink_agent::update::Phase::RepairRequired
+                    | oink_agent::update::Phase::InstallerBusy
+                    | oink_agent::update::Phase::AwaitingReboot
+            )
+            && handle.state::<Backend>().update_window.failure()
+        {
+            show_main(&handle);
         }
         // Update owner has already drained business work. Closing this client
         // must not request backend stop before the installer receives its lease.

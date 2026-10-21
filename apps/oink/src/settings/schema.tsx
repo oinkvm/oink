@@ -156,6 +156,7 @@ export const SECTIONS: SectionMeta[] = [
                 }, get desc() {
                     return tr('在本机注入其他设备的触摸板触点事件；关闭后改用系统快捷键映射');
                 }, get keywords() { return tr('触控板 手势 precision touchpad'); }, only: 'win' },
+            { id: 'macScrollFeel', get label() { return tr('模拟 Mac 触摸板滚动'); }, get desc() { return tr('被 Mac 的触摸板操控时，还原其双指滚动手感'); }, get keywords() { return tr('触控板 滚动 Mac macOS 双指 手感 惯性'); }, only: 'win' },
             { id: 'pointerTrail', get label() {
                     return tr('快速画圈显示指针尾迹');
                 }, get desc() {
@@ -291,12 +292,12 @@ export const SECTIONS: SectionMeta[] = [
                 }, get desc() {
                     return tr('发生崩溃或卡顿时发送技术信息，帮助改进 Oink；不包含屏幕内容、输入的文字和文件');
                 }, get keywords() { return tr('崩溃 隐私 上报 统计'); } },
-            { id: 'audioQuality', get label() { return tr('音频质量'); }, get desc() { return tr('最近 60 秒各来源的接收缓冲、码率和断音'); }, get keywords() { return tr('音频 缓冲 码率 断音 图表'); } },
             { id: 'latency', get label() {
                     return tr('连接质量');
                 }, get desc() {
                     return tr('每台在线设备的延迟');
                 }, get keywords() { return tr('延迟 网络 ping 图表 ms'); } },
+            { id: 'audioQuality', get label() { return tr('音频质量'); }, get desc() { return tr('最近 60 秒各来源的接收缓冲、码率和断音'); }, get keywords() { return tr('音频 缓冲 码率 断音 图表'); } },
         ],
     },
 ];

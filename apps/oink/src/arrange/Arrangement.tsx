@@ -8,7 +8,6 @@ import {
     snapGroup,
     snapGroupResize,
     growGroupAvoiding,
-    compactGroups,
     mergeVisibleGroups,
 } from './groups';
 import { tr } from '../i18n';
@@ -23,6 +22,7 @@ import { cornerArcPath, useCornerShape } from './cornerShape';
 import { cameraStore } from './cameraStore';
 import { growArrangementView, SpringCamera, visibleArrangement } from './camera';
 import { SnapFeedback } from './haptics';
+import { settleGroup } from './compaction';
 import { projectScreenRect } from './renderGeometry';
 export interface ArrangementSettings {
     showHotZones: boolean;
@@ -256,23 +256,27 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
         }
     };
     /** A manual edit is the only compaction trigger. New props (hotplug, hidden
-     * screens, connectivity, remote layouts) only retarget the springs above. */
-    const settle = (edited: Screen[]) => {
-        const released = mergeVisibleGroups(geometryScreens, edited);
-        const next = settings.compact ? compactGroups(released) : released;
-        return { next, compacted: next.some((s, i) => !sameRect(s, released[i])) };
+     * screens, connectivity, remote layouts) only retarget the springs above.
+     * Only the edited computer moves; hidden screens are not in `screens`. */
+    const settle = (id: string, r: Rect) => {
+        const group = members(id), from = bounds(group), rest = others(id);
+        const { dx, dy } = settings.compact
+            ? settleGroup(transformGroup(group, from, r), rest, rest.map(s => s.device ?? s.id)) : { dx: 0, dy: 0 };
+        const final = { ...r, x: r.x + dx, y: r.y + dy };
+        const transformed = transformGroup(group, from, final);
+        const next = mergeVisibleGroups(geometryScreens, screens.map(s => transformed.find(n => n.id === s.id) ?? s));
+        return { next, final, compacted: dx !== 0 || dy !== 0 };
     };
     /** Commit a keyboard edit of one computer, including its compaction, as one change. */
     const commit = (id: string, r: Rect, change: ScreensChange) => {
-        const transformed = transformGroup(members(id), bounds(members(id)), r);
-        const { next, compacted } = settle(screens.map(s => transformed.find(n => n.id === s.id) ?? s));
+        const { next, final, compacted } = settle(id, r);
         for (const screen of next) {
             if (screens.some(s => s.id === screen.id) && !sameRect(springs.target(screen.id) ?? screen, screen))
                 springs.to(screen.id, pickRect(screen), 'snappy');
         }
         if (!next.every((s, i) => sameRect(s, geometryScreens[i])))
             onScreensChange(next, change);
-        return { final: bounds(membersOf(next, id)), compacted };
+        return { final, compacted };
     };
     const begin = (e: ReactPointerEvent, s: Screen, mode: 'move' | 'resize', corner?: Corner) => {
         if (e.button !== 0 || drag.current || zoom <= 0)
@@ -401,10 +405,9 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
             animate(d.id, d.origin, 'snappy');
             return;
         }
-        const rest = geometryScreens.filter(s => !sameComputer(s, byId(d.id)!));
-        const free = freeGroup(membersOf(geometryScreens, d.id), d.origin, d.live, rest);
-        const transformed = transformGroup(members(d.id), d.origin, free);
-        const { next, compacted } = settle(screens.map(s => transformed.find(next => next.id === s.id) ?? s));
+        // Hidden screens neither block the drop nor take part in compaction.
+        const free = freeGroup(members(d.id), d.origin, d.live, others(d.id));
+        const { next, final, compacted } = settle(d.id, free);
         for (const screen of next) {
             if (screens.some(s => s.id === screen.id) && !sameRect(springs.target(screen.id) ?? screen, screen))
                 springs.to(screen.id, pickRect(screen), 'soft');
@@ -412,7 +415,6 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
         if (next.every((s, i) => sameRect(s, geometryScreens[i])))
             return;
         onScreensChange(next, { label: d.mode === 'move' ? tr('移动 {0}', name) : tr('缩放 {0}', name) });
-        const final = bounds(membersOf(next, d.id));
         const notes = [!sameRect(free, d.live) && tr('重叠，已弹到最近的空位'), compacted && tr('已靠拢')].filter((note): note is string => !!note);
         const where = noteSuffix(notes);
         log(d.mode === 'move'

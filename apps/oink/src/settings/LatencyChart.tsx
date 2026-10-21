@@ -161,7 +161,7 @@ export const DiagnosticsChart = memo(function DiagnosticsChart({ active, audio =
         {visible.length === 0 && <p className="lat__empty">{empty}</p>}
       </div>
       {failed && <p role="status">{audio ? tr('无法读取音频质量') : tr('无法读取连接质量')}</p>}
-      <div className="lat__table-scroll">
+      {series.length > 0 && <div className="lat__table-scroll">
         <table className={audio ? "lat__table lat__table--audio" : "lat__table"} aria-label={audio ? tr('音频质量') : tr('连接质量')}>
           <thead><tr>
             <th scope="col">{tr('设备名称')}</th>
@@ -186,6 +186,6 @@ export const DiagnosticsChart = memo(function DiagnosticsChart({ active, audio =
 
           </tr>)}</tbody>
         </table>
-      </div>
+      </div>}
     </div>);
 });

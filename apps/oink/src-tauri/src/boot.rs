@@ -8,11 +8,13 @@ pub struct BootInfo {
     pub platform: &'static str,
     pub version: &'static str,
     pub build: Option<String>,
+    pub open_update_failure: bool,
 }
 
 impl BootInfo {
     pub fn new(connected: bool) -> Self {
         Self {
+            open_update_failure: false,
             backend: if connected { "agent" } else { "none" },
             platform: if cfg!(target_os = "macos") {
                 "macos"

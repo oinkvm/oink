@@ -191,6 +191,18 @@ mod tests {
 
     #[test]
     fn file_owner_is_visible_without_a_callers_session_mutex() {
+        assert_file_owner_visibility(|_| None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_owner_release_is_visible_while_a_spawning_child_retains_its_descriptor() {
+        // dup and fork retain the same locked open file description. Keep the
+        // duplicate alive across the owner's release to force the spawn window.
+        assert_file_owner_visibility(|owner| Some(owner.try_clone().unwrap()));
+    }
+
+    fn assert_file_owner_visibility(inherit: impl Fn(&std::fs::File) -> Option<std::fs::File>) {
         use fs2::FileExt;
         let temp = tempfile::tempdir().unwrap();
         for (file, running, acquire) in [
@@ -219,9 +231,14 @@ mod tests {
                     .is_some()
             );
             assert!(!crate::host::stop_service(temp.path(), std::time::Duration::ZERO).unwrap());
+            let inherited = inherit(&owner);
+            // Match InstanceLock::drop: closing alone leaves flock held by a
+            // concurrently forked child until exec/exit, even with CLOEXEC.
+            fs2::FileExt::unlock(&owner).unwrap();
             drop(owner);
             assert_eq!(running(temp.path()), Some(false));
             assert!(crate::host::stop_service(temp.path(), std::time::Duration::ZERO).unwrap());
+            drop(inherited);
         }
     }
 
@@ -297,8 +314,15 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn dropping_owner_unlocks_a_descriptor_inherited_by_a_spawning_child() {
+        use std::os::fd::AsRawFd;
+
         let temp = tempfile::tempdir().unwrap();
         let owner = acquire(temp.path()).unwrap();
+        // Production helpers must not retain ownership after exec either.
+        // SAFETY: owner keeps this descriptor valid; F_GETFD only reads its flags.
+        let flags = unsafe { libc::fcntl(owner._file.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags, -1);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
         // dup and fork share the same open file description. CLOEXEC closes the
         // child's copy at exec, but not during the preceding spawn window.
         let inherited = owner._file.try_clone().unwrap();

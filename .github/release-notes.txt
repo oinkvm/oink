@@ -1,19 +1,13 @@
-Oink 0.1.3 improves screen arrangement, in-app updates and audio diagnostics.
+Oink 0.1.4 adds Mac-style scrolling on Windows, refines auto-compact and fixes a drag-and-drop issue.
 
 ## New
 
-- Gaps between screens now close up only after you move or resize a screen yourself; a new toolbar button turns this off.
-- Updates now open as a dialog in the main window, with download progress in the title bar and on the Cancel download button.
-- Diagnostics has a new audio quality chart showing buffer, bitrate and dropouts per device over the last minute, with each dropout marked on the chart.
-- On Windows without native touchpad input support, multi-finger gestures fall back to standard shortcuts and the touchpad setting is hidden.
+- New Windows setting "Emulate Mac trackpad scrolling": when a Mac trackpad controls the PC, two-finger scrolling feels like it does on the Mac.
+- Auto-compact now moves only the computer you just adjusted and stops where it touches another computer; hidden screens no longer affect the layout.
 
 ## Fixes
 
-- Fixed offline screens being hard to see in dark mode.
-- Fixed the settings page background and content appearing at different times.
-- Fixed pairing on Windows sometimes failing to finish when the computer is busy.
-- Fixed a rare case where audio forwarding could fail to start or restore muting.
-- Windows updates now clean up their downloaded files after installing.
+- Fixed files not dragging to another computer from the bottom edge of a Mac's external display.
 
 ## Downloads
 

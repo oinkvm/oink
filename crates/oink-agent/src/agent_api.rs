@@ -734,6 +734,7 @@ pub(crate) fn input_settings(node: &Node) -> InputSettings {
         event_frequency: s.event_frequency,
         accept_contacts: s.accept_contacts && contacts_injection_available,
         contacts_injection_available,
+        mac_scroll_feel: s.routing.mac_scroll_feel,
         emergency_hold_ms: s.emergency_hold_ms.get(),
         device_gain: s.screen_preferences.device_gain,
         scroll: ScrollSettings {
@@ -1166,10 +1167,10 @@ impl AgentApi for Node {
             for p in placements {
                 layout.place_device(p.device.0, p.origin, p.scale, true);
             }
-            // Adopt the submitted gaps. Contact compaction is part of the
-            // editor's manual edit and follows its local auto-compact toggle;
+            // Adopt the submitted placements exactly. The canvas editor owns
+            // collision checks and auto-compaction for its manual edits, and it
+            // ignores hidden or disabled screens, which this layout cannot see;
             // undo/redo replays exact history values through this call too.
-            layout.repair_overlaps();
         })?;
         layout_api(self)
     }
@@ -1307,18 +1308,6 @@ impl AgentApi for Node {
         Ok(())
     }
 
-    fn test_mac_scroll(&self, enabled: Option<bool>) -> ApiResult<bool> {
-        let _gate = self.owner_gate();
-        if let Some(enabled) = enabled {
-            self.edit_local_input_settings(
-                &serde_json::json!({"routing":{"test_mac_scroll":enabled}}),
-                |settings| {
-                    settings.routing.test_mac_scroll = enabled;
-                },
-            )?;
-        }
-        Ok(self.settings().routing.test_mac_scroll)
-    }
     fn input_settings(&self) -> ApiResult<InputSettings> {
         Ok(input_settings(self))
     }
@@ -1341,8 +1330,15 @@ impl AgentApi for Node {
         }
         let emergency_hold = crate::config::EmergencyHoldMs::try_from(s.emergency_hold_ms).map_err(invalid)?;
         crate::hotkeys::validate(&s.hotkeys).map_err(invalid)?;
-        self.edit_local_input_settings(&patch.value(), |candidate| {
+        // InputSettings is flat; explicit local overrides use the durable routing path.
+        // Preserve an explicit choice equal to the default without pinning siblings.
+        let mut local_patch = patch.value();
+        if let Some(value) = local_patch.as_object_mut().and_then(|p| p.remove("mac_scroll_feel")) {
+            local_patch["routing"] = serde_json::json!({"mac_scroll_feel": value});
+        }
+        self.edit_local_input_settings(&local_patch, |candidate| {
             let routing = &mut candidate.routing;
+            routing.mac_scroll_feel = s.mac_scroll_feel;
             routing.remote_scroll_speed = s.scroll.speed;
             routing.fixed_reference_display = match s.pointer.reference {
                 PointerReference::Fixed { display } => Some(display),

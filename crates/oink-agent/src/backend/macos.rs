@@ -96,7 +96,10 @@ define_class!(
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn launched(&self, _notification: &NSNotification) {
             // The login-item Apple event is only available inside this callback.
-            let show = !self.ivars().smoke && super::shows_on_start(self.ivars().launch, oink_autostart::launched_at_login());
+            let result = crate::update::presentation::outcome(&oink_foundation::paths::data_dir(),
+                option_env!("OINK_RELEASE_BUILD").and_then(|s|s.parse().ok()).unwrap_or(0));
+            let show = !self.ivars().smoke && crate::update::presentation::show_main(
+                super::shows_on_start(self.ivars().launch, oink_autostart::launched_at_login()), result);
             tracing::info!(launch = ?self.ivars().launch, show, "macOS launch decision");
             if !self.ivars().smoke { self.menu(); }
             let smoke = self.ivars().smoke;

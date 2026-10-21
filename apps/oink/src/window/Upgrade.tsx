@@ -1,4 +1,4 @@
-import { useState, useSyncExternalStore } from 'react';
+import { useEffect, useState, useSyncExternalStore } from 'react';
 import type { CSSProperties } from 'react';
 import { Button, Dialog, Icon, Tooltip } from 'oink-ui';
 import type { DialogProps } from 'oink-ui';
@@ -17,8 +17,8 @@ export function releaseNotesForLanguage(notes:Record<string,string>&{en:string},
   }
   return notes.en;
 }
-export function updatePhaseText(phase:UpdatePhase):string {
-  const text:Record<UpdatePhase,MessageKey>={disabled:'手动更新',idle:'已就绪',checking:'正在检查',available:'有可用更新',downloading:'正在下载',verifying:'正在验证',ready:'准备安装',quiescing:'正在准备更新',installing:'正在安装',awaiting_reboot:'等待系统重启',installer_busy:'安装程序正在运行',committed:'更新已安装',rolled_back:'已恢复到先前版本',repair_required:'需要修复安装',failed:'更新失败'};
+export function updatePhaseText(phase:Exclude<UpdatePhase,'idle'>):string {
+  const text:Record<Exclude<UpdatePhase,'idle'>,MessageKey>={disabled:'手动更新',checking:'正在检查',available:'有可用更新',downloading:'正在下载',verifying:'正在验证',ready:'准备安装',quiescing:'正在准备更新',installing:'正在安装',awaiting_reboot:'等待系统重启',installer_busy:'安装程序正在运行',committed:'更新已安装',rolled_back:'已恢复到先前版本',repair_required:'需要修复安装',failed:'更新失败'};
   return tr(text[phase]??'更新状态未知');
 }
 function blockerText(blocker:UpdateBlocker) {
@@ -42,8 +42,9 @@ const useDialogOpen=()=>useSyncExternalStore(subscribe,()=>dialogOpen);
 
 function useUpdateCommand() {
   const [pending,setPending]=useState(false);
-  const send=async(command:UpdateCommand)=>{setPending(true);try{await agent.query('update',()=>api.update(command));}catch{agent.fail('unavailable');}finally{setPending(false);}};
-  return {pending,send};
+  const [failed,setFailed]=useState(false);
+  const send=async(command:UpdateCommand)=>{setPending(true);setFailed(false);try{await agent.query('update',()=>api.update(command));}catch{if(command.type==='install')setFailed(true);else agent.fail('unavailable');}finally{setPending(false);}};
+  return {pending,send,failed};
 }
 const inProgress=(phase:UpdatePhase|undefined)=>phase==='downloading'||phase==='verifying';
 const dialogTitle=(version:string|undefined)=>version?tr('升级到 v{0}', version):tr('更新 Oink');
@@ -72,7 +73,13 @@ export function UpgradeButton() {
 
 /** The update flow as a modal inside the main window. */
 export function UpgradeDialog({container}:{container:HTMLElement|null}) {
-  const {update}=useAgent();const language=useLanguage();const open=useDialogOpen();const {pending,send}=useUpdateCommand();
+  const {update,boot}=useAgent();const language=useLanguage();const open=useDialogOpen();const {pending,send:command,failed:rejected}=useUpdateCommand();
+  const [restoredFailure,setRestoredFailure]=useState(false);
+  const failed=rejected||restoredFailure&&(!update||update.phase==='idle'||update.phase==='ready');
+  const send=(value:UpdateCommand)=>{setRestoredFailure(false);return command(value);};
+  const dismissDialog=()=>{setRestoredFailure(false);closeUpdateDialog();};
+  const changeOpen=(value:boolean)=>{if(!value)setRestoredFailure(false);setDialogOpen(value);};
+  useEffect(()=>{if(boot?.open_update_failure){setRestoredFailure(true);openUpdateDialog();}},[boot?.open_update_failure]);
   const manual=update?.phase==='disabled';
   const progress=inProgress(update?.phase);
   const ready=update?.phase==='ready';
@@ -84,13 +91,14 @@ export function UpgradeDialog({container}:{container:HTMLElement|null}) {
   // the background (the title-bar indicator reopens the dialog), so it reads
   // Hide next to Cancel download; without an action there is nothing to cancel.
   const dismiss=progress?tr('隐藏'):action?tr('取消'):tr('关闭');
-  return <Dialog {...({contained:true} as Partial<DialogProps>)} open={open} onOpenChange={setDialogOpen} container={container} size={400} title={dialogTitle(update?.candidate?.version)} actions={<>
-    <Button onClick={closeUpdateDialog}>{dismiss}</Button>
+  return <Dialog {...({contained:true} as Partial<DialogProps>)} open={open} onOpenChange={changeOpen} container={container} size={400} title={dialogTitle(update?.candidate?.version)} actions={<>
+    <Button onClick={dismissDialog}>{dismiss}</Button>
     {action}
   </>}>
-    {manual?<p>{tr('此版本需要手动下载并安装更新。')}</p>:<p role="status">{update?updatePhaseText(update.phase):tr('正在读取…')}</p>}
+    {/* Idle has no status line: it neither means an update is ready nor that a check ran. */}
+    {manual?<p>{tr('此版本需要手动下载并安装更新。')}</p>:failed?<p role="status">{updatePhaseText('failed')}</p>:!update?<p role="status">{tr('正在读取…')}</p>:update.phase!=='idle'&&<p role="status">{updatePhaseText(update.phase)}</p>}
     {!!update?.blockers.length&&<ul>{update.blockers.map(b=><li key={b}>{blockerText(b)}</li>)}</ul>}
-    {update?.error&&update.error!=='not_configured'&&<p role="alert">{tr(update.error==='busy'?'无法准备安装。请确认系统集成可用且没有其他安装程序运行，然后重试。':'无法完成更新，请重试或前往发布页面下载安装。')}</p>}
+    {(failed||update?.error&&update.error!=='not_configured')&&<p role="alert">{tr(!failed&&update?.error==='busy'?'无法准备安装。请确认系统集成可用且没有其他安装程序运行，然后重试。':'无法完成更新，请重试或前往发布页面下载安装。')}</p>}
     {ready&&<p>{tr('安装会立即中断输入、音频和文件共享，并重启 Oink。')}</p>}
     {update?.candidate&&<ul className="upgrade-notes">{releaseNotesForLanguage(update.candidate.notes,language).split('\n').map((line,i)=><li key={i}>{line}</li>)}</ul>}
   </Dialog>;

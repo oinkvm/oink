@@ -1,4 +1,3 @@
-import { compactRectangles } from './compaction';
 import { facing, overlaps, tolerance } from './facing';
 export { overlaps } from './facing';
 
@@ -221,9 +220,6 @@ export function facingGap(r: Rect, others: Rect[], axis: Axis, dir: 1 | -1): num
         return f ? [f.gap] : [];
     });
     return gaps.length ? Math.min(...gaps) : null;
-}
-export function compact(r: Rect, others: Rect[]): Rect {
-    return compactRectangles([r, ...others], ['moving', ...others.map((_, i) => String(i))], new Set(['moving']))[0];
 }
 export const sameRect = (a: Rect, b: Rect, eps = tolerance([a, b])) => Math.abs(a.x - b.x) < eps && Math.abs(a.y - b.y) < eps && Math.abs(a.w - b.w) < eps && Math.abs(a.h - b.h) < eps;
 export const pickRect = ({ x, y, w, h }: Rect): Rect => ({ x, y, w, h });

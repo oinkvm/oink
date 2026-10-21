@@ -16,13 +16,13 @@ it('renders per-source buffer lines and window statistics',async()=>{
  expect(screen.getAllByRole('cell').map(x=>x.textContent)).toEqual(['Source','5.00 ms','7.00 ms','8.00 ms','320.00 kbps','2']);
  expect(container.querySelector('.lat__line')?.getAttribute('d')).toContain('L');
 });
-it.each([['en','No audio received','Dropouts'],['zh-Hans','尚未接收音频','断音'],['ja','受信したオーディオはありません','音切れ'],['ko','수신한 오디오가 없습니다','끊김']] as const)('renders the empty state in %s',async (language,message,header)=>{
+it.each([['en','No audio received'],['zh-Hans','尚未接收音频'],['ja','受信したオーディオはありません'],['ko','수신한 오디오가 없습니다']] as const)('renders the empty state in %s',async (language,message)=>{
  setLanguage(language);mocks.query.mockResolvedValue({revision:1,sampled_at_ms:60000,sources:[]});
  const {container}=render(<AudioQualityChart active/>);
  await waitFor(()=>expect(mocks.query).toHaveBeenCalled());
  expect(container.querySelector('.lat__empty')?.textContent).toBe(message);
- expect(screen.getAllByRole('columnheader')).toHaveLength(6);
- expect(screen.getByRole('columnheader',{name:header}).textContent).toBe(header);
+ expect(screen.queryAllByRole('columnheader')).toHaveLength(0);
+ expect(screen.queryByRole('table')).toBeNull();
  expect(screen.queryByRole('tooltip')).toBeNull();
 });
 

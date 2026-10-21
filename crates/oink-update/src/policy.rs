@@ -1,33 +1,30 @@
 use crate::{Error, barrier::Blocker, feed::Severity};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Channel {
-    #[default]
-    Stable,
-    Beta,
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredPreferences")]
+pub struct Preferences {
+    pub checks_enabled: bool,
 }
-impl Channel {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Stable => "stable",
-            Self::Beta => "beta",
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredPreferences {
+    checks_enabled: bool,
+    // Oink 0.1.1–0.1.3 wrote this field. Accept and ignore it (including beta)
+    // so upgrading preserves checks_enabled; new preferences never write it.
+    #[serde(default, rename = "channel")]
+    _legacy_channel: serde::de::IgnoredAny,
+}
+impl From<StoredPreferences> for Preferences {
+    fn from(stored: StoredPreferences) -> Self {
+        Self {
+            checks_enabled: stored.checks_enabled,
         }
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Preferences {
-    pub checks_enabled: bool,
-    pub channel: Channel,
-}
 impl Default for Preferences {
     fn default() -> Self {
-        Self {
-            checks_enabled: true,
-            channel: Channel::Stable,
-        }
+        Self { checks_enabled: true }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,7 +114,6 @@ pub struct Candidate {
 pub struct UpdateStatus {
     pub current_build: u64,
     pub version: String,
-    pub channel: Channel,
     pub checks_enabled: bool,
     pub phase: Phase,
     pub candidate: Option<Candidate>,
@@ -183,13 +179,12 @@ impl ReadyState {
 mod tests {
     use super::*;
     #[test]
-    fn production_preferences_have_checks_and_channel_only() {
+    fn production_preferences_have_checks_only() {
         let preferences = Preferences::default();
-        assert_eq!(preferences.channel, Channel::Stable);
         assert!(preferences.checks_enabled);
         assert_eq!(
             serde_json::to_value(&preferences).unwrap(),
-            serde_json::json!({"checks_enabled":true,"channel":"stable"})
+            serde_json::json!({"checks_enabled":true})
         );
         for mode in ["automatic", "notify"] {
             assert!(
@@ -200,6 +195,23 @@ mod tests {
             );
         }
         assert!(serde_json::from_str::<Command>(r#"{"type":"automatic"}"#).is_err());
+    }
+    #[test]
+    fn legacy_channel_is_ignored_without_changing_checks() {
+        for channel in ["stable", "beta"] {
+            for checks_enabled in [false, true] {
+                let bytes = serde_json::to_vec(&serde_json::json!({
+                    "checks_enabled": checks_enabled, "channel": channel
+                }))
+                .unwrap();
+                let preferences: Preferences = crate::feed::strict_json(&bytes).unwrap();
+                assert_eq!(preferences.checks_enabled, checks_enabled);
+                assert_eq!(
+                    serde_json::to_value(preferences).unwrap(),
+                    serde_json::json!({"checks_enabled": checks_enabled})
+                );
+            }
+        }
     }
     #[test]
     fn deferrals_and_skip_survive_serialization() {

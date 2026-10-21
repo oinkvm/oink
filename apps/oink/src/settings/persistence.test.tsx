@@ -12,7 +12,7 @@ vi.mock('../api/client',()=>({call:mocks.call,api:{group:async()=>({members:[]})
 beforeEach(()=>{
   vi.clearAllMocks();localStorage.clear();
   mocks.state={localPreferences:{notification_level:'default',ui_language:'system',theme_mode:'system',theme_accent:{light:'#2E7BFF',dark:'#5599FF'},show_status_icon:true,confirm_quit:true,log_level:'info',log_max_mb:1024},
-    input:{event_frequency:'unlimited',wake_displays_on_input:true,cursor_trail:false,accept_contacts:true,device_gain:1,emergency_hold_ms:5000,hotkeys:[]},
+    input:{event_frequency:'unlimited',wake_displays_on_input:true,cursor_trail:false,accept_contacts:true,mac_scroll_feel:true,device_gain:1,emergency_hold_ms:5000,hotkeys:[]},
     clipboard:{text:true,rich_text:true,images:true,files:true,custom:true},audio:{settings:{keep_local_playback:true,receive_output:null,forwarding_enabled:true}}};
   mocks.call.mockResolvedValue(mocks.state.localPreferences);
 });
@@ -87,4 +87,18 @@ it.each(['disabled','minimal','default','verbose'] as const)('persists notificat
   expect(mocks.call).toHaveBeenCalledWith('set_ui_preferences',{settings:{notification_level:level}});
   expect(mocks.input).not.toHaveBeenCalled();
   expect(localStorage.getItem('oink:prefs')).toBeNull();
+});
+
+it('reads the default-on receiver preference and sends only its edited field',async()=>{
+  const {result}=renderHook(usePreferences);
+  expect(result.current.prefs.macScrollFeel).toBe(true);
+  expect(result.current.canEdit('macScrollFeel')).toBe(true);
+  await act(async()=>result.current.set('macScrollFeel',false));
+  expect(mocks.input).toHaveBeenCalledExactlyOnceWith({mac_scroll_feel:false});
+});
+it('does not overwrite the child preference when disabling contacts',async()=>{
+  const {result}=renderHook(usePreferences);
+  await act(async()=>result.current.set('touchpadInject',false));
+  expect(mocks.input).toHaveBeenCalledExactlyOnceWith({accept_contacts:false});
+  expect(result.current.prefs.macScrollFeel).toBe(true);
 });

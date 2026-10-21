@@ -18,6 +18,7 @@ pub mod shell_policy;
 mod sponsor;
 #[cfg(any(target_os = "macos", test))]
 mod uninstall;
+mod update_window;
 #[cfg(any(windows, test))]
 mod windows_hotkey;
 

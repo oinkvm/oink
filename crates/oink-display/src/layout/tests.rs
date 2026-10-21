@@ -262,46 +262,21 @@ fn research_example() -> Layout {
 }
 
 #[test]
-fn normalize_research_example() {
-    let mut l = research_example();
-    l.normalize();
-    // Close the inter-computer gap; preserve the OS-owned lower desktop gap.
-    let (top, lft, rgt) = (
-        rect_of(&l, &sid(A, "top")),
-        rect_of(&l, &sid(B, "l")),
-        rect_of(&l, &sid(B, "r")),
-    );
-    assert!(near(top.x, 0.0) && near(top.y, 15.0 / 686.0));
-    assert!(near(lft.x, 40.0 / 686.0) && near(lft.y, 355.0 / 686.0), "{lft:?}");
-    assert!(near(rgt.x, 310.0 / 686.0) && near(rgt.y, 355.0 / 686.0), "{rgt:?}");
-    assert!(l.overlaps().is_empty());
-    // 再规整一次不变
-    let mut again = l.clone();
-    again.normalize();
-    for (p, q) in l.screens.iter().zip(&again.screens) {
-        assert!(near(p.rect.x, q.rect.x) && near(p.rect.y, q.rect.y));
-    }
-}
-
-#[test]
-fn normalize_closes_staggered_three_computer_gap_at_first_contact() {
+fn removing_a_computer_keeps_the_remaining_gaps() {
+    // Auto-compaction follows only a canvas edit. A computer leaving the group
+    // is not one, so its gap and unrelated gaps stay as they are.
     let mut l = layout(vec![
-        screen(A, "top", Rect::new(508., 0., 868., 488.), 1.),
-        screen(B, "left", Rect::new(0., 525., 558., 361.), 1.),
-        screen(X, "right", Rect::new(737., 543., 584., 377.), 1.),
+        screen(A, "a", Rect::new(0., 0., 100., 100.), 1.),
+        screen(B, "b", Rect::new(100., 0., 100., 100.), 1.),
+        screen(X, "x", Rect::new(260., 0., 100., 100.), 1.),
     ]);
     let before = l.clone();
-    l.normalize();
-    assert_eq!(l.screens[0].rect, Rect::new(508., 37., 868., 488.));
-    assert_eq!(l.screens[1..], before.screens[1..]);
-    assert!(l.overlaps().is_empty());
-    let compacted = l.clone();
-    l.normalize();
-    assert_eq!(l, compacted);
+    l.remove_device(B);
+    assert_eq!(l.screens, [before.screens[0].clone(), before.screens[2].clone()]);
 }
 
 #[test]
-fn normalize_grid_and_overlaps() {
+fn repair_grid_overlaps() {
     // 2×2 网格：边框间隙各不相同，右下有 5/686 reference units 的测量重叠（c、d 左右压住）。
     let mut l = layout(vec![
         screen(A, "a", Rect::new(0.0, 0.0, 600.0 / 686.0, 340.0 / 686.0), 3.0 * 686.0),
@@ -324,7 +299,7 @@ fn normalize_grid_and_overlaps() {
             3.0 * 686.0,
         ),
     ]);
-    l.normalize();
+    l.repair_overlaps();
     let r = |k: &str| {
         let dev = if k == "a" || k == "b" { A } else { B };
         rect_of(&l, &sid(dev, k))
@@ -385,7 +360,7 @@ fn tiny_real_overlap_is_separated_only_by_its_depth_with_reference_pinned() {
             ),
         ]);
         let before = l.clone();
-        l.normalize_around(&pin);
+        l.repair_overlaps_around(&pin);
         assert_eq!(rect_of(&l, &pin), rect_of(&before, &pin));
         assert!(close(l.screens[0].rect.bottom(), l.screens[1].rect.y));
         for (a, b) in l.screens.iter().zip(&before.screens) {
@@ -1429,7 +1404,7 @@ fn new_display_preserves_native_group_and_moves_only_colliding_computers() {
 }
 
 #[test]
-fn set_physical_size_renormalizes() {
+fn set_physical_size_repairs_overlap() {
     let mut l = three_in_a_row();
     l.set_extent(&sid(X, "x"), Size::new(600.0 / 686.0, 340.0 / 686.0));
     assert!(l.overlaps().is_empty());
@@ -1536,10 +1511,10 @@ fn arb_layout() -> impl Strategy<Value = Layout> {
     })
 }
 
-/// 规整后的随机布局。
+/// 修复重叠后的随机布局。
 fn arb_logical() -> impl Strategy<Value = Layout> {
     arb_layout().prop_map(|mut l| {
-        l.normalize();
+        l.repair_overlaps();
         l
     })
 }
@@ -1710,11 +1685,11 @@ proptest! {
         }
     }
 
-    /// 规整：不重叠、尺寸不变、再规整一次不变（确定且稳定）。
+    /// 修复重叠：不重叠、尺寸不变、再修复一次不变（确定且稳定）。
     #[test]
-    fn normalize_invariants(l in arb_layout()) {
+    fn repair_invariants(l in arb_layout()) {
         let mut n = l.clone();
-        n.normalize();
+        n.repair_overlaps();
         assert_no_overlap(&n)?;
         for (p, q) in l.screens.iter().zip(&n.screens) {
             prop_assert_eq!(p.rect.w, q.rect.w);
@@ -1722,17 +1697,17 @@ proptest! {
             prop_assert_eq!(&p.id, &q.id);
         }
         let mut again = n.clone();
-        again.normalize();
+        again.repair_overlaps();
         for (p, q) in n.screens.iter().zip(&again.screens) {
             prop_assert!((p.rect.x - q.rect.x).abs() < (1e-3 / 686.0) && (p.rect.y - q.rect.y).abs() < (1e-3 / 686.0),
                 "{:?} → {:?}", p.rect, q.rect);
         }
         let mut twice = l.clone();
-        twice.normalize();
+        twice.repair_overlaps();
         prop_assert_eq!(&twice, &n, "确定性");
     }
 
-    /// 编辑：在逻辑布局上随意拖放屏幕或整台设备，结果仍不重叠、再规整不变，被拖的屏幕贴着别的屏幕。
+    /// 编辑：在逻辑布局上随意拖放屏幕或整台设备，修复重叠后不重叠、再修复不变。
     #[test]
     fn edits_keep_invariants(
         l in arb_logical(),
@@ -1747,12 +1722,11 @@ proptest! {
                 l.move_screen(&s.id, Point::new(x, y));
 
             }
-            // Free drag previews retain their requested gaps; a committed edit
-            // normalizes the complete layout, including untouched computers.
-            l.normalize();
+            // Contact compaction is the canvas editor's; the backend repairs collisions.
+            l.repair_overlaps();
             assert_no_overlap(&l)?;
             let mut again = l.clone();
-            again.normalize();
+            again.repair_overlaps();
             for (p, q) in l.screens.iter().zip(&again.screens) {
                 prop_assert!((p.rect.x - q.rect.x).abs() < (1e-3 / 686.0) && (p.rect.y - q.rect.y).abs() < (1e-3 / 686.0));
             }

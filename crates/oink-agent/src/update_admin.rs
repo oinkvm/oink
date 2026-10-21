@@ -1,29 +1,18 @@
 //! Fixed elevated Windows policy entry. This never requests or bypasses elevation.
-use oink_update::policy::{Channel, Command, Preferences};
+use oink_update::policy::{Command, Preferences};
 #[derive(clap::Args, Debug)]
 pub struct Args {
     #[arg(long, value_enum)]
     checks: Toggle,
-    #[arg(long, value_enum)]
-    channel: PolicyChannel,
 }
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum Toggle {
     On,
     Off,
 }
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-enum PolicyChannel {
-    Stable,
-    Beta,
-}
 pub fn run(args: Args) -> anyhow::Result<()> {
     let preferences = Preferences {
         checks_enabled: matches!(args.checks, Toggle::On),
-        channel: match args.channel {
-            PolicyChannel::Stable => Channel::Stable,
-            PolicyChannel::Beta => Channel::Beta,
-        },
     };
     let reply = oink_winsvc::update::request(oink_update::ipc::Request::Command {
         command: Command::SetPreferences { preferences },
@@ -44,13 +33,15 @@ mod tests {
         args: Args,
     }
     #[test]
-    fn policy_accepts_checks_and_channel_but_has_no_install_mode() {
-        assert!(PolicyCli::try_parse_from(["policy", "--checks", "on", "--channel", "stable"]).is_ok());
+    fn policy_accepts_only_checks() {
+        for checks in ["on", "off"] {
+            assert!(PolicyCli::try_parse_from(["policy", "--checks", checks]).is_ok());
+        }
+        for channel in ["stable", "beta"] {
+            assert!(PolicyCli::try_parse_from(["policy", "--checks", "on", "--channel", channel]).is_err());
+        }
         for mode in ["notify", "automatic"] {
-            assert!(
-                PolicyCli::try_parse_from(["policy", "--checks", "on", "--channel", "stable", "--mode", mode,])
-                    .is_err()
-            );
+            assert!(PolicyCli::try_parse_from(["policy", "--checks", "on", "--mode", mode]).is_err());
         }
     }
 }

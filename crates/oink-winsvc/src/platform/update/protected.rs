@@ -183,6 +183,13 @@ pub(super) fn directory(path: &Path) -> io::Result<()> {
     check(unsafe { CreateDirectoryW(wide(path.to_str().ok_or_else(denied)?).as_ptr(), &attrs) })?;
     open_one(path, true).map(|_| ())
 }
+pub(super) fn entries(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let _parents = pin_parents(path, true)?;
+    let _directory = open_one(path, true)?;
+    std::fs::read_dir(path)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect()
+}
 pub(super) fn read(path: &Path, max: u64) -> Result<Vec<u8>, Error> {
     let mut pinned = pin(path).map_err(|_| Error::Storage)?;
     bytes(&mut pinned.file, max)
@@ -330,32 +337,32 @@ pub(super) fn cached_msi(path: &Path, installer: &Path) -> io::Result<File> {
     open_one(path, false)
 }
 
-/// Remove only this updater's obsolete protected trees, after acquiring the
-/// maintenance lock and establishing that no transaction is pending.
-pub(super) fn prune(current_build: u64) -> Result<(), Error> {
+/// Background only: caller owns the maintenance lock and has joined collection
+/// before staging any new Ready artifact. Pending recovery owns all its files.
+pub(super) fn prune_completed(current_build: u64) -> Result<bool, Error> {
     let maintenance = maintenance().map_err(|_| Error::Storage)?;
-    prune_at(&maintenance, Some(current_build), open_one).map(|_| ())
-}
-/// Called under the maintenance lock before the service admits any requests.
-/// A pending transaction owns its files, including reboot/recovery state.
-pub(super) fn prune_completed() -> Result<bool, Error> {
-    let maintenance = maintenance().map_err(|_| Error::Storage)?;
-    prune_at(&maintenance, None, open_one)
+    prune_at(&maintenance, current_build, open_one)
 }
 fn prune_at(
     maintenance: &Path,
-    before_install: Option<u64>,
+    current_build: u64,
     mut open: impl FnMut(&Path, bool) -> io::Result<File>,
 ) -> Result<bool, Error> {
     if maintenance.join("pending.json").exists() {
         return Ok(false);
     }
+    let cache = maintenance.join("cache");
+    let prior = if cache.exists() {
+        let _cache = open(&cache, true).map_err(|_| Error::Storage)?;
+        std::fs::read_dir(&cache)
+            .map_err(|_| Error::Storage)?
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u64>().ok())
+            .filter(|build| *build < current_build)
+            .max()
+    } else {
+        None
+    };
     for (name, transactions) in [("transactions", true), ("cache", false)] {
-        // At startup retain both current and prior rollback packages. At the
-        // next install only the then-current package is needed as its rollback.
-        if !transactions && before_install.is_none() {
-            continue;
-        }
         let root = maintenance.join(name);
         if !root.exists() {
             continue;
@@ -370,14 +377,14 @@ fn prune_at(
                 super::valid_transaction(&name)
             } else {
                 name.parse::<u64>()
-                    .is_ok_and(|build| Some(build) != before_install && build.to_string() == name)
+                    .is_ok_and(|build| build != current_build && Some(build) != prior && build.to_string() == name)
             };
             if obsolete {
                 remove_tree(&child.path(), &mut open)?;
             }
         }
     }
-    if before_install.is_none() {
+    {
         // No Ready selection survives a service restart. Reclaim the fixed
         // download slot (including an interrupted atomic write) and orphaned
         // authorization only after ruling out a pending transaction.
@@ -428,9 +435,6 @@ mod tests {
         // Same traversal/sharing behavior, with only the privileged ACL check
         // replaced for an isolated ordinary-user filesystem fixture.
         for current in 31..35 {
-            assert!(prune_at(root, Some(current), open_raw).unwrap());
-            assert_eq!(std::fs::read_dir(root.join("cache")).unwrap().count(), 1);
-            assert_eq!(std::fs::read_dir(root.join("transactions")).unwrap().count(), 0);
             let next = current + 1;
             let cache = root.join(format!("cache/{next}"));
             std::fs::create_dir(&cache).unwrap();
@@ -439,13 +443,16 @@ mod tests {
             std::fs::create_dir_all(&tx).unwrap();
             std::fs::write(tx.join("unpacked.bin"), b"inventory fixture").unwrap();
             std::fs::write(root.join("downloads/candidate.msi"), b"download").unwrap();
+            assert!(prune_at(root, next, open_raw).unwrap());
+            assert_eq!(std::fs::read_dir(root.join("cache")).unwrap().count(), 2);
+            assert_eq!(std::fs::read_dir(root.join("transactions")).unwrap().count(), 0);
         }
         assert_eq!(std::fs::read_dir(root.join("cache")).unwrap().count(), 2);
-        assert_eq!(std::fs::read_dir(root.join("transactions")).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(root.join("transactions")).unwrap().count(), 0);
         std::fs::write(root.join("downloads/candidate.new"), b"interrupted write").unwrap();
         std::fs::write(root.join("msi-authorization.json"), b"orphan").unwrap();
-        assert!(prune_at(root, None, open_raw).unwrap());
-        assert!(prune_at(root, None, open_raw).unwrap()); // Idempotent restart.
+        assert!(prune_at(root, 35, open_raw).unwrap());
+        assert!(prune_at(root, 35, open_raw).unwrap()); // Idempotent restart.
         assert_eq!(std::fs::read_dir(root.join("transactions")).unwrap().count(), 0);
         assert_eq!(std::fs::read_dir(root.join("downloads")).unwrap().count(), 0);
         assert!(!root.join("msi-authorization.json").exists());
@@ -466,7 +473,7 @@ mod tests {
         std::fs::create_dir_all(&tx).unwrap();
         std::fs::write(tx.join("worker.exe"), b"never executed").unwrap();
         std::fs::write(root.join("pending.json"), b"recovery owns this tree").unwrap();
-        assert!(!prune_at(root, None, |_, _| panic!("must not open pending trees")).unwrap());
+        assert!(!prune_at(root, 35, |_, _| panic!("must not open pending trees")).unwrap());
         assert!(tx.join("worker.exe").exists());
         assert!(root.join("pending.json").exists());
     }

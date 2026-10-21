@@ -49,6 +49,7 @@ export interface Prefs {
     pointerGain: number;
     keepAwake: boolean;
     touchpadInject: boolean;
+    macScrollFeel: boolean;
     pointerTrail: boolean;
     clipText: boolean;
     clipRich: boolean;
@@ -81,6 +82,7 @@ export const DEFAULT_PREFS: Prefs = {
     pointerGain: 1,
     keepAwake: true,
     touchpadInject: true,
+    macScrollFeel: true,
     pointerTrail: true,
     clipText: true,
     clipRich: true,

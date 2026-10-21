@@ -87,6 +87,49 @@ pub(super) struct Inventory {
     pub build: u64,
     pub hashes: BTreeMap<String, String>,
 }
+/// First manual installation has no updater commit to reuse. Capture its
+/// trusted installed payload once, outside the explicit Install path. This is
+/// a rollback-health baseline, not a comparison with or extraction of its MSI.
+pub(super) fn installed_inventory(receipt: &Receipt, product_code: String) -> Result<Inventory, Error> {
+    let root = protected::root().map_err(|_| Error::Storage)?;
+    let mut paths: BTreeMap<String, std::path::PathBuf> = FILES
+        .iter()
+        .chain(NOTICES)
+        .map(|name| (name.to_string(), root.join(name)))
+        .collect();
+    if receipt.collector_included {
+        paths.insert("oink-crash-collector.exe".into(), root.join("oink-crash-collector.exe"));
+    }
+    let mut directories = vec![root.join("licenses")];
+    while let Some(directory) = directories.pop() {
+        for path in protected::entries(&directory).map_err(|_| Error::Storage)? {
+            if path.is_dir() {
+                directories.push(path);
+            } else {
+                let name = path
+                    .strip_prefix(&root)
+                    .map_err(|_| Error::Storage)?
+                    .to_str()
+                    .ok_or(Error::Metadata)?
+                    .replace('\\', "/");
+                oink_update::package::validate_path(&name)?;
+                paths.insert(name, path);
+            }
+        }
+    }
+    if !valid_product_code(&product_code) {
+        return Err(Error::Metadata);
+    }
+    let hashes = paths
+        .into_iter()
+        .map(|(name, path)| Ok((name, protected::hash(&path)?)))
+        .collect::<Result<_, Error>>()?;
+    Ok(Inventory {
+        product_code,
+        build: receipt.build,
+        hashes,
+    })
+}
 struct Msi(u32);
 impl Drop for Msi {
     fn drop(&mut self) {
@@ -276,7 +319,10 @@ pub(super) fn inspect(
                 parent.push(part);
                 protected::directory(&parent).map_err(|_| Error::Storage)?;
             }
-            protected::write(&output, &bytes)?;
+            // Native extraction already wrote these exact protected bytes.
+            // A same-volume move preserves them and avoids a second full write
+            // and a second payload tree to delete after the update.
+            retain_member(&extracted, &output)?;
             hashes.insert(name.clone(), hex(&Sha256::digest(&bytes)));
             if name.ends_with(".exe") {
                 signature::verify(&output, roots)?;
@@ -327,6 +373,9 @@ pub(super) fn inspect(
         hashes,
     })
 }
+fn retain_member(extracted: &Path, output: &Path) -> Result<(), Error> {
+    std::fs::rename(extracted, output).map_err(|_| Error::Storage)
+}
 fn valid_product_code(code: &str) -> bool {
     let code = code.trim_matches(['{', '}']);
     code.len() == 36
@@ -342,6 +391,17 @@ fn valid_product_code(code: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inspected_member_is_retained_without_a_second_payload_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let extracted = directory.path().join("cabinet-member");
+        let output = directory.path().join("product.exe");
+        std::fs::write(&extracted, b"verified payload").unwrap();
+        retain_member(&extracted, &output).unwrap();
+        assert!(!extracted.exists());
+        assert_eq!(std::fs::read(&output).unwrap(), b"verified payload");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
     #[test]
     #[ignore = "explicit external TEST MSI and previously verified inventory; no installation"]
     fn external_msi_native_cabinet_matches_every_previously_verified_file() {

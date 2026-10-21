@@ -735,9 +735,6 @@ impl AgentApi for RemoteApi {
             policy_version,
         })
     }
-    fn test_mac_scroll(&self, enabled: Option<bool>) -> ApiResult<bool> {
-        self.call(Request::TestMacScroll { enabled })
-    }
     fn input_settings(&self) -> ApiResult<InputSettings> {
         self.call(Request::InputSettings)
     }

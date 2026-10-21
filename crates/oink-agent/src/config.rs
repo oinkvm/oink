@@ -460,6 +460,29 @@ mod tests {
     }
 
     #[test]
+    fn mac_scroll_feel_defaults_on_and_ignores_retired_test_key() {
+        for legacy in [None, Some(false), Some(true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = AgentConfig::load_from(dir.path()).unwrap();
+            config.save().unwrap();
+            let mut raw = stored(dir.path());
+            if let Some(value) = legacy {
+                raw["local"] = serde_json::json!({"routing":{"test_mac_scroll":value}});
+            }
+            std::fs::write(config.settings_path(), serde_json::to_vec(&raw).unwrap()).unwrap();
+            let mut config = AgentConfig::load_from(dir.path()).unwrap();
+            assert!(config.settings.routing.mac_scroll_feel);
+            config
+                .update_local(&serde_json::json!({"routing":{"mac_scroll_feel":false}}), |s| {
+                    s.routing.mac_scroll_feel = false;
+                })
+                .unwrap();
+            let reloaded = AgentConfig::load_from(dir.path()).unwrap();
+            assert!(!reloaded.settings.routing.mac_scroll_feel);
+        }
+    }
+
+    #[test]
     fn unrelated_save_does_not_pin_current_local_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = AgentConfig::load_from(dir.path()).unwrap();

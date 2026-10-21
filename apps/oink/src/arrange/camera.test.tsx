@@ -42,10 +42,10 @@ beforeEach(() => {
 });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
-function Canvas({ snapping = false }: { snapping?: boolean }) {
+function Canvas({ snapping = false, compact = settings.compact }: { snapping?: boolean; compact?: boolean }) {
     const [screens, setScreens] = useState(initial);
     return <Arrangement screens={screens} onScreensChange={setScreens} selectedId="two" onSelect={() => {}}
-        settings={{ ...settings, snapping }} />;
+        settings={{ ...settings, snapping, compact }} />;
 }
 
 function displayed(element: Element) {
@@ -187,7 +187,8 @@ describe('camera follows animated screens', () => {
 
     it('follows keyboard motion and resize from their displayed positions', () => {
         const step = vi.spyOn(SpringCamera.prototype, 'step');
-        render(<Canvas />);
+        // With auto-compaction a key move away from the neighbour settles back.
+        render(<Canvas compact={false} />);
         settle();
         for (const ctrlKey of [false, true]) {
             const before = cameraStore.get()!;

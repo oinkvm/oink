@@ -101,26 +101,45 @@ pub(super) fn windows_build() -> Result<u32, Error> {
         .parse()
         .map_err(|_| Error::Metadata)
 }
+fn installed_product_code() -> Result<String, Error> {
+    let mut value = [0u16; 64];
+    let mut bytes = size_of_val(&value) as u32;
+    // SAFETY: fixed, read-only product registry record written by MSI.
+    let code = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            wide(r"Software\Oink").as_ptr(),
+            wide("ProductCode").as_ptr(),
+            RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
+            ptr::null_mut(),
+            value.as_mut_ptr().cast(),
+            &mut bytes,
+        )
+    };
+    if code != 0 {
+        return Err(Error::Storage);
+    }
+    let length = value.iter().position(|c| *c == 0).ok_or(Error::Metadata)?;
+    String::from_utf16(&value[..length]).map_err(|_| Error::Metadata)
+}
 fn cache(build: u64) -> Result<PathBuf, Error> {
     Ok(protected::maintenance()
         .map_err(|_| Error::Storage)?
         .join("cache")
         .join(build.to_string()))
 }
-pub(super) fn stage(
+pub(super) fn prepare_package(
     candidate: feed::Release,
     previous: Option<feed::Release>,
     envelope: &[u8],
-    sessions: Vec<Session>,
     roots: &Roots,
-) -> Result<String, Error> {
+) -> Result<PreparedPackage, Error> {
     protected::system().map_err(|_| Error::Policy)?;
-    let lock = protected::lock()?;
+    let _lock = protected::lock()?;
     if pending() {
         return Err(Error::Busy);
     }
     let receipt = installed()?;
-    protected::prune(receipt.build)?;
     let machine = policy()?;
     if candidate.build <= receipt.build.max(machine.successful_build) {
         return Err(Error::Replay);
@@ -156,7 +175,7 @@ pub(super) fn stage(
     protected::write(&candidate_msi, &candidate_bytes)?;
     protected::write(&directory.join("manifest.json"), envelope)?;
     let candidate_inventory = msi::inspect(&candidate_msi, &directory.join("candidate-check"), roots, &candidate)?;
-    let previous_inventory = msi::inspect(&previous_msi, &directory.join("previous-check"), roots, &previous)?;
+    let previous_inventory = cached_inventory(&receipt)?;
     let root = protected::root().map_err(|_| Error::Storage)?;
     let source = root.join("oink-update-worker.exe");
     signature::verify(&source, roots)?;
@@ -178,21 +197,78 @@ pub(super) fn stage(
     if free < feed::MAX_UNPACKED * 2 + candidate.package.length + previous.package.length {
         return Err(Error::Storage);
     }
-    let mut plan = Plan {
-        schema: 1,
-        transaction: tx.clone(),
+    let candidate_pin = protected::pin(&candidate_msi).map_err(|_| Error::Storage)?;
+    Ok(PreparedPackage {
+        transaction: tx,
         candidate,
         previous,
         candidate_inventory,
         previous_inventory,
+        worker_sha256: feed::hex(&Sha256::digest(&bytes)),
+        _candidate_pin: candidate_pin,
+    })
+}
+pub(super) struct PreparedPackage {
+    pub transaction: String,
+    candidate: feed::Release,
+    previous: feed::Release,
+    candidate_inventory: msi::Inventory,
+    previous_inventory: msi::Inventory,
+    worker_sha256: String,
+    _candidate_pin: protected::PinnedFile,
+}
+fn cached_inventory(receipt: &msi::Receipt) -> Result<msi::Inventory, Error> {
+    let destination = cache(receipt.build)?;
+    protected::directory(&destination).map_err(|_| Error::Storage)?;
+    let path = destination.join("inventory.json");
+    let inventory = if path.exists() {
+        feed::strict_json(&protected::read(&path, feed::MAX_FEED as u64)?)?
+    } else {
+        // A manual MSI install has no previous updater commit. Capture the
+        // protected installed payload as its rollback-health baseline once;
+        // do not open/extract its MSI or compare installed files with that MSI.
+        let inventory = msi::installed_inventory(receipt, installed_product_code()?)?;
+        protected::write(&path, &json(&inventory)?)?;
+        inventory
+    };
+    if inventory.build != receipt.build || inventory.product_code != installed_product_code()? {
+        return Err(Error::Metadata);
+    }
+    Ok(inventory)
+}
+pub(super) fn stage(prepared: &PreparedPackage, sessions: Vec<Session>) -> Result<String, Error> {
+    protected::system().map_err(|_| Error::Policy)?;
+    let lock = protected::lock()?;
+    if pending() {
+        return Err(Error::Busy);
+    }
+    let receipt = installed()?;
+    let machine = policy()?;
+    if receipt.build != prepared.previous.build
+        || prepared.candidate.build <= receipt.build.max(machine.successful_build)
+        || machine.quarantine.contains(&prepared.candidate.build)
+    {
+        return Err(Error::Replay);
+    }
+    let tx = prepared.transaction.clone();
+    let directory = transaction_dir(&tx)?;
+    let worker = directory.join("worker.exe");
+    let mut plan = Plan {
+        schema: 1,
+        transaction: tx.clone(),
+        candidate: prepared.candidate.clone(),
+        previous: prepared.previous.clone(),
+        candidate_inventory: prepared.candidate_inventory.clone(),
+        previous_inventory: prepared.previous_inventory.clone(),
         sessions,
         reboot_marker_armed: false,
         lock_handle: format!("{:016x}", lock.0 as usize),
         worker_pid: 0,
         worker_created_filetime: "0000000000000000".into(),
-        worker_sha256: feed::hex(&Sha256::digest(&bytes)),
+        worker_sha256: prepared.worker_sha256.clone(),
     };
     write_plan(&plan)?;
+    let maintenance = protected::maintenance().map_err(|_| Error::Storage)?;
     let journal = Journal::new(
         tx.clone(),
         plan.previous.build,
@@ -339,12 +415,10 @@ pub(super) fn run() -> Result<(), Error> {
 impl Worker {
     fn verify_candidate_manifest(&self) -> Result<(), Error> {
         let machine = policy()?;
-        let channel = machine.policy.preferences.channel;
         let manifest = feed::verify_manifest(
             &protected::read(&self.directory.join("manifest.json"), feed::MAX_FEED as u64)?,
             &self.roots.feed(),
-            channel,
-            &machine.watermarks.get(channel.name()).cloned().unwrap_or_default(),
+            &machine.watermarks.get("stable").cloned().unwrap_or_default(),
             now(),
         )?;
         feed::verify_version(&self.plan.candidate.version, &self.plan.previous.version)?;
@@ -680,11 +754,13 @@ impl Platform for Worker {
     fn commit_receipt(&mut self) -> Result<(), Error> {
         let destination = cache(self.plan.candidate.build)?;
         protected::directory(&destination).map_err(|_| Error::Storage)?;
-        protected::write(
-            &destination.join("package.msi"),
+        cache_verified_package(
+            &destination,
+            &self.plan.candidate,
+            &self.plan.candidate_inventory,
             &protected::read(&self.directory.join("candidate.msi"), feed::MAX_PACKAGE)?,
+            protected::write,
         )?;
-        protected::write(&destination.join("release.json"), &json(&self.plan.candidate)?)?;
         let mut machine = policy()?;
         machine.record_success(self.plan.candidate.build);
         save_policy(&machine)
@@ -752,6 +828,17 @@ impl Platform for Worker {
         Ok(())
     }
 }
+fn cache_verified_package(
+    directory: &Path,
+    release: &feed::Release,
+    inventory: &msi::Inventory,
+    bytes: &[u8],
+    mut write: impl FnMut(&Path, &[u8]) -> Result<(), Error>,
+) -> Result<(), Error> {
+    write(&directory.join("package.msi"), bytes)?;
+    write(&directory.join("release.json"), &json(release)?)?;
+    write(&directory.join("inventory.json"), &json(inventory)?)
+}
 fn remove_completed_files(
     maintenance: &Path,
     mut open: impl FnMut(&Path) -> std::io::Result<std::fs::File>,
@@ -775,7 +862,12 @@ fn remove_completed_files(
 }
 pub(super) fn cleanup_completed() -> Result<(), Error> {
     let _lock = protected::lock()?;
-    if protected::prune_completed()? {
+    if pending() {
+        return Ok(());
+    }
+    let receipt = installed()?;
+    let _inventory = cached_inventory(&receipt)?;
+    if protected::prune_completed(receipt.build)? {
         clear_boot_markers(HKEY_LOCAL_MACHINE, r"Software\Oink")?;
     }
     Ok(())
@@ -1266,6 +1358,32 @@ pub(super) fn resume_pending() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn committed_candidate_inventory_survives_for_rollback_without_another_msi_inspection() {
+        let fixture = tempfile::tempdir().unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(include_bytes!("notes-loopback-test.json")).unwrap();
+        let decoded = STANDARD.decode(manifest["payload"].as_str().unwrap()).unwrap();
+        let feed: feed::Manifest = serde_json::from_slice(&decoded).unwrap();
+        let release = &feed.releases[0];
+        let inventory = msi::Inventory {
+            product_code: "{01234567-89AB-CDEF-0123-456789ABCDEF}".into(),
+            build: release.build,
+            hashes: BTreeMap::from([("oink.exe".into(), "a".repeat(64))]),
+        };
+        cache_verified_package(
+            fixture.path(),
+            release,
+            &inventory,
+            b"fixture MSI, never installed",
+            |path, bytes| std::fs::write(path, bytes).map_err(|_| Error::Storage),
+        )
+        .unwrap();
+        let saved: msi::Inventory =
+            serde_json::from_slice(&std::fs::read(fixture.path().join("inventory.json")).unwrap()).unwrap();
+        assert_eq!(saved.build, inventory.build);
+        assert_eq!(saved.product_code, inventory.product_code);
+        assert_eq!(saved.hashes, inventory.hashes);
+    }
     #[test]
     fn completed_cleanup_reclaims_all_boot_markers_without_touching_other_registry_state() {
         let fixture = tempfile::tempdir().unwrap();

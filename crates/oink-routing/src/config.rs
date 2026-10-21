@@ -92,8 +92,10 @@ pub struct RoutingSettings {
     /// Runtime projection of the receiving owner's AcceptContacts preference.
     #[serde(skip)]
     pub accept_contacts: bool,
-    /// Local, CLI-only experiment: classify Mac scroll before native injection.
-    pub test_mac_scroll: bool,
+    /// Receiver-local Windows preference: classify Mac scroll before native injection.
+    /// Retired test_mac_scroll is intentionally ignored by local settings readers:
+    /// the promoted preference defaults on, independently of the old experiment.
+    pub mac_scroll_feel: bool,
     /// Runtime projection of this device owner's persistent game preference.
     #[serde(skip)]
     pub game_mode_preference: crate::GameMode,
@@ -137,7 +139,7 @@ impl Default for RoutingSettings {
             emergency_combo: true,
             forward_gestures: true,
             accept_contacts: true,
-            test_mac_scroll: false,
+            mac_scroll_feel: true,
             game_mode_preference: crate::GameMode::Auto,
             return_pointer_on_display_sleep: true,
             wake_displays_on_input: true,

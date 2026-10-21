@@ -135,6 +135,29 @@ pub(super) fn input_allowed() -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn legacy_machine_policy_preserves_checks_and_stable_watermark() {
+        for channel in ["stable", "beta"] {
+            for checks_enabled in [false, true] {
+                let mut stored = serde_json::to_value(MachinePolicy::default()).unwrap();
+                stored["policy"]["preferences"] =
+                    serde_json::json!({"checks_enabled": checks_enabled, "channel": channel});
+                stored["watermarks"]["stable"] =
+                    serde_json::json!({"sequence": 7, "payloadSha256": "stored", "lastVerifiedUnix": 123});
+                stored["watermarks"]["beta"] =
+                    serde_json::json!({"sequence": 99, "payloadSha256": "ignored", "lastVerifiedUnix": 456});
+                let policy: MachinePolicy =
+                    oink_update::feed::strict_json(&serde_json::to_vec(&stored).unwrap()).unwrap();
+                assert_eq!(policy.policy.preferences.checks_enabled, checks_enabled);
+                assert_eq!(policy.watermarks["stable"].sequence, 7);
+                let saved = serde_json::to_value(policy).unwrap();
+                assert_eq!(
+                    saved["policy"]["preferences"],
+                    serde_json::json!({"checks_enabled": checks_enabled})
+                );
+            }
+        }
+    }
+    #[test]
     fn successful_update_discards_only_obsolete_quarantine_history() {
         let mut policy = MachinePolicy {
             successful_build: 31,

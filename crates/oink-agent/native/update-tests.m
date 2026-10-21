@@ -48,6 +48,10 @@ static void mainQueueTurn(void) {
 }
 int main(void) {
     @autoreleasepool {
+        OinkUpdateDriver *stableDriver=[OinkUpdateDriver new];
+        SPUUpdater *stableUpdater=(SPUUpdater *)[TestUpdater new];
+        assert([[stableDriver feedURLStringForUpdater:stableUpdater] isEqualToString:@"https://updates.oink.hachiwii.com/mac/v1/mac-2026-01/stable/appcast.xml"]);
+        assert([stableDriver allowedChannelsForUpdater:stableUpdater].count==0);
         // Sparkle wraps URLSession failures in SUDownloadError before showing
         // them to our driver. A TLS failure must stay Network across the bridge.
         owner=[OinkUpdateDriver new];owner.callback=captureFailure;
@@ -213,7 +217,7 @@ int main(void) {
 
         owner=[OinkUpdateDriver new]; reply=-1;
         [owner showDownloadDidStartExtractingUpdate];
-        oink_update_preferences(false,false); // Notify/off/channel/deferral path.
+        oink_update_preferences(false); // Checks off/deferral path.
         assert(!oink_update_quit_allowed());
         [owner showReadyToInstallAndRelaunch:^(SPUUserUpdateChoice choice) {reply=(int)choice;}];
         assert(reply==SPUUserUpdateChoiceSkip);

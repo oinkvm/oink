@@ -967,6 +967,9 @@ pub struct InputSettings {
     #[serde(default)]
     pub event_frequency: EventFrequency,
     pub accept_contacts: bool,
+    /// Receiver-local Windows scroll feel; retained while contact acceptance is off.
+    #[serde(default = "default_true")]
+    pub mac_scroll_feel: bool,
     /// Read-only live native injector availability; absent means unavailable.
     #[serde(default)]
     pub contacts_injection_available: bool,
@@ -1883,7 +1886,7 @@ pub trait AgentApi: Send + Sync {
     fn move_screen(&self, screen: ScreenKey, origin: Point) -> ApiResult<Layout>;
     /// 整台设备放下（`Layout::move_device`），保存并同步。
     fn move_device(&self, device: DeviceKey, delta: Point) -> ApiResult<Layout>;
-    /// 用户交互缩放（`Layout::resize_screen`，保持当前宽高比，来源变为 `Manual`，然后规整），保存并同步。
+    /// 用户交互缩放（`Layout::resize_screen`，保持当前宽高比，来源变为 `Manual`，然后修复重叠），保存并同步。
     fn set_screen_size(&self, screen: ScreenKey, size: Size) -> ApiResult<Layout>;
 
     // 输入设置（core）
@@ -1901,7 +1904,6 @@ pub trait AgentApi: Send + Sync {
         _choice: oink_telemetry::Choice,
         _policy_version: u16,
     ) -> ApiResult<()>;
-    fn test_mac_scroll(&self, enabled: Option<bool>) -> ApiResult<bool>;
     fn input_settings(&self) -> ApiResult<InputSettings>;
     fn set_input_settings(&self, settings: PreferencePatch<InputSettings>) -> ApiResult<()>;
 
@@ -2204,10 +2206,6 @@ pub enum Request {
         size: Size,
     },
     InputSettings,
-    /// CLI-only receiver experiment; never an owner/group option.
-    TestMacScroll {
-        enabled: Option<bool>,
-    },
     SetInputSettings {
         settings: PreferencePatch<InputSettings>,
     },
@@ -2276,7 +2274,6 @@ pub enum Request {
 #[serde(untagged)]
 #[allow(clippy::large_enum_variant)]
 pub enum Reply {
-    TestMacScroll(bool),
     ConnectionQuality(ConnectionQuality),
     AudioQuality(AudioQuality),
     DeviceCards(crate::device_cards::DeviceCardsView),
@@ -2473,7 +2470,6 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
             choice,
             policy_version,
         } => unit(api.set_report_consent(expected_generation, choice, policy_version)),
-        R::TestMacScroll { enabled } => api.test_mac_scroll(enabled).map(Reply::TestMacScroll),
         R::InputSettings => api.input_settings().map(Reply::InputSettings),
         R::SetInputSettings { settings } => unit(api.set_input_settings(settings)),
         R::CacheUsage { device } => api.cache_usage(device).map(Reply::CacheUsage),
@@ -2874,6 +2870,7 @@ fn test_input_settings() -> InputSettings {
         event_frequency: Default::default(),
         accept_contacts: true,
         contacts_injection_available: true,
+        mac_scroll_feel: true,
         emergency_hold_ms: 5000,
         device_gain: 1.,
         scroll: ScrollSettings { speed: 1. },

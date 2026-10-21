@@ -1,16 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { bounds, fitArrangement, compact, cornerClearance, cornerPoint, opposite, overlapsAny, clampMove, resizeFromCorner, snapResize } from './geometry';
+import { bounds, fitArrangement, cornerClearance, cornerPoint, opposite, clampMove, resizeFromCorner, snapResize } from './geometry';
 import type { Corner } from './geometry';
 describe('designer arrangement geometry',()=>{
-  it('compacts toward adjacent screens without changing the edge projection',()=>{
-    const other={x:0,y:0,w:1512,h:982}, moved={x:1700,y:200,w:1000,h:600};
-    const result=compact(moved,[other]);
-    expect(result).toEqual({...moved,x:1512});expect(overlapsAny(result,[other])).toBe(false);
-  });
-  it('retains an existing contact instead of moving toward a farther screen',()=>{
-    const at={x:1512,y:0,w:800,h:500};
-    expect(compact(at,[{x:0,y:0,w:1512,h:982},{x:4000,y:0,w:800,h:500}])).toEqual(at);
-  });
   it('makes touching corners square and preserves independent outer corners',()=>{
     expect(cornerClearance({x:1512,y:0,w:800,h:982},[{x:0,y:0,w:1512,h:982}])).toEqual({nw:0,ne:null,sw:0,se:null});
   });

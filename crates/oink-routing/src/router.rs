@@ -703,7 +703,7 @@ impl Router {
         let dnd_was = self.dnd_enabled();
         self.apply_source_modes(settings.mouse_mode, settings.keyboard_mode);
         self.set_accept_contacts(settings.accept_contacts);
-        if self.cfg.settings.test_mac_scroll != settings.test_mac_scroll {
+        if self.cfg.settings.mac_scroll_feel != settings.mac_scroll_feel {
             self.retire_received_multifinger();
         }
         if self.cfg.settings.forward_gestures && !settings.forward_gestures {

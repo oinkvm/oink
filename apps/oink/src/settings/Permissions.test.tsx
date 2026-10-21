@@ -19,18 +19,37 @@ beforeAll(() => {
 afterEach(cleanup);
 const prefs = { prefs: DEFAULT_PREFS, set() {}, canEdit: () => true } as unknown as PrefsApi;
 const initial: Record<PermissionId, PermState> = { accessibility: 'not_granted', input: 'not_granted', network: 'not_required', files: 'unknown', audio: 'not_determined' };
-function view(perms = initial, query = '', onGrant = vi.fn(), onOpenPermissionSettings?: (id: PermissionId) => void, platform: Platform = 'mac') {
-  return <OinkProvider defaultMotion="reduced"><SettingsPage open platform={platform} api={prefs} capsIme={false} query={query} jump={null} onActive={() => {}} version="test" upgrade={{available:false,next:''}} perms={perms} onGrant={onGrant} onOpenPermissionSettings={onOpenPermissionSettings} onLog={() => {}} onAbout={() => {}} onBlocklist={() => {}}/></OinkProvider>;
+function view(perms = initial, query = '', onGrant = vi.fn(), onOpenPermissionSettings?: (id: PermissionId) => void, platform: Platform = 'mac', settings = prefs) {
+  return <OinkProvider defaultMotion="reduced"><SettingsPage open platform={platform} api={settings} capsIme={false} query={query} jump={null} onActive={() => {}} version="test" upgrade={{available:false,next:''}} perms={perms} onGrant={onGrant} onOpenPermissionSettings={onOpenPermissionSettings} onLog={() => {}} onAbout={() => {}} onBlocklist={() => {}}/></OinkProvider>;
 }
 it.each(['en','ja','ko','zh-Hans'])('hides contacts settings without an injector in %s', language => {
   setLanguage(language);
-  for (const available of [false,true]) {
+  for (const available of [undefined,false,true]) {
     agent.adopt('input', {contacts_injection_available:available} as unknown as InputSettings);
     const {container,unmount}=render(view(initial,'',vi.fn(),undefined,'win'));
-    expect(!!container.querySelector('[data-item="touchpadInject"]')).toBe(available);
+    expect(!!container.querySelector('[data-item="touchpadInject"]')).toBe(available===true);
+    expect(!!container.querySelector('[data-item="macScrollFeel"]')).toBe(available===true);
     unmount();
   }
   agent.adopt('input', null);
+});
+it.each(['en','ja','ko','zh-Hans'])('places the default-on Mac scroll switch below contacts and disables it with its parent in %s', language => {
+  setLanguage(language);
+  agent.adopt('input', {contacts_injection_available:true} as InputSettings);
+  for (const parent of [true,false]) {
+    const settings = {...prefs,prefs:{...DEFAULT_PREFS,touchpadInject:parent}};
+    const {container,unmount}=render(view(initial,'',vi.fn(),undefined,'win',settings));
+    const row=container.querySelector<HTMLElement>('[data-item="macScrollFeel"]');
+    expect(row).not.toBeNull();
+    expect(container.querySelector('[data-item="touchpadInject"]')?.nextElementSibling).toBe(row);
+    const control=within(row!).getByRole('switch') as HTMLInputElement;
+    expect(control.checked).toBe(true);
+    expect(control.disabled).toBe(!parent);
+    unmount();
+  }
+  const {container}=render(view());
+  expect(container.querySelector('[data-item="macScrollFeel"]')).toBeNull();
+  agent.adopt('input',null);
 });
 describe('applicable independent permission rows', () => {
   it.each(['en', 'zh-Hans'] as const)('shows the file recovery fault with a restart instruction in %s', language => {
@@ -192,4 +211,21 @@ it.each([
   for(const [query,id,section] of [[esc,'escStop','general'],[pause,'sc-pauseAll','shortcuts'],[uninstall,'uninstall','general']] as const){
     const found=searchSections('mac',query).get(section);expect(found==='all'||found?.has(id)).toBe(true);
   }
+});
+
+it.each(['en','ja','ko','zh-Hans'])('finds the localized Mac scroll setting through its keywords in %s',language=>{
+  setLanguage(language);
+  const item=sectionsFor('win').flatMap(section=>section.items).find(item=>item.id==='macScrollFeel')!;
+  expect(typeof item.label).toBe('string');
+  expect(item.desc).toBeTruthy();
+  if(language==='en') {
+    expect(item.label).toBe('Emulate Mac trackpad scrolling');
+    expect(item.desc).toBe('When a Mac trackpad controls this PC, keep its two-finger scrolling feel.');
+  }
+  if(language!=='zh-Hans') {
+    expect(item.label).not.toBe('模拟 Mac 触摸板滚动');
+    expect(item.desc).not.toBe('被 Mac 的触摸板操控时，还原其双指滚动手感');
+  }
+  const found=searchSections('win','macOS').get('input');
+  expect(found==='all'||found?.has('macScrollFeel')).toBe(true);
 });

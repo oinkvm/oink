@@ -3,7 +3,9 @@ use crate::{
     api::{ApiError, ApiEvent, ApiResult},
     node::{Node, lock},
 };
+pub mod presentation;
 use oink_foundation::maintenance;
+pub use oink_update::policy::Phase;
 use oink_update::{Error, barrier::Blocker, policy::*};
 use std::{
     path::Path,
@@ -32,6 +34,10 @@ pub(crate) struct Controller {
     pub ready: bool,
     #[cfg(not(windows))]
     installing: bool,
+    #[cfg(all(target_os = "macos", feature = "sparkle"))]
+    pub restored_result: bool,
+    #[cfg(windows)]
+    wake: Option<std::sync::mpsc::SyncSender<()>>,
 }
 impl Controller {
     pub(crate) fn load(dir: &Path) -> Self {
@@ -47,12 +53,11 @@ impl Controller {
         if error.is_some() {
             policy.preferences.checks_enabled = false;
         }
-        let status = UpdateStatus {
+        let mut status = UpdateStatus {
             current_build: option_env!("OINK_RELEASE_BUILD")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0),
             version: oink_update::RELEASE_VERSION.into(),
-            channel: policy.preferences.channel,
             checks_enabled: false,
             phase: Phase::Disabled,
             candidate: None,
@@ -65,7 +70,19 @@ impl Controller {
             scope: if cfg!(windows) { Scope::Machine } else { Scope::User },
             can_change_policy: !cfg!(windows),
         };
+        let restored = presentation::outcome(dir, status.current_build);
+        if let Some(result) = restored {
+            status.phase = match result {
+                presentation::Outcome::Committed => Phase::Committed,
+                presentation::Outcome::Failed => Phase::Failed,
+            };
+            status.error = (result == presentation::Outcome::Failed).then_some(Error::Transaction);
+        }
         Self {
+            #[cfg(windows)]
+            wake: None,
+            #[cfg(all(target_os = "macos", feature = "sparkle"))]
+            restored_result: restored.is_some(),
             #[cfg(not(windows))]
             policy,
             status,
@@ -150,7 +167,21 @@ impl Node {
     pub fn execute_update_command(&self, command: Command) -> ApiResult<UpdateStatus> {
         #[cfg(windows)]
         {
-            windows::command(command)
+            let installing = matches!(&command, Command::Install { .. });
+            if let Command::Install { expected_build } = &command {
+                presentation::begin(
+                    self.data_dir(),
+                    lock(&self.inner.update).status.current_build,
+                    *expected_build,
+                )
+                .map_err(|_| api_error(Error::Storage))?;
+                tracing::info!(target: "oink_update_timing", phase="install_clicked", "Windows update boundary");
+            }
+            let result = windows::command(self, command);
+            if installing && result.is_err() {
+                presentation::clear(self.data_dir());
+            }
+            result
         }
         #[cfg(not(windows))]
         {
@@ -175,6 +206,11 @@ impl Node {
                 }
                 Command::Install { expected_build } => {
                     state.begin_install(expected_build).map_err(api_error)?;
+                    if presentation::begin(self.data_dir(), state.status.current_build, expected_build).is_err() {
+                        state.installing = false;
+                        state.status.phase = Phase::Ready;
+                        return Err(api_error(Error::Storage));
+                    }
                     #[cfg(target_os = "macos")]
                     native::install_clicked();
                 }
@@ -185,7 +221,6 @@ impl Node {
                         state.policy = previous;
                         return Err(api_error(error));
                     }
-                    state.status.channel = preferences.channel;
                     state.status.checks_enabled = preferences.checks_enabled;
                     state.status.candidate = None;
                     state.ready = false;
@@ -410,6 +445,17 @@ fn install_failure(node: &Node, error: Error, blockers: Vec<Blocker>) {
     let status = state.status.clone();
     drop(state);
     node.emit(ApiEvent::UpdateStatusChanged(status));
+    reopen_failed_install(node);
+}
+#[cfg(not(windows))]
+fn reopen_failed_install(node: &Node) {
+    if presentation::outcome(node.data_dir(), lock(&node.inner.update).status.current_build).is_some() {
+        std::thread::spawn(|| {
+            if let Err(error) = crate::backend::show_ui() {
+                tracing::warn!(%error, "could not show failed update");
+            }
+        });
+    }
 }
 #[cfg(not(windows))]
 fn install_candidate(node: Node) {
@@ -804,6 +850,29 @@ mod tests {
         assert!(serde_json::to_value(&controller.status).unwrap().get("mode").is_none());
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn legacy_preferences_files_preserve_checks_and_drop_channel_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.json");
+        for channel in ["stable", "beta"] {
+            for checks_enabled in [false, true] {
+                let mut policy = serde_json::to_value(Policy::default()).unwrap();
+                policy["preferences"] = serde_json::json!({"checks_enabled": checks_enabled, "channel": channel});
+                std::fs::write(&path, serde_json::to_vec(&policy).unwrap()).unwrap();
+                let controller = Controller::load(dir.path());
+                assert_eq!(controller.status.error, Some(Error::NotConfigured));
+                assert_eq!(controller.policy.preferences.checks_enabled, checks_enabled);
+                controller.save(dir.path()).unwrap();
+                let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                assert_eq!(
+                    saved["preferences"],
+                    serde_json::json!({"checks_enabled": checks_enabled})
+                );
+            }
+        }
+    }
+
     #[test]
     fn stored_mode_is_invalid_and_never_rewritten_as_a_migration() {
         let dir = tempfile::tempdir().unwrap();
@@ -818,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn beta_status_is_disabled_even_with_enabled_checks() {
+    fn unconfigured_status_is_disabled_even_with_enabled_checks() {
         let directory = tempfile::tempdir().unwrap();
         let mut policy = Policy::default();
         policy.preferences.checks_enabled = true;

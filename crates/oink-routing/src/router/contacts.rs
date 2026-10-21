@@ -233,7 +233,7 @@ pub(super) struct MultiFinger {
     gesture: bool,
     scroll: Option<ScrollRoute<()>>,
 }
-/// Evidence-based target experiment: no native side effect before system
+/// Evidence-based target scroll selection: no native side effect before system
 /// Scroll/Gesture evidence (or three active contacts) selects a whole sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MultiPath {
@@ -295,7 +295,7 @@ impl Router {
         if starts {
             let native = self.cfg.os == Os::Windows && self.accept_contacts && self.touchpad_contacts.is_some();
             let classify = native
-                && self.cfg.settings.test_mac_scroll
+                && self.cfg.settings.mac_scroll_feel
                 && self.peers.get(&origin).is_some_and(|p| p.os == Os::MacOS);
             let path = if !native {
                 MultiPath::Gestures
@@ -977,14 +977,14 @@ mod tests {
             );
         }
     }
-    fn experiment(enabled: bool, capacity: Option<u8>) -> (Router, DeviceId) {
+    fn mac_scroll_router(enabled: bool, capacity: Option<u8>) -> (Router, DeviceId) {
         let origin = DeviceId([2; 32]);
         let mut r = router();
         r.test_connect(origin, 0);
         r.peers.get_mut(&origin).unwrap().os = Os::MacOS;
         r.set_touchpad_contacts(capacity);
         let mut settings = r.cfg.settings.clone();
-        settings.test_mac_scroll = enabled;
+        settings.mac_scroll_feel = enabled;
         r.set_settings(settings);
         r.out.clear();
         (r, origin)
@@ -993,10 +993,10 @@ mod tests {
         MultiEvent::Gesture(Gesture::Magnify { phase, amount: 0.1 })
     }
     #[test]
-    fn test_mac_scroll_selects_exactly_one_owner_with_option_off_on_and_unavailable() {
+    fn mac_scroll_feel_selects_exactly_one_owner_with_option_off_on_and_unavailable() {
         for enabled in [false, true] {
             for capacity in [None, Some(5)] {
-                let (mut r, origin) = experiment(enabled, capacity);
+                let (mut r, origin) = mac_scroll_router(enabled, capacity);
                 r.receive_contacts(origin, Frame::between(None, &sample(0, 2, 1000)));
                 let native = capacity.is_some() && !enabled;
                 assert_eq!(
@@ -1035,9 +1035,9 @@ mod tests {
         }
     }
     #[test]
-    fn test_mac_scroll_replays_native_pinch_and_three_finger_frames_in_source_order() {
+    fn mac_scroll_feel_replays_native_pinch_and_three_finger_frames_in_source_order() {
         for start_fingers in [2, 3] {
-            let (mut r, origin) = experiment(true, Some(5));
+            let (mut r, origin) = mac_scroll_router(true, Some(5));
             r.receive_contacts(origin, Frame::between(None, &sample(0, start_fingers, 1000)));
             if start_fingers == 2 {
                 assert!(r.out.is_empty());
@@ -1066,9 +1066,9 @@ mod tests {
         }
     }
     #[test]
-    fn test_mac_scroll_pending_count_changes_lifts_overflow_and_boundaries_are_safe() {
+    fn mac_scroll_feel_pending_count_changes_lifts_overflow_and_boundaries_are_safe() {
         for boundary in 0..6 {
-            let (mut r, origin) = experiment(true, Some(5));
+            let (mut r, origin) = mac_scroll_router(true, Some(5));
             r.receive_contacts(origin, Frame::between(None, &sample(0, 2, 1000)));
             assert!(r.out.is_empty());
             match boundary {
@@ -1105,7 +1105,7 @@ mod tests {
                 3 | 4 => {
                     if boundary == 3 {
                         let mut settings = r.cfg.settings.clone();
-                        settings.test_mac_scroll = false;
+                        settings.mac_scroll_feel = false;
                         r.set_settings(settings);
                     } else {
                         r.set_paused(true);
@@ -1121,9 +1121,9 @@ mod tests {
         }
     }
     #[test]
-    fn test_mac_scroll_policy_switch_cancels_chosen_owner_and_never_injects_tails() {
+    fn mac_scroll_feel_policy_switch_cancels_chosen_owner_and_never_injects_tails() {
         for native in [false, true] {
-            let (mut r, origin) = experiment(true, Some(5));
+            let (mut r, origin) = mac_scroll_router(true, Some(5));
             r.receive_contacts(origin, Frame::between(None, &sample(0, 2, 1000)));
             if native {
                 r.filter_multifinger(origin, magnify(GesturePhase::Began));
@@ -1132,7 +1132,7 @@ mod tests {
             }
             r.out.clear();
             let mut settings = r.cfg.settings.clone();
-            settings.test_mac_scroll = false;
+            settings.mac_scroll_feel = false;
             r.set_settings(settings);
             assert_eq!(cancels(&r), usize::from(native));
             if !native {

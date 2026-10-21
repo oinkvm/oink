@@ -5,13 +5,14 @@ import { OinkProvider } from 'oink-ui';
 import { UpgradeButton, UpgradeDialog, closeUpdateDialog, openUpdateDialog, releaseNotesForLanguage } from './Upgrade';
 import type { UpdatePhase, UpdateStatus } from '../api/update';
 import { setLanguage } from '../i18n';
-const mock=vi.hoisted(()=>({update:vi.fn(),query:vi.fn(),fail:vi.fn(),openUrl:vi.fn(),status:null as UpdateStatus|null}));
+const mock=vi.hoisted(()=>({update:vi.fn(),query:vi.fn(),fail:vi.fn(),openUrl:vi.fn(),status:null as UpdateStatus|null,boot:null as {open_update_failure?:boolean}|null}));
 vi.mock('../api/client',()=>({api:{update:mock.update},shell:{openUrl:mock.openUrl}}));
-vi.mock('../api/store',()=>({agent:{query:mock.query,fail:mock.fail},useAgent:()=>({update:mock.status})}));
+vi.mock('../api/store',()=>({agent:{query:mock.query,fail:mock.fail},useAgent:()=>({update:mock.status,boot:mock.boot})}));
 const candidate={build:31,version:'0.1.1',size:1,published_at:null,severity:'normal',notes:{en:'Fixes','zh-Hans':'修复'}};
-const base:UpdateStatus={current_build:30,version:'0.1.0',channel:'stable',checks_enabled:true,phase:'ready',candidate,checked_at:null,next_check:null,deferred_until:null,blockers:[],progress:100,error:null,scope:'user',can_change_policy:true};
+const base:UpdateStatus={current_build:30,version:'0.1.0',checks_enabled:true,phase:'ready',candidate,checked_at:null,next_check:null,deferred_until:null,blockers:[],progress:100,error:null,scope:'user',can_change_policy:true};
 beforeEach(()=>{
   setLanguage('en');vi.clearAllMocks();
+  mock.boot=null;
   Object.defineProperty(window,'matchMedia',{configurable:true,value:()=>({matches:true,addEventListener(){},removeEventListener(){}})});
   vi.stubGlobal('ResizeObserver',class{observe(){}unobserve(){}disconnect(){}});
   mock.status={...base,blockers:['audio','remote_input','locked']};
@@ -42,12 +43,26 @@ it('clicking Install submits once immediately despite active-sharing observation
   await waitFor(()=>expect(mock.update).toHaveBeenCalledExactlyOnceWith({type:'install',expected_build:31}));
   expect(screen.queryByText('Waiting for idle')).toBeNull();
 });
+it('reopens the update dialog after rollback without another user click',async()=>{
+  mock.boot={open_update_failure:true};mock.status={...base,phase:'rolled_back',error:'transaction'};
+  mainWindow();
+  await waitFor(()=>expect(dialog()).not.toBeNull());
+  expect(within(dialog()!).getByRole('status').textContent).toBe('Previous version restored');
+});
+it('shows an Install rejection as a failed update when native code restores the window',async()=>{
+  mock.update.mockRejectedValueOnce(new Error('install rejected'));
+  mainWindow();act(()=>openUpdateDialog());
+  fireEvent.click(screen.getByRole('button',{name:'Restart to update'}));
+  await waitFor(()=>expect(within(dialog()!).getByRole('status').textContent).toBe('Update failed'));
+  expect(within(dialog()!).getByRole('alert').textContent).toContain('Could not complete the update');
+});
 
 describe('phase content and button labels',()=>{
   // [phase, status text, buttons left to right, extra status fields]
   const cases:[UpdatePhase,string,string[],Partial<UpdateStatus>?][]=[
     ['checking','Checking',['Close'],{candidate:null,progress:null}],
-    ['idle','Ready',['Close'],{candidate:null,progress:null}],
+    // Idle says nothing: it does not mean an update is ready, nor that a check ran.
+    ['idle','',['Close'],{candidate:null,progress:null,checked_at:1_800_000_000}],
     ['available','Update available',['Cancel','Download update'],{progress:null}],
     ['downloading','Downloading',['Hide','Cancel download'],{progress:42}],
     ['verifying','Verifying',['Hide','Cancel download'],{progress:100}],
@@ -64,7 +79,8 @@ describe('phase content and button labels',()=>{
   it.each(cases)('%s',(phase,text,labels,extra)=>{
     mock.status={...base,phase,...extra};
     mainWindow();act(()=>openUpdateDialog());
-    expect(within(dialog()!).getByRole('status').textContent).toBe(text);
+    if(text)expect(within(dialog()!).getByRole('status').textContent).toBe(text);
+    else expect(within(dialog()!).queryByRole('status')).toBeNull();
     expect(buttons()).toEqual(labels);
     expect(new Set(buttons()).size).toBe(labels.length);
     if(mock.status.candidate)expect(within(dialog()!).getByText('Fixes')).toBeTruthy();
@@ -159,3 +175,24 @@ for(const [language,text] of [['ja','テスト日本語'],['ko','테스트 한�
     expect(within(screen.getByRole('dialog')).queryByText('Fixes')).toBeNull();
   });
 }
+
+for (const phase of ['idle','ready'] as const) {
+  it(`retains a relaunched failed-install dialog while service status is ${phase}`,()=>{
+    mock.boot={open_update_failure:true};mock.status={...base,phase,error:null};
+    mainWindow();
+    expect(within(screen.getByRole('dialog')).queryByText('Update failed')).toBeTruthy();
+    expect(screen.getByRole('alert')).toBeTruthy();
+  });
+}
+
+it('consumes a restored failure when dismissed so a later candidate can become Ready',()=>{
+  mock.boot={open_update_failure:true};mock.status={...base,phase:'idle',error:null};
+  const view=mainWindow();
+  expect(within(screen.getByRole('dialog')).getByText('Update failed')).toBeTruthy();
+  fireEvent.click(within(screen.getByRole('dialog')).getByRole('button',{name:'Close'}));
+  mock.status={...base,phase:'ready'};
+  view.rerender(<OinkProvider defaultMotion="reduced"><div className="win"><UpgradeButton/><UpgradeDialog container={null}/></div></OinkProvider>);
+  fireEvent.click(screen.getByRole('button',{name:'Complete update'}));
+  expect(within(screen.getByRole('dialog')).queryByText('Update failed')).toBeNull();
+  expect(within(screen.getByRole('dialog')).getByText('Ready to install')).toBeTruthy();
+});

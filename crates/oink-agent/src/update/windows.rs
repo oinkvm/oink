@@ -7,14 +7,23 @@ pub(super) fn status() -> ApiResult<UpdateStatus> {
         _ => Err(api_error(Error::Transaction)),
     }
 }
-pub(super) fn command(command: Command) -> ApiResult<UpdateStatus> {
+pub(super) fn command(node: &Node, command: Command) -> ApiResult<UpdateStatus> {
     match oink_winsvc::update::request(Request::Command { command }).map_err(api_error)? {
-        Reply::Status { status } => Ok(status),
+        Reply::Status { status } => {
+            let mut state = lock(&node.inner.update);
+            state.status = status.clone();
+            if let Some(wake) = &state.wake {
+                let _ = wake.try_send(());
+            }
+            Ok(status)
+        }
         Reply::Error { error } => Err(api_error(error)),
         _ => Err(api_error(Error::Transaction)),
     }
 }
 pub(super) fn attach(node: &Node) {
+    let (wake, receive) = std::sync::mpsc::sync_channel(1);
+    lock(&node.inner.update).wake = Some(wake);
     let startup = STARTUP.lock().unwrap().take();
     let mut initial = startup.map(|transaction| {
         (
@@ -33,12 +42,18 @@ pub(super) fn attach(node: &Node) {
         let mut registered = false;
         let mut health_mode = initial.is_some();
         let mut prepared = initial.take();
+        let mut delay = Duration::from_millis(500);
         loop {
-            std::thread::sleep(Duration::from_millis(500));
+            let _ = receive.recv_timeout(delay);
             let Some(inner) = weak.upgrade() else {
                 break;
             };
             let node = Node { inner };
+            delay = if prepared.is_some() || lock(&node.inner.update).status.phase == Phase::Quiescing {
+                Duration::from_millis(50)
+            } else {
+                Duration::from_millis(500)
+            };
             if !registered {
                 if status().is_err() {
                     continue;

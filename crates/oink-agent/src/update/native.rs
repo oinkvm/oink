@@ -4,7 +4,6 @@ unsafe extern "C" {
     fn oink_update_start(
         callback: extern "C" fn(u32, u64, u64, u32, *const c_char, *const c_char),
         timing: extern "C" fn(u32, u64, u64, u64, u64),
-        beta: bool,
         checks: bool,
     ) -> bool;
     fn oink_update_check();
@@ -12,7 +11,7 @@ unsafe extern "C" {
     fn oink_update_cancel();
     fn oink_update_install() -> bool;
     fn oink_update_quit_allowed() -> bool;
-    fn oink_update_preferences(checks: bool, beta: bool);
+    fn oink_update_preferences(checks: bool);
     fn oink_update_checks_enabled() -> bool;
     fn oink_update_current_build() -> u64;
     fn oink_update_timing(boundary: u32);
@@ -22,11 +21,13 @@ pub fn start(p: Preferences) {
         return;
     }
     // SAFETY: backend main-thread dispatch; callback has static lifetime.
-    let configured = unsafe { oink_update_start(event, timing, p.channel == Channel::Beta, p.checks_enabled) };
+    let configured = unsafe { oink_update_start(event, timing, p.checks_enabled) };
     if configured && let Ok(node) = crate::backend::node() {
         let mut state = lock(&node.inner.update);
-        state.status.error = None;
-        state.status.phase = Phase::Idle;
+        if !state.restored_result {
+            state.status.error = None;
+            state.status.phase = Phase::Idle;
+        }
         // SAFETY: updater created above; access remains on main thread.
         unsafe {
             state.status.current_build = oink_update_current_build();
@@ -98,7 +99,7 @@ pub fn quit_allowed() -> bool {
 pub fn preferences(p: Preferences) {
     // SAFETY: called from AppKit main thread after policy persistence.
     unsafe {
-        oink_update_preferences(p.checks_enabled, p.channel == Channel::Beta);
+        oink_update_preferences(p.checks_enabled);
     }
 }
 extern "C" fn event(kind: u32, build: u64, size: u64, progress: u32, version: *const c_char, notes: *const c_char) {
@@ -178,5 +179,9 @@ extern "C" fn event(kind: u32, build: u64, size: u64, progress: u32, version: *c
     }
     let status = state.status.clone();
     drop(state);
+    let failed = status.phase == Phase::Failed;
     node.emit(ApiEvent::UpdateStatusChanged(status));
+    if failed {
+        reopen_failed_install(&node);
+    }
 }

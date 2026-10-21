@@ -349,7 +349,7 @@ it('cancels a group gesture when live OS geometry changes or a member is unplugg
   expect(props.onScreensChange).not.toHaveBeenCalled();
 });
 
-it.each([false, true])('compacts the floating upper computer after releasing a lower computer with Shift=%s', shiftKey => {
+it.each([false, true])('moves only the released computer and keeps a nook release whose closure would change a projection, Shift=%s', shiftKey => {
   // One wide upper screen and two lower screens with staggered top edges.
   const screens: Screen[] = [
     { id: 'top', device: 'a', name: 'Upper', x: 508, y: 0, w: 868, h: 488, wallpaper: 0 },
@@ -372,9 +372,33 @@ it.each([false, true])('compacts the floating upper computer after releasing a l
   fireEvent.pointerMove(display, { clientX: 500 + 10 * zoom, clientY: 350, shiftKey });
   fireEvent.pointerUp(display, { shiftKey });
   const next = changed.mock.lastCall![0] as Screen[];
-  expect(next[0]).toEqual({ ...screens[0], y: 37 });
+  // Rising to the upper screen would move its seam with the lower-left screen;
+  // sliding left would move its interval under the upper screen.
+  expect(next[0]).toEqual(screens[0]);
   expect(next[1]).toEqual(screens[1]);
-  expect(next[2]).toEqual({ ...screens[2], x: 747 });
+  expect(next[2].x).toBeCloseTo(747);
+  expect(next[2].y).toBe(543);
+});
+
+it('ignores hidden screens: they neither block nor attract the released computer', () => {
+  const all: Screen[] = [
+    { id: 'a', device: 'a', name: 'A', x: 0, y: 0, w: 1000, h: 600, wallpaper: 0 },
+    { id: 'h', device: 'h', name: 'Hidden', x: 1500, y: 0, w: 1000, h: 600, wallpaper: 1 },
+    { id: 'b', device: 'b', name: 'B', x: 3000, y: 0, w: 1000, h: 600, wallpaper: 2 },
+  ];
+  const changed = vi.fn();
+  const { container } = render(<Arrangement screens={[all[0], all[2]]} geometryScreens={all} selectedId="b"
+    onSelect={vi.fn()} onScreensChange={changed} settings={{ ...settings, compact: true }}/>);
+  const display = container.querySelectorAll('.scr')[1];
+  const zoom = cameraStore.get()!.zoom;
+  fireEvent.pointerDown(display, { button: 0, clientX: 700, clientY: 300 });
+  // Released overlapping the hidden screen: no collision and no contact with it.
+  fireEvent.pointerMove(display, { clientX: 700 - 1200 * zoom, clientY: 300 });
+  fireEvent.pointerUp(display);
+  const next = changed.mock.lastCall![0] as Screen[];
+  expect(next[0]).toEqual(all[0]);
+  expect(next[1]).toEqual(all[1]);
+  expect(next[2].x).toBeCloseTo(1000);
 });
 
 

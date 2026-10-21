@@ -1,4 +1,4 @@
-//! Rigid computer editing, overlap repair and contact normalization.
+//! Rigid computer editing and overlap repair.
 
 use super::{
     Layout, ScreenId, SizeSource,
@@ -7,27 +7,15 @@ use super::{
 use oink_foundation::{DeviceId, Point, Rect, Size};
 
 impl Layout {
-    /// Repair overlaps, then close gaps without changing edge projections.
-    pub fn normalize(&mut self) {
-        self.repair_overlaps();
-        self.compact();
-    }
-
     /// Separate actual inter-computer collisions without closing intentional gaps.
     pub fn repair_overlaps(&mut self) {
         self.normalize_pinned(None);
     }
 
-    /// Normalize while keeping the specified screen anchored.
-    pub fn normalize_around(&mut self, id: &ScreenId) {
-        let pin = self.screens.iter().position(|s| &s.id == id);
-        self.normalize_pinned(pin);
-        self.compact_pinned(Some(id.device));
-    }
-
-    /// Native refresh preserves the changed computer's origin and scale. Only
-    /// real collisions may displace another computer; refresh is not an edit release.
-    pub(super) fn repair_overlaps_around(&mut self, id: &ScreenId) {
+    /// Repair collisions while keeping the specified screen anchored. Native
+    /// refresh and API resizes use this; neither is a canvas edit, and contact
+    /// compaction belongs to the canvas editor alone.
+    pub fn repair_overlaps_around(&mut self, id: &ScreenId) {
         let pin = self.screens.iter().position(|s| &s.id == id);
         self.normalize_pinned(pin);
     }
@@ -251,11 +239,11 @@ impl Layout {
             scale * k,
             true,
         );
-        self.normalize_around(id);
+        self.repair_overlaps_around(id);
         true
     }
 
-    /// 交互缩放保持当前宽高比和左上角，然后规整；短边至少 50/686 reference units、长边至多 4000/686 reference units。
+    /// 交互缩放保持当前宽高比和左上角，然后修复重叠；短边至少 50/686 reference units、长边至多 4000/686 reference units。
     /// Width drives a changed width; otherwise height drives the group scale.
     pub fn resize_screen(&mut self, id: &ScreenId, size: Size) -> bool {
         if !(size.w.is_finite() && size.h.is_finite() && size.w > 0.0 && size.h > 0.0) {

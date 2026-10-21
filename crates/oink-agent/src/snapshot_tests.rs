@@ -863,16 +863,33 @@ fn local_contacts_capability_and_effective_preference_recover() {
                 .unwrap();
             assert_eq!(preference.value().unwrap(), oink_protocol::v1::RawValue::Bool(true));
         }
-        assert!(!a.test_mac_scroll(None).unwrap());
-        a.test_mac_scroll(Some(true)).unwrap();
-        assert!(
-            crate::config::AgentConfig::load_from(&configs[0].data_dir)
-                .unwrap()
-                .settings
-                .routing
-                .test_mac_scroll
-        );
-        assert!(!b.test_mac_scroll(None).unwrap());
+        assert!(a.input_settings().unwrap().mac_scroll_feel);
+        assert!(b.input_settings().unwrap().mac_scroll_feel);
+        for enabled in [false, true] {
+            let node = a.clone();
+            tokio::task::spawn_blocking(move || {
+                node.set_input_settings(serde_json::from_value(serde_json::json!({"mac_scroll_feel":enabled})).unwrap())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(a.input_settings().unwrap().mac_scroll_feel, enabled);
+            assert_eq!(
+                crate::config::AgentConfig::load_from(&configs[0].data_dir)
+                    .unwrap()
+                    .settings
+                    .routing
+                    .mac_scroll_feel,
+                enabled
+            );
+            let stored: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(configs[0].data_dir.join("settings.json")).unwrap()).unwrap();
+            assert_eq!(stored["local"]["routing"]["mac_scroll_feel"], enabled);
+            assert!(
+                b.input_settings().unwrap().mac_scroll_feel,
+                "receiver preference is never synchronized"
+            );
+        }
         a.unsubscribe(subscription);
         a.shutdown().await;
         b.shutdown().await;

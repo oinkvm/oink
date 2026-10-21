@@ -118,18 +118,6 @@ pub fn source_projections(rects: &[Rect], i: usize, eps: f64) -> Vec<EdgeProject
     result
 }
 
-pub fn same_projections(a: &[EdgeProjection], b: &[EdgeProjection], eps: f64) -> bool {
-    a.len() == b.len()
-        && a.iter().zip(b).all(|(p, q)| {
-            p.kind == q.kind
-                && p.screen == q.screen
-                && p.side == q.side
-                && p.target == q.target
-                && (p.from - q.from).abs() <= eps
-                && (p.to - q.to).abs() <= eps
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
