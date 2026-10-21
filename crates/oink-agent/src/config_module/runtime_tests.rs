@@ -1663,6 +1663,18 @@ fn sleep_for_redial_test(owner: &mut Owner) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reachable_member_recovers_on_its_own_retry_after_many_timeouts() {
+    own_retry_recovery(Duration::ZERO).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn own_retry_recovery_allows_delayed_peer_owner() {
+    // Keep the peer owner unavailable across the idle retry and one candidate
+    // budget. Its network thread still accepts TLS; C0 can finish when the
+    // owner resumes, well inside the greeting's ten-second deadline.
+    own_retry_recovery(*RECONNECT_BACKOFF.iter().max().unwrap() + oink_network::link::DIAL_BUDGET).await;
+}
+
+async fn own_retry_recovery(peer_owner_delay: Duration) {
     let nodes = start(same_group(2)).await;
     assert!(until(|| ready(&nodes)).await);
     for node in &nodes {
@@ -1696,6 +1708,18 @@ async fn reachable_member_recovers_on_its_own_retry_after_many_timeouts() {
             Ok(())
         })
         .unwrap();
+    let held_peer = if peer_owner_delay.is_zero() {
+        None
+    } else {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (entered, entering) = tokio::sync::oneshot::channel();
+        nodes[1].group.send(move |_| {
+            entered.send(()).unwrap();
+            let _ = released.recv();
+        });
+        entering.await.unwrap();
+        Some(release)
+    };
     nodes[0]
         .group
         .call(move |owner| {
@@ -1708,15 +1732,34 @@ async fn reachable_member_recovers_on_its_own_retry_after_many_timeouts() {
             }
             owner.sleeping = false;
             let now = Instant::now();
-            assert!(owner.dials[&target].after.unwrap() <= now + Duration::from_secs(5));
-            assert!(owner.next_deadline() <= now + Duration::from_secs(5));
+            let idle_cap = *RECONNECT_BACKOFF.iter().max().unwrap();
+            assert!(owner.dials[&target].after.unwrap() <= now + idle_cap);
+            assert!(owner.next_deadline() <= now + idle_cap);
+            assert!(owner.member_candidates(target).len() <= oink_network::link::MAX_DIALS);
             Ok(())
         })
         .unwrap();
     let began = Instant::now();
-    // Five seconds for the idle retry, plus one second of loopback TLS/C0
-    // test allowance. The exact scheduling bound is checked without sleeps above.
-    let recovered = tokio::time::timeout(Duration::from_secs(6), async {
+    let release_peer = tokio::spawn(async move {
+        if let Some(release) = held_peer {
+            tokio::time::sleep(peer_owner_delay).await;
+            drop(release);
+        }
+    });
+    // The five-second cap is idle time after failure, not a Ready deadline.
+    // This fixture has drained prior dials and the next direct loopback round
+    // succeeds: allow its TLS, bootstrap/selection, route installation, C0
+    // greeting and signed admission budgets. There is no old failed round or
+    // relay search to add (unlike the arbitrary-reachability bound in network.md).
+    // Exact backoff/due behavior remains checked with synthetic Instants in
+    // member_retry_clock_picks_up_reachability_within_five_seconds_after_many_timeouts.
+    let recovery_budget = *RECONNECT_BACKOFF.iter().max().unwrap()
+        + oink_network::link::DIAL_BUDGET
+        + oink_network::negotiation::BOOTSTRAP_TIMEOUT
+        + oink_network::link::DIAL_BUDGET
+        + admission::GREETING_TIMEOUT
+        + ADMISSION_TIMEOUT;
+    let recovered = tokio::time::timeout(recovery_budget, async {
         while !ready(&nodes) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -1724,6 +1767,7 @@ async fn reachable_member_recovers_on_its_own_retry_after_many_timeouts() {
     .await
     .is_ok();
     let elapsed = began.elapsed();
+    release_peer.await.unwrap();
     let outbound = nodes[0]
         .group
         .call(move |owner| {
@@ -1735,7 +1779,12 @@ async fn reachable_member_recovers_on_its_own_retry_after_many_timeouts() {
         })
         .unwrap();
     stop(&nodes).await;
-    assert!(recovered, "the source's own retry did not recover in {elapsed:?}");
+    assert!(
+        recovered,
+        "the source's own retry did not recover in {elapsed:?} (stage budget {recovery_budget:?})"
+    );
     assert_eq!(outbound, Some(Direction::Outbound));
-    eprintln!("own retry after 20 timeouts reached Ready in {elapsed:?}");
+    eprintln!(
+        "own retry after 20 timeouts reached Ready in {elapsed:?} (stage budget {recovery_budget:?}, peer owner delay {peer_owner_delay:?})"
+    );
 }

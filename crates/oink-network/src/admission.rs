@@ -19,6 +19,9 @@ use oink_protocol::v1::{
     schema::{WireDto, WireValue},
 };
 use std::time::{Duration, Instant};
+/// C0 hello/info exchange after the link has been installed.
+pub const GREETING_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Clone, Debug)]
 pub struct Peer {
     pub greeting: dto::Greeting,
@@ -115,7 +118,7 @@ impl GreetingSession {
                 info: None,
                 peer_greeting: None,
                 result: None,
-                deadline: now + Duration::from_secs(10),
+                deadline: now + GREETING_TIMEOUT,
             },
             hello,
         ))

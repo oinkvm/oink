@@ -35,6 +35,9 @@ mod pairing_api;
 mod recovery;
 #[path = "runtime_state.rs"]
 mod state_owner;
+/// Signed state exchange after a same-group C0 greeting succeeds.
+const ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub(super) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -674,7 +677,7 @@ impl Owner {
                         tx: event.control_tx,
                         reader,
                         outbox: VecDeque::new(),
-                        deadline: Some(Instant::now() + Duration::from_secs(10)),
+                        deadline: Some(Instant::now() + admission::GREETING_TIMEOUT),
                     },
                 );
                 if let Some(hello) = hello {
@@ -1324,7 +1327,7 @@ impl Owner {
         )?;
         let session = self.sessions.get_mut(&id).expect("link");
         session.sent = Some(self.state.clone());
-        session.deadline = Some(Instant::now() + Duration::from_secs(10));
+        session.deadline = Some(Instant::now() + ADMISSION_TIMEOUT);
         self.send(id, request)
     }
     fn ready(&mut self, id: LinkId) -> v1::Result<()> {
