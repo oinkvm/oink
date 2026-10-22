@@ -55,6 +55,19 @@ pub enum PendingMode {
 }
 
 impl State {
+    fn inject(&mut self, event: &InjectEvent) {
+        if let Some(pos) = event.move_target() {
+            self.cursor = pos;
+        }
+        if let Some(timed) = &mut self.timed_injections {
+            timed.push((std::time::Instant::now(), event.clone()));
+        }
+        if let Some(sources) = &mut self.injection_sources {
+            sources.push(oink_input::source_time::injection_source());
+        }
+        self.injected.push(event.clone());
+    }
+
     fn apply(&mut self, m: PendingMode) {
         match m {
             PendingMode::Set(mode) => {
@@ -488,17 +501,19 @@ impl InputBackend for FakeInput {
     }
 
     fn inject(&self, event: &InjectEvent) -> Result<(), InputError> {
-        let mut s = self.state.lock().unwrap();
-        if let Some(pos) = event.move_target() {
-            s.cursor = pos;
-        }
-        if let Some(timed) = &mut s.timed_injections {
-            timed.push((std::time::Instant::now(), event.clone()));
-        }
-        if let Some(sources) = &mut s.injection_sources {
-            sources.push(oink_input::source_time::injection_source());
-        }
-        s.injected.push(event.clone());
+        self.state.lock().unwrap().inject(event);
+        Ok(())
+    }
+
+    fn release_drag_at(&self, at: Point) -> Result<(), InputError> {
+        let mut state = self.state.lock().unwrap();
+        // The native backend combines positioning and Up in one input. Model
+        // that under one lock rather than recording a separate pointer move.
+        state.cursor = at;
+        state.inject(&InjectEvent::Button {
+            button: oink_foundation::input::MouseButton::Left,
+            pressed: false,
+        });
         Ok(())
     }
 
@@ -530,8 +545,24 @@ impl InputBackend for FakeInput {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
-    use oink_foundation::input::{InputEvent, SourceKind};
+    use oink_foundation::input::{InputEvent, MouseButton, SourceKind};
     use std::sync::Arc;
+
+    #[test]
+    fn source_drag_release_uses_the_recorded_position() {
+        let fake = FakeInput::new();
+        fake.set_cursor(Point::new(900.0, 500.0));
+        let origin = Point::new(-120.0, 90.0);
+        fake.release_drag_at(origin).unwrap();
+        assert_eq!(fake.cursor_position().unwrap(), origin);
+        assert_eq!(
+            fake.take_injected(),
+            vec![InjectEvent::Button {
+                button: MouseButton::Left,
+                pressed: false,
+            }]
+        );
+    }
 
     #[test]
     fn feed_reaches_handler_and_inject_is_recorded() {
