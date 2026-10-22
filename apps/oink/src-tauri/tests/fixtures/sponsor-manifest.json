@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "items": [
+    {
+      "id": "support-link",
+      "name": { "default": "Support", "locales": { "zh": "赞助" } },
+      "icon": "https://oink.hachiwii.com/sponsor/assets/icon.png",
+      "action": { "type": "link", "url": "https://example.org/support" }
+    },
+    {
+      "id": "support-qr",
+      "name": { "default": "Scan to support" },
+      "icon": "https://oink.hachiwii.com/sponsor/assets/icon.png",
+      "action": {
+        "type": "qr",
+        "image": "https://oink.hachiwii.com/sponsor/assets/qr.png",
+        "caption": { "default": "Scan this code" }
+      }
+    }
+  ]
+}

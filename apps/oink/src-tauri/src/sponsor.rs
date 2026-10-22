@@ -300,9 +300,9 @@ mod tests {
     }
 
     #[test]
-    fn documented_example_is_a_valid_manifest() {
-        let doc = include_str!("../../../../docs/design/sponsor.md");
-        let example = doc.split("```json\n").nth(1).unwrap().split("```").next().unwrap();
+    fn example_is_a_valid_manifest() {
+        // Keep the schema example with the tests so source exports are self-contained.
+        let example = include_str!("../tests/fixtures/sponsor-manifest.json");
         assert_eq!(manifest(example.as_bytes(), &origin()).unwrap().len(), 2);
     }
 
