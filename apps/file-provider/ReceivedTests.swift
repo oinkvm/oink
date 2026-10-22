@@ -46,7 +46,8 @@ import FileProvider
         try JSONEncoder().encode(Catalog(token: "", port: 0, records: [final], received_at: 1000))
             .write(to: root.appendingPathComponent("typed.json"))
         let published = try catalogs(in: root).flatMap { $0.records }.first { $0.id == old.id }
-        precondition(published == final, "private materialization overlay hid the final typed-parent rename")
+        // Enumeration adds the persisted receipt date to the final record.
+        precondition(published == final.withCreationDate(1000), "private materialization overlay hid the final typed-parent rename")
         let lookup = try receivedOverlay(final, in: root)
         precondition(lookup == final, "direct item lookup returned the private prepared parent")
         let protected = try receivedProtected("typed", in: root)
