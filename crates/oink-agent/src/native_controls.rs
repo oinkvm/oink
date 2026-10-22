@@ -576,6 +576,12 @@ mod dispatch_tests {
         let home = tempfile::tempdir().unwrap();
         let net = oink_test_support::network_config(home.path().into(), "synthetic", 0);
         let node = start_with_clip(&net, &Displays::new("screen"), None).await;
+        let (completed, received) = std::sync::mpsc::channel();
+        let subscription = node.subscribe(std::sync::Arc::new(move |event| {
+            if let crate::api::ApiEvent::DeviceControlCompleted(done) = event {
+                let _ = completed.send(done.clone());
+            }
+        }));
         for id in [
             "keyboard-disabled",
             "keyboard-local",
@@ -600,6 +606,18 @@ mod dispatch_tests {
             // Card actions acknowledge admission before their owner transaction
             // finishes. Observe the same published facts the native menu uses.
             until("native menu reflects completed action", || {
+                // Admission is not success. Report an asynchronous owner refusal
+                // with the action ID instead of hiding it behind a menu timeout.
+                for done in received.try_iter() {
+                    assert!(
+                        matches!(
+                            done.result,
+                            DeviceControlResult::Applied | DeviceControlResult::NoChange
+                        ),
+                        "{id}: owner completion {:?}",
+                        done.result,
+                    );
+                }
                 let menu = model(&node.device_cards().unwrap(), UiLanguage::English);
                 match id {
                     "pause" => menu.tasks.iter().any(|item| item.id == "resume"),
@@ -651,6 +669,7 @@ mod dispatch_tests {
                 _ => unreachable!(),
             }
         }
+        node.unsubscribe(subscription);
         node.shutdown().await;
     }
 }

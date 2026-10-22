@@ -132,8 +132,17 @@ impl Node {
         }
     }
     pub(crate) fn refresh_device_cards(&self) {
-        let inputs = self.card_inputs();
-        let changed = lock(&self.inner.cards).update(&inputs, crate::layout_sync::now_ms());
+        self.refresh_device_cards_with(|| self.card_inputs());
+    }
+    fn refresh_device_cards_with(&self, collect: impl FnOnce() -> CardInputs) {
+        // Serialize collection as well as projection: an observer that read old
+        // owner facts must not publish after a newer command completion and put
+        // stale revision fences back into the native menu or device cards.
+        let changed = {
+            let mut cards = lock(&self.inner.cards);
+            let inputs = collect();
+            cards.update(&inputs, crate::layout_sync::now_ms())
+        };
         if let Some(changed) = changed {
             self.emit(ApiEvent::DeviceCards((*changed).clone()));
         }
@@ -146,5 +155,86 @@ impl Node {
             .snapshot()
             .map(|snapshot| (*snapshot).clone())
             .ok_or_else(sharing_not_started)
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+    use crate::api::AgentApi;
+    use crate::snapshot_tests::{Displays, start_with_clip, until};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_card_refresh_cannot_replace_newer_native_menu_tokens() {
+        let _watchdog = crate::test_watchdog::Scenario::new(module_path!(), "serialized card publication");
+        let dir = tempfile::tempdir().unwrap();
+        let node = start_with_clip(
+            &oink_test_support::network_config(dir.path().into(), "synthetic", 0),
+            &Displays::new("screen"),
+            None,
+        )
+        .await;
+        until("native mouse action ready", || {
+            node.device_cards()
+                .unwrap()
+                .cards
+                .iter()
+                .find(|c| c.is_self)
+                .and_then(|c| c.status.as_ref())
+                .is_some_and(|s| matches!(s.actions.mouse_disabled, CardAction::Invoke { .. }))
+        })
+        .await;
+        let (read, captured) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let old = node.clone();
+        let worker = std::thread::spawn(move || {
+            old.refresh_device_cards_with(|| {
+                let inputs = old.card_inputs();
+                read.send(()).unwrap();
+                resume.recv().unwrap();
+                inputs
+            })
+        });
+        captured.recv().unwrap();
+        // Collection must already own the projection lock. With the old split
+        // scope, a command completion could publish here and then be overwritten
+        // when this earlier collector resumed (including its stale action token).
+        let collection_serialized = node.inner.cards.try_lock().is_err();
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(
+            collection_serialized,
+            "another publication can overtake an in-progress card snapshot"
+        );
+
+        // Exercise both revision transitions through the real native dispatcher.
+        // Consume owner completion explicitly, so a refused asynchronous command
+        // reports its reason instead of becoming a generic menu timeout.
+        let (completed, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let subscription = node.subscribe(Arc::new(move |event| {
+            if let api::ApiEvent::DeviceControlCompleted(done) = event {
+                completed.send(done.result.clone()).unwrap();
+            }
+        }));
+        for (id, expected) in [
+            ("mouse-disabled", SharingMode::Disabled),
+            ("mouse-shared", SharingMode::Shared),
+        ] {
+            let n = node.clone();
+            tokio::task::spawn_blocking(move || crate::native_controls::dispatch(&n, id))
+                .await
+                .unwrap()
+                .unwrap();
+            let result = received.recv().await.unwrap();
+            assert!(
+                matches!(result, DeviceControlResult::Applied | DeviceControlResult::NoChange),
+                "{id}: {result:?}"
+            );
+            let cards = node.device_cards().unwrap();
+            let status = cards.cards.iter().find(|c| c.is_self).unwrap().status.as_ref().unwrap();
+            assert_eq!(status.mouse.configured_mode, Some(expected));
+        }
+        node.unsubscribe(subscription);
+        node.shutdown().await;
     }
 }
