@@ -71,21 +71,21 @@ class MsiContent(unittest.TestCase):
             'Registry': [['ArpDisplayVersion', '2', arp_key, 'DisplayVersion', '0.1.0', 'InstallRoot']],
             'Component': [['InstallRoot', '', 'INSTALLFOLDER', '260', '', 'InstallRootKey'],
                           ['MaintenanceRoot', '', 'MAINTENANCEFOLDER', '256', '', '']],
-            'CustomAction': [['CleanupMaintenance', '3585', 'InstallerCA', 'CleanupMaintenance'],
-                             ['CleanupCloudFiles', '3073', 'InstallerCA', 'CleanupCloudFiles']],
+            'CustomAction': [['CleanupMaintenance', '3649', 'InstallerCA', 'CleanupMaintenance'],
+                             ['CleanupUserData', '3649', 'InstallerCA', 'CleanupUserData']],
             'InstallExecuteSequence': [[action, '', str(sequence)] for action, sequence in [
                 ('InstallInitialize', 1500), ('RemoveRegistryValues', 2600), ('RegisterProduct', 6100),
                 ('WriteRegistryValues', 6101), ('InstallExecute', 6500),
                 ('RemoveExistingProducts', 6501), ('InstallFinalize', 6600), ('StartServices', 6502),
                 ('CheckProtectedState', 1502), ('StopServices', 1900), ('CheckQuiescence', 1901),
-                ('DeleteServices', 2000), ('RemoveFiles', 3500)]],
+                ('CostFinalize', 1000), ('InstallValidate', 1400), ('SetARPINSTALLLOCATION', 1001), ('DeleteServices', 2000), ('RemoveFiles', 3500)]],
             'Upgrade': [[upgrade, '', '0.0.1', '', '1', '', 'WIX_UPGRADE_DETECTED'],
                         [upgrade, '0.0.1', '', '', '2', '', 'WIX_DOWNGRADE_DETECTED']],
         })
         acl['InstallExecuteSequence'].append(['CleanupMaintenance', 'REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE', '6599'])
-        acl['InstallExecuteSequence'].append(['CleanupCloudFiles', 'REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE', '1902'])
+        acl['InstallExecuteSequence'].append(['CleanupUserData', 'REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE', '6598'])
         acl['Property'] += [['ARPPRODUCTICON', 'OinkIcon.ico'], ['OinkLaunch', '1'], ['OinkLogin', '1'],
-                            ['SecureCustomProperties', 'OINK_DESKTOP_SHORTCUT;OINK_GRACEFUL_STOP']]
+                            ['SecureCustomProperties', 'OINK_DESKTOP_SHORTCUT'], ['ALLUSERS', '1'], ['MSIRESTARTMANAGERCONTROL', 'Disable']]
         acl['Icon'] = [['OinkIcon.ico', hashlib.sha256((ROOT / 'apps/oink/src-tauri/icons/icon.ico').read_bytes()).hexdigest()]]
         acl['Binary'] = [[name, hashlib.sha256((ROOT / 'packaging/windows' / asset).read_bytes()).hexdigest()]
                          for name, asset in [('WixUI_Bmp_Dialog', 'installer-background.bmp'), ('WixUI_Bmp_Banner', 'installer-banner.bmp')]]
@@ -93,8 +93,11 @@ class MsiContent(unittest.TestCase):
                          for name, default in [('OinkWelcomeDlg', 'Install'), ('OinkExitDlg', 'Finish')]]
         acl['Shortcut'] = [[name, directory, 'Oink', component, target, '', '', '', 'OinkIcon.ico', '0', '', 'INSTALLFOLDER']
                            for name, directory, component, target in [
-                               ('StartMenuEntry', 'ProgramMenuFolder', 'UserEntry', 'Product'),
+                               ('StartMenuEntry', 'ProgramMenuFolder', 'UserEntry', '[#UiExe]'),
                                ('DesktopShortcut', 'DesktopFolder', 'DesktopEntry', '[#UiExe]')]]
+        acl['MsiShortcutProperty'] = [[name + 'Identity', name, 'System.AppUserModel.ID', IDENTITY['bundle_id'] + '.ui']
+                                      for name in ('StartMenuEntry', 'DesktopShortcut')]
+        acl['CustomAction'].append(['SetARPINSTALLLOCATION', '51', 'ARPINSTALLLOCATION', '[INSTALLFOLDER]'])
         acl['Component'] += [['DesktopEntry', '', 'DesktopFolder', '324', 'OINK_DESKTOP_SHORTCUT = "1"', 'DesktopKey']]
         acl['Registry'] += [['DesktopChoice', '2', 'Software\\Oink', 'DesktopShortcut', '[OINK_DESKTOP_SHORTCUT]', 'InstallRoot']]
         acl['RegLocator'] = [['SavedDesktopChoice', '2', 'Software\\Oink', 'DesktopShortcut', '18']]
@@ -127,19 +130,55 @@ class MsiContent(unittest.TestCase):
                                    ['AppSearch', '', '400'], ['ShowDesktopChoice', '', '998'],
                                    ['OinkWelcomeDlg', 'NOT Installed', '999'], ['CostFinalize', '', '1000'],
                                    ['ExecuteAction', '', '1300']]
-        acl['CustomAction'] += [[name, kind, 'InstallerCA', name] for name, kind in
-                                [('PrepareUserSessions', '257'), ('RefreshUserSessions', '1')]]
-        acl['InstallUISequence'] += [['PrepareUserSessions', 'UILevel = 5 AND NOT UPGRADINGPRODUCTCODE', '1298'],
-                                     ['OinkRunningDlg', 'OinkSessionsRunning = "1"', '1299']]
-        acl['InstallExecuteSequence'] += [['PrepareUserSessions', 'UILevel < 5 AND NOT UPGRADINGPRODUCTCODE', '1498'],
+        acl['CustomAction'].append(['PrepareUserSessions', '257', 'InstallerCA', 'PrepareUserSessions'])
+        acl['InstallUISequence'].append(['PrepareUserSessions', 'UILevel = 5 AND NOT UPGRADINGPRODUCTCODE', '1298'])
+        acl['InstallExecuteSequence'] += [['PrepareUserSessions', 'NOT UPGRADINGPRODUCTCODE', '1399'],
                                           ['CheckInstallPath', '', '1499']]
-        acl['Control'] += [['OinkRunningDlg', 'Heading', 'Text', '20', '18', '330', '24', '3', '',
-                            'Oink is running. Quit Oink and click Retry.']]
-        acl['ControlEvent'] += [['OinkRunningDlg', 'Retry', 'DoAction', 'RefreshUserSessions', '1', '1'],
-                                ['OinkRunningDlg', 'Retry', 'EndDialog', 'Return', 'NOT OinkSessionsRunning', '2'],
-                                ['OinkRunningDlg', 'Cancel', 'EndDialog', 'Exit', '1', '1']]
         ET.SubElement(xml, 'Launch', Condition='Installed OR WEBVIEW2RUNTIME')
         return xml, extracted, acl
+
+    def test_start_menu_maps_to_removable_machine_product(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, _, tables = self.fixture(Path(temp))
+            C.verify_start_registration(tables, IDENTITY)
+            for table, name, column, value in [
+                    ('CustomAction', 'SetARPINSTALLLOCATION', 3, 'INSTALLFOLDER'),
+                    ('InstallExecuteSequence', 'SetARPINSTALLLOCATION', 2, '999'),
+                    ('InstallExecuteSequence', 'SetARPINSTALLLOCATION', 1, 'NOT Installed'),
+                    ('Shortcut', 'StartMenuEntry', 4, 'Product'),
+                    ('MsiShortcutProperty', 'StartMenuEntryIdentity', 3, 'unstable.id'),
+                    ('Property', 'ALLUSERS', 1, '2')]:
+                changed = copy.deepcopy(tables)
+                next(row for row in changed[table] if row[0] == name)[column] = value
+                with self.subTest(table=table), self.assertRaisesRegex(RuntimeError, 'Start menu registration'):
+                    C.verify_start_registration(changed, IDENTITY)
+            for flag in ('ARPNOREMOVE', 'ARPSYSTEMCOMPONENT'):
+                changed = copy.deepcopy(tables)
+                changed['Property'].append([flag, '1'])
+                with self.assertRaisesRegex(RuntimeError, 'Start menu registration'):
+                    C.verify_start_registration(changed, IDENTITY)
+
+    def test_real_uninstall_deletes_data_but_upgrade_does_not(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, _, tables = self.fixture(Path(temp))
+            C.verify_data_cleanup(tables)
+            for table, column, value in [('CustomAction', 1, '3585'),
+                                         ('CustomAction', 1, '3073'),
+                                         ('InstallExecuteSequence', 1, 'REMOVE~="ALL"'),
+                                         ('InstallExecuteSequence', 1, ''),
+                                         ('InstallExecuteSequence', 2, '6601')]:
+                changed = copy.deepcopy(tables)
+                next(row for row in changed[table] if row[0] == 'CleanupUserData')[column] = value
+                with self.subTest(table=table), self.assertRaisesRegex(RuntimeError, 'committed standalone uninstall'):
+                    C.verify_data_cleanup(changed)
+
+    def test_post_uninstall_cleanup_cannot_rollback_product_removal(self):
+        source = (ROOT / 'packaging/windows/Package.wxs').read_text()
+        actions = {node.get('Id'): node for node in ET.fromstring(source).iter()
+                   if node.tag.rsplit('}', 1)[-1] == 'CustomAction'}
+        for name in ('CleanupUserData', 'CleanupMaintenance'):
+            with self.subTest(action=name):
+                self.assertEqual(actions[name].get('Return'), 'ignore')
 
     def test_license_cannot_be_empty_hidden_or_painted_over(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -156,26 +195,19 @@ class MsiContent(unittest.TestCase):
                 with self.subTest(table=table, name=name), self.assertRaises(RuntimeError):
                     C.verify_install_ui(changed)
 
-    def test_running_session_gate_is_client_first_and_quiet_opt_in(self):
+    def test_running_session_quit_is_client_first_at_every_ui_level(self):
         with tempfile.TemporaryDirectory() as temp:
             _, _, tables = self.fixture(Path(temp))
             C.verify_user_session_ui(tables)
             for table, name, column, value in [
                     ('CustomAction', 'PrepareUserSessions', 1, '3073'),
-                    ('CustomAction', 'RefreshUserSessions', 1, '257'),
                     ('InstallUISequence', 'PrepareUserSessions', 2, '1301'),
-                    ('InstallUISequence', 'OinkRunningDlg', 1, '1'),
-                    ('InstallExecuteSequence', 'PrepareUserSessions', 1, '1'),
-                    ('InstallExecuteSequence', 'PrepareUserSessions', 2, '1501'),
-                    ('Property', 'SecureCustomProperties', 1, 'OINK_DESKTOP_SHORTCUT')]:
+                    ('InstallExecuteSequence', 'PrepareUserSessions', 1, 'UILevel = 5'),
+                    ('InstallExecuteSequence', 'PrepareUserSessions', 2, '1401'),
+                    ('Property', 'MSIRESTARTMANAGERCONTROL', 1, '')]:
                 changed = copy.deepcopy(tables)
                 next(row for row in changed[table] if row[0] == name)[column] = value
                 with self.subTest(table=table, name=name), self.assertRaises(RuntimeError):
-                    C.verify_user_session_ui(changed)
-            for row in tables['ControlEvent'][-3:]:
-                changed = copy.deepcopy(tables)
-                changed['ControlEvent'].remove(row)
-                with self.assertRaises(RuntimeError):
                     C.verify_user_session_ui(changed)
             changed = copy.deepcopy(tables)
             changed['Property'].append(['OINK_GRACEFUL_STOP', '1'])
@@ -280,22 +312,6 @@ class MsiContent(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 C.verify_msi(manifest, extracted, IDENTITY, changed)
 
-    def test_cloud_cleanup_is_system_full_uninstall_after_quiescence(self):
-        with tempfile.TemporaryDirectory() as temp:
-            xml, extracted, tables = self.fixture(Path(temp))
-            manifest = Path(temp) / 'decompiled.wxs'
-            ET.ElementTree(xml).write(manifest)
-            C.verify_msi(manifest, extracted, IDENTITY, tables)
-            for field, value in [(1, ''), (1, 'REMOVE~="ALL"'), (2, '1899'), (2, '3501')]:
-                changed = copy.deepcopy(tables)
-                next(row for row in changed['InstallExecuteSequence'] if row[0] == 'CleanupCloudFiles')[field] = value
-                with self.assertRaises(RuntimeError):
-                    C.verify_msi(manifest, extracted, IDENTITY, changed)
-            changed = copy.deepcopy(tables)
-            next(row for row in changed['CustomAction'] if row[0] == 'CleanupCloudFiles')[1] = '1025'
-            with self.assertRaises(RuntimeError):
-                C.verify_msi(manifest, extracted, IDENTITY, changed)
-
     def test_service_restart_and_unconditional_maintenance_guards(self):
         with tempfile.TemporaryDirectory() as temp:
             xml, extracted, tables = self.fixture(Path(temp))
@@ -344,7 +360,7 @@ class MsiContent(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             xml, extracted, tables = self.fixture(root)
-            display = '0.2.0-inhouse.0123abcd'
+            display = '0.2.1-inhouse.0123abcd'
             for name in ('installed.json', 'oink-build.json'):
                 path = extracted / 'File' / name
                 receipt = json.loads(path.read_text())

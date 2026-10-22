@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
-import { cleanup, render } from '@testing-library/react';
-import { afterEach, beforeAll, expect, it } from 'vitest';
+import { cleanup, fireEvent, render } from '@testing-library/react';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { OinkProvider } from 'oink-ui';
 import { VolumeRow } from './VolumeRow';
+import type { SpeakerAction } from './VolumeRow';
 import type { Device } from './types';
 
 beforeAll(() => {
@@ -26,4 +27,38 @@ it('keeps known volume visible while a command is pending', () => {
   const {container} = render(<OinkProvider><VolumeRow d={{...device,pending:true}} open tabbable onSpeaker={()=>{}}/></OinkProvider>);
   expect(container.querySelector('[role="slider"]')?.getAttribute('aria-valuenow')).toBe('80');
   expect(container.querySelector('[role="slider"]')?.getAttribute('aria-disabled')).toBe('true');
+});
+
+describe('live volume', () => {
+  beforeAll(() => {
+    vi.stubGlobal('PointerEvent', MouseEvent);
+    HTMLElement.prototype.setPointerCapture = () => {};
+  });
+  const slider = (onSpeaker: (a: SpeakerAction) => void, d: Device = device) => {
+    const view = render(<OinkProvider><VolumeRow d={d} open tabbable onSpeaker={onSpeaker}/></OinkProvider>);
+    const el = view.container.querySelector<HTMLElement>('[role="slider"]')!;
+    el.getBoundingClientRect = () => ({ left: 0, top: 0, x: 0, y: 0, width: 200, height: 20, right: 200, bottom: 20, toJSON() {} });
+    return { ...view, el };
+  };
+  it('applies while dragging and sends the final value on release', () => {
+    const onSpeaker = vi.fn();
+    const { el } = slider(onSpeaker);
+    fireEvent.pointerDown(el, { button: 0, clientX: 100, pointerId: 1 });
+    fireEvent.pointerMove(el, { clientX: 120, pointerId: 1 });
+    fireEvent.pointerMove(el, { clientX: 120, pointerId: 1 });
+    fireEvent.pointerMove(el, { clientX: 150, pointerId: 1 });
+    expect(el.getAttribute('aria-valuenow')).toBe('150');
+    fireEvent.pointerUp(el, { pointerId: 1 });
+    // max 200 over 200px: one percent per pixel; a repeated position is not resent.
+    expect(onSpeaker.mock.calls.map(([a]) => [a.value, a.final ?? false])).toEqual([[100, false], [120, false], [150, false], [150, true]]);
+  });
+  it('applies keyboard and wheel steps at once', () => {
+    const onSpeaker = vi.fn();
+    const { el } = slider(onSpeaker);
+    fireEvent.keyDown(el, { key: 'ArrowRight' });
+    fireEvent.keyDown(el, { key: 'ArrowRight' });
+    fireEvent.wheel(el, { deltaY: -4 });
+    fireEvent.wheel(el, { deltaY: 4, shiftKey: true });
+    expect(onSpeaker.mock.calls.map(([a]) => a.value)).toEqual([81, 82, 83, 73]);
+  });
 });

@@ -581,6 +581,11 @@ impl<'a> OwnerContext<'a> {
         };
         let game = self.resources().and_then(|r| r.game().ok().flatten());
         DeviceCardStatus {
+            accessibility_granted: if self.member.os == "macos" && self.supports("oink.input.accessibility/1") {
+                self.facts.and_then(|f| f.accessibility_granted().ok().flatten())
+            } else {
+                None
+            },
             actions: DeviceCardActions {
                 screen_shared: self.action(CardOptionEdit::ScreenShared(true)),
                 screen_local: self.action(CardOptionEdit::ScreenShared(false)),
@@ -741,6 +746,19 @@ impl<'a> OwnerContext<'a> {
                 None
             },
             forwarding,
+            local_output: if self.supports("oink.audio.local-output/1") {
+                observed
+                    .as_ref()
+                    .and_then(|o| o.local_output().ok().flatten())
+                    .and_then(|volume| {
+                        Some(LocalOutputCard {
+                            volume_percent: volume.volume_percent().ok()?,
+                            muted: volume.muted().ok()?,
+                        })
+                    })
+            } else {
+                None
+            },
         }
     }
 }
@@ -861,6 +879,56 @@ mod tests {
         Arc::new(dto::DeviceFacts::from_raw(raw).unwrap())
     }
     #[test]
+    fn local_output_projects_self_and_peer_only_with_current_capable_facts() {
+        for id in [1, 2] {
+            for supported in [false, true] {
+                for reading in [None, Some((0u8, true)), Some((73u8, false))] {
+                    let mut member = row(id, "volume-owner", true);
+                    if supported {
+                        member.capabilities.push("oink.audio.local-output/1".into());
+                    }
+                    let mut raw = facts(&member, 0).raw().clone();
+                    let RawValue::Array(preferences) = raw.get_mut(&18).unwrap() else {
+                        unreachable!()
+                    };
+                    for preference in preferences {
+                        if let RawValue::Map(preference) = preference
+                            && preference.get(&1) == Some(&4u32.write())
+                        {
+                            preference.insert(3, false.write());
+                        }
+                    }
+                    let RawValue::Map(resources) = raw.get_mut(&16).unwrap() else {
+                        unreachable!()
+                    };
+                    resources.insert(
+                        5,
+                        map([(
+                            9,
+                            reading
+                                .map(|(percent, muted)| map([(1, percent.write()), (2, muted.write())]))
+                                .write(),
+                        )]),
+                    );
+                    member.facts = Some(Arc::new(dto::DeviceFacts::from_raw(raw).unwrap()));
+                    let mut input = inputs(vec![member]);
+                    input.exit_baseline = true;
+                    let mut projector = Projector::new().unwrap();
+                    let view = projector.update(&input, 1).unwrap();
+                    assert_eq!(
+                        view.cards[0].status.as_ref().unwrap().speaker.resource.configured_mode,
+                        Some(SpeakerMode::Unused)
+                    );
+                    let output = view.cards[0].status.as_ref().unwrap().speaker.local_output.clone();
+                    assert_eq!(
+                        output.map(|v| (v.volume_percent, v.muted)),
+                        if supported { reading } else { None }
+                    );
+                }
+            }
+        }
+    }
+    #[test]
     fn game_badges_project_each_owners_facts_independently_of_focus() {
         let mut members = vec![row(1, "self", true), row(2, "peer", true)];
         for member in &mut members {
@@ -949,6 +1017,26 @@ mod tests {
         assert_eq!(second.generated_at_ms, 30);
         assert_eq!(first.generated_at_ms, 10);
     }
+    #[test]
+    fn accessibility_requires_mac_current_owner_facts_and_negotiated_capability() {
+        let mut owner = row(2, "Mac", true);
+        owner.os = "macos".into();
+        let mut raw = facts(&owner, 0).as_ref().clone().into_raw();
+        raw.insert(23, RawValue::Bool(false));
+        owner.facts = Some(Arc::new(dto::DeviceFacts::from_raw(raw).unwrap()));
+        let mut projector = Projector::new().unwrap();
+        let mut input = inputs(vec![owner.clone()]);
+        let status = |view: Arc<DeviceCardsView>| view.cards[0].status.as_ref().unwrap().accessibility_granted;
+        assert_eq!(status(projector.update(&input, 0).unwrap()), None);
+        input.members[0].capabilities.push("oink.input.accessibility/1".into());
+        assert_eq!(status(projector.update(&input, 1).unwrap()), Some(false));
+        input.members[0].os = "windows".into();
+        assert_eq!(status(projector.update(&input, 2).unwrap()), None);
+        input.members[0].os = "macos".into();
+        input.members[0].live_boot = Some([99; 16]);
+        assert_eq!(status(projector.update(&input, 3).unwrap()), None);
+    }
+
     #[test]
     fn faults_are_owner_specific_and_actions_have_self_remote_semantics() {
         let mut me = row(1, "self", true);

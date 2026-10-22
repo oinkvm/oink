@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { bounds, fitArrangement, cornerClearance, cornerPoint, opposite, clampMove, resizeFromCorner, snapResize } from './geometry';
-import type { Corner } from './geometry';
+import { bounds, fitArrangement, cornerClearance, cornerPoint, opposite, clampMove, resizeFromCorner, snap, snapResize } from './geometry';
+import type { Corner, SnapEdges } from './geometry';
 describe('designer arrangement geometry',()=>{
   it('makes touching corners square and preserves independent outer corners',()=>{
     expect(cornerClearance({x:1512,y:0,w:800,h:982},[{x:0,y:0,w:1512,h:982}])).toEqual({nw:0,ne:null,sw:0,se:null});
@@ -93,4 +93,27 @@ it('retains a fractional native aspect ratio and the fixed seam through all resi
     expect(r.w / r.h).toBeCloseTo(1728 / 1117, 12);
     expect(cornerPoint(r, opposite[corner])).toEqual(cornerPoint(origin, opposite[corner]));
   }
+});
+
+describe('snap candidate roundoff', () => {
+  it('keeps the same matched edge when overlapping equal-height screens are reprojected', () => {
+    const neighbour = { x: 1000, y: 0, w: 800, h: 500 };
+    for (const y of [0, 1e-14, -1e-14, 1e-13, -1e-13]) {
+      const edges: SnapEdges = {};
+      const result = snap({ x: 600, y, w: 800, h: 500 }, [neighbour], 10, edges);
+      expect(result.y).toBeCloseTo(0, 12);
+      expect(edges).toEqual({ y: '0:2' });
+    }
+  });
+
+  it('keeps the first proportional resize candidate when two sizes differ only by roundoff', () => {
+    const origin = { x: 0, y: 0, w: 800, h: 500 };
+    const neighbour = { x: 1000, y: 625.0000000000001, w: 500, h: 500 };
+    for (const w of [1000, 1000.0000000000002, 999.9999999999998]) {
+      const edges: SnapEdges = {};
+      const result = snapResize({ ...origin, w, h: w * .625 }, origin, 'se', [neighbour], 10, 640, edges);
+      expect(result.w).toBeCloseTo(1000, 12);
+      expect(edges).toEqual({ x: '0:0' });
+    }
+  });
 });

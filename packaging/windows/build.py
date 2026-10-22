@@ -239,7 +239,7 @@ def main():
         '/DUNICODE', '/D_UNICODE', f'/I{a.output}', ROOT / 'packaging/windows/InstallerCA.cpp',
         f'/Fo{a.output}/InstallerCA.obj', '/link', f'/OUT:{a.output}/InstallerCA.dll', f'/IMPLIB:{a.output}/InstallerCA.lib',
         'msi.lib', 'advapi32.lib', 'shell32.lib', 'ole32.lib', 'bcrypt.lib', 'user32.lib', 'userenv.lib')
-    for test in ('AuthorizationTests', 'QuiescenceTests', 'MaintenanceCleanupTests', 'CloudFilesCleanupTests', 'FinishInstallTests', 'GracefulStopTests'):
+    for test in ('AuthorizationTests', 'QuiescenceTests', 'MaintenanceCleanupTests', 'CloudFilesCleanupTests', 'FinishInstallTests', 'GracefulStopTests', 'UserDataCleanupTests'):
         run('cl.exe', '/nologo', '/EHsc', '/std:c++17', '/W4', '/WX', '/MT', ROOT / f'packaging/windows/{test}.cpp',
             f'/Fo{a.output}/{test}.obj', f'/Fe{a.output}/{test}.exe', 'advapi32.lib', 'user32.lib')
         run(a.output / f'{test}.exe')

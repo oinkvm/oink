@@ -19,7 +19,7 @@ const remote: Device = {
 };
 function menu(props: Partial<SideContextMenuProps> & { target: string }) {
   const noop = () => {};
-  const handlers = { onShare: vi.fn(), onScreensHidden: vi.fn(), onHideScreen: vi.fn() };
+  const handlers = { onShare: vi.fn(), onScreensHidden: vi.fn(), onHideScreen: vi.fn(), onScreenGain: vi.fn() };
   render(<OinkProvider defaultMotion="reduced"><SideContextMenu
     devices={[remote]} requests={[]} nearby={[]}
     onGameMode={noop} onPause={noop} onLeave={noop} onEditAddress={noop}
@@ -40,7 +40,7 @@ it('draws device glyphs at menu icon size, like the prototype', async () => {
 });
 
 it('lists the online device items in prototype order with a danger kick', async () => {
-  menu({ target: 'device:remote', screens: [{ id: 'remote:1', device: 'remote', name: 'Display 1', hidden: false }] });
+  menu({ target: 'device:remote', screens: [{ id: 'remote:1', device: 'remote', name: 'Display 1', hidden: false, gain: 1 }] });
   expect(await items()).toEqual(['Lock pointer', 'Hide all screens', 'Input devices', 'Game mode', 'Set as audio output', 'Pause sharing', 'Remove from group']);
   expect(screen.getByRole('menuitem', { name: 'Remove from group' }).className).toMatch(/danger/);
 });
@@ -53,8 +53,8 @@ it('shows an open lock to unlock a locked pointer', async () => {
 
 it('offers show all once any screen of the device is hidden', async () => {
   const handlers = menu({ target: 'device:remote', screens: [
-    { id: 'remote:1', device: 'remote', name: 'Display 1', hidden: true },
-    { id: 'remote:2', device: 'remote', name: 'Display 2', hidden: false },
+    { id: 'remote:1', device: 'remote', name: 'Display 1', hidden: true, gain: 1 },
+    { id: 'remote:2', device: 'remote', name: 'Display 2', hidden: false, gain: 1 },
   ] });
   expect(await items()).not.toContain('Show screen');
   fireEvent.click(screen.getByRole('menuitem', { name: 'Show all screens' }));
@@ -62,14 +62,30 @@ it('offers show all once any screen of the device is hidden', async () => {
 });
 
 it('hides all screens while none is hidden', async () => {
-  const handlers = menu({ target: 'device:remote', screens: [{ id: 'remote:1', device: 'remote', name: 'Display 1', hidden: false }] });
+  const handlers = menu({ target: 'device:remote', screens: [{ id: 'remote:1', device: 'remote', name: 'Display 1', hidden: false, gain: 1 }] });
   fireEvent.click(await screen.findByRole('menuitem', { name: 'Hide all screens' }));
   expect(handlers.onScreensHidden).toHaveBeenCalledWith('remote', true);
 });
 
-it('offers only hiding on a screen', async () => {
-  const handlers = menu({ target: 'screen:remote:1', screens: [{ id: 'remote:1', device: 'remote', name: 'Display 1', hidden: false }] });
+it('offers hiding and the pointer gain on a screen', async () => {
+  const handlers = menu({ target: 'screen:remote:1', screens: [{ id: 'remote:1', device: 'remote', name: 'Display 1', hidden: false, gain: 1.25 }] });
   expect(await items()).toEqual(['Hide this screen']);
+  expect(screen.getByRole('spinbutton', { name: 'Remote pointer speed on Display 1' })).toBeDefined(); expect((screen.getByRole('spinbutton', { name: 'Remote pointer speed on Display 1' }) as HTMLInputElement).value).toBe('1.25x');
   fireEvent.click(screen.getByRole('menuitem', { name: 'Hide this screen' }));
   expect(handlers.onHideScreen).toHaveBeenCalledWith('remote:1');
+});
+
+it('saves a burst of gain steps once, at 0.1 per press', async () => {
+  vi.useFakeTimers();
+  try {
+    const handlers = menu({ target: 'screen:remote:1', screens: [{ id: 'remote:1', device: 'remote', name: 'Display 1', hidden: false, gain: 1 }] });
+    await vi.runOnlyPendingTimersAsync();
+    const input = screen.getByRole('spinbutton', { name: 'Remote pointer speed on Display 1' });
+    fireEvent.keyDown(input, { key: 'ArrowUp' });
+    fireEvent.keyDown(input, { key: 'ArrowUp' });
+    expect(handlers.onScreenGain).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(300);
+    expect(handlers.onScreenGain).toHaveBeenCalledTimes(1);
+    expect(handlers.onScreenGain).toHaveBeenCalledWith('remote:1', 1.2);
+  } finally { vi.useRealTimers(); }
 });

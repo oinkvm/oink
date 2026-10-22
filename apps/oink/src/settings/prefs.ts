@@ -38,7 +38,6 @@ export interface Prefs {
     confirmQuit: boolean;
     notificationLevel: import("../api/cards").UiPreferences["notification_level"];
     escStop: boolean;
-    upgradeHint: boolean;
     language: string;
     keyPreset: KeyPreset;
     keyCustom: Record<Platform, KeyMap>;
@@ -74,7 +73,6 @@ export const DEFAULT_PREFS: Prefs = {
     confirmQuit: true,
     notificationLevel: 'default',
     escStop: true,
-    upgradeHint: true,
     language: 'auto',
     keyPreset: 'mac',
     keyCustom: { mac: presetMap('mac', 'mac', false), win: presetMap('win', 'win', false) },

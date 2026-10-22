@@ -1,10 +1,5 @@
 use super::*;
 impl Owner {
-    pub(crate) fn layout_profile_merges(&self) -> ApiResult<Vec<dto::MergeTransferBundle>> {
-        self.journal
-            .committed_into(self.state.roster().anchor())
-            .map_err(internal)
-    }
     pub(crate) fn receive_revocation(&mut self, candidate: State) -> v1::Result<()> {
         self.commit(candidate).map_err(|_| v1::ErrorCode::StateConflict)?;
         let links = self.sessions.keys().copied().collect::<Vec<_>>();
@@ -160,6 +155,14 @@ impl Owner {
         let Some(wire) = self.journal.pending_projection().map_err(internal)? else {
             return Ok(true);
         };
+        if let Some(bundle) = self.journal.pending_bundle().map_err(internal)? {
+            let intent = bundle.certificate().and_then(|c| c.intent()).map_err(internal)?;
+            if let Err(error) = self.application.prepare_profile_join(&intent) {
+                tracing::warn!(%error, "profile handoff deferred before group projection");
+                self.projection_retry = Some(Instant::now() + Duration::from_millis(50));
+                return Ok(false);
+            }
+        }
         let roster = wire.roster().map_err(internal)?;
         let anchor = Anchor {
             group: GroupId(wire.group().map_err(internal)?.0),
@@ -467,9 +470,10 @@ impl Owner {
         faults: dto::ResourceFaults,
         options: dto::LocalOptionsSummary,
         game: Option<dto::GameObservation>,
+        accessibility_granted: Option<bool>,
     ) -> ApiResult<u64> {
         self.local
-            .input(mouse, keyboard, faults, options, game)
+            .input(mouse, keyboard, faults, options, game, accessibility_granted)
             .map_err(internal)?;
         self.publish()?;
         self.publish_facts()

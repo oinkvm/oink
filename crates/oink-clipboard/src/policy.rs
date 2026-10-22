@@ -256,6 +256,9 @@ struct FilteredFiles {
     policy: SharingPolicy,
 }
 impl Namespace for FilteredFiles {
+    fn origin(&self) -> Option<oink_foundation::DeviceId> {
+        self.inner.origin()
+    }
     fn real_clipboard_files(&self) -> bool {
         self.inner.real_clipboard_files()
     }
@@ -389,6 +392,9 @@ mod tests {
     }
     struct Files;
     impl Namespace for Files {
+        fn origin(&self) -> Option<DeviceId> {
+            Some(DeviceId([7; 32]))
+        }
         fn roots(&self) -> Vec<FileNode> {
             vec![file()]
         }
@@ -473,6 +479,11 @@ mod tests {
             inner: Arc::new(Files),
             policy: policy.clone(),
         };
+        assert_eq!(
+            files.origin(),
+            Some(DeviceId([7; 32])),
+            "format policy lost the original sending device"
+        );
         let mut reader = files.open(NodeId(1), 1, 0).unwrap();
         assert_eq!(reader.read(&mut [0; 1]).unwrap(), 1);
         policy.update(

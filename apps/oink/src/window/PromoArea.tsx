@@ -1,16 +1,27 @@
-import { tr } from '../i18n';
+import { tr, useLanguage } from '../i18n';
 import { useState } from 'react';
-import { CoffeeIcon, KofiMark, WeChatPayMark, WeChatQrDialog, openKofi } from '../sponsor/Sponsor';
+import { CoffeeIcon, SponsorQrDialog, useSponsorItems } from '../sponsor/Sponsor';
+import { localized, type SponsorItem } from '../sponsor/list';
 import { Button, DropdownMenu, MenuItem, Tooltip } from 'oink-ui';
 import { shell } from '../api/client';
 import { agent } from '../api/store';
 export function PromoArea({ sponsor = true, container = null }: { sponsor?: boolean; container?: HTMLElement | null }) {
-    const [qr, setQr] = useState(false);
+    const [qr, setQr] = useState<SponsorItem | null>(null);
+    const { items, showFallback } = useSponsorItems();
+    const language = useLanguage();
+    const imageError = () => { showFallback(); setQr(null); };
+    const select = (item: SponsorItem) => {
+      if (item.action.type === 'qr') setQr(item);
+      else if (new URL(item.action.url).protocol === 'https:') {
+        void shell.openUrl(item.action.url).catch(() => agent.fail('unavailable'));
+      }
+    };
     return (<div className="win__promo" role="group" aria-label={tr('推广')}>
       {sponsor && <DropdownMenu placement="bottom-end" matchTriggerWidth={false}
         trigger={<Button variant="ghost" size="sm" className="win__promo-sponsor" leading={<CoffeeIcon />}>{tr('赞助')}</Button>}>
-        <MenuItem icon={<KofiMark tile />} onSelect={() => { void openKofi(); }}>Ko-fi</MenuItem>
-        <MenuItem icon={<WeChatPayMark tile />} onSelect={() => setQr(true)}>{tr('微信支付')}</MenuItem>
+        {items.map(item => <MenuItem key={item.id}
+          icon={<img className="sponsor-mark" src={item.icon} alt="" width={20} height={20} onError={imageError} />}
+          onSelect={() => select(item)}>{localized(item.name, language)}</MenuItem>)}
       </DropdownMenu>}
       <Tooltip interactive={false} content="GitHub" placement="bottom">
         <Button variant="ghost" size="sm" iconOnly aria-label="GitHub" onClick={() => { void shell.openUrl('https://github.com/oinkvm/oink').catch(() => agent.fail('unavailable')); }}>
@@ -20,6 +31,6 @@ export function PromoArea({ sponsor = true, container = null }: { sponsor?: bool
           </svg>
         </Button>
       </Tooltip>
-      <WeChatQrDialog open={qr} onOpenChange={setQr} container={container} />
+      <SponsorQrDialog item={qr} onOpenChange={open => { if (!open) setQr(null); }} container={container} onImageError={imageError} />
     </div>);
 }

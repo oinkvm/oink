@@ -238,7 +238,6 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
             case 'showInMenuBar':
             case 'confirmQuit':
             case 'escStop':
-            case 'upgradeHint':
             case 'scrollInvert':
             case 'forwardInjectedInput':
             case 'keepAwake':
@@ -272,8 +271,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                 return { node: layoutProfiles ?? null, stack: true };
             case 'receivedFiles': return {node:<>
                 <span className="setp__size">{received ? `${received.incomplete ? '≥ ' : ''}${formatSize(received.materialized_bytes)}` : '—'}</span>
-                <Button size="sm" aria-label={tr('打开收到的文件夹')} onClick={openReceived}><Icon name="folder"/></Button>
-                <Button size="sm" onClick={openReceived}>{tr('管理')}</Button>
+                <Button size="sm" leading={<Icon name="folder"/>} onClick={openReceived}>{tr('管理')}</Button>
             </>};
             case 'receivedCleanup': return {node:<Select size="sm" aria-label={label} value={received?.cleanup ?? 'never'} disabled={!received || receivedSaving} onChange={value=>{void setReceivedCleanup(value as ReceivedFilesCleanup);}} options={[
                 {value:'days7',label:received?.time_basis==='last_used' ? tr('7 天未使用') : tr('收到 7 天后')},
@@ -419,7 +417,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
         }
         if (item.id.startsWith('perm-')) {
             const id = item.id.slice(5) as PermissionId;
-            return { desc: id === 'network' ? tr('系统设置 › 隐私与安全性 › 本地网络') : undefined,
+            return { desc: id === 'network' ? tr('系统设置 › 隐私与安全性 › 本地网络') : id === 'input' && perms.accessibility === 'granted' && perms.input === 'granted' ? tr('辅助功能已包含输入监控，无需重复授权') : undefined,
                 node: <PermissionControl id={id} state={perms[id]} grant={grant}/> };
         }
         return { node: null };

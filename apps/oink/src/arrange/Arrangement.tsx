@@ -17,12 +17,11 @@ import { CORNERS, fitArrangement, bounds, clampMove, facingGap, cornerPoint, cor
 import type { Camera, Corner, Rect, Screen, SnapEdges } from './geometry';
 import { useSpringRects } from './springs';
 import { useVisible } from '../window/useVisible';
-import { cornerArcPath, ringBandPath, useCornerShape } from './cornerShape';
-import type { CornerKs } from 'oink-ui';
+import { cornerArcPath, useCornerShape } from './cornerShape';
 import { cameraStore } from './cameraStore';
 import { growArrangementView, SpringCamera, visibleArrangement } from './camera';
 import { SnapFeedback } from './haptics';
-import { settleGroup, type Offset } from './compaction';
+import { compactScreens } from './compaction';
 import { projectScreenRect } from './renderGeometry';
 export interface ArrangementSettings {
     showHotZones: boolean;
@@ -36,13 +35,13 @@ export interface ScreensChange {
     label: string;
     merge?: string;
 }
-/** One native screen moved inside its computer (system arrangement on). `drag`
- * reports the desired top-left; `end` hands over the release compaction, which the
- * owner of the backend preview applies to the snapped rectangles of the computer. */
+/** One native screen moved inside its computer (effective system sync on). `drag`
+ * reports the desired top-left; the owner compacts that whole computer after the
+ * final native preview, and commits the gesture and compaction together. */
 export type ScreenMove =
     | { type: 'drag'; id: string; desired: { x: number; y: number } }
     | { type: 'end'; id: string; cancelled: true }
-    | { type: 'end'; id: string; cancelled: false; label: string; compact: (rects: Rect[]) => Offset };
+    | { type: 'end'; id: string; cancelled: false; label: string; compact: boolean };
 export interface ArrangementProps {
     screens: Screen[];
     platform?: 'mac' | 'win';
@@ -69,17 +68,6 @@ export interface ArrangementProps {
     onScreenMove?: (move: ScreenMove) => void;
 }
 const SCREEN_R = 12;
-/** The selection ring: a canvas-coloured gap band, then the accent band (px outside the edge). */
-const RING_GAP = 2.5, RING_OUT = 4.5;
-/** A selection ring drawn as one SVG: exact corners from the first frame on every engine
- * (see ringBandPath for why it is not a spread box-shadow). */
-function SelectionRing({ w, h, radii, ks }: { w: number; h: number; radii: [number, number, number, number]; ks: CornerKs }) {
-    const m = Math.ceil(RING_OUT) + 1;
-    return <svg className="scr__ring" aria-hidden width={w + 2 * m} height={h + 2 * m} viewBox={`${-m} ${-m} ${w + 2 * m} ${h + 2 * m}`} style={{ left: -m, top: -m }}>
-      <path className="scr__ring-gap" d={ringBandPath(w, h, radii, ks, 0, RING_GAP)}/>
-      <path className="scr__ring-accent" d={ringBandPath(w, h, radii, ks, RING_GAP, RING_OUT)}/>
-    </svg>;
-}
 const HANDLE_GAP = 7;
 const DRAG_SLOP = 3;
 interface Interaction {
@@ -304,26 +292,16 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
      * screens, connectivity, remote layouts) only retarget the springs above.
      * Only the edited computer moves; hidden screens are not in `screens`. */
     const settle = (id: string, r: Rect) => {
-        const group = members(id), from = bounds(group), rest = others(id);
-        const { dx, dy } = settings.compact
-            ? settleGroup(transformGroup(group, from, r), rest, rest.map(s => s.device ?? s.id)) : { dx: 0, dy: 0 };
-        const final = { ...r, x: r.x + dx, y: r.y + dy };
-        const transformed = transformGroup(group, from, final);
-        const next = mergeVisibleGroups(geometryScreens, screens.map(s => transformed.find(n => n.id === s.id) ?? s));
-        return { next, final, compacted: dx !== 0 || dy !== 0 };
-    };
-    /** Release handling for a native screen edit: collision repair and compaction
-     * translate the whole computer, from its snapped (visible) screen rectangles. */
-    const compactScreens = (id: string, rects: Rect[]): Offset => {
-        if (!rects.length) return { dx: 0, dy: 0 };
-        const rest = others(id), from = bounds(rects);
-        const free = freeGroup(rects, from, from, rest);
-        const { dx, dy } = settings.compact
-            ? settleGroup(transformGroup(rects, from, free), rest, rest.map(s => s.device ?? s.id)) : { dx: 0, dy: 0 };
-        return { dx: free.x - from.x + dx, dy: free.y - from.y + dy };
+        const group = members(id), from = bounds(group);
+        const transformed = transformGroup(group, from, r);
+        const released = mergeVisibleGroups(geometryScreens, screens.map(s => transformed.find(n => n.id === s.id) ?? s));
+        const shown = released.filter(s => screens.some(v => v.id === s.id));
+        const next = settings.compact ? compactScreens(released, shown, new Set(group.map(s => s.id))) : released;
+        const final = bounds(next.filter(s => group.some(m => m.id === s.id)));
+        return { next, final, compacted: next.some((s, i) => s.x !== released[i].x || s.y !== released[i].y) };
     };
     /** Single-screen computers have no independent native arrangement to edit. */
-    const editingScreen = (s: Screen) => !selectedGroup && !!onScreenMove && !!screenEditable?.(s) && membersOf(screens, s.id).length > 1;
+    const editingScreen = (s: Screen) => !selectedGroup && !!onScreenMove && !!screenEditable?.(s) && membersOf(geometryScreens, s.id).length > 1;
     /** Shown selected: the single screen of a system-arranged computer, else whole units. */
     const isSelected = (s: Screen) => screenSelection && sameComputer(s, screenSelection) ? s.id === selectedId
         : (!!selectedId && members(selectedId).some(m => m.id === s.id)) || !!selectedGroup?.has(s.id);
@@ -348,7 +326,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
             onSelect(s.id, 'toggle');
             return;
         }
-        if (mode === 'move' && !selectedGroup?.has(s.id) && !!onScreenMove && !!screenEditable?.(s) && membersOf(screens, s.id).length > 1) {
+        if (mode === 'move' && !selectedGroup?.has(s.id) && !!onScreenMove && !!screenEditable?.(s) && membersOf(geometryScreens, s.id).length > 1) {
             // A plain press on a system-arranged computer's screen selects that screen
             // alone and moves it on its own; snapping is the backend's.
             const wasSelected = !!screenSelection && selectedId === s.id;
@@ -518,7 +496,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
                 springs.to(d.id, d.origin, 'snappy');
                 return;
             }
-            onScreenMove?.({ type: 'end', id: d.id, cancelled: false, label: tr('移动 {0}', name), compact: rects => compactScreens(d.id, rects) });
+            onScreenMove?.({ type: 'end', id: d.id, cancelled: false, label: tr('移动 {0}', name), compact: settings.compact });
             return;
         }
         if (cancelled || sameRect(d.live, d.origin)) {
@@ -593,7 +571,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
                 // Same preview/commit path as a drag: the backend snaps the native screen.
                 const at = springs.target(own.id) ?? own;
                 onScreenMove?.({ type: 'drag', id: own.id, desired: { x: at.x + (axis === 'x' ? want : 0), y: at.y + (axis === 'y' ? want : 0) } });
-                onScreenMove?.({ type: 'end', id: own.id, cancelled: false, label: tr('移动 {0}', own.name), compact: rects => compactScreens(own.id, rects) });
+                onScreenMove?.({ type: 'end', id: own.id, cancelled: false, label: tr('移动 {0}', own.name), compact: settings.compact });
                 lingerProjection();
                 return;
             }
@@ -630,6 +608,14 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
         }
     };
     const paintOrigin = root.current?.getBoundingClientRect() ?? { x: 0, y: 0 };
+    // WebKit 26.0 / macOS 26.6.2 rasterizes per-tile translates at different
+    // local pixel phases: fractional canvas origins leave AA seams despite exact
+    // global edges. Removing clips or using native round corners does not help.
+    // Chromium needs translates at fractional DPR to avoid CSS layout's 1/64 px
+    // quantization. Only macOS uses layout positioning; world/camera/hit-test
+    // arithmetic and Windows painting remain unchanged.
+    const paintPosition = (r: Rect): CSSProperties => platform === 'mac'
+        ? { left: r.x, top: r.y } : { transform: `translate(${r.x}px, ${r.y}px)` };
     // Use only existing top-left whitespace. Include selection arcs/handles in
     // the exclusion margin, and keep the toolbar's top-right footprint clear.
     // Recalculate from painted springs so zoom and animation cannot cover hints.
@@ -668,7 +654,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
             const inGroup = grouped && !!selectedGroup?.has(s.id);
             const multi = (s.groupSize ?? membersOf(screens, s.id).length) > 1 || inGroup;
             const style = {
-                transform: `translate(${painted.x}px, ${painted.y}px)`,
+                ...paintPosition(painted),
                 width: W, height: H,
                 zIndex: isActive ? 3 : selected ? 2 : 1,
             } as CSSProperties;
@@ -700,7 +686,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
                         [c[1] === 'e' ? 'right' : 'left']: -out,
                         [c[0] === 's' ? 'bottom' : 'top']: -out,
                     } as CSSProperties} onPointerDown={(e) => begin(e, s, 'resize', c)}/>))}
-            {selected && (!multi || alone) && <SelectionRing w={W} h={H} radii={[rc.nw, rc.ne, rc.se, rc.sw]} ks={shape.ks}/>}
+            {selected && (!multi || alone) && <div className="scr__selection" aria-hidden style={{ borderTopLeftRadius: rc.nw, borderTopRightRadius: rc.ne, borderBottomRightRadius: rc.se, borderBottomLeftRadius: rc.sw }}/>}
             {!multi && <svg className="scr__arcs" aria-hidden width={W + 2 * M} height={H + 2 * M} viewBox={`${-M} ${-M} ${W + 2 * M} ${H + 2 * M}`} style={{ left: -M, top: -M }}>
               {CORNERS.map((c) => {
                     const d = cornerArcPath(c, W, H, gap, rc[c] + gap, shape.n);
@@ -732,7 +718,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
                     data-active={isActive ? active!.mode : undefined}
                     data-corner={isActive ? active!.corner : undefined}
                     style={{
-                        transform: `translate(${painted.x}px,${painted.y}px)`,
+                        ...paintPosition(painted),
                         width: W,
                         height: H,
                         zIndex: 4,
@@ -742,7 +728,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
                     onPointerCancel={e => end(e, true)}
                     onLostPointerCapture={e => end(e)}
                 >
-                    <div className="scr__group-border">{!(screenSelection && sameComputer(s, screenSelection)) && <SelectionRing w={W} h={H} radii={[R, R, R, R]} ks={shape.ks}/>}</div>
+                    <div className="scr__group-border"/>
                     {CORNERS.map(c => (
                         <div
                             key={c}
@@ -788,7 +774,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
         }).map(({ key, rects }) => {
             const painted = projectScreenRect(bounds(rects.map(m => springs.get(m.id) ?? m)), { zoom, ox, oy }, pixelRatio, paintOrigin);
             return <div key={`outline:${key}`} className="scr-outline" data-outline={key} aria-hidden
-                style={{ transform: `translate(${painted.x}px,${painted.y}px)`, width: painted.w, height: painted.h }}/>;
+                style={{ ...paintPosition(painted), width: painted.w, height: painted.h }}/>;
         })}
       {showHints && <div className="arr__keys" style={{ width: hintWidth }} role="group" aria-label={tr('排列快捷键')}>
         <div className="arr__keys-row">

@@ -86,3 +86,48 @@ it('compacts on the first turn-on even when the stored preference was off', asyn
   await flip();
   expect(backend.harness!.of('commit_arrangement')).toHaveLength(1);
 });
+
+it('records the complete global pass in one undo entry and leaves the toggle on', async () => {
+  render(<App/>);
+  const before = structuredClone(backend.harness!.fixture.state().snapshot);
+  await flip(); await flip();
+  expect(backend.harness!.of('commit_arrangement')).toHaveLength(1);
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Undo' })); });
+  await backend.harness!.settle();
+  expect(backend.harness!.of('replay_arrangement')).toHaveLength(1);
+  expect(backend.harness!.fixture.state().snapshot!.placements).toEqual(before!.placements);
+  expect(toggle().getAttribute('aria-pressed')).toBe('true');
+});
+
+it.each([{ sync: false, editable: false }, { sync: true, editable: true }, { sync: true, editable: false }])('compacts a multi-screen computer rigidly with sync=$sync editable=$editable in one undoable placement edit', async ({ sync, editable }) => {
+  backend.harness!.stop();
+  const initial = structuredClone(backend.harness!.fixture.state().snapshot!);
+  const [a, b] = initial.native;
+  initial.native = [
+    { ...a, primary: { device: a.device, display: 'main' }, screens: [
+      { screen: { device: a.device, display: 'main' }, origin: { x: 0, y: 0 }, size: { w: 10, h: 10 } },
+      { screen: { device: a.device, display: 'side' }, origin: { x: 10, y: -10 }, size: { w: 10, h: 40 } },
+    ] },
+    { ...b, screens: [{ screen: b.primary, origin: { x: 0, y: 0 }, size: { w: 10, h: 10 } }] },
+  ];
+  initial.placements = [{ device: a.device, origin: { x: 0, y: 0 }, scale: .001 }, { device: b.device, origin: { x: .01, y: .1 }, scale: .001 }];
+  initial.disabled = initial.native.flatMap(n => n.screens.map(s => ({ screen: s.screen, disabled: false })));
+  const h = backend.harness = profileHarness({ snapshot: initial, devices: initial.native.map(n => ({ device: n.device,
+    sync_system_arrangement: sync && n.device === a.device, can_edit_screens: editable && n.device === a.device,
+    native_token: n.token, preference_token: 'preference', availability: 'ready' })) });
+  agent.adopt('layout', h.fixture.layout());
+  render(<App/>);
+  await flip(); await flip();
+  const previews = h.of('preview_system_arrangement');
+  expect(previews).toHaveLength(0);
+  expect(h.of('commit_arrangement')).toHaveLength(1);
+  expect(h.of('commit_arrangement')[0].params!.native_plan_tokens).toEqual([]);
+  expect(h.fixture.state().snapshot!.native.map(n => n.screens)).toEqual(initial.native.map(n => n.screens));
+  expect(h.fixture.state().snapshot!.placements[0].origin.x).toBe(0);
+  expect(Math.abs(h.fixture.state().snapshot!.placements[0].origin.y - .07)).toBeLessThanOrEqual(2 ** -30);
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Undo' })); });
+  await h.settle();
+  expect(h.fixture.state().snapshot!.placements).toEqual(initial.placements);
+  expect(h.fixture.state().snapshot!.native.map(n => n.screens)).toEqual(initial.native.map(n => n.screens));
+  expect(screen.getByRole('button', { name: 'Undo' }).hasAttribute('disabled')).toBe(true);
+});

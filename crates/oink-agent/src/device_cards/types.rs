@@ -374,6 +374,12 @@ impl ForwardingCard {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct LocalOutputCard {
+    pub volume_percent: u8,
+    pub muted: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SpeakerCard {
     #[serde(flatten)]
     pub resource: ResourceCard<SpeakerMode, SpeakerIcon>,
@@ -386,6 +392,7 @@ pub struct SpeakerCard {
     pub active_sources: Option<u8>,
     pub receive_ready: Option<bool>,
     pub forwarding: Option<ForwardingCard>,
+    pub local_output: Option<LocalOutputCard>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameActions {
@@ -419,6 +426,9 @@ pub struct DeviceCardActions {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceCardStatus {
+    /// None for legacy peers, unsupported platforms, or unreported observations.
+    #[serde(rename = "accessibilityGranted")]
+    pub accessibility_granted: Option<bool>,
     pub actions: DeviceCardActions,
     pub cursor: CursorCard,
     pub screen: ResourceCard,

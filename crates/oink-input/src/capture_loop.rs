@@ -22,6 +22,11 @@ pub trait CaptureLoop: Send {
     fn event(&mut self, event: &CapturedEvent) -> Disposition;
     /// Local source gate; receiving remote input remains independent.
     fn capture_available(&mut self, _available: bool) {}
+    /// Capture was intentionally withdrawn (permission/safety/pause), not a
+    /// failed native attachment. Existing owners still receive source withdrawal.
+    fn capture_detached(&mut self) {
+        self.capture_available(false);
+    }
     /// Drain ready work and return the next motion/router deadline.
     fn poll(&mut self, now: Instant) -> Option<Instant>;
     fn stopped(&self) -> bool;
@@ -81,6 +86,14 @@ pub(crate) fn capture_available(available: bool) {
     OWNER.with(|slot| {
         if let Some(owner) = slot.borrow_mut().as_mut() {
             owner.capture_available(available);
+        }
+    });
+}
+#[cfg(target_os = "macos")]
+pub(crate) fn capture_detached() {
+    OWNER.with(|slot| {
+        if let Some(owner) = slot.borrow_mut().as_mut() {
+            owner.capture_detached();
         }
     });
 }

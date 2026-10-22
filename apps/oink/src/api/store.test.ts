@@ -3,8 +3,30 @@ import { shell } from './client';
 import { acceptSnapshot, createAgentStore } from './store';
 import type { DeviceCardsView } from './cards';
 import type { PairingSnapshot, PairView, NearbySnapshot } from './pairing';
+import type { PermissionItem, PermissionState } from './types';
 const view = (revision: string, stream = 'current'): DeviceCardsView => ({ schema: 1, stream, revision, group: null, generatedAtMs: 0, exitVolume: null, emergencyDelivery: null, cards: [] });
 describe('authenticated presentation ordering', () => {
+  it('adopts permission changes without focus and keeps them newer than a pending refresh', async () => {
+    const store = createAgentStore();
+    const sample = (state: PermissionState): PermissionItem[] => [
+      { kind: 'accessibility', state, required: true },
+      { kind: 'input_monitoring', state, required: true },
+    ];
+    // Deterministic fake source: hold a stale query while the backend's permission
+    // observer sends its authoritative AX + effective listening grant/revocation.
+    let complete!: (items: PermissionItem[]) => void;
+    const source = vi.fn(() => new Promise<PermissionItem[]>(resolve => { complete = resolve; }));
+    await store.query('permissions', async () => sample('NotGranted'));
+    const refresh = store.query('permissions', source);
+    store.receive({ type: 'permissions', data: sample('Granted') });
+    expect(store.get().permissions).toEqual(sample('Granted'));
+    complete(sample('NotGranted')); await refresh;
+    expect(store.get().permissions).toEqual(sample('Granted'));
+    store.receive({ type: 'permissions', data: sample('NotGranted') });
+    expect(store.get().permissions).toEqual(sample('NotGranted'));
+    expect(source).toHaveBeenCalledTimes(1);
+    expect(store.get().error).toBeNull();
+  });
   it('keeps an event that arrives before an initial query reply', async () => {
     const store = createAgentStore();
     let complete!: (v: DeviceCardsView) => void;

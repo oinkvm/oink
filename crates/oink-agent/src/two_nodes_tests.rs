@@ -1546,3 +1546,99 @@ fn remote_card_modes_apply_persist_and_publish_without_editing_requester() {
         },
     );
 }
+
+#[test]
+fn remote_pause_and_emergency_clear_only_owner_disables_and_publish_release() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "remote_pause_and_emergency_clear_only_owner_disables_and_publish_release",
+        Some(4),
+        async {
+            use crate::device_cards::{CardAction, DeviceControlReply, DeviceControlResult};
+            use oink_foundation::input::InputMode;
+            use oink_protocol::v1::{dto::LocalOption, schema::WireValue};
+            let a = start("disable-owner", 0).await;
+            let b = start("pause-requester", 0).await;
+            common::pair(&a.node, &b.node).await;
+            api(&b.node, |node| {
+                node.edit_device_option(node.id().into(), LocalOption::MouseMode, 1u32.write())
+                    .unwrap()
+            })
+            .await;
+            for emergency in [false, true] {
+                api(&a.node, |node| {
+                    node.edit_device_option(node.id().into(), LocalOption::MouseMode, 2u32.write())
+                        .unwrap();
+                    node.edit_device_option(node.id().into(), LocalOption::KeyboardDisabled, true.write())
+                        .unwrap();
+                })
+                .await;
+                if emergency {
+                    b.node
+                        .pause_all(crate::device_controls::runtime::fresh_request_id())
+                        .unwrap();
+                } else {
+                    let mut token = None;
+                    wait_for("remote pause action", 5., || {
+                        token = b
+                            .node
+                            .device_cards()
+                            .unwrap()
+                            .cards
+                            .iter()
+                            .find(|card| card.device.0 == a.node.id())
+                            .and_then(|card| card.pause.as_ref())
+                            .and_then(|pause| match &pause.action {
+                                CardAction::Invoke { token, .. } => Some(token.clone()),
+                                _ => None,
+                            });
+                        token.is_some()
+                    })
+                    .await;
+                    let token = token.unwrap();
+                    let id = crate::device_controls::runtime::fresh_request_id();
+                    b.node.invoke_device_card_action(id.clone(), token.clone()).unwrap();
+                    wait_for("received pause receipt", 5., || {
+                        match b.node.invoke_device_card_action(id.clone(), token.clone()).unwrap() {
+                            DeviceControlReply::Completed(result) => {
+                                assert_eq!(result.result, DeviceControlResult::Applied);
+                                true
+                            }
+                            _ => false,
+                        }
+                    })
+                    .await;
+                }
+                wait_for("received pause durable release", 5., || {
+                    let pause = a.node.pause_status();
+                    let settings = a.node.settings();
+                    pause.paused
+                        && !pause.settling
+                        && !settings.keyboard_disabled
+                        && settings.routing.mouse_mode == InputMode::Shared
+                })
+                .await;
+                let disk = crate::config::AgentConfig::load_from(a._dir.path()).unwrap();
+                assert!(!disk.settings.keyboard_disabled);
+                assert_eq!(disk.settings.routing.mouse_mode, InputMode::Shared);
+                wait_for("release reaches requester facts", 5., || {
+                    b.node.group().unwrap().members.iter().any(|member| {
+                        member.device.id.0 == a.node.id()
+                            && member.keyboard_disabled == Some(false)
+                            && member.mouse_mode == Some(InputMode::Shared)
+                    })
+                })
+                .await;
+                assert_eq!(b.node.settings().routing.mouse_mode, InputMode::Local);
+                a.node
+                    .set_local_paused(crate::device_controls::runtime::fresh_request_id(), false)
+                    .unwrap();
+                wait_for("owner resume stays enabled", 5., || !a.node.pause_status().paused).await;
+                assert!(!a.node.input_status().unwrap().keyboard_disabled);
+                assert_eq!(a.node.input_status().unwrap().mouse_mode, InputMode::Shared);
+            }
+            a.node.shutdown().await;
+            b.node.shutdown().await;
+        },
+    );
+}

@@ -1,5 +1,5 @@
 //! Emergency transport is a volatile one-shot operation, independent of the
-//! ordinary owner queue. Native safety runs before durable keyboard cleanup.
+//! ordinary owner queue. Native safety runs before durable keyboard/mouse disable cleanup.
 use super::{
     emergency::{Event, Recipient},
     runtime::boot,
@@ -54,13 +54,24 @@ impl Node {
         if status.backlog_sequence == 0 {
             return;
         }
-        {
+        let start_release = {
+            let config = lock(&self.inner.config);
+            let disabled = config.settings.keyboard_disabled
+                || config.settings.routing.mouse_mode == oink_foundation::input::InputMode::Disabled;
             let mut state = lock(&self.inner.controls);
             if status.backlog_sequence <= state.backlog_sequence {
                 return;
             }
             state.backlog_sequence = status.backlog_sequence;
             state.pause.input_backlog();
+            // Publish pause + pending together: a sampled backlog status can arrive
+            // before its ordered release notice. Resume must wait for durable cleanup.
+            let start = disabled && !state.disable_safety_pending;
+            state.disable_safety_pending |= disabled;
+            start
+        };
+        if start_release {
+            self.start_input_safety_release();
         }
         if let Some(clip) = self.clipboard() {
             clip.set_paused(true);
@@ -296,13 +307,7 @@ impl Node {
             };
             let cleanup_pending = applied.as_ref().is_none_or(|applied| applied.cleanup_pending);
             let _gate = node.owner_gate();
-            let saved = {
-                let mut config = lock(&node.inner.config);
-                let item = config.owner().item(dto::LocalOption::KeyboardDisabled);
-                item.ok_or(Failure::UnsupportedOption)
-                    .and_then(|item| item.revision().map_err(|_| Failure::InvalidValue))
-                    .and_then(|revision| config.edit_owner(dto::LocalOption::KeyboardDisabled, revision, false.write()))
-            };
+            let saved = lock(&node.inner.config).update_owner(|owner| owner.release_input_disables());
             let publication = node.publish_owner_preferences();
             {
                 let mut state = lock(&node.inner.controls);

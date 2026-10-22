@@ -192,3 +192,64 @@ fn exit_and_option_subtree_limits_are_checked_in_preflight_before_retention() {
         ErrorCode::LimitExceeded
     );
 }
+
+#[test]
+fn deferred_forwarding_persistence_is_an_optional_retained_request_extension() {
+    let mut old = support::sample_named("SetLocalOption");
+    old.remove(&6);
+    let legacy = SetLocalOption::from_raw(old.clone()).unwrap();
+    assert!(!legacy.defer_persistence().unwrap());
+    assert_eq!(legacy.raw(), &old); // no new bytes in an old-style request
+    let mut opted_in = old.clone();
+    opted_in.insert(6, true.write());
+    let request = SetLocalOption::from_raw(opted_in.clone()).unwrap();
+    assert!(request.defer_persistence().unwrap());
+    let bytes = encode(&Message::ConfigSetLocalOption(request), v1::limits::CONFIG_FRAME).unwrap();
+    let frame = OpaqueFrame::parse_exact(&bytes, v1::limits::CONFIG_FRAME).unwrap();
+    // Existing v1 retaining decoders preserve unknown fields and can ignore key
+    // 6, applying the original synchronous contract. False/missing stays old.
+    let Message::ConfigSetLocalOption(roundtrip) = frame.decode().unwrap() else {
+        panic!("wrong frame")
+    };
+    assert_eq!(roundtrip.raw(), &opted_in);
+    let mut invalid = old;
+    invalid.insert(6, V::Text("true".into()));
+    assert!(SetLocalOption::from_raw(invalid).is_err());
+}
+
+#[test]
+fn local_output_volume_is_optional_bounded_and_retained_in_existing_facts() {
+    for percent in [0u8, 100] {
+        let volume = LocalOutputVolume::from_raw([(1, percent.write()), (2, true.write())].into()).unwrap();
+        assert_eq!(volume.volume_percent().unwrap(), percent);
+        assert!(volume.muted().unwrap());
+    }
+    assert!(LocalOutputVolume::from_raw([(1, 101u8.write()), (2, false.write())].into()).is_err());
+    assert!(LocalOutputVolume::from_raw([(1, 50u8.write())].into()).is_err());
+    assert_eq!(
+        SpeakerObservation::from_raw(RawMap::new())
+            .unwrap()
+            .local_output()
+            .unwrap(),
+        None
+    );
+    let mut raw = support::sample_named("DeviceFacts");
+    raw.insert(
+        16,
+        V::Map(
+            [(
+                5,
+                V::Map([(9, V::Map([(1, 42u8.write()), (2, true.write())].into()))].into()),
+            )]
+            .into(),
+        ),
+    );
+    let message = Message::ConfigFacts(DeviceFacts::from_raw(raw).unwrap());
+    let bytes = encode(&message, v1::limits::CONFIG_FRAME).unwrap();
+    let decoded = OpaqueFrame::parse_exact(&bytes, v1::limits::CONFIG_FRAME)
+        .unwrap()
+        .decode()
+        .unwrap();
+    assert_eq!(decoded, message);
+    assert!(registry::CAPABILITIES.contains(&"oink.audio.local-output/1"));
+}

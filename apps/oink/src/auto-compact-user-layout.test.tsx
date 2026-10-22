@@ -47,7 +47,7 @@ beforeEach(() => {
 });
 afterEach(() => { backend.harness!.stop(); cleanup(); agent.reset(); localStorage.clear(); });
 
-it('a far bottom-right release of this Mac stops at the other Mac\'s bounding rectangle, as one undo step', async () => {
+it('a projection-free release reaches the other visible computer bounding corner, as one undo step', async () => {
   render(<App/>);
   // The hidden and disabled PC screen is not drawn.
   expect(document.querySelectorAll('.scr')).toHaveLength(3);
@@ -59,10 +59,14 @@ it('a far bottom-right release of this Mac stops at the other Mac\'s bounding re
   await act(async () => { fireEvent.pointerUp(display); });
   await backend.harness!.settle();
   expect(saved()).toHaveLength(1);
-  const builtIn = screenOf(B, '0'), external = screenOf(B, '1');
+  const builtIn = screenOf(B, '0');
   const c = origin(saved()[0], C);
-  expect(c.x).toBeCloseTo(external.origin.x + external.size.w, 9);
-  expect(c.y).toBeCloseTo(builtIn.origin.y + builtIn.size.h, 9);
+  const external = screenOf(B, '1');
+  const scale = builtIn.size.w / builtIn.display.bounds.w;
+  // Expanding the native geometry and its bounding rectangle can differ by one
+  // double ULP; this precision is much tighter than the fixed compaction grid.
+  expect(c.x).toBeCloseTo(builtIn.origin.x + external.display.bounds.x * scale + external.display.bounds.w * scale, 14);
+  expect(c.y).toBeCloseTo(builtIn.origin.y + builtIn.display.bounds.h * scale, 14);
   // Only the edited computer moves; the hidden PC keeps its place too.
   expect(origin(saved()[0], B)).toEqual(builtIn.origin);
   expect(origin(saved()[0], A)).toEqual(screenOf(A, '0').origin);

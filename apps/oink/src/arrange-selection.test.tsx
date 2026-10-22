@@ -227,15 +227,16 @@ describe('editing a selected group', () => {
     expect(placement(placements, A)).toEqual(before(A));
   });
 
-  it('compacts the group as one rigid unit', async () => {
+  it('compacts each moved unit once, keeping a balanced middle unit in place', async () => {
     setup(false, true);
     click(of('Beta')[0]);
     cmdClick(of('Gamma')[0]);
     await drag(of('Gamma')[0], 1.5);
     const placements = commits()[0].placements as Placement[];
-    // The group closed its gap to Alpha as a whole; Beta and Gamma kept their spacing.
-    expect(placement(placements, B).origin.x).toBeLessThan(before(B).origin.x + 1.5);
-    expect(placement(placements, C).origin.x - placement(placements, B).origin.x).toBeCloseTo(before(C).origin.x - before(B).origin.x, 9);
+    // Beta faces one unit on each side: its sum is constant, so the tie-break
+    // keeps its released position. Gamma then closes its gap to Beta.
+    expect(placement(placements, B).origin.x).toBeCloseTo(before(B).origin.x + 1.5, 9);
+    expect(placement(placements, C).origin.x - placement(placements, B).origin.x).toBeLessThan(before(C).origin.x - before(B).origin.x);
     expect(placement(placements, A)).toEqual(before(A));
   });
 
@@ -264,4 +265,24 @@ it('keeps sidebar and canvas selection linked and clears both on sidebar blank s
   fireEvent.click(document.querySelector('.win__side')!);
   expect(pressed()).toEqual([]);
   expect(document.querySelector('.dev[data-current]')).toBeNull();
+});
+
+it('treats an offline sync-on desktop as rigid and preserves the moved placement on reconnect', async () => {
+  const h = setup(true, false);
+  await act(async () => { h.fixture.setOnline(A, false); });
+  const nativeBefore = structuredClone(h.fixture.state().snapshot!.native);
+  click(of('Alpha')[1]);
+  expect(pressed()).toEqual(['Alpha:main', 'Alpha:side']);
+  await drag(of('Alpha')[1], -.3, .2);
+  expect(h.of('preview_system_arrangement')).toHaveLength(0);
+  expect(commits()).toHaveLength(1);
+  expect(commits()[0].native_plan_tokens).toEqual([]);
+  expect(h.fixture.state().snapshot!.native.map(n => n.screens)).toEqual(nativeBefore.map(n => n.screens));
+  const moved = structuredClone(h.fixture.state().snapshot!.placements);
+  expect(placement(moved, A).origin).not.toEqual(before(A).origin);
+  await act(async () => { h.fixture.setOnline(A, true); });
+  await h.settle();
+  expect(h.fixture.state().snapshot!.placements).toEqual(moved);
+  expect(h.fixture.state().snapshot!.native.map(n => n.screens)).toEqual(nativeBefore.map(n => n.screens));
+  expect(commits()).toHaveLength(1);
 });

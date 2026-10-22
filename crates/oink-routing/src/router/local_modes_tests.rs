@@ -723,38 +723,74 @@ fn first_local_wheel_after_departure_keeps_local_transform_and_never_forwards() 
 }
 
 #[test]
-fn paused_keyboard_guard_allows_physical_keys_and_returns_on_resume() {
+fn disable_release_pause_clears_both_sources_and_resume_keeps_them_enabled() {
     let mut r = router(false);
+    modes(&mut r, InputMode::Disabled, InputMode::Local);
     r.set_keyboard_disabled(true);
     r.set_fully_paused(true);
-    assert!(r.keyboard_disabled(), "pause retains the preference");
-    assert!(!r.keyboard_key_blocked(None));
+    assert!(!r.keyboard_disabled(), "pause clears the saved guard");
+    assert!(!r.mouse_disabled(), "pause clears mouse disable");
+    assert_eq!(r.config().settings.keyboard_mode, InputMode::Local);
     assert_eq!(
         event(&mut r, InputEvent::Key { code: A, pressed: true }),
         Disposition::Pass
     );
-    assert_eq!(
-        event(
-            &mut r,
-            InputEvent::Key {
-                code: A,
-                pressed: false
-            }
-        ),
-        Disposition::Pass
+    event(
+        &mut r,
+        InputEvent::Key {
+            code: A,
+            pressed: false,
+        },
     );
     r.set_fully_paused(false);
-    assert!(r.keyboard_disabled());
+    assert!(!r.keyboard_disabled());
+    assert!(!r.mouse_disabled());
     assert_eq!(
         event(&mut r, InputEvent::Key { code: A, pressed: true }),
-        Disposition::Swallow
+        Disposition::Pass
     );
 }
 
 #[test]
-fn locking_does_not_release_keyboard_guard() {
+fn disable_release_chord_clears_mouse_alone_or_both_after_one_second() {
+    for keyboard_disabled in [false, true] {
+        let mut r = router(false);
+        modes(&mut r, InputMode::Disabled, InputMode::Shared);
+        r.set_keyboard_disabled(keyboard_disabled);
+        for code in [
+            KeyCode::LEFT_CTRL,
+            KeyCode::RIGHT_ALT,
+            KeyCode::LEFT_SHIFT,
+            KeyCode::keyboard(0x18),
+        ] {
+            event(&mut r, InputEvent::Key { code, pressed: true });
+        }
+        r.tick(100 + 999_999);
+        assert!(r.mouse_disabled());
+        assert_eq!(r.keyboard_disabled(), keyboard_disabled);
+        r.tick(100 + 1_000_000);
+        assert!(!r.mouse_disabled(), "release chord must also clear mouse disable");
+        assert!(!r.keyboard_disabled());
+    }
+}
+
+#[test]
+fn locking_and_transient_suspension_do_not_release_either_disable() {
     let mut r = router(false);
+    modes(&mut r, InputMode::Disabled, InputMode::Shared);
     r.set_keyboard_disabled(true);
+    for code in [
+        KeyCode::LEFT_CTRL,
+        KeyCode::LEFT_ALT,
+        KeyCode::LEFT_SHIFT,
+        KeyCode::keyboard(0x18),
+    ] {
+        event(&mut r, InputEvent::Key { code, pressed: true });
+    }
+    r.set_input_suspended(true);
+    r.tick(2_000_000);
+    r.set_input_suspended(false);
+    assert!(r.mouse_disabled());
     r.out.clear();
     r.keyboard_session_locked(Some(true));
     r.keyboard_session_locked(Some(false));
@@ -762,7 +798,7 @@ fn locking_does_not_release_keyboard_guard() {
     assert!(
         !r.out
             .iter()
-            .any(|o| matches!(o, Output::Status(StatusEvent::KeyboardReleased)))
+            .any(|o| matches!(o, Output::Status(StatusEvent::InputDisablesReleased)))
     );
     assert_eq!(
         event(&mut r, InputEvent::Key { code: A, pressed: true }),

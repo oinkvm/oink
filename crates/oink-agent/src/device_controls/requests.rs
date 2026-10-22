@@ -96,16 +96,37 @@ pub fn forwarding_request(
     percent: u16,
     muted: bool,
 ) -> Result<Message, DeviceControlFailure> {
+    forwarding_request_with_persistence(binding, id, percent, muted, false)
+}
+pub fn forwarding_request_with_persistence(
+    binding: &TokenBinding,
+    id: &str,
+    percent: u16,
+    muted: bool,
+    defer_persistence: bool,
+) -> Result<Message, DeviceControlFailure> {
     if binding.operation != TokenOperation::ForwardingControls || percent > 200 {
         return Err(DeviceControlFailure::InvalidValue);
     }
-    option_request(
+    let Message::ConfigSetLocalOption(mut request) = option_request(
         binding,
         id,
         15,
         RawValue::Map([(1, percent.write()), (2, muted.write())].into_iter().collect()),
-    )
+    )?
+    else {
+        unreachable!()
+    };
+    if defer_persistence {
+        request
+            .edit(|raw| {
+                raw.insert(6, true.write());
+            })
+            .map_err(|_| DeviceControlFailure::InvalidValue)?;
+    }
+    Ok(Message::ConfigSetLocalOption(request))
 }
+
 pub fn volume_request(
     binding: &TokenBinding,
     id: &str,

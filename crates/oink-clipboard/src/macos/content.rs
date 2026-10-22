@@ -708,14 +708,22 @@ fn native_items(spec: &NativeSpec, urls: Option<&HashMap<NodeId, String>>) -> Re
         }
     }
     // Windows has one IDataObject containing many roots; AppKit requires a
-    // separate pasteboard item per file URL. Raw same-Mac items stay untouched.
+    // separate pasteboard item per file URL. Its other formats describe that
+    // same selection, not an additional item. Keep them on the first file so
+    // a browser image's URL/HTML does not produce a second drag-count badge.
+    // Raw same-Mac items (including genuinely separate images) stay untouched.
     if foreign {
+        let mut selection = if inventory.items.len() == 1 && !inventory.roots.is_empty() {
+            out.pop().map(|(_, item)| item)
+        } else {
+            None
+        };
         for root in &inventory.roots {
             let url = match urls {
                 Some(urls) => urls.get(&root.id).ok_or(ClipboardError::Unsupported)?.as_str(),
                 None => "",
             };
-            let item = NSPasteboardItem::new();
+            let item = selection.take().unwrap_or_else(NSPasteboardItem::new);
             if !item.setString_forType(&NSString::from_str(url), &NSString::from_str("public.file-url")) {
                 return Err(ClipboardError::Unsupported);
             }
@@ -804,6 +812,61 @@ mod tests {
             target.clearContents();
         });
     }
+    #[test]
+    fn windows_file_representations_share_the_first_file_item() {
+        use crate::model::{ContentSize, NodeKind};
+        use content::url::tests::{Projected, source, wide_bytes};
+        autoreleasepool(|_| {
+            for count in [1, 2] {
+                let source = source(
+                    ClipPlatform::Windows,
+                    &[(
+                        "UniformResourceLocatorW",
+                        wide_bytes("https://example.invalid/image.png"),
+                    )],
+                );
+                let mut inventory = source.inventory();
+                inventory.roots = (1..=count)
+                    .map(|id| crate::model::FileNode {
+                        id: NodeId(id),
+                        parent: None,
+                        name: format!("image-{id}.png"),
+                        kind: NodeKind::File,
+                        size: ContentSize::Known(42),
+                        version: 1,
+                        modified_ms: None,
+                    })
+                    .collect();
+                let spec = NativeSpec {
+                    inventory,
+                    contents: Arc::new(Projected(source, ClipPlatform::Mac)),
+                    files: vec![],
+                    file_contents: None,
+                    sensitivity: crate::Sensitivity::Normal,
+                };
+                let urls = (1..=count)
+                    .map(|id| (NodeId(id), format!("file:///tmp/target/image-{id}.png")))
+                    .collect();
+                for urls in [None, Some(&urls)] {
+                    let items = native_items(&spec, urls).unwrap();
+                    assert_eq!(items.len(), count as usize, "formats must not add a drag item");
+                    for (index, (node, item)) in items.iter().enumerate() {
+                        assert_eq!(*node, Some(NodeId(index as u64 + 1)));
+                        assert!(item.types().containsObject(&NSString::from_str("public.file-url")));
+                    }
+                    assert_eq!(
+                        items[0]
+                            .1
+                            .stringForType(&NSString::from_str("public.url"))
+                            .unwrap()
+                            .to_string(),
+                        "https://example.invalid/image.png"
+                    );
+                }
+            }
+        });
+    }
+
     #[test]
     fn windows_links_publish_mac_url_title_and_conditional_text_for_clipboard_and_drag() {
         use content::url::tests::{Projected, source, wide_bytes};

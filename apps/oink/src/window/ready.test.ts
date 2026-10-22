@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { revealWhenPainted } from './firstPaint';
+import { revealWhenReady } from './ready';
 let frames: Map<number, FrameRequestCallback>;
 let sequence: number;
 let fontsReady: () => void;
@@ -11,20 +11,21 @@ const paint = () => {
 beforeEach(() => {
   frames = new Map(); sequence = 0;
   Object.defineProperty(document, 'fonts', { configurable: true, value: { ready: new Promise<void>(r => { fontsReady = r; }) } });
-  vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => { frames.set(++sequence, callback); return sequence; });
+  vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameRequestCallback) => { frames.set(++sequence, callback); return sequence; }));
   vi.stubGlobal('cancelAnimationFrame', (id: number) => frames.delete(id));
 });
 afterEach(() => vi.unstubAllGlobals());
-it('waits for fonts and a full layout/paint before revealing the native window', async () => {
-  const reveal = vi.fn(); const stop = revealWhenPainted(reveal);
+it('reveals after DOM and fonts are ready even when an invisible WebView never produces frames', async () => {
+  const reveal = vi.fn(); const stop = revealWhenReady(reveal);
   paint(); paint(); expect(reveal).not.toHaveBeenCalled();
   fontsReady(); await Promise.resolve();
-  paint(); expect(reveal).not.toHaveBeenCalled();
-  paint(); expect(reveal).toHaveBeenCalledOnce(); stop();
+  expect(reveal).toHaveBeenCalledOnce();
+  expect(requestAnimationFrame).not.toHaveBeenCalled();
+  paint(); paint(); expect(reveal).toHaveBeenCalledOnce(); stop();
 });
-it.each(['fonts', 'layout'])('cancels a view closed during %s', async phase => {
-  const reveal = vi.fn(); const stop = revealWhenPainted(reveal);
-  if (phase === 'layout') { fontsReady(); await Promise.resolve(); paint(); }
+it.each(['fonts', 'queued font completion'])('cancels a view closed during %s', async phase => {
+  const reveal = vi.fn(); const stop = revealWhenReady(reveal);
+  if (phase === 'queued font completion') fontsReady();
   stop(); fontsReady(); await Promise.resolve(); paint(); paint();
   expect(reveal).not.toHaveBeenCalled();
 });

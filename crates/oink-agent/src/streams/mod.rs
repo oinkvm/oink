@@ -45,7 +45,7 @@ pub struct StreamRule {
 
 pub const RULES: [StreamRule; 9] = [
     StreamRule {
-        kind: StreamKind::LayoutProfilesV2,
+        kind: StreamKind::LayoutProfilesV3,
         obeys_pause: false,
         opens: OpenWhen::PerSend,
     },

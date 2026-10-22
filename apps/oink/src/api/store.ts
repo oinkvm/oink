@@ -67,7 +67,7 @@ export function createAgentStore() {
   let state = initial();
   let generation = 0;
   const listeners = new Set<() => void>();
-  const eventListeners = new Set<(event:ProductEvent)=>void>();
+  const eventListeners = new Set<(event:ProductEvent)=>void | boolean>();
   let initialPairEvents:PairingEvent[] = [], initialNearbyEvents:PairingEvent[] = [];
   const revisions = new Map<keyof AgentState, number>();
   const set = (patch: Partial<AgentState>) => { state = { ...state, ...patch }; listeners.forEach(l => l()); };
@@ -84,7 +84,10 @@ export function createAgentStore() {
     return !status || status.cursor.icon==='locked' || status.screen.configuredMode!==(p.desired==='shared'?'shared':'local');
   });
   const receive = (event: ProductEvent, publish = true) => {
-    if (publish) eventListeners.forEach(listener=>listener(event));
+    // A live control may own retries and final error presentation for its exact
+    // request. Other refusals still use the global receipt/toast path.
+    let handled = false;
+    if (publish) eventListeners.forEach(listener => { if (listener(event) === true) handled = true; });
     switch (event.type) {
       case 'device_cards': {
         const cards=acceptSnapshot(state.cards,event.data);
@@ -96,7 +99,7 @@ export function createAgentStore() {
         const result=event.data.result;
         const failed=result.outcome==='failed'||result.outcome==='refused';
         const pending = state.pending.flatMap(p=>p.requestId!==event.data.requestId?[p]:!failed&&p.resource==='screen'?[{...p,confirmed:true}]:[]);
-        set({ pending:reconcileScreens(pending,state.cards), error: result.outcome==='failed'||result.outcome==='refused' ? result.reason : null });
+        set({ pending:reconcileScreens(pending,state.cards), error: handled ? state.error : failed ? result.reason : null });
         return;
       }
       case 'update_status_changed': return adopt('update',event.data);
@@ -169,7 +172,7 @@ export function createAgentStore() {
     subscribe: (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
     receive, query, adopt, adoptProfiles,
     controlReply: (reply: DeviceControlReply) => { if (reply.type === 'device_control_completed') receive(reply); },
-    onEvent: (listener:(event:ProductEvent)=>void) => {eventListeners.add(listener);return()=>{eventListeners.delete(listener);};},
+    onEvent: (listener:(event:ProductEvent)=>void | boolean) => {eventListeners.add(listener);return()=>{eventListeners.delete(listener);};},
     consumePairingEvent: (id:string) => set({pairingEvents:state.pairingEvents.filter(event=>event.data.event_id!==id)}),
     reset: () => { generation++; revisions.clear(); initialPairEvents=[]; initialNearbyEvents=[]; set(initial()); },
     fail: (reason: string) => set({ error: reason }),

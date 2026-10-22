@@ -165,7 +165,7 @@ describe('Layout section', () => {
   });
 });
 
-it.each(['en','zh-Hans','ja','ko'] as const)('received files have two matching folder actions and received-time policy in %s',async language=>{
+it.each(['en','zh-Hans','ja','ko'] as const)('received files have one folder action with an icon and received-time policy in %s',async language=>{
   setLanguage(language);
   vi.spyOn(backend,'receivedFilesUsage').mockResolvedValue({materialized_bytes:2000,incomplete:false,time_basis:'received',cleanup:'never'});
   const open=vi.spyOn(backend,'openReceivedFiles').mockResolvedValue(null);
@@ -173,9 +173,10 @@ it.each(['en','zh-Hans','ja','ko'] as const)('received files have two matching f
   const {container}=render(view());
   const row=container.querySelector<HTMLElement>('[data-item="receivedFiles"]')!;
   await waitFor(()=>expect(row.textContent).toContain('2.0 KB'));
-  const buttons=within(row).getAllByRole('button');expect(buttons).toHaveLength(2);
-  fireEvent.click(buttons[0]);fireEvent.click(buttons[1]);
-  await waitFor(()=>expect(open).toHaveBeenCalledTimes(2));
+  const buttons=within(row).getAllByRole('button');expect(buttons).toHaveLength(1);
+  expect(buttons[0].querySelector('svg')).not.toBeNull();
+  fireEvent.click(buttons[0]);
+  await waitFor(()=>expect(open).toHaveBeenCalledTimes(1));
   const policy=container.querySelector<HTMLElement>('[data-item="receivedCleanup"]')!;
   expect(policy).not.toBeNull();
   expect(row.compareDocumentPosition(policy)&Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();

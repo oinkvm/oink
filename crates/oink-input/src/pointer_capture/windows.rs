@@ -1,29 +1,16 @@
 //! Windows policy, independent of Win32. Sampling and input only supply facts.
-//! Motion thresholds match router/game_capture.rs; macOS policy is unchanged.
-const ENTER_US: u64 = 300_000;
-const MOTION_US: u64 = 250_000;
-const EXIT_US: u64 = 200_000;
-const MAX_GAP_US: u64 = 100_000;
-const MIN_MOVES: u32 = 10;
+//! Two consecutive qualifying samples plus intervening motion enter; two
+//! consecutive failing samples exit. macOS policy is unchanged.
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MotionBatch {
-    first: u64,
-    last: u64,
-    count: u32,
-    max_gap: u64,
+    last: Option<u64>,
 }
 
 impl MotionBatch {
     /// Record once per nonzero physical report or successful remote injection.
     pub fn record(&mut self, now: u64) {
-        if self.count == 0 {
-            self.first = now;
-        } else {
-            self.max_gap = self.max_gap.max(now.saturating_sub(self.last));
-        }
-        self.last = now;
-        self.count = self.count.saturating_add(1);
+        self.last = Some(now);
     }
 }
 
@@ -86,75 +73,30 @@ impl Bounds {
 #[derive(Debug, Default)]
 pub(super) struct Detector {
     foreground: Option<u64>,
-    sampled_at: Option<u64>,
-    hidden_since: Option<u64>,
-    movement_since: Option<u64>,
-    last_move: Option<u64>,
-    moves: u32,
-    released_since: Option<u64>,
+    previous: Option<(u64, bool)>,
     pub active: bool,
 }
 
 impl Detector {
-    fn clear_motion(&mut self) {
-        self.movement_since = None;
-        self.last_move = None;
-        self.moves = 0;
-    }
-
     pub fn update(&mut self, s: super::CaptureSample, w: WindowsSample) -> bool {
-        let now = w.sampled_at;
         if self.foreground != Some(s.foreground) {
             *self = Self::default();
         }
         self.foreground = Some(s.foreground);
-        let continuous = self.sampled_at.is_some_and(|t| now.saturating_sub(t) <= MAX_GAP_US);
-        let previous_sample = self.sampled_at;
-        self.sampled_at = Some(now);
         let evidence = s.hidden && s.application_hidden != Some(false) && (s.confined || w.fullscreen);
-        if !evidence {
-            self.hidden_since = None;
-            self.clear_motion();
-            let since = *self.released_since.get_or_insert(now);
-            if now.saturating_sub(since) >= EXIT_US {
+        if let Some((previous_at, previous_evidence)) = self.previous {
+            if evidence && previous_evidence {
+                // The batch is drained under the same lock used to timestamp
+                // this sample. Only movement after the preceding sample counts;
+                // old/replayed batches cannot acquire a new capture interval.
+                if w.motion.last.is_some_and(|t| previous_at < t && t <= w.sampled_at) {
+                    self.active = true;
+                }
+            } else if !evidence && !previous_evidence {
                 self.active = false;
             }
-            return self.active;
         }
-        self.released_since = None;
-        if self.active {
-            return true; // Once established, no motion is needed to maintain capture.
-        }
-        if !continuous || self.hidden_since.is_none() {
-            self.hidden_since = Some(now);
-            self.clear_motion();
-            return false; // Discard movement preceding a qualifying visibility sample.
-        }
-        let b = w.motion;
-        if b.count == 0 {
-            if self.last_move.is_none_or(|t| now.saturating_sub(t) > MAX_GAP_US) {
-                self.clear_motion();
-            }
-            return false; // A burst followed by waiting never completes entry.
-        }
-        if b.max_gap > MAX_GAP_US
-            || now.saturating_sub(b.last) > MAX_GAP_US
-            || previous_sample.is_none_or(|t| b.first < t)
-        {
-            self.clear_motion();
-            return false;
-        }
-        if self.last_move.is_none_or(|t| b.first.saturating_sub(t) > MAX_GAP_US) {
-            self.clear_motion();
-            self.movement_since = Some(b.first);
-        }
-        self.moves = self.moves.saturating_add(b.count);
-        self.last_move = Some(b.last);
-        self.active = self.moves >= MIN_MOVES
-            && self
-                .movement_since
-                .is_some_and(|t| b.last.saturating_sub(t) >= MOTION_US)
-            && self.hidden_since.is_some_and(|t| now.saturating_sub(t) >= ENTER_US);
+        self.previous = Some((w.sampled_at, evidence));
         self.active
     }
 }
@@ -190,10 +132,43 @@ mod tests {
     }
     fn enter(d: &mut CaptureDetector, start: u64, fullscreen: bool, confined: bool) {
         assert!(!feed(d, sample(start, true, fullscreen, confined, &[])));
-        for i in 1..=6 {
-            let t = start + i * 50_000;
-            assert_eq!(feed(d, sample(t, true, fullscreen, confined, &[t - 25_000, t])), i == 6);
+        assert!(feed(
+            d,
+            sample(start + 50_000, true, fullscreen, confined, &[start + 25_000])
+        ));
+    }
+
+    #[test]
+    fn two_qualifying_samples_with_intervening_motion_enter() {
+        for (fullscreen, confined) in [(true, false), (false, true), (true, true)] {
+            let mut d = CaptureDetector::default();
+            assert!(!feed(&mut d, sample(0, true, fullscreen, confined, &[])));
+            assert!(feed(&mut d, sample(50_000, true, fullscreen, confined, &[25_000])));
         }
+    }
+
+    #[test]
+    fn two_qualifying_samples_without_motion_do_not_enter() {
+        let mut d = CaptureDetector::default();
+        assert!(!feed(&mut d, sample(0, true, true, false, &[])));
+        assert!(!feed(&mut d, sample(50_000, true, true, false, &[])));
+    }
+
+    #[test]
+    fn two_failing_samples_exit() {
+        let mut d = CaptureDetector::default();
+        enter(&mut d, 0, true, false);
+        assert!(feed(&mut d, sample(100_000, false, true, false, &[])));
+        assert!(!feed(&mut d, sample(150_000, false, true, false, &[])));
+    }
+
+    #[test]
+    fn one_failing_sample_does_not_exit() {
+        let mut d = CaptureDetector::default();
+        enter(&mut d, 0, true, false);
+        assert!(feed(&mut d, sample(100_000, false, true, false, &[])));
+        assert!(feed(&mut d, sample(150_000, true, true, false, &[])));
+        assert!(feed(&mut d, sample(200_000, false, true, false, &[])));
     }
 
     #[test]
@@ -326,57 +301,32 @@ mod tests {
     }
 
     #[test]
-    fn short_bursts_sparse_moves_and_sampling_gaps_do_not_enter() {
-        let mut d = CaptureDetector::default();
-        feed(&mut d, sample(0, true, true, false, &[]));
-        let burst: Vec<_> = (1..=20).map(|i| i * 1000).collect();
-        assert!(!feed(&mut d, sample(50_000, true, true, false, &burst)));
-        for i in 2..30 {
-            assert!(!feed(&mut d, sample(i * 50_000, true, true, false, &[])));
-        }
-        // Enough elapsed time, fewer than ten events in each continuous run.
-        let mut d = CaptureDetector::default();
-        for i in 0..9 {
-            assert!(!feed(&mut d, sample(i * 50_000, true, true, false, &[i * 50_000])));
-        }
-        // >100 ms breaks motion, even when visibility samples remain fresh.
-        for i in 9..12 {
-            assert!(!feed(&mut d, sample(i * 50_000, true, true, false, &[])));
-        }
-        for i in 12..20 {
-            assert!(!feed(&mut d, sample(i * 50_000, true, true, false, &[i * 50_000])));
-        }
-        // Sparse observations cannot bridge unobserved visibility intervals.
-        let mut d = CaptureDetector::default();
-        for i in 0..30 {
-            assert!(!feed(&mut d, sample(i * 150_000, true, true, false, &[i * 150_000])));
+    fn one_move_enters_without_duration_or_sampling_gap_thresholds() {
+        for gap in [1, 50_000, 150_000, 1_000_000] {
+            let mut d = CaptureDetector::default();
+            assert!(!feed(&mut d, sample(0, true, true, false, &[])));
+            assert!(feed(&mut d, sample(gap, true, true, false, &[gap])));
         }
     }
 
     #[test]
-    fn movement_duration_does_not_bypass_300ms_entry_stability() {
+    fn movement_before_the_first_sample_or_outside_the_interval_cannot_enter() {
+        let mut d = CaptureDetector::default();
+        assert!(!feed(&mut d, sample(50_000, true, true, false, &[25_000])));
+        assert!(!feed(&mut d, sample(100_000, true, true, false, &[])));
+        assert!(!feed(&mut d, sample(150_000, true, true, false, &[25_000])));
+        assert!(!feed(&mut d, sample(200_000, true, true, false, &[150_000])));
+        assert!(!feed(&mut d, sample(250_000, true, true, false, &[300_000])));
+        assert!(feed(&mut d, sample(300_000, true, true, false, &[275_000])));
+    }
+
+    #[test]
+    fn one_failing_sample_breaks_the_entry_pair() {
         let mut d = CaptureDetector::default();
         assert!(!feed(&mut d, sample(0, true, true, false, &[])));
-        for i in 1..=30 {
-            let t = i * 10_000;
-            // By 260 ms there are 26 moves spanning 250 ms, but entry still waits.
-            assert_eq!(feed(&mut d, sample(t, true, true, false, &[t])), i == 30);
-        }
-    }
-
-    #[test]
-    fn visibility_interruption_clears_candidate_and_release_debounces_200ms() {
-        let mut d = CaptureDetector::default();
-        for i in 0..6 {
-            let t = i * 50_000;
-            assert!(!feed(&mut d, sample(t, true, true, false, &[t])));
-        }
-        assert!(!feed(&mut d, sample(300_000, false, true, false, &[300_000])));
-        enter(&mut d, 350_000, true, false);
-        assert!(feed(&mut d, sample(700_000, false, true, false, &[])));
-        assert!(feed(&mut d, sample(899_999, false, true, false, &[])));
-        assert!(!feed(&mut d, sample(900_000, false, true, false, &[])));
-        enter(&mut d, 950_000, true, false);
+        assert!(!feed(&mut d, sample(50_000, false, true, false, &[25_000])));
+        assert!(!feed(&mut d, sample(100_000, true, true, false, &[75_000])));
+        assert!(feed(&mut d, sample(150_000, true, true, false, &[125_000])));
     }
 
     #[test]
@@ -430,9 +380,6 @@ mod motion_tests {
                 batch.record(now);
             }
         }
-        assert_eq!(
-            (batch.count, batch.first, batch.last, batch.max_gap),
-            (2, 0, 100_000, 100_000)
-        );
+        assert_eq!(batch.last, Some(100_000));
     }
 }

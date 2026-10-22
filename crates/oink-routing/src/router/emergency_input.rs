@@ -147,12 +147,17 @@ mod tests {
                 let mut r = router();
                 r.set_fully_paused(paused);
                 r.set_keyboard_disabled(guarded);
+                let mut settings = r.cfg.settings.clone();
+                settings.mouse_mode = oink_foundation::input::InputMode::Disabled;
+                r.set_settings(settings);
                 r.drain_outputs();
                 key(&mut r, KeyCode::ESCAPE, true, true, 10);
                 r.tick(5_000_009);
                 assert_eq!(stops(&mut r), 0);
                 r.tick(5_000_010);
                 assert_eq!(stops(&mut r), 1);
+                assert!(!r.keyboard_disabled());
+                assert!(!r.mouse_disabled());
                 key(&mut r, KeyCode::ESCAPE, true, true, 6_000_000);
                 r.tick(12_000_000);
                 assert_eq!(stops(&mut r), 0);
@@ -216,6 +221,9 @@ mod pause_all_tests {
             }]);
             r.set_fully_paused(guarded);
             r.set_keyboard_disabled(guarded);
+            let mut settings = r.cfg.settings.clone();
+            settings.mouse_mode = oink_foundation::input::InputMode::Disabled;
+            r.set_settings(settings);
             r.drain_outputs();
             let mut send = |code, pressed, physical| {
                 r.on_local_event(
@@ -236,6 +244,8 @@ mod pause_all_tests {
             assert_eq!(send(p, true, true), Disposition::Swallow);
             assert_eq!(send(p, true, true), Disposition::Swallow);
             assert_eq!(send(p, false, true), Disposition::Swallow);
+            assert!(!r.keyboard_disabled());
+            assert!(!r.mouse_disabled());
             let outputs = r.drain_outputs();
             assert_eq!(
                 outputs

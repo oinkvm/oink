@@ -260,6 +260,12 @@ pub trait InputBackend: Send + Sync {
         })
     }
 
+    /// Release an original source press at its recorded start, atomically with
+    /// positioning. Unsupported backends must not fall back to an unpositioned UP.
+    fn release_drag_at(&self, _at: Point) -> Result<(), InputError> {
+        Err(InputError::Unsupported)
+    }
+
     /// 结束物理左键发起的拖拽，macOS 保留 HID 按住状态，其他平台保持原注入行为。
     fn release_physical_drag(&self) -> Result<(), InputError> {
         self.inject(&InjectEvent::Button {

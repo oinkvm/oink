@@ -1,5 +1,5 @@
 
-.sponsor-mark { display: block; width: 18px; height: 18px; flex: none; }
+.sponsor-mark { display: block; width: 20px; height: 20px; flex: none; border-radius: 5px; object-fit: contain; }
 .sponsor-qr { display: grid; justify-items: center; gap: 10px; margin: 0; }
 .sponsor-qr img { background: #fff; display: block; width: 220px; height: 220px; object-fit: contain; border-radius: 12px; corner-shape: var(--ok-corner); --ok-shape: var(--ok-corner); box-shadow: 0 0 0 1px var(--ok-line); }
 .sponsor-qr figcaption { font: 400 12.5px/1.4 var(--ok-font); color: var(--ok-text-2); }

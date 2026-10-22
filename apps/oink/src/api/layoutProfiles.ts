@@ -43,6 +43,8 @@ export interface DeviceArrangementState {
   availability: 'ready' | 'offline' | 'unsupported' | 'unavailable';
   can_edit_screens: boolean;
 }
+/** Offline desktops always edit as rigid units, regardless of the retained setting. */
+export const effectiveSystemSync = (setting: boolean, online: boolean) => setting && online;
 export type AdjustmentCode = 'device_added' | 'device_removed' | 'screen_added' | 'screen_removed'
   | 'native_changed' | 'anchor_changed' | 'anchor_displaced' | 'overlap_repaired'
   | 'native_snapped' | 'owner_offline';

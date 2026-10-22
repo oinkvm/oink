@@ -18,16 +18,17 @@ permissions:
   id-token: write
 jobs:
   published:
-    if: github.repository == 'oinkvm/oink' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    if: github.repository == 'oinkvm/oink' && github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
+      # Pin code and update notes to the default-branch commit of this dispatch.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Require a live published stable release
+      - name: Require a live published stable release and validate trusted update notes
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}

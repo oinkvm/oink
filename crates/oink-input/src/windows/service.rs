@@ -80,6 +80,8 @@ pub(crate) fn send(inputs: &[INPUT]) -> Result<bool, InputError> {
                 if f.contains(MOUSEEVENTF_MOVE) {
                     if f.contains(MOUSEEVENTF_ABSOLUTE) && f.contains(MOUSEEVENTF_LEFTDOWN) {
                         Command::DragPress { x: m.dx, y: m.dy }
+                    } else if f.contains(MOUSEEVENTF_ABSOLUTE) && f.contains(MOUSEEVENTF_LEFTUP) {
+                        Command::DragRelease { x: m.dx, y: m.dy }
                     } else if f.contains(MOUSEEVENTF_ABSOLUTE) {
                         Command::Move { x: m.dx, y: m.dy }
                     } else {

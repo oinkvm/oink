@@ -43,9 +43,13 @@ impl Keyboard {
                 .iter()
                 .any(|k| self.down.contains(k))
     }
-    pub(super) fn deadline(&self) -> Option<Micros> {
+    pub(super) fn cancel_release_hold(&mut self) {
+        self.since = None;
+        self.down.clear();
+    }
+    pub(super) fn deadline(&self, disabled: bool) -> Option<Micros> {
         self.since
-            .filter(|_| self.disabled && self.exact())
+            .filter(|_| disabled && self.exact())
             .map(|t| t + KEYBOARD_RELEASE_HOLD_US)
     }
 }
@@ -109,11 +113,19 @@ impl Router {
             }
         }
     }
-    pub fn release_keyboard(&mut self) {
-        if self.keyboard.disabled {
-            // Persist the release intent before publishing the enabled observation.
-            self.out.push(Output::Status(StatusEvent::KeyboardReleased));
-            self.set_keyboard_disabled(false);
+    pub fn release_input_disables(&mut self) {
+        if !self.keyboard.disabled && !self.mouse_disabled() {
+            return;
+        }
+        // The agent persists both preferences as one owner transaction. Publish
+        // release intent before the enabled observations for its safety fence.
+        self.out.push(Output::Status(StatusEvent::InputDisablesReleased));
+        self.keyboard.since = None;
+        self.set_keyboard_disabled(false);
+        if self.mouse_disabled() {
+            let mut settings = self.cfg.settings.clone();
+            settings.mouse_mode = oink_foundation::input::InputMode::Shared;
+            self.set_settings(settings);
         }
     }
     pub fn set_keyboard_disabled(&mut self, disabled: bool) {
@@ -180,7 +192,7 @@ impl Router {
     /// Session transitions retire physical chord/tail observations, never the
     /// saved guard. Credential input is not a source of presses for this tracker.
     pub fn keyboard_session_locked(&mut self, locked: Option<bool>) {
-        if self.keyboard.disabled && locked.is_some() {
+        if (self.keyboard.disabled || self.mouse_disabled()) && locked.is_some() {
             self.keyboard.since = None;
             self.keyboard.down.clear();
             self.keyboard.suppressed.clear();
@@ -210,18 +222,25 @@ impl Router {
         if !pressed {
             self.keyboard.suppressed.remove(&code);
         }
-        if self.keyboard.disabled && !self.fully_paused && ev.physical {
-            if pressed {
-                self.keyboard.suppressed.insert(code);
-            }
-            if !self.keyboard.exact() {
+        let disabled = self.keyboard.disabled || self.mouse_disabled();
+        if disabled && !self.fully_paused && ev.physical {
+            let exact = self.keyboard.exact();
+            if !exact {
                 self.keyboard.since = None;
             } else if self.keyboard.since.is_none() {
                 self.keyboard.since = Some(now);
             }
-            return Some(Disposition::Swallow);
+            // Mouse-only disable leaves ordinary typing alone. Swallow the key
+            // completing the escape chord and its tail, without swallowing UPs
+            // for modifiers already passed to the OS or another device.
+            if self.keyboard.disabled || exact {
+                if pressed {
+                    self.keyboard.suppressed.insert(code);
+                }
+                return Some(Disposition::Swallow);
+            }
         }
-        if !self.keyboard.exact() {
+        if !disabled || !self.keyboard.exact() {
             self.keyboard.since = None;
         }
         suppressed.then_some(Disposition::Swallow)

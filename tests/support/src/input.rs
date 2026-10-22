@@ -300,9 +300,10 @@ impl MemoryLoop {
                         break;
                     }
                     let capturing = owner.capture_requested();
-                    let attached = {
+                    let (attached, detached) = {
                         let mut state = state.lock().unwrap();
                         let attached = capturing && !state.loop_capturing;
+                        let detached = !capturing && state.loop_capturing;
                         state.resume_hotkey = owner.paused_hotkey();
                         if attached {
                             state.capture_sessions += 1;
@@ -313,14 +314,19 @@ impl MemoryLoop {
                             state.mode = Some(CaptureMode::Local);
                         }
                         state.loop_capturing = capturing;
-                        state.loop_turns += 1;
-                        attached
+                        (attached, detached)
                     };
                     if attached {
                         // Match the native owner's successful capture attachment.
                         // Intentional detachment is not a capture failure.
                         owner.capture_available(true);
                     }
+                    if detached {
+                        // Match native withdrawal as well as attachment: owners
+                        // must publish the resulting resource observation.
+                        owner.capture_detached();
+                    }
+                    state.lock().unwrap().loop_turns += 1;
                     // Match native startup: returning from start_loop means the
                     // initial capture request has been applied, not just spawned.
                     if let Some((ready, thread)) = ready.take() {

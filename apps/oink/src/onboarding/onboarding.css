@@ -95,13 +95,23 @@
 .ob-mini__sel { fill: color-mix(in srgb, var(--ok-accent) 30%, transparent); stroke: var(--ok-accent); stroke-width: 1.5; }
 
 .ob-perms__card { text-align: start; }
-.ob-perms .ob-col { width: min(100%, 720px); padding-bottom: 0; }
+/* Twelve pixels less top padding than the other pages keeps the permission list
+   (including System Audio Recording) within the window without a scrollbar. */
+.ob-perms .ob-col { width: min(100%, 720px); padding-top: 12px; padding-bottom: 0; }
 .ob-perms .ob-sub { max-width: 720px; }
 .ob-perms .ob-perms__card { width: 100%; max-width: 560px; align-self: center; }
-.ob-perms__card .ok-row { font-size: 14px; font-weight: 400; }
-.ob-perms__card .ok-row__desc { font-size: 12.5px; font-weight: 300; }
-.ob .ok-btn { font-weight: 400; }
-.ob-perms__row .ok-btn { --_h: 28px; font-size: 12.5px; font-weight: 400; }
+.ob-perms__row .ok-btn { --_h: 28px; font-size: 12.5px; }
+/* Permission actions size to their label and share the page's small button height
+   (Skip); Settings keeps its fixed width. */
+.ob-perms .ok-btn.permission-button { --_h: var(--ok-h-sm); width: auto; padding: 0 calc(var(--_h) * .48); font-size: 13px; }
+/* Switch as tall as the page's small buttons, keeping the Settings switch
+   proportions (track 44x26, thumb 26x20 inset 3). */
+.ob-perms .ok-switch { --_sh: var(--ok-h-sm); }
+.ob-perms .ok-switch__track { width: calc(var(--_sh) * 44 / 26); height: var(--_sh); }
+.ob-perms .ok-switch__thumb { top: calc(var(--_sh) * 3 / 26); left: calc(var(--_sh) * 3 / 26); width: var(--_sh); height: calc(var(--_sh) * 20 / 26); }
+.ob-perms .ok-switch input:checked + .ok-switch__track .ok-switch__thumb { transform: translateX(calc(var(--_sh) * 12 / 26)); }
+.ob-perms .ok-switch:active input:not(:disabled) + .ok-switch__track .ok-switch__thumb { width: calc(var(--_sh) * 31 / 26); }
+.ob-perms .ok-switch:active input:checked:not(:disabled) + .ok-switch__track .ok-switch__thumb { transform: translateX(calc(var(--_sh) * 7 / 26)); }
 .ob-granted { display: inline-flex; align-items: center; gap: 6px; font: 500 13px/1 var(--ok-font); color: var(--ok-success-text); white-space: nowrap; animation: ob-pop var(--ok-spring-bouncy-dur) var(--ok-spring-bouncy); }
 .ob-granted .ok-icon { width: 16px; height: 16px; }
 @keyframes ob-pop { from { opacity: 0; transform: scale(.6); } }
@@ -110,6 +120,8 @@
 .ob-link { color: var(--ok-text-2); font-weight: 400; }
 
 .ob-telemetry__card { margin-top: 24px; }
+/* The column centres its content: 64px more bottom padding lifts it by 32px. */
+.ob-telemetry .ob-col { padding-bottom: 72px; }
 .ob-a { color: var(--ok-accent-text); text-decoration: underline; text-decoration-color: color-mix(in srgb, currentColor 40%, transparent); text-underline-offset: 2px; border-radius: 3px; }
 @media (hover: hover) { .ob-a:hover { text-decoration-color: currentColor; } }
 
@@ -156,3 +168,8 @@
   .ob-sub { margin-bottom: 16px; }
   .ob-or { margin: 16px 0 12px; }
 }
+
+/* Keep the welcome flow's existing emphasis in its manual pairing form and
+   permission confirmation, independent of the regular Settings controls. */
+.ob-connect .ok-input input { font-weight: 500; }
+.ob-skip-dialog .ok-dialog__actions .ok-btn { font-weight: 600; }

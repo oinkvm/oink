@@ -5,22 +5,25 @@ import { ApiFailure, api, shell } from './api/client';
 import { agent, start, useAgent } from './api/store';
 import { inTauri } from './api/transport';
 import { presentCards, resourceAction } from './devices/project';
+import { useGrant } from './settings/useGrant';
 import { DeviceList } from './devices/DeviceList';
 import { PauseGlyph } from './devices/icons';
 import { SideContextMenu, type SideContextMenuProps } from './devices/DeviceMenu';
 import { toggleShare } from './devices/data';
 import type { ShareKind, ShareValue } from './devices/data';
 import type { SpeakerAction } from './devices/VolumeRow';
+import { SpeakerControls, type SpeakerTarget } from './devices/speakerControls';
 import { mergeVisibleGroups } from './arrange/groups';
 import { Arrangement, type ScreenMove } from './arrange/Arrangement';
 import type { DeviceKey, Rect } from './api/types';
 import type { Screen } from './arrange/geometry';
 import { useHistory } from './arrange/useHistory';
 import { RENDER_SCALE, renderLayout, layoutPlacements, presentScreens, visibleScreens } from './arrange/adapter';
-import { LayoutProfileFailure, type ArrangementSnapshot, type CommitRequest, type LayoutOperation, type OperationReply, type PreviewReply, type ProfileSummary } from './api/layoutProfiles';
+import { effectiveSystemSync, LayoutProfileFailure, type ArrangementSnapshot, type CommitRequest, type LayoutOperation, type OperationReply, type PreviewReply, type ProfileSummary } from './api/layoutProfiles';
 import { nativeLayout, profileErrorText, profileName, sameArrangement } from './arrange/snapshot';
 import { runOperation } from './arrange/operations';
-import { compactAround } from './arrange/compaction';
+import { compactScreens } from './arrange/compaction';
+import { snapshotFromScreens } from './arrange/compactionEdit';
 import { CompactIcon } from './arrange/CompactIcon';
 import { nextSelection, type SelectMode } from './arrange/selection';
 import { ScreenPreview } from './arrange/screenPreview';
@@ -34,7 +37,7 @@ import { UpgradeButton, UpgradeDialog } from './window/Upgrade';
 import { PromoArea } from './window/PromoArea';
 import { StatusNotices } from './window/StatusNotices';
 import { observePanel } from './window/panel';
-import { revealWhenPainted } from './window/firstPaint';
+import { revealWhenReady } from './window/ready';
 import { Onboarding, OnboardingLanguage } from './onboarding/Onboarding';
 import { LeaveDialog } from './devices/LeaveDialog';
 import { AddressDialog } from './devices/AddressDialog';
@@ -71,7 +74,34 @@ export function App() {
     const view = new URLSearchParams(location.search).get('view') ?? 'main';
     const pairing = usePairing(view === 'main');
     const platform = state.boot?.platform === 'windows' ? 'win' : 'mac';
-    const devices = presentCards(state.cards, state.pending);
+    // Live sidebar volume: positions show at once; sends are coalesced per device.
+    const [speakerTargets, setSpeakerTargets] = useState<ReadonlyMap<string, SpeakerTarget>>(() => new Map());
+    const [speakerControls] = useState(() => new SpeakerControls({
+        read: device => {
+            const cards = agent.get().cards, exit = cards?.exitVolume;
+            if (exit?.receiverDevice === device)
+                return exit.canSet && exit.versionToken && exit.volumePercent != null && exit.muted != null
+                    ? { token: exit.versionToken, volume: exit.volumePercent, muted: exit.muted, exit: true } : null;
+            const speaker = cards?.cards.find(c => c.device === device)?.status?.speaker;
+            return speaker?.forwardingControlsToken && speaker.forwarding
+                ? { token: speaker.forwardingControlsToken, volume: speaker.forwarding.volumePercent, muted: speaker.forwarding.muted, exit: false } : null;
+        },
+        send: (requestId, facts, target, deferPersistence) => facts.exit
+            ? api.setExitVolume(requestId, facts.token, target.volume, target.muted)
+            : api.setForwardingControls(requestId, facts.token, target.volume, target.muted, deferPersistence),
+        onTargets: setSpeakerTargets,
+        onFailure: reason => {
+            agent.fail(reason);
+            if (reason === 'outcome_unknown') void agent.query('cards', api.deviceCards).catch(() => agent.fail('unavailable'));
+        },
+    }));
+    useEffect(() => agent.onEvent(event => { if (event.type === 'device_control_completed') return speakerControls.complete(event.data.requestId, event.data.result); }), [speakerControls]);
+    useEffect(() => () => speakerControls.dispose(), [speakerControls]);
+    useEffect(() => { speakerControls.refresh(); }, [state.cards, speakerControls]);
+    const devices = presentCards(state.cards, state.pending, state.permissions).map(d => {
+        const target = speakerTargets.get(d.id);
+        return target ? { ...d, speaker: { ...d.speaker, volume: target.volume, muted: target.muted } } : d;
+    });
     const self = devices.find(d => d.group === 'self');
     const [navOpen, setNavOpen] = useState(true);
     const [maximized,setMaximized] = useState(false);
@@ -153,8 +183,8 @@ export function App() {
     const selectScreen = (id: string | null, mode?: Exclude<SelectMode, 'plain'>) => {
         // Only a multi-screen computer writing its system arrangement has single screens.
         const single = (screen: string) => {
-            const device = visible.find(s => s.id === screen)?.device;
-            return !!device && editable.has(device) && visible.filter(s => s.device === device).length > 1;
+            const member = visible.find(s => s.id === screen), device = member?.device;
+            return !!member && !!device && independent(member) && editable.has(device) && screens.filter(s => s.device === device).length > 1;
         };
         const next = id ? nextSelection(selection, visible, id, mode ?? 'plain', single) : [];
         const primary = id && next.includes(id) ? id : next[0] ?? null;
@@ -167,7 +197,7 @@ export function App() {
     useEffect(() => { if (selectedGone) { setSelectedDevice(null); setSelected(null); setSelection([]); } }, [selectedGone]);
 
     useEffect(() => { void start(view); }, []);
-    useEffect(() => view !== 'panel' && inTauri ? revealWhenPainted(() => { void shell.ready().catch(() => agent.fail('unavailable')); }) : undefined, [view]);
+    useEffect(() => view !== 'panel' && inTauri ? revealWhenReady(() => { void shell.ready().catch(() => agent.fail('unavailable')); }) : undefined, [view]);
     useEffect(() => {
         if(!inTauri)return;
         let stopped=false;const stops:Array<()=>void>=[];
@@ -251,30 +281,15 @@ export function App() {
         if (!next) { permissionPage(); return; }
         void invoke(id, kind, (kind === 'speaker' ? next.speaker.mode : next[kind]) as ShareValue);
     };
-    const speaker = async (id: string, action: SpeakerAction) => {
-        const exit = state.cards?.exitVolume;
-        const card = state.cards?.cards.find(c => c.device === id);
-        const forwarding = card?.status?.speaker.forwarding;
-        const isExit = exit?.receiverDevice === id;
-        const token = isExit ? exit.versionToken : card?.status?.speaker.forwardingControlsToken;
-        const volume = isExit ? exit.volumePercent : forwarding?.volumePercent;
-        const muted = isExit ? exit.muted : forwarding?.muted;
-        if (!token || volume == null || muted == null || (isExit && !exit.canSet)) {
+    const speaker = (id: string, action: SpeakerAction) => {
+        const now = speakerControls.current(id);
+        if (!now) {
             agent.fail('unsupported');
             return;
         }
-        const requestId = crypto.randomUUID();
-        if (!agent.pending({ requestId, device: id, resource: 'speaker_controls', desired: action.type === 'mute' ? !muted : action.value }))
-            return;
-        try {
-            const apply = isExit ? api.setExitVolume : api.setForwardingControls;
-            const result = await apply(requestId, token, action.type === 'volume' ? action.value : volume, action.type === 'mute' ? !muted : false);
-            agent.controlReply(result);
-        }
-        catch {
-            agent.reject(requestId, 'outcome_unknown');
-            void agent.query('cards', api.deviceCards).catch(fail);
-        }
+        // Changing the volume also unmutes, as the owner's controls pair the two.
+        if (action.type === 'mute') speakerControls.set(id, { volume: now.volume, muted: !now.muted }, true);
+        else speakerControls.set(id, { volume: action.value, muted: false }, action.final === true, action.dragging === true);
     };
     const deviceName = (device: DeviceKey) => devices.find(d => d.id === device)?.name ?? device.slice(0, 8);
     /** Owner refusals of an operation, one line per computer. */
@@ -322,12 +337,24 @@ export function App() {
         }
         projection.update(layoutPlacements(state.layout, mergeVisibleGroups(screens, next)));
     };
+    const independent = (s: Screen) => !!profiles?.devices.some(d => d.device === s.device && effectiveSystemSync(d.sync_system_arrangement, d.availability !== 'offline' && !s.offline));
+    /** Compaction changes only placements. A native drag reuses its final normal
+     * preview token, so the drag and whole-computer translation commit together. */
+    const saveSnapshot = (after: ArrangementSnapshot, label: string, merge?: string, preview?: PreviewReply) => {
+        const present = history.value;
+        if (!present || savingLayout || sameArrangement(present, after)) return;
+        const previous = preview && present.native.find(n => n.device === preview.native.device);
+        const nativeChanged = preview && previous && preview.native.screens.some(s => {
+            const old = previous.screens.find(o => o.screen.display === s.screen.display);
+            return !old || old.origin.x !== s.origin.x || old.origin.y !== s.origin.y;
+        });
+        return commitEdit(after, label, merge, { placements: after.placements,
+            native_plan_tokens: nativeChanged ? [preview.plan_token] : [], disabled: [] }, nativeChanged ? [preview.native.device] : []);
+    };
     const saveScreens = (next: Screen[], label: string, merge?: string) => {
         const present = history.value;
-        if (!geometry || !present || savingLayout) return;
-        const moved = layoutPlacements(geometry, next);
-        const placements = present.placements.map(p => moved.find(m => m.device === p.device) ?? p);
-        return commitEdit({ ...present, placements }, label, merge, { placements, native_plan_tokens: [], disabled: [] }, []);
+        if (!present || savingLayout) return;
+        return saveSnapshot(snapshotFromScreens(present, screens, next), label, merge);
     };
     const travel = async (direction: 'undo' | 'redo') => {
         if (savingLayout || !history.value) return;
@@ -352,28 +379,6 @@ export function App() {
         catch (e) {
             history.restore(checkpoint);
             toast.danger({ title: direction === 'undo' ? tr('无法撤销') : tr('无法重做'), description: failureText(e) });
-        }
-    };
-    // Reset is one history entry from the operation's own endpoints, like Load:
-    // no compaction and no native restore.
-    const resetLayout = async () => {
-        const current = agent.get().layoutProfiles;
-        if (savingLayout || !current || canvas.current?.querySelector('[data-interacting]')) return;
-        const checkpoint = history.checkpoint();
-        try {
-            const op = await operate(request_id => api.resetArrangement({ request_id, expected_token: current.token }));
-            if (op.status !== 'failed' && op.after) {
-                if (op.history_required) {
-                    history.sync(op.before);
-                    history.commit(op.after, tr('重置排列'), undefined, { before: op.before, after: op.after, native_restore_devices: op.native_restore_devices, original_kind: 'reset' });
-                } else history.sync(op.after);
-            } else history.restore(checkpoint);
-            if (op.status === 'partial') toast.warning({ title: tr('排列只应用到了部分设备'), description: ownerProblems(op) });
-            else if (op.status === 'failed') toast.danger({ title: tr('无法重置排列'), description: ownerProblems(op) });
-        }
-        catch (e) {
-            history.restore(checkpoint);
-            toast.danger({ title: tr('无法重置排列'), description: failureText(e) });
         }
     };
     // A profile switch is one history entry with the operation's own endpoints (History contract).
@@ -425,7 +430,7 @@ export function App() {
     };
     // One native screen dragged inside a system-arranged computer: coalesced backend
     // previews while moving, one commit with the final plan token on release.
-    const editable = new Set((profiles?.devices ?? []).filter(d => d.sync_system_arrangement && d.can_edit_screens).map(d => d.device));
+    const editable = new Set((profiles?.devices ?? []).filter(d => effectiveSystemSync(d.sync_system_arrangement, d.availability !== 'offline') && d.can_edit_screens).map(d => d.device));
     const previewRects = (reply: PreviewReply) => {
         const placement = reply.placements.find(p => p.device === reply.native.device);
         if (!placement) return {};
@@ -461,14 +466,20 @@ export function App() {
         projection.linger();
         const present = history.checkpoint().present;
         if (!present) { setScreenPreview(null); return; }
-        const rects = previewRects(reply), visibleIds = new Set(visible.map(s => s.id));
-        const { dx, dy } = move.compact(Object.entries(rects).filter(([id]) => visibleIds.has(id)).map(([, r]) => r));
-        const placements = present.placements.map(p => {
-            const snapped = reply.placements.find(r => r.device === p.device && r.device === reply.native.device);
-            return snapped ? { ...snapped, origin: { x: snapped.origin.x + dx / RENDER_SCALE, y: snapped.origin.y + dy / RENDER_SCALE } } : p;
-        });
+        const placements = present.placements.map(p => reply.placements.find(r => r.device === p.device && r.device === reply.native.device) ?? p);
         const native = present.native.map(n => n.device === reply.native.device ? reply.native : n);
-        const done = commitEdit({ ...present, placements, native }, move.label, undefined, { placements, native_plan_tokens: [reply.plan_token], disabled: [] }, [reply.native.device]);
+        const released = { ...present, placements, native };
+        const draftGeometry = geometry && nativeLayout(geometry, native, released);
+        if (!draftGeometry) { setScreenPreview(null); return; }
+        const draft = presentScreens(renderLayout(draftGeometry, state.wallpapers, placements), devices);
+        const visibleIds = new Set(visible.map(s => s.id));
+        const next = move.compact ? compactScreens(draft, draft.filter(s => visibleIds.has(s.id)), new Set([move.id])) : draft;
+        const after = snapshotFromScreens(released, draft, next);
+        // Stage the complete native result, including the original gesture and
+        // compaction, then commit it through the same manual-history boundary.
+        projection.update(after.placements, after);
+        projection.linger();
+        const done = saveSnapshot(after, move.label, undefined, reply);
         setScreenPreview(null);
         await done;
     };
@@ -504,17 +515,23 @@ export function App() {
         if (id === 'files') await enableFileProvider();
         else await api.openPermissionSettings(id === 'input' ? 'input_monitoring' : id === 'network' ? 'local_network' : id === 'audio' ? 'audio_capture' : 'accessibility');
     };
+    const accessibilityGrant = useGrant(grant, openPermissionSettings);
     // A screen is hidden by its own bit or by its device's screen sharing being off.
     const menuScreens = (geometry?.geometry.screens ?? []).map(s => {
         const sharing = history.value?.screen_shared?.find(d => d.device === s.key.device);
         const own = history.value?.disabled.find(d => d.screen.device === s.key.device && d.screen.display === s.key.display)?.disabled ?? s.hidden;
-        return { id: `${s.key.device}:${s.key.display}`, key: s.key, device: s.key.device, name: s.display.name, hidden: own || (sharing ? !sharing.shared : s.device_disabled) };
+        return { id: `${s.key.device}:${s.key.display}`, key: s.key, device: s.key.device, name: s.display.name, gain: s.remote_gain ?? 1, hidden: own || (sharing ? !sharing.shared : s.device_disabled) };
     });
     const hiddenScreens = new Map<string, number>();
     for (const s of menuScreens) if (s.hidden) hiddenScreens.set(s.device, (hiddenScreens.get(s.device) ?? 0) + 1);
     const menu: Omit<SideContextMenuProps, 'children'> = {
         devices, screens: menuScreens,
         screenEditPending: savingLayout,
+        onScreenGain: (id, gain) => {
+            const key = menuScreens.find(s => s.id === id)?.key;
+            if (!key) return;
+            void api.setScreenRemoteGain(key, gain).then(() => agent.query('layout', api.layout)).catch(() => agent.fail('unavailable'));
+        },
         onHideScreen: id => {
             const present = history.value;
             const key = menuScreens.find(s => s.id === id)?.key;
@@ -541,7 +558,7 @@ export function App() {
                 { placements: present.placements, native_plan_tokens: [], disabled: patches, ...(off ? { screen_shared: sharing } : {}) }, []);
         },
         requests: pairing.requests, nearby: pairing.nearby, onShare: changeShare,
-        onGameMode: (id, mode) => { void invoke(id, 'game', mode); }, onSpeaker: (id, action) => { void speaker(id, action); },
+        onGameMode: (id, mode) => { void invoke(id, 'game', mode); }, onSpeaker: speaker,
         onPause: (id, paused) => { void invoke(id, 'pause', paused); }, onLeave: setLeaveId,
         onEditAddress: id => { const device=devices.find(d=>d.id===id); if(device)void address.open(device); },
         onShowWindow: () => { void shell.open('main').catch(fail); }, onAbout: () => { void shell.open('about').catch(fail); },
@@ -553,17 +570,14 @@ export function App() {
         const sharing = history.value?.screen_shared?.find(s => s.device === d.id);
         return sharing ? { ...d, screenSharing: sharing.shared, screen: sharing.shared ? 'shared' : 'disabled' } : d;
     })),[screens,geometry,devices,history.value]);
-    // Turning auto-compact on compacts once around this device, as one undoable edit of
-    // whole-computer translations (no native writes). Turning it off changes nothing.
+    // Exactly one identity-ordered pass, including this computer, in one edit.
     const toggleCompact = () => {
+        if (savingLayout) return;
         const on = !compactLayout;
         prefs.savePresentation({ compact_layout: on });
-        if (!on || savingLayout) return;
-        const computers = [...new Set(visible.map(s => s.device ?? s.id))].map(device => ({ device, rects: visible.filter(s => (s.device ?? s.id) === device) }));
-        const { offsets } = compactAround(computers, self?.id ?? null);
-        if (!offsets.size) return;
-        const next = visible.map(s => { const o = offsets.get(s.device ?? s.id); return o ? { ...s, x: s.x + o.dx, y: s.y + o.dy } : s; });
-        void saveScreens(mergeVisibleGroups(screens, next), tr('自动靠拢'));
+        if (!on) return;
+        const next = compactScreens(screens, visible);
+        void saveScreens(next, tr('自动靠拢'));
     };
     useEffect(()=>{if(selected&&!visible.some(s=>s.id===selected)){setSelected(null);setSelection([]);}},[visible,selected]);
     const permissions: Record<PermissionId, PermState> = {
@@ -600,10 +614,10 @@ export function App() {
                     else {
                         setNavOpen(true);
                         setNavMode(navMode === action ? 'devices' : action);
-                    } }} version={state.boot?.version ?? version} sideExtra={navMode === 'add' ? <SelfInfo container={winEl}/> : null} titleEnd={<>{prefs.prefs.upgradeHint && state.update?.candidate && state.update.phase !== 'disabled' && <UpgradeButton/>}<PromoArea sponsor={!prefs.presentation.hide_sponsor} container={winEl}/></>} titleCenter={self?.paused ? <span className="win__paused"><PauseGlyph/>{tr('共享已暂停')}</span> : null} navBack={platform === 'win' && navMode !== 'devices' ? { title: navMode === 'add' ? tr('添加设备') : tr('设置'), label: tr('返回设备列表'), onBack: () => setNavMode('devices') } : null} nav={collapsed => <>
+                    } }} version={state.boot?.version ?? version} sideExtra={navMode === 'add' ? <SelfInfo container={winEl}/> : null} titleEnd={<>{state.update?.candidate && state.update.phase !== 'disabled' && <UpgradeButton/>}<PromoArea sponsor={!prefs.presentation.hide_sponsor} container={winEl}/></>} titleCenter={self?.paused ? <span className="win__paused"><PauseGlyph/>{tr('共享已暂停')}</span> : null} navBack={platform === 'win' && navMode !== 'devices' ? { title: navMode === 'add' ? tr('添加设备') : tr('设置'), label: tr('返回设备列表'), onBack: () => setNavMode('devices') } : null} nav={collapsed => <>
           <div className="nav-stack">
             {platform === 'win' && <RequestsGroup pairing={pairing} collapsed={collapsed} onExpand={() => setNavOpen(true)} hidden={navMode === 'settings'}/>}
-            <div className="nav-view" key={navMode} data-view={navMode} data-anim={navSwitched ? '' : undefined}>{platform === 'mac' && <><AddHead open={navMode !== 'devices'} title={navMode === 'add' ? tr('添加设备') : tr('设置')} onBack={() => setNavMode('devices')}/><RequestsGroup pairing={pairing} collapsed={collapsed} onExpand={() => setNavOpen(true)} hidden={navMode === 'settings'}/></>}{navMode === 'add' ? <AddPanel pairing={pairing}/> : navMode === 'settings' ? <SettingsNav platform={platform} query={query} onQuery={setQuery} active={section} onJump={id => setJump({ section: id, n: Date.now() })}/> : <DeviceList devices={devices} selectedId={selectedDevice} onSelect={id => { setNavOpen(true); selectDevice(id); }} onToggle={toggle} onPause={menu.onPause} onSpeaker={menu.onSpeaker} hiddenScreens={hiddenScreens} collapsed={collapsed} now={Date.now()}/>}</div>
+            <div className="nav-view" key={navMode} data-view={navMode} data-anim={navSwitched ? '' : undefined}>{platform === 'mac' && <><AddHead open={navMode !== 'devices'} title={navMode === 'add' ? tr('添加设备') : tr('设置')} onBack={() => setNavMode('devices')}/><RequestsGroup pairing={pairing} collapsed={collapsed} onExpand={() => setNavOpen(true)} hidden={navMode === 'settings'}/></>}{navMode === 'add' ? <AddPanel pairing={pairing}/> : navMode === 'settings' ? <SettingsNav platform={platform} query={query} onQuery={setQuery} active={section} onJump={id => setJump({ section: id, n: Date.now() })}/> : <DeviceList onGrantAccessibility={() => { void accessibilityGrant.grant('accessibility'); }} devices={devices} selectedId={selectedDevice} onSelect={id => { setNavOpen(true); selectDevice(id); }} onToggle={toggle} onPause={menu.onPause} onSpeaker={menu.onSpeaker} hiddenScreens={hiddenScreens} collapsed={collapsed} now={Date.now()}/>}</div>
           </div>
         </>}>
         <div className="disp" data-hidden={navMode === 'settings' ? '' : undefined} aria-hidden={navMode === 'settings' || undefined} inert={navMode === 'settings'}>
@@ -612,15 +626,14 @@ export function App() {
             <div className="canvas-tools" role="toolbar" aria-label={tr('排列操作')}>
               <ProfileTools state={profiles} busy={savingLayout} onLoad={p => { void loadProfile(p); }} onCreate={() => setCreateOpen(true)} onManage={manageProfiles}/>
               <span className="canvas-tools__sep"/>
-              {/* Two screens with arrows closing their gap: compaction after a manual edit. */}
-              <Tooltip interactive={false} placement="bottom" content={tr('自动靠拢')}><Button variant="ghost" size="sm" iconOnly aria-label={tr('自动靠拢')} aria-pressed={compactLayout} onClick={toggleCompact}><CompactIcon/></Button></Tooltip>
-              <span className="canvas-tools__sep"/>
 
               <Tooltip interactive={false} content={`${tr('撤销')}|${platform === 'mac' ? '⌘Z' : 'Ctrl+Z'}`} placement="bottom"><Button variant="ghost" size="sm" iconOnly aria-label={tr('撤销')} aria-keyshortcuts={platform === 'mac' ? 'Meta+Z' : 'Control+Z'} disabled={savingLayout || history.undoCount === 0} onClick={() => { void travel('undo'); }}><Icon><path d="M7.2 4.6 3.8 8l3.4 3.4M4.3 8h7.2a4.2 4.2 0 0 1 0 8.4H9.2"/></Icon></Button></Tooltip>
               <Tooltip interactive={false} content={`${tr('重做')}|${platform === 'mac' ? '⇧⌘Z' : 'Ctrl+Y'}`} placement="bottom"><Button variant="ghost" size="sm" iconOnly aria-label={tr('重做')} aria-keyshortcuts={platform === 'mac' ? 'Shift+Meta+Z' : 'Control+Y'} disabled={savingLayout || history.redoCount === 0} onClick={() => { void travel('redo'); }}><Icon><path d="M12.8 4.6 16.2 8l-3.4 3.4M15.7 8H8.5a4.2 4.2 0 0 0 0 8.4h2.3"/></Icon></Button></Tooltip>
-              <span className="canvas-tools__sep"/><Tooltip interactive={false} placement="bottom" content={tr('重置排列')}><Button variant="ghost" size="sm" iconOnly aria-label={tr('重置排列')} disabled={savingLayout} onClick={() => { void resetLayout(); }}><Icon name="replay"/></Button></Tooltip>
+              <span className="canvas-tools__sep"/>
+              {/* Two screens with arrows closing their gap: compaction after a manual edit. */}
+              <Tooltip interactive={false} placement="bottom" content={tr('自动靠拢')}><Button variant="ghost" size="sm" iconOnly aria-label={tr('自动靠拢')} aria-pressed={compactLayout} disabled={savingLayout} onClick={toggleCompact}><CompactIcon/></Button></Tooltip>
             </div>
-            <Arrangement platform={platform} screens={visible} geometryScreens={screens} onProjection={previewScreens} onScreensChange={(next, change) => { void saveScreens(mergeVisibleGroups(screens,next), change.label, change.merge); }} selectedId={selected} onSelect={selectScreen} settings={{ showHotZones: false, snapping: true, compact: compactLayout, padding: navOpen ? 24 : 48, step: 10 }} keyScope={canvas} hintId={hint} selectedGroup={!screenOnly && selectedDevice ? new Set(screens.filter(s => s.device === selectedDevice).map(s => s.id)) : selection.length > 1 ? new Set(selection) : undefined} contextFor={s => `screen:${s.id}`} screenEditable={s => !!s.device && editable.has(s.device)} screenPreview={screenPreview} onScreenMove={move => { void moveScreen(move); }}/>
+            <Arrangement platform={platform} screens={visible} geometryScreens={screens} onProjection={previewScreens} onScreensChange={(next, change) => { void saveScreens(next, change.label, change.merge); }} selectedId={selected} onSelect={selectScreen} settings={{ showHotZones: false, snapping: true, compact: compactLayout, padding: navOpen ? 24 : 48, step: 10 }} keyScope={canvas} hintId={hint} selectedGroup={!screenOnly && selectedDevice ? new Set(screens.filter(s => s.device === selectedDevice).map(s => s.id)) : selection.length > 1 ? new Set(selection) : undefined} contextFor={s => `screen:${s.id}`} screenEditable={s => !!s.device && editable.has(s.device) && independent(s)} screenPreview={screenPreview} onScreenMove={move => { void moveScreen(move); }}/>
           </div>
         </div>
         {settingsMounted && <SettingsPage open={navMode === 'settings'} platform={platform} api={prefs} capsIme={state.input?.mac_caps_switches_input_source ?? null} query={query} jump={jump} onActive={setSection} version={state.boot?.version ?? version} upgrade={{ available: false, next: '' }} perms={permissions} onGrant={grant} onOpenPermissionSettings={openPermissionSettings} onLog={() => { }} onAbout={menu.onAbout} onBlocklist={() => setBlockedOpen(true)} layoutProfiles={<ProfileList state={profiles} onCreate={() => setCreateOpen(true)} onRename={renameProfile} onDelete={deleteProfile}/>} onOnboarding={replayOnboarding}/>}

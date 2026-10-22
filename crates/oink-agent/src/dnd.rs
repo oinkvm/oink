@@ -30,6 +30,8 @@ mod link_platform;
 mod preparation;
 #[cfg(any(target_os = "macos", all(test, debug_assertions)))]
 mod preparation_choice;
+#[cfg(any(target_os = "windows", all(test, debug_assertions)))]
+mod source_release;
 pub(crate) mod wire;
 pub(crate) use files::DndFiles;
 pub(crate) use link::{Handle as LinkHandle, start_link_runtime};
@@ -56,6 +58,7 @@ pub(crate) struct DndGlue {
     export_epoch: Mutex<Option<(DragOperation, u64)>>,
     source_physical: std::sync::atomic::AtomicBool,
     source_epoch: AtomicU64,
+    source_origin: Mutex<Option<(ClipId, oink_foundation::Point)>>,
     source_releases: Mutex<Option<(ClipId, Result<(), String>)>>,
     hold_observations: Mutex<HashMap<DragOperation, (ClipId, bool)>>,
 }
@@ -157,6 +160,21 @@ impl DndGlue {
                 return Err("obsolete original-UP command".into());
             }
         }
+        #[cfg(target_os = "windows")]
+        let result = source_release::at_origin(id, *self.source_origin.lock().unwrap(), |at| {
+            if let Some(input) = &self.input_backend {
+                input.release_drag_at(at).map_err(|error| error.to_string())
+            } else {
+                let inner = self.input_node.upgrade().ok_or_else(|| "service stopped".to_string())?;
+                Node { inner }
+                    .input_backend()
+                    .release_drag_at(at)
+                    .map_err(|error| error.to_string())
+            }
+        });
+        #[cfg(target_os = "windows")]
+        let _ = physical;
+        #[cfg(not(target_os = "windows"))]
         let result = self.submit_source_release(physical);
         *releases = Some((id, result.clone()));
         drop(releases);
@@ -785,7 +803,11 @@ impl DndGlue {
     fn execute_reported(&self, cmd: DndCmd, report: Option<crate::telemetry::Stamp>) -> Vec<DndEvent> {
         let admission = if matches!(
             &cmd,
-            DndCmd::Prepare { .. } | DndCmd::Begin { .. } | DndCmd::Probe { .. } | DndCmd::HoldSource { .. }
+            DndCmd::Prepare { .. }
+                | DndCmd::Begin { .. }
+                | DndCmd::Probe { .. }
+                | DndCmd::HoldSource { .. }
+                | DndCmd::ExportSource { .. }
         ) {
             let Some(lease) =
                 oink_foundation::maintenance::process().enter(oink_foundation::maintenance::ActivityKind::Drag)
@@ -842,12 +864,20 @@ impl DndGlue {
                 Vec::new()
             }
             DndCmd::HoldSource {
+                origin,
                 id,
                 epoch,
                 physical,
                 target,
                 crossing,
             } => {
+                // Keep the original press independently of native authority. A lost
+                // operation must never turn cleanup into an UP at the live cursor.
+                let mut recorded = self.source_origin.lock().unwrap();
+                if recorded.as_ref().is_none_or(|(previous, _)| previous.seq < id.seq) {
+                    *recorded = origin.map(|at| (id, at));
+                }
+                drop(recorded);
                 let operation = self.local.lock().unwrap().get_mut(&id).map(|drag| {
                     drag._update_activity = admission;
                     drag.owned = true;
@@ -914,6 +944,29 @@ impl DndGlue {
                     return vec![DndEvent::SourceHeld { id, epoch, ok: false }];
                 }
                 vec![DndEvent::SourceHeld { id, epoch, ok: true }]
+            }
+            DndCmd::ExportSource { id, epoch, physical } => {
+                let Some(operation) = self.source_operation(id, epoch) else {
+                    return vec![DndEvent::SourceExported {
+                        id,
+                        epoch,
+                        items: Err(oink_foundation::dnd::ExportFailure::Failed),
+                    }];
+                };
+                *self.export_epoch.lock().unwrap() = Some((operation, epoch));
+                if self.backend.source_requires_export(operation, true)
+                    && self.backend.export_source(operation, std::time::Instant::now(), &|| {
+                        self.source_release(id, physical)
+                    })
+                {
+                    Vec::new()
+                } else {
+                    vec![DndEvent::SourceExported {
+                        id,
+                        epoch,
+                        items: Err(oink_foundation::dnd::ExportFailure::Failed),
+                    }]
+                }
             }
             DndCmd::ResumeSource { id, epoch } => {
                 let operation = self.source_operation(id, epoch);

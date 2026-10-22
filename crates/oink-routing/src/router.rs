@@ -270,9 +270,12 @@ pub enum StatusEvent {
     LocalFactsChanged,
     KeyboardDisabled(bool),
     MouseDisabled(bool),
-    KeyboardReleased,
+    InputDisablesReleased,
     ScreenLocalInput(bool),
     GameMode(GameModeStatus),
+    /// Ordered transition of this device's own game mode, independent of group
+    /// pointer focus. Used for owner-local entry/exit notifications.
+    LocalGameMode(bool),
     /// Ordered local observation; snapshots can coalesce rapid lock transitions.
     FocusLock {
         holder: Option<DeviceId>,
@@ -729,7 +732,7 @@ impl Router {
         }
         let preference_changed = self.cfg.settings.game_mode_preference != settings.game_mode_preference;
         self.cfg.settings = settings;
-        if preference_changed && self.holder == self.me() {
+        if preference_changed {
             self.apply_game_preference();
         }
         if self.dnd_enabled() != dnd_was {
@@ -1090,10 +1093,20 @@ impl Router {
     /// Local owner pause destroys input ownership. Resuming this device cannot
     /// resume any other member.
     pub fn set_fully_paused(&mut self, paused: bool) {
+        if paused {
+            self.release_input_disables();
+        }
+        self.set_input_suspended(paused);
+    }
+
+    /// Capture suspension for sleep, update preparation, and session teardown is
+    /// not an owner pause. It must not clear the user's source disable choices.
+    pub fn set_input_suspended(&mut self, paused: bool) {
         if self.fully_paused == paused {
             return;
         }
         self.fully_paused = paused;
+        self.keyboard.cancel_release_hold();
         self.set_paused(paused);
         if paused {
             self.release_local_transformed();
@@ -1321,7 +1334,7 @@ impl Router {
         self.cancel_local_gesture();
         self.retire_received_multifinger();
         self.cancel_caps();
-        self.release_keyboard();
+        self.release_input_disables();
         self.end_focus_lock();
         self.fresh_join = false;
         let me = self.me();
@@ -1452,14 +1465,17 @@ impl Router {
         if self.fully_paused {
             return self
                 .keyboard
-                .deadline()
+                .deadline(self.keyboard_disabled() || self.mouse_disabled())
                 .into_iter()
                 .chain(self.emergency_deadline())
                 .min();
         }
         let timeout = self.timeout_us();
         let mut d = self.sync_deadline();
-        if let Some(t) = self.keyboard.deadline() {
+        if let Some(t) = self
+            .keyboard
+            .deadline(self.keyboard_disabled() || self.mouse_disabled())
+        {
             d = Some(d.map_or(t, |x| x.min(t)));
         }
         let mut take = |t: Micros| d = Some(d.map_or(t, |x| x.min(t)));
@@ -1680,8 +1696,12 @@ impl Router {
     pub fn tick(&mut self, now: Micros) {
         self.dnd.now = now;
         self.enforce_screen_policy();
-        if self.keyboard.deadline().is_some_and(|due| now >= due) {
-            self.release_keyboard();
+        if self
+            .keyboard
+            .deadline(self.keyboard_disabled() || self.mouse_disabled())
+            .is_some_and(|due| now >= due)
+        {
+            self.release_input_disables();
         }
         self.dnd_expire();
         if self.emergency_deadline().is_some_and(|deadline| now >= deadline) {
@@ -1744,7 +1764,7 @@ impl Router {
             return Disposition::Pass;
         }
         if self.holder == self.me() && (dx != 0. || dy != 0.) {
-            self.game.remote_capture.local_motion();
+            self.game.owner.remote_capture.local_motion();
         }
         let me = self.me();
         if self.game_mode().active {
@@ -2959,7 +2979,7 @@ impl Router {
         if dx != 0. || dy != 0. {
             self.last_pointer_source = Some(origin);
             if self.cfg.os == Os::MacOS && self.game.mode == GameMode::Auto && dx.is_finite() && dy.is_finite() {
-                self.game.remote_capture.motion(now);
+                self.game.owner.remote_capture.motion(now);
             }
         }
         let me = self.me();

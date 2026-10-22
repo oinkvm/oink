@@ -41,10 +41,24 @@ import Darwin
                 let id = NSFileProviderDomainIdentifier(providerDomain)
                 var domains = try await NSFileProviderManager.domains()
                 if let action = ProviderRemovalAction(rawValue: command) {
-                    guard CommandLine.arguments.count == 2 else { throw CocoaError(.fileReadInvalidFileName) }
-                    let result = try await action.perform(domains: domains, remove: { domain, mode in
-                        try await NSFileProviderManager.remove(domain, mode: mode)
-                    }, remaining: { try await NSFileProviderManager.domains() })
+                    let uninstall = Array(CommandLine.arguments.dropFirst(2)) == ["--uninstall"]
+                    guard CommandLine.arguments.count == 2 || uninstall else { throw CocoaError(.fileReadInvalidFileName) }
+                    // Fresh-install domain resets also use remove-domain. Only
+                    // explicit uninstall may erase the extension's own home.
+                    let app = try uninstall ? installedUninstallApp() : nil
+                    func removeDomains() async throws -> String {
+                        try await action.perform(domains: domains, remove: { domain, mode in
+                            try await NSFileProviderManager.remove(domain, mode: mode)
+                        }, remaining: { try await NSFileProviderManager.domains() })
+                    }
+                    let result: String
+                    if let app {
+                        result = try await finishUninstallProvider(removeDomains: removeDomains, stopExtension: {
+                            // Once domains are gone fileproviderd cannot relaunch
+                            // writers while the appex clears its own container.
+                            try stopOinkProcesses(app: app.appendingPathComponent("Contents/PlugIns"))
+                        }, clearExtension: { try clearUninstallExtension(app: app) })
+                    } else { result = try await removeDomains() }
                     print(result)
                     exit(0)
                 }
@@ -260,7 +274,11 @@ import Darwin
                 // no serial namespace wait before the existing child readiness rule.
                 let parent = catalog.records.filter { $0.id == batch + "-root" }
                 let urls = try await resolveItemURLs(parent + requested) { record in
-                    if command == "prepare-placeholders" || command == "publish-placeholders" {
+                    // Ordinary spares also change from a private parent to the
+                    // final source/batch path. An early URL can still describe
+                    // the old name or hidden flag on macOS 14/26; validate both
+                    // publication paths before handing URLs to other apps.
+                    if command == "prepare-placeholders" || command == "publish-placeholders" || command == "publish" {
                         return try await resolveFinalItemURL(record) {
                             try await manager.getUserVisibleURL(for: NSFileProviderItemIdentifier(record.id))
                         }.path

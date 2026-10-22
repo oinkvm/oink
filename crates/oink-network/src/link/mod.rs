@@ -292,6 +292,10 @@ impl LinkLayer {
         options: crate::LowOptions,
     ) -> Result<LowStream, LowError> {
         assert!(kind.is_business(), "private Low kind");
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            *self.0.low_open_attempts.lock().unwrap().entry(kind as u8).or_default() += 1;
+        }
         self.0
             .pool
             .get()

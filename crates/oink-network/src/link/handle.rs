@@ -60,6 +60,8 @@ pub(super) struct Shared {
     #[cfg(test)]
     pub expired_service_budget: AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
+    pub low_open_attempts: std::sync::Mutex<std::collections::BTreeMap<u8, u64>>,
+    #[cfg(any(test, feature = "test-support"))]
     pub hold_input_peer: ArcSwapOption<DeviceId>,
     #[cfg(any(test, feature = "test-support"))]
     pub input_header_held: Notify,
@@ -132,6 +134,8 @@ impl LinkLayer {
             stopped: AtomicBool::new(false),
             #[cfg(test)]
             expired_service_budget: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-support"))]
+            low_open_attempts: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
             hold_input_peer: ArcSwapOption::empty(),
             #[cfg(any(test, feature = "test-support"))]
@@ -290,6 +294,8 @@ mod config_order_tests {
             stopped: AtomicBool::new(false),
             #[cfg(test)]
             expired_service_budget: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-support"))]
+            low_open_attempts: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
             hold_input_peer: ArcSwapOption::empty(),
             #[cfg(any(test, feature = "test-support"))]

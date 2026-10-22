@@ -218,7 +218,7 @@ impl Driver {
         budget.reset(settings.event_frequency, now);
         let startup_hold = oink_foundation::maintenance::process().generation();
         if startup_hold.is_some() {
-            router.set_fully_paused(true);
+            router.set_input_suspended(true);
         }
         Self {
             backlog_sequence: 0,
@@ -350,7 +350,7 @@ impl Driver {
             if environment.system_sleeping != self.environment.system_sleeping {
                 self.adapter
                     .router_mut()
-                    .set_fully_paused(self.paused || environment.system_sleeping);
+                    .set_input_suspended(self.paused || environment.system_sleeping);
                 self.adapter
                     .router_mut()
                     .set_paused(self.paused || environment.system_sleeping || !self.controllable);
@@ -509,6 +509,7 @@ impl Driver {
             keyboard_disabled: self.adapter.router().keyboard_disabled(),
             caps_lock_switches_input_source: self.inject.backend().caps_lock_switches_input_source(),
             resource_faults: self.resource_faults(),
+            capture_failed: self.capture_fault == Some(oink_protocol::v1::dto::ResourceFaultCode::CaptureUnavailable),
             source_modes_revision: self.source_modes_revision,
             mouse_mode: self.adapter.router().config().settings.mouse_mode,
             keyboard_mode: self.adapter.router().config().settings.keyboard_mode,
@@ -676,13 +677,13 @@ impl Driver {
                 self.inject
                     .push_in_epoch(self.input_safety, InjectItem::OwnerBegin(failures.clone()));
                 // Received C0 events invalidate older resumes without originating a new group event.
-                if !self.adapter.router().keyboard_disabled() {
+                if !self.adapter.router().keyboard_disabled() && !self.adapter.router().mouse_disabled() {
                     self.emergency_sequence = self
                         .emergency_sequence
                         .checked_add(1)
                         .expect("emergency sequence exhausted");
                 }
-                self.adapter.router_mut().release_keyboard();
+                self.adapter.router_mut().release_input_disables();
                 self.command(InputCommand::Paused(true));
                 self.owner_fence(reply, failures, true, None);
             }
@@ -701,7 +702,8 @@ impl Driver {
                 accept_contacts,
                 reply,
             } => {
-                if keyboard_disabled && expected_emergency_sequence != self.emergency_sequence {
+                let disabling = keyboard_disabled || routing.mouse_mode == oink_foundation::input::InputMode::Disabled;
+                if disabling && expected_emergency_sequence != self.emergency_sequence {
                     let _ = reply.try_send(Err(oink_protocol::v1::dto::ControlFailure::StaleRevision));
                     return;
                 }
@@ -713,12 +715,7 @@ impl Driver {
                 self.refresh();
                 self.command(InputCommand::KeyboardDisabled(keyboard_disabled));
                 self.adapter.router_mut().set_local_input_transform(input_transform);
-                self.owner_fence(
-                    reply,
-                    failures,
-                    false,
-                    keyboard_disabled.then_some(expected_emergency_sequence),
-                );
+                self.owner_fence(reply, failures, false, disabling.then_some(expected_emergency_sequence));
             }
             InputCommand::ApplyOwnerPause {
                 paused,
@@ -757,7 +754,7 @@ impl Driver {
                 for peer in self.pairs.keys().copied().collect::<Vec<_>>() {
                     self.detach(peer);
                 }
-                self.adapter.router_mut().set_fully_paused(true);
+                self.adapter.router_mut().set_input_suspended(true);
                 self.motion = None;
                 self.outputs(None);
                 let fence = Arc::new(std::sync::atomic::AtomicU8::new(0));
@@ -777,7 +774,7 @@ impl Driver {
                     self.inject.backend().set_input_paused(self.paused);
                     self.adapter
                         .router_mut()
-                        .set_fully_paused(self.paused || self.environment.system_sleeping);
+                        .set_input_suspended(self.paused || self.environment.system_sleeping);
                     self.adapter
                         .router_mut()
                         .set_paused(self.paused || self.environment.system_sleeping || !self.controllable);
@@ -797,6 +794,9 @@ impl Driver {
                 }
             }
             InputCommand::Paused(paused) => {
+                if paused {
+                    self.adapter.router_mut().release_input_disables();
+                }
                 self.capture_initialized = true;
                 if cfg!(windows) && self.paused != paused {
                     self.capture_detector = Default::default();
@@ -820,12 +820,15 @@ impl Driver {
                 }
                 self.adapter
                     .router_mut()
-                    .set_fully_paused(paused || self.environment.system_sleeping);
+                    .set_input_suspended(paused || self.environment.system_sleeping);
                 self.adapter
                     .router_mut()
                     .set_paused(paused || self.environment.system_sleeping || !self.controllable);
             }
             InputCommand::Controllable(controllable) => {
+                if !controllable {
+                    self.capture_fault = None;
+                }
                 if self.controllable != controllable {
                     self.notices.post(InputNotice::Controllable(controllable));
                 }
@@ -928,6 +931,9 @@ impl Driver {
                 if let Some(cursor) = self.startup_cursor.take() {
                     self.adapter.router_mut().set_cursor(cursor);
                 }
+            }
+            InputCommand::LocalDisplayFailure => {
+                self.display_fault = Some(oink_protocol::v1::dto::ResourceFaultCode::BackendFailed);
             }
             InputCommand::PeerFacts {
                 boot,
@@ -1187,7 +1193,7 @@ impl Driver {
             }
         }
         if self.update_hold.is_some() {
-            self.adapter.router_mut().set_fully_paused(true);
+            self.adapter.router_mut().set_input_suspended(true);
         }
         self.outputs(None);
     }
@@ -1232,6 +1238,9 @@ impl Driver {
                     && sample.position.y < b.y + b.h - 8.
             })
         });
+        if router.paused() {
+            self.capture_detector = Default::default();
+        }
         let detected = self.capture_detector.update(
             (focus.epoch, focus.holder),
             sample,
@@ -1565,14 +1574,26 @@ impl Driver {
         let emergency = outputs
             .iter()
             .any(|output| matches!(output, Output::Status(StatusEvent::EmergencyStop { .. })));
-        let keyboard_released = outputs
+        let disables_released = outputs
             .iter()
-            .any(|output| matches!(output, Output::Status(StatusEvent::KeyboardReleased)));
-        if keyboard_released && !emergency {
+            .any(|output| matches!(output, Output::Status(StatusEvent::InputDisablesReleased)));
+        if disables_released {
+            // The routing owner has already cleared the live mode. Retire the
+            // matching saved snapshot too, so a later ordinary refresh cannot
+            // reinstall Disabled while durable safety cleanup is queued.
+            let mut settings = (*self.snapshots.settings.load()).clone();
+            if settings.mouse_mode == oink_foundation::input::InputMode::Disabled {
+                settings.mouse_mode = oink_foundation::input::InputMode::Shared;
+                self.snapshots.settings.publish(settings);
+                self.settings = self.snapshots.settings.load();
+                self.source_modes_revision += 1;
+            }
+        }
+        if disables_released && !emergency {
             self.emergency_sequence = self
                 .emergency_sequence
                 .checked_add(1)
-                .expect("keyboard safety sequence exhausted");
+                .expect("input disable safety sequence exhausted");
             self.status_dirty = true;
             self.publish();
         }
@@ -1610,7 +1631,7 @@ impl Driver {
                 }
                 self.adapter.detach(*peer);
             }
-            self.adapter.router_mut().set_fully_paused(true);
+            self.adapter.router_mut().set_input_suspended(true);
             outputs.extend(self.adapter.router_mut().drain_outputs());
         }
         // Once confinement has entered this session's native FIFO, subsequent
@@ -2196,6 +2217,20 @@ impl CaptureLoop for Driver {
         let _ = self.main.send(MainCommand::InputStatusChanged);
         self.wake_if_earlier();
     }
+    fn capture_detached(&mut self) {
+        // Withdrawal is an intentional source boundary, not an attachment error.
+        // A completed withdrawal is an observed nonfault, not missing evidence.
+        // None would make the keyboard card unknown throughout pause; unlike the
+        // mouse it has no independent injection observation to retain its health.
+        self.capture_fault = Some(oink_protocol::v1::dto::ResourceFaultCode::None);
+        self.now = Instant::now();
+        self.adapter.at(self.micros());
+        self.adapter.router_mut().set_capture_available(false);
+        self.outputs_at(None, ModeDispatch::Callback);
+        self.publish();
+        let _ = self.main.send(MainCommand::InputStatusChanged);
+        self.wake_if_earlier();
+    }
     fn event(&mut self, event: &CapturedEvent) -> Disposition {
         if !self.inject.backend().input_safety().accepts(self.input_safety) {
             return Disposition::Pass;
@@ -2309,7 +2344,7 @@ impl CaptureLoop for Driver {
                 self.command(InputCommand::AbortUpdate { generation });
                 oink_foundation::maintenance::process().reopen(generation);
             } else {
-                self.adapter.router_mut().set_fully_paused(true);
+                self.adapter.router_mut().set_input_suspended(true);
             }
         }
         if self.projection_until.is_some_and(|until| until <= now) {
@@ -2329,7 +2364,7 @@ impl CaptureLoop for Driver {
         let safety = self.inject.backend().input_safety();
         if safety != self.input_safety {
             // Even a pause/resume completed between polls ends the old session.
-            self.adapter.router_mut().set_fully_paused(true);
+            self.adapter.router_mut().set_input_suspended(true);
             for peer in self.pairs.keys().copied().collect::<Vec<_>>() {
                 self.fault(peer, Which::Inbound, false, StreamCode::None);
                 self.fault(peer, Which::Outbound, false, StreamCode::None);
@@ -2337,7 +2372,7 @@ impl CaptureLoop for Driver {
             self.input_safety = safety;
             self.adapter
                 .router_mut()
-                .set_fully_paused(self.paused || self.environment.system_sleeping || self.update_hold.is_some());
+                .set_input_suspended(self.paused || self.environment.system_sleeping || self.update_hold.is_some());
             self.adapter
                 .router_mut()
                 .set_paused(self.paused || self.environment.system_sleeping || !self.controllable);
@@ -2479,10 +2514,13 @@ fn captured_input(input: &InputMsg) -> bool {
 #[cfg(all(test, debug_assertions))]
 mod tests;
 
-/// Capture evidence is invalidated by a focus epoch change, even if its holder stays local.
+/// Confirmed capture belongs to this device, not a group focus epoch. Suspend
+/// observation while away: the source freeze is Oink's, not the application's.
+/// Unconfirmed evidence must still start over at a focus boundary.
 #[derive(Default)]
 struct ScopedCaptureDetector {
     scope: Option<(u64, DeviceId)>,
+    detected: bool,
     detector: oink_input::pointer_capture::CaptureDetector,
 }
 impl ScopedCaptureDetector {
@@ -2494,11 +2532,21 @@ impl ScopedCaptureDetector {
         interior: bool,
         now: u64,
     ) -> bool {
-        if self.scope != Some(scope) {
-            self.scope = Some(scope);
+        if !self.detected && (self.scope != Some(scope) || !eligible) {
             self.detector = Default::default();
         }
-        self.detector.update(sample, eligible, interior, now)
+        self.scope = Some(scope);
+        if !eligible {
+            return false;
+        }
+        // Native restoration can temporarily yield no sample. Unknown state
+        // cannot revoke confirmed capture; a valid sample resumes normal release
+        // and foreground-change detection without requiring new motion.
+        if sample.is_none() {
+            return self.detected;
+        }
+        self.detected = self.detector.update(sample, true, interior, now);
+        self.detected
     }
 }
 

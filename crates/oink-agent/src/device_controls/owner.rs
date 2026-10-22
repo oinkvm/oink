@@ -70,31 +70,36 @@ impl Node {
                 message: format!("Settings were saved; owner application failed: {reason:?}"),
             })
     }
-    pub(crate) fn persist_keyboard_safety_release(&self) {
+    pub(crate) fn persist_input_safety_release(&self) {
         {
-            let mut state = lock(&self.inner.controls);
-            if state.keyboard_safety_pending {
+            // Keep the saved-state check and pending mark together. Otherwise an
+            // ordinary pause can commit between them and a late release notice
+            // can make its already completed receipt spuriously Busy again.
+            let config = lock(&self.inner.config);
+            if !config.settings.keyboard_disabled
+                && config.settings.routing.mouse_mode != oink_foundation::input::InputMode::Disabled
+            {
                 return;
             }
-            state.keyboard_safety_pending = true;
+            let mut state = lock(&self.inner.controls);
+            if state.disable_safety_pending {
+                return;
+            }
+            state.disable_safety_pending = true;
         }
+        self.start_input_safety_release();
+    }
+    pub(crate) fn start_input_safety_release(&self) {
         let node = self.clone();
         self.inner.rt.spawn_blocking(move || {
             let _gate = node.owner_gate();
-            let saved = {
-                let mut config = lock(&node.inner.config);
-                config
-                    .owner()
-                    .revision(dto::LocalOption::KeyboardDisabled)
-                    .ok_or(Failure::UnsupportedOption)
-                    .and_then(|revision| config.edit_owner(dto::LocalOption::KeyboardDisabled, revision, false.write()))
-            };
+            let saved = lock(&node.inner.config).update_owner(|owner| owner.release_input_disables());
             let published = node.publish_owner_preferences();
             if saved.is_ok() {
-                lock(&node.inner.controls).keyboard_safety_pending = false;
+                lock(&node.inner.controls).disable_safety_pending = false;
             }
             if saved.is_err() || published.is_err() {
-                tracing::warn!("keyboard safety release persistence/publication failed");
+                tracing::warn!("input disable release persistence/publication failed");
             }
             node.emit(crate::api::ApiEvent::Pause(node.pause_status()));
             node.refresh_device_cards();
@@ -233,6 +238,15 @@ impl Node {
                 self.inner
                     .rt
                     .block_on(audio.set_claim(super::runtime::boot(requester), group, value, expected))?
+            } else if field(request.defer_persistence())? {
+                self.inner.rt.block_on(audio.set_option_with_persistence(
+                    super::runtime::boot(requester),
+                    group,
+                    option,
+                    expected,
+                    patch,
+                    true,
+                ))?
             } else {
                 self.inner.rt.block_on(audio.set_option(
                     super::runtime::boot(requester),
@@ -344,11 +358,23 @@ impl Node {
         self.consume_local_emergency();
         {
             let mut state = lock(&self.inner.controls);
-            if state.pause.revision() != previous || applied.emergency_sequence != observed.emergency_sequence {
+            if state.pause.revision() != previous
+                || (!paused && applied.emergency_sequence != observed.emergency_sequence)
+            {
                 return Err(Failure::StaleRevision);
             }
             state.pause = candidate;
         }
+        // A pause's own release advances the native safety fence. Commit both
+        // preferences under this same owner gate before publishing its receipt;
+        // resumes still reject any intervening safety sequence above.
+        let release_failure = if paused {
+            let saved = lock(&self.inner.config).update_owner(|owner| owner.release_input_disables());
+            lock(&self.inner.controls).disable_safety_pending = saved.is_err();
+            saved.err().map(|_| Failure::PersistenceFailed)
+        } else {
+            None
+        };
         if let Some(clip) = self.clipboard() {
             clip.set_paused(paused);
         }
@@ -361,6 +387,7 @@ impl Node {
         } else {
             None
         }
+        .or(release_failure)
         .or_else(|| publication.as_ref().err().copied());
         let raw: RawMap = [
             (1, field(request.request_id())?.write()),

@@ -624,7 +624,7 @@ fn forwarded_game_motion_uses_only_the_following_datagram_flow() {
 }
 
 #[test]
-fn new_focus_epoch_discards_passive_capture_even_when_holder_stays_local() {
+fn confirmed_passive_capture_survives_focus_epochs_and_absence_until_release() {
     use oink_input::pointer_capture::CaptureSample;
     let mut detector = ScopedCaptureDetector::default();
     let me = DeviceId([1; 32]);
@@ -644,17 +644,89 @@ fn new_focus_epoch_discards_passive_capture_even_when_holder_stays_local() {
         detector.update((326, me), Some(sample), true, true, now);
     }
     assert!(detector.update((326, me), Some(sample), true, true, 750_000));
-    // Restart gossip advances the epoch without taking focus away locally.
-    // Idle hidden state must not carry evidence from the old game scope.
-    for now in (800_000..=1_500_000).step_by(50_000) {
-        assert!(!detector.update((327, me), Some(sample), true, true, now));
+    let other = DeviceId([2; 32]);
+    // Oink's source freeze and unavailable samples cannot revoke local capture.
+    assert!(!detector.update((327, other), None, false, true, 800_000));
+    assert!(!detector.update((327, other), Some(sample), false, true, 850_000));
+    assert!(detector.update((328, me), None, true, true, 900_000));
+    // Idle hidden capture survives return and same-holder epoch renewal.
+    for now in (950_000..=1_500_000).step_by(50_000) {
+        assert!(detector.update((329, me), Some(sample), true, true, now));
     }
-    // Fresh movement can establish capture again normally.
-    for now in (1_550_000..=2_250_000).step_by(50_000) {
+    sample.hidden = false;
+    for now in (1_550_000..=1_800_000).step_by(50_000) {
+        detector.update((329, me), Some(sample), true, true, now);
+    }
+    assert!(!detector.detected);
+}
+
+#[test]
+fn unconfirmed_passive_capture_does_not_cross_focus_epochs() {
+    use oink_input::pointer_capture::CaptureSample;
+    let mut detector = ScopedCaptureDetector::default();
+    let me = DeviceId([1; 32]);
+    let mut sample = CaptureSample {
+        windows: None,
+        hidden: true,
+        application_hidden: Some(true),
+        confined: false,
+        position: oink_foundation::Point::new(400., 400.),
+        motion_serial: 0,
+        motion_observable: true,
+        foreground: 1,
+    };
+    for now in (0..=50_000).step_by(50_000) {
         sample.motion_serial += 1;
-        detector.update((327, me), Some(sample), true, true, now);
+        assert!(!detector.update((1, me), Some(sample), true, true, now));
     }
-    assert!(detector.update((327, me), Some(sample), true, true, 2_300_000));
+    for now in (100_000..=1_000_000).step_by(50_000) {
+        assert!(!detector.update((2, me), Some(sample), true, true, now));
+    }
+}
+
+#[test]
+fn confirmed_windows_capture_survives_absence_without_new_motion() {
+    use oink_input::pointer_capture::{
+        CaptureSample,
+        windows::{MotionBatch, WindowsSample},
+    };
+    let mut detector = ScopedCaptureDetector::default();
+    let me = DeviceId([1; 32]);
+    let mut sample = CaptureSample {
+        windows: None,
+        hidden: true,
+        application_hidden: Some(true),
+        confined: true,
+        position: oink_foundation::Point::new(400., 400.),
+        motion_serial: 0,
+        motion_observable: false,
+        foreground: 1,
+    };
+    for now in (0..=400_000).step_by(50_000) {
+        let mut motion = MotionBatch::default();
+        if now != 0 {
+            motion.record(now - 25_000);
+            motion.record(now);
+        }
+        sample.windows = Some(WindowsSample {
+            sampled_at: now,
+            fullscreen: true,
+            motion,
+        });
+        detector.update((1, me), Some(sample), true, true, now);
+    }
+    assert!(detector.detected);
+    assert!(!detector.update((2, DeviceId([2; 32])), None, false, true, 450_000));
+    sample.windows = Some(WindowsSample {
+        sampled_at: 1_000_000,
+        fullscreen: true,
+        motion: MotionBatch::default(),
+    });
+    assert!(detector.update((3, me), Some(sample), true, true, 1_000_000));
+    // A different foreground is new evidence, even if it also hides the cursor.
+    sample.foreground = 2;
+    sample.windows.as_mut().unwrap().sampled_at = 1_050_000;
+    assert!(!detector.update((3, me), Some(sample), true, true, 1_050_000));
 }
 
 #[test]
@@ -1492,7 +1564,7 @@ fn keyboard_guard_releases_old_keys_when_active_and_detaches_during_full_pause()
     h.driver.command(InputCommand::Paused(true));
     assert!(!h.driver.capture_requested());
     assert!(!h.driver.keyboard_disabled());
-    assert!(h.driver.adapter.router().keyboard_disabled());
+    assert!(!h.driver.adapter.router().keyboard_disabled());
 }
 
 #[test]
@@ -1719,6 +1791,76 @@ fn screen_identification_uses_attached_input_stream_and_obeys_pause() {
 }
 
 #[test]
+fn permission_grant_waits_for_capture_result_and_only_failed_attempts_alert() {
+    use oink_foundation::input::{InputPermissions, PermissionState as P};
+    let mut h = Harness::new();
+    let missing = InputPermissions {
+        accessibility: P::NotGranted,
+        input_monitoring: P::NotDetermined,
+        secure_input_active: false,
+    };
+    // Deterministic permission source: this sample includes AX's effective
+    // listening grant even though the independent IOHID entry is unchanged.
+    let granted = InputPermissions {
+        accessibility: P::Granted,
+        input_monitoring: P::Granted,
+        ..missing
+    };
+    let alerts = |driver: &Driver, permissions: &InputPermissions| {
+        crate::agent_api::capture_unavailable(permissions, &driver.shared.status.load(), false)
+    };
+    h.driver.command(InputCommand::Controllable(false));
+    h.driver.publish();
+    assert!(!alerts(&h.driver, &missing));
+    // The permission observer emits Overview before Controllable is consumed.
+    // The native handle is still detached here; no attempt has failed.
+    assert!(!alerts(&h.driver, &granted));
+    h.driver.command(InputCommand::Controllable(true));
+    h.driver.publish();
+    assert!(!alerts(&h.driver, &granted));
+    h.driver.capture_available(true);
+    assert!(!alerts(&h.driver, &granted));
+    // Intentional withdrawal must not leave a stale error for the next grant.
+    h.driver.capture_detached();
+    h.driver.command(InputCommand::Controllable(false));
+    h.driver.publish();
+    assert!(!alerts(&h.driver, &missing));
+    assert!(!alerts(&h.driver, &granted));
+    h.driver.command(InputCommand::Controllable(true));
+    h.driver.publish();
+    assert!(!alerts(&h.driver, &granted));
+    // A completed failed native attempt still publishes a real error immediately.
+    h.driver.capture_available(false);
+    assert!(alerts(&h.driver, &granted));
+    assert!(h.driver.shared.status.load().capture_failed);
+    h.driver.capture_available(true);
+    assert!(!alerts(&h.driver, &granted));
+    assert!(!h.driver.shared.status.load().capture_failed);
+}
+
+#[test]
+fn intentional_capture_withdrawal_keeps_keyboard_health_known() {
+    use oink_protocol::v1::dto::ResourceFaultCode as Fault;
+    let mut h = Harness::new();
+    h.driver.capture_available(true);
+    h.driver.command(InputCommand::KeyboardDisabled(true));
+    h.driver.command(InputCommand::Paused(true));
+    h.driver.capture_detached();
+    let status = h.driver.shared.status.load();
+    assert!(status.paused);
+    assert!(!status.keyboard_disabled);
+    assert!(!status.capture_failed);
+    assert_eq!(status.resource_faults.keyboard, Some(Fault::None));
+    // An intentional withdrawal also retires a previous failed attempt.
+    h.driver.capture_available(false);
+    h.driver.capture_detached();
+    assert_eq!(
+        h.driver.shared.status.load().resource_faults.keyboard,
+        Some(Fault::None)
+    );
+}
+
+#[test]
 fn resource_faults_keep_unknown_and_separate_capture_secure_input_and_cleanup() {
     use oink_foundation::input::KeyCode;
     use oink_protocol::v1::dto::ResourceFaultCode as Fault;
@@ -1865,6 +2007,10 @@ fn owner_resume_cannot_cross_an_emergency_sequence() {
 #[test]
 fn received_emergency_invalidates_resume_without_originating_another_group_event() {
     let mut h = Harness::new();
+    let mut settings = (*h.driver.settings).clone();
+    settings.mouse_mode = oink_foundation::input::InputMode::Disabled;
+    h.driver.snapshots.settings.publish(settings);
+    h.driver.refresh();
     h.driver.command(InputCommand::KeyboardDisabled(true));
     let (reply, received) = mpsc::sync_channel(1);
     h.driver.command(InputCommand::ReceiveEmergency { reply });
@@ -1882,6 +2028,9 @@ fn received_emergency_invalidates_resume_without_originating_another_group_event
     }
     assert!(h.driver.shared.status.load().paused);
     assert!(!h.driver.shared.status.load().keyboard_disabled);
+    assert!(!h.driver.adapter.router().mouse_disabled());
+    h.driver.refresh();
+    assert!(!h.driver.adapter.router().mouse_disabled());
     assert!(!std::iter::from_fn(|| h.driver.notices.take()).any(|notice| notice == InputNotice::EmergencyPause));
     let (reply, received) = mpsc::sync_channel(1);
     h.driver.command(InputCommand::ApplyOwnerPause {
@@ -2901,4 +3050,35 @@ fn target_cursor_clip_touching_actual_edge_blocks_handoff_after_rebase() {
     h.driver.cursor_resume();
     assert_eq!(h.driver.adapter.router().focus().holder, h.driver.local);
     assert_eq!(h.driver.adapter.router().local_pointer().unwrap().x, 999.);
+}
+
+#[test]
+fn stale_mouse_disable_cannot_cross_safety_release() {
+    let mut h = Harness::new();
+    let mut routing = (*h.driver.settings).clone();
+    routing.mouse_mode = oink_foundation::input::InputMode::Disabled;
+    h.driver.snapshots.settings.publish(routing.clone());
+    h.driver.refresh();
+    assert!(h.driver.adapter.router().mouse_disabled());
+    h.driver.command(InputCommand::SessionLocked(Some(true)));
+    h.driver.command(InputCommand::SessionLocked(Some(false)));
+    assert!(h.driver.adapter.router().mouse_disabled());
+    h.driver.command(InputCommand::Paused(true));
+    h.driver.command(InputCommand::Paused(false));
+    h.driver.refresh();
+    assert!(!h.driver.adapter.router().mouse_disabled());
+    let (reply, result) = mpsc::sync_channel(1);
+    h.driver.command(InputCommand::ApplyOwnerPreferences {
+        expected_emergency_sequence: 0,
+        routing,
+        keyboard_disabled: false,
+        input_transform: oink_foundation::input_transform::InputTransform::initial("macos"),
+        accept_contacts: false,
+        reply,
+    });
+    assert_eq!(
+        result.try_recv().unwrap(),
+        Err(oink_protocol::v1::dto::ControlFailure::StaleRevision)
+    );
+    assert!(!h.driver.adapter.router().mouse_disabled());
 }

@@ -19,6 +19,7 @@ use std::{
 
 pub(crate) struct Displays {
     info: Mutex<DisplayInfo>,
+    fail: std::sync::atomic::AtomicBool,
     changes: Mutex<Vec<ChangeHandler>>,
     wallpaper_changes: Mutex<Vec<ChangeHandler>>,
 }
@@ -37,6 +38,7 @@ impl Displays {
                 is_builtin: true,
                 is_virtual: false,
             }),
+            fail: std::sync::atomic::AtomicBool::new(false),
             changes: Mutex::new(Vec::new()),
             wallpaper_changes: Mutex::new(Vec::new()),
         })
@@ -56,9 +58,18 @@ impl Displays {
             callback();
         }
     }
+    fn fail_enumeration(&self, fail: bool) {
+        self.fail.store(fail, std::sync::atomic::Ordering::Release);
+        for callback in lock(&self.changes).clone() {
+            callback();
+        }
+    }
 }
 impl DisplayBackend for Displays {
     fn displays(&self) -> Result<Vec<DisplayInfo>, DisplayError> {
+        if self.fail.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(DisplayError::Platform("fake completed enumeration failure".into()));
+        }
         Ok(vec![self.info()])
     }
     fn watch(&self, callback: ChangeHandler) -> Result<(), DisplayError> {
@@ -104,6 +115,85 @@ pub(crate) async fn start_with_clip(
 }
 
 use oink_test_support::clipboard::FakeClipboard as Clipboard;
+
+#[test]
+fn display_alerts_follow_native_failure_and_recovery_without_connect_flashes() {
+    crate::test_watchdog::run(module_path!(), "display_alert_native_outcomes", Some(4), async {
+        use crate::api::{AlertKind, ApiEvent};
+        let dir = tempfile::tempdir().unwrap();
+        let displays = [Displays::new("display-a"), Displays::new("display-b")];
+        let a = start_with_clip(
+            &oink_test_support::network_config(dir.path().join("a"), "a", 0),
+            &displays[0],
+            None,
+        )
+        .await;
+        let b = start_with_clip(
+            &oink_test_support::network_config(dir.path().join("b"), "b", 0),
+            &displays[1],
+            None,
+        )
+        .await;
+        let seen: Arc<Mutex<Vec<crate::api::Alert>>> = Arc::default();
+        for node in [&a, &b] {
+            let seen = seen.clone();
+            node.subscribe(Arc::new(move |event| {
+                if let ApiEvent::Overview(view) = event {
+                    lock(&seen).extend(
+                        view.alerts
+                            .iter()
+                            .filter(|alert| {
+                                matches!(
+                                    alert.kind,
+                                    AlertKind::DisplayInfoUnavailable { .. }
+                                        | AlertKind::DisplayEnumerationFailed { .. }
+                                )
+                            })
+                            .cloned(),
+                    );
+                }
+            }));
+        }
+        pair(&a, &b).await;
+        active(&a, &b).await;
+        assert!(
+            lock(&seen).is_empty(),
+            "normal initial Facts must not manufacture display errors"
+        );
+        let alerts = |node: &Node| {
+            node.overview()
+                .unwrap()
+                .alerts
+                .into_iter()
+                .filter(|alert| {
+                    matches!(
+                        alert.kind, AlertKind::DisplayEnumerationFailed { device } if device == a.id().into()
+                    )
+                })
+                .count()
+        };
+        displays[0].fail_enumeration(true);
+        until("explicit enumeration failure reaches local and peer views", || {
+            alerts(&a) == 1 && alerts(&b) == 1
+        })
+        .await;
+        assert!(
+            has_display(&a, a.id(), &displays[0].info()),
+            "retain last good local geometry"
+        );
+        assert!(
+            has_display(&b, a.id(), &displays[0].info()),
+            "retain last good peer geometry"
+        );
+        displays[0].fail_enumeration(false);
+        until("successful enumeration clears local and peer errors", || {
+            alerts(&a) == 0 && alerts(&b) == 0
+        })
+        .await;
+        a.shutdown().await;
+        b.shutdown().await;
+    });
+}
 
 use crate as test_agent;
 #[path = "../tests/common/mod.rs"]

@@ -250,13 +250,19 @@ fn profile_ipc_native_edit_dedup_load_undo_and_restart() {
             }),
         )
         .await;
+        // A normal native drag plan can be committed with the whole computer's
+        // compacted placement. Compaction needs no second native preview/write.
+        let mut compacted = preview.placements.clone();
+        compacted[0].origin.x += 0.25;
+        compacted[0].origin.y += 0.125;
+        let expected_native = preview.native.screens.clone();
         let mut bits = current.disabled.clone();
         bits.iter_mut().find(|b| b.screen.display == "second").unwrap().disabled = true;
         let request = Request::CommitArrangement(CommitRequest {
             screen_shared: Vec::new(),
             request_id: "edit-once".into(),
             expected_token: state.token,
-            placements: preview.placements,
+            placements: compacted.clone(),
             native_plan_tokens: vec![preview.plan_token],
             disabled: bits,
         });
@@ -266,6 +272,9 @@ fn profile_ipc_native_edit_dedup_load_undo_and_restart() {
             OperationStatus::Applied
         );
         assert_eq!(display.calls.load(Ordering::SeqCst), 1);
+        let applied = query(&node).await.snapshot.unwrap();
+        assert_eq!(applied.placements, compacted);
+        assert_eq!(applied.native[0].screens, expected_native);
         let _: OperationReply = call(&node, request).await;
         assert_eq!(display.calls.load(Ordering::SeqCst), 1);
         let saved: LayoutProfilesState = call(
@@ -346,7 +355,7 @@ fn profiles_merge_and_sync_over_low_without_applying_native() {
         common::until("profile catalogs union and converge", || {
             let ca = lock(&a.inner.profiles.data).catalog.clone();
             let cb = lock(&b.inner.profiles.data).catalog.clone();
-            ca.as_ref().is_some_and(|c| c.profiles.len() == 4) && ca == cb
+            ca.as_ref().is_some_and(|c| c.profiles.len() == 3) && ca == cb
         })
         .await;
         assert_eq!(da.calls.load(Ordering::SeqCst) + db.calls.load(Ordering::SeqCst), 0);
@@ -369,7 +378,7 @@ fn profiles_merge_and_sync_over_low_without_applying_native() {
         })
         .await;
         // Exercise the larger catalog over the real Low transport, then deletion.
-        for i in 4..16 {
+        for i in 3..16 {
             let state = query(&a).await;
             let _: LayoutProfilesState = call(
                 &a,
@@ -516,7 +525,7 @@ fn multi_owner_load_returns_actual_partial_state_without_compensation() {
         common::until("catalog import converged", || {
             let ca = lock(&a.inner.profiles.data).catalog.clone();
             let cb = lock(&b.inner.profiles.data).catalog.clone();
-            ca.as_ref().is_some_and(|c| c.profiles.len() == 2) && ca == cb
+            ca.as_ref().is_some_and(|c| c.profiles.len() == 1) && ca == cb
         })
         .await;
         enable(&a, a.id().into(), "enable-a").await;
@@ -737,106 +746,6 @@ fn requester_restart_resolves_durable_pending_without_a_second_write() {
         assert_eq!(displays.calls.load(Ordering::SeqCst), 1);
         restarted.shutdown().await;
     });
-}
-
-async fn merged_group_with_missing_source_catalog(pre_feature: bool) {
-    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
-    let displays = [Displays::new(), Displays::new()];
-    let a = start(dirs[0].path(), displays[0].clone()).await;
-    let b = start(dirs[1].path(), displays[1].clone()).await;
-    query(&a).await;
-    query(&b).await;
-    common::pair(&a, &b).await;
-    common::until("catalog merge completed", || {
-        let ca = lock(&a.inner.profiles.data).catalog.clone();
-        let cb = lock(&b.inner.profiles.data).catalog.clone();
-        ca.as_ref()
-            .is_some_and(|c| c.profiles.len() == 2 && !c.imported_merges.is_empty())
-            && ca == cb
-    })
-    .await;
-    let group = a.group_id().unwrap().into();
-    a.shutdown().await;
-    b.shutdown().await;
-    if pre_feature {
-        // Model an upgrade from a release that wrote the certified group journal
-        // but never had layout-profile storage on either side.
-        for dir in &dirs {
-            std::fs::remove_dir_all(dir.path().join("layout-profiles-v2")).unwrap();
-        }
-    } else {
-        // Keep the pre-merge profile-store origin, but lose the source archive
-        // and its import receipt. This is a real certified, post-feature merge.
-        let mut catalog = super::store::load(dirs[0].path(), group).unwrap().unwrap();
-        catalog.imported_merges.clear();
-        for entry in std::fs::read_dir(dirs[0].path().join("layout-profiles-v2")).unwrap() {
-            let path = entry.unwrap().path();
-            if path.file_name().unwrap() != "activation.json" {
-                std::fs::remove_file(path).unwrap();
-            }
-        }
-        super::store::save(dirs[0].path(), &catalog).unwrap();
-    }
-    let restarted = start(dirs[0].path(), displays[0].clone()).await;
-    let n = restarted.clone();
-    tokio::task::spawn_blocking(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match n.reconcile_profile_merges() {
-                Err(e) if e.code == ErrorCode::Busy && std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(5))
-                }
-                result => break result,
-            }
-        }
-    })
-    .await
-    .unwrap()
-    .unwrap();
-    let state = query(&restarted).await;
-    assert_eq!(
-        state.readiness,
-        if pre_feature {
-            Readiness::Ready
-        } else {
-            Readiness::Syncing
-        }
-    );
-    assert_eq!(state.create_enabled, pre_feature);
-    if pre_feature {
-        let saved: LayoutProfilesState = call(
-            &restarted,
-            Request::CreateLayoutProfile(Create {
-                request_id: "save-after-upgrade".into(),
-                expected_token: state.token,
-                name: "Upgraded desk".into(),
-            }),
-        )
-        .await;
-        assert_eq!(saved.profiles.len(), 2);
-        assert_eq!(saved.readiness, Readiness::Ready);
-    }
-    assert_eq!(displays[0].calls.load(Ordering::SeqCst), 0);
-    restarted.shutdown().await;
-}
-
-#[test]
-fn pre_feature_merge_history_does_not_wait_for_nonexistent_catalogs() {
-    crate::test_watchdog::run(
-        module_path!(),
-        "pre-feature merge history",
-        Some(6),
-        merged_group_with_missing_source_catalog(true),
-    );
-}
-#[test]
-fn post_feature_merge_missing_source_catalog_stays_syncing() {
-    crate::test_watchdog::run(
-        module_path!(),
-        "pending post-feature catalog",
-        Some(6),
-        merged_group_with_missing_source_catalog(false),
-    );
 }
 
 #[test]
@@ -1148,4 +1057,425 @@ fn legacy_manual_commit_preserves_intervening_automatic_layout_fields() {
         assert_eq!(placement.origin.y, original.origin.y);
         node.shutdown().await;
     });
+}
+
+async fn directional_default_join(source_members: usize) {
+    let count = source_members + 2;
+    let dirs = (0..count).map(|_| tempfile::tempdir().unwrap()).collect::<Vec<_>>();
+    let displays = (0..count).map(|_| Displays::new()).collect::<Vec<_>>();
+    let mut nodes = Vec::new();
+    for i in 0..count {
+        nodes.push(start(dirs[i].path(), displays[i].clone()).await);
+    }
+    for node in &nodes {
+        query(node).await;
+    }
+    let source_default = lock(&nodes[0].inner.profiles.data)
+        .catalog
+        .as_ref()
+        .unwrap()
+        .active_profile_id
+        .clone();
+    if source_members == 2 {
+        common::pair(&nodes[0], &nodes[1]).await;
+        common::until("source group default converges", || {
+            let a = lock(&nodes[0].inner.profiles.data).catalog.clone();
+            let b = lock(&nodes[1].inner.profiles.data).catalog.clone();
+            a.as_ref()
+                .is_some_and(|c| c.profiles.len() == 1 && c.active_profile_id == source_default)
+                && a == b
+        })
+        .await;
+    }
+    let target_default = lock(&nodes[source_members].inner.profiles.data)
+        .catalog
+        .as_ref()
+        .unwrap()
+        .active_profile_id
+        .clone();
+    common::pair(&nodes[source_members], &nodes[source_members + 1]).await;
+    common::until("target group inherited default converges", || {
+        let a = lock(&nodes[source_members].inner.profiles.data).catalog.clone();
+        let b = lock(&nodes[source_members + 1].inner.profiles.data).catalog.clone();
+        a.as_ref()
+            .is_some_and(|c| c.profiles.len() == 1 && c.active_profile_id == target_default)
+            && a == b
+    })
+    .await;
+    let target_group = nodes[source_members + 1].group_id().unwrap();
+    // The responder accepts; the initiating source joins its existing group.
+    common::pair(&nodes[0], &nodes[source_members + 1]).await;
+    common::until("directional default rule converges on all members", || {
+        let catalogs = nodes
+            .iter()
+            .map(|n| lock(&n.inner.profiles.data).catalog.clone())
+            .collect::<Vec<_>>();
+        catalogs.iter().all(|c| c == &catalogs[0])
+            && catalogs[0].as_ref().is_some_and(|c| {
+                c.group.0 == target_group
+                    && c.profiles.len() == 1
+                    && c.active_profile_id == source_default
+                    && c.default_profile().is_some_and(|p| p.id == source_default)
+                    && c.completed_joins
+                        .values()
+                        .any(|j| j.dropped_defaults.contains(&target_default))
+            })
+    })
+    .await;
+    assert!(displays.iter().all(|d| d.calls.load(Ordering::SeqCst) == 0));
+    for node in nodes {
+        node.shutdown().await;
+    }
+}
+
+#[test]
+fn group_group_pairing_drops_acceptors_inherited_default_over_low() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "two groups default import",
+        Some(8),
+        directional_default_join(2),
+    );
+}
+
+#[test]
+fn single_device_pairing_drops_acceptor_group_default_over_low() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "device joins group default import",
+        Some(6),
+        directional_default_join(1),
+    );
+}
+
+async fn offline_acceptor_scenario(recover_projection: bool) {
+    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let displays = [Displays::new(), Displays::new()];
+    let a = start(dirs[0].path(), displays[0].clone()).await;
+    let b = start(dirs[1].path(), displays[1].clone()).await;
+    let source_default = query(&a).await.active_profile_id.unwrap();
+    let target_default = query(&b).await.active_profile_id.unwrap();
+    b.inner.profiles.defer_joins.store(true, Ordering::SeqCst);
+    common::pair(&a, &b).await;
+    common::until("acceptor interrupted before catalog commit", || {
+        b.inner.profiles.deferred_joins.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    let group = b.group_id().unwrap().into();
+    let pending = super::join::list(dirs[0].path(), group).unwrap();
+    assert_eq!(pending.len(), 1);
+    let id = pending[0].id.clone();
+    assert!(
+        pending[0]
+            .catalog
+            .as_ref()
+            .unwrap()
+            .profiles
+            .iter()
+            .any(|p| p.id == source_default)
+    );
+    assert!(
+        !super::store::load(dirs[1].path(), group)
+            .unwrap()
+            .unwrap()
+            .completed_joins
+            .contains_key(&id)
+    );
+    b.shutdown().await;
+    assert!(a.pending_profile_joins(b.id()).unwrap().iter().any(|j| j.id == id));
+    a.shutdown().await;
+    if recover_projection {
+        // Freeze the durable membership decision before the profile handoff
+        // and group projection acknowledgements. Startup must prepare the
+        // exact list while no live configuration handle exists yet.
+        use oink_protocol::v1::{RawValue as V, cbor, schema::WireValue};
+        for (dir, node) in dirs.iter().zip([&a, &b]) {
+            let path = dir.path().join(oink_network::pair_journal::FILE);
+            let journal = oink_network::pair_journal::Journal::load(&path, node.id()).unwrap();
+            let recovery = journal
+                .recoveries()
+                .unwrap()
+                .into_iter()
+                .find(|r| matches!(r.outcome, oink_network::pair_journal::Decision::Committed(_)))
+                .unwrap();
+            let oink_network::pair_journal::Decision::Committed(bundle) = recovery.outcome else {
+                unreachable!()
+            };
+            let intent = bundle.certificate().unwrap().intent().unwrap();
+            let projected = oink_network::group_merge::verify_bundle(
+                &bundle,
+                oink_network::group_merge::anchor(&intent.source().unwrap()).unwrap(),
+            )
+            .unwrap();
+            let mut raw = cbor::decode_map(&std::fs::read(&path).unwrap(), 64 * 1024 * 1024).unwrap();
+            raw.insert(
+                9,
+                V::Map(
+                    [
+                        (1, intent.pair_id().unwrap().write()),
+                        (2, recovery.decision.write()),
+                        (3, projected.wire().write()),
+                    ]
+                    .into(),
+                ),
+            );
+            oink_foundation::storage::atomic_write(&path, &cbor::encode_map(&raw, 64 * 1024 * 1024).unwrap()).unwrap();
+            std::fs::remove_file(dir.path().join("layout-profile-joins").join(format!("{id}.json"))).unwrap();
+        }
+    }
+    let b = start(dirs[1].path(), displays[1].clone()).await;
+    let a = start(dirs[0].path(), displays[0].clone()).await;
+    common::query(&a, &b).await;
+    common::active(&[&a, &b]).await;
+    common::until("retained source list completes after acceptor restart", || {
+        let ca = lock(&a.inner.profiles.data).catalog.clone();
+        let cb = lock(&b.inner.profiles.data).catalog.clone();
+        ca.as_ref().is_some_and(|c| {
+            c.completed_joins.contains_key(&id) && c.default_profile().is_some_and(|p| p.id == source_default)
+        }) && ca == cb
+    })
+    .await;
+    let result = super::store::load(dirs[1].path(), group).unwrap().unwrap();
+    assert!(!result.profiles.iter().any(|p| p.id == target_default));
+    assert!(a.pending_profile_joins(b.id()).unwrap().is_empty());
+    assert!(
+        super::join::read(dirs[0].path(), &id)
+            .unwrap()
+            .unwrap()
+            .catalog
+            .is_none()
+    );
+    assert!(displays.iter().all(|d| d.calls.load(Ordering::SeqCst) == 0));
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[test]
+fn acceptor_offline_before_merge_resends_durable_list_after_both_restart() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "offline acceptor profile handoff",
+        Some(6),
+        offline_acceptor_scenario(false),
+    );
+}
+#[test]
+fn committed_membership_recovers_profile_handoff_before_configuration_start() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "recover profile projection boundary",
+        Some(6),
+        offline_acceptor_scenario(true),
+    );
+}
+
+#[test]
+fn rapid_second_pairing_converges_three_real_nodes_without_import_proofs() {
+    crate::test_watchdog::run(module_path!(), "rapid second profile pairing", Some(6), async {
+        let dirs = [
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        ];
+        let displays = [Displays::new(), Displays::new(), Displays::new()];
+        let a = start(dirs[0].path(), displays[0].clone()).await;
+        let b = start(dirs[1].path(), displays[1].clone()).await;
+        let c = start(dirs[2].path(), displays[2].clone()).await;
+        let source_default = query(&a).await.active_profile_id.unwrap();
+        query(&b).await;
+        query(&c).await;
+        common::pair(&a, &b).await;
+        // The new join contract assumes the initiator has its converged source
+        // list. Pair again immediately when it has the acceptor's first result;
+        // do not wait for every member's catalog/facts/UI readiness.
+        common::until("initiator has the first acceptor result", || {
+            lock(&a.inner.profiles.data).catalog.as_ref().is_some_and(|c| {
+                c.group.0 == b.group_id().unwrap()
+                    && !c.completed_joins.is_empty()
+                    && c.default_profile().is_some_and(|p| p.id == source_default)
+            })
+        })
+        .await;
+        common::pair(&a, &c).await;
+        common::active(&[&a, &b, &c]).await;
+        common::until("rapid second result relays to every member", || {
+            let catalogs = [&a, &b, &c].map(|n| lock(&n.inner.profiles.data).catalog.clone());
+            catalogs[0].as_ref().is_some_and(|catalog| {
+                catalog.group.0 == c.group_id().unwrap()
+                    && catalog.default_profile().is_some_and(|p| p.id == source_default)
+            }) && catalogs.iter().all(|catalog| catalog == &catalogs[0])
+                && [&a, &b, &c]
+                    .iter()
+                    .all(|n| n.profile_snapshot().is_ok_and(|s| s.readiness == Readiness::Ready))
+        })
+        .await;
+        for node in [&a, &b, &c] {
+            assert_eq!(query(node).await.readiness, Readiness::Ready);
+        }
+        assert!(displays.iter().all(|d| d.calls.load(Ordering::SeqCst) == 0));
+        a.shutdown().await;
+        b.shutdown().await;
+        c.shutdown().await;
+    });
+}
+
+#[test]
+fn awaiting_target_catalog_never_mutates_retained_source_profiles() {
+    crate::test_watchdog::run(module_path!(), "awaiting catalog mutation fence", Some(6), async {
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let displays = [Displays::new(), Displays::new()];
+        let a = start(dirs[0].path(), displays[0].clone()).await;
+        let b = start(dirs[1].path(), displays[1].clone()).await;
+        let original = lock(&a.inner.profiles.data).catalog.clone().unwrap();
+        a.inner.profiles.defer_catalogs.store(true, Ordering::SeqCst);
+        b.inner.profiles.defer_joins.store(true, Ordering::SeqCst);
+        common::pair(&a, &b).await;
+        common::until("owner facts visible during pending catalog", || {
+            a.profile_snapshot().is_ok()
+        })
+        .await;
+        let current = query(&a).await;
+        assert_eq!(current.readiness, Readiness::Syncing);
+        assert!(
+            !common::profile_layout_ready(&a),
+            "retained source snapshot is not writable target readiness"
+        );
+        let n = a.clone();
+        let reply = tokio::task::spawn_blocking(move || {
+            n.layout_profile_command(Command::Rename(Rename {
+                request_id: "rename-during-handoff".into(),
+                expected_catalog_token: current.catalog_token,
+                profile_id: current.active_profile_id.unwrap(),
+                name: "Wrong group".into(),
+            }))
+        })
+        .await
+        .unwrap();
+        assert_eq!(reply["error"]["code"], "busy", "{reply}");
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = executed.clone();
+        let n = a.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            n.commit_manual_visibility(n.id().into(), None, true, || {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        assert!(!executed.load(Ordering::SeqCst));
+        assert_eq!(
+            super::store::load(dirs[0].path(), original.group).unwrap().unwrap(),
+            original
+        );
+        assert!(
+            super::store::load(dirs[0].path(), b.group_id().unwrap().into())
+                .unwrap()
+                .is_none()
+        );
+        a.shutdown().await;
+        b.shutdown().await;
+    });
+}
+
+#[test]
+fn pairing_durable_catalog_does_not_require_live_owner_facts() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "profile handoff without live facts",
+        Some(4),
+        pairing_without_live_facts(false),
+    );
+}
+
+#[test]
+fn source_granted_pairing_does_not_require_live_owner_facts() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "source permit without live facts",
+        Some(4),
+        pairing_without_live_facts(true),
+    );
+}
+
+async fn pairing_without_live_facts(source_permits: bool) {
+    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let a = start(dirs[0].path(), Displays::new()).await;
+    let b = start(dirs[1].path(), Displays::new()).await;
+    // Only the smaller device ID grants the permit. Exercise both roles
+    // explicitly: the pairing deadline must not depend on facts in either.
+    let (a, b) = if (a.id() < b.id()) == source_permits {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    // Both saved catalogs already exist. Facts/UI readiness is independent
+    // of the saved list and must not block the membership commit protocol.
+    let original = lock(&a.inner.profiles.data).catalog.clone().unwrap();
+    for node in [&a, &b] {
+        assert!(
+            super::store::load(&node.inner.data_dir, node.group_id().unwrap().into())
+                .unwrap()
+                .is_some()
+        );
+        node.inner
+            .profiles
+            .unavailable_observation
+            .store(true, Ordering::SeqCst);
+        assert_eq!(node.profile_snapshot().unwrap_err().code, ErrorCode::FactsUnavailable);
+    }
+    common::pair(&a, &b).await;
+    common::until("saved catalog transferred without live observation", || {
+        lock(&b.inner.profiles.data).catalog.as_ref().is_some_and(|c| {
+            !c.completed_joins.is_empty()
+                && c.default_profile().map(|p| &p.id) == original.default_profile().map(|p| &p.id)
+        })
+    })
+    .await;
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[test]
+fn catalog_publication_cannot_be_overwritten_by_snapshot_initialization() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "catalog publication versus snapshot init",
+        Some(4),
+        async {
+            let dir = tempfile::tempdir().unwrap();
+            let node = start(dir.path(), Displays::new()).await;
+            let old = lock(&node.inner.profiles.data).catalog.clone().unwrap();
+            let next = old
+                .rename(node.id().into(), &old.active_profile_id, "Arrived catalog")
+                .unwrap();
+            let loaded = Arc::new(std::sync::Barrier::new(2));
+            let resume = Arc::new(std::sync::Barrier::new(2));
+            *lock(&node.inner.profiles.pause_snapshot_init) = Some((loaded.clone(), resume.clone()));
+            lock(&node.inner.profiles.data).catalog = None;
+            let reader = node.clone();
+            let reading = std::thread::spawn(move || reader.profile_snapshot());
+            // Snapshot initialization now holds profiles.data and has read the old
+            // durable list, but has not yet written its recovered operation receipts.
+            loaded.wait();
+            let publishing = Arc::new(std::sync::Barrier::new(2));
+            *lock(&node.inner.profiles.catalog_publish_ready) = Some(publishing.clone());
+            let writer = node.clone();
+            let candidate = next.clone();
+            let writing = std::thread::spawn(move || writer.persist_catalog(candidate));
+            publishing.wait();
+            // In the broken ordering, the new catalog is already on disk while its
+            // publisher waits for profiles.data; resuming recovery overwrites it.
+            resume.wait();
+            reading.join().unwrap().unwrap();
+            writing.join().unwrap().unwrap();
+            assert_eq!(lock(&node.inner.profiles.data).catalog.as_ref(), Some(&next));
+            assert_eq!(
+                super::store::load(dir.path(), next.group).unwrap().as_ref(),
+                Some(&next)
+            );
+            node.shutdown().await;
+        },
+    );
 }

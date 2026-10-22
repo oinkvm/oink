@@ -51,7 +51,7 @@ describe('shared facing definition', () => {
                 cases.push({ rects: scaled(rs, k) });
             }
         }
-        const output = execFileSync('cargo', ['run', '--quiet', '-p', 'oink-display', '--example', 'layout_conformance'], {
+        const output = execFileSync('cargo', ['run', '-j2', '--quiet', '-p', 'oink-display', '--example', 'layout_conformance'], {
             cwd: fileURLToPath(new URL('../../../../', import.meta.url)),
             env: { ...process.env, CARGO_INCREMENTAL: '0', CARGO_PROFILE_DEV_DEBUG: '0', CARGO_PROFILE_TEST_DEBUG: '0' },
             input: JSON.stringify(cases), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 120000,

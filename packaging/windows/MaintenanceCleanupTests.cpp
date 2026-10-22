@@ -64,9 +64,9 @@ int main() {
             assert(DeleteFileW(lock_path.c_str()));
             assert(CreateHardLinkW(lock_path.c_str(), (base + L"\\user-data").c_str(), nullptr));
         } else if (!name.empty()) put(directory + L"\\" + name);
-        // A rollback's pending journal preserves Run/cloud registrations; an
+        // A rollback's journal/authorization preserves data/registrations; an
         // ordinary standalone uninstall removes them.
-        assert(cleanup::preserve_user_state(directory) == (name == L"pending.json"));
+        assert(cleanup::preserve_user_state(directory) == (name == L"pending.json" || name == L"msi-authorization.json"));
         const auto result = cleanup::after_uninstall(root, directory, L"maintenance.lock", regular_path, regular);
         if (name.empty()) {
             assert(result == cleanup::Result::removed && cleanup::absent(root));

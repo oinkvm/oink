@@ -5,6 +5,7 @@ import type { CSSProperties, ReactNode, TransitionEvent } from 'react';
 import { Button, Icon, Tooltip, mergeRefs, presets, speed } from 'oink-ui';
 import { useTrafficLightAlignment } from './useTrafficLightAlignment';
 import { OverlayScrollbar } from './OverlayScrollbar';
+import { quietActivationFocus } from './activationFocus';
 export type Platform = 'mac' | 'win';
 export interface WindowState {
     maximized: boolean;
@@ -82,6 +83,7 @@ function useNavCollapse(open: boolean) {
     return { collapsed, onTransitionEnd };
 }
 export const DesktopWindow = forwardRef<HTMLDivElement, DesktopWindowProps>(function DesktopWindow({ platform, state, active, title, onMinimize, onToggleMaximize, onClose, onActivate, navOpen, onToggleNav, onSideBlank, nav, onSideAction, pages = {}, navBack, sideExtra, version, titleCenter, titleEnd, cover, covered = false, coverBar, children }, ref) {
+    useEffect(quietActivationFocus, []);
     const navState = useNavCollapse(navOpen);
     const [expanding, setExpanding] = useState(false);
     const wasOpen = useRef(navOpen);

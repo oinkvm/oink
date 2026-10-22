@@ -2,7 +2,7 @@
   "en": {
     "about": "About Oink",
     "open": "Open Oink",
-    "quit": "Quit Oink…",
+    "quit": "Quit Oink",
     "edit": "Edit",
     "undo": "Undo",
     "redo": "Redo",
@@ -14,7 +14,7 @@
   "zh-Hans": {
     "about": "关于 Oink",
     "open": "打开 Oink",
-    "quit": "退出 Oink…",
+    "quit": "退出 Oink",
     "edit": "编辑",
     "undo": "撤销",
     "redo": "重做",
@@ -26,7 +26,7 @@
   "ja": {
     "about": "Oink について",
     "open": "Oink を開く",
-    "quit": "Oink を終了…",
+    "quit": "Oink を終了",
     "edit": "編集",
     "undo": "取り消す",
     "redo": "やり直す",
@@ -38,7 +38,7 @@
   "ko": {
     "about": "Oink에 관하여",
     "open": "Oink 열기",
-    "quit": "Oink 종료…",
+    "quit": "Oink 종료",
     "edit": "편집",
     "undo": "실행 취소",
     "redo": "실행 복귀",

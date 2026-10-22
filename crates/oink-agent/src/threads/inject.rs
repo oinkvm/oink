@@ -157,6 +157,7 @@ fn session_sensitive(item: &InjectItem) -> bool {
             | InjectItem::Dnd {
                 command: oink_routing::DndCmd::Begin { .. }
                     | oink_routing::DndCmd::HoldSource { .. }
+                    | oink_routing::DndCmd::ExportSource { .. }
                     | oink_routing::DndCmd::ResumeSource { .. }
                     | oink_routing::DndCmd::PrepareDrop { .. }
                     | oink_routing::DndCmd::Probe { .. },

@@ -1,4 +1,4 @@
-//! Focus-scoped relative input. No layout/damping calls occur on this path.
+//! Device-owned game mode with focus-scoped relative input. No layout/damping calls occur on this path.
 use super::*;
 pub use crate::control::GameMode;
 use serde::{Deserialize, Serialize};
@@ -19,8 +19,7 @@ pub struct GameModeStatus {
 pub(super) struct GameState {
     scope: Option<(u64, DeviceId)>,
     pub(super) mode: GameMode,
-    passive_detected: bool,
-    pub(super) remote_capture: super::game_capture::RemoteCapture,
+    pub(super) owner: OwnerGameState,
     detected: bool,
     active: bool,
     cursor_hiding_cause_available: Option<bool>,
@@ -31,10 +30,26 @@ pub(super) struct GameState {
     rx: HashMap<DeviceId, (u64, f64, f64)>,
 }
 
+/// Local policy and capture outlive the group pointer's visits. Remote holder
+/// announcements only update the focus snapshot, never this device's state.
+#[derive(Debug, Default)]
+pub(super) struct OwnerGameState {
+    mode: GameMode,
+    active: bool,
+    passive_detected: bool,
+    pub(super) remote_capture: super::game_capture::RemoteCapture,
+    cursor_hiding_cause_available: Option<bool>,
+}
+
 impl GameState {
     pub(super) fn for_owner(mode: GameMode) -> Self {
         Self {
             mode,
+            owner: OwnerGameState {
+                mode,
+                active: mode == GameMode::On,
+                ..Default::default()
+            },
             active: mode == GameMode::On,
             generation: 1,
             authority_generation: 1,
@@ -55,7 +70,8 @@ impl Router {
         }
     }
 
-    /// A manual override applies to the current focus device, never pulls focus home.
+    /// A manual override belongs to the current focus device, never pulls focus home.
+    /// It survives pointer departures until another explicit mode edit or pause.
     /// Remote requests complete asynchronously through the holder's status event.
     pub fn set_game_mode(&mut self, mode: GameMode) {
         if self.paused {
@@ -72,19 +88,22 @@ impl Router {
             return;
         }
         self.game.scope = Some((self.epoch, self.holder));
-        self.game.mode = mode;
+        self.game.owner.mode = mode;
         if mode != GameMode::Auto {
-            self.game.remote_capture.reset("manual_mode");
-            self.game.detected = self.game.passive_detected;
+            self.game.owner.remote_capture.reset("manual_mode");
+            self.game.detected = self.game.owner.passive_detected;
         }
         self.refresh_game();
     }
 
     pub(super) fn apply_game_preference(&mut self) {
-        self.game.mode = self.cfg.settings.game_mode_preference;
-        self.game.remote_capture.reset("owner_preference");
-        self.game.detected = self.game.passive_detected;
-        self.refresh_game();
+        self.game.owner.mode = self.cfg.settings.game_mode_preference;
+        self.game.owner.remote_capture.reset("owner_preference");
+        if self.holder == self.me() {
+            self.refresh_game();
+        } else {
+            self.refresh_owner_game();
+        }
     }
 
     pub fn toggle_game_mode(&mut self) {
@@ -98,8 +117,8 @@ impl Router {
     /// Debounced local platform observation, never the source's Oink-owned freeze.
     pub fn set_pointer_captured(&mut self, detected: bool) {
         if self.has_pointer_focus() {
-            self.game.passive_detected = detected;
-            let detected = detected || self.game.remote_capture.detected;
+            self.game.owner.passive_detected = detected;
+            let detected = detected || self.game.owner.remote_capture.detected;
             if self.game.detected != detected {
                 self.game.detected = detected;
                 self.refresh_game();
@@ -116,16 +135,21 @@ impl Router {
         passive_detected: bool,
         now: Micros,
     ) {
+        // A parked source cursor belongs to Oink. Its samples (including None
+        // during native restoration) cannot establish or revoke game capture.
+        if !self.has_pointer_focus() || self.paused || sample.is_none() {
+            return;
+        }
         let availability = sample.map(|s| s.application_hidden.is_some());
-        let availability_changed = self.has_pointer_focus() && self.game.cursor_hiding_cause_available != availability;
+        let availability_changed = self.game.cursor_hiding_cause_available != availability;
         if availability_changed {
-            self.game.cursor_hiding_cause_available = availability;
+            self.game.owner.cursor_hiding_cause_available = availability;
         }
         let previously_detected = self.game.detected;
-        if self.cfg.os == Os::MacOS && self.has_pointer_focus() && !self.paused && self.game.mode == GameMode::Auto {
-            self.game.remote_capture.observe(sample, now);
+        if self.cfg.os == Os::MacOS && self.game.mode == GameMode::Auto {
+            self.game.owner.remote_capture.observe(sample, now);
         } else {
-            self.game.remote_capture.reset("not_auto_focus_or_paused");
+            self.game.owner.remote_capture.reset("not_mac_auto");
         }
         self.set_pointer_captured(passive_detected);
         if availability_changed && previously_detected == self.game.detected {
@@ -141,14 +165,27 @@ impl Router {
         }
     }
 
-    fn refresh_game(&mut self) {
-        self.game.scope = Some((self.epoch, self.holder));
+    fn refresh_owner_game(&mut self) {
+        let owner = &mut self.game.owner;
         let active = !self.paused
-            && match self.game.mode {
-                GameMode::Auto => self.game.detected,
+            && match owner.mode {
+                GameMode::Auto => owner.passive_detected || owner.remote_capture.detected,
                 GameMode::On => true,
                 GameMode::Off => false,
             };
+        if owner.active != active {
+            owner.active = active;
+            self.out.push(Output::Status(StatusEvent::LocalGameMode(active)));
+        }
+    }
+
+    fn refresh_game(&mut self) {
+        self.refresh_owner_game();
+        self.game.scope = Some((self.epoch, self.holder));
+        self.game.mode = self.game.owner.mode;
+        self.game.detected = self.game.owner.passive_detected || self.game.owner.remote_capture.detected;
+        self.game.cursor_hiding_cause_available = self.game.owner.cursor_hiding_cause_available;
+        let active = self.game.owner.active;
         if self.game.active != active {
             self.game.active = active;
             self.game.authority_generation += 1;
@@ -179,17 +216,26 @@ impl Router {
     }
 
     pub(super) fn reset_game_focus(&mut self) {
+        // Rebuild only the current-holder snapshot and stream fences. The local
+        // owner survives every focus path, including explicit and edge handoffs.
         let scope = (self.epoch, self.holder);
         if self.game.scope != Some(scope) || self.paused {
-            self.game.remote_capture.reset("focus_changed_or_paused");
+            if self.paused {
+                self.game.owner = OwnerGameState {
+                    mode: self.cfg.settings.game_mode_preference,
+                    active: self.game.owner.active,
+                    ..Default::default()
+                };
+            }
             let authority_generation = self.game.authority_generation + 1;
             let mode = if self.holder == self.me() {
-                self.cfg.settings.game_mode_preference
+                self.game.owner.mode
             } else {
                 GameMode::Auto
             };
             self.game = GameState {
                 scope: Some(scope),
+                owner: std::mem::take(&mut self.game.owner),
                 mode,
                 active: !self.paused && mode == GameMode::On,
                 authority_generation,
@@ -205,6 +251,7 @@ impl Router {
             if self.holder == self.me() {
                 self.refresh_game();
             } else {
+                self.refresh_owner_game();
                 self.emit_game_status();
             }
         }
@@ -337,6 +384,212 @@ impl Router {
 mod connection_tests {
     use super::*;
 
+    fn pair() -> (Router, Router) {
+        let a = DeviceId([1; 32]);
+        let b = DeviceId([2; 32]);
+        let make = |me, peer| {
+            Router::new(
+                RouterConfig::new(
+                    oink_foundation::session::Boot {
+                        device_id: me,
+                        nonce: [me.0[0]; 16],
+                    },
+                    "device",
+                    Os::Other,
+                ),
+                crate::router::connection_tests::session_layout(me, peer),
+            )
+        };
+        let mut a = make(a, b);
+        let mut b = make(b, a.me());
+        a.attach_input(b.config().boot, b.session, true, true, FeelProfile::default(), 0);
+        a.peers.get_mut(&b.me()).unwrap().focus_ready = true;
+        b.attach_input(a.config().boot, a.session, true, true, FeelProfile::default(), 0);
+        b.peers.get_mut(&a.me()).unwrap().focus_ready = true;
+        a.reclaim_focus(None);
+        deliver(&mut a, &mut b);
+        a.drain_outputs();
+        b.drain_outputs();
+        (a, b)
+    }
+
+    fn deliver(from: &mut Router, to: &mut Router) {
+        for output in from.drain_outputs() {
+            if let Output::Send { to: target, msg, .. } = output
+                && target == to.me()
+            {
+                to.input_message(from.me(), msg, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn hotkey_return_preserves_game_mode_on_each_device() {
+        let (mut a, mut b) = pair();
+        a.set_game_mode(GameMode::On);
+        let generation = a.game.generation;
+        deliver(&mut a, &mut b);
+        // ReturnPointerHome is the command issued by the physical hotkey.
+        b.return_pointer_home();
+        deliver(&mut b, &mut a);
+        assert_eq!(a.holder, b.me());
+        assert!(!a.game_mode().active, "the destination starts in its own Auto mode");
+        b.set_game_mode(GameMode::On);
+        deliver(&mut b, &mut a);
+        a.return_pointer_home();
+        deliver(&mut a, &mut b);
+        assert_eq!(
+            a.game_mode().mode,
+            GameMode::On,
+            "leaving must not clear the device override"
+        );
+        assert!(a.game_mode().active);
+        assert!(a.game.generation > generation, "return starts a fresh relative stream");
+        b.return_pointer_home();
+        deliver(&mut b, &mut a);
+        assert!(b.game_mode().active, "both devices retain their own game mode");
+    }
+
+    #[test]
+    fn explicit_handoff_and_return_keep_manual_mode_but_toggle_still_exits() {
+        let (mut a, mut b) = pair();
+        a.set_game_mode(GameMode::On);
+        a.set_pointer_captured(false);
+        assert!(a.game_mode().active, "capture release cannot end manual On");
+        a.lock_focus_to(b.me()).unwrap();
+        deliver(&mut a, &mut b);
+        deliver(&mut b, &mut a);
+        b.lock_focus_to(a.me()).unwrap();
+        deliver(&mut b, &mut a);
+        assert!(a.game_mode().active);
+        a.toggle_game_mode();
+        assert_eq!(a.game_mode().mode, GameMode::Off);
+        b.return_pointer_home();
+        deliver(&mut b, &mut a);
+        a.return_pointer_home();
+        assert_eq!(a.game_mode().mode, GameMode::Off);
+        assert!(!a.game_mode().active);
+    }
+
+    #[test]
+    fn menu_preference_edit_while_away_replaces_the_retained_override() {
+        let (mut a, mut b) = pair();
+        a.set_game_mode(GameMode::On);
+        b.return_pointer_home();
+        deliver(&mut b, &mut a);
+        let mut settings = a.config().settings.clone();
+        settings.game_mode_preference = GameMode::Off;
+        a.set_settings(settings);
+        a.return_pointer_home();
+        assert_eq!(a.game_mode().mode, GameMode::Off);
+        assert!(!a.game_mode().active);
+    }
+
+    #[test]
+    fn auto_capture_survives_absence_without_movement_and_exits_on_release() {
+        for remote in [false, true] {
+            let (mut a, mut b) = pair();
+            a.cfg.os = Os::MacOS;
+            let hidden = PointerCaptureObservation {
+                hidden: true,
+                application_hidden: Some(true),
+                foreground: 42,
+            };
+            if remote {
+                a.observe_pointer_capture(Some(hidden), false, 0);
+                for now in (25_000..=300_000).step_by(25_000) {
+                    a.game.owner.remote_capture.motion(now);
+                    a.observe_pointer_capture(Some(hidden), false, now);
+                }
+            } else {
+                a.observe_pointer_capture(Some(hidden), true, 0);
+            }
+            assert!(a.game_mode().active && a.game_mode().detected);
+            let generation = a.game.generation;
+            b.return_pointer_home();
+            deliver(&mut b, &mut a);
+            // The non-focus owner receives source-freeze/unavailable observations.
+            a.observe_pointer_capture(None, false, 350_000);
+            a.observe_pointer_capture(
+                Some(PointerCaptureObservation {
+                    hidden: false,
+                    ..hidden
+                }),
+                false,
+                400_000,
+            );
+            a.return_pointer_home();
+            assert!(a.game_mode().active && a.game_mode().detected);
+            assert!(a.game.generation > generation);
+            a.observe_pointer_capture(None, false, 450_000); // native restoration
+            assert!(a.game_mode().active);
+            a.observe_pointer_capture(Some(hidden), !remote, 500_000);
+            assert!(a.game_mode().active, "idle capture needs no new entry motion");
+            let released = PointerCaptureObservation {
+                hidden: false,
+                ..hidden
+            };
+            for now in (550_000..=800_000).step_by(50_000) {
+                a.observe_pointer_capture(Some(released), false, now);
+            }
+            assert!(!a.game_mode().active && !a.game_mode().detected);
+        }
+    }
+
+    #[test]
+    fn game_mode_blocks_edges_and_edge_return_restores_the_owners_mode() {
+        let (mut a, mut b) = pair();
+        let mut layout = crate::SimpleLayout::new();
+        let bounds = Rect::new(0., 0., 1000., 600.);
+        layout.add_screen(ScreenId::new(a.me(), "screen"), bounds, Rect::new(0., 0., 250., 150.));
+        layout.add_screen(ScreenId::new(b.me(), "screen"), bounds, Rect::new(250., 0., 250., 150.));
+        let layout = Arc::new(layout);
+        a.set_layout(layout.clone());
+        b.set_layout(layout);
+        for router in [&mut a, &mut b] {
+            router.set_local_displays(vec![DisplayInfo {
+                key: "screen".into(),
+                name: "screen".into(),
+                bounds: Rect::new(0., 0., 1000., 600.),
+                pixel_width: 1000,
+                pixel_height: 600,
+                reference_extent: None,
+                rotation_deg: 0,
+                is_primary: true,
+                is_builtin: false,
+                is_virtual: false,
+            }]);
+        }
+        let at = ScreenPos::new(ScreenId::new(a.me(), "screen"), Point::new(999., 300.));
+        a.pointer = Some(at.clone());
+        a.set_game_mode(GameMode::On);
+        a.drain_outputs();
+        a.local_motion_unconstrained(5000., 0., Some(at.local), 1);
+        assert_eq!(a.holder, a.me());
+        assert!(a.game_mode().active);
+        assert!(!a.out.iter().any(|o| matches!(
+            o,
+            Output::Send {
+                msg: Message::Control(ControlMsg::FocusEnter { .. }),
+                ..
+            }
+        )));
+        b.return_pointer_home();
+        deliver(&mut b, &mut a);
+        b.set_cursor(Point::new(0., 300.));
+        // A real edge decision uses the same owner restoration as an explicit
+        // focus command. The screens touch, so no gap/portal threshold applies.
+        b.local_motion_unconstrained(-5000., 0., Some(Point::new(0., 300.)), 2);
+        assert_eq!(b.holder, a.me(), "ordinary edge routing hands focus back");
+        deliver(&mut b, &mut a);
+        assert_eq!(a.game_mode().mode, GameMode::On);
+        assert!(a.game_mode().active);
+        let old_generation = a.game.generation;
+        a.become_holder(a.epoch + 1, None); // same-device/screen epoch change
+        assert!(a.game_mode().active);
+        assert!(a.game.generation > old_generation);
+    }
+
     #[test]
     fn status_changes_once_but_wire_gossip_remains_periodic() {
         let me = DeviceId([1; 32]);
@@ -409,7 +662,7 @@ mod connection_tests {
     }
 
     #[test]
-    fn owner_preference_survives_focus_epochs_and_pause_but_override_does_not() {
+    fn owner_override_survives_focus_epochs_and_pause_restores_preference() {
         let me = DeviceId([1; 32]);
         let mut config = RouterConfig::new(
             oink_foundation::session::Boot {
@@ -426,8 +679,8 @@ mod connection_tests {
         assert!(!r.game_mode().active);
         assert_eq!(r.config().settings.game_mode_preference, GameMode::On);
         r.become_holder(2, None);
-        assert_eq!(r.game_mode().mode, GameMode::On);
-        assert!(r.game_mode().active);
+        assert_eq!(r.game_mode().mode, GameMode::Off);
+        assert!(!r.game_mode().active);
         r.set_fully_paused(true);
         assert!(!r.game_mode().active);
         r.set_fully_paused(false);

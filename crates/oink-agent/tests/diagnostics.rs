@@ -11,6 +11,7 @@ use oink_foundation::{
     display::DisplayInfo,
     input::{CapturedEvent, InputEvent, KeyCode, SourceKind},
 };
+use oink_protocol::frame::StreamKind;
 use oink_protocol::v1::{
     self, dto as w,
     schema::{Open, WireDto},
@@ -125,15 +126,8 @@ fn manifest(path: &str) -> serde_json::Value {
     let mut zip = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
     serde_json::from_reader(zip.by_name("manifest.json").unwrap()).unwrap()
 }
-fn low_operations(node: &Node) -> u64 {
-    node.links()
-        .unwrap()
-        .links()
-        .links
-        .iter()
-        .filter_map(|l| node.links().unwrap().low_status(l.link))
-        .map(|s| s.connections_opened + s.connections_reused)
-        .sum()
+fn diagnostic_low_attempts(node: &Node) -> u64 {
+    oink_network::link::testing::low_open_attempts(&node.links().unwrap(), StreamKind::Diagnostics)
 }
 #[test]
 fn each_member_exports_its_current_runtime_environment_without_a_local_save() {
@@ -309,6 +303,48 @@ fn each_member_exports_its_current_runtime_environment_without_a_local_save() {
     );
 }
 #[test]
+fn recording_is_independent_of_other_modules_low_traffic() {
+    common::watchdog::run(module_path!(), "recording with unrelated Low traffic", Some(4), async {
+        let temp = tempfile::tempdir().unwrap();
+        let (a, input) = start(&temp.path().join("a"), "recording-a", 0).await;
+        let (b, _) = start(&temp.path().join("b"), "recording-b", 0).await;
+        common::pair(&a, &b).await;
+        // This scenario requests Low itself. Wait for transport readiness, not
+        // silence from unrelated background owners or profile convergence.
+        wait("direct Low ready", || {
+            [(&a, &b), (&b, &a)].iter().all(|(node, peer)| {
+                node.links().unwrap().links().by_peer(peer.id()).is_some_and(|link| {
+                    link.path == oink_network::link::LinkPath::Direct
+                        && link.low_available
+                        && link.state == oink_network::link::LinkState::Ready
+                })
+            })
+        })
+        .await;
+        let before = [&a, &b].map(diagnostic_low_attempts);
+        assert_eq!(before, [0; 2]);
+        let cache_before = oink_network::link::testing::low_open_attempts(&a.links().unwrap(), StreamKind::Cache);
+        feed(&input, KeyCode::keyboard(4), true);
+        feed(&input, KeyCode::keyboard(4), false);
+        // A successful remote query guarantees unrelated Low traffic occurred
+        // inside the recording window, without relying on retry timing.
+        let device = b.id().into();
+        let usage = call(&a, move |node| node.cache_usage(Some(device))).await.unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].device, device);
+        assert!(oink_network::link::testing::low_open_attempts(&a.links().unwrap(), StreamKind::Cache) > cache_before);
+        assert_eq!(
+            before,
+            [&a, &b].map(diagnostic_low_attempts),
+            "unrelated Low traffic is not diagnostic recording"
+        );
+        for node in [&a, &b] {
+            node.shutdown().await;
+        }
+    });
+}
+
+#[test]
 fn local_recording_three_member_save_offline_pause_emergency_and_privacy() {
     common::watchdog::run(
         module_path!(),
@@ -327,28 +363,10 @@ async fn local_recording_three_member_save_offline_pause_emergency_and_privacy_s
     common::pair(&a, &b).await;
     common::pair(&a, &c).await;
     common::active(&[&a, &b, &c]).await;
-    // Pairing now starts capability-gated profile catalog transfers as well as
-    // the existing Low modules. Establish an idle baseline before attributing
-    // any new Low operation to local diagnostic recording.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
-    let mut previous = [&a, &b, &c].map(low_operations);
-    let mut unchanged_since = tokio::time::Instant::now();
-    loop {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let current = [&a, &b, &c].map(low_operations);
-        if current != previous {
-            previous = current;
-            unchanged_since = tokio::time::Instant::now();
-        }
-        if unchanged_since.elapsed() >= Duration::from_secs(3) {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "initial Low synchronization did not settle"
-        );
-    }
-    let before = [&a, &b, &c].map(low_operations);
+    // Observe Diagnostics opens, including failures, across all links. TCP pool
+    // counters also count unrelated modules and connection warm-up.
+    let before = [&a, &b, &c].map(diagnostic_low_attempts);
+    assert_eq!(before, [0; 3], "recording never starts a diagnostics Low request");
     for (input, code) in [(&ai, 4), (&bi, 5), (&ci, 6)] {
         feed(input, KeyCode::keyboard(code), true);
         feed(input, KeyCode::keyboard(code), false);
@@ -356,8 +374,8 @@ async fn local_recording_three_member_save_offline_pause_emergency_and_privacy_s
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(
         before,
-        [&a, &b, &c].map(low_operations),
-        "recording sends no Low operations"
+        [&a, &b, &c].map(diagnostic_low_attempts),
+        "recording sends no diagnostics Low requests"
     );
     wait("three-screen facts", || {
         [&a, &b, &c].iter().all(|n| n.layout().0.screens.len() == 3)
@@ -432,6 +450,10 @@ async fn local_recording_three_member_save_offline_pause_emergency_and_privacy_s
     }
     // Export samples and drains each recording owner before taking its snapshot.
     let bundle = call(&a, |n| n.export_diagnostics()).await.unwrap();
+    assert!(
+        diagnostic_low_attempts(&a) > before[0],
+        "explicit export opens diagnostics Low requests"
+    );
     assert_eq!(
         (
             bundle.included_device_count,

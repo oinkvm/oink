@@ -13,6 +13,7 @@ pub(crate) struct OwnerOptionApplied {
 
 use oink_audio::diagnostics::Cadence;
 mod discovery;
+mod local_output;
 mod report;
 mod timing;
 use crate::node::lock;

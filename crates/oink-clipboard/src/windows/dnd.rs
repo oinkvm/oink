@@ -644,29 +644,10 @@ impl DndBackend for WinDnd {
     }
 
     fn release(&self) -> bool {
-        {
-            let mut st = self.shared.lock();
-            st.releasing = true;
-            st.released = false;
-        }
-        let injected = self.shared.inject(InjectEvent::Button {
-            button: MouseButton::Left,
-            pressed: false,
-        });
-        let ok = injected && self.shared.wait(WAIT, |st| st.released);
-        {
-            let mut st = self.shared.lock();
-            st.releasing = false;
-            st.probing = false;
-            st.reported = false;
-        }
-        if let Some(t) = self.thread() {
-            self.hide(t.catcher);
-        }
-        if !ok {
-            tracing::warn!(injected, "source drag did not end on the catcher");
-        }
-        ok
+        // This legacy entry point has no original press position. Source cleanup
+        // must use finish_source's position-safe agent callback, including after
+        // authority loss; never synthesize an UP at the live desktop cursor.
+        false
     }
 
     fn source_image(&self) -> Option<oink_foundation::dnd::DragImage> {
@@ -1726,6 +1707,26 @@ mod artwork_desktop_tests;
 mod diagnostic_tests {
     use super::*;
     use windows::core::Interface;
+    #[test]
+    fn legacy_source_release_without_origin_never_injects() {
+        let shared = Arc::new(Shared {
+            native_jobs: OnceLock::new(),
+            sink: OnceLock::new(),
+            inject: OnceLock::from(Arc::new(|_: &InjectEvent| -> Result<(), String> {
+                panic!("unpositioned original-source event")
+            }) as Injector),
+            source_press: OnceLock::new(),
+            source_start: OnceLock::new(),
+            st: Mutex::new(St::default()),
+            cv: Condvar::new(),
+        });
+        let backend = WinDnd {
+            shared,
+            thread: OnceLock::new(),
+        };
+        assert!(!backend.release());
+    }
+
     #[test]
     fn continuation_diagnostics_preserve_release_cancel_and_target_notifications() {
         let shared = Arc::new(Shared {

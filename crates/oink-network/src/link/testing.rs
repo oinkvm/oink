@@ -80,3 +80,16 @@ pub async fn cutover_finished(links: &super::LinkLayer) {
 pub fn flush_commands(links: &super::LinkLayer) {
     links.config_phase_applied();
 }
+
+/// Counts outbound Low requests by module, including failed opens, across link
+/// replacement. Test-only observation: it does not alter admission or transport.
+pub fn low_open_attempts(layer: &super::LinkLayer, kind: oink_protocol::frame::StreamKind) -> u64 {
+    layer
+        .0
+        .low_open_attempts
+        .lock()
+        .unwrap()
+        .get(&(kind as u8))
+        .copied()
+        .unwrap_or(0)
+}

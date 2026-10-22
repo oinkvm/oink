@@ -7,7 +7,7 @@ import { problemText, tr, useLanguage } from '../i18n';
 function alertText(kind:Exclude<AlertKind, {type:'permission_missing'}>):string {
   switch(kind.type){
     case 'capture_unavailable':return tr('无法采集输入');
-    case 'display_info_unavailable':return tr('无法读取显示器信息');
+    case 'display_info_unavailable':case 'display_enumeration_failed':return tr('无法读取显示器信息');
     case 'secure_input':return tr('安全输入已启用，键盘共享暂不可用');
     case 'new_screen':return tr('检测到新屏幕，请检查排列');
     case 'group_state_unreadable':return tr('无法读取设备组状态');
@@ -47,7 +47,12 @@ export function StatusNotices(){
       description:[tr('{0}/{1} 已确认',coverage.recipients.filter(r=>r.state==='confirmed').length,coverage.recipients.length),tr('{0} 未确认',coverage.recipients.filter(r=>r.state==='unreachable'||r.state==='unconfirmed').length),...(coverage.recipients.some(r=>r.cleanupPending)?[tr('清理未完成')]:[])].join(' · '),
     });
     const active=new Set(notices.map(notice=>notice.id));
-    for(const id of shown.current.keys()) if(!active.has(id)) {toast.dismiss(id);shown.current.delete(id);}
+    for(const id of shown.current.keys()) if(!active.has(id)) {
+      // A completed native failure is a real error receipt. Let the normal
+      // toast duration finish even if a retry recovers quickly, so it is readable.
+      if(id!=='status:capture-unavailable' && !id.startsWith('status:display-info:'))toast.dismiss(id);
+      shown.current.delete(id);
+    }
     for(const notice of notices){
       // Overview snapshots and events describe the same retained issue. Stable IDs
       // update a changed issue in place; unchanged snapshots do not restart a toast.

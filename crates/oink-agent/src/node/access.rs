@@ -10,6 +10,7 @@ pub(super) struct InputObservation(
     dto::ResourceFaults,
     dto::LocalOptionsSummary,
     Option<dto::GameObservation>,
+    Option<bool>,
 );
 
 fn device_game_observation(
@@ -201,6 +202,11 @@ impl Node {
             faults,
             options,
             game,
+            match permissions.accessibility {
+                PermissionState::NotApplicable => None,
+                PermissionState::Granted => Some(true),
+                PermissionState::Denied | PermissionState::NotDetermined | PermissionState::NotGranted => Some(false),
+            },
         );
         if previous.as_ref() == Some(&observation) {
             return;
@@ -211,6 +217,7 @@ impl Node {
             observation.2.clone(),
             observation.3.clone(),
             observation.4.clone(),
+            observation.5,
         ) {
             Ok(_) => *previous = Some(observation),
             Err(error) => tracing::warn!(%error,"input owner observation publication failed"),

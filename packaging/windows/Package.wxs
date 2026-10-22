@@ -10,8 +10,6 @@
     <Property Id="OinkLaunch" Value="1" />
     <Property Id="OinkLogin" Value="1" />
     <Property Id="OINK_DESKTOP_SHORTCUT" Secure="yes" />
-    <!-- Opt-in for quiet/passive callers; never an elevated or SYSTEM stop. -->
-    <Property Id="OINK_GRACEFUL_STOP" Secure="yes" />
     <Property Id="OINK_SAVED_DESKTOP">
       <RegistrySearch Id="SavedDesktopChoice" Root="HKLM" Key="$(var.RegistryKey)"
                       Name="DesktopShortcut" Type="raw" Bitness="always64" />
@@ -48,7 +46,10 @@
     <Launch Condition="Installed OR (WEBVIEW2RUNTIME AND WEBVIEW2RUNTIME &lt;&gt; &quot;0.0.0.0&quot;)"
             Message="Install the Microsoft Edge WebView2 Evergreen Runtime for all users, then run Oink Setup again: https://developer.microsoft.com/microsoft-edge/webview2/" />
     <Property Id="ARPNOMODIFY" Value="1" />
-    <Property Id="ARPCOMMENTS" Value="User data and device identity are retained when uninstalling." />
+    <Property Id="ARPCOMMENTS" Value="Uninstalling removes Oink and its local user data." />
+    <!-- Start maps a real shortcut target to its removable ARP product. Set the
+         resolved primary folder after costing, not a literal formatted value. -->
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" After="CostFinalize" Sequence="execute" />
     <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
     <Property Id="REBOOT" Value="ReallySuppress" />
     <!-- Product builds can change without changing PE semver. Force the owned
@@ -81,7 +82,9 @@
         <Component Id="UserEntry" Guid="*">
           <File Id="UiExe" Source="$(var.Payload)/$(var.UiExe)" KeyPath="yes">
             <Shortcut Id="StartMenuEntry" Directory="ProgramMenuFolder" Name="$(var.ProductName)"
-                      Advertise="yes" Icon="OinkIcon.ico" IconIndex="0" WorkingDirectory="INSTALLFOLDER" />
+                      Advertise="no" Icon="OinkIcon.ico" IconIndex="0" WorkingDirectory="INSTALLFOLDER">
+              <ShortcutProperty Key="System.AppUserModel.ID" Value="com.hachiwii.oink.ui" />
+            </Shortcut>
           </File>
           <!-- UiExe hosts the user backend in service mode; the SYSTEM input broker and
                recovery CLI own no LAN listeners. Keep this component/key path
@@ -138,7 +141,9 @@
     <StandardDirectory Id="DesktopFolder">
       <Component Id="DesktopEntry" Guid="*" Transitive="yes" Condition="OINK_DESKTOP_SHORTCUT = &quot;1&quot;">
         <Shortcut Id="DesktopShortcut" Name="$(var.ProductName)" Target="[#UiExe]"
-                  WorkingDirectory="INSTALLFOLDER" Icon="OinkIcon.ico" IconIndex="0" />
+                  WorkingDirectory="INSTALLFOLDER" Icon="OinkIcon.ico" IconIndex="0">
+          <ShortcutProperty Key="System.AppUserModel.ID" Value="com.hachiwii.oink.ui" />
+        </Shortcut>
         <RegistryValue Root="HKLM" Key="$(var.RegistryKey)" Name="DesktopShortcutComponent"
                        Value="1" Type="integer" KeyPath="yes" />
       </Component>
@@ -147,20 +152,18 @@
     <CustomAction Id="CheckInstallPath" BinaryRef="InstallerCA" DllEntry="CheckInstallPath" Execute="immediate" Return="check" />
     <CustomAction Id="CheckProtectedState" BinaryRef="InstallerCA" DllEntry="CheckProtectedState" Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="CheckQuiescence" BinaryRef="InstallerCA" DllEntry="CheckQuiescence" Execute="deferred" Impersonate="no" Return="check" />
-    <CustomAction Id="CleanupCloudFiles" BinaryRef="InstallerCA" DllEntry="CleanupCloudFiles" Execute="deferred" Impersonate="no" Return="check" />
-    <CustomAction Id="CleanupMaintenance" BinaryRef="InstallerCA" DllEntry="CleanupMaintenance" Execute="commit" Impersonate="no" Return="check" />
+    <CustomAction Id="CleanupUserData" BinaryRef="InstallerCA" DllEntry="CleanupUserData" Execute="commit" Impersonate="no" Return="ignore" />
+    <CustomAction Id="CleanupMaintenance" BinaryRef="InstallerCA" DllEntry="CleanupMaintenance" Execute="commit" Impersonate="no" Return="ignore" />
     <!-- Commit-only: a failed uninstall must not silently disable autostart. -->
     <CustomAction Id="RemoveLoginEntry" BinaryRef="InstallerCA" DllEntry="RemoveLoginEntry" Execute="commit" Impersonate="no" Return="check" />
     <!-- Called only by the successful full-UI Finish button, in the client. -->
     <CustomAction Id="FinishInstall" BinaryRef="InstallerCA" DllEntry="FinishInstall" Execute="immediate" Return="check" />
-    <!-- Full UI runs this first in the client, before ExecuteAction/UAC. Quiet
-         mode has no UI sequence: its immediate impersonating action can request
-         stop only with the caller's verified normal token and explicit opt-in.
-         Nested major-upgrade removal keeps the worker/maintenance protocol. -->
+    <!-- Request normal Quit before files-in-use detection at every UI level.
+         The post-StopServices gate also waits for the existing SCM notification
+         to drain other sessions. No Restart Manager force-close or process kill. -->
     <CustomAction Id="PrepareUserSessions" BinaryRef="InstallerCA" DllEntry="PrepareUserSessions" Execute="firstSequence" Return="check" />
-    <CustomAction Id="RefreshUserSessions" BinaryRef="InstallerCA" DllEntry="RefreshUserSessions" Execute="immediate" Return="check" />
     <InstallExecuteSequence>
-      <Custom Action="PrepareUserSessions" Before="CheckInstallPath" Condition="UILevel &lt; 5 AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="PrepareUserSessions" Before="InstallValidate" Condition="NOT UPGRADINGPRODUCTCODE" />
       <!-- RegisterProduct writes the numeric upgrade version to ARP. Apply the
            human version afterward through the transactional Registry table, so
            repair/rollback/uninstall retain MSI ownership of the single entry.
@@ -174,9 +177,9 @@
       <Custom Action="CheckInstallPath" Before="InstallInitialize" />
       <Custom Action="CheckProtectedState" After="InstallInitialize" />
       <Custom Action="CheckQuiescence" After="StopServices" />
-      <!-- Unregister per-user cloud roots while backend quiescence is proven,
-           before removing binaries. Busy caches abort uninstall for retry. -->
-      <Custom Action="CleanupCloudFiles" After="CheckQuiescence" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <!-- Commit-only: never destroy user data if MSI rolls back. Cloud Files
+           unregister happens inside this action before deleting any data tree. -->
+      <Custom Action="CleanupUserData" Before="CleanupMaintenance" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="CleanupMaintenance" Before="InstallFinalize" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="RemoveLoginEntry" Before="RemoveRegistryValues" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>

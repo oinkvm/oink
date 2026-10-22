@@ -14,11 +14,11 @@ import type { PermState } from '../settings/SettingsPage';
 import { useGrant } from '../settings/useGrant';
 
 const PERMS: Array<{ id: PermissionId; label: MessageKey; desc: MessageKey }> = [
-  { id: 'accessibility', label: '辅助功能', desc: '如不授权，本机无法被其他设备控制' },
-  { id: 'input', label: '输入监控', desc: '如不授权，本机无法控制其他设备' },
-  { id: 'network', label: '本地网络', desc: '如不授权，本机无法发现和连接局域网设备' },
-  { id: 'files', label: '文件提供服务', desc: '如不启用，无法复制或拖拽大文件到本机' },
-  { id: 'audio', label: '系统音频录制', desc: '默认在本机播放；此权限仅允许你手动开启音频转发' },
+  { id: 'accessibility', label: '辅助功能', desc: '用于向本机注入键鼠事件' },
+  { id: 'input', label: '输入监控', desc: '用于控制其它设备' },
+  { id: 'network', label: '本地网络', desc: '用于发现和连接局域网设备' },
+  { id: 'files', label: '文件提供服务', desc: '用于向本机粘贴和拖拽文件' },
+  { id: 'audio', label: '系统音频录制', desc: '用于转发音频到其它设备' },
 ];
 
 // macOS only: Windows onboarding has no permissions page, launch at login is in Settings.
@@ -85,11 +85,11 @@ export function OnboardingPermissions({ preferences, perms, onGrant, onOpenSetti
             {tr('Oink 需要依靠系统权限来实现共享功能，缺少权限会影响部分功能可用性。')}
           </p>
           <Group className="ob-perms__card ob-in" style={{ '--d': '.1s' } as CSSProperties}>
-            <PermissionRow className="ob-perms__row" label={tr('开机自动启动')} description={tr('若关闭，重新启动后需要手动打开 Oink 才可恢复共享')}>
+            <PermissionRow className="ob-perms__row" label={tr('开机自动启动')} description={tr('开机后静默启动 Oink')}>
               <Switch aria-label={tr('开机自动启动')} checked={launch ?? false} disabled={launch === null || saving || preferences.launchStatus?.state === 'unavailable'} onChange={value => { touched.current = true; setLaunch(value); }} />
             </PermissionRow>
             {PERMS.filter(p => perms[p.id] !== 'not_required').map(p => (
-              <PermissionRow key={p.id} className="ob-perms__row" label={tr(p.label)} description={tr(p.desc)}>
+              <PermissionRow key={p.id} className="ob-perms__row" label={tr(p.label)} description={p.id === 'input' && perms.accessibility === 'granted' && perms.input === 'granted' ? tr('辅助功能已包含输入监控，无需重复授权') : tr(p.desc)}>
                 <PermissionControl id={p.id} state={perms[p.id]} grant={grant}/>
               </PermissionRow>
             ))}
@@ -99,13 +99,10 @@ export function OnboardingPermissions({ preferences, perms, onGrant, onOpenSetti
       <footer className="ob-foot ob-in" style={{ '--d': '.15s' } as CSSProperties}>
         {!done
           ? <Button variant="ghost" size="sm" className="ob-link" disabled={saving} onClick={() => setAsk(true)}>{tr('跳过')}</Button>
-          : <>
-            <p className="ob-done" role="status"><Icon name="check-circle" />{tr('全部授权完成')}</p>
-            <Button variant="accent" className="ob-next" loading={saving} trailing={<Icon name="arrow-right" />} onClick={() => { void proceed(); }}>{tr('下一步')}</Button>
-          </>}
+          : <p className="ob-done" role="status"><Icon name="check-circle" />{tr('已全部授权')}</p>}
       </footer>
       <Dialog
-        {...containedProps} open={ask} onOpenChange={setAsk} container={container} size={360}
+        {...containedProps} className="ob-skip-dialog" open={ask} onOpenChange={setAsk} container={container} size={360}
         title={tr('跳过剩余授权')}
         description={tr('未授予权限的功能暂时无法使用，您可随时在 设置 › 权限 中进行授权。')}
         actions={<>

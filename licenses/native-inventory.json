@@ -2838,6 +2838,80 @@
       "ownership": "third-party",
       "provenance": "Rendered snapshot; per-icon source review in apps/oink/src-tauri/icons/menu/README.md.",
       "modificationNotice": "Oink DeviceMenu UnlockIcon retains the oink-ui lock body rectangle (x=4.5, y=9, width=11, height=7.5, rx=2) and replaces the shackle with the Oink open-lock path; Icon CSS presentation attributes inlined."
+    },
+    {
+      "id": "asset:oink-sponsor-kofi@5eb472fe3d35",
+      "name": "Oink sponsor Ko-fi mark",
+      "version": "5eb472fe3d358a6878546a11faa7af7cfa3a7b5cf1d2e1b951b657497fd278cc",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink",
+      "source": {
+        "url": "https://github.com/oinkvm/oink/blob/74004ec174219de1eb63f6707949c0c91b704f49/apps/oink/src/sponsor/Sponsor.tsx",
+        "integrity": "sha256:5eb472fe3d358a6878546a11faa7af7cfa3a7b5cf1d2e1b951b657497fd278cc"
+      },
+      "path": "apps/oink/src/sponsor/kofi.svg",
+      "sha256": "5eb472fe3d358a6878546a11faa7af7cfa3a7b5cf1d2e1b951b657497fd278cc",
+      "licenseExpression": "GPL-3.0-only",
+      "selectedLicense": "GPL-3.0-only",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "LICENSE",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "path": "LICENSE-ADDITIONAL-TERMS.md",
+          "sha256": "c69f265a607a09f13de139896a182f61fae5c650d6d45269313297c07606286e"
+        }
+      ],
+      "copyright": [],
+      "ownership": "first-party",
+      "provenance": "Project-authored Ko-fi mark introduced in 74004ec174219de1eb63f6707949c0c91b704f49 as KofiMark. Exported with tile=true to a standalone SVG in 19f9f255163731c4148da5c9d2cdf94fd89d8836; geometry, colors and tile transform are unchanged, with JSX presentation attributes serialized as standard SVG attributes.",
+      "trademarkNotice": "Ko-fi names and brand identifiers remain the property of their respective owners. The project license covers this project-authored SVG implementation and grants no trademark rights or endorsement."
+    },
+    {
+      "id": "asset:oink-sponsor-wechat@3bf034edcb5f",
+      "name": "Oink sponsor WeChat Pay mark",
+      "version": "3bf034edcb5f857ab6fba9b0ccd549515ff6328f50eaba32260d7c3c57095ad1",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink",
+      "source": {
+        "url": "https://github.com/oinkvm/oink/blob/74004ec174219de1eb63f6707949c0c91b704f49/apps/oink/src/sponsor/Sponsor.tsx",
+        "integrity": "sha256:3bf034edcb5f857ab6fba9b0ccd549515ff6328f50eaba32260d7c3c57095ad1"
+      },
+      "path": "apps/oink/src/sponsor/wechat.svg",
+      "sha256": "3bf034edcb5f857ab6fba9b0ccd549515ff6328f50eaba32260d7c3c57095ad1",
+      "licenseExpression": "GPL-3.0-only",
+      "selectedLicense": "GPL-3.0-only",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "LICENSE",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "path": "LICENSE-ADDITIONAL-TERMS.md",
+          "sha256": "c69f265a607a09f13de139896a182f61fae5c650d6d45269313297c07606286e"
+        }
+      ],
+      "copyright": [],
+      "ownership": "first-party",
+      "provenance": "Project-authored WeChat Pay mark introduced in 74004ec174219de1eb63f6707949c0c91b704f49 as WeChatPayMark. Exported with tile=true to a standalone SVG in 19f9f255163731c4148da5c9d2cdf94fd89d8836; geometry, colors and tile transform are unchanged, with JSX presentation attributes serialized as standard SVG attributes.",
+      "trademarkNotice": "WeChat Pay names and brand identifiers remain the property of their respective owners. The project license covers this project-authored SVG implementation and grants no trademark rights or endorsement."
     }
   ],
   "systemComponents": [

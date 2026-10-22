@@ -200,7 +200,7 @@ impl Pool {
 fn parent_name(key: &str) -> String {
     format!(".Oink-prepared-{key}.noindex")
 }
-fn hide_parent(key: &str, catalog: &mut Catalog) {
+pub(super) fn hide_parent(key: &str, catalog: &mut Catalog) {
     let parent = &mut catalog.records[0];
     parent.name = parent_name(key);
     parent.hidden = Some(true);

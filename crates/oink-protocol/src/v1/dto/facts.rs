@@ -26,6 +26,8 @@ wire_map!(DeviceFacts, validate_facts, {
     20 => audio_exit_claim: Option<AudioExitClaim> = optional;
     21 => audio_claim_watermark: Option<AudioExitClaim> = optional;
     22 => native_arrangement_token: Option<Text<128>> = optional;
+    // oink.input.accessibility/1: absent means unknown or not applicable.
+    23 => accessibility_granted: Option<bool> = optional;
 });
 
 wire_map!(EndpointFact, validate_endpoint, {
@@ -125,7 +127,20 @@ wire_map!(SpeakerObservation, validate_speaker, {
     6 => active_sources: Option<u8> = optional;
     7 => receive_ready: Option<bool> = optional;
     8 => source_destination: Option<DeviceId> = optional;
+    9 => local_output: Option<LocalOutputVolume> = optional;
 });
+
+// Read-only observation of this owner's default output, independent of exit selection.
+wire_map!(LocalOutputVolume, validate_local_output, {
+    1 => volume_percent: u8 = required;
+    2 => muted: bool = required;
+});
+fn validate_local_output(raw: &RawMap) -> Result<()> {
+    if required::<u8>(raw, 1)? > 100 {
+        return Err(ErrorCode::UnsupportedValue.into());
+    }
+    Ok(())
+}
 
 // These contexts also occur in realtime directed Volume. Their nested typed
 // projections must borrow the input bytes rather than allocate retaining DTOs.
@@ -238,6 +253,7 @@ wire_map!(OptionRevision,validate_option_revision,{1=>option:LocalOption=require
 wire_map!(SetLocalOption,no_validation,{
     1=>request_id:Id16=required;2=>target:Boot=required;3=>option:LocalOption=required;
     4=>value:RawValue=required;5=>expected_revision:u64=required;
+    6=>defer_persistence:bool=false;
 });
 wire_map!(LocalOptionState,validate_option_state,{
     1=>option:LocalOption=required;2=>value:RawValue=required;3=>revision:u64=required;

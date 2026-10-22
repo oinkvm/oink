@@ -70,10 +70,7 @@ def validate_release(record, annotations, tag, commit, tree):
                  mac['launch_smoke']['status'] == 'passed' and mac['launch_smoke']['signed'] is True and
                  mac['launch_smoke']['seconds'] == 10 and mac['sparkle']['public_key_configured'] is True,
                  'notarized_signed_package_required')
-    feed.require(set(annotations) == {'channel', 'severity', 'notes'} and
-                 annotations['channel'] == 'stable' and annotations['severity'] in ('normal', 'critical'),
-                 'stable_annotations_required')
-    feed.validate_notes(annotations['notes'])
+    published_release.validate_annotations(annotations)
     archives = [a for a in mac['artifacts'] if a['name'].endswith('.zip')]
     feed.require(len(archives) == 1, 'sparkle_archive_required')
     asset = archives[0]
@@ -131,10 +128,7 @@ def candidate(state, output, cache, tag):
                  built_trust['epoch'] == config['mac']['epoch'], 'release_trust_changed')
     base = f'https://github.com/{config["repository"]}/releases/download/{tag}/'
     record = feed.loads(feed.download(base + 'release.json', feed.MAX_FEED, redirects=True))
-    annotation_bytes = feed.download(base + 'update.json', feed.MAX_FEED, redirects=True)
-    annotations = feed.loads(annotation_bytes)
-    annotation_asset = {'name': 'update.json', 'size': len(annotation_bytes), 'sha256': feed.digest(annotation_bytes)}
-    feed.require(annotation_asset in record['artifacts'], 'annotations_digest')
+    annotations = published_release.update_notes()
     asset = validate_release(record, annotations, tag, commit, tree)
     reg = feed_site.state_info(state)
     feed_site.verify_platform(state, 'mac', config, signatures=False)

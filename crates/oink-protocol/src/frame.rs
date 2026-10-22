@@ -55,6 +55,7 @@ pub enum StreamKind {
     /// Capability-gated companion layout-profile configuration snapshots.
     LayoutProfiles = 13,
     LayoutProfilesV2 = 14,
+    LayoutProfilesV3 = 15,
 }
 
 impl StreamKind {
@@ -74,6 +75,7 @@ impl StreamKind {
             12 => Self::Projection,
             13 => Self::LayoutProfiles,
             14 => Self::LayoutProfilesV2,
+            15 => Self::LayoutProfilesV3,
             _ => return None,
         })
     }

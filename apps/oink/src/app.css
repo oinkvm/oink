@@ -14,10 +14,6 @@ body { margin: 0; background: var(--ok-bg); color: var(--ok-text); font-family: 
   --ok-font-display: ui-rounded, "SF Pro Rounded", "Nunito", "Inter", -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Segoe UI", "Malgun Gothic", system-ui, sans-serif;
 }
 
-/* Menu and listbox items (dropdown menus, context menus, select options) use
-   the controls' regular weight, also when selected or being measured. */
-.ok-menu__item, .ok-menu__item[aria-selected=true], .ok-menu[data-measuring] .ok-menu__item, .ok-menu__meta { font-weight: 400; }
-
 .page {
   box-sizing: border-box;
   display: grid;
@@ -284,7 +280,7 @@ body { margin: 0; background: var(--ok-bg); color: var(--ok-text); font-family: 
 
 .upgrade { animation: ok-pop var(--ok-spring-dur) var(--ok-spring) both; }
 
-.ok-btn.upgrade--pill { --_h: 26px; min-width: 64px; padding: 0 var(--ok-s-3); font-size: 12.5px; }   
+.ok-btn.upgrade--pill { --_h: 26px; min-width: 64px; padding: 0 var(--ok-s-3); font-size: 12.5px; font-weight: 600; }
 .upgrade--bar {
   position: relative; display: inline-flex; align-items: center; justify-content: center; min-width: 64px; height: 26px; padding: 0 var(--ok-s-3);
   overflow: hidden; outline: none; appearance: none; border: 0; cursor: pointer;
@@ -478,9 +474,7 @@ body { margin: 0; background: var(--ok-bg); color: var(--ok-text); font-family: 
   container-type: size;
 }
 
-.scr__ring { position: absolute; pointer-events: none; overflow: visible; animation: scr-ring-in var(--ok-dur-2) var(--ok-ease-out); }
-.scr__ring-gap { fill: var(--ok-well); }
-.scr__ring-accent { fill: var(--ok-accent); }
+.scr__selection { position: absolute; inset: 0; pointer-events: none; corner-shape: var(--ok-corner); --ok-shape: var(--ok-corner); box-shadow: 0 0 0 2.5px var(--ok-well), 0 0 0 4.5px var(--ok-accent); animation: scr-ring-in var(--ok-dur-2) var(--ok-ease-out); }
 @keyframes scr-ring-in { from { opacity: 0; } }
 
 /* Offline screen surface. Light mode keeps a near-black "switched-off" fill.
@@ -683,7 +677,7 @@ body:has(.oink-app:is([data-view="main"], [data-view="panel"])) { background: tr
 /* A selected computer uses the same two-ring selection tokens as a screen. */
 .scr--group { pointer-events: none; }
 .scr--group .scr__hz { pointer-events: auto; }
-.scr__group-border { position: absolute; inset: 0; border-radius: calc(12px * var(--ok-rk)); }
+.scr__group-border { position: absolute; inset: 0; border-radius: calc(12px * var(--ok-rk)); corner-shape: var(--ok-corner); --ok-shape: var(--ok-corner); box-shadow: 0 0 0 2.5px var(--ok-well), 0 0 0 4.5px var(--ok-accent); }
 
 /* Keep native window controls and the language menu above the welcome cover. */
 .win[data-covered] .win__titlebar { z-index: 5; }
@@ -692,16 +686,15 @@ body:has(.oink-app:is([data-view="main"], [data-view="panel"])) { background: tr
 .win__cover-bar { position: absolute; top: 50%; translate: 0 -50%; z-index: 1; display: flex; align-items: center; }
 .win[data-platform="mac"] .win__cover-bar { right: 12px; }
 .win[data-platform="win"] .win__cover-bar { right: 150px; }
-.win__promo .ok-btn.win__promo-sponsor { font-weight: 400; padding-inline: 8px 10px; }
+.win__promo .ok-btn.win__promo-sponsor { padding-inline: 8px 10px; }
 
 /* Layout profiles in the canvas toolbar: the current profile's menu and `+`. */
 .canvas-tools__group { display: flex; align-items: center; gap: 2px; }
 .canvas-tools__chevron.ok-icon { width: 12px; height: 12px; flex: none; }
-.canvas-tools__anchor { display: inline-flex; }
 /* A fixed width, shorter than the 32-character name limit: long names end in an
    ellipsis here and show in full in the menu's tooltips. Ghost, so at rest it
    blends into the toolbar. */
-.lp-current.ok-btn { width: 132px; padding-inline: 10px 6px; font-weight: 400; }
+.lp-current.ok-btn { width: 132px; padding-inline: 10px 6px; }
 .lp-current .ok-btn__label { flex: 1; min-width: 0; justify-content: space-between; gap: 4px; }
 .lp-current__name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: start; }
 .lp-menu__name { display: block; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -709,15 +702,12 @@ body:has(.oink-app:is([data-view="main"], [data-view="panel"])) { background: tr
 /* A selected screen of a system-arranged computer is selected on its own: the screen
    keeps the solid two-ring selection, its computer's bounds are dashed and set
    outside that ring so the two never overlap. */
-/* Dashed outlines keep plain round corners (corner-shape and --ok-shape round). On
-   WebKit, which has no corner-shape, oink-ui's corner fallback repaints a squircle
-   element's outline as a border-image patch beside the native one; it has no dash
-   style, so each dashed outline was drawn twice, offset, with solid corners. Round
-   corners leave the outline to the engine alone, once, on WebKit and Chromium. */
-.scr--group[data-screen-selected] .scr__group-border { box-shadow: none; outline: 1.5px dashed var(--ok-accent); outline-offset: 7px; corner-shape: round; --ok-shape: round; }
+/* The library keeps dashed outlines native on WebKit and shaped on engines
+   with corner-shape support; both declarations keep the intended geometry. */
+.scr--group[data-screen-selected] .scr__group-border { box-shadow: none; outline: 1.5px dashed var(--ok-accent); outline-offset: 7px; corner-shape: var(--ok-corner); --ok-shape: var(--ok-corner); }
 /* A member of a multi-computer group: dashed accent just inside its own edge, so it
    never meets the group's solid ring or a neighbouring member's outline. */
-.scr-outline { position: absolute; top: 0; left: 0; z-index: 4; pointer-events: none; border-radius: calc(12px * var(--ok-rk)); corner-shape: round; --ok-shape: round; outline: 1.5px dashed var(--ok-accent); outline-offset: -4px; }
+.scr-outline { position: absolute; top: 0; left: 0; z-index: 4; pointer-events: none; border-radius: calc(12px * var(--ok-rk)); corner-shape: var(--ok-corner); --ok-shape: var(--ok-corner); outline: 1.5px dashed var(--ok-accent); outline-offset: -4px; }
 
 .lpm {
   box-sizing: border-box; display: flex; flex-direction: column; gap: 2px;
@@ -732,11 +722,10 @@ body:has(.oink-app:is([data-view="main"], [data-view="panel"])) { background: tr
 .lpm__note { font: 400 12px/1.2 var(--ok-font); color: var(--ok-text-2); }
 .lpm__edit { flex: 1; min-width: 0; display: flex; align-items: flex-start; gap: 6px; padding: 2px 0; }
 .lpm__field { flex: 1; min-width: 0; }
-.lpm__edit .ok-btn { flex: none; font-weight: 400; }
+.lpm__edit .ok-btn { flex: none; }
 /* Settings › Layout: the list, then Create under it on the left. */
 .lpm-panel { display: grid; gap: 10px; justify-items: start; width: 100%; }
 .lpm-panel > .lpm { width: 100%; }
-.lpm__create.ok-btn { font-weight: 400; }
 
 /* Windows sliders: oink-ui's 42×28 pill thumb reads as an oversized white pill
    among Windows' denser controls (user report, 2026-10-21). Every slider in the
@@ -746,3 +735,7 @@ body:has(.oink-app:is([data-view="main"], [data-view="panel"])) { background: tr
 .oink-app[data-platform="win"] .ok-slider__track { height: 4px; border-radius: 4px; }
 .oink-app[data-platform="win"] .ok-slider__ticks { height: 4px; }
 .oink-app[data-platform="win"] .ok-slider__ticks i { top: .5px; }
+
+/* Main window text is not selectable, except the Settings page and editable fields. */
+.win:not(.about) { user-select: none; -webkit-user-select: none; }
+.win:not(.about) :is(.setp, input, textarea, [contenteditable="true"]) { user-select: text; -webkit-user-select: text; }

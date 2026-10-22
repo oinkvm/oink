@@ -370,7 +370,12 @@ impl Router {
     }
     pub(super) fn dnd_publish_offer(&mut self, offer: OfferId) {
         let preview = self.dnd_preview_availability(offer.clip);
-        let Some(source) = self.dnd.sources.get_mut(&offer).filter(|s| s.confirmed) else {
+        let Some(source) = self
+            .dnd
+            .sources
+            .get_mut(&offer)
+            .filter(|s| s.confirmed && s.exporting.is_none())
+        else {
             return;
         };
         // The target now receives the group Announced too. Its Offered must
@@ -406,6 +411,146 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn held_mac_promise_is_exported_before_a_later_windows_offer() {
+        use oink_foundation::clipboard::ClipPlatform;
+        use oink_foundation::content::*;
+        let me = DeviceId([1; 32]);
+        let mac = DeviceId([2; 32]);
+        let windows = DeviceId([3; 32]);
+        let id = ClipId {
+            origin: me,
+            seq: DND_SEQ_BIT | 1,
+        };
+        let offer = Router::dnd_offer(id);
+        for (success, moved, released) in [
+            (true, false, false),
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let mut r = Router::new(
+                crate::RouterConfig::new(
+                    oink_foundation::session::Boot {
+                        device_id: me,
+                        nonce: [1; 16],
+                    },
+                    "source",
+                    crate::Os::MacOS,
+                ),
+                crate::router::connection_tests::session_layout(me, mac),
+            );
+            r.test_connect(mac, 1);
+            r.test_connect(windows, 1);
+            r.peers.get_mut(&windows).unwrap().os = crate::Os::Windows;
+            let previous = Holder { device: mac, epoch: 2 };
+            let next = Holder {
+                device: windows,
+                epoch: 3,
+            };
+            let mut source = source::Source::new(offer, me, previous);
+            source.phase = source::Phase::Held;
+            source.confirmed = true;
+            source.metadata(vec![ClipData::Native {
+                platform: ClipPlatform::Mac,
+                item: ContentItem {
+                    id: ItemId(1),
+                    file: None,
+                    virtual_files: true,
+                    representations: vec![Representation {
+                        id: RepresentationId(1),
+                        format: NativeFormat::Mac("com.apple.pasteboard.promised-file-url".into()),
+                        medium: Medium::Bytes,
+                        aspect: 1,
+                        index: -1,
+                        standard: None,
+                        data: RepresentationData::Promise(NodeId(1), vec![]),
+                    }],
+                },
+            }]);
+            r.dnd.sources.insert(offer, source);
+            r.dnd.native_source = Some(offer);
+            r.drain_outputs();
+            r.dnd_source_action(mac, offer, previous, SourceAction::Handoff { next }, None);
+            // A repeat request must not expose the pre-export promise either.
+            r.dnd_notice_request(windows, id, next, mac);
+            let offered = |out: &Output| {
+                matches!(
+                    out,
+                    Output::Send {
+                        msg: Message::Dnd(DndMsg::Notice(DragNotice {
+                            state: DragState::Offered { .. },
+                            ..
+                        })),
+                        ..
+                    }
+                )
+            };
+            let pending = r.drain_outputs();
+            assert!(
+                !pending.iter().any(offered),
+                "Windows cannot use unresolved Mac promises"
+            );
+            assert_eq!(
+                pending
+                    .iter()
+                    .filter(|output| matches!(output,
+                        Output::Dnd(DndCmd::ExportSource { id: found, epoch: 3, physical: true }) if *found == id
+                    ))
+                    .count(),
+                1,
+                "handoff exports the original native source exactly once"
+            );
+            let files = vec![ClipData::Files(vec![oink_foundation::clipboard::FileEntry {
+                path: "image.png".into(),
+                is_dir: false,
+                size: 42,
+                modified_ms: None,
+                local_path: None,
+            }])];
+            let final_holder = if moved {
+                let returned = Holder { device: mac, epoch: 4 };
+                r.dnd_source_action(windows, offer, next, SourceAction::Handoff { next: returned }, None);
+                assert!(!r.drain_outputs().iter().any(offered));
+                returned
+            } else {
+                next
+            };
+            if released {
+                assert!(!r.dnd.sources.get_mut(&offer).unwrap().released());
+            }
+            r.on_dnd_event(DndEvent::SourceExported {
+                id,
+                epoch: next.epoch,
+                items: if success {
+                    Ok(files.clone())
+                } else {
+                    Err(oink_foundation::dnd::ExportFailure::Failed)
+                },
+            });
+            let outputs = r.drain_outputs();
+            assert_eq!(outputs.iter().filter(|o| offered(o)).count(), usize::from(success));
+            if success {
+                let source = &r.dnd.sources[&offer];
+                assert_eq!(source.items, files);
+                assert_eq!(source.holder, final_holder);
+                assert!(source.exported);
+                r.on_dnd_event(DndEvent::SourceExported {
+                    id,
+                    epoch: next.epoch,
+                    items: Ok(files.clone()),
+                });
+                assert!(
+                    r.dnd.sources.contains_key(&offer),
+                    "duplicate export must not revoke the offer"
+                );
+                assert!(r.drain_outputs().is_empty());
+            } else {
+                assert!(!r.dnd.sources.contains_key(&offer));
+            }
+        }
+    }
+
     #[test]
     fn terminal_before_enter_rejects_late_offer_in_both_link_orders() {
         let me = DeviceId([1; 32]);

@@ -136,15 +136,19 @@ export function snapGroup(
     threshold: number,
     edges: SnapEdges,
 ): Rect {
+    const eps = tolerance([from, to, ...members, ...others]);
     let dx = Infinity, dy = Infinity;
+    // Equal-height/width overlaps offer equivalent edge pairs. Use the same
+    // roundoff tolerance as geometry.ts so camera growth cannot flip their keys
+    // and repeatedly trigger alignment feedback while the pointer is held.
     for (const edge of outerEdges(transformGroup(members, from, to)))
         for (const match of matches(edge, others, threshold)) {
             const delta = match.at - edge.at;
-            if (edge.axis === 'x' && Math.abs(delta) < Math.abs(dx)) {
+            if (edge.axis === 'x' && Math.abs(delta) < Math.abs(dx) - eps) {
                 dx = delta;
                 edges.x = match.key;
             }
-            if (edge.axis === 'y' && Math.abs(delta) < Math.abs(dy)) {
+            if (edge.axis === 'y' && Math.abs(delta) < Math.abs(dy) - eps) {
                 dy = delta;
                 edges.y = match.key;
             }
@@ -169,6 +173,7 @@ export function snapGroupResize(
 ): Rect {
     if (members.length === 1)
         return snapResize(to, from, c, others, threshold, minimumWidth, edges);
+    const eps = tolerance([from, to, ...members, ...others]);
     const anchor = cornerPoint(from, opposite[c]);
     let result = to, best = Infinity;
     for (const edge of outerEdges(transformGroup(members, from, to)))
@@ -177,7 +182,8 @@ export function snapGroupResize(
             if (Math.abs(distance) < 1e-9)
                 continue;
             const k = (match.at - anchor[edge.axis]) / distance, width = from.w * k;
-            if (width < minimumWidth || Math.abs(width - to.w) >= best)
+            // Preserve the first edge for roundoff-equivalent proportional sizes.
+            if (width < minimumWidth || Math.abs(width - to.w) >= best - eps)
                 continue;
             result = {
                 x: anchor.x + (from.x - anchor.x) * k,

@@ -19018,14 +19018,14 @@
       ]
     },
     {
-      "id": "npm:oink-ui@1.0.5",
+      "id": "npm:oink-ui@1.0.8",
       "name": "oink-ui",
-      "version": "1.0.5",
+      "version": "1.0.8",
       "ecosystem": "npm",
       "repository": "https://github.com/oinkvm/oink-ui",
       "source": {
-        "url": "https://registry.npmjs.org/oink-ui/-/oink-ui-1.0.5.tgz",
-        "integrity": "sha512-I7e1UtaBU3vsDJ0oZ6ofoCYyOaNc29NCSDWq7N9UY/vPvVg6irWpebB03b/7GbTiRKFq3YXq6Bbtwv2nKXD0/A=="
+        "url": "https://registry.npmjs.org/oink-ui/-/oink-ui-1.0.8.tgz",
+        "integrity": "sha512-H+tPG3OsEESwnLNAUzDfRS6yIArf/WYsa+pwM3uJmu6V9+6dzaGnFUk0ygJaqFqmihGVe2k0Pud+FFOXdnrZcQ=="
       },
       "licenseExpression": "MIT",
       "selectedLicense": "MIT",

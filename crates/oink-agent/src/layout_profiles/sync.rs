@@ -17,65 +17,16 @@ use oink_protocol::{
 };
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, time::Duration};
-const CAP: &str = "oink.layout.profiles/2";
+const CAP: &str = "oink.layout.profiles/3";
 const BUDGET: u64 = (MAX_BYTES + 1024 * 1024) as u64;
-fn digest(c: &dto::LayoutProfileCatalogV2) -> oink_protocol::v1::Result<[u8; 32]> {
+fn digest(c: &dto::LayoutProfileCatalogV3) -> oink_protocol::v1::Result<[u8; 32]> {
     Ok(Sha256::digest(c.encode(MAX_BYTES)?).into())
 }
 impl Node {
-    pub(super) fn reconcile_profile_merges(&self) -> Result<()> {
-        let _gate = self
-            .inner
-            .profiles
-            .gate
-            .try_lock()
-            .map_err(|_| ProfileError::new(ErrorCode::Busy, "Profile operation in progress"))?;
-        self.profile_snapshot()?;
-        let proofs = self
-            .link_config()
-            .map_err(super::state::unavailable)?
-            .layout_profile_merges()
-            .map_err(super::state::unavailable)?;
-        let mut pending = false;
-        for proof in proofs {
-            let intent = proof.certificate().and_then(|c| c.intent()).map_err(wire::invalid)?;
-            let source =
-                oink_network::group_merge::anchor(&intent.source().map_err(wire::invalid)?).map_err(wire::invalid)?;
-            let id = intent
-                .merge_id()
-                .map_err(wire::invalid)?
-                .0
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
-            let catalog = lock(&self.inner.profiles.data).catalog.clone().expect("catalog");
-            if catalog.imported_merges.contains(&id) {
-                continue;
-            }
-            if let Some(source) = store::load(&self.inner.data_dir, source.group.into())? {
-                self.persist_catalog(catalog.merge_group(&source, &id, self.id().into())?)?;
-            } else if !predates_profile_store(&proof, self.initialize_profile_store()?)? {
-                let config = self.link_config().map_err(super::state::unavailable)?;
-                let members = intent.members().map_err(wire::invalid)?.0;
-                // No import receipt is invented. If every source member is
-                // presently legacy, keep local editing usable; a later capable
-                // source still imports its archive through the certified path.
-                pending |= import_may_arrive(members.iter().map(|m| {
-                    let device = oink_network::wire_identity::read_device(&m.device().ok()?).ok()?;
-                    if device == self.id() {
-                        return Some(true);
-                    }
-                    config.peer_agreement(device).map(|a| a.contains(CAP))
-                }));
-            }
-        }
-        lock(&self.inner.profiles.data).pending_import = pending;
-        Ok(())
-    }
-    fn receive_profile_catalog(
+    fn receive_profile_message(
         &self,
         peer: oink_foundation::DeviceId,
-        message: dto::LayoutProfilesStateV2,
+        message: Message,
         valid: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Result<()> {
         let _gate = self
@@ -90,78 +41,87 @@ impl Node {
                 "Catalog sender is no longer a member",
             ));
         }
-        self.profile_snapshot()?;
-        let incoming = wire::read_catalog(message.catalog().map_err(wire::invalid)?)?;
-        if message.group().map_err(wire::invalid)?.0 != incoming.group.0.0 {
-            return Err(ProfileError::new(
-                ErrorCode::NotMember,
-                "Catalog envelope group mismatch",
-            ));
-        }
-        let current = lock(&self.inner.profiles.data).catalog.clone().expect("catalog");
-        let next = if incoming.group == current.group {
-            current.receive(&incoming, self.id().into())?
-        } else {
-            let proof = message
-                .merge()
-                .map_err(wire::invalid)?
-                .ok_or_else(|| ProfileError::new(ErrorCode::NotMember, "Missing merge proof"))?;
-            let known = self
-                .link_config()
-                .map_err(super::state::unavailable)?
-                .layout_profile_merges()
-                .map_err(super::state::unavailable)?;
-            if !known.contains(&proof) {
+        let group = self
+            .group_id()
+            .ok_or_else(|| super::state::unavailable("Group unavailable"))?;
+        match message {
+            Message::LayoutProfilesStateV3(message) => {
+                #[cfg(test)]
+                if self
+                    .inner
+                    .profiles
+                    .defer_catalogs
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(ProfileError::new(ErrorCode::Busy, "Injected catalog delivery delay"));
+                }
+                let incoming = wire::read_catalog(message.catalog().map_err(wire::invalid)?)?;
+                if message.group().map_err(wire::invalid)?.0 != group.0 || incoming.group.0 != group {
+                    return Err(ProfileError::new(ErrorCode::NotMember, "Catalog group mismatch"));
+                }
+                let current = store::load(&self.inner.data_dir, group.into())?;
+                let next = match &current {
+                    Some(c) => c.receive(&incoming, self.id().into())?,
+                    None => incoming.clone(),
+                };
+                if current.as_ref() != Some(&next) {
+                    self.persist_catalog(next)?;
+                }
+                if current.as_ref().is_none_or(|c| incoming.version >= c.version) {
+                    lock(&self.inner.profiles.data).pending_layout = message.layout_version().map_err(wire::invalid)?;
+                }
+            }
+            Message::LayoutProfilesJoin(message) => {
+                #[cfg(test)]
+                if self
+                    .inner
+                    .profiles
+                    .defer_joins
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.inner
+                        .profiles
+                        .deferred_joins
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Err(ProfileError::new(ErrorCode::Busy, "Injected acceptor interruption"));
+                }
+                if message.group().map_err(wire::invalid)?.0 != group.0 {
+                    return Err(ProfileError::new(ErrorCode::NotMember, "Join target mismatch"));
+                }
+                let id = message
+                    .merge_id()
+                    .map_err(wire::invalid)?
+                    .0
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
+                let join = super::join::read(&self.inner.data_dir, &id)?
+                    .ok_or_else(|| ProfileError::new(ErrorCode::NotMember, "Join not accepted locally"))?;
+                let source = wire::read_catalog(message.catalog().map_err(wire::invalid)?)?;
+                if join.acceptor.0 != self.id()
+                    || join.initiator.0 != peer
+                    || join.target.0 != group
+                    || join.source != source.group
+                {
+                    return Err(ProfileError::new(ErrorCode::NotMember, "Join participant mismatch"));
+                }
+                let current = store::load(&self.inner.data_dir, group.into())?
+                    .ok_or_else(|| super::state::unavailable("Accepting catalog unavailable"))?;
+                let next = current.merge_group(&source, &id, self.id().into())?;
+                if next != current {
+                    self.persist_catalog(next)?;
+                }
+            }
+            _ => {
                 return Err(ProfileError::new(
-                    ErrorCode::NotMember,
-                    "Merge proof has not been committed locally",
+                    ErrorCode::InvalidGeometry,
+                    "Unexpected profile message",
                 ));
             }
-            let intent = proof.certificate().and_then(|c| c.intent()).map_err(wire::invalid)?;
-            if intent.source().and_then(|s| s.group()).map_err(wire::invalid)?.0 != incoming.group.0.0 {
-                return Err(ProfileError::new(ErrorCode::NotMember, "Merge source mismatch"));
-            }
-            let id = intent
-                .merge_id()
-                .map_err(wire::invalid)?
-                .0
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
-            current.merge_group(&incoming, &id, self.id().into())?
-        };
-        if next != current {
-            self.persist_catalog(next)?;
-        }
-        if incoming.group == current.group && incoming.version >= current.version {
-            lock(&self.inner.profiles.data).pending_layout = message.layout_version().map_err(wire::invalid)?;
         }
         self.refresh_layout_profiles();
         Ok(())
     }
-}
-
-fn predates_profile_store(proof: &dto::MergeTransferBundle, activated_ms: u64) -> Result<bool> {
-    // The frozen merge protocol has no profile capability bit. Its certified
-    // plan does contain issuance times for the imported membership records.
-    // With no archived source catalog, only a plan strictly older than local
-    // feature activation is historical. Unknown times remain pending. An
-    // archive arriving later is still imported; this is not an import receipt.
-    let adds = proof
-        .plan()
-        .and_then(|plan| plan.unsigned_adds())
-        .map_err(wire::invalid)?
-        .0;
-    if adds.is_empty() {
-        return Ok(false);
-    }
-    for add in adds {
-        let issued_ms = add.issued_ms().map_err(wire::invalid)?;
-        if issued_ms == 0 || issued_ms >= activated_ms {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 async fn deliver(node: &Node, link: LinkId, catalog: Catalog) -> bool {
@@ -174,15 +134,21 @@ async fn deliver(node: &Node, link: LinkId, catalog: Catalog) -> bool {
     }
     let Ok(config) = node.link_config() else { return false };
     let version = config.applied().version.clone();
-    let Ok(links) = node.links() else { return false };
     let Ok(catalog) = wire::catalog(&catalog) else {
         return false;
     };
     let Ok(digest) = digest(&catalog) else { return false };
     let Ok(group) = catalog.group() else { return false };
     let Ok(message) =
-        dto::LayoutProfilesStateV2::from_raw([(1, group.write()), (2, catalog.write()), (4, version.write())].into())
+        dto::LayoutProfilesStateV3::from_raw([(1, group.write()), (2, catalog.write()), (4, version.write())].into())
     else {
+        return false;
+    };
+    send(node, link, Message::LayoutProfilesStateV3(message), group, digest).await
+}
+
+async fn send(node: &Node, link: LinkId, message: Message, group: dto::Id16, digest: [u8; 32]) -> bool {
+    let Ok(links) = node.links() else {
         return false;
     };
     let options = oink_network::LowOptions {
@@ -190,14 +156,14 @@ async fn deliver(node: &Node, link: LinkId, catalog: Catalog) -> bool {
         receive_max: 1024,
         operation_max: BUDGET + 1024,
     };
-    let Ok(mut stream) = links.open_low(link, StreamKind::LayoutProfilesV2, options).await else {
+    let Ok(mut stream) = links.open_low(link, StreamKind::LayoutProfilesV3, options).await else {
         return false;
     };
-    if stream.send(&Message::LayoutProfilesStateV2(message)).await.is_err() {
+    if stream.send(&message).await.is_err() {
         return false;
     }
     stream.finish();
-    let Ok(Some(Message::LayoutProfilesReceiptV2(receipt))) = stream.recv().await else {
+    let Ok(Some(Message::LayoutProfilesReceiptV3(receipt))) = stream.recv().await else {
         return false;
     };
     if receipt.accepted() != Ok(true) || receipt.group() != Ok(group) || receipt.digest().map(|h| h.0) != Ok(digest) {
@@ -206,12 +172,17 @@ async fn deliver(node: &Node, link: LinkId, catalog: Catalog) -> bool {
     matches!(stream.recv().await, Ok(None))
 }
 async fn receive(node: Node, mut incoming: InboundLow) {
-    let Message::LayoutProfilesStateV2(message) = incoming.first else {
+    let (catalog, group) = match &incoming.first {
+        Message::LayoutProfilesStateV3(m) => (m.catalog(), m.group()),
+        Message::LayoutProfilesJoin(m) => (m.catalog(), m.group()),
+        _ => return,
+    };
+    let (Ok(catalog), Ok(group)) = (catalog, group) else {
         return;
     };
-    let Ok(catalog) = message.catalog() else { return };
-    let Ok(hash) = digest(&catalog) else { return };
-    let Ok(group) = message.group() else { return };
+    let Ok(hash) = digest(&catalog) else {
+        return;
+    };
     let peer = incoming.stream.peer();
     if !node
         .link_config()
@@ -225,9 +196,15 @@ async fn receive(node: Node, mut incoming: InboundLow) {
         return;
     }
     let valid = incoming.stream.effect_validity();
-    let accepted = tokio::task::spawn_blocking(move || node.receive_profile_catalog(peer, message, valid))
-        .await
-        .is_ok_and(|v| v.is_ok());
+    let accepted = tokio::task::spawn_blocking(move || {
+        let result = node.receive_profile_message(peer, incoming.first, valid);
+        if let Err(error) = &result {
+            tracing::debug!(%peer, code=?error.code, reason=%error.message, "Profile transfer refused");
+        }
+        result
+    })
+    .await
+    .is_ok_and(|v| v.is_ok());
     let Ok(receipt) = dto::LayoutProfilesReceipt::from_raw(
         [(1, group.write()), (2, V::Bytes(hash.to_vec())), (3, accepted.write())].into(),
     ) else {
@@ -235,7 +212,7 @@ async fn receive(node: Node, mut incoming: InboundLow) {
     };
     if incoming
         .stream
-        .send(&Message::LayoutProfilesReceiptV2(receipt))
+        .send(&Message::LayoutProfilesReceiptV3(receipt))
         .await
         .is_ok()
     {
@@ -259,8 +236,19 @@ pub(crate) fn start(node: Node, mut port: ModulePort) -> tokio::task::JoinHandle
                         let task=outgoing.spawn(async move {
                             let mut delivered=None;let mut backoff=Duration::from_secs(2);
                             loop {
+                                if let Ok(joins) = node.pending_profile_joins(peer) {
+                                    for join in joins {
+                                        let Some(source) = join.catalog else {continue;};
+                                        let Ok(catalog) = wire::catalog(&source) else {continue;};
+                                        let Ok(hash) = digest(&catalog) else {continue;};
+                                        let group = oink_protocol::v1::schema::FixedBytes(join.target.0.0);
+                                        let Ok(id) = (0..join.id.len()).step_by(2).map(|i|u8::from_str_radix(&join.id[i..i+2],16)).collect::<std::result::Result<Vec<_>,_>>() else {continue;};
+                                        let Ok(message) = dto::LayoutProfilesJoin::from_raw([(1,group.write()),(2,V::Bytes(id)),(3,catalog.write())].into()) else {continue;};
+                                        let _ = tokio::time::timeout(Duration::from_secs(30),send(&node,link,Message::LayoutProfilesJoin(message),group,hash)).await;
+                                    }
+                                }
                                 let catalog=lock(&node.inner.profiles.data).catalog.clone();
-                                if let Some(catalog)=catalog {
+                                if let Some(catalog)=catalog && Some(catalog.group.0)==node.group_id() {
                                     let version=(catalog.group,catalog.version.clone());
                                     if delivered.as_ref()!=Some(&version) {
                                         if tokio::time::timeout(Duration::from_secs(30),deliver(&node,link,catalog)).await.unwrap_or(false){delivered=Some(version);backoff=Duration::from_secs(2);}else{tokio::time::sleep(backoff+Duration::from_millis(u64::from(peer.0[0])*3)).await;backoff=(backoff*2).min(Duration::from_secs(60));continue;}
@@ -279,7 +267,7 @@ pub(crate) fn start(node: Node, mut port: ModulePort) -> tokio::task::JoinHandle
                     let node=node.clone();
                     // Also refresh read-only native tokens after a display/mode
                     // change; unsupported test backends simply have no token.
-                    let _=tokio::task::spawn_blocking(move ||{let _=node.refresh_native_arrangement();let _=node.reconcile_profile_merges();node.poll_profile_operations();node.refresh_layout_profiles();}).await;
+                    let _=tokio::task::spawn_blocking(move ||{let _=node.refresh_native_arrangement();node.poll_profile_operations();node.refresh_layout_profiles();}).await;
                 }
                 _=incoming.join_next(),if !incoming.is_empty()=>{}
                 _=outgoing.join_next(),if !outgoing.is_empty()=>{}
@@ -290,20 +278,4 @@ pub(crate) fn start(node: Node, mut port: ModulePort) -> tokio::task::JoinHandle
         }
         incoming.abort_all();
     })
-}
-
-fn import_may_arrive(capabilities: impl Iterator<Item = Option<bool>>) -> bool {
-    let capabilities = capabilities.collect::<Vec<_>>();
-    capabilities.is_empty() || capabilities.iter().any(|c| *c != Some(false))
-}
-#[cfg(test)]
-mod tests {
-    use super::import_may_arrive;
-    #[test]
-    fn legacy_source_does_not_hold_catalog_controls_pending() {
-        assert!(!import_may_arrive([Some(false), Some(false)].into_iter()));
-        assert!(import_may_arrive([Some(false), None].into_iter()));
-        assert!(import_may_arrive([Some(false), Some(true)].into_iter()));
-        assert!(import_may_arrive([].into_iter()));
-    }
 }

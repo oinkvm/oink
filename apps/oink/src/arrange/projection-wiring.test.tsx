@@ -25,7 +25,7 @@ it('a resize press and release without motion does not compact or save layout',(
   const {container}=render(<Arrangement screens={screens} onProjection={preview} onScreensChange={save} selectedId="a" onSelect={()=>{}} settings={{showHotZones:false,snapping:false,compact:true,padding:48,step:10}}/>);
   for(let n=0;n<100&&frames.size;n++)tick();
   const screen=container.querySelector('.scr')!;
-  const [ox,oy]=(screen as HTMLElement).style.transform.match(/-?[\d.]+/g)!.map(Number);
+  const ox=parseFloat((screen as HTMLElement).style.left),oy=parseFloat((screen as HTMLElement).style.top);
   const zoom=cameraStore.get()!.zoom;
   fireEvent.pointerDown(container.querySelector('.scr [data-c="se"]')!,{button:0,clientX:ox+700*zoom,clientY:oy+500*zoom});
   expect(preview.mock.lastCall?.[0]).not.toBeNull();
@@ -85,7 +85,7 @@ it.each(['move','resize'] as const)('projects rigid group %s and every spring-ba
   const camera=cameraStore.get()!;
   const zoom=camera.zoom;
   // The rendered screen gives the current camera translation.
-  const [ox,oy]=(screen as HTMLElement).style.transform.match(/-?[\d.]+/g)!.map(Number);
+  const ox=parseFloat((screen as HTMLElement).style.left),oy=parseFloat((screen as HTMLElement).style.top);
   const x=ox+(mode==='move'?200:box.w)*zoom,y=oy+(mode==='move'?200:box.h)*zoom;
   fireEvent.pointerDown(target,{button:0,clientX:x,clientY:y});
   fireEvent.pointerMove(screen,{clientX:x+40,clientY:y+20});

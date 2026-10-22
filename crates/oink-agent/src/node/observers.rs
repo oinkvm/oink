@@ -130,7 +130,12 @@ impl Node {
                                     trail.set_displays(displays);
                                 }
                             }
-                            Err(error) => tracing::warn!(%error, "display refresh failed"),
+                            Err(error) => {
+                                // Keep geometry while publishing the completed
+                                // failure through the normal resource Facts.
+                                input.send(InputCommand::LocalDisplayFailure);
+                                tracing::warn!(%error, "display refresh failed");
+                            }
                         }
                     }
                     let mut environment = *node.inner.input_environment.load();

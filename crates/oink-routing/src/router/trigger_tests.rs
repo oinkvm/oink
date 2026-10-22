@@ -176,11 +176,9 @@ fn zone_native_held_drag_uses_the_channel_probe_and_hold_path() {
             items: vec![oink_foundation::clipboard::ClipData::Text("drag".into())],
         });
         assert_eq!(r.dnd_state_name(), "leaving");
-        assert!(
-            r.drain_outputs()
-                .iter()
-                .any(|o| matches!(o,Output::Dnd(DndCmd::HoldSource {id:found,..}) if *found==id))
-        );
+        assert!(r.drain_outputs().iter().any(
+            |o| matches!(o,Output::Dnd(DndCmd::HoldSource {id:found,origin,..}) if *found==id && *origin == Some(pos))
+        ));
     }
 }
 #[test]

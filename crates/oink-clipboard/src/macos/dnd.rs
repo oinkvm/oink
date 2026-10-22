@@ -1574,7 +1574,13 @@ define_class!(
         #[unsafe(method(writingOptionsForType:pasteboard:))]
         fn options(&self, ty: &NSString, pb: &NSPasteboard) -> NSPasteboardWritingOptions {
             if self.ivars().extra.types().containsObject(ty) {
-                return NSPasteboardWritingOptions::empty();
+                // Preserve lazy companion data. Returning empty makes AppKit's
+                // pasteboard publication synchronously call our remote provider
+                // on main during beginDraggingSession. Verified with a slow
+                // provider on macOS 26: immediate publication blocks; Promised
+                // publication makes no reads. File-promise control types still
+                // use the superclass, and explicit destination reads stay lazy.
+                return self.ivars().extra.writingOptionsForType_pasteboard(ty, pb);
             }
             // SAFETY: same signature; native file promises must retain their promised-writing option.
             unsafe { msg_send![super(self), writingOptionsForType: ty, pasteboard: pb] }
@@ -4209,6 +4215,46 @@ mod tests {
             sensitivity: crate::Sensitivity::Normal,
         });
         spec
+    }
+
+    #[test]
+    fn file_promise_companions_keep_remote_reads_lazy_at_drag_begin() {
+        objc2::rc::autoreleasepool(|_| {
+            let spec = native_content_spec(
+                "public.html",
+                oink_foundation::content::StandardFormat::Html,
+                b"<b>image</b>".to_vec(),
+            );
+            // This provider panics on open: publication must never read payloads.
+            let extra = super::super::content::promise_items(spec.native.as_ref().unwrap())
+                .unwrap()
+                .remove(0)
+                .1;
+            let remote = remote_spec();
+            let ClipData::Files(entries) = &remote.items[0] else {
+                unreachable!()
+            };
+            let queue = NSOperationQueue::new();
+            let delegate = PromiseDelegate::new(0, Arc::new(entries.clone()), remote.files.unwrap(), queue);
+            let this = DragFilePromise::alloc().set_ivars(DragPromiseIvars {
+                extra,
+                _delegate: delegate.clone(),
+            });
+            // SAFETY: the writer retains its initialized delegate and extra item.
+            let writer: Retained<DragFilePromise> = unsafe {
+                msg_send![super(this), initWithFileType: &*NSString::from_str("public.data"),
+                    delegate: ProtocolObject::<dyn NSFilePromiseProviderDelegate>::from_ref(&*delegate)]
+            };
+            let board = NSPasteboard::pasteboardWithUniqueName();
+            let ty = NSString::from_str("public.html");
+            assert!(
+                writer
+                    .writingOptionsForType_pasteboard(&ty, &board)
+                    .contains(NSPasteboardWritingOptions::Promised)
+            );
+            assert!(board.writeObjects(&NSArray::from_retained_slice(&[ProtocolObject::from_retained(writer)])));
+            board.clearContents();
+        });
     }
 
     #[test]

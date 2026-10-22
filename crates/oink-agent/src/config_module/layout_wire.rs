@@ -270,6 +270,15 @@ pub fn sync_local_displays(
         expanded.place_device(device, Point::new(origin.x()?, origin.y()?), groups[i].scale()?, manual);
     }
     expanded.sync_device(device, displays);
+    if index.is_some()
+        && old_screens.is_empty()
+        && let Some(info) = displays.first()
+    {
+        // The temporary screen above restores an empty group's saved transform.
+        // Its identical native bounds must not disguise this as an unchanged
+        // reconnect: reattaching a display really occupies new geometry.
+        expanded.repair_overlaps_around(&ScreenId::new(device, &info.key));
+    }
     let generated = to_wire(&expanded, current.source()?)?;
     for existing in &mut groups {
         if existing.device().and_then(|d| native_device(&d)) == Ok(device) {
@@ -493,6 +502,32 @@ mod tests {
         assert_eq!(screen.size_source().unwrap(), dto::SizeSource::Manual);
         assert_eq!(screen.local().unwrap().x().unwrap(), 200.0);
         assert_eq!(screen.local().unwrap().y().unwrap(), -600.0);
+    }
+    #[test]
+    fn reattaching_to_an_empty_group_still_repairs_newly_occupied_geometry() {
+        let a = DeviceId([11; 32]);
+        let b = DeviceId([12; 32]);
+        let info = display("a", 0.0, 0.0);
+        let mut layout = Layout::auto(&[(a, vec![info.clone()]), (b, vec![info.clone()])]);
+        layout.place_device(a, Point::default(), 1.0, true);
+        layout.place_device(b, Point::new(1000.0, 0.0), 1.0, true);
+        let wire = to_wire(&layout, dto::LayoutSource::Manual).unwrap();
+        let removed = sync_local_displays(&wire, a, &[], &Default::default(), 1).unwrap();
+        let mut raw = removed.layout.raw().clone();
+        let mut groups = removed.layout.devices().unwrap().0;
+        let index = groups
+            .iter()
+            .position(|g| native_device(&g.device().unwrap()).unwrap() == b)
+            .unwrap();
+        let mut occupied = groups[index].raw().clone();
+        occupied.insert(2, point(Point::default()));
+        groups[index] = dto::DevicePlacement::from_raw(occupied).unwrap();
+        raw.insert(1, RawValue::Array(groups.iter().map(WireValue::write).collect()));
+        let occupied = dto::LayoutValue::from_raw(raw).unwrap();
+        let restored = sync_local_displays(&occupied, a, &[info], &removed.detached, 2).unwrap();
+        let expanded = from_wire(&restored.layout).unwrap();
+        assert_eq!(expanded.device_transform(a).unwrap().0, Point::default());
+        assert_ne!(expanded.device_transform(b).unwrap().0, Point::default());
     }
     #[test]
     fn live_native_rearrangement_keeps_native_origin_and_one_scale() {

@@ -23,9 +23,19 @@ describe('pairing code entry', () => {
     }
     expect(complete).toHaveBeenCalledExactlyOnceWith('123456');
   });
-  it('centres the empty WebKit input line box', () => {
+  it('hides the text caret in every code box; the focus ring marks the active box', () => {
     const { container } = render(<><style>{pinCss + pairingCss}</style><Input complete={() => {}} /></>);
-    const style = getComputedStyle(container.querySelector('input')!);
-    expect(style.lineHeight).toBe('var(--ok-h-lg)');
+    for (const cell of container.querySelectorAll('input')) expect(['transparent', 'rgba(0, 0, 0, 0)']).toContain(getComputedStyle(cell).caretColor);
+  });
+  it('keeps paste and backspace moving through the boxes', () => {
+    const complete = vi.fn();
+    const { container } = render(<Input complete={complete} />);
+    const cells = [...container.querySelectorAll('input')];
+    fireEvent.change(cells[0], { target: { value: '7' } });
+    fireEvent.keyDown(cells[1], { key: 'Backspace' });
+    expect(document.activeElement).toBe(cells[0]);
+    fireEvent.paste(cells[0], { clipboardData: { getData: () => '654321' } });
+    expect(cells.map(c => c.value).join('')).toBe('654321');
+    expect(complete).toHaveBeenCalledExactlyOnceWith('654321');
   });
 });

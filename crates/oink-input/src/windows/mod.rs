@@ -25,6 +25,8 @@ mod rawinput;
 mod resume_hotkey;
 pub mod service;
 mod settings;
+#[cfg(all(test, debug_assertions))]
+mod source_release_desktop_tests;
 mod task_view;
 mod touchpad;
 pub(crate) mod trace;
@@ -325,6 +327,46 @@ impl InputBackend for WinInput {
             )
         };
         send(&[inject::drag_press_at(at, (vx, vy), (vw, vh))])
+    }
+    fn release_drag_at(&self, at: Point) -> Result<(), InputError> {
+        if !self.input_safety().active() {
+            return Err(InputError::NotStarted);
+        }
+        let _dpi = dpi::ThreadDpiGuard::per_monitor_v2();
+        // SAFETY: virtual-desktop metrics are read-only under the DPI guard.
+        let (vx, vy, vw, vh) = unsafe {
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            )
+        };
+        if !at.x.is_finite()
+            || !at.y.is_finite()
+            || vw <= 0
+            || vh <= 0
+            || at.x < f64::from(vx)
+            || at.y < f64::from(vy)
+            || at.x >= f64::from(vx) + f64::from(vw)
+            || at.y >= f64::from(vy) + f64::from(vh)
+        {
+            return Err(InputError::Unsupported);
+        }
+        let mut clip = windows::Win32::Foundation::RECT::default();
+        // A lost native hold may leave remote-mode confinement behind. Never
+        // let Windows clamp a positioned source UP onto that unrelated park.
+        // SAFETY: read-only clipping query with valid output storage.
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetClipCursor(&mut clip) }
+            .map_err(|error| InputError::Platform(error.to_string()))?;
+        if at.x < f64::from(clip.left)
+            || at.y < f64::from(clip.top)
+            || at.x >= f64::from(clip.right)
+            || at.y >= f64::from(clip.bottom)
+        {
+            return Err(InputError::Unsupported);
+        }
+        send(&[inject::drag_release_at(at, (vx, vy), (vw, vh))])
     }
     fn rebase_pointer_motion(&self) -> Result<Point, InputError> {
         *self

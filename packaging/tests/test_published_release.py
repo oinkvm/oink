@@ -16,19 +16,26 @@ import mac_release
 
 
 class PublishedFeedContract(unittest.TestCase):
-    def test_release_event_dispatches_publishers_on_the_default_branch(self):
+    def test_release_published_event_triggers_no_workflow_or_feed_dispatch(self):
         workflow = (ROOT / '.github/workflows/release.yml').read_text()
+        triggers = workflow.split('on:\n', 1)[1].split('permissions:\n', 1)[0]
+        self.assertEqual(re.findall(r'^  ([a-z_]+):', triggers, re.M), ['workflow_dispatch'])
+        self.assertNotIn('publish-updates:', workflow)
         self.assertNotIn('uses: ./.github/workflows/publish-', workflow)
-        self.assertIn('gh workflow run seed-update-feeds.yml', workflow)
-        self.assertIn('actions: write', workflow)
-        self.assertIn('--ref "$DEFAULT_BRANCH"', workflow)
-        self.assertIn('-f release_tag="$RELEASE_TAG" -f platform=both', workflow)
-        self.assertIn('python3 build-support/update/published_release.py', workflow)
-        # Pages can report the previous deployment as successful when several
-        # artifacts share a release-event SHA (actions/deploy-pages#383).
-        # A dispatch is the single publication path; never retry inline.
-        self.assertIn("github.event.action == 'published'", workflow)
-        self.assertIn('!github.event.release.draft && !github.event.release.prerelease', workflow)
+        self.assertNotIn('gh workflow run', workflow)
+        self.assertNotIn('actions: write', workflow)
+        for path in (ROOT / '.github/workflows').glob('*.yml'):
+            self.assertNotRegex(path.read_text(), r'(?m)^  release:', path.name)
+
+    def test_manual_publishers_pin_notes_and_code_to_dispatch_default_branch_commit(self):
+        for filename in ['seed-update-feeds.yml', 'publish-macos-feed.yml', 'publish-windows-feed.yml']:
+            workflow = (ROOT / '.github/workflows' / filename).read_text()
+            self.assertIn("github.event_name == 'workflow_dispatch'", workflow)
+            self.assertIn("github.ref == format('refs/heads/{0}', github.event.repository.default_branch)", workflow)
+            refs = re.findall(r'^          ref: (.*)$', workflow, re.M)
+            self.assertIn('${{ github.sha }}', refs)
+            self.assertTrue(all(ref in ('${{ github.sha }}', 'update-feed-state') for ref in refs))
+            self.assertEqual(workflow.count('uses: actions/checkout@'), len(refs))
 
     def test_recovery_can_publish_only_the_uncommitted_platform(self):
         workflow = (ROOT / '.github/workflows/seed-update-feeds.yml').read_text()
@@ -111,9 +118,19 @@ class PublishedReleaseGuard(unittest.TestCase):
         for tag in ['v0.1.2', 'v0.1.1-beta.1', '../main']:
             with self.subTest(tag=tag), self.assertRaises(ValueError): self.verify(tag)
 
-    def test_release_event_remains_bound_to_live_release_identity(self):
+    def test_release_published_event_is_rejected_before_any_live_request(self):
         self.event.update(action='published', release=copy.deepcopy(self.live))
-        with patch.dict(os.environ, GITHUB_EVENT_NAME='release'):
-            self.assertEqual(self.verify(), self.live)
-            self.live['id'] += 1
-            with self.assertRaisesRegex(ValueError, 'release_changed'): self.verify()
+        feed.write(self.path, self.event)
+        with patch.dict(os.environ, GITHUB_EVENT_NAME='release'), patch.object(self.module.subprocess, 'check_output') as request:
+            with self.assertRaisesRegex(ValueError, 'published_release_required'):
+                self.module.published('v0.1.1')
+            request.assert_not_called()
+
+    def test_trusted_notes_validate_channel_severity_and_existing_language_rules(self):
+        annotations = dict(channel='stable', severity='critical', notes={'en': 'Final', 'zh-Hans': '最终', 'ja': '最終', 'ko': '최종'})
+        for change in [dict(channel='beta'), dict(severity='urgent'), dict(extra=True),
+                       dict(notes={'en': 'Missing Chinese'}), dict(notes={**annotations['notes'], 'EN': 'Duplicate'}),
+                       dict(notes={**annotations['notes'], 'en': 'bad\x00text'})]:
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.module.validate_annotations({**annotations, **change})
+        self.assertEqual(self.module.validate_annotations(annotations), annotations)

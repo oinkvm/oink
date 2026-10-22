@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use oink_routing::RoutingSettings;
 use serde::{Deserialize, Serialize};
 
+mod deferred;
 pub mod owner;
 pub mod preferences;
 mod projection;
@@ -127,6 +128,7 @@ pub struct AgentConfig {
     owner: owner::OwnerStore,
     envelope: serde_json::Value,
     baseline: Settings,
+    deferred: Option<deferred::PendingWrite>,
 }
 
 impl AgentConfig {
@@ -193,6 +195,7 @@ impl AgentConfig {
             settings_issues: reader.issues,
             owner,
             envelope,
+            deferred: None,
         };
         if extended {
             config.save()?;
@@ -322,10 +325,15 @@ impl AgentConfig {
         Ok(result)
     }
     fn persist(&mut self) -> anyhow::Result<()> {
-        use base64::Engine;
         let _activity = oink_foundation::maintenance::process()
             .enter(oink_foundation::maintenance::ActivityKind::Configuration)
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::WouldBlock))?;
+        self.persist_admitted()
+    }
+    // Called only under a configuration admission lease (including the lease
+    // retained by a deferred edit while update admission is closed).
+    fn persist_admitted(&mut self) -> anyhow::Result<()> {
+        use base64::Engine;
         let before = projection::local(&self.baseline);
         let after = projection::local(&self.settings);
         let local = self.envelope.get_mut("local").ok_or(store::StoreError::Invalid)?;
@@ -336,6 +344,7 @@ impl AgentConfig {
         std::fs::create_dir_all(&self.data_dir)?;
         oink_foundation::storage::atomic_write(&self.settings_path(), &serde_json::to_vec_pretty(&self.envelope)?)?;
         self.baseline = self.settings.clone();
+        self.deferred = None;
         Ok(())
     }
     pub fn device_name(&self) -> String {

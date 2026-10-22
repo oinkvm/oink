@@ -48,24 +48,30 @@ struct Record: Codable, Equatable {
     let directory: Bool
     let size: UInt64?
     let modified: Int64?
+    let created: Int64?
     let node: UInt64?
     let version: UInt64
     let children: UInt64?
     // Present on private placeholder pool items.
     let hidden: Bool?
-    init(id: String, parent: String, name: String, directory: Bool, size: UInt64?, modified: Int64?, node: UInt64?, version: UInt64 = 0, children: UInt64? = nil, hidden: Bool? = nil) {
+    init(id: String, parent: String, name: String, directory: Bool, size: UInt64?, modified: Int64?, node: UInt64?, version: UInt64 = 0, children: UInt64? = nil, hidden: Bool? = nil, created: Int64? = nil) {
         self.id = id; self.parent = parent; self.name = name; self.directory = directory
         self.size = size; self.modified = modified; self.node = node; self.version = version; self.children = children; self.hidden = hidden
+        self.created = created
     }
     // Keep the item identity stable while replacing the content/metadata version.
     // The backend has persisted the same metadata before sending this header.
     func updating(_ metadata: CurrentMetadata) -> Record {
         Record(id: id, parent: parent, name: name, directory: directory, size: metadata.size,
-               modified: metadata.modified, node: node, version: metadata.version, children: children, hidden: hidden)
+               modified: metadata.modified, node: node, version: metadata.version, children: children, hidden: hidden, created: created)
     }
-    enum CodingKeys: String, CodingKey { case id, parent, name, directory, size, modified, node, version, children, hidden }
+    func withCreationDate(_ fallback: Int64?) -> Record {
+        Record(id: id, parent: parent, name: name, directory: directory, size: size, modified: modified,
+               node: node, version: version, children: children, hidden: hidden, created: created ?? fallback)
+    }
+    enum CodingKeys: String, CodingKey { case id, parent, name, directory, size, modified, created, node, version, children, hidden }
     init(from decoder: Decoder) throws {
-        try validateLocalKeys(decoder, allowed: ["id", "parent", "name", "directory", "size", "modified", "node", "version", "children", "hidden"])
+        try validateLocalKeys(decoder, allowed: ["id", "parent", "name", "directory", "size", "modified", "created", "node", "version", "children", "hidden"])
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(String.self, forKey: .id)
         parent = try values.decode(String.self, forKey: .parent)
@@ -73,6 +79,7 @@ struct Record: Codable, Equatable {
         directory = try values.decode(Bool.self, forKey: .directory)
         size = try values.decodeIfPresent(UInt64.self, forKey: .size)
         modified = try values.decodeIfPresent(Int64.self, forKey: .modified)
+        created = try values.decodeIfPresent(Int64.self, forKey: .created)
         node = try values.decodeIfPresent(UInt64.self, forKey: .node)
         version = try values.decode(UInt64.self, forKey: .version)
         children = try values.decodeIfPresent(UInt64.self, forKey: .children)
@@ -115,6 +122,10 @@ struct Catalog: Codable {
     let batch: [UInt8]?
     let urls: [String]
     let received_at: Double?
+    var receivedMilliseconds: Int64? {
+        guard let value = received_at, value.isFinite, value >= 0, value < Double(Int64.max) else { return nil }
+        return Int64(value)
+    }
     init(token: String, port: UInt16, records: [Record], batch: [UInt8]? = nil, urls: [String] = [], received_at: Double? = nil) {
         self.schema = 1
         self.token = token; self.port = port; self.records = records; self.batch = batch; self.urls = urls; self.received_at = received_at
@@ -215,21 +226,50 @@ func listDirectory(catalog: Catalog, record: Record, cursor: DirectoryCursor?) t
         guard next.version == result.version, !result.records.isEmpty,
               UInt64(next.offset) == UInt64(cursor?.offset ?? 0) + UInt64(result.records.count) else { throw NSFileProviderError(.cannotSynchronize) }
     }
-    return result
+    return DirectoryListing(records: result.records.map { $0.withCreationDate(catalog.receivedMilliseconds) }, next: result.next, version: result.version)
 }
-func container() throws -> URL {
+func appGroupContainer() throws -> URL {
     guard let group = Bundle.main.object(forInfoDictionaryKey: providerGroupKey) as? String, group == approvedAppGroup,
           let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) else {
         throw NSError(domain: "OinkFileProvider", code: 1, userInfo: [NSLocalizedDescriptionKey: "App Group unavailable"])
     }
-    let result = url.appendingPathComponent("FileProvider", isDirectory: true)
+    return url
+}
+func container() throws -> URL {
+    let result = try appGroupContainer().appendingPathComponent("FileProvider", isDirectory: true)
     try FileManager.default.createDirectory(at: result, withIntermediateDirectories: true)
     return result
 }
 func catalogs() throws -> [Catalog] { try catalogs(in: container()) }
 private func rawCatalogs(in root:URL) throws -> [Catalog] {
     try FileManager.default.contentsOfDirectory(at:root,includingPropertiesForKeys:nil)
-        .filter {$0.pathExtension=="json"}.map {try JSONDecoder().decode(Catalog.self,from:Data(contentsOf:$0))}
+        .filter {$0.pathExtension=="json"}.map { url in
+            let catalog = try JSONDecoder().decode(Catalog.self, from: Data(contentsOf: url))
+            // Source folders have no file payload or delivery received_at. For
+            // an existing undated source, its catalog's real creation time is
+            // the available persistent date; do not use the enumeration clock.
+            let undatedSource = catalog.records.contains {
+                $0.directory && $0.node == nil && $0.id.hasPrefix("source") && $0.modified == nil && $0.created == nil
+            }
+            let born = (undatedSource ? try? url.resourceValues(forKeys: [.creationDateKey]).creationDate : nil)
+                .map { Int64($0.timeIntervalSince1970 * 1000) }
+            let records = catalog.records.map { record in
+                let dated = record.directory && record.node == nil && record.id.hasPrefix("source")
+                    ? record.withCreationDate(record.modified ?? born) : record
+                // Empty, unbacked preparation catalogs contain no user nodes.
+                // Correct their visibility without renaming an existing path;
+                // real received empty folders still have a user directory node.
+                if catalog.received_at == nil && catalog.batch == nil && catalog.records.count == 1,
+                   record.directory, record.node == nil, record.children == 0, record.id.hasSuffix("-root") {
+                    return Record(id: dated.id, parent: dated.parent, name: dated.name, directory: true,
+                                  size: dated.size, modified: dated.modified, node: nil, version: dated.version,
+                                  children: dated.children, hidden: true, created: dated.created)
+                }
+                return dated
+            }
+            return Catalog(token: catalog.token, port: catalog.port, records: records,
+                           batch: catalog.batch, urls: catalog.urls, received_at: catalog.received_at)
+        }
 }
 func catalogs(in root: URL) throws -> [Catalog] {
     let raw=try rawCatalogs(in:root)
@@ -239,7 +279,7 @@ func catalogs(in root: URL) throws -> [Catalog] {
         var deleted=Set(entries.filter {$0.value.deleted}.map {$0.key})
         var previous=0
         while previous != deleted.count {previous=deleted.count;for record in records where deleted.contains(record.parent) {deleted.insert(record.id)}}
-        return raw.map {c in Catalog(token:c.token,port:c.port,records:c.records.compactMap {r in deleted.contains(r.id) ? nil : (entries[r.id]?.record ?? r)},batch:c.batch,urls:c.urls,received_at:c.received_at)}
+        return raw.map {c in Catalog(token:c.token,port:c.port,records:c.records.compactMap {r in deleted.contains(r.id) ? nil : (entries[r.id]?.record ?? r).withCreationDate(c.receivedMilliseconds ?? r.created)},batch:c.batch,urls:c.urls,received_at:c.received_at)}
     }
 }
 final class Item: NSObject, NSFileProviderItem {
@@ -251,7 +291,11 @@ final class Item: NSObject, NSFileProviderItem {
     var contentType: UTType { record.directory ? .folder : (UTType(filenameExtension: (record.name as NSString).pathExtension) ?? .data) }
     var documentSize: NSNumber? { record.size.map { NSNumber(value: $0) } }
     var childItemCount: NSNumber? { record.children.map { NSNumber(value: $0) } }
-    var contentModificationDate: Date? { record.modified.map { Date(timeIntervalSince1970: Double($0) / 1000) } }
+    // Source mtime is authoritative when supplied. Otherwise the persisted first
+    // publication time describes the received copy; never synthesize Date() on
+    // an enumeration, which would change anchors and versions while idle.
+    var creationDate: Date? { (record.created ?? record.modified).map { Date(timeIntervalSince1970: Double($0) / 1000) } }
+    var contentModificationDate: Date? { (record.modified ?? record.created).map { Date(timeIntervalSince1970: Double($0) / 1000) } }
     // These snapshots export ordinary copies. POSIX userWritable alone still produces uchg
     // on macOS 14 and 26 when capabilities only allow reading; Finder carries it to copies.
     // Declare ordinary operations too, including rename/move, which an immutable item forbids.
@@ -272,6 +316,7 @@ final class Item: NSObject, NSFileProviderItem {
         let modified = record.modified.map(String.init) ?? "unknown"
         let content = "\(record.version)-\(size)-\(modified)"
         var metadata = "\(content)-\(record.children.map(String.init) ?? "unknown")-\(record.parent)-\(record.name)"
+        if let created = record.created { metadata += "-created:\(created)" }
         // A reused provider identity must signal the rename and clear UF_HIDDEN
         // even when the real directory still has unknown size and version 1.
         // Generic -> final is metadata; never convert a file identity to folder.
@@ -663,6 +708,9 @@ struct ReceivedEntry: Codable {
     var modified_locally:Bool? = nil
     var original_parent:String? = nil
 }
+// `hidden` is reserved for our private prepared parents/slots, not user file
+// visibility. Keep their OS materialization outside the received-file overlay.
+func receivedRecordEligible(_ record: Record) -> Bool { record.hidden != true }
 private func receivedKey(_ id: String) -> String { String(id.split(separator:"-").first ?? "") }
 private func receivedFile(_ key:String, in root:URL) -> URL { root.appendingPathComponent(key).appendingPathExtension("received") }
 func withReceived<T>(in root:URL, _ operation:() throws -> T) throws -> T {
@@ -676,7 +724,11 @@ func withReceived<T>(in root:URL, _ operation:() throws -> T) throws -> T {
 func readReceived(_ key:String,in root:URL) throws -> [String:ReceivedEntry] {
     let file=receivedFile(key,in:root)
     guard FileManager.default.fileExists(atPath:file.path) else { return [:] }
+    // Prepared parents are intentionally materialized to warm the namespace.
+    // That is not receipt of user data. Their private snapshots must never
+    // override the final rename/reparent or protect a cancelled publication.
     return try JSONDecoder().decode([String:ReceivedEntry].self,from:Data(contentsOf:file))
+        .filter { receivedRecordEligible($0.value.record) }
 }
 private func writeReceived(_ key:String,_ entries:[String:ReceivedEntry],in root:URL) throws {
     try JSONEncoder().encode(entries).write(to:receivedFile(key,in:root),options:.atomic)
@@ -760,7 +812,7 @@ func receivedModify(_ item:NSFileProviderItem,fields:NSFileProviderItemFields,co
     let changedContents=fields.contains(.contents)
     let localSize=contents.flatMap {try? $0.resourceValues(forKeys:[.fileSizeKey]).fileSize}.map(UInt64.init)
     let size=changedContents ? ((item.documentSize ?? nil)?.uint64Value ?? localSize ?? old.size) : old.size
-    let record=Record(id:id,parent:parent,name:name,directory:old.directory,size:size,modified:old.modified,node:old.node,version:old.version+(changedContents ? 1:0),children:old.children,hidden:old.hidden)
+    let record=Record(id:id,parent:parent,name:name,directory:old.directory,size:size,modified:old.modified,node:old.node,version:old.version+(changedContents ? 1:0),children:old.children,hidden:old.hidden,created:old.created)
     try withReceived(in:root) {
         let key=receivedKey(id);var entries=try readReceived(key,in:root)
         if try receivedDeleted(old,in:root) {throw NSFileProviderError(.noSuchItem)}
@@ -782,7 +834,7 @@ func receivedUsage(manager:NSFileProviderManager,root:URL,days:UInt64,clear:Bool
     let records=try catalogs(in:root).flatMap {$0.records}
     for item in items {
         let id=item.itemIdentifier.rawValue
-        guard let record=records.first(where:{$0.id==id}) else {continue}
+        guard let record=records.first(where:{$0.id==id}), receivedRecordEligible(record) else {continue}
         let entry=try readReceived(receivedKey(id),in:root)[id] ?? ReceivedEntry(record:record,received_at:receivedTime(id,in:root),handed_off:false,materialized:false,deleted:false)
         guard !entry.deleted else {continue}
         do {

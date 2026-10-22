@@ -79,6 +79,7 @@ export interface SpeakerCard extends ResourceCard<
   makeExitAction: CardAction;
   forwardingControlsToken: string | null; // owner15 Boot/revision fence
   forwardingEnabled: boolean | null; // this row's source switch
+  localOutput: { volumePercent: number /* 0..100 */; muted: boolean } | null;
   activity: "idle" | "playing" | "forwarding" | "sound_sleep"
     | "preparing" | "waiting_for_exit" | "paused" | "sleeping"
     | "failed" | "unknown";
@@ -109,6 +110,7 @@ export interface DeviceCardActions {
   forwardingDisabled: CardAction;
 }
 export interface DeviceCardStatus {
+  accessibilityGranted?: boolean | null; // unknown/legacy/not applicable when absent or null
   actions: DeviceCardActions;
   cursor: CursorCard;
   screen: ResourceCard<SharingMode>;
@@ -184,7 +186,7 @@ export type DeviceControlResult =
       unknownCode: number | null };
 export type DeviceControlRequest =
   | { method: "set_forwarding_controls"; params: { requestId: string; versionToken: string;
-      volumePercent: number; muted: boolean } }
+      volumePercent: number; muted: boolean; deferPersistence?: boolean } }
   | { method: "invoke_device_card_action"; params: { requestId: string; token: string } }
   | { method: "set_exit_volume"; params: { requestId: string; versionToken: string;
       volumePercent: number; muted: boolean } };

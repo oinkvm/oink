@@ -213,6 +213,27 @@ impl OwnerStore {
         self.set_item(item.clone());
         Ok(item)
     }
+    /// Disabled is runtime intent, durably cleared before any owner/input task
+    /// starts. Preserve ordinary Local/Shared preferences and fence old Boots.
+    pub fn clear_input_disables_on_start(&mut self) -> Result<(), StoreError> {
+        self.clear_keyboard_on_start()?;
+        self.release_input_disables()
+    }
+    /// One config candidate commits both release values atomically. Never turn a
+    /// normal mouse Local preference into Shared while clearing a keyboard guard.
+    pub fn release_input_disables(&mut self) -> Result<(), StoreError> {
+        for (option, disabled, enabled) in [
+            (LocalOption::KeyboardDisabled, true.write(), false.write()),
+            (LocalOption::MouseMode, 2u32.write(), 0u32.write()),
+        ] {
+            let item = self.item(option).ok_or(StoreError::Invalid)?;
+            if item.value()? == disabled {
+                self.edit(option, item.revision()?, enabled)
+                    .map_err(|_| StoreError::Invalid)?;
+            }
+        }
+        Ok(())
+    }
     pub fn active_group(&self) -> Option<GroupId> {
         self.raw.get(&4).and_then(|value| store::group(value).ok())
     }

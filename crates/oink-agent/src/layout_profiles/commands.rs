@@ -208,6 +208,7 @@ impl Node {
             .map_err(|_| profile_api_error(ProfileError::new(ErrorCode::Busy, "Layout operation in progress")))?;
         let _gate = lock(&self.inner.profiles.gate);
         let state = self.profile_snapshot().map_err(profile_api_error)?;
+        self.current_profile_catalog().map_err(profile_api_error)?;
         if state
             .operation
             .as_ref()
@@ -248,6 +249,19 @@ impl Node {
         self.operation_event(op).map_err(profile_api_error)?;
         result
     }
+    fn current_profile_catalog(&self) -> Result<model::Catalog> {
+        let catalog = lock(&self.inner.profiles.data)
+            .catalog
+            .clone()
+            .ok_or_else(|| unavailable("Catalog unavailable"))?;
+        if Some(catalog.group.0) != self.group_id() {
+            return Err(ProfileError::new(
+                ErrorCode::Busy,
+                "Waiting for the target group catalog",
+            ));
+        }
+        Ok(catalog)
+    }
     pub(crate) fn layout_profile_command(&self, command: Command) -> serde_json::Value {
         match self.run_profile_command(command) {
             Ok(v) => v,
@@ -275,7 +289,7 @@ impl Node {
             .command_gate
             .try_lock()
             .map_err(|_| ProfileError::new(ErrorCode::Busy, "Another layout operation is in progress"))?;
-        // Background catalog imports are short and must not make an otherwise
+        // Background catalog writes are short and must not make an otherwise
         // idle UI report Busy. Only a concurrent user operation gets Busy.
         let _gate = self
             .inner
@@ -326,10 +340,7 @@ impl Node {
             ));
         }
         let current = snapshot(&state)?;
-        let catalog = lock(&self.inner.profiles.data)
-            .catalog
-            .clone()
-            .expect("initialized catalog");
+        let catalog = self.current_profile_catalog()?;
         let now = crate::layout_sync::now_ms();
         let reply = match command {
             Command::Query => unreachable!(),
@@ -568,7 +579,9 @@ impl Node {
         let device = state.devices.iter().find(|d| d.device == v.device).ok_or_else(stale)?;
         if !device.can_edit_screens {
             return Err(ProfileError::new(
-                if device.sync_system_arrangement {
+                if device.availability == Availability::Offline {
+                    ErrorCode::OwnerOffline
+                } else if effective_system_sync(device.sync_system_arrangement, true) {
                     ErrorCode::Unsupported
                 } else {
                     ErrorCode::SettingDisabled

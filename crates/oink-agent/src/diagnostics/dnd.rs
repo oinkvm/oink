@@ -225,6 +225,7 @@ impl InputTrace {
             DndCmd::ExportFailed { .. } => "ExportFailed",
             DndCmd::PrepareDrop { .. } => "PrepareDrop",
             DndCmd::HoldSource { .. } => "HoldSource",
+            DndCmd::ExportSource { .. } => "ExportSource",
             DndCmd::ResumeSource { .. } => "ResumeSource",
             DndCmd::FinishSource { .. } => "FinishSource",
             DndCmd::ReleaseSourceButton { .. } => "ReleaseSourceButton",
@@ -242,6 +243,7 @@ impl InputTrace {
         match command {
             DndCmd::UpdateImage { id, epoch, .. }
             | DndCmd::HoldSource { id, epoch, .. }
+            | DndCmd::ExportSource { id, epoch, .. }
             | DndCmd::LeaveHost { id, epoch, .. }
             | DndCmd::PrepareDrop { id, epoch }
             | DndCmd::Begin { id, epoch, .. } => {

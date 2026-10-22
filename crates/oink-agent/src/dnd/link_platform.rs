@@ -36,6 +36,7 @@ impl super::link::Handle {
             export_epoch: Mutex::new(None),
             source_epoch: AtomicU64::new(0),
             source_physical: std::sync::atomic::AtomicBool::new(false),
+            source_origin: Mutex::new(None),
             source_releases: Mutex::new(None),
             hold_observations: Mutex::new(HashMap::new()),
         });

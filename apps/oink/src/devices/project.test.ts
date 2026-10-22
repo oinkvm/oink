@@ -15,12 +15,33 @@ const card = (): DeviceCard => ({
     actions:{screenShared:unavailable,screenLocal:unavailable,mouseShared:unavailable,mouseLocal:unavailable,keyboardShared:unavailable,keyboardLocal:unavailable,keyboardDisabled:unavailable,keyboardEnabled:unavailable,clipboardShared:unavailable,clipboardLocal:unavailable,forwardingEnabled:unavailable,forwardingDisabled:unavailable},
     cursor:{icon:'unknown',focusDevice:null,focusName:null,lockedDevice:null,context:'unknown'},
     screen:resource(),mouse:resource(),keyboard:{...resource(),disabled:false},clipboard:resource(),
-    speaker:{...resource(),configuredMode:null,icon:'unknown',makeExitAction:unavailable,forwardingControlsToken:null,forwardingEnabled:null,activity:'unknown',receiverDevice:null,receiverName:null,activeSources:null,receiveReady:null,forwarding:null},
+    speaker:{...resource(),configuredMode:null,icon:'unknown',makeExitAction:unavailable,forwardingControlsToken:null,localOutput:null,forwardingEnabled:null,activity:'unknown',receiverDevice:null,receiverName:null,activeSources:null,receiveReady:null,forwarding:null},
     game:{preference:null,active:null,detected:null,actions:{auto:unavailable,on:unavailable,off:unavailable}},
   },
 });
 const view = (device:DeviceCard):DeviceCardsView => ({schema:1,stream:'test',revision:'1',group:null,generatedAtMs:0,exitVolume:null,emergencyDelivery:null,cards:[device]});
 describe('owner card presentation',()=>{
+  it('uses only explicit remote AX reports, leaving legacy faults and Windows alone',()=>{
+    const owner=card();owner.os='macos';
+    owner.status!.mouse.fault={code:'permission_denied',unknownCode:null,problem:null};
+    owner.status!.keyboard.fault={code:'permission_denied',unknownCode:null,problem:null};
+    expect(presentCards(view(owner),[])[0].accessibilityMissing).toBe(false);
+    owner.status!.accessibilityGranted=false;
+    expect(presentCards(view(owner),[])[0].accessibilityMissing).toBe(true);
+    owner.status!.accessibilityGranted=true;
+    expect(presentCards(view(owner),[])[0].accessibilityMissing).toBe(false);
+    owner.os='windows';owner.status!.accessibilityGranted=false;
+    expect(presentCards(view(owner),[])[0].accessibilityMissing).toBe(false);
+  });
+  it('uses the local permissions API even when the local card has a stale AX report',()=>{
+    const owner=card();owner.os='macos';owner.isSelf=true;owner.status!.accessibilityGranted=false;
+    expect(presentCards(view(owner),[],[])[0].accessibilityMissing).toBe(false);
+    for(const state of ['NotGranted','NotDetermined','Denied','Granted','NotApplicable'] as const) {
+      expect(presentCards(view(owner),[],[{kind:'accessibility',state,required:true}])[0].accessibilityMissing)
+        .toBe(!['Granted','NotApplicable'].includes(state));
+    }
+  });
+
   it('offers mouse disable only when the owner supplies an invokable action',()=>{
     const device=card();
     expect(presentCards(view(device),[])[0].canDisableMouse).toBe(false);
@@ -61,6 +82,12 @@ describe('owner card presentation',()=>{
     store.controlReply({type:'device_control_completed',data:{requestId:'screen',result:{outcome:'refused',reason:'stale_revision',unknownCode:null}}});
     expect(screenValue(presentCards(store.get().cards,store.get().pending)[0])).toBe('locked');
     expect(store.get().error).toBe('stale_revision');
+  });
+  it.each([true,false])('maps readable local output for self=%s and preserves null',isSelf=>{
+    const owner=card();owner.isSelf=isSelf;
+    expect(presentCards(view(owner),[])[0].speaker.localOutput).toBeNull();
+    owner.status!.speaker.localOutput={volumePercent:73,muted:true};
+    expect(presentCards(view(owner),[])[0].speaker.localOutput).toEqual({volume:73,muted:true});
   });
   it('preserves unavailable signal, cursor, role, volume and game observations',()=>{
     const [device] = presentCards(view(card()),[]);

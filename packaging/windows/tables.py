@@ -37,7 +37,7 @@ def read_content_tables(path):
         tables = {}
         for table in ('MsiLockPermissionsEx', 'CreateFolder', 'Property', 'Registry',
                       'Component', 'CustomAction', 'InstallExecuteSequence', 'Upgrade',
-                      'Icon', 'Binary', 'Dialog', 'Shortcut', 'Control', 'ControlEvent', 'ControlCondition', 'InstallUISequence',
+                      'Icon', 'Binary', 'Dialog', 'Shortcut', 'MsiShortcutProperty', 'Control', 'ControlEvent', 'ControlCondition', 'InstallUISequence',
                       'AppSearch', 'RegLocator', 'CheckBox', 'Media'):
             view = uint()
             checked(open_view(database.value, f'SELECT * FROM `{table}`', ctypes.byref(view)))

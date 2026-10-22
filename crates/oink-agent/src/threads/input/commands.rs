@@ -30,7 +30,7 @@ fn state_key(command: &InputCommand) -> Option<StateKey> {
         SessionLocked(_) => 19,
         TrailPinned(_) => 5,
         LocalFeel(_) => 6,
-        LocalDisplays(_) => 7,
+        LocalDisplays(_) | LocalDisplayFailure => 7,
         EdgeResistance(_) => 9,
         PointerSample { .. } => 10,
         VolumeExit(..) => 11,
@@ -86,6 +86,7 @@ impl Clone for StateCommand {
             TrailPinned(v) => TrailPinned(*v),
             LocalFeel(v) => LocalFeel(v.clone()),
             LocalDisplays(v) => LocalDisplays(v.clone()),
+            LocalDisplayFailure => LocalDisplayFailure,
             EdgeResistance(v) => EdgeResistance(v.clone()),
             PointerSample {
                 scope,

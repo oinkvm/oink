@@ -90,7 +90,7 @@ export function ManualSearch({ pairing, autoFocus = true }: {
             setIp(v.replace(/[^\d.]/g, '').slice(0, 15));
             if (error?.field === 'ip')
                 setError(null);
-        }} placeholder="192.168.1.20" inputMode="decimal" autoComplete="off" spellCheck={false} required autoFocus={autoFocus} invalid={error?.field === 'ip'} aria-describedby="manual-msg"/>
+        }} inputMode="decimal" autoComplete="off" spellCheck={false} required autoFocus={autoFocus} invalid={error?.field === 'ip'} aria-describedby="manual-msg"/>
         </label>
         <label className="manual__field manual__field--port">
           <span className="manual__label">{tr('端口')}</span>

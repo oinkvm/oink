@@ -427,11 +427,22 @@ impl AgentApi for RemoteApi {
         volume_percent: u16,
         muted: bool,
     ) -> ApiResult<crate::device_cards::DeviceControlReply> {
+        self.set_forwarding_controls_with_persistence(request_id, version_token, volume_percent, muted, false)
+    }
+    fn set_forwarding_controls_with_persistence(
+        &self,
+        request_id: String,
+        version_token: String,
+        volume_percent: u16,
+        muted: bool,
+        defer_persistence: bool,
+    ) -> ApiResult<crate::device_cards::DeviceControlReply> {
         self.call(Request::SetForwardingControls {
             request_id,
             version_token,
             volume_percent,
             muted,
+            defer_persistence,
         })
     }
     fn set_exit_volume(

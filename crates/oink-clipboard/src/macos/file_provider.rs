@@ -1030,7 +1030,8 @@ fn received_source_catalog(
         },
         Err(e) => return Err(e),
     };
-    for record in catalog.records.iter().rev() {
+    for index in (0..catalog.records.len()).rev() {
+        let record = &catalog.records[index];
         let overlay: serde_json::Value = match std::fs::read(root.join(format!("{}.received", record.id))) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => serde_json::Value::Null,
@@ -1039,7 +1040,20 @@ fn received_source_catalog(
         let entry = &overlay[&record.id];
         let parent = entry["record"]["parent"].as_str().unwrap_or(&record.parent);
         if entry["deleted"] != true && parent == "NSFileProviderRootContainerItemIdentifier" {
-            return Ok(record.id.clone());
+            let id = record.id.clone();
+            if record.modified.is_none() {
+                // A source container has no source-file mtime. Use its real
+                // catalog creation time once, keeping its identity/path intact.
+                catalog.records[index].modified = Some(
+                    std::fs::metadata(&path)?
+                        .created()?
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(io::Error::other)?
+                        .as_millis() as i64,
+                );
+                save_catalog(&path, &catalog)?;
+            }
+            return Ok(id);
         }
     }
     let id = if catalog.records.is_empty() {
@@ -1053,7 +1067,7 @@ fn received_source_catalog(
         name,
         directory: true,
         size: None,
-        modified: None,
+        modified: Some(crate::received::now() as i64),
         node: None,
         version: 1,
         children: None,
@@ -1081,6 +1095,7 @@ fn prepare_batch_with_root(
 ) -> io::Result<(Arc<Batch>, Vec<FileEntry>)> {
     let roots = contents.roots();
     let received_at = contents.origin().map(|_| crate::received::now());
+    let private_parent = roots.is_empty() && received_at.is_none();
     let mut source_parent = "NSFileProviderRootContainerItemIdentifier".to_owned();
     let mut delivery_name = id.to_owned();
     if let Some(previous) = previous_root {
@@ -1117,7 +1132,7 @@ fn prepare_batch_with_root(
         name: delivery_name,
         directory: true,
         size: None,
-        modified: None,
+        modified: previous_root.map_or(received_at.map(|at| at as i64), |record| record.modified),
         node: None,
         version: 1,
         children: Some(roots.len() as u64),
@@ -1129,30 +1144,33 @@ fn prepare_batch_with_root(
         entries.push(names.entry(&node)?);
     }
     let local_batch = contents.local_batch().map(|batch| batch.id());
-    Ok((
-        Arc::new(Batch {
-            urls: Mutex::default(),
-            token: token.clone(),
-            contents: Mutex::new(contents),
-            state: Mutex::new(CatalogState {
-                catalog: Catalog {
-                    schema: 1,
-                    token,
-                    port,
-                    records,
-                    batch: local_batch,
-                    urls: Vec::new(),
-                    received_at,
-                },
-                names,
-                aliases: HashMap::new(),
-                retired: false,
-            }),
-            catalog,
-            readers: Mutex::new(0),
+    let batch = Arc::new(Batch {
+        urls: Mutex::default(),
+        token: token.clone(),
+        contents: Mutex::new(contents),
+        state: Mutex::new(CatalogState {
+            catalog: Catalog {
+                schema: 1,
+                token,
+                port,
+                records,
+                batch: local_batch,
+                urls: Vec::new(),
+                received_at,
+            },
+            names,
+            aliases: HashMap::new(),
+            retired: false,
         }),
-        entries,
-    ))
+        catalog,
+        readers: Mutex::new(0),
+    });
+    // Empty stock is internal, just like typed stock. Never show its random
+    // publication key as a received folder while it awaits a real namespace.
+    if private_parent {
+        placeholders::hide_parent(id, &mut batch.state.lock().unwrap().catalog);
+    }
+    Ok((batch, entries))
 }
 
 fn restore_catalog(data: &std::path::Path, path: &std::path::Path, key: &str, port: u16) -> io::Result<Arc<Batch>> {
@@ -1654,6 +1672,14 @@ fn remove_catalog(path: &std::path::Path) {
     let Some(root) = CONTAINER.get() else { return };
     remove_catalog_in(root, path);
 }
+fn received_entry_protected(value: &serde_json::Value) -> bool {
+    // A warmed private parent is materialized, but has received no user data.
+    // Match the extension's overlay admission rule, including stale snapshots
+    // encountered while a typed parent is being renamed or retired.
+    value["record"]["hidden"] != true
+        && value["deleted"] != true
+        && (value["handed_off"] == true || value["materialized"] == true || value["fetching"].as_u64().unwrap_or(0) > 0)
+}
 fn received_catalog_protected(path: &std::path::Path) -> bool {
     if path.extension().is_some_and(|e| e == "json") {
         match std::fs::read(path).map(|b| serde_json::from_slice::<Catalog>(&b)) {
@@ -1667,14 +1693,7 @@ fn received_catalog_protected(path: &std::path::Path) -> bool {
         Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
             .ok()
             .and_then(|v| v.as_object().cloned())
-            .is_none_or(|entries| {
-                entries.values().any(|v| {
-                    v["deleted"] != true
-                        && (v["handed_off"] == true
-                            || v["materialized"] == true
-                            || v["fetching"].as_u64().unwrap_or(0) > 0)
-                })
-            }),
+            .is_none_or(|entries| entries.values().any(received_entry_protected)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::read(path)
             .ok()
             .and_then(|b| serde_json::from_slice::<Catalog>(&b).ok())
@@ -1718,12 +1737,7 @@ fn remove_catalog_in(root: &std::path::Path, path: &std::path::Path) {
                     .as_object()
                     .ok_or(io::ErrorKind::InvalidData)?
                     .iter()
-                    .filter(|(_, v)| {
-                        v["deleted"] != true
-                            && (v["handed_off"] == true
-                                || v["materialized"] == true
-                                || v["fetching"].as_u64().unwrap_or(0) > 0)
-                    })
+                    .filter(|(_, v)| received_entry_protected(v))
                     .map(|(id, _)| id.clone())
                     .collect();
                 let mut previous = 0;
@@ -2117,6 +2131,32 @@ mod tests {
     }
 
     #[test]
+    fn private_preparation_overlay_cannot_pin_a_cancelled_typed_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("typed.json");
+        let (batch, _) = prepare_batch(
+            Flat::new(&[], Arc::new(EmptyContents)).unwrap(),
+            "typed",
+            "secret".into(),
+            1,
+            path.clone(),
+        )
+        .unwrap();
+        let mut state = batch.state.lock().unwrap();
+        state.catalog.received_at = Some(1);
+        save_catalog(&path, &state.catalog).unwrap();
+        let mut private = state.catalog.records[0].clone();
+        private.hidden = Some(true);
+        drop(state);
+        std::fs::write(path.with_extension("received"), serde_json::to_vec(&serde_json::json!({
+            "typed-root": {"record": private, "received_at": 1, "handed_off": false, "materialized": true, "deleted": false}
+        })).unwrap()).unwrap();
+        assert!(!received_catalog_protected(&path));
+        remove_catalog_in(root.path(), &path);
+        assert!(!path.exists(), "an unused typed parent is not a received item");
+    }
+
+    #[test]
     fn late_directory_reader_cannot_resurrect_a_retired_working_set_catalog() {
         let root = tempfile::tempdir().unwrap();
         let key = "a".repeat(64);
@@ -2136,6 +2176,123 @@ mod tests {
         assert!(!path.exists());
         retained_reader.state.lock().unwrap().persist(&path).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn filtered_received_namespaces_group_by_device_keep_ids_and_publish_real_dates() {
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let owned = crate::content::Completed::test_single_file(data.path());
+        let local = crate::content::Completed::restore(data.path(), owned.id()).unwrap();
+        let origin = Namespace::origin(&local).unwrap();
+        let display = crate::received::source_folder(root.path(), origin, "Peer").unwrap();
+        let provider =
+            crate::policy::SharingPolicy::new(true, crate::policy::FormatFilters::default()).provider(Arc::new(local));
+        let namespace = provider.namespace().unwrap();
+        let key = "a".repeat(64);
+        let path = root.path().join(format!("{key}.json"));
+        let (first, _) = prepare_batch(namespace.clone(), &key, "a".into(), 1, path.clone()).unwrap();
+        let first_catalog = first.state.lock().unwrap().catalog.clone();
+        let parent = &first_catalog.records[0];
+        assert_eq!(parent.parent, format!("source{}", origin.to_hex()));
+        assert_eq!(parent.id, format!("{key}-root"));
+        assert_ne!(parent.name, key);
+        assert_eq!(parent.modified, first_catalog.received_at.map(|at| at as i64));
+        assert!(parent.modified.unwrap() > 1_700_000_000_000);
+        assert_eq!(parent.hidden, None);
+        let source_path = root.path().join(format!("{}.json", parent.parent));
+        let source: Catalog = serde_json::from_slice(&std::fs::read(&source_path).unwrap()).unwrap();
+        assert_eq!(source.records.len(), 1);
+        assert_eq!(source.records[0].name, display);
+        assert!(source.records[0].modified.unwrap() > 1_700_000_000_000);
+        assert_eq!(source.records[0].parent, "NSFileProviderRootContainerItemIdentifier");
+        save_catalog(&path, &first_catalog).unwrap();
+        // Device rename and another delivery reuse the one source folder.
+        assert_eq!(
+            crate::received::source_folder(root.path(), origin, "Renamed Peer").unwrap(),
+            display
+        );
+        let (next, _) =
+            prepare_batch(namespace, &"b".repeat(64), "b".into(), 2, root.path().join("next.json")).unwrap();
+        assert_eq!(next.state.lock().unwrap().catalog.records[0].parent, parent.parent);
+        let source_again: Catalog = serde_json::from_slice(&std::fs::read(source_path).unwrap()).unwrap();
+        assert_eq!(source_again.records.len(), 1);
+        assert_eq!(source_again.records[0].modified, source.records[0].modified);
+        let restored = restore_catalog(data.path(), &path, &key, 3).unwrap();
+        let restored = restored.state.lock().unwrap();
+        assert_eq!(restored.catalog.records[0].id, parent.id);
+        assert_eq!(restored.catalog.records[0].parent, parent.parent);
+        assert_eq!(restored.catalog.records[0].name, parent.name);
+        assert_eq!(restored.catalog.records[0].modified, parent.modified);
+        assert_eq!(restored.catalog.records[1].id, first_catalog.records[1].id);
+    }
+
+    #[test]
+    fn source_date_repair_preserves_an_existing_folder_identity_and_name() {
+        let root = tempfile::tempdir().unwrap();
+        let origin = oink_foundation::DeviceId([8; 32]);
+        let id = received_source_catalog(root.path(), origin, "Peer 080808080808".into()).unwrap();
+        let path = root.path().join(format!("{id}.json"));
+        let mut catalog: Catalog = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        catalog.records[0].modified = None;
+        save_catalog(&path, &catalog).unwrap();
+        let created = std::fs::metadata(&path)
+            .unwrap()
+            .created()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert_eq!(
+            received_source_catalog(root.path(), origin, "New name".into()).unwrap(),
+            id
+        );
+        let repaired: Catalog = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(repaired.records[0].modified, Some(created));
+        assert_eq!(repaired.records[0].name, catalog.records[0].name);
+        assert_eq!(repaired.records[0].parent, catalog.records[0].parent);
+        assert_eq!(
+            received_source_catalog(root.path(), origin, "Other name".into()).unwrap(),
+            id
+        );
+        let repeated: Catalog = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(repeated.records[0].modified, Some(created));
+    }
+
+    #[test]
+    fn empty_spare_parents_are_private_and_filling_preserves_their_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let key = "d".repeat(64);
+        let path = root.path().join(format!("{key}.json"));
+        let (spare, _) = prepare_batch(
+            Flat::new(&[], Arc::new(EmptyContents)).unwrap(),
+            &key,
+            "a".into(),
+            1,
+            path.clone(),
+        )
+        .unwrap();
+        let spare = spare.state.lock().unwrap().catalog.clone();
+        assert_eq!(spare.records[0].hidden, Some(true));
+        assert_eq!(spare.records[0].name, format!(".Oink-prepared-{key}.noindex"));
+        let entries = [FileEntry {
+            path: "fixture".into(),
+            is_dir: false,
+            size: 0,
+            modified_ms: None,
+            local_path: None,
+        }];
+        let (filled, _) = prepare_batch(
+            Flat::new(&entries, Arc::new(EmptyContents)).unwrap(),
+            &key,
+            "a".into(),
+            1,
+            path,
+        )
+        .unwrap();
+        let filled = filled.state.lock().unwrap();
+        assert_eq!(spare.records[0].id, filled.catalog.records[0].id);
+        assert_eq!(filled.catalog.records[0].hidden, None);
     }
 
     #[test]

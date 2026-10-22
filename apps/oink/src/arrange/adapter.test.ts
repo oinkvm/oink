@@ -137,3 +137,21 @@ it('hides every paused computer screen and restores exact stored geometry after 
     expect(resumed).toEqual(shown);
     expect(layoutPlacements(value,resumed)).toEqual([placement]);
 });
+
+
+it('excludes missing AX at view time and restores all geometry without changing hidden flags', () => {
+    const value = layout([
+        screen('a', {x:0,y:0,w:1000,h:600}),
+        {...screen('b', {x:1000,y:-200,w:800,h:500}),hidden:true},
+        {...screen('c', {x:1800,y:0,w:800,h:600}),key:{device:'peer',display:'c'}},
+    ]);
+    const before = structuredClone(value);
+    const shown = renderLayout(value, {}, [placement]);
+    const owner = {id:'computer',screenSharing:true,screen:'shared' as const,accessibilityMissing:true};
+    expect(visibleScreens(shown,value,[owner]).map(s=>s.id)).toEqual(['peer:c']);
+    expect(shown).toHaveLength(3);
+    const restored = visibleScreens(shown,value,[{...owner,accessibilityMissing:false}]);
+    expect(restored.map(s=>s.id)).toEqual(['computer:a','peer:c']);
+    expect(restored[0]).toEqual(shown[0]);
+    expect(value).toEqual(before);
+});

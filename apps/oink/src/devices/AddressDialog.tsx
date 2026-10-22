@@ -69,7 +69,7 @@ function AddressForm({ d, onConfirm }: {
             setIp(v.replace(/[^\d.]/g, '').slice(0, 15));
             if (error?.field === 'ip')
                 setError(null);
-        }} placeholder={d.ip} inputMode="decimal" autoComplete="off" spellCheck={false} autoFocus invalid={error?.field === 'ip'} aria-describedby="addr-msg"/>
+        }} inputMode="decimal" autoComplete="off" spellCheck={false} autoFocus invalid={error?.field === 'ip'} aria-describedby="addr-msg"/>
         </label>
         <label className="manual__field manual__field--port">
           <span className="manual__label">{tr('端口')}</span>

@@ -198,14 +198,58 @@ the stored parent and previous-feed artifact remain recovery inputs.
 
 `release.yml` workflow_dispatch builds/verifies both platforms and creates a
 **draft** containing the notarized DMG, MSI, the ZIP of the already-stapled app,
-`release.json`, `update.json` and `SHA256SUMS`. Fill `.github/update-notes.json`
-with `channel: stable`, `severity: normal|critical` and plain-text `en` and
-`zh-Hans` notes. Before tagging or building a release, the user must approve
-English and Simplified Chinese text in `.github/update-notes.json` and
-`.github/release-notes.txt`; subsequent changes to those texts need approval.
-Other translations do not need user review. Each newline separates a bullet.
-Include user-visible changes only; the unsigned-MSI limitation belongs only
-in release-notes.txt under Known limitations.
+`release.json` and `SHA256SUMS`. Its initial body comes from
+`.github/release-notes.txt`, which is a starting draft. Final update notes are
+not required to build, tag or assemble the draft. New releases have no
+`update.json` asset or notes binding in `release.json`/`SHA256SUMS`; installer
+hashes and provenance remain bound exactly as before.
+
+The release procedure is:
+
+1. Dispatch **Release packages** on the default branch (currently `main`), using
+   the reserved monotonically increasing build. For example, for 0.2.0/build 35:
+
+   ```sh
+   gh workflow run release.yml --repo oinkvm/oink --ref main -f build=35
+   ```
+
+2. The user edits the draft's release notes directly on GitHub, reviews the
+   draft and clicks **Publish**. Publishing the GitHub release triggers no
+   workflow and does not publish either update feed.
+
+3. After publication, read the final body (for example below), write
+   `.github/update-notes.json` from it, obtain user approval for the `en` and
+   `zh-Hans` text, and translate `ja` and `ko`. Those translations do not need
+   user review. Use `channel: stable`, `severity: normal|critical`; each newline
+   separates a plain-text bullet. Include user-visible changes only; keep the
+   unsigned-MSI limitation in the GitHub release's Known limitations.
+
+   ```sh
+   RELEASE_TAG=v0.2.0 # replace with the published release tag
+   gh release view "$RELEASE_TAG" --repo oinkvm/oink --json body --jq .body
+   # Edit .github/update-notes.json and obtain approval before committing.
+   PYTHONPATH=build-support/update python3 -c 'import published_release; published_release.update_notes()'
+   git add .github/update-notes.json
+   git commit -m "docs(release): finalize update notes for $RELEASE_TAG"
+   ```
+
+4. Land that notes commit on the trusted default branch through the normal
+   review/merge process. Then explicitly dispatch **Seed published stable
+   release feeds** on that branch for the published tag:
+
+   ```sh
+   gh workflow run seed-update-feeds.yml --repo oinkvm/oink --ref main \
+     -f release_tag="$RELEASE_TAG" -f platform=both
+   ```
+
+The manual dispatcher and both reusable publishers check out the dispatch's
+exact default-branch SHA, so code and notes remain consistent even if the branch
+advances during the run. They validate notes with `feed.validate_notes` and the
+stable-channel/severity rules before signing. Windows reads notes from that
+trusted checkout at signing time; Mac embeds them in the signed appcast.
+Neither publisher downloads release-asset notes, including legacy `update.json`.
+Do not change the notes between retries for a build already registered in the
+Windows catalog: the immutable-build check still rejects changed records.
 
 Notes are an extensible language map on the existing feeds and signing schema.
 Clients require English; the publisher requires English and Simplified Chinese,
@@ -215,19 +259,20 @@ per translation. Lookup uses exact UI language, progressively shorter parents,
 then English. 0.1.3 publishes only the approved `en` and `zh-Hans` entries so
 strict 0.1.1/0.1.2 clients can reach it. From 0.1.4 onward, adding languages is
 an accepted hard cut: those older clients reject the feed. No new URLs, v2
-schema, dual writing or compatibility projection is introduced. Notes and ZIP
-hashes remain bound into the release record and checksums. Private symbols
-are never release assets.
+schema, dual writing or compatibility projection is introduced. Notes are bound
+into signed appcasts/manifests and catalog records at manual feed publication;
+ZIP/DMG/MSI hashes remain bound into the release record and checksums. Existing
+signed feeds and catalog records remain valid. Windows manifest renewal uses
+those existing records and never reads the current `.github/update-notes.json`.
+Private symbols are never release assets.
 
-**release.published**, non-draft/non-prerelease, verifies the live release and
-dispatches **Seed published stable release feeds** on the trusted default branch.
-That dispatch is the single release publication path for both platforms. Pages
-can report success without serving a new artifact when several deployments run
-under a release event; see [actions/deploy-pages#383](https://github.com/actions/deploy-pages/issues/383).
-Using the supported dispatch event avoids that server-side behavior without
-changing deployment IDs, adding delays or retrying a failed deployment. The
-dispatcher needs only `contents: read` and job-scoped `actions: write`; no new
-secret or signing access is needed. Drafts and prereleases do not dispatch.
+The manual dispatch is the single release feed publication path for both
+platforms. Pages can report success without serving a new artifact when several
+deployments run under a release event; see
+[actions/deploy-pages#383](https://github.com/actions/deploy-pages/issues/383).
+Using the supported dispatch event avoids that behavior without deployment-ID
+changes, delays or retries. No `release.published` trigger or automatic dispatch
+remains. Drafts and prereleases are rejected by the live-release gate.
 
 To recover a failed initial publication without rebuilding
 or retagging the release, dispatch **Seed published stable release feeds** on the
@@ -322,8 +367,10 @@ Never label pure tests or packaging smoke as real Sparkle qualification.
 ## Windows candidate
 
 The Windows reusable publisher takes `release_tag`, fetches the final published
-`release.json`, MSI and `update.json`, and binds them to the fetched tag's commit
-and exact source-tree digest using trusted default-branch code. Native MSI
+`release.json` and MSI, and binds them to the fetched tag's commit and exact
+source-tree digest using trusted default-branch code. The signing job reads
+validated notes from `.github/update-notes.json` in the dispatch's pinned
+default-branch checkout, independently of the package assets. Native MSI
 inspection checks the embedded inventory. Ed25519 metadata/package signatures
 are mandatory; Authenticode/SignPath pins are additionally enforced when
 configured. An empty reviewed pin list permits unsigned Windows packages.

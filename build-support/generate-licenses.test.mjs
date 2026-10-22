@@ -58,3 +58,19 @@ test('native menu SVGs are inventoried with their reviewed shape ownership', () 
     }
   }
 });
+
+test('bundled sponsor marks retain project provenance, terms and brand notices', () => {
+  for (const name of ['kofi', 'wechat']) {
+    const path = `apps/oink/src/sponsor/${name}.svg`;
+    const asset = native.assets.find(asset => asset.path === path);
+    assert.ok(asset, path);
+    assert.equal(asset.ownership, 'first-party', path);
+    assert.equal(asset.licenseExpression, 'GPL-3.0-only', path);
+    assert.equal(asset.selectedLicense, 'GPL-3.0-only', path);
+    assert.deepEqual(asset.platforms, ['macos-arm64', 'windows-x64'], path);
+    assert.deepEqual(asset.scope, ['runtime'], path);
+    assert.deepEqual(asset.licenseFiles.map(file => file.path), ['LICENSE', 'LICENSE-ADDITIONAL-TERMS.md'], path);
+    assert.match(asset.provenance, /Project-authored.*Mark/, path);
+    assert.match(asset.trademarkNotice, /grants no trademark rights or endorsement/, path);
+  }
+});

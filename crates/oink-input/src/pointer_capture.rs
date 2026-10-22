@@ -4,9 +4,15 @@ use oink_foundation::Point;
 
 pub mod windows;
 
+// macOS-only policy; Windows uses its independent two-sample rule.
+const ENTER_US: u64 = 100_000;
+const EXIT_US: u64 = 100_000;
+const STATIONARY_US: u64 = 100_000;
+const MIN_MOVEMENT_SAMPLES: u32 = 1;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CaptureSample {
-    /// Windows-only full-screen and timestamped motion evidence.
+    /// Windows-only full-screen and timestamped motion evidence for two-sample decisions.
     pub windows: Option<windows::WindowsSample>,
     /// Platform-reported visibility, also used to suppress the pointer trail.
     /// On macOS the raw query can retain a stale typing-obscure value; the service
@@ -130,23 +136,25 @@ impl CaptureDetector {
         } else if self.previous.is_some_and(|p| p.motion_serial != s.motion_serial) {
             self.movement_samples = self.movement_samples.saturating_add(1);
         }
-        // Require motion in three distinct sampling intervals at one interior point.
+        // Require one observed motion interval and 100ms at one interior point.
         // Once established, idle while still hidden at that point is not a release.
         let motion_lock = s.motion_observable
             && interior
             && stationary
-            && (self.active || (self.movement_samples >= 3 && now.saturating_sub(self.stationary_since) >= 250_000));
+            && (self.active
+                || (self.movement_samples >= MIN_MOVEMENT_SAMPLES
+                    && now.saturating_sub(self.stationary_since) >= STATIONARY_US));
         let evidence = hidden && (s.confined || motion_lock || self.warp_lock);
         if evidence {
             self.exit_since = None;
             let start = *self.enter_since.get_or_insert(now);
-            if now.saturating_sub(start) >= 300_000 {
+            if now.saturating_sub(start) >= ENTER_US {
                 self.active = true;
             }
         } else {
             self.enter_since = None;
             let start = *self.exit_since.get_or_insert(now);
-            if now.saturating_sub(start) >= 200_000 {
+            if now.saturating_sub(start) >= EXIT_US {
                 self.active = false;
             }
         }
@@ -219,6 +227,38 @@ mod tests {
         })
     }
     #[test]
+    fn fast_entry_uses_one_motion_interval_and_100ms_debounce() {
+        let mut d = CaptureDetector::default();
+        assert!(!d.update(sample(true, false, 0), true, true, 0));
+        assert!(!d.update(sample(true, false, 1), true, true, 50_000));
+        assert!(!d.update(sample(true, false, 1), true, true, 100_000));
+        assert!(
+            d.evidence(100_000).enter_pending,
+            "100ms stationary plus one move establishes motion lock"
+        );
+        assert!(!d.update(sample(true, false, 1), true, true, 199_999));
+        assert!(d.update(sample(true, false, 1), true, true, 200_000));
+    }
+
+    #[test]
+    fn fast_clipped_entry_debounces_for_100ms() {
+        let mut d = CaptureDetector::default();
+        assert!(!d.update(sample(true, true, 0), true, true, 0));
+        assert!(!d.update(sample(true, true, 0), true, true, 99_999));
+        assert!(d.update(sample(true, true, 0), true, true, 100_000));
+    }
+
+    #[test]
+    fn fast_exit_debounces_for_100ms() {
+        let mut d = CaptureDetector::default();
+        d.update(sample(true, true, 0), true, true, 0);
+        assert!(d.update(sample(true, true, 0), true, true, 300_000));
+        assert!(d.update(sample(false, false, 0), true, true, 400_000));
+        assert!(d.update(sample(false, false, 0), true, true, 499_999));
+        assert!(!d.update(sample(false, false, 0), true, true, 500_000));
+    }
+
+    #[test]
     fn hiding_for_video_or_typing_does_not_enter() {
         let mut d = CaptureDetector::default();
         for i in 0..100 {
@@ -230,19 +270,19 @@ mod tests {
         let mut d = CaptureDetector::default();
         assert!(!d.update(sample(false, true, 0), true, true, 0));
         assert!(!d.update(sample(true, true, 0), true, true, 100_000));
-        assert!(!d.update(sample(true, true, 0), true, true, 399_999));
-        assert!(d.update(sample(true, true, 0), true, true, 400_000));
-        assert!(d.update(sample(false, false, 0), true, true, 500_000));
-        assert!(!d.update(sample(false, false, 0), true, true, 700_000));
+        assert!(!d.update(sample(true, true, 0), true, true, 199_999));
+        assert!(d.update(sample(true, true, 0), true, true, 200_000));
+        assert!(d.update(sample(false, false, 0), true, true, 300_000));
+        assert!(!d.update(sample(false, false, 0), true, true, 400_000));
     }
     #[test]
     fn stationary_movement_enters_and_idle_does_not_exit() {
         let mut d = CaptureDetector::default();
-        for i in 0..11 {
+        for i in 0..4 {
             assert!(!d.update(sample(true, false, i as u32), true, true, i * 50_000));
         }
-        assert!(d.update(sample(true, false, 11), true, true, 550_000));
-        assert!(d.update(sample(true, false, 11), true, true, 2_000_000));
+        assert!(d.update(sample(true, false, 4), true, true, 200_000));
+        assert!(d.update(sample(true, false, 4), true, true, 2_000_000));
         assert!(!d.update(sample(true, false, 12), false, true, 2_100_000));
     }
     #[test]
@@ -280,9 +320,11 @@ mod warp_tests {
         assert!(!d.update(sample(false, 200., 0), true, true, 0));
         assert!(!d.update(sample(true, 100., 0), true, true, 50_000));
         assert!(!d.update(sample(true, 104., 1), true, true, 100_000));
-        assert!(d.update(sample(true, 120., 5), true, true, 350_000));
-        assert!(d.update(sample(false, 120., 5), true, true, 400_000));
-        assert!(!d.update(sample(false, 120., 5), true, true, 600_000));
+        assert!(!d.update(sample(true, 120., 5), true, true, 149_999));
+        assert!(d.update(sample(true, 120., 5), true, true, 150_000));
+        assert!(d.update(sample(false, 120., 5), true, true, 200_000));
+        assert!(d.update(sample(false, 120., 5), true, true, 299_999));
+        assert!(!d.update(sample(false, 120., 5), true, true, 300_000));
     }
     #[test]
     fn hidden_movement_and_slow_drift_are_not_a_lock() {
@@ -398,10 +440,10 @@ mod hiding_reason_tests {
     #[test]
     fn unknown_cause_uses_stationary_motion_and_visible_release() {
         let mut d = CaptureDetector::default();
-        for i in 0..11 {
+        for i in 0..4 {
             assert!(!d.update(sample(None, 100., i), true, true, u64::from(i) * 50_000));
         }
-        assert!(d.update(sample(None, 100., 11), true, true, 550_000));
+        assert!(d.update(sample(None, 100., 4), true, true, 200_000));
         let mut visible = sample(None, 100., 11).unwrap();
         visible.hidden = false;
         assert!(d.update(Some(visible), true, true, 600_000));
@@ -438,8 +480,8 @@ mod hiding_reason_tests {
         }
         assert!(d.active);
         assert!(d.update(sample(Some(false), 100., 11), true, true, 600_000));
-        assert!(d.update(sample(Some(false), 100., 11), true, true, 799_999));
-        assert!(!d.update(sample(Some(false), 100., 11), true, true, 800_000));
+        assert!(d.update(sample(Some(false), 100., 11), true, true, 699_999));
+        assert!(!d.update(sample(Some(false), 100., 11), true, true, 700_000));
         for i in 0..=11 {
             d.update(
                 sample(Some(true), 100., 12 + i),

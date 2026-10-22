@@ -15,12 +15,26 @@ use oink_protocol::v1::{
 };
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{Mutex, OnceLock},
+    sync::Mutex,
 };
+
+#[cfg(test)]
+pub type SnapshotPause = (std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>);
 
 #[derive(Debug, Default)]
 pub struct State {
-    pub activation: OnceLock<Result<u64>>,
+    #[cfg(test)]
+    pub pause_snapshot_init: Mutex<Option<SnapshotPause>>,
+    #[cfg(test)]
+    pub catalog_publish_ready: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
+    #[cfg(test)]
+    pub unavailable_observation: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub defer_joins: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub defer_catalogs: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub deferred_joins: std::sync::atomic::AtomicUsize,
     pub gate: Mutex<()>,
     pub command_gate: Mutex<()>,
     pub native: super::native::Runtime,
@@ -33,7 +47,6 @@ pub struct Data {
     pub last: Option<LayoutProfilesState>,
     pub sequence: u64,
     pub pending_layout: Option<dto::ConfigVersion>,
-    pub pending_import: bool,
     pub operations: VecDeque<LayoutOperation>,
     pub operation_digests: BTreeMap<String, String>,
     pub unknown: BTreeMap<String, Vec<(DeviceKey, dto::LayoutArrangementRequest)>>,
@@ -70,14 +83,16 @@ pub fn preference_token(facts: &dto::DeviceFacts) -> String {
     model::hash(&oink_protocol::v1::cbor::encode_map(&raw, 4096).unwrap_or_default())
 }
 impl Node {
-    pub(crate) fn initialize_profile_store(&self) -> Result<u64> {
-        self.inner
-            .profiles
-            .activation
-            .get_or_init(|| store::activation_ms(&self.inner.data_dir))
-            .clone()
-    }
     pub(super) fn observe_profiles(&self) -> Result<Observation> {
+        #[cfg(test)]
+        if self
+            .inner
+            .profiles
+            .unavailable_observation
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(unavailable("Injected missing owner facts"));
+        }
         let config = self.link_config().map_err(unavailable)?;
         let applied = config.applied();
         let table = config.members();
@@ -130,7 +145,8 @@ impl Node {
                 preference_token: facts.map(|f| preference_token(f)).unwrap_or_default(),
                 native_token: token.clone(),
                 availability,
-                can_edit_screens: enabled && availability == Availability::Ready,
+                can_edit_screens: effective_system_sync(enabled, availability != Availability::Offline)
+                    && availability == Availability::Ready,
             });
             let Some((origin, scale)) = layout.device_transform(member.device) else {
                 continue;
@@ -193,7 +209,6 @@ impl Node {
         })
     }
     pub(super) fn profile_snapshot(&self) -> Result<LayoutProfilesState> {
-        self.initialize_profile_store()?;
         let mut observation = self.observe_profiles()?;
         let group = self
             .group_id()
@@ -201,9 +216,10 @@ impl Node {
             .into();
         let mut data = lock(&self.inner.profiles.data);
         if data.catalog.as_ref().is_none_or(|c| c.group != group) {
-            let catalog = match store::load(&self.inner.data_dir, group)? {
-                Some(c) => c,
-                None => {
+            let catalog = select_catalog(
+                store::load(&self.inner.data_dir, group)?,
+                || super::join::awaiting_catalog(&self.inner.data_dir, group),
+                || {
                     let c = Catalog::initial(
                         group,
                         self.id().into(),
@@ -212,10 +228,19 @@ impl Node {
                         crate::layout_sync::now_ms(),
                     )?;
                     store::save(&self.inner.data_dir, &c)?;
-                    c
-                }
+                    Ok(c)
+                },
+            )?;
+            #[cfg(test)]
+            if let Some((loaded, resume)) = lock(&self.inner.profiles.pause_snapshot_init).take() {
+                loaded.wait();
+                resume.wait();
+            }
+            let receipts = if catalog.group == group {
+                store::load_operations(&self.inner.data_dir, group)?
+            } else {
+                store::Operations::default()
             };
-            let receipts = store::load_operations(&self.inner.data_dir, group)?;
             data.operations = receipts.operations;
             data.operation_digests = receipts.digests;
             data.replies.clear();
@@ -247,7 +272,6 @@ impl Node {
                 }
             }
             data.pending_layout = None;
-            data.pending_import = false;
             let mut recovered = catalog;
             for op in &mut data.operations {
                 Self::autosave_operation(&mut recovered, op, self.id().into())?;
@@ -269,7 +293,9 @@ impl Node {
                     })
                     .collect::<Result<Vec<_>>>()?,
             };
-            store::save_with_operations(&self.inner.data_dir, &recovered, &receipts)?;
+            if recovered.group == group {
+                store::save_with_operations(&self.inner.data_dir, &recovered, &receipts)?;
+            }
             data.catalog = Some(recovered);
         }
         let applied_version = self.link_config().map_err(unavailable)?.applied().version.clone();
@@ -278,8 +304,8 @@ impl Node {
         }) {
             data.pending_layout = None;
         }
-        let syncing = data.pending_layout.is_some() || data.pending_import;
         let c = data.catalog.as_ref().expect("catalog initialized");
+        let syncing = data.pending_layout.is_some() || c.group != group;
         observation.snapshot.active_profile_id = c.active_profile_id.clone();
         let token = model::hash(&(
             c.version.token(),
@@ -363,9 +389,63 @@ impl Node {
         )
     }
     pub(super) fn persist_catalog(&self, catalog: Catalog) -> Result<()> {
+        #[cfg(test)]
+        if let Some(ready) = lock(&self.inner.profiles.catalog_publish_ready).take() {
+            ready.wait();
+        }
+        // Snapshot initialization also persists recovered receipts while holding
+        // data. Fence the disk write with that same lock, so a paused initializer
+        // cannot overwrite this catalog before its in-memory publication.
+        let mut data = lock(&self.inner.profiles.data);
         store::save(&self.inner.data_dir, &catalog)?;
-        lock(&self.inner.profiles.data).catalog = Some(catalog);
+        if data.catalog.as_ref().is_some_and(|c| c.group != catalog.group) {
+            data.operations.clear();
+            data.operation_digests.clear();
+            data.unknown.clear();
+            data.replies.clear();
+            data.previews.clear();
+        }
+        data.catalog = Some(catalog);
         self.inner.profiles.wake.notify_waiters();
         Ok(())
+    }
+}
+
+// Keep filesystem reads injectable so a handoff changing between observations
+// can be exercised without scheduler timing or a platform-specific filesystem.
+fn select_catalog<T>(
+    stored: Option<T>,
+    awaiting: impl FnOnce() -> Result<Option<T>>,
+    initial: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    match stored {
+        Some(c) => Ok(c),
+        None => match awaiting()? {
+            Some(c) => Ok(c),
+            None => initial(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+
+    #[test]
+    fn awaiting_catalog_is_consumed_from_one_observation() {
+        let mut reads = 0;
+        let catalog = select_catalog(
+            None,
+            || {
+                reads += 1;
+                // The retained handoff is available on the first read, then a
+                // concurrent completion/removal makes it absent on the next read.
+                Ok((reads == 1).then_some("retained source"))
+            },
+            || panic!("must not initialize a replacement default"),
+        )
+        .unwrap();
+        assert_eq!(catalog, "retained source");
+        assert_eq!(reads, 1);
     }
 }

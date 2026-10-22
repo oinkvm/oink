@@ -7,6 +7,7 @@ struct State {
     encoder: Option<oink_audio::source::Encoder>,
     volume: Option<oink_audio::volume::Reading>,
     volume_writes: usize,
+    volume_revision: u64,
     key_failed_after_write: bool,
     volume_wake: Option<Arc<dyn Fn() + Send + Sync>>,
     opened_outputs: Vec<String>,
@@ -78,7 +79,7 @@ impl AudioPlatform for Platform {
             percent: 55,
             muted: false,
         });
-        Ok(Box::new(Endpoint(self.0.clone())))
+        Ok(Box::new(Endpoint(self.0.clone(), std::cell::Cell::new(0))))
     }
     fn capture_encoded(
         &self,
@@ -166,7 +167,7 @@ impl Drop for TestPlayback {
     }
 }
 
-struct Endpoint(Arc<Mutex<State>>);
+struct Endpoint(Arc<Mutex<State>>, std::cell::Cell<u64>);
 impl oink_audio::volume::Endpoint for Endpoint {
     fn key(&mut self, action: oink_audio::volume::KeyAction) -> Result<(), oink_audio::volume::Fault> {
         let mut state = lock(&self.0);
@@ -189,10 +190,12 @@ impl oink_audio::volume::Endpoint for Endpoint {
     }
 
     fn changed(&self) -> bool {
-        false
+        self.1.get() != lock(&self.0).volume_revision
     }
     fn read(&mut self) -> Result<oink_audio::volume::Reading, oink_audio::volume::Fault> {
-        lock(&self.0).volume.ok_or_else(oink_audio::volume::Fault::unavailable)
+        let state = lock(&self.0);
+        self.1.set(state.volume_revision);
+        state.volume.ok_or_else(oink_audio::volume::Fault::unavailable)
     }
     fn write(&mut self, reading: oink_audio::volume::Reading) -> Result<(), oink_audio::volume::Fault> {
         let mut state = lock(&self.0);
@@ -1360,5 +1363,146 @@ async fn manual_update_remembers_current_cleanup_failure_until_admission_reopens
         owner.suspend_for_update().is_err(),
         "a second request cannot erase this attempt's error"
     );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn forwarding_drag_applies_and_publishes_each_revision_before_durability() {
+    let mut running = Running::start(true).await;
+    let owner = &mut running.owners[0];
+    let option = dto::LocalOption::ForwardingControls;
+    let mut revision = lock(&owner.store).owner().revision(option).unwrap();
+    // A released peer's request has no opt-in and retains synchronous semantics.
+    let legacy = owner
+        .set_option(
+            &boot(owner.links.boot()),
+            owner.group.applied().group,
+            option,
+            revision,
+            RawValue::Map([(1, 20u16.write()), (2, false.write())].into_iter().collect()),
+        )
+        .unwrap();
+    assert!(legacy.persisted);
+    revision += 1;
+    assert_eq!(
+        AgentConfig::load_from(running.directories[0].as_path())
+            .unwrap()
+            .settings
+            .audio
+            .forwarding_volume_percent,
+        20
+    );
+    let durable_before_drag = std::fs::read(lock(&owner.store).settings_path()).unwrap();
+    let mut sequence = owner.group.local_facts().fact_sequence().unwrap();
+    for percent in [25u16, 40, 65, 80] {
+        let patch = RawValue::Map([(1, percent.write()), (2, false.write())].into_iter().collect());
+        let applied = owner
+            .set_option_with_persistence(
+                &boot(owner.links.boot()),
+                owner.group.applied().group,
+                option,
+                revision,
+                patch,
+                true,
+            )
+            .unwrap();
+        assert_eq!(applied.outcome, dto::ControlOutcome::Applied);
+        assert!(!applied.persisted);
+        revision += 1;
+        assert_eq!(applied.current.revision().unwrap(), revision);
+        assert_eq!(owner.settings.forwarding_volume_percent, percent);
+        assert_eq!(lock(&owner.store).settings.audio.forwarding_volume_percent, percent);
+        let next = applied.fact_sequence.unwrap();
+        assert!(next > sequence);
+        sequence = next;
+        let preferences = owner.group.local_facts().preferences().unwrap().unwrap();
+        assert!(preferences.0.contains(&applied.current));
+        let durable = AgentConfig::load_from(running.directories[0].as_path()).unwrap();
+        assert_ne!(durable.owner().revision(option), Some(revision));
+        assert_eq!(
+            std::fs::read(lock(&owner.store).settings_path()).unwrap(),
+            durable_before_drag
+        );
+    }
+    // Release sends the same final value without opt-in: no revision change,
+    // but it must flush the pending snapshot before reporting durable success.
+    let final_reply = owner
+        .set_option(
+            &boot(owner.links.boot()),
+            owner.group.applied().group,
+            option,
+            revision,
+            RawValue::Map([(1, 80u16.write()), (2, false.write())].into_iter().collect()),
+        )
+        .unwrap();
+    assert_eq!(final_reply.outcome, dto::ControlOutcome::NoChange);
+    assert!(final_reply.persisted);
+    assert!(lock(&owner.store).forwarding_persisted());
+    let durable = AgentConfig::load_from(running.directories[0].as_path()).unwrap();
+    assert_eq!(durable.settings.audio.forwarding_volume_percent, 80);
+    assert_eq!(durable.owner().revision(option), Some(revision));
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn default_output_callbacks_publish_coalesced_facts_without_being_an_exit() {
+    let mut running = Running::new().await;
+    assert!(running.owners[0].exit_volume.state().is_none());
+    let now = Instant::now() + Duration::from_secs(1);
+    {
+        let mut state = lock(&running.platforms[0].0);
+        state.volume = Some(oink_audio::volume::Reading {
+            percent: 9,
+            muted: false,
+        });
+        state.volume_revision += 1;
+    }
+    running.owners[0].local_output.tick(now);
+    running.owners[0].publish_observations().unwrap();
+    let initial = running.owners[0].group.local_facts().fact_sequence().unwrap();
+    for (ms, percent) in [(1, 12), (50, 35), (150, 87)] {
+        let wake = {
+            let mut state = lock(&running.platforms[0].0);
+            state.volume = Some(oink_audio::volume::Reading { percent, muted: true });
+            state.volume_revision += 1;
+            state.volume_wake.clone().unwrap()
+        };
+        wake();
+        running.owners[0].local_output.tick(now + Duration::from_millis(ms));
+        running.owners[0].publish_observations().unwrap();
+        assert_eq!(running.owners[0].group.local_facts().fact_sequence().unwrap(), initial);
+    }
+    running.owners[0].local_output.tick(now + Duration::from_millis(200));
+    running.owners[0].publish_observations().unwrap();
+    let facts = running.owners[0].group.local_facts();
+    assert_eq!(facts.fact_sequence().unwrap(), initial + 1);
+    let volume = facts
+        .resources()
+        .unwrap()
+        .unwrap()
+        .speaker()
+        .unwrap()
+        .unwrap()
+        .local_output()
+        .unwrap()
+        .unwrap();
+    assert_eq!(volume.volume_percent().unwrap(), 87);
+    assert!(volume.muted().unwrap());
+    assert_eq!(lock(&running.platforms[0].0).volume_writes, 0);
+    running
+        .until(|running| {
+            running.owners[1]
+                .group
+                .members()
+                .members
+                .iter()
+                .find(|member| member.device == running.owners[0].links.id())
+                .and_then(|member| member.facts.as_ref())
+                .and_then(|facts| facts.resources().ok().flatten())
+                .and_then(|resources| resources.speaker().ok().flatten())
+                .and_then(|speaker| speaker.local_output().ok().flatten())
+                .is_some_and(|volume| volume.volume_percent() == Ok(87) && volume.muted() == Ok(true))
+        })
+        .await;
     running.stop().await;
 }

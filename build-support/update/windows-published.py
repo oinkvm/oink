@@ -54,16 +54,8 @@ def prepare(config, output):
     feed.require(package in combined['artifacts'] and re.fullmatch('[A-Za-z0-9_.-]+[.]msi', package['name']), 'asset')
     raw = asset(package['name'], feed.MAX_PACKAGE)
     feed.require(len(raw) == package['size'] and feed.digest(raw) == package['sha256'], 'asset_digest')
-    annotations_raw = asset('update.json', feed.MAX_FEED)
-    annotations_asset = [a for a in combined['artifacts'] if a['name'] == 'update.json']
-    feed.require(len(annotations_asset) == 1 and len(annotations_raw) == annotations_asset[0]['size'] and
-                 feed.digest(annotations_raw) == annotations_asset[0]['sha256'], 'annotation_digest')
-    annotations = feed.loads(annotations_raw)
-    feed.require(annotations['channel'] == ('beta' if live['prerelease'] else 'stable'), 'release_channel')
-    feed.validate_notes(annotations['notes'])
     output.mkdir(parents=True, exist_ok=True)
     feed.write(output / 'release.json', record)
-    feed.write(output / 'update.json', annotations)
     feed.write(output / package['name'], raw)
     with open(os.environ['GITHUB_OUTPUT'], 'a') as environment:
         environment.write(f'source_tree_sha256={record["source_tree_sha256"]}\n')

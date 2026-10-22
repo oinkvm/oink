@@ -66,72 +66,124 @@ impl OpenTrigger {
 
 pub use oink_agent::backend::foreground::handoff;
 
-/// A normal window may be requested again while its first WebView is loading.
-/// Only the frontend's ready acknowledgement releases that initial visibility.
+/// Wait for committed DOM/fonts, never for a frame from an invisible WebView.
+/// Generations keep a late acknowledgement from a destroyed view from revealing
+/// its replacement; repeated launch/reopen requests share the pending creation.
 #[derive(Debug, Default)]
-pub struct FirstPaintGate {
-    painting: std::collections::HashSet<String>,
-    creating: std::collections::HashSet<String>,
+pub struct WindowReadyGate {
+    next_generation: u32,
+    windows: std::collections::HashMap<String, WindowReadiness>,
 }
-impl FirstPaintGate {
-    /// Record the wait before entering a native message pump. An early frontend
-    /// acknowledgement cannot expose a window before native preparation finishes.
-    pub fn begin_creation(&mut self, label: &str) {
-        self.hold(label);
-        self.creating.insert(label.to_owned());
+#[derive(Debug)]
+struct WindowReadiness {
+    generation: u32,
+    creating: bool,
+    ready: bool,
+    revealed: bool,
+}
+impl WindowReadiness {
+    fn take_reveal(&mut self) -> bool {
+        if self.creating || !self.ready || self.revealed {
+            return false;
+        }
+        self.revealed = true;
+        true
     }
-    pub fn created(&mut self, label: &str) {
-        self.creating.remove(label);
+}
+impl WindowReadyGate {
+    pub fn begin_creation(&mut self, label: &str) -> u32 {
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("window generation exhausted");
+        let generation = self.next_generation;
+        self.windows.insert(
+            label.to_owned(),
+            WindowReadiness {
+                generation,
+                creating: true,
+                ready: false,
+                revealed: false,
+            },
+        );
+        generation
+    }
+    pub fn created(&mut self, label: &str) -> bool {
+        let Some(window) = self.windows.get_mut(label) else {
+            return false;
+        };
+        window.creating = false;
+        window.take_reveal()
     }
     pub fn forget(&mut self, label: &str) {
-        self.painting.remove(label);
-        self.creating.remove(label);
+        self.windows.remove(label);
     }
-    pub fn hold(&mut self, label: &str) {
-        self.painting.insert(label.to_owned());
-    }
-    pub fn ready(&mut self, label: &str) {
-        self.painting.remove(label);
+    pub fn ready(&mut self, label: &str, generation: u32) -> bool {
+        let Some(window) = self.windows.get_mut(label) else {
+            return false;
+        };
+        if window.generation != generation {
+            return false;
+        }
+        window.ready = true;
+        window.take_reveal()
     }
     pub fn can_show(&self, label: &str) -> bool {
-        !self.painting.contains(label) && !self.creating.contains(label)
+        self.windows
+            .get(label)
+            .is_some_and(|window| window.ready && !window.creating)
     }
 }
 
 #[cfg(test)]
-mod first_paint_tests {
+mod window_ready_tests {
     use super::*;
     #[test]
-    fn early_paint_ack_waits_for_native_creation_and_failed_creation_can_retry() {
-        let mut gate = FirstPaintGate::default();
-        gate.begin_creation("about");
-        gate.ready("about");
-        assert!(!gate.can_show("about"));
-        gate.created("about");
-        assert!(gate.can_show("about"));
-        gate.begin_creation("about");
-        gate.forget("about");
-        gate.begin_creation("about");
-        gate.created("about");
-        assert!(!gate.can_show("about"));
-        gate.ready("about");
-        assert!(gate.can_show("about"));
+    fn acknowledgement_during_native_creation_waits_and_only_reveals_once() {
+        let mut gate = WindowReadyGate::default();
+        let generation = gate.begin_creation("main");
+        assert!(!gate.ready("main", generation));
+        assert!(!gate.can_show("main"));
+        assert!(gate.created("main"));
+        assert!(
+            !gate.ready("main", generation),
+            "late/duplicate ready must not steal focus"
+        );
+        assert!(!gate.created("main"));
+        assert!(
+            gate.can_show("main"),
+            "an explicit later open still restores the window"
+        );
     }
-
     #[test]
-    fn repeated_open_waits_for_first_paint_and_recreated_windows_wait_again() {
-        let mut gate = FirstPaintGate::default();
-        gate.hold("main");
-        assert!(!gate.can_show("main"));
-        assert!(!gate.can_show("main"), "a second open cannot reveal an incomplete view");
-        gate.ready("main");
+    fn startup_showwindow_and_reopen_coalesce_until_dom_ready_without_a_paint() {
+        let mut gate = WindowReadyGate::default();
+        let generation = gate.begin_creation("main");
+        assert!(!gate.created("main"));
+        for _ in 0..3 {
+            assert!(!gate.can_show("main"));
+        }
+        assert!(gate.ready("main", generation));
+        assert!(!gate.ready("main", generation));
         assert!(gate.can_show("main"));
-        gate.hold("about");
-        assert!(!gate.can_show("about"));
-        assert!(gate.can_show("main"));
-        gate.ready("main"); // destruction forgets the old window
-        gate.hold("main");
+    }
+    #[test]
+    fn destroyed_failed_and_recreated_views_reject_old_acknowledgements() {
+        let mut gate = WindowReadyGate::default();
+        let old = gate.begin_creation("main");
+        gate.forget("main");
+        assert!(!gate.ready("main", old));
         assert!(!gate.can_show("main"));
+        let current = gate.begin_creation("main");
+        assert_ne!(old, current);
+        assert!(!gate.created("main"));
+        assert!(!gate.ready("main", old));
+        assert!(!gate.can_show("main"));
+        let about = gate.begin_creation("about");
+        assert!(!gate.created("about"));
+        assert!(gate.ready("about", about));
+        assert!(!gate.can_show("main"));
+        assert!(gate.ready("main", current));
     }
 }
 

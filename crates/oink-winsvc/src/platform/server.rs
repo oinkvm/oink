@@ -73,7 +73,7 @@ fn input(cmd: Command) -> Option<INPUT> {
             },
             KEYBDINPUT::default(),
         ),
-        command @ (Command::Move { x, y } | Command::DragPress { x, y }) => (
+        command @ (Command::Move { x, y } | Command::DragPress { x, y } | Command::DragRelease { x, y }) => (
             INPUT_MOUSE,
             MOUSEINPUT {
                 dx: x,
@@ -84,6 +84,8 @@ fn input(cmd: Command) -> Option<INPUT> {
                     | MOUSEEVENTF_VIRTUALDESK
                     | if matches!(command, Command::DragPress { .. }) {
                         MOUSEEVENTF_LEFTDOWN
+                    } else if matches!(command, Command::DragRelease { .. }) {
+                        MOUSEEVENTF_LEFTUP
                     } else {
                         0
                     },
@@ -158,6 +160,27 @@ fn input(cmd: Command) -> Option<INPUT> {
     })
 }
 fn send(cmd: Command) -> io::Result<()> {
+    if let Command::DragRelease { x, y } = cmd {
+        let mut clip = RECT::default();
+        // Validate on the actual injection desktop too, not only in the client.
+        // SAFETY: read-only desktop metrics and valid output rectangle.
+        let (px, py) = unsafe {
+            check(GetClipCursor(&mut clip))?;
+            (
+                i64::from(GetSystemMetrics(SM_XVIRTUALSCREEN))
+                    + i64::from(x) * i64::from(GetSystemMetrics(SM_CXVIRTUALSCREEN)) / 65536,
+                i64::from(GetSystemMetrics(SM_YVIRTUALSCREEN))
+                    + i64::from(y) * i64::from(GetSystemMetrics(SM_CYVIRTUALSCREEN)) / 65536,
+            )
+        };
+        if px < i64::from(clip.left)
+            || py < i64::from(clip.top)
+            || px >= i64::from(clip.right)
+            || py >= i64::from(clip.bottom)
+        {
+            return Err(denied());
+        }
+    }
     if let Some(i) = input(cmd) {
         // SAFETY: input constructed only from validated limited protocol commands.
         let (sent, error) = unsafe {
@@ -217,10 +240,18 @@ impl Injector {
             return self.release();
         }
         *stage = ErrorStage::Desktop;
+        // Original native drag authority belongs to Default. Do not reinterpret
+        // its recorded point on a newly active credential desktop.
+        if matches!(cmd, Command::DragRelease { .. }) && open_desktop()?.name != "Default" {
+            return Err(denied());
+        }
         self.attach()?;
         *stage = ErrorStage::Inject;
         send(cmd)?;
         match cmd {
+            Command::DragRelease { .. } => {
+                self.held.remove(&(0, 0));
+            }
             Command::DragPress { .. } => {
                 self.held.insert((0, 0), Command::Button { button: 0, down: false });
             }
@@ -767,6 +798,18 @@ mod drag_press_tests {
             assert_eq!(u32::from_le_bytes(reply.0[8..12].try_into().unwrap()), 7);
             assert_eq!(u32::from_le_bytes(reply.0[84..88].try_into().unwrap()), stage as u32);
         }
+    }
+    #[test]
+    fn helper_preserves_position_and_up_in_one_input() {
+        let event = input(Command::DragRelease { x: 123, y: 456 }).unwrap();
+        // SAFETY: DragRelease initializes INPUT_MOUSE's mi member.
+        let mouse = unsafe { event.Anonymous.mi };
+        assert_eq!((mouse.dx, mouse.dy), (123, 456));
+        assert_eq!(
+            mouse.dwFlags,
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_LEFTUP
+        );
+        assert_eq!(mouse.dwExtraInfo, TAG);
     }
     #[test]
     fn helper_preserves_position_and_down_in_one_input() {

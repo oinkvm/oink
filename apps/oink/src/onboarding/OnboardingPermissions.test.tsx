@@ -52,7 +52,7 @@ it('puts the macOS switch first in the shared permission list and applies only o
   const rows = document.querySelectorAll('.ob-perms__card > .permission-row');
   expect([...rows].map(row => row.querySelector('.ok-row__label')?.textContent)).toEqual(['Launch at login', 'Accessibility', 'Input Monitoring', 'File Provider']);
   expect(rows[0].contains(toggle)).toBe(true);
-  expect(rows[0].querySelector('.ok-row__desc')?.textContent).toBe('If turned off, you will need to open Oink manually after restarting to resume sharing.');
+  expect(rows[0].querySelector('.ok-row__desc')?.textContent).toBe('Starts Oink in the background at startup');
   fireEvent.click(toggle);
   expect(save).not.toHaveBeenCalled(); expect(props.onGrant).not.toHaveBeenCalled();
   expect(screen.queryByText('All permissions granted')).toBeNull();
@@ -99,6 +99,9 @@ it.each([false,true])('excludes the first login row (on=%s) from grant completio
   expect(save).not.toHaveBeenCalled();
   props.perms = granted; rerender(view());
   expect(screen.getByText('All permissions granted')).toBeTruthy();
+  expect(screen.getByText('Accessibility already allows Input Monitoring. No additional permission is needed.')).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'Skip' })).toBeNull();
+  expect(screen.queryByRole('button', { name: 'Next' })).toBeNull();
   // Editing the switch neither restarts nor cancels the grant-completion timer.
   await act(async () => { await vi.advanceTimersByTimeAsync(100); });
   fireEvent.click(screen.getByRole('switch')); fireEvent.click(screen.getByRole('switch'));
@@ -136,13 +139,30 @@ it('does not treat a failed OS query as a confirmed choice', async () => {
   expect(props.onDone).not.toHaveBeenCalled(); expect(save).not.toHaveBeenCalled();
 });
 
-it('confirms only once when Next races the automatic permission-completion timer', async () => {
+it('shows the Chinese completion label without Next and confirms only once', async () => {
   vi.useFakeTimers();
+  setLanguage('zh-Hans');
   const {view,props,save}=fixture(); props.perms=granted; render(view());
-  fireEvent.click(screen.getByRole('button',{name:'Next'}));
+  expect(screen.getByRole('status').textContent).toBe('已全部授权');
+  expect(screen.queryByRole('button',{name:'下一步'})).toBeNull();
+  expect(screen.queryByRole('button',{name:'跳过'})).toBeNull();
   await act(async()=>{await vi.advanceTimersByTimeAsync(180);});
+  await act(async()=>{await vi.advanceTimersByTimeAsync(1000);});
   expect(save).toHaveBeenCalledExactlyOnceWith(true);
   expect(props.onDone).toHaveBeenCalledTimes(1);
+});
+
+it('cancels automatic advance when a refreshed permission is revoked', async () => {
+  vi.useFakeTimers();
+  const {view,props,save}=fixture(); props.perms=granted;
+  const {rerender}=render(view());
+  await act(async()=>{await vi.advanceTimersByTimeAsync(100);});
+  props.perms=missing; rerender(view());
+  await act(async()=>{await vi.advanceTimersByTimeAsync(1000);});
+  expect(screen.getByRole('button',{name:'Skip'})).toBeTruthy();
+  expect(screen.queryByRole('button',{name:'Next'})).toBeNull();
+  expect(save).not.toHaveBeenCalled();
+  expect(props.onDone).not.toHaveBeenCalled();
 });
 
 it('reads the actual state if the initial status has not arrived', async () => {

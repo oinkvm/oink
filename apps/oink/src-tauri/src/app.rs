@@ -280,7 +280,7 @@ pub fn run() {
             open_diagnostics_folder,
             frontend_error,
             api_call,
-            crate::sponsor::shell_sponsor_qr,
+            crate::sponsor::shell_sponsor_list,
             crate::live_views::live_views,
             crate::shell::shell_open,
             crate::shell::shell_ready,
@@ -300,21 +300,21 @@ pub fn run() {
             crate::native_menu::shell_set_language
         ])
         .setup(|app| {
-            app.manage(crate::sponsor::SponsorQr::start());
+            app.manage(crate::sponsor::SponsorList::start());
             #[cfg(target_os = "macos")]
             {
                 crate::native_menu::install(app.handle(), oink_agent::config::UiLanguage::Auto)?;
                 app.on_menu_event(|app, event| {
-                    let view = match event.id().as_ref() {
-                        "shell-about" => crate::shell_policy::View::About,
-                        "shell-main" => crate::shell_policy::View::Main,
-                        "shell-quit" => crate::shell_policy::View::Quit,
+                    use oink_agent::native_controls::ShellAction;
+                    let action = match event.id().as_ref() {
+                        "shell-about" => ShellAction::About,
+                        "shell-main" => ShellAction::Show,
+                        "shell-quit" => ShellAction::Quit,
                         _ => return,
                     };
                     let app = app.clone();
                     tauri::async_runtime::spawn(async move {
-                        // shell_open logs failures for both menu and IPC requests.
-                        let _ = crate::shell::shell_open(app, view).await;
+                        crate::native_controls::shell_action(&app, action).await;
                     });
                 });
             }

@@ -30,6 +30,8 @@ tracing.workspace = true
 resvg = { version = "0.45.1", default-features = false }
 tokio.workspace = true
 base64 = "0.22"
+# Cloud sponsor assets: only bounded PNG/JPEG decoding.
+image = { version = "0.25.9", default-features = false, features = ["png", "jpeg"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
 
 # 产品只支持 macOS 与 Windows：其他系统上只编译与平台无关的部分（JSON 约定测试），

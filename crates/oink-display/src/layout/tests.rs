@@ -2058,3 +2058,22 @@ fn hidden_screens_keep_geometry_and_wall_both_directions_including_farther_targe
         }
     }
 }
+
+#[test]
+fn reconnecting_unchanged_native_geometry_never_repairs_retained_placements() {
+    let a = display("a", Rect::new(0.0, 0.0, 100.0, 100.0), (100, 100), None);
+    let b = display("b", Rect::new(100.0, 0.0, 100.0, 100.0), (100, 100), None);
+    let other = display("other", Rect::new(0.0, 0.0, 100.0, 100.0), (100, 100), None);
+    let mut l = Layout::auto(&[(A, vec![a.clone(), b.clone()]), (B, vec![other])]);
+    // Offline canvas edits ignore hidden native siblings. Such a sibling can
+    // overlap a different computer; repeating identical native facts on reconnect
+    // must not silently "repair" that previously accepted placement.
+    l.place_device(A, Point::new(10.0, 20.0), 1.0, false);
+    l.place_device(B, Point::new(150.0, 20.0), 1.0, false);
+    let before = l.screens.iter().map(|s| (s.id.clone(), s.rect)).collect::<Vec<_>>();
+    l.sync_device(A, &[a, b]);
+    assert_eq!(
+        l.screens.iter().map(|s| (s.id.clone(), s.rect)).collect::<Vec<_>>(),
+        before
+    );
+}

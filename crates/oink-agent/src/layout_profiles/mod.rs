@@ -7,6 +7,8 @@ mod autosave;
 mod commands;
 #[cfg(all(test, debug_assertions))]
 mod integration_tests;
+mod join;
+mod merge;
 pub mod native;
 pub mod state;
 pub mod store;

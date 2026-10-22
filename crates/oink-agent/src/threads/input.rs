@@ -80,6 +80,8 @@ pub enum InputCommand {
     /// Ordinary observer snapshots of local platform preferences.
     LocalFeel(oink_foundation::input::FeelProfile),
     LocalDisplays(Vec<oink_foundation::display::DisplayInfo>),
+    /// Enumeration completed with an error; retain the last good geometry.
+    LocalDisplayFailure,
     PeerFacts {
         boot: oink_foundation::session::Boot,
         os: Os,
@@ -262,6 +264,9 @@ pub struct InputStatus {
     pub game_mode: bool,
     pub keyboard_disabled: bool,
     pub resource_faults: ResourceFaults,
+    /// The native owner attempted attachment and it failed. A detached tap while
+    /// waiting for permission/resume is not evidence of capture failure.
+    pub capture_failed: bool,
     /// Cached native Caps behavior; absent until a supported backend observes it.
     pub caps_lock_switches_input_source: Option<bool>,
     pub source_modes_revision: u64,

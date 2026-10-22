@@ -522,7 +522,7 @@ impl Node {
     }
     pub(super) fn notification_status(&self, event: &StatusEvent) {
         let (kind, on) = match event {
-            StatusEvent::GameMode(game) => (1, game.holder == self.id() && game.active),
+            StatusEvent::LocalGameMode(active) => (1, *active),
             StatusEvent::FocusLock { holder } => (3, *holder == Some(self.id())),
             StatusEvent::KeyboardDisabled(disabled) => (4, *disabled),
             StatusEvent::MouseDisabled(disabled) => (5, *disabled),
@@ -539,7 +539,10 @@ impl Node {
                 5 => &mut state.mouse,
                 _ => &mut state.keyboard,
             };
-            if *current == on {
+            // LocalGameMode is already an authoritative, deduplicated owner
+            // transition. Its first event can be an exit from startup On, even
+            // though this notification observer never saw an entry event.
+            if *current == on && kind != 1 {
                 return;
             }
             *current = on;
@@ -572,9 +575,13 @@ impl Node {
             _ => None,
         };
         let request = Notification {
-            level: NotificationLevel::Notice,
+            level: if matches!(notice, 1 | 2) {
+                NotificationLevel::Info
+            } else {
+                NotificationLevel::Notice
+            },
             title: copy(self.notification_language(), notice).into(),
-            description: String::new(),
+            description: disable_hint(self.notification_language(), notice, cfg!(target_os = "macos")),
             screen: None,
             persistent: notice >= 3,
         };
@@ -600,6 +607,26 @@ fn level_number(level: NotificationLevel) -> u8 {
         NotificationLevel::Debug => 2,
     }
 }
+// Generate on the source owner: a forwarded toast must name that owner's keys.
+// Older peers already carry description verbatim; their empty descriptions stay empty.
+fn disable_hint(language: crate::config::UiLanguage, kind: u8, mac: bool) -> String {
+    use crate::config::UiLanguage::*;
+    if !matches!(kind, 4 | 5) {
+        return String::new();
+    }
+    let chord = if mac {
+        "Control+Option+Shift+U"
+    } else {
+        "Ctrl+Alt+Shift+U"
+    };
+    match language {
+        SimplifiedChinese => format!("按住 {chord} 1 秒解除"),
+        Japanese => format!("{chord} を1秒間押し続けると解除"),
+        Korean => format!("{chord} 키를 1초 동안 눌러 해제"),
+        _ => format!("Hold {chord} for 1 second to re-enable"),
+    }
+}
+
 fn copy(language: crate::config::UiLanguage, kind: u8) -> &'static str {
     use crate::config::UiLanguage::*;
     let index = usize::from(kind.min(5));
@@ -678,6 +705,27 @@ fn system_language() -> String {
 mod tests {
     use super::*;
     use oink_test_support::input::FakeInput;
+    #[test]
+    fn disable_toast_hint_names_source_keys_in_all_languages() {
+        use crate::config::UiLanguage::*;
+        for (language, expected) in [
+            (SimplifiedChinese, "按住 Ctrl+Alt+Shift+U 1 秒解除"),
+            (English, "Hold Ctrl+Alt+Shift+U for 1 second to re-enable"),
+            (Japanese, "Ctrl+Alt+Shift+U を1秒間押し続けると解除"),
+            (Korean, "Ctrl+Alt+Shift+U 키를 1초 동안 눌러 해제"),
+        ] {
+            for kind in [4, 5] {
+                assert_eq!(disable_hint(language, kind, false), expected);
+                assert_eq!(
+                    disable_hint(language, kind, true),
+                    expected.replace("Ctrl+Alt", "Control+Option")
+                );
+            }
+            for kind in [0, 1, 2, 3] {
+                assert!(disable_hint(language, kind, false).is_empty());
+            }
+        }
+    }
     pub(super) fn options(home: &std::path::Path) -> NodeOptions {
         let input = Arc::new(FakeInput::new());
         input.set_cursor(Point::new(-0.2, 40.));
@@ -713,6 +761,165 @@ mod tests {
             persistent: false,
         }
     }
+    fn game_notice_router(node: &Node) -> (oink_routing::Router, DeviceId) {
+        use oink_routing::{Os, Router, RouterConfig, ScreenId, SimpleLayout};
+        let peer = DeviceId([7; 32]);
+        let peer_session = [8; 16];
+        let mut layout = SimpleLayout::new();
+        let bounds = oink_foundation::Rect::new(0., 0., 1000., 800.);
+        layout.add_screen(ScreenId::new(node.id(), "right"), bounds, bounds);
+        layout.add_screen(
+            ScreenId::new(peer, "screen"),
+            bounds,
+            oink_foundation::Rect::new(1000., 0., 1000., 800.),
+        );
+        let mut router = Router::new(RouterConfig::new(node.boot(), "device", Os::Other), Arc::new(layout));
+        router.attach_input(
+            Boot {
+                device_id: peer,
+                nonce: peer_session,
+            },
+            peer_session,
+            true,
+            true,
+            Default::default(),
+            0,
+        );
+        (router, peer)
+    }
+
+    fn game_notice_focus_away(router: &mut oink_routing::Router, peer: DeviceId) {
+        use oink_routing::{
+            Packet,
+            control::{ControlMsg, FocusScope},
+        };
+        router.input_message(
+            peer,
+            Packet::Control(ControlMsg::FocusState {
+                lock_state: None,
+                epoch: router.focus().epoch + 1,
+                holder: peer,
+                scope: Some(FocusScope {
+                    members: vec![(router.device(), router.routing_session()), (peer, [8; 16])],
+                }),
+                session: Some([8; 16]),
+            }),
+            1,
+        );
+        assert_eq!(router.focus().holder, peer);
+    }
+
+    fn game_notice_outputs(node: &Node, router: &mut oink_routing::Router) {
+        for output in router.drain_outputs() {
+            if let oink_routing::Output::Status(event) = output {
+                node.notification_status(&event);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn game_banners_ignore_pointer_departure_and_return() {
+        use oink_routing::{GameMode, Packet, control::ControlMsg};
+        for auto in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let node = Node::prepare(options(home.path())).unwrap();
+            let (mut router, peer) = game_notice_router(&node);
+            game_notice_outputs(&node, &mut router);
+            if auto {
+                router.set_pointer_captured(true);
+            } else {
+                router.set_game_mode(GameMode::On);
+            }
+            game_notice_outputs(&node, &mut router);
+            let entry = lock(&node.inner.notifications).game_id.unwrap();
+            let count = lock(&node.inner.notifications).next;
+            game_notice_focus_away(&mut router, peer);
+            game_notice_outputs(&node, &mut router);
+            {
+                let state = lock(&node.inner.notifications);
+                assert_eq!(state.next, count, "pointer departure must not raise a game-exit banner");
+                assert_eq!(state.game_id, Some(entry));
+            }
+            // The other holder's real game transitions are not ours either.
+            for active in [true, false] {
+                router.input_message(
+                    peer,
+                    Packet::Control(ControlMsg::GameMode {
+                        epoch: router.focus().epoch,
+                        generation: 1,
+                        mode: GameMode::On,
+                        detected: false,
+                        active,
+                        cursor_hiding_cause_available: None,
+                    }),
+                    2,
+                );
+                game_notice_outputs(&node, &mut router);
+                assert_eq!(lock(&node.inner.notifications).next, count);
+            }
+            router.return_pointer_home();
+            assert_eq!(router.focus().holder, node.id());
+            assert!(router.game_mode().active);
+            game_notice_outputs(&node, &mut router);
+            assert_eq!(
+                lock(&node.inner.notifications).next,
+                count,
+                "pointer return must not raise a game-entry banner"
+            );
+            if auto {
+                router.set_pointer_captured(false);
+            } else {
+                router.toggle_game_mode();
+            }
+            game_notice_outputs(&node, &mut router);
+            let state = lock(&node.inner.notifications);
+            assert_eq!(state.next, count + 1, "actual game exit still raises one banner");
+            assert!(state.game_id.is_none());
+            assert_eq!(state.pending.values().next().unwrap().level, NotificationLevel::Info);
+        }
+    }
+
+    #[tokio::test]
+    async fn game_banners_follow_settings_edits_while_pointer_is_away() {
+        use oink_routing::GameMode;
+        let home = tempfile::tempdir().unwrap();
+        let node = Node::prepare(options(home.path())).unwrap();
+        let (mut router, peer) = game_notice_router(&node);
+        game_notice_focus_away(&mut router, peer);
+        game_notice_outputs(&node, &mut router);
+        let count = lock(&node.inner.notifications).next;
+        let mut settings = router.config().settings.clone();
+        settings.game_mode_preference = GameMode::On;
+        router.set_settings(settings.clone());
+        settings.game_mode_preference = GameMode::Off;
+        router.set_settings(settings.clone());
+        // Both edits must remain ordered even though the focus snapshot never
+        // changes and the final owner state equals the initial inactive state.
+        game_notice_outputs(&node, &mut router);
+        assert_eq!(lock(&node.inner.notifications).next, count + 2);
+        assert!(!lock(&node.inner.notifications).game);
+        router.set_settings(settings); // repeated Off is not another exit
+        router.return_pointer_home();
+        game_notice_outputs(&node, &mut router);
+        assert_eq!(lock(&node.inner.notifications).next, count + 2);
+    }
+
+    #[tokio::test]
+    async fn game_exit_banner_does_not_require_an_observed_entry() {
+        use oink_routing::{GameMode, Os, Router, RouterConfig, SimpleLayout};
+        let home = tempfile::tempdir().unwrap();
+        let node = Node::prepare(options(home.path())).unwrap();
+        let mut config = RouterConfig::new(node.boot(), "device", Os::Other);
+        config.settings.game_mode_preference = GameMode::On;
+        let mut router = Router::new(config, Arc::new(SimpleLayout::new()));
+        router.toggle_game_mode();
+        game_notice_outputs(&node, &mut router);
+        let state = lock(&node.inner.notifications);
+        assert_eq!(state.next, 1);
+        assert!(!state.game);
+        assert_eq!(state.pending.values().next().unwrap().action, None);
+    }
+
     #[tokio::test]
     async fn ipc_filtering_selection_and_device_local_persistence() {
         let home = tempfile::tempdir().unwrap();
@@ -1296,22 +1503,25 @@ mod owner_tests {
         });
         let id = lock(&owner.inner.notifications).pointer_id.unwrap();
         assert_only_owner(&requester, &owner, id, Undo::PointerUnlock);
+        assert_eq!(
+            lock(&owner.inner.notifications).pending[&id].level,
+            NotificationLevel::Notice
+        );
         owner.dismiss_notification(id);
         owner.notification_status(&StatusEvent::FocusLock { holder: None });
-        let mut game = owner.game_status();
-        game.holder = owner.id();
-        game.active = true;
-        owner.notification_status(&StatusEvent::GameMode(game));
+        owner.notification_status(&StatusEvent::LocalGameMode(true));
         let id = lock(&owner.inner.notifications).game_id.unwrap();
         assert_only_owner(&requester, &owner, id, Undo::GameOff);
-        let mut game = owner.game_status();
-        game.holder = owner.id();
-        game.active = false;
-        owner.notification_status(&StatusEvent::GameMode(game));
+        assert_eq!(
+            lock(&owner.inner.notifications).pending[&id].level,
+            NotificationLevel::Info
+        );
+        owner.notification_status(&StatusEvent::LocalGameMode(false));
         {
             let state = lock(&owner.inner.notifications);
             assert_eq!(state.pending.len(), 1, "game exit replaces the entry notice");
             let leave = state.pending.values().next().unwrap();
+            assert_eq!(leave.level, NotificationLevel::Info);
             assert_eq!(leave.destination, owner.id());
             assert!(leave.surface.is_some());
             assert!(leave.action.is_none());

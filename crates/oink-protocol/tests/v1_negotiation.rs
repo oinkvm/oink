@@ -313,3 +313,46 @@ fn profile_v2_catalog_is_gated_and_v1_keeps_its_eight_profile_bound() {
         );
     }
 }
+
+#[test]
+fn acceptor_profile_v3_messages_require_v3_on_both_endpoints() {
+    for both in [false, true] {
+        let (mut a, mut b) = offers();
+        add_cap(&mut a, "oink.layout.profiles/3", 4);
+        add_cap(&mut b, "oink.layout.profiles/2", 4);
+        if both {
+            add_cap(&mut b, "oink.layout.profiles/3", 4);
+        }
+        let selected = admission::negotiate(&bytes(a), &bytes(b), registry::CAPABILITIES, false).unwrap();
+        let agreement = admission::Agreement::new(selected.enabled().unwrap().0.into_iter().map(|s| s.0)).unwrap();
+        assert_eq!(agreement.contains("oink.layout.profiles/3"), both);
+        assert!(!agreement.contains("oink.layout.profiles/2"));
+        for message in [
+            Message::LayoutProfilesStateV3(
+                LayoutProfilesStateV3::from_raw(support::sample_named("LayoutProfilesStateV3")).unwrap(),
+            ),
+            Message::LayoutProfilesJoin(
+                LayoutProfilesJoin::from_raw(support::sample_named("LayoutProfilesJoin")).unwrap(),
+            ),
+            Message::LayoutProfilesReceiptV3(
+                LayoutProfilesReceipt::from_raw(support::sample(LayoutProfilesReceipt::SCHEMA)).unwrap(),
+            ),
+        ] {
+            let encoded = frame::encode(&message, v1::limits::LOW_FRAME).unwrap();
+            let context = admission::Context {
+                kind: 15,
+                transport: registry::Transport::Low,
+                phase: admission::Phase::Member,
+                agreement: &agreement,
+                direct: false,
+                old_member_lane: false,
+            };
+            assert_eq!(
+                context
+                    .decode(frame::OpaqueFrame::parse_exact(&encoded, v1::limits::LOW_FRAME).unwrap())
+                    .is_ok(),
+                both
+            );
+        }
+    }
+}

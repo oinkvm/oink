@@ -15,6 +15,8 @@ export interface SpeakerState {
     mutedKnown?: boolean;
     canSetVolume?: boolean;
     muted: boolean;
+    /** Local mode: the device's own system output volume (0..100) and mute, when its card reports them. */
+    localOutput?: { volume: number; muted: boolean } | null;
 }
 export interface Device {
     id: string;
@@ -29,6 +31,8 @@ export interface Device {
     cursor: CursorState;
     screen: ScreenState;
     screenSharing?: boolean | null;
+    /** Positive AX observation only; never infer from generic input faults. */
+    accessibilityMissing?: boolean;
     mouse: ShareState | 'disabled';
     keyboard: KeyboardState;
     keyboardBeforeLock?: 'shared' | 'local';

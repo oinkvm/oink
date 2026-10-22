@@ -109,6 +109,7 @@ mod tests {
     fn native_menu_catalog_contains_every_complete_language() {
         let catalog = super::catalog();
         for labels in [&catalog.en, &catalog.zh_hans, &catalog.ja, &catalog.ko] {
+            assert!(!labels.quit.ends_with('…'), "native Quit has no follow-up dialog");
             for label in [
                 &labels.about,
                 &labels.open,

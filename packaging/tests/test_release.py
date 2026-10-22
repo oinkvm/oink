@@ -53,16 +53,26 @@ class PublicRelease(unittest.TestCase):
         return path,record
 
     @patch.object(R, 'source_tree_sha256', return_value=TREE)
-    def test_both_platforms_staged_and_assembled_with_hashes(self, _hash):
+    def test_both_platforms_assemble_without_update_notes_and_with_package_hashes(self, _hash):
         with tempfile.TemporaryDirectory() as tmp:
             p=Path(tmp)
             for platform in ['macos','windows']:
                 self.package(p/'packages',platform)
                 R.stage(p/'packages',p/'download'/platform,platform,28,COMMIT)
-            assets=R.assemble(p/'download',p/'final',28,COMMIT)
+            # An empty working directory has no .github/update-notes.json.
+            previous = Path.cwd()
+            try:
+                os.chdir(p)
+                assets=R.assemble(p/'download',p/'final',28,COMMIT)
+            finally:
+                os.chdir(previous)
             self.assertEqual({x.suffix for x in assets},{'.dmg','.zip','.msi','.json',''})
-            self.assertEqual(len(list((p/'final').iterdir())),6)
-            self.assertEqual(json.loads((p/'final/update.json').read_text())['channel'], 'stable')
+            self.assertEqual(len(list((p/'final').iterdir())),5)
+            self.assertFalse((p/'final/update.json').exists())
+            release=json.loads((p/'final/release.json').read_text())
+            self.assertEqual({a['name'] for a in release['artifacts']},
+                             {a.name for a in assets if a.suffix in ('.dmg','.zip','.msi')})
+            self.assertNotIn('update.json', (p/'final/SHA256SUMS').read_text())
             for line in (p/'final/SHA256SUMS').read_text().splitlines():
                 sha,name=line.split('  ');self.assertEqual(sha,digest(p/'final'/name))
             record=json.loads((p/'download/windows/release-windows.json').read_text());record['built_commit']='c'*40

@@ -199,7 +199,7 @@ pub(crate) fn read_snapshot(v: d::LayoutProfileSnapshot, active: &str) -> v1::Re
     canonicalize(&mut s);
     Ok(s)
 }
-pub fn catalog(v: &Catalog) -> v1::Result<d::LayoutProfileCatalogV2> {
+pub fn catalog(v: &Catalog) -> v1::Result<d::LayoutProfileCatalogV3> {
     let profiles = v
         .profiles
         .iter()
@@ -235,13 +235,16 @@ pub fn catalog(v: &Catalog) -> v1::Result<d::LayoutProfileCatalogV2> {
             ]
             .into_iter()
             .collect::<v1::RawMap>();
+            if let Some(group) = p.default_group {
+                raw.insert(7, V::Bytes(group.0.0.to_vec()));
+            }
             if let ProfileName::Custom { value } = &p.name {
                 raw.insert(2, V::from(value.as_str()));
             }
             Ok(V::Map(restore_extensions(raw, &p.extensions)?))
         })
         .collect::<v1::Result<Vec<_>>>()?;
-    d::LayoutProfileCatalogV2::from_raw(restore_extensions(
+    d::LayoutProfileCatalogV3::from_raw(restore_extensions(
         [
             (1, v.schema.write()),
             (2, V::Bytes(v.group.0.0.to_vec())),
@@ -249,11 +252,30 @@ pub fn catalog(v: &Catalog) -> v1::Result<d::LayoutProfileCatalogV2> {
             (4, bytes(&v.active_profile_id, 16)?),
             (5, V::Array(profiles)),
             (
-                6,
+                9,
                 V::Array(
-                    v.imported_merges
+                    v.completed_joins
                         .iter()
-                        .map(|s| bytes(s, 32))
+                        .map(|(id, j)| {
+                            let mut raw: v1::RawMap = [
+                                (1, bytes(id, 32)?),
+                                (2, ver(&j.version)),
+                                (
+                                    4,
+                                    V::Array(
+                                        j.dropped_defaults
+                                            .iter()
+                                            .map(|id| bytes(id, 16))
+                                            .collect::<v1::Result<_>>()?,
+                                    ),
+                                ),
+                            ]
+                            .into();
+                            if let Some(id) = &j.default_profile {
+                                raw.insert(3, bytes(id, 16)?);
+                            }
+                            Ok(V::Map(raw))
+                        })
                         .collect::<v1::Result<_>>()?,
                 ),
             ),
@@ -262,13 +284,16 @@ pub fn catalog(v: &Catalog) -> v1::Result<d::LayoutProfileCatalogV2> {
         &v.extensions,
     )?)
 }
-pub fn read_catalog(v: d::LayoutProfileCatalogV2) -> Result<Catalog> {
-    fn read(v: d::LayoutProfileCatalogV2) -> v1::Result<Catalog> {
+pub fn read_catalog(v: d::LayoutProfileCatalogV3) -> Result<Catalog> {
+    fn read(v: d::LayoutProfileCatalogV3) -> v1::Result<Catalog> {
         let active = hex(&v.active()?.0);
         let mut retained =
-            extensions(&V::Map(v.raw().clone()), "LayoutProfileCatalogV2").unwrap_or(V::Map(Default::default()));
+            extensions(&V::Map(v.raw().clone()), "LayoutProfileCatalogV3").unwrap_or(V::Map(Default::default()));
         if let V::Map(raw) = &mut retained {
             raw.remove(&5);
+            for key in [6, 7, 8] {
+                raw.remove(&key);
+            }
         }
         Ok(Catalog {
             extensions: extension_bytes(retained)?,
@@ -288,6 +313,13 @@ pub fn read_catalog(v: d::LayoutProfileCatalogV2) -> Result<Catalog> {
                             extensions(&p.write(), "LayoutProfile").unwrap_or(V::Map(Default::default())),
                         )?,
                         id: hex(&p.id()?.0),
+                        default_group: p
+                            .default_group()?
+                            .map(|id| GroupKey(oink_foundation::GroupId(id.0)))
+                            .or_else(|| {
+                                let group = GroupKey(oink_foundation::GroupId(v.group().ok()?.0));
+                                (hex(&p.id().ok()?.0) == default_id(group)).then_some(group)
+                            }),
                         name: p
                             .name()?
                             .map(|n| ProfileName::Custom { value: n.0 })
@@ -316,7 +348,21 @@ pub fn read_catalog(v: d::LayoutProfileCatalogV2) -> Result<Catalog> {
                     })
                 })
                 .collect::<v1::Result<_>>()?,
-            imported_merges: v.imported_merges()?.0.into_iter().map(|h| hex(&h.0)).collect(),
+            completed_joins: v
+                .completed_joins()?
+                .0
+                .into_iter()
+                .map(|j| {
+                    Ok((
+                        hex(&j.merge_id()?.0),
+                        CompletedJoin {
+                            version: version(j.version()?)?,
+                            default_profile: j.default_profile()?.map(|id| hex(&id.0)),
+                            dropped_defaults: j.dropped_defaults()?.0.into_iter().map(|id| hex(&id.0)).collect(),
+                        },
+                    ))
+                })
+                .collect::<v1::Result<_>>()?,
         })
     }
     let c = read(v).map_err(invalid)?;

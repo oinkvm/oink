@@ -272,9 +272,9 @@ impl Node {
                 nonce
             },
         };
-        // This new backend Boot releases the previous keyboard exclusion before
+        // This new backend Boot releases both previous input disables before
         // capture or any local owner facts can be published.
-        config.update_owner(|owner| owner.clear_keyboard_on_start())?;
+        config.update_owner(|owner| owner.clear_input_disables_on_start())?;
         let unreadable =
             crate::config_module::group_store::load(&data_dir.join(crate::config_module::group_store::STATE_FILE), me)
                 .err()
@@ -368,9 +368,6 @@ impl Node {
                 stop: tokio::sync::watch::channel(false).0,
             }),
         };
-        // Persist the profile feature boundary before discovery can commit a
-        // new merge. Storage errors stay local to profile queries/operations.
-        let _ = node.initialize_profile_store();
         Ok(node)
     }
     pub fn id(&self) -> DeviceId {
@@ -534,6 +531,11 @@ impl Node {
         let tasks = std::mem::take(&mut *lock(&self.inner.tasks));
         for task in tasks {
             let _ = task.await;
+        }
+        // All owner tasks have stopped, so no slider edit can race the final
+        // flush. This covers ordinary quit and backend restart as well as update.
+        if let Err(error) = lock(&self.inner.config).flush_deferred() {
+            tracing::error!(%error, "pending settings could not be flushed before process exit");
         }
         if let Some(d) = self.inner.diagnostics.get() {
             let recorder = d.recorder.clone();

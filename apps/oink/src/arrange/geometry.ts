@@ -58,14 +58,18 @@ export function clampMove(r: Rect, others: Rect[], axis: 'x' | 'y', d: number): 
 /** Matched moving edge / neighbour edge, including exact zero-distance matches. */
 export interface SnapEdges { x?: string; y?: string }
 export function snap(r: Rect, others: Rect[], threshold: number, edges?: SnapEdges): Rect {
-    let bestX = threshold + 1, dx = 0;
-    let bestY = threshold + 1, dy = 0;
+    const eps = tolerance([r, ...others]);
+    let bestX = Infinity, dx = 0;
+    let bestY = Infinity, dy = 0;
+    // Keep the first candidate when distances differ only by roundoff. Camera
+    // reprojection can otherwise alternate equal top/bottom (or left/right)
+    // alignments and report a fresh haptic engagement on every frame.
     for (const [index, o] of others.entries()) {
         const nearY = r.y < o.y + o.h + threshold && o.y < r.y + r.h + threshold;
         const nearX = r.x < o.x + o.w + threshold && o.x < r.x + r.w + threshold;
         if (nearY) {
             for (const [edge, c] of [o.x - (r.x + r.w), o.x + o.w - r.x, o.x - r.x, o.x + o.w - (r.x + r.w)].entries()) {
-                if (Math.abs(c) < bestX) {
+                if (Math.abs(c) <= threshold && Math.abs(c) < bestX - eps) {
                     bestX = Math.abs(c);
                     dx = c;
                     if (edges) edges.x = `${index}:${edge}`;
@@ -74,7 +78,7 @@ export function snap(r: Rect, others: Rect[], threshold: number, edges?: SnapEdg
         }
         if (nearX) {
             for (const [edge, c] of [o.y - (r.y + r.h), o.y + o.h - r.y, o.y - r.y, o.y + o.h - (r.y + r.h)].entries()) {
-                if (Math.abs(c) < bestY) {
+                if (Math.abs(c) <= threshold && Math.abs(c) < bestY - eps) {
                     bestY = Math.abs(c);
                     dy = c;
                     if (edges) edges.y = `${index}:${edge}`;
@@ -138,6 +142,7 @@ export function resizeFromCorner(origin: Rect, c: Corner, p: {
 /** Snap only the moving edges: translating a resize would move its fixed corner. */
 export function snapResize(r: Rect, origin: Rect, c: Corner, others: Rect[], threshold: number, minimumWidth = MIN_W, edges?: SnapEdges): Rect {
     if (edges) { delete edges.x; delete edges.y; }
+    const eps = tolerance([r, origin, ...others]);
     const anchor = cornerPoint(origin, opposite[c]);
     const point = cornerPoint(r, c);
     const sx = c[1] === 'e' ? 1 : -1;
@@ -145,7 +150,8 @@ export function snapResize(r: Rect, origin: Rect, c: Corner, others: Rect[], thr
     let best = Infinity;
     let result = r;
     const consider = (width: number, distance: number, axis: 'x' | 'y', edge: string) => {
-        if (distance > threshold || width < minimumWidth || width > MAX_W || Math.abs(width - r.w) >= best)
+        // As with move snapping, equivalent sizes retain the first edge key.
+        if (distance > threshold || width < minimumWidth || width > MAX_W || Math.abs(width - r.w) >= best - eps)
             return;
         const h = width * origin.h / origin.w;
         best = Math.abs(width - r.w);

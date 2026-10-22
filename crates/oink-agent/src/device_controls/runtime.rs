@@ -43,7 +43,7 @@ pub(crate) struct State {
     pub(super) backlog_sequence: u64,
     pub(super) observed_emergency_sequence: u64,
     pub(super) safety_pending: bool,
-    pub(super) keyboard_safety_pending: bool,
+    pub(super) disable_safety_pending: bool,
     pub(super) emergency_worker: bool,
     group: Option<oink_foundation::GroupId>,
     owner_requests: Transactions<Message>,
@@ -52,7 +52,7 @@ pub(crate) struct State {
 }
 impl State {
     pub(crate) fn safety_pending(&self) -> bool {
-        self.safety_pending || self.keyboard_safety_pending
+        self.safety_pending || self.disable_safety_pending
     }
     pub(crate) fn emergency_delivery(&self) -> Option<EmergencyDeliveryCard> {
         self.emergencies.latest()

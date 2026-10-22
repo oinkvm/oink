@@ -57,25 +57,8 @@
 .setp__sec { display: grid; gap: 10px; min-width: 0; scroll-margin-top: 8px; }
 .setp__title { margin: 0 0 0 4px; font: 500 15px/1.3 var(--ok-font); color: var(--ok-text); }
 .setp__lead { margin: -4px 0 2px 4px; font: 450 13px/1.45 var(--ok-font); color: var(--ok-text-2); }
-.setp__card .ok-row { font-size: 14px; font-weight: 400; }
-.setp__card .ok-row__desc { font-size: 12.5px; font-weight: 300; }
-
-/* Every control's text uses the buttons' regular weight. */
-.setp :is(.ok-btn, .ok-select__trigger, .ok-seg__item, .ok-input input, .ok-input__affix) { font-weight: 400; }
-
-/* In every language the controls keep their natural width on the right of the
-   row, on one line; long labels and descriptions wrap instead. Stacked rows
-   (key mapping, charts) lay out their own. */
-.setp__card .ok-row:not(.ok-row--stack) > :not(.ok-row__text, .ok-row__leading) { flex: none; }
-.setp .ok-seg { flex: none; width: max-content; box-sizing: border-box; }
-
-/* A row whose content stays collapsed until opened: the head reads as a row. */
-.setp__card > .setp__acc { --_inset: inherit; }
-.setp__card > .ok-row + .setp__acc, .setp__card > .setp__acc + .ok-row { border-top: 1px solid var(--ok-line); }
-.setp__acc .ok-accordion__head { gap: var(--ok-s-4); min-height: 56px; padding: var(--_row) var(--_inset); border-radius: 0; font: 400 14px/1.3 var(--ok-font); }
-.setp__acc .ok-accordion__content { padding: 0; font: inherit; color: inherit; }
+/* App-specific empty content in an embedded accordion keeps the row inset. */
 .setp__acc .ok-accordion__content > .setp__note { padding: 0 var(--_inset) var(--_row); }
-.setp__acc .ok-accordion__content .ok-row { border-top: 1px solid var(--ok-line); }
 .setp__none { margin: 0; padding: 14px var(--_inset); font: 450 13px/1.4 var(--ok-font); color: var(--ok-text-3); }
 mark.setp__hit { background: var(--ok-accent-tint); color: inherit; border-radius: 3px; box-shadow: 0 0 0 1.5px var(--ok-accent-tint); }
 
@@ -103,8 +86,6 @@ mark.setp__hit { background: var(--ok-accent-tint); color: inherit; border-radiu
 
 .setp__sc { display: flex; align-items: center; gap: 12px; }
 .setp__hotkey { min-width: 132px; }
-/* Keycaps in Settings read one step lighter than oink-ui's 600. */
-.setp .ok-kbd { font-weight: 500; }
 .setp__hotkey[aria-invalid] { box-shadow: inset 0 0 0 1.5px var(--ok-danger); }
 .setp__sc-err { display: inline-flex; align-items: center; gap: 4px; color: var(--ok-danger-text); }
 .setp__sc-err .ok-icon { width: 14px; height: 14px; flex: none; }
@@ -194,11 +175,6 @@ mark.setp__hit { background: var(--ok-accent-tint); color: inherit; border-radiu
 .lat__empty { position: absolute; inset: 0; display: grid; place-items: center; margin: 0; font: 450 13px/1 var(--ok-font); color: var(--ok-text-3); }
 
 
-.setp .ok-switch__track { width: 44px; height: 26px; }
-.setp .ok-switch__thumb { width: 26px; height: 20px; }
-.setp .ok-switch input:checked + .ok-switch__track .ok-switch__thumb { transform: translateX(12px); }
-.setp .ok-switch:active input:not(:disabled) + .ok-switch__track .ok-switch__thumb { width: 31px; }
-.setp .ok-switch:active input:checked:not(:disabled) + .ok-switch__track .ok-switch__thumb { transform: translateX(7px); }
 
 
 .blk {
@@ -215,7 +191,7 @@ mark.setp__hit { background: var(--ok-accent-tint); color: inherit; border-radiu
 .blk__text { flex: 1; min-width: 0; display: grid; gap: 3px; }
 .blk__name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 500 14px/1.3 var(--ok-font); color: var(--ok-text); }
 .blk__id { font: 450 12px/1.2 var(--ok-font-mono); color: var(--ok-text-2); letter-spacing: .02em; }
-.blk__remove.ok-btn { flex: none; font-weight: 400; }
+.blk__remove.ok-btn { flex: none; }
 .blk__empty { display: flex; align-items: center; justify-content: center; gap: 6px; margin: 0; font: 400 13px/1 var(--ok-font); color: var(--ok-text-3); }
 .blk__empty .ok-icon { width: 16px; height: 16px; }
 

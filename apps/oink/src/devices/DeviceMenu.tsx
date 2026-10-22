@@ -1,7 +1,7 @@
 import { tr } from '../i18n';
 import { Fragment, useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent, MouseEvent, PointerEvent, ReactNode } from 'react';
-import { ContextMenu, Icon, MenuCheckboxItem, MenuItem, MenuRadioGroup, MenuRadioItem, MenuSeparator, MenuSub, Segmented, Tooltip } from 'oink-ui';
+import { ContextMenu, Icon, MenuCheckboxItem, MenuItem, MenuRadioGroup, MenuRadioItem, MenuSeparator, MenuSub, NumberInput, Segmented, Tooltip } from 'oink-ui';
 import { Glyph } from './icons';
 import type { GlyphName } from './icons';
 import type { Device, GameMode } from './types';
@@ -123,12 +123,48 @@ const LeaveIcon = <Icon><path d="M8.2 3.6H5.4a1.8 1.8 0 0 0-1.8 1.8v9.2a1.8 1.8 
 const BlockIcon = <Icon><circle cx="10" cy="10" r="6.6"/><path d="M5.3 5.3l9.4 9.4"/></Icon>;
 const UnlockIcon = <Icon><rect x="4.5" y="9" width="11" height="7.5" rx="2"/><path d="M7.2 9V6.6a2.8 2.8 0 0 1 5.5-.7"/></Icon>;
 const EyeOffIcon = <Icon><path d="M3 10s2.6-5 7-5 7 5 7 5-2.6 5-7 5-7-5-7-5Z"/><circle cx="10" cy="10" r="2.2"/><path d="M4 4l12 12"/></Icon>;
+/** Commit a burst of stepper presses (holding a button repeats) as one save. */
+const GAIN_SETTLE_MS = 300;
+
+/** The screen menu's pointer gain: 0.1 per button press, 0.01 when typed, same
+ * 0.1–5 range as Settings. Stepping shows the value at once and saves once the
+ * presses settle, or when the menu closes. */
+function ScreenGainRow({ name, gain, onCommit }: { name: string; gain: number; onCommit: (gain: number) => void }) {
+    const [draft, setDraft] = useState<number | null>(null);
+    const pending = useRef<number | null>(null);
+    const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+    const commit = useRef(onCommit);
+    commit.current = onCommit;
+    const flush = () => {
+        clearTimeout(timer.current);
+        const v = pending.current;
+        pending.current = null;
+        if (v !== null) commit.current(v);
+    };
+    useEffect(() => flush, []);
+    // The saved value arrives with the next layout; until then keep showing the draft.
+    useEffect(() => { if (pending.current === null) setDraft(null); }, [gain]);
+    const change = (v: number) => {
+        setDraft(v);
+        pending.current = v;
+        clearTimeout(timer.current);
+        timer.current = setTimeout(flush, GAIN_SETTLE_MS);
+    };
+    return <div className="devmenu__row devmenu__gain" onKeyDown={e => e.stopPropagation()}>
+      <span className="devmenu__label">{glyph('mouse')}{tr('指针速度')}</span>
+      <NumberInput size="sm" className="devmenu__gain-input" aria-label={tr('{0}的远程指针速度', name)} min={0.1} max={5} step={0.1} precision={2} rollValue={false}
+        value={draft ?? gain} onChange={change} format={v => `${v.toFixed(2)}x`}/>
+    </div>;
+}
+
 export interface SideContextMenuProps {
     devices: Device[];
     /** Every screen, hidden ones included: a device's Hide/Show all screens reads them. */
-    screens?: { id: string; device: string; name: string; hidden: boolean }[];
+    screens?: { id: string; device: string; name: string; hidden: boolean; gain: number }[];
     /** Canvas screen context: hide that one screen. */
     onHideScreen: (id: string) => void;
+    /** Canvas screen context: the screen's remote pointer gain, the same value as Settings. */
+    onScreenGain: (id: string, gain: number) => void;
     /** Device menu: hide all of its screens, or show them all again when any is hidden. */
     onScreensHidden: (deviceId: string, hidden: boolean) => void;
     screenEditPending?: boolean;
@@ -151,7 +187,7 @@ export interface SideContextMenuProps {
     children: ReactNode;
     standalone?: boolean;
 }
-export function SideContextMenu({ devices, screens = [], onHideScreen, onScreensHidden, screenEditPending = false, requests, nearby, onShare, onGameMode, onPause, onLeave, onEditAddress, onShowWindow, onAbout, onQuit, onAccept, onReject, onPair, onBlock, onOpenChange, children, standalone = false }: SideContextMenuProps) {
+export function SideContextMenu({ devices, screens = [], onHideScreen, onScreenGain, onScreensHidden, screenEditPending = false, requests, nearby, onShare, onGameMode, onPause, onLeave, onEditAddress, onShowWindow, onAbout, onQuit, onAccept, onReject, onPair, onBlock, onOpenChange, children, standalone = false }: SideContextMenuProps) {
     const [ctx, setCtx] = useState<Ctx | null>(null);
     const [open, setOpenState] = useState(false);
     const ctxRef = useRef<Ctx | null>(null);
@@ -228,6 +264,8 @@ export function SideContextMenu({ devices, screens = [], onHideScreen, onScreens
     else if (screen) {
         body = <Fragment key={`screen:${screen.id}`}>
           <MenuItem icon={EyeOffIcon} disabled={screenEditPending} onSelect={() => onHideScreen(screen.id)}>{tr('隐藏此屏幕')}</MenuItem>
+          <MenuSeparator/>
+          <ScreenGainRow key={screen.id} name={screen.name} gain={screen.gain} onCommit={gain => onScreenGain(screen.id, gain)}/>
         </Fragment>;
     }
     else if (request) {

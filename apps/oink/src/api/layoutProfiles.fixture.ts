@@ -5,7 +5,7 @@ import {
   createLayoutProfilesApi, LayoutProfileFailure,
   type Adjustment, type ArrangementSnapshot, type CommitRequest, type DeviceArrangementState,
   type LayoutOperation, type LayoutProfilesState, type NativeState, type PreviewReply,
-  type PreviewRequest, type ProfileError, type ProfileName, type ReplayRequest,
+  effectiveSystemSync, type PreviewRequest, type ProfileError, type ProfileName, type ReplayRequest,
 } from './layoutProfiles';
 
 const copy = <T>(value: T): T => structuredClone(value);
@@ -260,7 +260,7 @@ export function createLayoutProfilesFixture(options: LayoutProfilesFixtureOption
       if (!equal(nativeGeometry(current), nativeGeometry(stored))) {
         changedDevices.push(device.device); adjustments.push({ code: 'native_changed', device: device.device });
       }
-      if (device.sync_system_arrangement && device.availability === 'ready') {
+      if (effectiveSystemSync(device.sync_system_arrangement, true) && device.availability === 'ready') {
         let assembled: NativeState = { ...copy(current), screens: [{ ...copy(main), origin: { x: 0, y: 0 } }] };
         for (const s of current.screens.filter(s => key(s.screen) !== key(main.screen)).sort((a, b) => compare(key(a.screen), key(b.screen)))) {
           const old = stored.screens.find(o => key(o.screen) === key(s.screen));
@@ -370,7 +370,7 @@ export function createLayoutProfilesFixture(options: LayoutProfilesFixtureOption
       if (d.availability !== 'ready') return failure(d.availability === 'offline' ? 'owner_offline' : 'unsupported', 'Owner unavailable');
       if (d.preference_token !== p.expected_preference_token) return failure('stale_state', 'Refresh the owner preference');
       if (typeof p.enabled !== 'boolean') return failure('invalid_geometry', 'Expected a boolean setting');
-      d.sync_system_arrangement = p.enabled; d.can_edit_screens = p.enabled;
+      d.sync_system_arrangement = p.enabled; d.can_edit_screens = effectiveSystemSync(p.enabled, true);
       d.preference_token = `preference:${d.device}:${sequence + 1n}`; changed(); return state();
     }
     const catalogOnly = method === 'rename_layout_profile' || method === 'delete_layout_profile';
@@ -502,7 +502,7 @@ export function createLayoutProfilesFixture(options: LayoutProfilesFixtureOption
     flush: async () => { await Promise.all([...work]); },
     setOnline(device: string, online: boolean) {
       const d = devices.find(d => d.device === device) ?? failure('not_member', 'Unknown device');
-      d.availability = online ? 'ready' : 'offline'; d.can_edit_screens = online && d.sync_system_arrangement; changed();
+      d.availability = online ? 'ready' : 'offline'; d.can_edit_screens = effectiveSystemSync(d.sync_system_arrangement, online); changed();
     },
     /** Simulates native hotplug, remote layout/visibility edits, or group membership changes. */
     replaceCurrent(next: ArrangementSnapshot, nextDevices?: DeviceArrangementState[]) {

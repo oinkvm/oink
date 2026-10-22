@@ -101,12 +101,15 @@ pub const CAPABILITIES: &[&str] = &[
     "oink.device-resources/1",
     "oink.device-options/1",
     "oink.input.mouse-disabled/1",
+    "oink.input.accessibility/1",
     "oink.audio.exit-volume/1",
     "oink.notify/1",
     "oink.layout.profiles/1",
     "oink.layout.arrangement/1",
     "oink.layout.preview/1",
     "oink.layout.profiles/2",
+    "oink.layout.profiles/3",
+    "oink.audio.local-output/1",
 ];
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Stream {
@@ -149,6 +152,15 @@ pub const STREAMS: &[Stream] = &[
         "LayoutProfiles",
         1,
         &["oink.group/1", "oink.layout.profiles/1"],
+        false,
+        false,
+        true
+    ),
+    stream!(
+        15,
+        "LayoutProfilesV3",
+        1,
+        &["oink.group/1", "oink.layout.profiles/3"],
         false,
         false,
         true

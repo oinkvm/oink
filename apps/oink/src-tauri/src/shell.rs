@@ -10,7 +10,7 @@ use crate::shell_policy::{Activation, OpenTrigger, PANEL_HEIGHT, PANEL_WIDTH, Vi
 pub struct Shell {
     anchor: Mutex<Option<PanelAnchor>>,
     creation: crate::creation_queue::CreationQueue<WindowRequest>,
-    first_paint: Mutex<crate::shell_policy::FirstPaintGate>,
+    window_ready: Mutex<crate::shell_policy::WindowReadyGate>,
     activation: Mutex<std::collections::HashMap<String, Activation>>,
     #[cfg(target_os = "macos")]
     idle_exit: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
@@ -279,16 +279,15 @@ fn builder(app: &AppHandle, view: View) -> WebviewWindowBuilder<'_, tauri::Wry, 
 }
 
 #[tauri::command]
-pub fn shell_ready(app: AppHandle, window: tauri::WebviewWindow) {
+pub fn shell_ready(app: AppHandle, window: tauri::WebviewWindow, generation: u32) {
     if !View::from_label(window.label()).is_some_and(View::normal) {
         return;
     }
     crate::app::on_main(&app, move |app| {
         let ready = {
             let shell = app.state::<Shell>();
-            let mut gate = shell.first_paint.lock().unwrap();
-            gate.ready(window.label());
-            gate.can_show(window.label())
+            let mut gate = shell.window_ready.lock().unwrap();
+            gate.ready(window.label(), generation)
         };
         if ready && let Err(error) = show_normal(app, &window) {
             tracing::error!(view = window.label(), %error, "could not reveal ready product window");
@@ -349,15 +348,14 @@ fn create_normal(app: &AppHandle, view: View) -> tauri::Result<()> {
             .traffic_light_position(tauri::LogicalPosition::new(18.0 + gutter, 24.0 + gutter));
         #[cfg(windows)]
         let builder = builder.decorations(view == View::About).shadow(view != View::Main);
-        #[cfg(target_os = "macos")]
-        let builder = builder
-            .focused(false)
-            .background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled);
-        app.state::<Shell>().first_paint.lock().unwrap().begin_creation(label);
+        let generation = app.state::<Shell>().window_ready.lock().unwrap().begin_creation(label);
+        let builder = builder.initialization_script(format!(
+            "Object.defineProperty(window, '__OINK_WINDOW_GENERATION__', {{value: {generation}}});"
+        ));
         let window = match builder.build() {
             Ok(window) => window,
             Err(error) => {
-                app.state::<Shell>().first_paint.lock().unwrap().forget(label);
+                app.state::<Shell>().window_ready.lock().unwrap().forget(label);
                 return Err(error);
             }
         };
@@ -367,26 +365,28 @@ fn create_normal(app: &AppHandle, view: View) -> tauri::Result<()> {
         if view == View::Main {
             crate::main_window_macos::prepare(&window)?;
         }
-        #[cfg(target_os = "macos")]
-        {
-            // Ordered-out WKWebViews suspend animation frames even with inactive
-            // scheduling disabled. Match the panel: order without taking keys,
-            // at alpha zero, so layout can acknowledge readiness invisibly.
-            // SAFETY: Tauri lends its live NSWindow on the AppKit thread.
-            let native = unsafe { &*window.ns_window()?.cast::<objc2_app_kit::NSWindow>() };
-            native.setAlphaValue(0.0);
-            native.setIgnoresMouseEvents(true);
-            native.orderFront(None);
-        }
+        // Keep the native window ordered out until React commits its initial
+        // DOM/theme and fonts. No alpha-zero orderFront or WebKit rAF wait:
+        // invisible/occluded WKWebViews can stop frames even with background
+        // throttling disabled (observed on macOS 26). The DOM-ready IPC runs
+        // without a frame; showing/activating then permits the first paint.
     }
     if let Some(window) = app.get_webview_window(label) {
         tracing::info!(view = label, "product window prepared");
         #[cfg(windows)]
-        return finish_normal_windows(app, window, created && view == View::Main);
+        return finish_normal_windows(app, window, created, created && view == View::Main);
         #[cfg(target_os = "macos")]
         {
-            app.state::<Shell>().first_paint.lock().unwrap().created(label);
-            if app.state::<Shell>().first_paint.lock().unwrap().can_show(label) {
+            let reveal = {
+                let shell = app.state::<Shell>();
+                let mut gate = shell.window_ready.lock().unwrap();
+                if created {
+                    gate.created(label)
+                } else {
+                    gate.can_show(label)
+                }
+            };
+            if reveal {
                 show_normal(app, &window)?;
             }
         }
@@ -405,7 +405,12 @@ fn on_ui(app: &AppHandle, f: impl FnOnce() -> tauri::Result<()> + Send + 'static
 }
 
 #[cfg(windows)]
-fn finish_normal_windows(app: &AppHandle, window: tauri::WebviewWindow, prepare_main: bool) -> tauri::Result<()> {
+fn finish_normal_windows(
+    app: &AppHandle,
+    window: tauri::WebviewWindow,
+    created: bool,
+    prepare_main: bool,
+) -> tauri::Result<()> {
     let handle = app.clone();
     on_ui(app, move || {
         crate::cursor_dispatch_windows::prepare(&window)?;
@@ -413,19 +418,16 @@ fn finish_normal_windows(app: &AppHandle, window: tauri::WebviewWindow, prepare_
         if prepare_main {
             crate::main_window_windows::prepare(&window)?;
         }
-        handle
-            .state::<Shell>()
-            .first_paint
-            .lock()
-            .unwrap()
-            .created(window.label());
-        if handle
-            .state::<Shell>()
-            .first_paint
-            .lock()
-            .unwrap()
-            .can_show(window.label())
-        {
+        let reveal = {
+            let shell = handle.state::<Shell>();
+            let mut gate = shell.window_ready.lock().unwrap();
+            if created {
+                gate.created(window.label())
+            } else {
+                gate.can_show(window.label())
+            }
+        };
+        if reveal {
             show_normal(&handle, &window)?;
         }
         Ok(())
@@ -433,6 +435,12 @@ fn finish_normal_windows(app: &AppHandle, window: tauri::WebviewWindow, prepare_
 }
 
 fn show_normal(_app: &AppHandle, window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    // Startup, retained ShowWindow and LaunchServices Reopen can request the
+    // same view. Restore only when needed; an already focused window needs no
+    // further activation (and no second initial reveal).
+    if window.is_visible()? && window.is_focused()? {
+        return Ok(());
+    }
     #[cfg(windows)]
     crate::app_icon::prepare_window(_app, window);
     #[cfg(not(windows))]
@@ -466,7 +474,7 @@ fn show_normal(_app: &AppHandle, window: &tauri::WebviewWindow) -> tauri::Result
     }
     #[cfg(not(windows))]
     focus_window(window)?;
-    tracing::info!(view = window.label(), "painted product window shown");
+    tracing::info!(view = window.label(), "ready product window shown");
     Ok(())
 }
 
@@ -578,7 +586,7 @@ pub fn panel_visible(app: &AppHandle) -> bool {
 }
 
 pub fn window_destroyed(app: &AppHandle, label: &str) {
-    app.state::<Shell>().first_paint.lock().unwrap().forget(label);
+    app.state::<Shell>().window_ready.lock().unwrap().forget(label);
     #[cfg(target_os = "macos")]
     if label == "main" {
         crate::main_window_macos::closed();

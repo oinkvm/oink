@@ -8,6 +8,7 @@ import type { Layout, Placement } from './api/types';
 import { cameraStore } from './arrange/cameraStore';
 import { setLanguage } from './i18n';
 import { profileHarness } from './arrange/profileHarness';
+import { diagonalComputers } from './arrange/diagonalComputers.fixture';
 
 // The contract fixture adopts committed placements exactly; compaction is the editor's.
 const backend = vi.hoisted(() => ({ harness: null as null | ReturnType<typeof import('./arrange/profileHarness').profileHarness> }));
@@ -69,12 +70,12 @@ async function dragBeta(dx: number) {
   await backend.harness!.settle();
 }
 
-it('sits after the layout profile menu and left of undo and redo, defaults on and persists only on this device', () => {
+it('sits at the end of the toolbar after undo and redo, defaults on and persists only on this device', () => {
   const { unmount } = render(<App/>);
   const tools = screen.getByRole('toolbar', { name: 'Arrangement actions' });
   const names = Array.from(tools.querySelectorAll('button'), b => b.getAttribute('aria-label') ?? b.textContent);
   // The current layout profile's menu and + lead the toolbar.
-  expect(names).toEqual(['Current layout: Default layout', 'New layout', 'Auto-compact', 'Undo', 'Redo', 'Reset arrangement']);
+  expect(names).toEqual(['Current layout: Default layout', 'New layout', 'Undo', 'Redo', 'Auto-compact']);
   expect(toggle().getAttribute('aria-pressed')).toBe('true');
   expect(localStorage.getItem('oink:prefs')).toBeNull();
   fireEvent.click(toggle());
@@ -147,7 +148,23 @@ describe('turning auto-compact on', () => {
   const start = (value: Layout) => { agent.adopt('layout', value); backend.harness!.stop(); backend.harness = profileHarness({ layout: value }); };
   const flip = async () => { await act(async () => { fireEvent.click(toggle()); }); await backend.harness!.settle(); };
 
-  it('compacts once toward this device as one undo step; turning it off changes nothing', async () => {
+  it('closes the reported diagonal gap corner to corner in one undoable commit', async () => {
+    start(diagonalComputers);
+    render(<App/>);
+    await flip(); await flip();
+    expect(saved()).toHaveLength(1);
+    const left = saved()[0].find(p => p.device === A)!, right = saved()[0].find(p => p.device === B)!;
+    expect(left.origin.x + 1728 * left.scale).toBe(right.origin.x);
+    expect(left.origin.y + 1117 * left.scale).toBe(right.origin.y);
+    expect(right.origin).toEqual(diagonalComputers.geometry.screens[0].origin);
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Undo' })); });
+    await backend.harness!.settle();
+    expect(saved()).toHaveLength(2);
+    expect(saved()[1].find(p => p.device === A)!.origin).toEqual(diagonalComputers.geometry.screens[1].origin);
+    expect(saved()[1].find(p => p.device === B)!.origin).toEqual(diagonalComputers.geometry.screens[0].origin);
+  });
+
+  it('compacts once in identity order as one undo step; turning it off changes nothing', async () => {
     render(<App/>);
     await flip(); // off
     expect(toggle().getAttribute('aria-pressed')).toBe('false');
@@ -155,8 +172,8 @@ describe('turning auto-compact on', () => {
     await flip(); // on
     expect(toggle().getAttribute('aria-pressed')).toBe('true');
     expect(backend.harness!.of('commit_arrangement').map(r => r.params!.native_plan_tokens)).toEqual([[]]);
-    // This device (Alpha) is the anchor; Beta closes its gap.
-    expect(x(saved()[0], A)).toBe(0);
+    // Alpha sorts first and closes its gap to Beta; there is no anchor.
+    expect(x(saved()[0], A)).toBeCloseTo(.2, 9);
     expect(gapOf(saved()[0])).toBeCloseTo(0, 9);
     const undo = screen.getByRole('button', { name: 'Undo' }) as HTMLButtonElement;
     await act(async () => { fireEvent.click(undo); });

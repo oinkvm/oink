@@ -400,8 +400,8 @@ pub(crate) fn permission_items(node: &Node) -> Vec<PermissionItem> {
             kind,
             state: match kind {
                 PermissionKind::Accessibility => p.accessibility,
-                // Accessibility can permit an event tap too. Its successful
-                // attachment must not manufacture a separate IM grant.
+                // The input backend reports effective event-listening access,
+                // including Accessibility, without requesting a separate IM grant.
                 PermissionKind::InputMonitoring => p.input_monitoring,
                 #[cfg(target_os = "macos")]
                 PermissionKind::LocalNetwork if node.inner.native_services => mac_permissions::local_network_state(),
@@ -497,7 +497,15 @@ fn alerts(node: &Node) -> Vec<Alert> {
     if let Some(alert) = missing_permission_alert(permissions, capture, now) {
         out.push(alert);
     }
-    if capture == Some(false) && !node.fully_paused() && crate::node::capture_permitted(&input) {
+    // capture_active=false only means detached. During a grant the permission
+    // observer publishes before the capture owner has handled Controllable and
+    // installed its tap, so treating that Boolean as a failure produced a toast
+    // on every successful transition. Only the owner's completed failed attempt
+    // is a capture error; its successful attempt clears it immediately.
+    if node
+        .input_status()
+        .is_ok_and(|status| capture_unavailable(&input, &status, node.fully_paused()))
+    {
         out.push(Alert {
             id: "capture-unavailable".into(),
             level: AlertLevel::Error,
@@ -528,38 +536,38 @@ fn alerts(node: &Node) -> Vec<Alert> {
             at_ms: now,
         });
     }
-    let missing: Vec<_> = node
-        .layout()
-        .0
-        .effective(&node.layout_owners())
-        .screens()
-        .iter()
-        .filter(|screen| {
-            !node.device_facts(screen.id.device).is_some_and(|f| {
-                f.displays().is_ok_and(|displays| {
-                    displays
-                        .0
-                        .iter()
-                        .any(|d| d.key().is_ok_and(|key| key.0 == screen.id.display))
-                })
-            })
-        })
-        .map(|s| s.id.clone())
-        .collect();
-    for screen in missing {
-        out.push(Alert {
-            id: format!("display-info:{}:{}", screen.device.to_hex(), screen.display),
-            level: if node.links().is_ok_and(|l| l.links().ready(screen.device)) {
-                AlertLevel::Warning
-            } else {
-                AlertLevel::Info
-            },
-            kind: AlertKind::DisplayInfoUnavailable {
-                screen: (&screen).into(),
-            },
-            problem: None,
-            at_ms: now,
+    // Layout survives disconnects and can arrive before peer Facts. Missing
+    // Facts/displays are pending state, never a completed native failure. Read
+    // explicit screen outcomes from the current peer boot, once per device.
+    let devices: std::collections::BTreeSet<_> = node.group_members().into_iter().chain([node.id()]).collect();
+    for device in devices {
+        let facts = node.device_facts(device).filter(|facts| {
+            if device == node.id() {
+                return true;
+            }
+            node.links().is_ok_and(|links| links.links().ready(device))
+                && node
+                    .link_config()
+                    .ok()
+                    .and_then(|group| group.peer_boot(device))
+                    .is_some_and(|boot| {
+                        facts.boot().ok().is_some_and(|fact| {
+                            fact.device_id()
+                                .ok()
+                                .and_then(|id| oink_network::wire_identity::read_device(&id).ok())
+                                == Some(boot.device_id)
+                                && fact.nonce().ok().is_some_and(|nonce| nonce.0 == boot.nonce)
+                        })
+                    })
         });
+        let fault = facts
+            .and_then(|facts| facts.resources().ok().flatten())
+            .and_then(|resources| resources.faults().ok().flatten())
+            .and_then(|faults| faults.screen().ok().flatten())
+            .and_then(|fault| fault.code().ok());
+        if let Some(alert) = display_failure_alert(device, fault, now) {
+            out.push(alert);
+        }
     }
     let mut current = lock(&node.inner.current_alerts);
     for alert in &mut out {
@@ -573,6 +581,30 @@ fn alerts(node: &Node) -> Vec<Alert> {
     }
     *current = out.clone();
     out
+}
+
+pub(crate) fn capture_unavailable(
+    input: &oink_input::InputPermissions,
+    status: &crate::threads::input::InputStatus,
+    paused: bool,
+) -> bool {
+    status.capture_failed && !paused && crate::node::capture_permitted(input)
+}
+
+fn display_failure_alert(device: DeviceId, fault: Option<dto::ResourceFaultCode>, now: i64) -> Option<Alert> {
+    if !matches!(
+        fault,
+        Some(dto::ResourceFaultCode::DeviceUnavailable | dto::ResourceFaultCode::BackendFailed)
+    ) {
+        return None;
+    }
+    Some(Alert {
+        id: format!("display-info:{}", device.to_hex()),
+        level: AlertLevel::Warning,
+        kind: AlertKind::DisplayEnumerationFailed { device: device.into() },
+        problem: None,
+        at_ms: now,
+    })
 }
 
 pub(crate) fn overview(node: &Node) -> ApiResult<Overview> {
@@ -798,8 +830,24 @@ impl AgentApi for Node {
         volume_percent: u16,
         muted: bool,
     ) -> ApiResult<crate::device_cards::DeviceControlReply> {
+        self.set_forwarding_controls_with_persistence(request_id, version_token, volume_percent, muted, false)
+    }
+    fn set_forwarding_controls_with_persistence(
+        &self,
+        request_id: String,
+        version_token: String,
+        volume_percent: u16,
+        muted: bool,
+        defer_persistence: bool,
+    ) -> ApiResult<crate::device_cards::DeviceControlReply> {
         Ok(self.card_control(request_id, version_token, |binding, id| {
-            crate::device_controls::requests::forwarding_request(binding, id, volume_percent, muted)
+            crate::device_controls::requests::forwarding_request_with_persistence(
+                binding,
+                id,
+                volume_percent,
+                muted,
+                defer_persistence,
+            )
         }))
     }
     fn set_exit_volume(
@@ -1893,6 +1941,33 @@ mod link_tests;
 mod permission_tests {
     use super::*;
     use PermissionKind::*;
+
+    #[test]
+    fn display_alerts_require_completed_failure_not_pending_peer_facts() {
+        use dto::ResourceFaultCode as Fault;
+        let devices = [DeviceId([1; 32]), DeviceId([2; 32])];
+        // Fake source stages during connect: no Facts, no resource observation,
+        // then successful native enumeration. Cached layout screen count is irrelevant.
+        for source in [None, Some(Fault::Unknown(99)), Some(Fault::None)] {
+            assert!(
+                devices
+                    .iter()
+                    .all(|device| display_failure_alert(*device, source, 0).is_none())
+            );
+        }
+        for failure in [Fault::BackendFailed, Fault::DeviceUnavailable] {
+            let alert = display_failure_alert(devices[0], Some(failure), 10).unwrap();
+            assert_eq!(alert.id, format!("display-info:{}", devices[0].to_hex()));
+            assert_eq!(
+                alert.kind,
+                AlertKind::DisplayEnumerationFailed {
+                    device: devices[0].into()
+                }
+            );
+            let encoded = serde_json::to_value(&alert).unwrap();
+            assert_eq!(serde_json::from_value::<Alert>(encoded).unwrap(), alert);
+        }
+    }
 
     #[test]
     fn requests_do_not_open_settings_alongside_possible_dialogs() {

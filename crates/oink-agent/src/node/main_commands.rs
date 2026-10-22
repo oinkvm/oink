@@ -163,6 +163,7 @@ impl Node {
                     command,
                     oink_routing::DndCmd::Begin { .. }
                         | oink_routing::DndCmd::HoldSource { .. }
+                        | oink_routing::DndCmd::ExportSource { .. }
                         | oink_routing::DndCmd::ResumeSource { .. }
                         | oink_routing::DndCmd::PrepareDrop { .. }
                         | oink_routing::DndCmd::Probe { .. }
@@ -192,6 +193,7 @@ impl Node {
                     oink_routing::DndCmd::Begin { id, .. }
                     | oink_routing::DndCmd::PrepareDrop { id, .. }
                     | oink_routing::DndCmd::HoldSource { id, .. }
+                    | oink_routing::DndCmd::ExportSource { id, .. }
                     | oink_routing::DndCmd::FinishSource { id, .. }
                     | oink_routing::DndCmd::ResumeSource { id, .. }
                     | oink_routing::DndCmd::ReleaseSourceButton { id, .. }
@@ -418,7 +420,7 @@ impl Node {
     fn routing_status(&self, status: StatusEvent) {
         self.notification_status(&status);
         match status {
-            StatusEvent::FocusLock { .. } => {}
+            StatusEvent::FocusLock { .. } | StatusEvent::LocalGameMode(_) => {}
             StatusEvent::TouchpadContacts {
                 mode,
                 frames,
@@ -456,7 +458,7 @@ impl Node {
                 self.publish_local_options();
                 self.emit_group();
             }
-            StatusEvent::KeyboardReleased => self.persist_keyboard_safety_release(),
+            StatusEvent::InputDisablesReleased => self.persist_input_safety_release(),
             StatusEvent::LocalFactsChanged => self.publish_local_options(),
             StatusEvent::EmergencyStop { .. } => {
                 // InputStatusChanged consumes the local trigger sequence exactly once.

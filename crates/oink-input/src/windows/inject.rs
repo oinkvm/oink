@@ -63,6 +63,16 @@ pub(crate) fn drag_press_at(at: oink_foundation::Point, origin: (i32, i32), exte
     )
 }
 
+/// One combined absolute move and original-source Up; never split these events.
+pub(crate) fn drag_release_at(at: oink_foundation::Point, origin: (i32, i32), extent: (i32, i32)) -> INPUT {
+    mouse(
+        normalize(at.x.floor() as i32, origin.0, extent.0),
+        normalize(at.y.floor() as i32, origin.1, extent.1),
+        0,
+        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_LEFTUP,
+    )
+}
+
 /// 滚动量 → WHEEL 单位（小数）。
 /// 滚轮格数 → WHEEL 单位（`ScrollUnit::Line` 注入）。
 pub(crate) fn notch_to_wheel(notches: f64) -> f64 {
@@ -355,6 +365,23 @@ mod tests {
             MOUSEEVENTF_LEFTDOWN
         );
         assert!(button(MouseButton::Other(7), true).is_none());
+    }
+
+    #[test]
+    fn source_release_is_one_positioned_up_at_the_recorded_pixel() {
+        let at = oink_foundation::Point::new(-0.001, 300.25);
+        let input = drag_release_at(at, (-1920, -1080), (3840, 2160));
+        // SAFETY: drag_release_at initializes INPUT_MOUSE's mi member.
+        let mouse = unsafe { input.Anonymous.mi };
+        assert_eq!(
+            (denormalize(mouse.dx, -1920, 3840), denormalize(mouse.dy, -1080, 2160)),
+            (-1, 300)
+        );
+        assert_eq!(
+            mouse.dwFlags,
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_LEFTUP
+        );
+        assert_eq!(mouse.dwExtraInfo, INJECT_TAG);
     }
 
     #[test]

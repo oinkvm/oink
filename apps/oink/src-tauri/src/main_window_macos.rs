@@ -41,9 +41,9 @@ fn accepts_pointer(frame: NSRect, point: NSPoint, fullscreen: bool) -> bool {
 }
 
 fn sync_mouse_region(native: &NSWindow, captured: &Cell<bool>) {
-    // The first-paint handshake orders the window at alpha zero so WebKit can
-    // lay out. Mouse tracking must not make that invisible window interactive.
-    if native.alphaValue() == 0.0 {
+    // A normal window stays ordered out while its DOM is prepared. Mouse
+    // tracking must not make that hidden window interactive.
+    if !native.isVisible() {
         native.setIgnoresMouseEvents(true);
         return;
     }

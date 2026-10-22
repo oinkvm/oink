@@ -9,6 +9,32 @@ func finishUninstall(run: (UninstallFinishStep) throws -> Void) throws {
     for step in [UninstallFinishStep.processes, .privacy, .data, .trash] { try run(step) }
 }
 
+func finishUninstallProvider(removeDomains: () async throws -> String,
+                             stopExtension: () throws -> Void,
+                             clearExtension: () throws -> Void) async throws -> String {
+    let result = try await removeDomains()
+    try stopExtension()
+    try clearExtension()
+    return result
+}
+
+func clearUninstallExtension(app: URL) throws {
+    let task = Process()
+    task.executableURL = app.appendingPathComponent("Contents/PlugIns/OinkFileProvider.appex/Contents/MacOS/OinkFileProvider")
+    task.arguments = ["clear-uninstall-data"]
+    task.standardOutput = FileHandle.nullDevice
+    task.standardError = FileHandle.nullDevice
+    try task.run()
+    let deadline = Date().addingTimeInterval(10)
+    while task.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
+    if task.isRunning {
+        _ = kill(task.processIdentifier, SIGKILL)
+        task.waitUntilExit()
+        throw CocoaError(.executableRuntimeMismatch)
+    }
+    guard task.terminationStatus == 0 else { throw CocoaError(.fileWriteNoPermission) }
+}
+
 struct UninstallMessages: Decodable {
     let title: String
     let failure: String
@@ -115,13 +141,19 @@ func resetOinkPrivacy() -> [String] {
     return failed
 }
 
-func removeOinkData(home: URL) -> [String] {
-    let fm = FileManager.default
-    var failed: [String] = []
-    for id in uninstallBundleIDs {
+private func clearOinkPreferences() {
+    // The extension clears its sandbox preferences in its own process.
+    for id in uninstallBundleIDs.prefix(2) {
         UserDefaults.standard.removePersistentDomain(forName: id)
     }
     UserDefaults.standard.synchronize()
+}
+
+func removeOinkData(home: URL, groupContainer: () throws -> URL = appGroupContainer,
+                    clearPreferences: () -> Void = clearOinkPreferences) -> [String] {
+    let fm = FileManager.default
+    var failed: [String] = []
+    clearPreferences()
     for url in uninstallLocations(home: home) where fm.fileExists(atPath: url.path) {
         do { try fm.removeItem(at: url) } catch { failed.append(url.lastPathComponent) }
     }
@@ -134,20 +166,16 @@ func removeOinkData(home: URL) -> [String] {
             do { try fm.removeItem(at: report) } catch { failed.append(report.lastPathComponent) }
         }
     }
-    // Remove Oink-owned contents while leaving OS-owned container metadata and
-    // protected roots alone. macOS may deny access without Full Disk Access;
-    // uninstall never asks for it or tries to defeat container protection.
-    let containers = uninstallBundleIDs.map { home.appendingPathComponent("Library/Containers/\($0)") }
-        + [home.appendingPathComponent("Library/Group Containers/893V37X2CW.com.hachiwii.oink.files")]
-    for root in containers where fm.fileExists(atPath: root.path) {
-        do {
-            for child in try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
-                where !child.lastPathComponent.hasPrefix(".com.apple.") {
-                do { try fm.removeItem(at: child) }
-                catch { failed.append(root.lastPathComponent + "/" + child.lastPathComponent) }
-            }
-        } catch { failed.append(root.lastPathComponent) }
-    }
+    // macOS App Data protection can prompt on cross-container access; the
+    // macOS 26 uninstall finalizer was observed requesting SystemPolicyAppData
+    // just after resetting TCC. Never traverse Library/Containers here, even
+    // for another Oink bundle ID. The sandboxed appex clears its own Data home
+    // after domain removal and before this finalizer (including absent domains).
+    // Group membership alone is not a substitute for obtaining its URL through
+    // containerURL: https://developer.apple.com/documentation/xcode/accessing-app-group-containers
+    // Keep OS metadata/root; domain removal owns CloudStorage, not this code.
+    do { try clearContainerContents(at: groupContainer()) }
+    catch { failed.append("App Group") }
     return failed
 }
 

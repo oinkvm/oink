@@ -1406,7 +1406,7 @@ fn run_owned(
             // A preflight on another thread can withdraw rights while this loop
             // is asleep; callbacks already pass through using the same atomic gate.
             withdraw_capture(s, &run_loop, capture);
-            crate::capture_loop::capture_available(false);
+            crate::capture_loop::capture_detached();
         }
         observed.poll(s);
         drain_contacts(s);
@@ -1441,6 +1441,7 @@ fn run_owned(
             retry = now;
             if let Some(capture) = capture.take() {
                 withdraw_capture(s, &run_loop, capture);
+                crate::capture_loop::capture_detached();
             }
         }
         let contact_due = CONTACTS.with(|slot| slot.borrow().as_ref().and_then(super::contacts::Capture::deadline));

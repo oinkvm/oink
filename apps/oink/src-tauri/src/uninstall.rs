@@ -120,10 +120,14 @@ pub(crate) fn start(remote: &oink_agent::remote::RemoteApi, messages: Messages) 
                     } else {
                         "unregister-login-item"
                     };
-                    let result = Command::new(&manager)
-                        .arg(command)
-                        .output()
-                        .map_err(|e| e.to_string())?;
+                    let mut task = Command::new(&manager);
+                    task.arg(command);
+                    if step == Step::RemoveDomains {
+                        // Cleanup runs inside the sandboxed extension after its
+                        // domains/writers are gone, before the finalizer resets TCC.
+                        task.arg("--uninstall");
+                    }
+                    let result = task.output().map_err(|e| e.to_string())?;
                     if !result.status.success() {
                         return Err(format!("manager exited {}", result.status));
                     }

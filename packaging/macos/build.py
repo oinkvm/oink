@@ -28,6 +28,8 @@ from versioning import release_version, macos_version_fields
 
 ROOT = Path(__file__).resolve().parents[2]
 I = json.loads((ROOT / 'packaging/identity.json').read_text())
+PROVIDER_EXTENSION_FLAGS = ['-application-extension', '-Xlinker', '-e', '-Xlinker', '_OinkFileProviderMain',
+                            '-l', 'extension']
 
 
 def run(*args, **kwargs):
@@ -43,6 +45,14 @@ def write_swift_identity(path):
         f'    static let {key} = {json.dumps(value)}' for key, value in {
             'appGroupKey': I['macos']['app_group_key'], 'domain': I['macos']['file_provider_domain'],
             'displayName': I['name'], 'subsystem': I['macos']['file_provider_id']}.items()) + '\n}\n')
+
+
+def compile_provider_extension(common, generated, crash_object, output):
+    run(*common, '-module-name', I['binaries']['file_provider_extension'], *PROVIDER_EXTENSION_FLAGS,
+        ROOT / 'apps/file-provider/ExtensionMain.swift',
+        ROOT / 'apps/file-provider/ContainerCleanup.swift',
+        generated, ROOT / 'apps/file-provider/Shared.swift', ROOT / 'apps/file-provider/ReportCapture.swift',
+        ROOT / 'apps/file-provider/Extension.swift', crash_object, '-o', output)
 
 
 def main():
@@ -166,14 +176,12 @@ def main():
                   '-target', f'{a.arch}-apple-macos{I["macos_minimum"]}', '-parse-as-library', '-D', 'OINK_RELEASE']
         run('xcrun', 'clang', '-O2', '-g', f'-ffile-prefix-map={ROOT}=oink', '-std=c11', '-target', f'arm64-apple-macos{I["macos_minimum"]}',
             '-c', ROOT / 'apps/file-provider/CrashCapture.c', '-o', tmp / 'crash-capture.o')
-        run(*common, '-module-name', b['file_provider_extension'], '-application-extension',
-            '-Xlinker', '-e', '-Xlinker', '_NSExtensionMain', '-l', 'extension',
-            generated, ROOT / 'apps/file-provider/Shared.swift', ROOT / 'apps/file-provider/ReportCapture.swift',
-            ROOT / 'apps/file-provider/Extension.swift', tmp / 'crash-capture.o',
-            '-o', ext / 'Contents/MacOS' / b['file_provider_extension'])
+        compile_provider_extension(common, generated, tmp / 'crash-capture.o',
+                                   ext / 'Contents/MacOS' / b['file_provider_extension'])
         run(*common, '-Xlinker', '-sectcreate', '-Xlinker', '__TEXT', '-Xlinker', '__info_plist',
             '-Xlinker', tmp / 'manager.plist', generated, ROOT / 'apps/file-provider/Shared.swift',
-            ROOT / 'apps/file-provider/Uninstall.swift', ROOT / 'apps/file-provider/Manager.swift', '-o', mac / b['file_provider_manager'])
+            ROOT / 'apps/file-provider/ContainerCleanup.swift', ROOT / 'apps/file-provider/Uninstall.swift',
+            ROOT / 'apps/file-provider/Manager.swift', '-o', mac / b['file_provider_manager'])
         report = write_manifest(resources / 'report-manifest.json', a.source_tree_sha256, a.version, a.build,
                                 [('agent', mac / b['backend']), ('agent', mac / b['agent']),
                                  ('ui_rust', helper / 'Contents/MacOS' / b['ui']),

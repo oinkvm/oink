@@ -251,27 +251,27 @@ export const SECTIONS: SectionMeta[] = [
             { id: 'perm-accessibility', get label() {
                     return tr('辅助功能');
                 }, get desc() {
-                    return tr('控制本机的指针和键盘；没有它，鼠标共享不可用');
+                    return tr('用于向本机注入键鼠事件');
                 }, get keywords() { return tr('权限 鼠标 隐私'); } },
             { id: 'perm-input', get label() {
                     return tr('输入监控');
                 }, get desc() {
-                    return tr('读取本机键盘输入，发给正在控制的设备；没有它，键盘共享不可用');
+                    return tr('用于控制其它设备');
                 }, get keywords() { return tr('权限 键盘 隐私'); } },
             { id: 'perm-network', get label() {
                     return tr('本地网络');
                 }, get desc() {
-                    return tr('发现并连接同一网络里的设备');
+                    return tr('用于发现和连接局域网设备');
                 }, get keywords() { return tr('权限 网络 局域网 隐私'); } },
             { id: 'perm-files', get label() {
                     return tr('文件提供服务');
                 }, get desc() {
-                    return tr('在设备之间拖放、复制文件；需要在 Finder 里启用 Oink 文件位置');
+                    return tr('用于向本机粘贴和拖拽文件');
                 }, get keywords() { return tr('权限 文件 隐私'); } },
             { id: 'perm-audio', get label() {
                     return tr('系统音频录制');
                 }, get desc() {
-                    return tr('采集本机播放的声音，转发给音频出口');
+                    return tr('用于转发音频到其它设备');
                 }, get keywords() { return tr('权限 声音 录音 隐私 音频录制 系统音频录制'); } },
         ],
     },

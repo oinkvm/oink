@@ -34,6 +34,7 @@ impl helper::Native for Native {
         match command {
             Command::Button { button, down: true } => os.held.push(Command::Button { button, down: false }),
             Command::DragPress { .. } => os.held.push(Command::Button { button: 0, down: false }),
+            Command::DragRelease { .. } => os.held.retain(|up| *up != (Command::Button { button: 0, down: false })),
             Command::Key {
                 code,
                 scan,

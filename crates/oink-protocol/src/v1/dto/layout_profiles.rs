@@ -29,6 +29,7 @@ wire_map!(LayoutProfile, no_validation, {
     4 => last_used: LayoutProfileRecency = required;
     5 => content: LayoutProfileSnapshot = required;
     6 => state: LayoutProfileDeviceState = required;
+    7 => default_group: Option<Id16> = optional;
 });
 wire_map!(LayoutProfileRecency, no_validation, {
     1 => logical_ms: u64 = required;
@@ -130,4 +131,32 @@ wire_map!(LayoutProfileCatalogV2, no_validation, {
     4 => active: Id16 = required;
     5 => profiles: List<LayoutProfile,16> = required;
     6 => imported_merges: List<Hash32,256> = required;
+    7 => discarded_defaults: Option<List<Id16,512>> = optional;
+    8 => default_imports: Option<List<Hash32,256>> = optional;
+});
+
+// Acceptor-only joins. No profile import proof is carried on this stream.
+wire_map!(LayoutProfilesStateV3, no_validation, {
+    1 => group: Id16 = required;
+    2 => catalog: LayoutProfileCatalogV3 = required;
+    4 => layout_version: Option<ConfigVersion> = optional;
+});
+wire_map!(LayoutProfileCatalogV3, no_validation, {
+    1 => schema: u32 = required;
+    2 => group: Id16 = required;
+    3 => version: ConfigVersion = required;
+    4 => active: Id16 = required;
+    5 => profiles: List<LayoutProfile,16> = required;
+    9 => completed_joins: List<LayoutProfileJoinCompletion,256> = (List(Vec::new()));
+});
+wire_map!(LayoutProfileJoinCompletion, no_validation, {
+    1 => merge_id: Hash32 = required;
+    2 => version: ConfigVersion = required;
+    3 => default_profile: Option<Id16> = optional;
+    4 => dropped_defaults: List<Id16,16> = required;
+});
+wire_map!(LayoutProfilesJoin, no_validation, {
+    1 => group: Id16 = required;
+    2 => merge_id: Hash32 = required;
+    3 => catalog: LayoutProfileCatalogV3 = required;
 });

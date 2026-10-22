@@ -276,7 +276,7 @@ describe('rigid computer selection and gestures', () => {
     const border = container.querySelector('.scr--group') as HTMLElement;
     const members=Array.from(container.querySelectorAll('.scr:not(.scr--group)')).slice(0,2).map(el=>{
       const style=(el as HTMLElement).style;
-      const [x,y]=style.transform.match(/-?[\d.]+/g)!.map(Number);
+      const x=parseFloat(style.left),y=parseFloat(style.top);
       return {x,y,right:x+parseFloat(style.width),bottom:y+parseFloat(style.height)};
     });
     expect(parseFloat(border.style.width)).toBe(Math.max(...members.map(m=>m.right))-Math.min(...members.map(m=>m.x)));
@@ -536,7 +536,7 @@ describe('auto-compaction follows manual edits only', () => {
     expect(changed).not.toHaveBeenCalled();
   });
 
-  it.each([true, false])('a keyboard move compacts the whole layout only when compaction=%s', on => {
+  it.each([true, false])('a keyboard move compacts the edited unit only when compaction=%s', on => {
     const changed = vi.fn();
     render(<Arrangement screens={gap} selectedId="b" onSelect={vi.fn()} onScreensChange={changed}
       settings={{ ...settings, compact: on }}/>);

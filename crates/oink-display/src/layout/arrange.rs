@@ -96,6 +96,18 @@ impl Layout {
     pub fn sync_device(&mut self, device: DeviceId, displays: &[DisplayInfo]) {
         let placement = self.device_transform(device);
         let mut fresh = arrange_device(device, displays);
+        // Reconnects repeat the same native facts. A manual offline placement can
+        // legitimately overlap a hidden sibling; only newly occupied geometry
+        // may trigger repair, never an unchanged refresh or online transition.
+        let old = self
+            .screens
+            .iter()
+            .filter(|s| s.id.device == device)
+            .collect::<Vec<_>>();
+        let geometry_changed = old.len() != fresh.len()
+            || fresh
+                .iter()
+                .any(|s| !old.iter().any(|o| o.id == s.id && o.local == s.local));
         let (origin, scale) = placement.unwrap_or_else(|| {
             let group = bbox(fresh.iter().map(|s| s.rect));
             let existing = bbox(self.screens.iter().filter(|s| s.id.device != device).map(|s| s.rect));
@@ -134,11 +146,12 @@ impl Layout {
             }
         });
         self.screens.extend(fresh);
-        if let Some(id) = self
-            .screens
-            .iter()
-            .find(|s| s.id.device == device)
-            .map(|s| s.id.clone())
+        if geometry_changed
+            && let Some(id) = self
+                .screens
+                .iter()
+                .find(|s| s.id.device == device)
+                .map(|s| s.id.clone())
         {
             self.repair_overlaps_around(&id);
         }

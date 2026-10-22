@@ -137,6 +137,10 @@ impl ConfigChanges {
     }
 }
 pub trait ConfigApplication: Send + Sync {
+    fn prepare_profile_join(&self, _intent: &dto::MergeIntent) -> Result<(), String> {
+        Ok(())
+    }
+
     fn apply_state(&self, state: &group_store::StoredGroupState) -> Result<(), String>;
 }
 pub struct ConfigDeps {
@@ -302,11 +306,9 @@ impl ConfigModule {
         faults: dto::ResourceFaults,
         options: dto::LocalOptionsSummary,
         game: Option<dto::GameObservation>,
+        accessibility_granted: Option<bool>,
     ) -> ApiResult<u64> {
-        self.call(move |owner| owner.publish_input(mouse, keyboard, faults, options, game))
-    }
-    pub(crate) fn layout_profile_merges(&self) -> ApiResult<Vec<dto::MergeTransferBundle>> {
-        self.call(|owner| owner.layout_profile_merges())
+        self.call(move |owner| owner.publish_input(mouse, keyboard, faults, options, game, accessibility_granted))
     }
     pub(crate) fn publish_native_arrangement(&self, token: String) -> ApiResult<u64> {
         self.call(move |owner| owner.publish_native_arrangement(token))

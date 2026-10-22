@@ -104,9 +104,10 @@ export function Signal({ latency, offline }: {
     </svg>);
 }
 export type GlyphName = 'screen' | 'game' | 'mouse' | 'keyboard' | 'clipboard' | 'speaker';
-export function Glyph({ name, waves = 0 }: {
+export function Glyph({ name, waves = 0, muted = false }: {
     name: GlyphName;
     waves?: number;
+    muted?: boolean;
 }) {
     switch (name) {
         case 'screen':
@@ -137,24 +138,20 @@ export function Glyph({ name, waves = 0 }: {
           <rect x="5.6" y="1.6" width="4.8" height="2.6" rx="1"/>
         </svg>);
         case 'speaker': {
+            // Muted keeps the level visible but dimmed; the caller swaps the corner
+            // badge for a cross (Badge 'mute'), the same rule as the microphone.
             const arcs = [2.6, 4.4, 6.2, 8].slice(0, waves).map((r) => {
                 const c = 6.6, a = Math.SQRT1_2 * r;
                 return `M${(c + a).toFixed(2)} ${(8 - a).toFixed(2)}A${r} ${r} 0 0 1 ${(c + a).toFixed(2)} ${(8 + a).toFixed(2)}`;
             });
             return (<svg viewBox="0 0 16 16" aria-hidden>
           <path className="fill" d="M1.5 5.8h2.3L7.2 3v10L3.8 10.2H1.5z"/>
-          {arcs.map((d, i) => <path key={i} d={d}/>)}
+          {arcs.map((d, i) => <path key={i} d={d} className={muted ? 'dim' : undefined}/>)}
         </svg>);
         }
     }
 }
-export function Slash() {
-    return (<svg className="dev-slash" viewBox="0 0 18 18" aria-hidden>
-      <path className="slash-knock" d="M1.6 1.6l14.6 14.6"/>
-      <path d="M1.6 1.6l14.6 14.6"/>
-    </svg>);
-}
-export type BadgeName = 'wifi' | 'lock' | 'warning' | 'receive';
+export type BadgeName = 'wifi' | 'lock' | 'warning' | 'receive' | 'mute';
 export function Badge({ name }: {
     name: BadgeName;
 }) {
@@ -171,6 +168,9 @@ export function Badge({ name }: {
             break;
         case 'receive':
             body = <><path d="M5 1.2v4.6M3 3.9 5 5.9l2-2"/><path d="M1.6 6.6v1.4h6.8V6.6"/></>;
+            break;
+        case 'mute':
+            body = <path d="M2.6 2.6l4.8 4.8M7.4 2.6l-4.8 4.8"/>;
             break;
     }
     return (<svg className="dev-badge" data-badge={name} viewBox="-1 -1 12 12" aria-hidden>

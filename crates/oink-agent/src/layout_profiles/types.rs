@@ -61,6 +61,10 @@ pub enum Availability {
     Unsupported,
     Unavailable,
 }
+/// Retained sync preferences never make an offline desktop independently editable.
+pub fn effective_system_sync(setting: bool, online: bool) -> bool {
+    setting && online
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeviceArrangementState {
     pub device: DeviceKey,

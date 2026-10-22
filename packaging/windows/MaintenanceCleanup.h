@@ -13,10 +13,10 @@ inline bool absent(const std::wstring& path) {
 
 // Failed-health recovery uses a full /x before reinstalling the verified prior
 // MSI. Admission has already authenticated its SYSTEM worker and lock. Keep
-// user registrations while the protected journal exists, even if that worker
+// user data and registrations while the protected journal exists, even if that worker
 // dies and recovery must resume. Access failures also preserve user state.
 inline bool preserve_user_state(const std::wstring& directory) {
-    return !absent(directory + L"\\pending.json");
+    return !absent(directory + L"\\pending.json") || !absent(directory + L"\\msi-authorization.json");
 }
 
 template<class Validate>

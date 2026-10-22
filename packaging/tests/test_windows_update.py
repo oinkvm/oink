@@ -218,22 +218,22 @@ class PublishedRelease(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.event_path = self.root / 'event.json'
         self.output_path = self.root / 'output'
-        self.env = {'GITHUB_ACTIONS': 'true', 'GITHUB_EVENT_NAME': 'release', 'GITHUB_REPOSITORY': 'oinkvm/oink',
+        self.env = {'GITHUB_ACTIONS': 'true', 'GITHUB_EVENT_NAME': 'workflow_dispatch', 'GITHUB_REPOSITORY': 'oinkvm/oink',
+                    'GITHUB_REF': 'refs/heads/main',
                     'OINK_RELEASE_TAG': 'v1.0.0', 'GITHUB_EVENT_PATH': str(self.event_path),
                     'GITHUB_OUTPUT': str(self.root / 'github-output')}
         environment = patch.dict(os.environ, self.env)
         environment.start(); self.addCleanup(environment.stop)
         self.live = dict(id=2, draft=False, published_at='2026-10-20T00:00:00Z', tag_name='v1.0.0', prerelease=False, assets=[])
-        self.event = {'action': 'published', 'release': copy.deepcopy(self.live)}
+        self.event = {'repository': {'default_branch': 'main'}, 'inputs': {'release_tag': 'v1.0.0'}}
         self.msi = b'isolated non-executable TEST MSI bytes'
-        self.annotations = feed.encode({'channel': 'stable', 'severity': 'normal', 'notes': {'en': 'Test', 'zh-Hans': '测试'}})
         def artifact(name, raw): return {'name': name, 'size': len(raw), 'sha256': feed.digest(raw)}
         self.msi_artifact = artifact('Oink-test.msi', self.msi)
         self.record = {'schema': 1, 'product': 'Oink', 'build': 3, 'version': '1.0.0', 'built_commit': 'b'*40,
-                       'source_tree_sha256': 'a'*64, 'artifacts': [self.msi_artifact, artifact('update.json', self.annotations)],
+                       'source_tree_sha256': 'a'*64, 'artifacts': [self.msi_artifact],
                        'platforms': {'windows': {'build': 3, 'version': '1.0.0', 'built_commit': 'b'*40,
                                                 'source_tree_sha256': 'a'*64, 'artifacts': [self.msi_artifact]}}}
-        self.raw_assets = {'release.json': feed.encode(self.record), 'update.json': self.annotations, 'Oink-test.msi': self.msi}
+        self.raw_assets = {'release.json': feed.encode(self.record), 'Oink-test.msi': self.msi}
         self.config = {'repository': 'oinkvm/oink', 'windows': [EPOCH]}
 
     def prepare(self, commit='b'*40, source='a'*64):
@@ -247,21 +247,28 @@ class PublishedRelease(unittest.TestCase):
             published.prepare(self.config, self.output_path)
             self.assertEqual(run.call_args_list[0].args[0][:3], ['git', 'fetch', '--no-tags'])
 
-    def test_published_exact_tag_source_asset_and_annotations_are_required(self):
+    def test_published_exact_tag_source_and_msi_are_required_without_notes_asset(self):
         self.prepare()
         self.assertEqual((self.output_path / 'Oink-test.msi').read_bytes(), self.msi)
+        self.assertFalse((self.output_path / 'update.json').exists())
         self.assertIn('source_tree_sha256=' + 'a'*64, (self.root / 'github-output').read_text())
         for commit, source in [('c'*40, 'a'*64), ('b'*40, 'c'*64)]:
             with self.assertRaises(ValueError): self.prepare(commit, source)
         self.raw_assets['Oink-test.msi'] = b'replaced asset'
         with self.assertRaisesRegex(ValueError, 'asset_digest'): self.prepare()
 
-    def test_draft_event_or_live_draft_is_rejected_before_signing(self):
-        self.event['release']['draft'] = True
-        with self.assertRaisesRegex(ValueError, 'published_release_required'): self.prepare()
-        self.event['release']['draft'] = False
-        self.live['draft'] = True
-        with self.assertRaisesRegex(ValueError, 'release_not_public'): self.prepare()
-        self.live['draft'] = False
-        self.event['action'] = 'edited'
-        with self.assertRaisesRegex(ValueError, 'published_release_required'): self.prepare()
+    def test_live_draft_prerelease_or_release_event_is_rejected_before_signing(self):
+        for field in ['draft', 'prerelease']:
+            self.live[field] = True
+            with self.assertRaisesRegex(ValueError, 'release_not_public'): self.prepare()
+            self.live[field] = False
+        self.event.update(action='published', release=copy.deepcopy(self.live))
+        with patch.dict(os.environ, GITHUB_EVENT_NAME='release'):
+            with self.assertRaisesRegex(ValueError, 'published_release_required'): self.prepare()
+
+    def test_old_release_with_bound_notes_remains_usable_without_reading_its_notes(self):
+        self.record['artifacts'].append(dict(name='update.json', size=1, sha256='f'*64))
+        self.raw_assets['release.json'] = feed.encode(self.record)
+        self.raw_assets['update.json'] = b'old notes are ignored'
+        self.prepare()
+        self.assertFalse((self.output_path / 'update.json').exists())

@@ -32,12 +32,15 @@
     "oink.device-resources/1",
     "oink.device-options/1",
     "oink.input.mouse-disabled/1",
+    "oink.input.accessibility/1",
     "oink.audio.exit-volume/1",
     "oink.notify/1",
     "oink.layout.profiles/1",
     "oink.layout.arrangement/1",
     "oink.layout.preview/1",
-    "oink.layout.profiles/2"
+    "oink.layout.profiles/2",
+    "oink.layout.profiles/3",
+    "oink.audio.local-output/1"
   ],
   "diagnostic_events": [
     "protocol-violation/1",
@@ -9945,6 +9948,12 @@
             "key": 22,
             "name": "native_arrangement_token",
             "shape": "Option<Text<128>>"
+          },
+          {
+            "absence": "optional",
+            "key": 23,
+            "name": "accessibility_granted",
+            "shape": "Option<bool>"
           }
         ],
         "name": "DeviceFacts"
@@ -10958,6 +10967,12 @@
             "key": 5,
             "name": "expected_revision",
             "shape": "u64"
+          },
+          {
+            "absence": "false",
+            "key": 6,
+            "name": "defer_persistence",
+            "shape": "bool"
           }
         ],
         "name": "SetLocalOption"
@@ -11768,6 +11783,126 @@
           }
         ],
         "name": "ArrangementPreview"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.layout.profiles/3",
+        "oink.low/1"
+      ],
+      "id": 4640,
+      "name": "LayoutProfilesStateV3",
+      "pause": "Allow",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 15,
+          "transport": "Low"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "group",
+            "shape": "Id16"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "catalog",
+            "shape": "LayoutProfileCatalogV3"
+          },
+          {
+            "absence": "optional",
+            "key": 4,
+            "name": "layout_version",
+            "shape": "Option<ConfigVersion>"
+          }
+        ],
+        "name": "LayoutProfilesStateV3"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.layout.profiles/3",
+        "oink.low/1"
+      ],
+      "id": 4641,
+      "name": "LayoutProfilesReceiptV3",
+      "pause": "Allow",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 15,
+          "transport": "Low"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "group",
+            "shape": "Id16"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "digest",
+            "shape": "Hash32"
+          },
+          {
+            "absence": "required",
+            "key": 3,
+            "name": "accepted",
+            "shape": "bool"
+          }
+        ],
+        "name": "LayoutProfilesReceipt"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.layout.profiles/3",
+        "oink.low/1"
+      ],
+      "id": 4642,
+      "name": "LayoutProfilesJoin",
+      "pause": "Allow",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 15,
+          "transport": "Low"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "group",
+            "shape": "Id16"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "merge_id",
+            "shape": "Hash32"
+          },
+          {
+            "absence": "required",
+            "key": 3,
+            "name": "catalog",
+            "shape": "LayoutProfileCatalogV3"
+          }
+        ],
+        "name": "LayoutProfilesJoin"
       }
     },
     {
@@ -12633,6 +12768,139 @@
         {
           "absence": "required",
           "key": 1,
+          "name": "volume_percent",
+          "shape": "u8"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "muted",
+          "shape": "bool"
+        }
+      ],
+      "name": "LocalOutputVolume"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "group",
+          "shape": "Id16"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "catalog",
+          "shape": "LayoutProfileCatalogV3"
+        },
+        {
+          "absence": "optional",
+          "key": 4,
+          "name": "layout_version",
+          "shape": "Option<ConfigVersion>"
+        }
+      ],
+      "name": "LayoutProfilesStateV3"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "schema",
+          "shape": "u32"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "group",
+          "shape": "Id16"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "version",
+          "shape": "ConfigVersion"
+        },
+        {
+          "absence": "required",
+          "key": 4,
+          "name": "active",
+          "shape": "Id16"
+        },
+        {
+          "absence": "required",
+          "key": 5,
+          "name": "profiles",
+          "shape": "List<LayoutProfile,16>"
+        },
+        {
+          "absence": "(List(Vec::new()))",
+          "key": 9,
+          "name": "completed_joins",
+          "shape": "List<LayoutProfileJoinCompletion,256>"
+        }
+      ],
+      "name": "LayoutProfileCatalogV3"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "merge_id",
+          "shape": "Hash32"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "version",
+          "shape": "ConfigVersion"
+        },
+        {
+          "absence": "optional",
+          "key": 3,
+          "name": "default_profile",
+          "shape": "Option<Id16>"
+        },
+        {
+          "absence": "required",
+          "key": 4,
+          "name": "dropped_defaults",
+          "shape": "List<Id16,16>"
+        }
+      ],
+      "name": "LayoutProfileJoinCompletion"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "group",
+          "shape": "Id16"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "merge_id",
+          "shape": "Hash32"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "catalog",
+          "shape": "LayoutProfileCatalogV3"
+        }
+      ],
+      "name": "LayoutProfilesJoin"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
           "name": "group",
           "shape": "Id16"
         },
@@ -12694,6 +12962,18 @@
           "key": 6,
           "name": "imported_merges",
           "shape": "List<Hash32,256>"
+        },
+        {
+          "absence": "optional",
+          "key": 7,
+          "name": "discarded_defaults",
+          "shape": "Option<List<Id16,512>>"
+        },
+        {
+          "absence": "optional",
+          "key": 8,
+          "name": "default_imports",
+          "shape": "Option<List<Hash32,256>>"
         }
       ],
       "name": "LayoutProfileCatalogV2"
@@ -12776,6 +13056,12 @@
           "key": 6,
           "name": "state",
           "shape": "LayoutProfileDeviceState"
+        },
+        {
+          "absence": "optional",
+          "key": 7,
+          "name": "default_group",
+          "shape": "Option<Id16>"
         }
       ],
       "name": "LayoutProfile"
@@ -18244,6 +18530,12 @@
           "key": 5,
           "name": "expected_revision",
           "shape": "u64"
+        },
+        {
+          "absence": "false",
+          "key": 6,
+          "name": "defer_persistence",
+          "shape": "bool"
         }
       ],
       "name": "SetLocalOption"
@@ -20916,6 +21208,12 @@
           "key": 22,
           "name": "native_arrangement_token",
           "shape": "Option<Text<128>>"
+        },
+        {
+          "absence": "optional",
+          "key": 23,
+          "name": "accessibility_granted",
+          "shape": "Option<bool>"
         }
       ],
       "name": "DeviceFacts"
@@ -25525,6 +25823,12 @@
           "key": 8,
           "name": "source_destination",
           "shape": "Option<DeviceId>"
+        },
+        {
+          "absence": "optional",
+          "key": 9,
+          "name": "local_output",
+          "shape": "Option<LocalOutputVolume>"
         }
       ],
       "name": "SpeakerObservation"
@@ -25764,6 +26068,18 @@
       "kind": 13,
       "low": true,
       "name": "LayoutProfiles",
+      "priority": 1,
+      "reliable": false
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.layout.profiles/3"
+      ],
+      "datagram": false,
+      "kind": 15,
+      "low": true,
+      "name": "LayoutProfilesV3",
       "priority": 1,
       "reliable": false
     },

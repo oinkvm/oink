@@ -353,6 +353,11 @@ pub enum AlertKind {
     /// 链路重做：组状态文件读不出来（损坏、格式不认识、不是本机的）。后台没有启动共享，只提供 IPC；
     /// 界面据此提示，并给出「重置回初始状态」（[`AgentApi::reset_group_state`]）。
     GroupStateUnreadable,
+    /// A completed native screen observation failed, once per device rather than
+    /// once per cached screen. Missing peer facts are not a failure observation.
+    DisplayEnumerationFailed {
+        device: DeviceKey,
+    },
 }
 
 /// 需要用户注意的异常（托盘图标、状态页显示）。
@@ -1746,6 +1751,18 @@ pub trait AgentApi: Send + Sync {
         volume_percent: u16,
         muted: bool,
     ) -> ApiResult<crate::device_cards::DeviceControlReply>;
+    /// Opt-in for live dragging. Missing/false keeps the released synchronous
+    /// durability contract; implementations without this extension remain safe.
+    fn set_forwarding_controls_with_persistence(
+        &self,
+        request_id: String,
+        version_token: String,
+        volume_percent: u16,
+        muted: bool,
+        _defer_persistence: bool,
+    ) -> ApiResult<crate::device_cards::DeviceControlReply> {
+        self.set_forwarding_controls(request_id, version_token, volume_percent, muted)
+    }
     fn set_exit_volume(
         &self,
         request_id: String,
@@ -2047,6 +2064,8 @@ pub enum Request {
         version_token: String,
         volume_percent: u16,
         muted: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        defer_persistence: bool,
     },
     #[serde(rename_all = "camelCase")]
     SetExitVolume {
@@ -2432,8 +2451,15 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
             version_token,
             volume_percent,
             muted,
+            defer_persistence,
         } => api
-            .set_forwarding_controls(request_id, version_token, volume_percent, muted)
+            .set_forwarding_controls_with_persistence(
+                request_id,
+                version_token,
+                volume_percent,
+                muted,
+                defer_persistence,
+            )
             .map(Reply::InvokeDeviceCardAction),
         R::SetExitVolume {
             request_id,

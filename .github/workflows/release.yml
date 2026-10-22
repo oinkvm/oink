@@ -1,7 +1,5 @@
 name: Release packages
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       build:
@@ -197,26 +195,3 @@ jobs:
         run: |
           python build-support/public_release.py assemble --downloads "$RUNNER_TEMP/downloaded" --output "$RUNNER_TEMP/release" --build "$BUILD"
           python build-support/public_release.py publish --output "$RUNNER_TEMP/release" --notes .github/release-notes.txt
-  publish-updates:
-    if: github.event_name == 'release' && github.event.action == 'published' && !github.event.release.draft && !github.event.release.prerelease && github.repository == 'oinkvm/oink'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      actions: write
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          persist-credentials: false
-      - name: Publish feeds from the trusted default-branch dispatch
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        # deploy-pages#383: repeated release-event deployments may report an
-        # earlier artifact as successful. Dispatch is the sole publishing path,
-        # with the same live-release/signature/CAS gates, not a retry or delay.
-        run: |
-          python3 build-support/update/published_release.py --release-tag "$RELEASE_TAG"
-          gh workflow run seed-update-feeds.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f release_tag="$RELEASE_TAG" -f platform=both

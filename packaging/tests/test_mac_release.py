@@ -47,21 +47,44 @@ class MacReleaseTests(unittest.TestCase):
         for change in [dict(channel='beta'), dict(notes={'en':'missing Chinese'})]:
             with self.assertRaises(ValueError): M.validate_release(record, {**notes,**change}, 'v0.1.1', COMMIT, TREE)
 
-    def test_release_event_must_still_be_published_when_queried(self):
+    def test_manual_dispatch_must_still_be_published_when_queried(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'event.json'
             release = dict(id=10, tag_name='v0.1.1',draft=False,prerelease=False,published_at='2026-10-20T20:04:19Z')
-            event = dict(action='published', release=release)
+            event = dict(repository=dict(default_branch='main'), inputs=dict(release_tag='v0.1.1'))
             path.write_text(json.dumps(event))
-            env = dict(GITHUB_ACTIONS='true',GITHUB_EVENT_PATH=str(path),GITHUB_EVENT_NAME='release',GITHUB_REPOSITORY='oinkvm/oink')
+            env = dict(GITHUB_ACTIONS='true',GITHUB_EVENT_PATH=str(path),GITHUB_EVENT_NAME='workflow_dispatch',
+                       GITHUB_REF='refs/heads/main',GITHUB_REPOSITORY='oinkvm/oink')
             with patch.dict(os.environ,env), patch.object(M,'command',return_value=json.dumps(release).encode()):
                 M.published('v0.1.1')
-                for draft, prerelease in [(True,False),(False,True)]:
-                    path.write_text(json.dumps({**event,'release':{**release,'draft':draft,'prerelease':prerelease}}))
-                    with self.assertRaisesRegex(ValueError,'published_release_required'): M.published('v0.1.1')
-            path.write_text(json.dumps(event))
-            with patch.dict(os.environ,env), patch.object(M,'command',return_value=json.dumps({**release,'draft':True}).encode()):
-                with self.assertRaisesRegex(ValueError,'release_not_public'): M.published('v0.1.1')
+            for change in [dict(draft=True), dict(prerelease=True), dict(published_at=None)]:
+                with patch.dict(os.environ,env), patch.object(M,'command',return_value=json.dumps({**release,**change}).encode()):
+                    with self.assertRaisesRegex(ValueError,'release_not_public'): M.published('v0.1.1')
+
+    def test_candidate_reads_default_branch_notes_and_ignores_legacy_bound_asset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            annotations = dict(channel='stable', severity='critical', notes=NOTES)
+            M.feed.write(root / '.github/update-notes.json', annotations)
+            record = self.record()
+            # Legacy releases may list a hash-bound notes asset. Never request it.
+            record['artifacts'].append(dict(name='update.json', size=99, sha256='d'*64))
+            config = dict(repository='oinkvm/oink', mac=dict(enabled=True, public_key=PUBLIC, epoch='mac-2026-01'))
+            with patch.object(M, 'published'), patch.object(M.feed, 'ROOT', root), \
+                 patch.object(M.feed, 'trust', return_value=config), \
+                 patch.object(M, 'tag_source', return_value=(COMMIT, TREE, config['mac'])), \
+                 patch.object(M.feed, 'download', return_value=M.feed.encode(record)) as download, \
+                 patch.object(M, 'validate_release', wraps=M.validate_release) as validate, \
+                 patch.object(M.feed_site, 'state_info', side_effect=RuntimeError('stop before native signing')):
+                with self.assertRaisesRegex(RuntimeError, 'stop before native signing'):
+                    M.candidate(root/'state', root/'output', root/'cache', 'v0.1.1')
+                self.assertEqual(validate.call_args.args[1], annotations)
+                download.assert_called_once_with(
+                    'https://github.com/oinkvm/oink/releases/download/v0.1.1/release.json', M.feed.MAX_FEED, redirects=True)
+
+                M.feed.write(root / '.github/update-notes.json', {**annotations, 'channel': 'beta'})
+                with self.assertRaisesRegex(ValueError, 'stable_annotations_required'):
+                    M.candidate(root/'state', root/'output', root/'cache', 'v0.1.1')
 
     def test_new_item_preserves_older_notes_archive_and_has_no_beta_channel(self):
         with tempfile.TemporaryDirectory() as tmp:

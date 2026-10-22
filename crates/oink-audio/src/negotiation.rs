@@ -13,6 +13,7 @@ pub const CAPABILITIES: &[&str] = &[
     "oink.audio.pcm/1",
     "oink.audio.state/1",
     "oink.audio.exit-volume/1",
+    "oink.audio.local-output/1",
 ];
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

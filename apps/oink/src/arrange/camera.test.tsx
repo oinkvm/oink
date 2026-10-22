@@ -50,7 +50,7 @@ function Canvas({ snapping = false, compact = settings.compact }: { snapping?: b
 
 function displayed(element: Element) {
     const style = (element as HTMLElement).style;
-    const [x, y] = style.transform.match(/-?[\d.]+/g)!.map(Number);
+    const x = parseFloat(style.left), y = parseFloat(style.top);
     return { x, y, w: parseFloat(style.width), h: parseFloat(style.height) };
 }
 

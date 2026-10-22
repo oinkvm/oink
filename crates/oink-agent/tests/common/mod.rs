@@ -19,6 +19,14 @@ pub async fn until(what: &str, mut ready: impl FnMut() -> bool) {
     .unwrap_or_else(|_| panic!("timed out: {what}"));
 }
 
+/// A manual layout fixture needs a writable target catalog as well as owner facts.
+#[allow(dead_code, reason = "shared fixture also compiled into tests without layout edits")]
+pub fn profile_layout_ready(node: &Node) -> bool {
+    AgentApi::layout_profile_command(node, super::test_agent::layout_profiles::types::Command::Query).is_ok_and(
+        |state| state["readiness"] == "ready" && state.get("snapshot").is_some_and(|snapshot| !snapshot.is_null()),
+    )
+}
+
 static OPERATIONS: AtomicU64 = AtomicU64::new(1);
 
 /// Resolve an authenticated peer, including peers that are already members.

@@ -175,11 +175,14 @@ class PublicationTests(FeedTests):
                   'version': '1.0.0', 'minimumWindowsBuild': 19045}
         feed.write(folder/'release.json', record)
         feed.write(folder/'Oink-test.msi', raw)
-        feed.write(folder/'update.json', {'channel': 'stable', 'severity': 'normal', 'notes': {'zh-Hans': '测试更新', 'en': 'Test update'}})
+        # Notes from the trusted checkout win even if an old input contains update.json.
+        feed.write(folder/'update.json', {'channel': 'beta', 'notes': {'en': 'Stale release asset'}})
+        notes_path = self.state/'.github/update-notes.json'
+        feed.write(notes_path, {'channel': 'stable', 'severity': 'normal', 'notes': {'zh-Hans': '测试更新', 'en': 'Test update'}})
         config = {'windows': [EPOCH], 'repository': 'oinkvm/oink'}
         context = {'GITHUB_ACTIONS': 'true', 'GITHUB_REPOSITORY': 'oinkvm/oink', 'GITHUB_RUN_ID': '12',
                    'OINK_SOURCE_TREE_SHA256': 'a'*64, 'OINK_RELEASE_TAG': 'v1.0.0', 'OINK_SIGNPATH_APPROVAL_ID': 'TEST'}
-        with patch.dict(os.environ, context):
+        with patch.dict(os.environ, context), patch.object(feed, 'ROOT', self.state):
             release.sign_package(config, folder, self.state/'output.json')
             output = feed.read(self.state/'output.json')
             feed.write(self.state / 'registry.json', {'schema': 1, 'feeds': {EPOCH['epoch']: {
@@ -198,11 +201,19 @@ class PublicationTests(FeedTests):
             self.assertFalse(output['published'])
             self.assertEqual(output['release']['notes'], {'zh-Hans': '测试更新', 'en': 'Test update'})
             feed.verify(raw, output['release']['package']['ed25519'], PUB)
-            annotations = feed.read(folder/'update.json')
-            feed.write(folder/'update.json', {**annotations, 'notes': {'en': 'missing translation'}})
+            annotations = feed.read(notes_path)
+            feed.write(notes_path, {**annotations, 'notes': {'en': 'missing translation'}})
             with patch.object(feed, 'sign', side_effect=AssertionError('must validate notes before signing')):
                 with self.assertRaises(ValueError): release.sign_package(config, folder, self.state/'output.json')
-            feed.write(folder/'update.json', annotations)
+            # Renewal keeps the registered catalog even when current notes are
+            # invalid or belong to a later release. It never loads that file.
+            with patch.object(release.published_release, 'update_notes', side_effect=AssertionError('renewal must use catalog notes')), \
+                 patch.object(feed, 'download', return_value=raw):
+                feed.allocate(self.state, config, NOW)
+                for plan in feed.read(self.state/'pending-renewal.json')['plans']:
+                    payload = feed.loads(base64.b64decode(plan['payload']))
+                    self.assertEqual(payload['releases'], [output['release']])
+            feed.write(notes_path, annotations)
             (folder/'Oink-test.msi').write_bytes(b'tampered')
             with self.assertRaises(ValueError): release.sign_package(config, folder, self.state/'output.json')
             (folder/'Oink-test.msi').write_bytes(raw)

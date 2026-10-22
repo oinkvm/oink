@@ -23,6 +23,8 @@ macro_rules! enum_schemas {
     };
 }
 dto_schemas! {
+    LocalOutputVolume,
+    LayoutProfilesStateV3,LayoutProfileCatalogV3,LayoutProfileJoinCompletion,LayoutProfilesJoin,
     LayoutProfilesStateV2,LayoutProfileCatalogV2,LayoutProfileCatalog,LayoutProfile,LayoutProfileRecency,LayoutProfileDeviceState,
     ArrangementPreview,LayoutProfileScreens,LayoutProfileSnapshot,LayoutProfileSharing,LayoutProfilePlacement,LayoutProfileDisabled,
     LayoutProfileNative,LayoutProfileScreen,LayoutNativeOrigin,

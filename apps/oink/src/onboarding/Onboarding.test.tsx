@@ -103,13 +103,13 @@ it('omits inapplicable permissions and reuses the request then Settings grant fl
   await screen.findByText('Help us improve Oink');
 });
 
-it.each(['en', 'zh-Hans'] as const)('explains that granting audio permission keeps playback local in %s', async language => {
+it.each(['en', 'zh-Hans'] as const)('granting audio permission does not turn on forwarding in %s', async language => {
   setLanguage(language);
   const { props, view } = fixture({ platform: 'mac' });
   render(view());
   fireEvent.click(screen.getByRole('button', { name: language === 'en' ? 'Next' : '下一步' }));
   const forwarding = vi.spyOn(api, 'setAudioSettings');
-  const description = await screen.findByText(language === 'en' ? 'Audio stays local by default. This permission only allows forwarding when you turn it on.' : '默认在本机播放；此权限仅允许你手动开启音频转发');
+  const description = await screen.findByText(language === 'en' ? 'Used to forward audio to other devices' : '用于转发音频到其它设备');
   expect(props.onGrant).not.toHaveBeenCalled();
   fireEvent.click(description.closest('.permission-row')!.querySelector('button')!);
   await waitFor(() => expect(props.onGrant).toHaveBeenCalledExactlyOnceWith('audio'));

@@ -12,7 +12,6 @@ import { layoutProfilesFixtureSnapshot } from './api/layoutProfiles.fixture';
 import type { Placement } from './api/types';
 import { cameraStore } from './arrange/cameraStore';
 import { profileHarness } from './arrange/profileHarness';
-import { sameArrangement } from './arrange/snapshot';
 import { setLanguage } from './i18n';
 
 const backend = vi.hoisted(() => ({ harness: null as null | ReturnType<typeof import('./arrange/profileHarness').profileHarness> }));
@@ -77,14 +76,14 @@ async function openMenu() {
 const LONG = 'A layout name that is 32 chars!!';
 
 describe('current profile in the toolbar', () => {
-  it('leads the toolbar with the current profile menu and +, before auto-compact and undo/redo', () => {
+  it('leads the toolbar with the current profile menu and +, before undo/redo and auto-compact', () => {
     setup();
     render(<App/>);
     const tools = screen.getByRole('toolbar', { name: 'Arrangement actions' });
     const group = within(tools).getByRole('group', { name: 'Layout' });
     expect(Array.from(group.querySelectorAll('button'), b => b.getAttribute('aria-label'))).toEqual(['Current layout: Default layout', 'New layout']);
     expect(Array.from(tools.querySelectorAll('button'), b => b.getAttribute('aria-label'))).toEqual(
-      ['Current layout: Default layout', 'New layout', 'Auto-compact', 'Undo', 'Redo', 'Reset arrangement']);
+      ['Current layout: Default layout', 'New layout', 'Undo', 'Redo', 'Auto-compact']);
     expect(current().className).toContain('ok-btn--ghost');
     // No Save, Save as or dirty state any more.
     expect(screen.queryByRole('button', { name: /^Save/ })).toBeNull();
@@ -223,32 +222,6 @@ describe('creating a profile', () => {
   });
 });
 
-describe('Reset', () => {
-  it('records a changed reset once from the operation endpoints and replays it without native restore', async () => {
-    const h = setup(true);
-    render(<App/>);
-    await act(async () => { fireEvent.click(button('Reset arrangement')); });
-    await h.settle();
-    expect(h.of('reset_arrangement')).toHaveLength(1);
-    expect(h.requests.some(r => r.method === 'reset_initial_layout' || r.method === 'layout_profiles' || r.method === 'commit_arrangement')).toBe(false);
-    const op = h.fixture.state().operation!;
-    expect(op).toMatchObject({ kind: 'reset', status: 'applied', history_required: true, native_restore_devices: [] });
-    expect(button('Undo').disabled).toBe(false);
-
-    // An unchanged second reset adds no entry.
-    await act(async () => { fireEvent.click(button('Reset arrangement')); });
-    await h.settle();
-    expect(h.of('reset_arrangement')).toHaveLength(2);
-    expect(h.fixture.state().operation?.history_required).toBe(false);
-
-    await act(async () => { fireEvent.click(button('Undo')); });
-    await h.settle();
-    expect(h.of('replay_arrangement')[0].params).toMatchObject({ direction: 'undo', original_kind: 'reset', from: op.after, target: op.before, native_restore_devices: [] });
-    expect(button('Undo').disabled).toBe(true);
-    expect(sameArrangement(h.fixture.state().snapshot, op.before)).toBe(true);
-  });
-});
-
 describe('Settings › Layout profiles', () => {
   const openSettings = async (container: HTMLElement) => {
     fireEvent.click(container.querySelector('[data-action="settings"]')!);
@@ -361,8 +334,9 @@ describe('a system-arranged computer on the canvas', () => {
     expect(h.fixture.state().snapshot!.native.find(n => n.device === A)!.screens.find(s => s.screen.display === 'side')!.origin).toEqual({ x: 1200, y: 0 });
   });
 
-  it('applies release compaction to the whole computer after the native snap', async () => {
+  it('compacts the whole computer after a native drag and undoes both in one step', async () => {
     const h = setup(true);
+    const before = structuredClone(h.fixture.state().snapshot!);
     render(<App/>);
     const [, side] = alpha();
     select(side);
@@ -374,11 +348,48 @@ describe('a system-arranged computer on the canvas', () => {
     const last = h.of('preview_system_arrangement').at(-1)!.reply as PreviewReply;
     const [commit] = h.of('commit_arrangement').map(r => r.params!);
     const snapped = last.placements.find(p => p.device === A)!, final = (commit.placements as Placement[]).find(p => p.device === A)!;
-    // Alpha closes its gap to Beta as one translation; scale and native plan are unchanged.
+    // The native drag remains as previewed; compaction translates both siblings
+    // right together to close the gap to the next computer.
     expect(final.scale).toBe(snapped.scale);
-    expect(final.origin.x).toBeGreaterThan(snapped.origin.x);
+    expect(final.origin).toEqual({ x: .5, y: 0 });
+    expect(snapped.origin).toEqual({ x: 0, y: 0 });
+    expect(h.fixture.state().snapshot!.native.find(n => n.device === A)!.screens).toEqual(last.native.screens);
+    expect(h.of('preview_system_arrangement').every(p => (p.params!.moved_screen as { display: string }).display === 'side')).toBe(true);
+    expect(h.of('commit_arrangement')).toHaveLength(1);
     expect(commit.native_plan_tokens).toEqual([last.plan_token]);
-    expect((commit.placements as Placement[]).find(p => p.device === B)).toEqual(h.fixture.state().snapshot!.placements.find(p => p.device === B));
+    expect((commit.placements as Placement[]).filter(p => p.device !== A)).toEqual(before.placements.filter(p => p.device !== A));
+    await act(async () => { fireEvent.click(button('Undo')); });
+    await h.settle();
+    expect(h.fixture.state().snapshot!.placements).toEqual(before.placements);
+    expect(h.fixture.state().snapshot!.native.map(n => n.screens)).toEqual(before.native.map(n => n.screens));
+    expect(button('Undo').hasAttribute('disabled')).toBe(true);
+    await act(async () => { fireEvent.click(button('Redo')); });
+    await h.settle();
+    expect(h.fixture.state().snapshot!.placements.find(p => p.device === A)).toEqual(final);
+    expect(h.fixture.state().snapshot!.native.find(n => n.device === A)!.screens).toEqual(last.native.screens);
+  });
+
+  it('compacts the whole synced computer after resizing from a selected screen', async () => {
+    const h = setup(true);
+    const before = structuredClone(h.fixture.state().snapshot!);
+    render(<App/>);
+    const [, side] = alpha();
+    select(side);
+    await act(async () => { fireEvent.keyDown(document.body, { key: 'ArrowRight', metaKey: true }); });
+    await h.settle();
+    const commits = h.of('commit_arrangement');
+    expect(commits).toHaveLength(1);
+    expect(commits[0].params!.native_plan_tokens).toEqual([]);
+    const after = h.fixture.state().snapshot!;
+    expect(after.native.map(n => n.screens)).toEqual(before.native.map(n => n.screens));
+    const moved = after.placements.find(p => p.device === A)!;
+    expect(moved.scale).toBeCloseTo(.0011, 12);
+    expect(moved.origin.x + 2000 * moved.scale).toBeCloseTo(2.5, 8);
+    expect(after.placements.filter(p => p.device !== A)).toEqual(before.placements.filter(p => p.device !== A));
+    await act(async () => { fireEvent.click(button('Undo')); });
+    await h.settle();
+    expect(h.fixture.state().snapshot!.placements).toEqual(before.placements);
+    expect(button('Undo').hasAttribute('disabled')).toBe(true);
   });
 
   it('nudges a selected screen from the keyboard through the same preview and commit', async () => {
@@ -418,7 +429,7 @@ function adoptScreenActions() {
     actions: { screenShared:action,screenLocal:action,mouseShared:action,mouseLocal:action,keyboardShared:action,keyboardLocal:action,keyboardDisabled:action,keyboardEnabled:action,clipboardShared:action,clipboardLocal:action,forwardingEnabled:action,forwardingDisabled:action },
     cursor:{icon:'local',focusDevice:A,focusName:'Alpha',lockedDevice:null,context:'group'},
     screen:resource,mouse:resource,keyboard:{...resource,disabled:false},clipboard:resource,
-    speaker:{...resource,configuredMode:null,icon:'unknown',makeExitAction:action,forwardingControlsToken:null,forwardingEnabled:null,activity:'unknown',receiverDevice:null,receiverName:null,activeSources:null,receiveReady:null,forwarding:null},
+    speaker:{...resource,configuredMode:null,icon:'unknown',makeExitAction:action,forwardingControlsToken:null,localOutput:null,forwardingEnabled:null,activity:'unknown',receiverDevice:null,receiverName:null,activeSources:null,receiveReady:null,forwarding:null},
     game:{preference:null,active:null,detected:null,actions:{auto:action,on:action,off:action}},
   };
   agent.adopt('cards', next);
@@ -521,4 +532,28 @@ it('show all screens turns device sharing back on together with hidden screens',
   const back = h.fixture.layout().geometry.screens.filter(s => s.key.device === A);
   expect(back.every(s => s.device_disabled)).toBe(true);
   expect(back.find(s => s.key.display === 'side')?.hidden).toBe(true);
+});
+
+it('edits the sole visible screen independently when its synced native sibling is hidden', async () => {
+  const h = setup(true);
+  const initial = structuredClone(h.fixture.state().snapshot!);
+  initial.disabled.find(d => d.screen.device === A && d.screen.display === 'side')!.disabled = true;
+  h.fixture.replaceCurrent(initial);
+  agent.adopt('layout', h.fixture.layout());
+  render(<App/>);
+  fireEvent.click(button('Auto-compact')); // isolate the manual native edit
+  const main = document.querySelector<HTMLElement>('.scr:not(.scr--group)[aria-label^="Alpha,"]')!;
+  fireEvent.pointerDown(main, { button: 0, clientX: 600, clientY: 300 });
+  fireEvent.pointerUp(main);
+  const zoom = cameraStore.get()!.zoom;
+  fireEvent.pointerDown(main, { button: 0, clientX: 600, clientY: 300 });
+  fireEvent.pointerMove(main, { clientX: 600, clientY: 300 + .1 * 4096 * zoom });
+  await act(async () => { fireEvent.pointerUp(main); });
+  await h.settle();
+  expect(h.of('preview_system_arrangement').length).toBeGreaterThan(0);
+  const after = h.fixture.state().snapshot!, p = after.placements.find(p => p.device === A)!;
+  const sibling = after.native.find(n => n.device === A)!.screens.find(s => s.screen.display === 'side')!;
+  expect(p.origin.y).toBeCloseTo(.1, 9);
+  expect(p.origin.y + sibling.origin.y * p.scale).toBeCloseTo(0, 9);
+  expect(h.of('commit_arrangement')).toHaveLength(1);
 });

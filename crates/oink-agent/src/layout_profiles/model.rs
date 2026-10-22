@@ -45,11 +45,18 @@ pub struct Profile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extensions: Vec<u8>,
     pub id: String,
+    pub default_group: Option<GroupKey>,
     pub name: ProfileName,
     pub content_revision: Version,
     pub last_used: Recency,
     pub content: ArrangementSnapshot,
     pub match_state: DeviceState,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletedJoin {
+    pub version: Version,
+    pub default_profile: Option<String>,
+    pub dropped_defaults: BTreeSet<String>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Catalog {
@@ -60,7 +67,7 @@ pub struct Catalog {
     pub version: Version,
     pub active_profile_id: String,
     pub profiles: Vec<Profile>,
-    pub imported_merges: BTreeSet<String>,
+    pub completed_joins: BTreeMap<String, CompletedJoin>,
 }
 
 pub fn hash(value: &impl Serialize) -> String {
@@ -68,6 +75,9 @@ pub fn hash(value: &impl Serialize) -> String {
     // callers canonicalize identity-keyed lists before hashing.
     let bytes = serde_json::to_vec(value).expect("finite validated profile data");
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+pub fn default_id(group: GroupKey) -> String {
+    hash(&("oink.default-layout/1", group))[..32].to_owned()
 }
 pub fn new_id() -> Result<String> {
     let mut bytes = [0; 16];
@@ -101,11 +111,12 @@ impl Catalog {
             n.token.clear();
         }
         validate_snapshot(&snapshot)?;
-        let id = hash(&("oink.default-layout/1", group))[..32].to_owned();
+        let id = default_id(group);
         let version = Version { counter: 1, writer };
         let profile = Profile {
             extensions: Vec::new(),
             id: id.clone(),
+            default_group: Some(group),
             name: ProfileName::Default,
             content_revision: version.clone(),
             last_used: Recency {
@@ -123,7 +134,7 @@ impl Catalog {
             version,
             active_profile_id: id,
             profiles: vec![profile],
-            imported_merges: BTreeSet::new(),
+            completed_joins: BTreeMap::new(),
         })
     }
     pub fn validate(&self) -> Result<()> {
@@ -131,7 +142,17 @@ impl Catalog {
             || self.version.counter == 0
             || self.profiles.is_empty()
             || self.profiles.len() > MAX_PROFILES
-            || self.imported_merges.len() > 256
+            || self.completed_joins.len() > 256
+            || self.completed_joins.iter().any(|(id, j)| {
+                id.len() != 64
+                    || !id.bytes().all(|b| b.is_ascii_hexdigit())
+                    || j.version.counter == 0
+                    || j.dropped_defaults.len() > 16
+                    || j.dropped_defaults
+                        .iter()
+                        .chain(j.default_profile.iter())
+                        .any(|id| id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()))
+            })
             || !self.profiles.iter().any(|p| p.id == self.active_profile_id)
         {
             return Err(ProfileError::new(ErrorCode::InvalidGeometry, "Invalid profile catalog"));
@@ -179,7 +200,7 @@ impl Catalog {
     pub fn active(&self) -> &Profile {
         self.profile(&self.active_profile_id).expect("validated active profile")
     }
-    fn advance(&mut self, writer: DeviceKey) -> Result<()> {
+    pub(super) fn advance(&mut self, writer: DeviceKey) -> Result<()> {
         self.version = Version {
             counter: self
                 .version
@@ -234,6 +255,7 @@ impl Catalog {
         if let Some(name) = custom_name {
             let id = new_id()?;
             next.profiles.push(Profile {
+                default_group: None,
                 extensions: Vec::new(),
                 id: id.clone(),
                 name,
@@ -320,7 +342,7 @@ impl Catalog {
         }
         Ok(())
     }
-    fn disambiguate_names(&mut self) {
+    pub(super) fn disambiguate_names(&mut self) {
         // Merge order cannot choose a winner: stable ID order gives all replicas
         // the same names. Rehash equal prefixes until the bounded set is unique.
         let mut order = (0..self.profiles.len()).collect::<Vec<_>>();
@@ -358,67 +380,6 @@ impl Catalog {
                 active: p.id == self.active_profile_id,
             })
             .collect()
-    }
-    pub fn receive(&self, incoming: &Self, writer: DeviceKey) -> Result<Self> {
-        incoming.validate()?;
-        if incoming.group != self.group {
-            return Err(ProfileError::new(
-                ErrorCode::NotMember,
-                "Catalog belongs to another group",
-            ));
-        }
-        if let Some(merge_id) = incoming.imported_merges.difference(&self.imported_merges).next() {
-            // A source can import its archive before receiving the target's
-            // catalog. Its higher version then contains only part of the union.
-            // Complete each newly observed import against our retained catalog
-            // before LWW. Known imports stay on LWW so replay cannot undo deletes.
-            return self.merge_group(incoming, merge_id, writer);
-        }
-        match incoming.version.cmp(&self.version) {
-            std::cmp::Ordering::Greater => Ok(incoming.clone()),
-            std::cmp::Ordering::Less => Ok(self.clone()),
-            std::cmp::Ordering::Equal if incoming == self => Ok(self.clone()),
-            _ => Err(ProfileError::new(
-                ErrorCode::StaleState,
-                "Same catalog version has different content",
-            )),
-        }
-    }
-    /// The caller verifies the existing certified merge proof before importing.
-    pub fn merge_group(&self, source: &Self, merge_id: &str, writer: DeviceKey) -> Result<Self> {
-        source.validate()?;
-        if self.imported_merges.contains(merge_id) {
-            return Ok(self.clone());
-        }
-        let mut next = self.clone();
-        next.version.counter = next.version.counter.max(source.version.counter);
-        next.advance(writer)?;
-        for incoming in &source.profiles {
-            if let Some(p) = next.profiles.iter_mut().find(|p| p.id == incoming.id) {
-                let recency = p.last_used.clone().max(incoming.last_used.clone());
-                if incoming.content_revision > p.content_revision {
-                    *p = incoming.clone();
-                }
-                p.last_used = recency;
-            } else {
-                next.profiles.push(incoming.clone());
-            }
-        }
-        next.profiles
-            .sort_by(|a, b| b.last_used.cmp(&a.last_used).then(a.id.cmp(&b.id)));
-        next.profiles.truncate(MAX_PROFILES);
-        if !next.profiles.iter().any(|p| p.id == next.active_profile_id) {
-            next.active_profile_id = if next.profiles.iter().any(|p| p.id == source.active_profile_id) {
-                source.active_profile_id.clone()
-            } else {
-                next.profiles[0].id.clone()
-            };
-        }
-        next.imported_merges.extend(source.imported_merges.iter().cloned());
-        next.imported_merges.insert(merge_id.into());
-        next.disambiguate_names();
-        next.validate()?;
-        Ok(next)
     }
 }
 
@@ -672,7 +633,11 @@ pub fn restore(
                 if old.primary != stored.primary {
                     adjustments.push(adjustment(AdjustmentCode::AnchorChanged, device.device, None));
                 }
-                if device.sync_system_arrangement && device.availability == Availability::Ready {
+                if effective_system_sync(
+                    device.sync_system_arrangement,
+                    device.availability != Availability::Offline,
+                ) && device.availability == Availability::Ready
+                {
                     let mut exact = old.clone();
                     for screen in &mut exact.screens {
                         screen.origin = if screen.screen == old.primary {
@@ -792,7 +757,11 @@ pub fn replay(
     for device in &mut owners {
         let restore_native = native_devices.contains(&device.device);
         if restore_native {
-            if !device.sync_system_arrangement || device.availability != Availability::Ready {
+            if !effective_system_sync(
+                device.sync_system_arrangement,
+                device.availability != Availability::Offline,
+            ) || device.availability != Availability::Ready
+            {
                 return Err(ProfileError::new(
                     ErrorCode::SettingDisabled,
                     "History needs an available native owner with arrangement sync on",

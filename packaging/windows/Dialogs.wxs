@@ -91,24 +91,9 @@
           <Publish Event="EndDialog" Value="Return" />
         </Control>
       </Dialog>
-      <Dialog Id="OinkRunningDlg" Width="370" Height="150" Title="Oink Setup">
-        <Control Id="Heading" Type="Text" X="20" Y="18" Width="330" Height="24"
-                 Text="{\WixUI_Font_Title}Oink is running. Quit Oink and click Retry." />
-        <Control Id="Description" Type="Text" X="20" Y="51" Width="330" Height="44"
-                 Text="Oink could not quit automatically. Another signed-in user may also need to quit Oink. Setup will continue when all Oink user sessions have closed." />
-        <Control Id="BottomLine" Type="Line" X="0" Y="112" Width="370" Height="0" />
-        <Control Id="Retry" Type="PushButton" X="212" Y="123" Width="66" Height="17" Default="yes" Text="Retry">
-          <Publish Event="DoAction" Value="RefreshUserSessions" Order="1" />
-          <Publish Event="EndDialog" Value="Return" Order="2" Condition="NOT OinkSessionsRunning" />
-        </Control>
-        <Control Id="Cancel" Type="PushButton" X="290" Y="123" Width="66" Height="17" Cancel="yes" Text="Cancel">
-          <Publish Event="EndDialog" Value="Exit" />
-        </Control>
-      </Dialog>
       <InstallUISequence>
         <Show Dialog="OinkWelcomeDlg" Before="CostFinalize" Condition="NOT Installed" />
-        <Custom Action="PrepareUserSessions" Before="OinkRunningDlg" Condition="UILevel = 5 AND NOT UPGRADINGPRODUCTCODE" />
-        <Show Dialog="OinkRunningDlg" Before="ExecuteAction" Condition="OinkSessionsRunning = &quot;1&quot;" />
+        <Custom Action="PrepareUserSessions" Before="ExecuteAction" Condition="UILevel = 5 AND NOT UPGRADINGPRODUCTCODE" />
         <Show Dialog="OinkExitDlg" OnExit="success" />
       </InstallUISequence>
     </UI>

@@ -69,15 +69,17 @@ export function layoutPlacements(layout: Layout, screens: Screen[]): Placement[]
   });
 }
 
-/** Visibility is independent of connectivity and history placements. */
+/** View-time exclusion only: keep native geometry, profiles and hidden bits intact.
+ * Missing AX also excludes a computer from edit/compaction targets. Permission
+ * changes never compact or save; native controllability already gates routing. */
 export function visibleScreens(
   screens: Screen[],
   layout: Layout | null,
-  devices: ReadonlyArray<Pick<Device, 'id' | 'screenSharing' | 'screen' | 'paused'>>,
+  devices: ReadonlyArray<Pick<Device, 'id' | 'screenSharing' | 'screen' | 'paused' | 'accessibilityMissing'>>,
 ): Screen[] {
   return screens.filter(screen => {
     const owner = devices.find(device => device.id === screen.device);
     const backend = layout?.geometry.screens.find(item => `${item.key.device}:${item.key.display}` === screen.id);
-    return !owner?.paused && owner?.screenSharing !== false && owner?.screen !== 'disabled' && !backend?.hidden && !backend?.device_disabled;
+    return !owner?.accessibilityMissing && !owner?.paused && owner?.screenSharing !== false && owner?.screen !== 'disabled' && !backend?.hidden && !backend?.device_disabled;
   });
 }

@@ -125,9 +125,17 @@ fn input_permissions(ax: bool, listen: u32, secure_input_active: bool) -> InputP
         } else {
             PermissionState::NotGranted
         },
-        input_monitoring: match listen {
-            K_IOHID_ACCESS_TYPE_GRANTED => PermissionState::Granted,
-            K_IOHID_ACCESS_TYPE_UNKNOWN => PermissionState::NotDetermined,
+        // This is usable event-listening access, not a separate ListenEvent TCC
+        // database entry. Accessibility already authorizes listening and posting
+        // (Apple DTS: https://developer.apple.com/forums/thread/828052).
+        // Requiring IOHID's separate grant would keep the input safety gate closed
+        // after AX approval until an unnecessary explicit IM request. Query only:
+        // never register/request access, and never infer it from an old live tap.
+        // The reported macOS 26.6 flow still needs signed-host manual acceptance;
+        // deterministic tests cover grant/revoke with an unchanged IOHID result.
+        input_monitoring: match (ax, listen) {
+            (true, _) | (_, K_IOHID_ACCESS_TYPE_GRANTED) => PermissionState::Granted,
+            (_, K_IOHID_ACCESS_TYPE_UNKNOWN) => PermissionState::NotDetermined,
             _ => PermissionState::NotGranted,
         },
         secure_input_active,
@@ -376,7 +384,7 @@ mod thread_tests {
         }
         let p = input_permissions(true, K_IOHID_ACCESS_TYPE_UNKNOWN, true);
         assert_eq!(p.accessibility, PermissionState::Granted);
-        assert_eq!(p.input_monitoring, PermissionState::NotDetermined);
+        assert_eq!(p.input_monitoring, PermissionState::Granted);
         assert!(p.secure_input_active);
         assert_eq!(
             input_permissions(true, K_IOHID_ACCESS_TYPE_GRANTED, false).input_monitoring,
@@ -385,7 +393,7 @@ mod thread_tests {
     }
 
     #[test]
-    fn public_listen_preflight_is_authoritative_and_independent_of_ax() {
+    fn event_listening_access_includes_ax_and_preserves_iohid_without_ax() {
         use super::*;
         // Build 5 observed AX=true and IOHID=Granted, but an unrelated
         // audit-token check returned false and incorrectly downgraded it.
@@ -398,11 +406,29 @@ mod thread_tests {
                     (K_IOHID_ACCESS_TYPE_UNKNOWN, PermissionState::NotDetermined),
                 ] {
                     let p = input_permissions(ax, raw, secure);
-                    assert_eq!(p.input_monitoring, expected);
+                    assert_eq!(p.input_monitoring, if ax { PermissionState::Granted } else { expected });
                     assert_eq!(p.secure_input_active, secure);
                     assert_eq!(p.accessibility == PermissionState::Granted, ax);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn permission_refresh_tracks_ax_grant_and_revocation_without_an_im_request() {
+        use super::*;
+        // Fake read-only source: IOHID never changes and no request API is called.
+        for listen in [K_IOHID_ACCESS_TYPE_UNKNOWN, 1] {
+            let samples = [false, true, true, false].map(|ax| input_permissions(ax, listen, false));
+            let missing = if listen == K_IOHID_ACCESS_TYPE_UNKNOWN {
+                PermissionState::NotDetermined
+            } else {
+                PermissionState::NotGranted
+            };
+            assert_eq!(
+                samples.map(|p| p.input_monitoring),
+                [missing, PermissionState::Granted, PermissionState::Granted, missing]
+            );
         }
     }
 

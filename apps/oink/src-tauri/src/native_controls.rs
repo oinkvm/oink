@@ -49,18 +49,46 @@ pub fn invoke(app: &AppHandle, id: &str) {
                 .await;
         match result {
             Ok(Ok(Some(action))) => {
-                let view = match action {
-                    oink_agent::native_controls::ShellAction::Show => crate::shell_policy::View::Main,
-                    oink_agent::native_controls::ShellAction::About => crate::shell_policy::View::About,
-                    oink_agent::native_controls::ShellAction::Quit => crate::shell_policy::View::Quit,
-                };
-                let _ = crate::shell::shell_open(app, view).await;
+                shell_action(&app, action).await;
             }
             Ok(Ok(None)) => {}
             error => tracing::warn!(?error, "native control failed"),
         }
     });
 }
+/// Native Quit is already an explicit choice. Use the same graceful command as
+/// the confirmed in-app flow, rather than opening that flow's confirmation view.
+pub(crate) async fn shell_action(app: &AppHandle, action: oink_agent::native_controls::ShellAction) {
+    route_shell_action(
+        action,
+        |view| async move {
+            let _ = crate::shell::shell_open(app.clone(), view).await;
+        },
+        || async move {
+            if let Err(error) = crate::commands::shell_quit(app.clone()).await {
+                tracing::warn!(?error, "native quit failed");
+            }
+        },
+    )
+    .await;
+}
+async fn route_shell_action<O, Q>(
+    action: oink_agent::native_controls::ShellAction,
+    open: impl FnOnce(crate::shell_policy::View) -> O,
+    quit: impl FnOnce() -> Q,
+) where
+    O: std::future::Future<Output = ()>,
+    Q: std::future::Future<Output = ()>,
+{
+    use crate::shell_policy::View;
+    use oink_agent::native_controls::ShellAction;
+    match action {
+        ShellAction::Show => open(View::Main).await,
+        ShellAction::About => open(View::About).await,
+        ShellAction::Quit => quit().await,
+    }
+}
+
 fn refresh(app: &AppHandle) {
     let mut snapshot = SNAPSHOT.lock().unwrap();
     let Some(view) = &snapshot.view else {
@@ -132,4 +160,44 @@ fn windows_menu(app: &AppHandle, model: &oink_agent::native_controls::Model) -> 
         tracing::warn!(%error,"taskbar menu update failed");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod quit_tests {
+    use super::*;
+    #[tokio::test]
+    async fn explicit_native_quit_runs_shutdown_without_opening_any_window() {
+        let quit = std::cell::Cell::new(0);
+        route_shell_action(
+            oink_agent::native_controls::ShellAction::Quit,
+            |view| async move {
+                panic!("native quit opened {view:?} instead of shutting down");
+            },
+            || async {
+                quit.set(quit.get() + 1);
+            },
+        )
+        .await;
+        assert_eq!(quit.get(), 1);
+    }
+    #[tokio::test]
+    async fn native_window_actions_keep_their_requested_views() {
+        use crate::shell_policy::View;
+        use oink_agent::native_controls::ShellAction;
+        for (action, expected) in [(ShellAction::Show, View::Main), (ShellAction::About, View::About)] {
+            let opened = std::cell::Cell::new(None);
+            route_shell_action(
+                action,
+                |view| {
+                    opened.set(Some(view));
+                    std::future::ready(())
+                },
+                || async {
+                    panic!("window action requested shutdown");
+                },
+            )
+            .await;
+            assert_eq!(opened.get(), Some(expected));
+        }
+    }
 }

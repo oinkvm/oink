@@ -40,6 +40,7 @@ export type AlertLevel = "info" | "warning" | "error";
 export type AlertKind =
   | { type: "capture_unavailable" }
   | { type: "display_info_unavailable"; screen: ScreenKey }
+  | { type: "display_enumeration_failed"; device: DeviceKey }
   | { type: "permission_missing"; permissions: PermissionItem[] }
   | { type: "secure_input"; app: string | null }
   | { type: "peer_offline"; device: DeviceKey }

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import feed
+import published_release
 
 
 def release_context(config):
@@ -46,11 +47,7 @@ def sign_package(config, folder, output):
                  0 < asset['size'] <= feed.MAX_PACKAGE, 'asset')
     raw = (folder / asset['name']).read_bytes()
     feed.require(len(raw) == asset['size'] and feed.digest(raw) == asset['sha256'], 'asset_digest')
-    annotations = feed.read(folder / 'update.json')
-    feed.require(set(annotations) == {'channel', 'severity', 'notes'} and
-                 annotations['channel'] in ('stable', 'beta') and annotations['severity'] in ('normal', 'critical'),
-                 'release_annotations')
-    feed.validate_notes(annotations['notes'])
+    annotations = published_release.update_notes()
     package = {'url': f'https://github.com/{config["repository"]}/releases/download/{tag}/{asset["name"]}',
                'length': len(raw), 'sha256': feed.digest(raw), 'keyId': epoch['epoch'],
                'ed25519': feed.sign(raw, epoch['epoch'], epoch['public_key'])}

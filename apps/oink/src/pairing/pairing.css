@@ -222,12 +222,10 @@
 
 .pair__code-area { display: grid; justify-items: center; padding-top: 8px; }
 
-/* WebKit's empty text-field caret can use a different baseline from the digit
-   after focus/selection changes. Match the line box to the fixed cell height;
-   normal line-height moves the caret down on macOS 14.7.8. Checked on 14 and 26. */
-.pair__pin .ok-pin__cell {
-  line-height: var(--ok-h-lg);
-}
+/* No text caret in the code boxes: the accent ring already marks the box that takes
+   the next digit. macOS WebKit could draw the caret of an empty box from its middle
+   down past the bottom edge, depending on focus history. */
+.pair__pin .ok-pin__cell { caret-color: transparent; }
 .pair__pin .ok-pin__cell:disabled { opacity: 1; cursor: default; }
 .pair[data-status="verifying"] .ok-pin__cell { color: var(--ok-text-2); }
 .pair[data-status="success"] .ok-pin__cell { box-shadow: inset 0 0 0 1.5px var(--ok-success); }

@@ -318,6 +318,13 @@ impl Node {
                 vec![Blocker::IntegrationUnavailable]
             })?;
         }
+        // Drain the accepted slider snapshot before authorizing replacement,
+        // including a backend with no active audio owner. Its retained lease
+        // permits this flush after admission closed; failure blocks the update.
+        lock(&self.inner.config).flush_deferred().map_err(|error| {
+            tracing::warn!(%error, "update settings flush failed");
+            vec![Blocker::IntegrationUnavailable]
+        })?;
         token.validate()?;
         Ok(token)
     }

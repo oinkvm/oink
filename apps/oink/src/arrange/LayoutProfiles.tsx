@@ -25,9 +25,7 @@ export function ProfileTools({ state, busy, onLoad, onCreate, onManage }: {
   const name = active ? profileName(active.name) : '';
   const [open, setOpen] = useState(false);
   return <span className="canvas-tools__group" role="group" aria-label={tr('布局')}>
-    {/* The menu clones its trigger for ref and events, so the tooltip anchors on a wrapper. */}
-    <Tooltip interactive={false} placement="bottom" content={name || tr('布局')} disabled={open}><span className="canvas-tools__anchor">
-      <DropdownMenu placement="bottom-start" matchTriggerWidth={false} className="lp-menu" open={open} onOpenChange={setOpen}
+    <DropdownMenu placement="bottom-start" matchTriggerWidth={false} className="lp-menu" open={open} onOpenChange={setOpen}
         trigger={<Button variant="ghost" size="sm" className="lp-current" aria-label={tr('当前布局：{0}', name)} disabled={!ready || !state?.profiles.length}>
           <span className="lp-current__name">{name}</span><Icon className="canvas-tools__chevron" name="chevron-down"/>
         </Button>}>
@@ -40,7 +38,6 @@ export function ProfileTools({ state, busy, onLoad, onCreate, onManage }: {
         <MenuSeparator/>
         <MenuItem onSelect={onManage}>{tr('管理布局…')}</MenuItem>
       </DropdownMenu>
-    </span></Tooltip>
     <Tooltip interactive={false} placement="bottom" content={state && !state.create_enabled && state.profiles.length >= 16 ? tr('最多保存 16 个布局') : tr('新建布局')}>
       <Button variant="ghost" size="sm" iconOnly aria-label={tr('新建布局')} disabled={!ready || !state?.create_enabled} onClick={onCreate}><Icon name="plus"/></Button>
     </Tooltip>

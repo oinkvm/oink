@@ -115,7 +115,7 @@ fn catalog_wire_and_atomic_store_roundtrip() {
     let raw = wire::catalog(&c).unwrap();
     let bytes = raw.encode(MAX_BYTES).unwrap();
     assert_eq!(
-        wire::read_catalog(oink_protocol::v1::dto::LayoutProfileCatalogV2::decode(&bytes, MAX_BYTES).unwrap()).unwrap(),
+        wire::read_catalog(oink_protocol::v1::dto::LayoutProfileCatalogV3::decode(&bytes, MAX_BYTES).unwrap()).unwrap(),
         c
     );
     let root = tempfile::tempdir().unwrap();
@@ -296,48 +296,80 @@ fn sixteenth_profile_blocks_create_and_group_merge_drops_least_recent() {
         merged
     );
 }
-#[test]
-fn import_before_target_catalog_arrives_preserves_target_profiles() {
-    let s = snapshot();
-    let target = catalog(&s)
-        .save(device(1), &s, state(&s), Some("Target desk"), 20)
-        .unwrap();
-    let source = Catalog::initial(GroupKey(GroupId([5; 16])), device(2), &s, state(&s), 10)
-        .unwrap()
-        .save(device(2), &s, state(&s), Some("Source desk"), 20)
-        .unwrap();
-    let merge_id = "ab".repeat(32);
-    // Fix the delivery order: the source has switched groups, but has not yet
-    // received the target catalog over Low. Reconciliation imports its archive
-    // into the newly initialized target catalog and advances past both originals.
-    let provisional = Catalog::initial(target.group, device(2), &s, state(&s), 30).unwrap();
-    let early_import = provisional.merge_group(&source, &merge_id, device(2)).unwrap();
-    assert_eq!(early_import.profiles.len(), 3);
-    assert!(early_import.version > target.version);
-    let incoming = wire::read_catalog(wire::catalog(&early_import).unwrap()).unwrap();
-    // Same-group receipt must still union a newly observed import. Whole-value
-    // LWW here permanently loses Target desk: both peers converge to only three.
-    let received = target.receive(&incoming, device(1)).unwrap();
-    let expected = target
-        .profiles
-        .iter()
-        .chain(&source.profiles)
-        .map(|p| &p.id)
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        received.profiles.iter().map(|p| &p.id).collect::<BTreeSet<_>>(),
-        expected
-    );
-    assert_eq!(received.active_profile_id, target.active_profile_id);
-    assert!(received.version > early_import.version);
-    assert_eq!(early_import.receive(&received, device(2)).unwrap(), received);
 
-    // Once the import is known, a replay must not resurrect a later deletion.
-    let deleted = received
-        .delete(device(1), &source.active_profile_id, &s, state(&s), 40)
+fn accepting_default_is_dropped(source_devices: usize) {
+    let target_snapshot = snapshot();
+    let mut source_snapshot = snapshot();
+    source_snapshot.placements.truncate(source_devices);
+    source_snapshot.native.truncate(source_devices);
+    source_snapshot
+        .disabled
+        .retain(|s| source_snapshot.placements.iter().any(|p| p.device == s.screen.device));
+    let target = catalog(&target_snapshot);
+    let source = Catalog::initial(
+        GroupKey(GroupId([5; 16])),
+        device(2),
+        &source_snapshot,
+        state(&source_snapshot),
+        5,
+    )
+    .unwrap();
+    let target_default = target.active_profile_id.clone();
+    let source_default = source.active_profile_id.clone();
+    let target = target
+        .save(
+            device(1),
+            &target_snapshot,
+            state(&target_snapshot),
+            Some("Target custom"),
+            30,
+        )
+        .unwrap()
+        .activate(device(1), &target_default, true, 40)
         .unwrap();
-    assert_eq!(deleted.receive(&incoming, device(1)).unwrap(), deleted);
-    assert_eq!(received.receive(&deleted, device(2)).unwrap(), deleted);
+    let source = source
+        .save(
+            device(2),
+            &source_snapshot,
+            state(&source_snapshot),
+            Some("Source custom"),
+            20,
+        )
+        .unwrap();
+    let merged = target.merge_group(&source, &"ef".repeat(32), device(1)).unwrap();
+    assert!(!merged.profiles.iter().any(|p| p.id == target_default));
+    assert_eq!(merged.profiles.len(), 3);
+    assert_eq!(merged.active_profile_id, source_default);
+    assert_eq!(
+        merged
+            .profiles
+            .iter()
+            .filter(|p| p.name == ProfileName::Default)
+            .count(),
+        1
+    );
+    for profile in &merged.profiles {
+        let original = target
+            .profiles
+            .iter()
+            .chain(&source.profiles)
+            .find(|p| p.id == profile.id)
+            .unwrap();
+        assert_eq!(profile.content, original.content);
+        assert_eq!(profile.name, original.name);
+        assert_eq!(profile.content_revision, original.content_revision);
+        assert_eq!(profile.last_used, original.last_used);
+    }
+}
+
+#[test]
+fn group_join_discards_accepting_group_default() {
+    accepting_default_is_dropped(2);
+}
+
+#[test]
+fn single_device_join_discards_accepting_group_default() {
+    accepting_default_is_dropped(1);
 }
 
 #[test]
@@ -409,7 +441,7 @@ fn future_catalog_fields_survive_rename_save_and_store() {
         panic!()
     };
     placement.insert(77, V::Text("future placement".into()));
-    let c = wire::read_catalog(dto::LayoutProfileCatalogV2::from_raw(raw).unwrap()).unwrap();
+    let c = wire::read_catalog(dto::LayoutProfileCatalogV3::from_raw(raw).unwrap()).unwrap();
     let c = c.rename(device(1), &c.active_profile_id, "Renamed").unwrap();
     let mut changed = s.clone();
     changed.placements[0].origin.x = 50.0;
@@ -566,4 +598,216 @@ fn manual_visibility_of_new_screen_is_saved_without_automatic_drift() {
     );
     assert_eq!(content.native[0].screens.len(), 2);
     assert_eq!(content.placements[0].origin, saved.placements[0].origin);
+}
+
+#[test]
+fn offline_sync_is_effectively_rigid_and_reconnect_retains_placement() {
+    assert!(!effective_system_sync(false, false));
+    assert!(!effective_system_sync(false, true));
+    assert!(!effective_system_sync(true, false));
+    assert!(effective_system_sync(true, true));
+    let before = snapshot();
+    let mut edited = before.clone();
+    edited.placements[0].origin = Point::new(-300.0, 25.0);
+    let mut owners = devices(&before);
+    owners[0].sync_system_arrangement = true;
+    owners[0].availability = Availability::Offline;
+    let offline = restore(&edited, &before, &owners).unwrap();
+    assert_eq!(offline.snapshot.placements[0], edited.placements[0]);
+    assert_eq!(offline.snapshot.native[0].screens, before.native[0].screens);
+    assert!(!offline.native_devices.contains(&device(1)));
+    owners[0].availability = Availability::Ready;
+    let online = restore(&offline.snapshot, &offline.snapshot, &owners).unwrap();
+    assert_eq!(online.snapshot.placements, offline.snapshot.placements);
+    assert_eq!(online.snapshot.native[0].screens, before.native[0].screens);
+    assert!(online.native_devices.is_empty());
+}
+
+// The 0.2.0 catalog algorithm, kept here to exercise mixed-version import order.
+// It preserves unknown profile fields but only the target catalog's extensions.
+
+#[test]
+fn second_join_discards_inherited_default_even_after_rename() {
+    let s = snapshot();
+    let target = catalog(&s);
+    let first = Catalog::initial(GroupKey(GroupId([5; 16])), device(2), &s, state(&s), 10).unwrap();
+    let second = Catalog::initial(GroupKey(GroupId([6; 16])), device(3), &s, state(&s), 1).unwrap();
+    let merged = target.merge_group(&first, &"ab".repeat(32), device(1)).unwrap();
+    assert_eq!(merged.default_profile().unwrap().id, first.active_profile_id);
+    let merged = merged
+        .rename(device(1), &first.active_profile_id, "Renamed inherited default")
+        .unwrap();
+    let custom = merged.save(device(1), &s, state(&s), Some("Keep custom"), 30).unwrap();
+    let active_custom = custom.active_profile_id.clone();
+    let active_default = custom.activate(device(1), &first.active_profile_id, true, 40).unwrap();
+    let result = active_default
+        .merge_group(&second, &"cd".repeat(32), device(1))
+        .unwrap();
+    assert!(!result.profiles.iter().any(|p| p.id == first.active_profile_id));
+    assert_eq!(result.default_profile().unwrap().id, second.active_profile_id);
+    assert_eq!(result.active_profile_id, second.active_profile_id);
+    assert!(result.profiles.iter().any(|p| p.id == active_custom));
+    let kept = custom.merge_group(&second, &"cd".repeat(32), device(1)).unwrap();
+    assert_eq!(kept.active_profile_id, active_custom);
+}
+
+#[test]
+fn deleted_defaults_are_not_recreated_and_surviving_default_is_not_pinned_over_mru() {
+    let s = snapshot();
+    let target = catalog(&s);
+    let source = Catalog::initial(GroupKey(GroupId([5; 16])), device(2), &s, state(&s), 1).unwrap();
+    let target = target
+        .save(device(1), &s, state(&s), Some("Target custom"), 20)
+        .unwrap()
+        .delete(device(1), &target.active_profile_id, &s, state(&s), 21)
+        .unwrap();
+    let source = source
+        .save(device(2), &s, state(&s), Some("Source custom"), 20)
+        .unwrap()
+        .delete(device(2), &source.active_profile_id, &s, state(&s), 21)
+        .unwrap();
+    let merged = target.merge_group(&source, &"ab".repeat(32), device(1)).unwrap();
+    assert_eq!(merged.profiles.len(), 2);
+    assert!(merged.default_profile().is_none());
+    let mut full = catalog(&s);
+    for n in 0..15 {
+        full = full
+            .save(device(1), &s, state(&s), Some(&format!("Desk {n}")), 50 + n)
+            .unwrap();
+    }
+    let source = Catalog::initial(GroupKey(GroupId([6; 16])), device(2), &s, state(&s), 1)
+        .unwrap()
+        .save(device(2), &s, state(&s), Some("Newest"), 100)
+        .unwrap();
+    let merged = full.merge_group(&source, &"cd".repeat(32), device(1)).unwrap();
+    assert_eq!(merged.profiles.len(), 16);
+    assert!(merged.default_profile().is_none());
+}
+
+#[test]
+fn acceptor_crash_retry_keeps_completion_and_later_deletions_atomic() {
+    let s = snapshot();
+    let target = catalog(&s);
+    let source = Catalog::initial(GroupKey(GroupId([5; 16])), device(2), &s, state(&s), 10)
+        .unwrap()
+        .save(device(2), &s, state(&s), Some("Delete after import"), 20)
+        .unwrap();
+    let id = "bb".repeat(32);
+    let root = tempfile::tempdir().unwrap();
+    store::save(root.path(), &target).unwrap();
+    let computed = target.merge_group(&source, &id, device(1)).unwrap();
+    // Crash before the atomic import write: retry starts from the old envelope.
+    let recovered = store::load(root.path(), target.group)
+        .unwrap()
+        .unwrap()
+        .merge_group(&source, &id, device(1))
+        .unwrap();
+    assert_eq!(recovered, computed);
+    store::save(root.path(), &recovered).unwrap();
+    let deleted = recovered
+        .delete(device(1), &source.active_profile_id, &s, state(&s), 40)
+        .unwrap();
+    store::save(root.path(), &deleted).unwrap();
+    let recovered = store::load(root.path(), target.group).unwrap().unwrap();
+    assert_eq!(recovered.merge_group(&source, &id, device(1)).unwrap(), deleted);
+    assert!(recovered.completed_joins.contains_key(&id));
+    assert!(
+        recovered.completed_joins[&id]
+            .dropped_defaults
+            .contains(&target.active_profile_id)
+    );
+    assert!(!recovered.profiles.iter().any(|p| p.id == target.active_profile_id));
+}
+
+#[test]
+fn ordinary_stale_catalog_receipt_does_not_reorder_or_advance_after_create() {
+    let s = snapshot();
+    let before = catalog(&s);
+    let created = before.save(device(1), &s, state(&s), Some("New profile"), 20).unwrap();
+    assert_eq!(created.receive(&before, device(1)).unwrap(), created);
+}
+
+#[test]
+fn acceptor_result_is_adopted_without_member_side_merge() {
+    let s = snapshot();
+    let target = catalog(&s);
+    let source = Catalog::initial(GroupKey(GroupId([5; 16])), device(2), &s, state(&s), 10).unwrap();
+    let result = target.merge_group(&source, &"ab".repeat(32), device(1)).unwrap();
+    assert_eq!(target.receive(&result, device(3)).unwrap(), result);
+}
+
+#[test]
+fn simultaneous_acceptors_union_once_and_use_later_completed_default() {
+    let s = snapshot();
+    let target = catalog(&s);
+    let source_a = Catalog::initial(GroupKey(GroupId([5; 16])), device(2), &s, state(&s), 10).unwrap();
+    let source_b = Catalog::initial(GroupKey(GroupId([6; 16])), device(3), &s, state(&s), 20).unwrap();
+    let a = target.merge_group(&source_a, &"aa".repeat(32), device(1)).unwrap();
+    let b = target.merge_group(&source_b, &"bb".repeat(32), device(4)).unwrap();
+    assert!(b.version > a.version);
+    let joined = a.receive(&b, device(1)).unwrap();
+    assert_eq!(joined.profiles.len(), 2);
+    assert_eq!(joined.default_profile().unwrap().id, source_b.active_profile_id);
+    assert_eq!(joined.completed_joins.len(), 2);
+    assert!(joined.profiles.iter().any(|p| p.id == source_a.active_profile_id));
+    assert!(!joined.profiles.iter().any(|p| p.id == target.active_profile_id));
+    let other = b.receive(&a, device(4)).unwrap();
+    let converged = joined.receive(&other, device(1)).unwrap();
+    assert_eq!(other, converged);
+    assert_eq!(a.receive(&converged, device(1)).unwrap(), converged);
+    assert_eq!(b.receive(&converged, device(4)).unwrap(), converged);
+    // Ordinary later deletion stays deleted even when an old result is replayed.
+    let deleted = converged
+        .delete(device(1), &source_a.active_profile_id, &s, state(&s), 30)
+        .unwrap();
+    assert_eq!(deleted.receive(&a, device(1)).unwrap(), deleted);
+}
+
+#[test]
+fn rapid_second_pairing_result_needs_no_first_group_history() {
+    let s = snapshot();
+    let source = catalog(&s);
+    let intermediate = Catalog::initial(GroupKey(GroupId([5; 16])), device(2), &s, state(&s), 10).unwrap();
+    let final_target = Catalog::initial(GroupKey(GroupId([6; 16])), device(3), &s, state(&s), 20).unwrap();
+    let first = intermediate.merge_group(&source, &"aa".repeat(32), device(2)).unwrap();
+    let second = final_target.merge_group(&first, &"bb".repeat(32), device(3)).unwrap();
+    assert_eq!(second.completed_joins.len(), 1);
+    assert_eq!(second.default_profile().unwrap().id, source.active_profile_id);
+    assert_eq!(final_target.receive(&second, device(4)).unwrap(), second);
+    assert_eq!(second.receive(&final_target, device(3)).unwrap(), second);
+}
+
+#[test]
+fn old_saved_profiles_load_unchanged_and_obsolete_fields_are_ignored() {
+    use base64::Engine as _;
+    use oink_protocol::v1::{RawValue as V, dto};
+    let s = snapshot();
+    let original = catalog(&s)
+        .save(device(1), &s, state(&s), Some("Keep existing"), 20)
+        .unwrap();
+    let mut raw = wire::catalog(&original).unwrap().into_raw();
+    raw.remove(&9);
+    raw.insert(6, V::Array(vec![V::Bytes(vec![1; 32])]));
+    raw.insert(7, V::Array(vec![V::Bytes(vec![2; 16])]));
+    raw.insert(8, V::Array(vec![V::Bytes(vec![1; 32])]));
+    let legacy = dto::LayoutProfileCatalogV2::from_raw(raw).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    store::save(root.path(), &original).unwrap();
+    let path = std::fs::read_dir(root.path().join("layout-profiles-v2"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let envelope = serde_json::json!({"schema":1,"catalog_cbor":base64::engine::general_purpose::STANDARD.encode(legacy.encode(MAX_BYTES).unwrap())});
+    std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+    let loaded = store::load(root.path(), original.group).unwrap().unwrap();
+    assert_eq!(loaded, original);
+    store::save(root.path(), &loaded).unwrap();
+    assert_eq!(store::load(root.path(), original.group).unwrap().unwrap(), original);
+    assert!(
+        ![6, 7, 8]
+            .iter()
+            .any(|k| wire::catalog(&loaded).unwrap().raw().contains_key(k))
+    );
 }

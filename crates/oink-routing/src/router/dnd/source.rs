@@ -26,6 +26,8 @@ pub(super) struct Source {
     pub holder: Holder,
     pub phase: Phase,
     pub exported: bool,
+    /// A later Windows holder needs filenames from the still-held Mac promise.
+    pub exporting: Option<u64>,
     pub confirmed: bool,
     pub native: NativeObservation,
     pub ever_held: bool,
@@ -50,6 +52,7 @@ impl Source {
             holder,
             phase: Phase::Local,
             exported: false,
+            exporting: None,
             confirmed: false,
             native: NativeObservation::Observed,
             ever_held: false,
@@ -210,10 +213,11 @@ impl Source {
         };
     }
     pub fn export_ready(&mut self) -> bool {
-        if self.phase != Phase::Local || self.native_closed {
+        if !matches!(self.phase, Phase::Local | Phase::Held | Phase::Released) || self.native_closed {
             return false;
         }
         self.exported = true;
+        self.exporting = None;
         self.native = NativeObservation::Exported;
         self.confirmed = true;
         self.advance();

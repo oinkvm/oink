@@ -26,7 +26,7 @@ def verify_install_ui(tables):
     if properties.get('ARPPRODUCTICON') != 'OinkIcon.ico' or icons.get('OinkIcon.ico') != expected:
         raise RuntimeError('MSI ARP icon must embed the existing Oink app ICO')
     shortcuts = {row[0]: row for row in tables.get('Shortcut', [])}
-    for name, directory, component, target in [('StartMenuEntry', 'ProgramMenuFolder', 'UserEntry', 'Product'),
+    for name, directory, component, target in [('StartMenuEntry', 'ProgramMenuFolder', 'UserEntry', '[#UiExe]'),
                                                  ('DesktopShortcut', 'DesktopFolder', 'DesktopEntry', '[#UiExe]')]:
         row = shortcuts.get(name)
         if not row or (row[1], row[3], row[4], row[8], row[9], row[11]) != (
@@ -106,31 +106,48 @@ def verify_install_ui(tables):
 
 def verify_user_session_ui(tables):
     actions = {row[0]: row for row in tables.get('CustomAction', [])}
-    for name, kind in [('PrepareUserSessions', '257'), ('RefreshUserSessions', '1')]:
-        if actions.get(name, [])[1:4] != [kind, 'InstallerCA', name]:
-            raise RuntimeError('MSI graceful stop must be immediate impersonating DLL code, once per installation')
+    if actions.get('PrepareUserSessions', [])[1:4] != ['257', 'InstallerCA', 'PrepareUserSessions']:
+        raise RuntimeError('MSI graceful Quit must be immediate impersonating code, once per installation')
     properties = dict(tables.get('Property', []))
-    if 'OINK_GRACEFUL_STOP' in properties or 'OINK_GRACEFUL_STOP' not in properties.get('SecureCustomProperties', '').split(';'):
-        raise RuntimeError('MSI quiet graceful stop must be a secure explicit opt-in without a default')
+    if ('OINK_GRACEFUL_STOP' in properties or
+            'OINK_GRACEFUL_STOP' in properties.get('SecureCustomProperties', '').split(';') or
+            properties.get('MSIRESTARTMANAGERCONTROL') != 'Disable'):
+        raise RuntimeError('MSI normal Quit must not require opt-in or force-close via Restart Manager')
     ui = {row[0]: row for row in tables.get('InstallUISequence', [])}
     execute = {row[0]: row for row in tables.get('InstallExecuteSequence', [])}
     if (ui.get('PrepareUserSessions', ['', ''])[1] != 'UILevel = 5 AND NOT UPGRADINGPRODUCTCODE' or
-            ui.get('OinkRunningDlg', ['', ''])[1] != 'OinkSessionsRunning = "1"' or
-            not int(ui['PrepareUserSessions'][2]) < int(ui['OinkRunningDlg'][2]) < int(ui['ExecuteAction'][2]) or
-            execute.get('PrepareUserSessions', ['', ''])[1] != 'UILevel < 5 AND NOT UPGRADINGPRODUCTCODE' or
-            not int(execute['PrepareUserSessions'][2]) < int(execute['CheckInstallPath'][2]) < int(execute['InstallInitialize'][2]) or
-            'RefreshUserSessions' in ui or 'RefreshUserSessions' in execute):
-        raise RuntimeError('MSI running-session gate must precede elevation/transaction and exclude nested upgrade removal')
-    controls = {(row[0], row[1]): row for row in tables.get('Control', [])}
-    heading = controls.get(('OinkRunningDlg', 'Heading'))
-    if not heading or heading[2] != 'Text' or 'Oink is running. Quit Oink and click Retry.' not in heading[9]:
-        raise RuntimeError('MSI running-session dialog must explain how to continue')
-    events = tables.get('ControlEvent', [])
-    for expected in [['OinkRunningDlg', 'Retry', 'DoAction', 'RefreshUserSessions', '1', '1'],
-                     ['OinkRunningDlg', 'Retry', 'EndDialog', 'Return', 'NOT OinkSessionsRunning', '2'],
-                     ['OinkRunningDlg', 'Cancel', 'EndDialog', 'Exit', '1', '1']]:
-        if expected not in events:
-            raise RuntimeError('MSI running-session Retry must recheck without closing early, Cancel must abort')
+            not int(ui['PrepareUserSessions'][2]) < int(ui['ExecuteAction'][2]) or
+            execute.get('PrepareUserSessions', ['', ''])[1] != 'NOT UPGRADINGPRODUCTCODE' or
+            not int(execute['CostFinalize'][2]) < int(execute['PrepareUserSessions'][2]) < int(execute['InstallValidate'][2]) < int(execute['InstallInitialize'][2]) or
+            any(name in ui or name in execute or name in actions for name in ('RefreshUserSessions', 'OinkRunningDlg'))):
+        raise RuntimeError('MSI must request Quit before files-in-use detection and wait after StopServices')
+
+
+def verify_start_registration(tables, identity):
+    properties = dict(tables.get('Property', []))
+    actions = {row[0]: row for row in tables.get('CustomAction', [])}
+    execute = {row[0]: row for row in tables.get('InstallExecuteSequence', [])}
+    app_id = identity['bundle_id'] + '.ui'
+    links = {row[0]: row for row in tables.get('Shortcut', [])}
+    metadata = {(row[1], row[2]): row[3] for row in tables.get('MsiShortcutProperty', [])}
+    if (properties.get('ALLUSERS') != '1' or 'ARPNOREMOVE' in properties or 'ARPSYSTEMCOMPONENT' in properties or
+            actions.get('SetARPINSTALLLOCATION', [])[1:4] != ['51', 'ARPINSTALLLOCATION', '[INSTALLFOLDER]'] or
+            execute.get('SetARPINSTALLLOCATION', ['', ''])[1] or
+            not int(execute['CostFinalize'][2]) < int(execute['SetARPINSTALLLOCATION'][2]) < int(execute['RegisterProduct'][2]) or
+            any(links.get(name, ['', '', '', '', ''])[4] != '[#UiExe]' or
+                metadata.get((name, 'System.AppUserModel.ID')) != app_id
+                for name in ('StartMenuEntry', 'DesktopShortcut'))):
+        raise RuntimeError('MSI Start menu registration must map real app targets and stable identity to a removable ARP product')
+
+
+def verify_data_cleanup(tables):
+    actions = {row[0]: row for row in tables.get('CustomAction', [])}
+    execute = {row[0]: row for row in tables.get('InstallExecuteSequence', [])}
+    if (actions.get('CleanupUserData', [])[1:4] != ['3649', 'InstallerCA', 'CleanupUserData'] or
+            execute.get('CleanupUserData', ['', ''])[1] != 'REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE' or
+            not int(execute['CheckQuiescence'][2]) < int(execute['CleanupUserData'][2]) < int(execute['CleanupMaintenance'][2]) < int(execute['InstallFinalize'][2]) or
+            any(row[0] == 'CleanupUserData' for row in tables.get('InstallUISequence', []))):
+        raise RuntimeError('MSI user data cleanup must be non-fatal SYSTEM commit-only, on committed standalone uninstall before maintenance cleanup')
 
 
 def verify_registration(tables, metadata, identity):
@@ -166,17 +183,13 @@ def verify_registration(tables, metadata, identity):
     cleanup = [row for row in tables.get('CustomAction', []) if row[0] == 'CleanupMaintenance']
     maintenance = [row for row in tables.get('Component', []) if row[0] == 'MaintenanceRoot']
     conditions = {row[0]: row[1] for row in tables.get('InstallExecuteSequence', [])}
-    if (len(cleanup) != 1 or int(cleanup[0][1]) != 3585 or cleanup[0][2:4] != ['InstallerCA', 'CleanupMaintenance'] or
+    if (len(cleanup) != 1 or int(cleanup[0][1]) != 3649 or cleanup[0][2:4] != ['InstallerCA', 'CleanupMaintenance'] or
             len(maintenance) != 1 or int(maintenance[0][3]) & 16 or
             conditions.get('CleanupMaintenance') != 'REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE' or
             not sequence.get('StartServices', 0) < sequence.get('CleanupMaintenance', 0) < sequence['InstallFinalize']):
-        raise RuntimeError('MSI must clean maintenance only on committed standalone full uninstall, after service restart')
-    cloud = [row for row in tables.get('CustomAction', []) if row[0] == 'CleanupCloudFiles']
-    if (len(cloud) != 1 or int(cloud[0][1]) != 3073 or
-            cloud[0][2:4] != ['InstallerCA', 'CleanupCloudFiles'] or
-            conditions.get('CleanupCloudFiles') != 'REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE' or
-            not sequence['CheckQuiescence'] < sequence.get('CleanupCloudFiles', 0) < sequence['DeleteServices']):
-        raise RuntimeError('MSI must unregister per-user Cloud Files only on full uninstall, after quiescence and before file removal')
+        raise RuntimeError('MSI must clean maintenance non-fatally only on committed standalone full uninstall, after service restart')
+    verify_start_registration(tables, identity)
+    verify_data_cleanup(tables)
     upgrade = identity['windows']['upgrade_code'].upper()
     ranges = {row[6]: row for row in tables.get('Upgrade', [])}
     older, newer = ranges.get('WIX_UPGRADE_DETECTED'), ranges.get('WIX_DOWNGRADE_DETECTED')

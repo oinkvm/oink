@@ -37,6 +37,32 @@ function show(language:'en'|'zh-Hans'){
   return surface;
 }
 describe('status notices',()=>{
+  it('shows one completed display failure per device and keeps the receipt readable after recovery',async()=>{
+    const failure:Alert={id:'display-info:device',at_ms:0,level:'warning',kind:{type:'display_enumeration_failed',device:'2'.repeat(64)},problem:null};
+    show('en');
+    expect(screen.queryByText('Display information unavailable')).toBeNull();
+    act(()=>agent.receive({type:'overview',data:overview([failure])}));
+    expect(await screen.findAllByText('Display information unavailable')).toHaveLength(1);
+    act(()=>agent.receive({type:'overview',data:overview([{...failure,at_ms:1}])}));
+    expect(screen.getAllByText('Display information unavailable')).toHaveLength(1);
+    act(()=>agent.receive({type:'overview',data:overview([])}));
+    expect(screen.getAllByText('Display information unavailable')).toHaveLength(1);
+  });
+  it('shows a completed capture failure even while onboarding is unfinished',async()=>{
+    const failure:Alert={id:'capture-unavailable',at_ms:0,level:'error',kind:{type:'capture_unavailable'},problem:{code:'capture_unavailable',unknownCode:null,nativeCode:null,retryAfterMs:null}};
+    const status=overview([failure]);
+    expect(status.onboarding_done).toBe(false);
+    agent.receive({type:'overview',data:status});
+    show('en');
+    expect(await screen.findAllByText('Input capture unavailable')).toHaveLength(2);
+    expect(document.querySelectorAll('.ok-toast')).toHaveLength(1);
+    // Recovery does not dismiss a real failed-attempt receipt before it can be read.
+    const dismiss=vi.spyOn(toast,'dismiss');
+    act(()=>agent.receive({type:'overview',data:overview([])}));
+    expect(dismiss).not.toHaveBeenCalledWith('status:capture-unavailable');
+    expect(screen.getAllByText('Input capture unavailable')).toHaveLength(2);
+    dismiss.mockRestore();
+  });
   it('retains the backlog reason until sharing resumes',async()=>{
     const paused=overview([]);
     paused.pause={...paused.pause,paused:true,reason:'input_backlog'};

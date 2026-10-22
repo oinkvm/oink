@@ -35,6 +35,7 @@ enum Command {
         dto::LocalOption,
         u64,
         RawValue,
+        bool,
         tokio::sync::oneshot::Sender<Result<OwnerOptionApplied, dto::ControlFailure>>,
     ),
     SetClaim(
@@ -80,9 +81,29 @@ impl Handle {
         expected: u64,
         patch: RawValue,
     ) -> Result<OwnerOptionApplied, dto::ControlFailure> {
+        self.set_option_with_persistence(requester, group, option, expected, patch, false)
+            .await
+    }
+    pub async fn set_option_with_persistence(
+        &self,
+        requester: dto::Boot,
+        group: GroupId,
+        option: dto::LocalOption,
+        expected: u64,
+        patch: RawValue,
+        defer_persistence: bool,
+    ) -> Result<OwnerOptionApplied, dto::ControlFailure> {
         let (reply, wait) = tokio::sync::oneshot::channel();
         self.commands
-            .send(Command::SetOption(requester, group, option, expected, patch, reply))
+            .send(Command::SetOption(
+                requester,
+                group,
+                option,
+                expected,
+                patch,
+                defer_persistence,
+                reply,
+            ))
             .map_err(|_| dto::ControlFailure::ApplyFailed)?;
         wait.await.map_err(|_| dto::ControlFailure::ApplyFailed)?
     }
@@ -359,6 +380,7 @@ struct Owner {
     receive_sessions: BTreeMap<DeviceId, oink_audio::session::Receiver>,
     offers: BTreeMap<DeviceId, dto::SourceRouteOffer>,
     exit_volume: oink_audio::volume::Owner,
+    local_output: super::local_output::Observer,
     bound_output: Option<String>,
     volume_published: Option<dto::ExitVolumeState>,
     published_observations: Option<PublishedObservations>,
@@ -543,6 +565,7 @@ impl Owner {
             receive_sessions: BTreeMap::new(),
             offers: BTreeMap::new(),
             exit_volume: oink_audio::volume::Owner::new(local_boot),
+            local_output: Default::default(),
             bound_output: None,
             volume_published: None,
             published_observations: None,
@@ -622,6 +645,10 @@ impl Owner {
             };
             let deadline = self.streams.deadline().map_or(maintenance, |at| at.min(maintenance));
             let deadline = self.exit_switch_deadline.map_or(deadline, |at| at.min(deadline));
+            let deadline = lock(&self.store)
+                .deferred_deadline()
+                .map_or(deadline, |at| at.min(deadline));
+            let deadline = self.local_output.deadline().map_or(deadline, |at| at.min(deadline));
             tokio::select! {
                 _ = stop.changed() => break,
                 _ = wake.notified() => {},
@@ -650,7 +677,7 @@ impl Owner {
                     Some(Command::Refresh) => { self.platform.invalidate_devices(); self.discovery.changed(); },
                     Some(Command::Configure(settings, reply)) => self.configure(settings, reply),
                     Some(Command::VolumeKey(code)) => self.volume_key(code),
-                    Some(Command::SetOption(requester, group, option, expected, patch, reply)) => { let result = self.set_option(&requester, group, option, expected, patch); let _ = reply.send(result); },
+                    Some(Command::SetOption(requester, group, option, expected, patch, defer_persistence, reply)) => { let result = self.set_option_with_persistence(&requester, group, option, expected, patch, defer_persistence); let _ = reply.send(result); },
                     Some(Command::SetClaim(requester, group, claimed, expected, reply)) => { let result = self.set_claim(&requester, group, claimed, expected); let _ = reply.send(result); },
                     Some(Command::ExitVolume(requester, group, request, reply)) => { let result = self.set_exit_volume(&requester, group, request); let _ = reply.send(result); },
                     Some(Command::ExitKey(event, reply)) => { let result = self.exit_volume_key(event); let _ = reply.send(result); },
@@ -673,6 +700,12 @@ impl Owner {
                 self.message(peer, message);
             }
             self.tick();
+            if let Err(error) = lock(&self.store).flush_deferred_if_due(Instant::now()) {
+                tracing::error!(%error, "deferred audio preferences write failed; retaining pending state");
+            }
+        }
+        if let Err(error) = lock(&self.store).flush_deferred() {
+            tracing::error!(%error, "audio preferences shutdown flush failed");
         }
         self.streams.set_forwarding(false, 1.0);
         self.stop_source();
@@ -740,7 +773,12 @@ impl Owner {
         // Tick and PrepareUpdate can reach the same attempt in either order.
         self.update_suspended = true;
         self.streams.pause_changed(true);
-        let result = self.stop_source_checked().map_or(Ok(()), Err);
+        let cleanup = self.stop_source_checked().map_or(Ok(()), Err);
+        let flushed = lock(&self.store)
+            .flush_deferred()
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        let result = cleanup.and(flushed);
         self.retire_sessions();
         self.update_activity = None;
         self.update_cleanup = Some((generation, result.clone()));
@@ -866,6 +904,7 @@ impl Owner {
         }
         let _ = self.refresh_exit_binding(false);
         let _ = self.exit_volume.refresh(false);
+        self.local_output.tick(Instant::now());
         self.refresh_volume_context();
         let _ = self.publish_observations();
         if self.power_state.sleeping {
@@ -916,6 +955,7 @@ impl Owner {
         }
         let had_service = self.service_generation.is_some();
         self.service_generation = generation;
+        self.local_output.retire(Instant::now());
         // HAL can invalidate an output before publishing its restart notification.
         // Preserve the accepted one-second correlation; hotplug alone cannot retry.
         let eligible = self
@@ -1000,6 +1040,17 @@ impl Owner {
             .iter()
             .find(|output| output.is_default)
             .map(|output| output.id.clone());
+        if self.local_output.output() != new_default.as_deref() || !self.local_output.readable_endpoint() {
+            let wake = self.streams.wake();
+            let endpoint = new_default.as_ref().map_or_else(
+                || Err(oink_audio::volume::Fault::unavailable()),
+                |output| {
+                    self.platform
+                        .volume_endpoint(output, Arc::new(move || wake.notify_one()))
+                },
+            );
+            self.local_output.bind(new_default.clone(), endpoint, Instant::now());
+        }
         let selected_present = self
             .bound_output
             .as_ref()

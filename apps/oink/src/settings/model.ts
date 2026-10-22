@@ -7,7 +7,7 @@ import { DEFAULT_PREFS, presetMap, type Prefs, type PrefsApi, type KeyMap } from
 
 export type LocalPreferences = import('../api/cards').UiPreferences;
 /** Device-local UI preferences kept by this webview only (not backend or group data). */
-export interface PresentationPreferences { motion: 'auto' | 'reduced' | 'full'; show_update_hint: boolean; hide_sponsor: boolean; compact_layout: boolean }
+export interface PresentationPreferences { motion: 'auto' | 'reduced' | 'full'; hide_sponsor: boolean; compact_layout: boolean }
 export interface ReportStatus { configured:boolean;delivery_disabled:boolean;consent: {choice:'unasked'|'denied'|'granted';policy_version:number;generation:number} }
 const actions = {return_pointer_home:'recall',lock_focus:'lock',toggle_sharing:'pauseSelf',pause_all:'pauseAll',toggle_game_mode:'game'} as const;
 const hid = (usage:number) => (7 << 16) | usage;
@@ -22,8 +22,8 @@ function storePresentation(current: PresentationPreferences, patch: Partial<Pres
   return readPresentation();
 }
 function readPresentation(): PresentationPreferences {
-  try { const stored = JSON.parse(localStorage.getItem('oink:prefs') ?? '{}'); return { motion: ['auto','reduced','full'].includes(stored.motion) ? stored.motion : 'auto', show_update_hint: stored.show_update_hint !== false, hide_sponsor: stored.hide_sponsor === true, compact_layout: stored.compact_layout !== false }; }
-  catch { return {motion:'auto',show_update_hint:true,hide_sponsor:false,compact_layout:true}; }
+  try { const stored = JSON.parse(localStorage.getItem('oink:prefs') ?? '{}'); return { motion: ['auto','reduced','full'].includes(stored.motion) ? stored.motion : 'auto', hide_sponsor: stored.hide_sponsor === true, compact_layout: stored.compact_layout !== false }; }
+  catch { return {motion:'auto',hide_sponsor:false,compact_layout:true}; }
 }
 export function editTransform(current: InputTransform, platform: 'mac'|'win', prefs: Prefs, reverseWheel?: boolean): InputTransform {
   const target = platform === 'mac' ? 'windows' : 'macos';
@@ -67,7 +67,6 @@ export function usePreferences(): PrefsApi {
     setPrefs(p=>{
       const next:Prefs={...p,
         ...(local?{notificationLevel:local.notification_level,showInMenuBar:local.show_status_icon,confirmQuit:local.confirm_quit,language:local.ui_language,logLevel:local.log_level,logMaxMb:String(local.log_max_mb)}:{}),
-        upgradeHint:presentation.show_update_hint,
         ...(state.input?{pollLimit:state.input.event_frequency==='hz125'?'125':'none',keepAwake:state.input.wake_displays_on_input,pointerTrail:state.input.cursor_trail,touchpadInject:state.input.accept_contacts,macScrollFeel:state.input.mac_scroll_feel,forwardInjectedInput:state.input.forward_injected_input??false,pointerGain:state.input.device_gain,escStop:state.input.emergency_hold_ms!==0,
           shortcuts:{...p.shortcuts,...Object.fromEntries(state.input.hotkeys.filter(h=>h.action in actions).map(h=>[actions[h.action as keyof typeof actions],{on:h.enabled,keys:h.keys.map(k=>k==='Ctrl'?'Control':k).join('+')}]))}} as const:{}),
         ...(state.clipboard?{clipReceive:state.clipboard.receive ?? true,clipSend:state.clipboard.send ?? true,clipText:state.clipboard.text,clipRich:state.clipboard.rich_text,clipImage:state.clipboard.images,clipFiles:state.clipboard.files,clipPrivate:state.clipboard.custom}:{}),
@@ -132,9 +131,6 @@ export function usePreferences(): PrefsApi {
         if(!report)throw new Error('unavailable');
         await call<null>('set_report_consent',{expected_generation:report.consent.generation,choice:next.crashReports?'granted':'denied',policy_version:report.consent.policy_version});
         await agent.query('report',()=>call<ReportStatus>('report_status'));
-      }
-      if(changed('upgradeHint')){
-        setPresentation(storePresentation(presentation,{show_update_hint:next.upgradeHint}));
       }
       committed.current=next;setPrefs(queued.current??next);
     }catch{setPrefs(previous);queued.current=null;agent.fail('unavailable');}

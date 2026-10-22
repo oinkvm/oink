@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { bounds, type Screen } from './geometry';
+import { bounds, type Screen, type SnapEdges } from './geometry';
 import {
     freeGroup,
     growGroupAvoiding,
@@ -80,4 +80,32 @@ it('keyboard scaling allows another computer to remain in a native desktop gap',
     const target = growGroupAvoiding(group, bounds(group), 315, [{ x: 120, y: 0, w: 60, h: 100 }], 0);
     expect(target).not.toBeNull();
     expect(target!.w).toBe(315);
+});
+
+describe('group snap candidate roundoff', () => {
+    it('keeps the same matched edge when overlapping equal-height screens are reprojected', () => {
+        const origin = { x: 0, y: 0, w: 800, h: 500 };
+        const neighbour = { x: 1000, y: 0, w: 800, h: 500 };
+        for (const y of [0, 1e-14, -1e-14, 1e-13, -1e-13]) {
+            const edges: SnapEdges = {};
+            const result = snapGroup([origin], origin, { ...origin, x: 600, y }, [neighbour], 10, edges);
+            expect(result.y).toBeCloseTo(0, 12);
+            expect(edges).toEqual({ y: '0:top:0:0' });
+        }
+    });
+
+    it('keeps the first group resize candidate when two sizes differ only by roundoff', () => {
+        const members = [
+            { x: 0, y: 0, w: 400, h: 500 },
+            { x: 400, y: 0, w: 400, h: 500 },
+        ];
+        const origin = bounds(members);
+        const neighbour = { x: 1000, y: 625.0000000000001, w: 500, h: 500 };
+        for (const w of [1000, 1000.0000000000002, 999.9999999999998]) {
+            const edges: SnapEdges = {};
+            const result = snapGroupResize(members, origin, { ...origin, w, h: w * .625 }, 'se', [neighbour], 10, 640, edges);
+            expect(result.w).toBeCloseTo(1000, 12);
+            expect(edges).toEqual({ x: '1:right:0:0' });
+        }
+    });
 });

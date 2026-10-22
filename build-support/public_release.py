@@ -9,9 +9,6 @@ import shutil
 import subprocess
 from identity import IDENTITY
 from provenance import digest, source_tree_sha256
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent / 'update'))
-import feed
 
 
 def inputs(build, environment):
@@ -97,13 +94,6 @@ def assemble(downloads, output, build, commit):
             shutil.copy2(source, output / source.name)
             artifacts.append(a)
         records[platform] = record
-    annotations = feed.read(Path('.github/update-notes.json'))
-    if set(annotations) != {'channel', 'severity', 'notes'} or annotations['channel'] not in ('stable', 'beta') or annotations['severity'] not in ('normal', 'critical'):
-        raise ValueError('invalid update annotations')
-    feed.validate_notes(annotations['notes'])
-    update = output / 'update.json'
-    update.write_text(json.dumps(annotations, ensure_ascii=False, indent=2) + '\n')
-    artifacts.append(dict(name=update.name, size=update.stat().st_size, sha256=digest(update)))
     release = dict(schema=1, product=IDENTITY['name'], version=IDENTITY['version'], build=build,
                    built_commit=commit, source_tree_sha256=source_tree_sha256(), platforms=records, artifacts=artifacts)
     record_path = output / 'release.json'

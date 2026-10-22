@@ -169,6 +169,9 @@ message_registry! {
     0x0d2f => LayoutArrangementRequest(LayoutArrangementRequest), [Route {kind:2, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.group/1", "oink.layout.arrangement/1"], Allow;
     0x0d30 => LayoutArrangementResult(LayoutArrangementResult), [Route {kind:2, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.group/1", "oink.layout.arrangement/1"], Allow;
     0x1103 => ArrangementPreview(ArrangementPreview), [Route {kind:12, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.layout.projection/1", "oink.layout.preview/1"], Allow;
+    0x1220 => LayoutProfilesStateV3(LayoutProfilesStateV3), [Route {kind:15, transport:Transport::Low, extra_capabilities:&[]}], ["oink.group/1", "oink.layout.profiles/3", "oink.low/1"], Allow;
+    0x1221 => LayoutProfilesReceiptV3(LayoutProfilesReceipt), [Route {kind:15, transport:Transport::Low, extra_capabilities:&[]}], ["oink.group/1", "oink.layout.profiles/3", "oink.low/1"], Allow;
+    0x1222 => LayoutProfilesJoin(LayoutProfilesJoin), [Route {kind:15, transport:Transport::Low, extra_capabilities:&[]}], ["oink.group/1", "oink.layout.profiles/3", "oink.low/1"], Allow;
     0x1210 => LayoutProfilesStateV2(LayoutProfilesStateV2), [Route {kind:14, transport:Transport::Low, extra_capabilities:&[]}], ["oink.group/1", "oink.layout.profiles/2", "oink.low/1"], Allow;
     0x1211 => LayoutProfilesReceiptV2(LayoutProfilesReceipt), [Route {kind:14, transport:Transport::Low, extra_capabilities:&[]}], ["oink.group/1", "oink.layout.profiles/2", "oink.low/1"], Allow;
 }

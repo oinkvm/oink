@@ -78,6 +78,16 @@ it.each(['en','ja','ko','zh-Hans'])('places the default-on Mac scroll switch bel
   agent.adopt('input',null);
 });
 describe('applicable independent permission rows', () => {
+  it.each(['en', 'zh-Hans'] as const)('shows effective listening access through Accessibility without another grant in %s', language => {
+    setLanguage(language);
+    const grant=vi.fn();
+    const {container}=render(view({...initial,accessibility:'granted',input:'granted'},'',grant));
+    const row=container.querySelector<HTMLElement>('[data-item="perm-input"]')!;
+    expect(row.textContent).toContain(language === 'en' ? 'Accessibility already allows Input Monitoring. No additional permission is needed.' : '辅助功能已包含输入监控，无需重复授权');
+    expect(within(row).getByText(language === 'en' ? 'Granted' : '已授权')).toBeTruthy();
+    expect(row.querySelector('button')).toBeNull();
+    expect(grant).not.toHaveBeenCalled();
+  });
   it.each(['en', 'zh-Hans'] as const)('shows the file recovery fault with a restart instruction in %s', language => {
     setLanguage(language);
     const { container } = render(view({ ...initial, files: 'restart_required' }));
@@ -180,11 +190,10 @@ describe('applicable independent permission rows', () => {
 
 
 describe('settings actions', () => {
-  it.each(['en','zh-Hans'] as const)('opens Releases and hides the update notice setting in %s', async language => {
+  it.each(['en','zh-Hans'] as const)('opens Releases in %s', async language => {
     setLanguage(language);
     const open = vi.spyOn(shell, 'openUrl').mockResolvedValue();
     const { container } = render(view());
-    expect(container.querySelector('[data-item="upgradeHint"]')).toBeNull();
     fireEvent.click(container.querySelector('[data-item="version"] button')!);
     await waitFor(() => expect(open).toHaveBeenCalledWith('https://github.com/oinkvm/oink/releases'));
     const input = container.querySelector('[data-item="logMaxMb"] input')!;

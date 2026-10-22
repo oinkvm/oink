@@ -56,6 +56,24 @@ function drag(snapping = true, mode: 'move' | 'resize' = 'move') {
 }
 
 describe('alignment haptic command', () => {
+    it('fires once while equal-height screens overlap under a stationary pointer during camera growth', () => {
+        const { container } = render(<Canvas screens={[initial[0], { ...initial[1], h: initial[0].h }]} />);
+        const display = container.querySelector('.scr')!;
+        fireEvent.pointerDown(display, { button: 0, clientX: 300, clientY: 304 });
+        // First leave the initial top/bottom alignment, then overlap the neighbour
+        // near the canvas edge so camera growth continues with the pointer held.
+        fireEvent.pointerMove(display, { clientX: 300, clientY: 350 });
+        fireEvent.pointerMove(display, { clientX: 820, clientY: 304 });
+        expect(display.hasAttribute('data-overlap')).toBe(true);
+        expect(native.invoke).toHaveBeenCalledTimes(1);
+        const zoom = cameraStore.get()!.zoom;
+        for (let i = 0; i < 120; i++) tick();
+        expect(cameraStore.get()!.zoom).toBeLessThan(zoom);
+        expect(display.hasAttribute('data-overlap')).toBe(true);
+        expect(native.invoke).toHaveBeenCalledTimes(1);
+        fireEvent.pointerUp(display);
+    });
+
     it('keeps a held alignment through camera growth and uses the live zoom for the next engagement', () => {
         const { container } = render(<Canvas />);
         const [display, neighbour] = container.querySelectorAll<HTMLElement>('.scr');
@@ -71,14 +89,14 @@ describe('alignment haptic command', () => {
         const zoom = cameraStore.get()!.zoom;
         expect(zoom).toBeLessThan(original);
         expect(native.invoke).toHaveBeenCalledTimes(1);
-        const [nx, ny] = neighbour.style.transform.match(/-?[\d.]+/g)!.map(Number);
+        const nx = parseFloat(neighbour.style.left), ny = parseFloat(neighbour.style.top);
         now = 200;
         fireEvent.pointerMove(display, { clientX: nx - 400 * zoom + 15, clientY: ny + (312.5 + 80) * zoom });
         expect(native.invoke).toHaveBeenCalledTimes(1);
         // Eight canvas pixels is within the snap threshold at the current zoom.
         fireEvent.pointerMove(display, { clientX: nx - 400 * zoom + 8, clientY: ny + (312.5 + 80) * zoom });
         expect(native.invoke).toHaveBeenCalledTimes(2);
-        const x = Number(display.style.transform.match(/-?[\d.]+/g)![0]);
+        const x = parseFloat(display.style.left);
         expect(x + parseFloat(display.style.width)).toBeCloseTo(nx, 8);
         tick();
         fireEvent.pointerUp(display);
@@ -193,7 +211,7 @@ describe('computer-group alignment feedback', () => {
         fireEvent.pointerMove(screen, { clientX: 300 + 194 * zoom, clientY: 300 });
         expect(native.invoke).toHaveBeenCalledTimes(1);
         const [first, extra, other] = container.querySelectorAll<HTMLElement>('.scr:not(.scr--group)');
-        const x = (el: HTMLElement) => Number(el.style.transform.match(/-?[\d.]+/g)![0]);
+        const x = (el: HTMLElement) => parseFloat(el.style.left);
         expect(x(extra) - x(first)).toBeCloseTo(800 * zoom);
         expect(x(extra) + parseFloat(extra.style.width)).toBeCloseTo(x(other));
         fireEvent.pointerUp(screen);
@@ -224,7 +242,7 @@ describe('Shift during pointer gestures', () => {
         });
         const gap = () => {
             const screens = [...container.querySelectorAll<HTMLElement>('.scr:not(.scr--group)')];
-            const x = (el: HTMLElement) => Number(el.style.transform.match(/-?[\d.]+/g)![0]);
+            const x = (el: HTMLElement) => parseFloat(el.style.left);
             const neighbour = screens.pop()!;
             return x(neighbour) - Math.max(...screens.map(s => x(s) + parseFloat(s.style.width)));
         };

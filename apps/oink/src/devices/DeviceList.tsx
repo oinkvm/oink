@@ -1,7 +1,7 @@
 import { tr } from '../i18n';
 import type { MouseEvent } from 'react';
 import { Tooltip } from 'oink-ui';
-import { Badge, CursorMark, GameMark, Glyph, OsLogo, PauseMark, Signal, SignalMark, Slash } from './icons';
+import { Badge, CursorMark, GameMark, Glyph, OsLogo, PauseMark, Signal, SignalMark } from './icons';
 import type { BadgeName, GlyphName } from './icons';
 import type { Device, DeviceGroup } from './types';
 import { faultReason, formatLastSeen, offlineReasonText, gameActive } from './data';
@@ -19,6 +19,7 @@ interface Indicator {
     tip?: string;
     waves?: number;
     muted?: boolean;
+    disabled?: boolean;
 }
 export const volumeWaves = (v: number) => (v <= 0 ? 0 : v <= 33 ? 1 : v <= 66 ? 2 : v <= 100 ? 3 : 4);
 export function indicators(d: Device, noExit = false): Indicator[] {
@@ -37,17 +38,21 @@ export function indicators(d: Device, noExit = false): Indicator[] {
         label: tr('音频输出：{0}，音量 {1}', what, sp.volumeKnown === false ? tr('未知') : sp.volume),
         tip: tr('音频输出：{0}', what),
     });
-    const speaker: Indicator = sp.mode === 'unknown' ? { glyph: 'speaker', tone: 'warn', badge: 'warning', label: tr('音频输出：不可用') } : sp.mode === 'unused' ? { glyph: 'speaker', tone: 'muted', get label() {
-            return tr('音频输出：本地');
-        } }
-        : sp.mode === 'exit' ? { glyph: 'speaker', tone: 'accent', badge: 'receive', ...vol(sp.muted ? tr('出口静音') : tr('作为出口')) }
+    // Local: waves follow the device's own system volume (at most three); without an
+    // exit in the group there is nowhere to forward to, so the icon is disabled.
+    const out = sp.localOutput;
+    const local = (): Indicator => ({ glyph: 'speaker', tone: 'muted', disabled: noExit,
+        waves: out ? Math.min(3, volumeWaves(out.volume)) : 0, muted: out?.muted, badge: out?.muted ? 'mute' : undefined,
+        label: !out ? tr('音频输出：本地') : out.muted ? tr('音频输出：本地，已静音') : tr('音频输出：本地，音量 {0}', out.volume) });
+    const speaker: Indicator = sp.mode === 'unknown' ? { glyph: 'speaker', tone: 'warn', badge: 'warning', label: tr('音频输出：不可用') } : sp.mode === 'unused' ? local()
+        : sp.mode === 'exit' ? { glyph: 'speaker', tone: 'accent', badge: sp.muted ? 'mute' : 'receive', ...vol(sp.muted ? tr('出口静音') : tr('作为出口')) }
             : sp.mode === 'fault' ? fault('speaker', tr('音频输出'), 'speaker')
                 : (sp.waitingForExit ?? noExit) ? { glyph: 'speaker', tone: 'good', badge: 'warning', ...vol(sp.selectedExitUnavailable ? tr('所选出口不可用') : tr('无出口')) }
-                    : { glyph: 'speaker', tone: 'good', badge: 'wifi', ...vol(sp.muted ? tr('转发静音') : tr('正在转发')) };
+                    : { glyph: 'speaker', tone: 'good', badge: sp.muted ? 'mute' : 'wifi', ...vol(sp.muted ? tr('转发静音') : tr('正在转发')) };
     return [share('mouse', tr('鼠标'), d.mouse), keyboard, speaker];
 }
-function actionFor(d: Device, kind: ShareKind): string | null {
-    if (kind === 'speaker') return tr('点击选中这台设备，展开音量条');
+function actionFor(d: Device, kind: ShareKind, exitName: string | null): string | null {
+    if (kind === 'speaker') return d.speaker.mode !== 'unused' ? tr('点击选中这台设备，展开音量条') : exitName === null ? null : tr('点击转发音频到 {0}', exitName);
     if (d.actionability?.[kind] === 'open_permissions') return tr('点击前往设置 › 权限');
     if (d.actionability?.[kind] === 'unavailable') return null;
     if (d.unknown || d[kind] === 'unknown')
@@ -64,7 +69,6 @@ function actionFor(d: Device, kind: ShareKind): string | null {
             return tr('点击切换为{0}', d[kind] === 'shared' ? tr('本地') : tr('共享'));
     }
 }
-export const hasExit = (devices: Device[]) => devices.some((d) => d.group !== 'offline' && d.speaker.mode === 'exit');
 function StatusIcon({ ind, action, double, onActivate, tabbable }: {
     ind: Indicator;
     action: string | null;
@@ -73,13 +77,12 @@ function StatusIcon({ ind, action, double, onActivate, tabbable }: {
     tabbable: boolean;
 }) {
     const body = (<>
-      <Glyph name={ind.glyph} waves={ind.waves}/>
+      <Glyph name={ind.glyph} waves={ind.waves} muted={ind.muted}/>
       {ind.badge && <Badge name={ind.badge}/>}
-      {ind.muted && <Slash />}
     </>);
     if (!action || !onActivate) {
         return (<Tooltip interactive={false} content={ind.tip ?? ind.label}>
-        <span className="dev-ico" data-tone={ind.tone} role="img" aria-label={ind.label}>{body}</span>
+        <span className="dev-ico" data-tone={ind.tone} data-disabled={ind.disabled || undefined} role="img" aria-label={ind.label} aria-disabled={ind.disabled || undefined}>{body}</span>
       </Tooltip>);
     }
     const onClick = (e: MouseEvent<HTMLButtonElement>) => {
@@ -111,14 +114,14 @@ function Connection({ d }: {
         </span>)}
     </span>);
 }
-function MetaLine({ d, now, onToggle, onSelect, interactive, tabbable, noExit }: {
+function MetaLine({ d, now, onToggle, onSelect, interactive, tabbable, exitName }: {
     d: Device;
     now: number;
     onToggle?: (kind: ShareKind, mode: 'single' | 'double') => void;
     onSelect: () => void;
     interactive: boolean;
     tabbable: boolean;
-    noExit: boolean;
+    exitName: string | null;
 }) {
     if (d.group === 'offline') {
         return <span className="dev__meta"><span className="dev__seen">{tr('上次在线 {0}', formatLastSeen(d.lastSeen, now))}</span></span>;
@@ -128,9 +131,12 @@ function MetaLine({ d, now, onToggle, onSelect, interactive, tabbable, noExit }:
     }
     return (<span className="dev__meta">
       <span className="dev__status">
-        {indicators(d, noExit).map((ind) => {
+        {indicators(d, exitName === null).map((ind) => {
             const kind = ind.glyph as ShareKind;
-            return (<StatusIcon key={ind.glyph} ind={ind} tabbable={tabbable} action={interactive ? actionFor(d, kind) : null} double={false} onActivate={kind === 'speaker' ? onSelect : onToggle ? mode => onToggle(kind, mode) : undefined}/>);
+            // Audio: local mode forwards to the exit (the menu's "forward audio to …");
+            // forwarding and exit select the device and open its volume slider.
+            const activate = kind === 'speaker' && d.speaker.mode !== 'unused' ? onSelect : onToggle ? (mode: 'single' | 'double') => onToggle(kind, mode) : undefined;
+            return (<StatusIcon key={ind.glyph} ind={ind} tabbable={tabbable} action={interactive ? actionFor(d, kind, exitName) : null} double={false} onActivate={activate}/>);
         })}
       </span>
     </span>);
@@ -149,6 +155,15 @@ const GROUPS: Array<{
             return tr('离线');
         } },
 ];
+function AccessibilityIndicator({ local, onGrant, tabbable }: { local: boolean; onGrant?: () => void; tabbable: boolean }) {
+    const tip = local ? tr('缺少辅助功能权限，前往授权') : tr('缺少辅助功能权限，请在该设备上授权');
+    const glyph = <svg viewBox="0 0 16 16" aria-hidden><circle cx="8" cy="8" r="5.5"/><path d="m4.1 4.1 7.8 7.8"/></svg>;
+    return <Tooltip interactive={false} content={tip}>{local
+        ? <button type="button" className="dev__accessibility ok-focusable" aria-label={tip} tabIndex={tabbable ? undefined : -1} onClick={onGrant}>{glyph}</button>
+        : <span className="dev__accessibility" role="img" aria-label={tip}>{glyph}</span>}
+    </Tooltip>;
+}
+
 export interface DeviceListProps {
     devices: Device[];
     selectedId: string | null;
@@ -156,14 +171,15 @@ export interface DeviceListProps {
     onToggle?: (id: string, kind: ShareKind, mode: 'single' | 'double') => void;
     onSpeaker?: (id: string, a: SpeakerAction) => void;
     onPause?: (id: string, paused: boolean) => void;
+    onGrantAccessibility?: () => void;
     growIds?: ReadonlySet<string>;
     /** Hidden screens per device id (a device whose sharing is off counts all of its screens). */
     hiddenScreens?: ReadonlyMap<string, number>;
     collapsed: boolean;
     now?: number;
 }
-export function DeviceList({ devices, selectedId, onSelect, onToggle, onSpeaker, onPause, growIds, hiddenScreens, collapsed, now = Date.now() }: DeviceListProps) {
-    const noExit = !hasExit(devices);
+export function DeviceList({ devices, selectedId, onSelect, onToggle, onSpeaker, onPause, onGrantAccessibility, growIds, hiddenScreens, collapsed, now = Date.now() }: DeviceListProps) {
+    const exit = devices.find(d => d.group !== 'offline' && d.speaker.mode === 'exit');
     return (<div className="devs" data-collapsed={collapsed ? '' : undefined} role="group" aria-label={tr('设备')}>
       {GROUPS.map((g) => {
             const list = devices.filter((d) => d.group === g.id);
@@ -176,20 +192,21 @@ export function DeviceList({ devices, selectedId, onSelect, onToggle, onSpeaker,
             </h3>
             <ul className="devs__list">
               {list.map((d) => (<li key={d.id}>
-                  <DeviceItem d={d} now={now} selected={!collapsed && d.id === selectedId} collapsed={collapsed} noExit={noExit} onSelect={() => onSelect(d.id)} onToggle={onToggle ? (kind, mode) => onToggle(d.id, kind, mode) : undefined} onSpeaker={onSpeaker ? (a) => onSpeaker(d.id, a) : undefined} onPause={onPause ? (p) => onPause(d.id, p) : undefined} volumeOpen={!collapsed && d.id === selectedId} grow={collapsed && !!growIds?.has(d.id)} hiddenScreens={hiddenScreens?.get(d.id) ?? 0}/>
+                  <DeviceItem onGrantAccessibility={onGrantAccessibility} d={d} now={now} selected={!collapsed && d.id === selectedId} collapsed={collapsed} exitName={exit?.name ?? null} onSelect={() => onSelect(d.id)} onToggle={onToggle ? (kind, mode) => onToggle(d.id, kind, mode) : undefined} onSpeaker={onSpeaker ? (a) => onSpeaker(d.id, a) : undefined} onPause={onPause ? (p) => onPause(d.id, p) : undefined} volumeOpen={!collapsed && d.id === selectedId} grow={collapsed && !!growIds?.has(d.id)} hiddenScreens={hiddenScreens?.get(d.id) ?? 0}/>
                 </li>))}
             </ul>
           </section>);
         })}
     </div>);
 }
-export function DeviceItem({ d, now, selected, collapsed, noExit = false, onSelect, onToggle, onSpeaker, volumeOpen = false, grow = false, inPeek, hiddenScreens = 0 }: {
+export function DeviceItem({ d, now, selected, collapsed, exitName = null, onSelect, onToggle, onSpeaker, volumeOpen = false, grow = false, inPeek, hiddenScreens = 0, onGrantAccessibility }: {
     d: Device;
     now: number;
     selected: boolean;
     collapsed: boolean;
     onSelect: () => void;
-    noExit?: boolean;
+    /** The group's audio exit; a local-mode audio icon forwards to it. */
+    exitName?: string | null;
     onToggle?: (kind: ShareKind, mode: 'single' | 'double') => void;
     onSpeaker?: (a: SpeakerAction) => void;
     onPause?: (paused: boolean) => void;
@@ -198,12 +215,13 @@ export function DeviceItem({ d, now, selected, collapsed, noExit = false, onSele
     peek?: PeekHandlers;
     inPeek?: boolean;
     hiddenScreens?: number;
+    onGrantAccessibility?: () => void;
 }) {
     selected = selected && !collapsed;
     const summary = d.group === 'offline' ? tr('{0}，离线，上次在线 {1}', d.name, formatLastSeen(d.lastSeen, now)) : d.group === 'online' ? tr('{0}，在线，延迟 {1} ms', d.name, d.latency === null ? tr("未知") : d.latency) : tr('{0}，本机', d.name);
     const pausedNote = d.group !== 'offline' && d.paused ? tr('，已暂停') : '';
     const screenOff = d.group !== 'offline' && d.screen === 'disabled';
-    const game = d.group !== 'offline' && gameActive(d);
+    const game = d.group !== 'offline' && gameActive(d) && (d.cursor === 'local' || d.cursor === 'locked');
     const cursorNote = d.group !== 'offline' && (d.cursor === 'local' || d.cursor === 'locked') ? (d.cursor === 'locked' ? tr('，指针锁定在这里') : tr('，指针在这里')) : '';
     return (<div aria-busy={d.pending || undefined} className="dev" data-ctx={`device:${d.id}`} data-group={d.group} data-current={selected ? '' : undefined} data-grow={grow && hasVolume(d) ? '' : undefined}>
       <Tooltip interactive={false} placement="right" disabled={!collapsed} content={d.group === 'online' ? `${d.name} · ${d.latency === null ? tr("延迟未知") : `${Math.round(d.latency)} ms`}` : d.name}>
@@ -220,8 +238,8 @@ export function DeviceItem({ d, now, selected, collapsed, noExit = false, onSele
                 : d.group !== 'offline' && (d.cursor === 'local' || d.cursor === 'locked') && <CursorMark locked={d.cursor === 'locked'} tooltip={!collapsed}/>}
       </span>
       <span className="dev__text">
-        <span className="dev__title"><span className="dev__name">{d.name}</span>{hiddenScreens > 0 && <Tooltip interactive={false} content={tr('{0} 块屏幕已隐藏', hiddenScreens)}><span className="dev__hidden" role="img" aria-label={tr('{0} 块屏幕已隐藏', hiddenScreens)}><svg viewBox="0 0 16 16" aria-hidden><path d="M2 8s2.3-4.2 6-4.2S14 8 14 8s-2.3 4.2-6 4.2S2 8 2 8Z"/><circle cx="8" cy="8" r="1.8"/><path d="M3 3l10 10"/></svg></span></Tooltip>}</span>
-        <MetaLine onSelect={onSelect} d={d} now={now} onToggle={onToggle} interactive={!collapsed} tabbable={!inPeek} noExit={noExit}/>
+        <span className="dev__title"><span className="dev__name">{d.name}</span>{d.accessibilityMissing ? <AccessibilityIndicator local={d.group === 'self'} onGrant={onGrantAccessibility} tabbable={!collapsed && !inPeek}/> : hiddenScreens > 0 && <Tooltip interactive={false} content={tr('{0} 块屏幕已隐藏', hiddenScreens)}><span className="dev__hidden" role="img" aria-label={tr('{0} 块屏幕已隐藏', hiddenScreens)}><svg viewBox="0 0 16 16" aria-hidden><path d="M2 8s2.3-4.2 6-4.2S14 8 14 8s-2.3 4.2-6 4.2S2 8 2 8Z"/><circle cx="8" cy="8" r="1.8"/><path d="M3 3l10 10"/></svg></span></Tooltip>}</span>
+        <MetaLine onSelect={onSelect} d={d} now={now} onToggle={onToggle} interactive={!collapsed} tabbable={!inPeek} exitName={exitName}/>
       </span>
       <Connection d={d}/>
       

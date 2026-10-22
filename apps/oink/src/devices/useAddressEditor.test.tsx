@@ -28,6 +28,8 @@ describe('offline address editing',()=>{
     render(<OinkProvider defaultMotion="reduced"><AddressDialog {...result.current} container={null} onCancel={result.current.cancel} onConfirm={(d,ip,port)=>{void result.current.save(d,ip,port);}}/></OinkProvider>);
     expect(await screen.findByText(/Device is offline/)).toBeTruthy();
     expect(screen.getByText(/Saved addresses/).textContent).toContain('192.0.2.5:47470');
+    // No placeholder text in the IP box.
+    expect(screen.getByLabelText('IP address').hasAttribute('placeholder')).toBe(false);
     fireEvent.change(screen.getByLabelText('IP address'),{target:{value:'192.0.2.9'}});
     await act(async()=>{fireEvent.click(screen.getByRole('button',{name:'Confirm'}));});
     expect(setMemberAddress).toHaveBeenCalledWith('remote','192.0.2.9:47470');

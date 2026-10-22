@@ -279,6 +279,7 @@ impl Facts {
         faults: dto::ResourceFaults,
         options: dto::LocalOptionsSummary,
         game: Option<dto::GameObservation>,
+        accessibility_granted: Option<bool>,
     ) -> v1::Result<bool> {
         self.edit(|raw| {
             let mut resources = raw
@@ -287,6 +288,11 @@ impl Facts {
                 .transpose()?
                 .cloned()
                 .unwrap_or_default();
+            if let Some(granted) = accessibility_granted {
+                raw.insert(23, granted.write());
+            } else {
+                raw.remove(&23);
+            }
             resources.insert(2, mouse.write());
             resources.insert(3, keyboard.write());
             if let Some(game) = game {
@@ -341,9 +347,125 @@ pub(super) fn for_mouse_capability(facts: dto::DeviceFacts, supported: bool) -> 
     dto::DeviceFacts::from_raw(raw)
 }
 
+/// The optional observation travels in the existing ConfigFacts message. Strip
+/// it on every send (initial handshake and later publications) to an old peer.
+pub(super) fn for_local_output_capability(facts: dto::DeviceFacts, supported: bool) -> v1::Result<dto::DeviceFacts> {
+    if supported {
+        return Ok(facts);
+    }
+    let mut raw = facts.into_raw();
+    if let Some(RawValue::Map(resources)) = raw.get_mut(&16)
+        && let Some(RawValue::Map(speaker)) = resources.get_mut(&5)
+    {
+        speaker.remove(&9);
+    }
+    dto::DeviceFacts::from_raw(raw)
+}
+
+/// AX is an owner observation in ConfigFacts, never inferred from resource faults.
+pub(super) fn for_accessibility_capability(facts: dto::DeviceFacts, supported: bool) -> v1::Result<dto::DeviceFacts> {
+    if supported {
+        return Ok(facts);
+    }
+    let mut raw = facts.into_raw();
+    raw.remove(&23);
+    dto::DeviceFacts::from_raw(raw)
+}
+
 #[cfg(test)]
 mod mouse_mode_tests {
     use super::*;
+    #[test]
+    fn accessibility_facts_are_explicit_optional_and_capability_gated() {
+        let mut facts = Facts::new(
+            Boot {
+                device_id: oink_foundation::DeviceId([1; 32]),
+                nonce: [2; 16],
+            },
+            GroupId([3; 16]),
+            "owner",
+            "macos",
+            &OfferProfile::default(),
+        )
+        .unwrap();
+        assert_eq!(facts.value().accessibility_granted().unwrap(), None);
+        for granted in [false, true] {
+            facts
+                .edit(|raw| {
+                    raw.insert(23, granted.write());
+                    Ok(())
+                })
+                .unwrap();
+            let original = facts.value().clone();
+            assert_eq!(for_accessibility_capability(original.clone(), true).unwrap(), original);
+            let old = for_accessibility_capability(original.clone(), false).unwrap();
+            assert_eq!(old.accessibility_granted().unwrap(), None);
+            let mut expected = original.into_raw();
+            expected.remove(&23);
+            assert_eq!(old.raw(), &expected);
+            let message = v1::Message::ConfigFacts(old);
+            let encoded = v1::frame::encode(&message, v1::limits::CONFIG_FRAME).unwrap();
+            assert_eq!(
+                v1::frame::OpaqueFrame::parse_exact(&encoded, v1::limits::CONFIG_FRAME)
+                    .unwrap()
+                    .decode()
+                    .unwrap(),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn local_output_facts_are_capability_gated_for_old_peers() {
+        let mut facts = Facts::new(
+            Boot {
+                device_id: oink_foundation::DeviceId([1; 32]),
+                nonce: [2; 16],
+            },
+            GroupId([3; 16]),
+            "owner",
+            "test",
+            &OfferProfile::default(),
+        )
+        .unwrap();
+        facts
+            .edit(|raw| {
+                raw.insert(
+                    16,
+                    RawValue::Map(
+                        [(
+                            5,
+                            RawValue::Map(
+                                [
+                                    (2, dto::SpeakerActivity::Unused.write()),
+                                    (9, RawValue::Map([(1, 61u8.write()), (2, false.write())].into())),
+                                ]
+                                .into(),
+                            ),
+                        )]
+                        .into(),
+                    ),
+                );
+                Ok(())
+            })
+            .unwrap();
+        let original = facts.value().clone();
+        assert_eq!(for_local_output_capability(original.clone(), true).unwrap(), original);
+        let old = for_local_output_capability(original.clone(), false).unwrap();
+        let speaker = old.resources().unwrap().unwrap().speaker().unwrap().unwrap();
+        assert_eq!(speaker.local_output().unwrap(), None);
+        assert_eq!(speaker.activity().unwrap(), Some(dto::SpeakerActivity::Unused));
+        assert_eq!(old.fact_sequence().unwrap(), original.fact_sequence().unwrap());
+        // The old-peer frame is still the normal v1 ConfigFacts, with no new field.
+        let frame = v1::frame::encode(&v1::Message::ConfigFacts(old.clone()), v1::limits::CONFIG_FRAME).unwrap();
+        assert_eq!(
+            v1::frame::OpaqueFrame::parse_exact(&frame, v1::limits::CONFIG_FRAME)
+                .unwrap()
+                .decode()
+                .unwrap(),
+            v1::Message::ConfigFacts(old)
+        );
+    }
     #[test]
     fn disabled_mouse_facts_are_withheld_only_from_legacy_peers() {
         let mut facts = Facts::new(

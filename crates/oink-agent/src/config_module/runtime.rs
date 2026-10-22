@@ -276,6 +276,12 @@ impl Owner {
             Journal::load(&deps.data_dir.join(oink_network::pair_journal::FILE), device).map_err(|e| fail(&e))?;
         journal.recover().map_err(|e| fail(&e))?;
         if let Some(projected) = journal.pending_projection().map_err(|e| fail(&e))? {
+            if let Some(bundle) = journal.pending_bundle().map_err(|e| fail(&e))? {
+                let intent = bundle.certificate().and_then(|c| c.intent()).map_err(|e| fail(&e))?;
+                deps.application
+                    .prepare_profile_join(&intent)
+                    .map_err(StartError::Unreadable)?;
+            }
             stored.state = projected;
             group_store::save(&path, &stored).map_err(|e| fail(&e))?;
         }
@@ -774,12 +780,18 @@ impl Owner {
     fn send(&mut self, id: LinkId, message: Message) -> v1::Result<()> {
         let message = if let Message::ConfigFacts(facts) = message {
             let links = self.links.links();
-            let supports = self
+            let agreement = self
                 .sessions
                 .get(&id)
                 .and_then(|session| links.by_peer(session.peer_boot.device_id))
-                .is_some_and(|link| link.agreement.contains("oink.input.mouse-disabled/1"));
-            Message::ConfigFacts(super::facts::for_mouse_capability(facts, supports)?)
+                .map(|link| &link.agreement);
+            let supports = |cap| agreement.is_some_and(|agreement| agreement.contains(cap));
+            let facts = super::facts::for_mouse_capability(facts, supports("oink.input.mouse-disabled/1"))?;
+            let facts = super::facts::for_local_output_capability(facts, supports("oink.audio.local-output/1"))?;
+            Message::ConfigFacts(super::facts::for_accessibility_capability(
+                facts,
+                supports("oink.input.accessibility/1"),
+            )?)
         } else {
             message
         };

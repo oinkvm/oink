@@ -360,6 +360,38 @@ fn append_compatible() -> Result<(), Box<dyn std::error::Error>> {
             RawValue::Map(facts),
         )?;
     }
+    let file = "dto-DeviceFacts-local-output.hex";
+    if !directory.join(file).exists() {
+        let mut facts = support::sample_named("DeviceFacts");
+        let reading = RawValue::Map([(1, RawValue::Uint(73)), (2, RawValue::Bool(true))].into());
+        facts.insert(16, RawValue::Map([(5, RawValue::Map([(9, reading)].into()))].into()));
+        registry::validate_schema("DeviceFacts", &facts)?;
+        append_value(
+            &directory,
+            &mut manifest,
+            file,
+            "dto",
+            "DeviceFacts",
+            RawValue::Map(facts),
+        )?;
+    }
+    for (suffix, granted) in [("granted", true), ("missing", false)] {
+        let file = format!("dto-DeviceFacts-accessibility-{suffix}.hex");
+        if !directory.join(&file).exists() {
+            let mut facts = support::sample_named("DeviceFacts");
+            facts.insert(7, RawValue::Text("macos".into()));
+            facts.insert(23, RawValue::Bool(granted));
+            registry::validate_schema("DeviceFacts", &facts)?;
+            append_value(
+                &directory,
+                &mut manifest,
+                &file,
+                "dto",
+                "DeviceFacts",
+                RawValue::Map(facts),
+            )?;
+        }
+    }
     manifest["schema_sha256"] = support::schema_hash().into();
     std::fs::write(
         directory.join("schema.json"),

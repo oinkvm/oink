@@ -63,8 +63,15 @@ pub enum DndCmd {
         epoch: u64,
     },
     HoldSource {
+        origin: Option<oink_foundation::Point>,
         target: crate::config::Os,
         crossing: std::time::Instant,
+        id: ClipId,
+        epoch: u64,
+        physical: bool,
+    },
+    /// Export the original held promise for a later Windows destination.
+    ExportSource {
         id: ClipId,
         epoch: u64,
         physical: bool,
@@ -428,6 +435,31 @@ impl Router {
             self.out.push(Output::Dnd(DndCmd::ReleaseData { id: offer.clip }));
         }
         if let Some(next) = handoff {
+            let windows = self
+                .peers
+                .get(&next.device)
+                .is_some_and(|peer| peer.os == crate::Os::Windows);
+            if let Some(source) = self.dnd.sources.get_mut(&offer)
+                && windows
+                && !source.exported
+                && source.exporting.is_none()
+                && source.items.iter().any(|item| {
+                    matches!(item,
+                    ClipData::Native { platform: oink_foundation::clipboard::ClipPlatform::Mac, item }
+                    if item.file.is_none() && item.representations.iter().any(|rep|
+                        matches!(rep.data, oink_foundation::content::RepresentationData::Promise(..))))
+                })
+            {
+                // First-hop Mac hosts keep native promises. A later Windows
+                // holder needs the same source export as a direct departure,
+                // before it receives an offer with FileGroupDescriptor names.
+                source.exporting = Some(next.epoch);
+                self.out.push(Output::Dnd(DndCmd::ExportSource {
+                    id: offer.clip,
+                    epoch: next.epoch,
+                    physical: source.input == self.cfg.device,
+                }));
+            }
             self.dnd_announce_members(offer);
             self.dnd_publish_offer(offer);
             let actions = self.dnd.pending_source.remove(&(offer, next)).unwrap_or_default();
@@ -661,8 +693,18 @@ impl Router {
     pub fn on_dnd_event(&mut self, ev: DndEvent) {
         if let DndEvent::SourceExported { id, epoch, items } = ev {
             let offer = Self::dnd_offer(id);
-            let current = self.dnd.native_source == Some(offer)
-                && matches!(self.dnd.state, State::Leaving { id: active, epoch: active_epoch, native: true, .. } if active == id && active_epoch == epoch);
+            // An export callback owns only the native source it started for.
+            // Duplicate completion must not revoke an already published offer.
+            if self.dnd.native_source != Some(offer) {
+                return;
+            }
+            let initial = matches!(self.dnd.state, State::Leaving { id: active, epoch: active_epoch, native: true, .. } if active == id && active_epoch == epoch);
+            let later = self
+                .dnd
+                .sources
+                .get(&offer)
+                .is_some_and(|source| source.exporting == Some(epoch));
+            let current = initial || later;
             let ready = current
                 && !self.fully_paused
                 && items.is_ok()
@@ -676,20 +718,26 @@ impl Router {
             }
             self.out.push(Output::Dnd(DndCmd::ForgetSource { id }));
             if ready {
-                if let State::Leaving { items: pending, .. } = &mut self.dnd.state {
-                    *pending = items.unwrap();
+                if later {
+                    self.dnd.sources.get_mut(&offer).unwrap().metadata(items.unwrap());
+                    self.dnd_announce_members(offer);
+                    self.dnd_publish_offer(offer);
+                } else {
+                    if let State::Leaving { items: pending, .. } = &mut self.dnd.state {
+                        *pending = items.unwrap();
+                    }
+                    self.dnd_released(true);
                 }
-                self.dnd_released(true);
             } else {
                 if current
                     && !self.fully_paused
-                    && matches!(self.dnd.state, State::Leaving { released: false, .. })
+                    && (later || matches!(self.dnd.state, State::Leaving { released: false, .. }))
                     && let Err(failure) = items
                     && failure != oink_foundation::dnd::ExportFailure::Cancelled
                 {
                     self.out.push(Output::Dnd(DndCmd::ExportFailed { failure }));
                 }
-                if current {
+                if initial {
                     self.dnd.state = State::Idle;
                 }
                 if let Some(source) = self.dnd.sources.get_mut(&offer) {
@@ -1804,6 +1852,11 @@ impl Router {
                 source.native = NativeObservation::HoldRequested;
             }
             self.out.push(Output::Dnd(DndCmd::HoldSource {
+                origin: self
+                    .dnd
+                    .sources
+                    .get(&offer)
+                    .and_then(|source| source.origin.as_ref().map(|p| p.local)),
                 target: target_os,
                 crossing,
                 id,

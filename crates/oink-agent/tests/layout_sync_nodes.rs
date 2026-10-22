@@ -183,9 +183,8 @@ async fn three_nodes_manual_coordinates_offline_and_restart_scenario() {
         all.iter().all(|n| {
             n.online_set().len() == 3 && n.layout().0.screens.len() == 3
                 // Layout registers and owner Facts travel independently. A
-                // manual auto-save must not invent missing visibility.
-                && AgentApi::layout_profile_command(*n, oink_agent::layout_profiles::types::Command::Query)
-                    .is_ok_and(|s| s.get("snapshot").is_some_and(|snapshot| !snapshot.is_null()))
+                // manual auto-save needs known visibility and the writable target catalog.
+                && common::profile_layout_ready(n)
         })
     })
     .await;

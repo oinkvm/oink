@@ -62,7 +62,7 @@ impl Node {
         let aim_port = links.register(crate::streams::aim::KINDS);
         let projection_port = links.register(crate::streams::projection::KINDS);
         let wallpaper_port = links.register(crate::streams::wallpaper::KINDS);
-        let profiles_port = links.register(&[oink_protocol::frame::StreamKind::LayoutProfilesV2]);
+        let profiles_port = links.register(&[oink_protocol::frame::StreamKind::LayoutProfilesV3]);
         let cache_port = links.register(&[oink_protocol::frame::StreamKind::Cache]);
         let diagnostics_port = links.register(crate::streams::diagnostics::KINDS);
         let dnd_port = links.register(crate::streams::dnd::KINDS);
@@ -93,6 +93,10 @@ impl Node {
         self.publish_local_permissions();
         let initial_group = group.clone();
         tokio::task::spawn_blocking(move || initial_group.initialize_displays(initial_displays)).await??;
+        // Preserve the initial list before exposing the started Node to callers,
+        // including a crash before a later profile handoff callback.
+        let node = self.clone();
+        let _ = tokio::task::spawn_blocking(move || node.refresh_layout_profiles()).await;
         let applied = group.applied();
         let settings = self.settings();
         let directory = self.log_dir().join("Diagnostics");
@@ -234,6 +238,11 @@ impl Node {
 
 struct Application(std::sync::Weak<Inner>);
 impl crate::config_module::ConfigApplication for Application {
+    fn prepare_profile_join(&self, intent: &oink_protocol::v1::dto::MergeIntent) -> Result<(), String> {
+        let inner = self.0.upgrade().ok_or("backend stopped")?;
+        Node { inner }.prepare_profile_join(intent).map_err(|e| e.message)
+    }
+
     fn apply_state(&self, state: &crate::config_module::group_store::StoredGroupState) -> Result<(), String> {
         use oink_protocol::v1::{dto::LayoutValue, schema::WireDto};
         let inner = self.0.upgrade().ok_or("backend stopped")?;
@@ -281,11 +290,12 @@ fn application_profile() -> oink_network::negotiation::OfferProfile {
                 "oink.device-resources/1",
                 "oink.device-options/1",
                 "oink.input.mouse-disabled/1",
+                "oink.input.accessibility/1",
                 "oink.aim/1",
                 "oink.notify/1",
                 "oink.wallpaper/1",
                 "oink.layout.projection/1",
-                "oink.layout.profiles/2",
+                "oink.layout.profiles/3",
                 "oink.layout.arrangement/1",
                 "oink.layout.preview/1",
                 "oink.diagnostics.collect/1",

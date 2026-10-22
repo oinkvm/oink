@@ -1,4 +1,4 @@
-// Deferred preflight never stops processes or accepts arbitrary paths.
+// MSI stops its owned service; deferred validation waits for normal user shutdown.
 // Immediate client preparation requests the existing normal-user Quit path.
 // Product identifiers are generated from packaging/identity.json by build.py.
 #include <windows.h>
@@ -95,7 +95,7 @@ static bool protected_path(const std::wstring& path) {
 #include "Maintenance.h"
 #include "Quiescence.h"
 #include "MaintenanceCleanup.h"
-#include "CloudFilesCleanup.h"
+#include "UserDataCleanup.h"
 
 static std::wstring property(MSIHANDLE install, const wchar_t* name) {
     wchar_t value[32768]; DWORD size = static_cast<DWORD>(std::size(value));
@@ -314,17 +314,17 @@ static bool request_user_stop(MSIHANDLE install, const std::wstring& directory) 
     }
     MSIHANDLE message = MsiCreateRecord(0);
     MsiRecordSetStringW(message, 0, ok ?
-        L"PrepareUserSessions: graceful installed CLI stop requested; child token verified non-elevated, UIAccess=0, caller session matched." :
-        L"PrepareUserSessions: graceful stop unavailable; requires the original non-elevated signed-in caller and protected installed CLI. Quit Oink manually.");
+        L"PrepareUserSessions: graceful installed CLI stop requested; child user token verified, UIAccess=0, caller session matched." :
+        L"PrepareUserSessions: graceful stop unavailable; requires the original signed-in caller and protected installed CLI. StopServices will notify installed backends.");
     MsiProcessMessage(install, INSTALLMESSAGE_INFO, message);
     MsiCloseHandle(message);
     return ok;
 }
 
-static UINT user_session_gate(MSIHANDLE install, bool request) {
+static UINT user_session_gate(MSIHANDLE install) {
     const auto directory = root();
     if (directory.empty()) return fail(install, 3);
-    const bool allowed = request && graceful_stop::permitted(property(install, L"UILevel"), property(install, L"OINK_GRACEFUL_STOP"),
+    const bool allowed = graceful_stop::permitted(property(install, L"UILevel"),
         !property(install, L"UPGRADINGPRODUCTCODE").empty(), MsiGetMode(install, MSIRUNMODE_SCHEDULED) != FALSE,
         MsiGetMode(install, MSIRUNMODE_COMMIT) != FALSE, MsiGetMode(install, MSIRUNMODE_ROLLBACK) != FALSE);
     const auto state = graceful_stop::prepare(allowed, [&] { return user_sessions(directory); },
@@ -339,28 +339,31 @@ static UINT user_session_gate(MSIHANDLE install, bool request) {
         });
     if (state == graceful_stop::State::canceled) return ERROR_INSTALL_USEREXIT;
     const bool busy = state != graceful_stop::State::clear;
-    if (MsiSetPropertyW(install, L"OinkSessionsRunning", busy ? L"1" : L"") != ERROR_SUCCESS) return ERROR_INSTALL_FAILURE;
-    if (busy && property(install, L"UILevel") != L"5") {
+    // This is an early user-context request, not the replacement authority.
+    // Settings/basic UI and SYSTEM installs may not have a usable user token;
+    // MSI StopServices triggers each backend's existing SCM stop subscription.
+    // CheckQuiescence below observes the resulting normal cleanup in all sessions.
+    if (busy) {
         MSIHANDLE message = MsiCreateRecord(0);
-        MsiRecordSetStringW(message, 0, graceful_stop::failure(8));
-        MsiProcessMessage(install, INSTALLMESSAGE_INFO, message); // No quiet/passive dialog.
+        MsiRecordSetStringW(message, 0, L"Oink session remains; waiting for orderly shutdown after StopServices.");
+        MsiProcessMessage(install, INSTALLMESSAGE_INFO, message);
         MsiCloseHandle(message);
-        return ERROR_INSTALL_FAILURE;
     }
     return ERROR_SUCCESS;
 }
 extern "C" __declspec(dllexport) UINT __stdcall PrepareUserSessions(MSIHANDLE install) {
-    return user_session_gate(install, true);
-}
-extern "C" __declspec(dllexport) UINT __stdcall RefreshUserSessions(MSIHANDLE install) {
-    return user_session_gate(install, false);
+    return user_session_gate(install);
 }
 
 extern "C" __declspec(dllexport) UINT __stdcall CheckQuiescence(MSIHANDLE install) {
     // StopServices closes the launch endpoint and joins outstanding helpers.
-    // Check all product roles once here; MSI rollback restores service on failure.
+    // Wait for every product role here; MSI rollback restores service on failure.
     const auto directory = root();
-    return !directory.empty() && clients_quiescent(directory) ? ERROR_SUCCESS : fail(install, 8);
+    if (directory.empty()) return fail(install, 3);
+    const auto state = graceful_stop::observe([&] {
+        return clients_quiescent(directory) ? graceful_stop::State::clear : graceful_stop::State::busy;
+    }, [] { Sleep(250); return true; });
+    return state == graceful_stop::State::clear ? ERROR_SUCCESS : fail(install, 8);
 }
 
 extern "C" __declspec(dllexport) UINT __stdcall CheckProtectedState(MSIHANDLE install) {
@@ -396,12 +399,27 @@ extern "C" __declspec(dllexport) UINT __stdcall CheckProtectedState(MSIHANDLE in
     return valid ? ERROR_SUCCESS : fail(install, 10);
 }
 
+// Post-removal cleanup is best effort. Commit custom actions can still trigger
+// rollback; never emit INSTALLMESSAGE_ERROR or return failure after removal.
+static void cleanup_log(MSIHANDLE install, const std::wstring& path, const wchar_t* operation, DWORD error) {
+    MSIHANDLE record = MsiCreateRecord(3);
+    if (!record) return;
+    MsiRecordSetStringW(record, 0, L"Oink cleanup retained [1]; operation=[2]; error=[3]. Product removal will complete.");
+    MsiRecordSetStringW(record, 1, path.c_str());
+    MsiRecordSetStringW(record, 2, operation);
+    const auto code = std::to_wstring(error);
+    MsiRecordSetStringW(record, 3, code.c_str());
+    MsiProcessMessage(install, INSTALLMESSAGE_INFO, record);
+    MsiCloseHandle(record);
+}
+
 extern "C" __declspec(dllexport) UINT __stdcall CleanupMaintenance(MSIHANDLE install) {
     const auto directory = root();
-    if (directory.empty()) return fail(install, 12);
+    if (directory.empty()) { cleanup_log(install, ID_INSTALL_DIR, L"ProgramFiles", ERROR_PATH_NOT_FOUND); return ERROR_SUCCESS; }
     const auto result = cleanup::after_uninstall(directory, directory + L"\\" ID_MAINTENANCE,
         ID_MAINTENANCE_LOCK, protected_path, [](HANDLE lock) { return protected_handle(lock) && maintenance::lock_handle(lock); });
-    return result != cleanup::Result::failed ? ERROR_SUCCESS : fail(install, 12);
+    if (result == cleanup::Result::failed) cleanup_log(install, directory, L"maintenance cleanup", GetLastError());
+    return ERROR_SUCCESS;
 }
 
 extern "C" __declspec(dllexport) UINT __stdcall RemoveLoginEntry(MSIHANDLE) {
@@ -426,12 +444,10 @@ extern "C" __declspec(dllexport) UINT __stdcall RemoveLoginEntry(MSIHANDLE) {
     return ERROR_SUCCESS;
 }
 
-extern "C" __declspec(dllexport) UINT __stdcall CleanupCloudFiles(MSIHANDLE install) {
+extern "C" __declspec(dllexport) UINT __stdcall CleanupUserData(MSIHANDLE install) {
     if (cleanup::preserve_user_state(maintenance::directory())) return ERROR_SUCCESS;
-    if (cloud_cleanup::profiles(ID_DATA_DIRECTORY)) return ERROR_SUCCESS;
-    MSIHANDLE record = MsiCreateRecord(0);
-    MsiRecordSetStringW(record, 0, L"Cloud file cache cleanup failed. Close applications using shared files and retry uninstall.");
-    MsiProcessMessage(install, INSTALLMESSAGE_ERROR, record);
-    MsiCloseHandle(record);
-    return ERROR_INSTALL_FAILURE;
+    user_cleanup::profiles(ID_DATA_DIRECTORY, [install](const std::wstring& path, const wchar_t* operation, DWORD error) {
+        cleanup_log(install, path, operation, error);
+    });
+    return ERROR_SUCCESS;
 }

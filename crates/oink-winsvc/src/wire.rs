@@ -41,12 +41,18 @@ pub enum Command {
     },
     /// Lease only: the pipe owner handles it without desktop/query work or a reply.
     Heartbeat,
+    /// One absolute-positioned original source Up.
+    DragRelease {
+        x: i32,
+        y: i32,
+    },
 }
 impl Command {
     pub fn encode(self) -> [u8; FRAME_SIZE] {
         let (kind, a, b, c) = match self {
             Self::MoveRelative { dx, dy } => (7, dx, dy, 0),
             Self::DragPress { x, y } => (8, x, y, 0),
+            Self::DragRelease { x, y } => (10, x, y, 0),
             Self::Heartbeat => (9, 0, 0, 0),
             Self::Ping => (0, 0, 0, 0),
             Self::Release => (1, 0, 0, 0),
@@ -94,6 +100,10 @@ impl Command {
                 y: b as i32,
             },
             8 if a <= 65535 && b <= 65535 && c == 0 => Self::DragPress {
+                x: a as i32,
+                y: b as i32,
+            },
+            10 if a <= 65535 && b <= 65535 && c == 0 => Self::DragRelease {
                 x: a as i32,
                 y: b as i32,
             },
@@ -220,9 +230,13 @@ mod tests {
         for cmd in [
             Command::DragPress { x: 0, y: 65535 },
             Command::DragPress { x: 123, y: 456 },
+            Command::DragRelease { x: 123, y: 456 },
+            Command::DragRelease { x: 0, y: 65535 },
         ] {
             assert_eq!(Command::decode(&cmd.encode()), Some(cmd));
         }
+        assert_eq!(Command::decode(&Command::DragRelease { x: -1, y: 0 }.encode()), None);
+        assert_eq!(Command::decode(&Command::DragRelease { x: 0, y: 65536 }.encode()), None);
         assert_eq!(Command::decode(&Command::DragPress { x: -1, y: 0 }.encode()), None);
         assert_eq!(Command::decode(&Command::DragPress { x: 0, y: 65536 }.encode()), None);
     }

@@ -36,7 +36,10 @@ pub fn validate(request: &Message, response: &Message) -> Result<DeviceControlRe
             if success(outcome, reason)? {
                 let current = field(response.current())?.ok_or(Failure::StateConflict)?;
                 if field(current.option())? != field(request.option())?
-                    || !field(response.persisted())?
+                    // Forwarding slider success means applied AND published.
+                    // Its existing persisted flag remains an honest durability
+                    // signal; all other option families still require a save.
+                    || (!field(response.persisted())? && (field(request.option())? != dto::LocalOption::ForwardingControls || !field(request.defer_persistence())?))
                     || field(response.fact_sequence())?.is_none_or(|sequence| sequence == 0)
                 {
                     return Err(Failure::StateConflict);
@@ -172,6 +175,102 @@ mod tests {
             validate(
                 &request,
                 &Message::ConfigPauseDeviceResult(dto::PauseDeviceResult::from_raw(unchanged).unwrap())
+            ),
+            Err(Failure::StateConflict)
+        );
+    }
+    #[test]
+    fn forwarding_receipt_accepts_published_but_not_yet_durable_state_only() {
+        let binding = TokenBinding {
+            owner: OwnerVersion {
+                group: oink_foundation::GroupId([1; 16]).into(),
+                device: oink_foundation::DeviceId([2; 32]).into(),
+                boot_nonce: [3; 16],
+                revision: 1,
+            },
+            operation: TokenOperation::ForwardingControls,
+        };
+        let request = requests::forwarding_request_with_persistence(
+            &binding,
+            "00112233-4455-6677-8899-aabbccddeeff",
+            65,
+            false,
+            true,
+        )
+        .unwrap();
+        let Message::ConfigSetLocalOption(command) = &request else {
+            unreachable!()
+        };
+        let state = dto::LocalOptionState::from_raw(
+            [
+                (1, dto::LocalOption::ForwardingControls.write()),
+                (
+                    2,
+                    RawValue::Map([(1, 65u16.write()), (2, false.write())].into_iter().collect()),
+                ),
+                (3, 2u64.write()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+        let raw = [
+            (1, command.request_id().unwrap().write()),
+            (2, command.target().unwrap().write()),
+            (3, dto::ControlOutcome::Applied.write()),
+            (4, Failure::None.write()),
+            (5, state.write()),
+            (6, 9u64.write()),
+            (7, false.write()),
+        ]
+        .into_iter()
+        .collect();
+        let response = dto::LocalEditResult::from_raw(raw).unwrap();
+        assert_eq!(
+            validate(&request, &Message::ConfigLocalEditResult(response.clone())),
+            Ok(DeviceControlResult::Applied)
+        );
+        let mut legacy_request = command.raw().clone();
+        legacy_request.remove(&6);
+        let legacy_request = Message::ConfigSetLocalOption(dto::SetLocalOption::from_raw(legacy_request).unwrap());
+        assert_eq!(
+            validate(&legacy_request, &Message::ConfigLocalEditResult(response.clone())),
+            Err(Failure::StateConflict)
+        );
+        let mut durable_response = response.raw().clone();
+        durable_response.insert(7, true.write());
+        let durable_response =
+            Message::ConfigLocalEditResult(dto::LocalEditResult::from_raw(durable_response).unwrap());
+        // Both an old requester and a new requester talking to an old owner
+        // accept the released synchronous/persisted:true receipt.
+        assert_eq!(
+            validate(&legacy_request, &durable_response),
+            Ok(DeviceControlResult::Applied)
+        );
+        assert_eq!(validate(&request, &durable_response), Ok(DeviceControlResult::Applied));
+        let mut missing = response.raw().clone();
+        missing.remove(&6);
+        assert_eq!(
+            validate(
+                &request,
+                &Message::ConfigLocalEditResult(dto::LocalEditResult::from_raw(missing).unwrap())
+            ),
+            Err(Failure::StateConflict)
+        );
+        // The exception is scoped to the slider option; clipboard still needs durability.
+        let mut request_raw = command.raw().clone();
+        request_raw.insert(3, dto::LocalOption::ClipboardEnabled.write());
+        request_raw.insert(4, false.write());
+        let request = Message::ConfigSetLocalOption(dto::SetLocalOption::from_raw(request_raw).unwrap());
+        let mut state_raw = state.raw().clone();
+        state_raw.insert(1, dto::LocalOption::ClipboardEnabled.write());
+        state_raw.insert(2, false.write());
+        let mut response_raw = response.raw().clone();
+        response_raw.insert(5, dto::LocalOptionState::from_raw(state_raw).unwrap().write());
+        assert_eq!(
+            validate(
+                &request,
+                &Message::ConfigLocalEditResult(dto::LocalEditResult::from_raw(response_raw).unwrap())
             ),
             Err(Failure::StateConflict)
         );

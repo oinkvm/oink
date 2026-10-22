@@ -413,6 +413,7 @@ impl Owner {
             });
         let _ = reply.send(result);
     }
+    #[cfg(test)]
     pub(super) fn set_option(
         &mut self,
         requester: &dto::Boot,
@@ -420,6 +421,17 @@ impl Owner {
         option: LocalOption,
         expected: u64,
         patch: RawValue,
+    ) -> Result<OwnerOptionApplied, Failure> {
+        self.set_option_with_persistence(requester, group, option, expected, patch, false)
+    }
+    pub(super) fn set_option_with_persistence(
+        &mut self,
+        requester: &dto::Boot,
+        group: GroupId,
+        option: LocalOption,
+        expected: u64,
+        patch: RawValue,
+        defer_persistence: bool,
     ) -> Result<OwnerOptionApplied, Failure> {
         let gate = self.gate.clone();
         let _guard = lock(&gate);
@@ -447,7 +459,13 @@ impl Owner {
                     .claims(self.active_group.ok_or(Failure::NotMember)?)
                     .watermark(),
             )?;
-            lock(&self.store).edit_owner(option, expected, patch)?;
+            if defer_persistence {
+                lock(&self.store).edit_forwarding_deferred(expected, patch)?;
+            } else {
+                // Released peers and the final drag position require durability,
+                // even when their value is already the current in-memory value.
+                lock(&self.store).edit_owner(option, expected, patch)?;
+            }
             let settings = lock(&self.store).settings.audio.clone();
             self.apply_settings(settings);
         }
@@ -464,7 +482,7 @@ impl Owner {
         let current = lock(&self.store)
             .owner()
             .item(option)
-            .expect("validated durable option");
+            .expect("validated applied option");
         let facts = self.group.local_facts();
         let fact_sequence = facts
             .preferences()
@@ -481,7 +499,7 @@ impl Owner {
             current,
             outcome,
             reason,
-            persisted: true,
+            persisted: option != LocalOption::ForwardingControls || lock(&self.store).forwarding_persisted(),
             fact_sequence,
         }
     }
@@ -857,6 +875,18 @@ impl Owner {
                         .owner()
                         .filter(|owner| *owner != self.links.id())
                         .map(oink_network::wire_identity::device)
+                        .write(),
+                ),
+                (
+                    9,
+                    self.local_output
+                        .value()
+                        .map(|reading| {
+                            dto::LocalOutputVolume::from_raw(
+                                [(1, reading.percent.write()), (2, reading.muted.write())].into(),
+                            )
+                            .expect("bounded volume reading")
+                        })
                         .write(),
                 ),
             ]

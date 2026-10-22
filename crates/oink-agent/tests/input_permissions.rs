@@ -1,11 +1,13 @@
 #![cfg(debug_assertions)]
-//! 本机缺少键鼠权限（macOS「辅助功能」「输入监控」）时的行为，两个完整的服务进程经真实组网相连：
+//! Effective input permission and native outcome plumbing, with two full nodes
+//! over real networking and fake OS input. Raw macOS AX/IOHID normalization is
+//! covered by oink-input; this source can deliberately supply either missing right.
 //!
 //! - 缺「辅助功能」：注入被系统静默丢弃，本机按暂停处理——其他设备不把指针移进来（不再出现
 //!   「指针移过去就消失」）；提醒写明「本机无法共享键鼠」；
 //! - 两项权限均已授予后：其他设备可以控制本机；撤销任一权限收回旧会话；
 //! - 授予「输入监控」后不必重启：截获自动启动，本机可以控制其他设备；
-//! - 权限齐全但截获仍启动失败：提醒重新打开 Oink。
+//! - 权限齐全且原生挂接实际失败：报告恢复/重新打开提示；仅未挂接不构成失败。
 
 use oink_agent as test_agent;
 mod common;
@@ -39,7 +41,10 @@ fn display(key: &str) -> DisplayInfo {
     }
 }
 
-/// 像 macOS 一样受权限约束的输入：缺权限时截获启动失败，缺「辅助功能」时注入被静默丢弃。
+/// Fake effective permission source and native capture outcomes. These values are
+/// already InputBackend observations, not raw TCC entries: macOS's AX-or-IOHID
+/// normalization is tested in oink-input. Missing effective rights withdraw capture;
+/// only a completed attachment failure reports capture_available(false).
 #[derive(Clone)]
 struct GatedInput {
     fake: FakeInput,
@@ -81,6 +86,7 @@ struct GatedLoop {
     owner: Box<dyn oink_input::capture_loop::CaptureLoop>,
     input: GatedInput,
     allowed: bool,
+    outcome: Option<bool>,
 }
 impl oink_input::capture_loop::CaptureLoop for GatedLoop {
     fn set_wake(&mut self, wake: oink_input::capture_loop::Wake) {
@@ -90,13 +96,27 @@ impl oink_input::capture_loop::CaptureLoop for GatedLoop {
         self.owner.event(event)
     }
     fn poll(&mut self, now: Instant) -> Option<Instant> {
+        // Consume permission/pause commands before attempting native attachment,
+        // matching the macOS capture loop's poll -> capture_requested -> install.
+        let due = self.owner.poll(now);
         let permissions = self.input.get();
-        self.allowed = permissions.accessibility == PermissionState::Granted
+        let requested = self.owner.capture_requested()
+            && permissions.accessibility == PermissionState::Granted
             && (permissions.input_monitoring == PermissionState::Granted
-                || self.input.stale_input_monitoring.load(Ordering::Acquire))
-            && !self.input.fail_start.load(Ordering::Acquire);
+                || self.input.stale_input_monitoring.load(Ordering::Acquire));
+        let outcome = requested.then(|| !self.input.fail_start.load(Ordering::Acquire));
+        if outcome != self.outcome {
+            match outcome {
+                Some(false) => self.owner.capture_available(false),
+                None if self.outcome.is_some() => self.owner.capture_detached(),
+                // FakeInput reports successful attachment when allowed becomes true.
+                _ => {}
+            }
+            self.outcome = outcome;
+        }
+        self.allowed = outcome == Some(true);
         let refresh = now + Duration::from_millis(50);
-        Some(self.owner.poll(now).map_or(refresh, |due| due.min(refresh)))
+        Some(due.map_or(refresh, |due| due.min(refresh)))
     }
     fn stopped(&self) -> bool {
         self.owner.stopped()
@@ -106,6 +126,11 @@ impl oink_input::capture_loop::CaptureLoop for GatedLoop {
     }
     fn capture_available(&mut self, available: bool) {
         self.owner.capture_available(available);
+    }
+    fn capture_detached(&mut self) {
+        self.allowed = false;
+        self.outcome = None;
+        self.owner.capture_detached();
     }
 }
 
@@ -130,6 +155,7 @@ impl InputBackend for GatedInput {
             owner,
             input: self.clone(),
             allowed: false,
+            outcome: None,
         }))
     }
     fn capture_active(&self) -> Option<bool> {
@@ -417,9 +443,26 @@ async fn missing_permissions_block_then_recover_without_restart_scenario() {
         oink_agent::device_cards::UserFacingCode::PermissionDenied
     );
     assert!(permission_alert(&an, PermissionKind::InputMonitoring).is_some());
+    assert!(!an.input_status().unwrap().capture_failed);
     assert!(!has_alert(&an, "capture-unavailable"));
     let b2 = bn.clone();
     let aid = an.id();
+    let remote_ax = || {
+        bn.device_cards().ok().and_then(|view| {
+            view.cards
+                .iter()
+                .find(|c| c.device == aid.into())
+                .and_then(|c| c.status.as_ref())
+                .and_then(|s| s.accessibility_granted)
+        })
+    };
+    if cfg!(target_os = "macos") {
+        changes
+            .wait_for("B receives explicit missing AX owner fact", || {
+                remote_ax() == Some(false)
+            })
+            .await;
+    }
     changes
         .wait_for("B treats A as unreachable", || !b2.online_set().contains(&aid))
         .await;
@@ -447,9 +490,18 @@ async fn missing_permissions_block_then_recover_without_restart_scenario() {
     changes
         .wait_for("B sees A reachable again", || b2.online_set().contains(&aid))
         .await;
+    if cfg!(target_os = "macos") {
+        changes
+            .wait_for("B receives granted AX without reconnecting", || {
+                remote_ax() == Some(true)
+            })
+            .await;
+    }
     assert!(permission_alert(&an, PermissionKind::Accessibility).is_none());
     assert!(permission_alert(&an, PermissionKind::InputMonitoring).is_none());
     wait_for("target capture is active", 3., || an.capture_active() == Some(true)).await;
+    assert!(!an.input_status().unwrap().capture_failed);
+    assert!(!has_alert(&an, "capture-unavailable"));
     let b2 = bn.clone();
     push(&b_input, to_a, || {
         b2.input_status().unwrap().focus_info.clone().unwrap().holder == aid
@@ -490,10 +542,18 @@ async fn missing_permissions_block_then_recover_without_restart_scenario() {
         permission_alert(&an, PermissionKind::Accessibility).is_some()
     })
     .await;
+    if cfg!(target_os = "macos") {
+        changes
+            .wait_for("B receives revoked AX without changing layout", || {
+                remote_ax() == Some(false)
+            })
+            .await;
+    }
     assert_eq!(gated.input_safety(), original_safety);
     assert!(!an.pause_status().paused);
 
-    // Regrant with a simulated native attach failure: existing restart guidance.
+    // Regrant with a completed native attach failure, not a withheld capture
+    // request: only the former warrants the existing recovery/reopen guidance.
     gated.fail_start.store(true, Ordering::Release);
     gated.update(|p| {
         p.accessibility = PermissionState::Granted;
@@ -501,8 +561,11 @@ async fn missing_permissions_block_then_recover_without_restart_scenario() {
     });
     let a2 = an.clone();
     changes
-        .wait_for("restart alert", || has_alert(&a2, "capture-unavailable"))
+        .wait_for("completed native failure produces recovery alert", || {
+            has_alert(&a2, "capture-unavailable")
+        })
         .await;
+    assert!(an.input_status().unwrap().capture_failed);
     assert!(an.capture_active() != Some(true));
     assert_eq!(an.overview().unwrap().service, ServiceState::Degraded);
 
@@ -520,6 +583,7 @@ async fn missing_permissions_block_then_recover_without_restart_scenario() {
         .wait_for("all alerts cleared", || a2.overview().unwrap().alerts.is_empty())
         .await;
     assert_eq!(an.overview().unwrap().service, ServiceState::Running);
+    assert!(!an.input_status().unwrap().capture_failed);
 
     // Permission/capture recovery precedes the asynchronous new I0 opening.
     // Wait for both fresh stream pairs before feeding the finite edge gesture.
@@ -578,8 +642,9 @@ async fn input_monitoring_not_determined_or_stale_scenario() {
         oink_agent::device_cards::UserFacingCode::PermissionRequired
     );
 
-    // A live/stale tap must not override a current missing right. In particular,
-    // accessibility alone is not admission to receive remote input anymore.
+    // A live/stale tap must not override a current missing effective right. This
+    // deliberately inconsistent fake source tests owner admission, not raw TCC:
+    // the real macOS backend includes AX authorization in its listening result.
     gated.update(|p| p.input_monitoring = PermissionState::Denied);
     gated.stale_input_monitoring.store(true, Ordering::Release);
     let n2 = n.clone();
