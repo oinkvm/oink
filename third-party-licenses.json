@@ -12285,14 +12285,14 @@
       ]
     },
     {
-      "id": "cargo:tokio@1.53.1",
+      "id": "cargo:tokio@1.53.3",
       "name": "tokio",
-      "version": "1.53.1",
+      "version": "1.53.3",
       "ecosystem": "cargo",
       "repository": "https://github.com/tokio-rs/tokio",
       "source": {
-        "url": "https://crates.io/api/v1/crates/tokio/1.53.1/download",
-        "integrity": "sha256:202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+        "url": "https://crates.io/api/v1/crates/tokio/1.53.3/download",
+        "integrity": "sha256:ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
       },
       "licenseExpression": "MIT",
       "selectedLicense": "MIT",
