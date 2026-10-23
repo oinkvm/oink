@@ -16,6 +16,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'build-support'))
 from provenance import verify, digest
 from payload import copy_notices
+import embedded_release_notes
 from report_manifest import write_manifest, image_identity
 from signing import private_run, select_identity, notarize, staple_and_validate
 from sparkle import prepare as prepare_sparkle, VERSION as SPARKLE_VERSION, SHA256 as SPARKLE_SHA256
@@ -104,6 +105,7 @@ def main():
     resources = app / 'Contents/Resources'
     mac.mkdir(parents=True)
     resources.mkdir()
+    embedded_release_notes.write(ROOT, resources / 'oink-update-notes.json', a.build, a.source_commit)
     b = I['binaries']
     for role in ['backend', 'agent', 'crash_collector']:
         shutil.copy2(a.binaries / b[role], mac / b[role])

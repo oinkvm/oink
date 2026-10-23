@@ -20,6 +20,7 @@ from report_manifest import write_manifest, image_identity
 import xml.etree.ElementTree as ET
 
 from versioning import release_version
+import embedded_release_notes
 
 ROOT = Path(__file__).resolve().parents[2]
 I = json.loads((ROOT / 'packaging/identity.json').read_text())
@@ -186,7 +187,8 @@ def main():
     product_code = str(uuid.uuid5(uuid.UUID(w['upgrade_code']), str(a.build))).upper()
     license_rtf = a.output / 'license.rtf'
     write_license_rtf(license_rtf)
-    values = {'LicenseRtf': str(license_rtf),
+    notes_file = embedded_release_notes.write(ROOT, a.output / 'embedded-update-notes.json', a.build, a.source_commit)
+    values = {'UpdateNotesFile': str(notes_file), 'LicenseRtf': str(license_rtf),
               'DialogBmp': str(ROOT / 'packaging/windows/installer-background.bmp'),
               'BannerBmp': str(ROOT / 'packaging/windows/installer-banner.bmp'), 'ProductName': I['name'], 'Manufacturer': I['publisher'], 'ProductVersion': msi_version,
               'ProductCode': product_code, 'UpgradeCode': w['upgrade_code'],
@@ -259,6 +261,7 @@ def main():
     from content import verify_msi
     from tables import read_content_tables
     tables = read_content_tables(msi)
+    embedded_release_notes.verify_windows(tables, notes_file)
     (a.output / 'content-tables.json').write_text(json.dumps(tables, indent=2) + '\n')
     record['embedded_executables'] = verify_msi(a.output / 'decompiled.wxs', a.output / 'extracted', I, tables)
     record.update(product_code=product_code, msi_version=msi_version, signing='unsigned',

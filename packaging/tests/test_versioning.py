@@ -22,13 +22,13 @@ from versioning import release_version, local_source_commit, macos_version_field
 from windows_version import display_version_resource, set_display_version
 
 COMMIT = '0123abcd' * 5
-DISPLAY = '0.2.1-inhouse.0123abcd'
+DISPLAY = '0.2.2-inhouse.0123abcd'
 
 
 class LocalVersions(unittest.TestCase):
     def test_commit_label_including_numeric_leading_zero_hash(self):
         self.assertEqual(release_version('0.1.0-beta.1', COMMIT), DISPLAY)
-        self.assertEqual(release_version('0.1.0-beta.1', '01234567' * 5), '0.2.1-inhouse.01234567')
+        self.assertEqual(release_version('0.1.0-beta.1', '01234567' * 5), '0.2.2-inhouse.01234567')
         self.assertEqual(release_version('0.1.0-beta.2'), '0.1.0-beta.2')
         for commit in ('0123abcd', 'A' * 40, 'z' * 40, 'a' * 39, 'a' * 41, ''):
             with self.assertRaises(ValueError):
@@ -37,7 +37,7 @@ class LocalVersions(unittest.TestCase):
         self.assertEqual(release_version('0.1.0'), '0.1.0')
 
     def test_inhouse_uses_the_configured_version_and_public_versions_stay_exact(self):
-        self.assertEqual(IDENTITY['inhouse_version'], '0.2.1')
+        self.assertEqual(IDENTITY['inhouse_version'], '0.2.2')
         for public in ('0.1.4', '0.1.5', '1.2.9'):
             self.assertEqual(release_version(public, COMMIT), DISPLAY)
         with patch.dict(versioning.IDENTITY, inhouse_version='0.3.0'):
@@ -54,7 +54,7 @@ class LocalVersions(unittest.TestCase):
 
     def test_numeric_bundle_fields_and_msi_order_ignore_the_commit(self):
         self.assertEqual(macos_version_fields(DISPLAY, 17), dict(
-            CFBundleShortVersionString='0.2.1', CFBundleVersion='17', CFBundleGetInfoString=DISPLAY))
+            CFBundleShortVersionString='0.2.2', CFBundleVersion='17', CFBundleGetInfoString=DISPLAY))
         builds = (17, 18, 65535, 65536, 16777216, 2147483647)
         versions = [tuple(map(int, windows_product_version(build).split('.'))) for build in builds]
         self.assertEqual(versions, sorted(set(versions)))

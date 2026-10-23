@@ -148,6 +148,7 @@
                        Value="1" Type="integer" KeyPath="yes" />
       </Component>
     </StandardDirectory>
+    <Binary Id="OinkLocalUpdateNotes" SourceFile="$(var.UpdateNotesFile)" />
     <Binary Id="InstallerCA" SourceFile="$(var.CustomAction)" />
     <CustomAction Id="CheckInstallPath" BinaryRef="InstallerCA" DllEntry="CheckInstallPath" Execute="immediate" Return="check" />
     <CustomAction Id="CheckProtectedState" BinaryRef="InstallerCA" DllEntry="CheckProtectedState" Execute="deferred" Impersonate="no" Return="check" />

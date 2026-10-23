@@ -360,7 +360,7 @@ class MsiContent(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             xml, extracted, tables = self.fixture(root)
-            display = '0.2.1-inhouse.0123abcd'
+            display = '0.2.2-inhouse.0123abcd'
             for name in ('installed.json', 'oink-build.json'):
                 path = extracted / 'File' / name
                 receipt = json.loads(path.read_text())

@@ -406,3 +406,30 @@ fn notes_require_english_during_typed_deserialization_too() {
     assert!(serde_json::from_str::<ReleaseNotes>(r#"{"ja":"missing English"}"#).is_err());
     assert!(serde_json::from_str::<ReleaseNotes>(r#"{"en":"English","EN":"ambiguous"}"#).is_err());
 }
+
+#[test]
+fn bridge_client_selects_capability_two_release_from_schema_one_manifest() {
+    let mut p = payload();
+    let template = p["releases"][0].clone();
+    p["releases"] = json!(
+        [(36, "0.2.1", 1), (43, "0.2.2", 1), (50, "0.3.0", 2)].map(|(build, version, minimum)| {
+            let mut release = template.clone();
+            release["build"] = json!(build);
+            release["version"] = json!(version);
+            release["tag"] = json!(format!("v{version}"));
+            release["minimumUpdaterSchema"] = json!(minimum);
+            release
+        })
+    );
+    let m = check(&p, &Watermark::default(), NOW).unwrap();
+    let quarantine = BTreeSet::new();
+    let selection = Selection {
+        windows_build: 19045,
+        architecture: "x86_64",
+        installed_build: 36,
+        successful_build: 36,
+        quarantine: &quarantine,
+    };
+    assert_eq!(m.manifest().schema, 1);
+    assert_eq!(m.select(&selection).unwrap().unwrap().build, 50);
+}

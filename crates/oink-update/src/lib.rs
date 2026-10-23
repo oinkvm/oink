@@ -11,7 +11,11 @@ pub mod trust;
 pub const PRODUCT: &str = "com.hachiwii.oink";
 pub const WINDOWS_EPOCH: &str = "win-2026-01";
 pub const MAC_EPOCH: &str = "mac-2026-01";
+/// Signed document/IPC schema. Independent of package inspection capabilities.
 pub const SCHEMA: u32 = 1;
+/// Highest minimumUpdaterSchema admitted by this Windows updater. Capability 2
+/// inspects packages containing the exact bundled optional audio driver archive.
+pub const UPDATER_CAPABILITY: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error)]
 #[serde(rename_all = "snake_case")]

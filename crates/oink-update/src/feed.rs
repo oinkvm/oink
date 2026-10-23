@@ -1,5 +1,5 @@
 //! Verify the exact signed bytes before interpreting any selection metadata.
-use crate::{Error, PRODUCT, SCHEMA};
+use crate::{Error, PRODUCT, SCHEMA, UPDATER_CAPABILITY};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{
@@ -223,6 +223,9 @@ impl VerifiedManifest {
         Ok(())
     }
     pub fn select(&self, selection: &Selection<'_>) -> Result<Option<&Release>, Error> {
+        self.select_for_capability(selection, UPDATER_CAPABILITY)
+    }
+    fn select_for_capability(&self, selection: &Selection<'_>, capability: u32) -> Result<Option<&Release>, Error> {
         Ok(self
             .manifest
             .releases
@@ -232,7 +235,7 @@ impl VerifiedManifest {
                     && !selection.quarantine.contains(&r.build)
                     && r.architecture == selection.architecture
                     && r.minimum_windows_build <= selection.windows_build
-                    && r.minimum_updater_schema <= SCHEMA
+                    && r.minimum_updater_schema <= capability
                     && r.protocol_baseline == 1
             })
             .max_by_key(|r| r.build))
@@ -452,4 +455,53 @@ pub fn strict_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Er
     }
     serde_json::from_slice::<Unique>(bytes).map_err(|_| Error::Metadata)?;
     serde_json::from_slice(bytes).map_err(|_| Error::Metadata)
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn bridge_feed_gates_legacy_clients_without_changing_document_schema() {
+        let release = serde_json::json!({
+            "build":36,"version":"0.2.1","tag":"v0.2.1","sourceTreeSha256":"a".repeat(64),
+            "architecture":"x64","minimumWindowsBuild":19045,"protocolBaseline":1,
+            "minimumUpdaterSchema":1,"severity":"normal","notes":{"en":"Test"},
+            "package":{"url":"https://example.com/test.msi","length":1,"sha256":"b".repeat(64),
+                "keyId":crate::WINDOWS_EPOCH,"ed25519":STANDARD.encode([0;64])}
+        });
+        let releases = [(36, "0.2.1", 1), (43, "0.2.2", 1), (50, "0.3.0", 2)].map(|(build, version, minimum)| {
+            let mut r = release.clone();
+            r["build"] = build.into();
+            r["version"] = version.into();
+            r["minimumUpdaterSchema"] = minimum.into();
+            serde_json::from_value(r).unwrap()
+        });
+        let m = VerifiedManifest {
+            manifest: Manifest {
+                schema: SCHEMA,
+                product: PRODUCT.into(),
+                key_epoch: crate::WINDOWS_EPOCH.into(),
+                channel: Channel::Stable,
+                sequence: 1,
+                generated_at: "2026-10-14T00:00:00Z".into(),
+                expires_at: "2026-11-13T00:00:00Z".into(),
+                releases: releases.into(),
+            },
+            watermark: Watermark::default(),
+            expires_unix: i64::MAX,
+        };
+        let quarantine = BTreeSet::new();
+        let selection = Selection {
+            windows_build: 19045,
+            architecture: "x64",
+            installed_build: 36,
+            successful_build: 36,
+            quarantine: &quarantine,
+        };
+        assert_eq!(SCHEMA, 1);
+        assert_eq!(m.select_for_capability(&selection, 1).unwrap().unwrap().build, 43);
+        assert_eq!(m.select_for_capability(&selection, 2).unwrap().unwrap().build, 50);
+        assert_eq!(m.select(&selection).unwrap().unwrap().build, 50);
+    }
 }

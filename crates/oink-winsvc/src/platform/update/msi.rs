@@ -24,6 +24,7 @@ const FILES: &[&str] = &[
     "oink-build.json",
     "report-manifest.json",
 ];
+const AUDIO_DRIVER_ARCHIVE: &str = "AudioPlugin/VBCABLE_Driver_Pack45.zip";
 const NOTICES: &[&str] = &[
     "third-party-licenses.json",
     "THIRD_PARTY_LICENSES.md",
@@ -55,6 +56,7 @@ fn relative_file(
     if !(FILES.contains(&path.as_str())
         || NOTICES.contains(&path.as_str())
         || path == "oink-crash-collector.exe"
+        || path == AUDIO_DRIVER_ARCHIVE
         || path.starts_with("licenses/"))
     {
         return Err(Error::Metadata);
@@ -99,6 +101,12 @@ pub(super) fn installed_inventory(receipt: &Receipt, product_code: String) -> Re
         .collect();
     if receipt.collector_included {
         paths.insert("oink-crash-collector.exe".into(), root.join("oink-crash-collector.exe"));
+    }
+    // Older installations may predate the bundled optional driver. Its archive
+    // is data only; capture its exact installed hash when present for health and
+    // rollback checks, without permitting arbitrary plugin files.
+    if root.join(AUDIO_DRIVER_ARCHIVE).exists() {
+        paths.insert(AUDIO_DRIVER_ARCHIVE.into(), root.join(AUDIO_DRIVER_ARCHIVE));
     }
     let mut directories = vec![root.join("licenses")];
     while let Some(directory) = directories.pop() {
@@ -448,6 +456,17 @@ mod tests {
             hashes.len(),
             started.elapsed()
         );
+    }
+    #[test]
+    fn bundled_audio_driver_archive_has_one_exact_allowed_path() {
+        let directories = BTreeMap::from([("AudioPlugin".into(), ("INSTALLFOLDER".into(), "AudioPlugin".into()))]);
+        assert_eq!(
+            relative_file("AudioPlugin", "VBCABLE_Driver_Pack45.zip", &directories),
+            Ok("AudioPlugin/VBCABLE_Driver_Pack45.zip".into())
+        );
+        for name in ["other.zip", "driver.exe", "../escape.zip"] {
+            assert!(relative_file("AudioPlugin", name, &directories).is_err());
+        }
     }
     #[test]
     fn current_package_metadata_and_licenses_are_inspected_without_path_escape() {
