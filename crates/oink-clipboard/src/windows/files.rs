@@ -831,7 +831,10 @@ mod path_tests {
             };
             assert!(resolved.as_bool());
             let end = wide.iter().position(|v| *v == 0).unwrap();
-            assert_eq!(PathBuf::from(String::from_utf16(&wide[..end]).unwrap()), *expected);
+            let resolved = PathBuf::from(String::from_utf16(&wide[..end]).unwrap());
+            // Shell can expand an 8.3 spelling inherited from TEMP. Compare the
+            // existing files' canonical paths so identity, not spelling, must match.
+            assert_eq!(resolved.canonicalize().unwrap(), expected.canonicalize().unwrap());
         }
         let one = build_hdrop(&paths[..1]);
         let name = path_equivalent("FileNameW", &one).unwrap();
