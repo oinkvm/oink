@@ -154,5 +154,6 @@ impl TestClock {
     }
 }
 
-#[cfg(test)]
+// Uses the debug-only content fixture.
+#[cfg(all(test, debug_assertions))]
 pub(crate) mod tests;

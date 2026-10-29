@@ -420,7 +420,8 @@ impl Delivery {
             )?;
             request.completed.store(true, Ordering::Release);
         } else {
-            #[cfg(test)]
+            // Uses the debug-only population-create helper.
+            #[cfg(all(test, debug_assertions))]
             super::tests::before_population_create(self.id, index)?;
             let path = self.file_path(index);
             // The RH reference excludes new consumer opens until publication

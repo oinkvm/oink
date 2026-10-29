@@ -1633,6 +1633,8 @@ mod tests {
         let actual = unsafe { callback_path(&info, normalized.as_ptr()) };
         assert_eq!(actual, Some(PathBuf::from(r"C:\fixture\received\source\batch\Leaf")));
     }
+    // Uses the debug-only cache mutation helpers.
+    #[cfg(debug_assertions)]
     #[test]
     fn journal_restart_discards_open_balances_but_preserves_items_and_disqualifies_shell_cleanup() {
         let temp = tempfile::tempdir().unwrap();

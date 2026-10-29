@@ -168,7 +168,8 @@ fn serialize(url: &str) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[cfg(test)]
+// Uses the debug-only URL/content fixtures and STA helper.
+#[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
     use crate::content::url::tests::{Projected, source};

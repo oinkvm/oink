@@ -1525,7 +1525,8 @@ impl Work {
     }
 }
 
-#[cfg(test)]
+// Uses the debug-only content and drag-preview fixtures and cache mutation helpers.
+#[cfg(all(test, debug_assertions))]
 mod tests {
     mod shell_ops;
     mod zip_drop;

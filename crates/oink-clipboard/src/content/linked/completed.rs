@@ -357,5 +357,6 @@ pub fn subtree(root: NodeId, manifest: &[FileNode]) -> io::Result<Vec<FileNode>>
     }
     Ok(entries)
 }
-#[cfg(test)]
+// Uses the debug-only content fixture.
+#[cfg(all(test, debug_assertions))]
 mod tests;

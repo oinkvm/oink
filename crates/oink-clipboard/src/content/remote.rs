@@ -704,7 +704,8 @@ impl Provider for Remote {
             .then(|| Arc::new(self.clone()) as Arc<dyn namespace::Namespace>)
     }
 }
-#[cfg(test)]
+// Uses the debug-only content fixture.
+#[cfg(all(test, debug_assertions))]
 mod cancellation_tests {
     use super::*;
     #[test]

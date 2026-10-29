@@ -723,7 +723,8 @@ mod tests {
         assert_eq!(serde_json::from_value::<ApiError>(wire).unwrap(), error);
     }
 
-    #[cfg(target_os = "macos")]
+    // Uses the debug-only fake-platform Node entry point.
+    #[cfg(all(target_os = "macos", debug_assertions))]
     #[test]
     fn local_ready_cancel_is_independent_of_feed_configuration() {
         use crate::api::{AgentApi, Request};
