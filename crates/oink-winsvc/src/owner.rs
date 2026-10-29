@@ -154,7 +154,10 @@ impl Client {
         })
     }
     pub fn request(&self, command: Command, ordinary: bool, only_connected: bool) -> io::Result<Option<Reply>> {
-        if command == Command::Heartbeat || ordinary && !matches!(command, Command::Ping | Command::Position) {
+        if command == Command::Heartbeat
+            || command == Command::PowerSnapshot && !ordinary
+            || ordinary && !matches!(command, Command::Ping | Command::Position | Command::PowerSnapshot)
+        {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "ordinary input command"));
         }
         if self.shared.stop.load(Ordering::Acquire) {

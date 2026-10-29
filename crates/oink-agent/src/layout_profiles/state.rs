@@ -43,6 +43,8 @@ pub struct State {
 }
 #[derive(Debug, Default)]
 pub struct Data {
+    pub restore_tracker: super::topology::RestoreTracker,
+    pub restore_layout_version: Option<dto::ConfigVersion>,
     pub catalog: Option<Catalog>,
     pub last: Option<LayoutProfilesState>,
     pub sequence: u64,
@@ -55,6 +57,8 @@ pub struct Data {
 }
 #[derive(Debug)]
 pub struct Observation {
+    pub layout_version: dto::ConfigVersion,
+    pub physical_topology: Option<super::topology::PhysicalTopology>,
     pub snapshot: ArrangementSnapshot,
     pub devices: Vec<DeviceArrangementState>,
     pub device_state: DeviceState,
@@ -200,6 +204,8 @@ impl Node {
         model::canonicalize(&mut snapshot);
         model::validate_snapshot(&snapshot)?;
         Ok(Observation {
+            layout_version: applied.version.clone(),
+            physical_topology: super::topology::from_facts(&table),
             snapshot,
             devices,
             device_state: DeviceState {
@@ -274,7 +280,18 @@ impl Node {
             data.pending_layout = None;
             let mut recovered = catalog;
             for op in &mut data.operations {
+                let version = recovered.version.clone();
                 Self::autosave_operation(&mut recovered, op, self.id().into())?;
+                if recovered.version != version
+                    && let Some(save) = &op.manual_save
+                {
+                    recovered
+                        .profiles
+                        .iter_mut()
+                        .find(|p| p.id == save.profile_id)
+                        .unwrap()
+                        .saved_topology = observation.physical_topology.clone();
+                }
             }
             let receipts = store::Operations {
                 operations: data.operations.clone(),
@@ -312,18 +329,25 @@ impl Node {
             &observation.snapshot,
             &observation.devices,
             &observation.device_state,
+            &observation.physical_topology,
         ));
         let operation = data.operations.back().cloned();
         let busy = operation
             .as_ref()
             .is_some_and(|op| matches!(op.status, OperationStatus::Running | OperationStatus::OutcomeUnknown));
+        let mut profiles = c.summaries(&observation.device_state);
+        for summary in &mut profiles {
+            if let Some(saved) = &c.profile(&summary.id)?.saved_topology {
+                summary.exact_match = observation.physical_topology.as_ref() == Some(saved);
+            }
+        }
         let mut state = LayoutProfilesState {
             epoch: model::hash(&self.inner.boot.nonce),
             sequence: data.sequence.to_string(),
             token,
             catalog_token: c.version.token(),
             readiness: if syncing { Readiness::Syncing } else { Readiness::Ready },
-            profiles: c.summaries(&observation.device_state),
+            profiles,
             active_profile_id: Some(c.active_profile_id.clone()),
             create_enabled: !busy && !syncing && c.profiles.len() < model::MAX_PROFILES,
             snapshot: Some(observation.snapshot),
@@ -343,6 +367,9 @@ impl Node {
         Ok(state)
     }
     pub(crate) fn refresh_layout_profiles(&self) {
+        if let Err(error) = self.restore_matching_topology() {
+            tracing::warn!(%error, "automatic profile restore failed");
+        }
         let before = lock(&self.inner.profiles.data).sequence;
         if let Ok(state) = self.profile_snapshot()
             && before != lock(&self.inner.profiles.data).sequence
@@ -404,6 +431,13 @@ impl Node {
             data.unknown.clear();
             data.replies.clear();
             data.previews.clear();
+        }
+        if data
+            .catalog
+            .as_ref()
+            .is_some_and(|old| old.active_profile_id != catalog.active_profile_id)
+        {
+            data.restore_tracker = super::topology::RestoreTracker::default();
         }
         data.catalog = Some(catalog);
         self.inner.profiles.wake.notify_waiters();

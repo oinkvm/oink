@@ -20,7 +20,8 @@ pub(super) struct NativeEvent {
 
 pub(super) struct Events {
     history: History<NativeEvent, 8>,
-    buffer: [NativeEvent; 256],
+    // One second of ordinary 128-frame callbacks fits without a 1 ms poll.
+    buffer: [NativeEvent; 1024],
     previous_nonempty_ns: Option<u64>,
     last_report: Instant,
     previous_drain: Instant,
@@ -46,7 +47,7 @@ impl Events {
         );
         Self {
             history: History::default(),
-            buffer: [NativeEvent::default(); 256],
+            buffer: [NativeEvent::default(); 1024],
             previous_nonempty_ns: None,
             last_report: Instant::now(),
             previous_drain: Instant::now(),
@@ -114,7 +115,9 @@ impl Events {
             log_thread_scheduling(raw, "capture callback");
             self.scheduled = true;
         }
-        if delivery_gap >= Duration::from_millis(20) {
+        // This is supervisor drain latency, not PCM delivery. The encoder is
+        // callback-driven; a normal one-second bookkeeping interval is healthy.
+        if delivery_gap >= Duration::from_secs(2) {
             tracing::info!(start_us = monotonic_us(now), gap_us = delivery_gap.as_micros() as u64,
                 context = ?self.history, native_trimmed_frames = trimmed, channel_dropped = self.channel_dropped,
                 diagnostic_events_lost = lost, "audio capture delivery gap");

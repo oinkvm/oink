@@ -287,9 +287,10 @@ impl Router {
             if pressed {
                 match item {
                     HeldItem::Key(code) => {
+                        let sync_modifier = self.source_sync_modifier(code);
                         if let std::collections::hash_map::Entry::Vacant(e) = self.keys.entry(code) {
                             e.insert(vec![Target::Dropped]);
-                            if !code.is_modifier() {
+                            if !sync_modifier {
                                 self.gap_input.local_dropped.insert(item);
                             }
                         }
@@ -345,7 +346,7 @@ impl Router {
             } // pre-gap release follows its existing route
             if !self.is_held(origin, item) && !self.forwarded.contains_key(&(origin, item)) {
                 match item {
-                    HeldItem::Key(code) if code.is_modifier() => {
+                    HeldItem::Key(code) if code.is_modifier() || code == KeyCode::APPLE_FN => {
                         self.gap_input.modifiers.insert((origin, code), from);
                     }
                     _ => {
@@ -373,7 +374,12 @@ impl Router {
         {
             return true;
         }
-        self.gap.is_some() && !matches!(msg, InputMsg::Motion { .. } | InputMsg::Forwarded { .. })
+        let game_escape_motion = matches!(msg, InputMsg::RelativeMotion { .. })
+            && self.game_mode().active
+            && self.pointer_lock_escape_held();
+        self.gap.is_some()
+            && !game_escape_motion
+            && !matches!(msg, InputMsg::Motion { .. } | InputMsg::Forwarded { .. })
     }
 
     /// In physical-space mode a virtual point must not paint onto an unrelated
@@ -526,7 +532,24 @@ impl Router {
                 delta.0 * source.local.w / source.rect.w,
                 delta.1 * source.local.h / source.rect.h,
             );
-            if !self.push_gap_resistance(origin, &at, from, local_delta, now) {
+            // Entry protection belongs to the selected directed channel even
+            // when physical gap travel delays arrival at its destination.
+            let protected = self
+                .layout
+                .first_portal_from_source(from, hand, origin)
+                .map(|exit| {
+                    ScreenPos::new(
+                        ScreenId::new(exit.to.screen.device, exit.to.screen.display),
+                        exit.to.local,
+                    )
+                })
+                .filter(|dst| self.input_ready(dst.screen.device) && self.protected_entry(&dst.screen));
+            let allowed = if let Some(dst) = protected {
+                self.push_resistance(origin, &at, Some(from), &dst, local_delta, now)
+            } else {
+                self.push_gap_resistance(origin, &at, from, local_delta, now)
+            };
+            if !allowed {
                 self.diagnostic(DecisionKind::Refused, DecisionReason::Resistance, Some(&at));
                 self.pointer = Some(at);
                 return Some(Disposition::Pass);

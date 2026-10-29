@@ -306,6 +306,24 @@ fn decode_image(decoder: impl image::ImageDecoder, pixels_per_meter: Option<(u32
     })
 }
 
+/// CF_TIFF is an encoded TIFF stream, not a DIB header. Keep its decode under
+/// the same expanded-pixel and allocation budgets as the other image formats.
+pub(crate) fn tiff_to_png(bytes: &[u8]) -> Result<Vec<u8>, DecodeError> {
+    use image::ImageDecoder;
+    if bytes.len() as u64 > crate::model::REPRESENTATION_BYTES {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let failure = |error: image::ImageError| match error {
+        image::ImageError::Limits(_) => DecodeError::LimitExceeded,
+        _ => DecodeError::InvalidData(error.to_string()),
+    };
+    let mut decoder = image::codecs::tiff::TiffDecoder::new(Cursor::new(bytes)).map_err(failure)?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(crate::model::REPRESENTATION_BYTES);
+    decoder.set_limits(limits).map_err(failure)?;
+    encode_png(&decode_image(decoder, None)?).map_err(Into::into)
+}
+
 /// DIB → PNG。
 pub(crate) fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>, DecodeError> {
     match decode_dib(dib)? {
@@ -513,6 +531,38 @@ pub(crate) fn rgba_to_dib24(img: &Rgba) -> Vec<u8> {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiff_preserves_asymmetric_pixels_and_rejects_invalid_or_oversized_images() {
+        let image = sample();
+        let mut encoded = Cursor::new(Vec::new());
+        image::codecs::tiff::TiffEncoder::new(&mut encoded)
+            .encode(&image.data, image.width, image.height, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let mut bytes = encoded.into_inner();
+        assert_eq!(decode_png(&tiff_to_png(&bytes).unwrap()).unwrap(), image);
+        for bad in [b"invalid TIFF".as_slice(), &bytes[..8]] {
+            assert_eq!(
+                tiff_to_png(bad).unwrap_err().reason(),
+                crate::model::Unavailable::InvalidData
+            );
+        }
+        // A well-formed directory can declare enormous dimensions while the
+        // encoded input is tiny. Reject it before allocating the decoded image.
+        assert_eq!(&bytes[..2], b"II");
+        let ifd = u32_at(&bytes, 4).unwrap() as usize;
+        let entries = u16_at(&bytes, ifd).unwrap() as usize;
+        let width = (0..entries)
+            .map(|n| ifd + 2 + 12 * n)
+            .find(|offset| u16_at(&bytes, *offset) == Some(256))
+            .unwrap();
+        assert_eq!(u16_at(&bytes, width + 2), Some(4));
+        bytes[width + 8..width + 12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            tiff_to_png(&bytes).unwrap_err().reason(),
+            crate::model::Unavailable::LimitExceeded
+        );
+    }
 
     fn sample() -> Rgba {
         // 3×2：第一行 红 半透明绿 透明蓝；第二行 白 黑 灰

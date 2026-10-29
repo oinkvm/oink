@@ -37,6 +37,9 @@ export function OnboardingPermissions({ preferences, perms, onGrant, onOpenSetti
   leaving: boolean;
   onDone: () => void;
 }) {
+  useEffect(() => {
+    void agent.query('fileProvider', api.fileProviderStatus).catch(() => {});
+  }, []);
   const grant = useGrant(onGrant, onOpenSettings);
   const done = PERMS.every(p => ['granted', 'not_required', 'unsupported'].includes(perms[p.id]));
   const [ask, setAsk] = useState(false);

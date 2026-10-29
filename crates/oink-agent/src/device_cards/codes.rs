@@ -62,7 +62,8 @@ impl TryFrom<&dto::ResourceFault> for ResourceFault {
                 DeviceUnavailable,
                 CleanupFailed,
                 Unsupported,
-                BackendFailed
+                BackendFailed,
+                MicrophoneLoopback
             ]
         );
         Ok(Self {

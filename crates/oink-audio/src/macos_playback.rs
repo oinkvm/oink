@@ -18,6 +18,8 @@ use std::{
 
 #[derive(Clone, Copy, Debug)]
 pub struct NativeOutputTiming {
+    pub period_frames: u32,
+    pub native_gap_frames: Option<u64>,
     pub callback_at: Instant,
     /// HAL outputDataTime: first sample passed to hardware, not acoustic arrival.
     pub playback_at: Option<Instant>,
@@ -58,20 +60,20 @@ struct RawInfo {
     buffer_request_status: i32,
     lease_changed: u32,
 }
-type RenderCallback = Box<dyn FnMut(&mut [f32], NativeOutputTiming) + Send>;
-type RenderBridge = unsafe extern "C" fn(*mut c_void, *mut f32, usize, u32, u32, u32, u64, u64);
+type RenderCallback = Box<dyn crate::playback::NativeRender>;
+type RenderBridge = unsafe extern "C" fn(*mut c_void, *mut f32, usize, u32, u32, u32, u64, u64, f64);
 unsafe extern "C" {
     fn oink_audio_output_start(
         uid: *const c_char,
         requested: u32,
         render: RenderBridge,
+        complete: unsafe extern "C" fn(*mut c_void, u64),
         context: *mut c_void,
         info: *mut RawInfo,
         retained: *mut bool,
         error: *mut c_char,
         error_size: usize,
     ) -> *mut c_void;
-    fn oink_audio_output_device_id(output: *mut c_void) -> u32;
     fn oink_audio_output_stop(output: *mut c_void, released: *mut bool) -> i32;
     fn oink_audio_output_check(output: *mut c_void, error: *mut c_char, error_size: usize) -> i32;
     fn oink_audio_host_time_ns() -> u64;
@@ -79,7 +81,7 @@ unsafe extern "C" {
 
 #[derive(Debug)]
 pub struct NativePlayback {
-    schedule: Option<Result<crate::realtime::Schedule, String>>,
+    quiescent: Arc<AtomicBool>,
     info: NativeOutputInfo,
     invalidated: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -97,6 +99,8 @@ impl NativePlayback {
         let uid = CString::new(endpoint_raw_uid).map_err(|_| "Output UID contains NUL")?;
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
+        let quiescent = Arc::new(AtomicBool::new(false));
+        let worker_quiescent = quiescent.clone();
         let invalidated = Arc::new(AtomicBool::new(false));
         let worker_invalidated = invalidated.clone();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -108,6 +112,7 @@ impl NativePlayback {
                     clock: HostClock::new(),
                     panicked: AtomicBool::new(false),
                     last_callback_ns: AtomicU64::new(0),
+                    expected_frame: UnsafeCell::new(None),
                 });
                 let mut retained = false;
                 let mut raw_info = RawInfo::default();
@@ -119,6 +124,7 @@ impl NativePlayback {
                         uid.as_ptr(),
                         requested.unwrap_or(u32::MAX),
                         render_bridge,
+                        complete_bridge,
                         (&mut *state as *mut CallbackState).cast(),
                         &mut raw_info,
                         &mut retained,
@@ -137,11 +143,7 @@ impl NativePlayback {
                     raw,
                     state: Some(state),
                 };
-                // SAFETY: output owns this live native device until close.
-                let device = unsafe { oink_audio_output_device_id(output.raw) };
-                let period_ns = (raw_info.buffer_frames as f64 * 1e9 / raw_info.sample_rate.max(1.0)).round() as u64;
-                let schedule = crate::realtime::Schedule::device(device, period_ns);
-                if ready_tx.send(Ok((raw_info.into_info(requested), schedule))).is_err() {
+                if ready_tx.send(Ok(raw_info.into_info(requested))).is_err() {
                     return;
                 }
                 let started = Instant::now();
@@ -170,22 +172,22 @@ impl NativePlayback {
                     }
                 }
                 // Error publication asks the ordinary owner to retire the sink.
-                // Keep the native device/workgroup alive until that owner has
-                // joined the auxiliary worker and drops NativePlayback. Closing
-                // here immediately on a health error would invert that order.
+                // Keep callback ownership pinned until the ordinary owner
+                // requests shutdown, then report native quiescence.
                 while !stopping.load(Ordering::Acquire) {
                     thread::sleep(Duration::from_millis(1));
                 }
                 let status = output.close();
+                worker_quiescent.store(output.state.is_some(), Ordering::Release);
                 if status != 0 {
                     on_error(format!("Restore HAL output buffer failed: Core Audio status {status}"));
                 }
             })
             .map_err(|err| format!("Start HAL output worker: {err}"))?;
         match ready_rx.recv() {
-            Ok(Ok((info, schedule))) => Ok(Self {
+            Ok(Ok(info)) => Ok(Self {
                 info,
-                schedule: Some(schedule),
+                quiescent,
                 invalidated,
                 stop,
                 worker: Some(worker),
@@ -199,8 +201,12 @@ impl NativePlayback {
             }
         }
     }
-    pub fn take_schedule(&mut self) -> Result<crate::realtime::Schedule, String> {
-        self.schedule.take().ok_or("output workgroup already taken")?
+    pub fn shutdown(&mut self) -> bool {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.quiescent.load(Ordering::Acquire)
     }
     pub fn device_invalidated(&self) -> bool {
         self.invalidated.load(Ordering::Acquire)
@@ -211,10 +217,7 @@ impl NativePlayback {
 }
 impl Drop for NativePlayback {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        self.shutdown();
     }
 }
 
@@ -282,6 +285,7 @@ struct CallbackState {
     clock: HostClock,
     panicked: AtomicBool,
     last_callback_ns: AtomicU64,
+    expected_frame: UnsafeCell<Option<f64>>,
 }
 unsafe extern "C" fn render_bridge(
     context: *mut c_void,
@@ -292,6 +296,7 @@ unsafe extern "C" fn render_bridge(
     frames: u32,
     callback_ns: u64,
     playback_ns: u64,
+    sample_frame: f64,
 ) {
     // SAFETY: Native HAL serializes callbacks. State and scratch stay live until
     // AudioDeviceStop/DestroyIOProc return; len is the initialized float count.
@@ -305,7 +310,21 @@ unsafe extern "C" fn render_bridge(
     let Some(callback_at) = state.clock.instant(callback_ns) else {
         return;
     };
+    // SAFETY: HAL serializes both render and completion on this IOProc.
+    let expected = unsafe { &mut *state.expected_frame.get() };
+    let native_gap_frames = if sample_frame.is_finite() {
+        let gap = expected
+            .filter(|previous| sample_frame >= *previous - 0.5)
+            .map(|previous| (sample_frame - previous).max(0.0).round() as u64);
+        *expected = Some(sample_frame + frames as f64);
+        gap
+    } else {
+        *expected = None;
+        None
+    };
     let timing = NativeOutputTiming {
+        period_frames: frames,
+        native_gap_frames,
         callback_at,
         playback_at: state.clock.instant(playback_ns),
         sample_rate: rate,
@@ -316,8 +335,20 @@ unsafe extern "C" fn render_bridge(
     // SAFETY: Only this serialized HAL callback accesses the closure. The
     // worker accesses separate atomic fields through a shared reference.
     let callback = unsafe { &mut *state.callback.get() };
-    if catch_unwind(AssertUnwindSafe(|| callback(samples, timing))).is_err() {
+    if catch_unwind(AssertUnwindSafe(|| callback.fill(samples, timing))).is_err() {
         samples.fill(0.0);
+        state.panicked.store(true, Ordering::Release);
+    }
+}
+unsafe extern "C" fn complete_bridge(context: *mut c_void, elapsed_ns: u64) {
+    // SAFETY: native completion is serialized immediately after buffer copy.
+    let state = unsafe { &*context.cast::<CallbackState>() };
+    if state.panicked.load(Ordering::Relaxed) {
+        return;
+    }
+    // SAFETY: same sole IOProc owner as render_bridge.
+    let callback = unsafe { &mut *state.callback.get() };
+    if catch_unwind(AssertUnwindSafe(|| callback.complete(Duration::from_nanos(elapsed_ns)))).is_err() {
         state.panicked.store(true, Ordering::Release);
     }
 }
@@ -354,12 +385,17 @@ mod tests {
     fn hardware_timestamp_is_preserved_without_an_extra_buffer() {
         let epoch = Instant::now();
         let observed = Arc::new(std::sync::Mutex::new(None));
-        let result = observed.clone();
-        let mut state = CallbackState {
-            callback: UnsafeCell::new(Box::new(move |samples, timing| {
+        struct Probe(Arc<std::sync::Mutex<Option<NativeOutputTiming>>>);
+        impl crate::playback::NativeRender for Probe {
+            fn fill(&mut self, samples: &mut [f32], timing: NativeOutputTiming) {
                 samples.fill(0.25);
-                *result.lock().unwrap() = Some(timing);
-            })),
+                *self.0.lock().unwrap() = Some(timing);
+            }
+            fn complete(&mut self, _: Duration) {}
+        }
+        let mut state = CallbackState {
+            callback: UnsafeCell::new(Box::new(Probe(observed.clone()))),
+            expected_frame: UnsafeCell::new(None),
             clock: HostClock {
                 host_ns: 1_000_000_000,
                 instant: epoch,
@@ -379,6 +415,7 @@ mod tests {
                 128,
                 1_001_000_000,
                 1_005_000_000,
+                0.0,
             )
         };
         let timing = observed.lock().unwrap().unwrap();

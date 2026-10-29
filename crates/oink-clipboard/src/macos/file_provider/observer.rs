@@ -116,6 +116,11 @@ fn read_domains(sender: watch::Sender<Option<Status>>, generation: Arc<Mutex<u64
         *latest
     };
     let Some(class) = AnyClass::get(c"NSFileProviderManager") else {
+        tracing::warn!(
+            operation = "get_domains",
+            cause = "manager_class_unavailable",
+            "File Provider observation failed"
+        );
         sender.send_replace(Some(Err("File Provider manager unavailable".into())));
         return;
     };
@@ -125,7 +130,7 @@ fn read_domains(sender: watch::Sender<Option<Status>>, generation: Arc<Mutex<u64
         // domain registration or user-visible URL operation is performed.
         let status = unsafe {
             if let Some(error) = error.as_ref() {
-                Err(error.localizedDescription().to_string())
+                Err(format!("get_domains: {}", super::diagnostics::native_error(error)))
             } else if let Some(domains) = domains.as_ref() {
                 Ok(domains.iter().find_map(|domain| {
                     let id: Retained<NSString> = msg_send![&*domain, identifier];
@@ -150,6 +155,9 @@ fn read_domains(sender: watch::Sender<Option<Status>>, generation: Arc<Mutex<u64
         // flight. Its older callback must not overwrite the newer domain flags.
         let latest = generation.lock().unwrap();
         if *latest == revision {
+            if let Err(cause) = &status {
+                tracing::warn!(operation = "get_domains", %cause, "File Provider observation failed");
+            }
             sender.send_replace(Some(status));
         }
     });

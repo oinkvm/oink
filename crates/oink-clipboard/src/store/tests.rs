@@ -25,28 +25,24 @@ fn d1_restart_retires_orphaned_promise_writers_but_keeps_live_receivers() {
 }
 
 #[test]
-fn whole_delivery_commits_while_cache_reader_holds_previous_record() {
+fn ownership_commit_works_while_cache_reader_holds_previous_record() {
     let data = tempfile::tempdir().unwrap();
-    let id = BatchId([71; 16]);
-    let batch = Batch::create(data.path(), StoreKind::CompletedDelivery, id).unwrap();
-    // Pin the exact overlap with cache accounting's load(): the previous
-    // ownership record stays open throughout its atomic replacement.
+    let batch = Batch::create(data.path(), StoreKind::PromiseExport, BatchId([71; 16])).unwrap();
     let mut accounting = fs::File::open(batch.path().join(RECORD)).unwrap();
-    let receipt = batch.commit_manifest(b"whole delivery").unwrap();
-    assert_eq!(receipt, *blake3::hash(b"whole delivery").as_bytes());
+    batch.external_writers_started().unwrap();
     let mut old = Vec::new();
     accounting.read_to_end(&mut old).unwrap();
-    assert_eq!(serde_json::from_slice::<Record>(&old).unwrap().state, State::Receiving);
-    let restored = Batch::restore(data.path(), id).unwrap();
-    assert_eq!(restored.manifest().unwrap(), b"whole delivery");
+    assert!(!serde_json::from_slice::<Record>(&old).unwrap().external_writers);
+    assert!(load(batch.path(), StoreKind::PromiseExport).unwrap().external_writers);
+    batch.external_writers_finished().unwrap();
 }
 
 #[test]
 fn snapshots_fail_without_publishing_truncated_bytes_and_aggregate_all_representations() {
     let data = tempfile::tempdir().unwrap();
     let batch = Batch::create(data.path(), StoreKind::SourceSnapshot, BatchId([1; 16])).unwrap();
-    let (n, hash) = batch.snapshot_with_limits(1, &mut &b"abcd"[..], 4, 6).unwrap();
-    assert_eq!((n, hash), (4, *blake3::hash(b"abcd").as_bytes()));
+    let n = batch.snapshot_with_limits(1, &mut &b"abcd"[..], 4, 6).unwrap();
+    assert_eq!(n, 4);
     assert_eq!(fs::read(batch.path().join("r-1")).unwrap(), b"abcd");
     assert_eq!(
         batch
@@ -83,7 +79,7 @@ fn a_stalled_snapshot_does_not_block_reading_an_already_stored_representation() 
     }
     for state in [State::Receiving, State::Abandoned, State::Complete] {
         let data = tempfile::tempdir().unwrap();
-        let batch = Batch::create(data.path(), StoreKind::CompletedDelivery, BatchId([72; 16])).unwrap();
+        let batch = Batch::create(data.path(), StoreKind::SourceSnapshot, BatchId([72; 16])).unwrap();
         batch.snapshot(0, &mut &b"ready"[..]).unwrap();
         let (entered, waiting) = mpsc::channel();
         let (resume, paused) = mpsc::channel();
@@ -101,7 +97,7 @@ fn a_stalled_snapshot_does_not_block_reading_an_already_stored_representation() 
         let reading = batch.clone();
         let (opened, result) = mpsc::channel();
         let reader = std::thread::spawn(move || {
-            let _lease = reading.read_lease().unwrap();
+            let _lease = reading.clone();
             let bytes = fs::read(reading.path().join("r-0")).unwrap();
             match state {
                 State::Receiving => {}
@@ -129,30 +125,24 @@ fn a_stalled_snapshot_does_not_block_reading_an_already_stored_representation() 
 }
 
 #[test]
-fn pins_share_cache_clear_lifetime_and_completed_batches_restore_without_the_source() {
+fn pins_share_cache_clear_lifetime_until_last_source_reader() {
     let data = tempfile::tempdir().unwrap();
     let id = BatchId([2; 16]);
-    let batch = Batch::create(data.path(), StoreKind::CompletedDelivery, id).unwrap();
+    let batch = Batch::create(data.path(), StoreKind::SourceSnapshot, id).unwrap();
     batch.snapshot_with_limits(1, &mut &b"stored"[..], 10, 10).unwrap();
-    assert!(Batch::restore(data.path(), id).is_err());
     batch.complete().unwrap();
     let reader = batch.clone();
     drop(batch);
-    let (size, removed, incomplete) = usage(data.path(), StoreKind::CompletedDelivery, true);
+    let (size, removed, incomplete) = usage(data.path(), StoreKind::SourceSnapshot, true);
     assert_eq!(removed, 0);
     assert!(!incomplete);
     assert!(size.bytes > 0);
     assert_eq!(size.bytes, size.kept_bytes);
     drop(reader);
-    let restored = Batch::restore(data.path(), id).unwrap();
-    assert_eq!(fs::read(restored.path().join("r-1")).unwrap(), b"stored");
-    assert_eq!(usage(data.path(), StoreKind::CompletedDelivery, true).1, 0);
-    drop(restored);
-    let (size, removed, incomplete) = usage(data.path(), StoreKind::CompletedDelivery, true);
-    assert!(removed > 0);
+    cleanup_finished();
+    let (size, _, incomplete) = usage(data.path(), StoreKind::SourceSnapshot, true);
     assert!(!incomplete);
     assert_eq!(size.bytes, 0);
-    assert!(Batch::restore(data.path(), id).is_err());
 }
 
 #[test]
@@ -223,10 +213,6 @@ fn source_snapshot_last_reader_release_cleans_payload_without_manual_clear() {
 #[test]
 fn startup_cleans_only_unpinned_obligations_with_no_external_writer() {
     let data = tempfile::tempdir().unwrap();
-    let complete = Batch::create(data.path(), StoreKind::CompletedDelivery, BatchId([20; 16])).unwrap();
-    complete.commit_manifest(b"receipt").unwrap();
-    let completed_path = complete.path().to_owned();
-    drop(complete);
     let active = Batch::create(data.path(), StoreKind::SourceSnapshot, BatchId([21; 16])).unwrap();
     let active_path = active.path().to_owned();
     // Simulate persisted records left by a dead process, without creating an
@@ -242,7 +228,6 @@ fn startup_cleans_only_unpinned_obligations_with_no_external_writer() {
             state: State::Complete,
             external_writers: false,
             snapshot_bytes: 0,
-            manifest_hash: None,
             completed_at: Some(unix_now()),
         },
     )
@@ -252,7 +237,6 @@ fn startup_cleans_only_unpinned_obligations_with_no_external_writer() {
     recover(data.path());
     assert!(!stale.exists());
     assert!(active_path.exists());
-    assert!(completed_path.exists());
 }
 
 #[test]
@@ -291,99 +275,48 @@ fn storage_never_follows_links_and_private_snapshots_are_owner_only() {
 }
 
 #[test]
-fn retention_delivered_superseded_and_expired_reads() {
+fn owned_commits_and_cleanup_invalidate_without_a_filesystem_watcher() {
     let data = tempfile::tempdir().unwrap();
-    let batch = Batch::create(data.path(), StoreKind::CompletedDelivery, BatchId([81; 16])).unwrap();
-    batch.complete().unwrap();
-    let path = batch.path().to_owned();
-    let now = load(&path, StoreKind::CompletedDelivery).unwrap().completed_at.unwrap();
-    batch.delivered().unwrap();
-    sweep_at(data.path(), now);
-    assert!(path.exists(), "current publication protects delivered content");
-    let reader = batch.read_lease().unwrap();
-    assert!(batch.read_lease_with(|| now + RETENTION_SECS - 1).is_ok());
+    let root = data.path().join(StoreKind::PromiseExport.directory());
+    let batch = cache::assert_mutation(&root, || {
+        Batch::create(data.path(), StoreKind::PromiseExport, BatchId([211; 16]))
+    })
+    .unwrap();
+    cache::assert_mutation(&root, || batch.external_writers_started()).unwrap();
+    fs::write(batch.path().join("external"), b"promise callback bytes").unwrap();
+    cache::assert_mutation(&root, || batch.external_writers_finished()).unwrap();
+    cache::assert_mutation(&root, || batch.complete()).unwrap();
+    cache::assert_mutation(&root, || batch.abandon()).unwrap();
+
+    let snapshots = data.path().join(StoreKind::SourceSnapshot.directory());
+    let snapshot = Batch::create(data.path(), StoreKind::SourceSnapshot, BatchId([212; 16])).unwrap();
+    cache::assert_mutation(&snapshots, || snapshot.snapshot(1, &mut &b"snapshot"[..])).unwrap();
     assert!(
-        batch.read_lease_with(|| now + RETENTION_SECS).is_err(),
-        "a retained Batch cannot create a new reader at expiry"
+        cache::assert_mutation(&snapshots, || snapshot.snapshot_with_limits(
+            2,
+            &mut &b"too big"[..],
+            2,
+            100
+        ))
+        .is_err()
     );
-    sweep_at(data.path(), now + RETENTION_SECS);
-    assert!(path.exists(), "expiry waits for the active read");
-    drop(reader);
-    let _clipboard = cache::SourceLease::current(path.join("r-1"));
-    sweep_at(data.path(), now + RETENTION_SECS);
-    assert!(!path.exists(), "expiry ignores the publication owner");
 
-    let batch = Batch::create(data.path(), StoreKind::CompletedDelivery, BatchId([82; 16])).unwrap();
-    batch.complete().unwrap();
-    let path = batch.path().to_owned();
-    batch.delivered().unwrap();
-    drop(batch);
-    sweep_at(data.path(), now);
-    assert!(!path.exists(), "delivery plus supersede evicts before 24 hours");
-}
-
-#[test]
-fn retention_startup_uses_explicit_completion_and_rejects_missing_timestamp() {
-    let data = tempfile::tempdir().unwrap();
-    let batch = Batch::create(data.path(), StoreKind::CompletedDelivery, BatchId([83; 16])).unwrap();
-    batch.complete().unwrap();
-    let path = batch.path().to_owned();
-    let mut record = load(&path, StoreKind::CompletedDelivery).unwrap();
-    record.completed_at = Some(1);
-    save(&path, &record).unwrap();
-    drop(batch);
-    recover(data.path());
-    assert!(!path.exists(), "restart must not reset completion time");
-    let batch = Batch::create(data.path(), StoreKind::CompletedDelivery, BatchId([84; 16])).unwrap();
-    batch.complete().unwrap();
-    let path = batch.path().to_owned();
-    let mut record = load(&path, StoreKind::CompletedDelivery).unwrap();
-    record.completed_at = None;
-    save(&path, &record).unwrap();
-    drop(batch);
-    sweep_at(data.path(), unix_now() + RETENTION_SECS);
-    assert!(Batch::restore(data.path(), BatchId([84; 16])).is_err());
-    assert!(
-        path.exists(),
-        "a malformed obligation cannot be retired by guessing its age"
-    );
-    assert!(usage(data.path(), StoreKind::CompletedDelivery, true).2);
-    assert!(path.exists());
-    let mut json: serde_json::Value = serde_json::from_slice(&fs::read(path.join(RECORD)).unwrap()).unwrap();
-    json.as_object_mut().unwrap().remove("completed_at");
-    fs::write(path.join(RECORD), serde_json::to_vec(&json).unwrap()).unwrap();
-    assert!(load(&path, StoreKind::CompletedDelivery).is_err());
-}
-
-#[test]
-fn retention_keeps_unread_before_deadline_and_expires_exactly_at_deadline() {
-    let data = tempfile::tempdir().unwrap();
-    let batch = Batch::create(data.path(), StoreKind::CompletedDelivery, BatchId([86; 16])).unwrap();
-    batch.complete().unwrap();
-    let path = batch.path().to_owned();
-    let completed = load(&path, StoreKind::CompletedDelivery).unwrap().completed_at.unwrap();
-    drop(batch);
-    sweep_at(data.path(), completed + RETENTION_SECS - 1);
-    assert!(Batch::restore_at(data.path(), BatchId([86; 16]), completed + RETENTION_SECS - 1).is_ok());
-    assert!(Batch::restore_at(data.path(), BatchId([86; 16]), completed + RETENTION_SECS).is_err());
-    assert!(path.exists());
-    sweep_at(data.path(), completed - 1); // backward wall-clock adjustment cannot age a new record
-    assert!(path.exists());
-    sweep_at(data.path(), completed + RETENTION_SECS);
-    assert!(!path.exists());
-    assert_eq!(usage(data.path(), StoreKind::CompletedDelivery, false).0.bytes, 0);
-}
-
-#[cfg(windows)]
-#[test]
-fn placeholder_retention_uses_the_existing_completion_deadline() {
-    let data = tempfile::tempdir().unwrap();
-    let batch = Batch::create(data.path(), StoreKind::CompletedDelivery, BatchId([97; 16])).unwrap();
-    assert!(batch.remaining_retention().is_none());
-    batch.complete().unwrap();
-    let remaining = batch.remaining_retention().unwrap();
-    assert!(remaining <= std::time::Duration::from_secs(RETENTION_SECS));
-    assert!(remaining > std::time::Duration::from_secs(RETENTION_SECS - 10));
-    batch.0.record.lock().unwrap().completed_at = Some(unix_now() - RETENTION_SECS);
-    assert_eq!(batch.remaining_retention(), Some(std::time::Duration::ZERO));
+    // Create detached owned records explicitly: dropping a real Batch schedules
+    // asynchronous cleanup, which would race the recovery/clear boundary here.
+    for clear in [false, true] {
+        let stale = root.join(if clear { "clear" } else { "recover" });
+        create_directory(&stale).unwrap();
+        let mut record = load(batch.path(), StoreKind::PromiseExport).unwrap();
+        record.external_writers = false;
+        save(&stale, &record).unwrap();
+        fs::write(stale.join("payload"), b"owned bytes").unwrap();
+        cache::assert_mutation(&root, || {
+            if clear {
+                usage(data.path(), StoreKind::PromiseExport, true);
+            } else {
+                recover(data.path());
+            }
+        });
+        assert!(!stale.exists());
+    }
 }

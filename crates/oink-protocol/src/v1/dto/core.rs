@@ -454,7 +454,7 @@ fn validate_register(raw: &RawMap) -> Result<()> {
         return Err(ErrorCode::UnsupportedValue.into());
     }
     if defaulted::<bool>(raw, 5, || false)? {
-        if kind == 2 {
+        if matches!(kind, 2 | 8) {
             return Err(ErrorCode::UnsupportedValue.into());
         }
         if !required::<RawMap>(raw, 4)?.is_empty() {

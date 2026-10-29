@@ -1,29 +1,24 @@
-Oink 0.2.1 improves screen arrangement, audio controls and game mode, fixes file dragging and saved layouts, and makes uninstalling more reliable.
+Oink 0.3.0 adds microphone sharing, finer touchpad and pointer-lock controls, upgrading from a local installer and a new way of receiving files, and improves audio, pairing and screen layout.
 
 ## New
 
-- Adjust a screen's remote pointer speed directly from its context menu.
-- Volume changes apply while you drag the slider. The sidebar speaker icon shows local output volume and mute state.
+- Share a computer's microphone with your other computers.
+- When controlling Windows with a Mac touchpad, choose native multi-finger gestures and Mac-style two-finger scrolling independently.
+- Set a shortcut that moves the pointer straight to each computer. Hold the configurable escape key to move the pointer off a locked screen temporarily; the lock stays in place when you return.
+- Drop a downloaded DMG or MSI into Oink to upgrade from a local installer.
+- Rebuilt cross-device dragging and file copying to work with more apps, with improved file transfer and storage.
 
 ## Changes
 
-- Auto-compact moves each computer's screens together without changing their internal arrangement, preserves exact screen contacts, and leaves overlapping computer bounds in place.
-- Pausing Oink, using the emergency release shortcut or restarting Oink re-enables disabled keyboards and mice together.
-- Quit from the tray or menu bar menu now exits directly without a confirmation dialog.
-- Clearer permission guidance and status: computers without Accessibility access are marked and hidden from the layout until access is granted.
-- Windows uninstall now quits Oink gracefully and removes the uninstalling user's Oink data by default. Upgrades preserve data.
+- **Mixed-version groups:** 0.3.0 and 0.2.x computers can still share keyboard, mouse and audio. Clipboard sharing, file copying and file dragging require both computers to run 0.3.0. Upgrade all your computers; a normal upgrade does not require pairing again.
 
 ## Fixes
 
-- Fixed the main window sometimes not appearing when Oink is opened.
-- Fixed saved layouts getting stuck syncing or not merging correctly when joining a group.
-- Game mode stays enabled when the pointer leaves a computer and returns. Automatic detection responds faster, and moving between computers no longer produces false game-mode notices.
-- Fixed file drags through multiple computers, duplicate drag items and delays when preparing a drag. Improved release of the source mouse button.
-- Fixed received files appearing under the wrong source computer or with incorrect dates.
-- Fixed device controls sometimes rejecting clicks after their state changed, and visual seams and focus outlines in the layout.
-- Fixed temporary permission and screen-information states being reported as failures.
-- Mac uninstall cleans up File Provider data more reliably.
-- Restored the Windows Uninstall entry. Uninstall completes even if some leftover data cannot be removed.
+- Fixed held keys such as Tab and modifier keys being released unexpectedly during remote control, and improved input release and pointer restoration after switching computers or cancelling a drag.
+- Improved audio continuity during silent gaps, delayed delivery, output device changes and reconnection.
+- Fixed a "prepared peer lost" error when pairing again right after the first pairing, and improved pairing after a reset and reconnection within a device group.
+- Fixed layout changes that had already been applied being rejected as busy when re-sent after a restart.
+- Fixed Windows mirrored displays being reported as an unreadable system arrangement. Arrangement changes now move a mirrored group together and keep it mirrored.
 
 ## Downloads
 
@@ -35,3 +30,6 @@ Verify downloads against `SHA256SUMS`.
 ## Known limitations
 
 - The Windows MSI is not code-signed in this release. SmartScreen may say "Windows protected your PC": choose **More info → Run anyway**. UAC shows an unknown publisher.
+- Receiving files on a Mac requires the Oink File Provider location to be enabled; if prompted, enable it in Settings → Permissions. Windows skips symbolic links that point to other items in the same transfer; supported Mac-to-Mac transfers keep them.
+- Windows users on 0.2.1 need to install the 0.2.2 bridge update before the in-app update can install 0.3.0.
+- Downgrading to 0.2.x is not supported once the new received-file store is in use.

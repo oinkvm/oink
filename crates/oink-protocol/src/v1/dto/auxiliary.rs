@@ -40,6 +40,7 @@ wire_map!(NotifyShow,validate_notify,{
     1=>id:u64=required;2=>display:Text<512>=required;3=>level:u8=required;
     4=>title:Text<512>=required;5=>description:Text<2048>=required;
     6=>persistent:bool=required;7=>undo:bool=required;8=>kind:u8=required;
+    9=>microphone_muted:Option<bool>=optional;
 });
 wire_map!(NotifyAction,no_validation,{1=>id:u64=required;2=>undo:bool=required;});
 wire_map!(NotifyDismiss,no_validation,{1=>id:u64=required;});

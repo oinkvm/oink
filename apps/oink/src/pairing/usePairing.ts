@@ -136,7 +136,7 @@ export function usePairing(activeWindow = true) {
       if(dialog.mode==='manual'){await manual.current.close();setDialog(d=>({...d,open:false}));return;}
       let session=agent.get().pairings?.sessions.find(p=>p.id===dialog.session?.pairId);
       if(!session&&!terminal){await run(()=>agent.query('pairings',pairingApi.pairings));session=agent.get().pairings?.sessions.find(p=>p.id===dialog.session?.pairId);if(!session)throw new Error(problemText('unavailable'));}
-      if(session&&session.phase<7&&!terminal){const result=await run(()=>pairingApi.cancel(session.id,session.revision));if(result.type==='already_committed')toast({title:tr('配对已经提交'),action:{label:tr('撤销'),onClick:()=>{void run(()=>pairingApi.undo(crypto.randomUUID(),result.undo)).catch(error=>toast({title:tr('无法撤销配对'),description:errorText(error)}));}}});else if(result.type==='commit_unconfirmed')agent.fail('outcome_unknown');}
+      if(session&&session.phase<7&&!terminal){const result=await run(()=>pairingApi.cancel(session.id,session.revision));if(result.type==='already_committed')toast({title:tr('配对已经提交'),action:{label:tr('撤销'),onClick:()=>{void run(()=>pairingApi.undo(crypto.randomUUID(),result.undo)).catch(error=>toast({title:tr('无法撤销配对'),description:errorText(error)}));}}});}
       setDialog(d=>({...d,open:false}));setInput('');setCodes({});
     },
     dismiss:()=>{if(dialog.session)dismissed.current.add(dialog.session.pairId);setDialog(d=>({...d,open:false,session:null}));setInput('');},
@@ -149,7 +149,9 @@ export function usePairing(activeWindow = true) {
   if(session) {
     const view:PairView|undefined=current;
     const verified=view?.peer.verified;
-    const status:PairStatus=terminal?.id===session.pairId?terminal.status:!view||view.phase===0||!verified?'connecting':view.phase===7?'success':view.phase>=8?'failed':view.phase>=3||view.feedback==='correct'?'verifying':view.feedback==='wrong'?'wrong':view.phase===1&&!codes[view.id]?'connecting':'input';
+    // A peer can reject us before identity verification; the terminal snapshot
+    // must win immediately, without waiting for the durable receipt effect.
+    const status:PairStatus=terminal?.id===session.pairId?terminal.status:view?.phase===7?'success':view&&view.phase>=8?'failed':!view||view.phase===0||!verified?'connecting':view.phase>=3||view.feedback==='correct'?'verifying':view.feedback==='wrong'?'wrong':view.phase===1&&!codes[view.id]?'connecting':'input';
     session={...session,peer:verified?presentPeer(verified):session.peer,dir:view?.direction==='incoming'?'in':session.dir,code:codes[session.pairId]??'',input,status:submitting&&status!=='success'&&status!=='failed'?'verifying':status,wrongs:view?3-view.attempts_left:0,reason:terminal?.id===session.pairId?terminal.reason:view?.terminal?pairProblemText(view.terminal):undefined};
   }
   return {requests,nearby,blocked,dialog:{...dialog,session},actions,defaultPort:DEFAULT_PORT};

@@ -46,8 +46,8 @@ use oink_foundation::input::{InjectEvent, MouseButton};
 use super::file_provider::Registration;
 use super::files;
 use crate::dnd::{
-    DndBackend, DndSink, DragOperation, DragOps, DragSpec, Injector, PlatformDndEvent, SourceImageNudge, SourcePress,
-    SourceStart, SourceStartTrace,
+    DndBackend, DndSink, DragOperation, DragOps, DragSpec, Injector, PlatformDndEvent, SourceHoldInput,
+    SourceImageNudge, SourcePress, SourceStart, SourceStartTrace,
 };
 use crate::{ClipboardError, FileContents};
 
@@ -58,8 +58,11 @@ const SIZE: f64 = 48.0;
 /// 等主线程、等系统拖拽的上限。
 const WAIT: Duration = Duration::from_secs(1);
 const IMAGE_NUDGE_DELAY: Duration = Duration::from_millis(100);
-mod promise;
-mod proxy;
+mod drop_trace;
+mod hold_placement;
+pub(super) mod promise;
+pub(super) mod proxy;
+mod recovery;
 mod representation_trace;
 
 // ───────────── 主线程 ─────────────
@@ -148,7 +151,7 @@ fn apply_thumbnail(item: &NSDraggingItem, image: &oink_foundation::dnd::DragImag
 }
 
 /// 在主线程上执行 `f`，不等待。
-fn on_main(f: impl FnOnce(MainThreadMarker) + Send + 'static) {
+pub(super) fn on_main(f: impl FnOnce(MainThreadMarker) + Send + 'static) {
     if let Some(mtm) = MainThreadMarker::new() {
         f(mtm);
         return;
@@ -227,14 +230,19 @@ struct St {
     source_operation: Option<DragOperation>,
     thumbnail_budget: Option<super::thumbnail::Budget>,
     source_thumbnail: Option<(DragOperation, oink_foundation::dnd::DragImage)>,
-    /// Catcher ownership outlives the native ended callback until cleanup.
-    /// A new probe revokes it even before its first Detected callback.
+    /// The held source owns catcher cleanup until an explicit new probe.
+    /// Native entries alone do not authorize a new edge probe.
     probe_operation: Option<DragOperation>,
+    probe_generation: u64,
+    last_probe_operation: Option<DragOperation>,
+    last_source_operation: Option<DragOperation>,
     held_source: Option<DragOperation>,
     source_button: Option<MouseButton>,
     next_image_hold: u64,
     image_hold: Option<ImageHold>,
     cancel_move: Option<CancelMove>,
+    return_move: Option<SourceMove>,
+    inset_move: Option<SourceMove>,
     cancel_observation: Option<(DragOperation, CancelObservation)>,
     /// `release` 进行中：接收窗口接受放下。
     releasing: bool,
@@ -244,6 +252,8 @@ struct St {
     reported_seq: Option<isize>,
     /// 接收窗口在显示。
     probing: bool,
+    probed_at: Option<Instant>,
+    target_start: crate::dnd::TargetStartObservation,
     /// `begin` 等发起窗口的 `mouseDown:` 开始拖拽。
     began: bool,
     starting_operation: Option<DragOperation>,
@@ -259,9 +269,91 @@ struct St {
     over_source: bool,
     target_image: Option<oink_foundation::dnd::DragImage>,
     target_preview: Option<(DragOperation, Vec<ClipData>)>,
+    target_diagnostic: Option<Arc<drop_trace::Session>>,
 }
 
 impl St {
+    fn request_probe(&mut self) -> bool {
+        if self.held_source.is_some() {
+            return false;
+        }
+        // A terminal callback can precede ForgetSource while the panel is
+        // still visible. A new router request, not visibility, revokes cleanup.
+        self.probe_operation = None;
+        self.probe_generation = self.probe_generation.wrapping_add(1);
+        self.probing = true;
+        true
+    }
+
+    fn capture_probe(&mut self, sequence: isize, operation: DragOperation) {
+        if self.probe_operation.is_none() {
+            self.last_probe_operation = Some(operation);
+        }
+        self.reported_seq = Some(sequence);
+        self.source_operation = Some(operation);
+        if let Some(old) = self.thumbnail_budget.take() {
+            old.cancel();
+        }
+        self.source_thumbnail = None;
+    }
+
+    fn hold_probe(&mut self, operation: DragOperation) {
+        self.held_source = Some(operation);
+        self.return_move = None;
+        // A later native drag may enter the panel before this held source's
+        // ForgetSource arrives (observed on macOS 26). Assigning cleanup to
+        // every draggingEntered strands the panel: the old ForgetSource no
+        // longer matches, and the unrelated drag has no router hold to retire.
+        // Keep cleanup tied to HoldSource, including after native termination;
+        // request_probe still protects a genuinely new probe from old cleanup.
+        self.probe_operation = Some(operation);
+        self.last_probe_operation = Some(operation);
+    }
+
+    fn retire_probe(&mut self, operation: DragOperation) -> bool {
+        if self.probe_operation != Some(operation) {
+            return false;
+        }
+        self.clear_probe_state();
+        true
+    }
+
+    fn clear_probe_state(&mut self) {
+        self.probing = false;
+        if self.held_source.is_none()
+            && let Some(budget) = self.thumbnail_budget.take()
+        {
+            budget.cancel();
+        }
+        self.probe_operation = None;
+        self.reported_seq = None;
+    }
+
+    fn retire_probe_generation(&mut self, generation: u64) -> bool {
+        if self.probe_generation != generation {
+            return false;
+        }
+        self.clear_probe_state();
+        true
+    }
+
+    fn take_probe_cleanup(&mut self) -> ProbeCleanup {
+        let unused = if self.held_source.is_none()
+            && self
+                .export
+                .as_ref()
+                .is_some_and(|(_, export)| !export.started.load(Ordering::Acquire))
+        {
+            self.export.take()
+        } else {
+            None
+        };
+        ProbeCleanup {
+            unused,
+            retained_receivers: [self.held_source, self.export.as_ref().map(|(op, _)| *op)],
+        }
+    }
+
     fn probe_current(&self, sequence: isize) -> bool {
         // A catcher exit retires the operation even when AppKit keeps the
         // original native sequence. Re-entry must publish fresh metadata.
@@ -280,6 +372,34 @@ struct CancelMove {
     cancel_submitted: bool,
     started: Instant,
 }
+
+struct SourceMove {
+    operation: DragOperation,
+    native_sequence: i64,
+    destination: isize,
+    at: Point,
+    delivered: bool,
+    acknowledged: bool,
+}
+impl SourceMove {
+    fn observe(
+        &mut self,
+        operation: Option<DragOperation>,
+        native_sequence: i64,
+        destination: isize,
+        at: Point,
+    ) -> bool {
+        if operation != Some(self.operation)
+            || self.native_sequence != native_sequence
+            || self.destination != destination
+            || self.at != at
+        {
+            return false;
+        }
+        self.acknowledged = true;
+        true
+    }
+}
 impl CancelMove {
     fn observe(&mut self, at: Point, exited: bool) {
         self.exited |= exited;
@@ -292,6 +412,7 @@ impl CancelMove {
 
 impl St {
     fn retire_image_nudges(&mut self) {
+        self.inset_move = None;
         if let Some(hold) = &mut self.image_hold {
             hold.active = false;
             hold.pending.clear();
@@ -328,8 +449,9 @@ struct ImageHold {
     started: Instant,
     active: bool,
     ready: bool,
-    pending: Vec<ImageNudgeReason>,
+    pending: Vec<(ImageNudgeReason, u64)>,
     posts: Vec<ImageNudgeObservation>,
+    revision: u64,
 }
 impl ImageHold {
     fn matches(&self, operation: DragOperation, generation: u64) -> bool {
@@ -350,9 +472,10 @@ fn image_nudge_job(
     reason: ImageNudgeReason,
     changed: usize,
     enumeration_returned: Instant,
+    revision: u64,
 ) -> Option<(Instant, impl FnOnce() + Send + 'static)> {
     (changed != 0).then_some((enumeration_returned + IMAGE_NUDGE_DELAY, move || {
-        shared.post_image_nudge(operation, generation, reason)
+        shared.post_image_nudge(operation, generation, reason, revision)
     }))
 }
 
@@ -363,9 +486,17 @@ fn queue_image_nudge(
     reason: ImageNudgeReason,
     changed: usize,
     enumeration_returned: Instant,
+    revision: u64,
 ) {
-    if let Some((deadline, job)) = image_nudge_job(shared, operation, generation, reason, changed, enumeration_returned)
-    {
+    if let Some((deadline, job)) = image_nudge_job(
+        shared,
+        operation,
+        generation,
+        reason,
+        changed,
+        enumeration_returned,
+        revision,
+    ) {
         // One deadline per actual enumeration batch, measured from its return,
         // never from anchor readiness or a later callback. See the posting-site
         // OS-workaround comment in oink-input's nudge_held_drag.
@@ -379,6 +510,7 @@ struct Shared {
     source_press: OnceLock<SourcePress>,
     source_start: OnceLock<SourceStart>,
     image_nudge: OnceLock<SourceImageNudge>,
+    hold_input: OnceLock<SourceHoldInput>,
     st: Mutex<St>,
     cv: Condvar,
 }
@@ -393,7 +525,7 @@ struct NativeBegin {
 }
 
 impl Shared {
-    fn post_image_nudge(&self, operation: DragOperation, generation: u64, reason: ImageNudgeReason) {
+    fn post_image_nudge(&self, operation: DragOperation, generation: u64, reason: ImageNudgeReason, revision: u64) {
         // Keep validity and submission in one critical section. Cancel/Resume
         // cannot revoke then race a stale post behind their own dragged/UP event.
         // The native tap's ACK path never takes this clipboard-state mutex.
@@ -404,8 +536,11 @@ impl Shared {
         let Some(hold) = st.image_hold.as_mut().filter(|h| h.matches(operation, generation)) else {
             return;
         };
+        if revision != hold.revision {
+            return;
+        }
         if !hold.ready {
-            hold.pending.push(reason);
+            hold.pending.push((reason, revision));
             return;
         }
         let (Some(button), Some(inject)) = (hold.button, self.image_nudge.get()) else {
@@ -545,11 +680,13 @@ impl Shared {
 
 /// 主线程上的窗口与进行中的拖拽。
 struct Ui {
+    _recovery_monitors: recovery::Monitors,
     receivers: std::collections::BTreeMap<u64, Vec<Retained<NSFilePromiseReceiver>>>,
     source_info: Option<Retained<ProtocolObject<dyn NSDraggingInfo>>>,
     target_session: Option<(DragOperation, Retained<NSDraggingSession>)>,
     hold_visual: Option<HoldVisual>,
     operations: std::collections::BTreeMap<isize, DragOperation>,
+    diagnostics: std::collections::BTreeMap<isize, Arc<drop_trace::Session>>,
     catcher: Retained<NSPanel>,
     source: Retained<NSPanel>,
     source_view: Retained<DndView>,
@@ -558,6 +695,40 @@ struct Ui {
     /// Retained until the system drag ends; provider retains successful drops beyond this.
     current: Option<Registration>,
     current_proxies: Vec<Arc<proxy::Proxy>>,
+}
+
+struct ProbeCleanup {
+    unused: Option<(DragOperation, Arc<promise::Export>)>,
+    retained_receivers: [Option<DragOperation>; 2],
+}
+impl ProbeCleanup {
+    fn retain_receivers<T>(&self, receivers: &mut std::collections::BTreeMap<u64, T>) {
+        receivers.retain(|sequence, _| {
+            self.retained_receivers
+                .iter()
+                .flatten()
+                .any(|operation| operation.sequence == *sequence)
+        });
+    }
+
+    fn finish(mut self) {
+        if let Some((_, export)) = self.unused.take() {
+            export.cancel(false);
+        }
+        UI.with(|ui| {
+            if let Some(ui) = ui.borrow_mut().as_mut() {
+                self.retain_receivers(&mut ui.receivers);
+            }
+        });
+    }
+}
+
+fn hide_catcher() {
+    UI.with(|ui| {
+        if let Some(ui) = ui.borrow().as_ref() {
+            recovery::hide(&ui.catcher, Role::Catcher);
+        }
+    });
 }
 
 thread_local! {
@@ -677,6 +848,10 @@ impl HoldVisual {
 /// AppKit can request fresh artwork after the initial destination enumeration.
 /// The native probe handles this callback too; a one-shot hide misses that update.
 fn hide_drag_images(sender: &ProtocolObject<dyn NSDraggingInfo>) -> (usize, usize) {
+    enumerate_drag_images(sender, true)
+}
+
+fn enumerate_drag_images(sender: &ProtocolObject<dyn NSDraggingInfo>, hide_images: bool) -> (usize, usize) {
     use objc2::ClassType;
     let count = std::rc::Rc::new(std::cell::Cell::new(0));
     let restored = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -691,7 +866,11 @@ fn hide_drag_images(sender: &ProtocolObject<dyn NSDraggingInfo>) -> (usize, usiz
             // the provider pointer does not invoke it or read source payloads.
             unsafe {
                 let item = item.as_ref();
-                if hide_drag_item(item) {
+                if if hide_images {
+                    hide_drag_item(item)
+                } else {
+                    !item.imageComponentsProvider().is_null()
+                } {
                     observed.set(observed.get() + 1);
                 }
             }
@@ -761,6 +940,7 @@ fn end_held_source(shared: &Shared, accepted: bool, reason: NativeHoldEnd) {
             data.fail(crate::model::Unavailable::Cancelled);
         }
         st.cancel_move = None;
+        st.return_move = None;
         st.retire_image_nudges();
         st.source_button = None;
         st.source_present = false;
@@ -795,6 +975,7 @@ fn end_held_source(shared: &Shared, accepted: bool, reason: NativeHoldEnd) {
 }
 
 struct PreparedDrag {
+    diagnostic: Option<Arc<drop_trace::Session>>,
     spec: DragSpec,
     provider: Option<Registration>,
     image: Option<oink_foundation::dnd::DragImage>,
@@ -816,6 +997,7 @@ enum Role {
 fn dragged_types(_role: Role) -> Retained<NSArray<NSString>> {
     let mut types = vec![
         NSString::from_str("public.file-url"),
+        NSString::from_str("public.url"),
         NSString::from_str("public.utf8-plain-text"),
         NSString::from_str("public.image"),
         NSString::from_str("public.jpeg"),
@@ -853,11 +1035,24 @@ define_class!(
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
             tracing::debug!(role = ?self.ivars().role, "mouseDown on a drag-and-drop window");
+            if recovery::observe(&self.ivars().shared, self.ivars().role, recovery::Trigger::MouseDown) {
+                return;
+            }
             if self.ivars().role == Role::Source {
                 self.ivars().shared.lock().press_received = true;
                 self.ivars().shared.cv.notify_all();
                 self.start_drag(event);
             }
+        }
+
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, _event: &NSEvent) {
+            recovery::observe(&self.ivars().shared, self.ivars().role, recovery::Trigger::MouseDown);
+        }
+
+        #[unsafe(method(otherMouseDown:))]
+        fn other_mouse_down(&self, _event: &NSEvent) {
+            recovery::observe(&self.ivars().shared, self.ivars().role, recovery::Trigger::MouseDown);
         }
     }
 
@@ -868,6 +1063,7 @@ define_class!(
         fn dragging_entered(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
             let returned = self.entered(sender);
             self.observe_hold(sender.into(), HoldCallback::Entered, returned, self.is_own(sender));
+            self.observe_source_position(sender);
             returned
         }
 
@@ -883,6 +1079,7 @@ define_class!(
                 NSDragOperation::Copy
             } else { NSDragOperation::None };
             self.observe_hold(Some(sender), HoldCallback::Updated, returned, own);
+            self.observe_source_position(sender);
             returned
         }
 
@@ -891,6 +1088,17 @@ define_class!(
             if self.ivars().role != Role::Catcher { return; }
             let Some(sender) = sender else { return; };
             let shared = &self.ivars().shared;
+            let returning = shared.lock().return_move.as_ref().is_some_and(|r| {
+                r.native_sequence == sender.draggingSequenceNumber() as i64
+            });
+            if returning {
+                // Expanding the return surface can regenerate artwork before
+                // the return move is posted. Keep it hidden at the held anchor;
+                // only native acknowledgement at the logical return reveals it.
+                hide_drag_images(sender);
+                self.observe_source_position(sender);
+                return;
+            }
             let hold = {
                 let mut st = shared.lock();
                 let Some(hold) = st.image_hold.as_mut().filter(|h| h.active && h.native_sequence == sender.draggingSequenceNumber() as i64) else { return };
@@ -899,8 +1107,15 @@ define_class!(
             };
             let (items, providers) = hide_drag_images(sender);
             let enumeration_returned = Instant::now();
+            let revision = {
+                let mut st = shared.lock();
+                let Some(current) = st.image_hold.as_mut().filter(|h| h.matches(hold.0, hold.1)) else { return };
+                if providers != 0 { current.revision += 1; }
+                current.revision
+            };
             self.observe_hold(Some(sender), HoldCallback::Image { items, providers }, NSDragOperation::None, false);
-            queue_image_nudge(shared.clone(), hold.0, hold.1, ImageNudgeReason::ImageUpdate, providers, enumeration_returned);
+            queue_image_nudge(shared.clone(), hold.0, hold.1, ImageNudgeReason::ImageUpdate, providers, enumeration_returned, revision);
+            self.observe_source_position(sender);
         }
 
         #[unsafe(method(draggingExited:))]
@@ -926,12 +1141,17 @@ define_class!(
 
         #[unsafe(method(performDragOperation:))]
         fn perform(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
+            let mut timing = (self.ivars().role == Role::Catcher)
+                .then(|| promise::timing::perform(sender.draggingSequenceNumber() as i64)).flatten();
             self.observe_hold(Some(sender), HoldCallback::Perform, NSDragOperation::None, false);
             let shared = &self.ivars().shared;
             let export = { let st = shared.lock(); st.releasing.then(|| st.export.as_ref().map(|(_, export)| export.clone())).flatten() };
             if self.ivars().role == Role::Catcher && let Some(export) = export {
+                if let Some(timing) = timing.as_mut() {
+                    timing.bind(export.operation.map_or(0, |operation| operation.sequence));
+                }
                 let accepted = UI.with(|ui| {
-                    let receivers = ui.borrow().as_ref().and_then(|ui| ui.receivers.get(&export.operation.sequence).cloned());
+                    let receivers = export.operation.and_then(|operation| ui.borrow().as_ref().and_then(|ui| ui.receivers.get(&operation.sequence).cloned()));
                     receivers.is_some_and(|receivers| export.receive(&receivers, &sender.draggingPasteboard()))
                 });
                 if accepted { shared.lock().released = true; shared.cv.notify_all(); }
@@ -982,8 +1202,15 @@ define_class!(
 
     unsafe impl NSDraggingSource for DndView {
         #[unsafe(method(draggingSession:sourceOperationMaskForDraggingContext:))]
-        fn source_mask(&self, _session: &NSDraggingSession, context: NSDraggingContext) -> NSDragOperation {
+        fn source_mask(&self, session: &NSDraggingSession, context: NSDraggingContext) -> NSDragOperation {
             let ops = self.ivars().shared.lock().ops;
+            let diagnostic = UI.with(|u| u.borrow().as_ref()
+                .and_then(|ui| ui.diagnostics.get(&session.draggingSequenceNumber()).cloned()))
+                .or_else(|| {
+                    let st = self.ivars().shared.lock();
+                    st.target_diagnostic.as_ref().filter(|d| st.starting_operation == Some(d.operation)).cloned()
+                });
+            if let Some(diagnostic) = diagnostic { diagnostic.mask(context, ns_ops(ops)); }
             tracing::trace!(?ops, context = context.0, "drag source operation mask");
             ns_ops(ops)
         }
@@ -998,6 +1225,7 @@ define_class!(
             let operation = UI.with(|u| u.borrow().as_ref()
                 .and_then(|ui| ui.operations.get(&session.draggingSequenceNumber()).copied()))
                 .or_else(|| self.ivars().shared.lock().starting_operation);
+            if let Some(diagnostic) = self.ivars().shared.lock().target_diagnostic.as_ref().filter(|d| Some(d.operation) == operation) { diagnostic.enter(1); }
             if let Some(operation) = operation {
                 self.ivars().shared.complete_native_begin(Some(operation), Some(at));
             }
@@ -1007,6 +1235,10 @@ define_class!(
         fn ended(&self, session: &NSDraggingSession, _point: NSPoint, operation: NSDragOperation) {
             let shared = self.ivars().shared.clone();
             let dropped = operation != NSDragOperation::None;
+            let moved = operation.contains(NSDragOperation::Move);
+            let diagnostic = UI.with(|u| u.borrow_mut().as_mut()
+                .and_then(|ui| ui.diagnostics.remove(&session.draggingSequenceNumber())));
+            if let Some(diagnostic) = &diagnostic { diagnostic.end(operation, shared.lock().over_source); }
             // Capture this AppKit session's identity before waking cancel().
             // That wake may let the resource owner prepare another network
             // session before emit runs; looking up the current peer there would
@@ -1016,6 +1248,9 @@ define_class!(
                 .and_then(|ui| ui.operations.remove(&session.draggingSequenceNumber())));
             {
                 let mut st = shared.lock();
+                if diagnostic.as_ref().is_some_and(|d| st.target_diagnostic.as_ref().is_some_and(|active| active.operation == d.operation)) {
+                    st.target_diagnostic = None;
+                }
                 st.active = false;
                 st.ended = true;
                 shared.cv.notify_all();
@@ -1026,14 +1261,21 @@ define_class!(
             tracing::info!(dropped, ?operation, "drag started by Oink ended");
             UI.with(|u| {
                 if let Some(ui) = u.borrow_mut().as_mut() {
+                    // A late native end belongs to its own publication. It must
+                    // never mark a newer session's received files as moved.
                     if ui.target_session.as_ref().is_some_and(|(_, active)| active.draggingSequenceNumber() == session.draggingSequenceNumber()) {
                         ui.target_session = None;
+                        recovery::hide(&ui.source, Role::Source);
+                        if let Some(cur) = ui.current.take() {
+                            if !dropped {
+                                if let Some(diagnostic) = &diagnostic { diagnostic.cleanup(); }
+                                cur.cancel();
+                            } else if moved && let Err(error) = cur.move_completed() {
+                                tracing::warn!(%error, "cannot persist received MOVE completion");
+                            }
+                        }
+                        ui.current_proxies.clear();
                     }
-                    ui.source.orderOut(None);
-                    if let Some(cur) = ui.current.take() && !dropped {
-                        cur.cancel();
-                    }
-                    ui.current_proxies.clear();
                 }
             });
             if let Some(operation) = operation {
@@ -1052,6 +1294,48 @@ enum HoldCallback {
     Perform,
 }
 impl DndView {
+    fn observe_source_position(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) {
+        if self.ivars().role != Role::Catcher {
+            return;
+        }
+        let shared = &self.ivars().shared;
+        {
+            let st = shared.lock();
+            if st.return_move.is_none() && st.inset_move.is_none() {
+                return;
+            }
+        }
+        let Some((sequence, destination, at)) = UI.with(|u| {
+            let u = u.borrow();
+            let ui = u.as_ref()?;
+            let snapshot = destination_snapshot(&ui.catcher, Some(sender));
+            (snapshot.destination_ours && snapshot.mouse_hit_ours && snapshot.visible).then_some((
+                sender.draggingSequenceNumber() as i64,
+                ui.catcher.windowNumber(),
+                snapshot.session_location?,
+            ))
+        }) else {
+            return;
+        };
+        let mut st = shared.lock();
+        if st.releasing || st.cancel_move.is_some() {
+            return;
+        }
+        let operation = st.held_source;
+        let St {
+            return_move,
+            inset_move,
+            ..
+        } = &mut *st;
+        for movement in [return_move, inset_move] {
+            if let Some(movement) = movement
+                && movement.observe(operation, sequence, destination, at)
+            {
+                shared.cv.notify_all();
+            }
+        }
+    }
+
     fn new(mtm: MainThreadMarker, role: Role, shared: Arc<Shared>) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ViewIvars { role, shared });
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(SIZE, SIZE));
@@ -1205,16 +1489,11 @@ impl DndView {
             if st.probe_current(seq) {
                 return NSDragOperation::Copy;
             }
-            st.reported_seq = Some(seq);
             let operation = DragOperation::new();
-            st.source_operation = Some(operation);
-            if let Some(old) = st.thumbnail_budget.take() {
-                old.cancel();
-            }
-            st.source_thumbnail = None;
-            st.probe_operation = Some(operation);
+            st.capture_probe(seq, operation);
             operation
         };
+        let probed_at = shared.lock().probed_at;
         tracing::debug!(seq, ?ops, "system drag entered the edge catcher: reading it");
         // Audit only fixed format-presence bits. Never export arbitrary UTI names
         // or read extra payloads just to diagnose a browser drag.
@@ -1370,6 +1649,7 @@ impl DndView {
                     .collect()
             })
             .unwrap_or_default();
+        let native_read_at = Instant::now();
         // File metadata work stays off AppKit. Representation bytes are read only
         // by the original session's real performDragOperation callback below.
         let spawned = std::thread::Builder::new().name("oink-dnd-read".into()).spawn(move || {
@@ -1406,6 +1686,13 @@ impl DndView {
                 st.source_operation == Some(operation) && st.probing
             };
             if current {
+                crate::dnd::source_timing(crate::dnd::SourceTiming {
+                    operation,
+                    probed_at,
+                    recognized_at: thumbnail_start,
+                    native_read_at,
+                    inventory_at: Instant::now(),
+                });
                 shared.emit(PlatformDndEvent::Detected { operation, items, ops });
             }
         });
@@ -1422,6 +1709,7 @@ impl DndView {
         };
         let spec = UI.with(|u| u.borrow_mut().as_mut().and_then(|ui| ui.pending.take()));
         let Some(PreparedDrag {
+            diagnostic,
             spec,
             provider,
             image,
@@ -1441,6 +1729,7 @@ impl DndView {
         );
         let report_end = std::time::Instant::now();
         crate::dnd::preparation_timing(crate::dnd::PreparationStage::NativePreparation, prepared_at, report_end);
+        crate::dnd::preparation_timing(crate::dnd::PreparationStage::WritersPreview, prepared_at, report_end);
         tracing::debug!(
             dnd_phase = 23_u64,
             elapsed_us = report_end.saturating_duration_since(prepared_at).as_micros() as u64,
@@ -1463,19 +1752,42 @@ impl DndView {
             "target drag artwork geometry"
         );
         // 系统在发起拖拽的过程中就会问允许的操作（`source_mask`）：先记下。
-        shared.lock().ops = spec.ops;
+        shared.lock().ops = if provider.is_some()
+            && spec
+                .files
+                .as_ref()
+                .and_then(|files| files.namespace())
+                .is_some_and(|files| files.requires_native_files())
+        {
+            DragOps::COPY.union(DragOps::MOVE)
+        } else {
+            spec.ops
+        };
         let array = NSArray::from_retained_slice(&items);
         tracing::debug!(event = ?event.locationInWindow(), cursor = ?NSEvent::mouseLocation(),
             frame = ?self.window().map(|w| w.frame()), "starting AppKit dragging session");
-        shared.lock().starting_operation = Some(spec.operation);
+        {
+            let mut st = shared.lock();
+            st.starting_operation = Some(spec.operation);
+            st.target_diagnostic = diagnostic.clone();
+        }
         let native_at = Instant::now();
         let session = self.beginDraggingSessionWithItems_event_source(&array, event, ProtocolObject::from_ref(self));
+        let returned_at = Instant::now();
+        let target_start = shared.lock().target_start.take(spec.operation);
+        if let Some(timing) = target_start {
+            timing.complete(Some(returned_at));
+        }
+        crate::dnd::preparation_timing(crate::dnd::PreparationStage::NativeBegin, native_at, returned_at);
+        if let Some(diagnostic) = &diagnostic {
+            diagnostic.enter(2);
+        }
         // Observe AppKit's actual published board, including any native aliases;
         // inspecting the planned writers alone cannot prove what an app receives.
         representation_trace::record(&session.draggingPasteboard(), spec.operation, true);
         tracing::debug!(
             dnd_phase = 24_u64,
-            elapsed_us = native_at.elapsed().as_micros() as u64,
+            elapsed_us = returned_at.saturating_duration_since(native_at).as_micros() as u64,
             "AppKit drag session begin returned"
         );
         shared.lock().starting_operation = None;
@@ -1483,6 +1795,9 @@ impl DndView {
         UI.with(|u| {
             if let Some(ui) = u.borrow_mut().as_mut() {
                 ui.operations.insert(session.draggingSequenceNumber(), spec.operation);
+                if let Some(diagnostic) = diagnostic {
+                    ui.diagnostics.insert(session.draggingSequenceNumber(), diagnostic);
+                }
                 ui.target_session = Some((spec.operation, session.clone()));
                 ui.current = provider;
             }
@@ -1626,7 +1941,16 @@ fn dragging_items(
     });
     let mut writers: Vec<Writer> = Vec::new();
     if let Some(native) = &spec.native {
-        let fallback = provider.is_none() && !native.inventory.roots.is_empty();
+        // Incoming files require an OS-owned received copy. Never advertise a
+        // promise that cannot be fulfilled when File Provider is unavailable.
+        if provider.is_none()
+            && !native
+                .inventory
+                .namespace_roots_for(oink_foundation::clipboard::ClipPlatform::Mac)
+                .is_empty()
+        {
+            return Vec::new();
+        }
         let paths = provider.unwrap_or_default();
         let nodes: Vec<_> = native.inventory.roots.iter().map(|node| node.id).collect();
         let urls = nodes
@@ -1634,50 +1958,12 @@ fn dragging_items(
             .zip(paths)
             .map(|(node, path)| (node, super::pasteboard::file_url_string(&path)))
             .collect();
-        let native_writers = if fallback {
-            let Some(contents) = &spec.files else {
-                return Vec::new();
-            };
-            let Ok(items) = super::content::promise_items(native) else {
-                return Vec::new();
-            };
-            let entries = Arc::new(native.files.clone());
-            let queue = NSOperationQueue::new();
-            queue.setMaxConcurrentOperationCount(4);
-            let mut writers = Vec::new();
-            for (node, extra) in items {
-                if let Some(node) = node {
-                    let Some(top) = native.inventory.roots.iter().position(|root| root.id == node) else {
-                        return Vec::new();
-                    };
-                    let Some(entry) = entries.get(top) else {
-                        return Vec::new();
-                    };
-                    let delegate = PromiseDelegate::new(top, entries.clone(), contents.clone(), queue.clone());
-                    let ty = NSString::from_str(if entry.is_dir { "public.folder" } else { "public.data" });
-                    let this = DragFilePromise::alloc().set_ivars(DragPromiseIvars {
-                        extra,
-                        _delegate: delegate.clone(),
-                    });
-                    // SAFETY: the native writer retains its delegate in its ivars.
-                    let promise: Retained<DragFilePromise> = unsafe {
-                        msg_send![super(this), initWithFileType: &*ty,
-                            delegate: ProtocolObject::<dyn NSFilePromiseProviderDelegate>::from_ref(&*delegate)]
-                    };
-                    writers.push(ProtocolObject::from_retained(promise));
-                } else {
-                    writers.push(ProtocolObject::from_retained(extra));
-                }
-            }
-            Ok(writers)
-        } else {
-            super::content::writers(native, &urls)
-        };
+        let native_writers = super::content::writers(native, &urls);
         let Ok(native_writers) = native_writers else {
             return Vec::new();
         };
-        let (native_writers, proxies) = if native.inventory.has_promises() {
-            match proxy::wrap(native, native_writers) {
+        let (native_writers, proxies) = if proxy::needed(native) {
+            match proxy::wrap_drag(native, native_writers) {
                 Ok(wrapped) => wrapped,
                 Err(_) => {
                     tracing::warn!("native promise proxy construction failed");
@@ -2063,6 +2349,22 @@ struct Subset {
 }
 
 impl FileContents for Subset {
+    fn descriptor_nodes(&self) -> std::io::Result<Option<Vec<crate::model::FileNode>>> {
+        self.inner
+            .descriptor_nodes()?
+            .map(|nodes| {
+                self.map
+                    .iter()
+                    .map(|index| {
+                        nodes
+                            .get(*index)
+                            .cloned()
+                            .ok_or_else(|| std::io::ErrorKind::InvalidData.into())
+                    })
+                    .collect()
+            })
+            .transpose()
+    }
     fn open(&self, index: usize) -> std::io::Result<Box<dyn std::io::Read + Send>> {
         let i = *self
             .map
@@ -2202,6 +2504,117 @@ fn flip_point(p: Point, primary_height: f64) -> NSPoint {
     NSPoint::new(p.x, primary_height - p.y)
 }
 
+fn quartz_rect(mtm: MainThreadMarker, rect: NSRect) -> oink_foundation::Rect {
+    let top = to_cocoa(mtm, Point::new(rect.origin.x, rect.origin.y + rect.size.height));
+    oink_foundation::Rect::new(top.x, top.y, rect.size.width, rect.size.height)
+}
+
+fn cocoa_rect(mtm: MainThreadMarker, rect: oink_foundation::Rect) -> NSRect {
+    NSRect::new(
+        to_cocoa(mtm, Point::new(rect.x, rect.bottom())),
+        NSSize::new(rect.w, rect.h),
+    )
+}
+
+fn inset_source(
+    shared: &Arc<Shared>,
+    operation: DragOperation,
+    anchor: Point,
+    mtm: MainThreadMarker,
+) -> Option<Result<Point, ClipboardError>> {
+    let (panel, sender) = UI.with(|u| {
+        u.borrow()
+            .as_ref()
+            .and_then(|ui| ui.source_info.clone().map(|sender| (ui.catcher.clone(), sender)))
+    })?;
+    let snapshot = destination_snapshot(&panel, Some(&sender));
+    // macOS 26.6.2 Dock ExposeWindowDragHelper watches a one-point top
+    // strip and integrates drag deltas/time (0x100166a14, ECVelocityFilter).
+    // Even our zero-delta image refresh can complete that gesture. Leave the
+    // strip before image work. Current hit/last AppKit position can already be
+    // stale at the hot edge; build 41 rejected 17/19 holds before relocating.
+    // Authorize against the live session and the TARGET surface instead, then
+    // require its native position acknowledgement before publishing the hold.
+    if !hold_placement::can_escape(&snapshot) {
+        tracing::warn!(
+            sequence = operation.sequence,
+            ?snapshot,
+            "held source has no live destination"
+        );
+        return None;
+    }
+    let screens: Vec<_> = NSScreen::screens(mtm)
+        .iter()
+        .map(|s| quartz_rect(mtm, s.frame()))
+        .collect();
+    let at = hold_placement::inset(anchor, quartz_rect(mtm, panel.frame()), &screens)?;
+    let target_ours = hit_at(mtm, &panel, to_cocoa(mtm, at));
+    tracing::debug!(
+        sequence = operation.sequence,
+        ?anchor,
+        ?at,
+        ?snapshot,
+        target_ours,
+        "held source escape target ownership"
+    );
+    if !target_ours {
+        return None;
+    }
+    let mut st = shared.lock();
+    if !st.probing
+        || !st.source_present
+        || st.held_source != Some(operation)
+        || st.source_operation != Some(operation)
+        || st.releasing
+        || st.cancel_move.is_some()
+        || st.return_move.is_some()
+        || st.inset_move.is_some()
+    {
+        return None;
+    }
+    if at == anchor {
+        return Some(Ok(at));
+    }
+    st.inset_move = Some(SourceMove {
+        operation,
+        native_sequence: sender.draggingSequenceNumber() as i64,
+        destination: panel.windowNumber(),
+        at,
+        delivered: false,
+        acknowledged: false,
+    });
+    // Serialize the single post against Cancel/Resume. The input backend updates
+    // the committed anchor and frozen ledger together, even if its ACK is lost.
+    // Never retry a submitted movement.
+    let result = (shared.hold_input.get()?.relocate)(operation, at);
+    st.inset_move.as_mut()?.delivered = result.is_ok();
+    match result {
+        Ok(()) => {
+            tracing::info!(
+                dnd_hold_stage = 4_u64,
+                sequence = operation.sequence,
+                ?anchor,
+                ?at,
+                inset_points = at.y - anchor.y,
+                "held source top-edge inset delivered"
+            );
+            Some(Ok(at))
+        }
+        Err(error) => {
+            tracing::warn!(%error, sequence = operation.sequence, "held source inset failed; never replaying");
+            Some(Err(ClipboardError::Platform(error)))
+        }
+    }
+}
+
+fn expand_catcher(panel: &NSPanel, frame: oink_foundation::Rect) {
+    let frame = cocoa_rect(panel.mtm(), frame);
+    if panel.frame() != frame {
+        CATCHER_MOVES.set(CATCHER_MOVES.get().saturating_add(1));
+        panel.setFrame_display(frame, false);
+    }
+}
+
 fn catcher_frame(at: NSPoint, screens: &[NSRect], primary_height: f64) -> NSRect {
     // Keep one stationary strip while metadata is read asynchronously. Moving
     // a cursor-sized panel can cause draggingExited before HoldSource arrives.
@@ -2276,6 +2689,7 @@ fn catcher_frame(at: NSPoint, screens: &[NSRect], primary_height: f64) -> NSRect
 
 /// 把窗口放到以 `at`（Cocoa 坐标）为中心的位置并显示（不激活应用）。
 fn show_at(panel: &NSPanel, at: NSPoint, role: Role) {
+    recovery::shown(role, panel.isVisible());
     let frame = if role == Role::Catcher {
         let screens: Vec<_> = NSScreen::screens(panel.mtm()).iter().map(|s| s.frame()).collect();
         catcher_frame(at, &screens, screens.first().map_or(0., |s| s.size.height))
@@ -2558,6 +2972,9 @@ impl MacDnd {
                 return true;
             }
             st.ended = false;
+            if let Some(diagnostic) = &st.target_diagnostic {
+                diagnostic.cancel();
+            }
         }
         // 把发起窗口挪到光标下再抬起：放在不接受拖入的窗口上，拖拽失败，不会落到任何程序里。
         self.shared.lock().over_source = false;
@@ -2644,7 +3061,7 @@ impl MacDnd {
         on_main(|_| {
             UI.with(|u| {
                 if let Some(ui) = u.borrow().as_ref() {
-                    ui.catcher.orderOut(None);
+                    recovery::hide(&ui.catcher, Role::Catcher);
                 }
             });
         });
@@ -2662,6 +3079,7 @@ impl MacDnd {
                 source_press: OnceLock::new(),
                 source_start: OnceLock::new(),
                 image_nudge: OnceLock::new(),
+                hold_input: OnceLock::new(),
                 st: Mutex::new(St::default()),
                 cv: Condvar::new(),
             }),
@@ -2671,11 +3089,13 @@ impl MacDnd {
 
 impl MacDnd {
     fn begin_prepared(&self, spec: DragSpec, provider: Option<Registration>) -> Result<(), ClipboardError> {
+        let diagnostic = drop_trace::Session::new(&spec, provider.as_ref());
         self.shared.reset_native_begin(spec.operation);
         let mut trace = SourceStartTrace::default();
         tracing::debug!(?spec, "starting a drag");
         {
             let mut st = self.shared.lock();
+            st.last_source_operation = Some(spec.operation);
             st.began = false;
             st.press_received = false;
             st.ended = false;
@@ -2697,6 +3117,7 @@ impl MacDnd {
                 let mut u = u.borrow_mut();
                 let Some(ui) = u.as_mut() else { return false };
                 ui.pending = Some(PreparedDrag {
+                    diagnostic,
                     spec,
                     provider,
                     image,
@@ -2705,6 +3126,7 @@ impl MacDnd {
                 true
             })
         });
+        crate::dnd::preparation_timing(crate::dnd::PreparationStage::PendingWindow, prepared_at, Instant::now());
         tracing::debug!(
             dnd_phase = 20_u64,
             elapsed_us = prepared_at.elapsed().as_micros() as u64,
@@ -2729,6 +3151,7 @@ impl MacDnd {
         trace.critical_us = down
             .as_ref()
             .map_or(0, |attempt| attempt.critical_us.load(Ordering::Relaxed));
+        crate::dnd::preparation_timing(crate::dnd::PreparationStage::SourcePress, pressed_at, Instant::now());
         tracing::debug!(
             dnd_phase = 21_u64,
             elapsed_us = pressed_at.elapsed().as_micros() as u64,
@@ -2738,6 +3161,11 @@ impl MacDnd {
         let native_at = Instant::now();
         let remaining = WAIT.saturating_sub(receipt_at.elapsed());
         let began = received && self.shared.wait(remaining, |st| st.began);
+        crate::dnd::preparation_timing(
+            crate::dnd::PreparationStage::NativeAcknowledgement,
+            native_at,
+            Instant::now(),
+        );
         tracing::debug!(
             dnd_phase = 22_u64,
             elapsed_us = native_at.elapsed().as_micros() as u64,
@@ -2770,7 +3198,7 @@ impl MacDnd {
                     {
                         provider.cancel();
                     }
-                    ui.source.orderOut(None);
+                    recovery::hide(&ui.source, Role::Source);
                 }
             });
         });
@@ -2779,9 +3207,29 @@ impl MacDnd {
 }
 
 impl DndBackend for MacDnd {
+    fn observe_target_drop(&self, operation: DragOperation) {
+        if let Some(diagnostic) = self
+            .shared
+            .lock()
+            .target_diagnostic
+            .as_ref()
+            .filter(|d| d.operation == operation)
+        {
+            diagnostic.release();
+        }
+    }
     fn observe_native_timing(&self, operation: DragOperation, wait: bool, timing: crate::dnd::NativeBeginTiming) {
         self.shared.subscribe_native_timing(operation, wait, timing);
     }
+    fn target_start_timing(&self, operation: DragOperation, timing: Option<crate::dnd::NativeBeginTiming>) {
+        let mut st = self.shared.lock();
+        if let Some(timing) = timing {
+            st.target_start.arm(operation, timing);
+        } else {
+            let _ = st.target_start.take(operation);
+        }
+    }
+
     fn observe_native_begin(&self, operation: DragOperation, wait: bool, callback: NativeBeginCallback) {
         self.shared.subscribe_native_begin(operation, wait, callback);
     }
@@ -2799,6 +3247,12 @@ impl DndBackend for MacDnd {
     fn set_source_image_nudge(&self, nudge: SourceImageNudge) {
         let _ = self.shared.image_nudge.set(nudge);
     }
+    fn set_source_hold_input(&self, input: SourceHoldInput) {
+        let _ = self.shared.hold_input.set(input);
+    }
+    fn source_hold_installs_anchor(&self) -> bool {
+        true
+    }
     fn source_hold_ready(&self, operation: DragOperation) {
         let pending = {
             let mut st = self.shared.lock();
@@ -2808,11 +3262,11 @@ impl DndBackend for MacDnd {
             hold.ready = true;
             (hold.generation, std::mem::take(&mut hold.pending))
         };
-        for reason in pending.1 {
+        for (reason, revision) in pending.1 {
             let shared = self.shared.clone();
             // Pending means its 100ms deadline already fired before the input
             // anchor was armed. Do not start a second delay or post inline.
-            queue_main(move |_| shared.post_image_nudge(operation, pending.0, reason));
+            queue_main(move |_| shared.post_image_nudge(operation, pending.0, reason, revision));
         }
     }
     fn retire_source_image_nudges(&self, operation: DragOperation) {
@@ -2842,6 +3296,7 @@ impl DndBackend for MacDnd {
                 source_view.registerForDraggedTypes(&dragged_types(Role::Source));
                 let source = make_panel(mtm, &source_view);
                 *u.borrow_mut() = Some(Ui {
+                    _recovery_monitors: recovery::monitors(&shared),
                     receivers: Default::default(),
                     source_info: None,
                     target_session: None,
@@ -2851,6 +3306,7 @@ impl DndBackend for MacDnd {
                     source_view,
                     pending: None,
                     operations: Default::default(),
+                    diagnostics: Default::default(),
                     current: None,
                     current_proxies: Vec::new(),
                 });
@@ -2871,13 +3327,13 @@ impl DndBackend for MacDnd {
     fn probe(&self, at: Point) {
         {
             let mut st = self.shared.lock();
-            if st.held_source.is_some() {
+            let fresh = !st.probing;
+            if !st.request_probe() {
                 return;
             }
-            if !st.probing {
-                st.probe_operation = None;
+            if fresh {
+                st.probed_at = Some(Instant::now());
             }
-            st.probing = true;
         }
         let shared = self.shared.clone();
         on_main(move |mtm| {
@@ -2896,87 +3352,37 @@ impl DndBackend for MacDnd {
     }
 
     fn unprobe(&self) {
-        let unused = {
-            let mut st = self.shared.lock();
-            st.probing = false;
-            if st.held_source.is_none()
-                && let Some(budget) = st.thumbnail_budget.take()
-            {
-                budget.cancel();
-            }
-            st.probe_operation = None;
-            st.reported_seq = None;
-            if st.held_source.is_none()
-                && st
-                    .export
-                    .as_ref()
-                    .is_some_and(|(_, export)| !export.started.load(Ordering::Acquire))
-            {
-                st.export.take()
-            } else {
-                None
-            }
-        };
-        if let Some((operation, export)) = unused {
-            export.cancel(false);
-            on_main(move |_| {
-                UI.with(|ui| {
-                    if let Some(ui) = ui.borrow_mut().as_mut() {
-                        ui.receivers.remove(&operation.sequence);
-                    }
-                })
-            });
-        }
-        on_main(|_| {
-            UI.with(|u| {
-                if let Some(ui) = u.borrow().as_ref() {
-                    ui.catcher.orderOut(None);
+        let shared = self.shared.clone();
+        let generation = shared.lock().probe_generation;
+        on_main(move |_| {
+            let cleanup = {
+                let mut st = shared.lock();
+                // A new Probe can arrive before this main-queue job. Do not
+                // clear its state and then hide its pending window.
+                if !st.retire_probe_generation(generation) {
+                    return;
                 }
-            });
+                st.take_probe_cleanup()
+            };
+            cleanup.finish();
+            hide_catcher();
         });
     }
 
     fn unprobe_source(&self, operation: DragOperation) {
         let shared = self.shared.clone();
         on_main(move |_| {
-            let unused = {
+            let cleanup = {
                 let mut st = shared.lock();
-                if st.probe_operation != Some(operation) {
+                if !st.retire_probe(operation) {
                     return;
                 }
-                st.probing = false;
-                if st.held_source.is_none()
-                    && let Some(budget) = st.thumbnail_budget.take()
-                {
-                    budget.cancel();
-                }
-                st.probe_operation = None;
-                st.reported_seq = None;
-                if st.held_source.is_none()
-                    && st
-                        .export
-                        .as_ref()
-                        .is_some_and(|(_, export)| !export.started.load(Ordering::Acquire))
-                {
-                    st.export.take()
-                } else {
-                    None
-                }
+                st.take_probe_cleanup()
             };
-            if let Some((_, export)) = &unused {
-                export.cancel(false);
-            }
-            // Re-entry after Resume gets a new capture of the same AppKit drag.
-            // Check its operation and hide on the same main-queue turn; merely
-            // checking on the action thread could still hide a newer catcher.
-            UI.with(|u| {
-                if let Some(ui) = u.borrow_mut().as_mut() {
-                    if let Some((operation, _)) = unused {
-                        ui.receivers.remove(&operation.sequence);
-                    }
-                    ui.catcher.orderOut(None);
-                }
-            });
+            // Ownership check, state cleanup and native hide share one main
+            // queue turn with the safety net; a new show cannot interleave.
+            cleanup.finish();
+            hide_catcher();
         });
     }
 
@@ -3027,17 +3433,14 @@ impl DndBackend for MacDnd {
             export.cancel(false);
         }
     }
-    fn source_requires_export(&self, operation: DragOperation, windows_target: bool) -> bool {
-        // Mac targets retain the original source session and publish a promise
-        // proxy. Only its real drop requests receipt. Windows needs filenames
-        // for FileGroupDescriptor, so only that target calls in promises here.
-        windows_target
-            && self
-                .shared
-                .lock()
-                .export
-                .as_ref()
-                .is_some_and(|(op, export)| *op == operation && export.requires_export())
+    fn source_requires_export(&self, operation: DragOperation, _windows_target: bool) -> bool {
+        // Both targets publish a real received path alongside the original
+        // promise. Acquire the one-shot source once before releasing its session.
+        self.shared
+            .lock()
+            .export
+            .as_ref()
+            .is_some_and(|(op, export)| *op == operation && export.requires_export())
     }
     fn export_source(
         &self,
@@ -3060,14 +3463,63 @@ impl DndBackend for MacDnd {
         release().is_ok()
     }
     fn hold_source(&self, operation: DragOperation) -> Result<oink_foundation::dnd::DragAnchor, ClipboardError> {
+        let mut anchor = {
+            let mut st = self.shared.lock();
+            if !st.probing
+                || !st.source_present
+                || st.held_source.is_some()
+                || st.source_operation != Some(operation)
+                || st.releasing
+            {
+                return Err(ClipboardError::Unsupported);
+            }
+            let input = self.shared.hold_input.get().ok_or(ClipboardError::Unsupported)?;
+            // Freeze physical and injected movement before any image mutation.
+            // This returns the point committed by that same native transition,
+            // never a clipboard-thread sample taken before input freezes.
+            let anchor = (input.freeze)(operation).map_err(ClipboardError::Platform)?;
+            st.hold_probe(operation);
+            anchor
+        };
+        let shared = self.shared.clone();
+        let at = on_main_wait(WAIT, move |mtm| inset_source(&shared, operation, anchor.at, mtm))
+            .flatten()
+            .ok_or(ClipboardError::Unsupported)??;
+        if at != anchor.at {
+            self.shared.wait(WAIT, |st| {
+                st.held_source != Some(operation) || st.inset_move.as_ref().is_none_or(|m| m.acknowledged)
+            });
+            let mut st = self.shared.lock();
+            if st.held_source != Some(operation)
+                || st.releasing
+                || st.cancel_move.is_some()
+                || !st
+                    .inset_move
+                    .as_ref()
+                    .is_some_and(|m| m.operation == operation && m.at == at && m.delivered && m.acknowledged)
+            {
+                return Err(ClipboardError::Unsupported);
+            }
+            st.inset_move = None;
+            anchor.at = at;
+            tracing::info!(
+                dnd_hold_stage = 5_u64,
+                sequence = operation.sequence,
+                ?at,
+                "held source inset confirmed by native destination"
+            );
+        }
         let shared = self.shared.clone();
         let hidden = on_main_wait(WAIT, move |_| {
             {
                 let st = shared.lock();
                 if !st.probing
                     || !st.source_present
-                    || st.held_source.is_some()
+                    || st.held_source != Some(operation)
                     || st.source_operation != Some(operation)
+                    || st.releasing
+                    || st.cancel_move.is_some()
+                    || st.return_move.is_some()
                 {
                     return false;
                 }
@@ -3076,22 +3528,48 @@ impl DndBackend for MacDnd {
             let Some(sender) = sender else {
                 return false;
             };
+            let admitted = UI.with(|u| {
+                u.borrow().as_ref().is_some_and(|ui| {
+                    let snapshot = destination_snapshot(&ui.catcher, Some(&sender));
+                    let admitted = hold_placement::owns_frozen_source(&snapshot, anchor.at);
+                    if !admitted {
+                        tracing::warn!(
+                            sequence = operation.sequence,
+                            ?anchor,
+                            ?snapshot,
+                            "held source lost frozen destination ownership"
+                        );
+                    }
+                    admitted
+                })
+            });
+            if !admitted {
+                return false;
+            }
             let started = Instant::now();
             let (initial_items, changed) = hide_drag_images(&sender);
             let enumeration_returned = Instant::now();
-            if initial_items == 0 {
-                tracing::warn!(
-                    sequence = operation.sequence,
-                    "held source has no enumerable artwork items"
-                );
-                return false;
-            }
+            // Some sources have no enumerable artwork. Image hiding is best
+            // effort and must not gate holding the source in place.
             UI.with(|u| {
                 let mut ui = u.borrow_mut();
                 let Some(ui) = ui.as_mut() else {
                     return false;
                 };
                 let mut st = shared.lock();
+                // Image enumeration can overlap a worker's Cancel/Resume.
+                // Recheck before publishing artwork jobs; never resurrect a
+                // source whose authority was retired while AppKit was busy.
+                if !st.probing
+                    || !st.source_present
+                    || st.held_source != Some(operation)
+                    || st.source_operation != Some(operation)
+                    || st.releasing
+                    || st.cancel_move.is_some()
+                    || st.return_move.is_some()
+                {
+                    return false;
+                }
                 st.next_image_hold += 1;
                 let generation = st.next_image_hold;
                 ui.hold_visual = Some(HoldVisual::new(
@@ -3113,14 +3591,16 @@ impl DndBackend for MacDnd {
                     ready: false,
                     pending: Vec::new(),
                     posts: Vec::new(),
+                    revision: 1,
                 });
                 queue_image_nudge(
                     shared.clone(),
                     operation,
                     generation,
                     ImageNudgeReason::InitialHide,
-                    changed,
+                    changed.max(1),
                     enumeration_returned,
+                    1,
                 );
                 true
             })
@@ -3129,20 +3609,18 @@ impl DndBackend for MacDnd {
         if !hidden {
             return Err(ClipboardError::Unsupported);
         }
-        let at = cursor_cg().ok_or(ClipboardError::Unsupported)?;
         let st = self.shared.lock();
         if !st.probing
             || !st.source_present
             || st.held_source != Some(operation)
             || st.source_operation != Some(operation)
+            || st.releasing
+            || st.cancel_move.is_some()
+            || st.return_move.is_some()
         {
             return Err(ClipboardError::Unsupported);
         }
-        Ok(oink_foundation::dnd::DragAnchor {
-            generation: operation.sequence,
-            at,
-            surface: 0,
-        })
+        Ok(anchor)
     }
 
     fn resume_source(&self, operation: DragOperation) -> bool {
@@ -3152,6 +3630,7 @@ impl DndBackend for MacDnd {
                 return false;
             }
             st.held_source = None;
+            st.return_move = None;
             st.retire_image_nudges();
         }
         let shared = self.shared.clone();
@@ -3167,6 +3646,126 @@ impl DndBackend for MacDnd {
         });
         self.unprobe();
         true
+    }
+
+    fn resume_source_at(&self, operation: DragOperation, at: Option<Point>) -> bool {
+        let (Some(at), Some(input)) = (at, self.shared.hold_input.get()) else {
+            return false;
+        };
+        // Preserve the router's return coordinates. The frozen native anchor
+        // is only a holding location and must never become a routing origin.
+        let at = Point::new(at.x.floor(), at.y.floor());
+        let shared = self.shared.clone();
+        let prepared = on_main_wait(WAIT, move |mtm| {
+            let Some((panel, sender)) = UI.with(|u| {
+                u.borrow()
+                    .as_ref()
+                    .and_then(|ui| ui.source_info.clone().map(|sender| (ui.catcher.clone(), sender)))
+            }) else {
+                return false;
+            };
+            {
+                let mut st = shared.lock();
+                if st.held_source != Some(operation) || !st.source_present || st.releasing || st.cancel_move.is_some() {
+                    return false;
+                }
+                st.retire_image_nudges();
+                st.return_move = Some(SourceMove {
+                    operation,
+                    native_sequence: sender.draggingSequenceNumber() as i64,
+                    destination: panel.windowNumber(),
+                    at,
+                    delivered: false,
+                    acknowledged: false,
+                });
+            }
+            let frame = hold_placement::cover(
+                quartz_rect(mtm, panel.frame()),
+                oink_foundation::Rect::new(at.x - SIZE / 2., at.y - SIZE / 2., SIZE, SIZE),
+            );
+            expand_catcher(&panel, frame);
+            true
+        })
+        .unwrap_or(false);
+        if !prepared {
+            return false;
+        }
+        // WindowServer applies a resized surface asynchronously. As in
+        // place_and_press, wait for a real hit test; elapsed time cannot make
+        // this ready. Artwork readiness is independent of this ownership check.
+        let started = Instant::now();
+        let mut owns_return = false;
+        while started.elapsed() < WAIT {
+            let shared = self.shared.clone();
+            let ready = on_main_wait(WAIT, move |mtm| {
+                let st = shared.lock();
+                if st.held_source != Some(operation)
+                    || st.releasing
+                    || st.cancel_move.is_some()
+                    || !st
+                        .return_move
+                        .as_ref()
+                        .is_some_and(|r| r.operation == operation && r.at == at)
+                {
+                    return None;
+                }
+                UI.with(|u| {
+                    u.borrow()
+                        .as_ref()
+                        .map(|ui| hit_at(mtm, &ui.catcher, to_cocoa(mtm, at)))
+                })
+            });
+            match ready {
+                Some(Some(true)) => {
+                    owns_return = true;
+                    break;
+                }
+                Some(Some(false)) => std::thread::sleep(Duration::from_millis(5)),
+                _ => break,
+            }
+        }
+        if !owns_return {
+            tracing::warn!(?at, "held source return surface does not own the target");
+            return false;
+        }
+        let delivered = {
+            let mut st = self.shared.lock();
+            if st.held_source != Some(operation) || st.releasing || st.cancel_move.is_some() {
+                return false;
+            }
+            let Some(returning) = st.return_move.as_mut().filter(|r| r.operation == operation) else {
+                return false;
+            };
+            let posted = std::cell::Cell::new(None);
+            let result = (input.return_to)(operation, at, &|at| posted.set(Some(at)));
+            if let Some(at) = posted.get() {
+                returning.at = at;
+            }
+            returning.delivered = result.is_ok() && posted.get().is_some();
+            returning.delivered
+        };
+        if !delivered {
+            return false;
+        }
+        // Delivery is not a native session acknowledgement. Keep the catcher
+        // and its hidden image until AppKit observes this same source at the
+        // return point. Timeout/cancel fails; it never reveals at a stale held anchor.
+        self.shared.wait(WAIT, |st| {
+            st.held_source != Some(operation) || st.return_move.as_ref().is_none_or(|r| r.acknowledged)
+        });
+        let confirmed = {
+            let st = self.shared.lock();
+            st.held_source == Some(operation)
+                && st
+                    .return_move
+                    .as_ref()
+                    .is_some_and(|r| r.operation == operation && r.delivered && r.acknowledged)
+        };
+        if !confirmed {
+            return false;
+        }
+        let shared = self.shared.clone();
+        on_main_wait(WAIT, move |_| MacDnd { shared }.resume_source(operation)).unwrap_or(false)
     }
 
     fn observe_source_cancel_geometry(&self, operation: DragOperation, geometry: CancelGeometry) {
@@ -3215,6 +3814,7 @@ impl DndBackend for MacDnd {
                 cancel_submitted: false,
                 started,
             });
+            st.return_move = None;
             st.retire_image_nudges();
         }
         // Never run this on AppKit's thread: the native callback must be able to
@@ -3435,6 +4035,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn catcher_cleanup_survives_an_unrequested_native_drag_before_forget_source() {
+        // A different native drag can enter the still-visible panel before the
+        // router receives the old source's terminal callback and ForgetSource.
+        for enter_before_end in [true, false] {
+            let backend = MacDnd::new();
+            let held = DragOperation::new();
+            let unrelated = DragOperation::new();
+            {
+                let mut st = backend.shared.lock();
+                assert!(st.request_probe());
+                st.capture_probe(42, held);
+                st.hold_probe(held);
+                if enter_before_end {
+                    st.capture_probe(43, unrelated);
+                }
+            }
+            end_held_source(&backend.shared, false, NativeHoldEnd::CancelRepositioned);
+            let mut st = backend.shared.lock();
+            if !enter_before_end {
+                st.capture_probe(43, unrelated);
+            }
+            assert!(
+                st.retire_probe(held),
+                "native entry cannot steal the held source's cleanup"
+            );
+            assert!(!st.probing);
+        }
+    }
+
+    #[test]
+    fn catcher_cleanup_is_revoked_by_an_explicit_new_probe_before_detection() {
+        let backend = MacDnd::new();
+        let held = DragOperation::new();
+        {
+            let mut st = backend.shared.lock();
+            assert!(st.request_probe());
+            st.capture_probe(42, held);
+            st.hold_probe(held);
+            assert!(!st.request_probe(), "a live hold still owns its catcher");
+        }
+        end_held_source(&backend.shared, false, NativeHoldEnd::DraggingEnded);
+        let mut st = backend.shared.lock();
+        assert!(st.request_probe());
+        assert!(
+            !st.retire_probe(held),
+            "old cleanup must not hide a newly requested probe"
+        );
+        assert!(st.probing);
+        let next = DragOperation::new();
+        st.capture_probe(43, next);
+        st.hold_probe(next);
+        assert!(!st.retire_probe(held));
+        assert!(st.retire_probe(next));
+    }
+
+    #[test]
     fn reentering_a_native_drag_after_catcher_exit_starts_a_new_probe_operation() {
         let operation = DragOperation::new();
         let mut st = St {
@@ -3626,7 +4282,58 @@ mod tests {
             ready,
             pending: Vec::new(),
             posts: Vec::new(),
+            revision: 1,
         });
+    }
+
+    #[test]
+    fn source_return_ack_requires_the_same_operation_session_destination_and_point() {
+        let operation = DragOperation::new();
+        let at = Point::new(432., 6.);
+        let mut movement = SourceMove {
+            operation,
+            native_sequence: 7,
+            destination: 42,
+            at,
+            delivered: false,
+            acknowledged: false,
+        };
+        assert!(!movement.observe(Some(DragOperation::new()), 7, 42, at));
+        assert!(!movement.observe(None, 7, 42, at));
+        assert!(!movement.observe(Some(operation), 8, 42, at));
+        assert!(!movement.observe(Some(operation), 7, 43, at));
+        assert!(!movement.observe(Some(operation), 7, 42, Point::new(432., 0.)));
+        assert!(!movement.acknowledged);
+        assert!(movement.observe(Some(operation), 7, 42, at));
+        assert!(
+            !movement.delivered,
+            "native position cannot stand in for input delivery"
+        );
+    }
+
+    #[test]
+    fn source_retirement_revokes_pending_refresh() {
+        let backend = MacDnd::new();
+        let operation = DragOperation::new();
+        fake_image_hold(&backend, operation, 1, false);
+        let mut st = backend.shared.lock();
+        st.image_hold
+            .as_mut()
+            .unwrap()
+            .pending
+            .push((ImageNudgeReason::InitialHide, 1));
+        st.inset_move = Some(SourceMove {
+            operation,
+            native_sequence: 7,
+            destination: 42,
+            at: Point::new(432., 2.),
+            delivered: true,
+            acknowledged: false,
+        });
+        st.retire_image_nudges();
+        assert!(st.inset_move.is_none());
+        let hold = st.image_hold.as_ref().unwrap();
+        assert!(!hold.active && hold.pending.is_empty());
     }
 
     #[test]
@@ -3655,6 +4362,7 @@ mod tests {
                 ImageNudgeReason::InitialHide,
                 changed,
                 returned,
+                1,
             )
         };
         assert!(job(0, returned).is_none(), "no actual change, no timer or post");
@@ -3721,7 +4429,7 @@ mod tests {
                 let changed = items.iter().filter(|item| hide_drag_item(item)).count();
                 assert_eq!(changed, expected_changes);
                 if let Some((_, job)) =
-                    image_nudge_job(backend.shared.clone(), operation, 1, reason, changed, Instant::now())
+                    image_nudge_job(backend.shared.clone(), operation, 1, reason, changed, Instant::now(), 1)
                 {
                     job();
                 }
@@ -3754,18 +4462,18 @@ mod tests {
         fake_image_hold(&backend, operation, 1, false);
         backend
             .shared
-            .post_image_nudge(operation, 1, ImageNudgeReason::InitialHide);
+            .post_image_nudge(operation, 1, ImageNudgeReason::InitialHide, 1);
         assert!(seen.lock().unwrap().is_empty());
         {
             let mut st = backend.shared.lock();
             let hold = st.image_hold.as_mut().unwrap();
-            assert_eq!(hold.pending, [ImageNudgeReason::InitialHide]);
+            assert_eq!(hold.pending, [(ImageNudgeReason::InitialHide, 1)]);
             hold.ready = true;
             hold.pending.clear();
         }
         backend
             .shared
-            .post_image_nudge(operation, 1, ImageNudgeReason::InitialHide);
+            .post_image_nudge(operation, 1, ImageNudgeReason::InitialHide, 1);
         for _ in 0..4 {
             backend
                 .shared
@@ -3776,7 +4484,7 @@ mod tests {
                 .observe_image_update();
             backend
                 .shared
-                .post_image_nudge(operation, 1, ImageNudgeReason::ImageUpdate);
+                .post_image_nudge(operation, 1, ImageNudgeReason::ImageUpdate, 1);
         }
         assert_eq!(*seen.lock().unwrap(), vec![(operation, MouseButton::Right); 5]);
         let st = backend.shared.lock();
@@ -3794,29 +4502,29 @@ mod tests {
         fake_image_hold(&backend, operation, 2, true);
         backend
             .shared
-            .post_image_nudge(operation, 1, ImageNudgeReason::InitialHide);
+            .post_image_nudge(operation, 1, ImageNudgeReason::InitialHide, 1);
         backend
             .shared
-            .post_image_nudge(DragOperation::new(), 2, ImageNudgeReason::ImageUpdate);
+            .post_image_nudge(DragOperation::new(), 2, ImageNudgeReason::ImageUpdate, 1);
         backend.shared.lock().retire_image_nudges();
         backend
             .shared
-            .post_image_nudge(operation, 2, ImageNudgeReason::ImageUpdate);
+            .post_image_nudge(operation, 2, ImageNudgeReason::ImageUpdate, 1);
         fake_image_hold(&backend, operation, 3, true);
         backend.retire_source_image_nudges(operation);
         backend
             .shared
-            .post_image_nudge(operation, 3, ImageNudgeReason::InitialHide);
+            .post_image_nudge(operation, 3, ImageNudgeReason::InitialHide, 1);
         fake_image_hold(&backend, operation, 4, true);
         assert!(backend.resume_source(operation));
         backend
             .shared
-            .post_image_nudge(operation, 4, ImageNudgeReason::ImageUpdate);
+            .post_image_nudge(operation, 4, ImageNudgeReason::ImageUpdate, 1);
         fake_image_hold(&backend, operation, 5, true);
         assert!(!backend.prepare_source_cancel(operation, Point::new(0., 0.), &|_| {
             backend
                 .shared
-                .post_image_nudge(operation, 5, ImageNudgeReason::ImageUpdate);
+                .post_image_nudge(operation, 5, ImageNudgeReason::ImageUpdate, 1);
             Err("fake relocation failed".into())
         }));
     }
@@ -4141,6 +4849,7 @@ mod tests {
         }
         fn metadata(&self, _: usize) -> std::io::Result<Option<crate::FileMetadata>> {
             Ok(Some(crate::FileMetadata {
+                exec_bits: None,
                 size: 13,
                 modified_ms: Some(1700000001234),
             }))
@@ -4245,7 +4954,7 @@ mod tests {
                 msg_send![super(this), initWithFileType: &*NSString::from_str("public.data"),
                     delegate: ProtocolObject::<dyn NSFilePromiseProviderDelegate>::from_ref(&*delegate)]
             };
-            let board = NSPasteboard::pasteboardWithUniqueName();
+            let board = crate::macos::test_pasteboard::new();
             let ty = NSString::from_str("public.html");
             assert!(
                 writer
@@ -4484,6 +5193,7 @@ mod tests {
         objc2::rc::autoreleasepool(|_| {
             let mut spec = remote_spec();
             let root = FileNode {
+                exec_bits: None,
                 id: NodeId(1),
                 parent: None,
                 name: "example.txt".into(),
@@ -4533,7 +5243,12 @@ mod tests {
                     !MacDnd::new().prepare_preview(&spec),
                     "file companions must never be read for preview"
                 );
+                let available = urls.is_some();
                 let items = dragging_items(&spec, None, urls, &[]);
+                if !available {
+                    assert!(items.is_empty(), "disabled provider cannot advertise files");
+                    continue;
+                }
                 assert_eq!(items.len(), 1);
                 let components = items[0]
                     .imageComponents()
@@ -4565,7 +5280,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_provider_uses_real_file_promise_writer() {
+    fn private_byte_source_uses_a_local_file_promise_writer() {
         objc2::rc::autoreleasepool(|_| {
             let items = dragging_items(&remote_spec(), None, None, &[]);
             assert_eq!(items.len(), 1);
@@ -4574,11 +5289,56 @@ mod tests {
     }
 
     #[test]
+    fn url_only_pasteboard_matches_catcher_and_cancel_window_before_capture() {
+        objc2::rc::autoreleasepool(|_| {
+            let board = crate::macos::test_pasteboard::new();
+            for title in [None, Some("A link 猫")] {
+                board.clearContents();
+                let item = NSPasteboardItem::new();
+                item.setString_forType(
+                    &NSString::from_str("https://example.invalid/"),
+                    &NSString::from_str("public.url"),
+                );
+                if let Some(title) = title {
+                    item.setString_forType(&NSString::from_str(title), &NSString::from_str("public.url-name"));
+                }
+                assert!(board.writeObjects(&NSArray::from_retained_slice(&[ProtocolObject::from_retained(item)])));
+                for role in [Role::Catcher, Role::Source] {
+                    assert_eq!(
+                        board
+                            .availableTypeFromArray(&dragged_types(role))
+                            .map(|ty| ty.to_string()),
+                        Some("public.url".into()),
+                        "AppKit must find an accepted native type before it can call draggingEntered"
+                    );
+                }
+                let inventory = super::super::content::drag_inventory(
+                    &board,
+                    oink_foundation::content::OfferId {
+                        clip: oink_foundation::content::ClipId {
+                            origin: oink_foundation::DeviceId([1; 32]),
+                            seq: 1,
+                        },
+                        generation: 1,
+                    },
+                );
+                let wanted: Vec<_> = inventory
+                    .wanted(oink_foundation::clipboard::ClipPlatform::Windows)
+                    .collect();
+                assert_eq!(wanted.len(), 1);
+                assert_eq!(wanted[0].standard, Some(crate::model::StandardFormat::Url));
+                assert_eq!(inventory.items[0].file, None, "a web URL is not a file drag");
+            }
+            board.clearContents();
+        });
+    }
+
+    #[test]
     fn catcher_and_cancel_window_recognize_promises_without_calling_them_in() {
         objc2::rc::autoreleasepool(|_| {
             let items = dragging_items(&remote_spec(), None, None, &[]);
             let provider = items[0].item().downcast::<NSFilePromiseProvider>().unwrap();
-            let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+            let pasteboard = crate::macos::test_pasteboard::new();
             let offered = provider.writableTypesForPasteboard(&pasteboard);
             let intersects = |role| {
                 let registered = dragged_types(role);
@@ -4613,6 +5373,182 @@ mod tests {
             let object = items[0].item();
             let url = object.downcast_ref::<NSURL>().unwrap();
             assert_eq!(url.path().unwrap().to_string(), path.to_string_lossy());
+        });
+    }
+
+    #[test]
+    fn windows_linked_image_drag_keeps_link_and_deliverable_image_without_a_real_file_url() {
+        use crate::content::{
+            Provider,
+            namespace::Namespace,
+            url::tests::{Projected, source, wide_bytes},
+        };
+        use crate::model::{Inventory, NodeId, RepresentationId};
+        use oink_foundation::clipboard::ClipPlatform;
+        use std::collections::HashMap;
+        struct WithFiles {
+            contents: Projected,
+            files: Arc<dyn Namespace>,
+            reads: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Provider for WithFiles {
+            fn inventory(&self) -> Inventory {
+                self.contents.inventory()
+            }
+            fn open(&self, id: RepresentationId) -> std::io::Result<crate::FileReader> {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.contents.open(id)
+            }
+            fn namespace(&self) -> Option<Arc<dyn Namespace>> {
+                Some(self.files.clone())
+            }
+            fn translator(&self) -> Arc<dyn crate::content::Translator> {
+                self.contents.translator()
+            }
+        }
+        objc2::rc::autoreleasepool(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let image = dir.path().join("image.png");
+            std::fs::write(&image, b"original image file contents").unwrap();
+            let files: Arc<dyn Namespace> =
+                crate::content::namespace::Local::new(vec![(NodeId(1), image.clone())]).unwrap();
+            for (case, (title, text_first)) in [
+                (None, false),
+                (Some(""), false),
+                (Some("Linked image"), false),
+                (Some("Text link"), true),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let link = "https://example.invalid/linked-page";
+                let mut entries = vec![("UniformResourceLocatorW", wide_bytes(link))];
+                if text_first {
+                    entries.insert(0, ("CF_UNICODETEXT", wide_bytes("Text link")));
+                }
+                if let Some(title) = title {
+                    entries.push(("text/x-moz-url", wide_bytes(&format!("{link}\n{title}"))));
+                }
+                let mut source = source(ClipPlatform::Windows, &entries);
+                source.inventory.roots = files.roots();
+                source.inventory.items[0].file = Some(NodeId(1));
+                source.inventory.items[0].virtual_files = true;
+                let inventory = source.inventory.clone();
+                let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut spec = remote_spec();
+                spec.items = crate::content::items(&inventory);
+                spec.native = Some(crate::NativeSpec {
+                    inventory,
+                    contents: Arc::new(WithFiles {
+                        contents: Projected(source, ClipPlatform::Mac),
+                        files: files.clone(),
+                        reads: reads.clone(),
+                    }),
+                    files: vec![],
+                    file_contents: None,
+                    sensitivity: crate::Sensitivity::Normal,
+                });
+                let items = dragging_items(&spec, None, Some(vec![image.clone()]), &[]);
+                assert_eq!(items.len(), 1, "the image and link describe one drag item");
+                let published = items[0].item().downcast::<NSPasteboardItem>().unwrap();
+                let writer = proxy::companion_promise_provider(&published);
+                let board = crate::macos::test_pasteboard::new();
+                assert!(
+                    board.writeObjects(&NSArray::from_retained_slice(&[ProtocolObject::from_retained(
+                        published.clone()
+                    ),]))
+                );
+                let item = board.pasteboardItems().unwrap().objectAtIndex(0);
+                let types: Vec<_> = item.types().iter().map(|ty| ty.to_string()).collect();
+                eprintln!("published virtual link text_first={text_first} types={types:?}");
+                assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 0);
+                assert_eq!(
+                    item.stringForType(&NSString::from_str("public.url"))
+                        .map(|value| value.to_string()),
+                    Some(link.to_owned()),
+                    "the receiving application's pasteboard read must invoke the lazy URL provider"
+                );
+                // The published item above exercises the receiving app's real
+                // read. The retained native provider still owns image delivery.
+                let url = writer
+                    .pasteboardPropertyListForType(&NSString::from_str("public.url"))
+                    .expect("the advertised URL must resolve through the lazy promise proxy");
+                assert_eq!(url.downcast_ref::<NSData>().unwrap().to_vec(), link.as_bytes());
+                assert!(reads.load(std::sync::atomic::Ordering::Relaxed) > 0);
+                assert_eq!(types.iter().any(|ty| ty == "public.url-name"), title.is_some());
+                if text_first {
+                    assert_eq!(types[0], "public.utf8-plain-text");
+                    assert_eq!(
+                        item.stringForType(&NSString::from_str("public.utf8-plain-text"))
+                            .unwrap()
+                            .to_string(),
+                        "Text link"
+                    );
+                }
+                if title.is_some() {
+                    let html = item.stringForType(&NSString::from_str("public.html"));
+                    if title.is_some_and(|title| !title.is_empty()) {
+                        assert!(
+                            html.unwrap().to_string().contains(link),
+                            "the published HTML companion must remain readable"
+                        );
+                    } else {
+                        assert!(html.is_none(), "an empty title does not synthesize an HTML anchor");
+                    }
+                    assert_eq!(
+                        item.stringForType(&NSString::from_str("public.url-name"))
+                            .map(|value| value.to_string()),
+                        title.filter(|title| !title.is_empty()).map(str::to_owned)
+                    );
+                    let rendered = writer.pasteboardPropertyListForType(&NSString::from_str("public.url-name"));
+                    assert_eq!(
+                        rendered.map(|value| value.downcast_ref::<NSData>().unwrap().to_vec()),
+                        title
+                            .filter(|title| !title.is_empty())
+                            .map(|title| title.as_bytes().to_vec())
+                    );
+                }
+                assert!(
+                    !types.iter().any(|ty| ty == "public.file-url"),
+                    "a browser virtual image must not become a real file drag: {types:?}"
+                );
+                let promise_index = types
+                    .iter()
+                    .position(|ty| super::super::content::promise_type(ty))
+                    .unwrap();
+                assert!(types.iter().position(|ty| ty == "public.url").unwrap() < promise_index);
+                assert_eq!(promise::receivers(&board).unwrap().len(), 1);
+                let output = dir.path().join(format!("delivered-{case}.png"));
+                let url = NSURL::fileURLWithPath(&NSString::from_str(&output.to_string_lossy()));
+                let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let done_completed = completed.clone();
+                let done = block2::RcBlock::new(move |error: *mut NSError| {
+                    done_completed.store(error.is_null(), std::sync::atomic::Ordering::Release);
+                });
+                writer
+                    .delegate()
+                    .unwrap()
+                    .filePromiseProvider_writePromiseToURL_completionHandler(&writer, &url, &done);
+                assert!(completed.load(std::sync::atomic::Ordering::Acquire));
+                assert_eq!(std::fs::read(output).unwrap(), std::fs::read(&image).unwrap());
+                board.clearContents();
+
+                let clipboard = crate::macos::test_pasteboard::new();
+                let urls = HashMap::from([(NodeId(1), super::super::pasteboard::file_url_string(&image))]);
+                let before = reads.load(std::sync::atomic::Ordering::Relaxed);
+                super::super::content::write(
+                    Some(&clipboard.name().to_string()),
+                    spec.native.as_ref().unwrap(),
+                    &urls,
+                    &|| Ok(()),
+                )
+                .unwrap();
+                let item = clipboard.pasteboardItems().unwrap().objectAtIndex(0);
+                assert!(item.types().containsObject(&NSString::from_str("public.url")));
+                assert!(item.types().containsObject(&NSString::from_str("public.file-url")));
+                assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), before);
+                clipboard.clearContents();
+            }
         });
     }
 
@@ -4759,14 +5695,14 @@ mod tests {
     }
 
     #[test]
-    fn native_promise_fallback_keeps_raw_order_and_expands_folder_only_at_write() {
+    fn native_file_paths_require_a_provider_and_keep_raw_order() {
         use crate::content::namespace::{Files, Local};
         use crate::model::NodeId;
         objc2::rc::autoreleasepool(|_| {
             let temp = tempfile::tempdir().unwrap();
             let source = temp.path().join("source");
             std::fs::create_dir(&source).unwrap();
-            let board = NSPasteboard::pasteboardWithUniqueName();
+            let board = crate::macos::test_pasteboard::new();
             let item = NSPasteboardItem::new();
             item.setData_forType(&NSData::with_bytes(b"before"), &NSString::from_str("example.before"));
             item.setString_forType(
@@ -4793,15 +5729,16 @@ mod tests {
                 file_contents: Some(files.clone()),
                 sensitivity: crate::Sensitivity::Normal,
             });
-            let items = dragging_items(&spec, None, None, &spec.items);
+            assert!(dragging_items(&spec, None, None, &spec.items).is_empty());
+            let items = dragging_items(&spec, None, Some(vec![source.clone()]), &spec.items);
             assert_eq!(items.len(), 1);
             let writer = items[0].item();
-            let promise = writer.downcast_ref::<DragFilePromise>().unwrap();
-            let types = promise.writableTypesForPasteboard(&board);
+            let item = writer.downcast_ref::<NSPasteboardItem>().unwrap();
+            let types = item.types();
             let types: Vec<_> = types.iter().map(|ty| ty.to_string()).collect();
             assert_eq!(types.first().unwrap(), "example.before");
             assert_eq!(types.last().unwrap(), "example.after");
-            assert!(!types.iter().any(|ty| ty == "public.file-url"));
+            assert!(types.iter().any(|ty| ty == "public.file-url"));
             // A child created after hover is discovered by the actual write.
             std::fs::write(source.join("late-child"), b"whole folder").unwrap();
             let contents: Arc<dyn FileContents> = files;

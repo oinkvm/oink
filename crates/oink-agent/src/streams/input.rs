@@ -170,6 +170,10 @@ impl RouterAdapter for Adapter {
             return;
         }
         self.router.set_peer_touchpad_contacts(peer, state.touchpad_contacts);
+        self.router
+            .set_peer_scroll_pixels(peer, admission.agreement.contains("oink.input.scroll-pixels/1"));
+        self.router
+            .set_peer_touchpad_options(peer, admission.agreement.contains("oink.input.touchpad-options/1"));
         self.active.insert(peer);
         self.received.insert(peer, state.clone());
         for message in [
@@ -733,7 +737,20 @@ impl StreamModule for InputStreams {
                 });
             }
             let mut transform = None;
+            use oink_foundation::input::InputMode;
+            let mode = |raw| match raw {
+                0 => InputMode::Shared,
+                1 => InputMode::Local,
+                _ => InputMode::Disabled,
+            };
+            let mut mouse_mode = InputMode::Disabled;
+            let mut keyboard_mode = InputMode::Disabled;
             for option in facts.preferences()?.map_or(Vec::new(), |values| values.0) {
+                match option.option()? {
+                    dto::LocalOption::MouseMode => mouse_mode = mode(option.value()?.as_u64()?),
+                    dto::LocalOption::KeyboardMode => keyboard_mode = mode(option.value()?.as_u64()?),
+                    _ => {}
+                }
                 if option.option()? == dto::LocalOption::InputTransform {
                     let value = dto::InputTransformValue::read(&option.value()?)?;
                     transform = Some(
@@ -742,10 +759,16 @@ impl StreamModule for InputStreams {
                     );
                 }
             }
-            Ok((displays, transform, oink_routing::Os::parse(&facts.os()?.0)))
+            Ok((
+                displays,
+                transform,
+                oink_routing::Os::parse(&facts.os()?.0),
+                (mouse_mode, keyboard_mode),
+            ))
         };
-        if let Ok((displays, transform, os)) = project() {
+        if let Ok((displays, transform, os, modes)) = project() {
             self.input.send(InputCommand::PeerFacts {
+                application_modes: modes,
                 boot,
                 os,
                 displays,
@@ -1001,6 +1024,72 @@ mod os_tests {
     use oink_routing::input::InputMsg;
     use oink_routing::{Os, Output, Router, RouterConfig, SimpleLayout};
 
+    #[test]
+    fn touchpad_options_are_enabled_only_by_the_authenticated_input_agreement() {
+        for capable in [false, true] {
+            let local = DeviceId([1; 32]);
+            let peer = DeviceId([2; 32]);
+            let mut cfg = RouterConfig::new(boot(local), "local", Os::Windows);
+            cfg.settings.touchpad_injection = false;
+            let mut input = Adapter::new(Router::new(cfg, Arc::new(SimpleLayout::default())));
+            let remote = Router::new(
+                RouterConfig::new(boot(peer), "peer", Os::MacOS),
+                Arc::new(SimpleLayout::default()),
+            );
+            let mut state = ReceiveState::default();
+            for message in remote.input_opening(true) {
+                state.record(&message);
+            }
+            let mut admission = admission(peer);
+            if capable {
+                admission.agreement = Arc::new(
+                    oink_protocol::v1::admission::Agreement::new(
+                        [
+                            "oink.core/1",
+                            "oink.group/1",
+                            "oink.input/1",
+                            "oink.low/1",
+                            "oink.clipboard/1",
+                            "oink.input.relative/1",
+                            "oink.drag/1",
+                            "oink.input.touchpad-options/1",
+                        ]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>(),
+                    )
+                    .unwrap(),
+                );
+            }
+            input.attach(&admission, &state, Os::MacOS);
+            input.inbound(peer, enter(&input));
+            input.drain_outputs();
+            input.router_mut().set_accept_contacts(false);
+            input.inbound(
+                peer,
+                Message::Input(InputMsg::Scroll {
+                    source: oink_foundation::input::SourceKind::Touchpad,
+                    dx: 1.,
+                    dy: 2.,
+                    unit: oink_routing::input::ScrollAmount::Reference,
+                    phase: oink_foundation::input::ScrollPhase::Began,
+                }),
+            );
+            let outputs = input.drain_outputs();
+            assert_eq!(
+                outputs
+                    .iter()
+                    .any(|o| matches!(o, Output::Inject(InjectEvent::Scroll { .. }))),
+                capable
+            );
+            assert_eq!(
+                outputs
+                    .iter()
+                    .any(|o| matches!(o, Output::Inject(InjectEvent::TouchpadScroll { .. }))),
+                !capable
+            );
+        }
+    }
     #[test]
     fn handshake_os_maps_modifiers_before_facts_and_facts_override_it() {
         let local = DeviceId([1; 32]);

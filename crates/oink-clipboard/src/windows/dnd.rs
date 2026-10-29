@@ -91,6 +91,8 @@ struct St {
     releasing: bool,
     released: bool,
     probing: bool,
+    probed_at: Option<Instant>,
+    target_start: crate::dnd::TargetStartObservation,
     /// 这次拖入已经报告过（`DragEnter` 在拖拽进出窗口时会多次调用）。
     reported: bool,
     began: bool,
@@ -159,7 +161,7 @@ struct Shared {
 }
 
 impl Shared {
-    fn source_ended(&self, accepted: bool, reason: u64) {
+    fn source_ended(self: &Arc<Self>, accepted: bool, reason: u64) {
         // Sample at callback entry, before dropping the COM source reference or
         // notifying the router can change native hit testing. One end record only.
         let observed = self.lock().held_summary.as_ref().map(HoldSummary::sample);
@@ -168,7 +170,7 @@ impl Shared {
                 local.native_source = None;
             }
         });
-        let (operation, summary) = {
+        let (operation, summary, retire) = {
             let mut st = self.lock();
             if !accepted
                 && st.held_source.is_some()
@@ -176,21 +178,71 @@ impl Shared {
             {
                 data.fail(crate::model::Unavailable::Cancelled);
             }
+            // An ordinary probe may leave and re-enter while dragging. A held
+            // session leaving, or any native Drop, is terminal for its catcher.
+            let retire = st
+                .held_source
+                .or_else(|| (reason != 3).then_some(st.source_operation).flatten());
             st.source_present = false;
             st.source_operation = None;
             st.releasing = false;
-            (st.held_source.take(), st.held_summary.take())
+            (st.held_source.take(), st.held_summary.take(), retire)
         };
         if let Some(summary) = summary {
             summary.finish(reason, observed);
         }
         self.cv.notify_all();
+        if let Some(operation) = retire {
+            self.retire_probe(Some(operation));
+        }
         if let Some(operation) = operation {
             self.emit(if reason == 3 {
                 PlatformDndEvent::SourceCatcherLost { operation }
             } else {
                 PlatformDndEvent::SourceEnded { operation, accepted }
             });
+        }
+    }
+    /// Terminal cleanup must survive a source STA blocked in FileContents.
+    /// build 51's one-second `run` cancelled its queued hide; DragLeave later
+    /// retired the source but left a full-screen catcher visible on Windows 11.
+    /// Queue cleanup without expiry. Identity and hide still share the STA;
+    /// an old cleanup must not dismiss a newer probe after resume/recross.
+    fn retire_probe(self: &Arc<Self>, operation: Option<DragOperation>) {
+        if operation.is_none() {
+            let mut st = self.lock();
+            st.probing = false;
+            st.probe_operation = None;
+            st.reported = false;
+        }
+        let Some((jobs, catcher)) = self.native_jobs.get() else {
+            return;
+        };
+        let hwnd = *catcher;
+        let shared = self.clone();
+        if jobs
+            .send(Box::new(move || {
+                let mut st = shared.lock();
+                let obsolete = operation.map_or(st.probing, |operation| st.probe_operation != Some(operation));
+                if obsolete {
+                    return;
+                }
+                st.probing = false;
+                st.probe_operation = None;
+                st.reported = false;
+                drop(st);
+                // SAFETY: the queued job runs on this catcher's OLE STA. Never hide
+                // another process's window, and never synthesize source completion.
+                unsafe {
+                    let _ = ShowWindow(HWND(hwnd as _), SW_HIDE);
+                }
+            }))
+            .is_ok()
+        {
+            // SAFETY: asynchronous wake of our own STA; no timed acknowledgement.
+            unsafe {
+                let _ = PostMessageW(Some(HWND(hwnd as _)), WM_APP_JOB, WPARAM(0), LPARAM(0));
+            }
         }
     }
     fn lock(&self) -> std::sync::MutexGuard<'_, St> {
@@ -327,15 +379,6 @@ impl WinDnd {
         pending.store(false, Ordering::Release);
         result
     }
-
-    fn hide(&self, hwnd: isize) {
-        let _ = self.run(move || {
-            // SAFETY: 本线程的窗口。
-            unsafe {
-                let _ = ShowWindow(HWND(hwnd as _), SW_HIDE);
-            }
-        });
-    }
 }
 
 /// Read hit testing on the DPI-aware OLE thread. A successful injected button
@@ -376,6 +419,15 @@ fn place(hwnd: HWND, at: Point) -> bool {
 }
 
 impl DndBackend for WinDnd {
+    fn target_start_timing(&self, operation: DragOperation, timing: Option<crate::dnd::NativeBeginTiming>) {
+        let mut st = self.shared.lock();
+        if let Some(timing) = timing {
+            st.target_start.arm(operation, timing);
+        } else {
+            let _ = st.target_start.take(operation);
+        }
+    }
+
     fn observe_native_begin(
         &self,
         operation: DragOperation,
@@ -438,6 +490,7 @@ impl DndBackend for WinDnd {
                 return; // A queued follow must not shrink the live parking surface.
             }
             if !st.probing {
+                st.probed_at = Some(Instant::now());
                 st.reported = false;
                 st.probe_operation = None;
             }
@@ -461,37 +514,11 @@ impl DndBackend for WinDnd {
     }
 
     fn unprobe(&self) {
-        {
-            let mut st = self.shared.lock();
-            st.probing = false;
-            st.probe_operation = None;
-            st.reported = false;
-        }
-        if let Some(t) = self.thread() {
-            self.hide(t.catcher);
-        }
+        self.shared.retire_probe(None);
     }
 
     fn unprobe_source(&self, operation: DragOperation) {
-        let Some(t) = self.thread() else { return };
-        let hwnd = t.catcher;
-        let shared = self.shared.clone();
-        let _ = self.run(move || {
-            let mut st = shared.lock();
-            if st.probe_operation != Some(operation) {
-                return;
-            }
-            st.probing = false;
-            st.probe_operation = None;
-            st.reported = false;
-            drop(st);
-            // The identity check and hide share the OLE thread, so a newer
-            // DragEnter cannot replace the capture between them.
-            // SAFETY: the catcher belongs to this thread.
-            unsafe {
-                let _ = ShowWindow(HWND(hwnd as _), SW_HIDE);
-            }
-        });
+        self.shared.retire_probe(Some(operation));
     }
 
     fn set_content_store(&self, root: std::path::PathBuf) {
@@ -618,29 +645,42 @@ impl DndBackend for WinDnd {
         true
     }
     fn finish_source(&self, operation: DragOperation, accept: bool, release: &dyn Fn() -> Result<(), String>) -> bool {
-        {
-            let mut st = self.shared.lock();
-            if st.held_source != Some(operation) {
-                return false;
-            }
-            st.releasing = accept;
-            st.released = false;
-        }
-        if !accept {
-            // Third-party drag sources do not observe Oink's own cancel flag.
-            // Tagged Escape reaches their native modal loop on both platforms.
-            for pressed in [true, false] {
-                if !self.shared.inject(InjectEvent::Key {
-                    code: oink_foundation::input::KeyCode::ESCAPE,
-                    pressed,
-                }) {
+        let result = (|| {
+            {
+                let mut st = self.shared.lock();
+                if st.held_source != Some(operation) {
                     return false;
                 }
+                st.releasing = accept;
+                st.released = false;
             }
+            if !accept {
+                // Third-party drag sources do not observe Oink's own cancel flag.
+                // Tagged Escape reaches their native modal loop on both platforms.
+                for pressed in [true, false] {
+                    if !self.shared.inject(InjectEvent::Key {
+                        code: oink_foundation::input::KeyCode::ESCAPE,
+                        pressed,
+                    }) {
+                        return false;
+                    }
+                }
+            }
+            // Drop can synchronously snapshot a large provider. Do not block the
+            // input action queue or invent completion from a short acknowledgement.
+            release().is_ok()
+        })();
+        if !accept && !result {
+            // A failed Escape/release still owes teardown. Successful submission
+            // is only an input receipt: keep the full catcher until native
+            // DragLeave/Drop. Hiding it here can expose the source browser while
+            // its modal loop is still consuming the positioned UP. The keyed,
+            // non-expiring native-end cleanup also handles a slow source STA.
+            // Windows 11 field evidence and private-station lifecycle regression;
+            // installed-browser input acceptance still needs user verification.
+            self.unprobe_source(operation);
         }
-        // Drop can synchronously snapshot a large provider. Do not block the
-        // input action queue or invent completion from a short acknowledgement.
-        release().is_ok()
+        result
     }
 
     fn release(&self) -> bool {
@@ -712,6 +752,7 @@ impl DndBackend for WinDnd {
         }
         let operation = spec.operation;
         let source = t.source;
+        let pending_at = Instant::now();
         let prepared = self.run(move || {
             LOCAL.with(|l| {
                 if let Some(l) = l.borrow_mut().as_mut() {
@@ -720,9 +761,11 @@ impl DndBackend for WinDnd {
             });
             true
         });
+        crate::dnd::preparation_timing(crate::dnd::PreparationStage::PendingWindow, pending_at, Instant::now());
         if prepared != Some(true) {
             return Err(ClipboardError::Platform("drag source window unavailable".into()));
         }
+        let pressed_at = Instant::now();
         let mut down = false;
         let mut critical_at = None;
         let mut native_at = None;
@@ -771,8 +814,16 @@ impl DndBackend for WinDnd {
             .map(|_| Point::default());
         trace.received = received;
         trace.dropped = result.as_ref().copied().unwrap_or(0);
+        crate::dnd::preparation_timing(crate::dnd::PreparationStage::SourcePress, pressed_at, Instant::now());
         let remaining = native_at.map_or(WAIT, |at| WAIT.saturating_sub(at.elapsed()));
-        if result.is_ok() && received && self.shared.wait(remaining, |st| st.began) {
+        let ack_at = Instant::now();
+        let began = result.is_ok() && received && self.shared.wait(remaining, |st| st.began);
+        crate::dnd::preparation_timing(
+            crate::dnd::PreparationStage::NativeAcknowledgement,
+            ack_at,
+            Instant::now(),
+        );
+        if began {
             return Ok(());
         }
         tracing::warn!(down, ?at, source, "the drag did not start: releasing the button");
@@ -949,6 +1000,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
     }
 }
 
+pub(super) mod drop_trace;
 /// 发起窗口收到（注入的）左键按下：`DoDragDrop`，结束后报告。
 mod representation_trace;
 
@@ -962,13 +1014,16 @@ fn start_drag(hwnd: HWND) {
         tracing::debug!("button down on the drag source window without a pending drag");
         return;
     };
-    let (data, effects) = match data_object(&spec) {
+    let writers_at = Instant::now();
+    let (data, files, effects) = match data_object(&spec) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(%e, "cannot build the drag data");
             return;
         }
     };
+    let diagnostics = drop_trace::Session::new(spec.operation, effects);
+    files.observe_drag(diagnostics.clone());
     // Begin always uses default artwork. Late thumbnails update this same
     // IDataObject through the helper while OLE keeps the native drag alive.
     let (target_image, preview) = {
@@ -991,7 +1046,13 @@ fn start_drag(hwnd: HWND) {
             None
         }
     };
-    let source: IDropSource = DropSource { shared: shared.clone() }.into();
+    crate::dnd::preparation_timing(crate::dnd::PreparationStage::WritersPreview, writers_at, Instant::now());
+    let native_begin_at = Instant::now();
+    let source: IDropSource = DropSource {
+        shared: shared.clone(),
+        diagnostics: Some(diagnostics.clone()),
+    }
+    .into();
     // Keep the identity from the submitted spec across OLE's modal loop.
     // ended/notify below can unblock cancel and a replacement session before
     // emit runs; reading the current peer at that point would misattribute the
@@ -1024,6 +1085,14 @@ fn start_drag(hwnd: HWND) {
     );
     let hr = ole.scope(|| {
         // SAFETY: retained data/source objects and output effect belong to this initialized STA.
+        let entered_at = Instant::now();
+        crate::dnd::preparation_timing(crate::dnd::PreparationStage::NativeBegin, native_begin_at, entered_at);
+        let timing = shared.lock().target_start.take(operation);
+        if let Some(timing) = timing {
+            timing.complete(Some(entered_at));
+        }
+        // This ends at OLE call entry; DoDragDrop returns only when the drag ends.
+        // SAFETY: retained data/source and output effect belong to this initialized STA.
         unsafe { DoDragDrop(&data, &source, effects, &mut effect) }
     });
     ole.result(hr.0);
@@ -1045,7 +1114,9 @@ fn start_drag(hwnd: HWND) {
             let _ = refresh.DragLeave();
         }
     }
-    let dropped = hr == DRAGDROP_S_DROP && effect != DROPEFFECT_NONE;
+    let dropped = files.drag_dropped(hr, effect);
+    diagnostics.finish(hr, effect, dropped);
+    files.drag_ended(dropped, effect == DROPEFFECT_MOVE);
     // SAFETY: 本线程的窗口。
     unsafe {
         let _ = ShowWindow(hwnd, SW_HIDE);
@@ -1098,7 +1169,7 @@ fn from_effect(e: DROPEFFECT) -> DragOps {
 }
 
 /// 拖拽的数据对象：远端文件是虚拟文件（与剪贴板同一个实现），本机文件是 `CF_HDROP`，另有文本、图片。
-fn data_object(spec: &DragSpec) -> Result<(IDataObject, DROPEFFECT), String> {
+pub(super) fn data_object(spec: &DragSpec) -> Result<(IDataObject, Arc<vfile::Shared>, DROPEFFECT), String> {
     let f = formats();
     let mut fixed = Vec::new();
     let mut effects = DROPEFFECT_COPY;
@@ -1108,11 +1179,20 @@ fn data_object(spec: &DragSpec) -> Result<(IDataObject, DROPEFFECT), String> {
         match item {
             ClipData::Files(entries) => match &spec.files {
                 Some(contents) => {
+                    let registration_at = Instant::now();
                     cloud = super::cloud::Offer::new(
                         entries.clone(),
                         contents.clone(),
                         spec.native.as_ref().map(|n| &n.inventory),
                     );
+                    crate::dnd::preparation_timing(
+                        crate::dnd::PreparationStage::Registration,
+                        registration_at,
+                        Instant::now(),
+                    );
+                    if cloud.is_none() && contents.namespace().is_some_and(|files| files.requires_native_files()) {
+                        return Err("File provider unavailable".into());
+                    }
                     let d = files::descriptors(entries);
                     if d.skipped_long > 0 && cloud.as_ref().is_none_or(|o| o.virtual_files) {
                         return Err(format!(
@@ -1120,7 +1200,10 @@ fn data_object(spec: &DragSpec) -> Result<(IDataObject, DROPEFFECT), String> {
                             d.skipped_long
                         ));
                     }
-                    fixed.push((f.preferred_drop_effect, DROPEFFECT_COPY.0.to_le_bytes().to_vec()));
+                    if cloud.is_some() {
+                        effects = DROPEFFECT_COPY | DROPEFFECT_MOVE;
+                    }
+                    fixed.push((f.preferred_drop_effect, effects.0.to_le_bytes().to_vec()));
                     virtual_files = Some((d, contents.clone()));
                 }
                 None => {
@@ -1165,7 +1248,7 @@ fn data_object(spec: &DragSpec) -> Result<(IDataObject, DROPEFFECT), String> {
         native,
     );
     shared.host_drag_images();
-    Ok((data, effects))
+    Ok((data, shared, effects))
 }
 
 // ───────────── COM 对象 ─────────────
@@ -1173,6 +1256,7 @@ fn data_object(spec: &DragSpec) -> Result<(IDataObject, DROPEFFECT), String> {
 #[implement(IDropSource, IDropSourceNotify)]
 struct DropSource {
     shared: Arc<Shared>,
+    diagnostics: Option<Arc<drop_trace::Session>>,
 }
 
 impl IDropSource_Impl for DropSource_Impl {
@@ -1184,8 +1268,10 @@ impl IDropSource_Impl for DropSource_Impl {
                 ..ReadContext::current()
             },
         );
+        let mut cancelled = false;
         let result = trace.scope(|| {
-            if self.shared.lock().cancel || fescapepressed.as_bool() {
+            cancelled = self.shared.lock().cancel;
+            if cancelled || fescapepressed.as_bool() {
                 return DRAGDROP_S_CANCEL;
             }
             if grfkeystate.0 & MK_LBUTTON.0 == 0 {
@@ -1193,11 +1279,17 @@ impl IDropSource_Impl for DropSource_Impl {
             }
             S_OK
         });
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.continuation(result, grfkeystate, cancelled, fescapepressed.as_bool());
+        }
         trace.result(result.0);
         result
     }
 
     fn GiveFeedback(&self, effect: DROPEFFECT) -> HRESULT {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.feedback(effect);
+        }
         let trace = ReadTrace::new(
             read_stage::FEEDBACK,
             ReadContext {
@@ -1214,11 +1306,17 @@ impl IDropSource_Impl for DropSource_Impl {
 // Read-only OLE target notifications. No target HWND, title or caller identity is logged.
 impl IDropSourceNotify_Impl for DropSource_Impl {
     fn DragEnterTarget(&self, _hwndtarget: HWND) -> windows::core::Result<()> {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.target(true);
+        }
         let trace = ReadTrace::new(read_stage::TARGET_ENTER, ReadContext::current());
         trace.result(0);
         Ok(())
     }
     fn DragLeaveTarget(&self) -> windows::core::Result<()> {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.target(false);
+        }
         let trace = ReadTrace::new(read_stage::TARGET_LEAVE, ReadContext::current());
         trace.result(0);
         Ok(())
@@ -1378,6 +1476,7 @@ impl IDropTarget_Impl for Catcher_Impl {
                 return Ok(());
             };
             let started = Instant::now();
+            let probed_at = self.shared.lock().probed_at;
             let (dnd_formats, complete) = offered_formats(data);
             tracing::debug!(
                 dnd_formats,
@@ -1489,6 +1588,48 @@ impl IDropTarget_Impl for Catcher_Impl {
             // Stat selected roots off the OLE thread; descendants remain unvisited.
             let spawned = std::thread::Builder::new().name("oink-dnd-read".into()).spawn(move || {
                 if let Some(files) = virtual_files {
+                    let weak = Arc::downgrade(&shared);
+                    let files = files.drag(move |files| {
+                        use crate::content::namespace::Namespace;
+                        use crate::model::Unavailable;
+                        let shared = weak
+                            .upgrade()
+                            .ok_or_else(|| crate::content::unavailable(Unavailable::Cancelled))?;
+                        let root = shared
+                            .lock()
+                            .content_root
+                            .clone()
+                            .ok_or_else(|| crate::content::unavailable(Unavailable::Cancelled))?;
+                        let (jobs, catcher) = shared
+                            .native_jobs
+                            .get()
+                            .ok_or_else(|| crate::content::unavailable(Unavailable::Cancelled))?;
+                        jobs.send(Box::new(move || {
+                            // IDataObject never leaves this source STA. Release
+                            // the RefCell borrow before a reentrant GetData call.
+                            let data = LOCAL.with(|local| {
+                                local.borrow().as_ref().and_then(|local| {
+                                    local
+                                        .native_source
+                                        .as_ref()
+                                        .filter(|(op, _)| *op == operation)
+                                        .map(|(_, data)| data.clone())
+                                })
+                            });
+                            if let Some(data) = data {
+                                let _ = files.snapshot(&data, &root);
+                            } else {
+                                files.cancel();
+                            }
+                        }))
+                        .map_err(|_| crate::content::unavailable(Unavailable::Cancelled))?;
+                        // A content request needs an owned snapshot before the
+                        // grant can be issued, even before real Drop. Wake the
+                        // existing apartment job queue without injecting input.
+                        // SAFETY: catcher is the source STA's live message window.
+                        unsafe { PostMessageW(Some(HWND(*catcher as _)), WM_APP_JOB, WPARAM(0), LPARAM(0)) }
+                            .map_err(|_| crate::content::unavailable(Unavailable::Cancelled))
+                    });
                     if !source.attach_files(files) {
                         return;
                     }
@@ -1516,6 +1657,13 @@ impl IDropTarget_Impl for Catcher_Impl {
                     st.probing && st.source_operation == Some(operation)
                 };
                 if current {
+                    crate::dnd::source_timing(crate::dnd::SourceTiming {
+                        operation,
+                        probed_at,
+                        recognized_at: started,
+                        native_read_at: report_end,
+                        inventory_at: Instant::now(),
+                    });
                     shared.emit(PlatformDndEvent::Detected { operation, items, ops });
                 }
             });
@@ -1589,11 +1737,24 @@ impl IDropTarget_Impl for Catcher_Impl {
                         let id = crate::content::Provider::inventory(source.as_ref()).id;
                         let captured = virtual_files
                             .map_or(Ok(()), |files| files.snapshot(data, &root))
+                            .or_else(|error| {
+                                // GetData can reenter real Drop while the first
+                                // demand is still capturing on this STA. That
+                                // capture retains the source and wakes readers;
+                                // accepting COPY must not wait on its own stack.
+                                if error.kind() == std::io::ErrorKind::WouldBlock {
+                                    Ok(())
+                                } else {
+                                    Err(error)
+                                }
+                            })
                             .and_then(|()| super::content::snapshot(data, &root, id));
                         match captured {
                             Ok(snapshot) => source.complete(snapshot),
                             Err(error) => {
-                                source.fail(crate::content::reason(&error));
+                                let reason = crate::content::reason(&error);
+                                tracing::warn!(?reason, "native source Drop snapshot capture rejected");
+                                source.fail(reason);
                                 false
                             }
                         }
@@ -1702,6 +1863,8 @@ fn read_drag_paths(data: &IDataObject) -> Vec<std::path::PathBuf> {
 
 #[cfg(all(test, debug_assertions))]
 mod artwork_desktop_tests;
+#[cfg(all(test, debug_assertions))]
+mod catcher_desktop_tests;
 
 #[cfg(all(test, debug_assertions))]
 mod diagnostic_tests {
@@ -1738,7 +1901,11 @@ mod diagnostic_tests {
             st: Mutex::new(St::default()),
             cv: Condvar::new(),
         });
-        let source: IDropSource = DropSource { shared: shared.clone() }.into();
+        let source: IDropSource = DropSource {
+            shared: shared.clone(),
+            diagnostics: None,
+        }
+        .into();
         // SAFETY: only calls private Rust COM objects; no windows or input are used.
         unsafe {
             assert_eq!(source.QueryContinueDrag(false, MK_LBUTTON), S_OK);

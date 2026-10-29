@@ -1,0 +1,107 @@
+{
+  "App.tsx": [
+    "agent.fail(reason)",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail(e instanceof ApiFailure ? e.problem.code : 'unavailable')",
+    "agent.fail(action?.kind === 'unavailable' ? action.reason : 'unsupported')",
+    "fail(error)",
+    "agent.fail('unavailable')",
+    "shell.open('main').catch(fail)",
+    "shell.open('about').catch(fail)",
+    "shell.quit().catch(fail)",
+    "shell.open('main').then(()=>pairing.actions.accept(req)).catch(fail)",
+    "pairing.actions.reject(req).catch(fail)",
+    "pairing.actions.connect(p).catch(fail)",
+    "pairing.actions.block(p).catch(fail)",
+    "shell.quit().catch(fail)",
+    "shell.quit().catch(fail)",
+    "agent.fail('')",
+    "shell.quit().catch(fail)",
+    "(d.group === 'self' ? api.leaveGroup() : api.removeMember(d.id)).then(() => setLeaveId(null)).catch(fail)"
+  ],
+  "api/store.ts": [
+    "agent.fail(error instanceof ApiFailure ? error.problem.code : 'unavailable')",
+    "agent.fail('unavailable')"
+  ],
+  "onboarding/Onboarding.tsx": [
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')"
+  ],
+  "onboarding/OnboardingPermissions.tsx": [
+    "agent.fail('unavailable')"
+  ],
+  "pairing/AddPanel.tsx": [
+    "agent.fail('unavailable')"
+  ],
+  "pairing/PairDialog.tsx": [
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('persistence_failed')"
+  ],
+  "pairing/usePairing.ts": [
+    "agent.fail(error instanceof ApiFailure?error.problem.code:'unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('persistence_failed')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('persistence_failed')"
+  ],
+  "settings/ScreenPointerGains.tsx": [
+    "agent.fail('unavailable')"
+  ],
+  "settings/SettingsPage.tsx": [
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')"
+  ],
+  "settings/UpdatePreferences.tsx": [
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')"
+  ],
+  "settings/VirtualMicrophone.tsx": [
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('permission_denied')"
+  ],
+  "settings/model.ts": [
+    "agent.fail('unavailable')"
+  ],
+  "settings/useGrant.ts": [
+    "agent.fail('permission_denied')"
+  ],
+  "window/PromoArea.tsx": [
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')"
+  ],
+  "window/StatusNotices.tsx": [
+    "agent.fail('unavailable')"
+  ],
+  "window/Upgrade.tsx": [
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')"
+  ],
+  "window/panel.ts": [
+    "agent.fail('unavailable')",
+    "agent.fail('unavailable')"
+  ]
+}

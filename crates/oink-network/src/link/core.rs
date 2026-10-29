@@ -1027,7 +1027,11 @@ impl Core {
                     .find(|l| !l.installed && l.wire == wire && l.hop.connection_id == connection)
                     .map(|l| l.id)
                 {
-                    self.links.get_mut(&id).expect("link").installed = true;
+                    let link = self.links.get_mut(&id).expect("link");
+                    link.installed = true;
+                    // Pulses can only start on an installed path. Time spent
+                    // awaiting Installed belongs to the installation budget.
+                    link.heartbeat = Heartbeat::new(now);
                     self.connected(id);
                     // Selection can finish while the relay's install reply is
                     // in flight. Reconcile on either transition, not just Select.
@@ -1465,8 +1469,8 @@ impl Core {
             if let Some(c) = &l.cutover {
                 include(c.deadline);
             }
-            include(l.heartbeat.progress + HEARTBEAT_TIMEOUT);
             if l.installed {
+                include(l.heartbeat.progress + HEARTBEAT_TIMEOUT);
                 include(l.heartbeat.next);
             }
             if l.installed
@@ -1520,7 +1524,7 @@ impl Core {
                 Some(LinkLost::ConnectionLost)
             } else if link.cutover.as_ref().is_some_and(|m| now >= m.deadline) {
                 Some(LinkLost::CutoverTimeout)
-            } else if now.saturating_duration_since(link.heartbeat.progress) >= HEARTBEAT_TIMEOUT {
+            } else if link.installed && now.saturating_duration_since(link.heartbeat.progress) >= HEARTBEAT_TIMEOUT {
                 Some(LinkLost::HeartbeatTimeout)
             } else {
                 None

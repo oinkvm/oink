@@ -1,4 +1,4 @@
-//! Only a small allowlisted projection of Apple .ips files crosses this boundary.
+//! Only typed local crash summaries and an allowlisted Apple .ips projection cross this boundary.
 //! Paths, symbol text, image/thread names, registers and exception messages are never copied.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,6 +11,12 @@ pub struct Report {
     timestamp_ms: Option<i64>,
     exception_class: oink_telemetry::ExceptionClass,
     faulting_thread: Option<u64>,
+    #[serde(default)]
+    exception_code: Option<u32>,
+    #[serde(default)]
+    frames: Vec<oink_telemetry::Frame>,
+    #[serde(default)]
+    previous_instance: bool,
 }
 impl Report {
     pub(super) fn network(&self) -> oink_protocol::v1::Result<oink_protocol::v1::dto::DiagCrashSummary> {
@@ -44,11 +50,31 @@ impl Report {
             "timestamp_ms": self.timestamp_ms,
             "exception_class": self.exception_class,
             "faulting_thread": self.faulting_thread,
-            "association": if self.available { "not_correlated_with_trigger" } else { "unavailable" },
-            "belongs_to_previous_instance": Value::Null,
+            "exception_code": self.exception_code,
+            "frames": self.frames,
+            "association": if self.previous_instance { "previous_instance" } else if self.available { "not_correlated_with_trigger" } else { "unavailable" },
+            "belongs_to_previous_instance": if self.previous_instance { Value::Bool(true) } else { Value::Null },
             "age_at_save_ms": self.timestamp_ms.map(|time| at_ms.saturating_sub(time)),
         })
     }
+}
+pub(super) fn latest_for(directory: &std::path::Path, previous: Option<&str>) -> Report {
+    if let Some(summary) = ["crash", "crash-ui"]
+        .iter()
+        .filter_map(|name| oink_crash::local::read(&directory.join(name)))
+        .max_by_key(|summary| (previous == Some(summary.instance.as_str()), summary.collected_at))
+    {
+        return Report {
+            available: true,
+            timestamp_ms: i64::try_from(summary.collected_at.saturating_mul(1000)).ok(),
+            exception_class: summary.crash.exception_class,
+            exception_code: summary.crash.exception_code,
+            faulting_thread: Some(u64::from(summary.faulting_thread)),
+            frames: summary.crash.frames().copied().collect(),
+            previous_instance: previous == Some(summary.instance.as_str()),
+        };
+    }
+    latest()
 }
 #[cfg(any(target_os = "macos", all(test, debug_assertions)))]
 fn normalized_time(text: &str) -> Option<i64> {
@@ -80,6 +106,9 @@ fn missing() -> Report {
         timestamp_ms: None,
         exception_class: oink_telemetry::ExceptionClass::Unknown,
         faulting_thread: None,
+        exception_code: None,
+        frames: Vec::new(),
+        previous_instance: false,
     }
 }
 #[cfg(target_os = "macos")]
@@ -154,11 +183,177 @@ fn parse(bytes: &[u8]) -> Option<Report> {
         timestamp_ms,
         exception_class,
         faulting_thread: report.get("faultingThread").and_then(Value::as_u64),
+        frames: crate::telemetry::packaged_manifest()
+            .1
+            .as_ref()
+            .and_then(|manifest| oink_crash::macos::project_frames(&report, manifest, oink_telemetry::ImageSlot::Agent))
+            .unwrap_or_default(),
+        ..Report::default()
     })
 }
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+    #[test]
+    fn matching_previous_backend_summary_wins_over_newer_ui_crash() {
+        use oink_telemetry::*;
+        let directory = tempfile::tempdir().unwrap();
+        let instance = "a".repeat(24);
+        let crash = SafeCrash::empty(
+            BuildContext {
+                app_version: AppVersion {
+                    major: 1,
+                    minor: 0,
+                    patch: 0,
+                    build: 1,
+                },
+                os_version_class: OsVersionClass::Windows11,
+            },
+            Component::Agent,
+            CrashKind::NativeException,
+            ExceptionClass::BadAccess,
+        );
+        for (name, id, at, thread) in [
+            ("crash", instance.clone(), now() - 1, 11),
+            ("crash-ui", "b".repeat(24), now(), 22),
+        ] {
+            oink_crash::local::write(
+                &oink_crash::local::Target {
+                    root: directory.path().join(name),
+                    instance: id,
+                },
+                crash.clone(),
+                at,
+                thread,
+            )
+            .unwrap();
+        }
+        let report = latest_for(directory.path(), Some(&instance));
+        assert!(report.previous_instance);
+        assert_eq!(report.faulting_thread, Some(11));
+        assert_eq!(latest_for(directory.path(), None).faulting_thread, Some(22));
+    }
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "real Windows crash child; first build oink-crash-collector"]
+    fn windows_child_crash_is_exported_with_previous_instance() {
+        use crate::diagnostics::{Reason, store::Store};
+        use oink_telemetry::*;
+        const KEY: &str = "OINK_DIAG_NATIVE_CHILD";
+        if let Some(root) = std::env::var_os(KEY) {
+            let root = std::path::PathBuf::from(root);
+            let store = Store::open(root.clone(), "a".repeat(24), true).unwrap();
+            let executable = std::env::current_exe().unwrap();
+            let version = crate::telemetry::packaged_manifest().0;
+            let build = BuildContext {
+                app_version: version,
+                os_version_class: OsVersionClass::Windows11,
+            };
+            let manifest = oink_telemetry::capture::Manifest {
+                version,
+                images: vec![oink_crash::dump::executable_image(&executable, ImageSlot::Agent).unwrap()],
+            };
+            oink_crash::capsule::Capture::install();
+            let _collector = oink_crash::collector::Collector::start_with_local(
+                &executable
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("oink-crash-collector.exe"),
+                &root.join("raw"),
+                ReportConsent::default(),
+                build,
+                &manifest,
+                Component::Agent,
+                Some(oink_crash::local::Target {
+                    root: root.join("crash"),
+                    instance: store.instance.clone(),
+                }),
+            )
+            .unwrap();
+            // SAFETY: only this isolated child raises a fatal exception; no
+            // installed process, UI desktop, or reporting grant is involved.
+            unsafe {
+                use windows::Win32::System::Diagnostics::Debug::*;
+                SetErrorMode(SEM_NOGPFAULTERRORBOX);
+                RaiseException(0xe000_beef, 0, None);
+            }
+            std::process::exit(4);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "diagnostics::crash_report::tests::windows_child_crash_is_exported_with_previous_instance",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(KEY, dir.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(16);
+        while !oink_crash::local::read(&dir.path().join("crash")).is_some_and(|s| s.crash.frames().count() > 1)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let store = Store::open(dir.path().into(), "a".repeat(24), true).unwrap();
+        assert!(store.previous_instance.is_some());
+        let bundle = store.export(Reason::RecoveredCrash, 0, 0).unwrap();
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(bundle.path).unwrap()).unwrap();
+        let report: Value = serde_json::from_reader(zip.by_name("crash-report.json").unwrap()).unwrap();
+        assert_eq!(report["available"], true, "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(report["exception_code"], 0xe000_beefu32);
+        assert_eq!(report["belongs_to_previous_instance"], true);
+        assert!(report["frames"].as_array().unwrap().len() > 1);
+        assert!(!dir.path().join("raw/0.dmp").exists());
+        println!("real Windows ZIP crash summary: {}", report);
+    }
+    #[test]
+    fn local_windows_crash_is_available_and_correlated_without_report_consent() {
+        use oink_telemetry::*;
+        let dir = tempfile::tempdir().unwrap();
+        let target = oink_crash::local::Target {
+            root: dir.path().join("crash"),
+            instance: "abcdef012345abcdef012345".into(),
+        };
+        let mut crash = SafeCrash::empty(
+            BuildContext {
+                app_version: AppVersion {
+                    major: 1,
+                    minor: 0,
+                    patch: 0,
+                    build: 1,
+                },
+                os_version_class: OsVersionClass::Windows11,
+            },
+            Component::Agent,
+            CrashKind::NativeException,
+            ExceptionClass::BadAccess,
+        );
+        crash.exception_code = Some(0xc0000005);
+        crash.frames[0][0] = Some(Frame::Native {
+            image: ImageSlot::Agent,
+            offset: 42,
+            debug_id: [7; 16],
+            debug_age: 1,
+            code_id: Some(123),
+            image_size: 4096,
+        });
+        oink_crash::local::write(&target, crash, now(), 9).unwrap();
+        let report = latest_for(dir.path(), Some(&target.instance)).export_view((now() * 1000) as i64);
+        assert_eq!(report["available"], true);
+        assert_eq!(report["belongs_to_previous_instance"], true);
+        assert_eq!(report["exception_code"], 0xc0000005u32);
+        assert_eq!(report["faulting_thread"], 9);
+        assert_eq!(report["frames"].as_array().unwrap().len(), 1);
+        assert!(
+            latest_for(dir.path(), Some("012345abcdef012345abcdef")).export_view(0)["belongs_to_previous_instance"]
+                .is_null()
+        );
+    }
     #[test]
     fn historical_reports_use_utc_and_do_not_claim_trigger_correlation() {
         let western = normalized_time("2026-10-01 07:49:29.1955 -0700").unwrap();

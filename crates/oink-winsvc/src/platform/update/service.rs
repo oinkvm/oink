@@ -31,19 +31,47 @@ fn registered_sessions(
     }
     Ok(active)
 }
+const VERIFICATION_BUDGET: Duration = Duration::from_secs(120);
+
 pub(super) struct State {
     status: UpdateStatus,
     policy: MachinePolicy,
     queued: Option<Command>,
+    local_approval: Option<oink_update::local::Package>,
     registrations: BTreeMap<u32, Registration>,
     transaction: Option<String>,
     shutdown: bool,
     prepared_at: Option<Instant>,
+    verification_started: Option<Instant>,
     last_check: Option<Instant>,
     revision: u64,
     wake: Option<std::sync::mpsc::SyncSender<()>>,
 }
+fn verification_current(state: &State, revision: u64) -> Result<(), Error> {
+    if state.status.error == Some(Error::VerificationTimeout) {
+        return Err(Error::VerificationTimeout);
+    }
+    if state.revision != revision || state.status.phase != Phase::Verifying {
+        return Err(Error::Busy);
+    }
+    Ok(())
+}
 impl State {
+    fn expire_verification(&mut self, now: Instant) {
+        if self.status.phase == Phase::Verifying
+            && self
+                .verification_started
+                .is_some_and(|start| now.saturating_duration_since(start) >= VERIFICATION_BUDGET)
+        {
+            self.revision = self.revision.wrapping_add(1);
+            self.local_approval = None;
+            self.queued = None;
+            self.status.phase = Phase::Failed;
+            self.status.error = Some(Error::VerificationTimeout);
+            tracing::warn!("package verification timed out before session drain");
+        }
+    }
+
     fn request_check(&mut self) {
         // Check is asynchronous: callers share Checking and its eventual result.
         // A duplicate must not change the revision checked by the active fetch.
@@ -77,10 +105,12 @@ impl State {
             status,
             policy,
             queued: None,
+            local_approval: None,
             registrations: BTreeMap::new(),
             transaction: None,
             shutdown: false,
             prepared_at: None,
+            verification_started: None,
             last_check: None,
             revision: 0,
             wake: None,
@@ -109,6 +139,7 @@ fn journal_status(name: &str) -> Result<(Phase, Option<Error>), Error> {
 }
 pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, request: Request) -> Reply {
     let mut state = state.lock().unwrap();
+    state.expire_verification(Instant::now());
     let wake = !matches!(&request, Request::Poll { .. } | Request::Query);
     if pending() {
         let (phase, error) =
@@ -125,6 +156,40 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
             .get(&id)
             .is_some_and(|r| r.session.pid == pid && r.session.created == created);
         match request {
+            Request::ApproveLocal { path, sha256 } => {
+                // Kernel-authenticated process identity + elevated token are the
+                // authority. Medium callers cannot manufacture a consent record.
+                if !local_admitted(
+                    super::pipe::elevated(process),
+                    pending(),
+                    state.transaction.is_some() || state.local_approval.is_some(),
+                    state.status.phase,
+                ) {
+                    return Err(Error::Policy);
+                }
+                oink_update::trust::local_packages()?;
+                if !oink_update::local::hex(&sha256) {
+                    return Err(Error::Signature);
+                }
+                // Snapshot before replying: the elevated helper's successful
+                // reply lets the backend dispose its user-session spool file.
+                let (bytes, package) = super::local::read(std::path::Path::new(&path))?;
+                if package.sha256 != sha256 {
+                    return Err(Error::Signature);
+                }
+                package.validate(&state.status.version, state.status.current_build, "x64")?;
+                let directory = protected::maintenance().map_err(|_| Error::Storage)?.join("downloads");
+                protected::directory(&directory).map_err(|_| Error::Storage)?;
+                protected::write(&directory.join("candidate.msi"), &bytes)?;
+                state.revision = state.revision.wrapping_add(1);
+                tracing::info!(build = package.build, "elevated local package accepted");
+                state.local_approval = Some(package);
+                state.verification_started = Some(Instant::now());
+                state.queued = None;
+                state.status.phase = Phase::Verifying;
+                state.status.candidate = None;
+                state.status.error = None;
+            }
             Request::Query => {}
             Request::Startup => {
                 if pending() {
@@ -269,7 +334,9 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
                 return Ok(Reply::Registered);
             }
             Request::Command { command } => {
-                oink_update::trust::compiled()?;
+                if !matches!(command, Command::Cancel) {
+                    oink_update::trust::compiled()?;
+                }
                 let preparing =
                     (state.transaction.is_some() || state.status.phase == Phase::Quiescing) && !state.shutdown;
                 if !command_admitted(
@@ -283,6 +350,7 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
                     state.revision = state.revision.wrapping_add(1);
                 }
                 match command {
+                    Command::OpenLocal { .. } => return Err(Error::Policy),
                     Command::SetPreferences { preferences } => {
                         if !super::pipe::elevated(process) {
                             return Err(Error::Policy);
@@ -349,6 +417,15 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
     }
     result.unwrap_or_else(|error| Reply::Error { error })
 }
+fn local_admitted(elevated: bool, pending: bool, active: bool, phase: Phase) -> bool {
+    elevated
+        && !pending
+        && !active
+        && !matches!(
+            phase,
+            Phase::Downloading | Phase::Verifying | Phase::Quiescing | Phase::Installing
+        )
+}
 fn abort(state: &mut State) -> Result<(), Error> {
     if state.shutdown {
         return Err(Error::Transaction);
@@ -371,9 +448,15 @@ fn command_admitted(command: &Command, preparing: bool, active: bool) -> bool {
                 Command::SetPreferences { .. } | Command::Defer { .. } | Command::Skip { .. } | Command::Cancel
             ))
 }
-fn scheduled_command(queued: Option<Command>, policy: &Policy, last_check: Option<Instant>) -> Option<Command> {
+fn scheduled_command(
+    queued: Option<Command>,
+    policy: &Policy,
+    last_check: Option<Instant>,
+    feed_enabled: bool,
+) -> Option<Command> {
     queued.or_else(|| {
-        (policy.preferences.checks_enabled
+        (feed_enabled
+            && policy.preferences.checks_enabled
             && last_check.is_none_or(|at| at.elapsed() >= Duration::from_secs(24 * 3600)))
         .then_some(Command::Check)
     })
@@ -448,7 +531,7 @@ pub(super) fn http(url: &str, length: u64, package: bool) -> Result<Vec<u8>, Err
     Ok(bytes)
 }
 struct Selected {
-    manifest: VerifiedManifest,
+    manifest: Option<VerifiedManifest>,
     envelope: Vec<u8>,
     release: Release,
     prepared: Option<worker::PreparedPackage>,
@@ -498,12 +581,13 @@ fn check_feed(state: &Arc<Mutex<State>>, roots: &Roots) -> Result<Option<Selecte
         None
     };
     state.status.candidate = release.as_ref().map(|release| Candidate {
+        local_package: false,
         build: release.build,
         version: release.version.clone(),
         size: release.package.length,
         published_at: None,
         severity: release.severity,
-        notes: release.notes.clone(),
+        notes: Some(release.notes.clone()),
     });
     state.status.phase = if release.is_some() {
         Phase::Available
@@ -513,24 +597,32 @@ fn check_feed(state: &Arc<Mutex<State>>, roots: &Roots) -> Result<Option<Selecte
         Phase::Idle
     };
     Ok(release.map(|release| Selected {
-        manifest,
+        manifest: Some(manifest),
         envelope,
         release,
         prepared: None,
     }))
 }
 fn download(selected: &mut Selected, roots: &Roots, state: &Arc<Mutex<State>>) -> Result<(), Error> {
-    selected.manifest.ensure_fresh(now())?;
+    if let Some(manifest) = &selected.manifest {
+        manifest.ensure_fresh(now())?;
+    }
     let package = &selected.release.package;
     let bytes = http(&package.url, package.length, true)?;
     feed::verify_package(&bytes, package, &roots.feed())?;
     let directory = protected::maintenance().map_err(|_| Error::Storage)?.join("downloads");
     protected::directory(&directory).map_err(|_| Error::Storage)?;
     protected::write(&directory.join("candidate.msi"), &bytes)?;
-    state.lock().unwrap().status.phase = Phase::Verifying;
+    {
+        let mut current = state.lock().unwrap();
+        current.status.phase = Phase::Verifying;
+        current.verification_started = Some(Instant::now());
+    }
     let installed = state.lock().unwrap().status.current_build;
     let previous = selected
         .manifest
+        .as_ref()
+        .ok_or(Error::Policy)?
         .manifest()
         .releases
         .iter()
@@ -540,21 +632,16 @@ fn download(selected: &mut Selected, roots: &Roots, state: &Arc<Mutex<State>>) -
         selected.release.clone(),
         previous,
         &selected.envelope,
-        roots,
+        &worker::PackageTrust::Feed(roots.clone()),
+        false,
     )?);
     Ok(())
 }
 fn engine(state: Arc<Mutex<State>>, wake: std::sync::mpsc::Receiver<()>) {
-    let roots = match oink_update::trust::compiled() {
-        Ok(roots) => roots,
-        Err(error) => {
-            let mut state = state.lock().unwrap();
-            state.status.error = Some(error);
-            state.status.phase = Phase::Disabled;
-            state.status.checks_enabled = false;
-            return;
-        }
-    };
+    // In-house builds disable the feed gate. Their elevated local approvals
+    // still need a live engine, package inspection, recovery and health checks.
+    let roots = oink_update::trust::compiled();
+    tracing::info!(feed_enabled = roots.is_ok(), "Windows local update engine running");
     let mut selected: Option<Selected> = None;
     let mut was_pending = pending();
     let mut housekeeping: Option<std::thread::JoinHandle<Result<(), Error>>> = None;
@@ -583,13 +670,58 @@ fn engine(state: Arc<Mutex<State>>, wake: std::sync::mpsc::Receiver<()>) {
             selected = None;
         }
         was_pending = is_pending;
+        // Consume consent before scheduling another feed check. Copy untrusted
+        // input only after elevation, then bind the exact displayed hash in the
+        // protected staging directory before inspecting any installation plan.
+        let approval = {
+            let mut current = state.lock().unwrap();
+            current.local_approval.take().map(|package| (package, current.revision))
+        };
+        if let Some((package, revision)) = approval {
+            let result = (|| {
+                let _ = finish_housekeeping(&mut housekeeping);
+                let receipt = installed()?;
+                package.validate(&receipt.version, receipt.build, "x64")?;
+                if package.minimum_windows_build > worker::windows_build()? {
+                    return Err(Error::OsUnsupported);
+                }
+                let release = package.release();
+                let local_trust = worker::PackageTrust::Local(oink_update::trust::local_packages()?);
+                let prepared = worker::prepare_package(release.clone(), None, &[], &local_trust, true)?;
+                let mut current = state.lock().unwrap();
+                current.expire_verification(Instant::now());
+                verification_current(&current, revision)?;
+                selected = Some(Selected {
+                    manifest: None,
+                    envelope: vec![],
+                    release,
+                    prepared: Some(prepared),
+                });
+                current.status.candidate = Some(package.candidate());
+                current.status.phase = Phase::Ready;
+                current.verification_started = None;
+                current.queued = Some(Command::Install {
+                    expected_build: package.build,
+                });
+                Ok::<_, Error>(())
+            })();
+            if let Err(error) = result {
+                let mut state = state.lock().unwrap();
+                // A timeout/cancel invalidates this preparation. A newer
+                // approval must keep its own status when the old I/O returns.
+                if state.revision == revision {
+                    state.status.phase = Phase::Failed;
+                    state.status.error = Some(error);
+                }
+            }
+        }
         let command = {
             let mut state = state.lock().unwrap();
             if state.transaction.is_some() || pending() {
                 None
             } else {
                 let queued = state.queued.take();
-                scheduled_command(queued, &state.policy.policy, state.last_check).map(|command| {
+                scheduled_command(queued, &state.policy.policy, state.last_check, roots.is_ok()).map(|command| {
                     if command == Command::Check {
                         // Publish background admission under the same lock, so a
                         // manual check arriving before HTTP starts joins it too.
@@ -600,12 +732,13 @@ fn engine(state: Arc<Mutex<State>>, wake: std::sync::mpsc::Receiver<()>) {
                 })
             }
         };
+        let command_revision = command.as_ref().map(|(_, revision)| *revision);
         let result = (|| {
             if let Some((command, revision)) = command {
                 match command {
                     Command::Check => {
                         selected = None;
-                        selected = check_feed(&state, &roots)?;
+                        selected = check_feed(&state, roots.as_ref().map_err(|e| *e)?)?;
                     }
                     Command::Download => {
                         let candidate = selected.as_mut().ok_or(Error::Policy)?;
@@ -615,7 +748,9 @@ fn engine(state: Arc<Mutex<State>>, wake: std::sync::mpsc::Receiver<()>) {
                             // holding State or delaying UI/status requests.
                             let _ = finish_housekeeping(&mut housekeeping);
                             state.lock().unwrap().status.phase = Phase::Downloading;
-                            download(candidate, &roots, &state)?;
+                            download(candidate, roots.as_ref().map_err(|e| *e)?, &state)?;
+                            let current = state.lock().unwrap();
+                            verification_current(&current, revision)?;
                         }
                         state.lock().unwrap().status.phase = Phase::Ready;
                     }
@@ -642,8 +777,10 @@ fn engine(state: Arc<Mutex<State>>, wake: std::sync::mpsc::Receiver<()>) {
         })();
         if let Err(error) = result {
             let mut state = state.lock().unwrap();
-            state.status.error = Some(error);
-            state.status.phase = Phase::Failed;
+            if command_revision.is_none_or(|revision| state.revision == revision) {
+                state.status.error = Some(error);
+                state.status.phase = Phase::Failed;
+            }
         }
         if housekeeping.as_ref().is_some_and(|task| task.is_finished()) {
             cleanup_needed = finish_housekeeping(&mut housekeeping) == Some(Err(Error::Busy));
@@ -677,7 +814,9 @@ fn finish_housekeeping(task: &mut Option<std::thread::JoinHandle<Result<(), Erro
     Some(result)
 }
 fn prepare(state: &Arc<Mutex<State>>, selected: &Selected, expected_revision: u64) -> Result<(), Error> {
-    selected.manifest.ensure_fresh(now())?;
+    if let Some(manifest) = &selected.manifest {
+        manifest.ensure_fresh(now())?;
+    }
     let sessions = super::pipe::sessions().map_err(|_| Error::Busy)?;
     let (registrations, revision) = {
         let state = state.lock().unwrap();
@@ -768,6 +907,38 @@ fn transaction_matches(state: &State, tx: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn disabled_feed_does_not_schedule_checks_but_runs_explicit_local_install() {
+        let policy = Policy::default();
+        assert!(scheduled_command(None, &policy, None, false).is_none());
+        assert_eq!(
+            scheduled_command(Some(Command::Install { expected_build: 44 }), &policy, None, false),
+            Some(Command::Install { expected_build: 44 })
+        );
+    }
+    #[test]
+    fn stalled_verification_fails_and_late_preparation_cannot_install() {
+        let mut state = check_state();
+        let start = Instant::now();
+        state.status.phase = Phase::Verifying;
+        state.verification_started = Some(start);
+        let revision = state.revision;
+        state.expire_verification(start + VERIFICATION_BUDGET - Duration::from_millis(1));
+        assert_eq!(state.status.phase, Phase::Verifying);
+        state.expire_verification(start + VERIFICATION_BUDGET);
+        assert_eq!(state.status.phase, Phase::Failed);
+        assert_eq!(state.status.error, Some(Error::VerificationTimeout));
+        assert!(state.queued.is_none());
+        assert_eq!(verification_current(&state, revision), Err(Error::VerificationTimeout));
+    }
+    #[test]
+    fn cancellation_invalidates_a_prepared_local_package() {
+        let mut state = check_state();
+        state.status.phase = Phase::Verifying;
+        let revision = state.revision;
+        state.revision += 1;
+        assert_eq!(verification_current(&state, revision), Err(Error::Busy));
+    }
     fn check_state() -> State {
         State {
             status: UpdateStatus {
@@ -787,14 +958,36 @@ mod tests {
             },
             policy: MachinePolicy::default(),
             queued: None,
+            local_approval: None,
             registrations: BTreeMap::new(),
             transaction: None,
             shutdown: false,
             prepared_at: None,
+            verification_started: None,
             last_check: None,
             revision: 0,
             wake: None,
         }
+    }
+    #[test]
+    fn local_package_admission_requires_elevation_and_no_live_transaction() {
+        for phase in [
+            Phase::Idle,
+            Phase::Ready,
+            Phase::Downloading,
+            Phase::Verifying,
+            Phase::Quiescing,
+            Phase::Installing,
+        ] {
+            assert!(!local_admitted(false, false, false, phase));
+            assert!(!local_admitted(true, true, false, phase));
+            assert!(!local_admitted(true, false, true, phase));
+        }
+        assert!(local_admitted(true, false, false, Phase::Idle));
+        assert!(!local_admitted(true, false, false, Phase::Downloading));
+        assert!(!local_admitted(true, false, false, Phase::Verifying));
+        assert!(!local_admitted(true, false, false, Phase::Quiescing));
+        assert!(!local_admitted(true, false, false, Phase::Installing));
     }
     #[test]
     fn manual_checks_are_not_throttled_after_a_recent_result() {
@@ -807,7 +1000,7 @@ mod tests {
         assert_eq!(state.status.error, None);
         assert_eq!(state.queued, Some(Command::Check));
         assert_eq!(state.revision, 1);
-        assert!(scheduled_command(None, &state.policy.policy, state.last_check).is_none());
+        assert!(scheduled_command(None, &state.policy.policy, state.last_check, true).is_none());
     }
     #[test]
     fn manual_checks_join_a_queued_or_in_flight_check_without_invalidating_its_result() {
@@ -881,12 +1074,15 @@ mod tests {
             let mut policy = Policy::default();
             policy.defer(choice, 100);
             policy.skipped_build = Some(2);
-            assert!(scheduled_command(None, &policy, Some(now)).is_none());
-            assert!(matches!(scheduled_command(None, &policy, None), Some(Command::Check)));
-            policy.preferences.checks_enabled = false;
-            assert!(scheduled_command(None, &policy, None).is_none());
+            assert!(scheduled_command(None, &policy, Some(now), true).is_none());
             assert!(matches!(
-                scheduled_command(Some(Command::Install { expected_build: 2 }), &policy, Some(now)),
+                scheduled_command(None, &policy, None, true),
+                Some(Command::Check)
+            ));
+            policy.preferences.checks_enabled = false;
+            assert!(scheduled_command(None, &policy, None, true).is_none());
+            assert!(matches!(
+                scheduled_command(Some(Command::Install { expected_build: 2 }), &policy, Some(now), true),
                 Some(Command::Install { expected_build: 2 })
             ));
         }

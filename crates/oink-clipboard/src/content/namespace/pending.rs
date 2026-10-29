@@ -12,7 +12,7 @@ pub(crate) struct Pending {
     containers: HashSet<NodeId>,
     ready: Mutex<Option<Result<(), Unavailable>>>,
     changed: Condvar,
-    _batch: crate::store::Batch,
+    _batch: Mutex<Option<crate::store::Batch>>,
 }
 impl Pending {
     pub fn new(
@@ -25,7 +25,7 @@ impl Pending {
             containers: containers.into_iter().collect(),
             ready: Mutex::new(None),
             changed: Condvar::new(),
-            _batch: batch,
+            _batch: Mutex::new(Some(batch)),
         })
     }
     pub fn finish(&self, result: Result<(), Unavailable>) -> bool {
@@ -38,6 +38,12 @@ impl Pending {
         true
     }
     #[cfg(target_os = "macos")]
+    pub(crate) fn release_capture(&self) {
+        self.inner
+            .release_fulfilled(&self.containers.iter().copied().collect::<Vec<_>>());
+        self._batch.lock().unwrap().take();
+    }
+    #[cfg(target_os = "macos")]
     pub(crate) fn failed(&self) -> bool {
         matches!(*self.ready.lock().unwrap(), Some(Err(_)))
     }
@@ -47,6 +53,19 @@ impl Pending {
             ready = self.changed.wait(ready).unwrap();
         }
         ready.unwrap().map_err(unavailable)
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn wait_until(&self, deadline: std::time::Instant) -> io::Result<()> {
+        let mut ready = self.ready.lock().unwrap();
+        loop {
+            if let Some(result) = *ready {
+                return result.map_err(unavailable);
+            }
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| unavailable(Unavailable::NoProgress))?;
+            ready = self.changed.wait_timeout(ready, remaining).unwrap().0;
+        }
     }
 }
 impl Namespace for Pending {

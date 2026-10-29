@@ -1,9 +1,13 @@
+import { toast } from 'oink-ui';
+import { setLanguage, tr } from '../i18n';
 import { describe, expect, it, vi } from 'vitest';
 import { shell } from './client';
 import { acceptSnapshot, createAgentStore } from './store';
 import type { DeviceCardsView } from './cards';
 import type { PairingSnapshot, PairView, NearbySnapshot } from './pairing';
 import type { PermissionItem, PermissionState } from './types';
+import { captureNotices } from './notices.fixture';
+const notices = captureNotices();
 const view = (revision: string, stream = 'current'): DeviceCardsView => ({ schema: 1, stream, revision, group: null, generatedAtMs: 0, exitVolume: null, emergencyDelivery: null, cards: [] });
 describe('authenticated presentation ordering', () => {
   it('adopts permission changes without focus and keeps them newer than a pending refresh', async () => {
@@ -25,7 +29,7 @@ describe('authenticated presentation ordering', () => {
     store.receive({ type: 'permissions', data: sample('NotGranted') });
     expect(store.get().permissions).toEqual(sample('NotGranted'));
     expect(source).toHaveBeenCalledTimes(1);
-    expect(store.get().error).toBeNull();
+    expect(notices()).toEqual([]);
   });
   it('keeps an event that arrives before an initial query reply', async () => {
     const store = createAgentStore();
@@ -43,24 +47,21 @@ describe('authenticated presentation ordering', () => {
     expect(acceptSnapshot(current, view('13', 'retired'))).toBe(current);
     expect(acceptSnapshot(current, view('13'))?.revision).toBe('13');
   });
-  it('retires an outstanding query and its pending optimistic state on reconnect', async () => {
+  it('retires an outstanding query on reconnect', async () => {
     const store = createAgentStore();
     let complete!: (v: DeviceCardsView) => void;
     const query = store.query('cards', () => new Promise(r => { complete = r; }));
-    store.pending({ requestId: 'request', device: 'device', resource: 'mouse', desired: 'local' });
     store.reset(); complete(view('999', 'retired')); await query;
-    expect(store.get().cards).toBeNull(); expect(store.get().pending).toEqual([]);
+    expect(store.get().cards).toBeNull();
   });
   it('does not equate accepted, refused or unknown with applied owner facts', () => {
     const store = createAgentStore();
     store.receive({ type: 'device_cards', data: view('1') });
-    expect(store.pending({requestId:'one',device:'device',resource:'mouse',desired:'local'})).toBe(true);
-    expect(store.pending({requestId:'two',device:'device',resource:'mouse',desired:'shared'})).toBe(false);
     expect(store.get().cards?.revision).toBe('1');
     store.receive({type:'device_control_completed',data:{requestId:'one',result:{outcome:'failed',reason:'outcome_unknown',unknownCode:null}}});
-    expect(store.get().pending).toEqual([]);
+
     expect(store.get().cards?.revision).toBe('1');
-    expect(store.get().error).toBe('outcome_unknown');
+    expect(notices()).toEqual([]);
   });
   it('protects the blocked-device snapshot against a late query', async () => {
     const store = createAgentStore();
@@ -110,4 +111,22 @@ describe('native window activation ownership', () => {
     expect(open).not.toHaveBeenCalled();
     open.mockRestore();
   });
+});
+
+it.each(['zh-Hans','en','ja','ko'] as const)('toasts a local no-source hotkey event in %s',language=>{
+ setLanguage(language);
+ const info=vi.spyOn(toast,'info');
+ const store=createAgentStore();
+ store.receive({type:'no_shared_microphone'});
+ expect(info).toHaveBeenCalledWith({title:tr('当前没有设备共享麦克风')});
+ expect(notices()).toEqual([]);
+ info.mockRestore();setLanguage('en');
+});
+
+it('silences unowned unsupported-volume receipts and direct failures without clearing unrelated notices',()=>{
+  const store=createAgentStore();
+  store.fail('apply_failed');
+  store.fail('volume_unsupported');
+  for(const outcome of ['refused','failed'] as const)store.receive({type:'device_control_completed',data:{requestId:'unowned',result:{outcome,reason:'volume_unsupported',unknownCode:null}}});
+  expect(notices()).toContain('apply_failed');
 });

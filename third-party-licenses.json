@@ -631,6 +631,37 @@
       ]
     },
     {
+      "id": "cargo:async-trait@0.1.92",
+      "name": "async-trait",
+      "version": "0.1.92",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/dtolnay/async-trait",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/async-trait/0.1.92/download",
+        "integrity": "sha256:82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        },
+        {
+          "path": "licenses/texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+        }
+      ]
+    },
+    {
       "id": "cargo:atomic-waker@1.1.2",
       "name": "atomic-waker",
       "version": "1.1.2",
@@ -1098,6 +1129,35 @@
       ]
     },
     {
+      "id": "cargo:breakpad-symbols@0.26.1",
+      "name": "breakpad-symbols",
+      "version": "0.26.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rust-minidump/rust-minidump",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/breakpad-symbols/0.26.1/download",
+        "integrity": "sha256:9b544545512b213899840bb26f72cd13f9fb4c3de3dd5f8dc7219688f54aebe9"
+      },
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2015-2023 rust-minidump contributors"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/06de63df29199a394442b57a28e886059ddc940973e10646877a0793fd53e2c9.txt",
+          "sha256": "06de63df29199a394442b57a28e886059ddc940973e10646877a0793fd53e2c9"
+        }
+      ]
+    },
+    {
       "id": "cargo:brotli-decompressor@6.0.1",
       "name": "brotli-decompressor",
       "version": "6.0.1",
@@ -1374,6 +1434,35 @@
         {
           "path": "licenses/texts/ebaac853b53fec0ed475796f533ce676912a4df9ad9d8a621fa76d5060591e10.txt",
           "sha256": "ebaac853b53fec0ed475796f533ce676912a4df9ad9d8a621fa76d5060591e10"
+        }
+      ]
+    },
+    {
+      "id": "cargo:cachemap2@0.3.0",
+      "name": "cachemap2",
+      "version": "0.3.0",
+      "ecosystem": "cargo",
+      "repository": null,
+      "source": {
+        "url": "https://crates.io/api/v1/crates/cachemap2/0.3.0/download",
+        "integrity": "sha256:68ccbd3153aa153b2f5eff557537ffce81e4dd6c50ae0eddc41dc8d0c388436f"
+      },
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2021 hclarke"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/b5b44ae2ab9e1ef50d9aeba9686c5cf3ec666b402420cb3abf98caf996755d6e.txt",
+          "sha256": "b5b44ae2ab9e1ef50d9aeba9686c5cf3ec666b402420cb3abf98caf996755d6e"
         }
       ]
     },
@@ -1673,6 +1762,35 @@
         {
           "path": "licenses/texts/b8c6939380a400f53e11923d50fcc4dd2fa1ba8339fd9d04cda38a0251b6c9b0.txt",
           "sha256": "b8c6939380a400f53e11923d50fcc4dd2fa1ba8339fd9d04cda38a0251b6c9b0"
+        }
+      ]
+    },
+    {
+      "id": "cargo:circular@0.3.0",
+      "name": "circular",
+      "version": "0.3.0",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/sozu-proxy/circular",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/circular/0.3.0/download",
+        "integrity": "sha256:b0fc239e0f6cb375d2402d48afb92f76f5404fd1df208a41930ec81eda078bea"
+      },
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2017 Geoffroy Couprie"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/cef6497a64266f9c392ee9134aceb82739dadd176422fead980102109bf46d10.txt",
+          "sha256": "cef6497a64266f9c392ee9134aceb82739dadd176422fead980102109bf46d10"
         }
       ]
     },
@@ -2147,6 +2265,39 @@
         {
           "path": "licenses/texts/ec82b96487e9e778ee610c7ab245162464782cfa1f555c2299333f8dbe5c036a.txt",
           "sha256": "ec82b96487e9e778ee610c7ab245162464782cfa1f555c2299333f8dbe5c036a"
+        }
+      ]
+    },
+    {
+      "id": "cargo:core_detect@1.0.0",
+      "name": "core_detect",
+      "version": "1.0.0",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/thomcc/core_detect",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/core_detect/1.0.0/download",
+        "integrity": "sha256:7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2017-2020 The Rust Project Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/769f80b5bcb42ed0af4e4d2fd74e1ac9bf843cb80c5a29219d1ef3544428a6bb.txt",
+          "sha256": "769f80b5bcb42ed0af4e4d2fd74e1ac9bf843cb80c5a29219d1ef3544428a6bb"
+        },
+        {
+          "path": "licenses/texts/8569ebf6bf52937b961d9c9c934d8400a2bb6b09651a9afacbb3fc18fe5c09b1.txt",
+          "sha256": "8569ebf6bf52937b961d9c9c934d8400a2bb6b09651a9afacbb3fc18fe5c09b1"
         }
       ]
     },
@@ -2779,6 +2930,33 @@
       ]
     },
     {
+      "id": "cargo:debugid@0.8.0",
+      "name": "debugid",
+      "version": "0.8.0",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/getsentry/rust-debugid",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/debugid/0.8.0/download",
+        "integrity": "sha256:bef552e6f588e446098f6ba40d89ac146c8c7b64aade83c051ee00bb5d2bc18d"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
       "id": "cargo:der@0.7.10",
       "name": "der",
       "version": "0.7.10",
@@ -3387,6 +3565,39 @@
       ]
     },
     {
+      "id": "cargo:either@1.19.0",
+      "name": "either",
+      "version": "1.19.0",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rayon-rs/either",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/either/1.19.0/download",
+        "integrity": "sha256:0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2015"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/7576269ea71f767b99297934c0b2367532690f8c4badc695edf8e04ab6a1e545.txt",
+          "sha256": "7576269ea71f767b99297934c0b2367532690f8c4badc695edf8e04ab6a1e545"
+        },
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
       "id": "cargo:embed-resource@3.0.11",
       "name": "embed-resource",
       "version": "3.0.11",
@@ -3446,6 +3657,49 @@
         {
           "path": "licenses/texts/daacc37f680c7dd0a758ac99a109f2f57d9f21d3683df9e9245055922842a695.txt",
           "sha256": "daacc37f680c7dd0a758ac99a109f2f57d9f21d3683df9e9245055922842a695"
+        }
+      ]
+    },
+    {
+      "id": "cargo:encoding_rs@0.8.42",
+      "name": "encoding_rs",
+      "version": "0.8.42",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/hsivonen/encoding_rs",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/encoding_rs/0.8.42/download",
+        "integrity": "sha256:8e985e0451871ad22fb8d2b6b076e2028a502a0d3950998c2c5c0a4f9b5d9679"
+      },
+      "licenseExpression": "(Apache-2.0 OR MIT) AND BSD-3-Clause",
+      "selectedLicense": "BSD-3-Clause AND MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/11789f45bb180841cd362a5eee6789c68ddb573a11105e30768c308a6add0190.txt",
+          "sha256": "11789f45bb180841cd362a5eee6789c68ddb573a11105e30768c308a6add0190"
+        },
+        {
+          "path": "licenses/texts/3c2e06492c5e00fcd39515e4af4c560d8cee5c31e7a7e388db682bc9ee33ee32.txt",
+          "sha256": "3c2e06492c5e00fcd39515e4af4c560d8cee5c31e7a7e388db682bc9ee33ee32"
+        },
+        {
+          "path": "licenses/texts/3fa4ca83dcc9237839b1bdeb2e6d16bdfb5ec0c5ce42b24694d8bbf0dcbef72c.txt",
+          "sha256": "3fa4ca83dcc9237839b1bdeb2e6d16bdfb5ec0c5ce42b24694d8bbf0dcbef72c"
+        },
+        {
+          "path": "licenses/texts/838118388fe5c2e7f1dbbaeed13e1c7f3ebf88be91319c7c1d77c18e987d1a50.txt",
+          "sha256": "838118388fe5c2e7f1dbbaeed13e1c7f3ebf88be91319c7c1d77c18e987d1a50"
+        },
+        {
+          "path": "licenses/texts/cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30.txt",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
         }
       ]
     },
@@ -3552,6 +3806,39 @@
       ]
     },
     {
+      "id": "cargo:fallible-iterator@0.3.0",
+      "name": "fallible-iterator",
+      "version": "0.3.0",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/sfackler/rust-fallible-iterator",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/fallible-iterator/0.3.0/download",
+        "integrity": "sha256:2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2015 The rust-openssl-verify Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/0816e154b159ba255c563f7c8c7df5bbb8cc5fc96f5ab8cf9f4743b4f41fe7eb.txt",
+          "sha256": "0816e154b159ba255c563f7c8c7df5bbb8cc5fc96f5ab8cf9f4743b4f41fe7eb"
+        },
+        {
+          "path": "licenses/texts/c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08.txt",
+          "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08"
+        }
+      ]
+    },
+    {
       "id": "cargo:fastrand@2.5.0",
       "name": "fastrand",
       "version": "2.5.0",
@@ -3582,6 +3869,37 @@
         {
           "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
           "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
+      "id": "cargo:fax@0.2.7",
+      "name": "fax",
+      "version": "0.2.7",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/pdf-rs/fax",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/fax/0.2.7/download",
+        "integrity": "sha256:caf1079563223d5d59d83c85886a56e586cfd5c1a26292e971a0fa266531ac5a"
+      },
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright © 2021 The pdf-rs contributers."
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/7101390b4c8edd752f4c0de47f35d61b44d9cf0ee8dd032115e25644e277cfff.txt",
+          "sha256": "7101390b4c8edd752f4c0de47f35d61b44d9cf0ee8dd032115e25644e277cfff"
         }
       ]
     },
@@ -3984,6 +4302,39 @@
       ]
     },
     {
+      "id": "cargo:framehop@0.15.0",
+      "name": "framehop",
+      "version": "0.15.0",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/mstange/framehop/",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/framehop/0.15.0/download",
+        "integrity": "sha256:78a7d65f75e837647bf8b1594ad3b559a929ee9a58d956d9f46999749957b6b9"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2018 Markus Stange <mstange@themasta.com>"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/9ec2734f45b0d65192b9fee2307e05176b805a19efa994a553dcc5b2d3219a1e.txt",
+          "sha256": "9ec2734f45b0d65192b9fee2307e05176b805a19efa994a553dcc5b2d3219a1e"
+        },
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
       "id": "cargo:fs2@0.4.3",
       "name": "fs2",
       "version": "0.4.3",
@@ -4120,6 +4471,40 @@
       ]
     },
     {
+      "id": "cargo:futures-executor@0.3.34",
+      "name": "futures-executor",
+      "version": "0.3.34",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rust-lang/futures-rs",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/futures-executor/0.3.34/download",
+        "integrity": "sha256:031b47cf1a3c6cc8bc2fc76cd437f521619387907d469316e7c0bc278f1f5432"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2016 Alex Crichton",
+        "Copyright (c) 2017 The Tokio Authors"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/275c491d6d1160553c32fd6127061d7f9606c3ea25abfad6ca3f6ed088785427.txt",
+          "sha256": "275c491d6d1160553c32fd6127061d7f9606c3ea25abfad6ca3f6ed088785427"
+        },
+        {
+          "path": "licenses/texts/6652c868f35dfe5e8ef636810a4e576b9d663f3a17fb0f5613ad73583e1b88fd.txt",
+          "sha256": "6652c868f35dfe5e8ef636810a4e576b9d663f3a17fb0f5613ad73583e1b88fd"
+        }
+      ]
+    },
+    {
       "id": "cargo:futures-io@0.3.34",
       "name": "futures-io",
       "version": "0.3.34",
@@ -4128,6 +4513,42 @@
       "source": {
         "url": "https://crates.io/api/v1/crates/futures-io/0.3.34/download",
         "integrity": "sha256:53c0fa8157de1303bfffdaa1cc2a673bfffb60102f76b0ef4441659124373fed"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2016 Alex Crichton",
+        "Copyright (c) 2017 The Tokio Authors"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/275c491d6d1160553c32fd6127061d7f9606c3ea25abfad6ca3f6ed088785427.txt",
+          "sha256": "275c491d6d1160553c32fd6127061d7f9606c3ea25abfad6ca3f6ed088785427"
+        },
+        {
+          "path": "licenses/texts/6652c868f35dfe5e8ef636810a4e576b9d663f3a17fb0f5613ad73583e1b88fd.txt",
+          "sha256": "6652c868f35dfe5e8ef636810a4e576b9d663f3a17fb0f5613ad73583e1b88fd"
+        }
+      ]
+    },
+    {
+      "id": "cargo:futures-macro@0.3.34",
+      "name": "futures-macro",
+      "version": "0.3.34",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rust-lang/futures-rs",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/futures-macro/0.3.34/download",
+        "integrity": "sha256:9fb9654ba8355388abeb8dcb4fc62f511300867002afc858860463bdd9fe0c44"
       },
       "licenseExpression": "MIT OR Apache-2.0",
       "selectedLicense": "MIT",
@@ -4433,6 +4854,39 @@
       ]
     },
     {
+      "id": "cargo:gimli@0.32.3",
+      "name": "gimli",
+      "version": "0.32.3",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/gimli-rs/gimli",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/gimli/0.32.3/download",
+        "integrity": "sha256:e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2015 The Rust Project Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/7b63ecd5f1902af1b63729947373683c32745c16a10e8e6292e2e2dcd7e90ae0.txt",
+          "sha256": "7b63ecd5f1902af1b63729947373683c32745c16a10e8e6292e2e2dcd7e90ae0"
+        },
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
       "id": "cargo:glob@0.3.4",
       "name": "glob",
       "version": "0.3.4",
@@ -4464,6 +4918,39 @@
         {
           "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
           "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
+      "id": "cargo:half@2.7.1",
+      "name": "half",
+      "version": "2.7.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/VoidStarKat/half-rs",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/half/2.7.1/download",
+        "integrity": "sha256:6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/508a77d2e7b51d98adeed32648ad124b7b30241a8e70b2e72c99f92d8e5874d1.txt",
+          "sha256": "508a77d2e7b51d98adeed32648ad124b7b30241a8e70b2e72c99f92d8e5874d1"
+        },
+        {
+          "path": "licenses/texts/a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9.txt",
+          "sha256": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9"
         }
       ]
     },
@@ -4569,6 +5056,42 @@
         {
           "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
           "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
+      "id": "cargo:hex@0.4.3",
+      "name": "hex",
+      "version": "0.4.3",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/KokaKiwi/rust-hex",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/hex/0.4.3/download",
+        "integrity": "sha256:7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "build",
+        "runtime"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2013-2014 The Rust Project Developers.",
+        "Copyright (c) 2015-2020 The rust-hex Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08.txt",
+          "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08"
+        },
+        {
+          "path": "licenses/texts/f7bdb3426d045cd50efd4953026e3eb5a83d0199f458a075602611b9344da5b9.txt",
+          "sha256": "f7bdb3426d045cd50efd4953026e3eb5a83d0199f458a075602611b9344da5b9"
         }
       ]
     },
@@ -5614,6 +6137,39 @@
       ]
     },
     {
+      "id": "cargo:itertools@0.14.0",
+      "name": "itertools",
+      "version": "0.14.0",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rust-itertools/itertools",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/itertools/0.14.0/download",
+        "integrity": "sha256:2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2015"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/7576269ea71f767b99297934c0b2367532690f8c4badc695edf8e04ab6a1e545.txt",
+          "sha256": "7576269ea71f767b99297934c0b2367532690f8c4badc695edf8e04ab6a1e545"
+        },
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
       "id": "cargo:itoa@1.0.18",
       "name": "itoa",
       "version": "1.0.18",
@@ -6073,6 +6629,39 @@
       ]
     },
     {
+      "id": "cargo:macho-unwind-info@0.5.0",
+      "name": "macho-unwind-info",
+      "version": "0.5.0",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/mstange/macho-unwind-info",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/macho-unwind-info/0.5.0/download",
+        "integrity": "sha256:bb4bdc8b0ce69932332cf76d24af69c3a155242af95c226b2ab6c2e371ed1149"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2018 Markus Stange <mstange@themasta.com>"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/9ec2734f45b0d65192b9fee2307e05176b805a19efa994a553dcc5b2d3219a1e.txt",
+          "sha256": "9ec2734f45b0d65192b9fee2307e05176b805a19efa994a553dcc5b2d3219a1e"
+        },
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
       "id": "cargo:markup5ever@0.39.0",
       "name": "markup5ever",
       "version": "0.39.0",
@@ -6214,6 +6803,40 @@
       ]
     },
     {
+      "id": "cargo:memmap2@0.9.12",
+      "name": "memmap2",
+      "version": "0.9.12",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/RazrFalcon/memmap2-rs",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/memmap2/0.9.12/download",
+        "integrity": "sha256:6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2015 Dan Burkert",
+        "Copyright (c) 2020 Yevhenii Reizner"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/04ea4849dba9dcae07113850c6f1b1a69052c625210639914eee352023f750ad.txt",
+          "sha256": "04ea4849dba9dcae07113850c6f1b1a69052c625210639914eee352023f750ad"
+        },
+        {
+          "path": "licenses/texts/0d25d03b5ab49576178ad0cae7a2648d12c17ad0452fe49c07e55e4b59aa5257.txt",
+          "sha256": "0d25d03b5ab49576178ad0cae7a2648d12c17ad0452fe49c07e55e4b59aa5257"
+        }
+      ]
+    },
+    {
       "id": "cargo:mime@0.3.17",
       "name": "mime",
       "version": "0.3.17",
@@ -6273,6 +6896,130 @@
         {
           "path": "licenses/texts/79860758b46e85f70a1762c21a8fff4f2d220d89f9bdca096e12aed15b9951c5.txt",
           "sha256": "79860758b46e85f70a1762c21a8fff4f2d220d89f9bdca096e12aed15b9951c5"
+        }
+      ]
+    },
+    {
+      "id": "cargo:minidump-common@0.26.1",
+      "name": "minidump-common",
+      "version": "0.26.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rust-minidump/rust-minidump",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/minidump-common/0.26.1/download",
+        "integrity": "sha256:2e16d10087ae9e375bad7a40e8ef5504bc08e808ccc6019067ff9de42a84570f"
+      },
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2015-2023 rust-minidump contributors"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/06de63df29199a394442b57a28e886059ddc940973e10646877a0793fd53e2c9.txt",
+          "sha256": "06de63df29199a394442b57a28e886059ddc940973e10646877a0793fd53e2c9"
+        }
+      ]
+    },
+    {
+      "id": "cargo:minidump-unwind@0.26.1",
+      "name": "minidump-unwind",
+      "version": "0.26.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rust-minidump/rust-minidump",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/minidump-unwind/0.26.1/download",
+        "integrity": "sha256:4aa8b7212f59c525f93c62457c54f9f9ac550316ee0e41f129b4b19165d5acd1"
+      },
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2015-2023 rust-minidump contributors"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/06de63df29199a394442b57a28e886059ddc940973e10646877a0793fd53e2c9.txt",
+          "sha256": "06de63df29199a394442b57a28e886059ddc940973e10646877a0793fd53e2c9"
+        }
+      ]
+    },
+    {
+      "id": "cargo:minidump@0.26.1",
+      "name": "minidump",
+      "version": "0.26.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rust-minidump/rust-minidump",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/minidump/0.26.1/download",
+        "integrity": "sha256:a902ca21d9772a66d3d1b050b3436dcadb192694be01409e0219902dcf4bc1e8"
+      },
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2015-2023 rust-minidump contributors"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/06de63df29199a394442b57a28e886059ddc940973e10646877a0793fd53e2c9.txt",
+          "sha256": "06de63df29199a394442b57a28e886059ddc940973e10646877a0793fd53e2c9"
+        }
+      ]
+    },
+    {
+      "id": "cargo:minimal-lexical@0.2.1",
+      "name": "minimal-lexical",
+      "version": "0.2.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/Alexhuszagh/minimal-lexical",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/minimal-lexical/0.2.1/download",
+        "integrity": "sha256:68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2009 The Go Authors. All rights reserved."
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        },
+        {
+          "path": "licenses/texts/8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90.txt",
+          "sha256": "8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90"
+        },
+        {
+          "path": "licenses/texts/dbe1fff0fb1314b6af94f161511406275cf01c5a32441fbf24528a57a051d599.txt",
+          "sha256": "dbe1fff0fb1314b6af94f161511406275cf01c5a32441fbf24528a57a051d599"
         }
       ]
     },
@@ -6475,6 +7222,41 @@
       ]
     },
     {
+      "id": "cargo:multiversion_no_op@1.0.0",
+      "name": "multiversion_no_op",
+      "version": "1.0.0",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/hsivonen/multiversion_no_op",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/multiversion_no_op/1.0.0/download",
+        "integrity": "sha256:743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
+      },
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/3fa4ca83dcc9237839b1bdeb2e6d16bdfb5ec0c5ce42b24694d8bbf0dcbef72c.txt",
+          "sha256": "3fa4ca83dcc9237839b1bdeb2e6d16bdfb5ec0c5ce42b24694d8bbf0dcbef72c"
+        },
+        {
+          "path": "licenses/texts/cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30.txt",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        },
+        {
+          "path": "licenses/texts/d2a809eafabba137f508bea16a1b93d8ff24df7da6f38129d830db9bc118bdfe.txt",
+          "sha256": "d2a809eafabba137f508bea16a1b93d8ff24df7da6f38129d830db9bc118bdfe"
+        }
+      ]
+    },
+    {
       "id": "cargo:native-tls@0.2.18",
       "name": "native-tls",
       "version": "0.2.18",
@@ -6566,6 +7348,35 @@
         {
           "path": "licenses/texts/66e3ee1fa7f909ad3c612d556f2a0cdabcd809ad6e66f3b0605015ac64841b70.txt",
           "sha256": "66e3ee1fa7f909ad3c612d556f2a0cdabcd809ad6e66f3b0605015ac64841b70"
+        }
+      ]
+    },
+    {
+      "id": "cargo:nom@7.1.3",
+      "name": "nom",
+      "version": "7.1.3",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/Geal/nom",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/nom/7.1.3/download",
+        "integrity": "sha256:d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
+      },
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2014-2019 Geoffroy Couprie"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/4dbda04344456f09a7a588140455413a9ac59b6b26a1ef7cdf9c800c012d87f0.txt",
+          "sha256": "4dbda04344456f09a7a588140455413a9ac59b6b26a1ef7cdf9c800c012d87f0"
         }
       ]
     },
@@ -6693,6 +7504,39 @@
         {
           "path": "licenses/texts/e2e245f2b566d0bfafb0f6a04c16b82d710c4e6e7d799e39bb4ef6e541b85b98.txt",
           "sha256": "e2e245f2b566d0bfafb0f6a04c16b82d710c4e6e7d799e39bb4ef6e541b85b98"
+        }
+      ]
+    },
+    {
+      "id": "cargo:num-derive@0.4.2",
+      "name": "num-derive",
+      "version": "0.4.2",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rust-num/num-derive",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/num-derive/0.4.2/download",
+        "integrity": "sha256:ed3955f1a9c7c0c15e092f9c887db08b1fc683305fdf6eb6684f22555355e202"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2014 The Rust Project Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb.txt",
+          "sha256": "6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb"
+        },
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
         }
       ]
     },
@@ -7185,6 +8029,41 @@
       ]
     },
     {
+      "id": "cargo:object@0.36.7",
+      "name": "object",
+      "version": "0.36.7",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/gimli-rs/object",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/object/0.36.7/download",
+        "integrity": "sha256:62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
+      },
+      "licenseExpression": "Apache-2.0 OR MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2015 The Gimli Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/0b74dfa0bcee5c420c6b7f67b4b2658f9ab8388c97b8e733975f2cecbdd668a6.txt",
+          "sha256": "0b74dfa0bcee5c420c6b7f67b4b2658f9ab8388c97b8e733975f2cecbdd668a6"
+        },
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
       "id": "cargo:once_cell@1.21.4",
       "name": "once_cell",
       "version": "1.21.4",
@@ -7472,6 +8351,35 @@
         {
           "path": "licenses/texts/c9a75f18b9ab2927829a208fc6aa2cf4e63b8420887ba29cdb265d6619ae82d5.txt",
           "sha256": "c9a75f18b9ab2927829a208fc6aa2cf4e63b8420887ba29cdb265d6619ae82d5"
+        }
+      ]
+    },
+    {
+      "id": "cargo:pe-unwind-info@0.6.1",
+      "name": "pe-unwind-info",
+      "version": "0.6.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/mozilla/pe-unwind-info",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/pe-unwind-info/0.6.1/download",
+        "integrity": "sha256:e33c6dbf1a8fb7f71742cd70f5e9f0986e60b2d19dc0b28d9ca0d1323259274a"
+      },
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2023 Alex Franchuk <alex.franchuk@gmail.com>"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/91a870c16b8223cc0135b4219c2f3ced14a8f2bd7110073a829b216b1cc5ac00.txt",
+          "sha256": "91a870c16b8223cc0135b4219c2f3ced14a8f2bd7110073a829b216b1cc5ac00"
         }
       ]
     },
@@ -8103,6 +9011,48 @@
       ]
     },
     {
+      "id": "cargo:procfs-core@0.17.0",
+      "name": "procfs-core",
+      "version": "0.17.0",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/eminence/procfs",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/procfs-core/0.17.0/download",
+        "integrity": "sha256:239df02d8349b06fc07398a3a1697b06418223b1c7725085e801e7c0fc6a12ec"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (C) 1994, 1995 by Daniel Quinlan (quinlan@yggdrasil.com)",
+        "Copyright (C) 2000,2001,2002  Free Software Foundation, Inc.",
+        "Copyright (c) 2006, 2008 by Michael Kerrisk <mtk.manpages@gmail.com>",
+        "Copyright (c) 2015 The procfs Developers",
+        "Copyright 2003 Binh Nguyen",
+        "and Copyright (C) 2002-2008,2017 Michael Kerrisk <mtk.manpages@gmail.com>"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/9f595add2d755fc897ea3045cccbf7146acf51f8b5cf5d2669aee18634eef4bf.txt",
+          "sha256": "9f595add2d755fc897ea3045cccbf7146acf51f8b5cf5d2669aee18634eef4bf"
+        },
+        {
+          "path": "licenses/texts/c5bbf39118b0639bf8bd391ae0d7d81f25c1cb4066e0fdae6a405b20fb7ca170.txt",
+          "sha256": "c5bbf39118b0639bf8bd391ae0d7d81f25c1cb4066e0fdae6a405b20fb7ca170"
+        },
+        {
+          "path": "licenses/texts/c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08.txt",
+          "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08"
+        }
+      ]
+    },
+    {
       "id": "cargo:proptest@1.11.0",
       "name": "proptest",
       "version": "1.11.0",
@@ -8133,6 +9083,60 @@
         {
           "path": "licenses/texts/d8e0806926ce9f0a5030c382ecc0ffdf6de6fbea5c69a458435fd443fa7a5b92.txt",
           "sha256": "d8e0806926ce9f0a5030c382ecc0ffdf6de6fbea5c69a458435fd443fa7a5b92"
+        }
+      ]
+    },
+    {
+      "id": "cargo:prost-derive@0.13.5",
+      "name": "prost-derive",
+      "version": "0.13.5",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/tokio-rs/prost",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/prost-derive/0.13.5/download",
+        "integrity": "sha256:8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
+      "id": "cargo:prost@0.13.5",
+      "name": "prost",
+      "version": "0.13.5",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/tokio-rs/prost",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/prost/0.13.5/download",
+        "integrity": "sha256:2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+      },
+      "licenseExpression": "Apache-2.0",
+      "selectedLicense": "Apache-2.0",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
         }
       ]
     },
@@ -8185,6 +9189,41 @@
       "selectedLicense": "MIT",
       "modified": false,
       "scope": [
+        "test"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2015 The quick-error Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/058f01fe181608d027fcde7e528fc03ea3cf90f30903c407644b0a9bbc54f500.txt",
+          "sha256": "058f01fe181608d027fcde7e528fc03ea3cf90f30903c407644b0a9bbc54f500"
+        },
+        {
+          "path": "licenses/texts/c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08.txt",
+          "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08"
+        }
+      ]
+    },
+    {
+      "id": "cargo:quick-error@2.0.1",
+      "name": "quick-error",
+      "version": "2.0.1",
+      "ecosystem": "cargo",
+      "repository": "http://github.com/tailhook/quick-error",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/quick-error/2.0.1/download",
+        "integrity": "sha256:a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
         "test"
       ],
       "platforms": [
@@ -8768,6 +9807,39 @@
         {
           "path": "licenses/texts/90eb64f0279b0d9432accfa6023ff803bc4965212383697eee27a0f426d5f8d5.txt",
           "sha256": "90eb64f0279b0d9432accfa6023ff803bc4965212383697eee27a0f426d5f8d5"
+        }
+      ]
+    },
+    {
+      "id": "cargo:range-map@0.2.0",
+      "name": "range-map",
+      "version": "0.2.0",
+      "ecosystem": "cargo",
+      "repository": "http://github.com/jneem/range-map",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/range-map/0.2.0/download",
+        "integrity": "sha256:12a5a2d6c7039059af621472a4389be1215a816df61aa4d531cfe85264aee95f"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2014 The Rust Project Developers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb.txt",
+          "sha256": "6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb"
+        },
+        {
+          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
         }
       ]
     },
@@ -9474,6 +10546,7 @@
       "selectedLicense": "MIT",
       "modified": false,
       "scope": [
+        "build",
         "runtime",
         "test"
       ],
@@ -9733,6 +10806,62 @@
         {
           "path": "licenses/texts/fb77f0a9c53e473abe5103c8632ef9f0f2874d4fb3f17cb2d8c661aab9cee9d7.txt",
           "sha256": "fb77f0a9c53e473abe5103c8632ef9f0f2874d4fb3f17cb2d8c661aab9cee9d7"
+        }
+      ]
+    },
+    {
+      "id": "cargo:scroll@0.12.0",
+      "name": "scroll",
+      "version": "0.12.0",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/m4b/scroll",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/scroll/0.12.0/download",
+        "integrity": "sha256:6ab8598aa408498679922eff7fa985c25d58a90771bd6be794434c5277eab1a6"
+      },
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/6e24b7455f0b9afefdf4f3efd59a56ce76a3020c2dc4371937e281fc5e587fd7.txt",
+          "sha256": "6e24b7455f0b9afefdf4f3efd59a56ce76a3020c2dc4371937e281fc5e587fd7"
+        }
+      ]
+    },
+    {
+      "id": "cargo:scroll_derive@0.12.1",
+      "name": "scroll_derive",
+      "version": "0.12.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/m4b/scroll",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/scroll_derive/0.12.1/download",
+        "integrity": "sha256:1783eabc414609e28a5ba76aee5ddd52199f7107a0b24c2e9746a1ecc34a683d"
+      },
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2017"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/afb11426e09da40a1ae4f8fa17ddcc6b6a52d14df04c29bc5bcd06eb8730624d.txt",
+          "sha256": "afb11426e09da40a1ae4f8fa17ddcc6b6a52d14df04c29bc5bcd06eb8730624d"
         }
       ]
     },
@@ -10573,6 +11702,37 @@
       ]
     },
     {
+      "id": "cargo:simdutf8@0.1.5",
+      "name": "simdutf8",
+      "version": "0.1.5",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/rusticstuff/simdutf8",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/simdutf8/0.1.5/download",
+        "integrity": "sha256:e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9.txt",
+          "sha256": "0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9"
+        },
+        {
+          "path": "licenses/texts/1847e0e0698142ed4347c1441a9fa81c8fbddd44b1d8bbcd5e3647f991759d7f.txt",
+          "sha256": "1847e0e0698142ed4347c1441a9fa81c8fbddd44b1d8bbcd5e3647f991759d7f"
+        }
+      ]
+    },
+    {
       "id": "cargo:simplecss@0.2.2",
       "name": "simplecss",
       "version": "0.2.2",
@@ -10716,6 +11876,35 @@
         {
           "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
           "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
+      "id": "cargo:smart-default@0.7.1",
+      "name": "smart-default",
+      "version": "0.7.1",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/idanarye/rust-smart-default",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/smart-default/0.7.1/download",
+        "integrity": "sha256:0eb01866308440fc64d6c44d9e86c5cc17adfe33c4d6eed55da9145044d0ffc1"
+      },
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2017 Idan Arye"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/f09111a2bf85257f1d098de0095ad77fd12649fbbe9a33c8a13e422848b601bb.txt",
+          "sha256": "f09111a2bf85257f1d098de0095ad77fd12649fbbe9a33c8a13e422848b601bb"
         }
       ]
     },
@@ -11945,6 +13134,37 @@
         {
           "path": "licenses/texts/c9a75f18b9ab2927829a208fc6aa2cf4e63b8420887ba29cdb265d6619ae82d5.txt",
           "sha256": "c9a75f18b9ab2927829a208fc6aa2cf4e63b8420887ba29cdb265d6619ae82d5"
+        }
+      ]
+    },
+    {
+      "id": "cargo:tiff@0.10.3",
+      "name": "tiff",
+      "version": "0.10.3",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/image-rs/image-tiff",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/tiff/0.10.3/download",
+        "integrity": "sha256:af9605de7fee8d9551863fd692cce7637f548dbd9db9180fcc07ccc6d26c336f"
+      },
+      "licenseExpression": "MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2018 PistonDevelopers"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/20c097d0de27e2adc179140a3d542091951a030699c7e1c78655f2a2d08d4e3e.txt",
+          "sha256": "20c097d0de27e2adc179140a3d542091951a030699c7e1c78655f2a2d08d4e3e"
         }
       ]
     },
@@ -13691,6 +14911,39 @@
       ]
     },
     {
+      "id": "cargo:weezl@0.1.12",
+      "name": "weezl",
+      "version": "0.1.12",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/image-rs/weezl",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/weezl/0.1.12/download",
+        "integrity": "sha256:a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/573f5227db835cd30bbdd3aed3f82615f80119a4d5c82b4daf642dbfe2b6afde.txt",
+          "sha256": "573f5227db835cd30bbdd3aed3f82615f80119a4d5c82b4daf642dbfe2b6afde"
+        },
+        {
+          "path": "licenses/texts/769f80b5bcb42ed0af4e4d2fd74e1ac9bf843cb80c5a29219d1ef3544428a6bb.txt",
+          "sha256": "769f80b5bcb42ed0af4e4d2fd74e1ac9bf843cb80c5a29219d1ef3544428a6bb"
+        }
+      ]
+    },
+    {
       "id": "cargo:winapi-util@0.1.11",
       "name": "winapi-util",
       "version": "0.1.11",
@@ -14711,6 +15964,46 @@
       ]
     },
     {
+      "id": "cargo:zerocopy-derive@0.8.59",
+      "name": "zerocopy-derive",
+      "version": "0.8.59",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/google/zerocopy",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/zerocopy-derive/0.8.59/download",
+        "integrity": "sha256:ac4f328cf2f05d084e496c3e9c3f33ed0a183656a16e1fcec4d464d8373aec82"
+      },
+      "licenseExpression": "BSD-2-Clause OR Apache-2.0 OR MIT",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyright 2019 The Fuchsia Authors.",
+        "Copyright 2023 The Fuchsia Authors"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/1a2f5c12ddc934d58956aa5dbdd3255fe55fd957633ab7d0d39e4f0daa73f7df.txt",
+          "sha256": "1a2f5c12ddc934d58956aa5dbdd3255fe55fd957633ab7d0d39e4f0daa73f7df"
+        },
+        {
+          "path": "licenses/texts/83c1763356e822adde0a2cae748d938a73fdc263849ccff6b27776dff213bd32.txt",
+          "sha256": "83c1763356e822adde0a2cae748d938a73fdc263849ccff6b27776dff213bd32"
+        },
+        {
+          "path": "licenses/texts/9d185ac6703c4b0453974c0d85e9eee43e6941009296bb1f5eb0b54e2329e9f3.txt",
+          "sha256": "9d185ac6703c4b0453974c0d85e9eee43e6941009296bb1f5eb0b54e2329e9f3"
+        }
+      ]
+    },
+    {
       "id": "cargo:zerocopy@0.8.59",
       "name": "zerocopy",
       "version": "0.8.59",
@@ -15105,6 +16398,35 @@
       ]
     },
     {
+      "id": "cargo:zune-core@0.4.12",
+      "name": "zune-core",
+      "version": "0.4.12",
+      "ecosystem": "cargo",
+      "repository": null,
+      "source": {
+        "url": "https://crates.io/api/v1/crates/zune-core/0.4.12/download",
+        "integrity": "sha256:3f423a2c17029964870cfaabb1f13dfab7d092a62a29a89264f4d36990ca414a"
+      },
+      "licenseExpression": "MIT OR Apache-2.0 OR Zlib",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5.txt",
+          "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+        }
+      ]
+    },
+    {
       "id": "cargo:zune-core@0.5.3",
       "name": "zune-core",
       "version": "0.5.3",
@@ -15138,6 +16460,35 @@
         {
           "path": "licenses/texts/d30047bca3b516639339a3c279bb84c3483124fb5a9dafe3c75056a85090e745.txt",
           "sha256": "d30047bca3b516639339a3c279bb84c3483124fb5a9dafe3c75056a85090e745"
+        }
+      ]
+    },
+    {
+      "id": "cargo:zune-jpeg@0.4.21",
+      "name": "zune-jpeg",
+      "version": "0.4.21",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/etemesi254/zune-image/tree/dev/crates/zune-jpeg",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/zune-jpeg/0.4.21/download",
+        "integrity": "sha256:29ce2c8a9384ad323cf564b67da86e21d3cfdff87908bc1223ed5c99bc792713"
+      },
+      "licenseExpression": "MIT OR Apache-2.0 OR Zlib",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "windows-x64"
+      ],
+      "copyright": [],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5.txt",
+          "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
         }
       ]
     },
@@ -15257,6 +16608,39 @@
       ]
     },
     {
+      "id": "native:VB-CABLE@45",
+      "name": "VB-CABLE",
+      "version": "45",
+      "ecosystem": "native",
+      "repository": "https://www.vb-cable.com/",
+      "source": {
+        "url": "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip",
+        "integrity": "sha256:b950e39f01af1d04ea623c8f6d8eb9b6ea5c477c637295fabf20631c85116bfb"
+      },
+      "licenseExpression": "LicenseRef-VB-CABLE-Donationware",
+      "selectedLicense": "LicenseRef-VB-CABLE-Donationware",
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/04082f47b0ed315a3b3721a967884c7123552ac3f860a9fb6692c7e2130bf86d.txt",
+          "sha256": "04082f47b0ed315a3b3721a967884c7123552ac3f860a9fb6692c7e2130bf86d"
+        },
+        {
+          "path": "licenses/texts/2515cfd667fffcf54d00e0dda70df58a2b8843ff2ae95e12455764da25cb9eb9.txt",
+          "sha256": "2515cfd667fffcf54d00e0dda70df58a2b8843ff2ae95e12455764da25cb9eb9"
+        }
+      ],
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "copyright": [
+        "Copyrights V.Burel©2010-2024 All rights reserved."
+      ]
+    },
+    {
       "id": "native:WixToolset.Firewall.wixext@5.0.2",
       "name": "WixToolset.Firewall.wixext custom actions",
       "version": "5.0.2",
@@ -15309,6 +16693,44 @@
         }
       ],
       "copyright": []
+    },
+    {
+      "id": "native:libASPL@3.1.2+633e0f7",
+      "name": "libASPL",
+      "version": "3.1.2+633e0f7",
+      "ecosystem": "native",
+      "repository": "https://github.com/gavv/libASPL",
+      "source": {
+        "url": "https://github.com/gavv/libASPL/tree/633e0f70203edd87d320fc5a3cae901e1363aac5",
+        "integrity": "git:633e0f70203edd87d320fc5a3cae901e1363aac5"
+      },
+      "licenseExpression": "MIT AND AML",
+      "selectedLicense": "MIT AND AML",
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/2b33b4cadf8e88c15e8808950913acf8bd84bac10d6312e9fb128163850d22d0.txt",
+          "sha256": "2b33b4cadf8e88c15e8808950913acf8bd84bac10d6312e9fb128163850d22d0"
+        },
+        {
+          "path": "licenses/texts/9b2b45280cf33d7f726840a53283723c87b2295ff84d1cf3982c96b5bc4c50a9.txt",
+          "sha256": "9b2b45280cf33d7f726840a53283723c87b2295ff84d1cf3982c96b5bc4c50a9"
+        },
+        {
+          "path": "licenses/texts/bdb64a0bea4af109148b48446a9026be5d1f22dc14d18920cfcd52bf3f3e2347.txt",
+          "sha256": "bdb64a0bea4af109148b48446a9026be5d1f22dc14d18920cfcd52bf3f3e2347"
+        }
+      ],
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "macos-arm64"
+      ],
+      "copyright": [
+        "Copyright (C) 2012 Apple Inc. All Rights Reserved.",
+        "Copyright © 2020 Apple Inc."
+      ]
     },
     {
       "id": "npm:@asamuzakjp/css-color@3.2.0",
@@ -19018,14 +20440,14 @@
       ]
     },
     {
-      "id": "npm:oink-ui@1.0.8",
+      "id": "npm:oink-ui@1.0.11",
       "name": "oink-ui",
-      "version": "1.0.8",
+      "version": "1.0.11",
       "ecosystem": "npm",
       "repository": "https://github.com/oinkvm/oink-ui",
       "source": {
-        "url": "https://registry.npmjs.org/oink-ui/-/oink-ui-1.0.8.tgz",
-        "integrity": "sha512-H+tPG3OsEESwnLNAUzDfRS6yIArf/WYsa+pwM3uJmu6V9+6dzaGnFUk0ygJaqFqmihGVe2k0Pud+FFOXdnrZcQ=="
+        "url": "https://registry.npmjs.org/oink-ui/-/oink-ui-1.0.11.tgz",
+        "integrity": "sha512-xv9x+SQkazo5zYLI6J4F8iws6XMYHIO9fVGAHTY5g+vg+vqM7RnkM44JYdqWrfppfhZ1OtTGHgfF+K/JHhydEg=="
       },
       "licenseExpression": "MIT",
       "selectedLicense": "MIT",

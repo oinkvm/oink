@@ -2,7 +2,7 @@
 //! may commit them, publish the resulting Adds, or activate the returned state.
 use crate::{
     group_state::{self, State},
-    identity::{self, Identity},
+    identity::Identity,
     roster::{Anchor, Roster},
     wire_identity as wire,
 };
@@ -284,11 +284,10 @@ pub fn commit(
     if current.digest()? != target.digest()? || identity.id() != wire::read_device(&intent.target_issuer()?)? {
         return Err(v1::ErrorCode::StateConflict.into());
     }
-    verify_signature(
-        wire::read_device(&intent.source_issuer()?)?,
-        &authorization_input(plan, decision)?,
-        &source_signature,
-    )?;
+    if decision == 0 {
+        return Err(v1::ErrorCode::StateConflict.into());
+    }
+    check_signature_format(&source_signature)?;
     let roster = target.roster().sign_adds(identity, &plan.unsigned_adds()?.0)?;
     let mut raw = target.wire().raw().clone();
     raw.insert(3, roster.wire().write());
@@ -349,16 +348,11 @@ pub fn verify_bundle(bundle: &dto::MergeTransferBundle, trusted_source: Anchor) 
     if wire::read_device(&certificate.permit_coordinator()?)? != source_issuer.min(target_issuer) {
         return Err(v1::ErrorCode::AuthenticationFailed.into());
     }
-    verify_signature(
-        source_issuer,
-        &authorization_input(&plan, certificate.permit_decision()?)?,
-        &certificate.source_signature()?,
-    )?;
-    let mut raw = certificate.raw().clone();
-    raw.remove(&5);
-    let mut input = v1::labels::MERGE_COMMITTED.to_vec();
-    input.extend(v1::cbor::encode_map(&raw, v1::limits::PAIR_OBJECT)?);
-    verify_signature(target_issuer, &input, &certificate.target_signature()?)?;
+    if certificate.permit_decision()? == 0 {
+        return Err(v1::ErrorCode::StateConflict.into());
+    }
+    check_signature_format(&certificate.source_signature()?)?;
+    check_signature_format(&certificate.target_signature()?)?;
     let result = State::verify(bundle.target_state()?, target.roster().anchor())?;
     if result.digest()? != certificate.result_digest()?.0
         || !target
@@ -424,8 +418,10 @@ fn signature(identity: &Identity, input: &[u8]) -> Result<dto::Signature> {
         .into(),
     )
 }
-fn verify_signature(signer: DeviceId, input: &[u8], signature: &dto::Signature) -> Result<()> {
-    if signature.algorithm()?.0 != dto::ED25519 || !identity::verify_strict(&signer, input, &signature.value()?.0) {
+// Authentication belongs to TLS/member admission or the PAKE transaction.
+// Continue emitting v1 signatures, and retain their structural validation.
+fn check_signature_format(signature: &dto::Signature) -> Result<()> {
+    if signature.algorithm()?.0 != dto::ED25519 {
         return Err(v1::ErrorCode::AuthenticationFailed.into());
     }
     Ok(())
@@ -580,6 +576,37 @@ mod tests {
         )
         .unwrap()
     }
+    #[test]
+    fn full_trust_commit_and_reread_do_not_verify_embedded_signatures() {
+        let a = Identity::from_seed([1; 32]);
+        let b = Identity::from_seed([2; 32]);
+        let source = State::create(&a, "a", "test", 1).unwrap();
+        let target = State::create(&b, "b", "test", 1).unwrap();
+        let ctx = context(&source, &target, &a, &b);
+        let seed = seed(&source, target.roster().anchor(), 1).unwrap();
+        let plan = prepare(&source, &target, &ctx, &seed, 4).unwrap();
+        let auth = authorization(&a, &plan, 1).unwrap();
+        assert!(crate::identity::verify_strict(
+            &a.id(),
+            &authorization_input(&plan, 1).unwrap(),
+            &auth.value().unwrap().0
+        ));
+        crate::identity::STRICT_VERIFICATIONS.with(|count| count.set(0));
+        let proof = commit(&b, source.roster(), &target, &plan, auth, 1).unwrap();
+        verify_bundle(&proof, source.roster().anchor()).unwrap();
+        adopt(&proof, &source, a.id()).unwrap();
+        crate::identity::STRICT_VERIFICATIONS.with(|count| assert_eq!(count.get(), 0));
+        // v1 signatures are still produced for older peers.
+        let mut raw = proof.certificate().unwrap().into_raw();
+        let signature = dto::Signature::from_raw(raw.remove(&5).unwrap().as_map().unwrap().clone()).unwrap();
+        let mut input = v1::labels::MERGE_COMMITTED.to_vec();
+        input.extend(v1::cbor::encode_map(&raw, v1::limits::PAIR_OBJECT).unwrap());
+        assert!(crate::identity::verify_strict(
+            &b.id(),
+            &input,
+            &signature.value().unwrap().0
+        ));
+    }
     fn screen(device: DeviceId, name: &str, x: f64, y: f64, w: f64, h: f64) -> RawValue {
         let rect = RawValue::Map([(1, x.write()), (2, y.write()), (3, w.write()), (4, h.write())].into());
         RawValue::Map(
@@ -683,6 +710,17 @@ mod tests {
         assert!(result.roster().contains(a.id()));
         assert!(result.roster().contains(c.id()));
         assert_eq!(result.roster().member(c.id()).unwrap().epoch, 3);
+        let reconciled = result.reconcile_pointer_slots(b.id()).unwrap();
+        let adopted = adopt(&proof, &source, a.id())
+            .unwrap()
+            .reconcile_pointer_slots(a.id())
+            .unwrap();
+        assert_eq!(reconciled.pointer_slots().unwrap(), adopted.pointer_slots().unwrap());
+        assert_eq!(reconciled.pointer_slots().unwrap()[&b.id()], Some(0));
+        let slots = reconciled.pointer_slots().unwrap();
+        assert_ne!(slots[&a.id()], slots[&b.id()]);
+        assert_ne!(slots[&a.id()], slots[&c.id()]);
+
         assert_eq!(
             adopt(&proof, &source, c.id()).unwrap().digest().unwrap(),
             result.digest().unwrap()
@@ -792,7 +830,7 @@ mod tests {
         assert_eq!(source.wire().encode(v1::limits::CONFIG_STATE).unwrap(), before);
     }
     #[test]
-    fn forged_source_authorization_wrong_permit_changed_base_and_extra_result_are_rejected() {
+    fn wrong_signer_zero_permit_changed_base_and_extra_result_are_rejected() {
         let a = Identity::from_seed([1; 32]);
         let b = Identity::from_seed([2; 32]);
         let x = Identity::from_seed([9; 32]);
@@ -803,7 +841,7 @@ mod tests {
         let plan = prepare(&source, &target, &ctx, &seed, 4).unwrap();
         let sig = authorization(&a, &plan, 1).unwrap();
         assert!(authorization(&x, &plan, 1).is_err());
-        assert!(commit(&b, source.roster(), &target, &plan, sig.clone(), 2).is_err());
+        assert!(commit(&b, source.roster(), &target, &plan, sig.clone(), 0).is_err());
         let changed = target
             .with_roster(&target.roster().add(&b, x.id(), "x", "test", 5).unwrap())
             .unwrap();

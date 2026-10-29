@@ -1,4 +1,5 @@
-//! Device-owned game mode with focus-scoped relative input. No layout/damping calls occur on this path.
+//! Device-owned game mode with focus-scoped relative input. Only a held escape
+//! key plus fresh native edge evidence invokes normal crossing geometry.
 use super::*;
 pub use crate::control::GameMode;
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,7 @@ pub struct GameModeStatus {
 #[derive(Debug, Default)]
 pub(super) struct GameState {
     scope: Option<(u64, DeviceId)>,
+    pub(super) escape_cursor: Option<(DeviceId, ScreenPos)>,
     pub(super) mode: GameMode,
     pub(super) owner: OwnerGameState,
     detected: bool,
@@ -59,6 +61,10 @@ impl GameState {
 }
 
 impl Router {
+    pub(super) fn owner_game_active(&self) -> bool {
+        self.game.owner.active
+    }
+
     pub fn game_mode(&self) -> GameModeStatus {
         GameModeStatus {
             holder: self.holder,
@@ -117,6 +123,7 @@ impl Router {
     /// Debounced local platform observation, never the source's Oink-owned freeze.
     pub fn set_pointer_captured(&mut self, detected: bool) {
         if self.has_pointer_focus() {
+            let detected = detected && !self.dnd_pointer_active();
             self.game.owner.passive_detected = detected;
             let detected = detected || self.game.owner.remote_capture.detected;
             if self.game.detected != detected {
@@ -146,7 +153,13 @@ impl Router {
             self.game.owner.cursor_hiding_cause_available = availability;
         }
         let previously_detected = self.game.detected;
-        if self.cfg.os == Os::MacOS && self.game.mode == GameMode::Auto {
+        if self.dnd_pointer_active() {
+            // OLE's hidden image cursor on Windows 11 was observed to satisfy
+            // the capture heuristic during a PNG drag (build 53 case 012).
+            // Reset automatic evidence through the whole drag, including a
+            // pending Begin; explicit GameMode::On remains authoritative.
+            self.game.owner.remote_capture.reset("native_drag");
+        } else if self.cfg.os == Os::MacOS && self.game.mode == GameMode::Auto {
             self.game.owner.remote_capture.observe(sample, now);
         } else {
             self.game.owner.remote_capture.reset("not_mac_auto");
@@ -353,6 +366,7 @@ impl Router {
     }
 
     pub(super) fn receive_relative(&mut self, origin: DeviceId, epoch: u64, generation: u64, seq: u64, x: f64, y: f64) {
+        let escape_cursor = self.game.escape_cursor.take();
         // Relative packets never migrate to another focus/generation or get forwarded.
         if self.holder != self.me()
             || self.claim != self.me()
@@ -375,6 +389,18 @@ impl Router {
         *prev = (seq, x, y);
         if dx != 0. || dy != 0. {
             self.last_pointer_source = Some(origin);
+            self.gap_sync();
+            if self.gap.is_some()
+                && let Some(from) = self.pointer.clone()
+            {
+                self.escape_gap_motion(origin, &from, (dx, dy), self.dnd.now);
+                return;
+            }
+            if let Some((source, actual)) = escape_cursor.filter(|(source, _)| *source == origin)
+                && self.escape_cursor_motion(source, &actual, (dx, dy), self.dnd.now)
+            {
+                return;
+            }
             self.out.push(Output::Inject(InjectEvent::MoveRelative { dx, dy }));
         }
     }

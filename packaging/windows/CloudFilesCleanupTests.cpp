@@ -23,32 +23,40 @@ int wmain() {
     CloseHandle(directory);
     assert(length > 7 && length < 32768 && wcsncmp(resolved, L"\\\\?\\", 4) == 0 && resolved[5] == L':');
     const auto base = std::wstring(resolved + 4) + L"\\oink-cloud-cleanup-" + std::to_wstring(GetCurrentProcessId());
-    const auto path = base + L"\\CloudFiles";
-    std::filesystem::create_directories(path + L"\\nested");
-    // Diagnose host Cloud Filter availability without making this real-file
-    // unit test depend on that optional OS service. No root is registered here.
-    printf("Plain-directory Cloud Filter probe HRESULT=0x%08lx\n",
-        static_cast<unsigned long>(cloud_cleanup::unregister_root(path.c_str())));
-    HANDLE file = CreateFileW((path + L"\\nested\\data").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
-    assert(file != INVALID_HANDLE_VALUE); CloseHandle(file);
-    // A live non-delete-sharing handle must leave the root intact for retry.
-    file = CreateFileW((path + L"\\nested\\data").c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    assert(file != INVALID_HANDLE_VALUE);
-    // These are real NTFS handle/containment tests, not Cloud Filter driver
-    // integration tests. A plain fixture is not a registered sync root. Server
-    // builders need not provide a working Cloud Files provider/filter service.
-    assert(!cloud_cleanup::root(path, ordinary_directory));
-    assert(std::filesystem::exists(path));
-    CloseHandle(file);
-    assert(!cloud_cleanup::root(path, denied));
-    assert(std::filesystem::exists(path + L"\\nested\\data"));
-    assert(cloud_cleanup::root(path, ordinary_directory));
-    assert(!std::filesystem::exists(path));
-    assert(cloud_cleanup::root(path, ordinary_directory));
+    for (const auto name : {L"CloudLinkedFiles", L"CloudFiles"}) {
+        const auto path = base + L"\\" + name;
+        std::filesystem::create_directories(path + L"\\nested");
+        // Diagnose host Cloud Filter availability without making this real-file
+        // unit test depend on that optional OS service. No root is registered here.
+        printf("Plain-directory Cloud Filter probe HRESULT=0x%08lx\n",
+            static_cast<unsigned long>(cloud_cleanup::unregister_root(path.c_str())));
+        HANDLE file = CreateFileW((path + L"\\nested\\data").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+        assert(file != INVALID_HANDLE_VALUE); CloseHandle(file);
+        // A live non-delete-sharing handle must leave the root intact for retry.
+        file = CreateFileW((path + L"\\nested\\data").c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        assert(file != INVALID_HANDLE_VALUE);
+        // These are real NTFS handle/containment tests, not Cloud Filter driver
+        // integration tests. A plain fixture is not a registered sync root. Server
+        // builders need not provide a working Cloud Files provider/filter service.
+        assert(!cloud_cleanup::root(path, ordinary_directory));
+        assert(std::filesystem::exists(path));
+        CloseHandle(file);
+        std::wstring failed_path, operation; DWORD reported = 0;
+        assert(!cloud_cleanup::root(path, denied, true,
+            [&](const std::wstring& failed, const wchar_t* op, DWORD error) {
+                failed_path = failed; operation = op; reported = error;
+            }));
+        assert(failed_path == path && operation == L"CfUnregisterSyncRoot HRESULT" && reported == static_cast<DWORD>(E_ACCESSDENIED));
+        assert(std::filesystem::exists(path + L"\\nested\\data"));
+        assert(cloud_cleanup::root(path, ordinary_directory));
+        assert(!std::filesystem::exists(path));
+        assert(cloud_cleanup::root(path, ordinary_directory));
+    }
     // Ancestor reparse points cannot redirect privileged cleanup. Creating an
     // NTFS junction needs no privilege and does not modify any system settings.
     const auto target = base + L"\\outside";
-    std::filesystem::create_directories(target + L"\\CloudFiles");
+    for (const auto name : {L"CloudLinkedFiles", L"CloudFiles"})
+        std::filesystem::create_directories(target + L"\\" + name);
     const auto link = base + L"\\link";
     auto command = L"cmd.exe /c mklink /J \"" + link + L"\" \"" + target + L"\"";
     STARTUPINFOW startup{sizeof(startup)}; PROCESS_INFORMATION process{};
@@ -56,9 +64,11 @@ int wmain() {
     assert(WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0);
     DWORD exit = 1; assert(GetExitCodeProcess(process.hProcess, &exit) && exit == 0); CloseHandle(process.hThread); CloseHandle(process.hProcess);
     const unsigned before = unregister_calls;
-    assert(!cloud_cleanup::root(link + L"\\CloudFiles", ordinary_directory));
-    assert(unregister_calls == before);
-    assert(std::filesystem::exists(target + L"\\CloudFiles"));
+    for (const auto name : {L"CloudLinkedFiles", L"CloudFiles"}) {
+        assert(!cloud_cleanup::root(link + L"\\" + name, ordinary_directory));
+        assert(unregister_calls == before);
+        assert(std::filesystem::exists(target + L"\\" + name));
+    }
     std::filesystem::remove_all(base);
     return 0;
 }

@@ -1,5 +1,5 @@
 //! Shared input semantics and oink-ui button transitions for both native renderers.
-use super::Click;
+use super::{Click, Frame};
 use oink_foundation::{Point, Rect};
 use std::time::Instant;
 
@@ -9,6 +9,8 @@ pub struct Feedback {
     pub id: u64,
     pub hovered: bool,
     pub pressed: bool,
+    /// Pointer is over the visible toast card, including Undo.
+    pub toast_hovered: bool,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Input {
@@ -24,21 +26,33 @@ pub(super) struct HitState {
     pub interactive: bool,
     hovered: bool,
     down: Option<bool>,
+    toast_hovered: bool,
+    mask: Option<Frame>,
 }
 impl HitState {
     pub fn update(&mut self, id: u64, undo: Option<Rect>, interactive: bool) {
         if self.id != id || !interactive {
             self.hovered = false;
+            self.toast_hovered = false;
             self.down = None;
         }
+        self.mask = None;
         self.id = id;
         self.undo = undo;
         self.interactive = interactive;
+    }
+    pub fn update_frame(&mut self, frame: &Frame) {
+        self.update(frame.id, frame.undo, frame.interactive);
+        self.mask = Some(frame.clone());
+    }
+    pub fn contains(&self, point: Point) -> bool {
+        self.interactive && self.mask.as_ref().is_none_or(|f| f.contains(point))
     }
     pub fn feedback(&self) -> Feedback {
         Feedback {
             id: self.id,
             hovered: self.hovered,
+            toast_hovered: self.toast_hovered,
             pressed: self.hovered && self.down == Some(true),
         }
     }
@@ -49,15 +63,20 @@ impl HitState {
         let mut click = None;
         if let Input::Leave = input {
             self.hovered = false;
+            self.toast_hovered = false;
             self.down = None;
         } else {
             let (Input::Move(p) | Input::Down(p) | Input::Up(p)) = input else {
                 unreachable!()
             };
-            self.hovered = self.undo.is_some_and(|r| r.contains(p));
+            self.toast_hovered = self.contains(p);
+            self.hovered = self.toast_hovered && self.undo.is_some_and(|r| r.contains(p));
+            if !self.toast_hovered {
+                self.down = None;
+            }
             match input {
-                Input::Down(_) => self.down = Some(self.hovered),
-                Input::Up(_) if self.down.take() == Some(self.hovered) => {
+                Input::Down(_) => self.down = self.toast_hovered.then_some(self.hovered),
+                Input::Up(_) if self.down.take() == Some(self.hovered) && self.toast_hovered => {
                     click = Some(Click {
                         id: self.id,
                         undo: self.hovered,

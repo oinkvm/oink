@@ -4,7 +4,7 @@ import { afterEach, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import { OinkProvider } from 'oink-ui';
 import { UninstallControl } from './UninstallControl';
 import { searchSections, sectionsFor } from './schema';
-import { setLanguage } from '../i18n';
+import { setLanguage, tr } from '../i18n';
 const uninstall = vi.hoisted(() => vi.fn());
 vi.mock('../api/client', () => ({ shell: { uninstall } }));
 beforeAll(() => {
@@ -29,7 +29,7 @@ it('requires explicit confirmation and cancellation has no side effects', async 
     render(<OinkProvider defaultMotion="reduced"><UninstallControl/></OinkProvider>);
     fireEvent.click(screen.getByRole('button', { name: 'Uninstall Oink' }));
     expect(await screen.findByText('Uninstall Oink?')).toBeTruthy();
-    expect(screen.getByText(/This stops Oink, leaves the device group/).textContent).toContain('This cannot be undone.');
+    expect(screen.getByText(/This removes the installed Oink virtual microphone/).textContent).toContain('This cannot be undone.');
     expect(uninstall).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(uninstall).not.toHaveBeenCalled();
@@ -51,5 +51,27 @@ it('disables confirmation while native preparation is pending', async () => {
     const confirm = within(await screen.findByRole('dialog')).getByRole('button', { name: 'Uninstall Oink' });
     fireEvent.click(confirm);
     await waitFor(() => expect((confirm as HTMLButtonElement).disabled).toBe(true));
+    expect(screen.getByText(/Preparing to uninstall Oink\./).getAttribute('role')).toBe('status');
     expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+it.each(['zh-Hans', 'en', 'ja', 'ko'])('explains microphone authorization and allows retry after cancellation in %s', async lang => {
+    setLanguage(lang);
+    uninstall.mockRejectedValueOnce({ step: 'microphone_plugin', kind: 'cancelled', detail: 'execution error (-128)' }).mockResolvedValueOnce(undefined);
+    render(<OinkProvider defaultMotion="reduced"><UninstallControl/></OinkProvider>);
+    fireEvent.click(screen.getByRole('button', { name: tr('卸载 Oink') }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: tr('卸载 Oink') }));
+    expect(await screen.findByRole('alert')).toHaveProperty('textContent', tr('虚拟麦克风未移除，应用尚未移入废纸篓，可重试'));
+    expect(screen.getByRole('alert').textContent).not.toContain('(-128)');
+    fireEvent.click(within(dialog).getByRole('button', { name: tr('卸载 Oink') }));
+    await waitFor(() => expect(uninstall).toHaveBeenCalledTimes(2));
+});
+it.each(['authorization_denied', 'verification_failed', 'query_failed', 'other'])('keeps the specific microphone %s error visible', async kind => {
+    uninstall.mockRejectedValueOnce({ step: 'microphone_plugin', kind, detail: 'specific system reason' });
+    render(<OinkProvider defaultMotion="reduced"><UninstallControl/></OinkProvider>);
+    fireEvent.click(screen.getByRole('button', { name: 'Uninstall Oink' }));
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Uninstall Oink' }));
+    expect(await screen.findByRole('alert')).toHaveProperty('textContent',
+        'Could not remove the Oink virtual microphone. The app has not been moved to the Trash. You can retry. Reason: specific system reason');
 });

@@ -3,9 +3,9 @@ on:
   workflow_dispatch:
     inputs:
       build:
-        description: Reserved product build shared by public and in-house packages (0.2.2 uses 43)
+        description: Reserved product build shared by public and in-house packages (0.3.0 uses 76)
         required: true
-        default: '43'
+        default: '76'
         type: string
 permissions:
   contents: read
@@ -130,6 +130,12 @@ jobs:
           python build-support/package.py --public-version --platform "$PLATFORM" --build "$BUILD" --output-root "$RUNNER_TEMP/packages" --tool-cache "$RUNNER_TEMP/package-tools" "${args[@]}"
           python build-support/check-report-configuration.py --packages "$RUNNER_TEMP/packages" --platform "$PLATFORM"
           python build-support/public_release.py stage --packages "$RUNNER_TEMP/packages" --platform "$PLATFORM" --build "$BUILD" --output "$RUNNER_TEMP/distribution"
+      - name: Upload native debug files to the existing EU project
+        shell: bash
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          OINK_REPORT_DSN: ${{ secrets.OINK_REPORT_DSN }}
+        run: python build-support/upload_symbols.py --packages "$RUNNER_TEMP/packages" --tool-cache "$RUNNER_TEMP/package-tools"
       - name: Remove ephemeral signing material
         if: always() && runner.os == 'macOS'
         run: python packaging/macos/ci-keychain.py cleanup

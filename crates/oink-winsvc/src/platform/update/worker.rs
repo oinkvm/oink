@@ -4,7 +4,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use oink_update::{
     feed,
     transaction::{self, InstallOutcome, Journal, Platform, Stage},
-    trust::Roots,
+    trust::{LocalRoots, Roots},
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -44,8 +44,7 @@ fn command(binary: &'static str) -> Result<Command, Error> {
     let mut command = Command::new(directory.join(binary));
     command
         .env_clear()
-        .env("SystemRoot", directory.parent().ok_or(Error::Storage)?)
-        .env("PATH", &directory)
+        .envs(system_environment()?)
         .current_dir(protected::maintenance().map_err(|_| Error::Storage)?)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -65,6 +64,68 @@ fn msi_arguments(operation: &str, target: &std::ffi::OsStr, log: &Path) -> Vec<s
     .into_iter()
     .map(std::ffi::OsStr::to_owned)
     .collect()
+}
+fn repair_source_path(directory: &Path, name: &str) -> Result<PathBuf, Error> {
+    // Windows Installer resolves repairs with the original registered basename,
+    // even when /i names another file. Treat that OS metadata as one leaf only.
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(' ')
+        .replace('¹', "1")
+        .replace('²', "2")
+        .replace('³', "3")
+        .to_ascii_uppercase();
+    if name.encode_utf16().count() > 255
+        || !name.to_ascii_lowercase().ends_with(".msi")
+        || name.chars().any(|c| c.is_control() || r#"<>:"/\|?*"#.contains(c))
+        || name.ends_with(['.', ' '])
+        || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+    {
+        return Err(Error::Metadata);
+    }
+    Ok(directory.join("repair-source").join(name))
+}
+fn registered_package_name(product: &str) -> Result<String, Error> {
+    use windows_sys::Win32::System::ApplicationInstallationAndServicing::*;
+    let mut buffer = [0u16; 256];
+    let mut length = buffer.len() as u32;
+    // SAFETY: query only, exact independently inspected machine ProductCode;
+    // no source-list, security policy or Windows Installer registry mutation.
+    let code = unsafe {
+        MsiSourceListGetInfoW(
+            wide(product).as_ptr(),
+            ptr::null(),
+            MSIINSTALLCONTEXT_MACHINE,
+            MSICODE_PRODUCT as u32,
+            wide("PackageName").as_ptr(),
+            buffer.as_mut_ptr(),
+            &mut length,
+        )
+    };
+    if code != 0 || length as usize >= buffer.len() {
+        return Err(Error::Metadata);
+    }
+    String::from_utf16(&buffer[..length as usize]).map_err(|_| Error::Metadata)
+}
+#[derive(Debug, PartialEq, Eq)]
+enum RestorePackage {
+    RepairInPlace,
+    ReplaceProduct,
+}
+fn restore_package(previous: &str, candidate: &str, available: bool) -> Result<RestorePackage, Error> {
+    if !available {
+        return Err(Error::RepairRequired);
+    }
+    Ok(if previous == candidate {
+        RestorePackage::RepairInPlace
+    } else {
+        RestorePackage::ReplaceProduct
+    })
 }
 fn run_command(mut command: Command) -> Result<u32, Error> {
     // Keep the package and ancestor locks on our caller's stack until the MSI
@@ -128,12 +189,45 @@ fn cache(build: u64) -> Result<PathBuf, Error> {
         .join("cache")
         .join(build.to_string()))
 }
+// A protected local plan is authorized by the elevated installed CLI, not by
+// the feed enablement gate. Keep distinct types so its pins cannot authenticate
+// a feed manifest. In-house packages intentionally disable automatic updates.
+#[derive(Debug)]
+pub(super) enum PackageTrust {
+    Feed(Roots),
+    Local(LocalRoots),
+}
+impl PackageTrust {
+    fn compiled(local: bool) -> Result<Self, Error> {
+        if local {
+            oink_update::trust::local_packages().map(Self::Local)
+        } else {
+            oink_update::trust::compiled().map(Self::Feed)
+        }
+    }
+    fn pins(&self) -> &[String] {
+        match self {
+            Self::Feed(roots) => &roots.signer_spki_sha256,
+            Self::Local(roots) => &roots.signer_spki_sha256,
+        }
+    }
+    fn feed(&self) -> Result<feed::Trust<'_>, Error> {
+        match self {
+            Self::Feed(roots) => Ok(roots.feed()),
+            Self::Local(_) => Err(Error::Policy),
+        }
+    }
+}
 pub(super) fn prepare_package(
     candidate: feed::Release,
     previous: Option<feed::Release>,
     envelope: &[u8],
-    roots: &Roots,
+    roots: &PackageTrust,
+    local: bool,
 ) -> Result<PreparedPackage, Error> {
+    if local != matches!(roots, PackageTrust::Local(_)) {
+        return Err(Error::Policy);
+    }
     protected::system().map_err(|_| Error::Policy)?;
     let _lock = protected::lock()?;
     if pending() {
@@ -141,10 +235,26 @@ pub(super) fn prepare_package(
     }
     let receipt = installed()?;
     let machine = policy()?;
-    if candidate.build <= receipt.build.max(machine.successful_build) {
+    let floor = if local {
+        receipt.build
+    } else {
+        receipt.build.max(machine.successful_build)
+    };
+    if candidate.build < floor || (!local && candidate.build == floor) {
         return Err(Error::Replay);
     }
-    feed::verify_version(&candidate.version, &receipt.version)?;
+    if local {
+        msi::local_metadata(
+            &protected::maintenance()
+                .map_err(|_| Error::Storage)?
+                .join("downloads/candidate.msi"),
+            candidate.package.length,
+            candidate.package.sha256.clone(),
+        )?
+        .validate(&receipt.version, receipt.build, "x64")?;
+    } else {
+        feed::verify_version(&candidate.version, &receipt.version)?;
+    }
     let maintenance = protected::maintenance().map_err(|_| Error::Storage)?;
     for name in ["transactions", "cache"] {
         protected::directory(&maintenance.join(name)).map_err(|_| Error::Storage)?;
@@ -153,18 +263,34 @@ pub(super) fn prepare_package(
     protected::directory(&previous_directory).map_err(|_| Error::Storage)?;
     let previous = match previous {
         Some(previous) => previous,
-        None => feed::strict_json(&protected::read(&previous_directory.join("release.json"), 65536)?)?,
+        None if previous_directory.join("release.json").exists() => {
+            feed::strict_json(&protected::read(&previous_directory.join("release.json"), 65536)?)?
+        }
+        None if local => oink_update::local::Package {
+            product: oink_update::PRODUCT.into(),
+            version: receipt.version.clone(),
+            build: receipt.build,
+            architecture: "x64".into(),
+            source_tree_sha256: receipt.source_tree_sha256.clone(),
+            minimum_windows_build: receipt.minimum_windows_build,
+            length: 0,
+            sha256: "0".repeat(64),
+            notes: None,
+        }
+        .release(),
+        None => return Err(Error::Storage),
     };
     if previous.build != receipt.build {
         return Err(Error::Policy);
     }
     let previous_msi = previous_directory.join("package.msi");
-    if !previous_msi.exists() {
+    if !local && !previous_msi.exists() && !previous.package.url.is_empty() {
         let bytes = service::http(&previous.package.url, previous.package.length, true)?;
-        feed::verify_package(&bytes, &previous.package, &roots.feed())?;
+        feed::verify_package(&bytes, &previous.package, &roots.feed()?)?;
         protected::write(&previous_msi, &bytes)?;
         protected::write(&previous_directory.join("release.json"), &json(&previous)?)?;
     }
+    let rollback_package = previous_msi.exists();
     let mut random = [0u8; 16];
     getrandom::fill(&mut random).map_err(|_| Error::Storage)?;
     let tx = feed::hex(&random);
@@ -174,15 +300,24 @@ pub(super) fn prepare_package(
     let candidate_bytes = protected::read(&maintenance.join("downloads/candidate.msi"), feed::MAX_PACKAGE)?;
     protected::write(&candidate_msi, &candidate_bytes)?;
     protected::write(&directory.join("manifest.json"), envelope)?;
-    let candidate_inventory = msi::inspect(&candidate_msi, &directory.join("candidate-check"), roots, &candidate)?;
+    let candidate_inventory = msi::inspect(
+        &candidate_msi,
+        &directory.join("candidate-check"),
+        roots.pins(),
+        &candidate,
+    )?;
     let previous_inventory = cached_inventory(&receipt)?;
+    if candidate_inventory.product_code == previous_inventory.product_code {
+        // Refuse unusable source metadata before the original session drains.
+        repair_source_path(&directory, &registered_package_name(&candidate_inventory.product_code)?)?;
+    }
     let root = protected::root().map_err(|_| Error::Storage)?;
     let source = root.join("oink-update-worker.exe");
-    signature::verify(&source, roots)?;
+    signature::verify(&source, roots.pins())?;
     let worker = directory.join("worker.exe");
     let bytes = protected::read(&source, 64 * 1024 * 1024)?;
     protected::write(&worker, &bytes)?;
-    signature::verify(&worker, roots)?;
+    signature::verify(&worker, roots.pins())?;
     let mut free = 0;
     // SAFETY: fixed protected installation volume; query-only space check before stopping.
     check(unsafe {
@@ -200,6 +335,8 @@ pub(super) fn prepare_package(
     let candidate_pin = protected::pin(&candidate_msi).map_err(|_| Error::Storage)?;
     Ok(PreparedPackage {
         transaction: tx,
+        local,
+        rollback_package,
         candidate,
         previous,
         candidate_inventory,
@@ -210,6 +347,8 @@ pub(super) fn prepare_package(
 }
 pub(super) struct PreparedPackage {
     pub transaction: String,
+    local: bool,
+    rollback_package: bool,
     candidate: feed::Release,
     previous: feed::Release,
     candidate_inventory: msi::Inventory,
@@ -245,8 +384,9 @@ pub(super) fn stage(prepared: &PreparedPackage, sessions: Vec<Session>) -> Resul
     let receipt = installed()?;
     let machine = policy()?;
     if receipt.build != prepared.previous.build
-        || prepared.candidate.build <= receipt.build.max(machine.successful_build)
-        || machine.quarantine.contains(&prepared.candidate.build)
+        || prepared.candidate.build < receipt.build
+        || (!prepared.local && prepared.candidate.build <= receipt.build.max(machine.successful_build))
+        || (!prepared.local && machine.quarantine.contains(&prepared.candidate.build))
     {
         return Err(Error::Replay);
     }
@@ -255,6 +395,8 @@ pub(super) fn stage(prepared: &PreparedPackage, sessions: Vec<Session>) -> Resul
     let worker = directory.join("worker.exe");
     let mut plan = Plan {
         schema: 1,
+        local: prepared.local,
+        rollback_package: prepared.rollback_package,
         transaction: tx.clone(),
         candidate: prepared.candidate.clone(),
         previous: prepared.previous.clone(),
@@ -352,21 +494,40 @@ fn spawn_worker(worker: &Path, tx: &str, lock: &Handle) -> Result<(Handle, Handl
     ))
 }
 fn environment() -> Result<Vec<u16>, Error> {
-    let system = system_dir()?;
-    let mut value = format!(
-        "PATH={}\0SystemRoot={}\0",
-        system.display(),
-        system.parent().ok_or(Error::Storage)?.display()
-    )
-    .encode_utf16()
-    .collect::<Vec<_>>();
+    use std::os::windows::ffi::OsStrExt;
+    let mut value = Vec::new();
+    for (key, path) in system_environment()? {
+        value.extend(key.encode_utf16());
+        value.push(u16::from(b'='));
+        value.extend(path.as_os_str().encode_wide());
+        value.push(0);
+    }
     value.push(0);
     Ok(value)
+}
+
+fn system_environment() -> Result<[(&'static str, PathBuf); 3], Error> {
+    let system = system_dir()?;
+    let root = system.parent().ok_or(Error::Storage)?.to_owned();
+    let Some(std::path::Component::Prefix(prefix)) = system.components().next() else {
+        return Err(Error::Storage);
+    };
+    let drive = PathBuf::from(prefix.as_os_str());
+    // The worker later calls CreateEnvironmentBlock(user, FALSE) to restart the
+    // backend/UI. On Windows 11 26200 userenv still takes SystemDrive from its
+    // caller: omitting it leaves ProfileList's %SystemDrive% paths unexpanded,
+    // and SHGetKnownFolderPath then fails its default existence check. Merely
+    // rebuilding the user's environment did not repair that missing seed.
+    // Supply the OS-reported drive before userenv runs, also for MSI children;
+    // keep the SYSTEM environment allow-listed, without inheriting user input.
+    // https://learn.microsoft.com/windows/win32/api/userenv/nf-userenv-createenvironmentblock
+    // https://learn.microsoft.com/windows/win32/api/shlobj_core/ne-shlobj_core-known_folder_flag
+    Ok([("PATH", system), ("SystemDrive", drive), ("SystemRoot", root)])
 }
 struct Worker {
     plan: Plan,
     directory: PathBuf,
-    roots: Roots,
+    roots: PackageTrust,
     lock: Option<Handle>,
     failure: Option<FailurePolicy>,
     canceled: bool,
@@ -390,8 +551,8 @@ pub(super) fn run() -> Result<(), Error> {
     if plan.schema != 1 || plan.transaction != *tx || protected::hash(&image)? != plan.worker_sha256 {
         return Err(Error::Signature);
     }
-    let roots = oink_update::trust::compiled()?;
-    signature::verify(&image, &roots)?;
+    let roots = PackageTrust::compiled(plan.local)?;
+    signature::verify(&image, roots.pins())?;
     let mut journal = Journal::parse(&protected::read(
         &protected::maintenance()
             .map_err(|_| Error::Storage)?
@@ -415,9 +576,26 @@ pub(super) fn run() -> Result<(), Error> {
 impl Worker {
     fn verify_candidate_manifest(&self) -> Result<(), Error> {
         let machine = policy()?;
+        if self.plan.local {
+            let path = self.directory.join("candidate.msi");
+            let _pin = protected::pin(&path).map_err(|_| Error::Storage)?;
+            if protected::hash(&path)? != self.plan.candidate.package.sha256 {
+                return Err(Error::Signature);
+            }
+            let package = msi::local_metadata(
+                &path,
+                self.plan.candidate.package.length,
+                self.plan.candidate.package.sha256.clone(),
+            )?;
+            package.validate(&self.plan.previous.version, self.plan.previous.build, "x64")?;
+            if package.release() != self.plan.candidate {
+                return Err(Error::Metadata);
+            }
+            return Ok(());
+        }
         let manifest = feed::verify_manifest(
             &protected::read(&self.directory.join("manifest.json"), feed::MAX_FEED as u64)?,
-            &self.roots.feed(),
+            &self.roots.feed()?,
             &machine.watermarks.get("stable").cloned().unwrap_or_default(),
             now(),
         )?;
@@ -489,7 +667,9 @@ impl Worker {
             )
         };
         let mut removal_package = removal_release.package.clone();
-        let removal = if product_installed(&removal_inventory.product_code) {
+        let removal = if inventory.product_code != removal_inventory.product_code
+            && product_installed(&removal_inventory.product_code)
+        {
             removal_package.sha256 = cached_package_hash(&removal_inventory.product_code)?;
             Some((removal_inventory, &removal_package))
         } else {
@@ -498,6 +678,20 @@ impl Worker {
         // Package bytes were verified before staging. The protected copy is
         // immutable to users; hold its read-only handle while msiexec opens it.
         let _package = protected::pin(&path).map_err(|_| Error::Storage)?;
+        let repair = product_installed(&inventory.product_code);
+        let path = if repair {
+            let source = repair_source_path(&self.directory, &registered_package_name(&inventory.product_code)?)?;
+            protected::directory(source.parent().ok_or(Error::Storage)?).map_err(|_| Error::Storage)?;
+            let bytes = protected::read(&path, feed::MAX_PACKAGE)?;
+            if feed::hex(&Sha256::digest(&bytes)) != release.package.sha256 {
+                return Err(Error::Signature);
+            }
+            protected::write(&source, &bytes)?;
+            source
+        } else {
+            path
+        };
+        let _source = protected::pin(&path).map_err(|_| Error::Storage)?;
         self.authorize(inventory, &release.package, removal)?;
         let mut install = command("msiexec.exe")?;
         install.args(msi_arguments(
@@ -507,6 +701,11 @@ impl Worker {
                 .directory
                 .join(if rollback { "rollback.log" } else { "install.log" }),
         ));
+        if repair {
+            // A same-ProductCode repair must recache this explicitly approved
+            // MSI rather than silently repairing from the previous cached one.
+            install.args(["REINSTALL=ALL", "REINSTALLMODE=vamus"]);
+        }
         self.installer_outcome(run_command(install)?)
     }
     fn installer_outcome(&self, code: u32) -> Result<InstallOutcome, Error> {
@@ -552,7 +751,7 @@ impl Worker {
                 return Err(Error::Signature);
             }
             if name.ends_with(".exe") {
-                signature::verify(&root.join(name), &self.roots)?;
+                signature::verify(&root.join(name), self.roots.pins())?;
             }
         }
         let receipt = installed()?;
@@ -768,10 +967,30 @@ impl Platform for Worker {
     fn restore_previous_components_and_metadata(&mut self) -> Result<InstallOutcome, Error> {
         // A prior /i may have committed before a crash or 3010. Verify health
         // instead of reinstalling it on every boot (which may request reboot again).
+        let same_product = self.plan.previous_inventory.product_code == self.plan.candidate_inventory.product_code;
+        let previous_intact = same_product && installed()?.build == self.plan.previous_inventory.build && {
+            let root = protected::root().map_err(|_| Error::Storage)?;
+            self.plan
+                .previous_inventory
+                .hashes
+                .iter()
+                .all(|(name, hash)| protected::hash(&root.join(name)).is_ok_and(|actual| actual == *hash))
+        };
         if product_installed(&self.plan.previous_inventory.product_code)
-            && !product_installed(&self.plan.candidate_inventory.product_code)
+            && (!product_installed(&self.plan.candidate_inventory.product_code) || previous_intact)
         {
             return Ok(InstallOutcome::Installed);
+        }
+        // Older manual/in-house installations may have no complete prior MSI.
+        // Never uninstall a working candidate without an authenticated restore
+        // package: that would destroy user data. Preserve it for explicit repair.
+        if restore_package(
+            &self.plan.previous_inventory.product_code,
+            &self.plan.candidate_inventory.product_code,
+            self.plan.rollback_package,
+        )? == RestorePackage::RepairInPlace
+        {
+            return self.install(true);
         }
         // Authorize cached /x and verified prior /i separately under one lock.
         match self.remove_candidate()? {
@@ -1319,7 +1538,6 @@ fn product_installed(product: &str) -> bool {
 /// Recovery entry while SCM is still alive handles a crash before task arming.
 /// Once the task exists it independently covers service death and reboot.
 pub(super) fn resume_pending() -> Result<(), Error> {
-    let roots = oink_update::trust::compiled()?;
     let maintenance = protected::maintenance().map_err(|_| Error::Storage)?;
     let journal = Journal::parse(&protected::read(&maintenance.join("pending.json"), 65536)?)?;
     let directory = transaction_dir(&journal.transaction)?;
@@ -1336,9 +1554,10 @@ pub(super) fn resume_pending() -> Result<(), Error> {
             }
         }
     }
+    let roots = PackageTrust::compiled(plan.local)?;
     let lock = protected::lock()?;
     let worker = directory.join("worker.exe");
-    signature::verify(&worker, &roots)?;
+    signature::verify(&worker, roots.pins())?;
     if protected::hash(&worker)? != plan.worker_sha256 {
         return Err(Error::Signature);
     }
@@ -1356,8 +1575,20 @@ pub(super) fn resume_pending() -> Result<(), Error> {
 }
 
 #[cfg(test)]
+#[path = "tests/worker_environment.rs"]
+mod environment_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn local_package_pins_do_not_confer_manifest_authority() {
+        let local = PackageTrust::Local(LocalRoots {
+            signer_spki_sha256: vec!["a".repeat(64)],
+        });
+        assert_eq!(local.pins(), ["a".repeat(64)]);
+        assert!(matches!(local.feed(), Err(Error::Policy)));
+    }
     #[test]
     fn committed_candidate_inventory_survives_for_rollback_without_another_msi_inspection() {
         let fixture = tempfile::tempdir().unwrap();
@@ -1499,6 +1730,41 @@ mod tests {
         let directory = Path::new(r"C:\Program Files\Oink\maintenance\transactions\0123456789abcdef0123456789abcdef");
         let xml = recovery_task_xml("0123456789abcdef0123456789abcdef", directory).unwrap();
         super::super::task::validate_definition(&xml).unwrap();
+    }
+    #[test]
+    fn same_product_recovery_never_uninstalls_user_data() {
+        assert_eq!(restore_package("old", "old", true), Ok(RestorePackage::RepairInPlace));
+        assert_eq!(restore_package("old", "new", true), Ok(RestorePackage::ReplaceProduct));
+        assert_eq!(restore_package("old", "old", false), Err(Error::RepairRequired));
+        assert_eq!(restore_package("old", "new", false), Err(Error::RepairRequired));
+    }
+    #[test]
+    fn same_product_repair_preserves_the_registered_source_filename() {
+        let directory = Path::new(r"C:\Program Files\Oink\maintenance\transactions\test");
+        for name in ["baseline.msi", "Oink installer.msi", "Oink-更新.MSI"] {
+            assert_eq!(
+                repair_source_path(directory, name).unwrap(),
+                directory.join("repair-source").join(name)
+            );
+        }
+        for name in [
+            "",
+            "../baseline.msi",
+            r"..\baseline.msi",
+            r"C:\baseline.msi",
+            "file.msi:stream",
+            "file.msi.",
+            "file.msi ",
+            "file?.msi",
+            "NUL.msi",
+            "COM1.msi",
+            "NUL .msi",
+            "COM¹.msi",
+            "file.exe",
+            "a\0.msi",
+        ] {
+            assert_eq!(repair_source_path(directory, name), Err(Error::Metadata), "{name:?}");
+        }
     }
     #[test]
     fn installer_has_only_quiet_no_restart_and_protected_verbose_log_arguments() {

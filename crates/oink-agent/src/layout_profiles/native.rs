@@ -160,6 +160,13 @@ fn response(
     d::LayoutArrangementResult::from_raw(raw).expect("bounded result")
 }
 impl Node {
+    /// Record the observation without changing the caller's error/retry policy.
+    pub(crate) fn observe_native_arrangement(&self, call_site: &'static str) -> Result<NativeState> {
+        self.refresh_native_arrangement().inspect_err(|error| {
+            tracing::warn!(target: "oink_arrangement", call_site, code = ?error.code, %error,
+                "native arrangement observation failed");
+        })
+    }
     /// Read-only enumeration. Called from the blocking display worker, never the
     /// ConfigModule actor (publishing Facts synchronously calls that actor).
     pub(crate) fn refresh_native_arrangement(&self) -> Result<NativeState> {
@@ -169,8 +176,14 @@ impl Node {
             .display_backend
             .as_ref()
             .ok_or_else(|| fail(ErrorCode::Unsupported, "Display backend unavailable"))?;
-        let native = backend.native_configuration().map_err(unavailable)?;
-        let state = native_state(self.id().into(), &native)?;
+        let native = backend.native_configuration().map_err(|error| match error {
+            oink_display::DisplayError::Unsupported => fail(ErrorCode::Unsupported, "Native arrangement unavailable"),
+            error => unavailable(error),
+        })?;
+        let state = native_state(self.id().into(), &native).inspect_err(|error| {
+            tracing::warn!(target: "oink_arrangement", operation = "native_state",
+                display_paths = native.displays.len(), %error, "native arrangement read failed");
+        })?;
         self.link_config()
             .map_err(unavailable)?
             .publish_native_arrangement(state.token.clone())

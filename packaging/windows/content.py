@@ -106,8 +106,8 @@ def verify_install_ui(tables):
 
 def verify_user_session_ui(tables):
     actions = {row[0]: row for row in tables.get('CustomAction', [])}
-    if actions.get('PrepareUserSessions', [])[1:4] != ['257', 'InstallerCA', 'PrepareUserSessions']:
-        raise RuntimeError('MSI graceful Quit must be immediate impersonating code, once per installation')
+    if actions.get('PrepareUserSessions', [])[1:4] != ['1', 'InstallerCA', 'PrepareUserSessions']:
+        raise RuntimeError('MSI graceful Quit must be immediate impersonating execute-sequence code')
     properties = dict(tables.get('Property', []))
     if ('OINK_GRACEFUL_STOP' in properties or
             'OINK_GRACEFUL_STOP' in properties.get('SecureCustomProperties', '').split(';') or
@@ -115,12 +115,15 @@ def verify_user_session_ui(tables):
         raise RuntimeError('MSI normal Quit must not require opt-in or force-close via Restart Manager')
     ui = {row[0]: row for row in tables.get('InstallUISequence', [])}
     execute = {row[0]: row for row in tables.get('InstallExecuteSequence', [])}
-    if (ui.get('PrepareUserSessions', ['', ''])[1] != 'UILevel = 5 AND NOT UPGRADINGPRODUCTCODE' or
-            not int(ui['PrepareUserSessions'][2]) < int(ui['ExecuteAction'][2]) or
+    stop_actions = {name for name, row in actions.items() if row[2:4] == ['InstallerCA', 'PrepareUserSessions']}
+    if (any(name in ui for name in stop_actions) or
+            any(row[2] == 'DoAction' and row[3] in stop_actions for row in tables.get('ControlEvent', [])) or
+            not int(ui['OinkWelcomeDlg'][2]) < int(ui['ProgressDlg'][2]) < int(ui['ExecuteAction'][2]) or
+            not int(ui['MaintenanceWelcomeDlg'][2]) < int(ui['ProgressDlg'][2]) or
             execute.get('PrepareUserSessions', ['', ''])[1] != 'NOT UPGRADINGPRODUCTCODE' or
             not int(execute['CostFinalize'][2]) < int(execute['PrepareUserSessions'][2]) < int(execute['InstallValidate'][2]) < int(execute['InstallInitialize'][2]) or
             any(name in ui or name in execute or name in actions for name in ('RefreshUserSessions', 'OinkRunningDlg'))):
-        raise RuntimeError('MSI must request Quit before files-in-use detection and wait after StopServices')
+        raise RuntimeError('MSI must request Quit only in the execute sequence, after full-UI confirmation and before files-in-use detection')
 
 
 def verify_start_registration(tables, identity):
@@ -151,8 +154,8 @@ def verify_data_cleanup(tables):
 
 
 def verify_registration(tables, metadata, identity):
-    if metadata['version'] != release_version(identity['version'], metadata.get('source_commit')):
-        raise RuntimeError('MSI display version differs from the source commit')
+    if metadata['version'] != release_version(identity['version'], metadata.get('source_commit'), metadata['build']):
+        raise RuntimeError('MSI display version differs from the release build')
     properties = dict(tables.get('Property', []))
     numeric = windows_product_version(metadata['build'])
     if properties.get('ProductVersion') != numeric:

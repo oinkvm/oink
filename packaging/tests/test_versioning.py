@@ -22,26 +22,33 @@ from versioning import release_version, local_source_commit, macos_version_field
 from windows_version import display_version_resource, set_display_version
 
 COMMIT = '0123abcd' * 5
-DISPLAY = '0.2.2-inhouse.0123abcd'
+DISPLAY = f"{IDENTITY['inhouse_version']}-inhouse.17"
 
 
 class LocalVersions(unittest.TestCase):
-    def test_commit_label_including_numeric_leading_zero_hash(self):
-        self.assertEqual(release_version('0.1.0-beta.1', COMMIT), DISPLAY)
-        self.assertEqual(release_version('0.1.0-beta.1', '01234567' * 5), '0.2.2-inhouse.01234567')
+    def test_build_label_is_independent_of_source_commit(self):
+        self.assertEqual(release_version('0.1.0-beta.1', COMMIT, 17), DISPLAY)
+        self.assertEqual(release_version('0.1.0-beta.1', '01234567' * 5, 17),
+                         f"{IDENTITY['inhouse_version']}-inhouse.17")
         self.assertEqual(release_version('0.1.0-beta.2'), '0.1.0-beta.2')
         for commit in ('0123abcd', 'A' * 40, 'z' * 40, 'a' * 39, 'a' * 41, ''):
             with self.assertRaises(ValueError):
-                release_version('0.1.0-beta.1', commit)
-        self.assertEqual(release_version('0.1.0', COMMIT), DISPLAY)
+                release_version('0.1.0-beta.1', commit, 17)
+        self.assertEqual(release_version('0.1.0', COMMIT, 17), DISPLAY)
         self.assertEqual(release_version('0.1.0'), '0.1.0')
 
+    def test_inhouse_requires_a_valid_build(self):
+        for build in (None, 0, -1, 2**31, True, '44'):
+            with self.subTest(build=build), self.assertRaises(ValueError):
+                release_version('0.1.0', COMMIT, build)
+        self.assertEqual(release_version('0.1.0', COMMIT, 44),
+                         f"{IDENTITY['inhouse_version']}-inhouse.44")
+
     def test_inhouse_uses_the_configured_version_and_public_versions_stay_exact(self):
-        self.assertEqual(IDENTITY['inhouse_version'], '0.2.2')
         for public in ('0.1.4', '0.1.5', '1.2.9'):
-            self.assertEqual(release_version(public, COMMIT), DISPLAY)
-        with patch.dict(versioning.IDENTITY, inhouse_version='0.3.0'):
-            self.assertEqual(release_version('0.1.5', COMMIT), '0.3.0-inhouse.0123abcd')
+            self.assertEqual(release_version(public, COMMIT, 17), DISPLAY)
+        with patch.dict(versioning.IDENTITY, inhouse_version='0.4.0'):
+            self.assertEqual(release_version('0.1.5', COMMIT, 17), '0.4.0-inhouse.17')
         for public in ('0.1.4', '0.1.5', '0.2.0-beta.1'):
             self.assertEqual(release_version(public), public)
 
@@ -49,12 +56,12 @@ class LocalVersions(unittest.TestCase):
         for invalid in (None, '', '0.2', '0.2.0-beta.1', '01.2.0', 7):
             with self.subTest(invalid=invalid), patch.dict(versioning.IDENTITY, inhouse_version=invalid):
                 with self.assertRaisesRegex(ValueError, 'inhouse_version'):
-                    release_version('0.1.5', COMMIT)
+                    release_version('0.1.5', COMMIT, 17)
                 self.assertEqual(release_version('0.1.5'), '0.1.5')
 
     def test_numeric_bundle_fields_and_msi_order_ignore_the_commit(self):
         self.assertEqual(macos_version_fields(DISPLAY, 17), dict(
-            CFBundleShortVersionString='0.2.2', CFBundleVersion='17', CFBundleGetInfoString=DISPLAY))
+            CFBundleShortVersionString=IDENTITY['inhouse_version'], CFBundleVersion='17', CFBundleGetInfoString=DISPLAY))
         builds = (17, 18, 65535, 65536, 16777216, 2147483647)
         versions = [tuple(map(int, windows_product_version(build).split('.'))) for build in builds]
         self.assertEqual(versions, sorted(set(versions)))
@@ -118,6 +125,7 @@ class LocalVersions(unittest.TestCase):
                 with patch.object(sys, 'argv', argv), patch.object(module.platform, 'system', return_value='Windows'), \
                         patch.object(module.platform, 'machine', return_value='AMD64'), \
                         patch.object(module, 'local_source_commit', return_value=COMMIT) as resolve, \
+                        patch.object(module.package_notes, 'generate', return_value={'schema':1,'kind':'public' if public else 'inhouse','build':17,'source_commit':None if public else COMMIT,'notes':{'en':'Fixture notes'}}), \
                         patch.object(module, 'source_inventory', return_value=[]), \
                         patch.object(module, 'source_tree_sha256', return_value='a' * 64), \
                         patch.object(module.subprocess, 'check_output', side_effect=['rustc 1.99.0 fixture', 'v24.14.1', '11.11.0']), \
@@ -134,8 +142,11 @@ class LocalVersions(unittest.TestCase):
                         self.assertNotIn('--source-commit', command)
                     else:
                         self.assertEqual(command[command.index('--source-commit') + 1], COMMIT)
+                package_command = run.call_args_list[-1].args[0]
+                embedded = Path(package_command[package_command.index('--update-notes-file') + 1])
+                self.assertEqual(json.loads(embedded.read_text())['notes'], {'en':'Fixture notes'})
                 record = json.loads((Path(temp) / ('a' * 64) / 'windows-x64/build-environment.json').read_text())
-                self.assertEqual(record['version'], IDENTITY['version'] if public else release_version(IDENTITY['version'], COMMIT))
+                self.assertEqual(record['version'], IDENTITY['version'] if public else release_version(IDENTITY['version'], COMMIT, 17))
 
 
 class WindowsResources(unittest.TestCase):

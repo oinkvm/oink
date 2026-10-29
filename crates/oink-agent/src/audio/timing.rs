@@ -6,6 +6,8 @@ type LateEvent = (u64, i64, i64, Option<i64>, Option<i64>);
 #[derive(Default)]
 pub(super) struct ReceiveEvents {
     history: History<ReceiveEvent, 16>,
+    gap_reports: GapReports,
+    gap_count: u64,
     previous: Option<Instant>,
     previous_emit: Option<u64>,
     report_started: Option<Instant>,
@@ -16,6 +18,26 @@ pub(super) struct ReceiveEvents {
     dispatch: Histogram,
     insertion: Histogram,
 }
+// Retain the first incident immediately, then bound expensive context reports.
+#[derive(Default)]
+struct GapReports {
+    last: Option<Instant>,
+    suppressed: u64,
+}
+impl GapReports {
+    fn observe(&mut self, now: Instant) -> Option<u64> {
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(1))
+        {
+            self.suppressed += 1;
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
 impl ReceiveEvents {
     #[allow(clippy::too_many_arguments)]
     pub fn packet(
@@ -70,16 +92,20 @@ impl ReceiveEvents {
             late_us,
             arrival_late_us,
         ));
-        if gap >= Duration::from_millis(20)
+        let exceptional = gap >= Duration::from_millis(20)
             || sender_gap.is_some_and(|gap| gap >= 20_000_000)
             || inserted.saturating_duration_since(arrival) >= Duration::from_millis(20)
-            || late_us.is_some_and(|late| late >= 20_000)
-        {
+            || late_us.is_some_and(|late| late >= 20_000);
+        if exceptional {
+            self.gap_count += 1;
+        }
+        if exceptional && let Some(suppressed) = self.gap_reports.observe(inserted) {
             let context = self.history;
             super::report::submit(move || {
                 tracing::info!(
                     ?peer,
                     sequence,
+                    suppressed,
                     arrival_gap_us = gap.as_micros() as u64,
                     sender_gap_us = sender_gap.map(|ns| ns / 1000),
                     lateness_ms = late_us.map(|us| us as f64 / 1000.0),
@@ -100,6 +126,7 @@ impl ReceiveEvents {
         let lateness = self.late.take();
         let late_unknown = std::mem::take(&mut self.late_unknown);
         let late_count = std::mem::take(&mut self.late_count);
+        let gap_count = std::mem::take(&mut self.gap_count);
         let late_events = (late_count > 0).then_some(std::mem::take(&mut self.late_events));
         let quic_to_dispatch = self.dispatch.take();
         let dispatch_to_insertion = self.insertion.take();
@@ -122,6 +149,7 @@ impl ReceiveEvents {
                 ?lateness,
                 late_unknown,
                 late_count,
+                gap_count,
                 late_context_overwritten = late_count.saturating_sub(64),
                 ?late_events,
                 ?quic_to_dispatch,
@@ -130,5 +158,58 @@ impl ReceiveEvents {
             )
         });
         quic_to_dispatch.buckets.iter().any(|count| *count > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "isolated resource benchmark; run with --ignored --nocapture"]
+    fn resource_gap_report_benchmark() {
+        let origin = Instant::now();
+        let mut reports = GapReports::default();
+        let history = History::<ReceiveEvent, 16> {
+            events: [Some((42, Some(1000), 2000, 3000, Some(4000), true, None, None)); 16],
+            next: 0,
+        };
+        let mut emitted = 0;
+        let started = Instant::now();
+        for packet in 0..100_000 {
+            if reports.observe(origin + Duration::from_millis(packet * 10)).is_some() {
+                std::hint::black_box(format!("{history:?}"));
+                emitted += 1;
+            }
+        }
+        println!(
+            "exceptional_packets=100000 context_reports={emitted} elapsed_us={}",
+            started.elapsed().as_micros()
+        );
+    }
+
+    #[test]
+    fn gap_report_storm_is_bounded_without_losing_incident_counts() {
+        let now = Instant::now();
+        let mut reports = GapReports::default();
+        let mut emitted = 0;
+        let mut accounted = 0;
+        for packet in 0..1000 {
+            if let Some(suppressed) = reports.observe(now + Duration::from_millis(packet * 10)) {
+                emitted += 1;
+                accounted += 1 + suppressed;
+            }
+        }
+        assert_eq!(emitted, 10);
+        assert_eq!(accounted + reports.suppressed, 1000);
+        assert_eq!(reports.observe(now + Duration::from_secs(10)), Some(99));
+    }
+
+    #[test]
+    fn isolated_gap_is_reported_immediately_after_quiet() {
+        let now = Instant::now();
+        let mut reports = GapReports::default();
+        assert_eq!(reports.observe(now), Some(0));
+        assert_eq!(reports.observe(now + Duration::from_secs(5)), Some(0));
     }
 }

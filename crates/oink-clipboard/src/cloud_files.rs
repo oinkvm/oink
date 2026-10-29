@@ -7,12 +7,12 @@ pub(crate) struct Formats {
     pub hdrop: bool,
     pub virtual_files: bool,
 }
-pub(crate) fn formats(platform: ClipPlatform, virtual_source: bool, available: bool) -> Formats {
+pub(crate) fn formats(_platform: ClipPlatform, virtual_source: bool, available: bool) -> Formats {
     Formats {
         hdrop: available,
-        // A missing Cloud Files platform is an explicit capability branch.
-        // Keep virtual files there, including for Windows filesystem sources.
-        virtual_files: !available || platform != ClipPlatform::Windows || virtual_source,
+        // Real paths never gain stream/promise formats. One-shot sources keep
+        // their original stream alongside the received path; both require it.
+        virtual_files: available && virtual_source,
     }
 }
 
@@ -30,7 +30,7 @@ mod tests {
             formats(ClipPlatform::Mac, false, true),
             Formats {
                 hdrop: true,
-                virtual_files: true
+                virtual_files: false
             }
         );
         assert_eq!(
@@ -52,7 +52,7 @@ mod tests {
                 formats(source, false, false),
                 Formats {
                     hdrop: false,
-                    virtual_files: true
+                    virtual_files: false
                 }
             );
         }

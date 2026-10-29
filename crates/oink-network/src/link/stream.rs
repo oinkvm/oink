@@ -170,6 +170,7 @@ impl DatagramSend {
 /// threads inside a snapshot), by exactly one reader thread.
 #[derive(Clone, Debug)]
 pub struct DatagramRecv {
+    pub(super) partition: Option<usize>,
     pub(super) follows: StreamId,
     pub(super) _owner: Arc<DatagramOwner>,
     pub(super) queue: Arc<DatagramQueue>,
@@ -179,17 +180,14 @@ pub struct DatagramRecv {
 impl DatagramRecv {
     /// Includes a reliable writer's pending frame until QUIC accepts it.
     pub fn oldest_pending(&self) -> Option<std::time::Instant> {
-        self.queue.age.oldest()
+        self.queue.oldest()
     }
 
     pub fn follows(&self) -> StreamId {
         self.follows
     }
     pub fn take(&self) -> Result<Option<Vec<u8>>, Closed> {
-        if self.parent.as_ref().is_some_and(|q| q.is_closed()) {
-            return Err(Closed);
-        }
-        self.queue.take()
+        self.take_timed().map(|item| item.map(|(bytes, _)| bytes))
     }
     /// Copy into caller-owned storage without allocating. A short output buffer
     /// drops the datagram and returns TooLarge; a 1100-byte buffer always fits.
@@ -197,19 +195,29 @@ impl DatagramRecv {
         if self.parent.as_ref().is_some_and(|q| q.is_closed()) {
             return Err(DatagramError::Closed);
         }
-        self.queue.take_into(output)
+        self.take_timed_into(output).map(|item| item.map(|(len, _)| len))
     }
     /// Copy into caller storage and retain the network insertion timestamp.
     pub fn take_timed_into(&self, output: &mut [u8]) -> Result<Option<(usize, std::time::Instant)>, DatagramError> {
         if self.parent.as_ref().is_some_and(|q| q.is_closed()) {
             return Err(DatagramError::Closed);
         }
-        self.queue.take_timed_into(output)
+        match self.partition {
+            Some(lane) => self.queue.take_partition(lane, output),
+            None => self.queue.take_timed_into(output),
+        }
     }
     /// Arrival is stamped at queue insertion, not when a restarting device reads it.
     pub fn take_timed(&self) -> Result<Option<(Vec<u8>, std::time::Instant)>, Closed> {
         if self.parent.as_ref().is_some_and(|q| q.is_closed()) {
             return Err(Closed);
+        }
+        if self.partition.is_some() {
+            let mut bytes = [0; oink_protocol::v1::limits::DATAGRAM];
+            return self
+                .take_timed_into(&mut bytes)
+                .map_err(|_| Closed)
+                .map(|item| item.map(|(len, at)| (bytes[..len].to_vec(), at)));
         }
         self.queue.take_scheduled().map(|item| {
             item.map(|item| {
@@ -221,7 +229,10 @@ impl DatagramRecv {
         })
     }
     pub fn dropped(&self) -> u64 {
-        self.queue.dropped.load(std::sync::atomic::Ordering::Acquire)
+        self.partition.map_or_else(
+            || self.queue.dropped.load(Ordering::Acquire),
+            |lane| self.queue.partition_dropped(lane),
+        )
     }
     pub fn set_wake(&self, wake: Wake) {
         self.queue.set_wake(wake)
@@ -248,14 +259,45 @@ pub struct InboundStream {
 impl InboundStream {
     /// Allocate the receive queue(s) on the calling thread and tell the network thread to
     /// start reading. `datagram` is used only when `has_datagram`.
-    pub fn accept(mut self, spec: QueueSpec, datagram: QueueSpec) -> (RecvStream, Option<DatagramRecv>) {
+    pub fn accept(self, spec: QueueSpec, datagram: QueueSpec) -> (RecvStream, Option<DatagramRecv>) {
+        self.accept_inner(spec, datagram, None)
+    }
+    /// Fixed-copy M1 lanes selected by registered message IDs on the network
+    /// producer. No business task or competing audio callback demultiplexes them.
+    pub fn accept_partitioned(
+        self,
+        spec: QueueSpec,
+        datagram: QueueSpec,
+        types: [[u16; 2]; 2],
+    ) -> (RecvStream, Option<[DatagramRecv; 2]>) {
+        let (stream, packets) = self.accept_inner(spec, datagram, Some(types));
+        (
+            stream,
+            packets.map(|first| {
+                let mut second = first.clone();
+                second.partition = Some(1);
+                [first, second]
+            }),
+        )
+    }
+    fn accept_inner(
+        mut self,
+        spec: QueueSpec,
+        datagram: QueueSpec,
+        types: Option<[[u16; 2]; 2]>,
+    ) -> (RecvStream, Option<DatagramRecv>) {
         let id = StreamId {
             link: self.link,
             dir: super::StreamDir::In,
             tag: self.tag,
         };
         let queue = Queue::new(spec);
-        let datagram = self.has_datagram.then(|| DatagramQueue::new(datagram));
+        let datagram = self.has_datagram.then(|| {
+            types.map_or_else(
+                || DatagramQueue::new(datagram),
+                |types| DatagramQueue::new_partitioned(datagram, types),
+            )
+        });
         if let Some(command) = self.command.take() {
             let _ = command.send(super::handle::Command::Accept {
                 id,
@@ -268,6 +310,7 @@ impl InboundStream {
         (
             RecvStream { id, queue },
             datagram.map(|queue| DatagramRecv {
+                partition: types.map(|_| 0),
                 follows: id,
                 _owner: Arc::new(DatagramOwner(queue.clone())),
                 queue,

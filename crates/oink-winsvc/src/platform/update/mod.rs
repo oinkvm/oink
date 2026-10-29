@@ -1,6 +1,8 @@
 //! SYSTEM-owned update service and protected short-lived transaction worker.
 mod cabinet;
+mod local;
 mod msi;
+pub use local::{elevate as elevate_local, inspect as inspect_local, spool as spool_local};
 mod pipe;
 pub(super) mod protected;
 mod service;
@@ -50,6 +52,10 @@ struct HealthProof {
 #[serde(deny_unknown_fields)]
 struct Plan {
     schema: u32,
+    #[serde(default)]
+    local: bool,
+    #[serde(default = "yes")]
+    rollback_package: bool,
     transaction: String,
     candidate: Release,
     previous: Release,
@@ -129,6 +135,10 @@ pub(super) fn input_allowed() -> bool {
             .exists())
     };
     check().unwrap_or(false)
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[cfg(test)]

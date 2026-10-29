@@ -64,6 +64,9 @@ pub struct OrdinaryInput {
     _pending: oink_foundation::pending_age::Pending,
 }
 impl OrdinaryInput {
+    pub(crate) fn queued_at(&self) -> std::time::Instant {
+        self.at
+    }
     pub fn expired(&self) -> bool {
         self.at.elapsed() > std::time::Duration::from_secs(5)
     }
@@ -88,11 +91,17 @@ impl DndCompletion {
         let dropped = self.source_motion.take().map_or(0, |state| {
             state.fetch_and(!SOURCE_ACTIVE, std::sync::atomic::Ordering::AcqRel) & !SOURCE_ACTIVE
         });
+        self.release_input();
+        dropped
+    }
+
+    /// A hosted cancellation has submitted its final UP. The ordinary worker
+    /// still owns native Ended/cleanup, but no longer owns the input fence.
+    pub(crate) fn release_input(&self) {
         self.ready.store(true, std::sync::atomic::Ordering::Release);
         if self.gate.notify() {
             self.thread.unpark();
         }
-        dropped
     }
 }
 impl Drop for DndCompletion {
@@ -530,7 +539,7 @@ impl InjectHandle {
                     &item,
                     sequence,
                     &mut applied,
-                    self.trace.as_deref(),
+                    self.trace.as_ref(),
                     &self.faults,
                 ) {
                     trace_mode_route(&item, sequence, 0, Some(true));
@@ -606,7 +615,7 @@ fn apply_mode(
     item: &InjectItem,
     sequence: u64,
     applied: &mut u64,
-    trace: Option<&crate::diagnostics::input_trace::InputTrace>,
+    trace: Option<&std::sync::Arc<crate::diagnostics::input_trace::InputTrace>>,
     faults: &super::input::faults::NativeFaults,
 ) -> bool {
     if sequence <= *applied {
@@ -623,10 +632,22 @@ fn apply_mode(
     }
     let result = match *item {
         InjectItem::SetMode(mode) => native.set_mode(mode),
-        InjectItem::RestoreLocal { at } => native.restore_local(at),
+        InjectItem::RestoreLocal { at } => {
+            let trace = trace.cloned();
+            native.restore_local_with_completion(
+                at,
+                Box::new(move |success| {
+                    if let Some(trace) = trace {
+                        trace.mode(Some(CaptureMode::Local), Some(at), sequence, false, Some(success));
+                    }
+                }),
+            )
+        }
         _ => unreachable!("only capture modes carry a sequence"),
     };
-    if let Some(trace) = trace {
+    if (restore.is_none() || result.is_err())
+        && let Some(trace) = trace
+    {
         trace.mode(mode, restore, sequence, false, Some(result.is_ok()));
     }
     // A mode queued after intentional capture withdrawal needs no native work.
@@ -1041,7 +1062,7 @@ pub(crate) fn start_with_trace(
                             &item,
                             queued.mode_sequence,
                             &mut applied,
-                            input_trace.as_deref(),
+                            input_trace.as_ref(),
                             &native_faults,
                         );
                         if !success {
@@ -1092,6 +1113,13 @@ pub(crate) fn start_with_trace(
                     }
                     InjectItem::Dnd { command, main } => {
                         cursor.clear();
+                        if matches!(&command, oink_routing::DndCmd::Begin { .. }) {
+                            tracing::debug!(
+                                dnd_phase = 31_u64,
+                                elapsed_us = waited.as_micros() as u64,
+                                "drag injection queue wait finished"
+                            );
+                        }
                         if let (Some(stamp), Some(p)) = (queued.report, crate::telemetry::producer().as_ref()) {
                             p.interval(stamp, oink_telemetry::Metric::DragQueueWait, started);
                         }

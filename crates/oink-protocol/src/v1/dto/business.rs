@@ -93,6 +93,7 @@ hot_map!(InputKey, no_validation, {
     100 => origin: Option<Boot> = optional;
     101 => forwarded_hops: u8 = 0;
     102 => capture_time_us: Option<u32> = optional;
+    103 => application_route: Option<ApplicationKeyRoute> = optional;
 });
 
 hot_map!(InputButton, no_validation, {
@@ -120,6 +121,8 @@ hot_map!(InputHeldSync, no_validation, {
     100 => origin: Option<Boot> = optional;
     101 => forwarded_hops: u8 = 0;
     102 => capture_time_us: Option<u32> = optional;
+    103 => application_route: Option<ApplicationKeyRoute> = optional;
+    104 => application_keys: Option<List<ApplicationHeldKey,256>> = optional;
 });
 
 hot_map!(InputKeyRepeat, no_validation, {
@@ -128,6 +131,7 @@ hot_map!(InputKeyRepeat, no_validation, {
     100 => origin: Option<Boot> = optional;
     101 => forwarded_hops: u8 = 0;
     102 => capture_time_us: Option<u32> = optional;
+    103 => application_route: Option<ApplicationKeyRoute> = optional;
 });
 
 hot_map!(InputGesture, no_validation, {
@@ -186,7 +190,6 @@ wire_map!(ClipboardOffer, validate_clipboard_offer, {
     2 => source_change_count: u64 = required;
     3 => clock: u64 = required;
     4 => sensitivity: Sensitivity = required;
-    5 => content_digest: Digest = required;
     6 => inventory: Inventory = required;
     7 => time_ms: u64 = required;
 });
@@ -221,7 +224,6 @@ wire_map!(ContentRepresentationEnd, no_validation, {
     1 => offer: OfferId = required;
     2 => representation: u32 = required;
     3 => size: u64 = required;
-    4 => hash: Digest = required;
 });
 
 wire_map!(ContentRepresentationFailed, no_validation, {
@@ -269,7 +271,6 @@ wire_map!(ContentReadFile, no_validation, {
     2 => node: u64 = required;
     3 => version: u64 = required;
     4 => offset: u64 = required;
-    5 => check: Option<Digest> = optional;
     6 => demand: Demand = required;
 });
 
@@ -278,7 +279,6 @@ wire_map!(ContentFileBlock, no_validation, {
     2 => node: u64 = required;
     3 => version: u64 = required;
     4 => offset: u64 = required;
-    5 => hash: Digest = required;
     6 => bytes: Bytes<1048576> = required;
 });
 
@@ -370,6 +370,17 @@ wire_map!(DndPreviewRequest, no_validation, {
     3 => key: DragKey = required;
     4 => metadata_revision: u64 = required;
     5 => preview_revision: u64 = required;
+});
+
+// Reliable source intent complements M1: a lost wake packet cannot leave an
+// exit believing the previous burst is asleep forever. Identity is the admitted
+// per-kind stream, never the link alone; owners ignore retired generations.
+open_enum!(AudioMediaKind { Speaker=0, Microphone=1 });
+wire_map!(AudioMediaState, no_validation, {
+    1 => kind: AudioMediaKind = required;
+    2 => stream_id: u64 = required;
+    3 => burst: u64 = required;
+    4 => sleeping: bool = required;
 });
 
 wire_map!(AudioState, validate_audio_state, {
@@ -554,7 +565,6 @@ wire_map!(DiagnosticsSegmentEnd, no_validation, {
     2 => segment_id: u64 = required;
     3 => compressed_length: u32 = required;
     4 => raw_length: u32 = required;
-    5 => digest: Digest = required;
 });
 
 wire_map!(DiagnosticsEnd, no_validation, {
@@ -810,7 +820,7 @@ wire_map!(ScreenRect,no_validation,{1=>device:DeviceId=required;2=>display:Text<
 wire_map!(ScreenRef,no_validation,{1=>device:DeviceId=required;2=>display:Text<512>=required;});
 open_enum!(SourceKind { Mouse=0,Touchpad=1,Keyboard=2,Indeterminate=3 });
 open_enum!(GameMode { Auto=0,On=1,Off=2 });
-open_enum!(ScrollAmount { Reference=0,Lines=1 });
+open_enum!(ScrollAmount { Reference=0,Lines=1,Pixels=2 });
 open_enum!(ScrollPhase { None=0,Began=1,Changed=2,Ended=3,Cancelled=4,MomentumBegan=5,Momentum=6,MomentumEnded=7 });
 open_enum!(VolumeKey { Up=0,Down=1,Mute=2 });
 open_enum!(ContactPhase { Begin=0,Move=1,End=2,Cancel=3 });
@@ -830,7 +840,7 @@ fn validate_input_capability(raw: &RawMap) -> Result<()> {
     }
     Ok(())
 }
-fn validate_packet(raw: &RawMap) -> Result<()> {
+pub(super) fn validate_packet(raw: &RawMap) -> Result<()> {
     if RawValue::Map(raw.clone()).encoded_len()? + 10 > crate::v1::limits::DATAGRAM {
         return Err(ErrorCode::LimitExceeded.into());
     }
@@ -888,3 +898,43 @@ wire_map!(ContentFileVersion, no_validation, {
     1 => offer: OfferId = required;
     2 => entry: FileNode = required;
 });
+
+// Optional focus request, interpreted only by the current holder at this epoch.
+wire_map!(ControlMovePointer, no_validation, {
+    1 => epoch: u64 = required;
+    2 => target: DeviceId = required;
+});
+// Retained group register value (kind 0x1301); unknown to baseline peers.
+wire_map!(PointerShortcutSlots, no_validation, {
+    1 => entries: List<PointerShortcutSlot,16> = required;
+});
+wire_map!(PointerShortcutSlot, no_validation, {
+    1 => device: DeviceId = required;
+    2 => membership_epoch: u64 = required;
+    3 => slot: Option<u8> = optional;
+});
+
+// Optional physical-source hold state; never changes the device lock preference.
+wire_map!(ControlLockEscape, no_validation, {1 => held: bool = required;});
+
+// Device-owned entry policy, independent of the current focus epoch.
+wire_map!(ControlEntryProtection, no_validation, {
+    1 => locked: bool = required;
+    2 => game: bool = required;
+    3 => passive_displays: List<Text<512>,64> = required;
+});
+
+wire_map!(ControlPowerState, validate_power_state, {
+    1 => available: bool = required;
+    2 => display: bool = required;
+    3 => system: bool = required;
+    4 => activity: bool = required;
+});
+fn validate_power_state(raw: &RawMap) -> Result<()> {
+    if !required::<bool>(raw, 1)?
+        && (required::<bool>(raw, 2)? || required::<bool>(raw, 3)? || required::<bool>(raw, 4)?)
+    {
+        return Err(ErrorCode::UnsupportedValue.into());
+    }
+    Ok(())
+}

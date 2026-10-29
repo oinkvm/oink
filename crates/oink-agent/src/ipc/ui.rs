@@ -7,6 +7,7 @@ const FILE: &str = "ui-ipc.json";
 #[derive(Debug)]
 pub struct UiControl {
     task: tokio::task::JoinHandle<()>,
+    publication: publication::Publication,
     file: PathBuf,
 }
 
@@ -35,7 +36,9 @@ impl UiControl {
             token: secret.iter().map(|byte| format!("{byte:02x}")).collect(),
         };
         let file = data_dir.join(FILE);
-        write_private(&file, &serde_json::to_string(&endpoint)?)?;
+        let publish_path = file.clone();
+        let document = serde_json::to_string(&endpoint)?;
+        let publication = publication::Publication::start(move || write_private(&publish_path, &document))?;
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let (reader, mut writer) = stream.into_split();
@@ -64,7 +67,11 @@ impl UiControl {
                 }
             }
         });
-        Ok(Self { task, file })
+        Ok(Self {
+            task,
+            publication,
+            file,
+        })
     }
 
     /// Show the existing UI after the caller grants foreground permission.
@@ -129,6 +136,7 @@ impl UiControl {
 impl Drop for UiControl {
     fn drop(&mut self) {
         self.task.abort();
+        self.publication.stop();
         let _ = std::fs::remove_file(&self.file);
     }
 }

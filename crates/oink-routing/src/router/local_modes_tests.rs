@@ -730,7 +730,7 @@ fn disable_release_pause_clears_both_sources_and_resume_keeps_them_enabled() {
     r.set_fully_paused(true);
     assert!(!r.keyboard_disabled(), "pause clears the saved guard");
     assert!(!r.mouse_disabled(), "pause clears mouse disable");
-    assert_eq!(r.config().settings.keyboard_mode, InputMode::Local);
+    assert_eq!(r.config().settings.keyboard_mode, InputMode::Shared);
     assert_eq!(
         event(&mut r, InputEvent::Key { code: A, pressed: true }),
         Disposition::Pass
@@ -893,4 +893,40 @@ fn disabling_mouse_preserves_local_cursor_visibility_while_focus_is_remote() {
             .count(),
         1
     );
+}
+
+#[test]
+fn keyboard_and_mouse_disabled_modes_enable_to_shared_without_restoring_local() {
+    let mut r = router(false);
+    modes(&mut r, InputMode::Local, InputMode::Local);
+    modes(&mut r, InputMode::Disabled, InputMode::Disabled);
+    assert!(r.keyboard_disabled());
+    assert!(r.mouse_disabled());
+    assert_eq!(
+        event(&mut r, InputEvent::Key { code: A, pressed: true }),
+        Disposition::Swallow
+    );
+    r.release_input_disables();
+    assert_eq!(r.config().settings.keyboard_mode, InputMode::Shared);
+    assert_eq!(r.config().settings.mouse_mode, InputMode::Shared);
+    assert!(!r.keyboard_disabled());
+    assert!(!r.mouse_disabled());
+    // Held tails remain suppressed until lifted; a fresh physical press works.
+    event(
+        &mut r,
+        InputEvent::Key {
+            code: A,
+            pressed: false,
+        },
+    );
+    assert_eq!(
+        event(&mut r, InputEvent::Key { code: A, pressed: true }),
+        Disposition::Pass
+    );
+    modes(&mut r, InputMode::Disabled, InputMode::Disabled);
+    modes(&mut r, InputMode::Local, InputMode::Local);
+    assert!(!r.keyboard_disabled());
+    assert!(!r.mouse_disabled());
+    assert!(r.keyboard_local());
+    assert!(r.mouse_local());
 }

@@ -1,4 +1,5 @@
 use super::*;
+pub(in crate::content) mod batch;
 use crate::model::{ContentSize, INVENTORY_BYTES, MAX_DISCOVERED_NODES, NodeKind};
 use std::{
     collections::HashMap,
@@ -24,6 +25,7 @@ struct State {
     limit: usize,
     bytes: usize,
     retention: Option<super::super::transfer::FileRetention>,
+    batch: batch::Batch,
 }
 struct Node {
     entry: FileNode,
@@ -37,19 +39,21 @@ struct Node {
 pub(crate) struct Reference {
     path: PathBuf,
     offered: Fingerprint,
-    _source: crate::cache::SourceLease,
+    followed: Vec<batch::Followed>,
+    _source: Mutex<Option<crate::cache::SourceLease>>,
 }
 enum Location {
     Owned(Arc<Reference>),
     Offered(std::sync::Weak<Reference>),
 }
 impl Location {
-    fn new(path: PathBuf, offered: Fingerprint) -> Self {
+    fn new(path: PathBuf, offered: Fingerprint, followed: Vec<batch::Followed>) -> Self {
         let source = crate::cache::SourceLease::new(path.clone());
         Self::Owned(Arc::new(Reference {
             path,
             offered,
-            _source: source,
+            followed,
+            _source: Mutex::new(Some(source)),
         }))
     }
     fn get(&self) -> io::Result<Arc<Reference>> {
@@ -68,13 +72,14 @@ struct View {
     fingerprint: Fingerprint,
     entries: Vec<FileNode>,
 }
-#[derive(Clone, PartialEq, Eq)]
-struct Fingerprint {
-    identity: [u64; 2],
-    size: u64,
-    modified: SystemTime,
-    created: Option<SystemTime>,
-    directory: bool,
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(in crate::content) struct Fingerprint {
+    pub(in crate::content) identity: [u64; 2],
+    pub(in crate::content) size: u64,
+    pub(in crate::content) modified: SystemTime,
+    pub(in crate::content) created: Option<SystemTime>,
+    pub(in crate::content) directory: bool,
+    pub(in crate::content) exec_bits: Option<u16>,
 }
 impl Fingerprint {
     fn new(metadata: &Metadata, identity: [u64; 2]) -> io::Result<Self> {
@@ -84,13 +89,30 @@ impl Fingerprint {
             modified: metadata.modified()?,
             created: metadata.created().ok(),
             directory: metadata.is_dir(),
+            exec_bits: {
+                #[cfg(target_os = "macos")]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    metadata
+                        .is_file()
+                        .then(|| (metadata.permissions().mode() & 0o111) as u16)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    None
+                }
+            },
         })
     }
-    fn version(&self) -> u64 {
+    pub(in crate::content) fn version(&self) -> u64 {
         let mut hash = blake3::Hasher::new();
         for number in self.identity.into_iter().chain([self.size]) {
             hash.update(&number.to_le_bytes());
         }
+        // ctime/ChangeTime also change for access grants, xattrs, rw permissions and
+        // renames. They are not content versions: an unchanged drag source must
+        // remain readable through those metadata-only events. Same-size rewrites
+        // with restored mtime are outside this metadata fingerprint's precision.
         for time in [Some(self.modified), self.created].into_iter().flatten() {
             match time.duration_since(UNIX_EPOCH) {
                 Ok(value) => {
@@ -102,6 +124,12 @@ impl Fingerprint {
                     hash.update(&value.duration().as_nanos().to_le_bytes());
                 }
             }
+        }
+        // Executability is transfer metadata, so a chmod changing x bits must
+        // supersede a selected version even with identical bytes and mtime.
+        if let Some(bits) = self.exec_bits.filter(|bits| *bits != 0) {
+            hash.update(b"exec");
+            hash.update(&bits.to_le_bytes());
         }
         u64::from_le_bytes(hash.finalize().as_bytes()[..8].try_into().unwrap()).max(1)
     }
@@ -126,29 +154,64 @@ impl Local {
         if roots.len() > limit {
             return Err(unavailable(Unavailable::LimitExceeded));
         }
+        let had_roots = !roots.is_empty();
         let mut nodes = HashMap::new();
         let mut entries = Vec::new();
+        let mut batch = batch::Batch::default();
+        let mut prepared = Vec::new();
+        let mut used = std::collections::HashSet::new();
+        let mut ids = std::collections::HashSet::new();
         for (id, path) in roots {
-            let name = path
-                .file_name()
-                .and_then(|v| v.to_str())
-                .ok_or_else(|| unavailable(Unavailable::InvalidData))?
-                .to_owned();
-            if nodes.contains_key(&id) {
+            if !ids.insert(id) {
                 return Err(unavailable(Unavailable::InvalidData));
             }
-            let fingerprint = inspect(&path)?;
-            let entry = entry(id, None, name, &fingerprint)?;
+            let result: io::Result<_> = (|| {
+                let raw = path
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .ok_or_else(|| unavailable(Unavailable::InvalidData))?;
+                let name = batch::component(raw, &mut used);
+                let metadata = fs::symlink_metadata(&path)?;
+                // Register ALL ordinary selected roots before classifying a link,
+                // including a link selected before its target in native order.
+                if !crate::cache::is_link(&metadata) {
+                    let fingerprint = inspect(&path)?;
+                    batch.include(&path.canonicalize()?, vec![name.clone()], &fingerprint);
+                }
+                Ok((id, path, name))
+            })();
+            match result {
+                Ok(root) => prepared.push(root),
+                Err(error) => tracing::warn!(reason=?error.kind(), "skipping unavailable selected root"),
+            }
+        }
+        // Followed top-level directories also become members of this batch.
+        for (id, path, name) in prepared {
+            let captured = match batch.capture(&path, vec![name.clone()], &[]) {
+                Ok(Some(captured)) => captured,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(reason=?error.kind(), "skipping unavailable selected link");
+                    continue;
+                }
+            };
+            let mut entry = entry(id, None, name, &captured.fingerprint)?;
+            if let Some(target) = captured.link {
+                set_link(&mut entry, target);
+            }
             nodes.insert(
                 id,
                 Node {
                     entry: entry.clone(),
-                    location: Location::new(path, fingerprint),
+                    location: Location::new(captured.path, captured.fingerprint, captured.followed),
                     selected: None,
                     view: None,
                 },
             );
             entries.push(entry);
+        }
+        if had_roots && entries.is_empty() {
+            return Err(unavailable(Unavailable::NoSuchItem));
         }
         if crate::wire::nodes_size(&entries).map_err(|_| unavailable(Unavailable::InvalidData))? > INVENTORY_BYTES {
             return Err(unavailable(Unavailable::LimitExceeded));
@@ -168,6 +231,7 @@ impl Local {
                 limit,
                 bytes: INVENTORY_BYTES,
                 retention: None,
+                batch,
             })),
             cancelled: Arc::new(AtomicBool::new(false)),
             clipboard: false,
@@ -182,6 +246,49 @@ impl Local {
     }
 }
 impl Namespace for Local {
+    fn release_fulfilled(&self, roots: &[NodeId]) {
+        let state = self.state.lock().unwrap();
+        for node in state.nodes.values() {
+            let mut ancestor = &node.entry;
+            for _ in 0..256 {
+                if roots.contains(&ancestor.id) {
+                    if let Ok(reference) = node.location.get() {
+                        // Existing readers have independent path leases and
+                        // keep validating this unchanged identity record.
+                        reference._source.lock().unwrap().take();
+                    }
+                    break;
+                }
+                let Some(parent) = ancestor.parent.and_then(|id| state.nodes.get(&id)) else {
+                    break;
+                };
+                ancestor = &parent.entry;
+            }
+        }
+    }
+    fn source_roots(&self) -> io::Result<Vec<super::super::grants::SourceRoot>> {
+        self.valid()?;
+        let state = self.state.lock().unwrap();
+        let mut captured = Vec::new();
+        for entry in &self.roots {
+            let result = (|| {
+                verify_chain(&state, entry.id, self.clipboard)?;
+                let reference = state.nodes[&entry.id].location.get()?;
+                super::super::grants::SourceRoot::capture_followed(
+                    state.nodes[&entry.id].entry.clone(),
+                    &reference.path,
+                    &reference.offered,
+                    reference.followed.clone(),
+                )
+            })();
+            match result {
+                Ok(root) => captured.push(root),
+                Err(error) => tracing::warn!(reason=?error.kind(), "skipping unavailable source root"),
+            }
+        }
+        Ok(captured)
+    }
+
     fn real_clipboard_files(&self) -> bool {
         self.clipboard
     }
@@ -201,7 +308,14 @@ impl Namespace for Local {
         state.retention = Some(retention);
     }
     fn roots(&self) -> Vec<FileNode> {
-        self.roots.clone()
+        self.roots
+            .iter()
+            .cloned()
+            .map(|mut node| {
+                node.exec_bits = None;
+                node
+            })
+            .collect()
     }
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
@@ -237,26 +351,32 @@ impl Namespace for Local {
                 ancestor = state.nodes[&id].entry.parent;
             }
             let parent_path = reference.path.clone();
+            let mut logical = Vec::new();
+            let mut ancestor = Some(id);
+            while let Some(current) = ancestor {
+                logical.push(state.nodes[&current].entry.name.clone());
+                ancestor = state.nodes[&current].entry.parent;
+            }
+            logical.reverse();
             let available = state.limit.saturating_sub(state.nodes.len());
             let mut children = Vec::new();
-            // No recursive walk here. Directory mutation before/after enumeration
-            // invalidates the entire view; read_dir failure is never empty success.
-            for child in fs::read_dir(&parent_path)? {
+            let mut batch = state.batch.clone();
+            for (name, path) in batch::children(&parent_path)? {
                 self.valid()?;
-                let child = child?;
-                let metadata = fs::symlink_metadata(child.path())?;
-                if crate::cache::is_link(&metadata) || !(metadata.is_file() || metadata.is_dir()) {
-                    continue;
-                }
+                let mut child_path = logical.clone();
+                child_path.push(name.clone());
+                let captured = match batch.capture(&path, child_path, &reference.followed) {
+                    Ok(Some(captured)) => captured,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(reason=?error.kind(), "skipping unavailable linked item");
+                        continue;
+                    }
+                };
                 if children.len() >= available {
                     return Err(unavailable(Unavailable::LimitExceeded));
                 }
-                let name = child
-                    .file_name()
-                    .into_string()
-                    .map_err(|_| unavailable(Unavailable::InvalidData))?;
-                let fingerprint = inspect(&child.path())?;
-                children.push((name, child.path(), fingerprint));
+                children.push((name, captured));
             }
             if inspect(&parent_path)? != fingerprint {
                 return Err(unavailable(Unavailable::Superseded));
@@ -266,12 +386,21 @@ impl Namespace for Local {
             let mut staged = Vec::with_capacity(children.len());
             let mut next = state.next;
             let mut metadata_bytes = state.bytes;
-            for (name, path, fingerprint) in children {
+            for (name, captured) in children {
+                let batch::Captured {
+                    path,
+                    fingerprint,
+                    link,
+                    followed,
+                } = captured;
                 let child = NodeId(next);
                 next = next
                     .checked_add(1)
                     .ok_or_else(|| unavailable(Unavailable::LimitExceeded))?;
-                let entry = entry(child, Some(id), name, &fingerprint)?;
+                let mut entry = entry(child, Some(id), name, &fingerprint)?;
+                if let Some(target) = link {
+                    set_link(&mut entry, target);
+                }
                 metadata_bytes = metadata_bytes.saturating_add(
                     crate::wire::node(&entry)
                         .and_then(|value| oink_protocol::v1::schema::WireDto::encode(&value, INVENTORY_BYTES))
@@ -285,7 +414,7 @@ impl Namespace for Local {
                     child,
                     Node {
                         entry: entry.clone(),
-                        location: Location::new(path, fingerprint),
+                        location: Location::new(path, fingerprint, followed),
                         selected: None,
                         view: None,
                     },
@@ -297,6 +426,7 @@ impl Namespace for Local {
                     node.location.retain(retention);
                 }
             }
+            state.batch = batch;
             state.nodes.extend(staged);
             state.next = next;
             state.bytes = metadata_bytes;
@@ -330,6 +460,7 @@ impl Namespace for Local {
         node.entry.size = ContentSize::Known(current.size);
         node.entry.version = current.version();
         node.entry.modified_ms = modified_ms(current.modified);
+        node.entry.exec_bits = current.exec_bits;
         Ok(node.entry.clone())
     }
     fn open(&self, id: NodeId, version: u64, offset: u64) -> io::Result<FileReader> {
@@ -398,7 +529,15 @@ fn verify_chain(state: &State, mut id: NodeId, clipboard: bool) -> io::Result<()
             .get(&id)
             .ok_or_else(|| unavailable(Unavailable::NoSuchItem))?;
         let reference = node.location.get()?;
-        let current = inspect(&reference.path).map_err(|error| {
+        for guard in &reference.followed {
+            guard.verify()?;
+        }
+        let current = (if node.entry.kind.symlink_target().is_some() {
+            inspect_leaf(&reference.path)
+        } else {
+            inspect(&reference.path)
+        })
+        .map_err(|error| {
             if clipboard
                 && matches!(
                     super::super::reason(&error),
@@ -411,7 +550,7 @@ fn verify_chain(state: &State, mut id: NodeId, clipboard: bool) -> io::Result<()
             }
         })?;
         if current.identity != reference.offered.identity {
-            return Err(unavailable(if clipboard {
+            return Err(unavailable(if clipboard && reference.followed.is_empty() {
                 Unavailable::NoSuchItem
             } else {
                 Unavailable::Superseded
@@ -429,8 +568,14 @@ fn verify_chain(state: &State, mut id: NodeId, clipboard: bool) -> io::Result<()
         }
     }
 }
-fn entry(id: NodeId, parent: Option<NodeId>, name: String, fingerprint: &Fingerprint) -> io::Result<FileNode> {
+pub(in crate::content) fn entry(
+    id: NodeId,
+    parent: Option<NodeId>,
+    name: String,
+    fingerprint: &Fingerprint,
+) -> io::Result<FileNode> {
     let entry = FileNode {
+        exec_bits: fingerprint.exec_bits,
         id,
         parent,
         name,
@@ -464,7 +609,7 @@ fn modified_ms(time: SystemTime) -> Option<i64> {
         Err(e) => i64::try_from(e.duration().as_millis()).ok().map(|n| -n),
     }
 }
-fn inspect(path: &Path) -> io::Result<Fingerprint> {
+pub(in crate::content) fn inspect(path: &Path) -> io::Result<Fingerprint> {
     let metadata = fs::symlink_metadata(path)?;
     if crate::cache::is_link(&metadata) || !(metadata.is_file() || metadata.is_dir()) {
         return Err(unavailable(Unavailable::Unsupported));
@@ -481,7 +626,7 @@ fn inspect(path: &Path) -> io::Result<Fingerprint> {
         file_fingerprint(&file)
     }
 }
-fn file_fingerprint(file: &File) -> io::Result<Fingerprint> {
+pub(in crate::content) fn file_fingerprint(file: &File) -> io::Result<Fingerprint> {
     let metadata = file.metadata()?;
     #[cfg(unix)]
     let identity = {
@@ -508,3 +653,26 @@ fn file_fingerprint(file: &File) -> io::Result<Fingerprint> {
 
 #[cfg(all(test, debug_assertions))]
 mod tests;
+
+/// Only the link itself is inspected; no canonicalize/stat/open of its target.
+/// Windows does not publish reparse leaves; batch capture binds followed targets.
+pub(in crate::content) fn inspect_leaf(path: &Path) -> io::Result<Fingerprint> {
+    #[cfg(target_os = "macos")]
+    {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            use std::os::unix::fs::MetadataExt;
+            return Fingerprint::new(&metadata, [metadata.dev(), metadata.ino()]);
+        }
+    }
+    inspect(path)
+}
+pub(in crate::content) fn set_link(entry: &mut FileNode, target: String) {
+    let mut hash = blake3::Hasher::new();
+    hash.update(&entry.version.to_le_bytes());
+    hash.update(target.as_bytes());
+    entry.version = u64::from_le_bytes(hash.finalize().as_bytes()[..8].try_into().unwrap()).max(1);
+    entry.size = ContentSize::Known(target.len() as u64);
+    entry.kind = NodeKind::Symlink(target);
+    entry.exec_bits = None;
+}

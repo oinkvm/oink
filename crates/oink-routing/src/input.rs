@@ -33,6 +33,25 @@ pub struct VolumeKeyOrigin {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputMsg {
+    /// Terminal application delivery, carried by the existing key wire record.
+    /// Always inside Forwarded so physical source Boot and business hops survive.
+    ApplicationKey {
+        route: crate::application_focus::keys::KeyRoute,
+        code: KeyCode,
+        physical_code: Option<KeyCode>,
+        pressed: bool,
+    },
+    ApplicationRepeat {
+        route: crate::application_focus::keys::KeyRoute,
+        code: KeyCode,
+        n: u32,
+    },
+    /// Release-only repair for the additional application ledger. The route's
+    /// press ID is the snapshot watermark; each entry retains its press identity.
+    ApplicationHeldSync {
+        route: crate::application_focus::keys::KeyRoute,
+        keys: Vec<(KeyCode, u64)>,
+    },
     /// 指针位移，reference-plane distance（源机已加速的位移 × 参考屏 reference_per_native_unit）。
     /// Ordered；源端默认 125 Hz 额度补充（可选 Unlimited），增量合并；突发及保序刷新可超出此频率。
     /// `seq` 保留最新采样号，仅用于诊断。
@@ -123,7 +142,10 @@ pub enum InputMsg {
 /// 线上滚动量的单位。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScrollAmount {
-    /// reference-plane distance：源机的像素滚动 × 参考屏 reference_per_native_unit。
+    /// Source scroll pixels, without display-size or pointer-gain conversion.
+    Pixels,
+    /// Legacy reference-plane distance; encode/decode at the fixed canonical
+    /// .25/686 per pixel, never a physical display calibration.
     Reference,
     /// 行：源机的行滚动 × 源机每格行数（macOS 源为 1）。
     Lines,

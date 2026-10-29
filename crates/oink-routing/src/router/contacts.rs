@@ -45,6 +45,24 @@ impl Router {
             p.touchpad_contacts = capacity.filter(|n| (2..=5).contains(n));
         }
     }
+    /// Negotiated independently so older peers retain their reference-unit wire contract.
+    pub fn set_peer_scroll_pixels(&mut self, peer: DeviceId, supported: bool) {
+        if let Some(p) = self.peers.get_mut(&peer) {
+            p.scroll_pixels = supported;
+        }
+    }
+    pub fn set_peer_touchpad_options(&mut self, peer: DeviceId, supported: bool) {
+        if let Some(p) = self.peers.get_mut(&peer) {
+            p.touchpad_options = supported;
+        }
+    }
+    pub(super) fn touchpad_options_enabled(&self, origin: DeviceId) -> bool {
+        self.cfg.os == Os::Windows
+            && self
+                .peers
+                .get(&origin)
+                .is_some_and(|p| p.os == Os::MacOS && p.touchpad_options)
+    }
     fn contacts_destination(&self) -> Option<DeviceId> {
         if self.cfg.settings.forward_gestures && !self.paused && self.capture_available {
             match self.mouse_target() {
@@ -173,10 +191,36 @@ impl Router {
             }
             return;
         }
+        if frame.phase == Phase::Begin {
+            self.stop_synthetic_tail_on_touch(origin);
+        }
         if frame.phase == Phase::Begin && self.pending_contacts.origin == Some(origin) {
             self.pending_contacts.clear();
         }
         let allow = self.filter_multifinger(origin, MultiEvent::Contacts(frame.phase));
+        let scroll_only = self.touchpad_options_enabled(origin) && !self.cfg.settings.native_multifinger;
+        let mut cancel = false;
+        if let Some(state) = self.multifinger.get_mut(&origin) {
+            if frame.phase == Phase::Begin {
+                state.active_contacts = 0;
+            }
+            for change in frame.changes() {
+                match change.phase {
+                    Phase::Begin => state.active_contacts += 1,
+                    Phase::End | Phase::Cancel => state.active_contacts = state.active_contacts.saturating_sub(1),
+                    Phase::Move => {}
+                }
+            }
+            // Never submit a third finger to Windows in scroll-only mode. A
+            // lift back to two cannot resume a partially injected touch.
+            if scroll_only && state.active_contacts >= 3 && state.path == MultiPath::NativeScroll {
+                state.path = MultiPath::MappedGestures;
+                cancel = true;
+            }
+        }
+        if cancel && self.contacts_received.is_some_and(|(owner, _)| owner == origin) {
+            self.cancel_received_contacts();
+        }
         if self
             .multifinger
             .get(&origin)
@@ -205,12 +249,17 @@ impl Router {
             pending.frames[pending.len] = frame;
             pending.len += 1;
             if pending.active >= 3 {
-                self.multifinger.get_mut(&origin).expect("pending sequence").path = MultiPath::Native;
-                self.resolve_pending_contacts(origin, MultiPath::Native);
+                let path = if scroll_only {
+                    MultiPath::MappedGestures
+                } else {
+                    MultiPath::Native
+                };
+                self.multifinger.get_mut(&origin).expect("pending sequence").path = path;
+                self.resolve_pending_contacts(origin, path);
             }
             return;
         }
-        if !allow {
+        if !allow || cancel {
             return;
         }
         self.inject_received_contact(origin, frame);
@@ -244,6 +293,7 @@ pub(super) struct MultiFinger {
     path: MultiPath,
     pub(super) retired: bool,
     contacts: bool,
+    active_contacts: usize,
     gesture: bool,
     prelude: bool,
     scroll: Option<ScrollPaths>,
@@ -253,6 +303,10 @@ pub(super) struct MultiFinger {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MultiPath {
     Native,
+    /// Physical contacts admitted only after system two-finger scroll evidence.
+    NativeScroll,
+    /// Non-scroll semantic mapping after a scroll-only touch is classified.
+    MappedGestures,
     Gestures,
     Pending,
     Scroll,
@@ -261,6 +315,7 @@ enum MultiPath {
 #[derive(Clone, Copy, Debug)]
 struct Selection {
     path: MultiPath,
+    synthetic_scroll: bool,
     retired: bool,
 }
 impl Selection {
@@ -309,6 +364,28 @@ impl ScrollPaths {
             ScrollPhase::None => Some(current),
         }
     }
+    fn stop_synthetic_tail(&mut self, prelude: bool) -> bool {
+        // A new scroll can precede its raw Begin. Its Began already stopped the
+        // old pan; this late contact frame must not cancel the new finger scroll.
+        // Without that prelude, fingers can still name the OLD scroll whose
+        // Ended trails the physical lift/new Begin in the ordered source stream.
+        if prelude && self.fingers.is_some() {
+            return false;
+        }
+        let mut cancel = false;
+        for owner in self
+            .fingers
+            .iter_mut()
+            .chain(&mut self.pending)
+            .chain(&mut self.momentum)
+        {
+            if owner.scroll() && owner.synthetic_scroll {
+                owner.retired = true;
+                cancel = true;
+            }
+        }
+        cancel
+    }
     fn empty(&self) -> bool {
         self.fingers.is_none() && self.pending.is_none() && self.momentum.is_none()
     }
@@ -316,7 +393,7 @@ impl ScrollPaths {
         self.pending = None;
         let mut cancel = false;
         for owner in self.fingers.iter_mut().chain(&mut self.momentum) {
-            cancel |= owner.scroll();
+            cancel |= owner.scroll() && owner.synthetic_scroll;
             owner.retired = true;
         }
         cancel
@@ -359,7 +436,7 @@ impl Router {
         }
         let len = self.pending_contacts.len;
         self.pending_contacts.clear();
-        if path == MultiPath::Native {
+        if matches!(path, MultiPath::Native | MultiPath::NativeScroll) {
             for i in 0..len {
                 self.inject_received_contact(origin, self.pending_contacts.frames[i]);
             }
@@ -371,18 +448,53 @@ impl Router {
             MultiEvent::Gesture(g) => g.starts(),
             MultiEvent::Scroll(p) => matches!(p, ScrollPhase::Began | ScrollPhase::None),
         };
+        let options = self.touchpad_options_enabled(origin);
+        let scroll_only = options && !self.cfg.settings.native_multifinger;
+        let native_scroll_only = scroll_only && !self.cfg.settings.mac_scroll_feel;
+        // Pinch/rotation may follow scrolling in the same physical touch. End
+        // the native pan before the semantic mapper runs; do not replay contacts.
+        if native_scroll_only
+            && matches!(event, MultiEvent::Gesture(g) if g.starts())
+            && self
+                .multifinger
+                .get(&origin)
+                .is_some_and(|s| s.path == MultiPath::NativeScroll && !s.retired)
+        {
+            self.multifinger.get_mut(&origin).expect("native scroll").path = MultiPath::MappedGestures;
+            if self.contacts_received.is_some_and(|(owner, _)| owner == origin) {
+                self.cancel_received_contacts();
+            }
+        }
         if starts {
-            let native = self.cfg.os == Os::Windows && self.accept_contacts && self.touchpad_contacts.is_some();
+            let native = self.cfg.os == Os::Windows
+                && (if options {
+                    self.cfg.settings.touchpad_injection && (!scroll_only || native_scroll_only)
+                } else {
+                    self.accept_contacts
+                })
+                && self.touchpad_contacts.is_some();
             let classify = native
-                && self.cfg.settings.mac_scroll_feel
+                && (self.cfg.settings.mac_scroll_feel || native_scroll_only)
                 && self.peers.get(&origin).is_some_and(|p| p.os == Os::MacOS);
             let path = if !native {
                 MultiPath::Gestures
             } else if classify {
                 match event {
                     MultiEvent::Contacts(_) => MultiPath::Pending,
-                    MultiEvent::Scroll(_) => MultiPath::Scroll,
-                    MultiEvent::Gesture(_) => MultiPath::Native,
+                    MultiEvent::Scroll(_) => {
+                        if native_scroll_only {
+                            MultiPath::NativeScroll
+                        } else {
+                            MultiPath::Scroll
+                        }
+                    }
+                    MultiEvent::Gesture(_) => {
+                        if scroll_only {
+                            MultiPath::MappedGestures
+                        } else {
+                            MultiPath::Native
+                        }
+                    }
                 }
             } else {
                 MultiPath::Native
@@ -391,6 +503,7 @@ impl Router {
                 path,
                 retired: false,
                 contacts: false,
+                active_contacts: 0,
                 gesture: false,
                 prelude: false,
                 scroll: None,
@@ -415,8 +528,20 @@ impl Router {
         };
         if state.path == MultiPath::Pending && !state.retired && starts {
             state.path = match event {
-                MultiEvent::Scroll(_) => MultiPath::Scroll,
-                MultiEvent::Gesture(_) => MultiPath::Native,
+                MultiEvent::Scroll(_) => {
+                    if native_scroll_only {
+                        MultiPath::NativeScroll
+                    } else {
+                        MultiPath::Scroll
+                    }
+                }
+                MultiEvent::Gesture(_) => {
+                    if scroll_only {
+                        MultiPath::MappedGestures
+                    } else {
+                        MultiPath::Native
+                    }
+                }
                 _ => MultiPath::Pending,
             };
         }
@@ -438,6 +563,7 @@ impl Router {
             MultiEvent::Scroll(p) => {
                 let current = Selection {
                     path,
+                    synthetic_scroll: !options || self.cfg.settings.touchpad_injection,
                     retired: state.retired,
                 };
                 let owner = state.scroll.get_or_insert_with(ScrollPaths::default).phase(p, current);
@@ -457,7 +583,8 @@ impl Router {
             }
         };
         let selected = match path {
-            MultiPath::Native => matches!(event, MultiEvent::Contacts(_)),
+            MultiPath::Native | MultiPath::NativeScroll => matches!(event, MultiEvent::Contacts(_)),
+            MultiPath::MappedGestures => matches!(event, MultiEvent::Gesture(_)),
             MultiPath::Gestures => !matches!(event, MultiEvent::Contacts(_)),
             MultiPath::Scroll => matches!(event, MultiEvent::Scroll(_)),
             MultiPath::Pending | MultiPath::Suppressed => false,
@@ -485,6 +612,34 @@ impl Router {
                 .map_or(state.retired, |owner| owner.retired)
         })
     }
+    fn stop_synthetic_tail_on_touch(&mut self, origin: DeviceId) {
+        if self.cfg.os != Os::Windows
+            || self.touchpad_options_enabled(origin)
+                && !(self.cfg.settings.touchpad_injection && self.cfg.settings.mac_scroll_feel)
+        {
+            return;
+        }
+        let cancel = self.multifinger.get_mut(&origin).is_some_and(|state| {
+            state
+                .scroll
+                .as_mut()
+                .is_some_and(|scroll| scroll.stop_synthetic_tail(state.prelude))
+        });
+        if cancel {
+            self.out.push(Output::Inject(InjectEvent::TouchpadScroll {
+                dx: 0.,
+                dy: 0.,
+                pixels_per_reference: 1.,
+                wheel: oink_foundation::input::ScrollInjection {
+                    dx: 0.,
+                    dy: 0.,
+                    unit: ScrollUnit::Pixel,
+                    phase: ScrollPhase::Cancelled,
+                },
+            }));
+        }
+    }
+
     pub(super) fn retire_received_multifinger(&mut self) {
         self.cancel_received_contacts();
         self.pending_contacts.clear();
@@ -1125,6 +1280,282 @@ mod tests {
         r.out.clear();
         (r, origin)
     }
+    #[test]
+    fn continuous_fling_physical_touch_cancels_only_synthetic_tail() {
+        for (parent, mac) in [(true, true), (true, false), (false, false)] {
+            let (mut r, origin) = options_router(parent, true, mac);
+            r.set_accept_contacts(false);
+            r.focus_scope = Some(r.new_focus_scope());
+            let scroll = |phase| InputMsg::Scroll {
+                source: SourceKind::Touchpad,
+                dx: 0.,
+                dy: 1.,
+                unit: ScrollAmount::Reference,
+                phase,
+            };
+            let old = sample(0, 2, 1000);
+            r.receive_contacts(origin, Frame::between(None, &old));
+            r.on_input(origin, origin, 0, scroll(ScrollPhase::Began), 0);
+            r.receive_contacts(origin, Frame::between(Some(&old), &sample(8000, 0, 0)));
+            r.on_input(origin, origin, 0, scroll(ScrollPhase::Ended), 8000);
+            r.on_input(origin, origin, 0, scroll(ScrollPhase::MomentumBegan), 9000);
+            r.out.clear();
+            r.receive_contacts(origin, Frame::between(None, &sample(10000, 1, 1000)));
+            let cancelled = r
+                .out
+                .iter()
+                .filter(|o| {
+                    matches!(o,
+                Output::Inject(InjectEvent::TouchpadScroll { wheel, .. }) if wheel.phase == ScrollPhase::Cancelled)
+                })
+                .count();
+            assert_eq!(cancelled, usize::from(mac));
+            r.out.clear();
+            r.on_input(origin, origin, 0, scroll(ScrollPhase::Momentum), 11000);
+            assert!(
+                !r.out
+                    .iter()
+                    .any(|o| matches!(o, Output::Inject(InjectEvent::TouchpadScroll { .. })))
+            );
+            if !parent {
+                assert!(
+                    r.out
+                        .iter()
+                        .any(|o| matches!(o, Output::Inject(InjectEvent::Scroll { .. }))),
+                    "legacy wheel tail remains unchanged"
+                );
+            }
+        }
+    }
+    #[test]
+    fn parent_off_uses_plain_wheel_instead_of_synthetic_ptp() {
+        let (mut r, origin) = mac_scroll_router(true, Some(5));
+        r.set_peer_touchpad_options(origin, true);
+        let mut value = serde_json::to_value(&r.cfg.settings).unwrap();
+        value["touchpad_injection"] = false.into();
+        r.set_settings(serde_json::from_value(value).unwrap());
+        r.set_accept_contacts(false);
+        r.inject_scroll(
+            origin,
+            SourceKind::Touchpad,
+            1.,
+            2.,
+            ScrollAmount::Reference,
+            ScrollPhase::Began,
+        );
+        assert!(matches!(r.out.last(), Some(Output::Inject(InjectEvent::Scroll { .. }))));
+    }
+    fn options_router(parent: bool, native: bool, mac: bool) -> (Router, DeviceId) {
+        let (mut r, origin) = mac_scroll_router(mac, Some(5));
+        r.set_peer_touchpad_options(origin, true);
+        let mut settings = r.cfg.settings.clone();
+        settings.touchpad_injection = parent;
+        settings.native_multifinger = native;
+        r.set_settings(settings);
+        r.out.clear();
+        (r, origin)
+    }
+    #[test]
+    fn touchpad_options_matrix_selects_one_scroll_injection_path() {
+        for parent in [false, true] {
+            for native in [false, true] {
+                for mac in [false, true] {
+                    let (mut r, origin) = options_router(parent, native, mac);
+                    let first = sample(0, 2, 1000);
+                    r.receive_contacts(origin, Frame::between(None, &first));
+                    for phase in [ScrollPhase::Began, ScrollPhase::Changed, ScrollPhase::Ended] {
+                        if r.filter_multifinger(origin, MultiEvent::Scroll(phase)) {
+                            r.inject_scroll(origin, SourceKind::Touchpad, 1., 2., ScrollAmount::Reference, phase);
+                        }
+                    }
+                    r.receive_contacts(origin, Frame::between(Some(&first), &sample(8000, 0, 0)));
+                    let raw = r
+                        .out
+                        .iter()
+                        .any(|o| matches!(o, Output::Inject(InjectEvent::TouchpadContacts(_))));
+                    let synthetic = r
+                        .out
+                        .iter()
+                        .any(|o| matches!(o, Output::Inject(InjectEvent::TouchpadScroll { .. })));
+                    let wheel = r
+                        .out
+                        .iter()
+                        .any(|o| matches!(o, Output::Inject(InjectEvent::Scroll { .. })));
+                    assert_eq!(
+                        (raw, synthetic, wheel),
+                        (parent && !mac, parent && mac, !parent),
+                        "parent={parent} native={native} mac={mac}"
+                    );
+                    if raw {
+                        let frames: Vec<_> = r
+                            .out
+                            .iter()
+                            .filter_map(|o| match o {
+                                Output::Inject(InjectEvent::TouchpadContacts(f)) => Some(*f),
+                                _ => None,
+                            })
+                            .collect();
+                        assert_eq!(
+                            frames,
+                            [
+                                Frame::between(None, &first),
+                                Frame::between(Some(&first), &sample(8000, 0, 0))
+                            ],
+                            "native scroll preserves physical geometry/timestamps, bypassing inverse gain and the Mac curve"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn touchpad_options_matrix_maps_non_scroll_gestures_only_when_requested() {
+        for parent in [false, true] {
+            for native in [false, true] {
+                for mac in [false, true] {
+                    for fingers in [2, 3, 4] {
+                        let (mut r, origin) = options_router(parent, native, mac);
+                        r.receive_contacts(origin, Frame::between(None, &sample(0, fingers, 1000)));
+                        let gesture = Gesture::Magnify {
+                            phase: GesturePhase::Began,
+                            amount: 0.1,
+                        };
+                        r.remote_gesture(
+                            origin,
+                            0,
+                            gesture,
+                            InputMsg::Gesture {
+                                source: SourceKind::Touchpad,
+                                gesture,
+                            },
+                        );
+                        let raw = r
+                            .out
+                            .iter()
+                            .any(|o| matches!(o, Output::Inject(InjectEvent::TouchpadContacts(_))));
+                        let mapped = r
+                            .out
+                            .iter()
+                            .any(|o| matches!(o, Output::Inject(InjectEvent::Gesture(_))));
+                        assert_eq!(
+                            (raw, mapped),
+                            (parent && native, !parent || !native),
+                            "parent={parent} native={native} mac={mac} fingers={fingers}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn scroll_only_cancels_before_third_contact_or_pinch_without_replaying_tails() {
+        for pinch in [false, true] {
+            let (mut r, origin) = options_router(true, false, false);
+            let first = sample(0, 2, 1000);
+            r.receive_contacts(origin, Frame::between(None, &first));
+            assert!(r.out.is_empty());
+            assert!(!r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Began)));
+            assert_eq!(r.out.len(), 1);
+            r.out.clear();
+            if pinch {
+                assert!(r.filter_multifinger(origin, magnify(GesturePhase::Began)));
+            } else {
+                r.receive_contacts(origin, Frame::between(Some(&first), &sample(8000, 3, 1200)));
+                assert!(r.filter_multifinger(
+                    origin,
+                    MultiEvent::Gesture(Gesture::DockSwipe {
+                        axis: oink_foundation::input::SwipeAxis::Vertical,
+                        phase: GesturePhase::Began,
+                        progress: 0.1,
+                        velocity: 0.,
+                    })
+                ));
+            }
+            assert_eq!(cancels(&r), 1);
+            assert!(
+                !r.out
+                    .iter()
+                    .any(|o| matches!(o, Output::Inject(InjectEvent::TouchpadContacts(f)) if f.phase != Phase::Cancel))
+            );
+            r.out.clear();
+            r.receive_contacts(
+                origin,
+                Frame::between(Some(&sample(8000, 3, 1200)), &sample(16000, 2, 1300)),
+            );
+            assert!(!r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Changed)));
+            assert!(r.out.is_empty());
+        }
+    }
+    #[test]
+    fn scroll_only_never_uses_the_mac_curve_after_a_mapped_gesture_or_injector_loss() {
+        for fingers in [2, 3, 4] {
+            let (mut r, origin) = options_router(true, false, false);
+            r.receive_contacts(origin, Frame::between(None, &sample(0, fingers, 1000)));
+            assert!(r.filter_multifinger(origin, magnify(GesturePhase::Began)));
+            assert!(!r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Began)));
+            assert!(r.out.is_empty());
+        }
+        for parent in [false, true] {
+            for mac in [false, true] {
+                let (mut r, origin) = options_router(parent, false, mac);
+                r.set_touchpad_contacts(None);
+                assert!(r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Began)));
+                r.inject_scroll(
+                    origin,
+                    SourceKind::Touchpad,
+                    1.,
+                    2.,
+                    ScrollAmount::Reference,
+                    ScrollPhase::Began,
+                );
+                assert_eq!(
+                    r.out
+                        .iter()
+                        .any(|o| matches!(o, Output::Inject(InjectEvent::TouchpadScroll { .. }))),
+                    parent && mac
+                );
+            }
+        }
+    }
+    #[test]
+    fn legacy_mac_source_keeps_existing_contacts_and_scroll_paths() {
+        for legacy in [false, true] {
+            for mac in [false, true] {
+                let (mut r, origin) = mac_scroll_router(mac, Some(5));
+                let mut settings = r.cfg.settings.clone();
+                settings.touchpad_injection = false;
+                settings.native_multifinger = false;
+                r.set_settings(settings);
+                r.set_accept_contacts(legacy);
+                r.out.clear();
+                r.receive_contacts(origin, Frame::between(None, &sample(0, 2, 1000)));
+                let allow = r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Began));
+                assert_eq!(allow, !legacy || mac);
+                if allow {
+                    r.inject_scroll(
+                        origin,
+                        SourceKind::Touchpad,
+                        1.,
+                        2.,
+                        ScrollAmount::Reference,
+                        ScrollPhase::Began,
+                    );
+                }
+                assert!(
+                    !r.out
+                        .iter()
+                        .any(|o| matches!(o, Output::Inject(InjectEvent::Scroll { .. })))
+                );
+            }
+        }
+    }
+    #[test]
+    fn parent_off_retirement_never_creates_synthetic_native_scroll() {
+        let (mut r, origin) = options_router(false, true, true);
+        assert!(r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Began)));
+        r.retire_received_multifinger();
+        assert!(r.out.is_empty());
+    }
     fn magnify(phase: GesturePhase) -> MultiEvent {
         MultiEvent::Gesture(Gesture::Magnify { phase, amount: 0.1 })
     }
@@ -1186,7 +1617,7 @@ mod tests {
     }
 
     #[test]
-    fn new_touch_before_during_and_after_momentum_keeps_both_owners() {
+    fn new_touch_stops_old_synthetic_tail_and_preserves_new_native_owner() {
         for position in 0..3 {
             let (mut r, origin) = mac_scroll_router(true, Some(5));
             let old = sample(0, 2, 1000);
@@ -1203,12 +1634,20 @@ mod tests {
             r.out.clear();
             let next = sample(16000, 2, 1100);
             r.receive_contacts(origin, Frame::between(None, &next));
-            assert!(r.out.is_empty());
+            assert_eq!(
+                r.out
+                    .iter()
+                    .filter(|o| matches!(o,
+                Output::Inject(InjectEvent::TouchpadScroll { wheel, .. }) if wheel.phase == ScrollPhase::Cancelled))
+                    .count(),
+                usize::from(position != 2)
+            );
+            r.out.clear();
             if position == 0 {
-                assert!(r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::MomentumBegan)));
+                assert!(!r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::MomentumBegan)));
             }
             if position != 2 {
-                assert!(r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Momentum)));
+                assert!(!r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Momentum)));
             }
             r.receive_contacts(origin, Frame::between(Some(&next), &sample(24000, 3, 1300)));
             let frames: Vec<_> = r
@@ -1225,7 +1664,7 @@ mod tests {
             );
             assert!(!r.filter_multifinger(origin, magnify(GesturePhase::Began)));
             if position != 2 {
-                assert!(r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::MomentumEnded)));
+                assert!(!r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::MomentumEnded)));
             }
             // Old MomentumEnded cannot retire the newly admitted native touch.
             r.receive_contacts(
@@ -1252,10 +1691,12 @@ mod tests {
         r.receive_contacts(origin, Frame::between(Some(&old), &sample(8000, 0, 0)));
         let next = sample(16000, 2, 1000);
         r.receive_contacts(origin, Frame::between(None, &next));
-        assert!(r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Ended)));
+        assert!(r.out.iter().any(|o| matches!(o,
+            Output::Inject(InjectEvent::TouchpadScroll { wheel, .. }) if wheel.phase == ScrollPhase::Cancelled)));
+        assert!(!r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Ended)));
         assert_eq!(r.pending_contacts.len, 1);
-        assert!(r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::MomentumBegan)));
-        assert!(r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::MomentumEnded)));
+        assert!(!r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::MomentumBegan)));
+        assert!(!r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::MomentumEnded)));
         assert_eq!(r.pending_contacts.len, 1);
         r.receive_contacts(origin, Frame::between(Some(&next), &sample(24000, 3, 1300)));
         assert_eq!(
@@ -1360,7 +1801,7 @@ mod tests {
     }
 
     #[test]
-    fn input_dispatch_preserves_old_tail_order_around_native_replay() {
+    fn input_dispatch_cancels_old_tail_before_new_native_replay() {
         let (mut r, origin) = mac_scroll_router(true, Some(5));
         r.focus_scope = Some(r.new_focus_scope());
         let scroll = |phase| InputMsg::Scroll {
@@ -1399,20 +1840,17 @@ mod tests {
         assert_eq!(
             order,
             [
-                (None, Some(ScrollPhase::MomentumBegan), 0),
-                (None, Some(ScrollPhase::Momentum), 0),
+                (None, Some(ScrollPhase::Cancelled), 0),
                 (Some(Phase::Begin), None, 16000),
                 (Some(Phase::Move), None, 24000),
                 (Some(Phase::End), None, 32000),
-                (None, Some(ScrollPhase::Momentum), 0),
-                (None, Some(ScrollPhase::MomentumEnded), 0),
             ]
         );
         assert!(!r.multifinger.contains_key(&origin));
     }
 
     #[test]
-    fn optional_old_momentum_can_start_after_new_native_touch_ends() {
+    fn optional_old_momentum_cannot_restart_after_new_native_touch_ends() {
         let (mut r, origin) = mac_scroll_router(true, Some(5));
         let old = sample(0, 2, 1000);
         r.receive_contacts(origin, Frame::between(None, &old));
@@ -1422,8 +1860,8 @@ mod tests {
         let next = sample(16000, 3, 1100);
         r.receive_contacts(origin, Frame::between(None, &next));
         r.receive_contacts(origin, Frame::between(Some(&next), &sample(24000, 0, 0)));
-        assert!(r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::MomentumBegan)));
-        assert!(r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::MomentumEnded)));
+        assert!(!r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::MomentumBegan)));
+        assert!(!r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::MomentumEnded)));
         assert!(!r.multifinger.contains_key(&origin));
     }
 

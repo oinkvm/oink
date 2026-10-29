@@ -8,7 +8,7 @@ use std::{io, sync::Arc};
 
 #[cfg(any(target_os = "macos", all(test, debug_assertions)))]
 mod pending;
-#[cfg(any(target_os = "macos", all(test, debug_assertions)))]
+#[cfg(target_os = "macos")]
 pub(crate) use pending::Pending;
 pub(crate) mod local;
 pub use local::Local;
@@ -18,7 +18,109 @@ pub use files::Files;
 pub(crate) use files::Flat;
 pub(crate) use files::Names;
 
+/// The OS-owned received copy. Source reads use Namespace::open; native
+/// stream/promise readers use this copy, which may trigger OS hydration.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct StoredFile {
+    pub node: NodeId,
+    pub version: u64,
+    pub size: u64,
+}
+/// Keeps a native consumer alive before its first read and between file reads.
+/// Dropping the lease never cancels other consumers or a whole-drop download.
+pub type NativeLease = Box<dyn Send + Sync>;
+pub trait NativeFiles: Send + Sync + 'static {
+    /// Adapter-observed complete target consumption, distinct from hydration or Stored.
+    /// A directory means its entire subtree was successfully delivered.
+    fn consumed(&self, _nodes: &[NodeId]) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn lease(&self) -> io::Result<NativeLease> {
+        Ok(Box::new(()))
+    }
+    /// Atomically persist credentials before allowing body reads. Implementors
+    /// must not call back into the namespace while holding their catalog lock.
+    fn persist_link(&self, descriptor: &super::linked::Descriptor) -> io::Result<()>;
+    fn open(&self, node: NodeId, offset: u64) -> io::Result<FileReader>;
+    /// Enumerate the current received catalog, including FinalLocal roots.
+    fn list(&self, _node: NodeId, _cursor: Option<DirectoryCursor>) -> io::Result<DirectoryPage> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// Read the resident link itself without opening its target.
+    fn symlink_target(&self, _node: NodeId) -> io::Result<String> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    fn metadata(&self, node: NodeId) -> io::Result<crate::FileMetadata>;
+    fn download(
+        &self,
+        check: &super::ReaderGuard,
+        progress: &(dyn Fn(u64, u64) + Send + Sync),
+    ) -> io::Result<Vec<StoredFile>>;
+}
+
 pub trait Namespace: Send + Sync + 'static {
+    fn native_consumed(&self, _nodes: &[NodeId]) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Native promise/stream lifetime, including a callback that has not started.
+    fn native_lease(&self) -> io::Result<NativeLease> {
+        Ok(Box::new(()))
+    }
+    /// Original native file-format metadata, independent of source credentials.
+    /// This never reads a payload; prepare may be needed to resolve promise names.
+    fn native_file_metadata(&self) -> super::native_metadata::NativeFileMetadata {
+        self.source_link()
+            .map(|descriptor| descriptor.native)
+            .unwrap_or_default()
+    }
+    /// Current source clipboard identity after any native one-shot rendering.
+    /// Drag and ordinary file namespaces have no clipboard ownership.
+    fn clipboard_key(&self) -> io::Result<Option<[u8; 32]>> {
+        Ok(None)
+    }
+    /// Remote application streams must read the native received copy.
+    fn requires_native_files(&self) -> bool {
+        self.source_link().is_some()
+    }
+    /// Blocking preparation runs on a native/background worker, never a route
+    /// executor. No native path may be exposed before this succeeds.
+    fn prepare(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn bind_native(&self, _native: std::sync::Weak<dyn NativeFiles>) -> io::Result<()> {
+        Ok(())
+    }
+    /// None is a local/source namespace; remote publications return Some even
+    /// while their native copy is not ready, so streams cannot bypass it.
+    fn native_open(&self, _node: NodeId, _offset: u64) -> Option<io::Result<FileReader>> {
+        None
+    }
+    fn native_list(&self, _node: NodeId, _cursor: Option<DirectoryCursor>) -> Option<io::Result<DirectoryPage>> {
+        None
+    }
+    fn native_metadata(&self, _node: NodeId) -> Option<io::Result<crate::FileMetadata>> {
+        None
+    }
+    /// Durable credentials for this native received namespace. This is metadata
+    /// only: asking for it must not enumerate or read the remote source.
+    fn source_link(&self) -> Option<super::linked::Descriptor> {
+        None
+    }
+    fn source_roots(&self) -> io::Result<Vec<super::grants::SourceRoot>> {
+        Err(unavailable(Unavailable::Unsupported))
+    }
+    /// Roots fulfilled by a native one-shot source. The grant service retains
+    /// their complete, immutable bytes independently of the clipboard owner.
+    /// This query is metadata-only; select/open perform native fulfilment.
+    fn one_shot_roots(&self) -> Vec<NodeId> {
+        Vec::new()
+    }
+    /// The grant journal now owns complete immutable copies of these roots.
+    /// Release redundant native capture storage, while preserving metadata and
+    /// leases held by readers that were already opened. Never render again.
+    fn release_fulfilled(&self, _roots: &[NodeId]) {}
     fn origin(&self) -> Option<oink_foundation::DeviceId> {
         None
     }
@@ -44,9 +146,10 @@ pub trait Namespace: Send + Sync + 'static {
     fn local_batch(&self) -> Option<crate::store::Batch> {
         None
     }
-    /// Replace a published remote namespace with a dormant local catalog after
-    /// the same observable whole-delivery operation reaches Stored.
-    fn on_stored(&self, _ready: Box<dyn FnOnce(super::Completed) + Send>) {}
+    /// Temporary accounting protection; must not invalidate the accounting snapshot itself.
+    fn cache_batch(&self) -> Option<crate::store::Batch> {
+        self.local_batch()
+    }
 }
 
 /// Attach files to ordered raw representations without making native format
@@ -57,9 +160,7 @@ pub(super) struct WithFiles {
 }
 impl super::Provider for WithFiles {
     fn inventory(&self) -> super::Inventory {
-        let mut inventory = self.provider.inventory();
-        inventory.roots = self.files.roots();
-        inventory
+        self.provider.inventory().with_roots(self.files.roots())
     }
     fn open(&self, id: super::RepresentationId) -> io::Result<FileReader> {
         self.provider.open(id)
@@ -99,6 +200,22 @@ impl Restricted {
             allowed: std::sync::Mutex::new(allowed),
         })
     }
+    fn resolved_roots(&self) -> io::Result<Vec<FileNode>> {
+        let current = self.inner.roots();
+        let ids = self.inner.native_file_metadata().resolve_roots(
+            &self.roots.iter().map(|root| root.id).collect::<Vec<_>>(),
+            &current.iter().map(|root| root.id).collect::<Vec<_>>(),
+        )?;
+        ids.iter()
+            .map(|id| {
+                current
+                    .iter()
+                    .find(|root| root.id == *id)
+                    .cloned()
+                    .ok_or_else(|| unavailable(Unavailable::InvalidData))
+            })
+            .collect()
+    }
     fn check(&self, id: NodeId) -> io::Result<()> {
         if self.allowed.lock().unwrap().contains(&id) {
             Ok(())
@@ -108,6 +225,99 @@ impl Restricted {
     }
 }
 impl Namespace for Restricted {
+    fn release_fulfilled(&self, roots: &[NodeId]) {
+        let roots: Vec<_> = roots
+            .iter()
+            .copied()
+            .filter(|id| self.roots().iter().any(|root| root.id == *id))
+            .collect();
+        self.inner.release_fulfilled(&roots);
+    }
+    fn native_file_metadata(&self) -> super::native_metadata::NativeFileMetadata {
+        self.inner
+            .native_file_metadata()
+            .restricted(&self.roots().iter().map(|root| root.id).collect::<Vec<_>>())
+    }
+    fn clipboard_key(&self) -> io::Result<Option<[u8; 32]>> {
+        self.inner.clipboard_key()
+    }
+    fn one_shot_roots(&self) -> Vec<NodeId> {
+        self.inner
+            .one_shot_roots()
+            .into_iter()
+            .filter(|id| self.roots().iter().any(|root| root.id == *id))
+            .collect()
+    }
+    fn requires_native_files(&self) -> bool {
+        self.inner.requires_native_files()
+    }
+    fn prepare(&self) -> io::Result<()> {
+        self.inner.prepare()?;
+        let roots = self.resolved_roots()?;
+        let mut allowed = self.allowed.lock().unwrap();
+        for previous in &self.roots {
+            if !roots.iter().any(|root| root.id == previous.id) {
+                allowed.remove(&previous.id);
+            }
+        }
+        allowed.extend(roots.iter().map(|root| root.id));
+        Ok(())
+    }
+    fn native_lease(&self) -> io::Result<NativeLease> {
+        self.inner.native_lease()
+    }
+    fn native_consumed(&self, nodes: &[NodeId]) -> io::Result<()> {
+        self.inner.native_consumed(nodes)
+    }
+    fn bind_native(&self, native: std::sync::Weak<dyn NativeFiles>) -> io::Result<()> {
+        self.inner.bind_native(native)
+    }
+    fn native_list(&self, node: NodeId, cursor: Option<DirectoryCursor>) -> Option<io::Result<DirectoryPage>> {
+        if let Err(error) = self.check(node) {
+            return Some(Err(error));
+        }
+        self.inner.native_list(node, cursor).map(|page| {
+            let page = page?;
+            page.validate(cursor).map_err(unavailable)?;
+            self.allowed
+                .lock()
+                .unwrap()
+                .extend(page.entries.iter().map(|entry| entry.id));
+            Ok(page)
+        })
+    }
+    fn native_open(&self, node: NodeId, offset: u64) -> Option<io::Result<FileReader>> {
+        if let Err(error) = self.check(node) {
+            return Some(Err(error));
+        }
+        self.inner.native_open(node, offset)
+    }
+    fn native_metadata(&self, node: NodeId) -> Option<io::Result<crate::FileMetadata>> {
+        if let Err(error) = self.check(node) {
+            return Some(Err(error));
+        }
+        self.inner.native_metadata(node)
+    }
+    fn source_link(&self) -> Option<super::linked::Descriptor> {
+        self.inner.source_link().map(|mut descriptor| {
+            descriptor
+                .roots
+                .retain(|root| self.roots().iter().any(|entry| entry.id == root.id));
+            descriptor.native = self.native_file_metadata();
+            descriptor
+                .fulfilled
+                .retain(|root| self.roots().iter().any(|entry| entry.id == root.node));
+            descriptor
+        })
+    }
+    fn source_roots(&self) -> io::Result<Vec<super::grants::SourceRoot>> {
+        self.inner.source_roots().map(|roots| {
+            roots
+                .into_iter()
+                .filter(|root| self.roots().iter().any(|node| node.id == root.id()))
+                .collect()
+        })
+    }
     fn origin(&self) -> Option<oink_foundation::DeviceId> {
         self.inner.origin()
     }
@@ -118,7 +328,7 @@ impl Namespace for Restricted {
         self.inner.retain_files(retention);
     }
     fn roots(&self) -> Vec<FileNode> {
-        self.roots.clone()
+        self.resolved_roots().unwrap_or_else(|_| self.roots.clone())
     }
     fn list(&self, id: NodeId, cursor: Option<DirectoryCursor>) -> io::Result<DirectoryPage> {
         self.check(id)?;

@@ -87,6 +87,7 @@ fn local_pause_detaches_input_resumes_fresh_and_resets_on_restart() {
             let mut settings = node.input_settings().unwrap();
             settings.hotkeys = vec![oink_agent::api::Hotkey {
                 action: oink_agent::api::HotkeyAction::ToggleSharing,
+                device: None,
                 keys: vec!["Ctrl".into(), "Alt".into(), "S".into()],
                 enabled: true,
             }];

@@ -69,7 +69,7 @@ mod tests {
     use super::*;
     #[test]
     fn native_classes_preserve_items_order_and_multiplicity_without_reading_data() {
-        let board = NSPasteboard::pasteboardWithUniqueName();
+        let board = crate::macos::test_pasteboard::new();
         let first = NSPasteboardItem::new();
         for name in [
             "public.tiff",

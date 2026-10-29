@@ -459,6 +459,7 @@ impl Node {
         // Rebuild after publication, before completion removes the optimistic UI.
         self.refresh_device_cards();
         if let Some(completed) = completed {
+            self.complete_microphone_notice(&completed.request_id, &completed.result);
             self.emit(ApiEvent::DeviceControlCompleted(completed));
         }
     }
@@ -516,6 +517,8 @@ impl Node {
                 }
             ) {
                 "oink.input.mouse-disabled/1"
+            } else if matches!(binding.operation, TokenOperation::OwnerOption { option: 26..=28 }) {
+                "oink.input.touchpad-options/1"
             } else if matches!(binding.operation, TokenOperation::ExitVolume { .. }) {
                 "oink.audio.exit-volume/1"
             } else {
@@ -607,6 +610,9 @@ impl Node {
             let capability = if matches!(request, Message::ConfigSetLocalOption(edit) if edit.option().ok() == Some(oink_protocol::v1::dto::LocalOption::MouseMode) && (edit.value().ok().is_some_and(|v| v == oink_protocol::v1::RawValue::Uint(2)) || self.settings().routing.mouse_mode == oink_foundation::input::InputMode::Disabled))
             {
                 "oink.input.mouse-disabled/1"
+            } else if matches!(request, Message::ConfigSetLocalOption(edit) if edit.option().ok().is_some_and(|option| matches!(option.number(), 26..=28)))
+            {
+                "oink.input.touchpad-options/1"
             } else if matches!(request, Message::ConfigSetExitVolume(_)) {
                 "oink.audio.exit-volume/1"
             } else {

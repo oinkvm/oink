@@ -2,7 +2,7 @@
 //! The separate signed manager resolves URLs without marking the Oink process dataless-I/O exempt.
 use crate::FileProviderReason;
 use crate::model::{ContentSize, DirectoryCursor, FileNode, NodeId, NodeKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::fs::OpenOptionsExt;
@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use crate::{ClipboardError, FileContents, FileEntry};
 
 mod announced;
+mod moved;
+pub(crate) mod native;
 pub use announced::{
     Activation, PreparationKey, PreparedDrag, activate_prepared, prepare_announced, prepare_announced_with_cancel,
     revoke_prepared, try_prepare_enter_placeholder,
@@ -27,8 +29,10 @@ pub use announced::{
 mod preparation_cancel;
 pub use preparation_cancel::PreparationCancellation;
 
+mod diagnostics;
 mod launch;
 mod observer;
+mod owner_watch;
 mod placeholders;
 mod spare;
 mod storage_watch;
@@ -38,12 +42,37 @@ pub use placeholders::{configure_placeholder_pool, placeholder_pool_status, plac
 
 const MANAGER_TIMEOUT: Duration = Duration::from_secs(12);
 struct Batch {
+    owner: Weak<Batch>,
     urls: Mutex<Vec<PathBuf>>,
     token: String,
     contents: Mutex<Arc<dyn Namespace>>,
     state: Mutex<CatalogState>,
     catalog: PathBuf,
-    readers: Mutex<usize>,
+    readers: Arc<Mutex<usize>>,
+}
+impl Batch {
+    /// Shared with the signed maintenance manager. Keep the inode for the whole
+    /// consumer lifetime; no private catalog cleanup unlinks this lock file.
+    fn consumer_lock(&self) -> io::Result<std::fs::File> {
+        use std::os::fd::AsRawFd;
+        if self.catalog.as_os_str().is_empty() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(self.catalog.with_extension("consumers"))?;
+        // SAFETY: the file descriptor remains owned by the returned File. A
+        // nonblocking shared flock conflicts with the manager's exclusive flock.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(file)
+    }
 }
 // Watch only this reader. Closing a Finder stream cannot cancel the independent
 // whole-drop transfer or readers retained by another native consumer.
@@ -53,6 +82,7 @@ struct ReadWatch {
     connected: Arc<AtomicBool>,
     socket: TcpStream,
     worker: Option<std::thread::JoinHandle<()>>,
+    _consumer: std::fs::File,
 }
 impl ReadWatch {
     fn new(socket: &TcpStream, batch: Arc<Batch>) -> io::Result<Self> {
@@ -63,7 +93,13 @@ impl ReadWatch {
         let connected = Arc::new(AtomicBool::new(true));
         let live = connected.clone();
         let watched = batch.clone();
+        let state = batch.state.lock().unwrap();
+        if state.retired {
+            return Err(io::ErrorKind::NotFound.into());
+        }
+        let consumer = batch.consumer_lock()?;
         *batch.readers.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        drop(state);
         let worker = std::thread::Builder::new()
             .name("oink-provider-cancel".into())
             .spawn(move || {
@@ -92,6 +128,7 @@ impl ReadWatch {
                 connected,
                 socket: control,
                 worker: Some(worker),
+                _consumer: consumer,
             }),
             Err(e) => {
                 *batch.readers.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
@@ -120,11 +157,12 @@ struct Bridge {
     port: u16,
     batches: Mutex<HashMap<String, Arc<Batch>>>,
 }
-/// A target-local publication. Completed bytes have bounded cache retention;
-/// this owner pin protects consumption-based eviction, while only active reads
-/// can defer the absolute expiry. Cache clear retires inactive registrations.
+/// A target-local publication backed by the OS received store. Persistent links
+/// survive clipboard replacement; native consumers hold their own reader leases.
+/// Cancellation retires only this publication and its receiver-side namespace.
 #[derive(Clone)]
 pub struct Registration {
+    diagnostic_publication: (Instant, bool),
     key: String,
     bridge: Weak<Bridge>,
     batch: Arc<Batch>,
@@ -141,6 +179,9 @@ impl std::fmt::Debug for Registration {
     }
 }
 impl Registration {
+    pub(crate) fn diagnostic_publication(&self) -> (Instant, bool) {
+        self.diagnostic_publication
+    }
     pub fn entries(&self) -> &[FileEntry] {
         &self.entries
     }
@@ -167,7 +208,7 @@ impl Registration {
         // does not require looking up or reinitializing the process container.
         retire_catalog(&self.batch, &|| {
             if let Some(root) = self.batch.catalog.parent() {
-                remove_catalog_in(root, &self.batch.catalog);
+                cancel_catalog_in(root, &self.batch.catalog);
             }
         });
         signal_changes();
@@ -180,6 +221,10 @@ struct Record {
     parent: String,
     name: String,
     directory: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    symlink_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exec_bits: Option<u16>,
     size: Option<u64>,
     modified: Option<i64>,
     node: Option<u64>,
@@ -187,19 +232,34 @@ struct Record {
     children: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hidden: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    keep_local: Option<bool>,
 }
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Catalog {
     #[serde(deserialize_with = "crate::store::schema_one")]
     schema: u8,
     token: String,
     port: u16,
     records: Vec<Record>,
-    batch: Option<crate::store::BatchId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<crate::content::linked::Descriptor>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::content::linked::completed::FinalLocal::is_empty"
+    )]
+    settlement: crate::content::linked::completed::FinalLocal,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    arrived: Vec<NodeId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    failed: Vec<NodeId>,
     urls: Vec<PathBuf>,
     #[serde(default)]
     received_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    move_state: Option<moved::State>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    consumed: Vec<NodeId>,
 }
 struct CatalogState {
     catalog: Catalog,
@@ -207,7 +267,65 @@ struct CatalogState {
     aliases: HashMap<NodeId, String>,
     retired: bool,
 }
+impl Catalog {
+    fn persistent(&self) -> bool {
+        self.source.is_some() || !self.settlement.is_empty()
+    }
+    fn file_policies(&mut self) {
+        let mut pinned: HashSet<String> = self
+            .records
+            .iter()
+            .filter(|record| record.node.is_some_and(|node| self.settlement.contains(NodeId(node))))
+            .map(|record| record.id.clone())
+            .collect();
+        for _ in 0..256 {
+            let before = pinned.len();
+            for record in &self.records {
+                if pinned.contains(&record.parent) {
+                    pinned.insert(record.id.clone());
+                }
+            }
+            if before == pinned.len() {
+                break;
+            }
+        }
+        for record in &mut self.records {
+            record.keep_local = pinned.contains(&record.id).then_some(true);
+        }
+    }
+}
 impl CatalogState {
+    fn source_available(&self, node: NodeId) -> io::Result<()> {
+        // Failed one-shot roots can retain independent local edits. Their
+        // records remain readable locally but must never reconnect to the
+        // sender or accept a late EOF/listing. Native deletion is owned by the extension.
+        let missing = || crate::content::unavailable(crate::model::Unavailable::NoSuchItem);
+        if self.retired {
+            return Err(missing());
+        }
+        if self.catalog.failed.is_empty() {
+            return Ok(());
+        }
+        let mut record = self
+            .catalog
+            .records
+            .iter()
+            .find(|record| record.node == Some(node.0))
+            .ok_or_else(missing)?;
+        for _ in 0..256 {
+            if record
+                .node
+                .is_some_and(|node| self.catalog.failed.contains(&NodeId(node)))
+            {
+                return Err(missing());
+            }
+            match self.catalog.records.iter().find(|parent| parent.id == record.parent) {
+                Some(parent) => record = parent,
+                None => return Ok(()),
+            }
+        }
+        Err(io::ErrorKind::InvalidData.into())
+    }
     fn persist(&self, path: &std::path::Path) -> io::Result<()> {
         // An already-open directory reader may finish after cancellation. Its
         // result stays usable by that reader but must not resurrect a WS deletion.
@@ -228,6 +346,20 @@ fn retire_catalog(batch: &Batch, remove: &dyn Fn()) {
 enum Request {
     #[serde(rename = "read")]
     Read { token: String, batch: String, node: u64 },
+    #[serde(rename = "received-complete")]
+    Complete {
+        token: String,
+        batch: String,
+        node: u64,
+        version: u64,
+    },
+    #[serde(rename = "received-failed")]
+    Failed {
+        token: String,
+        batch: String,
+        node: u64,
+        version: u64,
+    },
     #[serde(rename = "list")]
     List {
         token: String,
@@ -242,11 +374,18 @@ struct Listing {
     next: Option<DirectoryCursor>,
     version: u64,
 }
-static DIAGNOSTIC: Mutex<FileProviderReason> = Mutex::new(FileProviderReason::DomainEnabled);
+struct PublicationDiagnostic {
+    reason: FileProviderReason,
+    detail: Option<String>,
+}
+static DIAGNOSTIC: Mutex<PublicationDiagnostic> = Mutex::new(PublicationDiagnostic {
+    reason: FileProviderReason::DomainEnabled,
+    detail: None,
+});
 static SPARE: Mutex<spare::Pool> = Mutex::new(spare::Pool::new());
 static DOMAIN_USABLE: AtomicBool = AtomicBool::new(false);
 static STORAGE: Mutex<()> = Mutex::new(());
-static BRIDGE: OnceLock<Result<Arc<Bridge>, String>> = OnceLock::new();
+static BRIDGE: OnceLock<Result<Arc<Bridge>, diagnostics::Failure>> = OnceLock::new();
 static CONTAINER: OnceLock<PathBuf> = OnceLock::new();
 static DATA: OnceLock<PathBuf> = OnceLock::new();
 static REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -263,13 +402,24 @@ pub fn finish_launch_preparation(success: bool) {
         block_after_startup_failure();
         return;
     }
-    STARTUP.finish(true);
+    // Publication attempted while preparation was pending may have recorded
+    // Checking/an older failure. Verified native readiness supersedes it.
+    {
+        let mut diagnostic = DIAGNOSTIC.lock().unwrap_or_else(|e| e.into_inner());
+        STARTUP.finish(true);
+        diagnostic.reason = FileProviderReason::DomainEnabled;
+        diagnostic.detail = None;
+    }
     DEMAND_CHANGED.notify_one();
 }
 /// A failed preparation stays blocked until a new process retries recovery.
 pub fn block_after_startup_failure() {
-    *DIAGNOSTIC.lock().unwrap_or_else(|e| e.into_inner()) = FileProviderReason::RegistrationFailed;
-    STARTUP.finish(false);
+    {
+        let mut diagnostic = DIAGNOSTIC.lock().unwrap_or_else(|e| e.into_inner());
+        STARTUP.finish(false);
+        diagnostic.reason = FileProviderReason::RegistrationFailed;
+        diagnostic.detail = Some("launch_preparation_failed; see launch stage error".into());
+    }
     DEMAND_CHANGED.notify_one();
 }
 pub fn launch_preparation_pending() -> bool {
@@ -293,13 +443,20 @@ pub(crate) fn initialize(data: PathBuf) {
     if DATA.set(data).is_err() {
         return;
     }
+    // container() needs DATA. Construction precedes initialize_store(), so a
+    // once-only warm-up there consumed its attempt with Checking and never ran
+    // the manager's domain initialization. Start only after the store is set.
+    warm_up();
     std::thread::spawn(|| {
         if !STARTUP.wait() {
             return;
         }
         if let Ok(root) = container(Instant::now() + MANAGER_TIMEOUT) {
-            let _storage = STORAGE.lock().unwrap_or_else(|e| e.into_inner());
-            if bridge(&root).is_ok() {
+            let ready = {
+                let _storage = STORAGE.lock().unwrap_or_else(|e| e.into_inner());
+                bridge(&root).is_ok()
+            };
+            if ready {
                 signal_changes();
             }
         }
@@ -330,7 +487,7 @@ pub struct DomainStatus {
 
 pub fn inspect() -> Result<Option<DomainStatus>, ClipboardError> {
     let json = manager(&["inspect"], Instant::now() + Duration::from_secs(3))?;
-    let domains: Vec<DomainStatus> = serde_json::from_str(&json).map_err(error)?;
+    let domains: Vec<DomainStatus> = serde_json::from_str(&json).map_err(|e| error_at("decode_helper_response", e))?;
     Ok(domains.into_iter().find(|d| d.id == "oink-files"))
 }
 
@@ -340,19 +497,25 @@ pub fn open_enable() -> Result<(), ClipboardError> {
 }
 /// Most recent registration/initialization result, suitable for diagnostics (never contains tokens).
 pub fn diagnostic() -> String {
-    publication_reason().detail()
+    if launch_preparation_pending() {
+        return FileProviderReason::Checking.detail();
+    }
+    let diagnostic = DIAGNOSTIC.lock().unwrap_or_else(|e| e.into_inner());
+    diagnostic.detail.clone().unwrap_or_else(|| diagnostic.reason.detail())
 }
 /// A real domain transition invalidates the previous publication result.
 pub fn domain_changed() {
     if STARTUP.result() == Some(true) {
-        *DIAGNOSTIC.lock().unwrap_or_else(|e| e.into_inner()) = FileProviderReason::DomainEnabled;
+        let mut diagnostic = DIAGNOSTIC.lock().unwrap_or_else(|e| e.into_inner());
+        diagnostic.reason = FileProviderReason::DomainEnabled;
+        diagnostic.detail = None;
     }
 }
 pub fn publication_reason() -> FileProviderReason {
     if launch_preparation_pending() {
         return FileProviderReason::Checking;
     }
-    *DIAGNOSTIC.lock().unwrap_or_else(|e| e.into_inner())
+    DIAGNOSTIC.lock().unwrap_or_else(|e| e.into_inner()).reason
 }
 pub fn failure_reason(error: &ClipboardError) -> FileProviderReason {
     match error {
@@ -361,18 +524,51 @@ pub fn failure_reason(error: &ClipboardError) -> FileProviderReason {
     }
 }
 fn record_result<T>(result: &Result<T, ClipboardError>) {
+    // A failed source grant/metadata request says nothing about the installed
+    // extension. Previously this was latched as RegistrationFailed, so a single
+    // cancelled/stale source disabled every subsequent drag despite an enabled
+    // domain. Fail this item with its typed cause and keep domain availability.
+    if let Err(ClipboardError::ContentUnavailable(reason)) = result {
+        tracing::warn!(
+            operation = "source_prepare",
+            ?reason,
+            "File Provider source unavailable"
+        );
+        return;
+    }
     let reason = match result {
         Ok(_) => FileProviderReason::UrlsReady,
         Err(e) => failure_reason(e),
     };
     // Cancellation describes the gesture, not the extension's availability.
     if reason != FileProviderReason::Cancelled {
-        *DIAGNOSTIC.lock().unwrap_or_else(|e| e.into_inner()) = reason;
+        let mut diagnostic = DIAGNOSTIC.lock().unwrap_or_else(|e| e.into_inner());
+        // A publication can return its pending-gate error after readiness was
+        // verified. Do not let that late result reinstate a stale Checking state.
+        if reason == FileProviderReason::Checking && !launch_preparation_pending() {
+            return;
+        }
+        diagnostic.reason = reason;
+        // All Platform errors reaching this private publication boundary are
+        // constructed by error_at from code-only diagnostics. Source errors keep
+        // their typed ContentUnavailable above; never use their Display text.
+        diagnostic.detail = result.as_ref().err().map(ToString::to_string);
+        if let Some(cause) = &diagnostic.detail {
+            tracing::warn!(operation = "publish", %reason, %cause, "File Provider publication failed");
+        }
         DEMAND_CHANGED.notify_one();
     }
 }
-fn error(e: impl std::fmt::Display) -> ClipboardError {
-    ClipboardError::Platform(format!("Oink 文件扩展：{e}"))
+#[track_caller]
+fn error(e: impl Into<diagnostics::Failure>) -> ClipboardError {
+    error_at("local_operation", e)
+}
+#[track_caller]
+fn error_at(operation: &'static str, e: impl Into<diagnostics::Failure>) -> ClipboardError {
+    let diagnostics::Failure(cause) = e.into();
+    tracing::warn!(operation, %cause, error_site = std::panic::Location::caller().line(),
+        "File Provider operation failed");
+    ClipboardError::Platform(format!("File Provider {operation}: {cause}"))
 }
 fn manager(args: &[&str], deadline: Instant) -> Result<String, ClipboardError> {
     let _update_activity = oink_foundation::maintenance::process()
@@ -403,7 +599,15 @@ fn manager_while(args: &[&str], deadline: Instant, current: &dyn Fn() -> bool) -
     }
     let mut command = Command::new(path);
     command.args(args);
-    run_manager(command, deadline, current)
+    let result = run_manager(command, deadline, current);
+    if result.is_err() {
+        // Only the command verb is logged, never batch IDs or other arguments.
+        tracing::warn!(
+            operation = args.first().copied().unwrap_or("none"),
+            "File Provider helper operation failed"
+        );
+    }
+    result
 }
 fn run_manager(mut command: Command, deadline: Instant, current: &dyn Fn() -> bool) -> Result<String, ClipboardError> {
     check_publication(deadline, current)?;
@@ -423,39 +627,59 @@ fn run_manager(mut command: Command, deadline: Instant, current: &dyn Fn() -> bo
         stderr.take(64 * 1024).read_to_end(&mut b).map(|_| b)
     });
     let status = loop {
-        if let Err(error) = check_publication(deadline, current) {
-            let _ = child.kill();
-            let _ = child.wait();
-            break Err(error);
-        }
+        // Observe a completed rejection before the clock check. Otherwise an
+        // error already returned by the helper could be relabelled as timeout.
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
-            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {}
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 break Err(error(e));
             }
         }
+        if let Err(error) = check_publication(deadline, current) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break Err(error);
+        }
+        std::thread::sleep(Duration::from_millis(5));
     };
     let stdout = out
         .join()
         .map_err(|_| error("manager output thread failed"))?
         .map_err(error)?;
-    let _stderr = err
+    let stderr = err
         .join()
         .map_err(|_| error("manager error thread failed"))?
         .map_err(error)?;
     // Helper output can contain user paths and bridge capabilities. Never log it.
     let status = status?;
     if !status.success() {
-        return Err(ClipboardError::FileProvider(match status.code() {
+        let reason = match status.code() {
             Some(2) => FileProviderReason::BoundExpired,
             Some(3) => FileProviderReason::DomainDisabled,
             Some(4) => FileProviderReason::ExtensionNotRegistered,
             Some(5) => FileProviderReason::DomainDisconnected,
+            Some(32) => FileProviderReason::ItemMissing,
+            Some(33) => FileProviderReason::ItemUnsupportedType,
+            Some(34) => FileProviderReason::ItemKindMismatch,
+            Some(35) => FileProviderReason::ItemTargetMismatch,
+            Some(36) => FileProviderReason::ItemIdentityMismatch,
+            Some(37) => FileProviderReason::ItemMetadataMismatch,
+            Some(38) => FileProviderReason::ItemAccessDenied,
+            Some(39) => FileProviderReason::ItemMetadataUnreadable,
             _ => FileProviderReason::RegistrationFailed,
-        }));
+        };
+        tracing::warn!(exit_code = status.code(), %reason, cause = %diagnostics::helper_error(&stderr),
+            "File Provider helper rejected operation");
+        if reason == FileProviderReason::RegistrationFailed {
+            return Err(error_at(
+                "helper",
+                diagnostics::Failure(format!("{status}; {}", diagnostics::helper_error(&stderr))),
+            ));
+        }
+        return Err(ClipboardError::FileProvider(reason));
     }
     String::from_utf8(stdout).map(|s| s.trim().to_owned()).map_err(error)
 }
@@ -467,27 +691,46 @@ fn container_while(deadline: Instant, current: &dyn Fn() -> bool) -> Result<Path
     if let Some(root) = CONTAINER.get() {
         return Ok(root.clone());
     }
+    let data = DATA
+        .get()
+        .ok_or(ClipboardError::FileProvider(FileProviderReason::Checking))?;
+    crate::upgrade::prepare(data, || Ok(())).map_err(|e| error_at("prepare_local_store", e))?;
     let root = PathBuf::from(manager_while(&["container"], deadline, current)?);
-    let _ = CONTAINER.set(root.clone());
     watch_storage(&root);
+    let _ = CONTAINER.set(root.clone());
     Ok(root)
 }
 /// Register/inspect the hidden domain off the input and UI threads. Never handles an authorization UI.
-pub(crate) fn warm_up() {
+fn warm_up() {
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
         std::thread::spawn(|| {
             if !STARTUP.wait() {
                 return;
             }
-            let result = container(Instant::now() + MANAGER_TIMEOUT)
-                .and_then(|_| manager(&["initialize"], Instant::now() + MANAGER_TIMEOUT));
+            let result = warm_up_domain(
+                || container(Instant::now() + MANAGER_TIMEOUT),
+                |_| manager(&["initialize"], Instant::now() + MANAGER_TIMEOUT).map(|_| ()),
+                || DEMAND_CHANGED.notify_one(),
+            );
             // Domain enablement is not evidence that a new item's URL is ready.
             if let Err(e) = result {
                 tracing::info!(%e, "File Provider initialization unavailable");
             }
         });
     });
+}
+fn warm_up_domain<T, E>(
+    container: impl FnOnce() -> Result<T, E>,
+    initialize: impl FnOnce(&T) -> Result<(), E>,
+    changed: impl FnOnce(),
+) -> Result<(), E> {
+    let result = container().and_then(|root| initialize(&root));
+    // An earlier read may have observed an absent domain. Registration completes
+    // in the separate manager, so explicitly refresh the read-only observer even
+    // if no NSFileProviderDomainDidChange notification arrives in this process.
+    changed();
+    result
 }
 fn signal_changes() {
     std::thread::spawn(|| {
@@ -664,13 +907,17 @@ fn random() -> io::Result<String> {
 fn bridge(root: &std::path::Path) -> Result<Arc<Bridge>, ClipboardError> {
     BRIDGE
         .get_or_init(|| {
-            let data = DATA.get().ok_or_else(|| "content store not configured".to_owned())?;
-            let listener = Arc::new(TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(|e| e.to_string())?);
+            let data = DATA
+                .get()
+                .ok_or_else(|| diagnostics::Failure::from("content store not configured"))?;
+            let listener =
+                Arc::new(TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(diagnostics::Failure::from)?);
             let bridge = Arc::new(Bridge {
-                port: listener.local_addr().map_err(|e| e.to_string())?.port(),
+                port: listener.local_addr().map_err(diagnostics::Failure::from)?.port(),
                 batches: Mutex::new(HashMap::new()),
             });
-            *bridge.batches.lock().unwrap() = recover_catalogs(data, root, bridge.port).map_err(|e| e.to_string())?;
+            *bridge.batches.lock().unwrap() =
+                recover_catalogs(data, root, bridge.port).map_err(diagnostics::Failure::from)?;
             // Bounded worker pool: untrusted clients cannot spawn unbounded threads or ask for paths.
             for _ in 0..4 {
                 let listener = listener.clone();
@@ -685,7 +932,7 @@ fn bridge(root: &std::path::Path) -> Result<Arc<Bridge>, ClipboardError> {
                             }
                         }
                     })
-                    .map_err(|e| e.to_string())?;
+                    .map_err(diagnostics::Failure::from)?;
             }
             Ok(bridge)
         })
@@ -699,9 +946,10 @@ fn recover_catalogs(
     root: &std::path::Path,
     port: u16,
 ) -> io::Result<HashMap<String, Arc<Batch>>> {
+    let _mutation = crate::cache::Mutation(root);
     let mut batches = HashMap::new();
     for key in placeholders::ledger_keys(root) {
-        remove_catalog_in(root, &root.join(format!("{key}.json")));
+        cancel_catalog_in(root, &root.join(format!("{key}.json")));
     }
     for entry in std::fs::read_dir(root)?.flatten() {
         let path = entry.path();
@@ -723,16 +971,26 @@ fn recover_catalogs(
                 Ok(batch) => {
                     batches.insert(key.into(), batch);
                 }
-                Err(_) => remove_catalog_in(root, &path),
+                Err(_) => {
+                    remove_catalog_in(root, &path);
+                }
             }
         }
     }
     Ok(batches)
 }
 fn save_catalog(path: &std::path::Path, catalog: &Catalog) -> io::Result<()> {
+    catalog.settlement.validate(catalog.source.as_ref())?;
     let bytes = serde_json::to_vec(catalog)?;
     if bytes.len() > 64 * 1024 * 1024 {
         return Err(io::ErrorKind::FileTooLarge.into());
+    }
+    // Accounting may retain an unchanged catalog. Do not let that read path
+    // rewrite it and schedule itself again through explicit owner invalidation.
+    if std::fs::read(path).is_ok_and(|previous| previous == bytes) {
+        // Preserve the commit barrier if an earlier rename succeeded but its
+        // directory flush failed. The file was flushed before that rename.
+        return crate::store::sync_directory(path.parent().unwrap());
     }
     let part = path.with_extension("tmp");
     let mut file = std::fs::OpenOptions::new()
@@ -752,6 +1010,11 @@ fn save_catalog(path: &std::path::Path, catalog: &Catalog) -> io::Result<()> {
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(part);
+    }
+    // A failed durability step can follow the committed rename. Failed writes
+    // that never replaced the catalog must not retrigger a failed usage scan.
+    if result.is_ok() || std::fs::read(path).is_ok_and(|current| current == bytes) {
+        crate::cache::changed(path.parent().unwrap());
     }
     result
 }
@@ -776,6 +1039,8 @@ fn node_record_with_aliases(
         ),
         name: entry.path.rsplit('/').next().unwrap().into(),
         directory: node.kind == NodeKind::Directory,
+        symlink_target: node.kind.symlink_target().map(str::to_owned),
+        exec_bits: node.exec_bits,
         size: match node.size {
             ContentSize::Known(n) => Some(n),
             ContentSize::Unknown => None,
@@ -785,6 +1050,7 @@ fn node_record_with_aliases(
         version: node.version,
         children: None,
         hidden: None,
+        keep_local: None,
     })
 }
 /// A native URL can be read long after its metadata was enumerated. Persist
@@ -793,9 +1059,7 @@ fn node_record_with_aliases(
 /// never be recreated by a reader admitted before its deletion.
 fn refresh_file_record(batch: &Batch, entry: &FileNode) -> io::Result<bool> {
     let mut state = batch.state.lock().unwrap();
-    if state.retired {
-        return Err(crate::content::unavailable(crate::model::Unavailable::NoSuchItem));
-    }
+    state.source_available(entry.id)?;
     let index = state
         .catalog
         .records
@@ -807,13 +1071,18 @@ fn refresh_file_record(batch: &Batch, entry: &FileNode) -> io::Result<bool> {
         ContentSize::Known(size) => Some(size),
         ContentSize::Unknown => None,
     };
-    if old.size == size && old.modified == entry.modified_ms && old.version == entry.version {
+    if old.size == size
+        && old.modified == entry.modified_ms
+        && old.version == entry.version
+        && old.exec_bits == entry.exec_bits
+    {
         return Ok(false);
     }
     let current = &mut state.catalog.records[index];
     current.size = size;
     current.modified = entry.modified_ms;
     current.version = entry.version;
+    current.exec_bits = entry.exec_bits;
     if let Err(error) = state.persist(&batch.catalog) {
         state.catalog.records[index] = old;
         return Err(error);
@@ -821,72 +1090,135 @@ fn refresh_file_record(batch: &Batch, entry: &FileNode) -> io::Result<bool> {
     Ok(true)
 }
 
-fn serve(mut stream: TcpStream, bridge: &Bridge) -> io::Result<()> {
-    let _update_activity = oink_foundation::maintenance::process()
-        .enter(oink_foundation::maintenance::ActivityKind::FileProvider)
-        .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
-
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let mut line = String::new();
-    io::BufReader::new((&stream).take(4096)).read_line(&mut line)?;
-    if !line.ends_with('\n') {
-        return Err(io::Error::other("incomplete request"));
-    }
-    let request: Request = serde_json::from_str(&line).map_err(|_| io::Error::other("invalid request"))?;
-    let (token, batch_id, node) = match &request {
-        Request::Read { token, batch, node } | Request::List { token, batch, node, .. } => {
-            (token, batch, NodeId(*node))
+/// A promise can enumerate through NativeFiles without a simultaneous system
+/// enumerator. Publish those children before returning their IDs: received-read
+/// and received-stat resolve only catalogued native items. Use the same commit
+/// as the extension's List request; background whole-tree download is not an
+/// ordering barrier for an individual promise callback.
+fn persist_listing(
+    batch: &Batch,
+    node: NodeId,
+    cursor: Option<crate::model::DirectoryCursor>,
+    page: &crate::model::DirectoryPage,
+) -> io::Result<Vec<Record>> {
+    let key = batch
+        .catalog
+        .file_stem()
+        .and_then(|key| key.to_str())
+        .ok_or(io::ErrorKind::InvalidData)?;
+    let mut state = batch.state.lock().unwrap();
+    state.source_available(node)?;
+    let mut records = Vec::new();
+    for child in &page.entries {
+        let CatalogState { names, aliases, .. } = &mut *state;
+        let record = node_record_with_aliases(key, child, names, aliases)?;
+        if !state.catalog.records.iter().any(|old| old.id == record.id) {
+            state.catalog.records.push(record.clone());
         }
-    };
-    let batch = bridge
-        .batches
-        .lock()
-        .unwrap()
-        .get(batch_id)
-        .cloned()
-        .filter(|b| &b.token == token)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "unknown capability"))?;
-    if !batch
-        .state
-        .lock()
-        .unwrap()
+        records.push(record);
+    }
+    if let Some(parent) = state
         .catalog
         .records
-        .iter()
-        .any(|record| record.node == Some(node.0))
+        .iter_mut()
+        .find(|record| record.node == Some(node.0))
     {
-        return Err(io::ErrorKind::NotFound.into());
+        parent.version = page.version;
+        if page.next.is_none() {
+            parent.children = Some(u64::from(cursor.map_or(0, |c| c.offset)) + page.entries.len() as u64);
+        }
     }
-    let _watch = ReadWatch::new(&stream, batch.clone())?;
+    state.catalog.file_policies();
+    state.persist(&batch.catalog)?;
+    Ok(records)
+}
+
+impl Batch {
+    fn source_available(&self, node: NodeId) -> io::Result<()> {
+        self.state.lock().unwrap().source_available(node)
+    }
+}
+
+fn serve(mut stream: TcpStream, bridge: &Bridge) -> io::Result<()> {
+    let admission = (|| {
+        let update_activity = oink_foundation::maintenance::process()
+            .enter(oink_foundation::maintenance::ActivityKind::FileProvider)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+        let mut line = String::new();
+        io::BufReader::new((&stream).take(4096)).read_line(&mut line)?;
+        if !line.ends_with('\n') {
+            return Err(io::Error::other("incomplete request"));
+        }
+        let request: Request = serde_json::from_str(&line).map_err(|_| io::Error::other("invalid request"))?;
+        let (token, batch_id, node) = match &request {
+            Request::Read { token, batch, node }
+            | Request::List { token, batch, node, .. }
+            | Request::Complete { token, batch, node, .. }
+            | Request::Failed { token, batch, node, .. } => (token, batch, NodeId(*node)),
+        };
+        let batch = bridge
+            .batches
+            .lock()
+            .unwrap()
+            .get(batch_id)
+            .cloned()
+            .filter(|b| &b.token == token)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "unknown capability"))?;
+        if !batch
+            .state
+            .lock()
+            .unwrap()
+            .catalog
+            .records
+            .iter()
+            .any(|record| record.node == Some(node.0))
+        {
+            return Err(io::ErrorKind::NotFound.into());
+        }
+        let batch_id = batch_id.clone();
+        Ok((update_activity, request, batch, node, batch_id))
+    })();
+    let (_update_activity, request, batch, node, batch_id) = admission.inspect_err(|error| {
+        reject_request(&mut stream, error);
+    })?;
+    match request {
+        Request::Complete { version, .. } => {
+            batch.received_complete(node, version)?;
+            return stream.write_all(&[0]);
+        }
+        Request::Failed { version, .. } => {
+            if batch
+                .state
+                .lock()
+                .unwrap()
+                .catalog
+                .records
+                .iter()
+                .any(|record| record.node == Some(node.0) && record.version == version)
+            {
+                batch.received_failed(node)?;
+            }
+            return stream.write_all(&[0]);
+        }
+        _ => {}
+    }
+    let reader = (|| {
+        batch.source_available(node)?;
+        ReadWatch::new(&stream, batch.clone())
+    })();
+    let _watch = reader.inspect_err(|error| {
+        reject_request(&mut stream, error);
+    })?;
     let contents = batch.contents.lock().unwrap().clone();
     let content_read = matches!(request, Request::Read { .. });
     let result: io::Result<()> = (|| match request {
+        Request::Complete { .. } | Request::Failed { .. } => unreachable!(),
         Request::List { cursor, .. } => {
             let page = contents.list(node, cursor)?;
-            let mut state = batch.state.lock().unwrap();
-            let mut records = Vec::new();
-            for child in &page.entries {
-                let CatalogState { names, aliases, .. } = &mut *state;
-                let record = node_record_with_aliases(batch_id, child, names, aliases)?;
-                if !state.catalog.records.iter().any(|old| old.id == record.id) {
-                    state.catalog.records.push(record.clone());
-                }
-                records.push(record);
-            }
-            if let Some(parent) = state
-                .catalog
-                .records
-                .iter_mut()
-                .find(|record| record.node == Some(node.0))
-            {
-                parent.version = page.version;
-                if page.next.is_none() {
-                    parent.children = Some(u64::from(cursor.map_or(0, |c| c.offset)) + page.entries.len() as u64);
-                }
-            }
-            state.persist(&batch.catalog)?;
-            drop(state);
+            let records = persist_listing(&batch, node, cursor, &page)?;
             let bytes = serde_json::to_vec(&Listing {
                 records,
                 next: page.next,
@@ -905,7 +1237,7 @@ fn serve(mut stream: TcpStream, bridge: &Bridge) -> io::Result<()> {
                 signal_changes();
             }
             let header = serde_json::to_vec(
-                &serde_json::json!({ "schema": 1, "size": size, "modified": entry.modified_ms, "version": entry.version }),
+                &serde_json::json!({ "schema": 1, "size": size, "modified": entry.modified_ms, "version": entry.version, "exec_bits": entry.exec_bits }),
             )?;
             stream.write_all(&(u32::MAX - 1).to_be_bytes())?;
             stream.write_all(&(header.len() as u32).to_be_bytes())?;
@@ -915,7 +1247,9 @@ fn serve(mut stream: TcpStream, bridge: &Bridge) -> io::Result<()> {
                 if !_watch.connected.load(Ordering::Acquire) {
                     return Err(io::ErrorKind::ConnectionAborted.into());
                 }
+                batch.source_available(node)?;
                 let count = reader.read(&mut buffer)?;
+                batch.source_available(node)?;
                 stream.write_all(&(count as u32).to_be_bytes())?;
                 if count == 0 {
                     return Ok(());
@@ -925,35 +1259,69 @@ fn serve(mut stream: TcpStream, bridge: &Bridge) -> io::Result<()> {
         }
     })();
     if let Err(ref error) = result {
+        let _ = batch.received_failed(node);
         let reason = crate::content::reason(error);
-        let unavailable = matches!(
-            reason,
-            crate::model::Unavailable::NoSuchItem | crate::model::Unavailable::Cancelled
-        ) || (content_read && reason == crate::model::Unavailable::Superseded)
-            // Prepared catalogs deliberately refuse speculative system reads.
-            // An activated delivery losing its content grant is permanent.
-            || (reason == crate::model::Unavailable::Permission
-                && batch.state.lock().unwrap().catalog.batch.is_some());
+        let linked = batch.state.lock().unwrap().catalog.persistent();
+        let unavailable = !linked
+            && (matches!(
+                reason,
+                crate::model::Unavailable::NoSuchItem | crate::model::Unavailable::Cancelled
+            ) || (content_read && reason == crate::model::Unavailable::Superseded));
         if unavailable {
             tracing::info!(
                 ?reason,
                 "File Provider publication withdrawn after permanent content failure"
             );
-            retire_publication(bridge, batch_id, &batch);
+            retire_publication(bridge, &batch_id, &batch);
         }
         let code = match reason {
             _ if unavailable => 2,
+            _ if linked
+                && matches!(
+                    error.kind(),
+                    io::ErrorKind::NotConnected
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::TimedOut
+                ) =>
+            {
+                1
+            }
+            crate::model::Unavailable::ReadFailed if linked => 5,
             crate::model::Unavailable::NoProgress => 1,
             crate::model::Unavailable::NoSuchItem | crate::model::Unavailable::ReadFailed => 2,
             crate::model::Unavailable::Superseded => 3,
             crate::model::Unavailable::Cancelled => 4,
+            crate::model::Unavailable::Permission => 6,
             _ => 5,
         };
+        tracing::debug!(?reason, code, "File Provider content request failed");
         let _ = stream
             .write_all(&u32::MAX.to_be_bytes())
             .and_then(|_| stream.write_all(&[code]));
     }
     result
+}
+
+// Rejections before streaming still need the bridge's typed failure frame.
+// An unframed EOF means a broken loopback connection to the extension (-1004),
+// which hides a withdrawn item or denied capability as a network outage.
+fn reject_request(stream: &mut TcpStream, error: &io::Error) {
+    let reason = crate::content::reason(error);
+    let code = match reason {
+        crate::model::Unavailable::NoSuchItem => 2,
+        crate::model::Unavailable::Superseded => 3,
+        crate::model::Unavailable::Cancelled => 4,
+        crate::model::Unavailable::Permission => 6,
+        crate::model::Unavailable::NoProgress => 1,
+        _ => 5,
+    };
+    tracing::debug!(?reason, code, "File Provider request rejected before streaming");
+    let _ = stream
+        .write_all(&u32::MAX.to_be_bytes())
+        .and_then(|_| stream.write_all(&[code]));
 }
 
 fn retire_publication(bridge: &Bridge, key: &str, batch: &Arc<Batch>) {
@@ -972,42 +1340,6 @@ fn retire_publication(bridge: &Bridge, key: &str, batch: &Arc<Batch>) {
     }
 }
 
-/// Called before the payload lifetime lock. Metadata must leave the working set
-/// when the corresponding delivery expires, even if a native URL owner survives.
-pub(crate) fn retire_unavailable(data: &std::path::Path, now: u64) {
-    let Some(Ok(bridge)) = BRIDGE.get() else { return };
-    let _ = received_usage(true);
-    retire_unavailable_in(bridge, data, now);
-}
-
-fn retire_unavailable_in(bridge: &Bridge, data: &std::path::Path, now: u64) {
-    let unavailable: Vec<_> = bridge
-        .batches
-        .lock()
-        .unwrap()
-        .iter()
-        .filter_map(|(key, batch)| {
-            let id = batch.state.lock().unwrap().catalog.batch?;
-            let all_deleted = (|| -> Option<bool> {
-                let overlay: serde_json::Value =
-                    serde_json::from_slice(&std::fs::read(batch.catalog.with_extension("received")).ok()?).ok()?;
-                let state = batch.state.lock().unwrap();
-                let leaves: Vec<_> = state.catalog.records.iter().filter(|r| !r.directory).collect();
-                Some(if leaves.is_empty() {
-                    !state.catalog.records.is_empty()
-                        && state.catalog.records.iter().all(|r| overlay[&r.id]["deleted"] == true)
-                } else {
-                    leaves.iter().all(|r| overlay[&r.id]["deleted"] == true)
-                })
-            })()
-            .unwrap_or(false);
-            (all_deleted || !crate::store::publication_available(data, id, now)).then(|| (key.clone(), batch.clone()))
-        })
-        .collect();
-    for (key, batch) in unavailable {
-        retire_publication(bridge, &key, &batch);
-    }
-}
 /// A trashed device folder keeps its identity and children. A later delivery
 /// creates a fresh active folder, rather than silently restoring the user's trash.
 fn received_source_catalog(
@@ -1024,9 +1356,14 @@ fn received_source_catalog(
             token: String::new(),
             port: 0,
             records: Vec::new(),
-            batch: None,
+            source: None,
+            settlement: Default::default(),
+            arrived: Vec::new(),
+            failed: Vec::new(),
             urls: Vec::new(),
             received_at: None,
+            move_state: None,
+            consumed: Vec::new(),
         },
         Err(e) => return Err(e),
     };
@@ -1062,6 +1399,8 @@ fn received_source_catalog(
         format!("{base}g{}", random()?)
     };
     catalog.records.push(Record {
+        exec_bits: None,
+        symlink_target: None,
         id: id.clone(),
         parent: "NSFileProviderRootContainerItemIdentifier".into(),
         name,
@@ -1072,6 +1411,7 @@ fn received_source_catalog(
         version: 1,
         children: None,
         hidden: None,
+        keep_local: None,
     });
     save_catalog(&path, &catalog)?;
     Ok(id)
@@ -1127,6 +1467,8 @@ fn prepare_batch_with_root(
     }
     let mut names = Names::new(crate::sync::files::TargetOs::MacOs);
     let mut records = vec![Record {
+        exec_bits: None,
+        symlink_target: None,
         id: format!("{id}-root"),
         parent: source_parent,
         name: delivery_name,
@@ -1137,14 +1479,16 @@ fn prepare_batch_with_root(
         version: 1,
         children: Some(roots.len() as u64),
         hidden: None,
+        keep_local: None,
     }];
     let mut entries = Vec::new();
     for node in roots {
         records.push(node_record(id, &node, &mut names)?);
         entries.push(names.entry(&node)?);
     }
-    let local_batch = contents.local_batch().map(|batch| batch.id());
-    let batch = Arc::new(Batch {
+    let source = contents.source_link();
+    let batch = Arc::new_cyclic(|owner| Batch {
+        owner: owner.clone(),
         urls: Mutex::default(),
         token: token.clone(),
         contents: Mutex::new(contents),
@@ -1154,19 +1498,25 @@ fn prepare_batch_with_root(
                 token,
                 port,
                 records,
-                batch: local_batch,
+                source,
+                settlement: Default::default(),
+                arrived: Vec::new(),
+                failed: Vec::new(),
                 urls: Vec::new(),
                 received_at,
+                move_state: None,
+                consumed: Vec::new(),
             },
             names,
             aliases: HashMap::new(),
             retired: false,
         }),
         catalog,
-        readers: Mutex::new(0),
+        readers: Arc::new(Mutex::new(0)),
     });
     // Empty stock is internal, just like typed stock. Never show its random
     // publication key as a received folder while it awaits a real namespace.
+    batch.state.lock().unwrap().catalog.file_policies();
     if private_parent {
         placeholders::hide_parent(id, &mut batch.state.lock().unwrap().catalog);
     }
@@ -1178,27 +1528,49 @@ fn restore_catalog(data: &std::path::Path, path: &std::path::Path, key: &str, po
     if crate::cache::is_link(&metadata) || !metadata.is_file() || metadata.len() > 64 * 1024 * 1024 {
         return Err(io::ErrorKind::InvalidData.into());
     }
-    let previous: Catalog = serde_json::from_slice(&std::fs::read(path)?)?;
-    let id = previous.batch.ok_or(io::ErrorKind::InvalidData)?;
-    let local = crate::content::Completed::restore(data, id)?;
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let legacy = crate::content::linked::completed::legacy_pending_roots(&value["source"]);
+    let mut previous: Catalog = serde_json::from_value(value)?;
+    native::recover_legacy_received(&mut previous, key, path, &legacy)?;
+    let unfinished = previous
+        .source
+        .as_ref()
+        .is_some_and(|source| !source.fulfilled.is_empty());
+    native::discard_incomplete(&mut previous, key, path)?;
+    if unfinished && !previous.persistent() {
+        cancel_catalog_in(path.parent().ok_or(io::ErrorKind::InvalidData)?, path);
+        return Err(io::ErrorKind::NotFound.into());
+    }
+    if previous.source.as_ref().is_some_and(|source| source.provisional) {
+        cancel_catalog_in(path.parent().ok_or(io::ErrorKind::InvalidInput)?, path);
+        return Err(io::ErrorKind::Interrupted.into());
+    }
+    let (contents, nodes): (Arc<dyn Namespace>, Vec<FileNode>) = if previous.persistent() {
+        let contents = previous
+            .settlement
+            .restore(previous.source.clone(), crate::content::linked::native_connector())?;
+        (contents, linked_catalog_nodes(key, &previous)?)
+    } else {
+        let _ = data;
+        return Err(io::ErrorKind::NotFound.into());
+    };
     let token = random()?;
-    let (batch, _) = prepare_batch_with_root(
-        Arc::new(local.clone()),
-        key,
-        token,
-        port,
-        path.to_owned(),
-        previous.records.first(),
-    )?;
+    let (batch, _) = prepare_batch_with_root(contents, key, token, port, path.to_owned(), previous.records.first())?;
     batch.state.lock().unwrap().catalog.received_at = previous.received_at;
     {
         let mut state = batch.state.lock().unwrap();
+        state.catalog.settlement = previous.settlement.clone();
+        state.catalog.move_state = previous.move_state;
+        state.catalog.consumed = previous.consumed.clone();
+        state.retired = previous.move_state == Some(moved::State::Removed);
+        state.catalog.arrived = previous.arrived.clone();
+        state.catalog.failed = previous.failed.clone();
         placeholders::restore_bindings(key, &previous, &mut state)?;
         if let (Some(old), Some(new)) = (previous.records.first(), state.catalog.records.first_mut()) {
             new.parent = old.parent.clone();
             new.name = old.name.clone();
         }
-        for node in local.nodes().iter().filter(|n| n.parent.is_some()) {
+        for node in nodes.iter().filter(|n| n.parent.is_some()) {
             let CatalogState { names, aliases, .. } = &mut *state;
             let record = node_record_with_aliases(key, node, names, aliases)?;
             state.catalog.records.push(record);
@@ -1211,6 +1583,8 @@ fn restore_catalog(data: &std::path::Path, path: &std::path::Path, key: &str, po
                     && old.parent == new.parent
                     && old.name == new.name
                     && old.directory == new.directory
+                    && old.symlink_target == new.symlink_target
+                    && old.exec_bits == new.exec_bits
                     && old.node == new.node
             })
         }) {
@@ -1226,11 +1600,73 @@ fn restore_catalog(data: &std::path::Path, path: &std::path::Path, key: &str, po
                 record.children = Some(counts.get(&record.id).copied().unwrap_or(0));
             }
         }
+        if previous.persistent() {
+            // Retain partial directory views and the metadata most recently
+            // observed by native fetches. Recovery does not enumerate a source.
+            state.catalog.records = previous.records.clone();
+        }
         state.catalog.urls = previous.urls.clone();
+        state.catalog.file_policies();
         save_catalog(path, &state.catalog)?;
     }
     *batch.urls.lock().unwrap() = previous.urls;
+    native::recover(&batch)?;
     Ok(batch)
+}
+
+fn linked_catalog_nodes(key: &str, catalog: &Catalog) -> io::Result<Vec<FileNode>> {
+    use std::collections::HashSet;
+    if catalog.records.len() > crate::model::MAX_DISCOVERED_NODES + 1 {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let root = format!("{key}-root");
+    let mut ids = HashSet::new();
+    let mut nodes = HashSet::new();
+    let mut parents = HashMap::new();
+    let mut result = Vec::new();
+    for record in &catalog.records {
+        if !ids.insert(&record.id) {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let Some(id) = record.node.map(NodeId) else {
+            if record.id != root || !record.directory {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            continue;
+        };
+        if !nodes.insert(id) {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let parent = if record.parent == root {
+            None
+        } else {
+            Some(*parents.get(&record.parent).ok_or(io::ErrorKind::InvalidData)?)
+        };
+        let node = FileNode {
+            exec_bits: record.exec_bits,
+            id,
+            parent,
+            name: record.name.clone(),
+            kind: if let Some(target) = &record.symlink_target {
+                NodeKind::Symlink(target.clone())
+            } else if record.directory {
+                NodeKind::Directory
+            } else {
+                NodeKind::File
+            },
+            size: record.size.map_or(ContentSize::Unknown, ContentSize::Known),
+            version: record.version,
+            modified_ms: record.modified,
+        };
+        if !node.valid() {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        if record.directory {
+            parents.insert(record.id.clone(), id);
+        }
+        result.push(node);
+    }
+    Ok(result)
 }
 /// Register a drag snapshot with a strict total wait budget. Only system-issued URLs are returned.
 pub fn register(
@@ -1379,7 +1815,11 @@ fn publish_inner(
         start,
         true,
     );
-    if timing.placeholder.used && result.is_err() {
+    if timing.placeholder.used
+        && result.as_ref().err().is_some_and(|error| {
+            !matches!(error, ClipboardError::ContentUnavailable(_)) && !failure_reason(error).item_rejected()
+        })
+    {
         use crate::provider_preparation::PlaceholderFallback;
         timing.placeholder.used = false;
         timing.placeholder.fallback = if placeholder_status().enabled {
@@ -1408,13 +1848,36 @@ fn storage_until(
     deadline: Instant,
     current: &dyn Fn() -> bool,
 ) -> Result<std::sync::MutexGuard<'static, ()>, ClipboardError> {
+    let started = Instant::now();
+    let mut waited = false;
     loop {
-        check_publication(deadline, current)?;
-        match STORAGE.try_lock() {
-            Ok(guard) => return Ok(guard),
-            Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(5)),
+        if let Err(error) = check_publication(deadline, current) {
+            tracing::info!(
+                dnd_phase = 56_u64,
+                elapsed_us = started.elapsed().as_micros() as u64,
+                reason = failure_reason(&error) as u64,
+                "File Provider catalog lock wait ended"
+            );
+            return Err(error);
         }
+        let guard = match STORAGE.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some(guard) = guard {
+            if waited {
+                tracing::info!(
+                    dnd_phase = 56_u64,
+                    elapsed_us = started.elapsed().as_micros() as u64,
+                    reason = 0_u64,
+                    "File Provider catalog lock acquired"
+                );
+            }
+            return Ok(guard);
+        }
+        waited = true;
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -1437,13 +1900,19 @@ fn publish_attempt(
     if !REQUESTED.swap(true, Ordering::AcqRel) {
         DEMAND_CHANGED.notify_one();
     }
+    let contents: Arc<dyn Namespace> = match contents.namespace() {
+        Some(namespace) => namespace,
+        None => Flat::new(entries, contents).map_err(|e| error_at("source_namespace", e))?,
+    };
+    contents.prepare().map_err(|error| {
+        let reason = crate::content::reason(&error);
+        tracing::warn!(operation = "source_prepare", ?reason, cause = %diagnostics::Failure::from(error).0,
+            "File Provider source preparation failed");
+        ClipboardError::ContentUnavailable(reason)
+    })?;
     let _storage = storage_until(deadline, current)?;
     let root = container_while(deadline, current)?;
     let bridge = bridge(&root)?;
-    let contents: Arc<dyn Namespace> = match contents.namespace() {
-        Some(namespace) => namespace,
-        None => Flat::new(entries, contents).map_err(error)?,
-    };
     check_publication(deadline, current)?;
     let mut placeholder = selected.or_else(|| {
         if try_placeholders && owner.is_some_and(PublicationOwner::permits_placeholder) {
@@ -1545,9 +2014,28 @@ fn publish_attempt(
     // Neither an unrelated Announced helper nor a refill owns STORAGE here.
     drop(_storage);
     let command = if typed { "publish-placeholders" } else { "publish" };
-    let result = manager_while(&[command, &batch_id], deadline, &publication_current).and_then(|json| {
+    let helper_started = Instant::now();
+    tracing::info!(
+        dnd_phase = 58_u64,
+        preparation_generation = trace.generation,
+        provider_path = if typed { 2_u64 } else { 1_u64 },
+        active = true,
+        "File Provider publication helper started"
+    );
+    let managed = manager_while(&[command, &batch_id], deadline, &publication_current);
+    tracing::info!(
+        dnd_phase = 58_u64,
+        preparation_generation = trace.generation,
+        provider_path = if typed { 2_u64 } else { 1_u64 },
+        active = false,
+        elapsed_us = helper_started.elapsed().as_micros() as u64,
+        success = managed.is_ok(),
+        reason = managed.as_ref().err().map(failure_reason).map(|r| r as u64),
+        "File Provider publication helper finished"
+    );
+    let result = managed.and_then(|json| {
         check_publication(deadline, &publication_current)?;
-        let paths: Vec<PathBuf> = serde_json::from_str(&json).map_err(error)?;
+        let paths: Vec<PathBuf> = serde_json::from_str(&json).map_err(|e| error_at("decode_helper_response", e))?;
         let _storage = storage_until(deadline, &publication_current)?;
         if paths.len() != entries.len() {
             return Err(error("incomplete File Provider URL list"));
@@ -1556,7 +2044,7 @@ fn publish_attempt(
         {
             let mut state = batch.state.lock().unwrap();
             state.catalog.urls = paths.clone();
-            save_catalog(&catalog, &state.catalog).map_err(error)?;
+            save_catalog(&catalog, &state.catalog).map_err(|e| error_at("save_catalog", e))?;
         }
         if typed {
             placeholders::complete(&root, &batch_id).map_err(error)?;
@@ -1578,6 +2066,7 @@ fn publish_attempt(
             })
             .collect();
         Ok(Registration {
+            diagnostic_publication: (Instant::now(), typed),
             key: batch_id.clone(),
             bridge: Arc::downgrade(&bridge),
             batch: batch.clone(),
@@ -1590,33 +2079,13 @@ fn publish_attempt(
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .map(|time| time.saturating_sub(start) / 1_000);
-    // Announced publications retain their admission wrapper even after Stored.
-    // Their deferred content owner is installed only by activate_prepared.
-    if result.is_ok()
-        && !matches!(
-            owner,
-            Some(PublicationOwner::Announced(_) | PublicationOwner::Entered(_, _))
-        )
-    {
-        let weak = Arc::downgrade(&batch);
-        batch.contents.lock().unwrap().on_stored(Box::new(move |local| {
-            let _storage = STORAGE.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(batch) = weak.upgrade() else { return };
-            // Existing native registrations/streams keep their independent pins.
-            // Only the dormant bridge catalog sheds its remote transfer owner.
-            *batch.contents.lock().unwrap() = Arc::new(local);
-            if let Some(root) = CONTAINER.get() {
-                crate::cache::changed(root);
-            }
-        }));
-    }
     if result.is_err() {
         bridge
             .batches
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&batch_id);
-        retire_catalog(&batch, &|| remove_catalog(&catalog));
+        retire_catalog(&batch, &|| cancel_catalog_in(&root, &catalog));
         if typed {
             placeholders::retire(vec![batch_id.clone()]);
         } else {
@@ -1659,7 +2128,9 @@ fn stage_publication_with_placeholders(
             let _ = std::fs::remove_file(catalog.with_extension("enumerated"));
         }
         check()?;
-        save_catalog(catalog, &batch.state.lock().unwrap().catalog).map_err(error)?;
+        save_catalog(catalog, &batch.state.lock().unwrap().catalog).map_err(|e| error_at("save_catalog", e))?;
+        let contents = batch.contents.lock().unwrap().clone();
+        native::bind(&batch, &contents).map_err(|e| error_at("bind_native", e))?;
         Ok((batch, entries))
     })();
     if result.is_err() {
@@ -1672,17 +2143,31 @@ fn remove_catalog(path: &std::path::Path) {
     let Some(root) = CONTAINER.get() else { return };
     remove_catalog_in(root, path);
 }
+fn cancel_catalog_in(root: &std::path::Path, path: &std::path::Path) {
+    assert_eq!(path.parent(), Some(root), "catalog cancellation escaped Oink storage");
+    if std::fs::symlink_metadata(root).is_ok_and(|m| !crate::cache::is_link(&m)) {
+        // Explicit failure withdraws provisional paths, including hydrated
+        // previews. Retention, in contrast, preserves delivered user payload.
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("enumerated"));
+        crate::cache::changed(root);
+    }
+}
 fn received_entry_protected(value: &serde_json::Value) -> bool {
     // A warmed private parent is materialized, but has received no user data.
     // Match the extension's overlay admission rule, including stale snapshots
     // encountered while a typed parent is being renamed or retired.
     value["record"]["hidden"] != true
+        && !(value["record"]["directory"] == true
+            && value["record"]["node"].is_null()
+            && value["modified_locally"] != true)
         && value["deleted"] != true
         && (value["handed_off"] == true || value["materialized"] == true || value["fetching"].as_u64().unwrap_or(0) > 0)
 }
 fn received_catalog_protected(path: &std::path::Path) -> bool {
     if path.extension().is_some_and(|e| e == "json") {
         match std::fs::read(path).map(|b| serde_json::from_slice::<Catalog>(&b)) {
+            Ok(Ok(catalog)) if catalog.persistent() => return true,
             Ok(Ok(catalog)) if catalog.received_at.is_none() => return false, // legacy layouts expire
             Ok(Err(_)) => return true, // uncertain metadata must not delete an adopted item
             _ => {}
@@ -1726,6 +2211,16 @@ pub fn open_received() -> io::Result<()> {
 fn remove_catalog_in(root: &std::path::Path, path: &std::path::Path) {
     assert_eq!(path.parent(), Some(root), "catalog removal escaped Oink storage");
     if std::fs::symlink_metadata(root).is_ok_and(|m| !crate::cache::is_link(&m)) {
+        if std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Catalog>(&bytes).ok())
+            .is_some_and(|catalog| catalog.persistent())
+        {
+            // Metadata and source credentials are the received item itself.
+            // Cache maintenance cannot sever a never-hydrated user's path.
+            // Explicit cancellation uses cancel_catalog_in instead.
+            return;
+        }
         if received_catalog_protected(path) {
             // Only retained children and their ancestor chain survive detachment;
             // never-read siblings lose their expired backing and disappear.
@@ -1748,6 +2243,18 @@ fn remove_catalog_in(root: &std::path::Path, path: &std::path::Path) {
                             keep.insert(record.parent.clone());
                         }
                     }
+                    // Local imports exist only in the extension overlay. Keep
+                    // their catalog ancestors so the overlay remains discoverable.
+                    for (id, value) in overlay.as_object().ok_or(io::ErrorKind::InvalidData)? {
+                        if keep.contains(id) && value["modified_locally"] == true {
+                            keep.insert(
+                                value["record"]["parent"]
+                                    .as_str()
+                                    .ok_or(io::ErrorKind::InvalidData)?
+                                    .into(),
+                            );
+                        }
+                    }
                 }
                 catalog.records.retain(|r| keep.contains(&r.id));
                 save_catalog(path, &catalog)
@@ -1766,35 +2273,23 @@ fn remove_catalog_in(root: &std::path::Path, path: &std::path::Path) {
     }
 }
 
-/// Translate live native URL references to owner leases before retention scans.
-/// This uses only the existing bridge state; it never invokes a system helper.
-pub(crate) fn retention_pins() -> Vec<crate::store::Batch> {
-    let sources = crate::cache::source_paths();
-    let Some(Ok(bridge)) = BRIDGE.get() else {
-        return Vec::new();
-    };
-    bridge
-        .batches
-        .lock()
-        .unwrap()
-        .values()
-        .filter_map(|batch| {
-            batch_needed(batch, &sources)
-                .then(|| batch.contents.lock().unwrap().local_batch())
-                .flatten()
-        })
-        .collect()
+fn cache_storage(storage: &Mutex<()>, clear: bool) -> Option<std::sync::MutexGuard<'_, ()>> {
+    // Usage is an eventually consistent read. Holding STORAGE across the native
+    // cache helper (up to 12s) serialized later drag publications behind the
+    // previous drag's accounting. Only destructive clear needs that exclusion.
+    clear.then(|| storage.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// Called only by the native owner, on request or storage notification; never registers a domain.
 pub fn cache_usage(clear: bool) -> (Vec<crate::cache::CacheSize>, u64, bool, Vec<crate::store::Batch>) {
     use crate::cache::{CacheCategory, CacheSize};
-    let _storage = STORAGE.lock().unwrap_or_else(|e| e.into_inner());
+    let _storage = cache_storage(&STORAGE, clear);
     let root = match container(Instant::now() + MANAGER_TIMEOUT) {
         Ok(root) => root,
         Err(_) => return (Vec::new(), 0, true, Vec::new()),
     };
     let root = &root;
+    let _mutation = clear.then(|| crate::cache::Mutation(root));
     let catalog_before = catalog_bytes(root).unwrap_or(0);
     let sources = crate::cache::source_paths();
     let mut protected = Vec::<String>::new();
@@ -1882,7 +2377,8 @@ pub fn cache_usage(clear: bool) -> (Vec<crate::cache::CacheSize>, u64, bool, Vec
             });
     }
     let mut catalog_bytes = 0;
-    let mut catalog_incomplete = STORAGE_WATCH.get().is_none_or(|r| r.is_err());
+    let mut catalog_incomplete =
+        STORAGE_WATCH.get().is_none_or(|r| r.is_err()) || OWNER_WATCH.get().is_none_or(|r| r.is_err());
     match std::fs::read_dir(root) {
         Ok(entries) => {
             for entry in entries {
@@ -1928,7 +2424,7 @@ pub fn cache_usage(clear: bool) -> (Vec<crate::cache::CacheSize>, u64, bool, Vec
     if let Some(Ok(bridge)) = BRIDGE.get() {
         for (key, batch) in bridge.batches.lock().unwrap().iter() {
             if (retained_catalogs.contains(key) || (clear && !may_clear_catalogs))
-                && let Some(pin) = batch.contents.lock().unwrap().local_batch()
+                && let Some(pin) = batch.contents.lock().unwrap().cache_batch()
             {
                 pins.push(pin);
             }
@@ -1996,8 +2492,10 @@ impl Drop for Registration {
     }
 }
 
+static OWNER_WATCH: OnceLock<Result<owner_watch::OwnerWatch, String>> = OnceLock::new();
 static STORAGE_WATCH: OnceLock<Result<Mutex<storage_watch::StorageWatch>, String>> = OnceLock::new();
 fn watch_storage(root: &std::path::Path) {
+    OWNER_WATCH.get_or_init(|| owner_watch::OwnerWatch::new(root));
     STORAGE_WATCH.get_or_init(|| storage_watch::StorageWatch::new(root).map(Mutex::new));
 }
 
@@ -2005,7 +2503,8 @@ pub(crate) fn cache_root() -> Option<PathBuf> {
     CONTAINER.get().cloned()
 }
 fn batch_needed(batch: &Arc<Batch>, sources: &[PathBuf]) -> bool {
-    Arc::strong_count(batch) > 1
+    batch.state.lock().unwrap().catalog.persistent()
+        || Arc::strong_count(batch) > 1
         || batch.contents.lock().unwrap().in_use()
         || batch
             .urls
@@ -2017,8 +2516,248 @@ fn batch_needed(batch: &Arc<Batch>, sources: &[PathBuf]) -> bool {
 
 #[cfg(all(test, debug_assertions))]
 mod tests {
+    #[test]
+    fn read_only_cache_helper_does_not_block_foreground_publication() {
+        let storage = Arc::new(Mutex::new(()));
+        let cache = storage.clone();
+        let (entered, ready) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _scan = cache_storage(&cache, false);
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+        });
+        ready.recv().unwrap();
+        let foreground_can_publish = storage.try_lock().is_ok();
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(
+            foreground_can_publish,
+            "a read-only File Provider helper serialized the next drag's catalog publication"
+        );
+        assert!(cache_storage(&storage, true).is_some(), "clear still needs exclusion");
+    }
+
+    #[test]
+    fn advertised_grant_publishes_app_links_and_execution_bits_to_provider_catalog() {
+        use crate::content::{grants::SourceGrants, namespace::Local};
+        use std::{
+            fs,
+            os::unix::fs::{PermissionsExt, symlink},
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("Fixture.app");
+        fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        fs::create_dir_all(app.join("Contents/Resources/nested")).unwrap();
+        fs::write(app.join("Contents/MacOS/fixture"), b"executable").unwrap();
+        fs::set_permissions(app.join("Contents/MacOS/fixture"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(app.join("Contents/Resources/nested/content.txt"), b"resource").unwrap();
+        symlink("nested", app.join("Contents/Resources/current")).unwrap();
+        symlink("nested/content.txt", app.join("Contents/Resources/linked.txt")).unwrap();
+        let source = Local::new(vec![(NodeId(1), app)]).unwrap();
+        let peer = oink_foundation::DeviceId([2; 32]);
+        let grants = SourceGrants::load(&temp.path().join("grants"), [(peer, [1; 32])]).unwrap();
+        grants.set_peer_safe_symlinks(
+            peer,
+            crate::negotiation::CAPABILITIES.contains(&"oink.files.safe-symlinks/1"),
+        );
+        grants.set_peer_exec_bits(
+            peer,
+            crate::negotiation::CAPABILITIES.contains(&"oink.files.exec-bits/1"),
+        );
+        let token = grants.issue(peer, source.as_ref(), &[NodeId(1)]).unwrap();
+        let received = grants.open(peer, token).unwrap();
+        let key = "e".repeat(64);
+        let catalog = temp.path().join(format!("{key}.json"));
+        let (batch, _) = prepare_batch(received.clone(), &key, "token".into(), 1, catalog.clone()).unwrap();
+        let mut directories = vec![NodeId(1)];
+        while let Some(id) = directories.pop() {
+            let page = received.list(id, None).unwrap();
+            persist_listing(&batch, id, None, &page).unwrap();
+            directories.extend(
+                page.entries
+                    .iter()
+                    .filter(|node| node.kind == NodeKind::Directory)
+                    .map(|node| node.id),
+            );
+        }
+        let catalog: Catalog = serde_json::from_slice(&fs::read(catalog).unwrap()).unwrap();
+        let item = |name: &str| catalog.records.iter().find(|record| record.name == name).unwrap();
+        assert_eq!(item("current").symlink_target.as_deref(), Some("nested"));
+        assert_eq!(item("linked.txt").symlink_target.as_deref(), Some("nested/content.txt"));
+        assert_eq!(item("fixture").exec_bits, Some(0o111));
+        assert!(
+            catalog
+                .records
+                .iter()
+                .filter(|record| record.directory)
+                .all(|record| record.exec_bits.is_none())
+        );
+    }
+    #[test]
+    fn warm_up_refreshes_initial_absent_domain_after_initialization_without_user_action() {
+        use std::cell::{Cell, RefCell};
+        // Fake getDomains initially runs before the manager's registration. The
+        // completion wake must re-read actual flags even without an OS notice.
+        let domain = Cell::new(false);
+        let observed = Cell::new(false);
+        let calls = RefCell::new(Vec::new());
+        super::warm_up_domain(
+            || {
+                calls.borrow_mut().push("container with initialized DATA");
+                Ok::<_, &str>("root")
+            },
+            |root| {
+                assert_eq!(*root, "root");
+                calls.borrow_mut().push("initialize domain");
+                domain.set(true);
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("refresh read-only domain flags");
+                observed.set(domain.get());
+            },
+        )
+        .unwrap();
+        assert!(observed.get());
+        assert_eq!(
+            *calls.borrow(),
+            [
+                "container with initialized DATA",
+                "initialize domain",
+                "refresh read-only domain flags"
+            ]
+        );
+        // Failure is also observed; it never becomes a fabricated enabled value.
+        assert!(
+            super::warm_up_domain(
+                || Err::<(), _>("container unavailable"),
+                |_| -> Result<(), &str> { panic!("failed container initialized domain") },
+                || observed.set(false),
+            )
+            .is_err()
+        );
+        assert!(!observed.get());
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn source_preparation_failure_does_not_disable_a_healthy_provider() {
+        const CHILD: &str = "OINK_TEST_PROVIDER_SOURCE_FAILURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "macos::file_provider::tests::source_preparation_failure_does_not_disable_a_healthy_provider"
+                    ])
+                    .env(CHILD, "1")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            return;
+        }
+        struct UnavailableSource(crate::model::Unavailable);
+        impl Namespace for UnavailableSource {
+            fn prepare(&self) -> io::Result<()> {
+                Err(crate::content::unavailable(self.0))
+            }
+            fn roots(&self) -> Vec<FileNode> {
+                linked_fixture().roots()
+            }
+            fn list(&self, _: NodeId, _: Option<DirectoryCursor>) -> io::Result<crate::model::DirectoryPage> {
+                panic!("failed source was enumerated")
+            }
+            fn select(&self, _: NodeId) -> io::Result<FileNode> {
+                panic!("failed source was selected")
+            }
+            fn open(&self, _: NodeId, _: u64, _: u64) -> io::Result<crate::FileReader> {
+                panic!("failed source was opened")
+            }
+        }
+        finish_launch_preparation(true);
+        let clipboard = super::super::MacClipboard {
+            name: Some(format!("com.hachiwii.oink.test.source-failure.{}", std::process::id())),
+            watcher: Mutex::new(None),
+            registration: Arc::new(Mutex::new(None)),
+            local: Arc::new(Mutex::new(None)),
+        };
+        for cause in [
+            crate::model::Unavailable::Cancelled,
+            crate::model::Unavailable::Superseded,
+            crate::model::Unavailable::Permission,
+            crate::model::Unavailable::NoSuchItem,
+        ] {
+            let source = crate::content::namespace::Files::new(
+                Arc::new(UnavailableSource(cause)),
+                crate::sync::files::TargetOs::MacOs,
+            )
+            .unwrap();
+            let error = publish(source.roots(), source.clone(), Duration::from_secs(1)).unwrap_err();
+            assert!(
+                matches!(error, ClipboardError::ContentUnavailable(reason) if reason == cause),
+                "lost source failure: {error}"
+            );
+            assert_eq!(
+                publication_reason(),
+                FileProviderReason::DomainEnabled,
+                "one source failure disabled all later file representations"
+            );
+            // Exercise the native adapter too: its old fallback erased the
+            // typed failure again and reported that the extension needed enablement.
+            let provider: Arc<dyn crate::content::Provider> = Arc::new(LinkedProvider(source.namespace().unwrap()));
+            let spec = crate::NativeSpec {
+                inventory: provider.inventory(),
+                contents: provider,
+                files: source.roots().to_vec(),
+                file_contents: Some(source),
+                sensitivity: crate::Sensitivity::Normal,
+            };
+            let error = crate::ClipboardBackend::write_native_guarded(
+                &clipboard,
+                spec,
+                Arc::new(|| panic!("failed source reached clipboard publication")),
+            )
+            .unwrap_err();
+            assert!(matches!(error, ClipboardError::ContentUnavailable(reason) if reason == cause));
+        }
+    }
+
+    #[test]
+    fn verified_launch_readiness_clears_a_pending_publication_error() {
+        const CHILD: &str = "OINK_TEST_PROVIDER_READY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Exercise production globals in a private process without
+            // initializing clipboard, registering a domain or touching IPC.
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "macos::file_provider::tests::verified_launch_readiness_clears_a_pending_publication_error",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        begin_launch_preparation();
+        let pending: Result<(), _> = Err(ClipboardError::FileProvider(FileProviderReason::Checking));
+        record_result(&pending);
+        assert!(check_launch_preparation().is_err());
+        finish_launch_preparation(true);
+        assert!(check_launch_preparation().is_ok());
+        assert_eq!(publication_reason(), FileProviderReason::DomainEnabled);
+        assert!(!launch_preparation_pending());
+        record_result(&pending);
+        assert_eq!(publication_reason(), FileProviderReason::DomainEnabled);
+        finish_launch_preparation(false);
+        assert!(check_launch_preparation().is_err());
+        record_result(&pending);
+        assert_eq!(publication_reason(), FileProviderReason::RegistrationFailed);
+    }
 
     #[test]
     fn numeric_stock_generation_links_refill_publication_and_activation() {
@@ -2131,6 +2870,76 @@ mod tests {
     }
 
     #[test]
+    fn empty_synthetic_receipts_do_not_survive_retirement_or_cancel() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("delivery.json");
+        let (batch, _) = prepare_batch(
+            Flat::new(&[], Arc::new(EmptyContents)).unwrap(),
+            "delivery",
+            "secret".into(),
+            1,
+            path.clone(),
+        )
+        .unwrap();
+        let mut catalog = batch.state.lock().unwrap().catalog.clone();
+        catalog.received_at = Some(1);
+        catalog.records[0].hidden = None;
+        catalog.records[0].name = "2026-10-23 01.00.00".into();
+        save_catalog(&path, &catalog).unwrap();
+        std::fs::write(
+            path.with_extension("received"),
+            serde_json::to_vec(&serde_json::json!({
+                "delivery-root": {"record": catalog.records[0], "received_at": 1,
+                    "handed_off": true, "materialized": true, "deleted": false}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !received_catalog_protected(&path),
+            "statting a synthetic directory is not receipt"
+        );
+        remove_catalog_in(root.path(), &path);
+        assert!(!path.exists(), "expired/failed empty parent survived");
+
+        // Hover can hydrate even a zero-byte file. Explicit native cancellation
+        // must retire the whole provisional publication, despite that receipt.
+        let file = Record {
+            exec_bits: None,
+            symlink_target: None,
+            id: "delivery-1".into(),
+            parent: "delivery-root".into(),
+            name: "zero".into(),
+            directory: false,
+            size: Some(0),
+            modified: None,
+            node: Some(1),
+            version: 1,
+            children: None,
+            hidden: None,
+            keep_local: None,
+        };
+        catalog.records.push(file.clone());
+        save_catalog(&path, &catalog).unwrap();
+        std::fs::write(path.with_extension("received"), serde_json::to_vec(&serde_json::json!({
+            "delivery-1": {"record": file, "received_at": 1, "handed_off": true, "materialized": true, "deleted": false}
+        })).unwrap()).unwrap();
+        Registration {
+            diagnostic_publication: (Instant::now(), false),
+            key: "delivery".into(),
+            bridge: Weak::new(),
+            batch: batch.clone(),
+            entries: vec![],
+            _content_pin: None,
+            admission: None,
+        }
+        .cancel();
+        assert!(!path.exists(), "cancel retained a preview-hydrated publication");
+        batch.state.lock().unwrap().persist(&path).unwrap();
+        assert!(!path.exists(), "late callback resurrected cancelled publication");
+    }
+
+    #[test]
     fn private_preparation_overlay_cannot_pin_a_cancelled_typed_publication() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("typed.json");
@@ -2178,16 +2987,54 @@ mod tests {
         assert!(!path.exists());
     }
 
+    pub(super) fn linked_fixture() -> Arc<dyn Namespace> {
+        use crate::content::Provider;
+        crate::content::linked::Connector::default()
+            .restore(crate::content::linked::Descriptor {
+                native: Default::default(),
+                provisional: false,
+                fulfilled: vec![],
+                offer: crate::content::tests::fixture().inventory().id,
+                token: crate::content::grants::LinkToken([9; 32]),
+                roots: vec![FileNode {
+                    exec_bits: None,
+                    id: NodeId(1),
+                    parent: None,
+                    name: "linked.txt".into(),
+                    kind: NodeKind::File,
+                    size: ContentSize::Known(6),
+                    version: 7,
+                    modified_ms: None,
+                }],
+            })
+            .unwrap()
+    }
+    struct LinkedProvider(Arc<dyn Namespace>);
+    impl crate::content::Provider for LinkedProvider {
+        fn inventory(&self) -> crate::model::Inventory {
+            let mut inventory = crate::content::tests::fixture().inventory();
+            inventory.roots = self.0.roots();
+            inventory
+        }
+        fn open(&self, _: crate::model::RepresentationId) -> io::Result<crate::FileReader> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+        fn translator(&self) -> Arc<dyn crate::content::Translator> {
+            crate::content::tests::fixture().translator()
+        }
+        fn namespace(&self) -> Option<Arc<dyn Namespace>> {
+            Some(self.0.clone())
+        }
+    }
+
     #[test]
     fn filtered_received_namespaces_group_by_device_keep_ids_and_publish_real_dates() {
         let data = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let owned = crate::content::Completed::test_single_file(data.path());
-        let local = crate::content::Completed::restore(data.path(), owned.id()).unwrap();
-        let origin = Namespace::origin(&local).unwrap();
+        let local = linked_fixture();
+        let origin = local.origin().unwrap();
         let display = crate::received::source_folder(root.path(), origin, "Peer").unwrap();
-        let provider =
-            crate::policy::SharingPolicy::new(true, crate::policy::FormatFilters::default()).provider(Arc::new(local));
+        let provider = crate::policy::SharingPolicy::new(true).provider(Arc::new(LinkedProvider(local)));
         let namespace = provider.namespace().unwrap();
         let key = "a".repeat(64);
         let path = root.path().join(format!("{key}.json"));
@@ -2206,7 +3053,8 @@ mod tests {
         assert_eq!(source.records[0].name, display);
         assert!(source.records[0].modified.unwrap() > 1_700_000_000_000);
         assert_eq!(source.records[0].parent, "NSFileProviderRootContainerItemIdentifier");
-        save_catalog(&path, &first_catalog).unwrap();
+        crate::cache::assert_mutation(path.parent().unwrap(), || save_catalog(&path, &first_catalog)).unwrap();
+        crate::cache::assert_no_mutation(path.parent().unwrap(), || save_catalog(&path, &first_catalog)).unwrap();
         // Device rename and another delivery reuse the one source folder.
         assert_eq!(
             crate::received::source_folder(root.path(), origin, "Renamed Peer").unwrap(),
@@ -2225,6 +3073,114 @@ mod tests {
         assert_eq!(restored.catalog.records[0].name, parent.name);
         assert_eq!(restored.catalog.records[0].modified, parent.modified);
         assert_eq!(restored.catalog.records[1].id, first_catalog.records[1].id);
+    }
+
+    #[test]
+    fn persistent_source_catalog_restores_unhydrated_paths_without_network_or_completed_cache() {
+        use crate::content::Provider;
+        use crate::content::linked::{Connector, Descriptor};
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let key = "d".repeat(64);
+        let path = root.path().join(format!("{key}.json"));
+        let descriptor = Descriptor {
+            native: Default::default(),
+            provisional: false,
+            fulfilled: vec![],
+            offer: crate::content::tests::fixture().inventory().id,
+            token: crate::content::grants::LinkToken([9; 32]),
+            roots: vec![FileNode {
+                exec_bits: None,
+                id: NodeId(1),
+                parent: None,
+                name: "folder".into(),
+                kind: NodeKind::Directory,
+                size: ContentSize::Unknown,
+                version: 0,
+                modified_ms: None,
+            }],
+        };
+        let files = Connector::default().restore(descriptor).unwrap();
+        let (batch, _) = prepare_batch(files, &key, "old-local-token".into(), 1, path.clone()).unwrap();
+        {
+            let mut state = batch.state.lock().unwrap();
+            let child = FileNode {
+                exec_bits: None,
+                id: NodeId(2),
+                parent: Some(NodeId(1)),
+                name: "known.txt".into(),
+                kind: NodeKind::File,
+                size: ContentSize::Known(3),
+                version: 1,
+                modified_ms: None,
+            };
+            let record = node_record(&key, &child, &mut state.names).unwrap();
+            state.catalog.records.push(record);
+            state.persist(&path).unwrap();
+        }
+        let old: Vec<_> = batch
+            .state
+            .lock()
+            .unwrap()
+            .catalog
+            .records
+            .iter()
+            .map(|r| (r.id.clone(), r.name.clone(), r.node))
+            .collect();
+        drop(batch);
+        let restored = restore_catalog(data.path(), &path, &key, 2).unwrap();
+        let current: Vec<_> = restored
+            .state
+            .lock()
+            .unwrap()
+            .catalog
+            .records
+            .iter()
+            .map(|r| (r.id.clone(), r.name.clone(), r.node))
+            .collect();
+        assert_eq!(current, old);
+        assert_eq!(restored.state.lock().unwrap().catalog.port, 2);
+        let files = restored.contents.lock().unwrap();
+        assert!(files.source_link().is_some());
+        assert_eq!(files.select(NodeId(2)).unwrap_err().kind(), io::ErrorKind::NotConnected);
+        drop(files);
+        assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), 0);
+        remove_catalog_in(root.path(), &path);
+        assert!(path.exists(), "cache clear cannot sever an unhydrated link");
+        assert!(batch_needed(&restored, &[]));
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let token = restored.token.clone();
+        let bridge = Bridge {
+            port: address.port(),
+            batches: Mutex::new(HashMap::from([(key.clone(), restored)])),
+        };
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            assert_eq!(serve(stream, &bridge).unwrap_err().kind(), io::ErrorKind::NotConnected);
+            assert_eq!(bridge.batches.lock().unwrap().len(), 1);
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        writeln!(
+            client,
+            "{}",
+            serde_json::json!({"operation":"read","token":token,"batch":key,"node":2})
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            bytes,
+            [255, 255, 255, 255, 1],
+            "offline is unavailable, never confirmed gone"
+        );
+        let mut catalog: Catalog = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        catalog.source.as_mut().unwrap().provisional = true;
+        save_catalog(&path, &catalog).unwrap();
+        assert!(restore_catalog(data.path(), &path, &key, 3).is_err());
+        assert!(!path.exists(), "restart removes provisional native metadata");
     }
 
     #[test]
@@ -2299,10 +3255,9 @@ mod tests {
     fn a_new_delivery_does_not_restore_a_trashed_source_folder_or_move_its_old_batches() {
         let data = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let owned = crate::content::Completed::test_single_file(data.path());
-        let local = crate::content::Completed::restore(data.path(), owned.id()).unwrap();
+        let local = linked_fixture();
         let first_path = root.path().join("first.json");
-        let (first, _) = prepare_batch(Arc::new(local.clone()), "first", "a".into(), 1, first_path.clone()).unwrap();
+        let (first, _) = prepare_batch(local.clone(), "first", "a".into(), 1, first_path.clone()).unwrap();
         let first_catalog = first.state.lock().unwrap().catalog.clone();
         save_catalog(&first_path, &first_catalog).unwrap();
         let old_parent = first_catalog.records[0].parent.clone();
@@ -2310,7 +3265,7 @@ mod tests {
         let mut source: Catalog = serde_json::from_slice(&std::fs::read(&source_path).unwrap()).unwrap();
         source.records[0].parent = "NSFileProviderTrashContainerItemIdentifier".into();
         std::fs::write(root.path().join(format!("{old_parent}.received")),serde_json::to_vec(&serde_json::json!({&old_parent:{"record":source.records[0],"received_at":1,"handed_off":false,"materialized":false,"deleted":false}})).unwrap()).unwrap();
-        let (next, _) = prepare_batch(Arc::new(local), "next", "b".into(), 2, root.path().join("next.json")).unwrap();
+        let (next, _) = prepare_batch(local, "next", "b".into(), 2, root.path().join("next.json")).unwrap();
         let new_parent = next.state.lock().unwrap().catalog.records[0].parent.clone();
         assert_ne!(old_parent, new_parent);
         let restored = restore_catalog(data.path(), &first_path, "first", 3).unwrap();
@@ -2370,6 +3325,64 @@ mod tests {
     }
 
     #[test]
+    fn local_imported_empty_directory_is_received_data_not_a_synthetic_parent() {
+        let local = serde_json::json!({
+            "record": {"id":"batch-local-123", "parent":"batch-root", "directory":true,"node":null},
+            "modified_locally":true,"handed_off":true,"materialized":true,"deleted":false
+        });
+        assert!(received_entry_protected(&local));
+        let mut synthetic = local.clone();
+        synthetic["modified_locally"] = false.into();
+        assert!(!received_entry_protected(&synthetic));
+        let mut deleted = local.clone();
+        deleted["deleted"] = true.into();
+        assert!(!received_entry_protected(&deleted));
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("batch.json");
+        let catalog = Catalog {
+            schema: 1,
+            token: String::new(),
+            port: 0,
+            records: vec![Record {
+                exec_bits: None,
+                symlink_target: None,
+                id: "batch-root".into(),
+                parent: "root".into(),
+                name: "received".into(),
+                directory: true,
+                size: None,
+                modified: None,
+                node: None,
+                version: 0,
+                children: None,
+                hidden: None,
+                keep_local: None,
+            }],
+            source: None,
+            settlement: Default::default(),
+            arrived: Vec::new(),
+            failed: Vec::new(),
+            urls: Vec::new(),
+            received_at: Some(1),
+            move_state: None,
+            consumed: Vec::new(),
+        };
+        save_catalog(&path, &catalog).unwrap();
+        std::fs::write(
+            path.with_extension("received"),
+            serde_json::to_vec(&serde_json::json!({"batch-local-123":local})).unwrap(),
+        )
+        .unwrap();
+        remove_catalog_in(root.path(), &path);
+        let restored: Catalog = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            restored.records.len(),
+            1,
+            "overlay-only import must retain its catalog ancestor"
+        );
+    }
+
+    #[test]
     fn startup_discards_leftover_spares_and_markers_without_touching_delivered_content() {
         let data = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -2405,14 +3418,13 @@ mod tests {
     }
 
     #[test]
-    fn recovery_retires_a_pending_placeholder_before_restoring_completed_backing() {
+    fn recovery_retires_a_pending_placeholder_before_restoring_linked_backing() {
         let data = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let owned = crate::content::Completed::test_single_file(data.path());
-        let local = crate::content::Completed::restore(data.path(), owned.id()).unwrap();
+        let local = linked_fixture();
         let key = "a".repeat(64);
         let path = root.path().join(format!("{key}.json"));
-        let (batch, _) = prepare_batch(Arc::new(local), &key, "old".into(), 1, path.clone()).unwrap();
+        let (batch, _) = prepare_batch(local, &key, "old".into(), 1, path.clone()).unwrap();
         placeholders::bind(&key, &mut batch.state.lock().unwrap()).unwrap();
         save_catalog(&path, &batch.state.lock().unwrap().catalog).unwrap();
         let ledger = path.with_extension("placeholder");
@@ -2424,25 +3436,68 @@ mod tests {
         assert!(recover_catalogs(data.path(), root.path(), 2).unwrap().is_empty());
         assert!(!path.exists() && !path.with_extension("placeholder-tmp").exists());
         assert!(ledger.exists()); // retain until the OS acknowledges deletion
-        assert!(crate::content::Completed::restore(data.path(), owned.id()).is_ok());
     }
 
     #[test]
-    fn manager_failure_reasons_select_only_known_unavailable_degradation() {
-        for (code, reason, degraded) in [
-            (1, FileProviderReason::RegistrationFailed, true),
+    fn manager_failure_reasons_identify_enablement_actions() {
+        for (code, reason, enable) in [
+            (1, FileProviderReason::RegistrationFailed, false),
             (2, FileProviderReason::BoundExpired, false),
             (3, FileProviderReason::DomainDisabled, true),
             (4, FileProviderReason::ExtensionNotRegistered, true),
-            (5, FileProviderReason::DomainDisconnected, true),
+            (5, FileProviderReason::DomainDisconnected, false),
         ] {
             let mut command = Command::new("/bin/sh");
             command.args(["-c", &format!("exit {code}")]);
             let error = run_manager(command, Instant::now() + MANAGER_TIMEOUT, &|| true).unwrap_err();
             assert_eq!(failure_reason(&error), reason);
-            assert_eq!(reason.degraded_promise(), degraded);
+            assert_eq!(reason.needs_enable(), enable);
         }
-        assert!(!FileProviderReason::Cancelled.degraded_promise());
+        assert!(!FileProviderReason::Cancelled.needs_enable());
+    }
+
+    #[test]
+    fn helper_failure_retains_native_codes_without_private_stderr() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", r#"printf '%s\n' 'crash /private/secret-name token=secret' 'OINK_FP_ERROR {"errors":[{"domain":"NSCocoaErrorDomain","code":4097},{"domain":"NSPOSIXErrorDomain","code":13}]}' >&2; exit 1"#]);
+        let error = run_manager(command, Instant::now() + MANAGER_TIMEOUT, &|| true).unwrap_err();
+        assert_eq!(failure_reason(&error), FileProviderReason::RegistrationFailed);
+        let detail = error.to_string();
+        assert!(detail.contains("NSCocoaErrorDomain code=4097 <- NSPOSIXErrorDomain code=13"));
+        assert!(!detail.contains("private") && !detail.contains("secret"));
+    }
+
+    #[test]
+    fn definitive_item_rejections_reach_drag_errors_without_waiting_for_the_bound() {
+        for (code, reason) in [
+            (32, FileProviderReason::ItemMissing),
+            (33, FileProviderReason::ItemUnsupportedType),
+            (34, FileProviderReason::ItemKindMismatch),
+            (35, FileProviderReason::ItemTargetMismatch),
+            (36, FileProviderReason::ItemIdentityMismatch),
+            (37, FileProviderReason::ItemMetadataMismatch),
+            (38, FileProviderReason::ItemAccessDenied),
+            (39, FileProviderReason::ItemMetadataUnreadable),
+        ] {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", &format!("exit {code}")]);
+            let started = Instant::now();
+            let error = run_manager(command, started + Duration::from_secs(30), &|| true).unwrap_err();
+            assert_eq!(failure_reason(&error), reason);
+            assert!(
+                error.to_string().contains(&reason.to_string()),
+                "drag start reports the concrete typed reason"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "rejection must not wait for the publication deadline"
+            );
+            assert!(!reason.needs_enable());
+            assert!(
+                reason.item_rejected(),
+                "a typed rejection must not retry ordinary publication"
+            );
+        }
     }
 
     #[test]
@@ -2485,55 +3540,9 @@ mod tests {
     }
 
     #[test]
-    fn restart_rotates_bridge_capability_and_keeps_completed_urls_readable_without_pinning_idle_cache() {
+    fn restart_refuses_a_catalog_without_a_persistent_source() {
         let data = tempfile::tempdir().unwrap();
         let catalogs = tempfile::tempdir().unwrap();
-        let owned = crate::content::Completed::test_single_file(data.path());
-        let local = crate::content::Completed::restore(data.path(), owned.id()).unwrap();
-        let path = catalogs.path().join("batch.json");
-        let (original, _) =
-            prepare_batch(Arc::new(local), "batch", "old-capability".into(), 1234, path.clone()).unwrap();
-        let urls = vec![catalogs.path().join("stable-provider-url")];
-        {
-            let mut state = original.state.lock().unwrap();
-            state.catalog.urls = urls.clone();
-            save_catalog(&path, &state.catalog).unwrap();
-        }
-        drop((original, owned));
-        let restored = restore_catalog(data.path(), &path, "batch", 4321).unwrap();
-        let current: Catalog = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_ne!(current.token, "old-capability");
-        assert_eq!(current.port, 4321);
-        assert_eq!(current.urls, urls);
-        assert_eq!(current.records[1].id, "batch-1");
-        assert_eq!(*restored.urls.lock().unwrap(), urls);
-        assert!(batch_needed(&restored, &urls));
-        assert!(!batch_needed(&restored, &[]));
-        let contents = restored.contents.lock().unwrap().clone();
-        let mut reader = contents.open(NodeId(1), 7, 0).unwrap();
-        assert_eq!(
-            crate::store::usage(data.path(), crate::store::StoreKind::CompletedDelivery, true).1,
-            0
-        );
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).unwrap();
-        assert_eq!(bytes, b"cached");
-        drop(reader);
-        assert!(crate::store::usage(data.path(), crate::store::StoreKind::CompletedDelivery, true).1 > 0);
-        assert!(contents.open(NodeId(1), 7, 0).is_err());
-        assert!(restore_catalog(data.path(), &path, "batch", 5678).is_err());
-    }
-
-    #[test]
-    fn restart_refuses_an_unfinished_delivery_catalog() {
-        let data = tempfile::tempdir().unwrap();
-        let catalogs = tempfile::tempdir().unwrap();
-        let owned = crate::store::Batch::create(
-            data.path(),
-            crate::store::StoreKind::CompletedDelivery,
-            crate::store::BatchId([11; 16]),
-        )
-        .unwrap();
         let path = catalogs.path().join("batch.json");
         save_catalog(
             &path,
@@ -2542,22 +3551,27 @@ mod tests {
                 token: "old".into(),
                 port: 1,
                 records: vec![],
-                batch: Some(owned.id()),
+                source: None,
+                settlement: Default::default(),
+                arrived: Vec::new(),
+                failed: Vec::new(),
                 urls: vec![],
                 received_at: None,
+                move_state: None,
+                consumed: Vec::new(),
             },
         )
         .unwrap();
         assert!(restore_catalog(data.path(), &path, "batch", 2).is_err());
     }
 
-    fn test_batch(contents: Arc<dyn FileContents>, entries: &[FileEntry]) -> Arc<Batch> {
+    fn test_batch(contents: Arc<dyn FileContents>, entries: &[FileEntry], catalog: PathBuf) -> Arc<Batch> {
         prepare_batch(
             Flat::new(entries, contents).unwrap(),
             "batch",
             "secret".into(),
             0,
-            PathBuf::new(),
+            catalog,
         )
         .unwrap()
         .0
@@ -2574,7 +3588,7 @@ mod tests {
             }
         }
         let active = Arc::new(AtomicBool::new(true));
-        let batch = test_batch(Arc::new(Busy(active.clone())), &[]);
+        let batch = test_batch(Arc::new(Busy(active.clone())), &[], PathBuf::new());
         assert_eq!(Arc::strong_count(&batch), 1);
         assert!(batch_needed(&batch, &[]));
         active.store(false, Ordering::Release);
@@ -2589,6 +3603,7 @@ mod tests {
         fn metadata(&self, index: usize) -> io::Result<Option<crate::FileMetadata>> {
             assert_eq!(index, 0);
             Ok(Some(crate::FileMetadata {
+                exec_bits: None,
                 size: b"current version is larger than the manifest".len() as u64,
                 modified_ms: Some(1790782863000),
             }))
@@ -2609,7 +3624,7 @@ mod tests {
         let opens = Arc::new(AtomicUsize::new(0));
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
-        let mut batch = test_batch(
+        let batch = test_batch(
             Arc::new(Bytes {
                 opens: opens.clone(),
                 fail,
@@ -2621,8 +3636,8 @@ mod tests {
                 modified_ms: None,
                 local_path: None,
             }],
+            catalog_root.path().join("batch.json"),
         );
-        Arc::get_mut(&mut batch).unwrap().catalog = catalog_root.path().join("batch.json");
         let bridge = Bridge {
             port: address.port(),
             batches: Mutex::new(HashMap::from([("batch".into(), batch)])),
@@ -2639,6 +3654,100 @@ mod tests {
         worker.join().unwrap();
         (result, opens.load(Ordering::SeqCst))
     }
+    fn read_batch(batch: Arc<Batch>, token: &str, node: u64) -> Vec<u8> {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let bridge = Bridge {
+            port: address.port(),
+            batches: Mutex::new(HashMap::from([("batch".into(), batch)])),
+        };
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = serve(stream, &bridge);
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        writeln!(
+            client,
+            "{}",
+            serde_json::json!({"operation":"read","token":token,"batch":"batch","node":node})
+        )
+        .unwrap();
+        let mut result = Vec::new();
+        client.read_to_end(&mut result).unwrap();
+        worker.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn appkit_move_end_keeps_the_file_readable_for_finders_later_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let opens = Arc::new(AtomicUsize::new(0));
+        let batch = test_batch(
+            Arc::new(Bytes {
+                opens: opens.clone(),
+                fail: false,
+            }),
+            &[FileEntry {
+                path: "file.txt".into(),
+                is_dir: false,
+                size: 1,
+                modified_ms: None,
+                local_path: None,
+            }],
+            root.path().join("batch.json"),
+        );
+        let registration = Registration {
+            diagnostic_publication: (Instant::now(), false),
+            key: "batch".into(),
+            bridge: Weak::new(),
+            batch: batch.clone(),
+            entries: Vec::new(),
+            _content_pin: None,
+            admission: None,
+        };
+        // Finder accepts MOVE before it asks File Provider for any content.
+        // Exercise the same callback boundary, with no reader/consumption yet.
+        registration.move_completed().unwrap();
+        let bytes = read_batch(batch.clone(), "secret", 1);
+        assert!(
+            bytes.starts_with(&(u32::MAX - 1).to_be_bytes()),
+            "Finder's post-drag fetch lost its source: {bytes:?}"
+        );
+        assert!(bytes.ends_with(&[0; 4]));
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert!(batch.state.lock().unwrap().catalog.move_state.is_none());
+        assert!(!batch.state.lock().unwrap().retired);
+    }
+
+    #[test]
+    fn rejected_provider_reads_send_their_typed_error_instead_of_eof() {
+        for (case, token, node, code) in [(0, "secret", 1, 2), (1, "secret", 99, 2), (2, "wrong", 1, 6)] {
+            let root = tempfile::tempdir().unwrap();
+            let opens = Arc::new(AtomicUsize::new(0));
+            let batch = test_batch(
+                Arc::new(Bytes {
+                    opens: opens.clone(),
+                    fail: false,
+                }),
+                &[FileEntry {
+                    path: "file.txt".into(),
+                    is_dir: false,
+                    size: 1,
+                    modified_ms: None,
+                    local_path: None,
+                }],
+                root.path().join("batch.json"),
+            );
+            if case == 0 {
+                batch.state.lock().unwrap().retired = true;
+            }
+            let bytes = read_batch(batch, token, node);
+            assert_eq!(bytes, [255, 255, 255, 255, code], "rejection {case} was not framed");
+            assert_eq!(opens.load(Ordering::SeqCst), 0);
+        }
+    }
+
     #[test]
     fn superseded_content_retires_the_visible_catalog_instead_of_retrying_its_version() {
         let root = tempfile::tempdir().unwrap();
@@ -2797,112 +3906,23 @@ mod tests {
     }
 
     #[test]
-    fn retention_withdraws_expired_missing_and_abandoned_catalogs_but_keeps_receiving() {
-        let data = tempfile::tempdir().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let receiving = crate::store::Batch::create(
-            data.path(),
-            crate::store::StoreKind::CompletedDelivery,
-            crate::store::BatchId([90; 16]),
-        )
-        .unwrap();
-        let owned = crate::content::Completed::test_single_file(data.path());
-        let local = crate::content::Completed::restore(data.path(), owned.id()).unwrap();
-        let (batch, _) = prepare_batch(
-            Arc::new(local),
-            "batch",
-            "secret".into(),
-            0,
-            root.path().join("batch.json"),
-        )
-        .unwrap();
-        let bridge = Bridge {
-            port: 0,
-            batches: Mutex::default(),
-        };
-        let publish = |id| {
-            let mut state = batch.state.lock().unwrap();
-            state.retired = false;
-            state.catalog.batch = Some(id);
-            save_catalog(&batch.catalog, &state.catalog).unwrap();
-            bridge.batches.lock().unwrap().insert("batch".into(), batch.clone());
-        };
-        publish(owned.id());
-        retire_unavailable_in(&bridge, data.path(), 0);
-        assert!(batch.catalog.exists());
-        // A URL owner and an admitted reader survive TTL. Retiring metadata
-        // stops new opens but must not interrupt that reader's verified bytes.
-        let selected = batch.contents.lock().unwrap().select(NodeId(1)).unwrap();
-        let mut reader = batch
-            .contents
-            .lock()
-            .unwrap()
-            .open(NodeId(1), selected.version, 0)
-            .unwrap();
-        retire_unavailable_in(&bridge, data.path(), u64::MAX);
-        assert!(!batch.catalog.exists());
-        assert!(bridge.batches.lock().unwrap().is_empty());
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).unwrap();
-        assert!(!bytes.is_empty());
-        publish(receiving.id());
-        retire_unavailable_in(&bridge, data.path(), u64::MAX);
-        assert!(batch.catalog.exists(), "Receiving has no completed-delivery TTL yet");
-        receiving.abandon().unwrap();
-        retire_unavailable_in(&bridge, data.path(), 0);
-        assert!(!batch.catalog.exists());
-        publish(crate::store::BatchId([92; 16]));
-        retire_unavailable_in(&bridge, data.path(), 0);
-        assert!(!batch.catalog.exists(), "consumed/removed payload still presented");
-    }
-
-    #[test]
-    fn retention_provider_rerequest_reports_unavailable_without_a_partial_header() {
-        let data = tempfile::tempdir().unwrap();
-        let catalogs = tempfile::tempdir().unwrap();
-        let owned = crate::content::Completed::test_single_file(data.path());
-        let local = crate::content::Completed::restore(data.path(), owned.id()).unwrap();
-        let path = owned.path().to_owned();
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let address = listener.local_addr().unwrap();
-        let (batch, _) = prepare_batch(
-            Arc::new(local),
-            "batch",
-            "secret".into(),
-            address.port(),
-            catalogs.path().join("batch.json"),
-        )
-        .unwrap();
-        crate::store::sweep_at(data.path(), u64::MAX);
-        assert!(!path.exists());
-        let bridge = Bridge {
-            port: address.port(),
-            batches: Mutex::new(HashMap::from([("batch".into(), batch)])),
-        };
-        let worker = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            assert_eq!(serve(stream, &bridge).unwrap_err().kind(), io::ErrorKind::NotFound);
-        });
-        let mut client = TcpStream::connect(address).unwrap();
-        client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        client
-            .write_all(b"{\"operation\":\"read\",\"token\":\"secret\",\"batch\":\"batch\",\"node\":1}\n")
-            .unwrap();
-        let mut bytes = Vec::new();
-        client.read_to_end(&mut bytes).unwrap();
-        worker.join().unwrap();
-        assert_eq!(bytes, [255, 255, 255, 255, 2]);
-    }
-
-    #[test]
     fn content_bridge_requires_capability_and_valid_node() {
-        for request in [
-            "{\"operation\":\"read\",\"token\":\"wrong\",\"batch\":\"batch\",\"node\":1}\n",
-            "{\"operation\":\"read\",\"token\":\"secret\",\"batch\":\"batch\",\"node\":99}\n",
-            "{\"operation\":\"read\",\"token\":\"secret\",\"batch\":\"../../path\",\"node\":1}\n",
+        for (request, code) in [
+            (
+                "{\"operation\":\"read\",\"token\":\"wrong\",\"batch\":\"batch\",\"node\":1}\n",
+                6,
+            ),
+            (
+                "{\"operation\":\"read\",\"token\":\"secret\",\"batch\":\"batch\",\"node\":99}\n",
+                2,
+            ),
+            (
+                "{\"operation\":\"read\",\"token\":\"secret\",\"batch\":\"../../path\",\"node\":1}\n",
+                6,
+            ),
         ] {
             let (bytes, opens) = exchange(request, false);
-            assert!(bytes.is_empty());
+            assert_eq!(bytes, [255, 255, 255, 255, code]);
             assert_eq!(opens, 0);
         }
     }
@@ -2945,7 +3965,12 @@ mod tests {
             }
         }
         let cancels = Arc::new(AtomicUsize::new(0));
-        let batch = test_batch(Arc::new(Cancellable(cancels.clone())), &[]);
+        let root = tempfile::tempdir().unwrap();
+        let batch = test_batch(
+            Arc::new(Cancellable(cancels.clone())),
+            &[],
+            root.path().join("batch.json"),
+        );
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let client_a = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server_a, _) = listener.accept().unwrap();

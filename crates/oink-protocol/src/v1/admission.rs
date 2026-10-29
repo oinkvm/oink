@@ -63,23 +63,79 @@ pub struct Violation {
 impl Context<'_> {
     /// Allocation-free endpoint path for the same registered input/media DTOs.
     pub fn decode_hot<'a>(&self, frame: OpaqueFrame<'a>) -> std::result::Result<super::hot::Message<'a>, Violation> {
-        self.admit(frame.header)?;
+        self.admit_frame(frame)?;
         super::hot::Message::decode(frame).map_err(|error| self.failure(error.code, Some(frame.header.type_id), None))
     }
 
     /// Destination entry point: admission precedes all payload allocation and a
     /// malformed ProtocolError never generates a reciprocal error response.
     pub fn decode(&self, frame: OpaqueFrame<'_>) -> std::result::Result<super::Message, Violation> {
-        self.admit(frame.header)?;
-        frame
+        self.admit_frame(frame)?;
+        let message = frame
             .decode()
-            .map_err(|error| self.failure(error.code, Some(frame.header.type_id), None))
+            .map_err(|error| self.failure(error.code, Some(frame.header.type_id), None))?;
+        let nodes =
+            execution_nodes(&message).map_err(|error| self.failure(error.code, Some(frame.header.type_id), None))?;
+        // Inventories describe the source selection, including link roots that
+        // Windows will omit. Creating/serving link nodes remains capability gated.
+        let declaration = matches!(
+            message,
+            super::Message::ClipboardOffer(_)
+                | super::Message::DndNotice(_)
+                | super::Message::AttachmentItems(_)
+                | super::Message::AttachmentHead(_)
+        );
+        let links = !declaration && nodes.iter().any(|node| node.symlink_target().ok().flatten().is_some());
+        let exec = nodes.iter().any(|node| node.exec_bits().ok().flatten().is_some());
+        if exec && !self.agreement.contains("oink.files.exec-bits/1") {
+            return Err(self.failure(
+                ErrorCode::UnnegotiatedCapability,
+                Some(frame.header.type_id),
+                Some("oink.files.exec-bits/1"),
+            ));
+        }
+        if links && !self.agreement.contains("oink.files.safe-symlinks/1") {
+            return Err(self.failure(
+                ErrorCode::UnnegotiatedCapability,
+                Some(frame.header.type_id),
+                Some("oink.files.safe-symlinks/1"),
+            ));
+        }
+        Ok(message)
     }
 
     /// Convert a destination owner's payload or execution-semantic rejection
     /// into the same scoped failure used by structural admission.
     pub fn payload_violation(&self, type_id: u16, code: ErrorCode) -> Violation {
         self.failure(code, Some(type_id), None)
+    }
+
+    /// Optional execution-bearing key fields require their own negotiated
+    /// capability even though the containing key message is baseline input.
+    /// Inspect the borrowed map before allocating any retained payload tree.
+    pub fn admit_frame(&self, frame: OpaqueFrame<'_>) -> std::result::Result<(), Violation> {
+        self.admit(frame.header)?;
+        if matches!(frame.header.type_id, 0x0202 | 0x0205 | 0x0207) {
+            let present = super::hot::Map::parse(frame.payload(), limits::RELIABLE_FRAME)
+                .and_then(|map| {
+                    let route = map.field(103)?;
+                    if frame.header.type_id == 0x0205 && route.is_none() {
+                        map.field(104)
+                    } else {
+                        Ok(route)
+                    }
+                })
+                .map_err(|error| self.failure(error.code, Some(frame.header.type_id), None))?
+                .is_some();
+            if present && !self.agreement.contains("oink.input.application-focus/1") {
+                return Err(self.failure(
+                    ErrorCode::UnnegotiatedCapability,
+                    Some(frame.header.type_id),
+                    Some("oink.input.application-focus/1"),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn failure(&self, code: ErrorCode, type_id: Option<u16>, capability: Option<&'static str>) -> Violation {
@@ -344,4 +400,39 @@ pub struct ProtocolViolation {
     pub isolation: Isolation,
     pub at_us: u64,
     pub suppressed: u64,
+}
+
+/// Execution metadata can appear in granted pages/roots and retained attachment heads.
+fn execution_nodes(message: &super::Message) -> Result<Vec<FileNode>> {
+    use super::{Message, schema::Open};
+    Ok(match message {
+        Message::ContentDirectory(value) => value.page()?.entries()?.0,
+        Message::ContentFileSelected(value) => vec![value.entry()?],
+        Message::ContentFileVersion(value) => vec![value.entry()?],
+        Message::CloudLinkOffer(value) => value.roots()?.0,
+        Message::ClipboardOffer(value) => value.inventory()?.roots()?.0,
+        Message::DndNotice(value) => value.inventory()?.roots()?.0,
+        Message::AttachmentItems(value) => value.items()?.roots()?.0,
+        Message::AttachmentHead(value) => {
+            let header = value.header()?;
+            match header.variant()? {
+                Open::Known(AttachmentKind::Offer) => {
+                    OfferAttachment::from_raw(header.body()?)?
+                        .offer()?
+                        .inventory()?
+                        .roots()?
+                        .0
+                }
+                Open::Known(AttachmentKind::Drag) => {
+                    DragAttachment::from_raw(header.body()?)?
+                        .notice()?
+                        .inventory()?
+                        .roots()?
+                        .0
+                }
+                _ => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    })
 }

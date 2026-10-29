@@ -8,7 +8,7 @@ type Receipts =
 pub(crate) struct DndFiles {
     pub(crate) native: Arc<oink_clipboard::content::Registry>,
     pub(crate) input: Mutex<Option<Arc<crate::threads::input::InputThread>>>,
-    receipts: tokio::sync::Mutex<Receipts>,
+    pub(super) receipts: tokio::sync::Mutex<Receipts>,
 }
 
 impl DndFiles {
@@ -88,9 +88,12 @@ impl DndFiles {
             offer,
         })
     }
-    pub(super) fn new() -> Self {
+    pub(super) fn new(grants: Option<oink_clipboard::content::grants::SourceGrants>) -> Self {
         Self {
-            native: Arc::default(),
+            native: Arc::new(grants.map_or_else(
+                oink_clipboard::content::Registry::default,
+                oink_clipboard::content::Registry::with_source_grants,
+            )),
             input: Mutex::new(None),
             receipts: Default::default(),
         }
@@ -148,6 +151,16 @@ struct LocalLink {
 use oink_clipboard::model::ContentMsg;
 use oink_clipboard::sync::files::{BoxFuture, BulkChannel};
 impl BulkLink for LocalLink {
+    fn bind_persistent(self: Arc<Self>, peer: oink_foundation::DeviceId) -> std::io::Result<Arc<dyn BulkLink>> {
+        if peer != self.peer {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        Ok(self)
+    }
+    fn supports_cloud_links(&self) -> bool {
+        true
+    }
+
     fn bind(self: Arc<Self>, _: oink_foundation::DeviceId, _: oink_foundation::content::ClipId) -> Arc<dyn BulkLink> {
         self
     }
@@ -177,6 +190,8 @@ impl BulkLink for LocalLink {
                     if delivery.offer == offer && files.receipt(peer, delivery, receipt).await {
                         let _ = server.send(&ContentMsg::TerminalAck { delivery, receipt }).await;
                     }
+                } else if request.persistent_request() {
+                    let _ = files.native.serve(peer, request, &mut server).await;
                 } else if let Some((requested, demand)) = request.request()
                     && requested == offer
                     && files

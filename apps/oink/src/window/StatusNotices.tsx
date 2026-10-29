@@ -6,7 +6,6 @@ import type { AlertKind } from '../api/types';
 import { problemText, tr, useLanguage } from '../i18n';
 function alertText(kind:Exclude<AlertKind, {type:'permission_missing'}>):string {
   switch(kind.type){
-    case 'capture_unavailable':return tr('无法采集输入');
     case 'display_info_unavailable':case 'display_enumeration_failed':return tr('无法读取显示器信息');
     case 'secure_input':return tr('安全输入已启用，键盘共享暂不可用');
     case 'new_screen':return tr('检测到新屏幕，请检查排列');
@@ -31,6 +30,11 @@ export function StatusNotices(){
   useEffect(()=>{
     const notices=(overview?.alerts ?? []).flatMap(alert=>{
       if(alert.kind.type==='permission_missing')return [];
+      // Older backends may include peer screen faults. A local display notice
+      // must never relabel another device's resource status as our own failure.
+      const displayDevice=alert.kind.type==='display_enumeration_failed' ? alert.kind.device
+        : alert.kind.type==='display_info_unavailable' ? alert.kind.screen.device : null;
+      if(displayDevice!==null && displayDevice!==overview?.this_device.id)return [];
       return [{
         id:`status:${alert.id}`, title:alertText(alert.kind), description:alert.problem ? problemText(alert.problem.code) : undefined,
         tone:alert.level==='error' ? 'danger' as const : alert.level==='warning' ? 'warning' as const : 'info' as const,
@@ -48,9 +52,7 @@ export function StatusNotices(){
     });
     const active=new Set(notices.map(notice=>notice.id));
     for(const id of shown.current.keys()) if(!active.has(id)) {
-      // A completed native failure is a real error receipt. Let the normal
-      // toast duration finish even if a retry recovers quickly, so it is readable.
-      if(id!=='status:capture-unavailable' && !id.startsWith('status:display-info:'))toast.dismiss(id);
+      toast.dismiss(id);
       shown.current.delete(id);
     }
     for(const notice of notices){

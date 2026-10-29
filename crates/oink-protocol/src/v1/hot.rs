@@ -1,6 +1,8 @@
 //! Borrowed projections of registered input/media DTOs. No new wire messages.
 //! Call endpoint admission first. Decode, typed reads and encode into a caller's
 //! slice allocate nothing; unknown fields remain borrowed, including nested ones.
+//! Errors retain code/offset; field-path annotation is deliberately omitted on
+//! this RT path because even malformed input must not allocate.
 //! Owning a retaining tree is an explicit cold-path operation (`Map::to_owned`).
 use super::{ErrorCode, RawMap, Result, cbor, dto::*, frame::*, limits, schema::*};
 use minicbor::{Decoder, Encoder};
@@ -17,7 +19,7 @@ impl<'a> Map<'a> {
             return Err(ErrorCode::LimitExceeded.into());
         }
         let mut d = Decoder::new(bytes);
-        cbor::preflight_map(&mut d, 0, |_, d, depth| cbor::skip_profile(d, depth))?;
+        cbor::preflight_map_hot(&mut d, 0, |_, d, depth| cbor::skip_profile(d, depth))?;
         if d.position() != bytes.len() {
             return Err(ErrorCode::MalformedFrame.into());
         }
@@ -48,7 +50,7 @@ impl<'a> Map<'a> {
         Ok(None)
     }
     pub fn required<T: BorrowValue>(self, key: u32) -> Result<T::Output<'a>> {
-        T::read_borrowed(self.field(key)?.ok_or(ErrorCode::MalformedFrame)?).map_err(|e| e.at_field(key))
+        T::read_borrowed(self.field(key)?.ok_or(ErrorCode::MalformedFrame)?)
     }
 }
 // Cache the current hot family's common scalar field spans on the stack.
@@ -79,7 +81,7 @@ impl<'a, T: HotDto> View<'a, T> {
         }
         let mut spans = [(0, 0); 10];
         let mut d = Decoder::new(bytes);
-        cbor::preflight_map(&mut d, 0, |key, d, depth| {
+        cbor::preflight_map_hot(&mut d, 0, |key, d, depth| {
             let start = d.position();
             cbor::skip_profile(d, depth)?;
             if let Some(slot) = slot(key) {
@@ -134,7 +136,7 @@ impl<'a, T: HotDto> View<'a, T> {
         }
     }
     pub fn required<U: BorrowValue>(&self, key: u32) -> Result<U::Output<'a>> {
-        U::read_borrowed(self.field(key)?.ok_or(ErrorCode::MalformedFrame)?).map_err(|e| e.at_field(key))
+        U::read_borrowed(self.field(key)?.ok_or(ErrorCode::MalformedFrame)?)
     }
 }
 pub trait HotDto: WireDto {
@@ -482,7 +484,9 @@ hot_messages!(
     InputTouchpadContacts,
     InputVolumeKeyOrigin,
     AudioPacket,
-    AudioSleep
+    AudioSleep,
+    MicrophonePacket,
+    MicrophoneSleep
 );
 
 /// Encode captured fields without allocating a RawMap. The caller must discard

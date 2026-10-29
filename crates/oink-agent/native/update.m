@@ -63,6 +63,7 @@ typedef NS_ENUM(uint32_t, OinkUpdateBoundary) {
 @property(copy) void (^found)(SPUUserUpdateChoice);
 @property(copy) void (^ready)(SPUUserUpdateChoice);
 @property(copy) void (^cancelDownload)(void);
+- (uint64_t)currentBuild;
 - (void)event:(uint32_t)event progress:(uint32_t)progress;
 - (void)cancel;
 - (void)check;
@@ -71,6 +72,7 @@ static OinkUpdateDriver *owner;
 static char updateReadinessContext;
 @implementation OinkUpdateDriver
 @synthesize updater=_updater;
+- (uint64_t)currentBuild {return [NSBundle.mainBundle.infoDictionary[@"CFBundleVersion"] longLongValue];}
 - (instancetype)init {
     if ((self=[super init])) _timing=[OinkUpdateTiming new];
     return self;
@@ -123,6 +125,14 @@ static char updateReadinessContext;
     _checkPending=NO; // An in-flight check supplied the requested result.
     _cancelDownload=nil; _cancelled=NO; _build=item.versionString.longLongValue; _expected=item.contentLength;
     if (_build==0 || item.informationOnlyUpdate || item.majorUpgrade) {reply(SPUUserUpdateChoiceDismiss); [self event:8 progress:4]; return;}
+    // A local DMG replacement bypasses Sparkle's installer bookkeeping. Its
+    // cached session may still offer the build now running (or an older one).
+    // Dismiss at the continuation owner before publishing or arming it; local
+    // equal-build repairs use the separate authenticated local-package path.
+    if (_build <= self.currentBuild) {
+        _found=nil; _ready=nil; _armed=NO;
+        reply(SPUUserUpdateChoiceDismiss); [self event:0 progress:0]; return;
+    }
     // Sparkle chooses only one localized <description>. A single signed custom
     // element preserves the complete language map as JSON for the common Rust validator
     // and Candidate shape; never fall back to localized HTML itemDescription.

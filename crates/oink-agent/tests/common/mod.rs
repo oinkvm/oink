@@ -27,6 +27,45 @@ pub fn profile_layout_ready(node: &Node) -> bool {
     )
 }
 
+/// Screen facts and input admission can precede catalog handoff. Manual edits
+/// also need the target catalog and its owner visibility snapshot to be ready.
+#[allow(dead_code, reason = "shared fixture also compiled into tests without layout edits")]
+pub async fn editable_layouts(nodes: &[&Node], screen_count: usize) {
+    until("editable shared layouts", || {
+        nodes
+            .iter()
+            .all(|node| node.layout().0.screens.len() == screen_count && profile_layout_ready(node))
+    })
+    .await;
+}
+
+/// A fresh-default fixture needs the completed directional catalog handoff before
+/// editing, pairing onward, or removing the acceptor. Matching target catalogs
+/// can precede its import of the source default; that later import replaces the
+/// target default even if the fixture has already edited it.
+#[allow(
+    dead_code,
+    reason = "shared fixture also compiled into tests without profile handoffs"
+)]
+pub async fn profile_handoff(nodes: &[&Node], source_default: &str) {
+    until("source default catalog converged after pairing", || {
+        let states = nodes
+            .iter()
+            .map(|node| {
+                AgentApi::layout_profile_command(*node, super::test_agent::layout_profiles::types::Command::Query)
+            })
+            .collect::<Result<Vec<_>, _>>();
+        states.is_ok_and(|states| {
+            states.iter().all(|state| {
+                state["readiness"] == "ready"
+                    && state["active_profile_id"] == source_default
+                    && state["catalog_token"] == states[0]["catalog_token"]
+            })
+        })
+    })
+    .await;
+}
+
 static OPERATIONS: AtomicU64 = AtomicU64::new(1);
 
 /// Resolve an authenticated peer, including peers that are already members.
@@ -104,10 +143,36 @@ pub async fn request(initiator: &Node, responder: &Node) -> (pairing::PairId, St
     let pairing::PairReply::Value(pairing::Started::Started { pair_id }) = started else {
         panic!("pairing start refused: {started:?}")
     };
-    until("explicit incoming pairing request", || {
-        responder.pairings().unwrap().requests.iter().any(|r| r.id == pair_id)
+    phase("explicit incoming pairing request");
+    let incoming = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let outgoing = initiator.pairings().unwrap();
+            let incoming = responder.pairings().unwrap();
+            // Started can already have a typed terminal outcome before a
+            // request is published. Preserve that cause instead of hiding it
+            // behind the request-arrival timeout.
+            assert!(
+                !outgoing.sessions.iter().any(|s| s.id == pair_id && s.phase == 8),
+                "pairing ended before incoming request: pair={pair_id}; outgoing={outgoing:?}; incoming={incoming:?}; initiator_group={:?}; responder_group={:?}",
+                initiator.group(), responder.group(),
+            );
+            if incoming.requests.iter().any(|r| r.id == pair_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     })
     .await;
+    assert!(
+        incoming.is_ok(),
+        "timed out: explicit incoming pairing request; pair={pair_id}; initiator={:?}; responder={:?}; outgoing={:?}; incoming={:?}; initiator_links={:?}; responder_links={:?}",
+        initiator.id(),
+        responder.id(),
+        initiator.pairings(),
+        responder.pairings(),
+        initiator.links().map(|l| l.links()),
+        responder.links().map(|l| l.links()),
+    );
     let request = responder
         .pairings()
         .unwrap()

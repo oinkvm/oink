@@ -30,10 +30,12 @@ static AudioObjectPropertyAddress system_properties[] = {
     {kAudioHardwarePropertyServiceRestarted, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
     {kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
     {kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
+    {kAudioHardwarePropertyDefaultInputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
 };
 static AudioObjectPropertyAddress device_properties[] = {
     {kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
     {kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain},
+    {kAudioDevicePropertyStreams, kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain},
 };
 static OSStatus changed(AudioObjectID object, UInt32 count,
                         const AudioObjectPropertyAddress addresses[], void *context) {
@@ -118,6 +120,11 @@ char *oink_audio_devices_snapshot(char *error, size_t capacity) {
         status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &system_properties[2],
             0, NULL, &default_size, &default_output);
         if (status != noErr) goto failed;
+        AudioDeviceID default_input = kAudioObjectUnknown;
+        default_size = sizeof(default_input);
+        status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &system_properties[3],
+            0, NULL, &default_size, &default_input);
+        if (status != noErr) goto failed;
         devices = [NSMutableArray array];
         next = [NSMutableSet set];
         AudioDeviceID *ids = storage.mutableBytes;
@@ -126,12 +133,20 @@ char *oink_audio_devices_snapshot(char *error, size_t capacity) {
             NSString *uid = text_property(device, kAudioDevicePropertyDeviceUID);
             NSString *name = text_property(device, kAudioObjectPropertyName);
             if (!uid || !name) { status = kAudioHardwareBadDeviceError; goto failed; }
+            bool input = has_streams(device, kAudioObjectPropertyScopeInput, &status);
+            if (status != noErr) goto failed;
             bool output = has_streams(device, kAudioObjectPropertyScopeOutput, &status);
             if (status != noErr) goto failed;
             // C comparison expressions box as integers; emit JSON booleans for
             // the typed Rust bridge, including is_default.
-            [devices addObject:@{ @"uid": uid, @"name": name,
-                @"output": output ? @YES : @NO, @"is_default": device == default_output ? @YES : @NO }];
+            UInt32 transport = 0;
+            UInt32 transport_size = sizeof(transport);
+            AudioObjectPropertyAddress transport_address = {kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+            // Unknown transport is not proof of physical hardware for automatic selection.
+            AudioObjectGetPropertyData(device, &transport_address, 0, NULL, &transport_size, &transport);
+            [devices addObject:@{ @"uid": uid, @"name": name, @"transport": @(transport),
+                @"is_default_input": device == default_input ? @YES : @NO,
+                @"input": input ? @YES : @NO, @"output": output ? @YES : @NO, @"is_default": device == default_output ? @YES : @NO }];
             [next addObject:@(device)];
         }
         if (!watched) watched = [NSMutableSet set];
@@ -168,3 +183,31 @@ char *oink_audio_devices_snapshot(char *error, size_t capacity) {
     }
 }
 void oink_audio_devices_free(char *value) { free(value); }
+
+// Only the explicit follow-default microphone policy calls this setter. A stale
+// plan must not overwrite a user's newer choice, and playback defaults are untouched.
+int32_t oink_audio_set_default_input(const char *expected, const char *replacement) {
+    @autoreleasepool {
+        AudioObjectPropertyAddress address = {kAudioHardwarePropertyDefaultInputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+        AudioDeviceID current = kAudioObjectUnknown;
+        UInt32 size = sizeof(current);
+        OSStatus status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, NULL, &size, &current);
+        if (status != noErr) return status;
+        NSString *uid = text_property(current, kAudioDevicePropertyDeviceUID);
+        if (!uid || ![uid isEqualToString:[NSString stringWithUTF8String:expected]]) return kAudioHardwareIllegalOperationError;
+        CFStringRef target_uid = (__bridge CFStringRef)[NSString stringWithUTF8String:replacement];
+        AudioObjectPropertyAddress translate = {kAudioHardwarePropertyTranslateUIDToDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+        AudioDeviceID target = kAudioObjectUnknown;
+        size = sizeof(target);
+        status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &translate, sizeof(target_uid), &target_uid, &size, &target);
+        if (status != noErr) return status;
+        if (target == kAudioObjectUnknown || !has_streams(target, kAudioObjectPropertyScopeInput, &status)) return kAudioHardwareBadDeviceError;
+        status = AudioObjectSetPropertyData(kAudioObjectSystemObject, &address, 0, NULL, sizeof(target), &target);
+        if (status != noErr) return status;
+        size = sizeof(current);
+        status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, NULL, &size, &current);
+        if (status != noErr) return status;
+        oink_audio_devices_invalidate();
+        return current == target ? noErr : kAudioHardwareIllegalOperationError;
+    }
+}

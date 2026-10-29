@@ -1,8 +1,12 @@
 //! Background agent composition and authenticated local UI/CLI interfaces.
 //! Resource owners apply state; device cards expose coherent presentation snapshots.
 
+// Share the RT heap audit with the DSP tests; enabled only in this test binary.
 mod agent_api;
 mod aim;
+#[cfg(test)]
+#[path = "../../oink-audio/src/allocation_audit.rs"]
+mod allocation_audit;
 pub mod api;
 pub mod appearance;
 mod attachment;
@@ -40,6 +44,7 @@ pub use oink_input::dispatch_raw_clip_guard;
 mod audio;
 pub mod backend;
 pub mod diagnostics;
+pub mod microphone_plugin;
 pub mod streams;
 pub mod threads;
 
@@ -56,3 +61,6 @@ pub mod update;
 
 pub mod native_controls;
 pub mod tray;
+
+#[cfg(any(windows, test))]
+mod restart_system;

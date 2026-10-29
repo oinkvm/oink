@@ -1,12 +1,12 @@
 // @vitest-environment jsdom
-import { cleanup, render, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { OinkProvider } from 'oink-ui';
 import { agent } from '../api/store';
 import type { PairView } from '../api/pairing';
 import { setLanguage } from '../i18n';
-import { usePairing } from './usePairing';
-import { PairDialog } from './PairDialog';
+import { usePairing, type Pairing } from './usePairing';
+import { ManualSearch, PairDialog } from './PairDialog';
 beforeAll(() => {
   Object.defineProperty(window, 'matchMedia', { value: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }) });
   vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} });
@@ -28,4 +28,18 @@ describe('pairing trust note', () => {
     expect(trigger.getAttribute('tabindex')).toBe('0');
     expect(trigger.getAttribute('aria-label')).toContain('192.0.2.1:47470');
   });
+});
+
+
+it('opens the manual-IP result context menu and blocks that peer', async () => {
+  const peer = { id: 'peer', device: 'peer', name: 'Peer', compatible: true, os: 'mac', ip: '192.0.2.1', port: 47470, deviceId: 'AAAA-BBBB-CCCC' };
+  const block = vi.fn().mockResolvedValue(undefined);
+  const pairing = { defaultPort: 47470, actions: { search: vi.fn().mockResolvedValue(peer), pairFound: vi.fn(), block } } as unknown as Pairing;
+  render(<OinkProvider defaultMotion="reduced"><ManualSearch pairing={pairing}/></OinkProvider>);
+  fireEvent.change(screen.getByRole('textbox', { name: 'IP address' }), { target: { value: '192.0.2.1' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+  const result = await screen.findByText('Peer');
+  fireEvent.contextMenu(result);
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'Block' }));
+  expect(block).toHaveBeenCalledExactlyOnceWith(peer);
 });

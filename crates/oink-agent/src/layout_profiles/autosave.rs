@@ -69,20 +69,30 @@ impl Catalog {
             if old == want || old == after {
                 continue;
             }
+            let x = old.origin.x != want.origin.x && model::close(want.origin.x, after.origin.x);
+            let y = old.origin.y != want.origin.y && model::close(want.origin.y, after.origin.y);
+            let scale = old.scale != want.scale && model::close(want.scale, after.scale);
+            if !x && !y && !scale {
+                continue;
+            }
             include_device(&mut content, actual, after.device);
             let saved = content
                 .placements
                 .iter_mut()
                 .find(|p| p.device == after.device)
                 .expect("inserted");
-            macro_rules! field { ($f:ident $(.$sub:ident)?) => {
-                if old.$f $(.$sub)? != want.$f $(.$sub)? && old.$f $(.$sub)? != after.$f $(.$sub)? {
-                    saved.$f $(.$sub)? = after.$f $(.$sub)?; changed = true;
-                }
-            }; }
-            field!(origin.x);
-            field!(origin.y);
-            field!(scale);
+            // A later factual repair is not evidence that this manual field
+            // committed (notably when recovering an interrupted operation).
+            if x {
+                saved.origin.x = after.origin.x;
+            }
+            if y {
+                saved.origin.y = after.origin.y;
+            }
+            if scale {
+                saved.scale = after.scale;
+            }
+            changed = true;
         }
         for after in &actual.disabled {
             let old = before.disabled.iter().find(|p| p.screen == after.screen);
@@ -107,8 +117,8 @@ impl Catalog {
                 if let (Some(old), Some(want)) = (
                     old.screens.iter().find(|s| s.screen == screen.screen),
                     want.screens.iter().find(|s| s.screen == screen.screen),
-                ) && ((old.origin != want.origin && old.origin != screen.origin)
-                    || (old.size != want.size && old.size != screen.size))
+                ) && ((old.origin != want.origin && want.origin == screen.origin)
+                    || (old.size != want.size && want.size == screen.size))
                 {
                     include_screen(&mut content, actual, &screen.screen);
                 }
@@ -126,11 +136,11 @@ impl Catalog {
                 let Some(saved) = saved.screens.iter_mut().find(|s| s.screen == screen.screen) else {
                     continue;
                 };
-                if old.origin != want.origin && old.origin != screen.origin {
+                if old.origin != want.origin && want.origin == screen.origin {
                     saved.origin = screen.origin;
                     changed = true;
                 }
-                if old.size != want.size && old.size != screen.size {
+                if old.size != want.size && want.size == screen.size {
                     saved.size = screen.size;
                     changed = true;
                 }
@@ -146,7 +156,7 @@ impl Catalog {
                 changed = true;
             }
         }
-        if before.topology != intended.topology && before.topology != actual.topology {
+        if before.topology != intended.topology && intended.topology == actual.topology {
             content.topology = actual.topology.clone();
             changed = true;
         }

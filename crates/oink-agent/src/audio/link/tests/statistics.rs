@@ -75,3 +75,101 @@ async fn local_audio_quality_samples_without_a_ui_and_flushes_on_receiver_retire
     assert_eq!(view.sources[0].bitrate_kbps, bytes as f64 * 8. / 60000.);
     running.stop().await;
 }
+
+#[test]
+fn speaker_and_microphone_sleep_keep_quality_counters_idle_and_wake_on_media() {
+    use crate::streams::audio::{ForwardFrom, MediaReader};
+    use oink_audio::media::Kind;
+    use oink_foundation::snapshot::Snapshot;
+    use oink_network::link::{
+        LinkId, QueueSpec,
+        testing::{partitioned_datagram_pair, post_datagram_at},
+    };
+    use oink_protocol::frame::{StreamKind, StreamTag};
+
+    for kind in [Kind::Speaker, Kind::Microphone] {
+        // Deliberately precede setup: every ingress/render timestamp below is
+        // synthetic, so scheduler delays must not change startup jitter waits.
+        let now = Instant::now() - Duration::from_secs(1);
+        let peer = DeviceId([42; 32]);
+        let (send, [speaker, microphone]) = partitioned_datagram_pair(
+            LinkId(1),
+            StreamTag {
+                kind: StreamKind::Audio,
+                ordinal: 1,
+            },
+            QueueSpec::datagram(StreamKind::Audio),
+            [
+                [Kind::Speaker.packet_id(), Kind::Speaker.sleep_id()],
+                [Kind::Microphone.packet_id(), Kind::Microphone.sleep_id()],
+            ],
+        );
+        let receive = match kind {
+            Kind::Speaker => speaker,
+            Kind::Microphone => microphone,
+        };
+        let table = Arc::new(Snapshot::new(ForwardTable {
+            to: vec![],
+            from: vec![ForwardFrom {
+                admission: Default::default(),
+                peer,
+                stream_id: 7,
+                format: StreamFormat::Opus5ms,
+                gain: 1.0,
+                playing: true,
+                packets: Arc::new(receive),
+            }],
+        }));
+        let reader = Arc::new(MediaReader::new_kind(table, peer, None, kind));
+        let mut sink = oink_audio::sink::Simulator::new(false);
+        let mut source = sink.source(StreamFormat::Opus5ms.config()).unwrap();
+        Receiver::connect_source(&source, &reader);
+        reader.give_realtime();
+        let mut encoder = oink_audio::dsp::Encoder::new_with_config(StreamFormat::Opus5ms.config()).unwrap();
+        let payload = encoder.encode(&[0.25; 480]).unwrap();
+        let post = |burst, ordinal, sleep, at| {
+            let mut packet = oink_audio::source::Packet {
+                burst,
+                ordinal,
+                sleep,
+                payload: [0; oink_audio::dsp::MAX_PACKET_BYTES],
+                len: payload.len(),
+                silent: false,
+                delivered_at: at,
+                encode_start: at,
+                encode_end: at,
+                remaining_samples: 0,
+            };
+            packet.payload[..payload.len()].copy_from_slice(&payload);
+            let mut bytes = [0; oink_audio::media::FRAME_CAPACITY];
+            let len = oink_audio::media::encode_kind(kind, &packet, 7, now, &mut bytes).unwrap();
+            post_datagram_at(&send, &bytes[..len], at).unwrap();
+        };
+        for sequence in 1..=8 {
+            post(1, sequence, false, now);
+        }
+        let mut output = [0.; 256];
+        sink.fill(&mut output, 48_000, 2, 128, now + Duration::from_millis(50), None);
+        assert!(output.iter().any(|s| s.abs() > 0.1));
+        post(1, 9, true, now + Duration::from_millis(50));
+        for tick in 1..=400 {
+            let at = now + Duration::from_micros(50_000 + tick * 2667);
+            crate::allocation_audit::assert_no_heap(|| sink.fill(&mut output, 48_000, 2, 128, at, None));
+        }
+        source.poll();
+        assert!(reader.bursts.asleep(now + Duration::from_secs(65)));
+        assert!(reader.health_error(now + Duration::from_secs(65)).is_none());
+        assert_eq!(reader.payload_bytes(), 8 * payload.len() as u64);
+        assert_eq!(source.stats().lost, 0, "{kind:?} Sleep manufactured PLC");
+        let at = (oink_audio::diagnostics::monotonic_us(now).max(0) / 1000) as u64 + 2000;
+        let quality: Vec<_> = reader.dropouts.snapshot(at).into_iter().flatten().collect();
+        assert_eq!(quality.iter().map(|b| b.interruptions).sum::<u64>(), 0, "{kind:?}");
+        assert_eq!(quality.iter().map(|b| b.concealed_ns).sum::<u64>(), 0, "{kind:?}");
+        assert_eq!(quality.iter().map(|b| b.missing_ns).sum::<u64>(), 0, "{kind:?}");
+        let wake = now + Duration::from_secs(2);
+        post(2, 1, false, wake - Duration::from_millis(50));
+        sink.fill(&mut output, 48_000, 2, 128, wake, None);
+        assert!(!reader.bursts.asleep(wake));
+        assert!(output.iter().any(|s| s.abs() > 0.1), "{kind:?} did not wake on media");
+    }
+}

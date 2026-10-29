@@ -232,7 +232,7 @@ function Connect({ pairing, ready, leaving, onSkip, onFinish }: Pick<OnboardingP
     <section className="ob-page ob-connect" data-leaving={leaving ? '' : undefined}>
       <div className="ob-main" inert={!ready}>
         <div className="ob-col ob-col--narrow ob-col--fit">
-          <Morph viewKey={pairingNow ? `pair-${s!.key}-${s!.status === 'failed' ? 'failed' : s!.status === 'connecting' ? 'connecting' : 'code'}` : 'list'} pending={pairingNow && s!.status === 'connecting' && s!.source !== 'nearby'}>
+          <Morph immediate={pairingNow && s!.status === 'failed'} viewKey={pairingNow ? `pair-${s!.key}-${s!.status === 'failed' ? 'failed' : s!.status === 'connecting' ? 'connecting' : 'code'}` : 'list'} pending={pairingNow && s!.status === 'connecting' && s!.source !== 'nearby'}>
           {pairingNow ? (
             <div className="ob-pair">
               <div className="ob-pair__head ob-in">

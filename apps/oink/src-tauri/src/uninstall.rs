@@ -20,6 +20,7 @@ pub(crate) fn preparing<T>(active: &AtomicBool, run: impl FnOnce() -> T) -> T {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Step {
     InstalledApp,
+    MicrophonePlugin,
     LeaveGroup,
     StopBackend,
     RemoveDomains,
@@ -27,9 +28,26 @@ pub(crate) enum Step {
     Finalizer,
 }
 
-fn prepare(mut run: impl FnMut(Step) -> Result<(), Step>) -> Result<(), Step> {
+#[derive(Debug, serde::Serialize)]
+#[serde(untagged)]
+pub(crate) enum Failure {
+    Step(Step),
+    Microphone {
+        step: Step,
+        kind: oink_agent::microphone_plugin::MicrophonePluginErrorKind,
+        detail: String,
+    },
+}
+impl From<Step> for Failure {
+    fn from(step: Step) -> Self {
+        Self::Step(step)
+    }
+}
+
+fn prepare<E>(mut run: impl FnMut(Step) -> Result<(), E>) -> Result<(), E> {
     for step in [
         Step::InstalledApp,
+        Step::MicrophonePlugin,
         Step::LeaveGroup,
         Step::StopBackend,
         Step::RemoveDomains,
@@ -65,16 +83,38 @@ pub(crate) struct Messages {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn start(remote: &oink_agent::remote::RemoteApi, messages: Messages) -> Result<(), Step> {
+pub(crate) fn start(remote: &oink_agent::remote::RemoteApi, messages: Messages) -> Result<(), Failure> {
     use oink_agent::api::AgentApi;
     use std::io::{BufRead, Write};
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
-    let exe = std::env::current_exe().map_err(|_| Step::InstalledApp)?;
-    let bundle = installed_bundle(&exe).ok_or(Step::InstalledApp)?;
+    let exe = std::env::current_exe().map_err(|_| Failure::from(Step::InstalledApp))?;
+    let bundle = installed_bundle(&exe).ok_or(Failure::from(Step::InstalledApp))?;
     let manager = bundle.join("Contents/MacOS/oink-file-provider");
     prepare(|step| {
+        if step == Step::MicrophonePlugin {
+            // Settings runs its installer in the backend process. Its pending
+            // operation must finish before this UI-local synchronous removal.
+            if oink_agent::instance::is_running(remote.data_dir()) == Some(true) {
+                use oink_agent::microphone_plugin::{MicrophonePluginErrorKind, MicrophonePluginOperation};
+                let status = remote.microphone_plugin_status().map_err(|error| Failure::Microphone {
+                    step,
+                    kind: MicrophonePluginErrorKind::QueryFailed,
+                    detail: error.to_string(),
+                })?;
+                if status.operation != MicrophonePluginOperation::Idle {
+                    return Err(Failure::Microphone {
+                        step,
+                        kind: MicrophonePluginErrorKind::Other,
+                        detail: "A microphone plugin operation is already pending; wait for it to finish and retry"
+                            .into(),
+                    });
+                }
+            }
+            return oink_agent::microphone_plugin::remove_for_app_uninstall(&bundle)
+                .map_err(|(kind, detail)| Failure::Microphone { step, kind, detail });
+        }
         let result: Result<(), String> = (|| {
             match step {
                 Step::InstalledApp => {
@@ -88,6 +128,7 @@ pub(crate) fn start(remote: &oink_agent::remote::RemoteApi, messages: Messages) 
                         return Err("installed bundle and default data directory required".into());
                     }
                 }
+                Step::MicrophonePlugin => unreachable!("handled before other preparation"),
                 Step::LeaveGroup => {
                     if oink_agent::instance::is_running(remote.data_dir()) == Some(true)
                         && remote.group().map_err(|e| e.to_string())?.members.len() > 1
@@ -177,7 +218,7 @@ pub(crate) fn start(remote: &oink_agent::remote::RemoteApi, messages: Messages) 
         })();
         result.map_err(|error| {
             tracing::warn!(?step, %error, "uninstall preparation failed");
-            step
+            Failure::from(step)
         })
     })
 }
@@ -195,6 +236,7 @@ mod tests {
     fn failed_uninstall_restores_backend_stop_handling_at_every_step() {
         for failed in [
             Step::InstalledApp,
+            Step::MicrophonePlugin,
             Step::LeaveGroup,
             Step::StopBackend,
             Step::RemoveDomains,
@@ -228,13 +270,14 @@ mod tests {
         let mut calls = Vec::new();
         prepare(|step| {
             calls.push(step);
-            Ok(())
+            Ok::<_, Step>(())
         })
         .unwrap();
         assert_eq!(
             calls,
             [
                 Step::InstalledApp,
+                Step::MicrophonePlugin,
                 Step::LeaveGroup,
                 Step::StopBackend,
                 Step::RemoveDomains,
@@ -255,6 +298,56 @@ mod tests {
             assert_eq!(seen.len(), calls.iter().position(|step| *step == failure).unwrap() + 1);
         }
     }
+    #[test]
+    fn microphone_presence_cancellation_and_errors_gate_all_destructive_steps_and_retry() {
+        use oink_agent::microphone_plugin::MicrophonePluginErrorKind::{Cancelled, Other};
+        for present in [false, true] {
+            for error in [None, Some(Cancelled), Some(Other)] {
+                let active = AtomicBool::new(false);
+                let mut calls = Vec::new();
+                let mut authorizations = 0;
+                let result = preparing(&active, || {
+                    prepare(|step| {
+                        calls.push(step);
+                        if step == Step::MicrophonePlugin && present {
+                            authorizations += 1;
+                            if let Some(kind) = error {
+                                return Err(Failure::Microphone {
+                                    step,
+                                    kind,
+                                    detail: "specific OS error".into(),
+                                });
+                            }
+                        }
+                        Ok(())
+                    })
+                });
+                assert!(!active.load(Ordering::Acquire));
+                assert_eq!(authorizations, usize::from(present));
+                if present && error.is_some() {
+                    assert_eq!(calls, [Step::InstalledApp, Step::MicrophonePlugin]);
+                    let serialized = serde_json::to_value(result.unwrap_err()).unwrap();
+                    assert_eq!(serialized["step"], "microphone_plugin");
+                    assert_eq!(
+                        serialized["kind"],
+                        if error == Some(Cancelled) { "cancelled" } else { "other" }
+                    );
+                    assert_eq!(serialized["detail"], "specific OS error");
+                    // Cancellation/error leaves preparation retryable in this UI.
+                    preparing(&active, || prepare(|_| Ok::<_, Failure>(()))).unwrap();
+                    assert!(!active.load(Ordering::Acquire));
+                } else {
+                    result.unwrap();
+                    assert_eq!(calls.last(), Some(&Step::Finalizer));
+                }
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(Failure::from(Step::StopBackend)).unwrap(),
+            "stop_backend"
+        );
+    }
+
     #[test]
     fn only_the_running_installed_outer_bundle_is_eligible() {
         for path in [

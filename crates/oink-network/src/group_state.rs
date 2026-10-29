@@ -41,7 +41,8 @@ impl State {
                 .into(),
             )?,
             roster.anchor(),
-        )
+        )?
+        .reconcile_pointer_slots(identity.id())
     }
     pub fn verify(state: dto::GroupState, anchor: Anchor) -> v1::Result<Self> {
         if state.group()?.0 != anchor.group.0 {
@@ -52,6 +53,9 @@ impl State {
         let mut layout = false;
         for register in state.registers()?.0 {
             retained::verify_register(&register)?;
+            if register.kind()? == 8 && !register.deleted()? {
+                dto::ApplicationFocusSettings::from_raw(register.value()?)?;
+            }
             if register.kind()? == 2 {
                 validate_layout(&dto::LayoutValue::from_raw(register.value()?)?)?;
                 layout = true;
@@ -60,7 +64,9 @@ impl State {
         if !layout {
             return Err(v1::ErrorCode::MalformedFrame.into());
         }
-        Ok(Self { wire: state, roster })
+        let state = Self { wire: state, roster };
+        state.pointer_slots()?;
+        Ok(state)
     }
     pub fn wire(&self) -> &dto::GroupState {
         &self.wire
@@ -155,6 +161,86 @@ pub fn validate_rect(rect: &dto::Rect) -> v1::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn group_application_setting_merges_from_any_member_and_survives_opaque_relay() {
+        fn edit(state: &State, writer: DeviceId, enabled: bool) -> State {
+            let mut registers = state.wire().registers().unwrap().0;
+            let current = registers.iter().find(|r| r.kind() == Ok(8));
+            let register = if let Some(current) = current {
+                retained::edit_register(current, &current.version().unwrap(), wire::device(writer), |raw| {
+                    raw.insert(1, enabled.write());
+                    Ok(())
+                })
+                .unwrap()
+            } else {
+                let version =
+                    dto::ConfigVersion::from_raw([(1, 1u64.write()), (3, wire::device(writer).write())].into())
+                        .unwrap();
+                let mut raw: RawMap = [
+                    (1, 8u32.write()),
+                    (3, version.write()),
+                    (
+                        4,
+                        RawValue::Map([(1, enabled.write()), (90, RawValue::from("retained"))].into()),
+                    ),
+                ]
+                .into();
+                raw.insert(6, retained::register_digest(&raw).unwrap().write());
+                dto::Register::from_raw(raw).unwrap()
+            };
+            registers.retain(|r| r.kind() != Ok(8));
+            registers.push(register);
+            registers.sort_by_key(|register| register.kind().expect("validated register kind"));
+            let mut raw = state.wire().raw().clone();
+            raw.insert(2, RawValue::Array(registers.iter().map(WireValue::write).collect()));
+            State::verify(dto::GroupState::from_raw(raw).unwrap(), state.roster().anchor()).unwrap()
+        }
+        let a = Identity::from_seed([1; 32]);
+        let b = Identity::from_seed([2; 32]);
+        let fresh = State::create(&a, "source", "test", 1).unwrap();
+        let base = fresh
+            .with_roster(&fresh.roster().add(&a, b.id(), "peer", "test", 2).unwrap())
+            .unwrap();
+        let on = edit(&base, a.id(), true);
+        // Opaque encoding/decoding preserves this additive register, as an old peer does.
+        let relay = dto::GroupState::from_raw(
+            v1::cbor::decode_map(
+                &on.wire().encode(v1::limits::CONFIG_STATE).unwrap(),
+                v1::limits::CONFIG_STATE,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let adopted = base.merge(&relay, a.id(), b.id()).unwrap();
+        let off = edit(&adopted, b.id(), false);
+        let merged = on.merge(off.wire(), b.id(), a.id()).unwrap();
+        let replay = merged.merge(on.wire(), a.id(), b.id()).unwrap();
+        let setting = replay
+            .wire()
+            .registers()
+            .unwrap()
+            .0
+            .into_iter()
+            .find(|r| r.kind() == Ok(8))
+            .unwrap();
+        assert!(
+            !dto::ApplicationFocusSettings::from_raw(setting.value().unwrap())
+                .unwrap()
+                .enabled()
+                .unwrap()
+        );
+        assert!(setting.value().unwrap().contains_key(&90));
+        assert_eq!(merged.layout().unwrap(), base.layout().unwrap());
+        // Concurrent equal-counter edits converge regardless of delivery order.
+        let concurrent = edit(&on, a.id(), true);
+        assert_eq!(
+            off.merge(concurrent.wire(), a.id(), b.id()).unwrap().digest().unwrap(),
+            concurrent.merge(off.wire(), b.id(), a.id()).unwrap().digest().unwrap()
+        );
+        let other = State::create(&b, "other", "test", 3).unwrap();
+        assert!(other.merge(on.wire(), a.id(), b.id()).is_err());
+    }
+
     #[test]
     fn admitted_signed_removals_are_retained_before_authority_is_revoked() {
         let a = Identity::from_seed([1; 32]);

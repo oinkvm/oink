@@ -50,12 +50,15 @@ mdns-sd = "0.21"
 libc = "0.2"
 
 [dev-dependencies]
+oink-foundation = { workspace = true, features = ["test-storage-retries"] }
 tokio = { workspace = true, features = ["test-util"] }
 oink-audio.workspace = true
 oink-clipboard.workspace = true
 blake3 = "1"
 tracing-subscriber.workspace = true
 tempfile = "3"
+# tests/support/src/ports.rs is included by path and uses fs2 file locks.
+fs2 = "0.4"
 
 [lints]
 workspace = true

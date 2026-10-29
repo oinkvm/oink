@@ -43,7 +43,7 @@ impl Provider for Clipboard {
     fn inventory(&self) -> Inventory {
         let mut inventory = self.inventory.clone();
         if let Some(files) = &self.files {
-            inventory.roots = files.roots();
+            inventory = inventory.with_roots(files.roots());
         }
         inventory
     }
@@ -82,6 +82,33 @@ struct CurrentFiles {
     check: Check,
 }
 impl namespace::Namespace for CurrentFiles {
+    fn native_file_metadata(&self) -> super::native_metadata::NativeFileMetadata {
+        if (self.check)().is_ok() {
+            self.inner.native_file_metadata()
+        } else {
+            Default::default()
+        }
+    }
+    fn clipboard_key(&self) -> io::Result<Option<[u8; 32]>> {
+        (self.check)()?;
+        let key = self.inner.clipboard_key()?;
+        (self.check)()?;
+        Ok(key)
+    }
+    fn one_shot_roots(&self) -> Vec<NodeId> {
+        self.inner.one_shot_roots()
+    }
+    fn release_fulfilled(&self, roots: &[NodeId]) {
+        self.inner.release_fulfilled(roots);
+    }
+    fn prepare(&self) -> io::Result<()> {
+        (self.check)()?;
+        self.inner.prepare()?;
+        (self.check)()
+    }
+    fn cancel(&self) {
+        self.inner.cancel();
+    }
     fn roots(&self) -> Vec<FileNode> {
         self.inner.roots()
     }

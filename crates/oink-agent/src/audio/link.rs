@@ -17,7 +17,11 @@ use oink_foundation::GroupId;
 use oink_network::link::{LinkLayer, ModuleEvent, ModulePort};
 use oink_network::wire_identity::{boot, read_device};
 mod control;
+mod microphone;
 use std::sync::atomic::{AtomicBool, AtomicU64};
+
+const PLAYBACK_RETRY_INITIAL: Duration = Duration::from_millis(250);
+const PLAYBACK_RETRY_MAX: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub(crate) struct Handle {
@@ -59,9 +63,22 @@ enum Command {
     Refresh,
     RefreshPermission,
     PrepareUpdate(SyncSender<Result<(), String>>),
+    PrepareDriverChange(Arc<AtomicBool>, SyncSender<Result<(), String>>),
     Stop,
     #[cfg(all(test, debug_assertions))]
     HoldPeriodicReports(tokio::sync::oneshot::Sender<()>),
+}
+/// The installer worker owns this guard through UAC, success, cancellation and
+/// failure. Dropping it re-evaluates the same route against the new inventory.
+pub(crate) struct DriverChangeGuard {
+    active: Arc<AtomicBool>,
+    handle: Handle,
+}
+impl Drop for DriverChangeGuard {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+        let _ = self.handle.refresh_devices();
+    }
 }
 impl Handle {
     #[cfg(all(test, debug_assertions))]
@@ -161,6 +178,19 @@ impl Handle {
             .send(Command::Refresh)
             .map_err(|_| "audio stopped".to_string())
     }
+    pub(crate) fn prepare_driver_change(&self) -> Result<DriverChangeGuard, String> {
+        let guard = DriverChangeGuard {
+            active: Arc::new(AtomicBool::new(true)),
+            handle: self.clone(),
+        };
+        let (reply, wait) = mpsc::sync_channel(1);
+        self.commands
+            .send(Command::PrepareDriverChange(guard.active.clone(), reply))
+            .map_err(|_| "audio owner unavailable")?;
+        wait.recv_timeout(Duration::from_secs(15))
+            .map_err(|_| "audio cleanup timed out")??;
+        Ok(guard)
+    }
     pub fn prepare_update(&self, deadline: Instant) -> Result<(), String> {
         let (reply, wait) = mpsc::sync_channel(1);
         self.commands
@@ -213,6 +243,20 @@ pub(crate) fn start_link_runtime(
     let worker = thread::Builder::new()
         .name("oink-audio-control".into())
         .spawn(move || {
+            // WASAPI session notifications require MTA before CPAL initializes
+            // COM on this dedicated control thread.
+            #[cfg(windows)]
+            let _microphone_apartment = if native_services {
+                match oink_audio::microphone::WorkerApartment::new() {
+                    Ok(apartment) => Some(apartment),
+                    Err(error) => {
+                        tracing::error!(%error, "audio control COM initialization failed");
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -278,10 +322,65 @@ pub(crate) fn start_link_runtime(
 }
 
 type QualityCallback = Arc<
-    dyn Fn(u64, Vec<crate::audio_quality::Observation>, Option<[Option<oink_audio::sink::DropoutBucket>; 60]>, bool)
-        + Send
+    dyn Fn(
+            u64,
+            Vec<crate::audio_quality::Observation>,
+            Option<[Option<oink_audio::sink::DropoutBucket>; oink_audio::sink::QUALITY_SECONDS]>,
+            bool,
+        ) + Send
         + Sync,
 >;
+
+/// Native loopback can legitimately stop callbacks while idle. Missing frames
+/// trigger a bounded reopen probe, never a silence/permission diagnosis. Zero
+/// PCM and intentionally omitted native silent frames both prove progress.
+/// Repeated empty opens back off to ten seconds;
+/// this also lets the encoder publish its five-second Sleep marker. Real frame
+/// progress returns the watchdog to its 500 ms health deadline.
+struct CaptureWatchdog {
+    frames: u64,
+    progressed: Option<Instant>,
+    timeout: Duration,
+}
+impl Default for CaptureWatchdog {
+    fn default() -> Self {
+        Self {
+            frames: 0,
+            progressed: None,
+            timeout: Duration::from_millis(500),
+        }
+    }
+}
+impl CaptureWatchdog {
+    fn opened(&mut self, now: Instant) {
+        self.frames = 0;
+        self.progressed = Some(now);
+    }
+    fn stalled(&mut self, now: Instant, frames: u64) -> bool {
+        if frames != self.frames || self.progressed.is_none() {
+            self.frames = frames;
+            self.progressed = Some(now);
+            self.timeout = Duration::from_millis(500);
+            return false;
+        }
+        if now.saturating_duration_since(self.progressed.unwrap()) < self.timeout {
+            return false;
+        }
+        self.progressed = Some(now);
+        self.timeout = (self.timeout * 2).min(Duration::from_secs(10));
+        true
+    }
+}
+
+/// Final state after the native worker has joined, including late failures.
+#[derive(Debug)]
+enum CaptureRetirement {
+    Stopped,
+    Rebuild,
+    Terminal(String),
+    Takeover(oink_audio::ForwardingOffReason),
+    CleanupFailed(String),
+}
 
 struct Receiver {
     quality_callback: Option<QualityCallback>,
@@ -299,9 +398,17 @@ struct Receiver {
     events: timing::ReceiveEvents,
 }
 impl Receiver {
+    fn connect_source(port: &oink_audio::sink::Source, reader: &Arc<MediaReader>) {
+        port.set_dropout_counters(reader.dropouts.clone());
+        let callback = reader.clone();
+        port.set_packet_reader(Arc::new(move |budget| callback.realtime(budget)));
+        let callback = reader.clone();
+        port.set_sleep_detector(Arc::new(move |now| callback.bursts.asleep(now)));
+    }
     fn quality_observation(&self, now: Instant, retiring: bool) -> crate::audio_quality::Observation {
         crate::audio_quality::Observation {
             device: self.peer,
+            kind: self.reader.kind,
             buffer_ms: (!retiring && !self.reader.bursts.asleep(now))
                 .then(|| self.source.as_ref().map_or(0., |s| s.stats().buffered_ms)),
             bytes: self.reader.payload_bytes(),
@@ -349,8 +456,15 @@ type PublishedObservations = (
     Option<dto::ExitVolumeState>,
 );
 
+struct PeerOutputs {
+    facts: Arc<dto::DeviceFacts>,
+    value: DeviceOutputs,
+}
+
 struct Owner {
+    microphone: microphone::State,
     update_suspended: bool,
+    driver_change: Option<Arc<AtomicBool>>,
     update_cleanup: Option<(Option<u64>, Result<(), String>)>,
     update_activity: Option<oink_foundation::maintenance::Lease>,
     links: LinkLayer,
@@ -366,12 +480,14 @@ struct Owner {
     on_status: Option<Arc<dyn Fn(Status) + Send + Sync>>,
     on_statistics: Option<Arc<dyn Fn(crate::api::AudioStatistics) + Send + Sync>>,
     published_state: Option<Status>,
+    peer_outputs: BTreeMap<DeviceId, PeerOutputs>,
     quality_at: Instant,
     output_quality: Arc<oink_audio::sink::DropoutCounters>,
     on_quality: Option<QualityCallback>,
     volume: Arc<oink_foundation::snapshot::Snapshot<Option<Arc<dto::AudioSessionContext>>>>,
     keep_local: Arc<AtomicBool>,
     store: Arc<Mutex<AgentConfig>>,
+    volume_context_inputs: Option<control::VolumeContextInputs>,
     gate: Arc<Mutex<()>>,
     active_group: Option<GroupId>,
     claims: Claims,
@@ -387,6 +503,7 @@ struct Owner {
     paused: bool,
     capture: Option<Box<dyn CaptureStream>>,
     encoded: Option<oink_audio::source::Encoded>,
+    capture_watchdog: CaptureWatchdog,
     selected: Option<Negotiated>,
     needs_generation: bool,
     exit_switch_deadline: Option<Instant>,
@@ -410,11 +527,12 @@ struct Owner {
     source_failed: bool,
     mute_cleanup_error: Option<String>,
     playback_failed: bool,
+    playback_retry_at: Option<Instant>,
+    playback_retry_delay: Duration,
     retry_default: Option<Option<String>>,
     device_revision: Option<u64>,
     service_generation: Option<u64>,
     awaiting_output_snapshot: bool,
-    output_invalidated_at: Option<Instant>,
     restart_playback: bool,
     output_latencies: Vec<OutputLatency>,
     devices: Vec<DeviceOutputs>,
@@ -430,13 +548,16 @@ struct Owner {
     cadence: Cadence,
     capture_observations: u64,
     capture_discarded_samples: u64,
+    capture_discontinuities: u64,
     capture_last: Option<oink_audio::source::Observation>,
     capture_levels: Option<oink_audio::CaptureLevels>,
     mute_recovery: Option<oink_audio::recovery::RecoveryReport>,
     forwarding_off_reason: Option<oink_audio::ForwardingOffReason>,
+    retired_capture_off_reason: Option<oink_audio::ForwardingOffReason>,
 }
 impl Drop for Owner {
     fn drop(&mut self) {
+        self.stop_microphone();
         self.stop_source();
         self.receivers.clear();
         self.playback = None;
@@ -493,13 +614,8 @@ impl Owner {
             Arc::new(UnitTestAudio)
         };
         let mut owner = Self::with_platform(context, settings, state, volume, platform);
+        owner.microphone.native = native_services;
         owner.mute_cleanup_error = recovery_error;
-        if recovered
-            .as_ref()
-            .is_some_and(|report| report.outcome == oink_audio::recovery::RecoveryOutcome::EndpointUnavailable)
-        {
-            owner.mute_cleanup_error = Some("saved muted source output unavailable; recovery journal retained".into());
-        }
         owner.mute_recovery = recovered;
         if native_services {
             owner.power = oink_audio::power::Monitor::new().ok();
@@ -536,7 +652,9 @@ impl Owner {
             CapturePermission::NotRequired
         };
         Self {
+            microphone: Default::default(),
             update_suspended: false,
+            driver_change: None,
             update_cleanup: None,
             update_activity: None,
             links,
@@ -555,8 +673,10 @@ impl Owner {
             output_quality: Default::default(),
             on_quality: None,
             published_state: None,
+            peer_outputs: BTreeMap::new(),
             volume,
             store,
+            volume_context_inputs: None,
             gate,
             active_group: None,
             claims: Claims::default(),
@@ -572,6 +692,7 @@ impl Owner {
             paused: applied.paused,
             capture: None,
             encoded: None,
+            capture_watchdog: CaptureWatchdog::default(),
             selected: None,
             needs_generation: false,
             exit_switch_deadline: None,
@@ -599,11 +720,12 @@ impl Owner {
             source_failed: false,
             mute_cleanup_error: None,
             playback_failed: false,
+            playback_retry_at: None,
+            playback_retry_delay: PLAYBACK_RETRY_INITIAL,
             retry_default: None,
             device_revision: platform.device_revision(),
             service_generation: platform.service_generation(),
             awaiting_output_snapshot: false,
-            output_invalidated_at: None,
             restart_playback: false,
             output_latencies: Vec::new(),
             platform,
@@ -620,10 +742,32 @@ impl Owner {
             cadence: Cadence::default(),
             capture_observations: 0,
             capture_discarded_samples: 0,
+            capture_discontinuities: 0,
             capture_last: None,
             capture_levels: None,
             mute_recovery: None,
             forwarding_off_reason,
+            retired_capture_off_reason: None,
+        }
+    }
+    fn maintenance_deadline(&self, now: Instant) -> Instant {
+        // A silent, admitted source keeps its native tap/encoder: sound onset is
+        // sent directly on M1 without this owner. Only its ordinary statistics
+        // can wait for the report deadline. Verification, active playback and
+        // microphone work retain 20 ms maintenance; commands/config/media and
+        // explicit handshake deadlines still wake the select immediately.
+        let active_capture = self.capture.is_some()
+            && (self.provisional || self.encoded.as_ref().is_none_or(|output| !output.sleeping()));
+        let deadline = if active_capture || self.playback.is_some() || self.microphone_active() {
+            now + Duration::from_millis(20)
+        } else {
+            self.report_at + Duration::from_secs(1)
+        };
+        if self.playback_retry_eligible() {
+            self.playback_retry_at
+                .map_or(deadline, |retry| deadline.min(retry.max(now)))
+        } else {
+            deadline
         }
     }
     async fn run(
@@ -638,13 +782,10 @@ impl Owner {
         loop {
             // Active streams keep their 20 ms health/statistics deadline. Idle
             // control sleeps until a real notification or the one-second report.
-            let maintenance = if self.capture.is_some() || self.playback.is_some() {
-                Instant::now() + Duration::from_millis(20)
-            } else {
-                self.report_at + Duration::from_secs(1)
-            };
+            let maintenance = self.maintenance_deadline(Instant::now());
             let deadline = self.streams.deadline().map_or(maintenance, |at| at.min(maintenance));
             let deadline = self.exit_switch_deadline.map_or(deadline, |at| at.min(deadline));
+            let deadline = self.microphone_deadline().map_or(deadline, |at| at.min(deadline));
             let deadline = lock(&self.store)
                 .deferred_deadline()
                 .map_or(deadline, |at| at.min(deadline));
@@ -672,9 +813,10 @@ impl Owner {
                 },
                 command = commands.recv() => match command {
                     Some(Command::Stop) | None => break,
+                    Some(Command::PrepareDriverChange(active, reply)) => { let result = self.prepare_driver_change(active); let _ = reply.send(result); },
                     Some(Command::PrepareUpdate(reply)) => { let result = self.suspend_for_update(); let _ = reply.send(result); },
                     Some(Command::RefreshPermission) => self.permission_observer.request(),
-                    Some(Command::Refresh) => { self.platform.invalidate_devices(); self.discovery.changed(); },
+                    Some(Command::Refresh) => { crate::microphone_plugin::devices_changed(); self.platform.invalidate_devices(); self.discovery.changed(); if !self.driver_change_active() { self.refresh_microphone(); } },
                     Some(Command::Configure(settings, reply)) => self.configure(settings, reply),
                     Some(Command::VolumeKey(code)) => self.volume_key(code),
                     Some(Command::SetOption(requester, group, option, expected, patch, defer_persistence, reply)) => { let result = self.set_option_with_persistence(&requester, group, option, expected, patch, defer_persistence); let _ = reply.send(result); },
@@ -723,24 +865,69 @@ impl Owner {
             self.stop_source();
         }
     }
-    fn release_capture(&mut self) -> Option<String> {
-        let mut cleanup = None;
+    fn release_capture(&mut self) -> CaptureRetirement {
+        self.retire_capture(true)
+    }
+    fn retire_capture(&mut self, rebuild: bool) -> CaptureRetirement {
         self.streams.set_forwarding(false, 1.0);
         self.needs_generation |= self.capture.is_some() && !self.provisional;
+        let mut outcome = if rebuild {
+            CaptureRetirement::Rebuild
+        } else {
+            CaptureRetirement::Stopped
+        };
         if let Some(mut capture) = self.capture.take() {
             capture.set_forwarding_pause(None);
-            // Joining already happens on Drop. Inspect its lease restoration
-            // result on EVERY lifecycle path before discarding the handle.
-            if let Some(error) = capture.finish() {
-                self.mute_cleanup_error = Some(error.clone());
-                cleanup = Some(error);
+            // Join before inspecting terminal state: a notification or generic
+            // native failure can arrive during retirement on any control path.
+            let cleanup = capture.finish();
+            let off = self.capture_off_reason(&*capture);
+            let error = capture
+                .error()
+                .or_else(|| self.encoded.as_ref().and_then(|e| e.error()).map(str::to_owned));
+            if self.settings.forwarding_enabled {
+                self.retired_capture_off_reason = off.or(self.retired_capture_off_reason);
             }
+            outcome = if let Some(error) = cleanup {
+                CaptureRetirement::CleanupFailed(error)
+            } else if let Some(reason) = off {
+                CaptureRetirement::Takeover(reason)
+            } else if rebuild && (error.is_some() || self.forwarding_pause.is_ended()) {
+                CaptureRetirement::Terminal(error.unwrap_or_else(|| "capture send ticket ended".into()))
+            } else {
+                outcome
+            };
         }
         self.encoded = None;
         self.capture_levels = None;
         self.capture_sent_base = self.sent.load(Ordering::Relaxed);
         self.provisional = false;
-        cleanup
+        // Every caller passes through this dispatch, including AudioPrepared and
+        // an empty forwarding table. A native terminal ticket is never reusable.
+        match &outcome {
+            CaptureRetirement::Terminal(error) => {
+                self.restart_reason = Some(error.clone());
+                self.forwarding_pause.stop();
+                self.renew_forwarding_ticket();
+            }
+            CaptureRetirement::CleanupFailed(error) => {
+                self.mute_cleanup_error = Some(error.clone());
+                self.error = Some(error.clone());
+                self.source_failed = true;
+            }
+            CaptureRetirement::Takeover(reason) => {
+                if self.settings.forwarding_enabled {
+                    self.retired_capture_off_reason = Some(*reason);
+                }
+            }
+            CaptureRetirement::Stopped | CaptureRetirement::Rebuild => {}
+        }
+        outcome
+    }
+    fn renew_forwarding_ticket(&mut self) {
+        self.forwarding_pause = self.platform.forwarding_pause();
+        self.forwarding_pause
+            .set_pause_allowed(matches!(self.resolution, Resolution::None { .. }));
     }
     fn stop_source(&mut self) {
         let _ = self.stop_source_checked();
@@ -749,17 +936,56 @@ impl Owner {
         self.exit_switch_deadline = None;
         self.streams.set_forwarding(false, 1.0);
         self.forwarding_pause.stop();
-        let cleanup = self.release_capture();
-        self.forwarding_pause = self.platform.forwarding_pause();
-        self.forwarding_pause
-            .set_pause_allowed(matches!(self.resolution, Resolution::None { .. }));
+        let outcome = self.retire_capture(false);
+        self.renew_forwarding_ticket();
         self.verified = false;
-        cleanup
+        match outcome {
+            CaptureRetirement::CleanupFailed(error) => Some(error),
+            _ => None,
+        }
     }
     fn fail_source(&mut self, error: String) {
         self.stop_source();
         self.error = Some(error);
         self.source_failed = true;
+    }
+    fn prepare_driver_change(&mut self, active: Arc<AtomicBool>) -> Result<(), String> {
+        if !active.load(Ordering::Acquire) {
+            return Err("audio cleanup cancelled".into());
+        }
+        if self
+            .driver_change
+            .as_ref()
+            .is_some_and(|change| change.load(Ordering::Acquire))
+        {
+            return Err("an audio driver operation is already pending".into());
+        }
+        // The vendor may remove the current default render endpoint and restart
+        // the audio service. Retire native IO and its mute lease on the owner
+        // before invoking it, and prevent reacquisition while UAC is pending.
+        self.driver_change = Some(active);
+        self.stop_microphone();
+        let cleanup = self.stop_source_checked().map_or(Ok(()), Err);
+        self.playback = None;
+        if let Some(starting) = self.starting_playback.take() {
+            // A dropped receiver alone cannot prove the opening worker released
+            // its endpoint. Refuse the driver operation if it is still opening.
+            let opened = starting
+                .result
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|_| "audio output still opening; driver operation refused")?;
+            drop(opened);
+        }
+        self.retire_sessions();
+        self.retire_output();
+        self.local_output.retire(Instant::now());
+        self.publish(self.phase());
+        cleanup
+    }
+    fn driver_change_active(&self) -> bool {
+        self.driver_change
+            .as_ref()
+            .is_some_and(|active| active.load(Ordering::Acquire))
     }
     fn suspend_for_update(&mut self) -> Result<(), String> {
         let generation = oink_foundation::maintenance::process().generation();
@@ -771,6 +997,7 @@ impl Owner {
         // Historical diagnostics still prevent unsafe capture reuse, but only
         // this attempt's capture restoration can refuse an explicit Install.
         // Tick and PrepareUpdate can reach the same attempt in either order.
+        self.stop_microphone();
         self.update_suspended = true;
         self.streams.pause_changed(true);
         let cleanup = self.stop_source_checked().map_or(Ok(()), Err);
@@ -786,6 +1013,15 @@ impl Owner {
         result
     }
     fn tick(&mut self) {
+        if self.driver_change_active() {
+            return;
+        }
+        if self.driver_change.take().is_some() {
+            self.platform.invalidate_devices();
+            self.discovery.changed();
+            self.refresh_microphone();
+            self.apply();
+        }
         let gate = self.gate.clone();
         let _guard = lock(&gate);
         if oink_foundation::maintenance::process().closed() {
@@ -821,45 +1057,51 @@ impl Owner {
             && self.playback.is_none()
             && self.starting_playback.is_none()
             && self.receivers.is_empty()
+            && !self.microphone_active()
             && self.mute_cleanup_error.is_none()
         {
             self.update_activity = None;
         }
     }
+    fn capture_off_reason(&self, capture: &dyn CaptureStream) -> Option<oink_audio::ForwardingOffReason> {
+        if self.settings.keep_local_playback {
+            return None;
+        }
+        // An established external-controls takeover keeps priority over a
+        // simultaneous default notification. Both precede generic stream faults.
+        if capture.local_controls_changed() {
+            Some(oink_audio::ForwardingOffReason::LocalVolumeChanged)
+        } else if capture.default_output_changed() {
+            Some(oink_audio::ForwardingOffReason::DefaultOutputChanged)
+        } else {
+            None
+        }
+    }
+    fn apply_capture_takeover(&mut self) {
+        let reason = self.retired_capture_off_reason.take().or_else(|| {
+            self.capture
+                .as_ref()
+                .and_then(|capture| self.capture_off_reason(&**capture))
+        });
+        let Some(reason) = reason else { return };
+        self.stop_source();
+        // Joining may have observed a later, authoritative takeover reason.
+        let reason = self.retired_capture_off_reason.take().unwrap_or(reason);
+        self.settings.forwarding_enabled = false;
+        self.source_failed = false;
+        self.error = self.mute_cleanup_error.clone();
+        self.forwarding_off_reason = Some(reason);
+        self.report_pending = true;
+        let mut settings = self.settings.clone();
+        settings.forwarding_off_reason = Some(reason);
+        if let Err(reason) = self.install_settings_locked(&mut settings) {
+            self.error = Some(format!("audio settings failure {}", reason.number()));
+        }
+    }
     fn tick_running(&mut self) {
         self.cadence.observe(Instant::now());
         self.observe_service_restart();
-        let automatic_off = self.capture.as_ref().and_then(|capture| {
-            if self.settings.keep_local_playback {
-                return None;
-            }
-            // Keep the established external-controls takeover reason. A
-            // pending default notification must not reclassify that action.
-            // Default changes still stop forwarding before generic fault
-            // handling, which would otherwise only suspend the switch.
-            if capture.local_controls_changed() {
-                Some(oink_audio::ForwardingOffReason::LocalVolumeChanged)
-            } else if capture.default_output_changed() {
-                Some(oink_audio::ForwardingOffReason::DefaultOutputChanged)
-            } else {
-                None
-            }
-        });
-        if let Some(reason) = automatic_off {
-            self.mute_cleanup_error = self.capture.as_mut().and_then(|capture| capture.finish());
-            self.stop_source();
-            self.settings.forwarding_enabled = false;
-            self.source_failed = false;
-            self.error = self.mute_cleanup_error.clone();
-            self.forwarding_off_reason = Some(reason);
-            self.report_pending = true;
-            let mut settings = self.settings.clone();
-            settings.forwarding_enabled = false;
-            settings.forwarding_off_reason = Some(reason);
-            if let Err(reason) = self.install_settings_locked(&mut settings) {
-                self.error = Some(format!("audio settings failure {}", reason.number()));
-            }
-        }
+        self.apply_capture_takeover();
         if let Some(power) = &self.power {
             let state = power.state();
             if state != self.power_state {
@@ -888,6 +1130,7 @@ impl Owner {
         let revision = self.platform.device_revision();
         if revision != self.device_revision {
             self.device_revision = revision;
+            crate::microphone_plugin::devices_changed();
             self.discovery.changed();
             if let Some(previous) = &self.retry_default
                 && self.settings.capture_scope == CaptureScope::DefaultOutput
@@ -907,6 +1150,7 @@ impl Owner {
         self.local_output.tick(Instant::now());
         self.refresh_volume_context();
         let _ = self.publish_observations();
+        self.tick_microphone();
         if self.power_state.sleeping {
             self.publish(AudioPhase::SoundSleep);
             return;
@@ -922,11 +1166,17 @@ impl Owner {
         // as the reply arrives. Publish before acknowledging, including failures.
     }
     fn fail_playback(&mut self, error: String) {
+        tracing::warn!(%error, output = ?self.bound_output,
+            invalidated = self.playback.as_ref().is_some_and(|playback| playback.device_invalidated()),
+            "audio playback retired");
         self.error = Some(error.clone());
         self.playback_failed = true;
+        self.playback_retry_at = Some(Instant::now() + self.playback_retry_delay);
+        self.playback_retry_delay = (self.playback_retry_delay * 2).min(PLAYBACK_RETRY_MAX);
         self.receivers.clear();
         self.playback = None;
-        self.starting_playback = None;
+        // A wake backlog can fail while native open is still running. Retain
+        // its result until tick_exit closes it before retrying the output.
         self.playback_idle = false;
         self.draining = false;
         for (peer, session) in std::mem::take(&mut self.receive_sessions) {
@@ -948,6 +1198,44 @@ impl Owner {
         }
         self.prepared.clear();
     }
+    fn reset_playback_retry(&mut self) {
+        self.playback_retry_at = None;
+        self.playback_retry_delay = PLAYBACK_RETRY_INITIAL;
+    }
+    fn playback_retry_eligible(&self) -> bool {
+        self.playback_failed
+            && self.starting_playback.is_none()
+            && self.resolution.owner() == Some(self.links.id())
+            && self.resolution.available()
+            && self.bound_output.is_some()
+            && !self.awaiting_output_snapshot
+            && !self.restart_playback
+            && !self.driver_change_active()
+            && !self.update_suspended
+            && !self.paused
+            && !self.power_state.sleeping
+            && self.mute_cleanup_error.is_none()
+            && !self.platform.capture_cleanup_failed()
+    }
+    fn start_playback(&mut self) -> Result<(), String> {
+        if self.driver_change_active() {
+            return Err("audio driver operation pending".into());
+        }
+        let platform = self.platform.clone();
+        let output = self.bound_output.as_ref().unwrap().clone();
+        let wake = self.streams.wake();
+        let (send, result) = mpsc::sync_channel(1);
+        let at = Instant::now();
+        thread::Builder::new()
+            .name("oink-audio-wake".into())
+            .spawn(move || {
+                let _ = send.send(platform.playback(&output));
+                wake.notify_one();
+            })
+            .map_err(|error| format!("start audio wake worker: {error}"))?;
+        self.starting_playback = Some(StartingPlayback { result, at });
+        Ok(())
+    }
     fn observe_service_restart(&mut self) {
         let generation = self.platform.service_generation();
         if generation == self.service_generation {
@@ -956,17 +1244,15 @@ impl Owner {
         let had_service = self.service_generation.is_some();
         self.service_generation = generation;
         self.local_output.retire(Instant::now());
-        // HAL can invalidate an output before publishing its restart notification.
-        // Preserve the accepted one-second correlation; hotplug alone cannot retry.
-        let eligible = self
-            .playback
-            .as_ref()
-            .is_some_and(|playback| playback.error().is_none() || playback.device_invalidated())
-            || self
-                .output_invalidated_at
-                .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
+        // A confirmed service incarnation change retires every old HAL handle.
+        // Health errors and empty device snapshots may precede srst by seconds;
+        // neither notification order nor elapsed wall time can gate recovery.
+        let eligible = self.playback.is_some()
+            || self.starting_playback.is_some()
+            || self.playback_failed
             || self.restart_playback
             || self.playback_idle;
+        tracing::info!(?generation, eligible, "audio service generation changed");
         if had_service && self.resolution.owner() == Some(self.links.id()) {
             self.exit_volume.retire();
             self.awaiting_output_snapshot = true;
@@ -1065,13 +1351,13 @@ impl Owner {
         }];
         if (self.playback.is_some() || self.playback_idle || self.starting_playback.is_some()) && !selected_present {
             self.fail_playback("selected output disconnected".into());
-            self.output_invalidated_at = Some(Instant::now());
         }
         // Only a fresh snapshot after the service notification can resolve the
-        // stable output UID. A failed open remains terminal until explicit retry.
-        if self.restart_playback && selected_present {
+        // stable output UID. Ordinary open failures use the bounded retry below.
+        if self.restart_playback && self.selected_output().is_some() {
             self.restart_playback = false;
             self.playback_failed = false;
+            self.reset_playback_retry();
         }
         if self.platform.device_revision().is_some()
             && self.platform.supports_default_following()
@@ -1097,6 +1383,35 @@ impl Owner {
         }
     }
     fn tick_exit(&mut self) {
+        self.tick_exit_at(Instant::now());
+    }
+    fn tick_exit_at(&mut self, now: Instant) {
+        if self.playback_failed
+            && let Some(starting) = &self.starting_playback
+        {
+            match starting.result.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => return,
+                // Drop any abandoned handle before the one shared retry path
+                // can rebind and open a replacement output generation.
+                _ => self.starting_playback = None,
+            }
+        }
+        // Endpoint install/default changes can outlive the last OS notification:
+        // WASAPI may enumerate a new endpoint before Initialize can open it.
+        // Retry the known selected endpoint, not device enumeration, with capped
+        // backoff. Keep the claim but issue a fresh output/session generation;
+        // old media and volume tokens must never reach the replacement handle.
+        if self.playback_retry_eligible() && self.playback_retry_at.is_some_and(|at| now >= at) {
+            self.playback_retry_at = None;
+            self.playback_failed = false;
+            if let Err(reason) = self.refresh_exit_binding(true) {
+                self.fail_playback(format!("audio output rebinding failed {}", reason.number()));
+                return;
+            }
+        }
+        for receiver in self.receivers.values() {
+            receiver.reader.poll_activity();
+        }
         if self.bound_output.is_none() || self.restart_playback || self.playback_failed {
             return;
         }
@@ -1117,15 +1432,11 @@ impl Owner {
             }
         }
         if let Some(error) = self.playback.as_ref().and_then(|playback| playback.error()) {
-            if self
-                .playback
-                .as_ref()
-                .is_some_and(|playback| playback.device_invalidated())
-            {
-                self.output_invalidated_at = Some(Instant::now());
-            }
             self.fail_playback(error);
             return;
+        }
+        if self.playback.is_some() {
+            self.reset_playback_retry();
         }
         let peers: Vec<_> = self.links.links().links.iter().map(|link| link.peer).collect();
         for peer in peers {
@@ -1215,20 +1526,10 @@ impl Owner {
             if self.starting_playback.is_none()
                 && !self.paused
                 && self.receivers.values().any(|receiver| !receiver.backlog.is_empty())
+                && let Err(error) = self.start_playback()
             {
-                let platform = self.platform.clone();
-                let output = self.bound_output.as_ref().unwrap().clone();
-                let wake = self.streams.wake();
-                let (send, result) = mpsc::sync_channel(1);
-                let at = Instant::now();
-                if let Err(error) = thread::Builder::new().name("oink-audio-wake".into()).spawn(move || {
-                    let _ = send.send(platform.playback(&output));
-                    wake.notify_one();
-                }) {
-                    self.fail_playback(format!("start audio wake worker: {error}"));
-                    return;
-                }
-                self.starting_playback = Some(StartingPlayback { result, at });
+                self.fail_playback(error);
+                return;
             }
             if let Some(starting) = &self.starting_playback {
                 match starting.result.try_recv() {
@@ -1239,13 +1540,16 @@ impl Owner {
                                 ?peer,
                                 burst = receiver.reader.bursts.generation(),
                                 startup_ms,
+                                queued_packets = receiver.backlog.len(),
                                 "audio output woke"
                             );
                         }
                         playback.set_output_quality_counters(self.output_quality.clone());
                         self.playback = Some(playback);
                         self.starting_playback = None;
+                        self.reset_playback_retry();
                         self.playback_idle = false;
+                        self.error = None;
                     }
                     Ok(Err(error)) => {
                         self.fail_playback(error);
@@ -1261,30 +1565,64 @@ impl Owner {
         }
         if let Some(playback) = &mut self.playback {
             for receiver in self.receivers.values_mut() {
-                if receiver.source.is_some() {
-                    continue;
-                }
-                match playback.realtime_source(dsp_config(receiver.format.format)) {
-                    Ok(Some(mut port)) => {
-                        port.set_dropout_counters(receiver.reader.dropouts.clone());
-                        while let Some(packet) = receiver.backlog.pop_front() {
-                            if !port.push_packet(packet) {
-                                self.fail_playback("audio wake receiver capacity exceeded".into());
-                                return;
+                if receiver.source.is_none() {
+                    match playback.realtime_source(dsp_config(receiver.format.format)) {
+                        Ok(Some(port)) => {
+                            Receiver::connect_source(&port, &receiver.reader);
+                            if receiver.backlog.is_empty() {
+                                receiver.reader.give_realtime();
                             }
+                            receiver.source = Some(port);
                         }
-                        let reader = receiver.reader.clone();
-                        receiver.reader.give_realtime();
-                        port.set_packet_reader(Arc::new(move || reader.realtime()));
-                        receiver.source = Some(port);
+                        Ok(None) => {
+                            self.error = Some("realtime audio receiver unavailable".into());
+                        }
+                        Err(error) => {
+                            self.fail_playback(format!("audio wake receiver unavailable: {error}"));
+                            return;
+                        }
                     }
-                    _ => {
-                        self.error = Some("realtime audio receiver unavailable".into());
+                }
+                if let Some(port) = &mut receiver.source
+                    && !receiver.backlog.is_empty()
+                {
+                    // Startup admits up to 64 packets, while the Opus5ms port
+                    // shares a 54-packet budget with its DSP. Feed validated
+                    // packets as RT frees space; a full port is backpressure,
+                    // not a broken device. Never discard the failed push or
+                    // let newer M1 packets overtake this retained onset.
+                    while let Some(packet) = receiver.backlog.front() {
+                        if !port.push_packet(*packet) {
+                            break;
+                        }
+                        receiver.backlog.pop_front();
+                    }
+                    if receiver.backlog.is_empty() {
+                        receiver.reader.give_realtime();
                     }
                 }
             }
         }
-        let now = Instant::now();
+        if let Some(error) = self
+            .receivers
+            .iter()
+            .filter(|(peer, _)| {
+                // An admitted route can outlive the source being switched off,
+                // paused, or failing capture. Its authoritative M0 state means
+                // media is not expected; do not blame the healthy output/M1.
+                self.peer_states.get(peer).is_none_or(|(state, _)| {
+                    state.forwarding_enabled
+                        && !matches!(
+                            state.phase,
+                            AudioPhase::Failed | AudioPhase::Idle | AudioPhase::Paused | AudioPhase::SoundSleep
+                        )
+                })
+            })
+            .find_map(|(_, receiver)| receiver.reader.health_error(now))
+        {
+            self.fail_playback(error.into());
+            return;
+        }
         for (peer, receiver) in &mut self.receivers {
             let sleeping = receiver.reader.bursts.asleep(now);
             let burst = receiver.reader.bursts.generation();
@@ -1356,11 +1694,20 @@ impl Owner {
         }
     }
     fn tick_source(&mut self) {
+        self.tick_source_at(Instant::now());
+    }
+    fn tick_source_at(&mut self, now: Instant) {
+        if self.driver_change_active() {
+            return;
+        }
+        if self.retired_capture_off_reason.is_some() {
+            self.apply_capture_takeover();
+        }
         if self.paused || !self.resolution.available() || !self.settings.forwarding_enabled {
             self.stop_source();
             return;
         }
-        if self.exit_switch_deadline.is_some_and(|at| Instant::now() >= at) {
+        if self.exit_switch_deadline.is_some_and(|at| now >= at) {
             self.fail_source("audio exit switch readiness timed out".into());
             return;
         }
@@ -1394,9 +1741,41 @@ impl Owner {
         if let Some(reason) = self.capture.as_ref().and_then(|capture| capture.restart_reason()) {
             self.restart_reason = Some(reason);
             let _ = self.release_capture();
+            if self.retired_capture_off_reason.is_some() {
+                self.apply_capture_takeover();
+                return;
+            }
+        }
+        if let Some(output) = &self.encoded
+            && self.capture_watchdog.stalled(
+                now,
+                // The native tap keeps listening while omitting exact-zero PCM
+                // after the five-second tail. Those callbacks prove health;
+                // the encoder's unchanged frame count alone does not prove a stall.
+                output.frames().saturating_add(
+                    self.capture
+                        .as_ref()
+                        .map_or(0, |capture| capture.omitted_silent_frames()),
+                ),
+            )
+        {
+            self.restart_reason = Some("capture produced no frames; reopening".into());
+            let _ = self.release_capture();
+            self.apply_capture_takeover();
+            return;
+        }
+        if self.capture.is_some() && self.forwarding_pause.is_ended() {
+            let _ = self.release_capture();
+            if self.retired_capture_off_reason.is_some() {
+                self.apply_capture_takeover();
+            }
+            return;
         }
         if let Some(error) = self.capture.as_ref().and_then(|capture| capture.error()) {
             self.fail_source(error);
+            return;
+        }
+        if self.source_failed {
             return;
         }
         if self.capture.is_none() {
@@ -1477,6 +1856,7 @@ impl Owner {
                         self.mute_cleanup_error = None;
                     }
                     capture.set_forwarding_pause(Some(self.forwarding_pause.clone()));
+                    self.capture_watchdog.opened(now.max(Instant::now()));
                     self.capture = Some(capture);
                     self.encoded = Some(output);
                     self.provisional = verify;
@@ -1503,6 +1883,7 @@ impl Owner {
             }
         }
         if let Some(output) = &self.encoded {
+            self.streams.report_media(oink_audio::media::Kind::Speaker, output, now);
             let sleeping = output.sleeping();
             let burst = output.burst();
             if sleeping != self.observed_source_sleep || burst != self.observed_source_burst {
@@ -1568,13 +1949,13 @@ impl Owner {
                     .iter()
                     .filter(|(_, r)| r.reader.payload_bytes() > 0)
                     .map(|(_, r)| r.quality_observation(now, false))
+                    .chain(self.microphone_quality(now))
                     .collect();
                 on_quality(
                     (oink_audio::diagnostics::monotonic_us(now).max(0) / 1000) as u64,
                     observations,
                     Some(
-                        self.output_quality
-                            .snapshot((oink_audio::diagnostics::monotonic_us(now).max(0) / 1000) as u64),
+                        self.output_quality_snapshot((oink_audio::diagnostics::monotonic_us(now).max(0) / 1000) as u64),
                     ),
                     false,
                 );
@@ -1583,6 +1964,7 @@ impl Owner {
         if let Some(encoded) = &mut self.encoded {
             while let Some(observation) = encoded.observation() {
                 self.capture_observations += 1;
+                self.capture_discontinuities += u64::from(observation.stamp.discontinuity);
                 self.capture_discarded_samples += observation.discarded_samples as u64;
                 self.capture_last = Some(observation);
             }
@@ -1670,11 +2052,32 @@ impl Owner {
                 let capture_realtime = self.encoded.as_ref().map(|encoded| encoded.take_metrics());
                 let capture_observations = std::mem::take(&mut self.capture_observations);
                 let discarded_samples = std::mem::take(&mut self.capture_discarded_samples);
+                let capture_discontinuities = std::mem::take(&mut self.capture_discontinuities);
                 let capture_last = self.capture_last.take();
                 let sent = self.sent.load(Ordering::Relaxed);
                 let send_dropped = self.dropped.load(Ordering::Relaxed);
                 let at = oink_audio::diagnostics::monotonic_us(Instant::now());
                 report::submit(move || {
+                    let output = playback.as_ref();
+                    // Scalars are retained; nested Debug structs are excluded
+                    // from privacy-filtered diagnostic bundles.
+                    tracing::debug!(target: "oink_audio_diagnostics", kind="audio_pipeline_sample",
+                        sample_mono_us=at,
+                        callbacks=output.map_or(0, |p| p.callbacks),
+                        callback_incidents_dropped=output.map_or(0, |p| p.callback_incidents_dropped),
+                        output_deadline_misses=output.map_or(0, |p| p.output_deadline_misses),
+                        output_worst_shortfall_us=output.map_or(0, |p| p.output_worst_shortfall_us),
+                        callback_over_budget=output.map_or(0, |p| p.callback_over_budget),
+                        callback_min_margin_us=output.and_then(|p| p.callback_min_margin_us),
+                        native_gap_frames=output.and_then(|p| p.native_gap_frames),
+                        callback_max_gap_us=output.map_or(0, |p| p.max_callback_gap_us),
+                        callback_max_work_us=output.map_or(0, |p| p.max_render_us),
+                        attribution_dropped=output.map_or(0, |p| p.attribution_dropped),
+                        capture_discontinuities, capture_discarded_samples=discarded_samples,
+                        "audio deadline and capture counters");
+                    if let Some(output) = output {
+                        report::callback_incidents(output);
+                    }
                     tracing::debug!(
                         ?worker_gaps,
                         ?playback,
@@ -1734,7 +2137,11 @@ impl Owner {
                             sample_mono_us=at, received=stats.received, late=stats.late,
                             concealed=stats.lost, empty_queue_plc_frames=stats.empty_queue_plc_frames,
                             gap_plc_frames=stats.gap_plc_frames, decode_errors=stats.decode_errors,
+                            work_limited=stats.work_limited,
                             buffered_ms=stats.buffered_ms, arrival_jitter_ms=stats.arrival_jitter_ms,
+                            rebufferings=stats.rebufferings, latency_trimmed_frames=stats.latency_trimmed_frames,
+                            drift_ppm=stats.drift_ppm, adaptation_ppm=stats.adaptation_ppm,
+                            boundary_hold_samples=stats.boundary_hold_samples,
                             "audio receiver counters");
                     });
                 }
@@ -1776,17 +2183,28 @@ impl Owner {
             };
             device.capture.push_str(suffix);
         }
-        devices.extend(
-            self.group
-                .members()
+        let members = self.group.members();
+        self.peer_outputs.retain(|peer, _| {
+            members
                 .members
                 .iter()
-                .filter(|member| !member.is_self)
-                .filter_map(|member| {
-                    let facts = member.facts.as_ref()?;
-                    if self.current_boot(member.device).as_ref() != facts.boot().ok().as_ref() {
-                        return None;
-                    }
+                .any(|member| member.device == *peer && !member.is_self && member.facts.is_some())
+        });
+        for member in members.members.iter().filter(|member| !member.is_self) {
+            let Some(facts) = &member.facts else { continue };
+            // Preserve live-boot fencing even when the retained fact is unchanged.
+            if self.current_boot(member.device).as_ref() != facts.boot().ok().as_ref() {
+                self.peer_outputs.remove(&member.device);
+                continue;
+            }
+            if self
+                .peer_outputs
+                .get(&member.device)
+                .is_none_or(|cached| !Arc::ptr_eq(&cached.facts, facts))
+            {
+                // Device metadata changes with facts, not with the 50 Hz mic
+                // health/statistics cadence. Decode its CBOR tree once per fact.
+                let value = (|| {
                     let capabilities = facts.capabilities().ok()?;
                     Some(DeviceOutputs {
                         device: member.device,
@@ -1805,10 +2223,27 @@ impl Owner {
                             .collect(),
                         capture: format!("{:?}", capabilities.capture_permission().ok()?),
                     })
-                }),
-        );
+                })();
+                self.peer_outputs.remove(&member.device);
+                if let Some(value) = value {
+                    self.peer_outputs.insert(
+                        member.device,
+                        PeerOutputs {
+                            facts: facts.clone(),
+                            value,
+                        },
+                    );
+                }
+            }
+            if let Some(cached) = self.peer_outputs.get(&member.device) {
+                devices.push(cached.value.clone());
+            }
+        }
         *lock(&self.state) = Status {
             resolution: self.resolution,
+            microphone_resolution: self.microphone.resolution,
+            microphone_inputs: self.microphone_inputs(),
+            microphone_input: lock(&self.store).settings.microphone.input.clone(),
             audio_activity: self.links.audio_active(),
             suspension: if cleanup_failed {
                 Some(oink_audio::SuspensionReason::MuteReleaseUnconfirmed)

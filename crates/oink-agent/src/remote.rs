@@ -199,11 +199,7 @@ impl RemoteApi {
         };
         let mut env = make(conn.endpoint.token.clone());
         env.build = Some(BuildIdentity::current());
-        let timeout = if matches!(env.call, Some(Request::ExportDiagnostics { .. })) {
-            crate::ipc::DIAGNOSTICS_SAVE_TIMEOUT
-        } else {
-            Some(CALL_TIMEOUT)
-        };
+        let timeout = crate::ipc::response_timeout(env.call.as_ref(), CALL_TIMEOUT);
         conn.reader
             .get_mut()
             .set_read_timeout(timeout)
@@ -605,6 +601,18 @@ impl AgentApi for RemoteApi {
     }
     fn audio_status(&self) -> ApiResult<oink_audio::Status> {
         self.call(Request::AudioStatus)
+    }
+    fn restart_system(&self) -> ApiResult<()> {
+        self.call(Request::RestartSystem)
+    }
+    fn microphone_plugin_status(&self) -> ApiResult<crate::microphone_plugin::MicrophonePluginStatus> {
+        self.call(Request::MicrophonePluginStatus)
+    }
+    fn microphone_plugin_action(
+        &self,
+        action: crate::microphone_plugin::Action,
+    ) -> ApiResult<crate::microphone_plugin::MicrophonePluginStatus> {
+        self.call(Request::MicrophonePluginAction { action })
     }
     fn refresh_audio_devices(&self) -> ApiResult<()> {
         self.call(Request::RefreshAudioDevices)

@@ -486,10 +486,21 @@ impl Sessions {
             .active
             .iter()
             .filter(|(_, s)| s.view.peer.device_id == device && s.view.direction == Direction::Incoming && !s.accepted)
-            .map(|(&id, s)| (id, s.view.revision))
+            .map(|(&id, s)| (id, s.view.peer))
             .collect::<Vec<_>>();
         rows.into_iter()
-            .flat_map(|(id, revision)| self.decline(id, revision).expect("serialized row"))
+            .flat_map(|(id, peer)| {
+                let reason = problem(dto::PairCode::Declined, dto::PairStage::Request);
+                let message = Message::ConfigPairDeclined(
+                    dto::PairDeclined::from_raw([(1, wire::pair(id).write()), (2, reason.write())].into())
+                        .expect("decline"),
+                );
+                // A saved block dismisses pending requests without a local failure.
+                // Retain the terminal view for late Accept and cache the ordinary
+                // decline for retries; the remote initiator still sees Declined.
+                assert!(self.finish(id, reason, message.clone()));
+                [Effect::Send { peer, message }, Effect::Changed]
+            })
             .collect()
     }
     pub fn submit(&mut self, id: PairId, revision: u64, attempt: u8, code: &str, now: Instant) -> Result<Vec<Effect>> {
@@ -815,8 +826,14 @@ impl Sessions {
         effects
     }
     fn end(&mut self, id: PairId, reason: dto::PairProblem) -> Vec<Effect> {
-        let Some(mut s) = self.active.remove(&id) else {
+        if !self.finish(id, reason.clone(), ended(id, reason.clone())) {
             return Vec::new();
+        }
+        vec![Effect::Changed, Effect::Ended { id, problem: reason }]
+    }
+    fn finish(&mut self, id: PairId, reason: dto::PairProblem, acknowledgement: Message) -> bool {
+        let Some(mut s) = self.active.remove(&id) else {
+            return false;
         };
         self.changed(id);
         s.view.phase = Phase::Ended;
@@ -826,11 +843,11 @@ impl Sessions {
             id,
             Terminal {
                 peer: s.view.peer,
-                acknowledgement: ended(id, reason.clone()),
+                acknowledgement,
                 view: Some(s.view),
             },
         );
-        vec![Effect::Changed, Effect::Ended { id, problem: reason }]
+        true
     }
     pub fn lost(&mut self, peer: Boot) -> Vec<Effect> {
         let ids = self
@@ -1096,6 +1113,62 @@ mod tests {
                     .unwrap();
             }
         }
+    }
+    #[test]
+    fn blocking_pending_requests_declines_peer_without_local_failure() {
+        let now = Instant::now();
+        let mut initiator = Sessions::new(boot(1));
+        let mut receiver = Sessions::new(boot(2));
+        let Message::ConfigPairRequest(request) = one(initiator
+            .start(
+                context(initiator.local, receiver.local, 1),
+                receiver.local,
+                transcript(),
+            )
+            .unwrap())
+        else {
+            panic!()
+        };
+        let id = wire::read_pair(&request.pair_id().unwrap()).unwrap();
+        let queued = one(receiver
+            .request(request.clone(), initiator.local, transcript(), false, now)
+            .unwrap());
+        initiator.receive(receiver.local, queued, now).unwrap();
+        let before = receiver.snapshot().revision;
+        let effects = receiver.block_pending(initiator.local.device_id);
+        assert!(effects.iter().any(|e| matches!(e, Effect::Changed)));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Ended { .. })),
+            "a durable local block is an expected request dismissal, not a pairing failure"
+        );
+        let declined = one(effects);
+        let Message::ConfigPairDeclined(ref message) = declined else {
+            panic!()
+        };
+        assert_eq!(
+            message.reason().unwrap(),
+            problem(dto::PairCode::Declined, dto::PairStage::Request)
+        );
+        assert!(receiver.snapshot().requests.is_empty());
+        assert!(receiver.snapshot().revision > before);
+        assert!(receiver.block_pending(initiator.local.device_id).is_empty());
+        assert_eq!(
+            one(receiver
+                .request(request, initiator.local, transcript(), true, now)
+                .unwrap()),
+            declined,
+            "retries must retain the ordinary decline response"
+        );
+        assert!(
+            initiator
+                .receive(receiver.local, declined, now)
+                .unwrap()
+                .iter()
+                .any(|effect| {
+                    matches!(effect, Effect::Ended { id: ended, problem } if *ended == id
+                && problem.code().unwrap() == dto::PairCode::Declined)
+                })
+        );
     }
     #[test]
     fn block_accept_order_and_rate_budget_survive_boot_changes() {

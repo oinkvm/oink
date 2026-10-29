@@ -15,10 +15,10 @@ import tempfile
 import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'build-support'))
 from provenance import verify, digest
+import package_notes
 from payload import copy_notices
-import embedded_release_notes
 from report_manifest import write_manifest, image_identity
-from signing import private_run, select_identity, notarize, staple_and_validate
+from signing import private_run, select_identity, notarize, staple_and_validate, awake_for_signing
 from sparkle import prepare as prepare_sparkle, VERSION as SPARKLE_VERSION, SHA256 as SPARKLE_SHA256
 from localizations import DECLARATIONS, STRINGS, write_localizations
 from macos_imports import verify_imports
@@ -51,7 +51,7 @@ def write_swift_identity(path):
 def compile_provider_extension(common, generated, crash_object, output):
     run(*common, '-module-name', I['binaries']['file_provider_extension'], *PROVIDER_EXTENSION_FLAGS,
         ROOT / 'apps/file-provider/ExtensionMain.swift',
-        ROOT / 'apps/file-provider/ContainerCleanup.swift',
+        ROOT / 'apps/file-provider/Upgrade.swift', ROOT / 'apps/file-provider/ContainerCleanup.swift',
         generated, ROOT / 'apps/file-provider/Shared.swift', ROOT / 'apps/file-provider/ReportCapture.swift',
         ROOT / 'apps/file-provider/Extension.swift', crash_object, '-o', output)
 
@@ -62,7 +62,8 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--arch', choices=['arm64'], default='arm64')
     p.add_argument('--version', default=I['version'])
-    p.add_argument('--source-commit', help='Full source commit for a local commit-labelled version')
+    p.add_argument('--update-notes-file', type=Path, help='Prepared embedded package notes')
+    p.add_argument('--source-commit', help='Full source commit for a in-house build-labelled version')
     p.add_argument('--build', type=int, required=True)
     p.add_argument('--source-tree-sha256', required=True)
     p.add_argument('--signing-fingerprint', default=os.environ.get('MACOS_SIGNING_FINGERPRINT'))
@@ -77,7 +78,7 @@ def main():
     if a.version != I['version']:
         p.error('version must match packaging/identity.json')
     try:
-        a.version = release_version(a.version, a.source_commit)
+        a.version = release_version(a.version, a.source_commit, a.build)
     except ValueError as error:
         p.error(str(error))
     trust = json.loads((ROOT / 'packaging/update-trust.json').read_text())
@@ -105,7 +106,6 @@ def main():
     resources = app / 'Contents/Resources'
     mac.mkdir(parents=True)
     resources.mkdir()
-    embedded_release_notes.write(ROOT, resources / 'oink-update-notes.json', a.build, a.source_commit)
     b = I['binaries']
     for role in ['backend', 'agent', 'crash_collector']:
         shutil.copy2(a.binaries / b[role], mac / b[role])
@@ -148,6 +148,12 @@ def main():
         load_commands = run('otool', '-l', mac / b['backend'], capture_output=True, text=True).stdout
         if '@executable_path/../Frameworks' not in load_commands:
             raise RuntimeError('Sparkle backend is missing the required Frameworks rpath')
+    notes_file = a.update_notes_file or a.output / 'embedded-update-notes.json'
+    if a.update_notes_file:
+        package_notes.read(notes_file, a.build, a.source_commit, ROOT)
+    else:
+        package_notes.write(notes_file, package_notes.generate(ROOT, a.build, a.source_commit, a.output.parent.parent))
+    package_notes.embed_macos(notes_file, app / 'Contents/Resources')
     plist(app / 'Contents/Info.plist', info)
     ext = app / 'Contents/PlugIns' / I['macos']['file_provider_bundle']
     (ext / 'Contents/MacOS').mkdir(parents=True)
@@ -159,11 +165,20 @@ def main():
     ext_info[I['macos']['app_group_key']] = group
     ext_info['NSExtension'] = dict(NSExtensionPointIdentifier='com.apple.fileprovider-nonui',
         NSExtensionPrincipalClass=b['file_provider_class'], NSExtensionFileProviderDocumentGroup=group,
-        NSExtensionFileProviderSupportsEnumeration=True)
+        NSExtensionFileProviderSupportsEnumeration=True, NSFileProviderUserInteractions=[])
     plist(ext / 'Contents/Info.plist', ext_info)
     copy_notices(resources)
     with tempfile.TemporaryDirectory(prefix='release-package-') as tmp:
         tmp = Path(tmp)
+        # Offline HAL tests load the bundle directly, without registering it
+        # with CoreAudio or starting I/O. Installation is a separate user action.
+        plugin_build = tmp / 'audio-plugin'
+        run('bash', ROOT / 'apps/audio-plugin/build.sh', plugin_build, a.source_tree_sha256)
+        plugin_payload = resources / 'AudioPlugin'
+        plugin_payload.mkdir()
+        plugin = plugin_payload / 'OinkMicrophone.driver'
+        shutil.copytree(plugin_build / 'OinkMicrophone.driver', plugin)
+        shutil.copy2(ROOT / 'apps/audio-plugin/install.sh', plugin_payload / 'install.sh')
         generated = tmp / 'ReleaseIdentity.swift'
         write_swift_identity(generated)
         host = {'com.apple.security.application-groups': [group], 'com.apple.security.device.audio-input': True}
@@ -182,8 +197,8 @@ def main():
                                    ext / 'Contents/MacOS' / b['file_provider_extension'])
         run(*common, '-Xlinker', '-sectcreate', '-Xlinker', '__TEXT', '-Xlinker', '__info_plist',
             '-Xlinker', tmp / 'manager.plist', generated, ROOT / 'apps/file-provider/Shared.swift',
-            ROOT / 'apps/file-provider/ContainerCleanup.swift', ROOT / 'apps/file-provider/Uninstall.swift',
-            ROOT / 'apps/file-provider/Manager.swift', '-o', mac / b['file_provider_manager'])
+            ROOT / 'apps/file-provider/Upgrade.swift', ROOT / 'apps/file-provider/ContainerCleanup.swift', ROOT / 'apps/file-provider/Uninstall.swift',
+            ROOT / 'apps/file-provider/NativeReceived.swift', ROOT / 'apps/file-provider/Manager.swift', '-o', mac / b['file_provider_manager'])
         report = write_manifest(resources / 'report-manifest.json', a.source_tree_sha256, a.version, a.build,
                                 [('agent', mac / b['backend']), ('agent', mac / b['agent']),
                                  ('ui_rust', helper / 'Contents/MacOS' / b['ui']),
@@ -192,12 +207,18 @@ def main():
         symbols = a.output / 'symbols.noindex'
         symbols.mkdir(exist_ok=True)
         symbol_images = [mac / b[role] for role in ('backend', 'agent', 'crash_collector', 'file_provider_manager')]
+        plugin_image = plugin / 'Contents/MacOS/OinkMicrophone'
+        plugin_dsym = plugin_build / 'OinkMicrophone.dSYM'
+        run('xcrun', 'dsymutil', plugin_image, '-o', plugin_dsym)
+        symbol_images.append(plugin_image)
         symbol_images += [helper / 'Contents/MacOS' / b['ui'], ext / 'Contents/MacOS' / b['file_provider_extension']]
         symbol_records = []
         for image in symbol_images:
             dsym = symbols / (image.name + '.dSYM')
             generated = (image.parent if image.name in (b['file_provider_manager'], b['file_provider_extension'])
                          else a.binaries) / (image.name + '.dSYM')
+            if image == plugin_image:
+                generated = plugin_dsym
             if not generated.is_dir():
                 raise RuntimeError('Link-time dSYM missing for ' + image.name)
             if dsym.exists():
@@ -244,79 +265,81 @@ def main():
         # before signing/notarization even when the SDK's availability is wrong.
         verify_imports([app], I['macos_minimum'])
 
-        def sign(path, identifier, entitlements=None):
-            args = ['codesign', '--force', '--options', 'runtime', '--timestamp', '--sign', a.identity, '--identifier', identifier]
-            if entitlements:
-                args += ['--entitlements', str(entitlements)]
-            private_run(*args, path)
-        if a.sparkle_cache:
-            # Sparkle's XPC services retain their upstream sandbox entitlements
-            # and identifiers while all code is re-signed by the app's team.
-            for path in sorted(framework.rglob('*'), key=lambda p: len(p.parts), reverse=True):
-                if path.is_symlink():
-                    continue
-                executable = path.is_file() and 'Mach-O' in run('file', '-b', path, capture_output=True, text=True).stdout
-                bundle = path.is_dir() and path.suffix in ['.app', '.xpc', '.framework']
-                if executable:
-                    arches = run('lipo', '-archs', path, capture_output=True, text=True).stdout.split()
-                    if arches != ['arm64']:
-                        thinned = tmp / 'arm64-image'
-                        run('lipo', path, '-thin', 'arm64', '-output', thinned)
-                        shutil.copymode(path, thinned)
-                        shutil.move(thinned, path)
-                if executable or bundle:
-                    private_run('codesign', '--force', '--options', 'runtime', '--timestamp', '--sign', a.identity,
-                        '--preserve-metadata=identifier,entitlements', path)
-            private_run('codesign', '--force', '--options', 'runtime', '--timestamp', '--sign', a.identity,
-                '--preserve-metadata=identifier,entitlements', framework)
-        sign(ext, I['macos']['file_provider_id'], tmp / 'extension.plist')
-        sign(mac / b['file_provider_manager'], I['bundle_id'], tmp / 'host.plist')
-        sign(helper, I['macos']['ui_id'])
-        sign(mac / b['agent'], I['macos']['agent_id'])
-        sign(mac / b['crash_collector'], I['bundle_id'] + '.crash-collector')
-        sign(app, I['bundle_id'], tmp / 'host.plist')
-        from content import verify_app
-        record['components'] = verify_app(app, I)
-        run('node', ROOT / 'build-support/check-package-licenses.mjs', app, 'macos-arm64', cwd=ROOT)
-        # Exercise the shipping signature, hardened runtime and embedded loader
-        # before notarization. Private smoke state never contacts the user host.
-        backend = mac / b['backend']
-        # LaunchServices discovers the nested appex when the host is launched,
-        # even though smoke disables File Provider work. Remove only this
-        # disposable bundle's registrations before another installation can
-        # choose it as its provider host; do this on smoke failures too.
-        with temporary_registration(app, I['macos']['file_provider_bundle'], I['macos']['file_provider_id']):
-            launch_smoke(backend, seconds=10)
-        record['launch_smoke'] = {'status': 'passed', 'seconds': 10, 'signed': True,
-                                  'backend': backend.relative_to(app).as_posix(),
-                                  'backend_sha256': digest(backend)}
-        app_notary = {'status': 'not-submitted'}
-        if a.notary_profile:
-            submission = tmp / 'submission.zip'
-            run('ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', app, submission)
-            # A ZIP is submitted, but the returned ticket belongs to its app.
-            app_notary = notarize(submission, a.notary_profile, a.notary_keychain, a.notary_timeout)
-            if app_notary['status'] == 'Accepted':
-                staple_and_validate(app)
-                app_notary['stapled'] = True
-        stem = f"{I['name']}-{a.version}-{a.build}-macos-{a.arch}"
-        dmg = a.output / f'{stem}.dmg'
-        from dmg import create
-        create(app, dmg, a.sparkle_cache)
-        private_run('codesign', '--force', '--timestamp', '--sign', a.identity, dmg)
-        private_run('codesign', '--verify', '--strict', dmg)
-        dmg_notary = notarize(dmg, a.notary_profile, a.notary_keychain, a.notary_timeout)
-        archive = a.output / f'{stem}.zip'
-        run('ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', app, archive)
-        record['notarization'] = {'app': app_notary, 'dmg': dmg_notary}
-        record['notarized'] = app_notary.get('stapled', False) and dmg_notary.get('stapled', False)
-        record['team_id'] = a.team
-        record['certificate_sha1'] = a.identity
-        record['artifacts'] = [{'name': f.name, 'size': f.stat().st_size,
-                                'sha256': hashlib.sha256(f.read_bytes()).hexdigest()} for f in [dmg, archive]]
-        (a.output / 'release.json').write_text(json.dumps(record, indent=2) + '\n')
-        shutil.rmtree(app)
-        (a.output / 'SHA256SUMS').write_text(''.join(f"{f['sha256']}  {f['name']}\n" for f in record['artifacts']))
+        with awake_for_signing():
+            def sign(path, identifier, entitlements=None):
+                args = ['codesign', '--force', '--options', 'runtime', '--timestamp', '--sign', a.identity, '--identifier', identifier]
+                if entitlements:
+                    args += ['--entitlements', str(entitlements)]
+                private_run(*args, path)
+            if a.sparkle_cache:
+                # Sparkle's XPC services retain their upstream sandbox entitlements
+                # and identifiers while all code is re-signed by the app's team.
+                for path in sorted(framework.rglob('*'), key=lambda p: len(p.parts), reverse=True):
+                    if path.is_symlink():
+                        continue
+                    executable = path.is_file() and 'Mach-O' in run('file', '-b', path, capture_output=True, text=True).stdout
+                    bundle = path.is_dir() and path.suffix in ['.app', '.xpc', '.framework']
+                    if executable:
+                        arches = run('lipo', '-archs', path, capture_output=True, text=True).stdout.split()
+                        if arches != ['arm64']:
+                            thinned = tmp / 'arm64-image'
+                            run('lipo', path, '-thin', 'arm64', '-output', thinned)
+                            shutil.copymode(path, thinned)
+                            shutil.move(thinned, path)
+                    if executable or bundle:
+                        private_run('codesign', '--force', '--options', 'runtime', '--timestamp', '--sign', a.identity,
+                            '--preserve-metadata=identifier,entitlements', path)
+                private_run('codesign', '--force', '--options', 'runtime', '--timestamp', '--sign', a.identity,
+                    '--preserve-metadata=identifier,entitlements', framework)
+            sign(plugin, 'com.hachiwii.oink.microphone.driver')
+            sign(ext, I['macos']['file_provider_id'], tmp / 'extension.plist')
+            sign(mac / b['file_provider_manager'], I['bundle_id'], tmp / 'host.plist')
+            sign(helper, I['macos']['ui_id'])
+            sign(mac / b['agent'], I['macos']['agent_id'])
+            sign(mac / b['crash_collector'], I['bundle_id'] + '.crash-collector')
+            sign(app, I['bundle_id'], tmp / 'host.plist')
+            from content import verify_app
+            record['components'] = verify_app(app, I)
+            run('node', ROOT / 'build-support/check-package-licenses.mjs', app, 'macos-arm64', cwd=ROOT)
+            # Exercise the shipping signature, hardened runtime and embedded loader
+            # before notarization. Private smoke state never contacts the user host.
+            backend = mac / b['backend']
+            # LaunchServices discovers the nested appex when the host is launched,
+            # even though smoke disables File Provider work. Remove only this
+            # disposable bundle's registrations before another installation can
+            # choose it as its provider host; do this on smoke failures too.
+            with temporary_registration(app, I['macos']['file_provider_bundle'], I['macos']['file_provider_id']):
+                launch_smoke(backend, seconds=10)
+            record['launch_smoke'] = {'status': 'passed', 'seconds': 10, 'signed': True,
+                                      'backend': backend.relative_to(app).as_posix(),
+                                      'backend_sha256': digest(backend)}
+            app_notary = {'status': 'not-submitted'}
+            if a.notary_profile:
+                submission = tmp / 'submission.zip'
+                run('ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', app, submission)
+                # A ZIP is submitted, but the returned ticket belongs to its app.
+                app_notary = notarize(submission, a.notary_profile, a.notary_keychain, a.notary_timeout)
+                if app_notary['status'] == 'Accepted':
+                    staple_and_validate(app)
+                    app_notary['stapled'] = True
+            stem = f"{I['name']}-{a.version}-{a.build}-macos-{a.arch}"
+            dmg = a.output / f'{stem}.dmg'
+            from dmg import create
+            create(app, dmg, a.sparkle_cache)
+            private_run('codesign', '--force', '--timestamp', '--sign', a.identity, dmg)
+            private_run('codesign', '--verify', '--strict', dmg)
+            dmg_notary = notarize(dmg, a.notary_profile, a.notary_keychain, a.notary_timeout)
+            archive = a.output / f'{stem}.zip'
+            run('ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', app, archive)
+            record['notarization'] = {'app': app_notary, 'dmg': dmg_notary}
+            record['notarized'] = app_notary.get('stapled', False) and dmg_notary.get('stapled', False)
+            record['team_id'] = a.team
+            record['certificate_sha1'] = a.identity
+            record['artifacts'] = [{'name': f.name, 'size': f.stat().st_size,
+                                    'sha256': hashlib.sha256(f.read_bytes()).hexdigest()} for f in [dmg, archive]]
+            (a.output / 'release.json').write_text(json.dumps(record, indent=2) + '\n')
+            shutil.rmtree(app)
+            (a.output / 'SHA256SUMS').write_text(''.join(f"{f['sha256']}  {f['name']}\n" for f in record['artifacts']))
 
 
 if __name__ == '__main__':

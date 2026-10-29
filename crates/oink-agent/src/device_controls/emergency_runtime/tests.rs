@@ -186,6 +186,39 @@ async fn disable_both(node: &Node) {
     .unwrap();
     assert!(node.input_status().unwrap().keyboard_disabled);
     assert_eq!(
+        node.input_status().unwrap().keyboard_mode,
+        oink_foundation::input::InputMode::Disabled
+    );
+    assert_eq!(
+        crate::config::AgentConfig::load_from(node.data_dir())
+            .unwrap()
+            .settings
+            .routing
+            .keyboard_mode,
+        oink_foundation::input::InputMode::Disabled
+    );
+    let facts = node.link_config().unwrap().local_facts();
+    let preferences = facts.preferences().unwrap().unwrap().0;
+    for (option, value) in [
+        (dto::LocalOption::KeyboardMode, 0u32.write()),
+        (dto::LocalOption::KeyboardDisabled, true.write()),
+    ] {
+        assert_eq!(
+            preferences
+                .iter()
+                .find(|p| p.option() == Ok(option))
+                .unwrap()
+                .value()
+                .unwrap(),
+            value
+        );
+    }
+    assert_eq!(
+        facts.resources().unwrap().unwrap().keyboard_mode().unwrap(),
+        Some(dto::SharingMode::Shared)
+    );
+    assert!(facts.local_options().unwrap().keyboard_disabled().unwrap());
+    assert_eq!(
         node.settings().routing.mouse_mode,
         oink_foundation::input::InputMode::Disabled
     );
@@ -194,9 +227,10 @@ async fn disable_both(node: &Node) {
 fn assert_disables_cleared(node: &Node) {
     use oink_foundation::input::InputMode;
     let disk = crate::config::AgentConfig::load_from(node.data_dir()).unwrap();
-    assert!(!disk.settings.keyboard_disabled);
+    assert_eq!(disk.settings.routing.keyboard_mode, InputMode::Shared);
     assert_eq!(disk.settings.routing.mouse_mode, InputMode::Shared);
     assert!(!node.input_status().unwrap().keyboard_disabled);
+    assert_eq!(node.input_status().unwrap().keyboard_mode, InputMode::Shared);
     assert_eq!(node.input_status().unwrap().mouse_mode, InputMode::Shared);
     let preferences = node
         .link_config()
@@ -208,6 +242,7 @@ fn assert_disables_cleared(node: &Node) {
         .0;
     for (option, value) in [
         (dto::LocalOption::KeyboardDisabled, false.write()),
+        (dto::LocalOption::KeyboardMode, 0u32.write()),
         (dto::LocalOption::MouseMode, 0u32.write()),
     ] {
         assert_eq!(
@@ -249,10 +284,7 @@ fn ordinary_pause_durably_clears_both_disables_and_resume_keeps_enabled() {
                     let _ = tx.send(result.clone());
                 }
             }));
-            for (keyboard_mode, keyboard_icon, value) in [
-                (SharingMode::Shared, SharingIcon::Shared, 0u32),
-                (SharingMode::Local, SharingIcon::Local, 1u32),
-            ] {
+            for value in [0u32, 1u32] {
                 let owner = node.clone();
                 tokio::task::spawn_blocking(move || {
                     owner
@@ -291,8 +323,8 @@ fn ordinary_pause_durably_clears_both_disables_and_resume_keeps_enabled() {
                         .as_ref()
                         .unwrap();
                     assert_eq!(status.keyboard.disabled, Some(false));
-                    assert_eq!(status.keyboard.resource.configured_mode, Some(keyboard_mode));
-                    assert_eq!(status.keyboard.resource.icon, keyboard_icon);
+                    assert_eq!(status.keyboard.resource.configured_mode, Some(SharingMode::Shared));
+                    assert_eq!(status.keyboard.resource.icon, SharingIcon::Shared);
                     assert_eq!(status.mouse.icon, SharingIcon::Shared);
                     assert_eq!(
                         status.keyboard.resource.condition,

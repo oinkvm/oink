@@ -6,6 +6,7 @@ pub mod claims;
 #[cfg(any(target_os = "macos", test))]
 mod endpoint_mute;
 pub mod media;
+pub mod microphone;
 pub mod model;
 pub mod negotiation;
 pub mod session;
@@ -40,6 +41,8 @@ pub mod recovery;
 pub mod scheduling;
 pub mod sink;
 pub mod source;
+#[cfg(any(windows, test))]
+mod wasapi_timing;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -175,6 +178,13 @@ pub struct Status {
     pub settings: Settings,
     #[serde(default)]
     pub resolution: claims::Resolution,
+    #[serde(default)]
+    pub microphone_resolution: claims::Resolution,
+    /// Local input selector metadata, from notification-invalidated discovery.
+    #[serde(default)]
+    pub microphone_inputs: Vec<microphone::InputDevice>,
+    #[serde(default)]
+    pub microphone_input: Option<String>,
     pub devices: Vec<DeviceOutputs>,
     #[serde(default)]
     pub device_states: Vec<DeviceState>,
@@ -215,6 +225,9 @@ impl Default for Status {
             audio_activity: Default::default(),
             settings: Default::default(),
             resolution: Default::default(),
+            microphone_resolution: Default::default(),
+            microphone_inputs: Default::default(),
+            microphone_input: None,
             devices: Default::default(),
             device_states: Default::default(),
             capture_permission: Default::default(),
@@ -384,3 +397,6 @@ mod settings_tests {
 }
 
 pub mod idle;
+
+#[cfg(feature = "test-support")]
+pub mod pull_test_support;

@@ -97,7 +97,7 @@ class ReleaseBuild(unittest.TestCase):
                 for call in [*calls, *read.call_args_list]:
                     self.assertEqual(call.kwargs['env']['OINK_RELEASE_BUILD'], '17')
                     self.assertEqual(call.kwargs['env']['RELEASE_BUILD'], '17')
-                    self.assertEqual(call.kwargs['env']['OINK_RELEASE_VERSION'], B.release_version(B.IDENTITY['version'], commit))
+                    self.assertEqual(call.kwargs['env']['OINK_RELEASE_VERSION'], B.release_version(B.IDENTITY['version'], commit, 17))
                     self.assertEqual(call.kwargs['env']['OINK_SOURCE_COMMIT'], commit or '')
                 self.assertEqual(calls[2].args[:2], ('cargo', 'clean'))
                 self.assertIn('--release', calls[2].args)
@@ -133,7 +133,7 @@ class ReleaseBuild(unittest.TestCase):
                         B.IDENTITY['macos_minimum'])
                     self.assertEqual(calls[3].kwargs['env']['CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO'], 'packed')
                 record = json.loads((output / 'release-build.json').read_text())
-                self.assertEqual(record['version'], B.release_version(B.IDENTITY['version'], commit))
+                self.assertEqual(record['version'], B.release_version(B.IDENTITY['version'], commit, 17))
                 self.assertEqual(record['source_commit'], commit)
                 self.assertEqual(record['update_test_feed'], origin)
                 self.assertEqual(record['update_test_fail_health'], fail_health)

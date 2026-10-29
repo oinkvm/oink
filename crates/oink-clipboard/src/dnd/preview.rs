@@ -219,13 +219,13 @@ mod tests {
                     standard: Some(StandardFormat::Png),
                     data: RepresentationData::Reader {
                         size: ContentSize::Unknown,
-                        hash: None,
                     },
                 }],
             },
         };
         assert_eq!(metadata(std::slice::from_ref(&native)).unwrap()[0].path, "drag.png");
         let roots = ClipData::FileRoots(vec![FileNode {
+            exec_bits: None,
             id: NodeId(1),
             parent: None,
             name: "example.txt".into(),

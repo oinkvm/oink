@@ -13,6 +13,7 @@
 //! - `system`：手感设置、权限、私有函数查找。
 
 mod activity;
+mod application_focus;
 pub mod capslock;
 mod contacts;
 mod cursor;
@@ -21,7 +22,9 @@ mod cursor_reveal;
 mod cursor_visibility;
 mod device;
 mod dock_frame;
+mod drag_hold;
 mod gesture_diagnostics;
+mod idle_pulse;
 mod inject;
 mod keyboard_diagnostics;
 use crate::mac_keymap as keymap;
@@ -85,6 +88,29 @@ struct MacInput {
 }
 
 impl InputBackend for MacInput {
+    fn application_focus_supported(&self) -> bool {
+        true
+    }
+    fn application_focus_watch(&self, observer: Option<crate::application_focus::Observer>) {
+        application_focus::watch(observer);
+    }
+    fn application_focus_sample(&self) -> oink_foundation::application_focus::Observation {
+        application_focus::sample()
+    }
+    fn application_focus_park(
+        &self,
+        expected: oink_foundation::application_focus::ObservationStamp,
+        operation: u64,
+        permit: crate::application_focus::Permit,
+    ) -> oink_foundation::application_focus::ParkResult {
+        let result = application_focus::park(expected, operation, permit);
+        tracing::info!(target: "oink_application_focus", operation, generation = expected.generation,
+            sequence = expected.sequence, ?result, "native park completed");
+        result
+    }
+    fn application_focus_dismiss(&self) {
+        application_focus::dismiss();
+    }
     fn stop_injection_session(&self) {
         let _ = self.set_cursor_constraint(None);
         self.injector.stop_session();
@@ -184,8 +210,26 @@ impl InputBackend for MacInput {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .ok_or(InputError::NotStarted)?
-            .set_drag_anchor(anchor);
-        Ok(())
+            .set_drag_anchor(anchor, &self.injector)
+    }
+
+    fn freeze_drag_anchor(&self, generation: u64) -> Result<oink_foundation::dnd::DragAnchor, InputError> {
+        self.tap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .ok_or(InputError::NotStarted)?
+            .freeze_drag_anchor(generation, &self.injector)
+    }
+
+    fn relocate_drag_anchor(&self, generation: u64, at: Point) -> Result<(), InputError> {
+        let at = inject::quartz_drag_point(at);
+        self.tap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .ok_or(InputError::NotStarted)?
+            .relocate_drag_anchor(generation, Point::new(at.x, at.y), &self.injector)
     }
 
     fn move_held_drag(&self, generation: u64, at: Point) -> Result<(), InputError> {
@@ -198,7 +242,7 @@ impl InputBackend for MacInput {
         let tap = self.tap.lock().unwrap_or_else(|e| e.into_inner());
         tap.as_ref()
             .ok_or(InputError::NotStarted)?
-            .move_held_drag(generation, at, &|| self.injector.move_held_drag(at, posted))
+            .move_held_drag(generation, at, &self.injector, posted)
     }
 
     fn nudge_held_drag(
@@ -210,7 +254,7 @@ impl InputBackend for MacInput {
         let tap = self.tap.lock().unwrap_or_else(|e| e.into_inner());
         tap.as_ref()
             .ok_or(InputError::NotStarted)?
-            .nudge_held_drag(generation, &|at| self.injector.nudge_held_drag(at, button, posted))
+            .nudge_held_drag(generation, &self.injector, button, posted)
     }
 
     fn restore_local(&self, at: Point) -> Result<(), InputError> {

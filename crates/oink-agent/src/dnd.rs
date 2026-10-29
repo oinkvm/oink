@@ -24,6 +24,8 @@ struct LocalDrag {
     items: Vec<ClipData>,
 }
 
+#[cfg(all(test, debug_assertions))]
+mod cancel_tests;
 mod files;
 mod link;
 mod link_platform;
@@ -32,6 +34,9 @@ mod preparation;
 mod preparation_choice;
 #[cfg(any(target_os = "windows", all(test, debug_assertions)))]
 mod source_release;
+pub(crate) mod timing;
+#[cfg(debug_assertions)]
+mod watchdog;
 pub(crate) mod wire;
 pub(crate) use files::DndFiles;
 pub(crate) use link::{Handle as LinkHandle, start_link_runtime};
@@ -54,6 +59,7 @@ pub(crate) struct DndGlue {
     update_targets: Mutex<HashMap<(ClipId, u64), oink_foundation::maintenance::Lease>>,
     #[cfg(target_os = "macos")]
     preparations: Mutex<HashMap<DeviceId, Arc<preparation::Slot>>>,
+    pending_begins: Mutex<HashMap<(ClipId, u64), preparation::BeginState>>,
     active_source: Mutex<Option<(ClipId, DragOperation)>>,
     export_epoch: Mutex<Option<(DragOperation, u64)>>,
     source_physical: std::sync::atomic::AtomicBool,
@@ -64,6 +70,11 @@ pub(crate) struct DndGlue {
 }
 
 impl DndGlue {
+    #[cfg(target_os = "macos")]
+    fn begin_without_files(&self, spec: DragSpec) -> Result<(), oink_clipboard::ClipboardError> {
+        let spec = crate::file_provider::without_files(spec)?.ok_or(oink_clipboard::ClipboardError::Unsupported)?;
+        self.backend.begin(spec)
+    }
     fn target_preparation_current(&self, id: ClipId, epoch: u64) -> bool {
         let valid = self.active_target.lock().unwrap().as_ref().is_some_and(|(_, grant)| {
             grant.preparation.key.drag.offer.clip == id && grant.holder.epoch == epoch && grant.begin_current()
@@ -76,6 +87,7 @@ impl DndGlue {
             })
     }
     fn target_ended(&self, id: ClipId, epoch: u64, dropped: bool) {
+        self.pending_begins.lock().unwrap().remove(&(id, epoch));
         // Retain admission until deferred delivery has acquired its own lease.
         let _update_activity = self.update_targets.lock().unwrap().remove(&(id, epoch));
         if let Some((_, grant)) = self
@@ -93,6 +105,7 @@ impl DndGlue {
         }
         let remote = self.native_targets.lock().unwrap().get(&(id, epoch)).cloned();
         if let Some(remote) = remote {
+            remote.record_drop_accepted(dropped);
             if dropped {
                 remote.set_demand(oink_clipboard::model::Demand::Drop(oink_foundation::content::Holder {
                     device: self.me,
@@ -105,23 +118,43 @@ impl DndGlue {
             }
         }
     }
-    fn cancel_host(&self, id: ClipId, epoch: u64, physical: bool) -> bool {
+    fn cancel_host(&self, id: ClipId, epoch: u64, physical: bool, released: Option<&dyn Fn()>) -> bool {
         // The ordinary queue may contain cancellation for an already retired host.
         // A new operation must never inherit its Esc or UP.
         let active = *self.active_operation.lock().unwrap();
         if !active.is_some_and(|(_, active, generation)| active == id && generation == epoch) {
+            // Preparation may still be waiting on a remote source, without a
+            // native operation to cancel. Retire its cached readers as well.
+            self.target_ended(id, epoch, false);
             return false;
         }
         self.target_ended(id, epoch, false);
-        let ok = if physical {
-            self.backend.cancel_physical(&|| self.release_active_target(true))
-        } else {
-            self.backend.cancel()
-        };
+        let ok = self.backend.cancel_physical(&|| {
+            self.release_active_target(physical)?;
+            // macOS may spend hundreds of milliseconds waiting for native Ended
+            // after this successful UP. Keep its reject-window recognition and
+            // release ordered, then let ordinary input proceed during that wait.
+            // Backends using the default cancel_physical never call this closure
+            // and retain their existing full-command fence.
+            if let Some(released) = released {
+                released();
+            }
+            Ok(())
+        });
         *self.active_operation.lock().unwrap() = None;
         ok
     }
     fn cancel_targets(&self) {
+        self.pending_begins.lock().unwrap().clear();
+        #[cfg(target_os = "macos")]
+        {
+            // A Begin waiting for metadata has no native target yet. Pause and
+            // shutdown must wake it as well as cancelling activated readers.
+            let slots = std::mem::take(&mut *self.preparations.lock().unwrap());
+            for slot in slots.into_values() {
+                slot.revoke();
+            }
+        }
         for (_, remote) in self.native_targets.lock().unwrap().drain() {
             remote.cancel();
         }
@@ -249,6 +282,7 @@ impl DndGlue {
                 origin: self.me,
                 seq: DND_SEQ_BIT | self.seq.fetch_add(1, Ordering::AcqRel),
             });
+        timing::bind(operation, id);
         if let Some(inner) = self.input_node.upgrade()
             && let Some(diagnostics) = inner.diagnostics.get()
         {
@@ -295,26 +329,17 @@ impl DndGlue {
         }
     }
 
-    fn begin(
+    fn prepare_spec(
         &self,
-        grant: DndTarget,
+        id: ClipId,
+        epoch: u64,
         at: oink_foundation::Point,
         items: Vec<ClipData>,
         retained_inventory: Option<Vec<u8>>,
-        report: Option<crate::telemetry::Stamp>,
-    ) -> Vec<DndEvent> {
-        let id = grant.preparation.key.drag.offer.clip;
-        let epoch = grant.holder.epoch;
-        if !grant.begin_current() {
-            return vec![DndEvent::Ended {
-                id,
-                epoch,
-                dropped: false,
-            }];
-        }
+    ) -> Result<preparation::PreparedStart, oink_clipboard::model::Unavailable> {
+        use oink_clipboard::{content::reason, model::Unavailable};
         let prepared_at = std::time::Instant::now();
         let operation = DragOperation::new();
-        *self.active_target.lock().unwrap() = Some((operation, grant.clone()));
         let exported = self
             .local
             .lock()
@@ -325,11 +350,7 @@ impl DndGlue {
         if id.origin == self.me && exported.is_none() {
             // Returning to C resumes its native session through ResumeSource.
             // A missing source session is failure, never a copied replacement.
-            return vec![DndEvent::Ended {
-                id,
-                epoch,
-                dropped: false,
-            }];
+            return Err(Unavailable::Superseded);
         }
         let local_export = exported.is_some();
         let items = exported.unwrap_or(items);
@@ -339,11 +360,7 @@ impl DndGlue {
             if !local_export && let Some(files) = &self.link_files {
                 files.accept(id.origin, id);
                 if !files.offer_current(id.origin, id) {
-                    return vec![DndEvent::Ended {
-                        id,
-                        epoch,
-                        dropped: false,
-                    }];
+                    return Err(Unavailable::Superseded);
                 }
             }
             let mut files: Option<Arc<dyn oink_clipboard::FileContents>> = None;
@@ -367,21 +384,11 @@ impl DndGlue {
                         .clone()
                         .map(|link| link as Arc<dyn oink_clipboard::sync::files::BulkLink>)
                 };
-                let Some(link) = link else {
-                    return vec![DndEvent::Ended {
-                        id,
-                        epoch,
-                        dropped: false,
-                    }];
-                };
+                let link = link.ok_or(Unavailable::Unsupported)?;
                 let batch = match oink_clipboard::store::BatchId::random() {
                     Ok(id) => id,
-                    Err(_) => {
-                        return vec![DndEvent::Ended {
-                            id,
-                            epoch,
-                            dropped: false,
-                        }];
+                    Err(error) => {
+                        return Err(reason(&error));
                     }
                 };
                 let target = if cfg!(target_os = "macos") {
@@ -399,26 +406,23 @@ impl DndGlue {
                     self.runtime.clone(),
                 ) {
                     Ok(remote) => remote,
-                    Err(_) => {
-                        return vec![DndEvent::Ended {
-                            id,
-                            epoch,
-                            dropped: false,
-                        }];
+                    Err(error) => {
+                        return Err(reason(&error));
                     }
                 };
-                if !inventory.roots.is_empty() {
+                let inventory = oink_clipboard::content::Provider::inventory(&remote);
+                if inventory.namespace_roots_for(target).is_empty() {
+                    items = oink_clipboard::policy::items_without_files(items);
+                    inventory.wanted(target).next().ok_or(Unavailable::Unsupported)?;
+                }
+                if !inventory.namespace_roots_for(target).is_empty() {
                     let contents = match oink_clipboard::content::namespace::Files::new(
                         Arc::new(remote.clone()),
                         TargetOs::current(),
                     ) {
                         Ok(contents) => contents,
-                        Err(_) => {
-                            return vec![DndEvent::Ended {
-                                id,
-                                epoch,
-                                dropped: false,
-                            }];
+                        Err(error) => {
+                            return Err(reason(&error));
                         }
                     };
                     // Native presentation table contains selected roots only. It
@@ -466,11 +470,7 @@ impl DndGlue {
                     sensitivity: oink_clipboard::Sensitivity::Normal,
                 })
             } else {
-                return vec![DndEvent::Ended {
-                    id,
-                    epoch,
-                    dropped: false,
-                }];
+                return Err(Unavailable::InvalidData);
             };
             DragSpec {
                 native,
@@ -483,15 +483,65 @@ impl DndGlue {
         };
         // Hover artwork can wait for the live source, just like other native
         // preparation. An Up/leave/cancel during that read cannot start a drag.
+        let preview_at = std::time::Instant::now();
+        oink_clipboard::dnd::preparation_timing(
+            oink_clipboard::dnd::PreparationStage::Metadata,
+            prepared_at,
+            preview_at,
+        );
         self.backend.prepare_preview(&spec);
+        oink_clipboard::dnd::preparation_timing(
+            oink_clipboard::dnd::PreparationStage::Preview,
+            preview_at,
+            std::time::Instant::now(),
+        );
+        Ok(preparation::PreparedStart {
+            spec,
+            prepared_at,
+            #[cfg(target_os = "macos")]
+            announced_roots,
+            #[cfg(target_os = "macos")]
+            fallback: None,
+        })
+    }
+
+    fn begin(
+        &self,
+        grant: DndTarget,
+        at: oink_foundation::Point,
+        items: Vec<ClipData>,
+        retained_inventory: Option<Vec<u8>>,
+        report: Option<crate::telemetry::Stamp>,
+    ) -> Vec<DndEvent> {
+        let id = grant.preparation.key.drag.offer.clip;
+        let epoch = grant.holder.epoch;
+        if !grant.begin_current() {
+            self.target_ended(id, epoch, false);
+            return vec![DndEvent::BeginFailed { id, epoch }];
+        }
+        let pending = self.pending_begins.lock().unwrap().remove(&(id, epoch));
+        let prepared = match pending {
+            Some(preparation::BeginState::Ready(prepared)) => prepared.map(|prepared| *prepared),
+            Some(preparation::BeginState::Pending) => None,
+            None => self.prepare_spec(id, epoch, at, items, retained_inventory).ok(),
+        };
+        let Some(preparation::PreparedStart {
+            spec,
+            prepared_at,
+            #[cfg(target_os = "macos")]
+            fallback,
+            ..
+        }) = prepared
+        else {
+            self.target_ended(id, epoch, false);
+            return vec![DndEvent::BeginFailed { id, epoch }];
+        };
+        let operation = spec.operation;
+        *self.active_target.lock().unwrap() = Some((operation, grant.clone()));
         if !self.target_preparation_current(id, epoch) {
             self.target_ended(id, epoch, false);
             self.backend.set_target_image(None);
-            return vec![DndEvent::Ended {
-                id,
-                epoch,
-                dropped: false,
-            }];
+            return vec![DndEvent::BeginFailed { id, epoch }];
         }
         *self.active_operation.lock().unwrap_or_else(|e| e.into_inner()) = Some((operation, id, epoch));
         if let Some(inner) = self.input_node.upgrade()
@@ -510,9 +560,10 @@ impl DndGlue {
             elapsed_us = report_end.saturating_duration_since(prepared_at).as_micros() as u64,
             "drag metadata and lazy readers prepared"
         );
+        timing::arm_target(self.backend.as_ref(), operation, grant.entered_at());
         let spec_at = spec.at;
         #[cfg(target_os = "macos")]
-        let result = if let Some(contents) = spec.files.clone().filter(|_| self.backend.uses_file_provider()) {
+        let result = if spec.files.is_some() && self.backend.uses_file_provider() {
             let entries = spec.items.iter().find_map(|item| match item {
                 ClipData::Files(entries) => Some(entries),
                 _ => None,
@@ -573,18 +624,14 @@ impl DndGlue {
                             }
                             registration
                         })
-                    } else if announced_roots {
-                        Err(ClipboardError::FileProvider(Reason::Cancelled))
+                    } else if let Some(fallback) = fallback {
+                        started = fallback.started;
+                        timing = fallback.timing;
+                        fallback.registration
                     } else {
-                        oink_clipboard::file_provider::register_drag_measured(
-                            id,
-                            epoch,
-                            &mut timing,
-                            started,
-                            entries,
-                            contents,
-                            &current,
-                        )
+                        // Every File Provider publication must already be ready
+                        // on the background preparation worker.
+                        Err(ClipboardError::FileProvider(Reason::Cancelled))
                     };
                     if let Some(p) = crate::telemetry::producer()
                         && let Some(stamp) = p.stamp_at(started)
@@ -639,15 +686,19 @@ impl DndGlue {
                         }
                         Err(e) => {
                             reason = oink_clipboard::file_provider::failure_reason(&e);
-                            if current() && reason.degraded_promise() {
-                                // Preserve the existing known-unavailable promise policy;
-                                // spare preparation never changes foreground failure causes.
-                                path = PreparationPath::DegradedPromise;
-                                self.backend.begin(spec)
+                            if current() && reason.needs_enable() {
+                                if let Some(inner) = self.input_node.upgrade() {
+                                    let notify = crate::node::lock(&inner.file_provider).require_drag(id);
+                                    if notify {
+                                        Node { inner }.emit(crate::api::ApiEvent::FileProviderRequired);
+                                    }
+                                }
+                                self.begin_without_files(spec)
                             } else {
                                 if current()
                                     && let Some(inner) = self.input_node.upgrade()
                                 {
+                                    tracing::warn!(?reason, "drag file preparation failed");
                                     Node { inner }.emit(crate::api::ApiEvent::DndPreparationFailed(reason.detail()));
                                 }
                                 Err(e)
@@ -704,6 +755,9 @@ impl DndGlue {
         };
         #[cfg(not(target_os = "macos"))]
         let result = self.backend.begin(spec);
+        if result.is_err() {
+            self.backend.target_start_timing(operation, None);
+        }
         if let Some(stamp) = report
             && let Some(p) = crate::telemetry::producer()
         {
@@ -746,11 +800,7 @@ impl DndGlue {
                     *active = None;
                 }
                 tracing::warn!(%e, ?id, "starting the drag failed");
-                vec![DndEvent::Ended {
-                    id,
-                    epoch,
-                    dropped: false,
-                }]
+                vec![DndEvent::BeginFailed { id, epoch }]
             }
         }
     }
@@ -800,7 +850,12 @@ impl DndGlue {
             items: items.ok_or_else(|| result.err().unwrap_or(oink_foundation::dnd::ExportFailure::Failed)),
         })
     }
-    fn execute_reported(&self, cmd: DndCmd, report: Option<crate::telemetry::Stamp>) -> Vec<DndEvent> {
+    fn execute_reported(
+        &self,
+        cmd: DndCmd,
+        report: Option<crate::telemetry::Stamp>,
+        released: Option<&dyn Fn()>,
+    ) -> Vec<DndEvent> {
         let admission = if matches!(
             &cmd,
             DndCmd::Prepare { .. }
@@ -829,6 +884,7 @@ impl DndGlue {
                 Vec::new()
             }
             DndCmd::ExportFailed { failure } => {
+                tracing::warn!(?failure, "drag file export failed");
                 if let Some(inner) = self.input_node.upgrade() {
                     Node { inner }.emit(crate::api::ApiEvent::DndExportFailed(failure));
                 }
@@ -844,6 +900,7 @@ impl DndGlue {
             }
             DndCmd::PrepareDrop { id, epoch } => {
                 if let Some(remote) = self.native_targets.lock().unwrap().get(&(id, epoch)) {
+                    remote.record_drop_start();
                     remote.set_demand(oink_clipboard::model::Demand::Drop(oink_foundation::content::Holder {
                         device: self.me,
                         epoch,
@@ -855,11 +912,12 @@ impl DndGlue {
                     .unwrap()
                     .as_ref()
                     .filter(|(_, g)| g.preparation.key.drag.offer.clip == id && g.holder.epoch == epoch)
-                    .map(|(_, g)| g.clone());
-                if let Some(grant) = grant
-                    && !self.release_target(&grant, false)
-                {
-                    return vec![DndEvent::HostReleaseFailed { id, epoch }];
+                    .map(|(operation, g)| (*operation, g.clone()));
+                if let Some((operation, grant)) = grant {
+                    self.backend.observe_target_drop(operation);
+                    if !self.release_target(&grant, false) {
+                        return vec![DndEvent::HostReleaseFailed { id, epoch }];
+                    }
                 }
                 Vec::new()
             }
@@ -909,6 +967,9 @@ impl DndGlue {
                         DndSourceEffect::Hold
                     })
                     .and_then(|anchor| {
+                        if self.backend.source_hold_installs_anchor() {
+                            return Ok(());
+                        }
                         self.set_source_anchor(Some(anchor)).map_err(|error| {
                             tracing::warn!(?operation, %error, dnd_hold_stage = 2_u64, "source input anchor failed");
                             DndSourceEffect::Anchor
@@ -968,14 +1029,14 @@ impl DndGlue {
                     }]
                 }
             }
-            DndCmd::ResumeSource { id, epoch } => {
+            DndCmd::ResumeSource { id, epoch, at } => {
                 let operation = self.source_operation(id, epoch);
-                let ok = operation.is_some_and(|operation| self.backend.resume_source(operation));
-                if operation.is_some() {
+                let ok = operation.is_some_and(|operation| self.backend.resume_source_at(operation, at));
+                if ok {
                     let _ = self.set_source_anchor(None);
                 }
                 if ok {
-                    Vec::new()
+                    vec![DndEvent::SourceResumed { id, epoch }]
                 } else {
                     vec![DndEvent::SourceEffectFailed {
                         id,
@@ -1113,11 +1174,11 @@ impl DndGlue {
                 Vec::new()
             }
             DndCmd::LeaveHost { id, epoch, physical } => {
-                let ok = self.cancel_host(id, epoch, physical);
+                let ok = self.cancel_host(id, epoch, physical, released);
                 vec![DndEvent::HostLeft { id, epoch, ok }]
             }
             DndCmd::Cancel { id, epoch, physical } => {
-                self.cancel_host(id, epoch, physical);
+                self.cancel_host(id, epoch, physical, released);
                 Vec::new()
             }
             DndCmd::Begin {

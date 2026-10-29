@@ -2,6 +2,14 @@
 use super::*;
 use dto::{ControlFailure as Failure, LocalOption};
 
+pub(super) struct VolumeContextInputs {
+    members: Arc<crate::config_module::MemberTable>,
+    peer_boot: Option<oink_foundation::session::Boot>,
+    resolution: Resolution,
+    forwarding_enabled: bool,
+    local_volume: Option<dto::ExitVolumeState>,
+}
+
 impl Owner {
     pub(super) fn members(&self) -> BTreeSet<DeviceId> {
         self.group
@@ -14,7 +22,7 @@ impl Owner {
     pub(super) fn current_boot(&self, peer: DeviceId) -> Option<dto::Boot> {
         if peer == self.links.id() {
             Some(boot(self.links.boot()))
-        } else if self.members().contains(&peer) {
+        } else if self.group.members().members.iter().any(|member| member.device == peer) {
             self.group.peer_boot(peer).map(boot)
         } else {
             None
@@ -108,6 +116,8 @@ impl Owner {
         if let Err(reason) = self.apply_locked() {
             tracing::warn!(reason = reason.number(), "audio owner reconciliation failed");
             // A persistence or baseline failure never authorizes a guessed exit.
+            self.microphone.resolution = Resolution::Unknown;
+            self.stop_microphone();
             self.transition(Resolution::Unknown);
         }
     }
@@ -138,6 +148,7 @@ impl Owner {
             };
         }
         self.paused = self.group.applied().paused;
+        self.apply_microphone()?;
         self.streams.pause_changed(self.paused || self.update_suspended);
         let Some(group) = self.active_group else {
             self.transition(Resolution::Unknown);
@@ -289,6 +300,7 @@ impl Owner {
         self.exit_volume.retire();
         self.bound_output = None;
         self.volume.publish(None);
+        self.volume_context_inputs = None;
     }
     pub(super) fn transition(&mut self, resolution: Resolution) {
         self.forwarding_pause
@@ -320,9 +332,9 @@ impl Owner {
         }
         self.source_failed = false;
         self.playback_failed = false;
+        self.reset_playback_retry();
         self.error = None;
         self.restart_playback = false;
-        self.output_invalidated_at = None;
     }
     pub(super) fn install_settings(&mut self, mut settings: Settings) -> Result<(), String> {
         let gate = self.gate.clone();
@@ -382,6 +394,7 @@ impl Owner {
         if output_changed || format_changed {
             self.retire_sessions();
             self.playback_failed = false;
+            self.reset_playback_retry();
             let _ = self.refresh_exit_binding(true);
         }
         if let Some(encoded) = &self.encoded {
@@ -436,6 +449,15 @@ impl Owner {
         let gate = self.gate.clone();
         let _guard = lock(&gate);
         self.authorize(requester, group)?;
+        if matches!(
+            option,
+            LocalOption::MicrophoneShareClaim
+                | LocalOption::MicrophoneControls
+                | LocalOption::MicrophoneReceiveMuted
+                | LocalOption::MicrophoneInput
+        ) {
+            return self.set_microphone_option(option, expected, patch);
+        }
         if !matches!(option, LocalOption::ForwardingEnabled | LocalOption::ForwardingControls) {
             return Err(Failure::UnsupportedOption);
         }
@@ -473,7 +495,7 @@ impl Owner {
         self.publish(self.phase());
         Ok(self.option_receipt(option, &before, published))
     }
-    fn option_receipt(
+    pub(super) fn option_receipt(
         &self,
         option: LocalOption,
         before: &dto::DevicePreference,
@@ -577,6 +599,9 @@ impl Owner {
         }
     }
     pub(super) fn refresh_exit_binding(&mut self, force: bool) -> Result<(), Failure> {
+        if self.driver_change_active() {
+            return Ok(());
+        }
         if self.resolution.owner() != Some(self.links.id()) {
             if self.exit_volume.state().is_some() {
                 self.exit_volume.retire();
@@ -607,6 +632,16 @@ impl Owner {
         self.playback_idle = false;
         self.draining = false;
         self.stop_source();
+        if output.is_some() && output != self.bound_output {
+            // A fresh endpoint (including a returning default) must not inherit
+            // the previous endpoint's failure. Explicitly selected outputs still
+            // remain unavailable while absent; never fall back to another UID.
+            if self.playback_failed {
+                self.error = None;
+            }
+            self.playback_failed = false;
+            self.reset_playback_retry();
+        }
         self.bound_output = output.clone();
         let endpoint = if self.mute_cleanup_error.is_some() || self.platform.capture_cleanup_failed() {
             Err(oink_audio::volume::Fault {
@@ -657,6 +692,11 @@ impl Owner {
         (version.exit().ok()? == current && version.exit_claim().ok()? == stamp.to_wire()).then_some(state)
     }
     pub(super) fn current_volume_context(&self) -> Option<Arc<dto::AudioSessionContext>> {
+        // This snapshot authorizes the focus router's physical volume keys,
+        // independently of explicit exit-volume controls or media activity.
+        if !self.settings.forwarding_enabled {
+            return None;
+        }
         let state = self.resolved_volume()?;
         if state.status() != Ok(dto::ExitVolumeStatus::Ready) {
             return None;
@@ -678,7 +718,30 @@ impl Owner {
             .ok()
             .map(Arc::new)
     }
-    pub(super) fn refresh_volume_context(&self) {
+    pub(super) fn refresh_volume_context(&mut self) {
+        let members = self.group.members();
+        let peer_boot = self.resolution.owner().and_then(|peer| self.group.peer_boot(peer));
+        let local_volume = self.exit_volume.state();
+        // Facts and native volume observations are immutable snapshots. A mic
+        // health tick need not rebuild the speaker's nested wire DTOs while all
+        // of these inputs are unchanged. Link loss/boot, roster/facts, claim,
+        // consent and local output generation changes invalidate immediately.
+        if self.volume_context_inputs.as_ref().is_some_and(|last| {
+            Arc::ptr_eq(&last.members, &members)
+                && last.peer_boot == peer_boot
+                && last.resolution == self.resolution
+                && last.forwarding_enabled == self.settings.forwarding_enabled
+                && last.local_volume.as_ref() == local_volume
+        }) {
+            return;
+        }
+        self.volume_context_inputs = Some(VolumeContextInputs {
+            members,
+            peer_boot,
+            resolution: self.resolution,
+            forwarding_enabled: self.settings.forwarding_enabled,
+            local_volume: local_volume.cloned(),
+        });
         let context = self.current_volume_context();
         if *self.volume.load() != context {
             self.volume.publish(context);
@@ -770,6 +833,9 @@ impl Owner {
         }
     }
     pub(super) fn problem(&self) -> Option<Problem> {
+        self.local_problem().or(self.remote_problem)
+    }
+    fn local_problem(&self) -> Option<Problem> {
         let code = if self.mute_cleanup_error.is_some() || self.platform.capture_cleanup_failed() {
             dto::UserFacingCode::CleanupFailed
         } else if self.permission == CapturePermission::Denied
@@ -777,8 +843,6 @@ impl Owner {
             && self.resolution.owner() != Some(self.links.id())
         {
             dto::UserFacingCode::PermissionDenied
-        } else if let Some(problem) = self.remote_problem {
-            return Some(problem);
         } else if self.source_failed {
             match self.error.as_deref() {
                 Some(error) if error.starts_with("capture_permission_required:") => {
@@ -901,7 +965,7 @@ impl Owner {
         let mut fault = [(1, dto::ResourceFaultCode::None.write())]
             .into_iter()
             .collect::<oink_protocol::v1::RawMap>();
-        if let Some(problem) = self.problem() {
+        if let Some(problem) = self.local_problem() {
             fault.insert(1, dto::ResourceFaultCode::from_number(problem.code.number()).write());
             fault.insert(3, problem.to_wire().write());
         }
@@ -924,11 +988,7 @@ impl Owner {
             if let Some(state) = &volume {
                 let changed = dto::ExitVolumeChanged::from_raw([(1, state.write())].into()).expect("volume state");
                 for member in self.group.members().members.iter().filter(|member| !member.is_self) {
-                    if self
-                        .group
-                        .peer_agreement(member.device)
-                        .is_some_and(|agreement| agreement.contains("oink.audio.exit-volume/1"))
-                    {
+                    if self.group.peer_supports(member.device, "oink.audio.exit-volume/1") {
                         self.group
                             .send_device_control(member.device, Message::ConfigExitVolumeChanged(changed.clone()))
                             .map_err(|_| Failure::ApplyFailed)?;
@@ -957,17 +1017,13 @@ impl Owner {
             )
     }
     pub(super) fn prepare_peer(&mut self, peer: DeviceId) {
-        if self.update_suspended {
+        if self.update_suspended || self.driver_change_active() {
             return;
         }
         let Some(current_boot) = self.current_boot(peer) else {
             return;
         };
-        if self
-            .group
-            .peer_agreement(peer)
-            .is_some_and(|agreement| agreement.contains("oink.audio.state/1"))
-        {
+        if self.group.peer_supports(peer, "oink.audio.state/1") {
             self.supported.insert(peer);
             self.streams.enable_state_reports(peer);
         }
@@ -978,10 +1034,7 @@ impl Owner {
         if stamp.owner != self.links.id() {
             if peer != stamp.owner
                 || !self.settings.forwarding_enabled
-                || !self
-                    .group
-                    .peer_agreement(peer)
-                    .is_some_and(|agreement| agreement.contains("oink.audio/1"))
+                || !self.group.peer_supports(peer, "oink.audio/1")
             {
                 return;
             }
@@ -1092,6 +1145,9 @@ impl Owner {
         let _ = self.streams.send(peer, &Message::AudioPreparedAck(ack), Instant::now());
     }
     pub(super) fn message(&mut self, peer: DeviceId, message: Message) {
+        if self.driver_change_active() {
+            return;
+        }
         if self.update_suspended {
             // Admission may reopen between receiving a fresh offer and the next
             // timer tick. Reconcile first so abort does not discard that offer.
@@ -1103,6 +1159,7 @@ impl Owner {
         let Some(current_boot) = self.current_boot(peer) else {
             return;
         };
+        self.microphone_message(peer, &message);
         match message {
             Message::AudioSourceRouteOffer(offer) => {
                 let reason =
@@ -1179,7 +1236,9 @@ impl Owner {
                             return;
                         }
                     } else if self.capture.is_some() {
-                        let _ = self.release_capture();
+                        if matches!(self.release_capture(), CaptureRetirement::CleanupFailed(_)) {
+                            return;
+                        }
                         self.needs_generation = false; // The exit just allocated this fresh stream.
                     }
                 }
@@ -1228,11 +1287,18 @@ impl Owner {
                     self.streams.forget_preparation(peer);
                     self.source_session.retire();
                     self.selected = None;
-                    self.fail_source("remote audio output failed".into());
+                    // The failed output belongs to the exit. Restore local audio
+                    // and wait for a fresh preparation without faulting this device.
+                    self.stop_source();
                     self.remote_problem = fault
                         .problem()
                         .ok()
                         .and_then(|problem| Problem::from_wire(problem).ok());
+                }
+            }
+            Message::AudioMediaState(state) => {
+                if let Some(receiver) = self.receivers.get(&peer) {
+                    receiver.reader.observe_media(&state, Instant::now());
                 }
             }
             Message::AudioState(wire) if self.supported.contains(&peer) => {

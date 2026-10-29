@@ -15,8 +15,14 @@ inline bool profile(const std::wstring& home, const wchar_t* directory,
                     cloud_cleanup::Unregister unregister = cloud_cleanup::unregister_root,
                     const cloud_cleanup::Report& report = {}) {
     const auto local = home + L"\\AppData\\Local\\" + directory;
-    if (!cloud_cleanup::root(local + L"\\Cache\\CloudFiles", unregister, true, report)) return false;
+    // CloudFiles is the sole active root; tolerate an installed build 48's
+    // abandoned CloudLinkedFiles registration during explicit uninstall only.
+    // Explicit uninstall owns both; unregister each before deleting its files,
+    // then remove the enclosing store only after both roots were cleaned.
     bool ok = true;
+    for (const auto root : {L"CloudLinkedFiles", L"CloudFiles"})
+        ok = cloud_cleanup::root(local + L"\\Cache\\" + root, unregister, true, report) && ok;
+    if (!ok) return false;
     for (const auto& path : {local, home + L"\\AppData\\Roaming\\" + directory})
         ok = tree(path, report) && ok;
     return ok;

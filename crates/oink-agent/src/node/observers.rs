@@ -37,9 +37,20 @@ impl Node {
         ready.await.unwrap();
     }
 
+    #[cfg(test)]
+    pub(crate) fn resume_platform_sensor_clock(&self) {
+        self.inner.platform_clock_held.store(false, Ordering::Release);
+        for worker in lock(&self.inner.ordinary_threads).iter() {
+            if worker.thread().name() == Some("oink-platform-observer") {
+                worker.thread().unpark();
+            }
+        }
+    }
+
     pub(super) fn start_platform_observer(&self) -> std::io::Result<()> {
         let dirty = Arc::new(AtomicBool::new(true));
         let observer = Arc::new(std::sync::OnceLock::<std::thread::Thread>::new());
+        let mut display_notifications = true;
         if let Some(display) = &self.inner.display_backend {
             let changed = dirty.clone();
             let observer = observer.clone();
@@ -47,6 +58,7 @@ impl Node {
                 display_changed(&changed, &observer);
             })) {
                 tracing::warn!(%error, "display observation unavailable");
+                display_notifications = false;
             }
         }
         let weak = Arc::downgrade(&self.inner);
@@ -64,6 +76,9 @@ impl Node {
                     .native_services
                     .then(oink_audio::power::Monitor::new)
                     .and_then(Result::ok);
+                let mut mirror_hold = oink_input::power::Hold::default();
+                let mut mirror_activity = None;
+                let mut mirror_error = None;
                 let mut previous_power = oink_audio::power::State::default();
                 let mut pending_power = None;
                 #[cfg(windows)]
@@ -81,6 +96,10 @@ impl Node {
                 let mut last_session = None;
                 let mut display_revision = 0;
                 let mut enumerated = None;
+                let mut display_retry_at = None;
+                let mut display_fallback_at = Instant::now() + Duration::from_secs(30);
+                let mut native_retry_at = None;
+                let mut native_backoff = Duration::from_secs(2);
                 loop {
                     let Some(inner) = weak.upgrade() else { break };
                     if *inner.stop.borrow() {
@@ -103,10 +122,41 @@ impl Node {
                         input.send(InputCommand::SessionLocked(session));
                         last_session = Some(session);
                     }
-                    if dirty.swap(false, Ordering::AcqRel) {
+                    let now = Instant::now();
+                    let refresh_displays = dirty.swap(false, Ordering::AcqRel)
+                        || display_retry_at.is_some_and(|at| now >= at)
+                        || (!display_notifications && now >= display_fallback_at);
+                    if refresh_displays || native_retry_at.is_some_and(|at| now >= at) {
+                        // Reconfiguration callbacks also cover mode identity changes
+                        // whose visible bounds stay equal. Never read native state
+                        // on the idle profile clock; retry only failed observations.
+                        if refresh_displays {
+                            native_backoff = Duration::from_secs(2);
+                        }
+                        match node.observe_native_arrangement("observer") {
+                            Ok(_) => native_retry_at = None,
+                            Err(error) if error.code == crate::layout_profiles::types::ErrorCode::Unsupported => {
+                                native_retry_at = None;
+                            }
+                            Err(_) => {
+                                native_retry_at = Some(Instant::now() + native_backoff);
+                                native_backoff = (native_backoff * 2).min(Duration::from_secs(30));
+                            }
+                        }
+                    }
+                    if refresh_displays {
+                        display_fallback_at = Instant::now() + Duration::from_secs(30);
                         let _arrangement = lock(&node.inner.profiles.native.observation_gate);
                         match node.current_displays() {
                             Ok(displays) => {
+                                if displays.is_empty() {
+                                    if display_retry_at.is_none() {
+                                        tracing::warn!("display enumeration returned no displays");
+                                    }
+                                    display_retry_at = Some(Instant::now() + Duration::from_millis(250));
+                                } else if display_retry_at.take().is_some() {
+                                    tracing::info!(count = displays.len(), "display enumeration recovered");
+                                }
                                 if let Err(reason) = node.seed_live_screen_preferences(&displays) {
                                     tracing::warn!(
                                         ?reason,
@@ -134,7 +184,13 @@ impl Node {
                                 // Keep geometry while publishing the completed
                                 // failure through the normal resource Facts.
                                 input.send(InputCommand::LocalDisplayFailure);
-                                tracing::warn!(%error, "display refresh failed");
+                                if display_retry_at.is_none() {
+                                    tracing::warn!(%error, "display refresh failed");
+                                }
+                                // Reconfiguration callbacks do not guarantee a second
+                                // notification after a transient failure. Retry read-only
+                                // enumeration until recovery, even with unchanged geometry.
+                                display_retry_at = Some(Instant::now() + Duration::from_millis(250));
                             }
                         }
                     }
@@ -146,6 +202,7 @@ impl Node {
                             pending_power = Some(state);
                             environment.system_sleeping = state.sleeping;
                             if state.sleeping {
+                                let _ = mirror_hold.apply(oink_input::power::State::default());
                                 group.sleep();
                             } else {
                                 group.wake();
@@ -160,6 +217,14 @@ impl Node {
                             pending_power = None;
                         }
                     }
+                    node.power_tick(
+                        Instant::now(),
+                        environment.system_sleeping,
+                        session == Some(true),
+                        &mut mirror_hold,
+                        &mut mirror_activity,
+                        &mut mirror_error,
+                    );
                     if let Some(asleep) = power.as_mut().and_then(|power| power.poll()) {
                         environment.displays_asleep = asleep;
                     }
@@ -315,12 +380,13 @@ impl Node {
                         diagnostic_revision = revision;
                     },
                     change = changes.next() => match change {
+                        Some(crate::config_module::ConfigChange::PowerState{group,boot,received,value})=>node.receive_power(group,boot,received,value),
                         Some(crate::config_module::ConfigChange::DeviceControl{peer,message})=>node.receive_device_control(peer.into(),message),
                         Some(crate::config_module::ConfigChange::PairingEvent(event))=>node.emit((*event).into()),
                         Some(crate::config_module::ConfigChange::BlockedDevices)=>{
                             if let Ok(snapshot)=node.link_config().and_then(|group|group.blocked_devices()){node.emit(ApiEvent::BlockedDevices{snapshot});}
                         },
-                        Some(_) => { node.emit_layout(); node.emit_group(); },
+                        Some(_) => { node.apply_hotkeys(&node.effective_hotkeys()); node.emit(ApiEvent::InputSettings(crate::agent_api::input_settings(&node))); node.emit_layout(); node.emit_group(); },
                         None => break,
                     },
                     deadline = sample.tick() => {
@@ -328,6 +394,11 @@ impl Node {
                         node.sample_rtt(statistics_sample_time(deadline.into_std(), Instant::now()));
                         node.reconcile_controls();
                         node.refresh_device_cards();
+                        if lock(&node.inner.sinks).iter().any(|s| s.views.card_signals)
+                            && let Some(signals) = node.device_card_signals(crate::connection_quality::now_ms_at(std::time::Instant::now()))
+                        {
+                            node.emit(ApiEvent::DeviceCardSignals(signals));
+                        }
                         if let Ok(input) = node.input_thread() {
                             let now = Instant::now();
                             let mut timings = input.take_injection_timing(now);
@@ -369,6 +440,7 @@ impl Node {
                 diagnostics.recorder.sample_scheduler(&links.scheduler());
             }
             let now = crate::connection_quality::now_ms_at(sampled_at);
+            let requested = lock(&self.inner.sinks).iter().any(|s| s.views.group_quality);
             let quality = {
                 let mut history = lock(&self.inner.quality);
                 history.record(
@@ -388,9 +460,11 @@ impl Node {
                         )
                     }),
                 );
-                history.view(now)
+                requested.then(|| history.view(now))
             };
-            self.emit(ApiEvent::ConnectionQuality(quality));
+            if let Some(quality) = quality {
+                self.emit(ApiEvent::ConnectionQuality(quality));
+            }
             for link in &table.links {
                 if let Some(rtt) = link.rtt
                     && let Some(generation) = self.inner.reports.ingress.generation()

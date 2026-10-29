@@ -13,25 +13,184 @@ pub(super) struct Node {
     pub life: Item,
     pub directory: bool,
     pub deleted: bool,
+    /// Source Gone only disables source reads. Native deletion needs separate proof.
+    #[serde(default)]
+    pub withdrawn: bool,
+    #[serde(default)]
+    pub local_final: bool,
+    #[serde(default)]
+    pub renamed_locally: bool,
     pub handed_off: bool,
     pub length: u64,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Source {
+    pub descriptor: Option<crate::content::linked::Descriptor>,
+    #[serde(default)]
+    pub settlement: crate::content::linked::completed::FinalLocal,
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub failed: HashSet<crate::model::NodeId>,
+    pub nodes: Vec<crate::model::FileNode>,
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub pending: HashSet<crate::model::NodeId>,
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub listed: HashSet<crate::model::NodeId>,
+    pub base: PathBuf,
+}
+impl Source {
+    fn validate(&self) -> io::Result<()> {
+        if !self.listed.is_subset(&self.pending)
+            || self.pending.iter().any(|id| {
+                !self
+                    .nodes
+                    .iter()
+                    .any(|node| node.id == *id && node.kind == crate::model::NodeKind::Directory)
+            })
+        {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        self.settlement.validate(self.descriptor.as_ref())?;
+        if self.descriptor.is_none() && self.settlement.is_empty() {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        if self.nodes.is_empty()
+            || self.nodes.len() > crate::model::MAX_DISCOVERED_NODES
+            || self.base.as_os_str().is_empty()
+            || self.base.is_absolute()
+            || self
+                .base
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(())
+    }
 }
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Journal {
     pub deliveries: BTreeMap<u64, Vec<Node>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub moves: BTreeMap<u64, super::moved::State>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub consumed: BTreeMap<u64, HashSet<usize>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sources: BTreeMap<u64, Source>,
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub cancelled: HashSet<u64>,
     #[serde(skip)]
     pub opens: HashMap<(u64, usize), i64>,
+    /// Admission barrier held across the native unlink, without holding a mutex
+    /// through an OS call which can synchronously dispatch provider callbacks.
+    #[serde(skip)]
+    pub cleanup_inflight: HashSet<(u64, usize)>,
+    /// Confirmed unlink/NotFound, distinct from pre-unlink durable tombstones.
+    /// Completed old paths leave the retry set without removing their journal.
+    #[serde(skip)]
+    pub cleanup_complete: HashSet<(u64, usize)>,
     #[serde(skip)]
     pub pending_gaps: HashSet<u64>,
 }
 impl Journal {
+    pub(super) fn has_open_received_item(&self, id: u64) -> bool {
+        // Windows 11 can deliver an open without a matching cloud close when
+        // MOVE converts a child to an ordinary file outside the sync root.
+        // Once that old item is gone, its balance cannot protect the empty old
+        // parent. Keep balances for every remaining item (including directories);
+        // deletion still requires an exclusive, identity-checked native handle.
+        self.opens.iter().any(|((owner, index), count)| {
+            *owner == id
+                && *count > 0
+                && self
+                    .deliveries
+                    .get(&id)
+                    .and_then(|nodes| nodes.get(*index))
+                    .is_none_or(|node| !node.deleted)
+        })
+    }
     pub fn load(root: &Path) -> io::Result<Self> {
-        let mut state: Self = match std::fs::read(root.with_extension("received")) {
-            Ok(b) => serde_json::from_slice(&b)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Self::default(),
-            Err(e) => return Err(e),
+        if let Ok(meta) = std::fs::symlink_metadata(root.with_extension("received"))
+            && (!meta.is_file() || crate::cache::is_link(&meta) || meta.len() > 64 * 1024 * 1024)
+        {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let value: serde_json::Value = match std::fs::read(root.with_extension("received")) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => return Err(error),
         };
+        let legacy: HashMap<u64, _> = value["sources"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(id, source)| {
+                Some((
+                    id.parse().ok()?,
+                    crate::content::linked::completed::legacy_pending_roots(&source["descriptor"]),
+                ))
+            })
+            .collect();
+        let mut state: Self = serde_json::from_value(value)?;
+        for (id, source) in &state.sources {
+            source.validate()?;
+            if state
+                .deliveries
+                .get(id)
+                .is_none_or(|nodes| nodes.len() != source.nodes.len())
+            {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+        }
+        for (id, source) in &mut state.sources {
+            if !state.cancelled.contains(id)
+                && !state.moves.contains_key(id)
+                && source
+                    .descriptor
+                    .as_ref()
+                    .is_some_and(|descriptor| !descriptor.provisional)
+                && let Some(legacy) = legacy.get(id)
+            {
+                for root in legacy {
+                    if source.failed.contains(root) {
+                        continue;
+                    }
+                    let entries = crate::content::linked::completed::subtree(*root, &source.nodes)?;
+                    let received = entries.iter().all(|entry| {
+                        let index = source.nodes.iter().position(|node| node.id == entry.id).unwrap();
+                        let node = &state.deliveries[id][index];
+                        !node.deleted
+                            && !node.withdrawn
+                            && if node.directory {
+                                !source.pending.contains(&entry.id)
+                            } else {
+                                node.handed_off && entry.size == crate::model::ContentSize::Known(node.length)
+                            }
+                    });
+                    if received {
+                        // Build 72 already persisted byte handoff and directory
+                        // completion. Convert before restart withdrawal; no CF
+                        // residency/pin proof, body read or sender query.
+                        source
+                            .settlement
+                            .recover_legacy_received(&mut source.descriptor, *root, &source.nodes)?;
+                    }
+                }
+            }
+            let roots = source.descriptor.as_ref().map_or_else(Vec::new, |descriptor| {
+                descriptor.fulfilled.iter().map(|root| root.node).collect()
+            });
+            for root in roots {
+                source.failed.insert(root);
+                let entries = crate::content::linked::completed::subtree(root, &source.nodes)?;
+                for (index, entry) in source.nodes.iter().enumerate() {
+                    if entries.iter().any(|candidate| candidate.id == entry.id) {
+                        state.deliveries.get_mut(id).ok_or(io::ErrorKind::InvalidData)?[index].withdrawn = true;
+                    }
+                }
+            }
+        }
         for nodes in state.deliveries.values_mut() {
             for node in nodes {
                 if node.path.is_absolute()
@@ -59,6 +218,9 @@ impl Journal {
             life: Item::new(received::now()),
             directory: true,
             deleted: true,
+            withdrawn: false,
+            local_final: false,
+            renamed_locally: false,
             handed_off: false,
             length: 0,
         });
@@ -80,11 +242,148 @@ impl Journal {
         }
     }
     pub fn save(&self, root: &Path) -> io::Result<()> {
-        oink_foundation::storage::atomic_write(&root.with_extension("received"), &serde_json::to_vec(self)?)
+        for source in self.sources.values() {
+            source.validate()?;
+        }
+        let bytes = serde_json::to_vec(self)?;
+        if bytes.len() > 64 * 1024 * 1024 {
+            return Err(io::ErrorKind::FileTooLarge.into());
+        }
+        let path = root.with_extension("received");
+        // received_usage runs maintenance. Rewriting/invalidating an unchanged
+        // journal would make every accounting query schedule another query.
+        if std::fs::read(&path).is_ok_and(|previous| previous == bytes) {
+            // A previous post-rename flush may have failed; identical contents
+            // still need the durability barrier before reporting a commit.
+            return std::fs::OpenOptions::new().write(true).open(&path)?.sync_all();
+        }
+        let result = oink_foundation::storage::atomic_write(&path, &bytes);
+        // A post-rename durability error still committed new accounting state.
+        // A rejected write did not; notifying it would loop failed usage scans.
+        if result.is_ok() || std::fs::read(&path).is_ok_and(|current| current == bytes) {
+            crate::cache::changed(root);
+        }
+        result
     }
 }
 impl Service {
+    pub(super) fn cancel_received(&self, id: u64) {
+        {
+            let mut journal = self.received.lock().unwrap();
+            journal.cancelled.insert(id);
+            if let Err(error) = journal.save(&self.root) {
+                tracing::warn!(%error,"cannot persist received cancellation");
+            }
+        }
+        {
+            let mut deliveries = self.deliveries.lock().unwrap();
+            if let Some(delivery) = deliveries.get(&id) {
+                for file in delivery.files() {
+                    file.deleted.store(true, Ordering::Release);
+                }
+            }
+            // Keep the reader counter discoverable until existing consumers
+            // drain. Admission is already closed by the journal marker.
+            if deliveries
+                .get(&id)
+                .is_none_or(|delivery| delivery.readers.load(Ordering::Acquire) == 0)
+            {
+                deliveries.remove(&id);
+            }
+        }
+        self.received_sweep();
+    }
+    fn cleanup_cancelled(&self) {
+        let (cancelled, deliveries, complete) = {
+            let journal = self.received.lock().unwrap();
+            (
+                journal.cancelled.clone(),
+                journal.deliveries.clone(),
+                journal.cleanup_complete.clone(),
+            )
+        };
+        for id in cancelled {
+            if self
+                .deliveries
+                .lock()
+                .unwrap()
+                .get(&id)
+                .is_some_and(|delivery| delivery.readers.load(Ordering::Acquire) != 0)
+            {
+                continue;
+            }
+            let Some(nodes) = deliveries.get(&id) else {
+                continue;
+            };
+            // Only our exact native identities are removed. Exclusive handles
+            // defer busy files until the next maintenance pass; no tree unlink.
+            for (index, node) in nodes
+                .iter()
+                .enumerate()
+                .filter(|(index, node)| !node.directory && !complete.contains(&(id, *index)))
+            {
+                let path = self.root.join(&node.path);
+                let removed = match std::fs::symlink_metadata(&path) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+                    Ok(_) => cleanup_finished(&exclusive_delete_handle(&self.api, &path, |handle| {
+                        !node.local_final
+                            && !node.renamed_locally
+                            && self
+                                .handle_identity(handle, 0)
+                                .is_ok_and(|(owner, slot, _)| owner == id && slot == index)
+                            && self.clean_cancelled_file(handle, node.length).unwrap_or(false)
+                    })),
+                    _ => false,
+                };
+                if removed {
+                    self.cleanup_done(id, index, &path);
+                }
+            }
+            let mut dirs: Vec<_> = nodes
+                .iter()
+                .enumerate()
+                .filter(|(index, node)| node.directory && !complete.contains(&(id, *index)))
+                .collect();
+            dirs.sort_by_key(|(_, n)| std::cmp::Reverse(n.path.components().count()));
+            for (index, node) in dirs {
+                let path = self.root.join(&node.path);
+                let result = exclusive_delete_handle(&self.api, &path, |handle| {
+                    self.handle_identity(handle, 0)
+                        .is_ok_and(|(owner, slot, _)| owner == id && slot == index)
+                });
+                if cleanup_finished(&result) {
+                    self.cleanup_done(id, index, &path);
+                }
+            }
+        }
+    }
+    fn clean_cancelled_file(&self, handle: HANDLE, expected_length: u64) -> io::Result<bool> {
+        let mut buffer = [0u64; 1024];
+        let mut written = 0;
+        // SAFETY: aligned output and the protected exclusive deletion handle.
+        hr(unsafe {
+            (self.api.info)(
+                handle,
+                CF_PLACEHOLDER_INFO_STANDARD,
+                buffer.as_mut_ptr().cast(),
+                std::mem::size_of_val(&buffer) as u32,
+                &mut written,
+            )
+        })?;
+        // SAFETY: successful native query initialized standard info.
+        let info = unsafe { &*buffer.as_ptr().cast::<CF_PLACEHOLDER_STANDARD_INFO>() };
+        let mut length = 0i64;
+        // SAFETY: same protected file and fixed-size output.
+        if unsafe { GetFileSizeEx(handle, &mut length) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(info.InSyncState == CF_IN_SYNC_STATE_IN_SYNC
+            && info.ModifiedDataSize == 0
+            && length >= 0
+            && length as u64 == expected_length)
+    }
     pub(super) fn native_complete(&self, id: u64, index: usize, length: u64) {
+        let _mutation = crate::cache::Mutation(&self.root);
         let mut journal = self.received.lock().unwrap();
         if let Some(node) = journal.deliveries.get_mut(&id).and_then(|v| v.get_mut(index)) {
             node.handed_off = true;
@@ -101,17 +400,43 @@ impl Service {
             .and_then(|nodes| nodes.get(index))
             .map(|node| self.root.join(&node.path));
         drop(journal);
-        if let Some(path) = path
-            && self.full_and_pin(&path, length).unwrap_or(false)
+        // Best-effort policy publication only. Receive completion is independent
+        // of Cloud Filter residency/pin state and never opens a second reader.
+        let delivery = self.deliveries.lock().unwrap().get(&id).cloned();
+        if let Some(delivery) = delivery
+            && let Err(error) = delivery.complete_received()
         {
-            let mut journal = self.received.lock().unwrap();
-            if let Some(node) = journal.deliveries.get_mut(&id).and_then(|v| v.get_mut(index)) {
-                node.life.materialized = true;
-            }
-            let _ = journal.save(&self.root);
+            tracing::warn!(%error, "cannot persist one-shot completion");
+        }
+        if let Some(path) = path {
+            self.request_keep_local(&path);
         }
     }
+    pub(super) fn request_keep_local(&self, path: &Path) {
+        let result = (|| -> io::Result<()> {
+            let file = std::fs::OpenOptions::new()
+                .access_mode(0x40000)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)?;
+            // SAFETY: synchronous policy request, owned handle with WRITE_DAC.
+            hr(unsafe {
+                (self.api.pin)(
+                    file.as_raw_handle(),
+                    CF_PIN_STATE_PINNED,
+                    CF_SET_PIN_FLAG_NONE,
+                    std::ptr::null_mut(),
+                )
+            })
+        })();
+        if let Err(error) = result {
+            tracing::debug!(%error, "received keep-local request failed");
+        }
+    }
+
     pub(super) fn received_sweep(&self) {
+        self.cleanup_cancelled();
+        self.cleanup_moved();
         let snapshot = self.received.lock().unwrap().deliveries.clone();
         for (id, nodes) in snapshot {
             for (index, node) in nodes.iter().enumerate() {
@@ -132,6 +457,18 @@ impl Service {
                 let mut journal = self.received.lock().unwrap();
                 let busy = journal.opens.get(&(id, index)).copied().unwrap_or(0) > 0
                     || live.as_ref().is_some_and(|d| d.readers.load(Ordering::Acquire) > 0);
+                let linked = journal.sources.contains_key(&id);
+                let awaiting_publication = journal.sources.get(&id).is_some_and(|source| {
+                    source
+                        .nodes
+                        .get(index)
+                        .and_then(|node| node.parent)
+                        .is_some_and(|parent| source.pending.contains(&parent))
+                });
+                if missing && awaiting_publication {
+                    continue;
+                }
+
                 let Some(current) = journal.deliveries.get_mut(&id).and_then(|v| v.get_mut(index)) else {
                     continue;
                 };
@@ -143,7 +480,8 @@ impl Service {
                 }
                 // Recovery only removes provably never-complete placeholders. A
                 // successful handoff or prior materialization is protected on errors.
-                let stale = !current.life.materialized && !current.handed_off && live.is_none() && owned_incomplete;
+                let stale =
+                    !linked && !current.life.materialized && !current.handed_off && live.is_none() && owned_incomplete;
                 if missing {
                     current.deleted = true;
                     continue;
@@ -161,22 +499,47 @@ impl Service {
                     let allocated = std::fs::symlink_metadata(&path)
                         .and_then(|m| crate::cache::allocated(&path, &m))
                         .unwrap_or(0);
-                    let result = exclusive_delete(&path, || {
-                        let journal = self.received.lock().unwrap();
+                    let mut reserved = false;
+                    let result = exclusive_delete_handle(&self.api, &path, |handle| {
+                        if !self
+                            .handle_identity(handle, 0)
+                            .is_ok_and(|(owner, slot, _)| owner == id && slot == index)
+                        {
+                            return false;
+                        }
+                        // A missing live owner only permits stale-placeholder
+                        // retirement when the native data still proves clean.
+                        // Explicit age policy can separately retire local edits.
+                        let clean_unfinished =
+                            !stale || self.clean_cancelled_file(handle, node.length).unwrap_or(false);
+                        let mut journal = self.received.lock().unwrap();
                         let Some(current) = journal.deliveries.get(&id).and_then(|v| v.get(index)) else {
                             return false;
                         };
-                        let busy = journal.opens.get(&(id, index)).copied().unwrap_or(0) > 0;
-                        current.path == node.path
+                        let busy = journal.opens.get(&(id, index)).copied().unwrap_or(0) > 0
+                            || live
+                                .as_ref()
+                                .is_some_and(|delivery| delivery.readers.load(Ordering::Acquire) != 0);
+                        let eligible = current.path == node.path
                             && !current.deleted
                             && !busy
-                            && (stale && !current.life.materialized && !current.handed_off
+                            && (stale
+                                && clean_unfinished
+                                && !current.local_final
+                                && !current.renamed_locally
+                                && !current.life.materialized
+                                && !current.handed_off
                                 || current
                                     .life
                                     .cleanup(received::now(), received::setting(), Basis::LastUsed, false)
-                                    .is_some())
+                                    .is_some());
+                        reserved = eligible && journal.cleanup_inflight.insert((id, index));
+                        reserved
                     });
                     let mut journal = self.received.lock().unwrap();
+                    if reserved {
+                        journal.cleanup_inflight.remove(&(id, index));
+                    }
                     let Some(current) = journal.deliveries.get_mut(&id).and_then(|v| v.get_mut(index)) else {
                         continue;
                     };
@@ -211,7 +574,6 @@ impl Service {
                 }
             }
         }
-        self.expire_legacy();
         self.prune_empty_received();
         let journal = self.received.lock().unwrap();
         if journal.save(&self.root).is_err() {
@@ -256,13 +618,11 @@ impl Service {
     }
     pub(super) fn received_observe(&self, id: u64, index: usize, reader: Reader, open: bool, deleted: bool) {
         let mut journal = self.received.lock().unwrap();
-        let unbalanced = if !deleted {
-            let balance = journal.opens.entry((id, index)).or_default();
-            *balance += if open { 1 } else { -1 };
-            *balance < 0
-        } else {
-            false
-        };
+        // A close which deletes the placeholder still balances its open. The
+        // separate DELETE_COMPLETION callback does not represent a close.
+        let balance = journal.opens.entry((id, index)).or_default();
+        *balance += if open { 1 } else { -1 };
+        let unbalanced = *balance < 0;
         if !journal.deliveries.contains_key(&id) {
             journal.pending_gaps.insert(id);
         }
@@ -477,7 +837,7 @@ fn trusted(path: &Path) -> bool {
 
 /// Windows native names can differ from the configured root only by case.
 /// Preserve the actual tail; textual strip_prefix would deny legitimate edits.
-fn relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
+pub(super) fn relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
     use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
     let mut tail = path.components();
     for component in root.components() {
@@ -524,6 +884,32 @@ unsafe fn callback_path(info: &CF_CALLBACK_INFO, pointer: *const u16) -> Option<
         Some(PathBuf::from(format!("{}{}", string(info.VolumeDosName)?, p)))
     }
 }
+fn rename_allowed(root: &Path, old: &Path, new: &Path, flags: CF_CALLBACK_RENAME_FLAGS) -> bool {
+    let Some(old) = relative_path(root, old) else {
+        return false;
+    };
+    // Source/device and batch directories are provider bookkeeping, not received
+    // items. Never let a shell move that bookkeeping or reparent across batches.
+    if old.components().count() <= 2 || !old.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+        return false;
+    }
+    match relative_path(root, new) {
+        Some(new) => {
+            new.components().count() > 2
+                && old.components().take(2).eq(new.components().take(2))
+                && new.components().all(|c| matches!(c, std::path::Component::Normal(_)))
+        }
+        // This is the destination application's move of its received copy.
+        // CfAPI still owns hydration/move execution. A successful completion
+        // outside the root never makes the destination an Oink-managed path:
+        // the journal retains only the old identity for absent-item retirement.
+        None => {
+            new.is_absolute()
+                && flags & CF_CALLBACK_RENAME_FLAG_SOURCE_IN_SCOPE != 0
+                && flags & CF_CALLBACK_RENAME_FLAG_TARGET_IN_SCOPE == 0
+        }
+    }
+}
 pub(super) unsafe extern "system" fn renaming(info: *const CF_CALLBACK_INFO, params: *const CF_CALLBACK_PARAMETERS) {
     // SAFETY: cfapi owns callback/context/path pointers for this call.
     unsafe {
@@ -533,36 +919,116 @@ pub(super) unsafe extern "system" fn renaming(info: *const CF_CALLBACK_INFO, par
         };
         let old = callback_path(i, i.NormalizedPath);
         let new = callback_path(i, (*params).Anonymous.Rename.TargetPath);
-        let allowed = old.zip(new).is_some_and(|(old, new)| {
-            let Some(old) = relative_path(&service.root, &old) else {
-                return false;
-            };
-            let Some(new) = relative_path(&service.root, &new) else {
-                return false;
-            };
-            old.components().count() > 2
-                && new.components().count() > 2
-                && old.components().take(2).eq(new.components().take(2))
-                && new.components().all(|c| matches!(c, std::path::Component::Normal(_)))
-        });
-        let mut op = operation(i.ConnectionKey, i.TransferKey, i.RequestKey);
-        op.Type = CF_OPERATION_TYPE_ACK_RENAME;
-        let mut p = CF_OPERATION_PARAMETERS {
-            ParamSize: (offset_of!(CF_OPERATION_PARAMETERS, Anonymous) + size_of::<CF_OPERATION_PARAMETERS_0_6>())
-                as u32,
-            Anonymous: CF_OPERATION_PARAMETERS_0 {
-                AckRename: CF_OPERATION_PARAMETERS_0_6 {
-                    Flags: CF_OPERATION_ACK_RENAME_FLAG_NONE,
-                    CompletionStatus: if allowed {
-                        STATUS_SUCCESS
-                    } else {
-                        STATUS_CLOUD_FILE_ACCESS_DENIED
-                    },
-                },
+        let flags = (*params).Anonymous.Rename.Flags;
+        let allowed = old
+            .as_ref()
+            .zip(new.as_ref())
+            .is_some_and(|(old, new)| rename_allowed(&service.root, old, new, flags));
+        let connection = i.ConnectionKey;
+        let transfer = i.TransferKey;
+        let request = i.RequestKey;
+        tracing::info!(target: "oink_file_diagnostics", file_stage = 60_u8,
+            file_request = request, file_flags = flags, allowed,
+            "cloud file rename requested");
+        if allowed && flags & CF_CALLBACK_RENAME_FLAG_TARGET_IN_SCOPE == 0 {
+            let deliveries: Vec<_> = service.deliveries.lock().unwrap().values().cloned().collect();
+            let active = deliveries.into_iter().find_map(|delivery| {
+                if !delivery.downloading.load(Ordering::Acquire) {
+                    return None;
+                }
+                let index = delivery.native_paths.lock().unwrap().iter().position(|path| {
+                    old.as_deref()
+                        .is_some_and(|old| relative_path(path, old).is_some_and(|tail| tail.as_os_str().is_empty()))
+                })?;
+                Some((delivery, index))
+            });
+            if let Some((delivery, index)) = active {
+                // The rename's live transfer key also admits directory population.
+                // Publish it before joining the download: CfCreatePlaceholders
+                // itself waits behind this still-unacknowledged rename.
+                let population = delivery
+                    .file(index)
+                    .entry
+                    .is_dir
+                    .then(|| population::Pending::register(&delivery, index, transfer, request, None));
+                let provider = service.clone();
+                // MOVE must not convert a directory's children into ordinary
+                // files while the active whole-drop download is still flushing
+                // and recording them. Join that same download on a separate
+                // thread; blocking a fetch worker would starve its own hydration.
+                // Ordinary moves without an active download keep platform behavior.
+                if std::thread::Builder::new()
+                    .name("oink-cloud-move".into())
+                    .spawn(move || {
+                        let current = provider.clone();
+                        let id = delivery.id;
+                        let check: crate::content::ReaderGuard = Arc::new(move || {
+                            if current.stopping.load(Ordering::Acquire)
+                                || current.received.lock().unwrap().cancelled.contains(&id)
+                            {
+                                Err(unavailable())
+                            } else {
+                                Ok(())
+                            }
+                        });
+                        let result = crate::content::namespace::NativeFiles::download(&*delivery, &check, &|_, _| {});
+                        drop(population);
+                        acknowledge_rename(
+                            &provider.api,
+                            connection,
+                            transfer,
+                            request,
+                            if result.is_ok() {
+                                STATUS_SUCCESS
+                            } else {
+                                STATUS_CLOUD_FILE_UNSUCCESSFUL
+                            },
+                        );
+                    })
+                    .is_ok()
+                {
+                    return;
+                }
+                acknowledge_rename(
+                    &service.api,
+                    connection,
+                    transfer,
+                    request,
+                    STATUS_CLOUD_FILE_UNSUCCESSFUL,
+                );
+                return;
+            }
+        }
+        acknowledge_rename(
+            &service.api,
+            connection,
+            transfer,
+            request,
+            if allowed {
+                STATUS_SUCCESS
+            } else {
+                STATUS_CLOUD_FILE_ACCESS_DENIED
             },
-        };
-        let _ = (service.api.execute)(&op, &mut p);
+        );
     }
+}
+fn acknowledge_rename(api: &Api, connection: CF_CONNECTION_KEY, transfer: i64, request: i64, status: NTSTATUS) {
+    let mut op = operation(connection, transfer, request);
+    op.Type = CF_OPERATION_TYPE_ACK_RENAME;
+    let mut p = CF_OPERATION_PARAMETERS {
+        ParamSize: (offset_of!(CF_OPERATION_PARAMETERS, Anonymous) + size_of::<CF_OPERATION_PARAMETERS_0_6>()) as u32,
+        Anonymous: CF_OPERATION_PARAMETERS_0 {
+            AckRename: CF_OPERATION_PARAMETERS_0_6 {
+                Flags: CF_OPERATION_ACK_RENAME_FLAG_NONE,
+                CompletionStatus: status,
+            },
+        },
+    };
+    // SAFETY: all scalar keys and acknowledgement buffers live through execute.
+    let result = unsafe { (api.execute)(&op, &mut p) };
+    tracing::info!(target: "oink_file_diagnostics", file_stage = 61_u8,
+        file_request = request, file_status = status as u32, file_code = result as u32,
+        "cloud file rename acknowledged");
 }
 pub(super) unsafe extern "system" fn renamed(info: *const CF_CALLBACK_INFO, params: *const CF_CALLBACK_PARAMETERS) {
     // SAFETY: both native paths are valid for this completion.
@@ -586,43 +1052,57 @@ pub(super) unsafe extern "system" fn renamed(info: *const CF_CALLBACK_INFO, para
         for node in journal.deliveries.values_mut().flatten() {
             if let Ok(tail) = node.path.strip_prefix(&old) {
                 node.path = new.join(tail);
+                node.renamed_locally = true;
                 node.life.observe(Reader::Unknown, received::now());
+            }
+        }
+        for source in journal.sources.values_mut() {
+            if let Ok(tail) = source.base.strip_prefix(&old) {
+                source.base = new.join(tail);
+            }
+        }
+        drop(journal);
+        for delivery in service.deliveries.lock().unwrap().values() {
+            for path in delivery.native_paths.lock().unwrap().iter_mut() {
+                if let Ok(tail) = path.strip_prefix(service.root.join(&old)) {
+                    *path = service.root.join(&new).join(tail);
+                }
             }
         }
         crate::cache::changed(&service.root);
     }
 }
 
-fn exclusive_delete(path: &Path, eligible: impl FnOnce() -> bool) -> io::Result<()> {
-    let file = std::fs::OpenOptions::new()
-        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
-        .share_mode(0)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)?;
-    // Re-evaluate after obtaining the exclusive handle: no reader can sneak
-    // between the last-used/classification decision and native deletion.
-    if !eligible() {
+pub(super) fn cleanup_finished(result: &io::Result<()>) -> bool {
+    result.is_ok()
+        || result
+            .as_ref()
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+}
+
+pub(super) fn exclusive_delete_handle(
+    api: &Arc<Api>,
+    path: &Path,
+    eligible: impl FnOnce(HANDLE) -> bool,
+) -> io::Result<()> {
+    // An ordinary share-none handle does not exclude a writable mapping left
+    // after its creator closed. RH admission plus a protected reference does.
+    let file = protection::Protected::open(
+        api.clone(),
+        path,
+        CF_OPEN_FILE_FLAG_EXCLUSIVE | CF_OPEN_FILE_FLAG_DELETE_ACCESS | CF_OPEN_FILE_FLAG_WRITE_ACCESS,
+    )?;
+    if !eligible(file.handle) {
         return Err(io::ErrorKind::WouldBlock.into());
     }
-    let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
-    // SAFETY: the exclusive DELETE handle and fixed-size disposition are live.
-    if unsafe {
-        SetFileInformationByHandle(
-            file.as_raw_handle(),
-            FileDispositionInfo,
-            (&mut disposition as *mut FILE_DISPOSITION_INFO).cast(),
-            size_of::<FILE_DISPOSITION_INFO>() as u32,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    drop(file);
+    file.delete()?;
+    crate::cache::changed(path);
     Ok(())
 }
 
 impl Service {
     pub(super) fn create_container(&self, path: &Path, id: u64) -> io::Result<()> {
+        let _mutation = crate::cache::Mutation(&self.root);
         let name = wide(path.file_name().ok_or(io::ErrorKind::InvalidInput)?);
         let mut identity = [0u8; 16];
         identity[..8].copy_from_slice(&id.to_le_bytes());
@@ -717,9 +1197,9 @@ pub(super) unsafe fn deleted_path(info: *const CF_CALLBACK_INFO) {
         let deliveries = service.deliveries.lock().unwrap();
         for (id, index) in changed {
             if let Some(delivery) = deliveries.get(&id)
-                && let Some(flag) = delivery.deleted.get(index)
+                && let Some(file) = delivery.get_file(index)
             {
-                flag.store(true, Ordering::Release);
+                file.deleted.store(true, Ordering::Release);
             }
         }
         tracing::info!(
@@ -736,19 +1216,30 @@ impl Service {
         self.disk_identity(path)
             .is_ok_and(|(owner, slot, _)| owner == id && slot == index)
     }
-    fn disk_identity(&self, path: &Path) -> io::Result<(u64, usize, bool)> {
+    pub(super) fn disk_identity(&self, path: &Path) -> io::Result<(u64, usize, bool)> {
         let meta = std::fs::symlink_metadata(path)?;
         let file = std::fs::OpenOptions::new()
             .access_mode(FILE_READ_ATTRIBUTES)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)?;
+        self.handle_identity(file.as_raw_handle(), meta.len())
+    }
+    pub(super) fn handle_identity(&self, handle: HANDLE, length: u64) -> io::Result<(u64, usize, bool)> {
+        self.handle_identity_traced(handle, length, HydrationTrace::default())
+    }
+    pub(super) fn handle_identity_traced(
+        &self,
+        handle: HANDLE,
+        length: u64,
+        trace: HydrationTrace,
+    ) -> io::Result<(u64, usize, bool)> {
         let mut buffer = [0u64; 1024];
         let mut returned = 0;
         // SAFETY: aligned output covers the header and our fixed 16-byte identity.
-        hr(unsafe {
+        trace.hr(54, unsafe {
             (self.api.info)(
-                file.as_raw_handle(),
+                handle,
                 CF_PLACEHOLDER_INFO_STANDARD,
                 buffer.as_mut_ptr().cast(),
                 (buffer.len() * 8) as u32,
@@ -765,12 +1256,24 @@ impl Service {
         Ok((
             u64::from_le_bytes(bytes[..8].try_into().unwrap()),
             u64::from_le_bytes(bytes[8..].try_into().unwrap()) as usize,
-            info.OnDiskDataSize >= meta.len() as i64,
+            info.OnDiskDataSize >= length as i64,
         ))
     }
     /// Runs once before publishing CURRENT. Only an owned batch identity permits
     /// recovery; arbitrary user files and reparse targets are never traversed.
     pub(super) fn recover_received(&self) -> io::Result<()> {
+        let _mutation = crate::cache::Mutation(&self.root);
+        {
+            let mut journal = self.received.lock().unwrap();
+            let provisional: Vec<_> = journal
+                .sources
+                .iter()
+                .filter(|(_, source)| source.descriptor.as_ref().is_some_and(|link| link.provisional))
+                .map(|(id, _)| *id)
+                .collect();
+            journal.cancelled.extend(provisional);
+            journal.save(&self.root)?;
+        }
         for source in std::fs::read_dir(&self.root)?.flatten() {
             if !source.file_type()?.is_dir() && !crate::cache::is_link(&source.metadata()?) {
                 continue;
@@ -803,7 +1306,16 @@ impl Service {
                             continue;
                         }
                         let directory = meta.is_dir();
-                        if directory {
+                        // Enumerating a partial native directory here would pull
+                        // the remote source during startup. Its durable catalog
+                        // already records every previously discovered child.
+                        let pending = self.received.lock().unwrap().sources.get(&id).is_some_and(|source| {
+                            source
+                                .nodes
+                                .get(index)
+                                .is_some_and(|node| source.pending.contains(&node.id))
+                        });
+                        if directory && !pending {
                             queue.push(path.clone());
                         }
                         let mut life = Item::new(received::now());
@@ -816,6 +1328,9 @@ impl Service {
                                 life,
                                 directory,
                                 deleted: false,
+                                withdrawn: false,
+                                local_final: false,
+                                renamed_locally: false,
                                 handed_off: full && !directory,
                                 length: meta.len(),
                             },
@@ -831,75 +1346,125 @@ impl Service {
                     self.received.lock().unwrap().merge_discovered(id, found);
                 }
             }
+            // Includes old failed preparations with no journaled delivery.
+            // rmdir cannot remove any materialized/user payload.
+            let _ = std::fs::remove_dir(&source_path);
         }
+        self.restore_linked_deliveries()?;
         self.received.lock().unwrap().save(&self.root)?;
         self.received_sweep();
         Ok(())
     }
-    /// Pre-release random batches keep their old 24h deadline. Only matching
-    /// native Cloud identities are removable; foreign files prevent rmdir.
-    fn expire_legacy(&self) {
-        let Ok(entries) = std::fs::read_dir(&self.root) else {
-            return;
+
+    fn restore_linked_deliveries(&self) -> io::Result<()> {
+        let saved: Vec<_> = {
+            let journal = self.received.lock().unwrap();
+            journal
+                .sources
+                .iter()
+                .filter(|(id, _)| !journal.cancelled.contains(id))
+                .filter_map(|(id, source)| {
+                    journal
+                        .deliveries
+                        .get(id)
+                        .map(|nodes| (*id, source.clone(), nodes.clone()))
+                })
+                .collect()
         };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if name.len() != 16 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+        for (id, source, nodes) in saved {
+            let cancelled = self.received.lock().unwrap().cancelled.contains(&id);
+            if nodes.iter().all(|node| node.deleted) {
                 continue;
             }
-            let Ok(id) = u64::from_str_radix(name, 16) else {
-                continue;
-            };
-            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
-                continue;
-            };
-            if !meta.is_dir()
-                || crate::cache::is_link(&meta)
-                || !meta
-                    .created()
-                    .ok()
-                    .and_then(|t| t.elapsed().ok())
-                    .is_some_and(|age| age.as_secs() >= cloud_files::RETENTION_SECS)
+            source.validate()?;
+            let path = self.root.join(&source.base);
+            if !self.owned_container(&path, id).unwrap_or(false)
+                && !nodes.iter().enumerate().any(|(index, node)| {
+                    !node.deleted && self.native_identity_matches(&self.root.join(&node.path), id, index)
+                })
             {
                 continue;
             }
-            let mut queue = vec![entry.path()];
-            let mut dirs = Vec::new();
-            while let Some(parent) = queue.pop() {
-                dirs.push(parent.clone());
-                let Ok(children) = std::fs::read_dir(parent) else {
-                    continue;
-                };
-                for child in children.flatten() {
-                    let path = child.path();
-                    let Ok((owner, index, _)) = self.disk_identity(&path) else {
-                        continue;
-                    };
-                    if owner != id || index >= crate::model::MAX_DISCOVERED_NODES {
-                        continue;
+            let mut names = crate::content::namespace::Names::new(crate::sync::files::TargetOs::Windows);
+            let entries = nodes
+                .iter()
+                .enumerate()
+                .map(|(index, node)| {
+                    let original = source.nodes.get(index).ok_or(io::ErrorKind::InvalidData)?;
+                    let mut entry = names.entry(original)?;
+                    if entry.is_dir != node.directory {
+                        return Err(io::ErrorKind::InvalidData.into());
                     }
-                    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
-                        queue.push(path);
-                    } else if exclusive_delete(&path, || true).is_ok() {
-                        tracing::info!(cleanup_reason = "old_layout", count = 1_u64, "received file removed");
-                    }
-                }
-            }
-            dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
-            for path in dirs {
-                let _ = std::fs::remove_dir(path);
-            }
+                    entry.size = node.length;
+                    Ok(entry)
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let namespace = source
+                .settlement
+                .restore(source.descriptor, crate::content::linked::native_connector())?;
+            let contents = crate::content::namespace::Files::restore_table(
+                namespace,
+                crate::sync::files::TargetOs::Windows,
+                source.nodes,
+                entries.clone(),
+            )?;
+            let native_paths: Vec<_> = nodes.iter().map(|node| self.root.join(&node.path)).collect();
+            let roots = contents
+                .descriptor_nodes()?
+                .unwrap()
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| node.parent.is_none())
+                .map(|(index, _)| native_paths[index].clone())
+                .collect();
+            let delivery = Arc::new(Delivery {
+                service: self.context.as_ref().clone(),
+                population: Mutex::new(()),
+                population_requests: Mutex::new(HashMap::new()),
+                download: OnceLock::new(),
+                downloading: AtomicBool::new(false),
+                id,
+                path,
+                native_paths: Mutex::new(native_paths),
+                roots,
+                files: Mutex::new(
+                    entries
+                        .into_iter()
+                        .zip(&nodes)
+                        .map(|(entry, node)| {
+                            let file = DeliveredFile::new(entry, node.deleted || cancelled);
+                            file.withdrawn.store(node.withdrawn, Ordering::Release);
+                            file.local_final.store(node.local_final, Ordering::Release);
+                            Arc::new(file)
+                        })
+                        .collect(),
+                ),
+                contents: Mutex::new(contents),
+                created: Instant::now(),
+                readers: Arc::new(AtomicUsize::new(0)),
+            });
+            self.deliveries.lock().unwrap().insert(id, delivery.clone());
+            native::bind(&delivery)?;
         }
+        Ok(())
     }
     fn prune_empty_received(&self) {
-        let deliveries = self.received.lock().unwrap().deliveries.clone();
-        for nodes in deliveries.values() {
+        let (deliveries, complete) = {
+            let journal = self.received.lock().unwrap();
+            (journal.deliveries.clone(), journal.cleanup_complete.clone())
+        };
+        for (id, nodes) in &deliveries {
             // Empty directory deliveries are received items too; preserve them
             // by default and apply the explicit age policy without recursion.
-            if nodes.iter().all(|n| n.directory)
+            let cancelled = {
+                let journal = self.received.lock().unwrap();
+                if journal.cleanup_complete.contains(&(*id, usize::MAX)) {
+                    continue;
+                }
+                journal.cancelled.contains(id)
+            };
+            if !cancelled
+                && nodes.iter().all(|n| n.directory)
                 && nodes.iter().any(|n| {
                     !n.deleted && received::setting().days() == 0
                         || !n.deleted
@@ -912,21 +1477,79 @@ impl Service {
             if nodes.iter().any(|n| !n.directory && !n.deleted) {
                 continue;
             }
+            let live = self.deliveries.lock().unwrap().get(id).cloned();
+            {
+                let mut journal = self.received.lock().unwrap();
+                if live
+                    .as_ref()
+                    .is_some_and(|delivery| delivery.readers.load(Ordering::Acquire) != 0)
+                    || journal.has_open_received_item(*id)
+                    || journal.cleanup_inflight.iter().any(|(owner, _)| owner == id)
+                {
+                    continue;
+                }
+                journal.cleanup_inflight.insert((*id, usize::MAX));
+            }
+            // A batch may mix an empty selection with a nonempty selection.
+            // Finishing/moving the latter's last file does not consume the former.
+            // Preserve each originally empty directory under its own age policy;
+            // only former file ancestors are synthetic empty-parent cleanup.
+            // Paths are journal identities, not filesystem enumeration/following.
+            let file_paths: std::collections::BTreeSet<_> = nodes
+                .iter()
+                .filter(|node| !node.directory)
+                .map(|node| node.path.clone())
+                .collect();
+            let now = received::now();
+            let days = received::setting().days();
             let mut dirs: Vec<_> = nodes
                 .iter()
-                .filter(|n| n.directory)
-                .map(|n| self.root.join(&n.path))
+                .enumerate()
+                .filter(|(index, node)| {
+                    node.directory
+                        && !complete.contains(&(*id, *index))
+                        && (cancelled
+                            || days != 0 && now.saturating_sub(node.life.last_used) >= days * received::DAY
+                            || file_paths
+                                .range(node.path.clone()..)
+                                .next()
+                                .is_some_and(|path| path.starts_with(&node.path)))
+                })
+                .map(|(index, node)| (self.root.join(&node.path), index))
                 .collect();
             if let Some(node) = nodes.first() {
                 let batch: PathBuf = node.path.components().take(2).collect();
-                dirs.push(self.root.join(batch));
+                dirs.push((self.root.join(batch), usize::MAX));
             }
-            dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+            dirs.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
             dirs.dedup();
-            for path in dirs {
-                let _ = std::fs::remove_dir(path);
+            for (path, index) in dirs {
+                let result = exclusive_delete_handle(&self.api, &path, |handle| {
+                    self.handle_identity(handle, 0)
+                        .is_ok_and(|(owner, slot, _)| owner == *id && slot == index)
+                });
+                if cleanup_finished(&result) {
+                    self.cleanup_done(*id, index, &path);
+                }
             }
+            self.received
+                .lock()
+                .unwrap()
+                .cleanup_inflight
+                .remove(&(*id, usize::MAX));
+            // The plain source grouping directory has no native identity. Leave
+            // an empty group rather than unlink a possible replacement by path.
         }
+    }
+    pub(super) fn cleanup_done(&self, id: u64, index: usize, path: &Path) {
+        let mut journal = self.received.lock().unwrap();
+        if let Some(node) = journal.deliveries.get_mut(&id).and_then(|nodes| nodes.get_mut(index)) {
+            if self.root.join(&node.path) != path {
+                return;
+            }
+            node.deleted = true;
+        }
+        journal.cleanup_complete.insert((id, index));
     }
 }
 
@@ -959,6 +1582,40 @@ pub(super) fn valid_root(path: &Path) -> io::Result<bool> {
 mod tests {
     use super::*;
     #[test]
+    fn received_moves_can_leave_root_but_cannot_move_provider_bookkeeping() {
+        let root = Path::new(r"C:\Oink\CloudFiles");
+        let old = root.join(r"source\batch\file.txt");
+        let outside = Path::new(r"C:\destination\file.txt");
+        let source = CF_CALLBACK_RENAME_FLAG_SOURCE_IN_SCOPE;
+        let both = source | CF_CALLBACK_RENAME_FLAG_TARGET_IN_SCOPE;
+        assert!(rename_allowed(root, &old, outside, source));
+        assert!(rename_allowed(
+            root,
+            &old,
+            &root.join(r"source\batch\renamed.txt"),
+            both
+        ));
+        for path in [root.to_path_buf(), root.join("source"), root.join(r"source\batch")] {
+            assert!(!rename_allowed(root, &path, outside, source));
+        }
+        assert!(!rename_allowed(
+            root,
+            &old,
+            &root.join(r"source\other-batch\file.txt"),
+            both
+        ));
+        assert!(!rename_allowed(
+            root,
+            &old,
+            &root.join(r"source\batch\..\file.txt"),
+            both
+        ));
+        assert!(!rename_allowed(root, &old, outside, both));
+        assert!(!rename_allowed(root, &old, outside, CF_CALLBACK_RENAME_FLAG_NONE));
+        assert!(!rename_allowed(root, outside, &old, both));
+        assert!(!rename_allowed(root, &old, Path::new("relative"), source));
+    }
+    #[test]
     fn callback_paths_preserve_leaf_case_and_reject_neighboring_roots() {
         let root = Path::new(r"C:\fixture\received");
         assert_eq!(
@@ -988,13 +1645,17 @@ mod tests {
             life,
             directory: false,
             deleted: false,
+            withdrawn: false,
+            local_final: false,
+            renamed_locally: false,
             handed_off: true,
             length: 4,
         };
         let mut journal = Journal::default();
         journal.deliveries.insert(7, vec![node]);
         journal.opens.insert((7, 0), 1);
-        journal.save(&root).unwrap();
+        crate::cache::assert_mutation(&root, || journal.save(&root)).unwrap();
+        crate::cache::assert_no_mutation(&root, || journal.save(&root)).unwrap();
         let recovered = Journal::load(&root).unwrap();
         assert!(recovered.opens.is_empty());
         let item = &recovered.deliveries[&7][0].life;

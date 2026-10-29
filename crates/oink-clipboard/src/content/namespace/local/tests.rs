@@ -113,7 +113,7 @@ fn stable_file_identity_ignores_offer_ids_and_cancel_closes_existing_readers() {
 
 #[cfg(unix)]
 #[test]
-fn links_are_skipped_and_replacing_an_ancestor_cannot_redirect_a_reader() {
+fn external_links_follow_but_replacing_an_ancestor_cannot_redirect_a_reader() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir(dir.path().join("root")).unwrap();
     fs::create_dir(dir.path().join("outside")).unwrap();
@@ -122,8 +122,10 @@ fn links_are_skipped_and_replacing_an_ancestor_cannot_redirect_a_reader() {
     std::os::unix::fs::symlink(dir.path().join("outside"), dir.path().join("root/link")).unwrap();
     let tree = Local::new(vec![(NodeId(1), dir.path().join("root"))]).unwrap();
     let page = tree.list(NodeId(1), None).unwrap();
-    assert_eq!(page.entries.len(), 1);
-    let selected = tree.select(page.entries[0].id).unwrap();
+    assert_eq!(page.entries.len(), if cfg!(target_os = "macos") { 2 } else { 1 });
+    let selected = tree
+        .select(page.entries.iter().find(|n| n.name == "file").unwrap().id)
+        .unwrap();
     let mut reader = tree.open(selected.id, selected.version, 0).unwrap();
     fs::rename(dir.path().join("root"), dir.path().join("moved")).unwrap();
     std::os::unix::fs::symlink(dir.path().join("outside"), dir.path().join("root")).unwrap();
@@ -176,4 +178,340 @@ fn moved_deleted_or_replaced_identity_is_no_such_item() {
             Unavailable::NoSuchItem
         );
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn safe_symlinks_are_leaf_metadata_and_never_traversed() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("Fixture.app");
+    fs::create_dir_all(root.join("Resources/nested")).unwrap();
+    fs::write(root.join("Resources/nested/content.txt"), b"payload").unwrap();
+    for (name, target) in [
+        ("current", "nested"),
+        ("linked.txt", "nested/content.txt"),
+        ("dangling", "missing"),
+        ("loop", "."),
+        ("escape", "../../outside"),
+        ("absolute", "/tmp/outside"),
+    ] {
+        symlink(target, root.join("Resources").join(name)).unwrap();
+    }
+    symlink("../Resources", root.join("Resources/back")).unwrap();
+    let source = Local::new(vec![(NodeId(1), root)]).unwrap();
+    let resources = source.list(NodeId(1), None).unwrap().entries.remove(0);
+    let page = source.list(resources.id, None).unwrap();
+    assert_eq!(page.entries.len(), 5);
+    for link in page.entries.iter().filter(|node| node.kind.symlink_target().is_some()) {
+        assert!(source.list(link.id, None).is_err());
+        assert!(source.select(link.id).is_err());
+        assert!(source.open(link.id, link.version, 0).is_err());
+    }
+    assert!(
+        page.entries
+            .iter()
+            .all(|node| node.name != "absolute" && node.name != "escape")
+    );
+    assert_eq!(
+        page.entries.iter().find(|node| node.name == "current").unwrap().kind,
+        NodeKind::Symlink("nested".into())
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn execute_bits_are_file_metadata_and_chmod_changes_the_selected_version() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("executable");
+    fs::write(&path, b"payload").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o4755)).unwrap();
+    let source = Local::clipboard(vec![(NodeId(1), path.clone())]).unwrap();
+    assert_eq!(
+        source.roots()[0].exec_bits,
+        None,
+        "group-wide announcements carry no execution metadata"
+    );
+    let executable = source.select(NodeId(1)).unwrap();
+    assert_eq!(executable.exec_bits, Some(0o111));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let ordinary = source.select(NodeId(1)).unwrap();
+    assert_eq!(ordinary.exec_bits, Some(0));
+    assert_ne!(ordinary.version, executable.version);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn batch_links_follow_external_targets_and_keep_cross_root_identities() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let a = temp.path().join("A");
+    let b = temp.path().join("B");
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    fs::write(b.join("data"), b"inside").unwrap();
+    fs::write(temp.path().join("outside"), b"outside").unwrap();
+    symlink("../B/data", a.join("relative")).unwrap();
+    symlink(b.join("data"), a.join("absolute")).unwrap();
+    symlink("../outside", a.join("external")).unwrap();
+    symlink("missing", a.join("broken")).unwrap();
+    symlink(b.join("data"), temp.path().join("root-link")).unwrap();
+    let source = Local::new(vec![
+        (NodeId(1), temp.path().join("root-link")),
+        (NodeId(2), a),
+        (NodeId(3), b),
+    ])
+    .unwrap();
+    assert_eq!(source.roots()[0].kind, NodeKind::Symlink("B/data".into()));
+    let page = source.list(NodeId(2), None).unwrap();
+    for name in ["relative", "absolute"] {
+        assert_eq!(
+            page.entries.iter().find(|node| node.name == name).unwrap().kind,
+            NodeKind::Symlink("../B/data".into())
+        );
+    }
+    assert!(page.entries.iter().all(|node| node.name != "broken"));
+    let outside = page.entries.iter().find(|node| node.name == "external").unwrap();
+    assert_eq!(outside.kind, NodeKind::File);
+    let selected = source.select(outside.id).unwrap();
+    let mut reader = source.open(outside.id, selected.version, 0).unwrap();
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"outside");
+    fs::write(temp.path().join("replacement"), b"new").unwrap();
+    fs::rename(temp.path().join("replacement"), temp.path().join("outside")).unwrap();
+    assert_eq!(
+        super::super::super::reason(&reader.read(&mut [0; 1]).unwrap_err()),
+        Unavailable::Superseded
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn selected_link_file_directory_mixed_broken_roots_and_nested_cycles() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("target");
+    fs::create_dir_all(dir.join("nested")).unwrap();
+    fs::write(dir.join("nested/data"), b"directory").unwrap();
+    fs::write(temp.path().join("file"), b"file").unwrap();
+    symlink(&dir, temp.path().join("directory-alias")).unwrap();
+    symlink(temp.path().join("file"), temp.path().join("file-alias")).unwrap();
+    symlink("missing", temp.path().join("broken")).unwrap();
+    symlink(".", dir.join("cycle")).unwrap();
+    symlink(temp.path().join("file"), dir.join("outside-file")).unwrap();
+    let source = Local::new(vec![
+        (NodeId(1), temp.path().join("directory-alias")),
+        (NodeId(2), temp.path().join("broken")),
+        (NodeId(3), temp.path().join("file-alias")),
+        (NodeId(4), temp.path().join("absent")),
+    ])
+    .unwrap();
+    assert_eq!(
+        source.roots().iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+        ["directory-alias", "file-alias"]
+    );
+    assert_eq!(source.roots()[0].kind, NodeKind::Directory);
+    assert_eq!(source.roots()[1].kind, NodeKind::File);
+    let page = source.list(NodeId(1), None).unwrap();
+    assert_eq!(
+        page.entries.iter().find(|n| n.name == "cycle").unwrap().kind,
+        NodeKind::Symlink(".".into())
+    );
+    let nested = page.entries.iter().find(|n| n.name == "nested").unwrap();
+    let file = source.list(nested.id, None).unwrap().entries.remove(0);
+    let selected = source.select(file.id).unwrap();
+    let mut bytes = Vec::new();
+    source
+        .open(file.id, selected.version, 0)
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, b"directory");
+    let selected = source.select(NodeId(3)).unwrap();
+    let mut bytes = Vec::new();
+    source
+        .open(NodeId(3), selected.version, 0)
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, b"file");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn recursive_external_directory_follow_is_bounded_and_target_retargeting_is_superseded() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    for name in ["selected", "external", "other"] {
+        fs::create_dir(temp.path().join(name)).unwrap();
+    }
+    fs::write(temp.path().join("other/data"), b"third").unwrap();
+    symlink("../external", temp.path().join("selected/follow")).unwrap();
+    symlink("../other", temp.path().join("external/recurse")).unwrap();
+    symlink("../external", temp.path().join("other/cycle")).unwrap();
+    let source = Local::new(vec![(NodeId(1), temp.path().join("selected"))]).unwrap();
+    let follow = source.list(NodeId(1), None).unwrap().entries.remove(0);
+    assert_eq!(follow.kind, NodeKind::Directory);
+    let recurse = source.list(follow.id, None).unwrap().entries.remove(0);
+    assert_eq!(recurse.kind, NodeKind::Directory);
+    let children = source.list(recurse.id, None).unwrap().entries;
+    assert_eq!(
+        children.iter().find(|n| n.name == "cycle").unwrap().kind,
+        NodeKind::Symlink("..".into())
+    );
+    let data = children.iter().find(|n| n.name == "data").unwrap();
+    let selected = source.select(data.id).unwrap();
+    let mut reader = source.open(data.id, selected.version, 0).unwrap();
+    fs::remove_file(temp.path().join("selected/follow")).unwrap();
+    symlink("../other", temp.path().join("selected/follow")).unwrap();
+    assert_eq!(
+        super::super::super::reason(&reader.read(&mut [0; 1]).unwrap_err()),
+        Unavailable::Superseded
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_selected_and_nested_junctions_follow_external_targets_but_skip_cycles() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("target");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("file"), b"payload").unwrap();
+    let create = |link: &Path, to: &Path| {
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(to)
+            .output()
+            .unwrap();
+        assert!(
+            status.status.success(),
+            "junction creation failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    };
+    create(&temp.path().join("selected"), &target);
+    create(&target.join("nested"), &target);
+    let external = temp.path().join("external");
+    fs::create_dir(&external).unwrap();
+    fs::write(external.join("external-file"), b"outside").unwrap();
+    create(&target.join("follow"), &external);
+    create(&external.join("cycle"), &target);
+    let source = Local::new(vec![(NodeId(1), temp.path().join("selected"))]).unwrap();
+    assert_eq!(source.roots()[0].name, "selected");
+    assert_eq!(source.roots()[0].kind, NodeKind::Directory);
+    let page = source.list(NodeId(1), None).unwrap();
+    assert_eq!(page.entries.len(), 2);
+    let follow = page.entries.iter().find(|node| node.name == "follow").unwrap();
+    let followed = source.list(follow.id, None).unwrap();
+    assert_eq!(followed.entries.len(), 1);
+    assert_eq!(followed.entries[0].name, "external-file");
+    let selected = source.select(followed.entries[0].id).unwrap();
+    let mut reader = source.open(selected.id, selected.version, 0).unwrap();
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"outside");
+    fs::create_dir(temp.path().join("replacement")).unwrap();
+    fs::remove_dir(target.join("follow")).unwrap();
+    create(&target.join("follow"), &temp.path().join("replacement"));
+    assert_eq!(
+        super::super::super::reason(&reader.read(&mut [0; 1]).unwrap_err()),
+        Unavailable::Superseded
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn repeated_directory_identity_is_a_link_and_followed_trees_obey_limits() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("root")).unwrap();
+    fs::create_dir(temp.path().join("external")).unwrap();
+    fs::write(temp.path().join("external/file"), b"payload").unwrap();
+    for name in ["a", "b"] {
+        symlink("../external", temp.path().join("root").join(name)).unwrap();
+    }
+    let source = Local::with_limit(vec![(NodeId(1), temp.path().join("root"))], 3).unwrap();
+    let page = source.list(NodeId(1), None).unwrap();
+    assert_eq!(page.entries[0].kind, NodeKind::Directory);
+    assert_eq!(page.entries[1].kind, NodeKind::Symlink("a".into()));
+    assert_eq!(
+        super::super::super::reason(&source.list(page.entries[0].id, None).unwrap_err()),
+        Unavailable::LimitExceeded
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_selected_and_nested_file_symlinks_follow_outside_batch() {
+    use std::os::windows::fs::symlink_file;
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("root")).unwrap();
+    fs::write(temp.path().join("outside"), b"outside").unwrap();
+    symlink_file(temp.path().join("outside"), temp.path().join("root/link")).unwrap();
+    let source = Local::new(vec![(NodeId(1), temp.path().join("root"))]).unwrap();
+    let item = source.list(NodeId(1), None).unwrap().entries.remove(0);
+    assert_eq!(item.kind, NodeKind::File);
+    let selected = source.select(item.id).unwrap();
+    let mut bytes = Vec::new();
+    source
+        .open(item.id, selected.version, 0)
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, b"outside");
+    let selected = Local::new(vec![(NodeId(1), temp.path().join("root/link"))]).unwrap();
+    assert_eq!(selected.roots()[0].kind, NodeKind::File);
+    let internal = Local::new(vec![
+        (NodeId(1), temp.path().join("outside")),
+        (NodeId(2), temp.path().join("root/link")),
+    ])
+    .unwrap();
+    assert_eq!(internal.roots().len(), 1);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn unreadable_roots_and_link_targets_do_not_cancel_readable_items() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("root")).unwrap();
+    fs::write(temp.path().join("root/good"), b"good").unwrap();
+    fs::write(temp.path().join("private"), b"private").unwrap();
+    symlink("../private", temp.path().join("root/unreadable")).unwrap();
+    fs::set_permissions(temp.path().join("private"), fs::Permissions::from_mode(0o0)).unwrap();
+    let source = Local::new(vec![
+        (NodeId(1), temp.path().join("private")),
+        (NodeId(2), temp.path().join("root")),
+    ])
+    .unwrap();
+    assert_eq!(source.roots().len(), 1);
+    let page = source.list(NodeId(2), None).unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].name, "good");
+    fs::set_permissions(temp.path().join("private"), fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn batch_link_chains_preserve_current_indirection() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("Framework");
+    fs::create_dir_all(root.join("Versions/A/Resources")).unwrap();
+    symlink("A", root.join("Versions/Current")).unwrap();
+    symlink("Versions/Current/Resources", root.join("Resources")).unwrap();
+    symlink("Versions/Current", root.join("Alias")).unwrap();
+    let source = Local::new(vec![(NodeId(1), root)]).unwrap();
+    let page = source.list(NodeId(1), None).unwrap();
+    assert_eq!(
+        page.entries.iter().find(|node| node.name == "Alias").unwrap().kind,
+        NodeKind::Symlink("Versions/Current".into())
+    );
+    assert_eq!(
+        page.entries.iter().find(|node| node.name == "Resources").unwrap().kind,
+        NodeKind::Symlink("Versions/Current/Resources".into())
+    );
 }

@@ -14,6 +14,7 @@ pub struct Registry(
     Mutex<HashMap<(OfferId, DeviceId), ClipboardObligation>>,
     Mutex<HashMap<DeliveryId, ClipboardReceipt>>,
     Arc<Mutex<std::collections::VecDeque<RetainedFile>>>,
+    Option<grants::SourceGrants>,
 );
 
 const RETAINED_FILES: usize = 1024;
@@ -58,9 +59,12 @@ struct ClipboardObligation {
     activity: Arc<Mutex<Activity>>,
 }
 struct Source {
+    grants: Option<grants::SourceGrants>,
+    offer: OfferId,
     provider: Arc<dyn Provider>,
     valid: AtomicBool,
     activity: Mutex<Activity>,
+    clipboard_source: std::sync::OnceLock<Arc<dyn namespace::Namespace>>,
 }
 struct Activity {
     started: bool,
@@ -68,7 +72,19 @@ struct Activity {
     // High-water marks stop retries of the same data extending the obligation.
     progress: HashMap<(u8, u64), u64>,
 }
+impl Drop for Source {
+    fn drop(&mut self) {
+        self.discard_pending();
+    }
+}
 impl Source {
+    fn discard_pending(&self) {
+        if let Some(grants) = &self.grants
+            && grants.discard_pending(self.offer).is_err()
+        {
+            tracing::warn!("provisional source grant removal could not be persisted");
+        }
+    }
     fn progress(&self, kind: u8, id: u64, through: u64) {
         let mut activity = self.activity.lock().unwrap();
         let previous = activity.progress.entry((kind, id)).or_default();
@@ -111,8 +127,19 @@ impl Clone for SourceLease {
     }
 }
 impl SourceLease {
+    #[cfg(debug_assertions)]
+    pub fn watchdog_snapshot_for_test(&self) -> String {
+        format!(
+            "valid={} source_refs={} activity={:?}",
+            self.0.valid.load(Ordering::Acquire),
+            Arc::strong_count(&self.0),
+            self.0.activity.try_lock().map(|a| (a.started, a.progress.len()))
+        )
+    }
+
     pub fn cancel(&self) {
         self.0.valid.store(false, Ordering::Release);
+        self.0.discard_pending();
         self.0.provider.cancel();
     }
     pub fn inventory(&self) -> Inventory {
@@ -120,6 +147,37 @@ impl SourceLease {
     }
 }
 impl Registry {
+    #[cfg(debug_assertions)]
+    pub fn watchdog_snapshot_for_test(&self) -> String {
+        // Never upgrade a weak source here. Dropping its last strong reference
+        // would run source retirement, including disk I/O, on the watchdog.
+        let sources = self.0.try_lock().map(|sources| {
+            sources
+                .iter()
+                .map(|(offer, source)| (*offer, source.strong_count()))
+                .collect::<Vec<_>>()
+        });
+        format!(
+            "source_registry leases={sources:?} obligations={:?} receipts={:?}\n{}",
+            self.1.try_lock().map(|v| v.len()),
+            self.2.try_lock().map(|v| v.len()),
+            self.4
+                .as_ref()
+                .map_or_else(|| "grants=none".into(), |grants| grants.watchdog_snapshot_for_test())
+        )
+    }
+
+    /// Clipboard and drag registries share one durable, roster-bound authority.
+    pub fn with_source_grants(grants: grants::SourceGrants) -> Self {
+        Self(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Some(grants),
+        )
+    }
+
     fn begin_clipboard(self: &Arc<Self>, peer: DeviceId, delivery: DeliveryId) -> io::Result<()> {
         if delivery.receiver != peer {
             return Err(unavailable(Unavailable::Permission));
@@ -240,6 +298,7 @@ impl Registry {
     pub fn cancel_all(&self) {
         for source in self.0.lock().unwrap().values().filter_map(Weak::upgrade) {
             source.valid.store(false, Ordering::Release);
+            source.discard_pending();
             source.provider.cancel();
         }
         self.1.lock().unwrap().clear();
@@ -258,8 +317,11 @@ impl Registry {
             ));
         }
         let source = Arc::new(Source {
+            grants: self.4.clone(),
+            offer: inventory.id,
             provider,
             valid: AtomicBool::new(true),
+            clipboard_source: std::sync::OnceLock::new(),
             activity: Mutex::new(Activity {
                 started: false,
                 last: tokio::time::Instant::now(),
@@ -275,7 +337,26 @@ impl Registry {
     /// the current clipboard owner cannot revoke these paths; explicit policy
     /// cancellation still clears them and cancels admitted readers.
     pub fn register_clipboard(&self, provider: Arc<dyn Provider>) -> io::Result<SourceLease> {
+        let files = provider.namespace();
+        let key = files.as_ref().map(|files| files.clipboard_key()).transpose()?.flatten();
+        self.register_clipboard_identified(provider, key, files)
+    }
+    /// The capture worker supplies native metadata before sharing-policy
+    /// filtering. The retained source is only an identity probe, never a route
+    /// around the provider's policy checks for content reads.
+    pub fn register_clipboard_identified(
+        &self,
+        provider: Arc<dyn Provider>,
+        key: Option<[u8; 32]>,
+        identity_source: Option<Arc<dyn namespace::Namespace>>,
+    ) -> io::Result<SourceLease> {
         let lease = self.register(provider)?;
+        if let Some(files) = identity_source {
+            let _ = lease.0.clipboard_source.set(files);
+        }
+        if let Some(grants) = &self.4 {
+            grants.observe_clipboard(Some((lease.0.offer, key)))?;
+        }
         if let Some(files) = lease.0.provider.namespace() {
             files.retain_files(FileRetention {
                 table: Arc::downgrade(&self.3),
@@ -283,6 +364,26 @@ impl Registry {
             });
         }
         Ok(lease)
+    }
+
+    pub fn check_clipboard(&self, backend: &dyn crate::ClipboardBackend) -> io::Result<()> {
+        if let Some(grants) = &self.4 {
+            // Do not acquire registry -> grants in the opposite order from
+            // cancel_all/discard_pending while probing the durable state.
+            let sources = self.0.lock().unwrap().clone();
+            grants.check_clipboard_with(|offer| {
+                let source = sources.get(&offer).and_then(Weak::upgrade);
+                if let Some(files) = source.and_then(|source| source.clipboard_source.get().cloned()) {
+                    match files.clipboard_key() {
+                        Ok(Some(key)) => return Ok((key, true)),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Err(error),
+                        _ => {}
+                    }
+                }
+                backend.clipboard_key().map(|key| (key, false))
+            })?;
+        }
+        Ok(())
     }
 
     /// Network endpoints check the authenticated receiver's reconstruction
@@ -306,6 +407,42 @@ impl Registry {
         .await
     }
 
+    /// Legacy peers may still request ordinary representations, but cannot use
+    /// old namespace operations or promise controls to bypass the cloud contract.
+    pub fn non_file_request(&self, request: &ContentMsg) -> bool {
+        let ContentMsg::ReadRepresentation {
+            offer, representation, ..
+        } = request
+        else {
+            return false;
+        };
+        self.0
+            .lock()
+            .unwrap()
+            .get(offer)
+            .and_then(Weak::upgrade)
+            .is_some_and(|source| {
+                super::find(&source.provider.inventory(), *representation).is_some_and(|rep| {
+                    !matches!(rep.data, RepresentationData::File(_) | RepresentationData::Promise(..))
+                })
+            })
+    }
+    /// Local source policy, selected using the authenticated requesting device.
+    pub fn set_peer_file_filter(&self, peer: DeviceId, omit_ds_store: bool) {
+        if let Some(grants) = &self.4 {
+            grants.set_peer_file_filter(peer, omit_ds_store);
+        }
+    }
+    pub fn set_peer_safe_symlinks(&self, peer: DeviceId, enabled: bool) {
+        if let Some(grants) = &self.4 {
+            grants.set_peer_safe_symlinks(peer, enabled);
+        }
+    }
+    pub fn set_peer_exec_bits(&self, peer: DeviceId, enabled: bool) {
+        if let Some(grants) = &self.4 {
+            grants.set_peer_exec_bits(peer, enabled);
+        }
+    }
     pub async fn serve_negotiated_traced(
         self: &Arc<Self>,
         peer: DeviceId,
@@ -315,6 +452,12 @@ impl Registry {
         target_profile: &oink_protocol::v1::dto::FormatSupport,
         diagnostic: oink_foundation::drag_trace::Context,
     ) -> io::Result<()> {
+        if request.persistent_request() {
+            if !crate::negotiation::namespace_supported(source_profile, target_profile) {
+                return Err(unavailable(Unavailable::Unsupported));
+            }
+            return self.serve_traced(peer, request, channel, diagnostic).await;
+        }
         let Some((offer, _)) = request.request() else {
             return Err(unavailable(Unavailable::InvalidData));
         };
@@ -374,6 +517,85 @@ impl Registry {
         channel: &mut dyn BulkChannel,
         diagnostic: oink_foundation::drag_trace::Context,
     ) -> io::Result<()> {
+        if let ContentMsg::CloudLinkRequest { offer, roots, demand } = request {
+            let source = self.0.lock().unwrap().get(&offer).and_then(Weak::upgrade);
+            let grants = self.4.clone();
+            let validity = channel.effect_validity();
+            let result = tokio::task::spawn_blocking(move || {
+                if matches!(demand, Demand::Hover(holder) | Demand::Drop(holder) if holder.device != peer) {
+                    return Err(unavailable(Unavailable::Permission));
+                }
+                let source = source
+                    .filter(|source| source.valid.load(Ordering::Acquire))
+                    .ok_or_else(|| unavailable(Unavailable::Superseded))?;
+                let grants = grants.ok_or_else(|| unavailable(Unavailable::Unsupported))?;
+                if !validity() {
+                    return Err(unavailable(Unavailable::Cancelled));
+                }
+                let files = source
+                    .provider
+                    .namespace()
+                    .ok_or_else(|| unavailable(Unavailable::NoSuchItem))?;
+                let token = grants.issue_for(peer, Some(offer), files.as_ref(), &roots, demand)?;
+                if !source.valid.load(Ordering::Acquire) || !validity() {
+                    if !source.valid.load(Ordering::Acquire) {
+                        source.discard_pending();
+                    } else {
+                        // This preparation left its host; the native source is
+                        // still live and may cross to another holder next.
+                        grants.abandon(peer, token)?;
+                    }
+                    return Err(unavailable(Unavailable::Cancelled));
+                }
+                let files = grants.open(peer, token)?;
+                let roots = files.roots();
+                let native = files.native_file_metadata();
+                let fulfilled = grants.fulfilled_roots(peer, token)?;
+                Ok((token, roots, fulfilled, native))
+            })
+            .await
+            .map_err(|_| unavailable(Unavailable::ReadFailed))
+            .and_then(|r| r);
+            let token = result.as_ref().ok().map(|(token, _, _, _)| *token);
+            let symlinks = result
+                .as_ref()
+                .ok()
+                .map(|(_, roots, _, _)| {
+                    roots
+                        .iter()
+                        .filter(|root| root.kind.symlink_target().is_some())
+                        .map(|root| root.id)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let response = match result {
+                Ok((token, roots, fulfilled, native)) => ContentMsg::CloudLinkOffer {
+                    native,
+                    offer,
+                    token,
+                    roots,
+                    fulfilled,
+                },
+                Err(error) => {
+                    let reason = reason(&error);
+                    tracing::warn!(target: "oink_file_diagnostics", file_stage = 42_u8,
+                            file_offer = offer.clip.seq, file_generation = offer.generation,
+                            file_reason = ?reason, "source file namespace rejected");
+                    ContentMsg::CloudLinkUnavailable { offer, reason }
+                }
+            };
+            let result = send(channel, response).await;
+            if let (Some(grants), Some(token)) = (&self.4, token) {
+                if result.is_err() {
+                    let _ = grants.abandon(peer, token);
+                } else if !matches!(demand, Demand::Hover(_)) {
+                    for node in symlinks {
+                        grants.sent(peer, token, node)?;
+                    }
+                }
+            }
+            return result;
+        }
         if let ContentMsg::BeginDelivery { delivery, demand } = request {
             let offer = delivery.offer;
             if delivery.receiver != peer {
@@ -450,7 +672,7 @@ impl Registry {
         let queued =
             oink_foundation::drag_trace::Trace::new(oink_foundation::drag_trace::stage::SOURCE_OPEN, diagnostic);
         let open_context = queued.context();
-        let reader = tokio::task::spawn_blocking(move || {
+        let reader = representation_work(channel, move || {
             let opened = oink_foundation::drag_trace::Trace::new(
                 oink_foundation::drag_trace::stage::SOURCE_OPEN,
                 oink_foundation::drag_trace::Context { aux: 1, ..open_context },
@@ -466,8 +688,7 @@ impl Registry {
             opened.io(&result);
             result
         })
-        .await
-        .map_err(|_| unavailable(Unavailable::ReadFailed))?;
+        .await?;
         queued.io(&reader);
         drop(queued);
         let mut reader = match reader {
@@ -486,7 +707,6 @@ impl Registry {
         };
         let validity = channel.effect_validity();
         let mut offset = 0;
-        let mut hash = blake3::Hasher::new();
         loop {
             if !source.valid.load(Ordering::Acquire) || !validity() {
                 return send(
@@ -500,7 +720,7 @@ impl Registry {
                 .await;
             }
             let remaining = REPRESENTATION_BYTES - offset;
-            let (returned, read) = tokio::task::spawn_blocking(move || {
+            let (returned, read) = representation_work(channel, move || {
                 let reading = oink_foundation::drag_trace::Trace::new(
                     oink_foundation::drag_trace::stage::SOURCE_READ,
                     diagnostic,
@@ -513,8 +733,7 @@ impl Registry {
                 reading.io(&result);
                 (reader, result)
             })
-            .await
-            .map_err(|_| unavailable(Unavailable::ReadFailed))?;
+            .await?;
             reader = returned;
             // Reading can block in a native provider. A permission change during
             // that call must win before its finished bytes enter the transport.
@@ -562,12 +781,10 @@ impl Registry {
                         offer,
                         representation,
                         size: offset,
-                        hash: *hash.finalize().as_bytes(),
                     },
                 )
                 .await;
             }
-            hash.update(&bytes);
             let length = bytes.len() as u64;
             send(
                 channel,
@@ -582,6 +799,28 @@ impl Registry {
             offset += length;
             self.progress(peer, offer, &source, 0, representation.0 as u64, offset);
         }
+    }
+}
+// Representation consumers send no further frames until completion. Observe
+// their stream closing while a native source call runs, so a timed-out paste
+// releases its serving operation immediately. An already executing OS call
+// cannot be forcibly stopped; its eventual result is discarded with the task.
+// File Provider / Cloud Files operations do not use this callback bound.
+async fn representation_work<T: Send + 'static>(
+    channel: &mut dyn BulkChannel,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> io::Result<T> {
+    let mut work = tokio::task::spawn_blocking(work);
+    tokio::select! {
+        result = &mut work => result.map_err(|_| unavailable(Unavailable::ReadFailed)),
+        closed = channel.recv() => {
+            work.abort(); // Also prevents a queued native call from starting.
+            match closed {
+                Ok(Some(_)) => Err(unavailable(Unavailable::InvalidData)),
+                Ok(None) => Err(unavailable(Unavailable::Cancelled)),
+                Err(error) => Err(error),
+            }
+        },
     }
 }
 async fn send(channel: &mut dyn BulkChannel, message: ContentMsg) -> io::Result<()> {
@@ -614,6 +853,30 @@ async fn send(channel: &mut dyn BulkChannel, message: ContentMsg) -> io::Result<
     result
 }
 
+struct OneShotSend {
+    grants: Option<super::grants::SourceGrants>,
+    peer: DeviceId,
+    token: Option<super::grants::LinkToken>,
+    successful: bool,
+}
+impl OneShotSend {
+    fn finish(&mut self, node: Option<crate::model::NodeId>) -> io::Result<()> {
+        self.successful = true;
+        if let (Some(grants), Some(token), Some(node)) = (&self.grants, self.token, node) {
+            grants.sent(self.peer, token, node)?;
+        }
+        Ok(())
+    }
+}
+impl Drop for OneShotSend {
+    fn drop(&mut self) {
+        if !self.successful
+            && let (Some(grants), Some(token)) = (&self.grants, self.token)
+        {
+            let _ = grants.abandon(self.peer, token);
+        }
+    }
+}
 impl Registry {
     async fn serve_namespace(
         &self,
@@ -622,6 +885,43 @@ impl Registry {
         channel: &mut dyn BulkChannel,
     ) -> io::Result<()> {
         use crate::model::Demand;
+        let persistent = match &request {
+            ContentMsg::CloudLinkList { token, .. }
+            | ContentMsg::CloudLinkSelect { token, .. }
+            | ContentMsg::CloudLinkRead { token, .. } => Some(*token),
+            _ => None,
+        };
+        // A channel is the temporary read context. It never survives a current
+        // link's revocation; a later channel must authenticate and open again.
+        let request = match request {
+            ContentMsg::CloudLinkList {
+                offer, node, cursor, ..
+            } => ContentMsg::ListDirectory {
+                offer,
+                node,
+                cursor,
+                demand: Demand::Clipboard,
+            },
+            ContentMsg::CloudLinkSelect { offer, node, .. } => ContentMsg::SelectFile {
+                offer,
+                node,
+                demand: Demand::Clipboard,
+            },
+            ContentMsg::CloudLinkRead {
+                offer,
+                node,
+                version,
+                offset,
+                ..
+            } => ContentMsg::ReadFile {
+                offer,
+                node,
+                version,
+                offset,
+                demand: Demand::Clipboard,
+            },
+            request => request,
+        };
         let (offer, _) = request.request().ok_or_else(|| unavailable(Unavailable::InvalidData))?;
         let node = match request {
             ContentMsg::ListDirectory { node, .. }
@@ -637,51 +937,101 @@ impl Registry {
                 ContentMsg::FileFailed { offer, node, reason }
             }
         };
-        let source = self.0.lock().unwrap().get(&offer).and_then(Weak::upgrade);
-        let Some(source) = source else {
-            let missing = if matches!(request.request(), Some((_, Demand::Clipboard))) {
-                Unavailable::NoSuchItem
-            } else {
-                Unavailable::Superseded
+        let (source, files) = if let Some(token) = persistent {
+            let result = self
+                .4
+                .as_ref()
+                .ok_or_else(|| unavailable(Unavailable::Unsupported))
+                .and_then(|grants| grants.open(peer, token));
+            match result {
+                Ok(files) => (None, files),
+                Err(error) => return send(channel, failure(reason(&error))).await,
+            }
+        } else {
+            let source = self.0.lock().unwrap().get(&offer).and_then(Weak::upgrade);
+            let Some(source) = source else {
+                let missing = if matches!(request.request(), Some((_, Demand::Clipboard))) {
+                    Unavailable::NoSuchItem
+                } else {
+                    Unavailable::Superseded
+                };
+                return send(channel, failure(missing)).await;
             };
-            return send(channel, failure(missing)).await;
+            if !source.valid.load(Ordering::Acquire) {
+                return send(channel, failure(Unavailable::Superseded)).await;
+            }
+            if matches!(request.request(), Some((_, Demand::Hover(_))))
+                && source
+                    .provider
+                    .inventory()
+                    .items
+                    .iter()
+                    .flat_map(|item| &item.representations)
+                    .any(|rep| matches!(rep.data, RepresentationData::Promise(id, _) if id == node))
+            {
+                return send(channel, failure(Unavailable::Permission)).await;
+            }
+            let Some(files) = source.provider.namespace() else {
+                return send(channel, failure(Unavailable::NoSuchItem)).await;
+            };
+            (Some(source), files)
         };
-        if !source.valid.load(Ordering::Acquire) {
-            return send(channel, failure(Unavailable::Superseded)).await;
-        }
-        if matches!(request.request(), Some((_, Demand::Hover(_))))
-            && source
-                .provider
-                .inventory()
-                .items
-                .iter()
-                .flat_map(|item| &item.representations)
-                .any(|rep| matches!(rep.data, RepresentationData::Promise(id, _) if id == node))
-        {
-            return send(channel, failure(Unavailable::Permission)).await;
-        }
-        let Some(files) = source.provider.namespace() else {
-            return send(channel, failure(Unavailable::NoSuchItem)).await;
+        let active = || {
+            source
+                .as_ref()
+                .is_none_or(|source| source.valid.load(Ordering::Acquire))
+        };
+        let progress = |kind, id, through| {
+            if let Some(source) = &source {
+                self.progress(peer, offer, source, kind, id, through);
+            }
         };
         let validity = channel.effect_validity();
+        let mut one_shot = OneShotSend {
+            grants: self.4.clone(),
+            peer,
+            token: persistent,
+            successful: false,
+        };
         match request {
             ContentMsg::ListDirectory { cursor, .. } => {
-                let mut work = tokio::task::spawn_blocking(move || files.list(node, cursor));
+                let grants = persistent.is_none().then(|| self.4.clone()).flatten();
+                let strip_exec = persistent.is_none() && self.4.is_none();
+                let mut work = tokio::task::spawn_blocking(move || match grants {
+                    Some(grants) => grants.list_for_peer(peer, files.as_ref(), node, cursor),
+                    None => files.list(node, cursor).map(|mut page| {
+                        // Without a grant store there is no per-peer execution
+                        // authority. Keep the ordinary transient file behavior.
+                        if strip_exec {
+                            for entry in &mut page.entries {
+                                entry.exec_bits = None;
+                            }
+                        }
+                        page
+                    }),
+                });
                 loop {
-                    if !source.valid.load(Ordering::Acquire) || !validity() {
+                    if !active() || !validity() {
                         return send(channel, failure(Unavailable::Cancelled)).await;
                     }
                     tokio::select! {
                         result = &mut work => {
                             let response = match result.map_err(|_| unavailable(Unavailable::ReadFailed)).and_then(|r| r) {
-                                Ok(page) if source.valid.load(Ordering::Acquire) && validity() => {
-                                    self.progress(peer, offer, &source, 1, node.0, cursor.map_or(0, |c| c.offset) as u64 + page.entries.len() as u64 + 1);
+                                Ok(page) if active() && validity() => {
+                                    progress(1, node.0, cursor.map_or(0, |c| c.offset) as u64 + page.entries.len() as u64 + 1);
                                     ContentMsg::Directory { offer, page }
                                 },
                                 Ok(_) => failure(Unavailable::Cancelled),
                                 Err(error) => failure(reason(&error)),
                             };
-                            return send(channel, response).await;
+                            let completed = match &response {
+                                ContentMsg::Directory { page, .. } if page.next.is_none() => Some(node),
+                                _ => None,
+                            };
+                            let successful = matches!(response, ContentMsg::Directory { .. });
+                            send(channel, response).await?;
+                            if successful { one_shot.finish(completed)?; }
+                            return Ok(());
                         },
                         // A bounded preparing response is not a completed empty
                         // page and does not reset the target's no-progress timer.
@@ -701,8 +1051,13 @@ impl Registry {
                     .map_err(|_| unavailable(Unavailable::ReadFailed))
                     .and_then(|r| r);
                 let response = match result {
-                    Ok(entry) if source.valid.load(Ordering::Acquire) && validity() => {
-                        self.progress(peer, offer, &source, 3, node.0, 1);
+                    Ok(mut entry) if active() && validity() => {
+                        if let Some(grants) = &self.4 {
+                            entry = grants.project_for_peer(peer, entry);
+                        } else {
+                            entry.exec_bits = None;
+                        }
+                        progress(3, node.0, 1);
                         if latest {
                             ContentMsg::FileVersion { offer, entry }
                         } else {
@@ -712,12 +1067,19 @@ impl Registry {
                     Ok(_) => failure(Unavailable::Cancelled),
                     Err(error) => failure(reason(&error)),
                 };
-                send(channel, response).await
+                let successful = matches!(
+                    response,
+                    ContentMsg::FileSelected { .. } | ContentMsg::FileVersion { .. }
+                );
+                send(channel, response).await?;
+                if successful {
+                    one_shot.finish(None)?;
+                }
+                Ok(())
             }
             ContentMsg::ReadFile {
                 version,
                 offset,
-                check,
                 demand,
                 ..
             } => {
@@ -735,16 +1097,8 @@ impl Registry {
                     {
                         return Err(unavailable(Unavailable::Superseded));
                     }
-                    if offset > 0 {
-                        let start = (offset - 1) / FILE_BLOCK * FILE_BLOCK;
-                        let mut last = vec![0; (offset - start) as usize];
-                        files.open(node, version, start)?.read_exact(&mut last)?;
-                        if check != Some(*blake3::hash(&last).as_bytes()) {
-                            return Err(unavailable(Unavailable::Superseded));
-                        }
-                    } else if check.is_some() {
-                        return Err(unavailable(Unavailable::InvalidData));
-                    }
+                    // User decision (2026-10-29): TLS/QUIC AEAD covers byte integrity;
+                    // the metadata version fingerprint binds resumed reads to this file.
                     Ok((files.open(node, version, offset)?, size))
                 })
                 .await
@@ -756,7 +1110,7 @@ impl Registry {
                 };
                 let mut offset = offset;
                 loop {
-                    if !source.valid.load(Ordering::Acquire) || !validity() {
+                    if !active() || !validity() {
                         return send(channel, failure(Unavailable::Cancelled)).await;
                     }
                     let left = size - offset;
@@ -777,13 +1131,16 @@ impl Registry {
                     .await
                     .map_err(|_| unavailable(Unavailable::ReadFailed))?;
                     reader = returned;
-                    if !source.valid.load(Ordering::Acquire) || !validity() {
+                    if !active() || !validity() {
                         return send(channel, failure(Unavailable::Cancelled)).await;
                     }
 
                     match read {
                         Ok(bytes) if bytes.is_empty() => {
-                            return send(
+                            // Close the source handle before deleting its cache
+                            // (Windows does not permit unlinking an open file).
+                            drop(reader);
+                            send(
                                 channel,
                                 ContentMsg::FileEnd {
                                     offer,
@@ -792,7 +1149,9 @@ impl Registry {
                                     size,
                                 },
                             )
-                            .await;
+                            .await?;
+                            one_shot.finish(Some(node))?;
+                            return Ok(());
                         }
                         Ok(bytes) => {
                             let length = bytes.len() as u64;
@@ -803,13 +1162,12 @@ impl Registry {
                                     node,
                                     version,
                                     offset,
-                                    hash: *blake3::hash(&bytes).as_bytes(),
                                     bytes,
                                 },
                             )
                             .await?;
                             offset += length;
-                            self.progress(peer, offer, &source, 2, node.0, offset);
+                            progress(2, node.0, offset);
                         }
                         Err(error) => return send(channel, failure(reason(&error))).await,
                     }
@@ -1006,5 +1364,561 @@ mod retained_tests {
         registry.cancel_all();
         assert!(files.select(NodeId(1)).is_err());
         assert!(registry.3.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod persistent_tests {
+    use super::*;
+    use crate::model::NodeId;
+    use crate::sync::files::BoxFuture;
+    const PEER: DeviceId = DeviceId([2; 32]);
+    const MEMBERS: [(DeviceId, [u8; 32]); 1] = [(PEER, [9; 32])];
+    #[derive(Default)]
+    struct Replies {
+        messages: Vec<ContentMsg>,
+        revoke_after_block: Option<grants::SourceGrants>,
+        fail_end: bool,
+        validity: Option<Arc<AtomicBool>>,
+    }
+    impl BulkChannel for Replies {
+        fn effect_validity(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+            let validity = self.validity.clone();
+            Arc::new(move || {
+                validity
+                    .as_ref()
+                    .is_none_or(|validity| validity.load(Ordering::Acquire))
+            })
+        }
+        fn send<'a>(&'a mut self, message: &'a ContentMsg) -> BoxFuture<'a, io::Result<()>> {
+            Box::pin(async move {
+                self.messages.push(message.clone());
+                if self.fail_end && matches!(message, ContentMsg::FileEnd { .. }) {
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+                if matches!(message, ContentMsg::FileBlock { .. })
+                    && let Some(grants) = self.revoke_after_block.take()
+                {
+                    grants.reconcile_members([])?;
+                }
+                Ok(())
+            })
+        }
+        fn recv(&mut self) -> BoxFuture<'_, io::Result<Option<ContentMsg>>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn finish(&mut self) {}
+    }
+    #[tokio::test]
+    async fn revoked_preparation_reply_preserves_the_live_one_shot_source_for_next_holder() {
+        struct OneShot {
+            files: Arc<namespace::Local>,
+            request: Arc<AtomicBool>,
+            released: AtomicBool,
+        }
+        impl namespace::Namespace for OneShot {
+            fn one_shot_roots(&self) -> Vec<NodeId> {
+                vec![NodeId(1)]
+            }
+            fn roots(&self) -> Vec<crate::model::FileNode> {
+                self.files.roots()
+            }
+            fn list(
+                &self,
+                id: NodeId,
+                cursor: Option<crate::model::DirectoryCursor>,
+            ) -> io::Result<crate::model::DirectoryPage> {
+                self.files.list(id, cursor)
+            }
+            fn select(&self, id: NodeId) -> io::Result<crate::model::FileNode> {
+                self.files.select(id)
+            }
+            fn open(&self, id: NodeId, version: u64, offset: u64) -> io::Result<FileReader> {
+                self.files.open(id, version, offset)
+            }
+            fn release_fulfilled(&self, roots: &[NodeId]) {
+                self.files.release_fulfilled(roots);
+                if !self.released.swap(true, Ordering::AcqRel) {
+                    // Revoke exactly after adoption, before the preparation
+                    // worker can publish its reply. The source remains live.
+                    self.request.store(false, Ordering::Release);
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.png");
+        std::fs::write(&path, b"image").unwrap();
+        let grants = grants::SourceGrants::load(dir.path(), MEMBERS).unwrap();
+        let registry = Arc::new(Registry::with_source_grants(grants));
+        let valid = Arc::new(AtomicBool::new(true));
+        let files = Arc::new(OneShot {
+            files: namespace::Local::new(vec![(NodeId(1), path)]).unwrap(),
+            request: valid.clone(),
+            released: AtomicBool::new(false),
+        });
+        let provider = with_files(Arc::new(super::super::tests::fixture()), files);
+        let offer = provider.inventory().id;
+        let lease = registry.register(provider).unwrap();
+        let mut replies = Replies {
+            validity: Some(valid.clone()),
+            ..Default::default()
+        };
+        registry
+            .serve(
+                PEER,
+                ContentMsg::CloudLinkRequest {
+                    offer,
+                    roots: vec![NodeId(1)],
+                    demand: Demand::Hover(oink_foundation::content::Holder { device: PEER, epoch: 1 }),
+                },
+                &mut replies,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            replies.messages.pop(),
+            Some(ContentMsg::CloudLinkUnavailable {
+                reason: Unavailable::Cancelled,
+                ..
+            })
+        ));
+        valid.store(true, Ordering::Release);
+        registry
+            .serve(
+                PEER,
+                ContentMsg::CloudLinkRequest {
+                    offer,
+                    roots: vec![NodeId(1)],
+                    demand: Demand::Hover(oink_foundation::content::Holder { device: PEER, epoch: 2 }),
+                },
+                &mut replies,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            replies.messages.pop(),
+            Some(ContentMsg::CloudLinkOffer { .. })
+        ));
+        lease.cancel();
+    }
+    #[tokio::test]
+    async fn one_shot_transport_completion_and_failure_release_without_receiver_ack() {
+        struct OneShot(Arc<namespace::Local>);
+        impl namespace::Namespace for OneShot {
+            fn one_shot_roots(&self) -> Vec<NodeId> {
+                vec![NodeId(1)]
+            }
+            fn roots(&self) -> Vec<crate::model::FileNode> {
+                self.0.roots()
+            }
+            fn list(
+                &self,
+                id: NodeId,
+                cursor: Option<crate::model::DirectoryCursor>,
+            ) -> io::Result<crate::model::DirectoryPage> {
+                self.0.list(id, cursor)
+            }
+            fn select(&self, id: NodeId) -> io::Result<crate::model::FileNode> {
+                self.0.select(id)
+            }
+            fn open(&self, id: NodeId, version: u64, offset: u64) -> io::Result<FileReader> {
+                self.0.open(id, version, offset)
+            }
+        }
+        for fail_end in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source");
+            std::fs::write(&path, b"body").unwrap();
+            let links = dir.path().join("links");
+            let grants = grants::SourceGrants::load(&links, MEMBERS).unwrap();
+            let token = grants
+                .issue(
+                    PEER,
+                    &OneShot(namespace::Local::new(vec![(NodeId(1), path.clone())]).unwrap()),
+                    &[NodeId(1)],
+                )
+                .unwrap();
+            let entry = grants.open(PEER, token).unwrap().select(NodeId(1)).unwrap();
+            let registry = Arc::new(Registry::with_source_grants(grants.clone()));
+            let offer = super::super::tests::fixture().inventory().id;
+            let mut replies = Replies {
+                fail_end,
+                ..Default::default()
+            };
+            let result = registry
+                .serve(
+                    PEER,
+                    ContentMsg::CloudLinkRead {
+                        offer,
+                        token,
+                        node: NodeId(1),
+                        version: entry.version,
+                        offset: 0,
+                    },
+                    &mut replies,
+                )
+                .await;
+            assert_eq!(result.is_err(), fail_end);
+            assert!(
+                replies
+                    .messages
+                    .iter()
+                    .any(|message| matches!(message, ContentMsg::FileEnd { .. }))
+            );
+            assert!(
+                std::fs::read_dir(links.join("fulfilled-sources-v1"))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+            assert!(grants.open(PEER, token).unwrap().select(NodeId(1)).is_err());
+            assert_eq!(std::fs::read(path).unwrap(), b"body");
+        }
+    }
+    async fn issue(registry: &Arc<Registry>, path: &Path) -> (OfferId, grants::LinkToken) {
+        let files = namespace::Local::new(vec![(NodeId(1), path.to_owned())]).unwrap();
+        let provider = with_files(Arc::new(super::super::tests::fixture()), files);
+        let offer = provider.inventory().id;
+        let lease = registry.register(provider).unwrap();
+        let mut replies = Replies::default();
+        registry
+            .serve(
+                PEER,
+                ContentMsg::CloudLinkRequest {
+                    offer,
+                    roots: vec![NodeId(1)],
+                    demand: Demand::Clipboard,
+                },
+                &mut replies,
+            )
+            .await
+            .unwrap();
+        let ContentMsg::CloudLinkOffer { token, .. } = replies.messages.pop().unwrap() else {
+            panic!("grant not issued")
+        };
+        registry
+            .serve(
+                PEER,
+                ContentMsg::CloudLinkRequest {
+                    offer,
+                    roots: vec![NodeId(1)],
+                    demand: Demand::Clipboard,
+                },
+                &mut replies,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(replies.messages.pop(), Some(ContentMsg::CloudLinkOffer { token: repeated, .. }) if repeated == token)
+        );
+        // The original native source may disappear immediately after issuance.
+        drop(lease);
+        assert!(registry.0.lock().unwrap()[&offer].upgrade().is_none());
+        (offer, token)
+    }
+
+    #[tokio::test]
+    async fn resumed_reads_rely_on_metadata_version_for_both_request_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        let mut bytes = vec![1; FILE_BLOCK as usize];
+        bytes.extend_from_slice(b"tail");
+        std::fs::write(&path, bytes).unwrap();
+        let grants = grants::SourceGrants::load(&dir.path().join("links"), MEMBERS).unwrap();
+        let registry = Arc::new(Registry::with_source_grants(grants));
+        let (offer, token) = issue(&registry, &path).await;
+        // Keep a live offer too, so both request types can resume the selected
+        // metadata version without rereading or hashing the previous block.
+        let _legacy = registry
+            .register(with_files(
+                Arc::new(super::super::tests::fixture()),
+                namespace::Local::new(vec![(NodeId(1), path.clone())]).unwrap(),
+            ))
+            .unwrap();
+        let mut replies = Replies::default();
+        registry
+            .serve(
+                PEER,
+                ContentMsg::CloudLinkSelect {
+                    offer,
+                    token,
+                    node: NodeId(1),
+                },
+                &mut replies,
+            )
+            .await
+            .unwrap();
+        let ContentMsg::FileSelected { entry, .. } = replies.messages.pop().unwrap() else {
+            panic!("selection")
+        };
+        let version = entry.version;
+        for (legacy, version, allowed) in [
+            (false, version, true),
+            (true, version, true),
+            (false, version + 1, false),
+        ] {
+            let request = if legacy {
+                ContentMsg::ReadFile {
+                    offer,
+                    node: NodeId(1),
+                    version,
+                    offset: FILE_BLOCK,
+                    demand: Demand::Clipboard,
+                }
+            } else {
+                ContentMsg::CloudLinkRead {
+                    offer,
+                    token,
+                    node: NodeId(1),
+                    version,
+                    offset: FILE_BLOCK,
+                }
+            };
+            replies.messages.clear();
+            registry.serve(PEER, request, &mut replies).await.unwrap();
+            if allowed {
+                assert!(matches!(&replies.messages[0], ContentMsg::FileBlock { bytes, .. } if bytes == b"tail"));
+                assert!(matches!(replies.messages[1], ContentMsg::FileEnd { .. }));
+            } else {
+                assert!(matches!(
+                    replies.messages.as_slice(),
+                    [ContentMsg::FileFailed {
+                        reason: Unavailable::Superseded,
+                        ..
+                    }]
+                ));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn persistent_reads_survive_source_registry_restart_and_revalidate_device() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("original");
+        std::fs::write(&file, b"persistent payload").unwrap();
+        let grants = grants::SourceGrants::load(directory.path(), MEMBERS).unwrap();
+        let registry = Arc::new(Registry::with_source_grants(grants));
+        let (offer, token) = issue(&registry, &file).await;
+        drop(registry);
+        std::fs::rename(&file, directory.path().join("renamed")).unwrap();
+        let grants = grants::SourceGrants::load(directory.path(), MEMBERS).unwrap();
+        let registry = Arc::new(Registry::with_source_grants(grants));
+        let mut replies = Replies::default();
+        registry
+            .serve(
+                PEER,
+                ContentMsg::CloudLinkSelect {
+                    offer,
+                    token,
+                    node: NodeId(1),
+                },
+                &mut replies,
+            )
+            .await
+            .unwrap();
+        let ContentMsg::FileSelected { entry, .. } = replies.messages.pop().unwrap() else {
+            panic!("not selected")
+        };
+        let request = ContentMsg::CloudLinkRead {
+            offer,
+            token,
+            node: NodeId(1),
+            version: entry.version,
+            offset: 0,
+        };
+        registry
+            .serve(DeviceId([3; 32]), request.clone(), &mut replies)
+            .await
+            .unwrap();
+        assert!(matches!(
+            replies.messages.pop(),
+            Some(ContentMsg::FileFailed {
+                reason: Unavailable::Permission,
+                ..
+            })
+        ));
+        registry.serve(PEER, request, &mut replies).await.unwrap();
+        assert!(matches!(&replies.messages[0], ContentMsg::FileBlock { bytes, .. } if bytes == b"persistent payload"));
+        assert!(matches!(replies.messages[1], ContentMsg::FileEnd { size: 18, .. }));
+    }
+    #[tokio::test]
+    async fn persistent_stream_stops_after_roster_revocation_and_never_reports_complete() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("large");
+        std::fs::write(&file, vec![42; 2 * FILE_BLOCK as usize]).unwrap();
+        let grants = grants::SourceGrants::load(directory.path(), MEMBERS).unwrap();
+        let registry = Arc::new(Registry::with_source_grants(grants.clone()));
+        let (offer, token) = issue(&registry, &file).await;
+        let entry = grants.open(PEER, token).unwrap().select(NodeId(1)).unwrap();
+        let mut replies = Replies {
+            revoke_after_block: Some(grants),
+            ..Default::default()
+        };
+        registry
+            .serve(
+                PEER,
+                ContentMsg::CloudLinkRead {
+                    offer,
+                    token,
+                    node: entry.id,
+                    version: entry.version,
+                    offset: 0,
+                },
+                &mut replies,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replies.messages.len(), 2);
+        assert!(matches!(replies.messages[0], ContentMsg::FileBlock { .. }));
+        assert!(matches!(
+            replies.messages[1],
+            ContentMsg::FileFailed {
+                reason: Unavailable::Permission,
+                ..
+            }
+        ));
+    }
+    #[tokio::test]
+    async fn provisional_grants_are_revoked_by_cancel_end_and_registry_shutdown() {
+        for action in 0..3 {
+            let directory = tempfile::tempdir().unwrap();
+            let file = directory.path().join("source");
+            std::fs::write(&file, b"payload").unwrap();
+            let grants = grants::SourceGrants::load(directory.path(), MEMBERS).unwrap();
+            let registry = Arc::new(Registry::with_source_grants(grants.clone()));
+            let files = namespace::Local::new(vec![(NodeId(1), file)]).unwrap();
+            let provider = with_files(Arc::new(super::super::tests::fixture()), files);
+            let offer = provider.inventory().id;
+            let lease = registry.register(provider).unwrap();
+            let mut replies = Replies::default();
+            registry
+                .serve(
+                    PEER,
+                    ContentMsg::CloudLinkRequest {
+                        offer,
+                        roots: vec![NodeId(1)],
+                        demand: Demand::Hover(oink_foundation::content::Holder { device: PEER, epoch: 1 }),
+                    },
+                    &mut replies,
+                )
+                .await
+                .unwrap();
+            let ContentMsg::CloudLinkOffer { token, .. } = replies.messages.pop().unwrap() else {
+                panic!("no provisional grant")
+            };
+            let files = grants.open(PEER, token).unwrap();
+            let selected = files.select(NodeId(1)).unwrap();
+            registry
+                .serve(
+                    PEER,
+                    ContentMsg::CloudLinkRead {
+                        offer,
+                        token,
+                        node: NodeId(1),
+                        version: selected.version,
+                        offset: 0,
+                    },
+                    &mut replies,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                replies.messages.last(),
+                Some(ContentMsg::FileFailed {
+                    reason: Unavailable::Permission,
+                    ..
+                })
+            ));
+            match action {
+                0 => lease.cancel(),
+                1 => drop(lease),
+                _ => registry.cancel_all(),
+            }
+            assert!(grants.open(PEER, token).is_err());
+            assert!(files.select(NodeId(1)).is_err());
+        }
+    }
+    #[tokio::test]
+    async fn persistent_grant_reply_can_be_retried_after_source_rename() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("source");
+        std::fs::write(&file, b"payload").unwrap();
+        let grants = grants::SourceGrants::load(directory.path(), MEMBERS).unwrap();
+        let registry = Arc::new(Registry::with_source_grants(grants));
+        let files = namespace::Local::new(vec![(NodeId(1), file.clone())]).unwrap();
+        let provider = with_files(Arc::new(super::super::tests::fixture()), files);
+        let offer = provider.inventory().id;
+        let _lease = registry.register(provider).unwrap();
+        let request = ContentMsg::CloudLinkRequest {
+            offer,
+            roots: vec![NodeId(1)],
+            demand: Demand::Clipboard,
+        };
+        let mut replies = Replies::default();
+        registry.serve(PEER, request.clone(), &mut replies).await.unwrap();
+        let first = replies.messages.pop().unwrap();
+        assert!(matches!(first, ContentMsg::CloudLinkOffer { .. }));
+        std::fs::rename(&file, directory.path().join("renamed")).unwrap();
+        registry.serve(PEER, request, &mut replies).await.unwrap();
+        assert_eq!(replies.messages.pop(), Some(first));
+    }
+    #[tokio::test]
+    async fn persistent_grants_require_live_offer_scope_and_authenticated_holder() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("source");
+        std::fs::write(&file, b"payload").unwrap();
+        let grants = grants::SourceGrants::load(directory.path(), MEMBERS).unwrap();
+        let registry = Arc::new(Registry::with_source_grants(grants));
+        let files = namespace::Local::new(vec![(NodeId(1), file)]).unwrap();
+        let provider = with_files(Arc::new(super::super::tests::fixture()), files);
+        let offer = provider.inventory().id;
+        let lease = registry.register(provider).unwrap();
+        for (roots, demand) in [
+            (vec![NodeId(2)], Demand::Clipboard),
+            (
+                vec![NodeId(1)],
+                Demand::Hover(oink_foundation::content::Holder {
+                    device: DeviceId([3; 32]),
+                    epoch: 1,
+                }),
+            ),
+        ] {
+            let mut replies = Replies::default();
+            registry
+                .serve(
+                    PEER,
+                    ContentMsg::CloudLinkRequest { offer, roots, demand },
+                    &mut replies,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                replies.messages[0],
+                ContentMsg::CloudLinkUnavailable {
+                    reason: Unavailable::Permission,
+                    ..
+                }
+            ));
+        }
+        lease.cancel();
+        let mut replies = Replies::default();
+        registry
+            .serve(
+                PEER,
+                ContentMsg::CloudLinkRequest {
+                    offer,
+                    roots: vec![NodeId(1)],
+                    demand: Demand::Clipboard,
+                },
+                &mut replies,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            replies.messages[0],
+            ContentMsg::CloudLinkUnavailable {
+                reason: Unavailable::Superseded,
+                ..
+            }
+        ));
     }
 }

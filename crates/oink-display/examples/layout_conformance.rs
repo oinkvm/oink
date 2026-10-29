@@ -1,4 +1,4 @@
-//! Executable oracle for the frontend's generated facing-geometry conformance tests.
+//! Executable oracle for regenerating the shared facing-geometry test corpus.
 //! Test-only JSON stdin/stdout; this is not an application wire or persisted format.
 use oink_display::layout::facing;
 use oink_foundation::Rect;

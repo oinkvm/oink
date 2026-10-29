@@ -194,10 +194,27 @@ impl Reconcile {
         }
     }
 
+    fn visibility(&mut self, wanted: bool, transition: bool, query: impl FnOnce() -> bool) -> Option<bool> {
+        if !wanted && !transition {
+            // There is no hide request to repair in ordinary local mode. The
+            // native visibility read can enter WindowServer; do not pay for it
+            // on every idle observation. Preserve session/display diagnostics
+            // and the existing remote-hide reconciliation cadence.
+            self.next = None;
+            self.failures = 0;
+            return None;
+        }
+        Some(query())
+    }
+
     pub(crate) fn check(&mut self, transition: bool, remote: bool) {
         let wanted = hidden() && remote;
-        // SAFETY: argument-free read, outside input callback.
-        let before = unsafe { CGCursorIsVisible() } != 0;
+        let Some(before) = self.visibility(wanted, transition, || {
+            // SAFETY: argument-free read, outside input callback.
+            unsafe { CGCursorIsVisible() != 0 }
+        }) else {
+            return;
+        };
         if self.due(wanted, before, transition, Instant::now()) {
             let ok = renew_hide();
             // CG visibility is a diagnostic heuristic, not proof of the displayed bitmap.
@@ -225,6 +242,19 @@ pub(crate) fn freeze() {
     if !DISSOCIATED.swap(true, Ordering::AcqRel) {
         let _ = CGAssociateMouseAndMouseCursorPosition(false);
     }
+}
+
+pub(crate) fn freeze_checked() -> Result<(), crate::InputError> {
+    hide();
+    let result = CGAssociateMouseAndMouseCursorPosition(false);
+    if result.0 != 0 {
+        return Err(crate::InputError::Platform(format!(
+            "source cursor freeze failed: {}",
+            result.0
+        )));
+    }
+    DISSOCIATED.store(true, Ordering::Release);
+    Ok(())
 }
 
 /// 光标隐藏、解耦时把它放到 `to`：投递一个带注入标记的鼠标移动事件（不是 warp）。系统照常处理这个事件——
@@ -475,6 +505,24 @@ mod reconcile_tests {
         // check also makes the test safely detect the former broken forwarding wrapper.
         let valid = !info.is_null() && !context.is_null() && unsafe { (*info).si_signo == sig };
         SIGNAL_METADATA_OK.store(valid, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn idle_local_reconciliation_never_queries_native_visibility() {
+        let mut reconcile = Reconcile {
+            next: Some(Instant::now()),
+            failures: 3,
+        };
+        for _ in 0..240 {
+            assert_eq!(
+                reconcile.visibility(false, false, || panic!("idle native visibility query")),
+                None
+            );
+        }
+        assert_eq!(reconcile.failures, 0);
+        assert_eq!(reconcile.next, None);
+        assert_eq!(reconcile.visibility(true, false, || true), Some(true));
+        assert_eq!(reconcile.visibility(false, true, || false), Some(false));
     }
 
     #[test]

@@ -90,6 +90,10 @@ arrayvec 0.7.8 (MIT)
 Full terms: licenses/texts/4da95ec4ecb65b738d470b7d762894ad9c97da93e6cbfb18b570fc2c96f4b871.txt
 Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
 
+async-trait 0.1.92 (MIT)
+Full terms: licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt
+Full terms: licenses/texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt
+
 atomic-waker 1.1.2 (MIT)
 Copyright (c) 2016 Alex Crichton
 Copyright (c) 2017 The Tokio Authors
@@ -158,6 +162,10 @@ Full terms: licenses/texts/d5c22aa3118d240e877ad41c5d9fa232f9c77d757d4aac0c2f943
 block2 0.6.2 (MIT)
 Full terms: licenses/texts/b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5.txt
 
+breakpad-symbols 0.26.1 (MIT)
+Copyright (c) 2015-2023 rust-minidump contributors
+Full terms: licenses/texts/06de63df29199a394442b57a28e886059ddc940973e10646877a0793fd53e2c9.txt
+
 brotli-decompressor 6.0.1 (MIT)
 Copyright (c) 2016 Dropbox, Inc.
 Full terms: licenses/texts/b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5.txt
@@ -199,6 +207,10 @@ cab 0.6.0 (MIT)
 Copyright (c) 2017 Matthew D. Steele
 Full terms: licenses/texts/ebaac853b53fec0ed475796f533ce676912a4df9ad9d8a621fa76d5060591e10.txt
 
+cachemap2 0.3.0 (MIT)
+Copyright (c) 2021 hclarke
+Full terms: licenses/texts/b5b44ae2ab9e1ef50d9aeba9686c5cf3ec666b402420cb3abf98caf996755d6e.txt
+
 camino 1.2.6 (MIT)
 Full terms: licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt
 Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
@@ -237,6 +249,10 @@ chacha20 0.10.2 (MIT)
 Copyright (c) 2019-2026 The RustCrypto Project Developers
 Full terms: licenses/texts/a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5.txt
 Full terms: licenses/texts/b8c6939380a400f53e11923d50fcc4dd2fa1ba8339fd9d04cda38a0251b6c9b0.txt
+
+circular 0.3.0 (MIT)
+Copyright (c) 2017 Geoffroy Couprie
+Full terms: licenses/texts/cef6497a64266f9c392ee9134aceb82739dadd176422fead980102109bf46d10.txt
 
 clap 4.6.7 (MIT)
 Full terms: licenses/texts/249fdb6694467dd615b259f7ddde07be3f8ae5a72cecebb0e24f6629af4215fe.txt
@@ -306,6 +322,11 @@ Copyright (c) 2012-2013 Mozilla Foundation
 Full terms: licenses/texts/62065228e42caebca7e7d7db1204cbb867033de5982ca4009928915e4095f3a3.txt
 Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
 Full terms: licenses/texts/ec82b96487e9e778ee610c7ab245162464782cfa1f555c2299333f8dbe5c036a.txt
+
+core_detect 1.0.0 (MIT)
+Copyright (c) 2017-2020 The Rust Project Developers
+Full terms: licenses/texts/769f80b5bcb42ed0af4e4d2fd74e1ac9bf843cb80c5a29219d1ef3544428a6bb.txt
+Full terms: licenses/texts/8569ebf6bf52937b961d9c9c934d8400a2bb6b09651a9afacbb3fc18fe5c09b1.txt
 
 coreaudio-rs 0.14.2 (MIT)
 Copyright (c) 2015
@@ -392,6 +413,9 @@ data-url 0.3.2 (MIT)
 Copyright (c) 2013-2025 The rust-url developers
 Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
 Full terms: licenses/texts/b38f11f6096706e6de553dabe2a7ed142d59b6fa8c97e290c67496154745cdd5.txt
+
+debugid 0.8.0 (Apache-2.0)
+Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
 
 der 0.7.10 (MIT)
 Copyright (c) 2020-2023 The RustCrypto Project Developers
@@ -481,6 +505,11 @@ Copyright 2018-2022 RustCrypto Developers
 Full terms: licenses/texts/78779d420019e6b4630376af8e86b6b335ee8a2f89ede6e0411e0469a326aaa4.txt
 Full terms: licenses/texts/b3470648aff02beb36d7a53240fc9260ed80ed93bd43bace6b67d7ef7336ee33.txt
 
+either 1.19.0 (MIT)
+Copyright (c) 2015
+Full terms: licenses/texts/7576269ea71f767b99297934c0b2367532690f8c4badc695edf8e04ab6a1e545.txt
+Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
+
 embed-resource 3.0.11 (MIT)
 Copyright (c) 2017 nabijaczleweli
 Full terms: licenses/texts/1abdbbd4e3f95e56c79d4a8af190254c23ddb14db34aadadfafef9c3af041113.txt
@@ -489,6 +518,13 @@ embed_plist 1.2.2 (MIT)
 Copyright (c) 2020 Nikolai Vazquez
 Full terms: licenses/texts/cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30.txt
 Full terms: licenses/texts/daacc37f680c7dd0a758ac99a109f2f57d9f21d3683df9e9245055922842a695.txt
+
+encoding_rs 0.8.42 (BSD-3-Clause AND MIT)
+Full terms: licenses/texts/11789f45bb180841cd362a5eee6789c68ddb573a11105e30768c308a6add0190.txt
+Full terms: licenses/texts/3c2e06492c5e00fcd39515e4af4c560d8cee5c31e7a7e388db682bc9ee33ee32.txt
+Full terms: licenses/texts/3fa4ca83dcc9237839b1bdeb2e6d16bdfb5ec0c5ce42b24694d8bbf0dcbef72c.txt
+Full terms: licenses/texts/838118388fe5c2e7f1dbbaeed13e1c7f3ebf88be91319c7c1d77c18e987d1a50.txt
+Full terms: licenses/texts/cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30.txt
 
 equivalent 1.0.2 (MIT)
 Copyright (c) 2016--2023
@@ -504,9 +540,18 @@ Copyright (c) 2014 Chris Wong
 Full terms: licenses/texts/8764a597675778ddfd4e25f81b08a05dbcf089ac05662df7613fe67f150e3aa2.txt
 Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
 
+fallible-iterator 0.3.0 (MIT)
+Copyright (c) 2015 The rust-openssl-verify Developers
+Full terms: licenses/texts/0816e154b159ba255c563f7c8c7df5bbb8cc5fc96f5ab8cf9f4743b4f41fe7eb.txt
+Full terms: licenses/texts/c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08.txt
+
 fastrand 2.5.0 (MIT)
 Full terms: licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt
 Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
+
+fax 0.2.7 (MIT)
+Copyright © 2021 The pdf-rs contributers.
+Full terms: licenses/texts/7101390b4c8edd752f4c0de47f35d61b44d9cf0ee8dd032115e25644e277cfff.txt
 
 fdeflate 0.3.7 (MIT)
 Full terms: licenses/texts/0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594.txt
@@ -562,6 +607,11 @@ Copyright (c) 2013-2016 The rust-url developers
 Full terms: licenses/texts/20c7855c364d57ea4c97889a5e8d98470a9952dade37bd9248b9a54431670e5e.txt
 Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
 
+framehop 0.15.0 (MIT)
+Copyright (c) 2018 Markus Stange <mstange@themasta.com>
+Full terms: licenses/texts/9ec2734f45b0d65192b9fee2307e05176b805a19efa994a553dcc5b2d3219a1e.txt
+Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
+
 fs2 0.4.3 (MIT)
 Copyright (c) 2015 The Rust Project Developers
 Full terms: licenses/texts/7b63ecd5f1902af1b63729947373683c32745c16a10e8e6292e2e2dcd7e90ae0.txt
@@ -583,7 +633,19 @@ Copyright (c) 2017 The Tokio Authors
 Full terms: licenses/texts/275c491d6d1160553c32fd6127061d7f9606c3ea25abfad6ca3f6ed088785427.txt
 Full terms: licenses/texts/6652c868f35dfe5e8ef636810a4e576b9d663f3a17fb0f5613ad73583e1b88fd.txt
 
+futures-executor 0.3.34 (MIT)
+Copyright (c) 2016 Alex Crichton
+Copyright (c) 2017 The Tokio Authors
+Full terms: licenses/texts/275c491d6d1160553c32fd6127061d7f9606c3ea25abfad6ca3f6ed088785427.txt
+Full terms: licenses/texts/6652c868f35dfe5e8ef636810a4e576b9d663f3a17fb0f5613ad73583e1b88fd.txt
+
 futures-io 0.3.34 (MIT)
+Copyright (c) 2016 Alex Crichton
+Copyright (c) 2017 The Tokio Authors
+Full terms: licenses/texts/275c491d6d1160553c32fd6127061d7f9606c3ea25abfad6ca3f6ed088785427.txt
+Full terms: licenses/texts/6652c868f35dfe5e8ef636810a4e576b9d663f3a17fb0f5613ad73583e1b88fd.txt
+
+futures-macro 0.3.34 (MIT)
 Copyright (c) 2016 Alex Crichton
 Copyright (c) 2017 The Tokio Authors
 Full terms: licenses/texts/275c491d6d1160553c32fd6127061d7f9606c3ea25abfad6ca3f6ed088785427.txt
@@ -632,10 +694,19 @@ Copyright (c) 2018-2026 The rust-random Project Developers
 Full terms: licenses/texts/523a42c25d245dde9c015f882cec7f4555aad883382a6cf19b4b7d9b2cd5419b.txt
 Full terms: licenses/texts/aaff376532ea30a0cd5330b9502ad4a4c8bf769c539c87ffe78819d188a18ebf.txt
 
+gimli 0.32.3 (MIT)
+Copyright (c) 2015 The Rust Project Developers
+Full terms: licenses/texts/7b63ecd5f1902af1b63729947373683c32745c16a10e8e6292e2e2dcd7e90ae0.txt
+Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
+
 glob 0.3.4 (MIT)
 Copyright (c) 2014 The Rust Project Developers
 Full terms: licenses/texts/6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb.txt
 Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
+
+half 2.7.1 (MIT)
+Full terms: licenses/texts/508a77d2e7b51d98adeed32648ad124b7b30241a8e70b2e72c99f92d8e5874d1.txt
+Full terms: licenses/texts/a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9.txt
 
 hashbrown 0.12.3 (MIT)
 Copyright (c) 2016 Amanieu d'Antras
@@ -651,6 +722,12 @@ heck 0.5.0 (MIT)
 Copyright (c) 2015 The Rust Project Developers
 Full terms: licenses/texts/7b63ecd5f1902af1b63729947373683c32745c16a10e8e6292e2e2dcd7e90ae0.txt
 Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
+
+hex 0.4.3 (MIT)
+Copyright (c) 2013-2014 The Rust Project Developers.
+Copyright (c) 2015-2020 The rust-hex Developers
+Full terms: licenses/texts/c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08.txt
+Full terms: licenses/texts/f7bdb3426d045cd50efd4953026e3eb5a83d0199f458a075602611b9344da5b9.txt
 
 hkdf 0.12.4 (MIT)
 Copyright (c) 2015-2018 Vlad Filippov
@@ -801,6 +878,11 @@ is_terminal_polyfill 1.70.2 (MIT)
 Full terms: licenses/texts/6efb0476a1cc085077ed49357026d8c173bf33017278ef440f222fb9cbcb66e6.txt
 Full terms: licenses/texts/c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08.txt
 
+itertools 0.14.0 (MIT)
+Copyright (c) 2015
+Full terms: licenses/texts/7576269ea71f767b99297934c0b2367532690f8c4badc695edf8e04ab6a1e545.txt
+Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
+
 itoa 1.0.18 (MIT)
 Full terms: licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt
 Full terms: licenses/texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt
@@ -867,6 +949,11 @@ Full terms: licenses/texts/044983df14c97f2f9570766aaf977b3cdfc4a06cf1f36b776331c
 Full terms: licenses/texts/3f9f0f7e5a5911a8042e32c83ff5d061ce1ffd02e8a207ec2135a44ad73b4191.txt
 Full terms: licenses/texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt
 
+macho-unwind-info 0.5.0 (MIT)
+Copyright (c) 2018 Markus Stange <mstange@themasta.com>
+Full terms: licenses/texts/9ec2734f45b0d65192b9fee2307e05176b805a19efa994a553dcc5b2d3219a1e.txt
+Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
+
 markup5ever 0.39.0 (MIT)
 Copyright (c) 2014 The html5ever Project Developers
 Full terms: licenses/texts/86dd7f026f916daf7511e39951ad8ea8cf55a8db67ae64060dacf829761c18f3.txt
@@ -887,6 +974,12 @@ Full terms: licenses/texts/01c266bced4a434da0051174d6bee16a4c82cf634e2679b6155d4
 Full terms: licenses/texts/0f96a83840e146e43c0ec96a22ec1f392e0680e6c1226e6f3ba87e0740af850f.txt
 Full terms: licenses/texts/7e12e5df4bae12cb21581ba157ced20e1986a0508dd10d0e8a4ab9a4cf94e85c.txt
 
+memmap2 0.9.12 (MIT)
+Copyright (c) 2015 Dan Burkert
+Copyright (c) 2020 Yevhenii Reizner
+Full terms: licenses/texts/04ea4849dba9dcae07113850c6f1b1a69052c625210639914eee352023f750ad.txt
+Full terms: licenses/texts/0d25d03b5ab49576178ad0cae7a2648d12c17ad0452fe49c07e55e4b59aa5257.txt
+
 mime 0.3.17 (MIT)
 Copyright (c) 2014 Sean McArthur
 Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
@@ -894,6 +987,24 @@ Full terms: licenses/texts/df9cfd06d8a44d9a671eadd39ffd97f166481da015a30f45dfd27
 
 minicbor 2.3.0 (BlueOak-1.0.0)
 Full terms: licenses/texts/79860758b46e85f70a1762c21a8fff4f2d220d89f9bdca096e12aed15b9951c5.txt
+
+minidump-common 0.26.1 (MIT)
+Copyright (c) 2015-2023 rust-minidump contributors
+Full terms: licenses/texts/06de63df29199a394442b57a28e886059ddc940973e10646877a0793fd53e2c9.txt
+
+minidump-unwind 0.26.1 (MIT)
+Copyright (c) 2015-2023 rust-minidump contributors
+Full terms: licenses/texts/06de63df29199a394442b57a28e886059ddc940973e10646877a0793fd53e2c9.txt
+
+minidump 0.26.1 (MIT)
+Copyright (c) 2015-2023 rust-minidump contributors
+Full terms: licenses/texts/06de63df29199a394442b57a28e886059ddc940973e10646877a0793fd53e2c9.txt
+
+minimal-lexical 0.2.1 (MIT)
+Copyright (c) 2009 The Go Authors. All rights reserved.
+Full terms: licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt
+Full terms: licenses/texts/8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90.txt
+Full terms: licenses/texts/dbe1fff0fb1314b6af94f161511406275cf01c5a32441fbf24528a57a051d599.txt
 
 miniz_oxide 0.8.9 (MIT)
 Copyright (c) 2017 Frommi
@@ -932,6 +1043,11 @@ Full terms: licenses/texts/2ab5537b8c0cb1d475e2145b6a7994b04e7c71e6e5bd836f7f9c4
 Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
 Full terms: licenses/texts/b99f9d43803f2ac979c50949df630bd8eeaf2fcd1b9fdb9093710d70f5dfb63d.txt
 
+multiversion_no_op 1.0.0 (MIT)
+Full terms: licenses/texts/3fa4ca83dcc9237839b1bdeb2e6d16bdfb5ec0c5ce42b24694d8bbf0dcbef72c.txt
+Full terms: licenses/texts/cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30.txt
+Full terms: licenses/texts/d2a809eafabba137f508bea16a1b93d8ff24df7da6f38129d830db9bc118bdfe.txt
+
 native-tls 0.2.18 (MIT)
 Copyright (c) 2016 The rust-native-tls Developers
 Full terms: licenses/texts/c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08.txt
@@ -944,6 +1060,10 @@ Full terms: licenses/texts/f7715d38a3fa1b4ac97c5729740752505a39cb92ee83ab5b102ae
 nix 0.31.3 (MIT)
 Copyright (c) 2015 Carl Lerche + nix-rust Authors
 Full terms: licenses/texts/66e3ee1fa7f909ad3c612d556f2a0cdabcd809ad6e66f3b0605015ac64841b70.txt
+
+nom 7.1.3 (MIT)
+Copyright (c) 2014-2019 Geoffroy Couprie
+Full terms: licenses/texts/4dbda04344456f09a7a588140455413a9ac59b6b26a1ef7cdf9c800c012d87f0.txt
 
 notify-types 2.1.0 (MIT)
 Copyright (c) 2023 Notify Contributors
@@ -962,6 +1082,11 @@ Full terms: licenses/texts/284465860407420254e39be4e1bdcaaf2e7f2d18e06f9bab75bc7
 num-conv 0.2.2 (MIT)
 Full terms: licenses/texts/0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594.txt
 Full terms: licenses/texts/e2e245f2b566d0bfafb0f6a04c16b82d710c4e6e7d799e39bb4ef6e541b85b98.txt
+
+num-derive 0.4.2 (MIT)
+Copyright (c) 2014 The Rust Project Developers
+Full terms: licenses/texts/6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb.txt
+Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
 
 num-traits 0.2.19 (MIT)
 Copyright (c) 2014 The Rust Project Developers
@@ -1016,6 +1141,11 @@ Full terms: licenses/texts/b05785f9f18e6716bab63424b11454513b9943a222595b7041100
 objc2 0.6.4 (MIT)
 Full terms: licenses/texts/b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5.txt
 
+object 0.36.7 (MIT)
+Copyright (c) 2015 The Gimli Developers
+Full terms: licenses/texts/0b74dfa0bcee5c420c6b7f67b4b2658f9ab8388c97b8e733975f2cecbdd668a6.txt
+Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
+
 once_cell 1.21.4 (MIT)
 Full terms: licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt
 Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
@@ -1063,6 +1193,10 @@ parking_lot_core 0.9.12 (MIT)
 Copyright (c) 2016 The Rust Project Developers
 Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
 Full terms: licenses/texts/c9a75f18b9ab2927829a208fc6aa2cf4e63b8420887ba29cdb265d6619ae82d5.txt
+
+pe-unwind-info 0.6.1 (MIT)
+Copyright (c) 2023 Alex Franchuk <alex.franchuk@gmail.com>
+Full terms: licenses/texts/91a870c16b8223cc0135b4219c2f3ced14a8f2bd7110073a829b216b1cc5ac00.txt
 
 pem-rfc7468 0.7.0 (MIT)
 Copyright (c) 2021 The RustCrypto Project Developers
@@ -1150,10 +1284,27 @@ proc-macro2 1.0.107 (MIT)
 Full terms: licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt
 Full terms: licenses/texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt
 
+procfs-core 0.17.0 (MIT)
+Copyright (C) 1994, 1995 by Daniel Quinlan (quinlan@yggdrasil.com)
+Copyright (C) 2000,2001,2002  Free Software Foundation, Inc.
+Copyright (c) 2006, 2008 by Michael Kerrisk <mtk.manpages@gmail.com>
+Copyright (c) 2015 The procfs Developers
+Copyright 2003 Binh Nguyen
+and Copyright (C) 2002-2008,2017 Michael Kerrisk <mtk.manpages@gmail.com>
+Full terms: licenses/texts/9f595add2d755fc897ea3045cccbf7146acf51f8b5cf5d2669aee18634eef4bf.txt
+Full terms: licenses/texts/c5bbf39118b0639bf8bd391ae0d7d81f25c1cb4066e0fdae6a405b20fb7ca170.txt
+Full terms: licenses/texts/c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08.txt
+
 proptest 1.11.0 (MIT)
 Copyright (c) 2016 FullContact, Inc
 Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
 Full terms: licenses/texts/d8e0806926ce9f0a5030c382ecc0ffdf6de6fbea5c69a458435fd443fa7a5b92.txt
+
+prost-derive 0.13.5 (Apache-2.0)
+Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
+
+prost 0.13.5 (Apache-2.0)
+Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
 
 pxfm 0.1.30 (Apache-2.0)
 Copyright 2024 Radzivon Bartoshyk
@@ -1161,6 +1312,11 @@ Full terms: licenses/texts/2aa92cada6431e75615e3fe6cb1a9082c98f777d48ae1c087c0da
 Full terms: licenses/texts/90bf2d659c43045111b65c733ab2a6d4cbcb422a098368c8c58a9ba3db4ed0c5.txt
 
 quick-error 1.2.3 (MIT)
+Copyright (c) 2015 The quick-error Developers
+Full terms: licenses/texts/058f01fe181608d027fcde7e528fc03ea3cf90f30903c407644b0a9bbc54f500.txt
+Full terms: licenses/texts/c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08.txt
+
+quick-error 2.0.1 (MIT)
 Copyright (c) 2015 The quick-error Developers
 Full terms: licenses/texts/058f01fe181608d027fcde7e528fc03ea3cf90f30903c407644b0a9bbc54f500.txt
 Full terms: licenses/texts/c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08.txt
@@ -1256,6 +1412,11 @@ Copyright 2018 Developers of the Rand project
 Full terms: licenses/texts/209fbbe0ad52d9235e37badf9cadfe4dbdc87203179c0899e738b39ade42177b.txt
 Full terms: licenses/texts/35242e7a83f69875e6edeff02291e688c97caafe2f8902e4e19b49d3e78b4cab.txt
 Full terms: licenses/texts/90eb64f0279b0d9432accfa6023ff803bc4965212383697eee27a0f426d5f8d5.txt
+
+range-map 0.2.0 (MIT)
+Copyright (c) 2014 The Rust Project Developers
+Full terms: licenses/texts/6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb.txt
+Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
 
 raw-window-handle 0.6.2 (MIT)
 Copyright (c) 2019 Osspial
@@ -1415,6 +1576,13 @@ Copyright (c) 2016-2019 Ulrik Sverdrup "bluss" and scopeguard developers
 Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
 Full terms: licenses/texts/fb77f0a9c53e473abe5103c8632ef9f0f2874d4fb3f17cb2d8c661aab9cee9d7.txt
 
+scroll 0.12.0 (MIT)
+Full terms: licenses/texts/6e24b7455f0b9afefdf4f3efd59a56ce76a3020c2dc4371937e281fc5e587fd7.txt
+
+scroll_derive 0.12.1 (MIT)
+Copyright (c) 2017
+Full terms: licenses/texts/afb11426e09da40a1ae4f8fa17ddcc6b6a52d14df04c29bc5bcd06eb8730624d.txt
+
 security-framework-sys 2.17.0 (MIT)
 Copyright (c) 2015 Steven Fackler
 Full terms: licenses/texts/91e934255ba3b2f21103d68c5581c23ef34aa95c4628e4405b8c901935e11c69.txt
@@ -1527,6 +1695,10 @@ Full terms: licenses/texts/b3470648aff02beb36d7a53240fc9260ed80ed93bd43bace6b67d
 simd-adler32 0.3.10 (MIT)
 Full terms: licenses/texts/42a35170233e83e18856792e748de4c1ce4a63b2afce9a370c89ef3fe23f9f2d.txt
 
+simdutf8 0.1.5 (MIT)
+Full terms: licenses/texts/0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9.txt
+Full terms: licenses/texts/1847e0e0698142ed4347c1441a9fa81c8fbddd44b1d8bbcd5e3647f991759d7f.txt
+
 simplecss 0.2.2 (MIT)
 Copyright (c) 2018 Reizner Evgeniy
 Full terms: licenses/texts/0b5f24524360e15bcf9fb79bca875f5aa62f01f94f2988e23238c7ec0e6e8784.txt
@@ -1548,6 +1720,10 @@ smallvec 1.16.2 (MIT)
 Copyright (c) 2018 The Servo Project Developers
 Full terms: licenses/texts/0b28172679e0009b655da42797c03fd163a3379d5cfa67ba1f1655e974a2a1a9.txt
 Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
+
+smart-default 0.7.1 (MIT)
+Copyright (c) 2017 Idan Arye
+Full terms: licenses/texts/f09111a2bf85257f1d098de0095ad77fd12649fbbe9a33c8a13e422848b601bb.txt
 
 socket-pktinfo 0.4.1 (MIT)
 Copyright (c) 2025 Pixsper
@@ -1724,6 +1900,10 @@ thread_local 1.1.10 (MIT)
 Copyright (c) 2016 The Rust Project Developers
 Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
 Full terms: licenses/texts/c9a75f18b9ab2927829a208fc6aa2cf4e63b8420887ba29cdb265d6619ae82d5.txt
+
+tiff 0.10.3 (MIT)
+Copyright (c) 2018 PistonDevelopers
+Full terms: licenses/texts/20c097d0de27e2adc179140a3d542091951a030699c7e1c78655f2a2d08d4e3e.txt
 
 time-core 0.1.9 (MIT)
 Full terms: licenses/texts/0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594.txt
@@ -1963,6 +2143,10 @@ Full terms: licenses/texts/b05785f9f18e6716bab63424b11454513b9943a222595b7041100
 webview2-com 0.39.1 (MIT)
 Full terms: licenses/texts/b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5.txt
 
+weezl 0.1.12 (MIT)
+Full terms: licenses/texts/573f5227db835cd30bbdd3aed3f82615f80119a4d5c82b4daf642dbfe2b6afde.txt
+Full terms: licenses/texts/769f80b5bcb42ed0af4e4d2fd74e1ac9bf843cb80c5a29219d1ef3544428a6bb.txt
+
 winapi-util 0.1.11 (MIT)
 Copyright (c) 2017 Andrew Gallant
 Full terms: licenses/texts/01c266bced4a434da0051174d6bee16a4c82cf634e2679b6155d40d75012390f.txt
@@ -2106,6 +2290,13 @@ Copyright © 2020-2024 Unicode, Inc.
 ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 Full terms: licenses/texts/f367c1b8e1aa262435251e442901da4607b4650e0e63a026f5044473ecfb90f2.txt
 
+zerocopy-derive 0.8.59 (MIT)
+Copyright 2019 The Fuchsia Authors.
+Copyright 2023 The Fuchsia Authors
+Full terms: licenses/texts/1a2f5c12ddc934d58956aa5dbdd3255fe55fd957633ab7d0d39e4f0daa73f7df.txt
+Full terms: licenses/texts/83c1763356e822adde0a2cae748d938a73fdc263849ccff6b27776dff213bd32.txt
+Full terms: licenses/texts/9d185ac6703c4b0453974c0d85e9eee43e6941009296bb1f5eb0b54e2329e9f3.txt
+
 zerocopy 0.8.59 (MIT)
 Copyright 2019 The Fuchsia Authors.
 Copyright 2023 The Fuchsia Authors
@@ -2162,10 +2353,16 @@ zopfli 0.8.3 (Apache-2.0)
 Copyright 2011 Google Inc.
 Full terms: licenses/texts/018b1cb87efdf7a04c2fcc13d57ed63f62149113fb207b27ea13430d64f13513.txt
 
+zune-core 0.4.12 (MIT)
+Full terms: licenses/texts/b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5.txt
+
 zune-core 0.5.3 (MIT)
 Full terms: licenses/texts/c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4.txt
 Full terms: licenses/texts/d201d14804d3bcd3b944147173175e4abfbd838b7c8069b6bd3452496bf13e6c.txt
 Full terms: licenses/texts/d30047bca3b516639339a3c279bb84c3483124fb5a9dafe3c75056a85090e745.txt
+
+zune-jpeg 0.4.21 (MIT)
+Full terms: licenses/texts/b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5.txt
 
 zune-jpeg 0.5.15 (MIT)
 Full terms: licenses/texts/c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4.txt
@@ -2192,11 +2389,23 @@ Copyright (c) 2015-2017 Mayur Pawashe.
 Copyright 2003-2005 Colin Percival
 Full terms: licenses/texts/389a4e4e9a32f059775b13a06e25a591445ba229d2838d26dd3e7c0c45127cfe.txt
 
+VB-CABLE 45 (LicenseRef-VB-CABLE-Donationware)
+Copyrights V.Burel©2010-2024 All rights reserved.
+Full terms: licenses/texts/04082f47b0ed315a3b3721a967884c7123552ac3f860a9fb6692c7e2130bf86d.txt
+Full terms: licenses/texts/2515cfd667fffcf54d00e0dda70df58a2b8843ff2ae95e12455764da25cb9eb9.txt
+
 WixToolset.Firewall.wixext custom actions 5.0.2 (MS-RL)
 Full terms: licenses/texts/dfdf2048787635215a6baf3b9d461dee89a2904d246787258a44f072a98d4786.txt
 
 WixToolset.UI.wixext installer UI 5.0.2 (MS-RL)
 Full terms: licenses/texts/dfdf2048787635215a6baf3b9d461dee89a2904d246787258a44f072a98d4786.txt
+
+libASPL 3.1.2+633e0f7 (MIT AND AML)
+Copyright (C) 2012 Apple Inc. All Rights Reserved.
+Copyright © 2020 Apple Inc.
+Full terms: licenses/texts/2b33b4cadf8e88c15e8808950913acf8bd84bac10d6312e9fb128163850d22d0.txt
+Full terms: licenses/texts/9b2b45280cf33d7f726840a53283723c87b2295ff84d1cf3982c96b5bc4c50a9.txt
+Full terms: licenses/texts/bdb64a0bea4af109148b48446a9026be5d1f22dc14d18920cfcd52bf3f3e2347.txt
 
 @asamuzakjp/css-color 3.2.0 (MIT)
 Copyright (c) 2024 asamuzaK (Kazz)
@@ -2712,7 +2921,7 @@ Copyright (c) 2018-2021 Josh Junon
 Copyright © 2025-PRESENT Kevin Deng (https://github.com/sxzz)
 Full terms: licenses/texts/ee48679d379ca6b4493d5e231094d85f818dd9be40b1a4f234fb7ff657ee35d9.txt
 
-oink-ui 1.0.8 (MIT)
+oink-ui 1.0.11 (MIT)
 Copyright (c) 2026 Hachiwii
 Full terms: licenses/texts/8b61d0a08992a88429c51bd40e944339a96a55e9f33ad737ee5e06a0e1ca011d.txt
 

@@ -56,7 +56,7 @@ impl Node {
         }
         let start_release = {
             let config = lock(&self.inner.config);
-            let disabled = config.settings.keyboard_disabled
+            let disabled = config.settings.routing.keyboard_mode == oink_foundation::input::InputMode::Disabled
                 || config.settings.routing.mouse_mode == oink_foundation::input::InputMode::Disabled;
             let mut state = lock(&self.inner.controls);
             if status.backlog_sequence <= state.backlog_sequence {

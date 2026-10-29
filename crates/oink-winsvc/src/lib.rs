@@ -3,6 +3,7 @@ pub mod helper;
 pub mod owner;
 #[cfg(windows)]
 mod platform;
+pub mod power;
 pub mod wire;
 #[cfg(windows)]
 pub use platform::{backend, client, run, update};

@@ -4,6 +4,7 @@ impl Router {
     /// Observe hardware keys before owner pause, keyboard guard, or overlay gates.
     /// Repeated downs cannot rearm until the real Escape release is observed.
     pub fn observe_emergency_event(&mut self, event: &CapturedEvent, now: Micros) -> bool {
+        self.observe_lock_escape_event(event);
         if !event.physical {
             return false;
         }

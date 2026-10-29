@@ -118,7 +118,7 @@ use oink_test_support::clipboard::FakeClipboard as Clipboard;
 
 #[test]
 fn display_alerts_follow_native_failure_and_recovery_without_connect_flashes() {
-    crate::test_watchdog::run(module_path!(), "display_alert_native_outcomes", Some(4), async {
+    crate::test_watchdog::run(module_path!(), "display_alert_native_outcomes", Some(8), async {
         use crate::api::{AlertKind, ApiEvent};
         let dir = tempfile::tempdir().unwrap();
         let displays = [Displays::new("display-a"), Displays::new("display-b")];
@@ -173,10 +173,17 @@ fn display_alerts_follow_native_failure_and_recovery_without_connect_flashes() {
                 .count()
         };
         displays[0].fail_enumeration(true);
-        until("explicit enumeration failure reaches local and peer views", || {
-            alerts(&a) == 1 && alerts(&b) == 1
+        until("explicit failure remains available in peer resource facts", || {
+            b.device_facts(a.id())
+                .and_then(|facts| facts.resources().ok().flatten())
+                .and_then(|resources| resources.faults().ok().flatten())
+                .and_then(|faults| faults.screen().ok().flatten())
+                .and_then(|fault| fault.code().ok())
+                == Some(oink_protocol::v1::dto::ResourceFaultCode::BackendFailed)
         })
         .await;
+        assert_eq!(alerts(&b), 0, "peer resource faults are not local enumeration notices");
+        until("persistent local enumeration failure is reported", || alerts(&a) == 1).await;
         assert!(
             has_display(&a, a.id(), &displays[0].info()),
             "retain last good local geometry"
@@ -185,7 +192,8 @@ fn display_alerts_follow_native_failure_and_recovery_without_connect_flashes() {
             has_display(&b, a.id(), &displays[0].info()),
             "retain last good peer geometry"
         );
-        displays[0].fail_enumeration(false);
+        // Recovery must be discovered even when the OS emits no second callback.
+        displays[0].fail.store(false, std::sync::atomic::Ordering::Release);
         until("successful enumeration clears local and peer errors", || {
             alerts(&a) == 0 && alerts(&b) == 0
         })
@@ -616,8 +624,12 @@ async fn independent_pause_status_reads_do_not_report_a_resume_scenario() {
 
 #[test]
 fn runtime_shutdown_cancels_observers_after_unwind() {
+    let _scenario =
+        crate::test_watchdog::Scenario::new(module_path!(), "runtime_shutdown_cancels_observers_after_unwind");
+    let (prepared, started) = std::sync::mpsc::sync_channel(0);
+    let (unwind, begin_unwind) = std::sync::mpsc::sync_channel(0);
     let (done, ready) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    let worker = std::thread::spawn(move || {
         let result = std::panic::catch_unwind(|| {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -626,23 +638,34 @@ fn runtime_shutdown_cancels_observers_after_unwind() {
                 .unwrap();
             rt.block_on(async {
                 let dir = tempfile::tempdir().unwrap();
-                let _node = start_with_clip(
+                let node = start_with_clip(
                     &oink_test_support::network_config(dir.path().into(), "panic", 0),
                     &Displays::new("panic"),
                     None,
                 )
                 .await;
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                // Observe an actual observer iteration instead of assuming that
+                // it ran during a 100ms sleep. Release the held clock before unwind.
+                node.hold_platform_sensor_clock().await;
+                node.resume_platform_sensor_clock();
+                prepared.send(()).unwrap();
+                begin_unwind.recv().unwrap();
                 panic!("intentional fixture unwind");
             });
         });
         done.send(result.is_err()).unwrap();
     });
+    // Startup (disk I/O, thread creation and observer readiness) is bounded by
+    // the process watchdog, not charged to the original 5s shutdown budget.
+    started.recv().expect("observer fixture must start");
+    crate::test_watchdog::phase("runtime unwind and observer cancellation");
+    unwind.send(()).unwrap();
     assert!(
         ready
             .recv_timeout(Duration::from_secs(5))
             .expect("runtime must not join an immortal blocking observer")
     );
+    worker.join().unwrap();
 }
 
 #[cfg(windows)]
@@ -1008,11 +1031,71 @@ fn local_contacts_capability_and_effective_preference_recover() {
             );
             let stored: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(configs[0].data_dir.join("settings.json")).unwrap()).unwrap();
-            assert_eq!(stored["local"]["routing"]["mac_scroll_feel"], enabled);
+            assert!(stored["local"]["routing"].get("mac_scroll_feel").is_none());
+            until("touchpad scroll owner preference observed", || {
+                b.device_facts(a.id())
+                    .and_then(|f| f.preferences().ok().flatten())
+                    .is_some_and(|p| {
+                        p.0.iter().any(|p| {
+                            p.option() == Ok(oink_protocol::v1::dto::LocalOption::MacScrollFeel)
+                                && p.value() == Ok(oink_protocol::v1::RawValue::Bool(enabled))
+                        })
+                    })
+            })
+            .await;
+            let remote = b.device_facts(a.id()).unwrap().preferences().unwrap().unwrap().0;
+            assert_eq!(
+                remote
+                    .iter()
+                    .find(|p| p.option() == Ok(oink_protocol::v1::dto::LocalOption::MacScrollFeel))
+                    .unwrap()
+                    .value()
+                    .unwrap(),
+                oink_protocol::v1::RawValue::Bool(enabled)
+            );
             assert!(
                 b.input_settings().unwrap().mac_scroll_feel,
-                "receiver preference is never synchronized"
+                "owner observation does not overwrite the observing peer preference"
             );
+        }
+        // Exercise all three owner commands over the authenticated link; the
+        // fake backend is the only injector and never calls the native desktop.
+        input.set_touchpad_contacts(Some(5));
+        a.publish_local_options();
+        for (option, field) in [
+            (
+                oink_protocol::v1::dto::LocalOption::TouchpadInjection,
+                "accept_contacts",
+            ),
+            (
+                oink_protocol::v1::dto::LocalOption::NativeMultifinger,
+                "native_multifinger",
+            ),
+            (oink_protocol::v1::dto::LocalOption::MacScrollFeel, "mac_scroll_feel"),
+        ] {
+            for enabled in [false, true] {
+                let requester = b.clone();
+                let target = a.id();
+                tokio::task::spawn_blocking(move || {
+                    requester.edit_device_option(target.into(), option, oink_protocol::v1::RawValue::Bool(enabled))
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    serde_json::to_value(a.input_settings().unwrap()).unwrap()[field],
+                    enabled
+                );
+                let reloaded = crate::config::AgentConfig::load_from(&configs[0].data_dir).unwrap();
+                assert_eq!(
+                    reloaded.owner().value(option),
+                    Some(oink_protocol::v1::RawValue::Bool(enabled))
+                );
+                assert_eq!(
+                    serde_json::to_value(b.input_settings().unwrap()).unwrap()[field],
+                    field != "accept_contacts"
+                );
+            }
         }
         a.unsubscribe(subscription);
         a.shutdown().await;

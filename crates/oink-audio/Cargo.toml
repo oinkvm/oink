@@ -8,6 +8,9 @@ license.workspace = true
 publish.workspace = true
 repository.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 oink-foundation.workspace = true
 oink-protocol.workspace = true
@@ -23,8 +26,11 @@ crossbeam-queue = "0.3"
 [build-dependencies]
 cc = "1"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Media_Control", "Foundation_Collections", "Win32_System_WinRT", "Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_Security", "Win32_System_Performance", "Win32_System_Power", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
+windows = { version = "0.62", features = ["Media_Control", "Foundation_Collections", "Win32_System_WinRT", "Win32_Media_Audio", "Win32_Devices_FunctionDiscovery", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Media_Audio_Endpoints", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_Security", "Win32_System_Performance", "Win32_System_Power", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
 
 windows-core = "0.62"
 
@@ -41,3 +47,15 @@ bytes = "1"
 libc = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+
+[[example]]
+name = "pull_native_silent"
+required-features = ["test-support"]
+
+[[example]]
+name = "pull_bounds"
+required-features = ["test-support"]
+
+[[example]]
+name = "resource_pull"
+required-features = ["test-support"]

@@ -6,8 +6,12 @@ export type ScreenState = 'shared' | 'disabled' | 'unknown' | 'fault';
 export type GameMode = 'auto' | 'on' | 'off';
 export type KeyboardState = 'shared' | 'local' | 'disabled' | 'fault' | 'unknown';
 export interface SpeakerState {
+    activity?: import('../api/cards').SpeakerCard['activity'];
+    /** Configured role survives a capture/playback fault icon. */
+    configuredMode?: 'unused' | 'source' | 'receiver' | null;
     waitingForExit?: boolean;
     selectedExitUnavailable?: boolean;
+    exitUnknown?: boolean;
     canMakeExit?: boolean;
     mode: 'unused' | 'exit' | 'forwarding' | 'fault' | 'unknown';
     volume: number;
@@ -35,15 +39,21 @@ export interface Device {
     accessibilityMissing?: boolean;
     mouse: ShareState | 'disabled';
     keyboard: KeyboardState;
-    keyboardBeforeLock?: 'shared' | 'local';
     clipboard: ShareState;
     speaker: SpeakerState;
+    microphone?: {
+        mode: 'unavailable' | 'idle' | 'source' | 'receiver' | 'muted';
+        permissionGranted: boolean; virtualReady: boolean; waitingForSource?: boolean;
+        captureActive?: boolean; consumerActive?: boolean; receivingActive?: boolean;
+        fault?: import('../api/cards').ResourceFault | null;
+        volume: number; muted: boolean; canSetVolume: boolean;
+    };
+    inputPermissionMissing?: boolean;
     gameMode: GameMode | null;
     gameActive?: boolean | null;
     gameDetected?: boolean;
     paused?: boolean;
     pauseReason?: "none" | "local_user" | "remote_user" | "emergency" | "input_backlog" | "unknown";
-    pending?: boolean;
     unknown?: boolean;
     canPause?: boolean;
     canDisableMouse?: boolean;

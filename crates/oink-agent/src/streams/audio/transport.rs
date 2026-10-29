@@ -107,3 +107,100 @@ pub(crate) mod testing {
         (queue.clone(), queue)
     }
 }
+
+#[cfg(all(test, debug_assertions))]
+mod split_tests {
+    use super::*;
+    use oink_audio::media::Kind;
+    use oink_network::link::{LinkId, QueueSpec};
+    use oink_protocol::frame::{StreamKind, StreamTag};
+    use oink_protocol::v1::hot::{self, Value};
+
+    #[test]
+    fn overflow_is_bounded_and_accounted_only_to_the_delayed_lane() {
+        let (send, [speaker, microphone]) = oink_network::link::testing::partitioned_datagram_pair(
+            LinkId(1),
+            StreamTag {
+                kind: StreamKind::Audio,
+                ordinal: 1,
+            },
+            QueueSpec {
+                messages: 16,
+                bytes: 16 * 1100,
+            },
+            [[0x0604, 0x0606], [0x0618, 0x0619]],
+        );
+        let before = Instant::now();
+        for sequence in 1..=13 {
+            let kind = if sequence == 13 {
+                Kind::Microphone
+            } else {
+                Kind::Speaker
+            };
+            let mut bytes = [0; oink_audio::media::FRAME_CAPACITY];
+            let len = hot::encode_into(
+                kind.sleep_id(),
+                &[(1, Value::Uint(1)), (2, Value::Uint(1)), (3, Value::Uint(sequence))],
+                &mut bytes,
+                oink_audio::media::FRAME_CAPACITY,
+            )
+            .unwrap();
+            send.post(&bytes[..len]).unwrap();
+        }
+        let after = Instant::now();
+        let mut bytes = [0; oink_audio::media::FRAME_CAPACITY];
+        assert!(microphone.take_timed_into(&mut bytes).unwrap().is_some());
+        assert_eq!(microphone.dropped(), 0);
+        assert_eq!(speaker.dropped(), 4);
+        for sequence in 1..=8 {
+            let (len, arrived) = speaker.take_timed_into(&mut bytes).unwrap().unwrap();
+            assert!(arrived >= before && arrived <= after, "queueing retains ingress time");
+            let message =
+                oink_protocol::v1::frame::OpaqueFrame::parse_exact(&bytes[..len], oink_audio::media::FRAME_CAPACITY)
+                    .unwrap()
+                    .decode()
+                    .unwrap();
+            let oink_protocol::v1::Message::AudioSleep(sleep) = message else {
+                panic!("wrong lane")
+            };
+            assert_eq!(sleep.sequence(), Ok(sequence));
+        }
+        assert!(speaker.take_timed_into(&mut bytes).unwrap().is_none());
+    }
+    #[test]
+    fn either_consumer_reads_its_kind_without_stealing_the_other_stream() {
+        let (send, [speaker, microphone]) = oink_network::link::testing::partitioned_datagram_pair(
+            LinkId(1),
+            StreamTag {
+                kind: StreamKind::Audio,
+                ordinal: 1,
+            },
+            QueueSpec {
+                messages: 16,
+                bytes: 16 * 1100,
+            },
+            [[0x0604, 0x0606], [0x0618, 0x0619]],
+        );
+        for kind in [Kind::Microphone, Kind::Speaker, Kind::Microphone, Kind::Speaker] {
+            let mut bytes = [0; oink_audio::media::FRAME_CAPACITY];
+            let len = hot::encode_into(
+                kind.sleep_id(),
+                &[(1, Value::Uint(1)), (2, Value::Uint(1)), (3, Value::Uint(1))],
+                &mut bytes,
+                oink_audio::media::FRAME_CAPACITY,
+            )
+            .unwrap();
+            send.post(&bytes[..len]).unwrap();
+        }
+        let mut bytes = [0; oink_audio::media::FRAME_CAPACITY];
+        for (lane, expected) in [
+            (speaker.clone(), Kind::Speaker),
+            (speaker, Kind::Speaker),
+            (microphone.clone(), Kind::Microphone),
+            (microphone, Kind::Microphone),
+        ] {
+            let (len, _) = lane.take_timed_into(&mut bytes).unwrap().unwrap();
+            assert_eq!(Kind::from_frame(&bytes[..len]).unwrap(), expected);
+        }
+    }
+}

@@ -1,5 +1,6 @@
 //! Wire-only maps retain unknown keys recursively. Endpoint owners validate
 //! execution semantics after structural decoding and negotiated admission.
+mod application_focus;
 mod attachment;
 mod auxiliary;
 mod business;
@@ -12,9 +13,11 @@ mod drag;
 mod facts;
 mod input_values;
 mod layout_profiles;
+mod microphone;
 mod pairing;
 mod transport;
 use super::schema::{Ascii, Bytes, FixedBytes, List, Text};
+pub use application_focus::*;
 pub use attachment::*;
 pub use auxiliary::*;
 pub use business::*;
@@ -27,6 +30,7 @@ pub use drag::*;
 pub use facts::*;
 pub use input_values::*;
 pub use layout_profiles::*;
+pub use microphone::*;
 pub use pairing::*;
 pub use transport::*;
 pub type Id16 = FixedBytes<16>;

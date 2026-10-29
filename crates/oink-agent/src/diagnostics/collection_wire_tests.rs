@@ -219,24 +219,6 @@ async fn respond(
     if ["chunk-request", "segment-id", "offset", "empty-chunk"].contains(&mode) {
         return Ok(());
     }
-    let digest = dto::<w::Digest>([
-        (
-            "algorithm",
-            RawValue::from(if mode == "digest-algorithm" {
-                "blake3-256"
-            } else {
-                "sha256"
-            }),
-        ),
-        (
-            "bytes",
-            if mode == "digest" {
-                RawValue::Bytes(vec![0; 32])
-            } else {
-                v1::retained::sha256(&bytes).write()
-            },
-        ),
-    ])?;
     let end = dto::<w::DiagnosticsSegmentEnd>([
         ("request_id", id.write()),
         ("segment_id", 0u64.write()),
@@ -248,10 +230,9 @@ async fn respond(
             "raw_length",
             (raw.len() as u32 + u32::from(mode == "raw-length")).write(),
         ),
-        ("digest", digest.write()),
     ])?;
     stream.send(&Message::DiagnosticsSegmentEnd(end)).await?;
-    if ["digest", "digest-algorithm", "compressed-length", "raw-length"].contains(&mode) {
+    if ["compressed-length", "raw-length"].contains(&mode) {
         return Ok(());
     }
     let coverage = if mode == "missing-coverage" {
@@ -277,10 +258,10 @@ async fn respond(
     Ok(())
 }
 #[test]
-fn admitted_low_rejects_mixed_ids_offsets_lengths_and_digests_before_commit() {
+fn admitted_low_rejects_mixed_ids_offsets_and_lengths_before_commit() {
     crate::test_watchdog::run(
         module_path!(),
-        "admitted_low_rejects_mixed_ids_offsets_lengths_and_digests_before_commit",
+        "admitted_low_rejects_mixed_ids_offsets_and_lengths_before_commit",
         Some(4),
         async {
             let mut fixture = Fixture::<DiagnosticsStreams>::start().await;
@@ -294,8 +275,6 @@ fn admitted_low_rejects_mixed_ids_offsets_lengths_and_digests_before_commit() {
                 "segment-id",
                 "offset",
                 "empty-chunk",
-                "digest",
-                "digest-algorithm",
                 "compressed-length",
                 "raw-length",
                 "missing-coverage",

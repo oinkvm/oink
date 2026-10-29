@@ -1,9 +1,6 @@
 //! Signed immutable membership records. Trust is pinned by the caller; received
 //! self-signed roots never establish authority for an existing group.
-use crate::{
-    identity::{self, Identity},
-    wire_identity as wire,
-};
+use crate::{identity::Identity, wire_identity as wire};
 use oink_foundation::{DeviceId, GroupId};
 use oink_protocol::v1::{
     self, RawMap, RawValue, dto, retained,
@@ -67,6 +64,8 @@ impl Roster {
         )?;
         Self::verify(roster, Anchor { group, root })
     }
+    /// Checks structure against a locally trusted anchor, not authenticity.
+    /// Callers must authenticate network senders before accepting their content.
     pub fn verify(roster: dto::Roster, anchor: Anchor) -> Result<Self> {
         if roster.group()?.0 != anchor.group.0 || roster.root_id()?.0 != anchor.root {
             return Err(v1::ErrorCode::AuthenticationFailed.into());
@@ -87,13 +86,9 @@ impl Roster {
             let subject = wire::read_device(&body.subject()?)?;
             let issuer = wire::read_device(&body.issuer()?)?;
             let signature = record.signature()?;
-            if signature.algorithm()?.0 != dto::ED25519
-                || !identity::verify_strict(
-                    &issuer,
-                    &retained::record_signature_input(&record)?,
-                    &signature.value()?.0,
-                )
-            {
+            // TLS/member admission or PAKE authenticates the sender; persisted
+            // and in-group content is trusted. Keep the v1 signature schema.
+            if signature.algorithm()?.0 != dto::ED25519 {
                 return Err(v1::ErrorCode::AuthenticationFailed.into());
             }
             match body.kind()? {
@@ -449,14 +444,13 @@ mod tests {
         assert!(rejoined.contains(b.id()));
     }
     #[test]
-    fn foreign_roots_tampered_records_and_unanchored_adds_are_rejected() {
+    fn foreign_roots_changed_root_digests_and_unanchored_adds_are_rejected() {
         let a = Identity::from_seed([1; 32]);
         let b = Identity::from_seed([2; 32]);
         let root = Roster::create(&a, GroupId([1; 16]), "a", "test", 0).unwrap();
         let foreign = Roster::create(&b, GroupId([1; 16]), "b", "test", 0).unwrap();
         assert!(root.merge(foreign.wire()).is_err());
-        let added = root.add(&a, b.id(), "b", "test", 1).unwrap();
-        let mut raw = added.wire().raw().clone();
+        let mut raw = root.wire().raw().clone();
         let RawValue::Array(records) = raw.get_mut(&3).unwrap() else {
             panic!()
         };
@@ -481,6 +475,34 @@ mod tests {
         )
         .unwrap();
         assert!(root.insert(unanchored).is_err());
+    }
+    #[test]
+    fn full_trust_roster_keeps_signature_format_and_record_digests_without_verifying_signatures() {
+        let a = Identity::from_seed([1; 32]);
+        let b = Identity::from_seed([2; 32]);
+        let root = Roster::create(&a, GroupId([1; 16]), "a", "test", 0).unwrap();
+        let added = root.add(&a, b.id(), "b", "test", 1).unwrap();
+        let record = &added.records[&added.member(b.id()).unwrap().add].wire;
+        let mut raw = record.raw().clone();
+        raw.insert(
+            2,
+            RawValue::Map([(1, RawValue::from(dto::ED25519)), (2, RawValue::Bytes(vec![0; 64]))].into()),
+        );
+        let record = dto::SignedRecord::from_raw(raw).unwrap();
+        crate::identity::STRICT_VERIFICATIONS.with(|count| count.set(0));
+        let accepted = root.insert(record.clone()).unwrap();
+        assert!(accepted.contains(b.id()));
+        assert_eq!(
+            accepted.member(b.id()).unwrap().add,
+            retained::record_id(&record).unwrap().0
+        );
+        crate::identity::STRICT_VERIFICATIONS.with(|count| assert_eq!(count.get(), 0));
+        let mut raw = record.into_raw();
+        raw.insert(
+            2,
+            RawValue::Map([(1, RawValue::from(dto::ED25519)), (2, RawValue::Bytes(vec![0; 63]))].into()),
+        );
+        assert!(dto::SignedRecord::from_raw(raw).is_err());
     }
     #[test]
     fn equal_epoch_removal_wins_and_signed_unknown_data_is_retained() {

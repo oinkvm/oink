@@ -24,6 +24,7 @@ use tokio::sync::watch;
 use crate::api::{self, ApiError, ApiEvent, Request};
 use crate::node::Node;
 
+mod publication;
 mod ui;
 pub use ui::UiControl;
 
@@ -153,6 +154,7 @@ impl ServiceInfo {
 #[derive(Debug)]
 pub struct Server {
     task: tokio::task::JoinHandle<()>,
+    publication: publication::Publication,
     file: PathBuf,
     port: u16,
     closing: watch::Sender<bool>,
@@ -191,13 +193,12 @@ impl Server {
         getrandom::fill(&mut secret).map_err(|e| anyhow::anyhow!("IPC token entropy: {e}"))?;
         let token: String = secret.iter().map(|byte| format!("{byte:02x}")).collect();
         let file = node.data_dir().join(IPC_FILE);
-        write_private(
-            &file,
-            &serde_json::to_string(&Endpoint {
-                port,
-                token: token.clone(),
-            })?,
-        )?;
+        let document = serde_json::to_string(&Endpoint {
+            port,
+            token: token.clone(),
+        })?;
+        let publish_path = file.clone();
+        let publication = publication::Publication::start(move || write_private(&publish_path, &document))?;
         tracing::info!(port, "local IPC listening");
         let (closing, _) = watch::channel(false);
         let conns: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::default();
@@ -225,6 +226,7 @@ impl Server {
         };
         Ok(Self {
             task,
+            publication,
             file,
             port,
             closing,
@@ -247,6 +249,7 @@ impl Server {
     pub(crate) async fn disconnect_clients(&self) {
         self.task.abort();
         self.closing.send_replace(true);
+        self.publication.stop_async().await;
         let conns: Vec<_> = std::mem::take(&mut *self.conns.lock().unwrap_or_else(|e| e.into_inner()));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         for mut h in conns {
@@ -259,6 +262,7 @@ impl Server {
     /// 立即停止（不等订阅者）。
     pub fn stop(self) {
         self.task.abort();
+        self.publication.stop();
         self.closing.send_replace(true);
         for h in self.conns.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
             h.abort();
@@ -273,7 +277,7 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     }
     // Publish an owner-only, Medium-minimum file even from an elevated UI.
     // The loopback transport has no UIPI boundary; its secret remains private.
-    oink_foundation::storage::atomic_write(path, text.as_bytes())
+    oink_foundation::storage::atomic_write_quiet(path, text.as_bytes())
 }
 
 async fn write_line(w: &mut tokio::net::tcp::OwnedWriteHalf, v: &serde_json::Value) -> anyhow::Result<()> {
@@ -417,6 +421,19 @@ async fn stream_events(
 /// Same completed-result contract for CLI and RemoteApi/UI saves. The server
 /// single-flights saves; a transport deadline cannot imply that it cancelled one.
 pub(crate) const DIAGNOSTICS_SAVE_TIMEOUT: Option<Duration> = None;
+
+/// Package hydration can legitimately outlast an ordinary IPC call. Its native
+/// reader owns completion/failure; a transport deadline would report failure
+/// while the backend is still staging. Both UI pooled calls and CLI use this.
+pub(crate) fn response_timeout(request: Option<&Request>, ordinary: Duration) -> Option<Duration> {
+    match request {
+        Some(Request::ExportDiagnostics { .. }) => DIAGNOSTICS_SAVE_TIMEOUT,
+        Some(Request::Update {
+            command: api::UpdateCommand::OpenLocal { .. },
+        }) => None,
+        _ => Some(ordinary),
+    }
+}
 pub(crate) fn diagnostics_read_error(error: std::io::Error) -> String {
     if matches!(
         error.kind(),
@@ -495,11 +512,7 @@ impl Client {
 
     /// 调用一个 API（`Request`），返回应答的 JSON。
     pub fn call(&self, req: Request) -> anyhow::Result<serde_json::Value> {
-        let timeout = if matches!(req, Request::ExportDiagnostics { .. }) {
-            DIAGNOSTICS_SAVE_TIMEOUT
-        } else {
-            Some(Duration::from_secs(30))
-        };
+        let timeout = response_timeout(Some(&req), Duration::from_secs(30));
         self.roundtrip_with_timeout(
             &Envelope {
                 call: Some(req),
@@ -603,6 +616,16 @@ mod tests {
         .unwrap();
         let server = Server::start_on(node.clone(), 0).await.unwrap();
         let remote = crate::remote::RemoteApi::new(dir.path());
+        // This test node has fake native services: exercise the real IPC/client
+        // dispatch and unsupported guard without invoking any operating-system restart.
+        assert!(matches!(
+            node.restart_system(),
+            Err(crate::api::ApiError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            remote.restart_system(),
+            Err(crate::api::ApiError::Unsupported { .. })
+        ));
         let count = Arc::new(AtomicUsize::new(0));
         let seen = count.clone();
         remote.subscribe(Arc::new(move |event| {
@@ -656,6 +679,22 @@ mod tests {
         node.shutdown().await;
     }
 
+    #[test]
+    fn package_hydration_has_no_response_deadline_and_next_call_restores_its_bound() {
+        let package = Request::Update {
+            command: api::UpdateCommand::OpenLocal {
+                path: "/received/Oink.dmg".into(),
+            },
+        };
+        let ordinary = Request::Update {
+            command: api::UpdateCommand::Check,
+        };
+        for duration in [Duration::from_secs(30), Duration::from_secs(120)] {
+            assert_eq!(response_timeout(Some(&package), duration), None);
+            assert_eq!(response_timeout(Some(&ordinary), duration), Some(duration));
+            assert_eq!(response_timeout(None, duration), Some(duration));
+        }
+    }
     #[test]
     fn diagnostic_save_socket_timeout_explains_unconfirmed_completion() {
         let listener = (47470..=47489)

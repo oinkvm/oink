@@ -5,6 +5,17 @@ use super::{Error, ErrorCode, Result, limits};
 use minicbor::{Decoder, Encoder};
 use std::collections::BTreeMap;
 
+// Owning encoding is explicitly cold. Keep the dependency's decoder in its
+// no-alloc configuration so even type errors cannot allocate a diagnostic.
+struct OwnedWriter(Vec<u8>);
+impl minicbor::encode::Write for OwnedWriter {
+    type Error = std::convert::Infallible;
+    fn write_all(&mut self, bytes: &[u8]) -> std::result::Result<(), Self::Error> {
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
 pub type RawMap = BTreeMap<u32, RawValue>;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -59,9 +70,9 @@ impl RawValue {
         if len > maximum {
             return Err(ErrorCode::LimitExceeded.into());
         }
-        let mut out = Encoder::new(Vec::with_capacity(len));
+        let mut out = Encoder::new(OwnedWriter(Vec::with_capacity(len)));
         encode_value(self, &mut out);
-        Ok(out.into_writer())
+        Ok(out.into_writer().0)
     }
     pub fn encoded_len(&self) -> Result<usize> {
         value_len(self, 0)
@@ -92,11 +103,11 @@ pub fn encode_map(map: &RawMap, maximum: usize) -> Result<Vec<u8>> {
     if len > maximum {
         return Err(ErrorCode::LimitExceeded.into());
     }
-    let mut encoder = Encoder::new(Vec::with_capacity(len));
+    let mut encoder = Encoder::new(OwnedWriter(Vec::with_capacity(len)));
     encode_map_to(map, &mut encoder);
-    Ok(encoder.into_writer())
+    Ok(encoder.into_writer().0)
 }
-fn encode_map_to(map: &RawMap, encoder: &mut Encoder<Vec<u8>>) {
+fn encode_map_to(map: &RawMap, encoder: &mut Encoder<OwnedWriter>) {
     encoder.map(map.len() as u64).unwrap();
     for (key, value) in map {
         encoder.u32(*key).unwrap();
@@ -147,7 +158,7 @@ fn value_len(v: &RawValue, depth: usize) -> Result<usize> {
     };
     Ok(size)
 }
-fn encode_value(v: &RawValue, e: &mut Encoder<Vec<u8>>) {
+fn encode_value(v: &RawValue, e: &mut Encoder<OwnedWriter>) {
     // Vec's minicbor writer is infallible. All profile/budget validation precedes allocation.
     match v {
         RawValue::Uint(n) => {
@@ -287,7 +298,8 @@ fn decode_value(d: &mut Decoder<'_>, depth: usize, materialize: bool) -> Result<
                     return Err(ErrorCode::MalformedFrame.into());
                 }
                 previous = key;
-                let value = decode_value(d, depth + 1, materialize).map_err(|e| e.at_field(key))?;
+                let value = decode_value(d, depth + 1, materialize)
+                    .map_err(|e| if materialize { e.at_field(key) } else { e })?;
                 if materialize {
                     m.insert(key, value);
                 }
@@ -330,7 +342,24 @@ pub fn skip_profile(d: &mut Decoder<'_>, depth: usize) -> Result<()> {
 pub fn preflight_map(
     d: &mut Decoder<'_>,
     depth: usize,
+    field: impl FnMut(u32, &mut Decoder<'_>, usize) -> Result<()>,
+) -> Result<()> {
+    preflight_map_impl(d, depth, field, true)
+}
+
+/// Realtime borrowed views retain error code/offset without heap field paths.
+pub(crate) fn preflight_map_hot(
+    d: &mut Decoder<'_>,
+    depth: usize,
+    field: impl FnMut(u32, &mut Decoder<'_>, usize) -> Result<()>,
+) -> Result<()> {
+    preflight_map_impl(d, depth, field, false)
+}
+fn preflight_map_impl(
+    d: &mut Decoder<'_>,
+    depth: usize,
     mut field: impl FnMut(u32, &mut Decoder<'_>, usize) -> Result<()>,
+    annotate: bool,
 ) -> Result<()> {
     if depth >= limits::DEPTH {
         return Err(ErrorCode::LimitExceeded.into());
@@ -348,7 +377,7 @@ pub fn preflight_map(
             return Err(ErrorCode::MalformedFrame.into());
         }
         previous = key;
-        field(key, d, depth + 1).map_err(|e| e.at_field(key))?;
+        field(key, d, depth + 1).map_err(|e| if annotate { e.at_field(key) } else { e })?;
     }
     Ok(())
 }

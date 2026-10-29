@@ -98,7 +98,7 @@ fn timestamp(s: &str) -> Option<u64> {
     })?;
     u64::try_from(t.unix_timestamp()).ok()
 }
-fn debug_id(s: &str) -> Option<[u8; 16]> {
+pub fn debug_id(s: &str) -> Option<[u8; 16]> {
     if s.len() != 36 || [8, 13, 18, 23].iter().any(|i| s.as_bytes()[*i] != b'-') {
         return None;
     }
@@ -163,26 +163,61 @@ pub fn extract(
         _ => ExceptionClass::Unknown,
     };
     let mut crash = SafeCrash::empty(lifetime.build, lifetime.component, CrashKind::NativeException, class);
+    for (slot, frame) in crash
+        .frames
+        .iter_mut()
+        .flatten()
+        .zip(project_frames(&raw, manifest, lifetime.image)?)
+    {
+        *slot = Some(frame);
+    }
+    Some((crash, at))
+}
+/// Shared numeric projection for attributable upload and local diagnostic views.
+pub fn project_frames(raw: &Value, manifest: &Manifest, preferred: ImageSlot) -> Option<Vec<Frame>> {
+    let images = raw.get("usedImages")?.as_array()?;
+    if images.len() > 4096 {
+        return None;
+    }
     let thread = raw
         .get("faultingThread")
         .and_then(Value::as_u64)
         .and_then(|i| raw.get("threads")?.as_array()?.get(i as usize))?;
     let frames = thread.get("frames")?.as_array()?;
-    for (slot, frame) in crash.frames.iter_mut().flatten().zip(frames.iter().filter_map(|f| {
-        let index = f.get("imageIndex")?.as_u64()? as usize;
-        let image = images.get(index)?;
-        let id = debug_id(image.get("uuid")?.as_str()?)?;
-        let shipped = manifest.image(id, lifetime.image)?;
-        let offset = f.get("imageOffset")?.as_u64()?;
-        (offset < shipped.text_size).then_some(Frame::Native {
-            image: shipped.slot,
-            offset,
-            debug_id: id,
-        })
-    })) {
-        *slot = Some(frame);
-    }
-    Some((crash, at))
+    Some(
+        frames
+            .iter()
+            .enumerate()
+            .filter_map(|(position, f)| {
+                let index = f.get("imageIndex")?.as_u64()? as usize;
+                let image = images.get(index)?;
+                let offset = f.get("imageOffset")?.as_u64()?;
+                // .ips frame zero is the context PC; subsequent frames are return
+                // PCs. Apply Sentry symbolic's architecture rule BEFORE dropping
+                // system frames, or the first retained caller becomes a false PC.
+                let offset = if position == 0 {
+                    offset
+                } else {
+                    match image.get("arch")?.as_str()? {
+                        "arm64" | "arm64e" => (offset & !3).checked_sub(4)?,
+                        "x86_64" | "x86_64h" => offset.checked_sub(1)?,
+                        _ => return None, // Never guess a return-PC adjustment.
+                    }
+                };
+                let id = debug_id(image.get("uuid")?.as_str()?)?;
+                let shipped = manifest.image(id, preferred)?;
+                (offset < shipped.text_size).then_some(Frame::Native {
+                    image: shipped.slot,
+                    offset,
+                    debug_id: id,
+                    debug_age: 0,
+                    code_id: None,
+                    image_size: shipped.text_size,
+                })
+            })
+            .take(64)
+            .collect(),
+    )
 }
 /// Bounded scan only in the presence of a previously armed lifetime. No startup
 /// backfill or OS-owned file deletion; all attribution checks precede projection.
@@ -231,6 +266,42 @@ pub fn recover(
 mod tests {
     use super::*;
     #[test]
+    fn caller_addresses_are_normalized_before_filtering_system_frames() {
+        let manifest = Manifest {
+            version: AppVersion {
+                major: 1,
+                minor: 0,
+                patch: 0,
+                build: 1,
+            },
+            images: vec![oink_telemetry::capture::Image {
+                slot: ImageSlot::Agent,
+                debug_id: [1; 16],
+                debug_age: 0,
+                code_id: None,
+                text_size: 4096,
+            }],
+        };
+        for (arch, expected) in [("arm64", 20), ("x86_64", 23)] {
+            let raw = serde_json::json!({"usedImages":[
+                {"uuid":"02020202-0202-0202-0202-020202020202", "arch":arch},
+                {"uuid":"01010101-0101-0101-0101-010101010101", "arch":arch}],
+                "faultingThread":0,"threads":[{"frames":[
+                    {"imageIndex":0,"imageOffset":24},
+                    {"imageIndex":1,"imageOffset":24},
+                    {"imageIndex":1,"imageOffset":4096}]}]});
+            let frames = project_frames(&raw, &manifest, ImageSlot::Agent).unwrap();
+            assert!(matches!(frames[0], Frame::Native{offset,..} if offset == expected));
+            assert_eq!(frames.len(), 2, "normalize before checking image extent too");
+            let mut context = raw;
+            context["threads"][0]["frames"] = serde_json::json!([{ "imageIndex":1, "imageOffset":24 }]);
+            assert!(matches!(
+                project_frames(&context, &manifest, ImageSlot::Agent).unwrap()[0],
+                Frame::Native { offset: 24, .. }
+            ));
+        }
+    }
+    #[test]
     fn executable_identity_comes_from_the_image_and_rejects_ambiguous_commands() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut bytes = vec![0u8; 56];
@@ -263,6 +334,8 @@ mod tests {
             images: vec![oink_telemetry::capture::Image {
                 slot: ImageSlot::Agent,
                 debug_id: [1; 16],
+                debug_age: 0,
+                code_id: None,
                 text_size: 4096,
             }],
         };

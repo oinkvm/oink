@@ -8,7 +8,7 @@
 //!   包含更长路径时整批返回 Unsupported，调用方可预取为 CF_HDROP；见 [`super::files::descriptors`]）；
 //! - `FileContents`（按 `lindex` 取，`IStream`）：[`FileStream`]，`Read` 从 [`FileContents::open`] 读取，
 //!   数据未到时阻塞等待；
-//! - `Preferred DropEffect` = 复制；同时写入的其他表示形式（文件名文本等）与隐私标记（HGLOBAL）；
+//! - received 文件的 `Preferred DropEffect` = COPY | MOVE，原源始终 COPY；同时写入的其他表示形式（文件名文本等）与隐私标记（HGLOBAL）；
 //! - Shell 拖拽图像 helper 的私有 IStream 上下文按 COM 引用计数保存并返回。
 //! - 粘贴方通过 `SetData` 写回的格式（`Performed DropEffect`、`Paste Succeeded` 等）原样保存、可读回；
 //! - `IDataObjectAsyncCapability`：资源管理器据此在后台线程复制并显示进度窗口。
@@ -45,8 +45,8 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Duration;
 
 use windows::Win32::Foundation::{
-    CLIPBRD_E_CANT_OPEN, DATA_S_SAMEFORMATETC, DV_E_DVASPECT, DV_E_FORMATETC, DV_E_LINDEX, DV_E_TYMED, E_NOTIMPL,
-    E_POINTER, FILETIME, GlobalFree, HGLOBAL, OLE_E_ADVISENOTSUPPORTED, S_FALSE, S_OK, STG_E_ACCESSDENIED,
+    CLIPBRD_E_CANT_OPEN, DATA_S_SAMEFORMATETC, DRAGDROP_S_DROP, DV_E_DVASPECT, DV_E_FORMATETC, DV_E_LINDEX, DV_E_TYMED,
+    E_NOTIMPL, E_POINTER, FILETIME, GlobalFree, HGLOBAL, OLE_E_ADVISENOTSUPPORTED, S_FALSE, S_OK, STG_E_ACCESSDENIED,
     STG_E_INVALIDFUNCTION, STG_E_READFAULT, STG_E_WRITEFAULT,
 };
 use windows::Win32::System::Com::Marshal::CoMarshalInterThreadInterfaceInStream;
@@ -59,12 +59,15 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::DataExchange::{GetClipboardSequenceNumber, IsClipboardFormatAvailable};
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock};
-use windows::Win32::System::Ole::{OleFlushClipboard, OleSetClipboard, ReleaseStgMedium};
+use windows::Win32::System::Ole::{DROPEFFECT, OleFlushClipboard, OleSetClipboard, ReleaseStgMedium};
 use windows::Win32::UI::Shell::{IDataObjectAsyncCapability, IDataObjectAsyncCapability_Impl, SHCreateStdEnumFmtEtc};
 use windows::core::{BOOL, HRESULT, IUnknownImpl, Interface, PWSTR, Ref, implement};
 
 use super::files::{DescMeta, Descriptors, FD_FILESIZE, FILEDESCRIPTOR_SIZE};
 use crate::{ClipboardError, FileContents};
+
+#[cfg(all(test, debug_assertions))]
+mod shell_drop_tests;
 
 /// 写入虚拟文件所需的全部内容（在调用方线程准备好，交给剪贴板线程）。
 pub(crate) struct Spec {
@@ -134,6 +137,7 @@ fn publish(data: IDataObject, shared: Arc<Shared>, fixed: Vec<(u32, Vec<u8>)>) -
             fixed,
         })
     });
+    super::worker::publication_changed(Some(published_count));
     Ok(published_count)
 }
 
@@ -148,8 +152,16 @@ pub(crate) fn build_inner(
     with_files: bool,
     native: Option<super::content::target::Target>,
 ) -> (IDataObject, Arc<Shared>) {
+    let mut spec = spec;
+    let shortcut = native.as_ref().and_then(|target| target.shortcut.clone());
+    let generated = shortcut.is_some();
+    let with_files = with_files || generated;
+    if let Some(contents) = shortcut {
+        spec.contents = contents;
+    }
+    let cloud = spec.cloud.map(Arc::new);
     let descriptors = OnceLock::new();
-    if spec.contents.namespace().is_none() {
+    if !generated && spec.contents.namespace().is_none() {
         let mut prepared = spec.descriptors;
         omit_unknown_sizes(&mut prepared, spec.contents.as_ref());
         let _ = descriptors.set(Ok(prepared));
@@ -158,14 +170,18 @@ pub(crate) fn build_inner(
         publication: super::content::diagnostics::Publication::new(),
         contents: spec.contents,
         flushing: AtomicBool::new(!with_files),
-        cloud_paths: spec.cloud.is_some(),
+        cloud_paths: cloud.is_some(),
+        cloud: cloud.clone(),
         hosted_drag: AtomicBool::new(false),
+        async_running: AtomicBool::new(false),
+        drag_diagnostics: OnceLock::new(),
+        drag_completion: Mutex::new(DragCompletion::default()),
     });
-    // No cloud offer means the platform capability was unavailable. Retain
-    // virtual formats here; publication/fetch errors never switch formats later.
-    let virtual_files = spec.cloud.as_ref().is_none_or(|offer| offer.virtual_files);
+    // Local virtual providers and generated URL shortcuts need no cloud item.
+    // Remote native-file publications reject a missing provider before build.
+    let virtual_files = cloud.as_ref().is_none_or(|offer| offer.virtual_files);
     let obj = DataObject {
-        cloud: spec.cloud,
+        cloud,
         virtual_files,
         native,
         shared: Arc::clone(&shared),
@@ -227,18 +243,21 @@ pub(crate) fn release_if_replaced() {
             && !is_current(&c.data)
         {
             *cur = None;
+            super::worker::publication_changed(None);
         }
     });
 }
 
 /// 普通写入之前调用：剪贴板马上会被清空，数据对象由 OLE 释放；本线程的引用一并释放。
 pub(crate) fn forget() {
+    super::worker::publication_changed(None);
     CURRENT.with(|c| c.borrow_mut().take());
 }
 
 /// 进程退出（剪贴板线程收到 `WM_CLOSE`）时调用，见模块文档。剪贴板上仍留有文件清单时调用
 /// `clear_and_write` 清空剪贴板并写回其他表示形式。
 pub(crate) fn shutdown(cf_descriptor: u32, clear_and_write: impl FnOnce(&[(u32, Vec<u8>)])) {
+    super::worker::publication_changed(None);
     let Some(cur) = CURRENT.with(|c| c.borrow_mut().take()) else {
         return;
     };
@@ -267,7 +286,82 @@ pub(crate) struct Shared {
     /// 退出前的 `OleFlushClipboard`：不再提供文件格式。
     flushing: AtomicBool,
     cloud_paths: bool,
+    cloud: Option<Arc<super::cloud::Offer>>,
     hosted_drag: AtomicBool,
+    async_running: AtomicBool,
+    drag_diagnostics: OnceLock<Arc<super::dnd::drop_trace::Session>>,
+    drag_completion: Mutex<DragCompletion>,
+}
+
+#[derive(Default)]
+struct DragCompletion {
+    logical: Option<u32>,
+    performed: Option<u32>,
+    pasted: Option<u32>,
+    ended: Option<(bool, bool)>,
+    asynchronous: Option<(HRESULT, u32)>,
+}
+#[derive(Clone, Copy)]
+enum MoveAction {
+    DeleteReceived,
+    ConvergeIdentity,
+}
+impl DragCompletion {
+    // Microsoft source rules: delete only the unoptimized MOVE combination.
+    // SetData outcomes precede EndOperation for asynchronous transfers; the
+    // caller defers this decision while InOperation is true. No consumption or
+    // residency check can replace the target's report (user, 2026-10-29).
+    // https://learn.microsoft.com/en-us/windows/win32/shell/datascenarios
+    fn move_action(&self) -> Option<MoveAction> {
+        if self.ended.is_some_and(|(dropped, _)| !dropped) {
+            return None;
+        }
+        let performed_move = self.performed == Some(2);
+        if let Some((result, effect)) = self.asynchronous {
+            if result.is_err() {
+                return None;
+            }
+            if self.pasted == Some(2) {
+                return Some(if performed_move {
+                    MoveAction::DeleteReceived
+                } else {
+                    MoveAction::ConvergeIdentity
+                });
+            }
+            if effect == 2 && performed_move {
+                return Some(MoveAction::DeleteReceived);
+            }
+            return (effect == 2 || performed_move || self.logical == Some(2) || self.ended == Some((true, true)))
+                .then_some(MoveAction::ConvergeIdentity);
+        }
+        if self.pasted == Some(2) {
+            return Some(if performed_move {
+                MoveAction::DeleteReceived
+            } else {
+                MoveAction::ConvergeIdentity
+            });
+        }
+        let (dropped, moved) = self.ended?;
+        if !dropped {
+            return None;
+        }
+        if moved && performed_move {
+            return Some(MoveAction::DeleteReceived);
+        }
+        (moved || performed_move || self.logical == Some(2)).then_some(MoveAction::ConvergeIdentity)
+    }
+    fn accepted(&self, hr: HRESULT, effect: DROPEFFECT, pending: bool) -> bool {
+        if hr != DRAGDROP_S_DROP {
+            return false;
+        }
+        let transferred = |effect: u32| effect & 7 != 0; // COPY | MOVE | LINK, excluding SCROLL.
+        if let Some((result, _)) = self.asynchronous {
+            // EndOperation's HRESULT reports extraction success. Its effect is
+            // the physical performed effect, which is NONE for optimized MOVE.
+            return result.is_ok();
+        }
+        pending || transferred(effect.0) || self.logical.is_some_and(transferred)
+    }
 }
 
 pub(super) fn disable_files(shared: &Shared) {
@@ -275,12 +369,70 @@ pub(super) fn disable_files(shared: &Shared) {
 }
 
 impl Shared {
+    /// Explorer can return NONE for a pending/optimized MOVE, then read our
+    /// IDataObject after DoDragDrop. Cancelling here revoked CIDA/HDROP before
+    /// that read (Windows 11). InOperation and logical completion distinguish
+    /// this accepted drop from rejection; EndOperation still owns late failure.
+    /// A cancelled native loop never becomes accepted, and this grants no right
+    /// to delete the original remote file or infer physical MOVE cleanup.
+    pub(super) fn drag_dropped(&self, hr: HRESULT, effect: DROPEFFECT) -> bool {
+        self.drag_completion
+            .lock()
+            .unwrap()
+            .accepted(hr, effect, self.async_running.load(Ordering::Acquire))
+    }
+    pub(super) fn observe_drag(&self, diagnostics: Arc<super::dnd::drop_trace::Session>) {
+        let _ = self.drag_diagnostics.set(diagnostics);
+    }
     pub(super) fn host_drag_images(&self) {
         self.hosted_drag.store(true, Ordering::Relaxed);
     }
     fn cancel(&self, why: &str) {
         tracing::info!("虚拟文件：{why}，通知取消");
+        // Each hosted drag owns a provisional namespace. A reusable clipboard
+        // object can already have completed copies from earlier pastes.
+        if self.hosted_drag.load(Ordering::Relaxed) {
+            self.flushing.store(true, Ordering::SeqCst);
+            if let Some(cloud) = &self.cloud {
+                cloud.cancel();
+            }
+        }
         self.contents.cancel();
+    }
+    fn move_completed(&self) {
+        if let Some(cloud) = &self.cloud
+            && let Err(error) = cloud.move_completed()
+        {
+            tracing::debug!(%error, "native MOVE intent not persisted; retain received copy");
+        }
+    }
+    fn reconcile_move(&self) {
+        if self.async_running.load(Ordering::Acquire) {
+            return;
+        }
+        let action = self.drag_completion.lock().unwrap().move_action();
+        let Some(cloud) = &self.cloud else {
+            return;
+        };
+        let result = match action {
+            Some(MoveAction::DeleteReceived) => {
+                self.move_completed();
+                return;
+            }
+            Some(MoveAction::ConvergeIdentity) => cloud.optimized_move_completed(),
+            None => return,
+        };
+        if let Err(error) = result {
+            tracing::debug!(%error, "optimized MOVE identity convergence will retry");
+        }
+    }
+    pub(super) fn drag_ended(&self, dropped: bool, moved: bool) {
+        self.drag_completion.lock().unwrap().ended = Some((dropped, moved));
+        if !dropped {
+            self.cancel("native drag cancelled or failed");
+        } else {
+            self.reconcile_move();
+        }
     }
 }
 
@@ -319,7 +471,7 @@ struct ObjState {
 
 #[implement(IDataObject, IDataObjectAsyncCapability, Agile = false)]
 struct DataObject {
-    cloud: Option<super::cloud::Offer>,
+    cloud: Option<Arc<super::cloud::Offer>>,
     virtual_files: bool,
     native: Option<super::content::target::Target>,
     shared: Arc<Shared>,
@@ -382,6 +534,55 @@ fn omit_unknown_sizes(descriptors: &mut Descriptors, contents: &dyn FileContents
 }
 
 impl DataObject {
+    fn original_descriptor(&self, name: &str) -> bool {
+        self.native.as_ref().is_some_and(|native| native.spec.inventory.items.iter().flat_map(|item| &item.representations).any(|rep| {
+            matches!(&rep.format, crate::model::NativeFormat::WindowsRegistered(format) if format.eq_ignore_ascii_case(name))
+                && matches!(rep.data, crate::model::RepresentationData::File(_))
+        }))
+    }
+    fn wide_descriptor(&self) -> bool {
+        !self.original_descriptor("FileGroupDescriptor") || self.original_descriptor("FileGroupDescriptorW")
+    }
+    fn ansi_descriptor(&self) -> Option<u32> {
+        (self.original_descriptor("FileGroupDescriptor")
+            || self
+                .descriptors
+                .get()
+                .is_some_and(|value| value.as_ref().is_ok_and(|value| value.ansi.is_some())))
+        .then(|| {
+            super::content::format_id(&crate::model::NativeFormat::WindowsRegistered(
+                "FileGroupDescriptor".into(),
+            ))
+            .map(u32::from)
+        })
+        .flatten()
+    }
+    fn path_formats(&self) -> Vec<(u32, &'static str)> {
+        if self.cloud.is_none() || self.shared.flushing.load(Ordering::SeqCst) {
+            return vec![];
+        }
+        let Some(native) = self.native.as_ref() else {
+            return vec![];
+        };
+        let inventory = &native.spec.inventory;
+        if !inventory.items.iter().any(|item| item.file.is_some())
+            || inventory.items.iter().any(|item| item.virtual_files)
+        {
+            return vec![];
+        }
+        let names: &[&str] = if inventory.roots.len() == 1 {
+            &["Shell IDList Array", "FileNameW", "FileName"]
+        } else {
+            &["Shell IDList Array"]
+        };
+        names
+            .iter()
+            .filter_map(|name| {
+                super::content::format_id(&crate::model::NativeFormat::WindowsRegistered((*name).into()))
+                    .map(|id| (id as u32, *name))
+            })
+            .collect()
+    }
     fn descriptors(&self) -> windows::core::Result<&Descriptors> {
         self.descriptors
             .get_or_init(|| {
@@ -394,7 +595,23 @@ impl DataObject {
                 if entries.len() > 65_535 {
                     return Err(STG_E_READFAULT);
                 }
-                let mut descriptors = super::files::descriptors(&entries);
+                let native = self
+                    .shared
+                    .contents
+                    .namespace()
+                    .map(|namespace| namespace.native_file_metadata())
+                    .unwrap_or_default();
+                let mut descriptors = if native.windows.is_empty() {
+                    super::files::descriptors(&entries)
+                } else {
+                    let nodes = self
+                        .shared
+                        .contents
+                        .descriptor_nodes()
+                        .map_err(|_| STG_E_READFAULT)?
+                        .ok_or(STG_E_READFAULT)?;
+                    super::files::native_descriptors(&entries, &nodes, &native).map_err(|_| STG_E_READFAULT)?
+                };
                 if descriptors.skipped_long > 0 || descriptors.bytes.len() > crate::model::INVENTORY_BYTES {
                     return Err(STG_E_READFAULT);
                 }
@@ -413,11 +630,14 @@ impl DataObject {
         }
         let cf = u32::from(f.cfFormat);
         let tymed = f.tymed;
-        if !self.virtual_files && (cf == self.cf_descriptor || cf == self.cf_contents) {
+        let descriptor = (cf == self.cf_descriptor && self.wide_descriptor()) || self.ansi_descriptor() == Some(cf);
+        if (cf == self.cf_descriptor && !self.wide_descriptor())
+            || (!self.virtual_files && (descriptor || cf == self.cf_contents))
+        {
             return DV_E_FORMATETC;
         }
-        let cloud_fmt = cf == 15 && self.cloud.is_some();
-        let file_fmt = cf == self.cf_descriptor || cf == self.cf_contents || cloud_fmt;
+        let cloud_fmt = (cf == 15 && self.cloud.is_some()) || self.path_formats().iter().any(|(id, _)| *id == cf);
+        let file_fmt = descriptor || cf == self.cf_contents || cloud_fmt;
         if file_fmt && self.shared.flushing.load(Ordering::SeqCst) {
             return DV_E_FORMATETC;
         }
@@ -435,7 +655,7 @@ impl DataObject {
             return if tymed & stored.tymed() != 0 { S_OK } else { DV_E_TYMED };
         }
         let known = cloud_fmt
-            || cf == self.cf_descriptor
+            || descriptor
             || self.fixed.iter().any(|(c, _)| *c == cf)
             || self
                 .state
@@ -474,11 +694,21 @@ impl DataObject {
         let mut files = Vec::new();
         if !self.shared.flushing.load(Ordering::SeqCst) {
             if self.virtual_files {
-                files.push(fe(self.cf_descriptor, TYMED_HGLOBAL.0 as u32));
+                if self.wide_descriptor() {
+                    files.push(fe(self.cf_descriptor, TYMED_HGLOBAL.0 as u32));
+                }
+                if let Some(ansi) = self.ansi_descriptor() {
+                    files.push(fe(ansi, TYMED_HGLOBAL.0 as u32));
+                }
                 files.push(fe(self.cf_contents, TYMED_ISTREAM.0 as u32));
             }
             if self.cloud.is_some() {
                 files.push(fe(15, TYMED_HGLOBAL.0 as u32));
+                files.extend(
+                    self.path_formats()
+                        .iter()
+                        .map(|(id, _)| fe(*id, TYMED_HGLOBAL.0 as u32)),
+                );
             }
         }
         let mut v = self
@@ -533,6 +763,7 @@ fn data_call(shared: &Shared, stage: u16, format: Option<&FORMATETC>, aux: u32) 
 
 impl IDataObject_Impl for DataObject_Impl {
     fn GetData(&self, pformatetcin: *const FORMATETC) -> windows::core::Result<STGMEDIUM> {
+        let callback = crate::content::native_read::Callback::begin();
         // SAFETY: COM owns the optional FORMATETC for this callback. No pointed-to data is logged.
         let trace = data_call(
             &self.shared,
@@ -560,7 +791,12 @@ impl IDataObject_Impl for DataObject_Impl {
                 return Err(hr.into());
             }
             let cf = u32::from(f.cfFormat);
-            if cf == 15
+            let path_name = self
+                .path_formats()
+                .into_iter()
+                .find(|(id, _)| *id == cf)
+                .map(|(_, name)| name);
+            if (cf == 15 || path_name.is_some())
                 && let Some(cloud) = &self.cloud
             {
                 tracing::info!(target: "oink_file_diagnostics", file_stage = 20_u8,
@@ -574,9 +810,21 @@ impl IDataObject_Impl for DataObject_Impl {
                     );
                     windows::core::Error::from(STG_E_READFAULT)
                 })?;
+                let bytes = if let Some(name) = path_name {
+                    super::files::path_equivalent(name, &bytes)
+                        .map_err(|_| windows::core::Error::from(STG_E_READFAULT))?
+                } else {
+                    bytes
+                };
+                if let Some(diagnostics) = self.shared.drag_diagnostics.get() {
+                    diagnostics.bytes(cf, &bytes);
+                }
                 return medium_hglobal(&bytes);
             }
             if cf == self.cf_contents {
+                if let Some(cloud) = &self.cloud {
+                    cloud.hdrop().map_err(|_| windows::core::Error::from(STG_E_READFAULT))?;
+                }
                 let descriptors = self.descriptors()?;
                 let Some(i) = usize::try_from(f.lindex)
                     .ok()
@@ -589,7 +837,15 @@ impl IDataObject_Impl for DataObject_Impl {
                 tracing::info!(target: "oink_file_diagnostics", file_stage = 20_u8,
                 file_object = self.shared.publication.observe(None).object, file_format = 2_u8,
                 file_index = entry, size, "native file content requested");
+                let lease = self
+                    .shared
+                    .contents
+                    .namespace()
+                    .map(|files| files.native_lease())
+                    .transpose()
+                    .map_err(|_| windows::core::Error::from(STG_E_READFAULT))?;
                 let stream = FileStream {
+                    _lease: lease,
                     shared: Arc::clone(&self.shared),
                     entry,
                     name,
@@ -615,7 +871,13 @@ impl IDataObject_Impl for DataObject_Impl {
                 tracing::debug!("native file descriptors requested");
                 return medium_hglobal(&self.descriptors()?.bytes);
             }
+            if self.ansi_descriptor() == Some(cf) {
+                return medium_hglobal(self.descriptors()?.ansi.as_ref().ok_or(STG_E_READFAULT)?);
+            }
             if let Some((_, b)) = self.fixed.iter().find(|(c, _)| *c == cf) {
+                if let Some(diagnostics) = self.shared.drag_diagnostics.get() {
+                    diagnostics.bytes(cf, b);
+                }
                 return medium_hglobal(b);
             }
             let stored = self.state.lock().ok().and_then(|s| s.stored.get(&f.cfFormat).cloned());
@@ -630,6 +892,16 @@ impl IDataObject_Impl for DataObject_Impl {
                 .err()
                 .map_or(0, |error: &windows::core::Error| error.code().0),
         );
+        if result.is_ok() {
+            callback.served();
+        }
+        // SAFETY: COM keeps the optional input FORMATETC alive for this call.
+        let format = unsafe { pformatetcin.as_ref() };
+        if let Some(diagnostics) = self.shared.drag_diagnostics.get()
+            && let Some(format) = format
+        {
+            diagnostics.format(2, format, result.as_ref().err().map_or(0, |error| error.code().0));
+        }
         result
     }
 
@@ -667,6 +939,13 @@ impl IDataObject_Impl for DataObject_Impl {
             }
         });
         trace.result(result.0);
+        // SAFETY: COM keeps the optional input FORMATETC alive for this call.
+        let format = unsafe { pformatetc.as_ref() };
+        if let Some(diagnostics) = self.shared.drag_diagnostics.get()
+            && let Some(format) = format
+        {
+            diagnostics.format(1, format, result.0);
+        }
         result
     }
 
@@ -722,6 +1001,37 @@ impl IDataObject_Impl for DataObject_Impl {
                     tracing::warn!(format = f.cfFormat, medium = m.tymed, "unsupported SetData medium");
                     return Err(DV_E_TYMED.into());
                 };
+                if let Some(diagnostics) = self.shared.drag_diagnostics.get()
+                    && let StoredMedium::Bytes(bytes) = &value
+                {
+                    diagnostics.receipt(f.cfFormat, bytes);
+                }
+                if let StoredMedium::Bytes(bytes) = &value
+                    && let Some(effect) = bytes.get(..4)
+                {
+                    let effect = u32::from_le_bytes(effect.try_into().unwrap());
+                    let logical = windows::Win32::System::DataExchange::RegisterClipboardFormatW(windows::core::w!(
+                        "Logical Performed DropEffect"
+                    ));
+                    let performed = windows::Win32::System::DataExchange::RegisterClipboardFormatW(windows::core::w!(
+                        "Performed DropEffect"
+                    ));
+                    let pasted = windows::Win32::System::DataExchange::RegisterClipboardFormatW(windows::core::w!(
+                        "Paste Succeeded"
+                    ));
+                    if f.cfFormat as u32 == logical {
+                        self.shared.drag_completion.lock().unwrap().logical = Some(effect);
+                    }
+                    if f.cfFormat as u32 == performed {
+                        self.shared.drag_completion.lock().unwrap().performed = Some(effect);
+                    }
+                    if f.cfFormat as u32 == pasted {
+                        self.shared.drag_completion.lock().unwrap().pasted = Some(effect);
+                    }
+                    if [logical, performed, pasted].contains(&(f.cfFormat as u32)) {
+                        self.shared.reconcile_move();
+                    }
+                }
                 // Each helper/process may cache a different drag-image window.
                 // Keep exactly one published window for a hosted drag, including
                 // thumbnail replacement and native target reentry. A zero value
@@ -787,6 +1097,9 @@ impl IDataObject_Impl for DataObject_Impl {
             // SAFETY: 数组在调用期间有效，系统复制一份。
             let formats = self.formats();
             for (index, format) in formats.iter().enumerate() {
+                if let Some(diagnostics) = self.shared.drag_diagnostics.get() {
+                    diagnostics.format(0, format, 0);
+                }
                 let entry = data_call(
                     &self.shared,
                     oink_foundation::drag_trace::stage::ENUM_FORMATS,
@@ -865,7 +1178,12 @@ impl IDataObjectAsyncCapability_Impl for DataObject_Impl {
     }
 
     fn StartOperation(&self, _pbcreserved: Ref<'_, IBindCtx>) -> windows::core::Result<()> {
+        if let Some(diagnostics) = self.shared.drag_diagnostics.get() {
+            diagnostics.async_start();
+        }
         tracing::debug!("native asynchronous file operation started");
+        *self.shared.drag_completion.lock().unwrap() = DragCompletion::default();
+        self.shared.async_running.store(true, Ordering::Release);
         if let Ok(mut s) = self.state.lock() {
             s.in_operation = true;
         }
@@ -882,13 +1200,24 @@ impl IDataObjectAsyncCapability_Impl for DataObject_Impl {
         _pbcreserved: Ref<'_, IBindCtx>,
         dweffects: u32,
     ) -> windows::core::Result<()> {
+        if let Some(diagnostics) = self.shared.drag_diagnostics.get() {
+            diagnostics.async_end(hresult.0, dweffects);
+        }
         tracing::debug!(result = ?hresult, effect = dweffects, "native asynchronous file operation ended");
+        self.shared.drag_completion.lock().unwrap().asynchronous = Some((hresult, dweffects));
         if let Ok(mut s) = self.state.lock() {
             s.in_operation = false;
         }
-        if hresult.is_err() || dweffects == 0 {
+        self.shared.async_running.store(false, Ordering::Release);
+        // EndOperation uses CFSTR_PERFORMEDDROPEFFECT semantics: NONE is a
+        // successful optimized MOVE, not failed extraction (the HRESULT owns
+        // that result). Never cancel delivered data solely for this effect.
+        if hresult.is_err() {
             self.shared.cancel("粘贴方结束了异步操作但没有成功");
+        } else {
+            self.shared.reconcile_move();
         }
+
         Ok(())
     }
 }
@@ -907,6 +1236,8 @@ struct StreamState {
     /// 曾经完整读完过一次（之后即使 Seek 回去再释放，也不算取消）。
     completed: bool,
     logged_caller: bool,
+    consumed_to: u64,
+    proof_sent: bool,
 }
 
 #[implement(IStream, Agile = false)]
@@ -919,9 +1250,30 @@ struct FileStream {
     declared_size: Option<u64>,
     mtime: u64,
     st: Mutex<StreamState>,
+    // GetData transfers an unread consumer to OLE. Its last COM reference,
+    // rather than the first/last Read call, determines when cleanup may run.
+    _lease: Option<crate::content::namespace::NativeLease>,
 }
 
 impl FileStream {
+    fn consumed_range(&self, st: &mut StreamState, start: u64, count: usize) {
+        if start <= st.consumed_to {
+            st.consumed_to = st.consumed_to.max(start + count as u64);
+        }
+        if !st.proof_sent
+            && st.eof
+            && st.consumed_to == st.pos
+            && let Some(cloud) = &self.shared.cloud
+        {
+            match cloud.target_consumed(self.entry) {
+                Ok(()) => st.proof_sent = true,
+                Err(error) => {
+                    tracing::debug!(%error, "stream consumption proof not persisted; retain received copy")
+                }
+            }
+        }
+    }
+
     fn current_size(&self) -> std::io::Result<u64> {
         self.metadata_size(self.shared.contents.metadata(self.entry)?)
     }
@@ -1008,8 +1360,12 @@ impl ISequentialStream_Impl for FileStream_Impl {
         let Ok(mut st) = self.st.lock() else {
             return STG_E_READFAULT;
         };
+        let start = st.pos;
         match self.read_into(&mut st, buf) {
             Ok(n) => {
+                if cb != 0 {
+                    self.consumed_range(&mut st, start, n);
+                }
                 tracing::trace!(requested = cb, read = n, offset = st.pos, "native file read");
                 if !pcbread.is_null() {
                     // SAFETY: 调用方提供的输出参数。
@@ -1020,6 +1376,7 @@ impl ISequentialStream_Impl for FileStream_Impl {
             Err(e) => {
                 tracing::warn!(target: "oink_file_diagnostics", file_stage = 21_u8,
                     file_object = self.shared.publication.observe(None).object, file_index = self.entry,
+                    file_code = e.raw_os_error().unwrap_or(0) as u32,
                     file_reason = crate::content::reason(&e) as u8,
                     "native file stream read failed");
                 if !pcbread.is_null() {
@@ -1082,16 +1439,18 @@ impl IStream_Impl for FileStream_Impl {
         let mut result = Ok(());
         while left > 0 {
             let want = left.min(buf.len() as u64) as usize;
-            let n = {
+            let (start, n) = {
                 let mut st = self
                     .st
                     .lock()
                     .map_err(|_| windows::core::Error::from(STG_E_READFAULT))?;
+                let start = st.pos;
                 match self.read_into(&mut st, &mut buf[..want]) {
-                    Ok(n) => n,
+                    Ok(n) => (start, n),
                     Err(e) => {
                         tracing::warn!(target: "oink_file_diagnostics", file_stage = 21_u8,
                             file_object = self.shared.publication.observe(None).object, file_index = self.entry,
+                            file_code = e.raw_os_error().unwrap_or(0) as u32,
                             file_reason = crate::content::reason(&e) as u8,
                             "native file stream read failed");
                         result = Err(STG_E_READFAULT.into());
@@ -1100,6 +1459,9 @@ impl IStream_Impl for FileStream_Impl {
                 }
             };
             if n == 0 {
+                if let Ok(mut st) = self.st.lock() {
+                    self.consumed_range(&mut st, start, 0);
+                }
                 break;
             }
             read += n as u64;
@@ -1114,6 +1476,9 @@ impl IStream_Impl for FileStream_Impl {
             if w != n as u32 {
                 result = Err(STG_E_WRITEFAULT.into());
                 break;
+            }
+            if let Ok(mut st) = self.st.lock() {
+                self.consumed_range(&mut st, start, n);
             }
             left -= n as u64;
             if n < want {
@@ -1261,9 +1626,193 @@ fn mta_stream(stream: FileStream) -> windows::core::Result<IStream> {
 }
 
 #[cfg(all(test, debug_assertions))]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn shell_completion_keeps_pending_data_and_respects_late_failure_and_native_cancel() {
+        std::thread::spawn(|| {
+            use windows::Win32::{
+                Foundation::{DRAGDROP_S_CANCEL, E_ABORT},
+                System::{
+                    DataExchange::RegisterClipboardFormatW,
+                    Ole::{DROPEFFECT_NONE, OleInitialize, OleUninitialize},
+                },
+            };
+            // SAFETY: private apartment and IDataObjects, no system clipboard/desktop.
+            unsafe { OleInitialize(None).unwrap() };
+            struct Apartment;
+            impl Drop for Apartment {
+                fn drop(&mut self) {
+                    // SAFETY: balances successful initialization on this thread.
+                    unsafe { OleUninitialize() };
+                }
+            }
+            let _apartment = Apartment;
+            let make = || {
+                let memory = Arc::new(Memory {
+                    bytes: b"fixture".to_vec(),
+                    opens: AtomicUsize::new(0),
+                    cancels: AtomicUsize::new(0),
+                    dynamic: AtomicBool::new(false),
+                });
+                let f = super::super::formats();
+                let (data, shared) = build(
+                    Spec {
+                        cloud: None,
+                        descriptors: super::super::files::descriptors(&[]),
+                        fixed: vec![(13, vec![0, 0])],
+                        contents: memory.clone(),
+                        cf_descriptor: f.file_descriptor,
+                        cf_contents: f.file_contents,
+                    },
+                    true,
+                );
+                shared.host_drag_images();
+                (data, shared, memory)
+            };
+            let (data, shared, memory) = make();
+            let asynchronous: IDataObjectAsyncCapability = data.cast().unwrap();
+            // SAFETY: apartment-owned COM objects and ordinary scalar arguments.
+            unsafe { asynchronous.StartOperation(None).unwrap() };
+            let accepted = shared.drag_dropped(DRAGDROP_S_DROP, DROPEFFECT_NONE);
+            assert!(accepted, "Explorer returns before extraction finishes");
+            shared.drag_ended(accepted, false);
+            assert_eq!(memory.cancels.load(Ordering::SeqCst), 0);
+            assert!(!shared.flushing.load(Ordering::SeqCst));
+            // SAFETY: same private object, explicit consumer failure after the loop.
+            unsafe { asynchronous.EndOperation(E_ABORT, None, 0).unwrap() };
+            assert_eq!(memory.cancels.load(Ordering::SeqCst), 1);
+            assert!(shared.flushing.load(Ordering::SeqCst));
+            assert!(!shared.drag_dropped(DRAGDROP_S_DROP, DROPEFFECT_NONE));
+
+            let (data, shared, memory) = make();
+            let asynchronous: IDataObjectAsyncCapability = data.cast().unwrap();
+            // Completion can race ahead of the native loop return.
+            // SAFETY: same apartment-owned object with matching operation lifetime.
+            unsafe {
+                asynchronous.StartOperation(None).unwrap();
+                asynchronous.EndOperation(S_OK, None, 2).unwrap();
+            }
+            assert!(shared.drag_dropped(DRAGDROP_S_DROP, DROPEFFECT_NONE));
+            assert_eq!(memory.cancels.load(Ordering::SeqCst), 0);
+
+            let (data, shared, memory) = make();
+            let asynchronous: IDataObjectAsyncCapability = data.cast().unwrap();
+            // SAFETY: private matching lifetime; optimized MOVE reports NONE.
+            unsafe {
+                asynchronous.StartOperation(None).unwrap();
+                asynchronous.EndOperation(S_OK, None, 0).unwrap();
+            }
+            let accepted = shared.drag_dropped(DRAGDROP_S_DROP, DROPEFFECT_NONE);
+            assert!(accepted, "completed optimized MOVE still succeeded");
+            shared.drag_ended(accepted, false);
+            assert_eq!(memory.cancels.load(Ordering::SeqCst), 0);
+            assert!(!shared.flushing.load(Ordering::SeqCst));
+
+            let (data, shared, memory) = make();
+            for (name, effect) in [
+                (windows::core::w!("Logical Performed DropEffect"), 2u32),
+                (windows::core::w!("Performed DropEffect"), 0),
+            ] {
+                // SAFETY: registered constant name, valid FORMATETC and owned medium.
+                unsafe {
+                    let format = FORMATETC {
+                        cfFormat: RegisterClipboardFormatW(name) as u16,
+                        dwAspect: 1,
+                        lindex: -1,
+                        tymed: 1,
+                        ..Default::default()
+                    };
+                    let mut medium = medium_hglobal(&effect.to_le_bytes()).unwrap();
+                    data.SetData(&format, &medium, false).unwrap();
+                    ReleaseStgMedium(&mut medium);
+                }
+            }
+            assert!(
+                shared.drag_dropped(DRAGDROP_S_DROP, DROPEFFECT_NONE),
+                "optimized MOVE receipt"
+            );
+            assert!(
+                !shared.drag_dropped(DRAGDROP_S_CANCEL, DROPEFFECT_NONE),
+                "a native cancellation is authoritative"
+            );
+            shared.drag_ended(false, false);
+            assert_eq!(memory.cancels.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                memory.opens.load(Ordering::SeqCst),
+                0,
+                "completion and diagnostics never fetch bodies"
+            );
+            let (_, rejected, _) = make();
+            assert!(
+                !rejected.drag_dropped(DRAGDROP_S_DROP, DROPEFFECT_NONE),
+                "no target acceptance evidence"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn native_get_data_timeout_fails_then_retries_same_object() {
+        use crate::content::native_read::{NativeReadOutcome, TEST_OUTCOMES, TestClock, tests::Harness};
+        std::thread::spawn(|| {
+            let mut harness = Harness::new(oink_foundation::clipboard::ClipPlatform::Windows, true);
+            let clock = Arc::new(TestClock::default());
+            let expiry = harness.expire_when_waiting(clock.clone());
+            // SAFETY: private STA/object; never reads or changes the user's clipboard.
+            unsafe {
+                windows::Win32::System::Ole::OleInitialize(None).unwrap();
+            }
+            let native = super::super::content::target::build(harness.spec()).unwrap();
+            let formats = super::super::formats();
+            let (data, shared) = build_inner(
+                Spec {
+                    cloud: None,
+                    descriptors: super::super::files::descriptors(&[]),
+                    fixed: vec![],
+                    contents: Arc::new(Memory {
+                        bytes: vec![],
+                        opens: AtomicUsize::new(0),
+                        cancels: AtomicUsize::new(0),
+                        dynamic: AtomicBool::new(false),
+                    }),
+                    cf_descriptor: formats.file_descriptor,
+                    cf_contents: formats.file_contents,
+                },
+                false,
+                Some(native),
+            );
+            let text = FORMATETC {
+                cfFormat: 13,
+                dwAspect: 1,
+                tymed: 1,
+                lindex: -1,
+                ..Default::default()
+            };
+            // SAFETY: initialized COM apartment and valid owned structures/media.
+            unsafe {
+                assert_eq!(
+                    clock.scope(|| data.GetData(&text)).err().unwrap().code(),
+                    STG_E_READFAULT
+                );
+                expiry.join().unwrap();
+                TEST_OUTCOMES
+                    .with_borrow(|outcomes| assert_eq!(outcomes.last().unwrap().1, NativeReadOutcome::TimedOut));
+                harness.allow_retry();
+                let mut medium = data.GetData(&text).unwrap();
+                assert_eq!(hglobal_bytes(medium.u.hGlobal).unwrap(), harness.bytes);
+                ReleaseStgMedium(&mut medium);
+                TEST_OUTCOMES.with_borrow(|outcomes| assert_eq!(outcomes.last().unwrap().1, NativeReadOutcome::Served));
+                drop((data, shared));
+                windows::Win32::System::Ole::OleUninitialize();
+            }
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn diagnosed_text_data_object_keeps_lazy_reads_and_rejects_file_probes() {
@@ -1307,7 +1856,6 @@ mod tests {
                 index: -1,
                 data: RepresentationData::Reader {
                     size: ContentSize::Unknown,
-                    hash: None,
                 },
             }];
             let native = super::super::content::target::build(crate::NativeSpec {
@@ -1389,6 +1937,7 @@ mod tests {
         }
         fn metadata(&self, _: usize) -> std::io::Result<Option<crate::FileMetadata>> {
             Ok(self.dynamic.load(Ordering::SeqCst).then_some(crate::FileMetadata {
+                exec_bits: None,
                 size: self.bytes.len() as u64,
                 modified_ms: Some(1234),
             }))
@@ -1406,12 +1955,17 @@ mod tests {
         });
         (
             FileStream {
+                _lease: None,
                 shared: Arc::new(Shared {
                     publication: crate::windows::content::diagnostics::Publication::new(),
                     contents: memory.clone(),
                     flushing: AtomicBool::new(false),
                     cloud_paths: false,
+                    cloud: None,
                     hosted_drag: AtomicBool::new(false),
+                    async_running: AtomicBool::new(false),
+                    drag_diagnostics: OnceLock::new(),
+                    drag_completion: Mutex::new(DragCompletion::default()),
                 }),
                 entry: 0,
                 name: "test".into(),
@@ -1423,6 +1977,23 @@ mod tests {
             memory,
         )
     }
+    pub(crate) fn read_native_contents(contents: Arc<dyn FileContents>, size: u64) -> std::io::Result<Vec<u8>> {
+        let (mut file, _) = stream(size, &[]);
+        Arc::get_mut(&mut file.shared).unwrap().contents = contents;
+        let stream: IStream = file.into();
+        let mut output = Vec::new();
+        loop {
+            let mut buffer = [0u8; 64 * 1024];
+            let mut count = 0;
+            // SAFETY: live writable buffer/count, direct local COM object.
+            let result = unsafe { stream.Read(buffer.as_mut_ptr().cast(), buffer.len() as u32, Some(&mut count)) };
+            result.ok().map_err(std::io::Error::other)?;
+            output.extend_from_slice(&buffer[..count as usize]);
+            if result == S_FALSE {
+                return Ok(output);
+            }
+        }
+    }
     struct SizedContents {
         opens: AtomicUsize,
     }
@@ -1432,6 +2003,7 @@ mod tests {
         }
         fn metadata(&self, index: usize) -> std::io::Result<Option<crate::FileMetadata>> {
             Ok(Some(crate::FileMetadata {
+                exec_bits: None,
                 size: [7, 0, 5_000_000_000, 19, 0][index],
                 modified_ms: None,
             }))

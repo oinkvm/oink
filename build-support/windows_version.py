@@ -1,4 +1,4 @@
-"""Set Explorer's display strings without putting commit labels in numeric PE fields."""
+"""Set Explorer's display strings without putting in-house labels in numeric PE fields."""
 import ctypes
 from ctypes import wintypes as W
 from pathlib import Path

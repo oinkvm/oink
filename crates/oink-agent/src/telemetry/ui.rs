@@ -9,6 +9,10 @@ pub struct UiCapture {
     build: BuildContext,
     generation: u64,
     observed_generation: u64,
+    #[cfg(windows)]
+    local_instance: Option<[u8; 12]>,
+    #[cfg(windows)]
+    local_generation: u64,
     capture: Option<Arc<oink_crash::capsule::Capture>>,
     #[cfg(windows)]
     collector: Option<oink_crash::collector::Collector>,
@@ -25,6 +29,10 @@ impl UiCapture {
             },
             generation: 0,
             observed_generation: 0,
+            #[cfg(windows)]
+            local_instance: None,
+            #[cfg(windows)]
+            local_generation: 0,
             capture: None,
             #[cfg(windows)]
             collector: None,
@@ -38,14 +46,35 @@ impl UiCapture {
             return Ok(Vec::new());
         }
         self.observed_generation = status.consent.generation;
+        #[cfg(windows)]
+        let applied = {
+            let mut applied = *status;
+            if applied.local_diagnostics_generation < self.local_generation {
+                // An initial RPC can complete after diagnostic disable. Its
+                // old local grant must not re-arm capture in the UI.
+                applied.local_diagnostics_instance = self.local_instance;
+            } else {
+                self.local_generation = applied.local_diagnostics_generation;
+            }
+            applied
+        };
+        #[cfg(windows)]
+        let status = &applied;
+
         if !status.configured || !status.consent.granted() || self.manifest.is_none() {
             self.shutdown();
             let _ = std::fs::remove_file(self.dir.join("capsules/ui.bin"));
             let _ = std::fs::remove_file(self.dir.join("capsules/ui-lifetime.json"));
             let _ = std::fs::remove_dir_all(self.dir.join("raw/ui"));
+            #[cfg(windows)]
+            self.start_local(status);
             return Ok(Vec::new());
         }
         if self.generation == status.consent.generation {
+            #[cfg(windows)]
+            if self.local_instance != status.local_diagnostics_instance {
+                self.start_local(status);
+            }
             return Ok(Vec::new());
         }
         self.shutdown();
@@ -92,19 +121,7 @@ impl UiCapture {
         self.capture = Some(capture);
         self.generation = consent.generation;
         #[cfg(windows)]
-        if let Ok(executable) = std::env::current_exe()
-            && let Some(parent) = executable.parent()
-        {
-            self.collector = oink_crash::collector::Collector::start(
-                &parent.join("oink-crash-collector.exe"),
-                &self.dir.join("raw/ui"),
-                consent,
-                self.build,
-                manifest,
-                Component::UiRust,
-            )
-            .ok();
-        }
+        self.start_local(status);
         #[cfg(target_os = "macos")]
         if let Ok(executable) = std::env::current_exe()
             && let Some(id) = oink_crash::macos::executable_uuid(&executable)
@@ -129,6 +146,42 @@ impl UiCapture {
             oink_telemetry::store::atomic_write(&self.dir.join("capsules/ui-lifetime.json"), &bytes)?;
         }
         Ok(recovered)
+    }
+    #[cfg(windows)]
+    fn start_local(&mut self, status: &ReportStatus) {
+        self.collector.take();
+        self.local_instance = status.local_diagnostics_instance;
+        let Some(manifest) = self.manifest.as_ref() else {
+            return;
+        };
+        let Some(data) = self.dir.parent() else {
+            return;
+        };
+        let current = oink_foundation::paths::StoragePaths::current();
+        let paths = if data == current.data {
+            current
+        } else {
+            oink_foundation::paths::StoragePaths::isolated(data.into())
+        };
+        let local = self.local_instance.as_ref().map(|instance| oink_crash::local::Target {
+            root: paths.logs.join("Diagnostics/crash-ui"),
+            instance: oink_crash::local::instance_hex(*instance),
+        });
+        if let Ok(executable) = std::env::current_exe()
+            && let Some(parent) = executable.parent()
+        {
+            oink_crash::capsule::Capture::install();
+            self.collector = oink_crash::collector::Collector::start_with_local(
+                &parent.join("oink-crash-collector.exe"),
+                &self.dir.join("raw/ui"),
+                super::native_consent(status.consent, status.configured),
+                self.build,
+                manifest,
+                Component::UiRust,
+                local,
+            )
+            .ok();
+        }
     }
     pub fn shutdown(&mut self) {
         let owned = self.generation != 0 || self.capture.is_some();
@@ -170,6 +223,8 @@ mod tests {
                 images: vec![oink_telemetry::capture::Image {
                     slot: ImageSlot::UiRust,
                     debug_id: [7; 16],
+                    debug_age: 0,
+                    code_id: None,
                     text_size: 4096,
                 }],
             }),
@@ -179,6 +234,10 @@ mod tests {
             },
             generation: 0,
             observed_generation: 0,
+            #[cfg(windows)]
+            local_instance: None,
+            #[cfg(windows)]
+            local_generation: 0,
             capture: None,
             #[cfg(windows)]
             collector: None,
@@ -198,8 +257,31 @@ mod tests {
             delivery_disabled: false,
             rust_crash: Coverage::NumericCapsule,
             native_crash: Coverage::Unavailable,
+            local_diagnostics_instance: None,
+            local_diagnostics_generation: 0,
             file_provider: Coverage::Unavailable,
         }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn late_status_cannot_restore_disabled_local_diagnostics() {
+        let root = tempfile::tempdir().unwrap();
+        let mut capture = fixture(root.path());
+        let mut enabled = granted();
+        enabled.consent.choice = Choice::Denied;
+        enabled.local_diagnostics_instance = Some([1; 12]);
+        enabled.local_diagnostics_generation = 1;
+        capture.apply(&enabled).unwrap();
+        assert_eq!(capture.local_instance, Some([1; 12]));
+        let disabled = ReportStatus {
+            local_diagnostics_instance: None,
+            local_diagnostics_generation: 2,
+            ..enabled
+        };
+        capture.apply(&disabled).unwrap();
+        capture.apply(&enabled).unwrap();
+        assert!(capture.local_instance.is_none());
+        assert_eq!(capture.local_generation, 2);
     }
     #[test]
     fn ui_fatal_child_writes_only_scrubbed_numeric_capsule() {

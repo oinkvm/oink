@@ -32,6 +32,20 @@ pub struct Mask {
 pub trait TextRaster: Send + std::fmt::Debug {
     /// `cap`：大写字母 / 数字的高度（像素）；`bold`：较重的字重（数值、标题）。
     fn line(&self, text: &str, cap: f64, bold: bool) -> Mask;
+    /// Optional native color rendering onto an opaque destination. `origin` is
+    /// the advance's left edge and cap top. False keeps the alpha-mask path for
+    /// transparent surfaces or implementations that only provide coverage.
+    fn paint_opaque(
+        &self,
+        _canvas: &mut Canvas,
+        _text: &str,
+        _cap: f64,
+        _bold: bool,
+        _origin: (f64, f64),
+        _color: Color,
+    ) -> bool {
+        false
+    }
 }
 
 /// 线段字形的后备实现（见模块说明）。不认识的字符（包括中文）留空。
@@ -131,7 +145,12 @@ impl<'a> Pen<'a> {
     /// 以 `cx` 为中线写一行字；`y` 是大写字母顶的位置。返回这行字的宽度。
     pub fn centered(&mut self, cx: f64, y: f64, cap: f64, text: &str, bold: bool, color: Color) -> f64 {
         let m = self.font.line(text, cap, bold);
-        blit(self.canvas, &m, cx - m.advance / 2.0 - m.left, y, color);
+        if !self
+            .font
+            .paint_opaque(self.canvas, text, cap, bold, (cx - m.advance / 2.0, y), color)
+        {
+            blit(self.canvas, &m, cx - m.advance / 2.0 - m.left, y, color);
+        }
         m.advance
     }
 

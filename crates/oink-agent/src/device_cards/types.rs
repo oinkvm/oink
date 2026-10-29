@@ -81,6 +81,7 @@ codes!(ResourceFaultCode {
     CleanupFailed,
     Unsupported,
     BackendFailed,
+    MicrophoneLoopback,
     Unrecognized
 });
 codes!(CardCondition {
@@ -295,6 +296,24 @@ pub enum CardConnection {
     },
 }
 
+/// Small measurement update on the existing 1 Hz statistics clock. The card
+/// stream/revision fence prevents an old sample from reviving an offline row.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceCardSignals {
+    pub stream: String,
+    pub revision: DecimalU64,
+    pub sampled_at_ms: u64,
+    pub signals: Vec<DeviceCardSignal>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceCardSignal {
+    pub device: DeviceKey,
+    pub rtt_ms: Option<f64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserFacingProblem {
@@ -394,6 +413,31 @@ pub struct SpeakerCard {
     pub forwarding: Option<ForwardingCard>,
     pub local_output: Option<LocalOutputCard>,
 }
+codes!(MicrophoneMode {
+    Unavailable,
+    Idle,
+    Source,
+    Receiver,
+    Muted
+});
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MicrophoneCard {
+    pub mode: MicrophoneMode,
+    pub fault: Option<ResourceFault>,
+    pub receiving_active: bool,
+    pub permission_granted: bool,
+    pub virtual_ready: bool,
+    pub capture_active: bool,
+    pub consumer_active: bool,
+    pub source_device: Option<DeviceKey>,
+    pub source_name: Option<String>,
+    pub share_action: CardAction,
+    pub local_action: CardAction,
+    pub receive_action: CardAction,
+    pub controls_token: Option<String>,
+    pub forwarding: Option<ForwardingCard>,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameActions {
     pub auto: CardAction,
@@ -435,6 +479,7 @@ pub struct DeviceCardStatus {
     pub mouse: ResourceCard,
     pub keyboard: KeyboardCard,
     pub speaker: SpeakerCard,
+    pub microphone: MicrophoneCard,
     pub clipboard: ResourceCard,
     pub game: GameCard,
 }

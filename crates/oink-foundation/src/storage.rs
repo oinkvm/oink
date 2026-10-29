@@ -40,6 +40,16 @@ pub fn open_private_lock(path: &Path) -> io::Result<File> {
 /// Flush a private sibling, replace the destination atomically, and flush the
 /// containing directory on Unix. Failed writes remove only their own staging file.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    atomic_write_impl(path, bytes, true)
+}
+
+/// Same private atomic publication, with retry diagnostics owned by the caller.
+/// Used by the IPC publication supervisor to log one failure and one recovery.
+pub fn atomic_write_quiet(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    atomic_write_impl(path, bytes, false)
+}
+
+fn atomic_write_impl(path: &Path, bytes: &[u8], _log_retries: bool) -> io::Result<()> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let parent = path
         .parent()
@@ -66,7 +76,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         #[cfg(windows)]
-        windows::replace(&file, path)?;
+        windows::replace(&file, path, _log_retries)?;
         #[cfg(not(windows))]
         {
             drop(file);

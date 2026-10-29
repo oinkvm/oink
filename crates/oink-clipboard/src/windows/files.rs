@@ -6,6 +6,8 @@
 //! - 写入实体文件：只写顶层条目（文件夹由粘贴方递归复制），另写 `Preferred DropEffect` = 复制。
 //! - 虚拟文件：[`descriptors`] 把清单转成 `FILEGROUPDESCRIPTORW`，并清理不安全的路径（`..`、盘符、Windows 不允许的字符）。
 
+mod native;
+pub(crate) use native::native_descriptors;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -58,6 +60,171 @@ pub(crate) fn build_hdrop(paths: &[PathBuf]) -> Vec<u8> {
     }
     out.extend_from_slice(&[0, 0]);
     out
+}
+
+#[windows::core::implement(windows::Win32::UI::Shell::IFileSystemBindData)]
+struct ShellFindData(std::sync::Mutex<windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW>);
+impl windows::Win32::UI::Shell::IFileSystemBindData_Impl for ShellFindData_Impl {
+    fn SetFindData(
+        &self,
+        data: *const windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW,
+    ) -> windows::core::Result<()> {
+        // SAFETY: a non-null COM argument covers one complete fixed-size record.
+        let data = unsafe { data.as_ref() }.ok_or(windows::Win32::Foundation::E_POINTER)?;
+        *self.0.lock().unwrap() = *data;
+        Ok(())
+    }
+    fn GetFindData(
+        &self,
+        data: *mut windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW,
+    ) -> windows::core::Result<()> {
+        if data.is_null() {
+            return Err(windows::Win32::Foundation::E_POINTER.into());
+        }
+        // SAFETY: checked writable COM output, no ownership transferred.
+        unsafe {
+            data.write(*self.0.lock().unwrap());
+        }
+        Ok(())
+    }
+}
+
+/// Only Cloud Files directories get an ordinary-directory Shell view. A junction,
+/// symlink or non-cloud reparse point must never acquire that representation.
+fn shell_directory_metadata(
+    mut data: windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW,
+) -> Option<windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW> {
+    use windows_sys::Win32::Storage::{CloudFilters::*, FileSystem::*};
+    // SAFETY: pure attribute/tag classification; no filesystem access or hydration.
+    let state = unsafe { CfGetPlaceholderStateFromAttributeTag(data.dwFileAttributes, data.dwReserved0) };
+    if data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || state == CF_PLACEHOLDER_STATE_INVALID
+        || state & CF_PLACEHOLDER_STATE_PLACEHOLDER == 0
+    {
+        return None;
+    }
+    data.dwFileAttributes &= !FILE_ATTRIBUTE_REPARSE_POINT;
+    Some(data)
+}
+
+/// Shell path equivalents identify the actual containing folder and its direct
+/// children. Shell consumers use IShellFolder child APIs, whose PIDLs must have
+/// one SHITEMID; a desktop parent plus absolute, multilevel children is not that
+/// representation. Received roots all live in one receiver-local batch folder.
+pub(crate) fn shell_id_list(paths: &[PathBuf]) -> std::io::Result<Vec<u8>> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{
+        Win32::{
+            Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW},
+            System::Com::{CoTaskMemFree, CreateBindCtx},
+            UI::Shell::{
+                IFileSystemBindData, ILCreateFromPathW, ILFindLastID, ILFree, ILGetSize, IShellItem,
+                SHCreateItemFromParsingName, SHGetIDListFromObject, STR_FILE_SYS_BIND_DATA,
+            },
+        },
+        core::PCWSTR,
+    };
+    let invalid = || crate::content::unavailable(crate::model::Unavailable::InvalidData);
+    if paths.is_empty() || paths.len() > 65_535 {
+        return Err(invalid());
+    }
+    let parent = paths[0].parent().ok_or_else(invalid)?;
+    if !parent.is_absolute() || paths.iter().any(|path| path.parent() != Some(parent)) {
+        return Err(invalid());
+    }
+    let mut lists = Vec::with_capacity(paths.len() + 1);
+    for (index, path) in std::iter::once(parent)
+        .chain(paths.iter().map(PathBuf::as_path))
+        .enumerate()
+    {
+        if !path.is_absolute() {
+            return Err(invalid());
+        }
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: the path is NUL terminated. Shell owns the returned allocation
+        // until the matching deallocator below; only its declared size is copied.
+        let bytes = unsafe {
+            let mut found = WIN32_FIND_DATAW::default();
+            let metadata = if let Ok(find) = FindFirstFileW(PCWSTR(wide.as_ptr()), &mut found) {
+                FindClose(find).map_err(|_| invalid())?;
+                shell_directory_metadata(found)
+            } else {
+                None
+            };
+            let bound = metadata.is_some();
+            let pidl = if let Some(metadata) = metadata {
+                // Windows 11 Shell Drop silently omits an empty CF directory when
+                // ILCreateFromPath caches its reparse representation. Population,
+                // pinning and COPY do not repair it. Bind the receiver-owned folder
+                // as an ordinary directory in this PIDL only; disk attributes, CF
+                // identity, lazy discovery and source-read authority stay unchanged.
+                // IFileOperation accepts the old PIDL; the native Drop regression
+                // must cover this distinct consumer. Caller owns the native STA.
+                let context = CreateBindCtx(0).map_err(|_| invalid())?;
+                let data: IFileSystemBindData = ShellFindData(std::sync::Mutex::new(metadata)).into();
+                context
+                    .RegisterObjectParam(STR_FILE_SYS_BIND_DATA, &data)
+                    .map_err(|_| invalid())?;
+                let item: IShellItem =
+                    SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), &context).map_err(|_| invalid())?;
+                SHGetIDListFromObject(&item).map_err(|_| invalid())?
+            } else {
+                ILCreateFromPathW(PCWSTR(wide.as_ptr()))
+            };
+            if pidl.is_null() {
+                return Err(invalid());
+            }
+            let item = if index == 0 { pidl } else { ILFindLastID(pidl) };
+            let size = ILGetSize(Some(item));
+            let bytes = if size >= 2 && size as usize <= crate::model::INVENTORY_BYTES {
+                Some(std::slice::from_raw_parts(item.cast::<u8>(), size as usize).to_vec())
+            } else {
+                None
+            };
+            if bound {
+                CoTaskMemFree(Some(pidl.cast()));
+            } else {
+                ILFree(Some(pidl));
+            }
+            bytes.ok_or_else(invalid)?
+        };
+        lists.push(bytes);
+    }
+    let mut offset = 4 + 4 * lists.len();
+    let mut bytes = (paths.len() as u32).to_le_bytes().to_vec();
+    for list in &lists {
+        bytes.extend_from_slice(&(offset as u32).to_le_bytes());
+        offset += list.len();
+        if offset > crate::model::INVENTORY_BYTES {
+            return Err(invalid());
+        }
+    }
+    for list in lists {
+        bytes.extend(list);
+    }
+    Ok(bytes)
+}
+/// Rebuild path formats from our own HDROP, never from a sender's path/PIDL.
+pub(crate) fn path_equivalent(name: &str, hdrop: &[u8]) -> std::io::Result<Vec<u8>> {
+    let paths = parse_hdrop(hdrop, |_| unreachable!("our HDROP is UTF-16"));
+    if name == "Shell IDList Array" {
+        return shell_id_list(&paths);
+    }
+    if paths.len() != 1 {
+        return Err(crate::content::unavailable(crate::model::Unavailable::Unsupported));
+    }
+    let path = strip_verbatim(
+        paths[0]
+            .to_str()
+            .ok_or_else(|| crate::content::unavailable(crate::model::Unavailable::InvalidData))?,
+    );
+    if name == "FileNameW" {
+        Ok(path.encode_utf16().chain(Some(0)).flat_map(u16::to_le_bytes).collect())
+    } else if name == "FileName" {
+        crate::content::url::ansi(&path)
+    } else {
+        Err(crate::content::unavailable(crate::model::Unavailable::Unsupported))
+    }
 }
 
 /// 去掉 `\\?\` 前缀（`\\?\UNC\server\share` → `\\server\share`），粘贴方与剪贴板历史更认普通形式；
@@ -240,7 +407,7 @@ pub(crate) const FILEDESCRIPTOR_SIZE: usize = 592;
 const NAME_CAP: usize = 260;
 
 /// Windows 文件名里不允许的字符与保留名，换成安全的形式。
-fn sanitize_component(c: &str) -> String {
+pub(super) fn sanitize_component(c: &str) -> String {
     let mut s: String = c
         .chars()
         .map(|ch| match ch {
@@ -295,6 +462,7 @@ pub(crate) struct DescMeta {
 pub(crate) struct Descriptors {
     /// `FILEGROUPDESCRIPTORW` 的字节。
     pub bytes: Vec<u8>,
+    pub ansi: Option<Vec<u8>>,
     /// 描述符下标 → 清单下标（`FileContents::open` 的参数）。
     pub index: Vec<usize>,
     /// 描述符下标 → 名字、大小等，供 `IStream::Stat`。
@@ -372,6 +540,7 @@ pub(crate) fn descriptors(entries: &[FileEntry]) -> Descriptors {
     let n = index.len() as u32;
     bytes[0..4].copy_from_slice(&n.to_le_bytes());
     Descriptors {
+        ansi: None,
         bytes,
         index,
         meta,
@@ -533,5 +702,149 @@ mod tests {
             vec![root.join("top"), root.join("single.bin")]
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+    #[test]
+    fn shell_directory_view_only_masks_cloud_reparse_metadata() {
+        use windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
+        let mut data = WIN32_FIND_DATAW {
+            dwFileAttributes: 0x410,
+            dwReserved0: 0x9000001a,
+            ..Default::default()
+        };
+        let projected = shell_directory_metadata(data).unwrap();
+        assert_eq!(projected.dwFileAttributes, 0x10);
+        assert_eq!(data.dwFileAttributes, 0x410, "only the copied Shell view changes");
+        data.dwReserved0 = 0xa000000c; // symlink
+        assert!(shell_directory_metadata(data).is_none());
+        data.dwReserved0 = 0xa0000003; // junction
+        assert!(shell_directory_metadata(data).is_none());
+        data.dwReserved0 = 0x9000001a;
+        data.dwFileAttributes = 0x480; // regular cloud file
+        assert!(shell_directory_metadata(data).is_none());
+        data.dwFileAttributes = 0x10;
+        data.dwReserved0 = 0;
+        assert!(shell_directory_metadata(data).is_none());
+    }
+
+    #[test]
+    fn shell_can_bind_the_received_selection_as_direct_children() {
+        std::thread::spawn(|| {
+            use windows::Win32::{
+                System::{
+                    Com::{DVASPECT_CONTENT, FORMATETC, IDataObject, TYMED_HGLOBAL},
+                    Ole::{OleInitialize, OleUninitialize},
+                    SystemServices::{SFGAO_CANCOPY, SFGAO_CANMOVE, SFGAO_FILESYSTEM},
+                },
+                UI::Shell::{IShellFolder, SHBindToObject},
+            };
+            // SAFETY: this private test thread has no previous COM apartment.
+            unsafe {
+                OleInitialize(None).unwrap();
+            }
+            struct Apartment;
+            impl Drop for Apartment {
+                fn drop(&mut self) {
+                    // SAFETY: balances this thread's successful OleInitialize.
+                    unsafe {
+                        OleUninitialize();
+                    }
+                }
+            }
+            let _apartment = Apartment;
+            let root = tempfile::tempdir().unwrap();
+            let paths = [root.path().join("one.txt"), root.path().join("two.txt")];
+            for path in &paths {
+                std::fs::write(path, b"fixture").unwrap();
+            }
+            let bytes = shell_id_list(&paths).unwrap();
+            let pidl = |index: usize| {
+                let at = 4 + 4 * index;
+                let offset = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+                bytes[offset..].as_ptr().cast()
+            };
+            // SAFETY: CIDA offsets own complete native parent/child PIDLs for
+            // the duration of these Shell calls. No desktop or shared root is used.
+            unsafe {
+                let folder: IShellFolder = SHBindToObject(None, pidl(0), None).unwrap();
+                let wanted = (SFGAO_CANCOPY | SFGAO_CANMOVE | SFGAO_FILESYSTEM).0;
+                let mut attributes = wanted;
+                folder.GetAttributesOf(&[pidl(1), pidl(2)], &mut attributes).unwrap();
+                assert_eq!(
+                    attributes & wanted,
+                    wanted,
+                    "Shell must recognize the files as copy/move sources"
+                );
+                let data: IDataObject = folder
+                    .GetUIObjectOf(Default::default(), &[pidl(1), pidl(2)], None)
+                    .unwrap();
+                let format = FORMATETC {
+                    cfFormat: 15,
+                    dwAspect: DVASPECT_CONTENT.0,
+                    lindex: -1,
+                    tymed: TYMED_HGLOBAL.0 as u32,
+                    ..Default::default()
+                };
+                data.QueryGetData(&format).ok().unwrap();
+            }
+        })
+        .join()
+        .unwrap();
+    }
+    #[test]
+    fn shell_paths_share_local_identity_and_legacy_names_require_one_item() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = [temp.path().join("first.txt"), temp.path().join("second.txt")];
+        for path in &paths {
+            std::fs::write(path, b"fixture").unwrap();
+        }
+        let bytes = shell_id_list(&paths).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), 2);
+        let parent_offset = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        for (index, expected) in paths.iter().enumerate() {
+            let at = 8 + 4 * index;
+            let offset = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            let child_size = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
+            assert!(child_size > 0);
+            assert_eq!(
+                &bytes[offset + child_size..offset + child_size + 2],
+                &[0, 0],
+                "Shell folder APIs require one direct child, not an absolute PIDL"
+            );
+            let mut wide = [0u16; 260];
+            // SAFETY: offsets refer to complete native PIDLs copied above, and
+            // the writable output buffer has the API's required MAX_PATH size.
+            let resolved = unsafe {
+                use windows::Win32::UI::Shell::{ILCombine, ILFree, SHGetPathFromIDListW};
+                let absolute = ILCombine(
+                    Some(bytes.as_ptr().add(parent_offset).cast()),
+                    Some(bytes.as_ptr().add(offset).cast()),
+                );
+                assert!(!absolute.is_null());
+                let result = SHGetPathFromIDListW(absolute, &mut wide);
+                ILFree(Some(absolute));
+                result
+            };
+            assert!(resolved.as_bool());
+            let end = wide.iter().position(|v| *v == 0).unwrap();
+            assert_eq!(PathBuf::from(String::from_utf16(&wide[..end]).unwrap()), *expected);
+        }
+        let one = build_hdrop(&paths[..1]);
+        let name = path_equivalent("FileNameW", &one).unwrap();
+        let wide: Vec<_> = name
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .take_while(|v| *v != 0)
+            .collect();
+        assert_eq!(PathBuf::from(String::from_utf16(&wide).unwrap()), paths[0]);
+        assert!(path_equivalent("FileNameW", &build_hdrop(&paths)).is_err());
+        assert!(shell_id_list(&[PathBuf::from("relative")]).is_err());
+        assert!(shell_id_list(&[paths[0].clone(), temp.path().join("nested/file.txt")]).is_err());
     }
 }

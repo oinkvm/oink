@@ -68,6 +68,8 @@ typedef struct {
     _Atomic uint64_t trimmed_frames; // RT consumer writes; ordinary diagnostics reads
     semaphore_t wake;
     _Atomic bool wake_pending;
+    _Atomic uint64_t omitted_silent_frames; // HAL producer; ordinary watchdog reads.
+    uint64_t zero_frames; // HAL producer only; retain the five-second burst tail.
     uint64_t next_sequence; // HAL producer only; includes dropped frames.
     mach_timebase_info_data_t timebase;
     OinkCaptureInfo info;
@@ -233,6 +235,29 @@ static OSStatus capture_io(AudioObjectID device, const AudioTimeStamp *now,
     capture->next_sequence += frames;
     uint64_t available = RING_FRAMES - (write - read);
     capture_event(capture, callback_ns, host_ns, sequence, frames, write, read);
+    // Keep the tap running. Exact zero only: do not discard quiet onset samples,
+    // non-finite data, the leading zeros in an onset buffer, or a live burst tail.
+    // On macOS 14.7.8 the device-clock tap keeps delivering exact-zero buffers
+    // when nothing plays. Keep its IOProc open to hear onset; omit only copies
+    // and worker wakes. The watchdog reads the omitted-frame atomic directly:
+    // mirroring it via the 1s health loop misses its 500ms progress deadline.
+    // This does not discard nonzero PCM or change the five-second burst tail.
+    bool zero = true;
+    for (uint32_t i = 0; i < frames; ++i) {
+        if (left[i * stride] != 0.0f || right[i * right_stride] != 0.0f) {
+            zero = false;
+            break;
+        }
+    }
+    uint64_t tail = (uint64_t)(capture->sample_rate * 5.0);
+    bool quiet = zero && capture->zero_frames >= tail;
+    capture->zero_frames = zero ? (capture->zero_frames < tail ? capture->zero_frames + frames : tail) : 0;
+    if (quiet && capture->wake != MACH_PORT_NULL) {
+        // The tap is still healthy. Count deliberately omitted zeros separately
+        // from delivered PCM so the stall watchdog does not reopen a silent tap.
+        atomic_fetch_add_explicit(&capture->omitted_silent_frames, frames, memory_order_relaxed);
+        return noErr;
+    }
     if (frames > available) frames = (uint32_t)available;
     for (uint32_t i = 0; i < frames; ++i) {
         size_t index = ((write + i) & (RING_FRAMES - 1)) * 2;
@@ -800,6 +825,7 @@ void *oink_audio_capture_start(bool mute, uint32_t requested_frames, uint32_t ca
             atomic_init(&capture->closing, false);
             atomic_init(&capture->wake_pending, false);
             atomic_init(&capture->trimmed_frames, 0);
+            atomic_init(&capture->omitted_silent_frames, 0);
             const char *stage = "Resolve Oink audio process";
             char detail[256] = {0};
             CATapDescription *description = nil;
@@ -1076,6 +1102,32 @@ int32_t oink_audio_capture_check(void *opaque, char *error, size_t error_size) {
     }
     return 0;
 }
+
+uint64_t oink_audio_capture_omitted_silent_frames(void *opaque) {
+    OinkCapture *capture = opaque;
+    return atomic_load_explicit(&capture->omitted_silent_frames, memory_order_relaxed);
+}
+
+// Hardware-free fixture: exercise the real callback's steady-silence path.
+void *oink_audio_capture_test_silent_new(void) {
+    OinkCapture *capture = calloc(1, sizeof(*capture));
+    if (!capture) return NULL;
+    mach_timebase_info(&capture->timebase);
+    capture->sample_rate = 48000;
+    capture->zero_frames = 240000;
+    if (semaphore_create(mach_task_self(), &capture->wake, SYNC_POLICY_FIFO, 0) != KERN_SUCCESS) {
+        free(capture);
+        return NULL;
+    }
+    return capture;
+}
+void oink_audio_capture_test_silent_callback(void *opaque) {
+    float zeros[128 * 2] = {0};
+    AudioBufferList input = {.mNumberBuffers = 1,
+        .mBuffers = {{.mNumberChannels = 2, .mDataByteSize = sizeof(zeros), .mData = zeros}}};
+    capture_io(0, NULL, &input, NULL, NULL, NULL, opaque);
+}
+void oink_audio_capture_test_silent_free(void *opaque) { capture_free(opaque); }
 
 size_t oink_audio_capture_read(void *opaque, float *output, size_t capacity_frames,
                                 uint64_t *host_ns, uint64_t *callback_ns, uint64_t *sequence) {

@@ -199,45 +199,46 @@ the stored parent and previous-feed artifact remain recovery inputs.
 `release.yml` workflow_dispatch builds/verifies both platforms and creates a
 **draft** containing the notarized DMG, MSI, the ZIP of the already-stapled app,
 `release.json` and `SHA256SUMS`. Its initial body comes from
-`.github/release-notes.txt`, which is a starting draft. Final update notes are
-not required to build, tag or assemble the draft. New releases have no
+`.github/release-notes.txt`, which is a starting draft. Final update notes must
+be approved and committed **before** building the draft. Both platforms embed
+the `.github/update-notes.json` language map (all four UI languages) in the
+packages. New releases have no
 `update.json` asset or notes binding in `release.json`/`SHA256SUMS`; installer
 hashes and provenance remain bound exactly as before.
 
 The release procedure is:
 
-1. Dispatch **Release packages** on the default branch (currently `main`), using
+1. K1 drafts the English and Simplified Chinese update notes in
+   `.github/update-notes.json`. Obtain user approval, translate Japanese and
+   Korean, validate and commit all four languages on the trusted default branch.
+   Use `channel: stable`, `severity: normal|critical`; each newline separates a
+   plain-text bullet. Include user-visible changes only. The unsigned-MSI
+   limitation belongs in the GitHub release's Known limitations.
+
+   ```sh
+   PYTHONPATH=build-support/update python3 -c 'import published_release; published_release.update_notes()'
+   git add .github/update-notes.json
+   git commit -m "docs(release): finalize update notes"
+   ```
+
+2. Dispatch **Release packages** on the default branch (currently `main`), using
    the reserved monotonically increasing build. For example, for 0.2.0/build 35:
 
    ```sh
    gh workflow run release.yml --repo oinkvm/oink --ref main -f build=35
    ```
 
-2. The user edits the draft's release notes directly on GitHub, reviews the
+3. The user may edit the draft's release body directly on GitHub, reviews the
    draft and clicks **Publish**. Publishing the GitHub release triggers no
-   workflow and does not publish either update feed.
+   workflow and does not publish either update feed. GitHub body edits, including
+   later edits, do not change the embedded/committed in-app notes.
 
-3. After publication, read the final body (for example below), write
-   `.github/update-notes.json` from it, obtain user approval for the `en` and
-   `zh-Hans` text, and translate `ja` and `ko`. Those translations do not need
-   user review. Use `channel: stable`, `severity: normal|critical`; each newline
-   separates a plain-text bullet. Include user-visible changes only; keep the
-   unsigned-MSI limitation in the GitHub release's Known limitations.
+4. Keep the approved file unchanged for this build. After publication, explicitly
+   dispatch **Seed published stable release feeds** on the trusted default branch
+   carrying those same finalized notes, for the published tag:
 
    ```sh
    RELEASE_TAG=v0.2.0 # replace with the published release tag
-   gh release view "$RELEASE_TAG" --repo oinkvm/oink --json body --jq .body
-   # Edit .github/update-notes.json and obtain approval before committing.
-   PYTHONPATH=build-support/update python3 -c 'import published_release; published_release.update_notes()'
-   git add .github/update-notes.json
-   git commit -m "docs(release): finalize update notes for $RELEASE_TAG"
-   ```
-
-4. Land that notes commit on the trusted default branch through the normal
-   review/merge process. Then explicitly dispatch **Seed published stable
-   release feeds** on that branch for the published tag:
-
-   ```sh
    gh workflow run seed-update-feeds.yml --repo oinkvm/oink --ref main \
      -f release_tag="$RELEASE_TAG" -f platform=both
    ```

@@ -16,6 +16,7 @@ pub use preference_patch::PreferencePatch;
 pub(crate) mod request_context;
 pub use preferences::UiPreferences;
 
+pub use oink_update::Error as UpdateError;
 pub use oink_update::policy::{Command as UpdateCommand, UpdateStatus};
 
 pub use oink_autostart::{LaunchAtLoginState, LaunchAtLoginStatus};
@@ -141,6 +142,10 @@ impl From<&ScreenKey> for dl::ScreenId {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum ApiError {
+    /// An updater refusal is a domain result, not a lost backend connection.
+    UpdateFailed {
+        update_error: oink_update::Error,
+    },
     /// 服务未运行或尚未就绪。
     Unavailable {
         #[serde(skip)]
@@ -184,6 +189,7 @@ pub enum ApiError {
 impl ApiError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::UpdateFailed { .. } => "update_failed",
             Self::Unavailable { .. } => "unavailable",
             Self::NotFound { .. } => "not_found",
             Self::InvalidArgument { .. } => "invalid_argument",
@@ -200,6 +206,7 @@ impl ApiError {
     pub fn problem(&self) -> crate::device_cards::UserFacingProblem {
         use crate::device_cards::{UserFacingCode as Code, UserFacingProblem};
         let code = match self {
+            Self::UpdateFailed { .. } => Code::StateConflict,
             Self::Unavailable { .. } => Code::LocalServiceUnavailable,
             Self::NotFound { .. } => Code::DeviceUnavailable,
             Self::InvalidArgument { .. } => Code::InvalidValue,
@@ -221,6 +228,7 @@ impl ApiError {
     }
     pub fn message(&self) -> &str {
         match self {
+            Self::UpdateFailed { .. } => "update command rejected",
             Self::InvalidAddress => "invalid_address",
             Self::NotMember => "not_member",
             Self::PersistenceFailed => "persistence_failed",
@@ -239,9 +247,17 @@ impl ApiError {
 impl Serialize for ApiError {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut value = serializer.serialize_struct("ApiError", 2)?;
+        let fields = if matches!(self, Self::UpdateFailed { .. }) {
+            3
+        } else {
+            2
+        };
+        let mut value = serializer.serialize_struct("ApiError", fields)?;
         value.serialize_field("code", self.code())?;
         value.serialize_field("problem", &self.problem())?;
+        if let Self::UpdateFailed { update_error } = self {
+            value.serialize_field("update_error", update_error)?;
+        }
         value.end()
     }
 }
@@ -345,7 +361,6 @@ pub enum AlertKind {
     EmergencyStop {
         device: DeviceKey,
     },
-    CaptureUnavailable,
     DisplayInfoUnavailable {
         screen: ScreenKey,
     },
@@ -353,8 +368,8 @@ pub enum AlertKind {
     /// 链路重做：组状态文件读不出来（损坏、格式不认识、不是本机的）。后台没有启动共享，只提供 IPC；
     /// 界面据此提示，并给出「重置回初始状态」（[`AgentApi::reset_group_state`]）。
     GroupStateUnreadable,
-    /// A completed native screen observation failed, once per device rather than
-    /// once per cached screen. Missing peer facts are not a failure observation.
+    /// Local display enumeration failed continuously beyond the settling window.
+    /// Shared screen resource faults (including injection) are not enumeration results.
     DisplayEnumerationFailed {
         device: DeviceKey,
     },
@@ -477,7 +492,7 @@ pub struct Member {
     pub reachable: bool,
     /// Facts have no expiry interval; retained for the UI projection and always true.
     pub facts_fresh: bool,
-    /// Accepted runtime source state; offline/unknown is None, never a cached claim.
+    /// Compatibility projection of keyboard_mode; offline/unknown is None.
     pub keyboard_disabled: Option<bool>,
     pub mouse_mode: Option<oink_foundation::input::InputMode>,
     pub keyboard_mode: Option<oink_foundation::input::InputMode>,
@@ -902,6 +917,12 @@ pub enum HotkeyAction {
     OpenWindow,
     /// 锁定当前焦点机并发送原始相对位移，再按一次恢复普通指针。
     ToggleGameMode,
+    /// Toggle forwarding mute on the current group microphone source.
+    ToggleMicrophoneMute,
+    /// Jump to the device identified by Hotkey.device.
+    MovePointerTo,
+    /// Hold one key to bypass a pointer lock at normal screen edges.
+    LockEscape,
 }
 
 impl HotkeyAction {
@@ -913,6 +934,9 @@ impl HotkeyAction {
         HotkeyAction::PauseAll,
         HotkeyAction::OpenWindow,
         HotkeyAction::ToggleGameMode,
+        HotkeyAction::ToggleMicrophoneMute,
+        HotkeyAction::MovePointerTo,
+        HotkeyAction::LockEscape,
     ];
 
     /// 序列化时的名字（`"lock_focus"` 等），也是路由 `StatusEvent::Hotkey::action` 的写法。
@@ -924,6 +948,9 @@ impl HotkeyAction {
             HotkeyAction::PauseAll => "pause_all",
             HotkeyAction::OpenWindow => "open_window",
             HotkeyAction::ToggleGameMode => "toggle_game_mode",
+            HotkeyAction::ToggleMicrophoneMute => "toggle_microphone_mute",
+            HotkeyAction::MovePointerTo => "move_pointer_to",
+            HotkeyAction::LockEscape => "lock_escape",
         }
     }
 
@@ -939,6 +966,8 @@ impl HotkeyAction {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Hotkey {
     pub action: HotkeyAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<DeviceKey>,
     pub keys: Vec<String>,
     pub enabled: bool,
 }
@@ -960,6 +989,9 @@ impl Default for KeySupport {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InputSettings {
+    /// One default-off group setting, stored in GroupState register 8.
+    #[serde(default)]
+    pub application_focus_enabled: bool,
     /// Observed native Caps Lock input-source preference; never writable by clients.
     // Replies and subscription events are deserialized by the desktop bridge too.
     // The settings owner ignores this field on edits; skipping it here loses native observations.
@@ -972,7 +1004,10 @@ pub struct InputSettings {
     #[serde(default)]
     pub event_frequency: EventFrequency,
     pub accept_contacts: bool,
-    /// Receiver-local Windows scroll feel; retained while contact acceptance is off.
+    /// Owner's native non-scroll gesture preference; retained while the parent is off.
+    #[serde(default = "default_true")]
+    pub native_multifinger: bool,
+    /// Owner's Windows scroll feel; retained while native touchpad input is off.
     #[serde(default = "default_true")]
     pub mac_scroll_feel: bool,
     /// Windows source-local preference. Never replicated to peers.
@@ -1030,8 +1065,53 @@ pub struct CacheDeviceClear {
     pub result: CacheClear,
 }
 
-/// Five local clipboard format filters; the device owner controls the master switch.
-pub use oink_clipboard::policy::FormatFilters as ClipboardSettings;
+/// Settings IPC retains its original format fields, always true. Format choices
+/// are neither stored locally nor applied; received legacy values are ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(from = "oink_clipboard::policy::Settings")]
+pub struct ClipboardSettings {
+    pub receive: bool,
+    pub send: bool,
+    pub remove_ds_store: bool,
+}
+impl Default for ClipboardSettings {
+    fn default() -> Self {
+        oink_clipboard::policy::Settings::default().into()
+    }
+}
+impl From<oink_clipboard::policy::Settings> for ClipboardSettings {
+    fn from(settings: oink_clipboard::policy::Settings) -> Self {
+        Self {
+            receive: settings.receive,
+            send: settings.send,
+            remove_ds_store: settings.remove_ds_store,
+        }
+    }
+}
+impl From<ClipboardSettings> for oink_clipboard::policy::Settings {
+    fn from(settings: ClipboardSettings) -> Self {
+        Self {
+            receive: settings.receive,
+            send: settings.send,
+            remove_ds_store: settings.remove_ds_store,
+        }
+    }
+}
+impl Serialize for ClipboardSettings {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut fields = serializer.serialize_struct("ClipboardSettings", 8)?;
+        fields.serialize_field("receive", &self.receive)?;
+        fields.serialize_field("send", &self.send)?;
+        fields.serialize_field("text", &true)?;
+        fields.serialize_field("rich_text", &true)?;
+        fields.serialize_field("images", &true)?;
+        fields.serialize_field("files", &true)?;
+        fields.serialize_field("custom", &true)?;
+        fields.serialize_field("remove_ds_store", &self.remove_ds_store)?;
+        fields.end()
+    }
+}
 pub use oink_clipboard::received::{Cleanup as ReceivedFilesCleanup, Usage as ReceivedFilesUsage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1192,6 +1272,8 @@ pub enum FileTransferPhase {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveViews {
     pub stats: bool,
+    #[serde(default)]
+    pub card_signals: bool,
     pub group_quality: bool,
     pub audio_quality: bool,
     pub diagnostics: bool,
@@ -1200,10 +1282,49 @@ pub struct LiveViews {
 impl LiveViews {
     pub const ALL: Self = Self {
         stats: true,
+        card_signals: true,
         group_quality: true,
         audio_quality: true,
         diagnostics: true,
     };
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LatencyWindowStats {
+    pub p50_ms: Option<f64>,
+    pub p90_ms: Option<f64>,
+    pub p99_ms: Option<f64>,
+    pub max_ms: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AudioWindowStats {
+    pub buffer_avg_ms: Option<f64>,
+    pub bitrate_kbps: f64,
+    pub interruptions: u64,
+    pub output_interruptions: u64,
+    pub discontinuities: u64,
+    pub concealed_ms: f64,
+    pub late_packets: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OutputWindowStats {
+    pub interruptions: u64,
+    pub discontinuities: u64,
+    pub missing_ms: f64,
+    #[serde(default)]
+    pub callbacks: u64,
+    #[serde(default)]
+    pub callback_over_budget: u64,
+    #[serde(default)]
+    pub native_timing_callbacks: u64,
+    #[serde(default)]
+    pub native_gap_frames: u64,
+    #[serde(default)]
+    pub callback_max_work_us: u64,
+    #[serde(default)]
+    pub callback_min_margin_us: Option<i64>,
 }
 
 /// A process-monotonic timestamp and the existing link RTT, in milliseconds.
@@ -1214,6 +1335,8 @@ pub struct QualitySample {
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PeerQuality {
+    /// Five-minute statistics; the existing scalar fields describe one minute.
+    pub stats_5m: LatencyWindowStats,
     pub device: DeviceKey,
     pub name: String,
     pub path: LinkKind,
@@ -1239,12 +1362,18 @@ pub struct AudioQualitySample {
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AudioSourceQuality {
+    /// Five-minute statistics; the existing scalar fields describe one minute.
+    pub stats_5m: AudioWindowStats,
+    #[serde(default)]
+    pub kind: oink_audio::media::Kind,
     pub device: DeviceKey,
     pub name: String,
     pub samples: Vec<AudioQualitySample>,
     pub buffer_avg_ms: Option<f64>,
     pub bitrate_kbps: f64,
     pub interruptions: u64,
+    pub output_interruptions: u64,
+    pub discontinuities: u64,
     pub concealed_ms: f64,
     pub late_packets: u64,
     pub glitches: Vec<oink_audio::sink::DropoutBucket>,
@@ -1257,12 +1386,27 @@ pub struct AudioQuality {
     pub output: Option<AudioOutputQuality>,
 }
 
-/// Shared native output FIFO; never attributed to any particular source.
+/// Native output processing/timeline; contributors retain attributed gap counts.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AudioOutputQuality {
+    /// Five-minute statistics; the existing scalar fields describe one minute.
+    pub stats_5m: OutputWindowStats,
     pub interruptions: u64,
+    pub discontinuities: u64,
     pub missing_ms: f64,
     pub glitches: Vec<oink_audio::sink::DropoutBucket>,
+    #[serde(default)]
+    pub callbacks: u64,
+    #[serde(default)]
+    pub callback_over_budget: u64,
+    #[serde(default)]
+    pub native_timing_callbacks: u64,
+    #[serde(default)]
+    pub native_gap_frames: u64,
+    #[serde(default)]
+    pub callback_max_work_us: u64,
+    #[serde(default)]
+    pub callback_min_margin_us: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1413,6 +1557,8 @@ pub enum PermissionKind {
     LocalNetwork,
     /// Optional macOS system-audio capture permission.
     AudioCapture,
+    /// Optional microphone capture, requested only by an explicit Grant action.
+    Microphone,
     /// Windows 防火墙入站规则（默认 UDP 47470/47471：交互连接/发现；TCP 47472：Low 数据流）。
     Firewall,
     /// Windows 系统服务：锁屏、管理员授权弹窗也能被远端键鼠操作（可选）。
@@ -1433,6 +1579,7 @@ impl PermissionKind {
             // guide opens this parent pane and instructs the user to select Local
             // Network; the Permissions row shows that navigation explicitly.
             Self::LocalNetwork => Some("x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension"),
+            Self::Microphone => Some("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"),
             Self::AudioCapture => Some("x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture"),
             Self::Firewall | Self::SystemService => None,
         }
@@ -1441,6 +1588,7 @@ impl PermissionKind {
     /// Windows 设置中对应页面的 URI（`start` 打开）。
     pub fn windows_settings_uri(self) -> Option<&'static str> {
         match self {
+            Self::Microphone => Some("ms-settings:privacy-microphone"),
             Self::Firewall => Some("windowsdefender://network"),
             Self::SystemService => Some("ms-settings:appsfeatures"),
             _ => None,
@@ -1646,6 +1794,7 @@ pub enum ApiEvent {
     },
 
     DeviceCards(crate::device_cards::DeviceCardsView),
+    DeviceCardSignals(crate::device_cards::DeviceCardSignals),
     DeviceControlCompleted(crate::device_cards::DeviceControlCompleted),
     BlockedDevices {
         snapshot: crate::device_cards::BlockedDevicesSnapshot,
@@ -1666,6 +1815,8 @@ pub enum ApiEvent {
     LaunchAtLogin(LaunchAtLoginStatus),
     Audio(oink_audio::Status),
     GameMode(GameModeStatus),
+    /// Ephemeral feedback on the device where the hotkey was pressed.
+    NoSharedMicrophone,
     /// core
     Overview(Overview),
     Pause(PauseStatus),
@@ -1689,6 +1840,8 @@ pub enum ApiEvent {
     ClipActivity(ClipActivity),
     FileTransfer(Option<FileTransferStatus>),
     FileProviderStatus(FileProviderStatus),
+    /// A file publication needs a user-initiated enable action.
+    FileProviderRequired,
     /// core
     Permissions(Vec<PermissionItem>),
     /// core：每秒一次的连接质量。
@@ -1948,6 +2101,28 @@ pub trait AgentApi: Send + Sync {
     fn audio_status(&self) -> ApiResult<oink_audio::Status>;
     /// Explicit list-open refresh; ordinary status sampling stays cache-only.
     fn refresh_audio_devices(&self) -> ApiResult<()>;
+    /// Local explicit UI confirmation only; never called by installation or startup.
+    fn restart_system(&self) -> ApiResult<()> {
+        Err(ApiError::Unsupported {
+            message: "System restart unavailable".into(),
+        })
+    }
+    fn set_microphone_input(&self, _input: Option<String>) -> ApiResult<()> {
+        Err(ApiError::Unsupported {
+            message: "microphone input selection unavailable".into(),
+        })
+    }
+    fn microphone_plugin_status(&self) -> ApiResult<crate::microphone_plugin::MicrophonePluginStatus> {
+        Ok(crate::microphone_plugin::MicrophonePluginStatus::default())
+    }
+    fn microphone_plugin_action(
+        &self,
+        _action: crate::microphone_plugin::Action,
+    ) -> ApiResult<crate::microphone_plugin::MicrophonePluginStatus> {
+        Err(ApiError::Unsupported {
+            message: "virtual microphone installation unavailable".into(),
+        })
+    }
     /// Enabling with an exit selected starts capture on every source in the group.
     fn set_audio_settings(&self, _settings: PreferencePatch<oink_audio::Settings>) -> ApiResult<()>;
     fn cache_usage(&self, _device: Option<DeviceKey>) -> ApiResult<Vec<CacheDevice>>;
@@ -2183,6 +2358,14 @@ pub enum Request {
     },
     AudioStatus,
     RefreshAudioDevices,
+    RestartSystem,
+    MicrophonePluginStatus,
+    SetMicrophoneInput {
+        input: Option<String>,
+    },
+    MicrophonePluginAction {
+        action: crate::microphone_plugin::Action,
+    },
     SetAudioSettings {
         settings: PreferencePatch<oink_audio::Settings>,
     },
@@ -2369,6 +2552,7 @@ pub enum Reply {
     UpdateStatus(UpdateStatus),
     LayoutProjection(ProjectionStatus),
     Audio(oink_audio::Status),
+    MicrophonePlugin(crate::microphone_plugin::MicrophonePluginStatus),
     GameMode(GameModeStatus),
     Aim(AimStatus),
     Unit,
@@ -2533,6 +2717,10 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
         R::SetUiPreferences { settings } => api.set_ui_preferences(settings).map(Reply::UiPreferences),
         R::AudioStatus => api.audio_status().map(Reply::Audio),
         R::RefreshAudioDevices => unit(api.refresh_audio_devices()),
+        R::RestartSystem => unit(api.restart_system()),
+        R::SetMicrophoneInput { input } => unit(api.set_microphone_input(input)),
+        R::MicrophonePluginStatus => api.microphone_plugin_status().map(Reply::MicrophonePlugin),
+        R::MicrophonePluginAction { action } => api.microphone_plugin_action(action).map(Reply::MicrophonePlugin),
         R::SetAudioSettings { settings } => unit(api.set_audio_settings(settings)),
         R::Overview => api.overview().map(Reply::Overview),
         R::PauseStatus => api.pause_status().map(Reply::Pause),
@@ -2910,6 +3098,7 @@ mod input_transform_contract_tests {
         };
         let mut native = oink_foundation::input_transform::InputTransform::initial("macos");
         native.macos.keyboard = KeyboardMapping {
+            saved_custom: None,
             preset: KeyPreset::Custom,
             caps_tap_hold: None,
             table: vec![caps],
@@ -2919,6 +3108,7 @@ mod input_transform_contract_tests {
                 target: source,
                 reverse_wheel: None,
                 keyboard: Some(KeyboardMapping {
+                    saved_custom: None,
                     preset: KeyPreset::Custom,
                     caps_tap_hold: None,
                     table: vec![function],
@@ -2928,6 +3118,7 @@ mod input_transform_contract_tests {
                 target: peer,
                 reverse_wheel: None,
                 keyboard: Some(KeyboardMapping {
+                    saved_custom: None,
                     preset: KeyPreset::Custom,
                     caps_tap_hold: None,
                     table: vec![media],
@@ -2965,7 +3156,7 @@ mod product_boundary {
         ] {
             assert!(serde_json::from_value::<Request>(value.clone()).is_err(), "{value}");
         }
-        for method in ["overview", "file_provider_placeholder_pool"] {
+        for method in ["overview", "file_provider_placeholder_pool", "restart_system"] {
             assert!(
                 serde_json::from_value::<Request>(serde_json::json!({"method": method})).is_ok(),
                 "{method}"
@@ -2989,6 +3180,7 @@ fn test_input_settings() -> InputSettings {
         event_frequency: Default::default(),
         accept_contacts: true,
         contacts_injection_available: true,
+        native_multifinger: true,
         mac_scroll_feel: true,
         forward_injected_input: false,
         emergency_hold_ms: 5000,
@@ -3005,6 +3197,7 @@ fn test_input_settings() -> InputSettings {
         wake_displays_on_input: true,
         cursor_trail: true,
         cursor_trail_duration_ms: 270,
+        application_focus_enabled: false,
         gap_travel: false,
     }
 }

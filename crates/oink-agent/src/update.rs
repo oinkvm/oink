@@ -3,6 +3,9 @@ use crate::{
     api::{ApiError, ApiEvent, ApiResult},
     node::{Node, lock},
 };
+mod local;
+#[cfg(target_os = "macos")]
+pub mod local_mac;
 pub mod presentation;
 use oink_foundation::maintenance;
 pub use oink_update::policy::Phase;
@@ -30,6 +33,8 @@ pub(crate) struct Controller {
     #[cfg(not(windows))]
     pub policy: Policy,
     pub status: UpdateStatus,
+    local: Option<local::Staged>,
+    local_mode: bool,
     #[cfg(not(windows))]
     pub ready: bool,
     #[cfg(not(windows))]
@@ -86,6 +91,8 @@ impl Controller {
             #[cfg(not(windows))]
             policy,
             status,
+            local: None,
+            local_mode: false,
             #[cfg(not(windows))]
             ready: false,
             #[cfg(not(windows))]
@@ -148,9 +155,8 @@ impl Controller {
     }
 }
 fn api_error(error: Error) -> ApiError {
-    ApiError::Unavailable {
-        message: error.to_string(),
-    }
+    tracing::warn!(?error, reason = %error, "update command rejected");
+    ApiError::UpdateFailed { update_error: error }
 }
 #[cfg(not(windows))]
 fn now() -> i64 {
@@ -158,6 +164,9 @@ fn now() -> i64 {
 }
 impl Node {
     pub fn query_update_status(&self) -> UpdateStatus {
+        if lock(&self.inner.update).local_mode {
+            return lock(&self.inner.update).status.clone();
+        }
         #[cfg(windows)]
         if let Ok(status) = windows::status() {
             return status;
@@ -165,6 +174,48 @@ impl Node {
         lock(&self.inner.update).status.clone()
     }
     pub fn execute_update_command(&self, command: Command) -> ApiResult<UpdateStatus> {
+        match &command {
+            Command::Install { expected_build } => tracing::info!(
+                command_type = "install",
+                expected_build,
+                step = "backend_update_received",
+                "update IPC"
+            ),
+            Command::Cancel => tracing::info!(command_type = "cancel", step = "backend_update_received", "update IPC"),
+            Command::Check => tracing::info!(command_type = "check", step = "backend_update_received", "update IPC"),
+            _ => {}
+        }
+        if let Command::OpenLocal { path } = &command {
+            return local::open(self, path);
+        }
+        if lock(&self.inner.update).local_mode {
+            match &command {
+                Command::Install { expected_build } => return local::install(self, *expected_build),
+                Command::Cancel | Command::Check => {
+                    let mut state = lock(&self.inner.update);
+                    state.local = None;
+                    state.local_mode = false;
+                    state.status.candidate = None;
+                    state.status.error = None;
+                    state.status.progress = None;
+                    #[cfg(not(windows))]
+                    {
+                        state.ready = false;
+                        state.status.phase = Phase::Idle;
+                    }
+                    #[cfg(not(windows))]
+                    if command == Command::Cancel {
+                        let status = state.status.clone();
+                        drop(state);
+                        self.emit(ApiEvent::UpdateStatusChanged(status.clone()));
+                        // OpenLocal already disarmed the feed continuation. A
+                        // local cancellation must also work in manual-only builds.
+                        return Ok(status);
+                    }
+                }
+                _ => return Err(api_error(Error::Busy)),
+            }
+        }
         #[cfg(windows)]
         {
             let installing = matches!(&command, Command::Install { .. });
@@ -193,6 +244,7 @@ impl Node {
                 return Err(api_error(Error::Transaction));
             }
             match command {
+                Command::OpenLocal { .. } => unreachable!("handled before platform dispatch"),
                 Command::Check => {
                     if state.begin_check().map_err(api_error)? {
                         crate::backend::on_main(native::check);
@@ -372,6 +424,10 @@ impl Prepared {
         {
             tracing::warn!(%error, "could not deliver explicit product quit to UI");
         }
+        #[cfg(target_os = "macos")]
+        if let Some(provider) = self.provider.as_mut() {
+            provider.commit();
+        }
         self.node.request_stop();
         self.consumed = true;
         Ok(())
@@ -444,6 +500,7 @@ pub(crate) fn attach(node: &Node) {
 
 #[cfg(not(windows))]
 fn install_failure(node: &Node, error: Error, blockers: Vec<Blocker>) {
+    tracing::info!(step="install_failed", error=?error, ?blockers, "upgrade aborted before backend exit");
     let mut state = lock(&node.inner.update);
     state.installing = false;
     state.status.phase = Phase::Failed;
@@ -632,6 +689,103 @@ fn close_mac_clients(token: &Prepared, parent: &Path) -> Result<mac_provider::Su
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_update_preserves_its_reason_across_the_ui_ipc() {
+        #[derive(Clone)]
+        struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Log {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Log(Default::default());
+        let output = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || output.clone())
+            .finish();
+        let error = tracing::subscriber::with_default(subscriber, || api_error(Error::Policy));
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains("update command rejected") && text.contains("Policy"),
+            "missing typed refusal: {text}"
+        );
+        let wire = serde_json::to_value(&error).unwrap();
+        assert_eq!(wire["code"], "update_failed");
+        assert_eq!(wire["update_error"], "policy");
+        assert_eq!(wire["problem"]["code"], "state_conflict");
+        assert_eq!(serde_json::from_value::<ApiError>(wire).unwrap(), error);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn local_ready_cancel_is_independent_of_feed_configuration() {
+        use crate::api::{AgentApi, Request};
+        use crate::ipc::Server;
+        use crate::remote::RemoteApi;
+        use std::sync::Arc;
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let node = runtime
+            .block_on(Node::start_with_fake_platform(crate::node::NodeOptions {
+                net: oink_test_support::network_config(directory.path().into(), "local-update", 0),
+                input: Arc::new(oink_test_support::input::FakeInput::new()),
+                displays: vec![],
+                display_backend: None,
+                clipboard: None,
+                mode_switch_in_callback: true,
+                capture_reports_key_repeat: true,
+                cursor_trail: false,
+            }))
+            .unwrap();
+        {
+            let mut state = lock(&node.inner.update);
+            state.local_mode = true;
+            state.ready = true;
+            state.status.phase = Phase::Ready;
+            state.status.error = None;
+            state.status.candidate = Some(Candidate {
+                local_package: true,
+                build: 65,
+                version: "0.3.0-inhouse.65".into(),
+                size: 1,
+                published_at: None,
+                severity: oink_update::feed::Severity::Normal,
+                notes: Some(oink_update::feed::ReleaseNotes::from_json(br#"{"en":"Local fixes"}"#).unwrap()),
+            });
+        }
+        let server = runtime.block_on(Server::start_on(node.clone(), 0)).unwrap();
+        let remote = RemoteApi::new(directory.path());
+        let ready = remote.update_status().unwrap();
+        assert_eq!(ready.phase, Phase::Ready);
+        assert_eq!(ready.candidate.unwrap().build, 65);
+        // A stale confirmation travels through the same Request -> RemoteApi
+        // -> server dispatch path as the webview, without authorizing an install.
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "method":"update", "params":{"command":{"type":"install", "expected_build":66}}
+        }))
+        .unwrap();
+        let refusal = crate::api::dispatch(&remote, request).unwrap_err();
+        assert_eq!(serde_json::to_value(refusal).unwrap()["update_error"], "policy");
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "method":"update", "params":{"command":{"type":"cancel"}}
+        }))
+        .unwrap();
+        let result = crate::api::dispatch(&remote, request);
+        runtime.block_on(server.close());
+        runtime.block_on(node.shutdown());
+        assert!(
+            result.is_ok(),
+            "a local cancellation must not enter feed policy: {result:?}"
+        );
+        assert_eq!(node.query_update_status().phase, Phase::Idle);
+    }
 
     #[cfg(not(windows))]
     #[test]
@@ -841,6 +995,7 @@ mod tests {
         controller.status.phase = Phase::Ready;
         controller.status.error = None;
         controller.status.candidate = Some(Candidate {
+            local_package: false,
             build: 31,
             version: "0.1.1".into(),
             size: 1,

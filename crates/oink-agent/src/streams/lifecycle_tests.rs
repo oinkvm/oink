@@ -124,7 +124,12 @@ impl<O: Owner> Fixture<O> {
                 tier: Tier::Elevated,
             })
             .await
-            .unwrap();
+            .unwrap_or_else(|error| {
+                panic!(
+                    "isolated lifecycle LinkLayer bind {}:{}: {error:?}",
+                    network.bind_ip, network.port
+                )
+            });
             let port = links.register(KINDS);
             pending.push((directory, identity, network, links, config_port, port));
         }
@@ -1061,6 +1066,7 @@ async fn clipboard_file_operation_interruption_retains_binding_and_reopens_at_re
         },
         items: vec![],
         roots: vec![FileNode {
+            exec_bits: None,
             id: NodeId(11),
             parent: None,
             name: "native-file".into(),
@@ -1089,7 +1095,6 @@ async fn clipboard_file_operation_interruption_retains_binding_and_reopens_at_re
         node: NodeId(11),
         version: 17,
         offset: OFFSET,
-        check: Some([7; 32]),
         demand: Demand::Clipboard,
     };
     for reason in 0..3 {
@@ -1219,8 +1224,7 @@ fn large_clipboard_offer(origin: DeviceId, sequence: u64) -> dto::ClipboardOffer
                     index: -1,
                     standard: None,
                     data: RepresentationData::Reader {
-                        size: ContentSize::Known(u64::from(n)),
-                        hash: Some([sequence as u8; 32]),
+                        size: ContentSize::Known(u64::from(n) + sequence * 1000),
                     },
                 }],
             })
@@ -1290,7 +1294,7 @@ async fn clipboard_current_six_hundred_items_during_open_in_both_roles_scenario(
                         let inventory = oink_clipboard::wire::local_inventory(&offer.inventory().unwrap()).unwrap();
                         assert_eq!(inventory.items.len(), 600);
                         assert!(inventory.items.iter().flat_map(|item| &item.representations).all(
-                            |rep| matches!(rep.data,RepresentationData::Reader{hash:Some(hash),..} if hash==[sequence as u8;32])
+                            |rep| matches!(rep.data,RepresentationData::Reader{size:ContentSize::Known(size)} if size==u64::from(rep.id.0 - 1)+sequence*1000)
                         ));
                         complete[index] |= sequence == 2;
                     }
@@ -1341,7 +1345,6 @@ fn clipboard_unadmitted_tail_expires_and_retires_with_its_link() {
                                 standard: None,
                                 data: RepresentationData::Reader {
                                     size: ContentSize::Unknown,
-                                    hash: None,
                                 },
                             }],
                         })

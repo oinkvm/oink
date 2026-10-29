@@ -56,6 +56,10 @@ struct State {
     admissions: Vec<CrashAdmission>,
     queue: Vec<Pending>,
     reservoirs: [Reservoir; 8],
+    // Additive checkpoint field: preserve consent and spent budgets from the
+    // existing four families when clipboard measurements are first enabled.
+    #[serde(default)]
+    clipboard_reservoirs: [Reservoir; 2],
     audio_minute: Option<Candidate>,
     audio_seen: u64,
 }
@@ -64,7 +68,16 @@ pub struct Store {
     dir: PathBuf,
     _lock: File,
     state: State,
+    last_checkpoint: Vec<u8>,
     disabled: bool,
+}
+impl Drop for Store {
+    fn drop(&mut self) {
+        // Release this writer's lease explicitly. On Unix, a concurrent fork
+        // inherits the locked open file description until exec, even with
+        // CLOEXEC; closing only our descriptor can leave the next owner Busy.
+        let _ = fs2::FileExt::unlock(&self._lock);
+    }
 }
 #[derive(Clone, Debug)]
 pub struct Submission {
@@ -140,7 +153,10 @@ impl Store {
                 if s.schema != 3
                     || s.queue.len() > 266
                     || s.admissions.len() > 5
-                    || s.reservoirs.iter().any(|r| r.keys.len() > 16 || r.candidates.len() > 2)
+                    || s.reservoirs
+                        .iter()
+                        .chain(&s.clipboard_reservoirs)
+                        .any(|r| r.keys.len() > 16 || r.candidates.len() > 2)
                 {
                     return Err(Error::Invalid);
                 }
@@ -156,6 +172,7 @@ impl Store {
                 admissions: Vec::new(),
                 queue: Vec::new(),
                 reservoirs: std::array::from_fn(|_| Reservoir::default()),
+                clipboard_reservoirs: std::array::from_fn(|_| Reservoir::default()),
                 audio_minute: None,
                 audio_seen: 0,
             },
@@ -165,6 +182,7 @@ impl Store {
             dir: dir.to_path_buf(),
             _lock: lock,
             state,
+            last_checkpoint: Vec::new(),
             disabled: false,
         };
         if !consent.granted() || store.state.consent != consent {
@@ -199,15 +217,23 @@ impl Store {
             self.disabled = true;
             return Err(Error::Limit);
         }
+        // Rejected samples and retries can leave state unchanged. Keep exact
+        // bytes only after a successful durable write; changed admissions,
+        // budgets and consent still use the same synchronous persistence path.
+        if bytes == self.last_checkpoint {
+            return Ok(());
+        }
         if let Err(e) = atomic_write(&self.dir.join("checkpoint.json"), &bytes) {
             self.disabled = true;
             return Err(e);
         }
+        self.last_checkpoint = bytes;
         Ok(())
     }
     fn clear(&mut self) {
         self.state.queue.clear();
         self.state.reservoirs = std::array::from_fn(|_| Reservoir::default());
+        self.state.clipboard_reservoirs = std::array::from_fn(|_| Reservoir::default());
         self.state.audio_minute = None;
         self.state.audio_seen = 0;
         // Raw/capsule staging belongs exclusively to this report writer. OS crash
@@ -343,7 +369,9 @@ impl Store {
                     });
                 }
             } else {
-                let gated = if distribution || matches!(context.metric.family(), Family::Drag | Family::Link) {
+                let gated = if distribution
+                    || matches!(context.metric.family(), Family::Drag | Family::Link | Family::Clipboard)
+                {
                     random_below(10)? == 0
                 } else {
                     true
@@ -359,18 +387,20 @@ impl Store {
         if is_crash { self.persist() } else { Ok(()) }
     }
     fn offer(&mut self, report: Report, at: u64) -> Result<()> {
-        let family = report.context().ok_or(Error::Invalid)?.metric.family() as usize;
+        let family = report.context().ok_or(Error::Invalid)?.metric.family();
+        let reservoirs = if family == Family::Clipboard {
+            &mut self.state.clipboard_reservoirs[..]
+        } else {
+            &mut self.state.reservoirs[family as usize * 2..family as usize * 2 + 2]
+        };
         let dist = matches!(report, Report::PerformanceDistribution(_));
         // The 16-key cap is shared by both reservoirs in a family.
         let context = report.context().unwrap();
-        let keys: std::collections::HashSet<_> = self.state.reservoirs[family * 2..family * 2 + 2]
-            .iter()
-            .flat_map(|r| r.keys.iter().copied())
-            .collect();
+        let keys: std::collections::HashSet<_> = reservoirs.iter().flat_map(|r| r.keys.iter().copied()).collect();
         if !keys.contains(&context) && keys.len() >= 16 {
             return Err(Error::Limit);
         }
-        self.state.reservoirs[family * 2 + usize::from(dist)].offer(report, at, if dist { 1 } else { 2 })
+        reservoirs[usize::from(dist)].offer(report, at, if dist { 1 } else { 2 })
     }
     pub fn advance(&mut self, now: u64) -> Result<()> {
         self.expire(now);
@@ -382,12 +412,17 @@ impl Store {
         if now / DAY > self.state.budget.day {
             // Seal once atomically with queue and counters. Clock rollback never
             // restores budget, and shutdown/restart never seals a second quota.
-            let candidates: Vec<_> = self
+            let mut candidates: Vec<_> = self
                 .state
                 .reservoirs
                 .iter_mut()
+                .chain(&mut self.state.clipboard_reservoirs)
                 .flat_map(|r| std::mem::take(r).candidates)
                 .collect();
+            for end in (1..candidates.len()).rev() {
+                let selected = random_below((end + 1) as u64)? as usize;
+                candidates.swap(end, selected);
+            }
             let last_perf = self.state.budget.last_perf;
             let last_crash = self.state.budget.last_crash;
             let pause_perf = self.state.budget.pause_perf;
@@ -487,6 +522,7 @@ impl Store {
                 });
                 if transactions_until > 0 {
                     self.state.reservoirs = std::array::from_fn(|_| Reservoir::default());
+                    self.state.clipboard_reservoirs = std::array::from_fn(|_| Reservoir::default());
                     self.state.audio_minute = None;
                 }
             }
@@ -503,7 +539,12 @@ impl Store {
     }
     pub fn has_work(&self) -> bool {
         !self.state.queue.is_empty()
-            || self.state.reservoirs.iter().any(|r| !r.candidates.is_empty())
+            || self
+                .state
+                .reservoirs
+                .iter()
+                .chain(&self.state.clipboard_reservoirs)
+                .any(|r| !r.candidates.is_empty())
             || self.state.audio_minute.is_some()
     }
 }
@@ -511,6 +552,61 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn dropped_writer_releases_its_lease_while_an_inherited_descriptor_remains_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path(), consent(), DAY).unwrap();
+        // A fork in another thread shares this open file description until exec,
+        // even with CLOEXEC. A duplicate models that lifetime without forking a
+        // multithreaded test process or depending on how quickly exec is scheduled.
+        let inherited = store._lock.try_clone().unwrap();
+        drop(store);
+        let reopened = Store::open(directory.path(), consent(), DAY);
+        drop(inherited);
+        assert!(
+            reopened.is_ok(),
+            "the retired writer still owns its lease: {reopened:?}"
+        );
+    }
+
+    #[test]
+    fn unchanged_checkpoint_does_not_replace_file_but_crashes_remain_durable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("checkpoint.json");
+        let mut store = Store::open(directory.path(), consent(), DAY).unwrap();
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(DAY);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        store.checkpoint().unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), old);
+        store.observe(1, crash(7), DAY, DAY).unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().modified().unwrap(), old);
+        drop(store);
+        let restored = Store::open(directory.path(), consent(), DAY).unwrap();
+        assert_eq!(restored.state.admissions.len(), 1);
+        assert_eq!(restored.state.queue.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "isolated resource benchmark; run with --ignored --nocapture"]
+    fn resource_checkpoint_benchmark() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path(), consent(), DAY).unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..1000 {
+            store.checkpoint().unwrap();
+        }
+        println!(
+            "unchanged_checkpoints=1000 elapsed_us={}",
+            started.elapsed().as_micros()
+        );
+    }
+
     #[test]
     fn checkpoint_replacement_preserves_an_open_readers_snapshot() {
         let directory = tempfile::tempdir().unwrap();
@@ -729,6 +825,87 @@ mod tests {
         assert_eq!(s.status().crashes, 0);
         assert_eq!(s.status().performance, 1);
     }
+    #[test]
+    fn clipboard_family_preserves_spent_budget_and_shares_the_global_seal_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path(), consent(), DAY).unwrap();
+        s.state.budget.perf_roots = 12;
+        s.persist().unwrap();
+        drop(s);
+        let path = dir.path().join("checkpoint.json");
+        let mut checkpoint: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        checkpoint.as_object_mut().unwrap().remove("clipboard_reservoirs");
+        std::fs::write(&path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        let mut s = Store::open(dir.path(), consent(), DAY + 1).unwrap();
+        assert_eq!(s.state.budget.perf_roots, 12);
+        assert_eq!(s.consent(), consent());
+        for metric in [
+            Metric::DragQueueWait,
+            Metric::LinkSetup {
+                result: SetupResult::Ready,
+            },
+            Metric::InputReceiveToNativeComplete,
+            Metric::AudioPushToPresentationEstimate,
+            Metric::ClipboardPublish,
+        ] {
+            for _ in 0..3 {
+                let Report::MeasuredInterval(mut sample) = interval() else {
+                    unreachable!()
+                };
+                sample.context.metric = metric;
+                s.offer(Report::MeasuredInterval(sample), DAY + 2).unwrap();
+            }
+        }
+        assert_eq!(s.state.clipboard_reservoirs[0].candidates.len(), 2);
+        for metric in [
+            Metric::DragPrepareStage {
+                stage: PrepareStage::ParentVisible,
+            },
+            Metric::NetworkRtt,
+            Metric::InputQueueWaitWindowMax,
+            Metric::AudioBuffered {
+                stage: AudioStage::Total,
+            },
+        ] {
+            let Report::MeasuredInterval(sample) = interval() else {
+                unreachable!()
+            };
+            let d = Report::PerformanceDistribution(PerformanceDistribution {
+                context: MeasurementContext {
+                    metric,
+                    ..sample.context
+                },
+                histogram: HistogramSchema::Duration14,
+                bins: sampling::singleton(10),
+                sample_count: 1,
+                missing: 0,
+                saturated: false,
+                window_us: Some(10),
+                seal_us: 1,
+            });
+            d.validate().unwrap();
+            s.offer(d, DAY + 2).unwrap();
+        }
+        assert_eq!(
+            s.state
+                .reservoirs
+                .iter()
+                .chain(&s.state.clipboard_reservoirs)
+                .map(|r| r.candidates.len())
+                .sum::<usize>(),
+            14
+        );
+        s.advance(2 * DAY).unwrap();
+        assert_eq!(s.state.budget.sealed, 12);
+        assert_eq!(s.status().performance, 12);
+        s.advance(2 * DAY + 1).unwrap();
+        assert_eq!(s.status().performance, 12);
+        s.set_consent(consent().change(1, Choice::Denied, POLICY_VERSION).unwrap())
+            .unwrap();
+        assert!(!s.has_work());
+        assert_eq!(s.state.budget.sealed, 12);
+    }
+
     #[test]
     fn no_startup_midnight_or_shutdown_ping_and_reservoirs_bounded() {
         let dir = tempfile::tempdir().unwrap();

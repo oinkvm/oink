@@ -455,6 +455,9 @@ impl input_trace::InputTrace {
     }
 }
 impl RoutingDiagnostics for input_trace::InputTrace {
+    fn application_focus(&self, record: oink_routing::application_focus::Diagnostic) {
+        self.evidence(input_trace::Evidence::ApplicationFocus(record));
+    }
     fn source_decision(&self, record: oink_routing::router::SourceDecision) {
         self.evidence(input_trace::Evidence::SourceRouting(record));
     }

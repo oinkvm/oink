@@ -12,7 +12,7 @@ import { OnboardingPermissions } from './OnboardingPermissions';
 
 vi.mock('oink-ui', async importOriginal => ({ ...await importOriginal<typeof import('oink-ui')>(), speed: () => 0 }));
 
-vi.mock('../api/store', () => ({ agent: { fail: vi.fn() } }));
+vi.mock('../api/store', () => ({ agent: { fail: vi.fn(), query: vi.fn().mockResolvedValue(undefined) } }));
 beforeAll(() => {
   Object.defineProperty(window, 'matchMedia', { value: () => ({ matches: true, addEventListener() {}, removeEventListener() {} }) });
   vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} });

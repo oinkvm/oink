@@ -181,6 +181,7 @@ fn render_thread(shared: Arc<(Mutex<State>, Condvar)>, health: Arc<crate::diagno
     let _worker = health.worker();
     health.pulse();
     let Some(mut backend) = platform::Backend::new(health.clone()) else {
+        tracing::info!("projection native backend unavailable");
         health.failed();
         return;
     };
@@ -194,6 +195,7 @@ fn render_thread(shared: Arc<(Mutex<State>, Condvar)>, health: Arc<crate::diagno
     let mut last_view: Option<View> = None;
     let mut last_dragging = false;
     let mut last_alpha = -1.0;
+    let mut reported_frames = None;
     loop {
         let (view, expired) = {
             let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -247,6 +249,11 @@ fn render_thread(shared: Arc<(Mutex<State>, Condvar)>, health: Arc<crate::diagno
                         Some(frame)
                     })
                     .collect();
+                let counts = (view.projections.len(), next.len());
+                if reported_frames != Some(counts) {
+                    tracing::info!(requested = counts.0, frames = counts.1, "projection render visibility");
+                    reported_frames = Some(counts);
+                }
                 cached = next_cache;
                 if next.is_empty() {
                     health.hide(Hide::Explicit);

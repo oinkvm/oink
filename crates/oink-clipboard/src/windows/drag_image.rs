@@ -590,7 +590,6 @@ mod tests {
                     standard: Some(StandardFormat::Text),
                     data: RepresentationData::Reader {
                         size: ContentSize::Unknown,
-                        hash: None,
                     },
                 }],
             },
@@ -609,6 +608,7 @@ mod tests {
         assert_eq!((native_image.width, native_image.height), (6, 4));
         assert_eq!(native_image.pixels(), legacy_image.pixels());
         let items = [ClipData::FileRoots(vec![FileNode {
+            exec_bits: None,
             id: NodeId(1),
             parent: None,
             name: "example.txt".into(),

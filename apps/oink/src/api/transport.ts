@@ -1,13 +1,15 @@
 // The product UI calls its native shell over Tauri IPC.
-import type { ApiError, UserFacingProblem } from './cards';
+import type { ApiError, UserFacingProblem, UpdateError } from './cards';
 
 export class ApiFailure extends Error {
   code: ApiError['code'];
   problem: UserFacingProblem;
+  updateError?: UpdateError;
   constructor(err: ApiError) {
     super(err.problem.code);
     this.code = err.code;
     this.problem = err.problem;
+    this.updateError = err.update_error;
   }
 }
 

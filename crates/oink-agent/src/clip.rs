@@ -1,10 +1,11 @@
 //! Native clipboard ownership, copy ordering and delivery lifetime.
-use crate::api::{ClipActivity, ClipKind, ClipOutcome, ClipboardSettings, FileTransferPhase, FileTransferStatus};
+use crate::api::{ClipActivity, ClipKind, ClipOutcome, FileTransferPhase, FileTransferStatus};
 use crate::streams::StreamModule;
 use oink_clipboard::{
     ClipboardBackend,
     content::{self, Provider},
     model::{ClipId, Demand, Inventory, Unavailable},
+    policy::Settings as ClipboardSettings,
 };
 use oink_foundation::DeviceId;
 use oink_protocol::v1::dto;
@@ -28,6 +29,8 @@ mod fetch_tests;
 mod health_tests;
 #[cfg(all(test, debug_assertions))]
 mod native_transfer_tests;
+#[cfg(all(test, debug_assertions))]
+mod promise_tests;
 mod runtime;
 #[cfg(all(test, debug_assertions))]
 mod transfer_tests;
@@ -52,6 +55,8 @@ struct Publication {
     inventory: Inventory,
     files: bool,
     materialized: bool,
+    provider_unavailable: bool,
+    requires_enable: bool,
     result: Result<u64, oink_clipboard::ClipboardError>,
 }
 enum Input {
@@ -60,14 +65,9 @@ enum Input {
     Captured(
         u64,
         Result<oink_clipboard::CapturedClipboard, oink_clipboard::ClipboardError>,
+        Option<[u8; 32]>,
     ),
     Progress(ClipId, oink_clipboard::store::BatchId, content::TransferProgress),
-    Prefetched {
-        id: ClipId,
-        ticket: Arc<()>,
-        before: u64,
-        result: Result<oink_clipboard::NativeSpec, Unavailable>,
-    },
     Applied {
         id: ClipId,
         ticket: Arc<WriteTicket>,
@@ -81,6 +81,7 @@ enum Input {
     Stop(oneshot::Sender<()>),
 }
 struct Shared {
+    _native_connection: Option<content::linked::Connection>,
     native: Arc<content::Registry>,
     native_target: Mutex<Option<(ClipId, content::Remote)>>,
     links: Arc<crate::streams::clipboard::files::FileLinks>,
@@ -130,8 +131,8 @@ impl ClipHandle {
     fn reconfigure(&self) {
         let active = self.shared.enabled.load(Ordering::Acquire) && !self.shared.paused.load(Ordering::Acquire);
         let settings = self.settings();
-        self.shared.policy.update(active && settings.send, settings);
-        self.shared.receive_policy.update(active && settings.receive, settings);
+        self.shared.policy.update(active && settings.send);
+        self.shared.receive_policy.update(active && settings.receive);
         self.shared.native.cancel_all();
         if let Some((_, remote)) = self.shared.native_target.lock().unwrap().take() {
             remote.cancel();
@@ -198,15 +199,17 @@ struct Task {
     tx: UnboundedSender<Input>,
     shared: Arc<Shared>,
     observed: u64,
+    copy_report: Option<crate::telemetry::Stamp>,
+    apply_report: Option<(ClipId, crate::telemetry::Stamp)>,
     last_write: Option<u64>,
     remote_scope: Option<(ClipId, DeviceId, oink_network::link::StreamId)>,
     cancelled: Option<ClipId>,
-    prefetch: Option<(ClipId, Arc<()>)>,
     provider_retry: Option<ClipId>,
     fetch_requested: Option<ClipId>,
     native_write: Option<NativeWrite>,
     queued_write: Option<(ClipId, oink_clipboard::NativeSpec)>,
     on_transfer: OnTransfer,
+    on_provider_required: Arc<dyn Fn() + Send + Sync>,
     on_activity: OnActivity,
     name_of: NameOf,
 }
@@ -233,7 +236,9 @@ impl Task {
         let tx = self.tx.clone();
         self.capture = Some(tokio::task::spawn_blocking(move || {
             let count = backend.change_count();
-            let _ = tx.send(Input::Captured(count, backend.capture(&data)));
+            let captured = backend.capture(&data);
+            let key = backend.clipboard_key().ok();
+            let _ = tx.send(Input::Captured(count, captured, key));
         }));
     }
     fn observe(&mut self, count: u64) {
@@ -252,11 +257,12 @@ impl Task {
             return;
         }
         self.cancel_native_write();
-        self.prefetch = None;
         self.fetch_requested = None;
         self.provider_retry = None;
         self.remote_scope = None;
         self.cancelled = None;
+        self.copy_report = crate::telemetry::producer().and_then(|p| p.stamp());
+        self.apply_report = None;
         self.ordering.local_change(count, Instant::now());
         if !self.sending() {
             self.ordering.revoke_local();
@@ -269,10 +275,8 @@ impl Task {
             return true;
         }
         self.fault = Some(dto::ResourceFaultCode::BackendFailed);
-        self.shared.policy.update(false, *self.shared.settings.lock().unwrap());
-        self.shared
-            .receive_policy
-            .update(false, *self.shared.settings.lock().unwrap());
+        self.shared.policy.update(false);
+        self.shared.receive_policy.update(false);
         self.shared.native.cancel_all();
         if let Some((_, remote)) = self.shared.native_target.lock().unwrap().take() {
             remote.cancel();
@@ -289,6 +293,7 @@ impl Task {
         &mut self,
         before: u64,
         result: Result<oink_clipboard::CapturedClipboard, oink_clipboard::ClipboardError>,
+        native_key: Option<[u8; 32]>,
     ) {
         self.capture = None;
         if !self.sending() {
@@ -347,6 +352,7 @@ impl Task {
             return;
         };
         self.fault = None;
+        let identity_source = provider.namespace();
         let provider = self.shared.policy.provider(provider);
         let Ok(inventory) = oink_clipboard::wire::inventory(&provider.inventory()) else {
             return;
@@ -359,10 +365,8 @@ impl Task {
         ) {
             Ok(offer) => offer,
             Err(_) => {
-                self.shared.policy.update(false, *self.shared.settings.lock().unwrap());
-                self.shared
-                    .receive_policy
-                    .update(false, *self.shared.settings.lock().unwrap());
+                self.shared.policy.update(false);
+                self.shared.receive_policy.update(false);
                 self.shared.native.cancel_all();
                 self.streams.set_offer(None);
                 return;
@@ -379,7 +383,11 @@ impl Task {
             return;
         };
         let provider = content::identified(provider, id);
-        let lease = match self.shared.native.register_clipboard(provider) {
+        let lease = match self
+            .shared
+            .native
+            .register_clipboard_identified(provider, native_key, identity_source)
+        {
             Ok(lease) => lease,
             Err(_) => return,
         };
@@ -390,6 +398,11 @@ impl Task {
             ClipOutcome::Synced,
         );
         self.streams.set_offer(Some(offer));
+        if let Some(stamp) = self.copy_report.take()
+            && let Some(p) = crate::telemetry::producer()
+        {
+            p.interval(stamp, oink_telemetry::Metric::ClipboardPublish, Instant::now());
+        }
     }
     fn current_id(&self) -> Option<ClipId> {
         self.ordering
@@ -456,7 +469,7 @@ impl Task {
         };
         let provider = self.shared.receive_policy.provider(Arc::new(remote.clone()));
         let inventory = provider.inventory();
-        if inventory.wanted(target).next().is_none() && inventory.roots.is_empty() {
+        if inventory.wanted(target).next().is_none() && inventory.namespace_roots_for(target).is_empty() {
             return Err(E::Unsupported);
         }
         let (files, file_contents) = if inventory.namespace_roots_for(target).is_empty() {
@@ -488,7 +501,7 @@ impl Task {
             }));
             let tx = self.tx.clone();
             let mut progress = remote.progress();
-            let batch = remote.batch().id();
+            let batch = remote.batch_id();
             tokio::spawn(async move {
                 loop {
                     let value = progress.borrow_and_update().clone();
@@ -525,11 +538,10 @@ impl Task {
         if !self.may_write(id) {
             return;
         }
-        if self.prefetch.as_ref().is_some_and(|(current, _)| *current == id)
-            || self
-                .native_write
-                .as_ref()
-                .is_some_and(|write| write.id == id && write.ticket.valid.load(Ordering::Acquire))
+        if self
+            .native_write
+            .as_ref()
+            .is_some_and(|write| write.id == id && write.ticket.valid.load(Ordering::Acquire))
         {
             return;
         }
@@ -573,6 +585,11 @@ impl Task {
             ticket: ticket.clone(),
             contents: spec.contents.clone(),
         });
+        let report = self
+            .apply_report
+            .take()
+            .filter(|(current, _)| *current == id)
+            .map(|(_, stamp)| stamp);
         let backend = self.backend.clone();
         let before = backend.change_count();
         let policy = self.shared.receive_policy.publication_guard();
@@ -588,14 +605,42 @@ impl Task {
                     Err(content::unavailable(Unavailable::Cancelled))
                 }
             });
-            let inventory = spec.inventory.clone();
-            let files = !spec.files.is_empty();
+            let mut inventory = spec.inventory.clone();
+            let mut files = !spec.files.is_empty();
             let materialized = files && spec.file_contents.is_none();
-            let result = if ticket.valid.load(Ordering::Acquire) {
-                backend.write_native_guarded(spec, guard)
+            let non_files = spec.clone().without_files().ok().flatten();
+            let mut result = if ticket.valid.load(Ordering::Acquire) {
+                backend.write_native_guarded(spec, guard.clone())
             } else {
                 Err(oink_clipboard::ClipboardError::Busy)
             };
+            let provider_unavailable = matches!(
+                &result,
+                Err(oink_clipboard::ClipboardError::FileProviderUnavailable
+                    | oink_clipboard::ClipboardError::FileProvider(_))
+            );
+            let requires_enable = match &result {
+                Err(oink_clipboard::ClipboardError::FileProvider(reason)) => reason.needs_enable(),
+                Err(oink_clipboard::ClipboardError::FileProviderUnavailable) => true,
+                _ => false,
+            };
+            if provider_unavailable && let Some(non_files) = non_files {
+                inventory = non_files.inventory.clone();
+                files = false;
+                result = backend.write_native_guarded(non_files, guard);
+            }
+            if let Some(stamp) = report
+                && let Some(p) = crate::telemetry::producer()
+            {
+                let result = if !ticket.valid.load(Ordering::Acquire) {
+                    oink_telemetry::OperationResult::Cancelled
+                } else if result.is_ok() {
+                    oink_telemetry::OperationResult::Completed
+                } else {
+                    oink_telemetry::OperationResult::Failed
+                };
+                p.interval(stamp, oink_telemetry::Metric::ClipboardApply { result }, Instant::now());
+            }
             let _ = tx.send(Input::Applied {
                 id,
                 ticket,
@@ -603,6 +648,8 @@ impl Task {
                     inventory,
                     files,
                     materialized,
+                    provider_unavailable,
+                    requires_enable,
                     result,
                 },
             });
@@ -640,10 +687,7 @@ impl Task {
                         ));
                     }
                 }
-                Err(oink_clipboard::ClipboardError::FileProviderUnavailable) => {
-                    self.provider_retry = Some(id);
-                    self.set_transfer(self.status(id, FileTransferPhase::Pending, Some("等待文件下载请求".into())));
-                }
+                Err(_) if publication.provider_unavailable => {}
                 Err(error) => self.record(
                     id.origin,
                     &publication.inventory,
@@ -651,6 +695,13 @@ impl Task {
                         message: error.to_string(),
                     },
                 ),
+            }
+        }
+        if publication.provider_unavailable && ticket.valid.load(Ordering::Acquire) && self.may_write(id) {
+            self.provider_retry = Some(id);
+            self.set_transfer(self.status(id, FileTransferPhase::Failed, Some("File provider unavailable".into())));
+            if publication.requires_enable {
+                (self.on_provider_required)();
             }
         }
         if self.fetch_requested == Some(id) && self.may_write(id) {
@@ -671,10 +722,7 @@ impl Task {
         self.cancelled = self.cancelled.filter(|old| *old != id);
     }
     fn fetch(&mut self) {
-        let Some(id) = self
-            .current_id()
-            .filter(|_| self.active() && self.shared.settings.lock().unwrap().files)
-        else {
+        let Some(id) = self.current_id().filter(|_| self.active()) else {
             return;
         };
         self.fetch_requested = Some(id);
@@ -690,7 +738,7 @@ impl Task {
         let Some(offer) = self.ordering.current().cloned() else {
             return;
         };
-        let Ok(mut spec) = self.spec(&offer) else {
+        let Ok(spec) = self.spec(&offer) else {
             return;
         };
         if spec.files.is_empty() {
@@ -707,48 +755,19 @@ impl Task {
         else {
             return;
         };
-        if self.provider_retry != Some(id) {
-            remote.start_delivery();
-            self.fetch_requested = None;
-            return;
-        }
-        if self.prefetch.is_some() {
-            return;
-        }
         self.fetch_requested = None;
-        let ticket = Arc::new(());
-        self.prefetch = Some((id, ticket.clone()));
-        let before = self.backend.change_count();
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let result = async {
-                let local = remote
-                    .prefetch_bounded(64 * 1024 * 1024)
-                    .await
-                    .map_err(|e| content::reason(&e))?;
-                tokio::task::spawn_blocking(move || {
-                    spec.files = local.materialize().map_err(|e| content::reason(&e))?;
-                    spec.inventory = local.inventory();
-                    spec.contents = Arc::new(local);
-                    spec.file_contents = None;
-                    Ok(spec)
-                })
-                .await
-                .map_err(|_| Unavailable::ReadFailed)?
-            }
-            .await;
-            let _ = tx.send(Input::Prefetched {
-                id,
-                ticket,
-                before,
-                result,
-            });
-        });
+        if self.provider_retry == Some(id) {
+            self.set_transfer(self.status(id, FileTransferPhase::Failed, Some("File provider unavailable".into())));
+            return;
+        }
+        remote.start_delivery();
     }
+
     fn progress(&self, id: ClipId, batch: oink_clipboard::store::BatchId, value: content::TransferProgress) {
         // Clearing the current file offer retires its diagnostic record. Native
         // readers may outlive it, but queued progress must not re-admit it.
-        if self.shared.transfer.lock().unwrap().is_none()
+        if self.provider_retry == Some(id)
+            || self.shared.transfer.lock().unwrap().is_none()
             || (self.cancelled == Some(id) && value.phase != content::TransferPhase::Cancelled)
         {
             return;
@@ -759,7 +778,7 @@ impl Task {
             .lock()
             .unwrap()
             .as_ref()
-            .is_some_and(|(clip, r)| *clip == id && r.batch().id() == batch)
+            .is_some_and(|(clip, r)| *clip == id && r.batch_id() == batch)
         {
             return;
         }
@@ -791,7 +810,6 @@ impl Task {
     }
     fn reconfigure(&mut self) {
         self.cancel_native_write();
-        self.prefetch = None;
         self.fetch_requested = None;
         self.provider_retry = None;
         self.cancelled = None;

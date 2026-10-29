@@ -42,41 +42,45 @@ pub fn encode(report: &AdmittedReport) -> Result<Vec<u8>> {
             }
             tags["component"] = json!(c.component);
             tags["crash_kind"] = json!(c.crash_kind);
-            let frames: Vec<Value> = c
-                .frames()
-                .filter_map(|f| match f {
-                    // Relative native addresses require validated symbolication. Until
-                    // that release gate is met, retain numeric code data as attributes,
-                    // never invent synthetic load addresses or absolute PCs.
-                    Frame::Native { .. } => None,
-                    Frame::Script {
-                        script: ScriptSlot::Main,
-                        line,
-                        column,
-                    } => Some(json!({"filename":"app:///main.js","lineno":line,"colno":column,"in_app":true})),
-                })
-                .collect();
+            let mut images = Vec::<Value>::new();
+            let mut frames: Vec<Value> = c.frames().map(|f| match f {
+                Frame::Native { image, offset, debug_id, debug_age, code_id, image_size } => {
+                    let mut id = uuid(debug_id);
+                    if *debug_age != 0 { id.push_str(&format!("-{debug_age:x}")); }
+                    let index = images.iter().position(|i| i["debug_id"] == id).unwrap_or_else(|| {
+                        let windows = code_id.is_some() || matches!(build.os_version_class, OsVersionClass::Windows10 | OsVersionClass::Windows11);
+                        // Labels come exclusively from shipped-code enums. Relative mode
+                        // identifies a debug image without exporting an ASLR load address.
+                        let mut value = json!({"type":if windows {"pe"} else {"macho"}, "debug_id":id,
+                            "code_file":image, "image_addr":"0x0", "image_size":image_size});
+                        if let Some(code) = code_id {
+                            value["code_id"] = json!(format!("{:08x}{:x}", code >> 32, code & 0xffff_ffff));
+                        } else if !windows { value["code_id"] = json!(hex(debug_id)); }
+                        images.push(value);
+                        images.len()-1
+                    });
+                    json!({"instruction_addr":format!("0x{offset:x}"), "addr_mode":format!("rel:{index}"), "in_app":true})
+                }
+                Frame::Script { script: ScriptSlot::Main, line, column } =>
+                    json!({"filename":"app:///main.js","lineno":line,"colno":column,"in_app":true}),
+            }).collect();
+            // Capture order is fault -> callers; Sentry expects oldest -> newest.
+            frames.reverse();
+            if !images.is_empty() {
+                event["debug_meta"] = json!({"images":images});
+            }
             event["level"] = json!("fatal");
             let mut exception = json!({"type":c.exception_class,"mechanism":{"type":"generic","handled":false}});
             // Sentry discards an empty `stacktrace.frames` as invalid and flags the
             // event with a processing error, so a crash without script frames
             // carries no stacktrace object at all.
             if !frames.is_empty() {
-                exception["stacktrace"] = json!({"frames":frames});
+                // Windows unwind already adjusts PCs. macOS normalizes before
+                // filtering; Relay must never adjust this shortened stack again.
+                exception["stacktrace"] = json!({"frames":frames,"instruction_addr_adjustment":"none"});
             }
             event["exception"] = json!({"values":[exception]});
-            let native: Vec<Value> = c
-                .frames()
-                .filter_map(|f| match f {
-                    Frame::Native {
-                        image,
-                        offset,
-                        debug_id,
-                    } => Some(json!({"image":image,"offset":offset,"debug_id":uuid(debug_id)})),
-                    _ => None,
-                })
-                .collect();
-            event["contexts"] = json!({"oink_crash":{"type":"oink_crash","exception_code":c.exception_code,"stack_available":!native.is_empty() || !frames.is_empty(),"native_frames":native,"callsite":c.callsite,"line":c.line,"column":c.column}});
+            event["contexts"] = json!({"oink_crash":{"type":"oink_crash","exception_code":c.exception_code,"stack_available":!frames.is_empty(),"callsite":c.callsite,"line":c.line,"column":c.column}});
             "event"
         }
         Report::MeasuredInterval(_) | Report::PerformanceDistribution(_) => {
@@ -166,6 +170,163 @@ pub fn encode_persisted(bytes: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     #[test]
+    fn target_drag_intervals_reach_sentry_with_fixed_stage_and_boundary_tags() {
+        for metric in [
+            Metric::DragSourceStage {
+                stage: SourceStage::ProbeRecognition,
+            },
+            Metric::DragSourceStage {
+                stage: SourceStage::NativeRead,
+            },
+            Metric::DragSourceStage {
+                stage: SourceStage::MetadataCompletion,
+            },
+            Metric::DragSourceStage {
+                stage: SourceStage::Inventory,
+            },
+            Metric::DragSourceStage {
+                stage: SourceStage::InventoryToLearned,
+            },
+            Metric::DragSourceStage {
+                stage: SourceStage::LearnedToNotice,
+            },
+            Metric::DragSourceStage {
+                stage: SourceStage::RecognizedToNotice,
+            },
+            Metric::DragTargetStart {
+                boundary: TargetStartBoundary::AppkitSessionReturned,
+            },
+            Metric::DragTargetStart {
+                boundary: TargetStartBoundary::OleCallEnter,
+            },
+            Metric::DragPrepareStage {
+                stage: PrepareStage::Metadata,
+            },
+            Metric::DragPrepareStage {
+                stage: PrepareStage::EntryToBegin,
+            },
+            Metric::DragPrepareStage {
+                stage: PrepareStage::TargetPreparation,
+            },
+            Metric::DragPrepareStage {
+                stage: PrepareStage::PreparationQueue,
+            },
+            Metric::DragPrepareStage {
+                stage: PrepareStage::BeginDispatch,
+            },
+            Metric::DragPrepareStage {
+                stage: PrepareStage::PendingWindow,
+            },
+            Metric::DragPrepareStage {
+                stage: PrepareStage::SourcePress,
+            },
+            Metric::DragPrepareStage {
+                stage: PrepareStage::NativeAcknowledgement,
+            },
+            Metric::DragPrepareStage {
+                stage: PrepareStage::WritersPreview,
+            },
+            Metric::DragPrepareStage {
+                stage: PrepareStage::NativeBegin,
+            },
+            Metric::DragPrepareStage {
+                stage: PrepareStage::Preview,
+            },
+            Metric::DragPrepareStage {
+                stage: PrepareStage::Namespace,
+            },
+        ] {
+            let report = Report::MeasuredInterval(MeasuredInterval {
+                context: MeasurementContext { metric, ..context() },
+                elapsed_us: 123_456,
+            });
+            assert_eq!(metric.family(), Family::Drag);
+            let bytes = encode(&AdmittedReport::new(report, 12345678).unwrap()).unwrap();
+            let event: Value = serde_json::from_slice(bytes.split(|b| *b == b'\n').nth(2).unwrap()).unwrap();
+            assert_eq!(event["tags"]["metric"], metric.name());
+            let fields = serde_json::to_value(metric).unwrap();
+            for (key, value) in fields.as_object().unwrap() {
+                assert_eq!(event["tags"][key], *value);
+            }
+            assert!(event.get("user").is_none());
+            assert!(event.get("spans").unwrap().as_array().unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn native_frames_are_symbolicatable_without_absolute_addresses_or_paths() {
+        let mut crash = SafeCrash::empty(
+            context().build,
+            Component::Agent,
+            CrashKind::NativeException,
+            ExceptionClass::BadAccess,
+        );
+        crash.frames[0][0] = Some(Frame::Native {
+            image: ImageSlot::Agent,
+            offset: 24,
+            debug_id: [1; 16],
+            debug_age: 0,
+            code_id: None,
+            image_size: 4096,
+        });
+        crash.frames[0][1] = Some(Frame::Native {
+            image: ImageSlot::Agent,
+            offset: 48,
+            debug_id: [1; 16],
+            debug_age: 0,
+            code_id: None,
+            image_size: 4096,
+        });
+        let bytes = encode(&AdmittedReport::new(Report::SafeCrash(crash), 3600).unwrap()).unwrap();
+        let event: Value = serde_json::from_slice(bytes.split(|b| *b == b'\n').nth(2).unwrap()).unwrap();
+        assert_eq!(
+            event["debug_meta"]["images"][0]["debug_id"],
+            "01010101-0101-0101-0101-010101010101"
+        );
+        let frames = event["exception"]["values"][0]["stacktrace"]["frames"]
+            .as_array()
+            .unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            event["exception"]["values"][0]["stacktrace"]["instruction_addr_adjustment"],
+            "none"
+        );
+        assert_eq!(frames[0]["instruction_addr"], "0x30");
+        assert_eq!(frames[0]["addr_mode"], "rel:0");
+        assert!(event["contexts"]["oink_crash"].get("native_frames").is_none());
+    }
+    #[test]
+    fn pe_frames_keep_pdb_age_and_code_identity() {
+        let mut crash = SafeCrash::empty(
+            BuildContext {
+                os_version_class: OsVersionClass::Windows11,
+                ..context().build
+            },
+            Component::Agent,
+            CrashKind::NativeException,
+            ExceptionClass::BadAccess,
+        );
+        crash.frames[0][0] = Some(Frame::Native {
+            image: ImageSlot::Agent,
+            offset: 24,
+            debug_id: [1; 16],
+            debug_age: 0x1a,
+            code_id: Some(0x12345678_00004000),
+            image_size: 4096,
+        });
+        let admitted = AdmittedReport::new(Report::SafeCrash(crash), 3600).unwrap();
+        let bytes = encode(&admitted).unwrap();
+        let event: Value = serde_json::from_slice(bytes.split(|b| *b == b'\n').nth(2).unwrap()).unwrap();
+        assert_eq!(event["debug_meta"]["images"][0]["type"], "pe");
+        assert_eq!(
+            event["debug_meta"]["images"][0]["debug_id"],
+            "01010101-0101-0101-0101-010101010101-1a"
+        );
+        assert_eq!(event["debug_meta"]["images"][0]["code_id"], "123456784000");
+        let mut poison = serde_json::to_value(&admitted).unwrap();
+        poison["report"]["data"]["frames"][0][0]["module_path"] = json!("PRIVATE");
+        assert!(encode_persisted(&serde_json::to_vec(&poison).unwrap()).is_err());
+    }
+    #[test]
     fn queued_crash_retains_its_source_suffix_independently_of_the_sender_build() {
         let mut admitted = AdmittedReport::new(
             Report::SafeCrash(SafeCrash::empty(
@@ -203,6 +364,86 @@ mod tests {
             codec: None,
         }
     }
+    #[test]
+    fn clipboard_and_drop_records_only_emit_closed_performance_fields() {
+        let metrics = [
+            Metric::ClipboardPublish,
+            Metric::ClipboardApply {
+                result: OperationResult::Completed,
+            },
+            Metric::NativeRepresentationRead {
+                result: OperationResult::TimedOut,
+            },
+            Metric::ClipboardTransfer {
+                result: OperationResult::Failed,
+                reason: TransferFailure::Permission,
+            },
+            Metric::FileFirstByte {
+                size: SizeBucket::UpTo1MiB,
+            },
+            Metric::FileComplete {
+                result: OperationResult::Completed,
+                reason: TransferFailure::None,
+                size: SizeBucket::UpTo16MiB,
+                throughput: ThroughputBucket::UpTo10MiBps,
+            },
+            Metric::DragDropAccepted {
+                result: OperationResult::Cancelled,
+            },
+            Metric::DragTransfer {
+                result: OperationResult::Failed,
+                reason: TransferFailure::Io,
+            },
+        ];
+        for metric in metrics {
+            let report = Report::MeasuredInterval(MeasuredInterval {
+                context: MeasurementContext { metric, ..context() },
+                elapsed_us: 123_456,
+            });
+            let admitted = AdmittedReport::new(report, 1_234_567).unwrap();
+            let spool = serde_json::to_vec(&admitted).unwrap();
+            let bytes = encode_persisted(&spool).unwrap();
+            let event: Value = serde_json::from_slice(bytes.split(|b| *b == b'\n').nth(2).unwrap()).unwrap();
+            assert_eq!(event["type"], "transaction");
+            assert_eq!(event["transaction"], metric.name());
+            assert_eq!(event["spans"], json!([]));
+            assert_eq!(event["contexts"]["trace"]["data"], json!({}));
+            let tags = event["tags"].as_object().unwrap();
+            assert!(tags.keys().all(|key| matches!(
+                key.as_str(),
+                "schema_version"
+                    | "policy_version"
+                    | "os_version_class"
+                    | "metric"
+                    | "revision"
+                    | "sampling_scheme"
+                    | "result"
+                    | "reason"
+                    | "size"
+                    | "throughput"
+            )));
+            assert!(event.get("user").is_none());
+            for (field, poison) in [
+                ("name", "private-file.txt"),
+                ("path", "/Users/private/secret"),
+                ("hash", "0123456789abcdef"),
+                ("device_id", "private-peer"),
+                ("content", "private clipboard contents"),
+                ("error", "arbitrary error text"),
+                ("mime", "private/format"),
+                ("bytes", "123456789"),
+            ] {
+                let mut forged = serde_json::to_value(&admitted).unwrap();
+                forged["report"]["data"]["context"]["metric"][field] = json!(poison);
+                assert!(
+                    encode_persisted(&serde_json::to_vec(&forged).unwrap()).is_err(),
+                    "{field}"
+                );
+                assert!(!String::from_utf8_lossy(&bytes).contains(poison));
+            }
+        }
+    }
+
     #[test]
     fn every_variant_has_only_event_or_transaction_no_children_no_runtime_strings() {
         let reports = [

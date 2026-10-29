@@ -1,5 +1,7 @@
 //! Explicit native-domain conversion at the shared v1 codec boundary.
 use crate::model as domain;
+mod native_files;
+use native_files::{local_native_files, native_files};
 use oink_foundation::content::ClipId;
 use oink_foundation::{
     DeviceId,
@@ -27,6 +29,15 @@ fn text(value: impl Into<String>) -> V {
 }
 fn number(value: impl Into<u64>) -> V {
     V::Uint(value.into())
+}
+fn fulfilled_root(value: &crate::content::grants::FulfilledRoot) -> V {
+    V::Map(map([(1, number(value.node.0)), (2, V::Bytes(value.id.to_vec()))]))
+}
+fn local_fulfilled_root(value: wire::FulfilledRoot) -> v1::Result<crate::content::grants::FulfilledRoot> {
+    Ok(crate::content::grants::FulfilledRoot {
+        node: domain::NodeId(value.node()?),
+        id: value.id()?.0,
+    })
 }
 
 pub fn device(value: DeviceId) -> wire::DeviceId {
@@ -236,9 +247,7 @@ fn local_size(value: wire::ContentSize) -> v1::Result<domain::ContentSize> {
 }
 fn representation_data(value: &domain::RepresentationData) -> v1::Result<wire::RepresentationData> {
     wire::RepresentationData::from_raw(match value {
-        domain::RepresentationData::Reader { size: value, hash } => {
-            body(0, map([(1, size(*value)?.write()), (2, optional(hash.map(digest)))]))
-        }
+        domain::RepresentationData::Reader { size: value } => body(0, map([(1, size(*value)?.write())])),
         domain::RepresentationData::Inline(bytes) => body(1, map([(1, V::Bytes(bytes.clone()))])),
         domain::RepresentationData::File(node) => body(2, map([(1, number(node.0))])),
         domain::RepresentationData::Unavailable(reason) => body(3, map([(1, unavailable(*reason).write())])),
@@ -253,7 +262,6 @@ fn local_representation_data(value: wire::RepresentationData) -> v1::Result<doma
             let value = wire::RepresentationReader::from_raw(value.body()?)?;
             domain::RepresentationData::Reader {
                 size: local_size(value.size()?)?,
-                hash: value.hash()?.map(local_digest).transpose()?,
             }
         }
         Open::Known(wire::RepresentationDataKind::Inline) => {
@@ -302,37 +310,51 @@ fn local_representation(value: wire::Representation) -> v1::Result<domain::Repre
     })
 }
 pub fn node(value: &domain::FileNode) -> v1::Result<wire::FileNode> {
-    wire::FileNode::from_raw(map([
+    let mut raw = map([
         (1, number(value.id.0)),
         (2, optional(value.parent.map(|node| node.0))),
         (3, text(&value.name)),
         (
             4,
-            match value.kind {
+            match &value.kind {
                 domain::NodeKind::File => wire::NodeKind::File,
                 domain::NodeKind::Directory => wire::NodeKind::Directory,
+                domain::NodeKind::Symlink(_) => wire::NodeKind::Symlink,
             }
             .write(),
         ),
         (5, size(value.size)?.write()),
         (6, number(value.version)),
         (7, optional(value.modified_ms)),
-    ]))
+    ]);
+    if let Some(target) = value.kind.symlink_target() {
+        raw.insert(8, text(target));
+    }
+    if let Some(bits) = value.exec_bits {
+        raw.insert(9, V::Uint(bits.into()));
+    }
+    wire::FileNode::from_raw(raw)
 }
 pub fn local_node(value: wire::FileNode) -> v1::Result<domain::FileNode> {
-    Ok(domain::FileNode {
+    let node = domain::FileNode {
+        exec_bits: value.exec_bits()?,
         id: domain::NodeId(value.id()?),
         parent: value.parent()?.map(domain::NodeId),
         name: value.name()?.0,
         kind: match value.kind()? {
             wire::NodeKind::File => domain::NodeKind::File,
             wire::NodeKind::Directory => domain::NodeKind::Directory,
+            wire::NodeKind::Symlink => domain::NodeKind::Symlink(value.symlink_target()?.ok_or_else(invalid)?.0),
             _ => return Err(invalid()),
         },
         size: local_size(value.size()?)?,
         version: value.version()?,
         modified_ms: value.modified_ms()?,
-    })
+    };
+    if !node.valid() {
+        return Err(invalid());
+    }
+    Ok(node)
 }
 pub fn inventory(value: &domain::Inventory) -> v1::Result<wire::Inventory> {
     let items = value
@@ -366,7 +388,13 @@ pub fn inventory(value: &domain::Inventory) -> v1::Result<wire::Inventory> {
                 value
                     .roots
                     .iter()
-                    .map(|root| node(root).map(|root| root.write()))
+                    .map(|root| {
+                        // Announcements are group-wide; execution metadata is supplied
+                        // by the later per-peer file grant/select, after negotiation.
+                        let mut root = root.clone();
+                        root.exec_bits = None;
+                        node(&root).map(|root| root.write())
+                    })
                     .collect::<v1::Result<_>>()?,
             ),
         ),
@@ -390,7 +418,6 @@ pub fn descriptor_inventory(original: &wire::Inventory) -> v1::Result<wire::Inve
                     7,
                     representation_data(&domain::RepresentationData::Reader {
                         size: domain::ContentSize::Known(bytes.len() as u64),
-                        hash: Some(blake3::hash(&bytes).into()),
                     })?
                     .write(),
                 );
@@ -554,6 +581,94 @@ macro_rules! message {
 pub fn content(value: &domain::ContentMsg) -> v1::Result<v1::Message> {
     use domain::ContentMsg as M;
     Ok(match value {
+        M::CloudLinkRequest {
+            offer,
+            roots,
+            demand: asked,
+        } => message!(
+            CloudLinkRequest,
+            map([
+                (1, offer_id(*offer).write()),
+                (2, V::Array(roots.iter().map(|id| number(id.0)).collect())),
+                (3, demand(*asked)?.write())
+            ])
+        ),
+        M::CloudLinkOffer {
+            offer,
+            token,
+            roots,
+            fulfilled,
+            native,
+        } => message!(
+            CloudLinkOffer,
+            map([
+                (1, offer_id(*offer).write()),
+                (2, V::Bytes(token.0.to_vec())),
+                (
+                    3,
+                    V::Array(
+                        roots
+                            .iter()
+                            .map(node)
+                            .collect::<v1::Result<Vec<_>>>()?
+                            .into_iter()
+                            .map(|n| n.write())
+                            .collect()
+                    )
+                ),
+                (
+                    4,
+                    if fulfilled.is_empty() {
+                        V::Null
+                    } else {
+                        V::Array(fulfilled.iter().map(fulfilled_root).collect())
+                    }
+                ),
+                (5, native_files(native))
+            ])
+        ),
+        M::CloudLinkUnavailable { offer, reason } => message!(
+            CloudLinkUnavailable,
+            map([(1, offer_id(*offer).write()), (2, unavailable(*reason).write())])
+        ),
+        M::CloudLinkList {
+            offer,
+            token,
+            node,
+            cursor: value,
+        } => message!(
+            CloudLinkList,
+            map([
+                (1, offer_id(*offer).write()),
+                (2, V::Bytes(token.0.to_vec())),
+                (3, number(node.0)),
+                (4, optional(value.map(cursor)))
+            ])
+        ),
+        M::CloudLinkSelect { offer, token, node } => message!(
+            CloudLinkSelect,
+            map([
+                (1, offer_id(*offer).write()),
+                (2, V::Bytes(token.0.to_vec())),
+                (3, number(node.0))
+            ])
+        ),
+        M::CloudLinkRead {
+            offer,
+            token,
+            node,
+            version,
+            offset,
+        } => message!(
+            CloudLinkRead,
+            map([
+                (1, offer_id(*offer).write()),
+                (2, V::Bytes(token.0.to_vec())),
+                (3, number(node.0)),
+                (4, number(*version)),
+                (5, number(*offset)),
+            ])
+        ),
         M::BeginDelivery {
             delivery,
             demand: value,
@@ -601,14 +716,12 @@ pub fn content(value: &domain::ContentMsg) -> v1::Result<v1::Message> {
             offer,
             representation,
             size,
-            hash,
         } => message!(
             ContentRepresentationEnd,
             map([
                 (1, offer_id(*offer).write()),
                 (2, number(representation.0)),
                 (3, number(*size)),
-                (4, digest(*hash).write())
             ])
         ),
         M::RepresentationFailed {
@@ -678,7 +791,6 @@ pub fn content(value: &domain::ContentMsg) -> v1::Result<v1::Message> {
             node,
             version,
             offset,
-            check,
             demand: value,
         } => message!(
             ContentReadFile,
@@ -687,7 +799,6 @@ pub fn content(value: &domain::ContentMsg) -> v1::Result<v1::Message> {
                 (2, number(node.0)),
                 (3, number(*version)),
                 (4, number(*offset)),
-                (5, optional(check.map(digest))),
                 (6, demand(*value)?.write())
             ])
         ),
@@ -696,7 +807,6 @@ pub fn content(value: &domain::ContentMsg) -> v1::Result<v1::Message> {
             node,
             version,
             offset,
-            hash,
             bytes,
         } => message!(
             ContentFileBlock,
@@ -705,7 +815,6 @@ pub fn content(value: &domain::ContentMsg) -> v1::Result<v1::Message> {
                 (2, number(node.0)),
                 (3, number(*version)),
                 (4, number(*offset)),
-                (5, digest(*hash).write()),
                 (6, V::Bytes(bytes.clone()))
             ])
         ),
@@ -748,6 +857,51 @@ pub fn content(value: &domain::ContentMsg) -> v1::Result<v1::Message> {
 pub fn local_content(message: v1::Message) -> v1::Result<domain::ContentMsg> {
     use domain::ContentMsg as M;
     Ok(match message {
+        v1::Message::CloudLinkRequest(value) => M::CloudLinkRequest {
+            offer: local_offer_id(value.offer()?)?,
+            roots: value.roots()?.0.into_iter().map(domain::NodeId).collect(),
+            demand: local_demand(value.demand()?)?,
+        },
+        v1::Message::CloudLinkOffer(value) => M::CloudLinkOffer {
+            native: local_native_files(value.native()?)?,
+            offer: local_offer_id(value.offer()?)?,
+            token: crate::content::grants::LinkToken(value.token()?.0),
+            roots: value
+                .roots()?
+                .0
+                .into_iter()
+                .map(local_node)
+                .collect::<v1::Result<_>>()?,
+            fulfilled: value
+                .fulfilled()?
+                .map(|roots| roots.0)
+                .unwrap_or_default()
+                .into_iter()
+                .map(local_fulfilled_root)
+                .collect::<v1::Result<_>>()?,
+        },
+        v1::Message::CloudLinkUnavailable(value) => M::CloudLinkUnavailable {
+            offer: local_offer_id(value.offer()?)?,
+            reason: local_unavailable(value.reason()?),
+        },
+        v1::Message::CloudLinkList(value) => M::CloudLinkList {
+            offer: local_offer_id(value.offer()?)?,
+            token: crate::content::grants::LinkToken(value.token()?.0),
+            node: domain::NodeId(value.node()?),
+            cursor: value.cursor()?.map(local_cursor).transpose()?,
+        },
+        v1::Message::CloudLinkSelect(value) => M::CloudLinkSelect {
+            offer: local_offer_id(value.offer()?)?,
+            token: crate::content::grants::LinkToken(value.token()?.0),
+            node: domain::NodeId(value.node()?),
+        },
+        v1::Message::CloudLinkRead(value) => M::CloudLinkRead {
+            offer: local_offer_id(value.offer()?)?,
+            token: crate::content::grants::LinkToken(value.token()?.0),
+            node: domain::NodeId(value.node()?),
+            version: value.version()?,
+            offset: value.offset()?,
+        },
         v1::Message::ContentBeginDelivery(value) => M::BeginDelivery {
             delivery: local_delivery_id(value.delivery()?)?,
             demand: local_demand(value.demand()?)?,
@@ -774,7 +928,6 @@ pub fn local_content(message: v1::Message) -> v1::Result<domain::ContentMsg> {
             offer: local_offer_id(value.offer()?)?,
             representation: domain::RepresentationId(value.representation()?),
             size: value.size()?,
-            hash: local_digest(value.hash()?)?,
         },
         v1::Message::ContentRepresentationFailed(value) => M::RepresentationFailed {
             offer: local_offer_id(value.offer()?)?,
@@ -818,7 +971,6 @@ pub fn local_content(message: v1::Message) -> v1::Result<domain::ContentMsg> {
             node: domain::NodeId(value.node()?),
             version: value.version()?,
             offset: value.offset()?,
-            check: value.check()?.map(local_digest).transpose()?,
             demand: local_demand(value.demand()?)?,
         },
         v1::Message::ContentFileBlock(value) => M::FileBlock {
@@ -826,7 +978,6 @@ pub fn local_content(message: v1::Message) -> v1::Result<domain::ContentMsg> {
             node: domain::NodeId(value.node()?),
             version: value.version()?,
             offset: value.offset()?,
-            hash: local_digest(value.hash()?)?,
             bytes: value.bytes()?.0,
         },
         v1::Message::ContentFileEnd(value) => M::FileEnd {
@@ -861,6 +1012,107 @@ mod tests {
     use super::*;
     use crate::content::Provider;
     use domain::{ContentMsg as M, ItemId, NodeId, RepresentationId};
+
+    #[test]
+    fn symlink_leaf_roundtrip_keeps_relative_target_and_redacts_debug() {
+        let link = domain::FileNode {
+            exec_bits: None,
+            id: NodeId(2),
+            parent: Some(NodeId(1)),
+            name: "current".into(),
+            kind: domain::NodeKind::Symlink("nested/content.txt".into()),
+            size: domain::ContentSize::Known(18),
+            version: 7,
+            modified_ms: None,
+        };
+        assert_eq!(local_node(node(&link).unwrap()).unwrap(), link);
+        assert!(!format!("{link:?}").contains("nested"));
+        let regular = domain::FileNode {
+            kind: domain::NodeKind::File,
+            ..link.clone()
+        };
+        assert!(
+            !node(&regular).unwrap().raw().contains_key(&8),
+            "baseline nodes must not gain wire fields"
+        );
+    }
+
+    #[test]
+    fn persistent_file_messages_round_trip_without_exposing_tokens_in_debug() {
+        let offer = crate::content::tests::fixture().inventory().id;
+        let token = crate::content::grants::LinkToken([42; 32]);
+        let root = domain::FileNode {
+            exec_bits: None,
+            id: NodeId(1),
+            parent: None,
+            name: "file".into(),
+            kind: domain::NodeKind::File,
+            size: domain::ContentSize::Known(5),
+            version: 4,
+            modified_ms: None,
+        };
+        let messages = [
+            M::CloudLinkRequest {
+                offer,
+                roots: vec![root.id],
+                demand: domain::Demand::Clipboard,
+            },
+            M::CloudLinkOffer {
+                native: crate::content::native_metadata::NativeFileMetadata {
+                    windows: vec![crate::content::native_metadata::WindowsFileDescriptor {
+                        root: NodeId(1),
+                        node: NodeId(1),
+                        index: 2,
+                        wide: Some(vec![3; 72]),
+                        ansi: Some(vec![4; 332]),
+                    }],
+                    promises: vec![crate::content::native_metadata::MacPromiseGroup {
+                        controls: vec![crate::content::native_metadata::MacPromiseControl {
+                            name: "com.apple.NSFilePromiseItemMetaData".into(),
+                            bytes: b"public.data".to_vec(),
+                        }],
+                        anchor: NodeId(7),
+                        roots: vec![NodeId(1)],
+                        indices: vec![3],
+                    }],
+                },
+                offer,
+                token,
+                roots: vec![root],
+                fulfilled: vec![crate::content::grants::FulfilledRoot {
+                    node: NodeId(1),
+                    id: [3; 16],
+                }],
+            },
+            M::CloudLinkUnavailable {
+                offer,
+                reason: domain::Unavailable::Permission,
+            },
+            M::CloudLinkList {
+                offer,
+                token,
+                node: NodeId(1),
+                cursor: None,
+            },
+            M::CloudLinkSelect {
+                offer,
+                token,
+                node: NodeId(1),
+            },
+            M::CloudLinkRead {
+                offer,
+                token,
+                node: NodeId(1),
+                version: 4,
+                offset: 0,
+            },
+        ];
+        for message in messages {
+            assert_eq!(local_content(content(&message).unwrap()).unwrap(), message);
+            assert!(!format!("{message:?}").contains("42"));
+            assert!(!format!("{:?}", content(&message).unwrap()).contains("42"));
+        }
+    }
     #[test]
     fn url_descriptors_match_protocol_goldens_and_round_trip() {
         for (platform, name, bytes, golden) in [
@@ -963,6 +1215,7 @@ mod tests {
             sequence: 9,
         };
         let entry = domain::FileNode {
+            exec_bits: None,
             id: NodeId(8),
             parent: Some(NodeId(7)),
             name: "file".into(),
@@ -1001,7 +1254,6 @@ mod tests {
                 offer,
                 representation: RepresentationId(2),
                 size: 2,
-                hash: [3; 32],
             },
             M::RepresentationFailed {
                 offer,
@@ -1036,7 +1288,6 @@ mod tests {
                 node: NodeId(8),
                 version: 1,
                 offset: 0,
-                check: None,
                 demand: domain::Demand::Clipboard,
             },
             M::FileBlock {
@@ -1044,7 +1295,6 @@ mod tests {
                 node: NodeId(8),
                 version: 1,
                 offset: 0,
-                hash: [4; 32],
                 bytes: vec![5; 16],
             },
             M::FileEnd {

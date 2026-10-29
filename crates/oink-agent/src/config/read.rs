@@ -166,6 +166,13 @@ pub(crate) fn patch_json(raw: &mut Value, before: &Value, after: &Value) {
                 if before.get(key) == Some(value) {
                     continue;
                 }
+                // A chord is one value. Explicit edits are already present in
+                // raw when persist replays this patch; retaining primitive key
+                // names individually would append the replacement key twice.
+                if key == "keys" && after.contains_key("action") {
+                    raw.insert(key.clone(), value.clone());
+                    continue;
+                }
                 if let Some(old) = before.get(key) {
                     let raw = raw.entry(key.clone()).or_insert_with(|| {
                         if old.is_object() && value.is_object() {
@@ -186,17 +193,16 @@ pub(crate) fn patch_json(raw: &mut Value, before: &Value, after: &Value) {
             }
         }
         (Value::Array(raw), Value::Array(before), Value::Array(after)) => {
-            // Hotkeys have stable action identity. Unknown actions survive edits
+            // Hotkeys have stable action/target identity. Unknown actions survive edits
             // to known bindings, including explicit removal and reordering.
             let keyed = before.iter().chain(after).all(|v| v.get("action").is_some());
             if keyed {
                 let mut updated = Vec::new();
                 for new in after {
-                    let key = new.get("action");
-                    let old = before.iter().find(|v| v.get("action") == key);
+                    let old = before.iter().find(|v| hotkey_identity(v, new));
                     let mut retained = raw
                         .iter()
-                        .find(|v| v.get("action") == key)
+                        .find(|v| hotkey_identity(v, new))
                         .cloned()
                         .unwrap_or_else(|| new.clone());
                     if let Some(old) = old {
@@ -206,7 +212,7 @@ pub(crate) fn patch_json(raw: &mut Value, before: &Value, after: &Value) {
                 }
                 updated.extend(
                     raw.iter()
-                        .filter(|v| !before.iter().any(|old| old.get("action") == v.get("action")))
+                        .filter(|v| !before.iter().any(|old| hotkey_identity(old, v)))
                         .cloned(),
                 );
                 *raw = updated;
@@ -253,7 +259,7 @@ pub(crate) fn explicit_json(raw: &mut Value, patch: &Value, canonical: &Value) {
     } else if let (Some(raw), Some(known)) = (raw.as_array_mut(), canonical.as_array()) {
         if known.iter().all(|entry| entry.get("action").is_some()) {
             for entry in known {
-                if let Some(retained) = raw.iter_mut().find(|old| old.get("action") == entry.get("action")) {
+                if let Some(retained) = raw.iter_mut().find(|old| hotkey_identity(old, entry)) {
                     explicit_json(retained, entry, entry);
                 } else {
                     raw.push(entry.clone());
@@ -276,4 +282,9 @@ fn known_equal(raw: &Value, known: &Value) -> bool {
         }
         _ => raw == known,
     }
+}
+
+fn hotkey_identity(a: &Value, b: &Value) -> bool {
+    a.get("action") == b.get("action")
+        && a.get("device").filter(|v| !v.is_null()) == b.get("device").filter(|v| !v.is_null())
 }

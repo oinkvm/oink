@@ -90,7 +90,7 @@ fn unreadable_group_keeps_ipc_and_reset_starts_sharing_in_same_node() {
         .unwrap();
     let owner = oink_agent::config::AgentConfig::load_from(dir.path()).unwrap();
     assert_eq!(owner.owner().active_group(), Some(stored.group()));
-    assert!(!owner.settings.keyboard_disabled);
+    assert!(owner.settings.routing.keyboard_mode != oink_foundation::input::InputMode::Disabled);
     let envelope: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.path().join(STATE_FILE)).unwrap()).unwrap();
     assert_eq!(envelope["schema"], 1);

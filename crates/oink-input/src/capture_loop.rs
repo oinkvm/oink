@@ -40,6 +40,10 @@ pub trait CaptureLoop: Send {
     fn local_modifier_mapping(&self) -> (Vec<(crate::KeyCode, crate::KeyCode)>, Vec<crate::KeyCode>) {
         (Vec::new(), Vec::new())
     }
+    /// Live pointer authority, independently of keyboard-local preferences.
+    fn pointer_holder(&self) -> bool {
+        false
+    }
     fn keyboard_remote(&self) -> Option<bool> {
         None
     }
@@ -67,6 +71,10 @@ pub trait CaptureLoop: Send {
     fn keyboard_key_blocked(&self, _code: Option<crate::KeyCode>) -> bool {
         self.keyboard_disabled()
     }
+    /// Whether input-driven session idle refresh is currently permitted.
+    fn idle_refresh_allowed(&self) -> bool {
+        false
+    }
     fn capture_requested(&self) -> bool {
         true
     }
@@ -89,7 +97,7 @@ pub(crate) fn capture_available(available: bool) {
         }
     });
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn capture_detached() {
     OWNER.with(|slot| {
         if let Some(owner) = slot.borrow_mut().as_mut() {
@@ -206,4 +214,19 @@ pub(crate) fn local_modifier_mapping() -> (Vec<(crate::KeyCode, crate::KeyCode)>
 // A nested native callback may run while routing is borrowed; report unknown.
 pub(crate) fn trace_focus() -> Option<(oink_foundation::DeviceId, u64)> {
     OWNER.with(|slot| slot.try_borrow().ok()?.as_ref()?.trace_focus())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn idle_refresh_allowed() -> bool {
+    OWNER.with(|slot| slot.borrow().as_ref().is_some_and(|owner| owner.idle_refresh_allowed()))
+}
+
+#[cfg(windows)]
+pub(crate) fn pointer_holder() -> bool {
+    // A borrowed owner is unknown, never authority to reset native visibility.
+    // Standalone backends have no router; their Local mode is their authority.
+    OWNER.with(|slot| {
+        slot.try_borrow()
+            .is_ok_and(|slot| slot.as_ref().is_none_or(|owner| owner.pointer_holder()))
+    })
 }

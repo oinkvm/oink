@@ -23,6 +23,16 @@ use std::sync::Arc;
 /// the queue is bounded and `InputThread::send` never blocks.
 #[derive(Debug)]
 pub enum InputCommand {
+    #[cfg(debug_assertions)]
+    DndWatchdogSnapshotForTest(std::sync::mpsc::SyncSender<String>),
+    ApplicationFocusObserved {
+        claim: oink_routing::application_focus::Claim,
+        observation: oink_foundation::application_focus::Observation,
+    },
+    ApplicationFocusApplied {
+        request: oink_routing::application_focus::ParkRequest,
+        result: oink_foundation::application_focus::ParkResult,
+    },
     PrepareUpdate {
         generation: u64,
         reply:
@@ -39,7 +49,6 @@ pub enum InputCommand {
     ApplyOwnerPreferences {
         expected_emergency_sequence: u64,
         routing: RoutingSettings,
-        keyboard_disabled: bool,
         input_transform: oink_foundation::input_transform::InputTransform,
         accept_contacts: bool,
         reply: OwnerApplyReply,
@@ -69,6 +78,7 @@ pub enum InputCommand {
         reply: std::sync::mpsc::SyncSender<Result<(), oink_routing::FocusLockError>>,
     },
     ReturnPointerHome,
+    MovePointerTo(oink_foundation::DeviceId),
     GameMode(GameMode),
     KeyboardDisabled(bool),
     PeerAdmission(PeerAdmission),
@@ -83,6 +93,7 @@ pub enum InputCommand {
     /// Enumeration completed with an error; retain the last good geometry.
     LocalDisplayFailure,
     PeerFacts {
+        application_modes: (oink_foundation::input::InputMode, oink_foundation::input::InputMode),
         boot: oink_foundation::session::Boot,
         os: Os,
         displays: Vec<oink_foundation::display::DisplayInfo>,
@@ -131,6 +142,7 @@ pub enum InputCommand {
     },
     /// Result of a drag-and-drop system call from the main thread.
     DndEvent(DndEvent),
+    DndPrepared(oink_routing::DndCmd),
     DndContentDemand {
         peer: DeviceId,
         offer: oink_foundation::content::OfferId,
@@ -254,6 +266,7 @@ pub struct PeerInput {
 /// (`SharingState::derive`), the tray and diagnostics.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InputStatus {
+    pub application_focus: Option<oink_routing::application_focus::Snapshot>,
     pub update_held_input: bool,
     pub update_remote_control: bool,
     pub update_locked: bool,
@@ -262,11 +275,11 @@ pub struct InputStatus {
     pub focus_info: Option<oink_routing::FocusInfo>,
     pub group_focus: oink_routing::GroupFocusStatus,
     pub game_mode: bool,
+    /// Derived compatibility observation, never independent of keyboard_mode.
     pub keyboard_disabled: bool,
     pub resource_faults: ResourceFaults,
-    /// The native owner attempted attachment and it failed. A detached tap while
-    /// waiting for permission/resume is not evidence of capture failure.
-    pub capture_failed: bool,
+    /// Persistent local enumeration failure only; shared screen faults also include input injection.
+    pub display_enumeration_fault: Option<oink_protocol::v1::dto::ResourceFaultCode>,
     /// Cached native Caps behavior; absent until a supported backend observes it.
     pub caps_lock_switches_input_source: Option<bool>,
     pub source_modes_revision: u64,
@@ -310,10 +323,13 @@ pub struct Environment {
 pub struct InputSnapshots {
     pub mode_switch_in_callback: bool,
     pub capture_reports_key_repeat: bool,
+    /// Saved source policy installed before capture starts. Later owner edits
+    /// arrive atomically with routing settings through ApplyOwnerPreferences.
+    pub local_input_transform: oink_foundation::input_transform::InputTransform,
     /// Compiled by the config module. When a new one no longer contains the device that
     /// has focus, the thread takes focus back.
     pub layout: Arc<Snapshot<RouterLayout>>,
-    /// Hot keys, feel, scroll direction, modifier mapping, pacing step.
+    /// Runtime routing settings; source key mappings are installed separately.
     pub settings: Arc<Snapshot<RoutingSettings>>,
     pub environment: Arc<Snapshot<Environment>>,
 }
@@ -446,6 +462,29 @@ impl InputThread {
     }
     pub fn status(&self) -> Arc<InputStatus> {
         self.shared.status.load()
+    }
+    #[cfg(all(test, debug_assertions, target_os = "macos"))]
+    pub(crate) fn pending_drag_for_test(&self, id: oink_foundation::content::ClipId, epoch: u64) {
+        let mut status = (*self.status()).clone();
+        status.dnd_host_pending = Some((id, epoch));
+        self.shared.status.publish(status);
+    }
+
+    /// Only a failing watchdog asks the owner for its full DND state. A stalled
+    /// owner must not stall the watchdog as well; the published status remains
+    /// available even when this bounded query cannot be answered.
+    #[cfg(debug_assertions)]
+    pub(crate) fn dnd_watchdog_snapshot_for_test(&self) -> String {
+        let (reply, receive) = std::sync::mpsc::sync_channel(1);
+        self.send(InputCommand::DndWatchdogSnapshotForTest(reply));
+        receive
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .unwrap_or_else(|error| {
+                format!(
+                    "router_dnd unavailable: {error}; owner stopped={}",
+                    self.shared.stopped.load(std::sync::atomic::Ordering::Acquire)
+                )
+            })
     }
 
     /// Observe receipt of discarded motion while a test holds native source press.

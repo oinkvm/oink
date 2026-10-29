@@ -2,26 +2,27 @@
 //! logs and device lifetime stay on the owning ordinary thread.
 use crate::{
     dsp, handoff,
-    playback::{Feed, Playback, PlaybackInfo, PlaybackMetrics, PlaybackOptions},
-    realtime,
+    playback::{FadeOut, Playback, PlaybackInfo, PlaybackMetrics, PlaybackOptions, PullBlock, PullInput},
 };
 use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicUsize, Ordering},
     },
-    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 mod dropouts;
 pub(crate) mod quality;
 pub(crate) use dropouts::Ledger as DropoutLedger;
-pub use dropouts::{DropoutBucket, DropoutCounters};
+pub use dropouts::{DropoutBucket, DropoutCounters, QUALITY_SECONDS};
 
-const MAX_SOURCES: usize = 16;
+const MAX_SOURCES: usize = crate::playback::MIX_SOURCES;
+static NEXT_SOURCE: AtomicU64 = AtomicU64::new(1);
 const MIX_SAMPLES: usize = 240;
 const INPUT_BATCH: usize = 8;
+#[cfg(test)]
+use std::thread;
 #[derive(Clone, Copy, Debug)]
 pub struct Packet {
     pub burst: u64,
@@ -32,7 +33,7 @@ pub struct Packet {
     pub network_read: Option<Instant>,
     pub source_emit: Option<u64>,
 }
-type PacketReader = Arc<dyn Fn() -> (bool, Option<Packet>) + Send + Sync>;
+type PacketReader = Arc<dyn Fn(&mut usize) -> (bool, Option<Packet>) + Send + Sync>;
 #[derive(Clone, Copy, Debug)]
 pub struct Outcome {
     pub sequence: u64,
@@ -52,24 +53,26 @@ struct Snapshot {
 #[derive(Clone, Copy, Debug)]
 pub struct Rendered {
     pub samples: [f32; MIX_SAMPLES],
+    pub len: usize,
     pub at: Instant,
 }
 struct Status {
     reader: std::sync::OnceLock<PacketReader>,
+    sleeping: std::sync::OnceLock<Arc<dyn Fn(Instant) -> bool + Send + Sync>>,
     playing: AtomicBool,
     active: AtomicBool,
     // Packet handoff plus existing receiver occupancy share this exact budget.
     // There is no second jitter reserve in front of Receiver.
     occupied: AtomicUsize,
     accepted: AtomicU64,
-    dropout_counters: std::sync::OnceLock<Arc<DropoutCounters>>,
+    dropout_counters: Arc<std::sync::OnceLock<Arc<DropoutCounters>>>,
     highest_accepted: AtomicU64,
     accepted_at_ns: AtomicU64,
     epoch: Instant,
     feedback_dropped: AtomicU64,
     rendered_dropped: AtomicU64,
 }
-/// Ordinary-thread endpoint; the underlying DSP exists only on the RT worker.
+/// Ordinary-thread endpoint; the underlying DSP exists only on the native callback.
 pub struct Source {
     tx: handoff::Producer<Packet>,
     outcomes: handoff::Consumer<Option<Outcome>>,
@@ -81,7 +84,6 @@ pub struct Source {
     rejections: dsp::Rejections,
     observed_accepted: u64,
     local_rejected: u64,
-    wake: realtime::Signal,
     rendered: Option<handoff::Consumer<Option<Rendered>>>,
 }
 impl std::fmt::Debug for Source {
@@ -92,11 +94,14 @@ impl std::fmt::Debug for Source {
     }
 }
 impl Source {
-    /// Read M1 directly at the render worker's native cadence. False means paused:
+    /// Read M1 directly at the native callback's native cadence. False means paused:
     /// queued packets are consumed without playback and the receiver is retained.
-    pub fn set_packet_reader(&self, reader: Arc<dyn Fn() -> (bool, Option<Packet>) + Send + Sync>) {
+    pub fn set_packet_reader(&self, reader: PacketReader) {
         let _ = self.status.reader.set(reader);
-        self.wake.notify();
+    }
+    /// Observe validated stream sleep on the callback, preserving the finite tail.
+    pub fn set_sleep_detector(&self, sleeping: Arc<dyn Fn(Instant) -> bool + Send + Sync>) {
+        let _ = self.status.sleeping.set(sleeping);
     }
     pub fn rendered(&mut self) -> Option<Rendered> {
         self.rendered.as_mut()?.pop().flatten()
@@ -144,10 +149,6 @@ impl Source {
             self.rejections.queue_capacity += 1;
             return false;
         }
-        // Admit ready media promptly instead of spending another device period
-        // in the handoff. Rendering is still gated by native consumption demand,
-        // so arrival wakeups cannot advance the playback clock or add reserve.
-        self.wake.notify();
         true
     }
     /// Ordinary-owner handover of packets saved during device start-up.
@@ -167,7 +168,6 @@ impl Source {
             self.status.occupied.fetch_sub(frames, Ordering::AcqRel);
             return false;
         }
-        self.wake.notify();
         true
     }
     pub fn poll(&mut self) {
@@ -207,30 +207,31 @@ impl Source {
 impl Drop for Source {
     fn drop(&mut self) {
         self.status.active.store(false, Ordering::Release);
-        // Control-side retirement may wake an otherwise silent device waiter.
-        self.wake.notify();
     }
 }
 struct SourceState {
+    id: u64,
+    splice: quality::SpliceRamp,
+    fade: FadeOut,
     packets: handoff::Consumer<Packet>,
     outcomes: handoff::Producer<Option<Outcome>>,
     snapshots: handoff::Producer<Snapshot>,
     status: Arc<Status>,
     receiver: dsp::Receiver,
     rendered: Option<handoff::Producer<Option<Rendered>>>,
-    pcm: [f32; dsp::FRAME_SAMPLES],
-    offset: usize,
-    remaining: usize,
+    codec_budget: usize,
+    retire_pending: bool,
     rejections: dsp::Rejections,
     burst: u64,
     quality: quality::Interruptions,
 }
 impl SourceState {
-    fn prepare(config: dsp::Config, wake: realtime::Signal, observe: bool) -> Result<(Source, Box<Self>), String> {
-        let receiver = dsp::Receiver::new_with_config(config)?;
+    fn prepare(config: dsp::Config, observe: bool) -> Result<(Source, Box<Self>), String> {
+        let mut receiver = dsp::Receiver::new_with_config(config)?;
         let capacity = receiver.packet_capacity();
         let status = Arc::new(Status {
             reader: Default::default(),
+            sleeping: Default::default(),
             playing: AtomicBool::new(true),
             active: AtomicBool::new(true),
             occupied: AtomicUsize::new(0),
@@ -242,6 +243,7 @@ impl SourceState {
             feedback_dropped: AtomicU64::new(0),
             rendered_dropped: AtomicU64::new(0),
         });
+        receiver.set_dropout_store(status.dropout_counters.clone());
         let (tx, packets) = handoff::channel(
             capacity,
             Packet {
@@ -270,15 +272,17 @@ impl SourceState {
             (None, None)
         };
         let state = Box::new(SourceState {
+            id: NEXT_SOURCE.fetch_add(1, Ordering::Relaxed),
+            splice: quality::SpliceRamp::default(),
+            fade: FadeOut::default(),
             rendered,
             packets,
             outcomes,
             snapshots,
             status: status.clone(),
             receiver,
-            pcm: [0.0; dsp::FRAME_SAMPLES],
-            offset: 0,
-            remaining: 0,
+            codec_budget: usize::MAX,
+            retire_pending: false,
             rejections: dsp::Rejections::default(),
             burst: 0,
             quality: Default::default(),
@@ -295,18 +299,26 @@ impl SourceState {
             rejections: dsp::Rejections::default(),
             observed_accepted: 0,
             local_rejected: 0,
-            wake,
         };
         Ok((source, state))
     }
 
+    #[cfg(test)]
     fn receive(&mut self, now: Instant) {
-        self.receiver.set_dropout_counters(self.status.dropout_counters.get());
-        for _ in 0..INPUT_BATCH {
+        self.receive_bounded(now, INPUT_BATCH, true);
+    }
+    fn receive_bounded(&mut self, now: Instant, mut budget: usize, external: bool) -> usize {
+        let initial_budget = budget;
+        while budget != 0 {
             let packet = if let Some(packet) = self.packets.pop() {
+                budget -= 1;
                 Some(packet)
-            } else if let Some(read) = self.status.reader.get() {
-                let (playing, packet) = read();
+            } else if let Some(read) = self.status.reader.get().filter(|_| external) {
+                let before = budget;
+                let (playing, packet) = read(&mut budget);
+                if budget == before {
+                    budget -= 1;
+                }
                 self.status.playing.store(playing, Ordering::Release);
                 if !playing {
                     self.quality.reset();
@@ -335,8 +347,6 @@ impl SourceState {
                 self.receiver.reset_burst();
                 self.quality.reset();
                 self.status.occupied.fetch_sub(buffered, Ordering::AcqRel);
-                self.offset = 0;
-                self.remaining = 0;
                 self.burst = packet.burst;
             }
             let buffered_before = self.receiver.buffered_frames();
@@ -380,38 +390,43 @@ impl SourceState {
                 self.status.feedback_dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
+        initial_budget - budget
     }
-    fn render(&mut self, now: Instant, demand: usize, out: &mut [f32; MIX_SAMPLES]) {
-        if self.remaining < MIX_SAMPLES {
-            // All negotiated codec frames are multiples of the fixed mix unit.
-            let samples = self.receiver.config().frame_samples();
-            let before = self.receiver.buffered_frames();
-            self.receiver.render_into(now, demand, &mut self.pcm[..samples], None);
-            let after = self.receiver.buffered_frames();
-            if after >= before {
-                self.status.occupied.fetch_add(after - before, Ordering::Release);
-            } else {
-                self.status.occupied.fetch_sub(before - after, Ordering::AcqRel);
-            }
-            self.offset = 0;
-            self.remaining = samples;
+    fn render(&mut self, now: Instant, demand: usize, out: &mut [f32]) {
+        let before = self.receiver.buffered_frames();
+        self.receiver.pull_into(now, demand, out, &mut self.codec_budget, None);
+        let after = self.receiver.buffered_frames();
+        if after >= before {
+            self.status.occupied.fetch_add(after - before, Ordering::Release);
+        } else {
+            self.status.occupied.fetch_sub(before - after, Ordering::AcqRel);
         }
-        out.copy_from_slice(&self.pcm[self.offset..self.offset + MIX_SAMPLES]);
         if let Some(counters) = self.status.dropout_counters.get() {
             self.quality.block(
                 (crate::diagnostics::monotonic_us(now).max(0) / 1000) as u64,
-                &self.receiver.output_kinds()[self.offset / 2..(self.offset + MIX_SAMPLES) / 2],
+                self.receiver.output_kinds(),
                 out,
                 counters,
             );
         }
-        if let Some(rendered) = &mut self.rendered
-            && rendered.push(Some(Rendered { samples: *out, at: now })).is_err()
-        {
-            self.status.rendered_dropped.fetch_add(1, Ordering::Relaxed);
+        for (frame, kind) in out.as_chunks_mut::<2>().0.iter_mut().zip(self.receiver.output_kinds()) {
+            self.splice.apply(frame, *kind, dsp::SAMPLE_RATE);
+            self.fade.apply(frame, *kind != quality::OutputKind::Intentional);
         }
-        self.offset += MIX_SAMPLES;
-        self.remaining -= MIX_SAMPLES;
+        if let Some(rendered) = &mut self.rendered {
+            let mut samples = [0.0; MIX_SAMPLES];
+            samples[..out.len()].copy_from_slice(out);
+            if rendered
+                .push(Some(Rendered {
+                    samples,
+                    len: out.len(),
+                    at: now,
+                }))
+                .is_err()
+            {
+                self.status.rendered_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
     fn snapshot(&mut self) {
         let recent = self.receiver.take_rejections();
@@ -427,35 +442,80 @@ impl SourceState {
         }
     }
 }
+#[cfg(test)]
 trait Output {
+    fn gap(&mut self) -> Option<crate::playback::OutputGap> {
+        None
+    }
+    fn push_mix(&mut self, samples: &[f32], sources: [u64; MAX_SOURCES]) -> bool {
+        let _ = sources;
+        self.push(samples, None)
+    }
     fn needs_frame(&self) -> bool;
     fn frames_needed(&self) -> usize;
     fn push(&mut self, samples: &[f32], sequence: Option<u64>) -> bool;
-}
-impl Output for Feed {
-    fn needs_frame(&self) -> bool {
-        self.needs_frame()
-    }
-    fn frames_needed(&self) -> usize {
-        self.frames_needed()
-    }
-    fn push(&mut self, samples: &[f32], sequence: Option<u64>) -> bool {
-        self.push(samples, sequence)
-    }
 }
 struct Registry {
     slots: [AtomicPtr<SourceState>; MAX_SOURCES],
     stop: AtomicBool,
     draining: AtomicBool,
     drained: AtomicBool,
-    started: AtomicUsize,
     error: AtomicI32,
-    metrics: realtime::Counters,
 }
-// SAFETY: slots publish exclusively-owned SourceStates. Only the single RT
-// thread dereferences them; ordinary owner never reads/mutates a live state.
-// RT clears a slot with Release after its last access; ordinary owner reclaims
-// only after observing that null with Acquire (or after joining the worker).
+// Sources are published only by control. The callback is the sole DSP owner.
+// Null release is its final access; control reclaims only after acquire or a
+// native shutdown which proves callbacks can no longer run.
+struct Frozen {
+    sources: [*mut SourceState; MAX_SOURCES],
+    playing: [bool; MAX_SOURCES],
+    draining: bool,
+    work: crate::playback::CallbackWork,
+}
+// SAFETY: transferred into exactly one serialized native callback; pointers
+// are dereferenced only there and storage stays pinned until retirement ack.
+unsafe impl Send for Frozen {}
+impl Default for Frozen {
+    fn default() -> Self {
+        Self {
+            sources: [std::ptr::null_mut(); MAX_SOURCES],
+            playing: [false; MAX_SOURCES],
+            draining: false,
+            work: Default::default(),
+        }
+    }
+}
+struct PullRender {
+    registry: Arc<Registry>,
+    frozen: Frozen,
+}
+impl PullRender {
+    fn new(registry: Arc<Registry>) -> Self {
+        Self {
+            registry,
+            frozen: Default::default(),
+        }
+    }
+}
+impl PullInput for PullRender {
+    fn begin(&mut self, frames: usize, now: Instant) {
+        self.registry.begin(frames, now, &mut self.frozen);
+    }
+    fn pull(&mut self, output: &mut [f32], demand: usize, now: Instant) -> PullBlock {
+        self.registry.pull(output, demand, now, &mut self.frozen)
+    }
+    fn end(&mut self) {
+        self.registry.end(&mut self.frozen);
+    }
+    fn gap(&mut self, gap: crate::playback::OutputGap) {
+        self.registry.gap(gap);
+    }
+    fn drained(&self) -> bool {
+        self.registry.drained.load(Ordering::Acquire)
+    }
+    fn work(&self) -> crate::playback::CallbackWork {
+        self.frozen.work
+    }
+}
 impl Registry {
     fn new() -> Self {
         Self {
@@ -463,81 +523,156 @@ impl Registry {
             stop: AtomicBool::new(false),
             draining: AtomicBool::new(false),
             drained: AtomicBool::new(false),
-            started: AtomicUsize::new(0),
             error: AtomicI32::new(0),
-            metrics: realtime::Counters::default(),
         }
     }
-    fn work(&self, feed: &mut impl Output, now: Instant) {
+    fn gap(&self, gap: crate::playback::OutputGap) {
+        // Called before begin can acknowledge last callback's retired sources.
         for slot in &self.slots {
             let ptr = slot.load(Ordering::Acquire);
             if ptr.is_null() {
                 continue;
             }
-            // SAFETY: one RT reader, owner retains allocation until slot clear.
+            // SAFETY: same sole callback executor as begin/pull/end.
+            let state = unsafe { &*ptr };
+            if gap.sources.contains(&state.id)
+                && let Some(counters) = state.status.dropout_counters.get()
+            {
+                counters.record_quality(DropoutBucket {
+                    output_interruptions: gap.delta.interruptions,
+                    ..gap.delta
+                });
+            }
+        }
+    }
+    fn begin(&self, frames: usize, now: Instant, frozen: &mut Frozen) {
+        *frozen = Frozen::default();
+        frozen.draining = self.draining.load(Ordering::Acquire);
+        if self.stop.load(Ordering::Acquire) {
+            return;
+        }
+        for (index, slot) in self.slots.iter().enumerate() {
+            let ptr = slot.load(Ordering::Acquire);
+            if ptr.is_null() {
+                continue;
+            }
+            // SAFETY: sole RT owner; control retains until this slot is cleared.
             let state = unsafe { &mut *ptr };
-            if !state.status.active.load(Ordering::Acquire) {
+            let active = state.status.active.load(Ordering::Acquire);
+            if state.retire_pending || (!active && !state.status.playing.load(Ordering::Acquire)) {
+                // No access after release, including gap attribution. The prior
+                // callback's gap has already been delivered above.
                 slot.store(std::ptr::null_mut(), Ordering::Release);
                 continue;
             }
-            state.receive(now);
-        }
-        let draining = self.draining.load(Ordering::Acquire);
-        for _ in 0..8 {
-            if draining {
-                let pending = self.slots.iter().any(|slot| {
-                    let ptr = slot.load(Ordering::Acquire);
-                    if ptr.is_null() {
-                        return false;
-                    }
-                    // SAFETY: this is the same sole RT owner as the render loop.
-                    let state = unsafe { &*ptr };
-                    state.remaining != 0 || state.status.occupied.load(Ordering::Acquire) != 0
-                });
-                if !pending {
-                    // Stop producing too: the native queue must become empty before
-                    // its zero-period acknowledgement is allowed to close the stream.
-                    self.drained.store(true, Ordering::Release);
-                    break;
-                }
+            if !active {
+                state.fade.start(dsp::SAMPLE_RATE);
             }
-            if !feed.needs_frame() {
+            let codec = state.receiver.config().frame_size();
+            let scans = INPUT_BATCH.max(frames.div_ceil(codec) + 2).min(32);
+            frozen.work.scan_steps += state.receive_bounded(now, scans, active && !frozen.draining) as u64;
+            // A sleeping source has a finite tail even while another source
+            // keeps the device active. Drain that tail without inventing PLC.
+            let sleeping = state.status.sleeping.get().is_some_and(|sleeping| sleeping(now));
+            state.receiver.set_draining(frozen.draining || !active || sleeping);
+            // Invalid packet decode may also need PLC: bound both C calls.
+            state.codec_budget = 2 * ((frames * 1011).div_ceil(codec * 1000) + 1);
+            frozen.playing[index] = state.status.playing.load(Ordering::Acquire) || !active;
+            frozen.work.sources += u64::from(frozen.playing[index]);
+            frozen.sources[index] = ptr;
+        }
+    }
+    fn pull(&self, output: &mut [f32], demand: usize, now: Instant, frozen: &mut Frozen) -> PullBlock {
+        let mut inputs = [[0.0; MIX_SAMPLES]; MAX_SOURCES];
+        let mut sources = [0; MAX_SOURCES];
+        let mut present = 0;
+        let mut fault = false;
+        let mut rendering = false;
+        for (index, ptr) in frozen.sources.iter().copied().enumerate() {
+            if ptr.is_null() || !frozen.playing[index] {
+                continue;
+            }
+            // SAFETY: begin froze this live slot for the whole transaction.
+            let state = unsafe { &mut *ptr };
+            if frozen.draining && state.status.occupied.load(Ordering::Acquire) == 0 && !state.fade.fading() {
+                continue;
+            }
+            let before = state.receiver.stats();
+            let budget = state.codec_budget;
+            state.render(now, demand, &mut inputs[present][..output.len()]);
+            let after = state.receiver.stats();
+            frozen.work.codec_calls += budget.saturating_sub(state.codec_budget) as u64;
+            frozen.work.plc_frames += after.lost.saturating_sub(before.lost);
+            frozen.work.decode_errors += after.decode_errors.saturating_sub(before.decode_errors);
+            frozen.work.work_limited += after.work_limited.saturating_sub(before.work_limited);
+            fault |= after.work_limited != before.work_limited;
+            let source_rendering = state.fade.fading()
+                || state
+                    .receiver
+                    .output_kinds()
+                    .iter()
+                    .any(|kind| *kind != quality::OutputKind::Intentional);
+            rendering |= source_rendering;
+            // Output-wide native gaps can only affect sources contributing to
+            // this timeline. An intentionally idle port must not inherit them.
+            if source_rendering {
+                sources[present] = state.id;
+            }
+            present += 1;
+        }
+        let refs: [&[f32]; MAX_SOURCES] = std::array::from_fn(|i| &inputs[i][..output.len()]);
+        dsp::mix(&refs[..present], output);
+        if fault {
+            self.error.store(1, Ordering::Release);
+        }
+        PullBlock {
+            sources,
+            kind: if fault {
+                quality::OutputKind::Missing
+            } else if !rendering {
+                quality::OutputKind::Intentional
+            } else {
+                quality::OutputKind::Audio
+            },
+        }
+    }
+    fn end(&self, frozen: &mut Frozen) {
+        let mut pending = false;
+        for ptr in frozen.sources.iter().copied().filter(|ptr| !ptr.is_null()) {
+            // SAFETY: no slot is acknowledged until a subsequent begin.
+            let state = unsafe { &mut *ptr };
+            state.snapshot();
+            if !state.status.active.load(Ordering::Acquire) && state.fade.finished() {
+                state.retire_pending = true;
+            }
+            pending |= state.status.occupied.load(Ordering::Acquire) != 0
+                || (!state.status.active.load(Ordering::Acquire) && !state.fade.finished());
+        }
+        self.drained.store(frozen.draining && !pending, Ordering::Release);
+    }
+    // Test-only request collector, using exactly the callback begin/pull/end
+    // core. This owns no PCM queue and has no producer/worker scheduling path.
+    #[cfg(test)]
+    fn work(&self, output: &mut impl Output, now: Instant) {
+        for _ in 0..256 {
+            let Some(gap) = output.gap() else { break };
+            self.gap(gap);
+        }
+        let mut frozen = Frozen::default();
+        self.begin(output.frames_needed(), now, &mut frozen);
+        for _ in 0..137 {
+            if !output.needs_frame() {
                 break;
             }
-            let mut inputs = [[0.0; MIX_SAMPLES]; MAX_SOURCES];
-            let mut present = 0;
-            for slot in &self.slots {
-                let ptr = slot.load(Ordering::Acquire);
-                if ptr.is_null() {
-                    continue;
-                }
-                // SAFETY: as above; retirement is completed only by this loop.
-                let state = unsafe { &mut *ptr };
-                if state.status.active.load(Ordering::Acquire)
-                    && state.status.playing.load(Ordering::Acquire)
-                    && (!draining || state.remaining != 0 || state.status.occupied.load(Ordering::Acquire) != 0)
-                {
-                    state.receiver.set_draining(draining);
-                    state.render(
-                        now,
-                        feed.frames_needed().saturating_sub(state.remaining / 2),
-                        &mut inputs[present],
-                    );
-                    present += 1;
-                }
+            let frames = output.frames_needed().min(120);
+            if frames == 0 {
+                break;
             }
-            let refs: [&[f32]; MAX_SOURCES] = std::array::from_fn(|i| inputs[i].as_slice());
             let mut mixed = [0.0; MIX_SAMPLES];
-            dsp::mix(&refs[..present], &mut mixed);
-            feed.push(&mixed, None);
+            let block = self.pull(&mut mixed[..frames * 2], output.frames_needed(), now, &mut frozen);
+            let _ = output.push_mix(&mixed[..frames * 2], block.sources);
         }
-        for slot in &self.slots {
-            let ptr = slot.load(Ordering::Acquire);
-            if !ptr.is_null() {
-                // SAFETY: same exclusive RT ownership, no control dereference.
-                unsafe { &mut *ptr }.snapshot();
-            }
-        }
+        self.end(&mut frozen);
     }
 }
 
@@ -546,8 +681,6 @@ pub struct Sink {
     registry: Arc<Registry>,
     // Boxing is intentional: published addresses must not move with this Vec.
     states: Vec<(usize, Box<SourceState>)>,
-    wake: realtime::Signal,
-    worker: Option<JoinHandle<(Feed, realtime::Schedule)>>,
 }
 impl std::fmt::Debug for Sink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -561,66 +694,25 @@ impl Sink {
         Self::start_with_options(id, &PlaybackOptions::default())
     }
     pub fn start_with_options(id: &str, options: &PlaybackOptions) -> Result<Self, String> {
-        let mut playback = Playback::start_with_options(id, options)?;
-        let (mut feed, mut schedule, wake) = playback.take_realtime_feed()?;
         let registry = Arc::new(Registry::new());
-        let shared = registry.clone();
-        let worker_wake = wake.clone();
-        let worker = thread::Builder::new()
-            .name("oink-audio-render".into())
-            .spawn(move || {
-                {
-                    match schedule.enter() {
-                        Ok(guard) => {
-                            shared.started.store(1, Ordering::Release);
-                            let mut previous: Option<Instant> = None;
-                            while !shared.stop.load(Ordering::Acquire) {
-                                if let Err(error) = worker_wake.wait() {
-                                    shared.error.store(error, Ordering::Release);
-                                    break;
-                                }
-                                if shared.stop.load(Ordering::Acquire) {
-                                    break;
-                                }
-                                let now = Instant::now();
-                                shared.work(&mut feed, now);
-                                shared.metrics.observe(
-                                    previous.map(|before| now.saturating_duration_since(before)),
-                                    now.elapsed(),
-                                );
-                                previous = Some(now);
-                            }
-                            drop(guard);
-                        }
-                        Err(error) => {
-                            shared.error.store(error, Ordering::Release);
-                            shared.started.store(2, Ordering::Release);
-                        }
-                    }
-                }
-                (feed, schedule)
-            })
-            .map_err(|e| format!("start audio render worker: {e}"))?;
-        let mut sink = Self {
+        let playback = Playback::start_with_options(id, options, Box::new(PullRender::new(registry.clone())))?;
+        Ok(Self {
             playback,
             registry,
             states: Vec::with_capacity(MAX_SOURCES),
-            wake,
-            worker: Some(worker),
-        };
-        let started = Instant::now();
-        while sink.registry.started.load(Ordering::Acquire) == 0 && started.elapsed() < Duration::from_secs(2) {
-            thread::sleep(Duration::from_millis(1));
-        }
-        if sink.registry.started.load(Ordering::Acquire) != 1 {
-            sink.stop();
-            return Err(format!(
-                "audio render scheduling failed: {}",
-                sink.registry.error.load(Ordering::Acquire)
-            ));
-        }
-        sink.wake.notify();
-        Ok(sink)
+        })
+    }
+    /// Test-only native probe: runs the full pull core but masks every native
+    /// output buffer to zero before it reaches the device. Requires exclusive use of the machine.
+    #[cfg(feature = "test-support")]
+    pub fn start_silent_test(id: &str, options: &PlaybackOptions) -> Result<Self, String> {
+        let registry = Arc::new(Registry::new());
+        let playback = Playback::start_silent_test(id, options, Box::new(PullRender::new(registry.clone())))?;
+        Ok(Self {
+            playback,
+            registry,
+            states: Vec::with_capacity(MAX_SOURCES),
+        })
     }
     fn reap(&mut self) {
         self.states
@@ -641,7 +733,7 @@ impl Sink {
             .iter()
             .position(|slot| slot.load(Ordering::Acquire).is_null())
             .ok_or("audio source slots awaiting retirement")?;
-        let (source, mut state) = SourceState::prepare(config, self.wake.clone(), observe)?;
+        let (source, mut state) = SourceState::prepare(config, observe)?;
         let ptr = &mut *state as *mut SourceState;
         self.states.push((index, state));
         self.registry.slots[index].store(ptr, Ordering::Release);
@@ -649,25 +741,28 @@ impl Sink {
     }
 
     fn stop(&mut self) {
-        self.registry.stop.store(true, Ordering::Release);
-        self.wake.notify();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        self.registry.draining.store(true, Ordering::Release);
         for (_, state) in &self.states {
             state.status.active.store(false, Ordering::Release);
         }
-        for slot in &self.registry.slots {
-            slot.store(std::ptr::null_mut(), Ordering::Release);
+        let quiescent = self.playback.shutdown();
+        if quiescent {
+            self.registry.stop.store(true, Ordering::Release);
+            for slot in &self.registry.slots {
+                slot.store(std::ptr::null_mut(), Ordering::Release);
+            }
+            self.states.clear();
+        } else {
+            // HAL retained its callback context: preserve every pointer that
+            // context could still read. Never trade a leak for use-after-free.
+            for (_, state) in self.states.drain(..) {
+                let _ = Box::leak(state);
+            }
         }
-        self.states.clear();
     }
     pub fn error(&self) -> Option<String> {
-        let error = self.registry.error.load(Ordering::Acquire);
-        if error != 0 {
-            Some(format!("audio render worker failed: {error}"))
-        } else if self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
-            Some("audio render worker stopped".into())
+        if self.registry.error.load(Ordering::Acquire) != 0 {
+            Some("audio pull exhausted per-source codec budget".into())
         } else {
             self.playback.error()
         }
@@ -679,13 +774,11 @@ impl Sink {
         self.registry.drained.store(false, Ordering::Release);
         self.registry.draining.store(true, Ordering::Release);
         self.playback.begin_idle_drain();
-        self.wake.notify();
     }
     pub fn cancel_idle_drain(&self) {
         self.playback.cancel_idle_drain();
         self.registry.draining.store(false, Ordering::Release);
         self.registry.drained.store(false, Ordering::Release);
-        self.wake.notify();
     }
     pub fn idle_drained(&self) -> bool {
         self.registry.drained.load(Ordering::Acquire)
@@ -699,9 +792,7 @@ impl Sink {
         self.playback.info()
     }
     pub fn take_metrics(&self) -> PlaybackMetrics {
-        let mut metrics = self.playback.take_metrics();
-        metrics.worker = Some(self.registry.metrics.take());
-        metrics
+        self.playback.take_metrics()
     }
 }
 impl Drop for Sink {
@@ -713,6 +804,237 @@ impl Drop for Sink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dormant_source_drains_without_plc_or_quality_events_while_another_source_plays() {
+        let config = dsp::Config::low_latency_pcm();
+        let now = Instant::now();
+        let registry = Registry::new();
+        let (mut dormant, mut quiet_state) = SourceState::prepare(config, false).unwrap();
+        let (mut active, mut active_state) = SourceState::prepare(config, false).unwrap();
+        registry.slots[0].store(&mut *quiet_state, Ordering::Release);
+        registry.slots[1].store(&mut *active_state, Ordering::Release);
+        let sleep = Arc::new(AtomicBool::new(false));
+        let observed = sleep.clone();
+        dormant.set_sleep_detector(Arc::new(move |_| observed.load(Ordering::Acquire)));
+        let counters = Arc::new(DropoutCounters::default());
+        dormant.set_dropout_counters(counters.clone());
+        let mut encoder = dsp::Encoder::new_with_config(config).unwrap();
+        let payload = encoder.encode(&[0.2; 240]).unwrap();
+        for seq in 0..8 {
+            assert!(dormant.push(seq, &payload, now, None, None));
+            assert!(active.push(seq, &payload, now, None, None));
+        }
+        let mut output = [0.; MIX_SAMPLES];
+        let mut frozen = Frozen::default();
+        let render = |tick: u64, frozen: &mut Frozen, output: &mut [f32]| {
+            let at = now + Duration::from_micros(50_000 + tick * 2500);
+            registry.begin(120, at, frozen);
+            let block = registry.pull(output, 120, at, frozen);
+            registry.end(frozen);
+            block
+        };
+        render(0, &mut frozen, &mut output);
+        assert!(output.iter().any(|v| *v > 0.1));
+        sleep.store(true, Ordering::Release);
+        for tick in 1..80 {
+            assert!(active.push(7 + tick, &payload, now, None, None));
+            let mut block = PullBlock {
+                sources: [0; MAX_SOURCES],
+                kind: quality::OutputKind::Intentional,
+            };
+            crate::allocation_audit::assert_no_heap(|| block = render(tick, &mut frozen, &mut output));
+            assert!(output.iter().any(|v| *v > 0.1), "other source stopped");
+            if tick > 12 {
+                assert!(
+                    !block.sources.contains(&quiet_state.id),
+                    "dormant source blamed for native gaps"
+                );
+            }
+        }
+        assert_eq!(quiet_state.receiver.stats().lost, 0, "Sleep manufactured PLC");
+        let at = (crate::diagnostics::monotonic_us(now).max(0) / 1000) as u64 + 1000;
+        let buckets: Vec<_> = counters.snapshot(at).into_iter().flatten().collect();
+        assert_eq!(buckets.iter().map(|b| b.interruptions).sum::<u64>(), 0);
+        assert_eq!(buckets.iter().map(|b| b.concealed_ns).sum::<u64>(), 0);
+        assert_eq!(buckets.iter().map(|b| b.missing_ns).sum::<u64>(), 0);
+        // A new media burst resumes on the same port.
+        sleep.store(false, Ordering::Release);
+        assert!(dormant.push_packet(Packet {
+            burst: 2,
+            sequence: 1,
+            payload: {
+                let mut bytes = [0; dsp::MAX_PACKET_BYTES];
+                bytes[..payload.len()].copy_from_slice(&payload);
+                bytes
+            },
+            len: payload.len(),
+            arrived: now,
+            network_read: None,
+            source_emit: None
+        }));
+        render(80, &mut frozen, &mut output);
+        assert_eq!(quiet_state.burst, 2);
+    }
+
+    #[test]
+    fn callback_work_counts_bad_decode_plc_and_resets_for_each_pull_transaction() {
+        let config = dsp::Config::low_latency_opus();
+        let now = Instant::now();
+        let (mut source, mut state) = SourceState::prepare(config, false).unwrap();
+        let registry = Registry::new();
+        registry.slots[0].store(&mut *state, Ordering::Release);
+        let mut encoder = dsp::Encoder::new_with_config(config).unwrap();
+        let payload = encoder.encode(&[0.2; 480]).unwrap();
+        // Valid five-ms TOC, invalid compressed packet: one failed decode plus
+        // one PLC, distinct from an exhausted per-callback work budget.
+        assert!(source.push(0, &[0x8b, 0x41], now, None, None));
+        for seq in 1..4 {
+            assert!(source.push(seq, &payload, now, None, None));
+        }
+        let mut frozen = Frozen::default();
+        let mut output = [0.0; MIX_SAMPLES];
+        let at = now + Duration::from_millis(20);
+        crate::allocation_audit::assert_no_heap(|| {
+            registry.begin(128, at, &mut frozen);
+            registry.pull(&mut output, 128, at, &mut frozen);
+            registry.pull(&mut output[..16], 8, at, &mut frozen);
+            registry.end(&mut frozen);
+        });
+        assert_eq!(frozen.work.sources, 1);
+        assert_eq!(frozen.work.scan_steps, 4);
+        assert_eq!(frozen.work.codec_calls, 2);
+        assert_eq!(frozen.work.plc_frames, 1);
+        assert_eq!(frozen.work.decode_errors, 1);
+        assert_eq!(frozen.work.work_limited, 0);
+        registry.begin(48, at + Duration::from_millis(3), &mut frozen);
+        registry.pull(&mut output[..96], 48, at, &mut frozen);
+        registry.end(&mut frozen);
+        assert_eq!(frozen.work.scan_steps, 0);
+        assert_eq!(frozen.work.codec_calls, 0, "remaining decoded PCM needs no codec call");
+        assert_eq!(frozen.work.plc_frames, 0);
+        assert_eq!(frozen.work.decode_errors, 0);
+    }
+
+    #[test]
+    fn output_gap_is_attributed_to_affected_streams_without_reusing_retired_ids() {
+        struct Feedback(Option<crate::playback::OutputGap>);
+        impl Output for Feedback {
+            fn gap(&mut self) -> Option<crate::playback::OutputGap> {
+                self.0.take()
+            }
+            fn needs_frame(&self) -> bool {
+                false
+            }
+            fn frames_needed(&self) -> usize {
+                0
+            }
+            fn push(&mut self, _: &[f32], _: Option<u64>) -> bool {
+                false
+            }
+        }
+        let (source, mut state) = SourceState::prepare(dsp::Config::low_latency_pcm(), false).unwrap();
+        let counters = Arc::new(DropoutCounters::default());
+        source.set_dropout_counters(counters.clone());
+        let registry = Registry::new();
+        registry.slots[0].store(&mut *state, Ordering::Release);
+        let mut ids = [0; MAX_SOURCES];
+        ids[0] = state.id;
+        let gap = crate::playback::OutputGap {
+            sources: ids,
+            delta: DropoutBucket {
+                at_ms: 1000,
+                interruptions: 1,
+                discontinuities: 1,
+                ..Default::default()
+            },
+        };
+        registry.work(&mut Feedback(Some(gap)), Instant::now());
+        assert_eq!(counters.snapshot(1000)[1].unwrap().output_interruptions, 1);
+        assert_eq!(counters.snapshot(1000)[1].unwrap().interruptions, 1);
+        state.id = NEXT_SOURCE.fetch_add(1, Ordering::Relaxed);
+        registry.work(&mut Feedback(Some(gap)), Instant::now());
+        assert_eq!(counters.snapshot(1000)[1].unwrap().interruptions, 1);
+    }
+
+    #[test]
+    fn packet_gap_recovery_has_no_pcm_step_or_added_frames() {
+        let config = dsp::Config::low_latency_pcm();
+        let origin = Instant::now();
+        let (mut source, mut state) = SourceState::prepare(config, false).unwrap();
+        let mut encoder = dsp::Encoder::new_with_config(config).unwrap();
+        for seq in [0, 1, 3, 4, 5, 6, 7] {
+            let value = if seq < 2 { 0.5 } else { -0.5 };
+            let payload = encoder.encode(&vec![value; config.frame_samples()]).unwrap();
+            assert!(source.push(seq, &payload, origin, None, None));
+        }
+        state.receive(origin);
+        let mut samples = Vec::new();
+        for tick in 0..7 {
+            let mut output = [0.0; MIX_SAMPLES];
+            state.render(origin + Duration::from_millis(100 + tick * 3), 120, &mut output);
+            samples.extend_from_slice(&output);
+        }
+        assert_eq!(samples.len(), 7 * MIX_SAMPLES);
+        assert!(samples.last().unwrap() < &-0.49);
+        for pair in samples.as_chunks::<2>().0.windows(2) {
+            assert!((pair[1][0] - pair[0][0]).abs() < 0.02, "splice step: {pair:?}");
+        }
+    }
+
+    #[test]
+    fn exit_pop_retired_source_fades_buffered_pcm_before_acknowledgement() {
+        struct Recording {
+            samples: Vec<f32>,
+            needed: usize,
+        }
+        impl Output for Recording {
+            fn needs_frame(&self) -> bool {
+                self.needed > 0
+            }
+            fn frames_needed(&self) -> usize {
+                self.needed
+            }
+            fn push(&mut self, samples: &[f32], _: Option<u64>) -> bool {
+                self.samples.extend_from_slice(samples);
+                self.needed = self.needed.saturating_sub(samples.len() / 2);
+                true
+            }
+        }
+        for packets in [1, 12] {
+            let now = Instant::now();
+            let (mut source, mut state) = SourceState::prepare(dsp::Config::low_latency_pcm(), false).unwrap();
+            let mut encoder = dsp::Encoder::new_with_config(dsp::Config::low_latency_pcm()).unwrap();
+            let payload = encoder.encode(&[0.25; 240]).unwrap();
+            for sequence in 0..packets {
+                assert!(source.push(sequence, &payload, now, None, None));
+            }
+            let registry = Registry::new();
+            registry.slots[0].store(&mut *state, Ordering::Release);
+            let mut output = Recording {
+                samples: Vec::new(),
+                needed: 120,
+            };
+            registry.work(&mut output, now + Duration::from_millis(50));
+            let before = *output.samples.last().unwrap();
+            assert!(before > 0.24);
+            output.samples.clear();
+            drop(source); // Same retirement as link_lost / stream removal.
+            for tick in 0..8 {
+                output.needed = 120;
+                registry.work(&mut output, now + Duration::from_millis(50 + tick * 3));
+            }
+            assert!(
+                (output.samples[0] - before).abs() < 0.001,
+                "retirement cuts nonzero PCM directly to silence"
+            );
+            assert!(output.samples[2..1440].iter().any(|s| *s > 0.01 && *s < 0.24));
+            assert!(output.samples[1438..].iter().all(|s| *s == 0.0));
+            for pair in output.samples.as_chunks::<2>().0.windows(2) {
+                assert!((pair[1][0] - pair[0][0]).abs() < 0.001);
+            }
+            assert!(registry.slots[0].load(Ordering::Acquire).is_null());
+        }
+    }
     struct OutputProbe {
         needed: usize,
         frames: usize,
@@ -735,11 +1057,41 @@ mod tests {
         }
     }
     #[test]
+    fn exit_pop_retirement_does_not_replay_paused_pcm() {
+        let config = dsp::Config::low_latency_pcm();
+        let now = Instant::now();
+        let (mut source, mut state) = SourceState::prepare(config, false).unwrap();
+        let mut encoder = dsp::Encoder::new_with_config(config).unwrap();
+        let payload = encoder.encode(&[0.25; 240]).unwrap();
+        for sequence in 0..12 {
+            assert!(source.push(sequence, &payload, now, None, None));
+        }
+        let registry = Registry::new();
+        registry.slots[0].store(&mut *state, Ordering::Release);
+        let mut out = OutputProbe {
+            needed: 120,
+            frames: 0,
+            peak: 0.0,
+        };
+        registry.work(&mut out, now + Duration::from_millis(50));
+        assert!(out.peak > 0.24);
+        source.status.playing.store(false, Ordering::Release);
+        out.peak = 0.0;
+        out.needed = 120;
+        registry.work(&mut out, now + Duration::from_millis(53));
+        assert_eq!(out.peak, 0.0);
+        drop(source);
+        out.needed = 120;
+        registry.work(&mut out, now + Duration::from_millis(56));
+        assert_eq!(out.peak, 0.0, "retirement must not make a paused source audible");
+        assert!(registry.slots[0].load(Ordering::Acquire).is_null());
+    }
+    #[test]
     fn short_opus_concealment_is_measured_when_rendered_and_late_packets_are_separate() {
         let mut config = dsp::Config::low_latency_opus();
         config.jitter.adaptive = false;
         let origin = Instant::now();
-        let (mut source, mut state) = SourceState::prepare(config, realtime::Signal::new().unwrap(), false).unwrap();
+        let (mut source, mut state) = SourceState::prepare(config, false).unwrap();
         let counter = Arc::new(DropoutCounters::default());
         source.set_dropout_counters(counter.clone());
         let mut encoder = dsp::Encoder::new_with_config(config).unwrap();
@@ -770,7 +1122,7 @@ mod tests {
     fn local_dropout_counter_uses_receiver_classification_and_survives_bursts() {
         let config = dsp::Config::low_latency_pcm();
         let origin = Instant::now();
-        let (mut source, mut state) = SourceState::prepare(config, realtime::Signal::new().unwrap(), false).unwrap();
+        let (mut source, mut state) = SourceState::prepare(config, false).unwrap();
         let counter = Arc::new(DropoutCounters::default());
         source.set_dropout_counters(counter.clone());
         let at = (crate::diagnostics::monotonic_us(origin).max(0) / 1000) as u64;
@@ -811,7 +1163,7 @@ mod tests {
         let mut config = dsp::Config::low_latency_pcm();
         config.jitter.adaptive = false;
         let origin = Instant::now();
-        let (mut source, mut state) = SourceState::prepare(config, realtime::Signal::new().unwrap(), false).unwrap();
+        let (mut source, mut state) = SourceState::prepare(config, false).unwrap();
         let registry = Registry::new();
         registry.slots[0].store(&mut *state, Ordering::Release);
         let mut encoder = dsp::Encoder::new_with_config(config).unwrap();
@@ -839,7 +1191,8 @@ mod tests {
         output.peak = 0.0;
         output.needed = config.frame_size();
         registry.work(&mut output, restored);
-        assert!(output.peak > 0.1, "restored packets render in the same source/burst");
+        // Recovery starts immediately, now with a five-millisecond splice ramp.
+        assert!(output.peak > 0.01, "restored packets render in the same source/burst");
         assert_eq!(
             source.status.occupied.load(Ordering::Acquire),
             state.receiver.buffered_frames()
@@ -855,7 +1208,7 @@ mod tests {
     #[test]
     fn direct_reader_runs_with_stalled_control_and_keeps_receiver_on_pause() {
         let config = dsp::Config::low_latency_pcm();
-        let (source, mut state) = SourceState::prepare(config, realtime::Signal::new().unwrap(), true).unwrap();
+        let (source, mut state) = SourceState::prepare(config, true).unwrap();
         let sequence = Arc::new(AtomicU64::new(0));
         let enabled = Arc::new(AtomicBool::new(true));
         let cursor = sequence.clone();
@@ -863,7 +1216,8 @@ mod tests {
         let mut encoder = dsp::Encoder::new_with_config(config).unwrap();
         let mut payload = [0; dsp::MAX_PACKET_BYTES];
         let len = encoder.encode_into(&[0.1; 240], &mut payload).unwrap();
-        source.set_packet_reader(Arc::new(move || {
+        source.set_packet_reader(Arc::new(move |budget| {
+            *budget = budget.saturating_sub(1);
             let sequence = cursor.fetch_add(1, Ordering::Relaxed);
             (
                 playing.load(Ordering::Acquire),
@@ -911,9 +1265,8 @@ mod tests {
             dsp::Config::low_latency_opus(),
             dsp::Config::low_latency_pcm(),
         ] {
-            let signal = realtime::Signal::new().unwrap();
             let registry = Registry::new();
-            let (mut source, mut state) = SourceState::prepare(config, signal, true).unwrap();
+            let (mut source, mut state) = SourceState::prepare(config, true).unwrap();
             registry.slots[0].store(&mut *state, Ordering::Release);
             let mut encoder = dsp::Encoder::new_with_config(config).unwrap();
             let mut payload = [0; dsp::MAX_PACKET_BYTES];
@@ -944,7 +1297,14 @@ mod tests {
             assert!(source.stats().received > 0);
             assert!(source.take_rejections().queue_capacity > 0);
             drop(source);
-            registry.work(&mut out, Instant::now());
+            crate::allocation_audit::assert_no_heap(|| {
+                // Retirement now consumes the finite fade before releasing its
+                // storage; it uses the same RT budget and remains allocation-free.
+                for _ in 0..8 {
+                    out.needed = 120;
+                    registry.work(&mut out, Instant::now());
+                }
+            });
             assert!(registry.slots[0].load(Ordering::Acquire).is_null());
         }
     }
@@ -964,10 +1324,8 @@ mod tests {
                 thread::yield_now();
             }
         });
-        let wake = realtime::Signal::new().unwrap();
         for _ in 0..1000 {
-            let (mut source, mut state) =
-                SourceState::prepare(dsp::Config::low_latency_pcm(), wake.clone(), false).unwrap();
+            let (mut source, mut state) = SourceState::prepare(dsp::Config::low_latency_pcm(), false).unwrap();
             let status = source.status.clone();
             assert!(registry.slots[0].load(Ordering::Acquire).is_null());
             registry.slots[0].store(&mut *state, Ordering::Release);
@@ -995,7 +1353,7 @@ mod wake_tests {
     fn startup_backlog_keeps_complete_pcm_onset_through_real_receiver() {
         let config = dsp::Config::low_latency_pcm();
         let now = Instant::now();
-        let (mut source, mut state) = SourceState::prepare(config, realtime::Signal::new().unwrap(), false).unwrap();
+        let (mut source, mut state) = SourceState::prepare(config, false).unwrap();
         let mut encoder = dsp::Encoder::new_with_config(config).unwrap();
         // Ten ms pre-roll, twenty ms nonzero linear PCM, then twenty ms digital zero.
         // Device opening took fifty ms; arrival timestamps retain their original spacing.
@@ -1082,7 +1440,7 @@ mod wake_tests {
         }
         let config = dsp::Config::low_latency_pcm();
         let now = Instant::now();
-        let (mut source, mut state) = SourceState::prepare(config, realtime::Signal::new().unwrap(), false).unwrap();
+        let (mut source, mut state) = SourceState::prepare(config, false).unwrap();
         // The dormant owner received a finite beep, and a very slow open finished
         // after the thirty-second no-packet timeout. No ingress queue overflowed.
         let mut encoder = dsp::Encoder::new_with_config(config).unwrap();
@@ -1143,8 +1501,7 @@ mod wake_tests {
             dsp::Config::opus_10ms(),
         ] {
             let now = Instant::now();
-            let (mut source, mut state) =
-                SourceState::prepare(config, realtime::Signal::new().unwrap(), false).unwrap();
+            let (mut source, mut state) = SourceState::prepare(config, false).unwrap();
             let mut encoder = dsp::Encoder::new_with_config(config).unwrap();
             let mut payload = [0; dsp::MAX_PACKET_BYTES];
             let len = encoder
@@ -1201,5 +1558,74 @@ mod wake_tests {
                 assert_eq!(a, b, "old decoder/phase/jitter leaked into the new burst");
             }
         }
+    }
+}
+
+/// Executes the production callback core without opening any native device.
+/// The ordinary owner creates/publishes sources; every fill owns the full DSP
+/// transaction. Intended for integration audits and synthetic deadline evidence.
+#[cfg(feature = "test-support")]
+pub struct Simulator {
+    registry: Arc<Registry>,
+    states: Vec<(usize, Box<SourceState>)>,
+    render: crate::playback::Render,
+}
+#[cfg(feature = "test-support")]
+impl Simulator {
+    pub fn new(trace: bool) -> Self {
+        let registry = Arc::new(Registry::new());
+        let render = crate::playback::Render::simulated(Box::new(PullRender::new(registry.clone())), trace);
+        Self {
+            registry,
+            states: Vec::with_capacity(MAX_SOURCES),
+            render,
+        }
+    }
+    pub fn source(&mut self, config: dsp::Config) -> Result<Source, String> {
+        self.states
+            .retain(|(index, _)| !self.registry.slots[*index].load(Ordering::Acquire).is_null());
+        let index = self
+            .registry
+            .slots
+            .iter()
+            .position(|slot| slot.load(Ordering::Acquire).is_null())
+            .ok_or("source slots awaiting retirement")?;
+        let (source, mut state) = SourceState::prepare(config, false)?;
+        let ptr = &mut *state as *mut SourceState;
+        self.states.push((index, state));
+        self.registry.slots[index].store(ptr, Ordering::Release);
+        Ok(source)
+    }
+    pub fn fill(&mut self, output: &mut [f32], rate: u32, channels: u16, period: u32, at: Instant, gap: Option<u64>) {
+        self.render.simulate(output, rate, channels, period, at, gap);
+    }
+    pub fn metrics(&self) -> PlaybackMetrics {
+        self.render.observations()
+    }
+    pub fn set_output_quality_counters(&self, counters: Arc<DropoutCounters>) {
+        self.render.simulated_quality(counters);
+    }
+    pub fn begin_idle_drain(&self) {
+        self.registry.draining.store(true, Ordering::Release);
+    }
+    pub fn cancel_idle_drain(&self) {
+        self.registry.draining.store(false, Ordering::Release);
+    }
+    pub fn invalidate(&mut self) {
+        // &mut self proves no fill is running. Equivalent to native quiescence.
+        self.registry.stop.store(true, Ordering::Release);
+        for slot in &self.registry.slots {
+            slot.store(std::ptr::null_mut(), Ordering::Release);
+        }
+        self.states.clear();
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl std::fmt::Debug for Simulator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Simulator")
+            .field("sources", &self.states.len())
+            .finish_non_exhaustive()
     }
 }

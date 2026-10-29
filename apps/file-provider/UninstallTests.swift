@@ -66,6 +66,8 @@ import Foundation
         try write(metadata)
         try write(group.appendingPathComponent("FileProvider/temporary/payload"))
         try write(group.appendingPathComponent("FileProvider/Reports/capsule.bin"))
+        try write(group.appendingPathComponent("LinkedFileProvider/received/journal"))
+        try write(group.appendingPathComponent("LinkedFileProvider/temporary/payload"))
         try fm.createSymbolicLink(at: group.appendingPathComponent("external-link"), withDestinationURL: outside)
         for location in uninstallLocations(home: testHome) { try write(location) }
         var preferencesCleared = false

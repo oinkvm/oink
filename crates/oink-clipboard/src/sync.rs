@@ -112,14 +112,12 @@ impl Ordering {
         raw.insert(1, crate::wire::offer_id(id).write());
         inventory = dto::Inventory::from_raw(raw)?;
         let build = |inventory: &dto::Inventory| -> v1::Result<dto::ClipboardOffer> {
-            let digest = blake3::hash(&inventory.encode(crate::model::INVENTORY_BYTES)?);
             dto::ClipboardOffer::from_raw(
                 [
                     (1, crate::wire::offer_id(id).write()),
                     (2, V::Uint(count)),
                     (3, V::Uint(clock)),
                     (4, crate::wire::sensitivity(sensitivity).write()),
-                    (5, crate::wire::digest(digest.into()).write()),
                     (6, inventory.write()),
                     (7, V::Uint(time)),
                 ]
@@ -143,11 +141,6 @@ impl Ordering {
         let id = crate::wire::local_offer_id(offer.id()?)?;
         if id.clip.origin != peer || peer == self.device {
             return Ok(false);
-        }
-        let inventory = offer.inventory()?;
-        let digest = crate::wire::local_digest(offer.content_digest()?)?;
-        if blake3::hash(&inventory.encode(crate::model::INVENTORY_BYTES)?).as_bytes() != &digest {
-            return Err(v1::ErrorCode::StateConflict.into());
         }
         let clock = offer.clock()?;
         self.clock = self.clock.max(clock);
@@ -240,7 +233,7 @@ mod tests {
         assert_eq!(crate::wire::local_offer_id(first.id().unwrap()).unwrap().clip.seq, 100);
         assert_eq!(crate::wire::local_offer_id(second.id().unwrap()).unwrap().clip.seq, 101);
         assert_eq!(state.clock(), 101);
-        assert_ne!(first.content_digest().unwrap(), second.content_digest().unwrap());
+        assert_ne!(first.id().unwrap(), second.id().unwrap());
         state.written(2);
         assert!(!state.local_change(2, Instant::now()));
         assert!(state.capture(inventory(), 2, Sensitivity::Normal, 0).unwrap().is_none());

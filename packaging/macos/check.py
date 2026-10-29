@@ -17,10 +17,10 @@ def main():
         common = ['xcrun', 'swiftc', '-swift-version', '5', '-parse-as-library', '-D', 'OINK_RELEASE',
                   '-target', f'arm64-apple-macos{I["macos_minimum"]}']
         shared = [generated, ROOT / 'apps/file-provider/Shared.swift',
-                  ROOT / 'apps/file-provider/ContainerCleanup.swift']
+                  ROOT / 'apps/file-provider/Upgrade.swift', ROOT / 'apps/file-provider/ContainerCleanup.swift']
         for entry in ['Extension.swift', 'Manager.swift']:
             flags = (['-application-extension', ROOT / 'apps/file-provider/ReportCapture.swift']
-                     if entry == 'Extension.swift' else [ROOT / 'apps/file-provider/Uninstall.swift'])
+                     if entry == 'Extension.swift' else [ROOT / 'apps/file-provider/Uninstall.swift', ROOT / 'apps/file-provider/NativeReceived.swift'])
             run(*common, '-typecheck', *shared, *flags, ROOT / 'apps/file-provider' / entry)
         run('xcrun', 'clang', '-O2', '-std=c11', '-target', f'arm64-apple-macos{I["macos_minimum"]}',
             '-c', ROOT / 'apps/file-provider/CrashCapture.c', '-o', tmp / 'crash-capture.o')
@@ -38,11 +38,13 @@ def main():
         if '_OinkFileProviderMain' not in symbols:
             raise RuntimeError('File Provider bootstrap entry is missing from the release image')
         if args.test:
-            for entry in ['Tests.swift', 'EnumeratorTests.swift', 'UninstallTests.swift', 'ReceivedTests.swift']:
+            for entry in ['UpgradeTests.swift', 'Tests.swift', 'EnumeratorTests.swift', 'UninstallTests.swift', 'ReceivedTests.swift', 'NativeReceivedTests.swift']:
                 extension = [ROOT / 'apps/file-provider/Extension.swift', ROOT / 'apps/file-provider/ReportCapture.swift',
                              tmp / 'crash-capture.o'] if entry == 'EnumeratorTests.swift' else []
                 if entry == 'UninstallTests.swift':
                     extension = [ROOT / 'apps/file-provider/Uninstall.swift']
+                if entry == 'NativeReceivedTests.swift':
+                    extension = [ROOT / 'apps/file-provider/NativeReceived.swift']
                 output = tmp / entry.removesuffix('.swift')
                 run(*common, '-D', 'DEBUG', *shared, *extension, ROOT / 'apps/file-provider' / entry, '-o', output)
                 run(output)

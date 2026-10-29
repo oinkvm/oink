@@ -10,7 +10,18 @@ pub const PORTABLE_FORMATS: &[&str] = &[
     "oink:privacy-markers/1",
     dto::URL_FORMAT,
 ];
-pub const CAPABILITIES: &[&str] = &["oink.clipboard/1", "oink.drag/1", "oink.cache/1"];
+pub const CAPABILITIES: &[&str] = &[
+    "oink.clipboard/1",
+    "oink.drag/1",
+    "oink.cache/1",
+    "oink.cloud-file-links/1",
+    // The registry only defines codecs. Production offers must also advertise
+    // these implemented Mac receive contracts, or every grant projects them out.
+    #[cfg(target_os = "macos")]
+    "oink.files.safe-symlinks/1",
+    #[cfg(target_os = "macos")]
+    "oink.files.exec-bits/1",
+];
 
 /// Negotiation describes implemented reconstruction contracts. The per-device
 /// filters separately remove disabled representations from every actual offer.

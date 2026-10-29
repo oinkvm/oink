@@ -235,13 +235,51 @@ pub fn catalog(v: &Catalog) -> v1::Result<d::LayoutProfileCatalogV3> {
             ]
             .into_iter()
             .collect::<v1::RawMap>();
+            if let Some(topology) = &p.saved_topology {
+                raw.insert(9, ver(&p.content_revision));
+                raw.insert(
+                    8,
+                    list(topology, |d| {
+                        map([
+                            (1, dev(d.device)),
+                            (
+                                2,
+                                list(&d.screens, |s| {
+                                    map([
+                                        (1, V::from(s.id.as_str())),
+                                        (
+                                            2,
+                                            map([
+                                                (1, s.bounds.x.write()),
+                                                (2, s.bounds.y.write()),
+                                                (3, s.bounds.w.write()),
+                                                (4, s.bounds.h.write()),
+                                            ]),
+                                        ),
+                                        (3, s.pixel_width.write()),
+                                        (4, s.pixel_height.write()),
+                                        (5, s.scale.write()),
+                                        (6, s.rotation.write()),
+                                        (7, s.primary.write()),
+                                    ])
+                                }),
+                            ),
+                        ])
+                    }),
+                );
+            }
             if let Some(group) = p.default_group {
                 raw.insert(7, V::Bytes(group.0.0.to_vec()));
             }
             if let ProfileName::Custom { value } = &p.name {
                 raw.insert(2, V::from(value.as_str()));
             }
-            Ok(V::Map(restore_extensions(raw, &p.extensions)?))
+            let mut raw = restore_extensions(raw, &p.extensions)?;
+            if p.saved_topology.is_none() {
+                raw.remove(&8);
+                raw.remove(&9);
+            }
+            Ok(V::Map(raw))
         })
         .collect::<v1::Result<Vec<_>>>()?;
     d::LayoutProfileCatalogV3::from_raw(restore_extensions(
@@ -308,7 +346,51 @@ pub fn read_catalog(v: d::LayoutProfileCatalogV3) -> Result<Catalog> {
                 .map(|p| {
                     let used = p.last_used()?;
                     let state = p.state()?;
+                    let content_revision = version(p.content_revision()?)?;
+                    // Older writers preserve unknown fields while saving a new
+                    // content revision. Their retained topology is no longer an
+                    // observation of that save, so it must never enable restore.
+                    let saved_topology = if p.physical_topology_revision()?.map(version).transpose()?.as_ref()
+                        == Some(&content_revision)
+                    {
+                        p.physical_topology()?
+                    } else {
+                        None
+                    };
                     Ok(Profile {
+                        saved_topology: saved_topology
+                            .map(|ds| {
+                                ds.0.into_iter()
+                                    .map(|d| {
+                                        Ok(super::topology::PhysicalDevice {
+                                            device: device(d.device()?)?,
+                                            screens: d
+                                                .screens()?
+                                                .0
+                                                .into_iter()
+                                                .map(|s| {
+                                                    let r = s.bounds()?;
+                                                    Ok(super::topology::PhysicalScreen {
+                                                        id: s.id()?.0,
+                                                        bounds: oink_foundation::Rect::new(
+                                                            r.x()?,
+                                                            r.y()?,
+                                                            r.w()?,
+                                                            r.h()?,
+                                                        ),
+                                                        pixel_width: s.pixel_width()?,
+                                                        pixel_height: s.pixel_height()?,
+                                                        scale: s.scale()?,
+                                                        rotation: s.rotation()?,
+                                                        primary: s.primary()?,
+                                                    })
+                                                })
+                                                .collect::<v1::Result<_>>()?,
+                                        })
+                                    })
+                                    .collect::<v1::Result<_>>()
+                            })
+                            .transpose()?,
                         extensions: extension_bytes(
                             extensions(&p.write(), "LayoutProfile").unwrap_or(V::Map(Default::default())),
                         )?,
@@ -324,7 +406,7 @@ pub fn read_catalog(v: d::LayoutProfileCatalogV3) -> Result<Catalog> {
                             .name()?
                             .map(|n| ProfileName::Custom { value: n.0 })
                             .unwrap_or(ProfileName::Default),
-                        content_revision: version(p.content_revision()?)?,
+                        content_revision,
                         last_used: Recency {
                             logical_ms: used.logical_ms()?,
                             writer: device(used.writer()?)?,

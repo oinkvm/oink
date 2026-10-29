@@ -12,7 +12,9 @@ repository.workspace = true
 oink-foundation.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-minicbor = { version = "2.3", features = ["std"] }
+# Decode errors must stay allocation-free, including malformed RT media.
+# minicbor's alloc/std features format error messages into heap Strings.
+minicbor = { version = "2.3", default-features = false }
 sha2 = "0.10"
 
 [dev-dependencies]

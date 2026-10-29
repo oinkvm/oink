@@ -164,6 +164,84 @@
         "sha256": "5ef2c707614b9f70b6bbadd2d4abcb4124efee215e9b16bfbc80113079a604c7"
       },
       "compatibilityReview": "The MSI embeds unmodified dialog resources and native custom actions from the WiX UI extension as separate installer files; these do not link Oink GPL code. This is an aggregate distribution, not relicensing MS-RL code to GPL. Preserve MS-RL and attribution; provide the complete corresponding WiX source at the pinned upstream commit with release source materials, including any changes if modified. No global MS-RL allowance is granted to application dependencies."
+    },
+    {
+      "id": "native:libASPL@3.1.2+633e0f7",
+      "name": "libASPL",
+      "version": "3.1.2+633e0f7",
+      "ecosystem": "native",
+      "repository": "https://github.com/gavv/libASPL",
+      "source": {
+        "url": "https://github.com/gavv/libASPL/tree/633e0f70203edd87d320fc5a3cae901e1363aac5",
+        "integrity": "git:633e0f70203edd87d320fc5a3cae901e1363aac5"
+      },
+      "licenseExpression": "MIT AND AML",
+      "selectedLicense": "MIT AND AML",
+      "licenseFiles": [
+        {
+          "path": "apps/audio-plugin/licenses/LICENSE",
+          "sha256": "bdb64a0bea4af109148b48446a9026be5d1f22dc14d18920cfcd52bf3f3e2347"
+        },
+        {
+          "path": "apps/audio-plugin/licenses/LICENSE.apple2012",
+          "sha256": "9b2b45280cf33d7f726840a53283723c87b2295ff84d1cf3982c96b5bc4c50a9"
+        },
+        {
+          "path": "apps/audio-plugin/licenses/LICENSE.apple2020",
+          "sha256": "2b33b4cadf8e88c15e8808950913acf8bd84bac10d6312e9fb128163850d22d0"
+        }
+      ],
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "macos-arm64"
+      ],
+      "archive": {
+        "url": "https://codeload.github.com/gavv/libASPL/tar.gz/633e0f70203edd87d320fc5a3cae901e1363aac5",
+        "sha256": "8583fb549419eab14b5c636ee4eb1f0b1df74c534eaf2f990d8bb0fb5de6e01b"
+      },
+      "compatibilityReview": "Recovered pinned HAL dependency. MIT plus Apple sample-code AML grant redistribution with retained notices; retain all three upstream license texts in the driver and package. HAL component only."
+    },
+    {
+      "id": "native:VB-CABLE@45",
+      "name": "VB-CABLE",
+      "version": "45",
+      "ecosystem": "native",
+      "repository": "https://www.vb-cable.com/",
+      "source": {
+        "url": "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip",
+        "integrity": "sha256:b950e39f01af1d04ea623c8f6d8eb9b6ea5c477c637295fabf20631c85116bfb"
+      },
+      "licenseExpression": "LicenseRef-VB-CABLE-Donationware",
+      "selectedLicense": "LicenseRef-VB-CABLE-Donationware",
+      "licenseFiles": [
+        {
+          "path": "licenses/native/VB-CABLE-Pack45-README.txt",
+          "sha256": "2515cfd667fffcf54d00e0dda70df58a2b8843ff2ae95e12455764da25cb9eb9"
+        },
+        {
+          "path": "licenses/native/VB-CABLE-distribution-notice.txt",
+          "sha256": "04082f47b0ed315a3b3721a967884c7123552ac3f860a9fb6692c7e2130bf86d"
+        }
+      ],
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "archive": {
+        "url": "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip",
+        "sha256": "b950e39f01af1d04ea623c8f6d8eb9b6ea5c477c637295fabf20631c85116bfb"
+      },
+      "packagePatterns": [
+        "**/AudioPlugin/VBCABLE_Driver_Pack45.zip"
+      ],
+      "linkage": "Separate optional OS driver, unchanged archive; no code linked into Oink",
+      "compatibilityReview": "Standard package only, published vendor distribution permission; attribution and donation link shown before explicit installation. See distribution notice for professional-license conditions and older readme wording."
     }
   ],
   "assets": [

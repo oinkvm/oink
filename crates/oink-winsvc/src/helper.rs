@@ -237,7 +237,12 @@ impl Server {
         } else {
             &self.state.input
         };
-        if work.request.ordinary && !matches!(work.request.command, Command::Ping | Command::Position) {
+        if work.request.ordinary
+            && !matches!(
+                work.request.command,
+                Command::Ping | Command::Position | Command::PowerSnapshot
+            )
+        {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "ordinary mutation"));
         }
         lane.requests

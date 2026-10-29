@@ -1,4 +1,22 @@
 //! An install request owns the main window until failure or process replacement.
+
+/// Decode inside the command boundary so rejected updater arguments have a
+/// logged, typed receipt instead of Tauri's unstructured argument-error string.
+pub(crate) fn decode(request: serde_json::Value) -> Result<oink_agent::api::Request, oink_agent::api::ApiError> {
+    let updating = request.get("method").and_then(|value| value.as_str()) == Some("update");
+    serde_json::from_value(request).map_err(|error| {
+        tracing::warn!(step = "request_decode", %error, "API request rejected");
+        if updating {
+            oink_agent::api::ApiError::UpdateFailed {
+                update_error: oink_agent::api::UpdateError::Metadata,
+            }
+        } else {
+            oink_agent::api::ApiError::InvalidArgument {
+                message: error.to_string(),
+            }
+        }
+    })
+}
 pub(crate) fn dispatch<T, E>(
     install: bool,
     hide: impl FnOnce() -> Result<(), E>,
@@ -41,6 +59,30 @@ impl Owner {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    #[test]
+    fn install_arguments_decode_before_any_window_or_backend_action() {
+        use oink_agent::api::{ApiError, Request, UpdateCommand, UpdateError};
+        let request =
+            serde_json::json!({"method":"update","params":{"command":{"type":"install","expected_build":65}}});
+        assert_eq!(
+            decode(request).unwrap(),
+            Request::Update {
+                command: UpdateCommand::Install { expected_build: 65 }
+            }
+        );
+        for command in [
+            serde_json::json!({"type":"install"}),
+            serde_json::json!({"type":"install","expected_build":"65"}),
+            serde_json::json!({"type":"install","expected_build":65,"extra":true}),
+        ] {
+            assert_eq!(
+                decode(serde_json::json!({"method":"update","params":{"command":command}})),
+                Err(ApiError::UpdateFailed {
+                    update_error: UpdateError::Metadata
+                })
+            );
+        }
+    }
     #[test]
     fn install_closes_main_before_the_backend_and_reopens_on_rejection() {
         let calls = RefCell::new(Vec::new());

@@ -1,173 +1,40 @@
-use super::super::manifest::Manifest;
 use super::*;
-use crate::model::NodeKind;
+
 impl Remote {
-    /// Retain only the offer's network capability, never the completed payload
-    /// or its owner pin. A later read is authorized anew by the source registry.
-    pub(super) fn refetcher(&self) -> Arc<dyn Fn() -> io::Result<super::super::Completed> + Send + Sync> {
-        let data = self.0.batch.path().parent().unwrap().parent().unwrap().to_owned();
-        let inventory = self.0.inventory.clone();
-        let wire_inventory = self.0.wire_inventory.clone();
-        let target = self.0.target;
-        let link = self.0.link.clone();
-        let runtime = self.0.runtime.clone();
-        let demand = match *self.0.demand.lock().unwrap() {
-            Demand::Hover(holder) => Demand::Drop(holder),
-            demand => demand,
+    /// The local PrepareDrop owner supplies the actual start. Merely upgrading
+    /// demand after an acceptance callback must not invent a missing start.
+    pub fn record_drop_start(&self) {
+        if self.0.drop_report.get().is_none() {
+            // Remember even an uncollected start: a repeated PrepareDrop after
+            // opting in must not backfill the already-started operation.
+            let _ = self.0.drop_report.set(crate::timing::start());
+        }
+    }
+    /// Called at the existing native session-end callback, not Begin success.
+    pub fn record_drop_accepted(&self, accepted: bool) {
+        if self.0.drop_report_ended.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        crate::timing::record(
+            self.0.drop_report.get().copied().flatten(),
+            crate::timing::Measurement::DropAccepted { accepted },
+        );
+    }
+    pub(super) fn record_delivery(&self, outcome: crate::timing::Outcome) {
+        let drag = self.0.report_drag;
+        let at = if drag {
+            self.0.drop_report.get().copied().flatten()
+        } else {
+            self.0.delivery_report.get().copied()
         };
-        let receiver = *self.0.receiver.lock().unwrap();
-        Arc::new(move || {
-            let remote = Remote::on_wire_runtime(
-                &data,
-                BatchId::random()?,
-                wire_inventory.clone(),
-                target,
-                link.clone(),
-                demand,
-                runtime.clone(),
-            )?;
-            if let Some(receiver) = receiver {
-                remote.set_receiver(receiver);
-            }
-            // Do not expose a new partial file or reuse a cached receipt. The
-            // source must still authorize this offer and the whole delivery must
-            // pass its normal integrity/timeout checks before reopening locally.
-            runtime.block_on(async {
-                // BeginDelivery has no negative response variant. Validate the
-                // current offer with a metadata request first so a superseded
-                // source returns its typed failure instead of an EOF retry loop.
-                if let Some(root) = inventory.namespace_roots_for(target).first() {
-                    let request = if root.kind == NodeKind::Directory {
-                        ContentMsg::ListDirectory {
-                            offer: inventory.id,
-                            node: root.id,
-                            cursor: None,
-                            demand,
-                        }
-                    } else {
-                        ContentMsg::SelectFile {
-                            offer: inventory.id,
-                            node: root.id,
-                            demand,
-                        }
-                    };
-                    tokio::time::timeout(
-                        Duration::from_secs(10),
-                        remote.metadata_request(request, crate::model::DIRECTORY_PAGE_BYTES as u64 + 65536),
-                    )
-                    .await
-                    .map_err(|_| unavailable(Unavailable::NoProgress))??;
-                }
-                if !remote.start_delivery() {
-                    return Err(unavailable(Unavailable::Cancelled));
-                }
-                let mut progress = remote.progress();
-                progress
-                    .wait_for(|p| {
-                        matches!(
-                            p.phase,
-                            super::super::TransferPhase::Stored
-                                | super::super::TransferPhase::Failed
-                                | super::super::TransferPhase::Cancelled
-                        )
-                    })
-                    .await
-                    .map_err(|_| unavailable(Unavailable::Cancelled))?;
-                if progress.borrow().phase != super::super::TransferPhase::Stored {
-                    return Err(unavailable(
-                        progress.borrow().failure.unwrap_or(Unavailable::NoSuchItem),
-                    ));
-                }
-                super::super::Completed::restore(&data, remote.0.batch.id())
-            })
-        })
+        crate::timing::record(at, crate::timing::Measurement::Delivery { drag, outcome });
     }
-    /// File Provider's explicit-download fallback must discover a known bounded
-    /// total before opening any file. Unknown length is not a zero-sized file.
-    pub async fn prefetch_bounded(&self, maximum: u64) -> io::Result<super::super::Completed> {
-        let result = async {
-            self.begin_delivery().await?;
-            let nodes = self.expand().await?;
-            let mut total = 0u64;
-            for node in nodes.iter().filter(|node| node.kind == NodeKind::File) {
-                let demand = *self.0.demand.lock().unwrap();
-                let selected = self
-                    .metadata_request(
-                        ContentMsg::SelectFile {
-                            offer: self.0.inventory.id,
-                            node: node.id,
-                            demand,
-                        },
-                        65536,
-                    )
-                    .await?;
-                let ContentMsg::FileSelected { offer, entry } = selected else {
-                    return Err(unavailable(Unavailable::InvalidData));
-                };
-                if offer != self.0.inventory.id
-                    || entry.id != node.id
-                    || entry.parent != node.parent
-                    || entry.name != node.name
-                    || entry.kind != NodeKind::File
-                {
-                    return Err(unavailable(Unavailable::InvalidData));
-                }
-                let ContentSize::Known(size) = entry.size else {
-                    return Err(unavailable(Unavailable::Unsupported));
-                };
-                self.update_progress(true, |_| {});
-                total = total
-                    .checked_add(size)
-                    .filter(|sum| *sum <= maximum)
-                    .ok_or_else(|| unavailable(Unavailable::LimitExceeded))?;
-            }
-            self.0.max_files.fetch_min(maximum, Ordering::AcqRel);
-            if !self.start_delivery() {
-                return Err(unavailable(Unavailable::Cancelled));
-            }
-            let mut progress = self.progress();
-            progress
-                .wait_for(|p| {
-                    matches!(
-                        p.phase,
-                        super::super::TransferPhase::Stored
-                            | super::super::TransferPhase::Failed
-                            | super::super::TransferPhase::Cancelled
-                    )
-                })
-                .await
-                .map_err(|_| unavailable(Unavailable::Cancelled))?;
-            if progress.borrow().phase != super::super::TransferPhase::Stored {
-                return Err(unavailable(progress.borrow().failure.unwrap_or(Unavailable::Cancelled)));
-            }
-            let data = self.0.batch.path().parent().unwrap().parent().unwrap().to_owned();
-            let id = self.0.batch.id();
-            tokio::task::spawn_blocking(move || super::super::Completed::restore(&data, id))
-                .await
-                .map_err(|_| unavailable(Unavailable::ReadFailed))?
-        }
-        .await;
-        if let Err(error) = &result {
-            self.fail_delivery(reason(error));
-            if !self.0.delivery_started.load(Ordering::Acquire) {
-                let remote = self.clone();
-                self.0.runtime.spawn(async move {
-                    remote.report_terminal().await;
-                });
-            }
-        }
-        result
-    }
+
     pub fn progress(&self) -> tokio::sync::watch::Receiver<super::super::TransferProgress> {
         self.0.progress.subscribe()
     }
     pub fn receipt(&self) -> Option<[u8; 32]> {
         *self.0.receipt.lock().unwrap()
-    }
-    /// Clipboard's configured file budget applies while discovering the tree;
-    /// DnD leaves the default unlimited file budget. Raw budgets stay separate.
-    pub fn set_file_budget(&self, bytes: u64) {
-        self.0.max_files.store(bytes, Ordering::Release);
     }
     pub(super) fn deadline(&self) -> tokio::time::Instant {
         *self.0.last_progress.lock().unwrap() + Duration::from_millis(NO_PROGRESS_MS)
@@ -202,6 +69,9 @@ impl Remote {
         if self.0.delivery_started.swap(true, Ordering::AcqRel) {
             return true;
         }
+        if let Some(at) = crate::timing::start() {
+            let _ = self.0.delivery_report.set(at);
+        }
         self.update_progress(true, |p| {
             p.phase = super::super::TransferPhase::Preparing;
             p.discovered = self.0.inventory.roots.len() as u64;
@@ -221,15 +91,11 @@ impl Remote {
                         .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
+                        remote.record_delivery(crate::timing::Outcome::Completed);
                         *remote.0.receipt.lock().unwrap() = Some(receipt);
                         remote.update_progress(true, |p| {
                             p.phase = super::super::TransferPhase::Stored;
                             p.enumerating = false;
-                        });
-                    } else {
-                        let batch = remote.0.batch.clone();
-                        remote.0.runtime.spawn_blocking(move || {
-                            let _ = batch.abandon();
                         });
                     }
                 }
@@ -298,9 +164,12 @@ impl Remote {
         {
             return;
         }
+        self.record_delivery(crate::timing::Outcome::Failed(failure));
         self.0.cancelled.store(true, Ordering::Release);
         self.0.changed.notify_waiters();
-        self.cancel_files(failure);
+        if let Some(files) = &self.0.files {
+            files.cancel();
+        }
         for slot in self.0.slots.lock().unwrap().values() {
             let mut state = slot.result.lock().unwrap();
             if state.is_none() {
@@ -313,10 +182,6 @@ impl Remote {
         self.update_progress(false, |p| {
             p.phase = super::super::TransferPhase::Failed;
             p.failure = Some(failure);
-        });
-        let batch = self.0.batch.clone();
-        self.0.runtime.spawn_blocking(move || {
-            let _ = batch.abandon();
         });
     }
     async fn begin_delivery(&self) -> io::Result<()> {
@@ -345,7 +210,51 @@ impl Remote {
         Ok(())
     }
     async fn deliver(&self) -> io::Result<[u8; 32]> {
-        self.begin_delivery().await?;
+        // The native OS provider owns every received file. This task requests
+        // hydration and observes completion; it never allocates a backing file.
+        let mut digest = blake3::Hasher::new();
+        digest.update(b"oink-native-delivery-v1");
+        // This digest identifies duplicate ACKs alongside DeliveryId; it is not
+        // content verification. TLS/QUIC AEAD covers bytes (2026-10-29 decision).
+        let mut file_bytes = 0u64;
+        if let Some(files) = &self.0.files {
+            files.prepare().await?;
+            let native = files.wait_native().await?;
+            let remote = self.clone();
+            let received = tokio::task::spawn_blocking(move || {
+                let check_remote = remote.clone();
+                let check: ReaderGuard = Arc::new(move || {
+                    if check_remote.0.cancelled.load(Ordering::Acquire) {
+                        Err(unavailable(Unavailable::Cancelled))
+                    } else {
+                        Ok(())
+                    }
+                });
+                native.download(&check, &|bytes, count| {
+                    remote.update_progress(true, |p| {
+                        p.phase = super::super::TransferPhase::Receiving;
+                        p.bytes = bytes;
+                        p.files_done = count;
+                    })
+                })
+            })
+            .await
+            .map_err(|_| unavailable(Unavailable::ReadFailed))??;
+            for file in &received {
+                digest.update(&file.node.0.to_le_bytes());
+                digest.update(&file.version.to_le_bytes());
+                digest.update(&file.size.to_le_bytes());
+                file_bytes = file_bytes
+                    .checked_add(file.size)
+                    .ok_or_else(|| unavailable(Unavailable::LimitExceeded))?;
+            }
+            self.update_progress(true, |p| {
+                p.files_done = received.len() as u64;
+                p.total_files = Some(p.files_done);
+            });
+        } else {
+            self.begin_delivery().await?;
+        }
         let mut wanted = Vec::new();
         for representation in self.0.inventory.wanted(self.0.target) {
             if representation.data.size().is_some()
@@ -355,93 +264,54 @@ impl Remote {
                 wanted.push((representation.id, self.request(representation.id)));
             }
         }
-        let nodes = self.expand().await?;
-        let mut files = Vec::new();
-        for node in nodes.iter().filter(|node| node.kind == NodeKind::File) {
-            // expand() starts each file as discovered. Asking again joins the
-            // same slot used by File Provider and native IStream readers.
-            let slot = self.file_request(node.id)?;
-            files.push(Self::wait_file(&slot).await?);
-        }
-        let mut inventory = self.0.inventory.clone();
         for (id, slot) in wanted {
             loop {
                 let changed = slot.changed.notified();
                 let result = *slot.result.lock().unwrap();
                 if let Some(result) = result {
-                    if let Err(failure) = result
-                        && (!matches!(
-                            failure,
-                            Unavailable::Superseded | Unavailable::Cancelled | Unavailable::NoProgress
-                        ) || (!files.is_empty()
-                            && matches!(*self.0.demand.lock().unwrap(), Demand::Clipboard)
-                            && matches!(failure, Unavailable::Superseded | Unavailable::NoSuchItem)))
-                    {
-                        // Conversion/read failures belong to this representation;
-                        // successful siblings still form a usable native item.
-                        // A retained disk file and a native clipboard byte format
-                        // have independent authority. The file can still complete
-                        // after the clipboard slot changed; record the unavailable
-                        // companion explicitly in the committed inventory instead
-                        // of revoking verified file bytes. Drop remains atomic.
-                        for rep in inventory
-                            .items
-                            .iter_mut()
-                            .flat_map(|item| &mut item.representations)
-                            .filter(|rep| rep.id == id)
+                    if let Err(failure) = result {
+                        // A failed companion format never revokes received files.
+                        if self.0.files.is_none()
+                            && matches!(
+                                failure,
+                                Unavailable::Superseded | Unavailable::Cancelled | Unavailable::NoProgress
+                            )
                         {
-                            rep.data = RepresentationData::Unavailable(failure);
+                            return Err(unavailable(failure));
                         }
-                    } else {
-                        result.map_err(unavailable)?;
+                        digest.update(&id.0.to_le_bytes());
+                        digest.update(&[failure as u8]);
                     }
                     break;
                 }
                 changed.await;
             }
         }
-        self.valid()?;
-        let nodes = {
-            let tree = self.0.tree.lock().unwrap();
-            nodes
-                .iter()
-                .map(|node| tree.nodes[&node.id].clone())
-                .collect::<Vec<_>>()
-        };
-        let total = files
-            .iter()
-            .try_fold(0u64, |sum, file| sum.checked_add(file.size))
-            .ok_or_else(|| unavailable(Unavailable::LimitExceeded))?;
-        let representations: Vec<_> = self
+        if self.0.cancelled.load(Ordering::Acquire) {
+            return Err(unavailable(Unavailable::Cancelled));
+        }
+        let mut representations: Vec<_> = self
             .0
             .representations
             .lock()
             .unwrap()
             .iter()
-            .map(|(id, (size, hash))| (*id, *size, *hash))
+            .map(|(id, bytes)| (*id, bytes.size))
             .collect();
+        representations.sort_by_key(|(id, _)| id.0);
         let total = representations
             .iter()
-            .try_fold(total, |sum, (_, size, _)| sum.checked_add(*size))
+            .try_fold(file_bytes, |sum, (id, size)| {
+                digest.update(&id.0.to_le_bytes());
+                digest.update(&size.to_le_bytes());
+                sum.checked_add(*size)
+            })
             .ok_or_else(|| unavailable(Unavailable::LimitExceeded))?;
         self.update_progress(false, |p| {
             p.total_bytes = Some(total);
             p.bytes = total;
+            p.enumerating = false;
         });
-        let manifest = Manifest {
-            inventory: crate::wire::updated_inventory(&self.0.wire_inventory, &inventory)
-                .map_err(|_| unavailable(Unavailable::InvalidData))?,
-            target: self.0.target,
-            nodes,
-            files,
-            representations,
-        };
-        let batch = self.0.batch.clone();
-        tokio::task::spawn_blocking(move || {
-            let bytes = manifest.encode()?;
-            batch.commit_manifest(&bytes)
-        })
-        .await
-        .map_err(|_| unavailable(Unavailable::ReadFailed))?
+        Ok(*digest.finalize().as_bytes())
     }
 }

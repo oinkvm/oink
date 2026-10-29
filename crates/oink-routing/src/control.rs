@@ -27,9 +27,30 @@ pub struct FocusLock {
     pub locked: bool,
 }
 
+/// Owner policy used to damp entry before focus reaches this device.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryProtection {
+    pub locked: bool,
+    pub game: bool,
+    pub passive_displays: Vec<String>,
+}
+
 /// Input effects carried by the current Input stream.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ControlMsg {
+    ApplicationFocus(crate::application_focus::Message),
+    EntryProtection {
+        state: EntryProtection,
+    },
+    /// Keyboard-source physical escape state, sent reliably to its current focus.
+    /// Focus changes release the old target and synchronize the new one.
+    LockEscape {
+        held: bool,
+    },
+    MovePointer {
+        epoch: u64,
+        target: DeviceId,
+    },
     Feel {
         profile: FeelProfile,
     },

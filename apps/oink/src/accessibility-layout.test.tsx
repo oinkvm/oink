@@ -63,7 +63,7 @@ it('removes every remote AX-missing screen from rendering and selection, then re
   const {container}=render(<App/>);
   await backend.harness!.settle();
   expect(container.querySelectorAll('.scr:not(.scr--group)')).toHaveLength(1);
-  expect(screen.getByRole('img',{name:'Accessibility permission missing, please grant it on that device'})).toBeDefined();
+  expect(screen.getByRole('img',{name:'Accessibility permission missing'})).toBeDefined();
   await act(async()=>{fireEvent.click(container.querySelector(`[data-ctx="device:${B}"] .dev__hit`)!);});
   expect(container.querySelector('.scr[data-selected]')).toBeNull();
   expect(backend.harness!.fixture.state().snapshot).toEqual(before);

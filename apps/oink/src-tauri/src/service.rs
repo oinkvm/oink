@@ -68,11 +68,9 @@ pub fn dispatch_args() -> Option<ExitCode> {
 /// Startup only; a Windows UI requests the SYSTEM launch broker exactly once.
 #[cfg(windows)]
 pub fn start_once(api: &RemoteApi, exe: &Path) -> Result<(), String> {
+    let mut seen_owner = false;
     match oink_agent::instance::is_running(api.data_dir()) {
-        Some(true) => {
-            api.hello().map_err(|_| "backend_unavailable".to_owned())?;
-            return validate_running_backend(api);
-        }
+        Some(true) => seen_owner = true,
         Some(false) => {
             oink_agent::backend::launch::start_backend(api.data_dir())
                 .map_err(|e| format!("UIAccess backend launch failed: {e}"))?;
@@ -82,15 +80,26 @@ pub fn start_once(api: &RemoteApi, exe: &Path) -> Result<(), String> {
     let _ = exe;
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
+        // A live backend may still be retrying its endpoint publication after
+        // Windows scanner denial. Keep reading the file while that owner lives;
+        // the launch deadline only bounds acquiring ownership, not publication.
+        let owned = match oink_agent::instance::is_running(api.data_dir()) {
+            Some(true) => {
+                seen_owner = true;
+                true
+            }
+            Some(false) if seen_owner => return Err("backend_unavailable".into()),
+            Some(false) if Instant::now() >= deadline => return Err("backend_start_timeout".into()),
+            Some(false) => false,
+            None => return Err("backend_ownership_unavailable".into()),
+        };
         api.reset_connections();
         match api.hello() {
-            Ok(_) if oink_agent::instance::is_running(api.data_dir()) == Some(true) => {
+            Ok(_) if owned => {
                 return validate_running_backend(api);
             }
-            Ok(_) if Instant::now() >= deadline => return Err("backend_ownership_unavailable".into()),
             Ok(_) => {}
             Err(error) if api.build_mismatch() => return Err(error.to_string()),
-            Err(error) if Instant::now() >= deadline => return Err(format!("后台启动超时：{error}")),
             Err(_) => {}
         }
         std::thread::sleep(Duration::from_millis(100));

@@ -7,6 +7,7 @@ use oink_foundation::input::MouseButton;
 
 #[derive(Clone, Default)]
 struct Drag {
+    received: Arc<Mutex<Vec<Arc<super::received::Received>>>>,
     export_required: Arc<std::sync::atomic::AtomicBool>,
     export_operation: Arc<Mutex<Option<DragOperation>>>,
     export_provider: Arc<Mutex<Option<Arc<dyn oink_clipboard::content::Provider>>>>,
@@ -20,6 +21,9 @@ struct Drag {
     inject: Arc<Mutex<Option<Injector>>>,
     offer: Arc<Mutex<Option<Vec<ClipData>>>>,
     began: Arc<Mutex<Option<DragSpec>>>,
+    begin_stage: Arc<std::sync::atomic::AtomicU8>,
+    begin_returned: Arc<std::sync::atomic::AtomicBool>,
+    begin_error: Arc<Mutex<Option<String>>>,
     calls: Arc<Mutex<Vec<&'static str>>>,
     begin_gate: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
     cancel_gate: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
@@ -31,12 +35,29 @@ struct Drag {
     critical_us: Arc<Mutex<Vec<u64>>>,
     start_gate: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
     begin_return: Arc<Mutex<Option<BoundaryGate>>>,
+    resume_offer: Arc<Mutex<Option<BoundaryGate>>>,
     resume_return: Arc<Mutex<Option<BoundaryGate>>>,
     unprobe_return: Arc<Mutex<Option<BoundaryGate>>>,
+    // Model native completion arriving after FinishSource has returned.
+    defer_source_end: Arc<std::sync::atomic::AtomicBool>,
+    pending_source_end: Arc<Mutex<Option<PlatformDndEvent>>>,
 }
 struct BoundaryGate {
     entered: std::sync::mpsc::Sender<()>,
     release: std::sync::mpsc::Receiver<()>,
+}
+fn watchdog_read<T>(weak: &std::sync::Weak<Mutex<T>>, read: impl FnOnce(&T) -> String) -> String {
+    let Some(value) = weak.upgrade() else {
+        return "gone".into();
+    };
+    // These probes run immediately before exit. Releasing the last native
+    // provider/reader reference here could itself block in teardown.
+    let value = std::mem::ManuallyDrop::new(value);
+    match value.try_lock() {
+        Ok(value) => read(&value),
+        Err(std::sync::TryLockError::WouldBlock) => "unavailable: WouldBlock".into(),
+        Err(std::sync::TryLockError::Poisoned(_)) => "unavailable: Poisoned".into(),
+    }
 }
 fn stop_at_boundary(slot: &Mutex<Option<BoundaryGate>>) {
     if let Some(gate) = slot.lock().unwrap().take() {
@@ -148,6 +169,7 @@ impl DndBackend for Drag {
         assert_eq!(*self.native.lock().unwrap(), Some(operation));
         self.unprobe();
         self.calls.lock().unwrap().push("resume");
+        stop_at_boundary(&self.resume_offer);
         *self.offer.lock().unwrap() = Some(self.native_items.lock().unwrap().clone());
         stop_at_boundary(&self.resume_return);
         true
@@ -174,14 +196,55 @@ impl DndBackend for Drag {
             .push(if accepted { "commit" } else { "source_cancel" });
         release().unwrap();
         *self.native.lock().unwrap() = None;
-        self.sink.lock().unwrap().as_ref().unwrap()(PlatformDndEvent::SourceEnded { operation, accepted });
+        let ended = PlatformDndEvent::SourceEnded { operation, accepted };
+        if self.defer_source_end.load(std::sync::atomic::Ordering::Acquire) {
+            *self.pending_source_end.lock().unwrap() = Some(ended);
+        } else {
+            self.sink.lock().unwrap().as_ref().unwrap()(ended);
+        }
         true
+    }
+    fn source_completion_is_async(&self) -> bool {
+        self.defer_source_end.load(std::sync::atomic::Ordering::Acquire)
     }
     fn release(&self) -> bool {
         self.calls.lock().unwrap().push("release");
         true
     }
     fn begin(&self, spec: DragSpec) -> Result<(), ClipboardError> {
+        self.begin_returned.store(false, std::sync::atomic::Ordering::Release);
+        self.begin_stage.store(1, std::sync::atomic::Ordering::Release);
+        let result = self.begin_observed(spec);
+        *self.begin_error.lock().unwrap() = result.as_ref().err().map(ToString::to_string);
+        self.begin_returned.store(true, std::sync::atomic::Ordering::Release);
+        result
+    }
+    fn cancel(&self) -> bool {
+        self.calls.lock().unwrap().push("cancel");
+        if let Some(gate) = self.cancel_gate.lock().unwrap().take() {
+            gate.recv().expect("release delayed Cancel");
+        }
+        self.inject_button(false);
+        self.end(false);
+        true
+    }
+}
+impl Drag {
+    async fn take_resumed_offer(&self, phase: &str) -> Vec<ClipData> {
+        // The resume call marker precedes native offer publication. Consume the
+        // actual offer while checking readiness, releasing its mutex each poll.
+        // If it never arrives, the scenario watchdog dumps state without an
+        // Option panic under this mutex poisoning the native callback thread.
+        let mut offer = None;
+        common::watchdog::until(phase, || {
+            offer = self.offer.lock().unwrap().take();
+            offer.is_some()
+        })
+        .await;
+        offer.expect("watchdog wait observed the resumed native offer")
+    }
+
+    fn begin_observed(&self, spec: DragSpec) -> Result<(), ClipboardError> {
         self.calls.lock().unwrap().push("begin");
         if let Some(gate) = self.begin_gate.lock().unwrap().take() {
             gate.recv().expect("release delayed Begin");
@@ -190,6 +253,7 @@ impl DndBackend for Drag {
         let mut press_result = Ok(());
         let started = Instant::now();
         let mut critical = || {
+            self.begin_stage.store(3, std::sync::atomic::Ordering::Release);
             let input = self.input.lock().unwrap().clone().unwrap();
             let centre = input.cursor_position().unwrap();
             self.calls.lock().unwrap().push("placed");
@@ -205,12 +269,14 @@ impl DndBackend for Drag {
                 .expect("operation-keyed source press")(spec.operation, cursor);
             received = press_result.is_ok() && (cursor.x - centre.x).abs() <= 24. && (cursor.y - centre.y).abs() <= 24.;
         };
+        self.begin_stage.store(2, std::sync::atomic::Ordering::Release);
         if let Some(start) = self.source_start.lock().unwrap().clone() {
             let dropped = start(&mut critical).map_err(ClipboardError::Platform)?;
             self.dropped.store(dropped, std::sync::atomic::Ordering::Relaxed);
         } else {
             critical();
         }
+        self.begin_stage.store(4, std::sync::atomic::Ordering::Release);
         self.critical_us
             .lock()
             .unwrap()
@@ -219,21 +285,74 @@ impl DndBackend for Drag {
         if !received {
             return Err(ClipboardError::Platform("source press missed 48px window".into()));
         }
+        if let Some(namespace) = spec.files.as_ref().and_then(|files| files.namespace()) {
+            self.begin_stage.store(5, std::sync::atomic::Ordering::Release);
+            let received = super::received::Received::bind(namespace)
+                .map_err(|error| ClipboardError::Platform(error.to_string()))?;
+            self.received.lock().unwrap().push(received);
+        }
         *self.began.lock().unwrap() = Some(spec);
+        self.begin_stage.store(6, std::sync::atomic::Ordering::Release);
         stop_at_boundary(&self.begin_return);
         Ok(())
     }
-    fn cancel(&self) -> bool {
-        self.calls.lock().unwrap().push("cancel");
-        if let Some(gate) = self.cancel_gate.lock().unwrap().take() {
-            gate.recv().expect("release delayed Cancel");
-        }
-        self.inject_button(false);
-        self.end(false);
-        true
+    fn register_watchdog(&self, dev: &Dev) {
+        let node = dev.node.dnd_watchdog_probe_for_test();
+        let input = dev.input.watchdog_probe_for_test();
+        let native = self.watchdog_probe();
+        common::watchdog::on_timeout(format!("DND {} {:?}", dev.name, dev.node.id()), move || {
+            format!("{}\n{}\n{}", node(), input(), native())
+        });
     }
-}
-impl Drag {
+    fn watchdog_probe(&self) -> impl Fn() -> String + Send + Sync + 'static {
+        let stage = Arc::downgrade(&self.begin_stage);
+        let returned = Arc::downgrade(&self.begin_returned);
+        let error = Arc::downgrade(&self.begin_error);
+        let began = Arc::downgrade(&self.began);
+        let calls = Arc::downgrade(&self.calls);
+        let native = Arc::downgrade(&self.native);
+        let exported = Arc::downgrade(&self.export_operation);
+        let provider = Arc::downgrade(&self.export_provider);
+        let received = Arc::downgrade(&self.received);
+        let offer = Arc::downgrade(&self.offer);
+        let probing = Arc::downgrade(&self.probing);
+        let probe_operation = Arc::downgrade(&self.probe_operation);
+        move || {
+            let stage = stage
+                .upgrade()
+                .map(|s| match s.load(std::sync::atomic::Ordering::Acquire) {
+                    0 => "idle",
+                    1 => "begin entered",
+                    2 => "source start wait",
+                    3 => "source press",
+                    4 => "press complete",
+                    5 => "binding received",
+                    6 => "native published",
+                    _ => "unknown",
+                });
+            let returned = returned.upgrade().map(|v| v.load(std::sync::atomic::Ordering::Acquire));
+            let probing = probing.upgrade().map(|v| v.load(std::sync::atomic::Ordering::Acquire));
+            format!(
+                "fixture begin_stage={stage:?} begin_returned={returned:?} begin_error={}\nbegan={} calls={} native_source={} export={} export_provider={}\nprobing={probing:?} probe_operation={} next_probe_offer={}\nreceived={}",
+                watchdog_read(&error, |v| format!("{v:?}")),
+                watchdog_read(&began, |v| format!(
+                    "{:?}",
+                    v.as_ref().map(|s| (s.operation, s.files.is_some(), s.native.is_some()))
+                )),
+                watchdog_read(&calls, |v| format!("{v:?}")),
+                watchdog_read(&native, |v| format!("{v:?}")),
+                watchdog_read(&exported, |v| format!("{v:?}")),
+                watchdog_read(&provider, |v| v.is_some().to_string()),
+                watchdog_read(&probe_operation, |v| format!("{v:?}")),
+                watchdog_read(&offer, |v| format!("{:?}", v.as_ref().map(Vec::len))),
+                watchdog_read(&received, |v| v
+                    .iter()
+                    .map(|r| r.watchdog_snapshot())
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            )
+        }
+    }
     fn exported(&self, provider: Arc<dyn oink_clipboard::content::Provider>) {
         *self.export_provider.lock().unwrap() = Some(provider);
         let operation = self.export_operation.lock().unwrap().unwrap();
@@ -252,6 +371,7 @@ impl Drag {
     async fn attach(dev: &Dev) -> Self {
         let drag = Self::default();
         *drag.input.lock().unwrap() = Some(dev.input.clone());
+        drag.register_watchdog(dev);
         dev.node.start_dnd_backend(Box::new(drag.clone())).unwrap();
         drag.wait_started(dev).await;
         drag
@@ -285,6 +405,93 @@ impl Drag {
 }
 
 #[test]
+fn watchdog_dumps_blocked_dnd_fixture() {
+    const CHILD: &str = "OINK_DND_WATCHDOG_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let dev = start(root.path(), "watchdog").await;
+            let drag = Drag::attach(&dev).await;
+            // Arm only after startup: this tests failure diagnostics, not a
+            // scheduling budget or a reproduction of the original hang.
+            let _scenario = common::watchdog::Scenario::with_limit(
+                format!("{}::watchdog fixture", module_path!()),
+                Duration::from_millis(50),
+                "blocked DND fixture",
+            );
+            drag.register_watchdog(&dev);
+            let mut waiting =
+                std::pin::pin!(drag.take_resumed_offer("blocked DND fixture: waiting for resumed source offer"));
+            let early = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(waiting.as_mut(), cx).is_ready())
+            })
+            .await;
+            assert!(!early, "a missing recross offer must wait for watchdog diagnostics");
+            let _began = drag.began.lock().unwrap();
+            let _calls = drag.calls.lock().unwrap();
+            loop {
+                std::thread::park();
+            }
+        });
+        unreachable!();
+    }
+    let test = format!("{}::watchdog_dumps_blocked_dnd_fixture", module_path!());
+    let test = test.split_once("::").unwrap().1;
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test])
+        .env(CHILD, "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("DND diagnostics prevented watchdog termination");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(101));
+    let message = String::from_utf8(output.stderr).unwrap();
+    for expected in [
+        "SCENARIO WATCHDOG",
+        "blocked DND fixture",
+        "WATCHDOG DIAGNOSTIC: DND",
+        "input_status=",
+        "target_grant=",
+        "native_publications=",
+        "admission_leases=",
+        "source_registry leases=",
+        "grants state=",
+        "native_input=",
+        "paused:",
+        "begin_stage=",
+        "begin_returned=",
+        "begin_error=",
+        "waiting for resumed source offer",
+        "next_probe_offer=None",
+        "began=unavailable: WouldBlock",
+        "calls=unavailable: WouldBlock",
+    ] {
+        assert!(message.contains(expected), "missing {expected}: {message}");
+    }
+    // A stalled input owner is a supported diagnostic result, including under
+    // heavy load; the probe's 50 ms bound is not a scheduling assertion.
+    assert!(
+        message.contains("router_dnd unavailable:")
+            || (message.contains("router_dnd state=") && message.contains("source_sessions=")),
+        "{message}"
+    );
+}
+
+#[test]
 fn drag_attachment_waits_for_backend_start_to_return() {
     common::watchdog::run(
         module_path!(),
@@ -294,6 +501,7 @@ fn drag_attachment_waits_for_backend_start_to_return() {
             let root = tempfile::tempdir().unwrap();
             let dev = start(root.path(), "gated").await;
             let drag = Drag::default();
+            drag.register_watchdog(&dev);
             let (release, gate) = std::sync::mpsc::channel();
             *drag.start_gate.lock().unwrap() = Some(gate);
             dev.node.start_dnd_backend(Box::new(drag.clone())).unwrap();
@@ -719,6 +927,50 @@ enum RecrossBoundary {
     Unprobe,
 }
 #[test]
+fn recross_waits_for_resumed_offer_publication() {
+    common::watchdog::run(
+        module_path!(),
+        "recross_waits_for_resumed_offer_publication",
+        Some(2),
+        async {
+            let source = Drag::default();
+            common::watchdog::on_timeout("delayed resume offer", source.watchdog_probe());
+            let operation = DragOperation::new();
+            let items = vec![ClipData::Text("resumed native offer".into())];
+            *source.native.lock().unwrap() = Some(operation);
+            *source.native_items.lock().unwrap() = items.clone();
+            // Reproduce preemption after the call marker but before the fake
+            // provider publishes its next offer. No scheduling deadline decides
+            // whether the consumer can proceed.
+            let (entered, release) = boundary(&source.resume_offer);
+            let backend = source.clone();
+            let worker = std::thread::spawn(move || backend.resume_source(operation));
+            reached(entered).await;
+            assert_eq!(*source.calls.lock().unwrap(), ["resume"]);
+            assert!(source.offer.lock().unwrap().is_none());
+            let mut waiting = std::pin::pin!(source.take_resumed_offer("resumed source published next probe offer"));
+            let early = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    std::future::Future::poll(waiting.as_mut(), cx)
+                })))
+            })
+            .await;
+            // Release and join even when exercising the old panicking reader,
+            // so the red regression leaves no blocked provider behind.
+            release.send(()).unwrap();
+            let resumed = worker.join();
+            assert!(
+                matches!(early, Ok(std::task::Poll::Pending)),
+                "recross must wait for offer publication after recording resume"
+            );
+            assert!(resumed.unwrap());
+            assert_eq!(waiting.await, items);
+            assert!(!source.offer.is_poisoned());
+        },
+    );
+}
+
+#[test]
 fn recross_before_native_boundary_completion_preserves_next_probe() {
     common::watchdog::run(
         module_path!(),
@@ -846,7 +1098,13 @@ async fn file_recross_with_boundary(target_input: bool, abandon_probe: bool, gat
             let mut early_probe = None;
             if let Some((entered, release)) = resume_gate {
                 reached(entered).await;
-                early_probe = Some(source.offer.lock().unwrap().take().unwrap());
+                early_probe = Some(
+                    source
+                        .take_resumed_offer(&format!(
+                            "recross {crossing} {gate:?}: gated resume published next probe offer"
+                        ))
+                        .await,
+                );
                 os_move_xy(&input.input, 0., -5000.);
                 release.send(()).unwrap();
             }
@@ -862,7 +1120,11 @@ async fn file_recross_with_boundary(target_input: bool, abandon_probe: bool, gat
                 let items = if let Some(items) = early_probe {
                     items
                 } else {
-                    let items = source.offer.lock().unwrap().take().unwrap();
+                    let items = source
+                        .take_resumed_offer(&format!(
+                            "recross {crossing} {gate:?}: resumed source published next probe offer"
+                        ))
+                        .await;
                     os_move_xy(&input.input, 0., -5000.);
                     items
                 };
@@ -1364,4 +1626,57 @@ fn exported_promise_whole_delivery_survives_source_release_and_return_to_source(
             }
         },
     );
+}
+
+#[path = "dnd_slow_source.rs"]
+mod slow_source;
+
+#[test]
+fn sharing_off_clears_an_orphan_catcher_even_when_routing_is_idle() {
+    common::watchdog::run(module_path!(), "sharing off clears orphan catcher", Some(2), async {
+        let root = tempfile::tempdir().unwrap();
+        let dev = start(root.path(), "idle-catcher").await;
+        let drag = Drag::attach(&dev).await;
+        assert!(!dev.node.input_status().unwrap().dnd_active);
+        // Model the native surface surviving an earlier failed retirement. The
+        // router is idle, so it has no active probe to generate an Unprobe for.
+        drag.probing.store(true, std::sync::atomic::Ordering::Release);
+        api(&dev.node, |node| {
+            node.set_local_paused("00000000-0000-4000-8000-000000001301".into(), true)
+        })
+        .await
+        .unwrap();
+        let cleared = tokio::time::timeout(Duration::from_secs(2), async {
+            while drag.probing.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(dev.node.input_status().unwrap().paused);
+        dev.node.shutdown().await;
+        assert!(cleared, "sharing off did not retire an orphan native catcher");
+    });
+}
+
+#[test]
+fn peer_pause_retires_the_held_source_catcher() {
+    common::watchdog::run(module_path!(), "peer pause retires held catcher", Some(4), async {
+        let root = tempfile::tempdir().unwrap();
+        let (a, b, source, target) = drag_pair(root.path()).await;
+        begin_drag(&a, &b, &source, &target, vec![ClipData::Text("held source".into())]).await;
+        assert!(source.probing.load(std::sync::atomic::Ordering::Acquire));
+        api(&b.node, |node| {
+            node.set_local_paused("00000000-0000-4000-8000-000000001302".into(), true)
+        })
+        .await
+        .unwrap();
+        common::watchdog::until("paused peer cancels and retires held source", || {
+            source.native.lock().unwrap().is_none() && !source.probing.load(std::sync::atomic::Ordering::Acquire)
+        })
+        .await;
+        assert!(source.calls.lock().unwrap().contains(&"source_cancel"));
+        a.node.shutdown().await;
+        b.node.shutdown().await;
+    });
 }

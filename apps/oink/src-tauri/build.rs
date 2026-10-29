@@ -12,6 +12,22 @@ fn main() {
     }
     #[cfg(any(target_os = "macos", windows))]
     if target_os == "windows" {
+        #[cfg(windows)]
+        {
+            println!("cargo:rerun-if-changed=native/package-drop-windows.cpp");
+            println!("cargo:rerun-if-changed=native/package-drop-windows.h");
+            cc::Build::new()
+                .cpp(true)
+                // Keep the receiver standalone on clean Windows installations;
+                // C++ containers must not add an MSVCP140.dll prerequisite.
+                .static_crt(true)
+                .file("native/package-drop-windows.cpp")
+                .flag("/std:c++17")
+                .compile("oink-package-drop");
+            for library in ["ole32", "shell32", "comctl32", "user32", "uuid"] {
+                println!("cargo:rustc-link-lib={library}");
+            }
+        }
         // Link the same Common Controls v6 manifest into every executable,
         // including libtest harnesses. Tauri's binary-only .res manifest leaves
         // library unit tests loading v5, which lacks TaskDialogIndirect and

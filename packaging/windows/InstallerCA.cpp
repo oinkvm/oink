@@ -1,5 +1,5 @@
 // MSI stops its owned service; deferred validation waits for normal user shutdown.
-// Immediate client preparation requests the existing normal-user Quit path.
+// Immediate execute-sequence preparation requests the existing normal-user Quit path.
 // Product identifiers are generated from packaging/identity.json by build.py.
 #include <windows.h>
 #include <msiquery.h>
@@ -276,7 +276,7 @@ static graceful_stop::State user_sessions(const std::wstring& directory) {
 static bool request_user_stop(MSIHANDLE install, const std::wstring& directory) {
     // Use only the actual caller's token. Never borrow Explorer/another session,
     // stop a service, send window-close/input messages, or terminate any process.
-    // Quiet opt-in immediate actions may run in the server while impersonating
+    // Execute-sequence immediate actions may run in the server while impersonating
     // the original caller; CreateProcessAsUser preserves that exact user token.
     HANDLE caller = nullptr;
     if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY | TOKEN_DUPLICATE, TRUE, &caller)) {
@@ -339,7 +339,7 @@ static UINT user_session_gate(MSIHANDLE install) {
         });
     if (state == graceful_stop::State::canceled) return ERROR_INSTALL_USEREXIT;
     const bool busy = state != graceful_stop::State::clear;
-    // This is an early user-context request, not the replacement authority.
+    // This pre-InstallValidate user-context request is not replacement authority.
     // Settings/basic UI and SYSTEM installs may not have a usable user token;
     // MSI StopServices triggers each backend's existing SCM stop subscription.
     // CheckQuiescence below observes the resulting normal cleanup in all sessions.
@@ -449,5 +449,18 @@ extern "C" __declspec(dllexport) UINT __stdcall CleanupUserData(MSIHANDLE instal
     user_cleanup::profiles(ID_DATA_DIRECTORY, [install](const std::wstring& path, const wchar_t* operation, DWORD error) {
         cleanup_log(install, path, operation, error);
     });
+    return ERROR_SUCCESS;
+}
+
+// The archive retained by explicit installation survives MSI file removal. The
+// embedded script rechecks ownership, exact device identity, hash and trust.
+#include "microphone-cleanup.h"
+#include "EmbeddedPowerShell.h"
+extern "C" __declspec(dllexport) UINT __stdcall CleanupMicrophone(MSIHANDLE install) {
+    wchar_t system[MAX_PATH]{};
+    if (!GetSystemDirectoryW(system, MAX_PATH)) return ERROR_SUCCESS;
+    std::wstring executable = std::wstring(system) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
+    DWORD code = embedded_powershell::run(executable, MICROPHONE_CLEANUP, system);
+    if (code) cleanup_log(install, L"VB-CABLE", L"managed microphone cleanup", code);
     return ERROR_SUCCESS;
 }

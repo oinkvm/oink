@@ -4,9 +4,11 @@ import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 import { agent } from '../api/store';
 import { pairingApi } from '../api/pairing';
 import { usePairing } from './usePairing';
+import { toast } from 'oink-ui';
+import { setLanguage } from '../i18n';
 import type { PairingEvent } from '../api/pairing';
 import type { Overview } from '../api/types';
-beforeEach(() => agent.adopt('overview', { this_device: { id: 'local' } } as Overview));
+beforeEach(() => { setLanguage('en'); vi.mocked(toast).mockClear(); agent.adopt('overview', { this_device: { id: 'local' } } as Overview); });
 vi.mock('oink-ui', () => ({ speed: () => 1, toast: vi.fn() }));
 afterEach(() => { cleanup(); agent.reset(); localStorage.clear(); vi.restoreAllMocks(); });
 describe('durable pairing replay', () => {
@@ -22,6 +24,7 @@ describe('durable pairing replay', () => {
     renderHook(() => usePairing(true));
     await waitFor(() => expect(ack).toHaveBeenCalledWith('9007199254740993'));
     expect(subscribe).toHaveBeenCalledWith('9007199254740992');
+    expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Pairing failed' }));
     await waitFor(() => expect(agent.get().pairingEvents).toEqual([]));
   });
   it('leaves durable replay to the main window', () => {

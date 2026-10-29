@@ -94,6 +94,7 @@ struct Window {
     layer: Retained<CALayer>,
 }
 struct Ui {
+    reported_visibility: Option<(usize, usize)>,
     owner: u64,
     desired: usize,
     generation: u64,
@@ -223,6 +224,7 @@ fn apply(mtm: MainThreadMarker, generation: u64, owner: u64, frames: Vec<Frame>,
                 }
             }
             *ui = Some(Ui {
+                reported_visibility: None,
                 owner,
                 desired: 0,
                 generation,
@@ -324,6 +326,12 @@ fn apply(mtm: MainThreadMarker, generation: u64, owner: u64, frames: Vec<Frame>,
                 level = w.panel.level(), frame = ?w.panel.frame(), "projection panel presented");
         }
         CATransaction::commit();
+        let visible = ui.windows.iter().filter(|w| w.panel.isVisible()).count();
+        let visibility = (ui.desired, visible);
+        if ui.reported_visibility != Some(visibility) {
+            tracing::info!(requested = ui.desired, visible, "projection native panel visibility");
+            ui.reported_visibility = Some(visibility);
+        }
     });
 }
 

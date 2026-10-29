@@ -7,7 +7,7 @@ import type { DeviceCardsView } from './api/cards';
 import type { Layout, Placement } from './api/types';
 import { cameraStore } from './arrange/cameraStore';
 import { setLanguage } from './i18n';
-import { profileHarness } from './arrange/profileHarness';
+import { profileHarness, snapshotOf } from './arrange/profileHarness';
 import { diagonalComputers } from './arrange/diagonalComputers.fixture';
 
 // The contract fixture adopts committed placements exactly; compaction is the editor's.
@@ -112,6 +112,7 @@ it('saves the compacted layout for a manual drag as one undo step', async () => 
   await dragBeta(0.1);
   expect(saved()).toHaveLength(1);
   expect(gapOf(saved()[0])).toBeCloseTo(0, 9);
+  expect(saved()[0].find(p => p.device === A)).toEqual(snapshotOf(layout()).placements.find(p => p.device === A));
   const undo = screen.getByRole('button', { name: 'Undo' }) as HTMLButtonElement;
   await act(async () => { fireEvent.click(undo); });
   await backend.harness!.settle();
@@ -148,40 +149,12 @@ describe('turning auto-compact on', () => {
   const start = (value: Layout) => { agent.adopt('layout', value); backend.harness!.stop(); backend.harness = profileHarness({ layout: value }); };
   const flip = async () => { await act(async () => { fireEvent.click(toggle()); }); await backend.harness!.settle(); };
 
-  it('closes the reported diagonal gap corner to corner in one undoable commit', async () => {
+  it('only changes the preference, even when computers have a diagonal gap', async () => {
     start(diagonalComputers);
     render(<App/>);
     await flip(); await flip();
-    expect(saved()).toHaveLength(1);
-    const left = saved()[0].find(p => p.device === A)!, right = saved()[0].find(p => p.device === B)!;
-    expect(left.origin.x + 1728 * left.scale).toBe(right.origin.x);
-    expect(left.origin.y + 1117 * left.scale).toBe(right.origin.y);
-    expect(right.origin).toEqual(diagonalComputers.geometry.screens[0].origin);
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Undo' })); });
-    await backend.harness!.settle();
-    expect(saved()).toHaveLength(2);
-    expect(saved()[1].find(p => p.device === A)!.origin).toEqual(diagonalComputers.geometry.screens[1].origin);
-    expect(saved()[1].find(p => p.device === B)!.origin).toEqual(diagonalComputers.geometry.screens[0].origin);
-  });
-
-  it('compacts once in identity order as one undo step; turning it off changes nothing', async () => {
-    render(<App/>);
-    await flip(); // off
-    expect(toggle().getAttribute('aria-pressed')).toBe('false');
     expect(saved()).toEqual([]);
-    await flip(); // on
-    expect(toggle().getAttribute('aria-pressed')).toBe('true');
-    expect(backend.harness!.of('commit_arrangement').map(r => r.params!.native_plan_tokens)).toEqual([[]]);
-    // Alpha sorts first and closes its gap to Beta; there is no anchor.
-    expect(x(saved()[0], A)).toBeCloseTo(.2, 9);
-    expect(gapOf(saved()[0])).toBeCloseTo(0, 9);
-    const undo = screen.getByRole('button', { name: 'Undo' }) as HTMLButtonElement;
-    await act(async () => { fireEvent.click(undo); });
-    await backend.harness!.settle();
-    expect(backend.harness!.of('replay_arrangement').map(r => r.params!.direction)).toEqual(['undo']);
-    expect(x(saved()[1], B)).toBeCloseTo(1.2, 12);
-    expect(undo.disabled).toBe(true);
-    expect(toggle().getAttribute('aria-pressed')).toBe('true');
+    expect((screen.getByRole('button', { name: 'Undo' }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it('only turns on when the layout is already compact', async () => {
@@ -201,4 +174,72 @@ describe('turning auto-compact on', () => {
     await flip();
     expect(saved()).toEqual([]);
   });
+});
+
+it('publishes a rigid projection on press before pointer movement', async () => {
+  render(<App/>);
+  const tile = document.querySelector('.scr[aria-label^="Beta,"]')!;
+  fireEvent.pointerDown(tile, { button: 0, clientX: 600, clientY: 300 });
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
+  const frames = backend.harness!.of('preview_layout_projection');
+  expect(frames.some(r => r.params?.ended === false)).toBe(true);
+  fireEvent.pointerUp(tile);
+});
+
+it('cancels a held drag when another computer hotplugs instead of saving that automatic geometry', async () => {
+  render(<App/>);
+  const display = document.querySelector('.scr[aria-label^="Beta,"]')!;
+  const zoom = cameraStore.get()!.zoom;
+  fireEvent.pointerDown(display, { button: 0, clientX: 600, clientY: 300 });
+  fireEvent.pointerMove(display, { clientX: 600 + .1 * 4096 * zoom, clientY: 300 });
+  const changed = layout();
+  changed.geometry.screens[0].size.w *= 2;
+  changed.geometry.screens[0].display.bounds.w *= 2;
+  await act(async () => {
+    agent.adopt('layout', changed);
+    agent.adopt('layoutProfiles', { ...backend.harness!.fixture.state(), sequence: '999', snapshot: snapshotOf(changed) });
+  });
+  await act(async () => { fireEvent.pointerUp(display); });
+  await backend.harness!.settle();
+  expect(saved()).toEqual([]);
+});
+
+it.each([false, true])('adopts remote hotplug repair and topology restore without compacting or saving, held=%s', async held => {
+  const before = layout([
+    { device: A, origin: { x: 0, y: -1080 / 1920 }, scale: 1 / 1920 },
+    { device: B, origin: { x: 0, y: 0 }, scale: 1 / 1920 },
+  ]);
+  agent.adopt('layout', before);
+  backend.harness!.stop();
+  const h = backend.harness = profileHarness({ layout: before });
+  const original = structuredClone(h.fixture.state().snapshot!);
+  const catalog = h.fixture.state().catalog_token;
+  render(<App/>);
+  const tile = document.querySelector('.scr[aria-label^="Beta,"]')!;
+  if (held) fireEvent.pointerDown(tile, { button: 0, clientX: 600, clientY: 300 });
+
+  // Replay the observed sequence: owner keeps its anchor, a new upper screen
+  // pushes the other computer up; unplug leaves that repair until profile restore.
+  const plugged = structuredClone(original);
+  const extra = { device: B, display: 'extra' };
+  plugged.native.find(n => n.device === B)!.screens.push({ screen: extra,
+    origin: { x: 0, y: -1080 }, size: { w: 1920, h: 1080 } });
+  plugged.disabled.push({ screen: extra, disabled: false });
+  plugged.placements.find(p => p.device === A)!.origin.y = -2160 / 1920;
+  const unplugged = structuredClone(original);
+  unplugged.placements = structuredClone(plugged.placements);
+  for (const next of [plugged, unplugged, original]) {
+    await act(async () => {
+      h.fixture.replaceCurrent(next);
+      agent.receive({ type: 'layout', data: { ...h.fixture.layout(), source: 'default' } });
+    });
+    await h.settle();
+    expect(h.of('commit_arrangement')).toEqual([]);
+    expect(h.fixture.state().catalog_token).toBe(catalog);
+    expect(h.fixture.state().snapshot!.placements).toEqual(next.placements);
+  }
+  if (held) await act(async () => { fireEvent.pointerUp(tile); });
+  expect(h.of('commit_arrangement')).toEqual([]);
+  expect(h.of('preview_system_arrangement')).toEqual([]);
+  expect((screen.getByRole('button', { name: 'Undo' }) as HTMLButtonElement).disabled).toBe(true);
 });

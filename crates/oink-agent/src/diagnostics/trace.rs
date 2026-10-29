@@ -49,6 +49,21 @@ fn clipboard_numeric_field(name: &str) -> bool {
     )
 }
 
+// Reviewed native promise timing scalars. Keep their admission target-scoped;
+// Debug, strings and booleans cannot stand in for clocks or metadata numbers.
+fn promise_numeric_field(name: &str) -> bool {
+    matches!(
+        name,
+        "file_promise_event"
+            | "promise_native_sequence"
+            | "promise_at_us"
+            | "promise_delay_us"
+            | "file_size"
+            | "file_mtime_ns"
+            | "file_kind"
+    )
+}
+
 fn provider_numeric_field(name: &str) -> bool {
     matches!(
         name,
@@ -59,6 +74,102 @@ fn provider_numeric_field(name: &str) -> bool {
             | "placeholder_refill"
             | "placeholder_blocked"
     )
+}
+
+// Numeric-only schema shared with macos/dnd/drop_trace.rs. The recorder never
+// accepts paths, names, native type strings or free-form errors for this event.
+fn drop_numeric_field(name: &str) -> bool {
+    matches!(
+        name,
+        "dnd_drop_schema"
+            | "dnd_drop_total"
+            | "dnd_drop_truncated"
+            | "dnd_drop_provider"
+            | "dnd_drop_placeholder"
+            | "dnd_drop_offered_within"
+            | "dnd_drop_offered_outside"
+            | "dnd_drop_mask_contexts"
+            | "dnd_drop_hover_mask_known"
+            | "dnd_drop_end_operation"
+            | "dnd_drop_dropped"
+            | "dnd_drop_publication_enter_us"
+            | "dnd_drop_publication_release_us"
+            | "dnd_drop_publication_end_us"
+            | "dnd_drop_enter_trigger"
+            | "dnd_drop_enter_lag_us"
+            | "dnd_drop_release_lag_us"
+            | "dnd_drop_enter_cleanup"
+            | "dnd_drop_release_cleanup"
+            | "dnd_drop_release_observed"
+            | "dnd_drop_cancel_requested"
+            | "dnd_drop_over_source"
+    )
+}
+fn windows_drop_numeric_field(name: &str) -> bool {
+    matches!(
+        name,
+        "dnd_win_drop_schema"
+            | "dnd_win_drop_dropped"
+            | "dnd_win_drop_offered"
+            | "dnd_win_drop_hresult"
+            | "dnd_win_drop_effect"
+            | "dnd_win_drop_feedback"
+            | "dnd_win_drop_feedback_calls"
+            | "dnd_win_drop_feedback_seen"
+            | "dnd_win_drop_enters"
+            | "dnd_win_drop_leaves"
+            | "dnd_win_drop_continue"
+            | "dnd_win_drop_keys"
+            | "dnd_win_drop_cancel"
+            | "dnd_win_drop_escape"
+            | "dnd_win_drop_elapsed_us"
+            | "dnd_win_drop_async_started"
+            | "dnd_win_drop_async_ended"
+            | "dnd_win_drop_async_result"
+            | "dnd_win_drop_async_effect"
+            | "dnd_win_drop_performed"
+            | "dnd_win_drop_logical"
+            | "dnd_win_drop_paste"
+            | "dnd_win_drop_truncated"
+    )
+}
+fn windows_drop_formats(value: &str) -> bool {
+    value.len() <= 16384
+        && serde_json::from_str::<Vec<[i64; 10]>>(value).is_ok_and(|rows| {
+            rows.len() <= 64
+                && rows.iter().all(|row| {
+                    (0..=65535).contains(&row[0])
+                        && (0..=12).contains(&row[1])
+                        && i32::try_from(row[2]).is_ok()
+                        && u32::try_from(row[3]).is_ok()
+                        && u32::try_from(row[4]).is_ok()
+                        && (0..=1).contains(&row[5])
+                        && row[6] >= 0
+                        && i32::try_from(row[7]).is_ok()
+                        && row[8] >= 0
+                        && i32::try_from(row[9]).is_ok()
+                })
+        })
+}
+fn drop_items(value: &str) -> bool {
+    value.len() <= 32768
+        && serde_json::from_str::<Vec<[u64; 17]>>(value).is_ok_and(|rows| {
+            rows.len() <= 256
+                && rows.iter().enumerate().all(|(index, row)| {
+                    row[0] == index as u64
+                        && (1..=2).contains(&row[1])
+                        && row[16] <= 2
+                        && [2, 9].into_iter().all(|start| {
+                            row[start] <= 4
+                                && row[start + 1] <= 2
+                                && row[start + 2] <= 2
+                                && row[start + 3] <= 1
+                                && row[start + 4] <= 1
+                                && row[start + 5] <= 65535
+                                && row[start + 6] <= 65535
+                        })
+                })
+        })
 }
 
 fn allowed(name: &str) -> bool {
@@ -106,6 +217,8 @@ fn allowed(name: &str) -> bool {
             | "dnd_preview_hotspot_y"
             | "dnd_preview_scale"
             | "dnd_phase"
+            | "dnd_preparation_stage"
+            | "dnd_preparation_timeout"
             | "dnd_formats"
             | "dnd_formats_complete"
             | "dnd_representation_schema"
@@ -263,7 +376,14 @@ fn allowed(name: &str) -> bool {
 }
 impl Scalars {
     fn add(&mut self, f: &Field, v: f64) {
-        let permitted = if self.2 == "oink_windows_external_input" {
+        let permitted = if self.4 == "oink_arrangement" {
+            matches!(
+                f.name(),
+                "win32_error" | "display_paths" | "display_modes" | "query_flags" | "visible_displays" | "source_index"
+            )
+        } else if self.4 == "oink_microphone_routing" {
+            f.name() == "to_device_key" && (0.0..281_474_976_710_656.0).contains(&v)
+        } else if self.2 == "oink_windows_external_input" {
             matches!(
                 f.name(),
                 "move_count"
@@ -362,6 +482,50 @@ impl Scalars {
                     | "decode_errors"
                     | "buffered_ms"
                     | "arrival_jitter_ms"
+                    | "output_deadline_misses"
+                    | "output_worst_shortfall_us"
+                    | "callback_over_budget"
+                    | "callback_min_margin_us"
+                    | "native_gap_frames"
+                    | "worker_deadline_misses"
+                    | "worker_worst_lateness_us"
+                    | "worker_max_gap_us"
+                    | "worker_max_work_us"
+                    | "callback_max_gap_us"
+                    | "callback_max_work_us"
+                    | "callbacks"
+                    | "callback_incidents_dropped"
+                    | "callback_sequence"
+                    | "callback_frames"
+                    | "callback_rate"
+                    | "callback_budget_us"
+                    | "callback_work_us"
+                    | "callback_gap_us"
+                    | "callback_ingress_us"
+                    | "callback_pull_us"
+                    | "callback_output_us"
+                    | "callback_publish_us"
+                    | "callback_adapter_us"
+                    | "callback_sources"
+                    | "callback_scan_steps"
+                    | "callback_codec_calls"
+                    | "callback_plc_frames"
+                    | "callback_decode_errors"
+                    | "callback_work_limited"
+                    | "callback_missing_frames"
+                    | "callback_fault"
+                    | "work_limited"
+                    | "permission_query_us"
+                    | "permission_query_ok"
+                    | "permission_right"
+                    | "capture_discontinuities"
+                    | "capture_discarded_samples"
+                    | "attribution_dropped"
+                    | "rebufferings"
+                    | "latency_trimmed_frames"
+                    | "drift_ppm"
+                    | "adaptation_ppm"
+                    | "boundary_hold_samples"
                     | "sample_mono_us"
                     | "pacing_id"
                     | "duration_ms"
@@ -378,14 +542,23 @@ impl Scalars {
             )
         } else {
             allowed(f.name())
+                || (self.4 == "oink_clipboard::macos::dnd::drop_trace" && drop_numeric_field(f.name()))
+                || (self.4 == "oink_clipboard::windows::dnd::drop_trace" && windows_drop_numeric_field(f.name()))
                 || (self.4 == "oink_dnd_read" && oink_foundation::drag_trace::FIELDS.contains(&f.name()))
+                // User-approved native panel safety net. Only process-local
+                // operation numbers, state bits and elapsed visibility survive.
+                || (self.4 == "oink_dnd_recovery" && matches!(f.name(),
+                    "dnd_recovery_trigger" | "dnd_recovery_role" | "dnd_recovery_visible_ms"
+                    | "dnd_recovery_operation" | "dnd_recovery_probing" | "dnd_recovery_probe_owned"
+                    | "dnd_recovery_held_source" | "dnd_recovery_recovered"))
                 // This callsite emits a typed FileProviderReason discriminant.
                 // Do not admit numeric `reason` from unrelated targets.
                 || (self.4 == "oink_clipboard::macos::file_provider" && provider_numeric_field(f.name()))
                 || (self.4 == "oink_clipboard::windows::content::target" && clipboard_numeric_field(f.name()))
                 || (self.4 == "oink_file_diagnostics" && matches!(f.name(),
-                    "file_stage" | "file_request" | "file_index" | "file_code" | "file_reason"
+                    "file_stage" | "file_request" | "file_index" | "file_code" | "file_reason" | "file_status"
                     | "file_object" | "file_format" | "file_offer" | "file_generation" | "file_node"))
+                || (self.4 == "oink_file_diagnostics" && promise_numeric_field(f.name()))
         };
         if permitted && v.is_finite() && self.0.len() < 24 {
             self.0.push((f.name().into(), v));
@@ -415,12 +588,75 @@ impl Visit for Scalars {
         }
     }
     fn record_str(&mut self, field: &Field, value: &str) {
+        if self.4 == "oink_arrangement" {
+            let permitted = match field.name() {
+                "call_site" => matches!(value, "startup" | "observer"),
+                "operation" => matches!(
+                    value,
+                    "buffer_sizes"
+                        | "buffer_bounds"
+                        | "query"
+                        | "target_name"
+                        | "target_key"
+                        | "enumerate"
+                        | "source_index"
+                        | "source_identity"
+                        | "visible_source"
+                        | "bounds"
+                        | "native_state"
+                ),
+                _ => false,
+            };
+            if permitted && self.1.len() < 8 {
+                self.1.push((field.name().into(), value.into()));
+            }
+            return;
+        }
+        if self.4 == "oink_microphone_routing" {
+            let safe = match field.name() {
+                "from_device_class" => matches!(value, "ours_virtual" | "unavailable"),
+                "reason" => matches!(
+                    value,
+                    "previous_default"
+                        | "built_in"
+                        | "first_physical"
+                        | "switch_failed"
+                        | "explicit_selection"
+                        | "no_alternative"
+                ),
+                _ => false,
+            };
+            if safe && self.1.len() < 8 {
+                self.1.push((field.name().into(), value.into()));
+            }
+            return;
+        }
         if matches!(self.2, "oink_overlay_diagnostics" | "oink_windows_external_input") {
             return;
         }
         if clipboard_numeric_field(field.name())
             || (self.4 == "oink_clipboard::macos::file_provider" && provider_numeric_field(field.name()))
         {
+            return;
+        }
+        if field.name() == "dnd_drop_items" {
+            if self.4 == "oink_clipboard::macos::dnd::drop_trace" && drop_items(value) {
+                self.1.push((field.name().into(), value.into()));
+            }
+            return;
+        }
+        if matches!(field.name(), "dnd_win_drop_formats" | "dnd_win_drop_cida") {
+            let valid = if field.name() == "dnd_win_drop_formats" {
+                windows_drop_formats(value)
+            } else {
+                value.len() <= 256 && serde_json::from_str::<[u64; 5]>(value).is_ok()
+            };
+            if self.4 == "oink_clipboard::windows::dnd::drop_trace" && valid {
+                self.1.push((field.name().into(), value.into()));
+            }
+            return;
+        }
+        if drop_numeric_field(field.name()) || windows_drop_numeric_field(field.name()) {
             return;
         }
         if field.name() == "dnd_representation_classes" {
@@ -643,6 +879,9 @@ impl Visit for Scalars {
                         | "collection_stage"
                         | "collection_end"
                         | "audio_receiver_sample"
+                        | "audio_pipeline_sample"
+                        | "audio_callback_incident"
+                        | "audio_permission_sample"
                 ),
                 "network_path" => matches!(value, "direct" | "relayed" | "unknown"),
                 "channel" => value == "low_tcp",
@@ -743,6 +982,7 @@ impl Visit for Scalars {
     fn record_bool(&mut self, f: &Field, v: bool) {
         if !provider_numeric_field(f.name())
             && !clipboard_numeric_field(f.name())
+            && !promise_numeric_field(f.name())
             && !oink_foundation::drag_trace::FIELDS.contains(&f.name())
         {
             self.add(f, f64::from(v));
@@ -802,6 +1042,8 @@ fn detailed_callsite(module: &str, has_field: impl Fn(&str) -> bool) -> bool {
         || module == "oink_routing::router::trail"
         || module.ends_with("::resistance")
         || module.ends_with("::dnd")
+        || module == "oink_clipboard::macos::dnd::drop_trace"
+        || module == "oink_clipboard::windows::dnd::drop_trace"
         || module == "oink_clipboard::macos::dnd::representation_trace"
         || module == "oink_clipboard::windows::dnd::representation_trace"
         || (module.ends_with("::windows::drag_image") && has_field("dnd_preview_stage"))
@@ -876,9 +1118,19 @@ fn record_event(event: &TraceEvent<'_>, rs: &[Weak<Inner>]) {
     if local_only_target(m.target()) {
         return;
     }
-    let detailed = m
-        .module_path()
-        .is_some_and(|module| detailed_callsite(module, |f| m.fields().field(f).is_some()));
+    // Native read boundaries are DEBUG in ordinary logs but retain their exact
+    // numeric request/timing evidence in the independent flight recorder.
+    let detailed = m.target() == "oink_dnd_read"
+        // These reviewed, bounded samples are emitted on the ordinary audio
+        // reporter/permission observer. Output samples have no `concealed` field. Testing
+        // only Scalars used to hide that DEBUG admission discarded every one.
+        || (m.target() == "oink_audio_diagnostics"
+            && m.fields().field("sample_mono_us").is_some()
+            && (m.fields().field("output_deadline_misses").is_some()
+                || m.fields().field("callback_sequence").is_some()
+                || m.fields().field("permission_query_us").is_some()))
+        || m.module_path()
+            .is_some_and(|module| detailed_callsite(module, |f| m.fields().field(f).is_some()));
     if (*m.level() > tracing::Level::INFO && !detailed)
         || *m.level() > tracing::Level::DEBUG
         || (*m.level() > tracing::Level::WARN && !m.target().starts_with("oink"))
@@ -891,7 +1143,11 @@ fn record_event(event: &TraceEvent<'_>, rs: &[Weak<Inner>]) {
     {
         return;
     }
-    let module = if bundle_only_target(m.target()) || matches!(m.target(), "oink_link_diagnostics" | "oink_dnd_read") {
+    let module = if bundle_only_target(m.target())
+        || matches!(
+            m.target(),
+            "oink_link_diagnostics" | "oink_dnd_read" | "oink_dnd_recovery"
+        ) {
         m.target()
     } else {
         m.module_path().unwrap_or("external")
@@ -966,6 +1222,40 @@ mod tests {
     }
     use tracing_subscriber::layer::SubscriberExt;
 
+    #[test]
+    fn drag_panel_recovery_warning_reaches_the_ring_with_ownership_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::start(dir.path().into(), DeviceId([92; 32]), None, true).unwrap();
+        recorder.wait_recovery();
+        let subscriber = tracing_subscriber::registry().with(scoped(&recorder));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "oink_dnd_recovery",
+                dnd_recovery_trigger = 1_u64, dnd_recovery_role = 0_u64,
+                dnd_recovery_visible_ms = 60000_u64, dnd_recovery_operation = 28_u64,
+                dnd_recovery_probing = true, dnd_recovery_probe_owned = false,
+                dnd_recovery_held_source = 0_u64, dnd_recovery_recovered = true,
+                path = "PRIVATE PATH", "drag panel safety net observed a stranded window");
+        });
+        let row = std::iter::from_fn(|| recorder.inner.queue.load().pop()).find_map(|row| match row.event {
+            Event::Log {
+                module,
+                level,
+                fields,
+                labels,
+                ..
+            } if module == "oink_dnd_recovery" => Some((level, fields, labels)),
+            _ => None,
+        });
+        recorder.shutdown();
+        let (level, fields, labels) = row.expect("fixed-target warning must enter the diagnostic ring");
+        assert_eq!(level, 1);
+        assert_eq!(fields.len(), 8);
+        assert!(fields.contains(&("dnd_recovery_operation".into(), 28.)));
+        assert!(fields.contains(&("dnd_recovery_probing".into(), 1.)));
+        assert!(fields.contains(&("dnd_recovery_recovered".into(), 1.)));
+        assert!(labels.is_empty());
+    }
+
     struct Collect(Arc<Mutex<Vec<Scalars>>>);
     impl<S: Subscriber> Layer<S> for Collect {
         fn on_event(&self, event: &TraceEvent<'_>, _: Context<'_, S>) {
@@ -979,6 +1269,23 @@ mod tests {
             event.record(&mut values);
             lock(&self.0).push(values);
         }
+    }
+    #[test]
+    fn microphone_repair_keeps_class_reason_and_pseudonym_without_native_identity() {
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Collect(rows.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "oink_microphone_routing", from_device_class="ours_virtual", reason="built_in", to_device_key=12345_u64, to_device="PRIVATE ENDPOINT", name="PRIVATE", error="PRIVATE");
+        });
+        let rows = lock(&rows);
+        assert_eq!(rows[0].0, [("to_device_key".into(), 12345.)]);
+        assert_eq!(
+            rows[0].1,
+            [
+                ("from_device_class".into(), "ours_virtual".into()),
+                ("reason".into(), "built_in".into())
+            ]
+        );
     }
     #[test]
     fn overlay_health_keeps_typed_counters_without_native_or_desktop_identity() {
@@ -1188,13 +1495,81 @@ mod tests {
     }
 
     #[test]
+    fn drag_preparation_timeout_keeps_stage_without_file_names() {
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Collect(rows.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "oink_agent::dnd", dnd_phase = 55_u64,
+                dnd_preparation_stage = 3_u64, dnd_preparation_timeout = true,
+                elapsed_us = 3_000_000_u64, name = "PRIVATE-NAME", path = "PRIVATE-PATH");
+        });
+        let rows = lock(&rows);
+        assert!(rows[0].0.contains(&("dnd_preparation_stage".into(), 3.)));
+        assert!(rows[0].0.contains(&("dnd_preparation_timeout".into(), 1.)));
+        assert!(rows[0].1.is_empty());
+    }
+
+    #[test]
+    fn promise_timing_survives_saved_package_without_names_or_untyped_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let recorder = crate::diagnostics::tests::isolated(temp.path().into(), DeviceId([42; 32]), None, true).unwrap();
+        recorder.wait_recovery();
+        let subscriber = tracing_subscriber::registry().with(scoped(&recorder));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "oink_file_diagnostics",
+                file_promise_event = 7_u8, file_request = 92_u64, file_index = 1_u64,
+                promise_native_sequence = 44_i64, promise_at_us = 148273_u64,
+                promise_delay_us = 55_u64, elapsed_us = 100_u64, file_status = 0_i64,
+                file_size = Some(20536_u64), file_mtime_ns = Some(123_i64), file_kind = Some(1_u8),
+                name = "PRIVATE-NAME", path = "PRIVATE-PATH", error = "PRIVATE-ERROR");
+            tracing::info!(target: "oink_file_diagnostics",
+                file_promise_event = "PRIVATE", promise_at_us = true, file_size = "PRIVATE-SIZE");
+            tracing::info!(target: "oink_unrelated", file_promise_event = 7_u8, promise_at_us = 1_u64, file_size = 20536_u64);
+        });
+        let bundle = recorder.save(Reason::Manual).unwrap();
+        recorder.shutdown();
+        let rows = super::super::tests::timeline(&bundle.path, "merged.ndjson");
+        let logs: Vec<_> = rows.iter().filter_map(|row| row.pointer("/event/Log")).collect();
+        assert_eq!(logs.len(), 3);
+        let fields: Vec<(String, f64)> = serde_json::from_value(logs[0]["fields"].clone()).unwrap();
+        assert_eq!(
+            fields.len(),
+            11,
+            "numeric promise timing was lost from the exported evidence"
+        );
+        for (key, value) in [
+            ("file_promise_event", 7.),
+            ("promise_native_sequence", 44.),
+            ("promise_at_us", 148273.),
+            ("promise_delay_us", 55.),
+            ("file_size", 20536.),
+            ("file_mtime_ns", 123.),
+            ("file_kind", 1.),
+        ] {
+            assert!(fields.contains(&(key.into(), value)), "missing {key}");
+        }
+        assert_eq!(logs[0]["labels"], serde_json::json!([]));
+        for log in &logs[1..] {
+            assert_eq!(log["fields"], serde_json::json!([]));
+            assert_eq!(log["labels"], serde_json::json!([]));
+        }
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(bundle.path).unwrap()).unwrap();
+        for index in 0..zip.len() {
+            use std::io::Read;
+            let mut text = String::new();
+            zip.by_index(index).unwrap().read_to_string(&mut text).unwrap();
+            assert!(!text.contains("PRIVATE"));
+        }
+    }
+
+    #[test]
     fn file_hydration_diagnostics_keep_numeric_stages_without_paths_or_error_text() {
         let rows = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(Collect(rows.clone()));
         tracing::subscriber::with_default(subscriber, || {
             tracing::warn!(target: "oink_file_diagnostics",
                 file_stage = 11_u8, file_request = 3_u64, file_index = 1_u64,
-                file_code = 0x80070185_u32, file_reason = 8_u8,
+                file_code = 0x80070185_u32, file_reason = 8_u8, file_status = 0xc000cf12_u32,
                 file_object = 4_u64, file_format = 1_u8,
                 file_offer = 8_u64, file_generation = 2_u64, file_node = 9_u64,
                 name = "PRIVATE-NAME", path = "PRIVATE-PATH", error = "PRIVATE-ERROR");
@@ -1202,8 +1577,9 @@ mod tests {
         });
         let rows = lock(&rows);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0.len(), 10);
+        assert_eq!(rows[0].0.len(), 11);
         assert!(rows[0].0.contains(&("file_code".into(), 0x80070185_u32 as f64)));
+        assert!(rows[0].0.contains(&("file_status".into(), 0xc000cf12_u32 as f64)));
         assert!(rows[0].1.is_empty());
         assert!(rows[1].0.is_empty());
     }
@@ -1443,6 +1819,26 @@ mod tests {
         assert!(rows[1].1.is_empty());
     }
     #[test]
+    fn audio_deadlines_and_capture_discontinuities_survive_diagnostics() {
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Collect(rows.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "oink_audio_diagnostics", kind="audio_pipeline_sample",
+                output_deadline_misses=1_u64, output_worst_shortfall_us=167_u64,
+                worker_deadline_misses=2_u64, worker_worst_lateness_us=900_u64,
+                worker_max_gap_us=3100_u64, worker_max_work_us=80_u64,
+                callback_max_gap_us=2800_u64, callback_max_work_us=50_u64,
+                callback_over_budget=1_u64, callback_min_margin_us=Some(-333_i64), native_gap_frames=Some(480_u64),
+                capture_discontinuities=3_u64, capture_discarded_samples=240_u64,
+                attribution_dropped=0_u64, device="private-device", pcm="private-payload");
+        });
+        let rows = lock(&rows);
+        assert_eq!(rows[0].0.len(), 14);
+        assert!(rows[0].0.contains(&("callback_min_margin_us".into(), -333.0)));
+        assert_eq!(rows[0].1, [("kind".into(), "audio_pipeline_sample".into())]);
+    }
+
+    #[test]
     fn collection_and_receiver_counters_survive_without_payload_or_identity() {
         let rows = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(Collect(rows.clone()));
@@ -1499,6 +1895,75 @@ mod tests {
         assert_eq!(values[0].0.len(), 5);
         assert!(values[0].1.is_empty());
         assert!(values[0].0.iter().any(|(k, v)| k == "dnd_formats" && *v == 511.));
+    }
+    #[test]
+    fn failed_drop_diagnostics_keep_only_reviewed_numeric_shape() {
+        const ROW: &str = "[[0,1,1,2,2,0,0,0,0,1,2,2,0,0,0,0,1]]";
+        assert!(drop_items(ROW));
+        for bad in [
+            "private.txt",
+            "[[0,-1]]",
+            "[[0,1.5]]",
+            "[[]]",
+            "[[0,1,1,2,2,0,0,0,0,1,2,2,0,0,0,0,99]]",
+        ] {
+            assert!(!drop_items(bad));
+        }
+        let values = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Collect(values.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "oink_clipboard::macos::dnd::drop_trace",
+                dnd_drop_schema = 1_u64, dnd_drop_dropped = false,
+                dnd_drop_end_operation = 0_u64, dnd_drop_release_observed = true,
+                dnd_drop_items = ROW, path = "/private/secret", error = "private error");
+            tracing::info!(target: "oink_clipboard::macos::dnd::drop_trace",
+                dnd_drop_items = "secret.txt", dnd_drop_schema = "private text");
+            tracing::info!(target: "unreviewed", dnd_drop_schema = 1_u64, dnd_drop_items = ROW);
+        });
+        let values = lock(&values);
+        assert_eq!(values[0].0.len(), 4);
+        assert_eq!(values[0].1, [("dnd_drop_items".into(), ROW.into())]);
+        assert!(values[1..].iter().all(|row| row.0.is_empty() && row.1.is_empty()));
+        assert!(detailed_callsite("oink_clipboard::macos::dnd::drop_trace", |_| false));
+    }
+    #[test]
+    fn windows_failed_drop_diagnostics_keep_only_reviewed_numeric_shape() {
+        const ROWS: &str = "[[15,1,-1,1,1,1,1,0,1,-2147221404]]";
+        assert!(windows_drop_formats(ROWS));
+        for bad in [
+            "secret.txt",
+            "[[]]",
+            "[[15,1,-1,1,1,1,1,0,1,\"secret\"]]",
+            "[[15,1,-1,1,1,1,1,0,1,2147483648]]",
+        ] {
+            assert!(!windows_drop_formats(bad));
+        }
+        let values = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Collect(values.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "oink_clipboard::windows::dnd::drop_trace",
+                dnd_win_drop_schema = 1_u64, dnd_win_drop_hresult = 262400_i64,
+                dnd_win_drop_effect = 0_u64, dnd_win_drop_cancel = false,
+                dnd_win_drop_logical = 2_i64, dnd_win_drop_performed = -1_i64,
+                dnd_win_drop_formats = ROWS, dnd_win_drop_cida = "[3,1,1,1,4]",
+                path = "C:/private/secret", error = "private error");
+            tracing::info!(target: "oink_clipboard::windows::dnd::drop_trace",
+                dnd_win_drop_formats = "secret.txt", dnd_win_drop_cida = "[\"secret\"]",
+                dnd_win_drop_schema = "private text");
+            tracing::info!(target: "unreviewed", dnd_win_drop_schema = 1_u64,
+                dnd_win_drop_formats = ROWS, dnd_win_drop_cida = "[0,0,0,0,0]");
+        });
+        let values = lock(&values);
+        assert_eq!(values[0].0.len(), 6);
+        assert_eq!(
+            values[0].1,
+            [
+                ("dnd_win_drop_formats".into(), ROWS.into()),
+                ("dnd_win_drop_cida".into(), "[3,1,1,1,4]".into())
+            ]
+        );
+        assert!(values[1..].iter().all(|row| row.0.is_empty() && row.1.is_empty()));
+        assert!(detailed_callsite("oink_clipboard::windows::dnd::drop_trace", |_| false));
     }
     #[test]
     fn ordered_drag_class_diagnostics_reject_names_payload_and_unreviewed_producers() {

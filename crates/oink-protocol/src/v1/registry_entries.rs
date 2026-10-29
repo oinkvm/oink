@@ -64,6 +64,13 @@ message_registry! {
     0x0610 => AudioPreparedAck(AudioPreparedAck), [Route {kind:5, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.audio/1"], Suspend;
     0x0611 => AudioSourceRouteOffer(SourceRouteOffer), [Route {kind:5, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.audio/1"], Suspend;
     0x0612 => AudioPrepareRefused(AudioPrepareRefused), [Route {kind:5, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.audio/1"], Suspend;
+    0x0613 => MicrophoneDemand(MicrophoneDemand), [Route {kind:5, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.audio/1", "oink.audio.microphone/1"], Suspend;
+    0x0614 => MicrophonePrepared(MicrophonePrepared), [Route {kind:5, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.audio/1", "oink.audio.microphone/1"], Suspend;
+    0x0615 => MicrophoneReady(MicrophoneReady), [Route {kind:5, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.audio/1", "oink.audio.microphone/1"], Suspend;
+    0x0616 => MicrophoneRenew(MicrophoneRenew), [Route {kind:5, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.audio/1", "oink.audio.microphone/1"], Suspend;
+    0x0617 => MicrophoneStop(MicrophoneStop), [Route {kind:5, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.audio/1", "oink.audio.microphone/1"], Suspend;
+    0x0618 => MicrophonePacket(MicrophonePacket), [Route {kind:5, transport:Transport::Datagram, extra_capabilities:&[]}], ["oink.audio/1", "oink.audio.microphone/1"], Suspend;
+    0x0619 => MicrophoneSleep(MicrophoneSleep), [Route {kind:5, transport:Transport::Datagram, extra_capabilities:&[]}], ["oink.audio/1", "oink.audio.microphone/1"], Suspend;
     0x0700 => AimOpen(AimOpen), [Route {kind:7, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.aim/1"], Allow;
     0x0701 => AimJoined(AimJoined), [Route {kind:7, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.aim/1"], Allow;
     0x0702 => AimDeclined(AimDeclined), [Route {kind:7, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.aim/1"], Allow;
@@ -174,4 +181,16 @@ message_registry! {
     0x1222 => LayoutProfilesJoin(LayoutProfilesJoin), [Route {kind:15, transport:Transport::Low, extra_capabilities:&[]}], ["oink.group/1", "oink.layout.profiles/3", "oink.low/1"], Allow;
     0x1210 => LayoutProfilesStateV2(LayoutProfilesStateV2), [Route {kind:14, transport:Transport::Low, extra_capabilities:&[]}], ["oink.group/1", "oink.layout.profiles/2", "oink.low/1"], Allow;
     0x1211 => LayoutProfilesReceiptV2(LayoutProfilesReceipt), [Route {kind:14, transport:Transport::Low, extra_capabilities:&[]}], ["oink.group/1", "oink.layout.profiles/2", "oink.low/1"], Allow;
+    0x010d => ApplicationFocus(ApplicationFocusRecord), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1", "oink.input.application-focus/1"], Suspend;
+    0x1300 => ControlMovePointer(ControlMovePointer), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1", "oink.pointer.move/1"], Suspend;
+    0x010e => ControlLockEscape(ControlLockEscape), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1", "oink.pointer.lock-escape/1"], Suspend;
+    0x010f => ControlEntryProtection(ControlEntryProtection), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1", "oink.pointer.entry-protection/1"], Suspend;
+    0x0110 => ControlPowerState(ControlPowerState), [Route {kind:2, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.group/1", "oink.power/1"], Allow;
+    0x0334 => CloudLinkRequest(CloudLinkRequest), [Route {kind:4, transport:Transport::Low, extra_capabilities:&[]}, Route {kind:10, transport:Transport::Low, extra_capabilities:&["oink.drag/1"]}], ["oink.clipboard/1", "oink.low/1", "oink.cloud-file-links/1"], Suspend;
+    0x0335 => CloudLinkOffer(CloudLinkOffer), [Route {kind:4, transport:Transport::Low, extra_capabilities:&[]}, Route {kind:10, transport:Transport::Low, extra_capabilities:&["oink.drag/1"]}], ["oink.clipboard/1", "oink.low/1", "oink.cloud-file-links/1"], Suspend;
+    0x0336 => CloudLinkUnavailable(CloudLinkUnavailable), [Route {kind:4, transport:Transport::Low, extra_capabilities:&[]}, Route {kind:10, transport:Transport::Low, extra_capabilities:&["oink.drag/1"]}], ["oink.clipboard/1", "oink.low/1", "oink.cloud-file-links/1"], Suspend;
+    0x0337 => CloudLinkList(CloudLinkList), [Route {kind:4, transport:Transport::Low, extra_capabilities:&[]}, Route {kind:10, transport:Transport::Low, extra_capabilities:&["oink.drag/1"]}], ["oink.clipboard/1", "oink.low/1", "oink.cloud-file-links/1"], Suspend;
+    0x0338 => CloudLinkSelect(CloudLinkSelect), [Route {kind:4, transport:Transport::Low, extra_capabilities:&[]}, Route {kind:10, transport:Transport::Low, extra_capabilities:&["oink.drag/1"]}], ["oink.clipboard/1", "oink.low/1", "oink.cloud-file-links/1"], Suspend;
+    0x0339 => CloudLinkRead(CloudLinkRead), [Route {kind:4, transport:Transport::Low, extra_capabilities:&[]}, Route {kind:10, transport:Transport::Low, extra_capabilities:&["oink.drag/1"]}], ["oink.clipboard/1", "oink.low/1", "oink.cloud-file-links/1"], Suspend;
+    0x061a => AudioMediaState(AudioMediaState), [Route {kind:5, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.audio/1", "oink.audio.media-health/1"], Suspend;
 }

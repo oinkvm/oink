@@ -163,8 +163,10 @@
 .dev-badge { position: absolute; right: 0; bottom: 0; width: 10px; height: 10px; fill: none; stroke: currentColor; stroke-width: 1.3; stroke-linecap: round; stroke-linejoin: round; }
 .dev-badge__knock { fill: var(--dev-bg); stroke: none; transition: fill var(--ok-dur-2) var(--ok-ease-out); }
 
-.dev-badge[data-badge="wifi"] { color: var(--ok-success); }
+.dev-badge[data-badge="wifi"] { color: inherit; }
 .dev-badge[data-badge="receive"] { color: var(--ok-accent); }
+.dev-ico[data-tone="good"] .dev-badge[data-badge="receive"] { color: inherit; }
+.dev-badge[data-badge="send"] { color: inherit; }
 
 .dev-ico .dev-badge .warn-body { fill: var(--ok-warning); }
 .dev-badge .warn-mark { stroke: #1B1C22; stroke-width: 1.2; }
@@ -253,7 +255,10 @@
 .win__side[data-expanding] .dev__vol[data-open] { transition-delay: calc(150ms * var(--ok-ms)); }
 .dev .dev__vol .vol { pointer-events: auto; }   
 .vol { --vol-c: var(--ok-success); --vol-on: #FFFFFF; display: flex; align-items: center; gap: 4px; margin-top: 12px; }
-.vol[data-tone="accent"] { --vol-c: var(--ok-accent); --vol-on: var(--ok-on-accent); }   
+.vol[data-tone="accent"] { --vol-c: var(--ok-accent); --vol-on: var(--ok-on-accent); }
+/* The pink accent pairs with white here, matching the green bar; other accents keep on-accent. */
+[data-accent="pink"] .vol[data-tone="accent"] { --vol-on: #FFFFFF; }   
+:root[data-theme="dark"] .vol[data-tone="accent"] { --vol-on: #FFFFFF; }
 .vol__btn, .ok-btn.vol__end { flex: none; }
 .ok-btn.vol__btn,
 .ok-btn.vol__btn[aria-pressed="true"] { --_h: 24px; --_bg: transparent; --_bg-hover: transparent; color: var(--ok-text-2); }   
@@ -300,10 +305,6 @@
 .devmenu__glyph svg .fill { fill: currentColor; stroke: none; }
 .devmenu__seg { justify-self: end; }
 /* Screen menu gain: the stepper ends where an item's hover box ends. */
-.devmenu__gain { padding-right: 0; }
-.devmenu__gain .devmenu__label { font-weight: 400; }
-.devmenu__gain-input { justify-self: end; }
-.devmenu__gain-input input { font-variant-numeric: tabular-nums; }
 .devmenu__seg .ok-seg__item { padding: 0; }
 
 .devmenu__seg .ok-seg__item > span { align-self: stretch; display: flex; }
@@ -353,3 +354,15 @@
 .dev__accessibility { flex: none; display: grid; place-items: center; box-sizing: border-box; width: 18px; height: 18px; padding: 0; border: 0; background: none; color: var(--ok-danger); line-height: 0; pointer-events: auto; }
 button.dev__accessibility { cursor: pointer; }
 .dev__accessibility svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+.devmenu__permission { position: relative; min-width: 0; }
+.devmenu__grant { position: absolute; inset: 0; border: 0; padding: 0; background: transparent; cursor: pointer; border-radius: 6px; }
+
+/* Audio status tooltips have exactly three state-specific lines. */
+.dev-ico__tip { display: grid; gap: 2px; }
+.dev-ico__tip > span { display: block; white-space: nowrap; }
+
+.devmenu__label[data-tone="accent"],
+.devmenu__label[data-tone="accent"] .devmenu__glyph { color: var(--ok-accent); }
+
+/* Optical alignment includes the microphone badge; preserve the shared layout gap. */
+.dev-ico[data-glyph="microphone"] { translate: -2.5px; }

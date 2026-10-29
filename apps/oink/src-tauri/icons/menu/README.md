@@ -21,8 +21,7 @@ Hands-on acceptance: on Windows, open the tray menu in light/dark and high-contr
 themes at 100%, 125%, 150% and 200% scaling, including switching monitors. Check
 icon legibility, alignment, disabled items, check marks, and submenu behavior.
 Automated raster/theme tests and an unattached HMENU test do not establish visual
-acceptance. Desktop automation on the Windows test host is not supported by the
-current device-test guard, so visual acceptance remains a user hands-on item.
+acceptance, so visual acceptance remains a hands-on check.
 
 ## Source and licence review
 

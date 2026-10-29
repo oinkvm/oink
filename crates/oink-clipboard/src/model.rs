@@ -28,6 +28,37 @@ pub struct Inventory {
     pub roots: Vec<FileNode>,
 }
 impl Inventory {
+    /// Reconcile native file items with the usable namespace without changing
+    /// item/representation IDs (native readers still use their original slots).
+    pub(crate) fn with_roots(mut self, roots: Vec<FileNode>) -> Self {
+        let ids: std::collections::HashSet<_> = roots.iter().map(|root| root.id).collect();
+        // CF_HDROP represents the entire Windows selection in one native item.
+        // Its first-root anchor is only a group handle, unlike per-file Mac items.
+        // Keep original native slots while rebinding a skipped anchor.
+        if self.platform == ClipPlatform::Windows {
+            for item in &mut self.items {
+                if item.file.is_some_and(|id| !ids.contains(&id))
+                    && !item.virtual_files
+                    && item.representations.iter().any(|rep| {
+                        rep.format == NativeFormat::WindowsPredefined(15)
+                            && matches!(rep.data, RepresentationData::File(_))
+                    })
+                    && let Some(root) = roots.first()
+                {
+                    item.file = Some(root.id);
+                    for rep in &mut item.representations {
+                        if matches!(rep.data, RepresentationData::File(_)) {
+                            rep.data = RepresentationData::File(root.id);
+                        }
+                    }
+                }
+            }
+        }
+        self.items.retain(|item| item.file.is_none_or(|id| ids.contains(&id)));
+        self.roots = roots;
+        self
+    }
+
     /// File-service roots, including private promise containers. Native adapters
     /// publish only `roots`; promise containers are protocol capabilities and
     /// must never be turned into user-visible filenames or placeholder URLs.
@@ -35,13 +66,29 @@ impl Inventory {
         self.namespace_roots_for(self.platform)
     }
     pub fn namespace_roots_for(&self, target: ClipPlatform) -> Vec<FileNode> {
-        let mut roots = self.roots.clone();
+        let mut roots: Vec<_> = self
+            .roots
+            .iter()
+            .filter(|node| target != ClipPlatform::Windows || node.kind.symlink_target().is_none())
+            .cloned()
+            .collect();
         let mut seen: std::collections::HashSet<_> = roots.iter().map(|n| n.id).collect();
-        for rep in self.wanted(target) {
-            if let RepresentationData::Promise(id, _) = rep.data
+        // A fulfilled promise keeps its native controls, but its actual roots
+        // are already published. The process-local container is no longer a
+        // separate source grant or a user-visible received directory.
+        seen.extend(self.items.iter().filter(|item| item.file.is_some()).flat_map(|item| {
+            item.representations.iter().filter_map(|rep| match rep.data {
+                RepresentationData::Promise(anchor, _) => Some(anchor),
+                _ => None,
+            })
+        }));
+        for rep in self.items.iter().flat_map(|item| &item.representations) {
+            if target != ClipPlatform::Unknown
+                && let RepresentationData::Promise(id, _) = rep.data
                 && seen.insert(id)
             {
                 roots.push(FileNode {
+                    exec_bits: None,
                     id,
                     parent: None,
                     name: "_promise".into(),
@@ -64,9 +111,17 @@ impl Inventory {
     /// Projection retains item/representation order. File delivery identities are
     /// adapted by the target; native source paths are never published there.
     pub fn wanted(&self, target: ClipPlatform) -> impl Iterator<Item = &Representation> {
+        let skipped: std::collections::HashSet<_> = self
+            .roots
+            .iter()
+            .filter(|root| target == ClipPlatform::Windows && root.kind.symlink_target().is_some())
+            .map(|root| root.id)
+            .collect();
         self.items.iter().flat_map(move |item| {
+            let skip = item.file.is_some_and(|id| skipped.contains(&id));
             item.representations.iter().filter(move |rep| {
-                target != ClipPlatform::Unknown
+                !skip
+                    && target != ClipPlatform::Unknown
                     && !matches!(rep.data, RepresentationData::Unavailable(_))
                     && ((target == self.platform && rep.format.platform() != ClipPlatform::Unknown)
                         || matches!(rep.data, RepresentationData::File(_))
@@ -254,7 +309,6 @@ pub enum ContentMsg {
         offer: OfferId,
         representation: RepresentationId,
         size: u64,
-        hash: [u8; 32],
     },
     RepresentationFailed {
         offer: OfferId,
@@ -294,9 +348,6 @@ pub enum ContentMsg {
         node: NodeId,
         version: u64,
         offset: u64,
-        /// Verified last block of a resumed prefix. A mismatch fails this
-        /// operation; it cannot silently mix the old prefix and new suffix.
-        check: Option<[u8; 32]>,
         demand: Demand,
     },
     FileBlock {
@@ -304,7 +355,6 @@ pub enum ContentMsg {
         node: NodeId,
         version: u64,
         offset: u64,
-        hash: [u8; 32],
 
         bytes: Vec<u8>,
     },
@@ -340,15 +390,60 @@ pub enum ContentMsg {
         delivery: DeliveryId,
         receipt: Option<[u8; 32]>,
     },
+    /// Authorize persistent real-file access while the offered source is live.
+    CloudLinkRequest {
+        offer: OfferId,
+        roots: Vec<NodeId>,
+        demand: Demand,
+    },
+    CloudLinkOffer {
+        offer: OfferId,
+        token: crate::content::grants::LinkToken,
+        roots: Vec<FileNode>,
+        fulfilled: Vec<crate::content::grants::FulfilledRoot>,
+        native: crate::content::native_metadata::NativeFileMetadata,
+    },
+    CloudLinkUnavailable {
+        offer: OfferId,
+        reason: Unavailable,
+    },
+    /// Each operation creates a temporary namespace bound to the authenticated
+    /// receiver. `offer` only correlates replies; no process/offer lookup occurs.
+    CloudLinkList {
+        offer: OfferId,
+        token: crate::content::grants::LinkToken,
+        node: NodeId,
+        cursor: Option<DirectoryCursor>,
+    },
+    CloudLinkSelect {
+        offer: OfferId,
+        token: crate::content::grants::LinkToken,
+        node: NodeId,
+    },
+    CloudLinkRead {
+        offer: OfferId,
+        token: crate::content::grants::LinkToken,
+        node: NodeId,
+        version: u64,
+        offset: u64,
+    },
 }
 
 impl ContentMsg {
+    pub fn persistent_request(&self) -> bool {
+        matches!(
+            self,
+            Self::CloudLinkList { .. } | Self::CloudLinkSelect { .. } | Self::CloudLinkRead { .. }
+        )
+    }
+
     pub fn request(&self) -> Option<(OfferId, Demand)> {
         match self {
             Self::BeginDelivery { delivery, demand } => Some((delivery.offer, *demand)),
             Self::ReadRepresentation { offer, demand, .. }
             | Self::ListDirectory { offer, demand, .. }
             | Self::SelectFile { offer, demand, .. }
+            | Self::CloudLinkRequest { offer, demand, .. }
             | Self::ReadFile { offer, demand, .. } => Some((*offer, *demand)),
             _ => None,
         }
@@ -380,6 +475,12 @@ impl std::fmt::Debug for ContentMsg {
             Self::TargetStored { .. } => "TargetStored",
             Self::Failed { .. } => "Failed",
             Self::TerminalAck { .. } => "TerminalAck",
+            Self::CloudLinkRequest { .. } => "CloudLinkRequest",
+            Self::CloudLinkOffer { .. } => "CloudLinkOffer",
+            Self::CloudLinkUnavailable { .. } => "CloudLinkUnavailable",
+            Self::CloudLinkList { .. } => "CloudLinkList",
+            Self::CloudLinkSelect { .. } => "CloudLinkSelect",
+            Self::CloudLinkRead { .. } => "CloudLinkRead",
         })
     }
 }

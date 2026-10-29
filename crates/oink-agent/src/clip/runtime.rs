@@ -42,13 +42,27 @@ pub(crate) fn start_link_runtime(
     let ordering = oink_clipboard::sync::Ordering::new(node.id(), clock.value());
     let (tx, rx) = unbounded_channel();
     let observed = backend.change_count();
+    let native = Arc::new(
+        group
+            .source_grants()
+            .map_or_else(content::Registry::default, content::Registry::with_source_grants),
+    );
+    // A returned exported promise has a native catalog whose source is this
+    // device. Recovery must use the same durable token service locally: there
+    // is deliberately no network peer/connection to ourselves. Transient Drop
+    // authorization still belongs to DndFiles::local, not to this adapter.
+    links.pause_changed(!enabled || paused);
+    links.set_local_source(node.id(), native.clone());
     let shared = Arc::new(Shared {
-        native: Arc::default(),
+        _native_connection: node
+            .native_services_enabled()
+            .then(|| content::linked::native_connector().connect(links.clone(), tokio::runtime::Handle::current())),
+        native,
         native_target: Mutex::default(),
         links,
         settings: Mutex::new(settings),
-        policy: oink_clipboard::policy::SharingPolicy::new(enabled && !paused && settings.send, settings),
-        receive_policy: oink_clipboard::policy::SharingPolicy::new(enabled && !paused && settings.receive, settings),
+        policy: oink_clipboard::policy::SharingPolicy::new(enabled && !paused && settings.send),
+        receive_policy: oink_clipboard::policy::SharingPolicy::new(enabled && !paused && settings.receive),
         enabled: AtomicBool::new(enabled),
         paused: AtomicBool::new(paused),
         activity: Mutex::default(),
@@ -71,6 +85,7 @@ pub(crate) fn start_link_runtime(
     let weak = Arc::downgrade(&node.inner);
     let weak2 = weak.clone();
     let weak3 = weak.clone();
+    let weak4 = weak.clone();
     let task = Task {
         streams,
         ordering,
@@ -85,10 +100,11 @@ pub(crate) fn start_link_runtime(
         tx,
         shared,
         observed,
+        copy_report: None,
+        apply_report: None,
         last_write: None,
         remote_scope: None,
         cancelled: None,
-        prefetch: None,
         provider_retry: None,
         fetch_requested: None,
         native_write: None,
@@ -96,6 +112,13 @@ pub(crate) fn start_link_runtime(
         on_transfer: Arc::new(move |value| {
             if let Some(inner) = weak.upgrade() {
                 Node { inner }.emit(crate::api::ApiEvent::FileTransfer(value));
+            }
+        }),
+        on_provider_required: Arc::new(move || {
+            if cfg!(target_os = "macos")
+                && let Some(inner) = weak4.upgrade()
+            {
+                Node { inner }.emit(crate::api::ApiEvent::FileProviderRequired);
             }
         }),
         name_of: Arc::new(move |peer| {
@@ -125,11 +148,16 @@ impl Task {
         let mut stop = node.stop_receiver();
         let wake = self.streams.wake();
         let mut serving = tokio::task::JoinSet::new();
+        let mut maintaining = tokio::task::JoinSet::new();
+        let mut maintenance = tokio::time::interval(Duration::from_secs(1));
+        maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let data = self.data_dir.clone();
         let backend = self.backend.clone();
+        let registry = self.shared.native.clone();
         let _ = tokio::task::spawn_blocking(move || {
             oink_clipboard::store::recover(&data);
             backend.initialize_store(data);
+            let _ = registry.check_clipboard(backend.as_ref());
         })
         .await;
         self.streams.pause_changed(!self.active());
@@ -165,6 +193,18 @@ impl Task {
                 _=wake.notified()=>{},
                 _=tokio::time::sleep_until(deadline.into())=>{},
                 _=serving.join_next(),if !serving.is_empty()=>{},
+                _=maintaining.join_next(),if !maintaining.is_empty()=>{},
+                _=maintenance.tick(),if maintaining.is_empty()=>{
+                    let registry = self.shared.native.clone();
+                    let backend = self.backend.clone();
+                    // Metadata-only even while sharing/watch is paused. Native
+                    // identity and durable cleanup never run on the actor.
+                    maintaining.spawn_blocking(move || {
+                        if let Err(error) = registry.check_clipboard(backend.as_ref()) {
+                            tracing::debug!(kind = ?error.kind(), "source clipboard retention check deferred");
+                        }
+                    });
+                },
                 change=changes.next()=>match change {
                     Some(ConfigChange::State{..})=>handle.set_paused(group.applied().paused),
                     Some(ConfigChange::Facts{device,capabilities_changed})=>self.streams.facts_changed(device,capabilities_changed),
@@ -180,34 +220,15 @@ impl Task {
                     Some(ModuleEvent::PathChanged{..})=>{},None=>break,
                 },
                 command=commands.recv()=>match command {
-                    Some(Input::Captured(before,result))=>self.captured(before,result),
+                    Some(Input::Captured(before,result,key))=>self.captured(before,result,key),
                     Some(Input::Applied{id,ticket,publication})=>self.applied(id,ticket,publication),
                     Some(Input::LocalChange(count))=>if self.active(){self.observe(count);},
                     Some(Input::Reconfigure)=>self.reconfigure(),
                     Some(Input::FetchFiles)=>self.fetch(),
-                    Some(Input::CancelFiles)=>{self.cancel_native_write();self.fetch_requested=None;self.prefetch=None;self.cancelled=self.current_id();if let Some(mut status)=handle.transfer(){status.phase=FileTransferPhase::Cancelled;self.set_transfer(Some(status));}},
+                    Some(Input::CancelFiles)=>{self.cancel_native_write();self.fetch_requested=None;self.cancelled=self.current_id();if let Some(mut status)=handle.transfer(){status.phase=FileTransferPhase::Cancelled;self.set_transfer(Some(status));}},
                     #[cfg(target_os = "macos")]
                     Some(Input::FileProviderAvailable)=>if self.active()&&self.provider_retry.is_some()&& let Some(offer)=self.ordering.current().cloned(){self.apply(offer);},
                     Some(Input::Progress(id,batch,value))=>self.progress(id,batch,value),
-                    Some(Input::Prefetched{id,ticket,before,result})=>{
-                        if self.prefetch.as_ref().is_some_and(|(clip,current)|*clip==id&&Arc::ptr_eq(current,&ticket)) {
-                            self.prefetch=None;
-                            if self.backend.change_count()==before {
-                                match result {
-                                    Ok(spec) if self.may_write(id)=>self.enqueue_native_write(id,spec),
-                                    Ok(spec) if self.receiving()&&self.cancelled!=Some(id)
-                                        &&self.current_id().is_none_or(|current|current==id)
-                                        &&self.shared.links.offer_current(id.origin,id)=>{
-                                        if let Some((_,old))=self.queued_write.take(){old.contents.cancel();}
-                                        self.queued_write=Some((id,spec));
-                                    },
-                                    Ok(_)=>{},
-                                    Err(_) if self.may_write(id)=>self.set_transfer(self.status(id,FileTransferPhase::Failed,Some("文件准备未完成".into()))),
-                                    Err(_)=>{},
-                                }
-                            }
-                        }
-                    },
                     Some(Input::Barrier(reply))=>{let _=reply.send(());},
                     Some(Input::Stop(reply))=>{let _=reply.send(());break;},None=>break,
                 },
@@ -232,6 +253,7 @@ impl Task {
                 if !self.receiving() {
                     continue;
                 }
+                let report = crate::telemetry::producer().and_then(|p| p.stamp());
                 self.observe(self.backend.change_count());
                 let Some(stream) = self.streams.inbound_id(peer) else {
                     continue;
@@ -242,6 +264,7 @@ impl Task {
                             continue;
                         }
                         if accepted && let Some(id) = self.current_id() {
+                            self.apply_report = report.map(|stamp| (id, stamp));
                             self.remote_scope = Some((id, peer, stream));
                             self.cancelled = None;
                             self.apply(offer);
@@ -273,6 +296,7 @@ impl Task {
         self.shared.native.cancel_all();
         self.shared.links.cancel_all();
         serving.abort_all();
+        maintaining.abort_all();
         while serving.join_next().await.is_some() {}
         let _ = self.backend.set_watch_paused(true);
     }
@@ -319,10 +343,14 @@ impl ClipHandle {
             ContentMsg::Failed { delivery, .. } => {
                 self.receipt(operation.stream, kind, peer, delivery, None).await;
             }
-            request if request.request().is_some() => {
-                let (offer, demand) = request.request().unwrap();
+            request if request.request().is_some() || request.persistent_request() => {
+                let persistent = request.persistent_request();
                 let registry = match kind {
-                    StreamKind::Clipboard if self.shared.policy.enabled() && demand == Demand::Clipboard => {
+                    StreamKind::Clipboard
+                        if self.shared.policy.enabled()
+                            && (persistent
+                                || request.request().is_some_and(|(_, demand)| demand == Demand::Clipboard)) =>
+                    {
                         self.shared.native.clone()
                     }
                     StreamKind::Dnd => {
@@ -331,10 +359,15 @@ impl ClipHandle {
                             operation.stream.cancel();
                             return;
                         };
-                        if !files.authorize(peer, offer, demand, diagnostic).await {
-                            operation.stream.cancel();
-                            return;
+                        if !persistent {
+                            let (offer, demand) = request.request().unwrap();
+                            if !files.authorize(peer, offer, demand, diagnostic).await {
+                                operation.stream.cancel();
+                                return;
+                            }
                         }
+                        // Later file reads are authorized by the durable grant,
+                        // never by an expired drag's input-holder epoch.
                         files.native.clone()
                     }
                     _ => {
@@ -342,10 +375,27 @@ impl ClipHandle {
                         return;
                     }
                 };
+                if !self.shared.links.peer_cloud_links(peer, operation.stream.link())
+                    && !registry.non_file_request(&request)
+                {
+                    operation.stream.cancel();
+                    return;
+                }
                 let Some(profile) = self.shared.links.peer_formats(peer, operation.stream.link()) else {
                     operation.stream.cancel();
                     return;
                 };
+                let omit_ds_store = self
+                    .shared
+                    .links
+                    .peer_os(peer)
+                    .is_some_and(|os| self.settings().omit_ds_store_for(std::env::consts::OS, &os));
+                registry.set_peer_file_filter(peer, omit_ds_store);
+                registry.set_peer_exec_bits(peer, self.shared.links.peer_exec_bits(peer, operation.stream.link()));
+                registry.set_peer_safe_symlinks(
+                    peer,
+                    self.shared.links.peer_safe_symlinks(peer, operation.stream.link()),
+                );
                 let mut channel = LinkBulk(operation.stream);
                 let result = registry
                     .serve_negotiated_traced(

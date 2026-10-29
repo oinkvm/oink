@@ -4,11 +4,14 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         cc::Build::new()
             .file("native/permissions.m")
+            .file("native/local-update.m")
             .flag("-fobjc-arc")
             .flag("-fblocks")
             .flag("-mmacosx-version-min=14.2")
             .warnings(true)
             .compile("oink_permissions");
+        println!("cargo:rerun-if-changed=native/local-update.m");
+        println!("cargo:rustc-link-lib=framework=Security");
         println!("cargo:rustc-link-lib=framework=Network");
         println!("cargo:rustc-link-lib=framework=Foundation");
     }

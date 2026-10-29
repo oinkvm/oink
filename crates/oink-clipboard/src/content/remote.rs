@@ -9,15 +9,16 @@ use std::sync::{
 use std::time::Duration;
 
 pub(super) mod delivery;
-pub(super) mod tree;
+mod memory;
+mod network;
+mod tree;
 
 #[derive(Clone)]
 pub struct Remote(Arc<Inner>);
 struct Inner {
     inventory: Inventory,
-    wire_inventory: oink_protocol::v1::dto::Inventory,
     target: ClipPlatform,
-    batch: Batch,
+    batch_id: BatchId,
     link: Arc<dyn BulkLink>,
     runtime: tokio::runtime::Handle,
     slots: Mutex<HashMap<RepresentationId, Arc<Slot>>>,
@@ -27,18 +28,25 @@ struct Inner {
     terminal: std::sync::atomic::AtomicU8,
     changed: tokio::sync::Notify,
     parallel: Arc<tokio::sync::Semaphore>,
-    tree: Mutex<tree::Tree>,
+    files: Option<super::linked::Publication>,
     progress: tokio::sync::watch::Sender<super::TransferProgress>,
     last_progress: Mutex<tokio::time::Instant>,
     delivery_started: AtomicBool,
+    delivery_report: std::sync::OnceLock<std::time::Instant>,
+    report_drag: bool,
+    drop_report: std::sync::OnceLock<Option<std::time::Instant>>,
+    drop_report_ended: AtomicBool,
     receipt: Mutex<Option<[u8; 32]>>,
-    representations: Mutex<HashMap<RepresentationId, (u64, [u8; 32])>>,
+    representations: Mutex<HashMap<RepresentationId, Arc<memory::Bytes>>>,
+    memory: Arc<memory::Budget>,
     received: Mutex<HashMap<RepresentationId, u64>>,
-    max_files: std::sync::atomic::AtomicU64,
 }
 struct Slot {
     diagnostic: ReadContext,
     hover: bool,
+    abort: std::sync::OnceLock<tokio::task::AbortHandle>,
+    received: std::sync::atomic::AtomicU64,
+    deadline_floor: Option<tokio::time::Instant>,
     drop_requested: AtomicBool,
     result: Mutex<Option<Result<(), Unavailable>>>,
     ready: Condvar,
@@ -71,6 +79,38 @@ impl Translator for NoTranslation {
     }
 }
 impl Remote {
+    /// Read-only, nonblocking failure diagnostics. Do not acquire the progress
+    /// watch's read lock: a stuck writer is one reason a watchdog may be firing.
+    #[cfg(debug_assertions)]
+    pub fn watchdog_snapshot_for_test(&self) -> String {
+        let slots = self.0.slots.try_lock().map(|slots| {
+            slots
+                .iter()
+                .map(|(id, slot)| {
+                    (
+                        *id,
+                        slot.hover,
+                        slot.drop_requested.load(Ordering::Acquire),
+                        format!("{:?}", slot.result.try_lock()),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        format!(
+            "remote terminal={} cancelled={} delivery_started={} demand={:?} receiver={:?} receipt={:?} slots={slots:?}\n{}",
+            self.0.terminal.load(Ordering::Acquire),
+            self.0.cancelled.load(Ordering::Acquire),
+            self.0.delivery_started.load(Ordering::Acquire),
+            self.0.demand.try_lock(),
+            self.0.receiver.try_lock(),
+            self.0.receipt.try_lock().map(|r| r.is_some()),
+            self.0
+                .files
+                .as_ref()
+                .map_or_else(|| "publication=none".into(), |files| files.watchdog_snapshot_for_test()),
+        )
+    }
+
     pub fn new(
         data: &Path,
         batch: BatchId,
@@ -105,19 +145,43 @@ impl Remote {
         demand: Demand,
         runtime: tokio::runtime::Handle,
     ) -> io::Result<Self> {
-        let inventory =
+        let mut inventory =
             crate::wire::local_inventory(&wire_inventory).map_err(|_| unavailable(Unavailable::InvalidData))?;
         inventory.validate().map_err(unavailable)?;
+        if target == ClipPlatform::Windows {
+            let roots = inventory
+                .roots
+                .iter()
+                .filter(|root| root.kind.symlink_target().is_none())
+                .cloned()
+                .collect();
+            inventory = inventory.with_roots(roots);
+        }
         let link = link.bind(inventory.id.clip.origin, inventory.id.clip);
+        if !link.supports_cloud_links() {
+            // Capability absence silently removes only file delivery. Mixed
+            // offers retain their text, image and other non-file representations.
+            inventory = crate::policy::without_files(inventory);
+        }
         if !inventory.namespace_roots_for(target).is_empty() && !link.supports_namespace() {
             return Err(unavailable(Unavailable::Unsupported));
         }
-        let tree = Mutex::new(tree::Tree::new(&inventory.namespace_roots_for(target)));
+        let roots = inventory.namespace_roots_for(target);
+        let _ = data;
+        let files = (!roots.is_empty())
+            .then(|| super::linked::Publication::new(inventory.id, roots, link.clone(), demand, runtime.clone()));
+        let inline = inventory
+            .wanted(target)
+            .filter_map(|rep| match &rep.data {
+                RepresentationData::Inline(bytes) => Some(bytes.len() as u64),
+                _ => None,
+            })
+            .sum::<u64>();
         Ok(Self(Arc::new(Inner {
             inventory,
-            wire_inventory,
             target,
-            batch: Batch::create(data, StoreKind::CompletedDelivery, batch)?,
+            batch_id: batch,
+            memory: memory::Budget::new(crate::model::SNAPSHOT_BYTES.saturating_sub(inline)),
             link,
             runtime,
             slots: Mutex::default(),
@@ -127,18 +191,24 @@ impl Remote {
             terminal: std::sync::atomic::AtomicU8::new(0),
             changed: tokio::sync::Notify::new(),
             parallel: Arc::new(tokio::sync::Semaphore::new(4)),
-            tree,
+            files,
             progress: tokio::sync::watch::channel(super::TransferProgress::new()).0,
             last_progress: Mutex::new(tokio::time::Instant::now()),
             delivery_started: AtomicBool::new(false),
+            delivery_report: std::sync::OnceLock::new(),
+            report_drag: !matches!(demand, Demand::Clipboard),
+            drop_report: std::sync::OnceLock::new(),
+            drop_report_ended: AtomicBool::new(false),
             receipt: Mutex::new(None),
             representations: Mutex::new(HashMap::new()),
             received: Mutex::default(),
-            max_files: std::sync::atomic::AtomicU64::new(u64::MAX),
         })))
     }
     pub fn set_demand(&self, demand: Demand) {
         *self.0.demand.lock().unwrap() = demand;
+        if let Some(files) = &self.0.files {
+            files.set_demand(demand);
+        }
     }
     pub fn set_receiver(&self, receiver: oink_foundation::DeviceId) {
         let mut current = self.0.receiver.lock().unwrap();
@@ -156,7 +226,7 @@ impl Remote {
                     .lock()
                     .unwrap()
                     .ok_or_else(|| unavailable(Unavailable::InvalidData))?,
-                u64::from_le_bytes(self.0.batch.id().0[..8].try_into().unwrap()),
+                u64::from_le_bytes(self.0.batch_id.0[..8].try_into().unwrap()),
             ),
             Demand::Drop(holder) | Demand::Hover(holder) => (holder.device, holder.epoch),
         };
@@ -166,8 +236,8 @@ impl Remote {
             sequence,
         })
     }
-    pub fn batch(&self) -> &Batch {
-        &self.0.batch
+    pub fn batch_id(&self) -> BatchId {
+        self.0.batch_id
     }
     pub fn automatic_pull(&self) -> bool {
         if !self.0.inventory.automatic_pull(self.0.target) {
@@ -192,6 +262,7 @@ impl Remote {
         {
             return;
         }
+        self.record_delivery(crate::timing::Outcome::Cancelled);
         self.0.cancelled.store(true, Ordering::Release);
         self.0.changed.notify_waiters();
         for slot in self.0.slots.lock().unwrap().values() {
@@ -202,14 +273,12 @@ impl Remote {
             slot.ready.notify_all();
             slot.changed.notify_waiters();
         }
-        self.cancel_files(Unavailable::Cancelled);
+        if let Some(files) = &self.0.files {
+            files.cancel();
+        }
         self.update_progress(false, |p| {
             p.phase = super::TransferPhase::Cancelled;
             p.failure = Some(Unavailable::Cancelled);
-        });
-        let batch = self.0.batch.clone();
-        self.0.runtime.spawn_blocking(move || {
-            let _ = batch.abandon();
         });
     }
     fn request(&self, id: RepresentationId) -> Arc<Slot> {
@@ -240,6 +309,12 @@ impl Remote {
         let slot = Arc::new(Slot {
             diagnostic: slot_trace.context(),
             hover: matches!(demand, Demand::Hover(_)),
+            abort: std::sync::OnceLock::new(),
+            received: Default::default(),
+            // A later native read gets its own callback budget even when the
+            // earlier transfer watchdog expired. Do not reset file progress.
+            deadline_floor: super::native_read::remote_read()
+                .map(|read| tokio::time::Instant::now() + read.remaining()),
             drop_requested: AtomicBool::new(false),
             result: Mutex::new(None),
             ready: Condvar::new(),
@@ -252,7 +327,7 @@ impl Remote {
         let activity =
             oink_foundation::maintenance::process().enter(oink_foundation::maintenance::ActivityKind::FileTransfer);
         let completion = SlotCompletion(ready.clone());
-        self.0.runtime.spawn(async move {
+        let task = self.0.runtime.spawn(async move {
             let fetch_trace = ReadTrace::new(read_stage::FETCH, ready.diagnostic);
             let _completion = completion;
             let Some(_update_activity) = activity else {
@@ -264,7 +339,7 @@ impl Remote {
             let mut demand = demand;
             loop {
                 let result = content
-                    .fetch(id, demand, fetch_trace.context())
+                    .fetch(id, demand, fetch_trace.context(), &ready)
                     .await
                     .map_err(|e| reason(&e));
                 // Serialize with request(), not just the physical release. An
@@ -284,22 +359,31 @@ impl Remote {
                     continue;
                 }
                 if done.is_none() {
-                    *done = Some(result);
+                    *done = Some(result.map(|bytes| {
+                        content.0.representations.lock().unwrap().insert(id, Arc::new(bytes));
+                    }));
                 }
                 ready.ready.notify_all();
                 ready.changed.notify_waiters();
                 break;
             }
         });
+        slot.abort.set(task.abort_handle()).unwrap();
         slot
     }
-    async fn fetch(&self, id: RepresentationId, demand: Demand, diagnostic: ReadContext) -> io::Result<()> {
+    async fn fetch(
+        &self,
+        id: RepresentationId,
+        demand: Demand,
+        diagnostic: ReadContext,
+        slot: &Slot,
+    ) -> io::Result<memory::Bytes> {
         let queued = ReadTrace::new(read_stage::PARALLEL_WAIT, diagnostic);
         let permit = self.0.parallel.clone().acquire_owned().await;
         queued.result(if permit.is_ok() { 0 } else { -1 });
         drop(queued);
         let _permit = permit.map_err(|_| unavailable(Unavailable::Cancelled))?;
-        let mut deadline = self.deadline();
+        let mut deadline = self.deadline_with_floor(slot.deadline_floor);
         let mut backoff = Duration::from_millis(500);
         loop {
             if self.0.cancelled.load(Ordering::Acquire) || self.0.link.is_cancelled() {
@@ -308,10 +392,10 @@ impl Remote {
             let result = tokio::select! {
                 _ = self.0.changed.notified() => return Err(unavailable(Unavailable::Cancelled)),
                 _ = self.0.link.cancelled() => return Err(unavailable(Unavailable::Cancelled)),
-                result = self.attempt(id, demand, &mut deadline, diagnostic) => result,
+                result = self.attempt(id, demand, &mut deadline, diagnostic, slot) => result,
             };
             match result {
-                Ok(()) => return Ok(()),
+                Ok(bytes) => return Ok(bytes),
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -328,7 +412,7 @@ impl Remote {
                 _ = self.0.link.cancelled() => return Err(unavailable(Unavailable::Cancelled)),
                 _ = tokio::time::sleep_until(deadline.min(tokio::time::Instant::now()+backoff)) => {},
             }
-            deadline = self.deadline();
+            deadline = self.deadline_with_floor(slot.deadline_floor);
             if tokio::time::Instant::now() >= deadline {
                 return Err(unavailable(Unavailable::NoProgress));
             }
@@ -341,7 +425,8 @@ impl Remote {
         demand: Demand,
         deadline: &mut tokio::time::Instant,
         diagnostic: ReadContext,
-    ) -> io::Result<()> {
+        slot: &Slot,
+    ) -> io::Result<memory::Bytes> {
         let attempt = ReadTrace::new(read_stage::LOW_OPEN, diagnostic);
         let offer = self.0.inventory.id;
         // The link owner admits every bulk operation against explicit wire
@@ -388,60 +473,23 @@ impl Remote {
         drop(sending);
         sent?;
         let response = ReadTrace::new(read_stage::RESPONSE_WAIT, context);
-        let (tx, rx) = tokio::sync::mpsc::channel(2);
-        let batch = self.0.batch.clone();
-        let writer_trace = ReadTrace::new(read_stage::CACHE_WRITE, context);
-        let writer_context = writer_trace.context();
-        let writer = tokio::task::spawn_blocking(move || {
-            let writing = ReadTrace::new(
-                read_stage::CACHE_WRITE,
-                ReadContext {
-                    aux: 1,
-                    ..writer_context
-                },
-            );
-            let result = batch.snapshot(
-                id.0,
-                &mut Incoming {
-                    rx,
-                    bytes: io::Cursor::new(Vec::new()),
-                    failed: false,
-                    finished: false,
-                },
-            );
-            writing.io(&result);
-            result
-        });
-        let result = self.receive(id, channel.as_mut(), &tx, deadline).await;
+        let result = self.receive(id, channel.as_mut(), deadline, slot).await;
         response.io(&result);
-        drop(response);
-        if let Err(error) = &result {
-            let _ = tx.send(Err(io::Error::new(error.kind(), "content read failed"))).await;
-        } else {
-            let _ = tx.send(Ok(Vec::new())).await;
-        }
-        drop(tx);
-        let stored = writer.await.map_err(|_| unavailable(Unavailable::ReadFailed))?;
-        writer_trace.io(&stored);
-        drop(writer_trace);
-        result?;
-        let stored = stored?;
-        self.0.representations.lock().unwrap().insert(id, stored);
-        Ok(())
+        result
     }
     async fn receive(
         &self,
         id: RepresentationId,
         channel: &mut dyn BulkChannel,
-        tx: &tokio::sync::mpsc::Sender<io::Result<Vec<u8>>>,
         deadline: &mut tokio::time::Instant,
-    ) -> io::Result<()> {
+        slot: &Slot,
+    ) -> io::Result<memory::Bytes> {
         let offer = self.0.inventory.id;
+        let mut stored = memory::Bytes::new(self.0.memory.clone());
         let mut offset = 0_u64;
-        let mut hash = blake3::Hasher::new();
         let validity = channel.effect_validity();
         loop {
-            let message = self.receive_content(channel).await?;
+            let message = self.receive_content_with_floor(channel, slot.deadline_floor).await?;
             if !validity() || self.0.cancelled.load(Ordering::Acquire) {
                 return Err(unavailable(Unavailable::Cancelled));
             }
@@ -456,11 +504,9 @@ impl Remote {
                         .checked_add(bytes.len() as u64)
                         .filter(|n| *n <= REPRESENTATION_BYTES)
                         .ok_or_else(|| unavailable(Unavailable::LimitExceeded))?;
-                    hash.update(&bytes);
 
-                    tx.send(Ok(bytes))
-                        .await
-                        .map_err(|_| unavailable(Unavailable::StorageFull))?;
+                    stored.push(bytes)?;
+                    slot.received.store(offset, Ordering::Release);
                     let fresh = {
                         let mut received = self.0.received.lock().unwrap();
                         let previous = received.entry(id).or_default();
@@ -469,33 +515,15 @@ impl Remote {
                         fresh
                     };
                     self.update_progress(fresh > 0, |p| p.bytes = p.bytes.saturating_add(fresh));
-                    *deadline = self.deadline();
+                    *deadline = self.deadline_with_floor(slot.deadline_floor);
                 }
                 ContentMsg::RepresentationEnd {
                     offer: got,
                     representation,
                     size,
-                    hash: digest,
-                } if got == offer
-                    && representation == id
-                    && size == offset
-                    && digest == *hash.finalize().as_bytes() =>
-                {
-                    let rep = find(&self.0.inventory, id).ok_or_else(|| unavailable(Unavailable::NoSuchItem))?;
-                    if self.0.target == self.0.inventory.platform {
-                        match rep.data {
-                            RepresentationData::Reader {
-                                size: ContentSize::Known(n),
-                                ..
-                            } if n != size => return Err(unavailable(Unavailable::Superseded)),
-                            RepresentationData::Reader {
-                                hash: Some(expected), ..
-                            } if expected != digest => return Err(unavailable(Unavailable::Superseded)),
-                            _ => {}
-                        }
-                    }
-                    self.end_channel(channel).await?;
-                    return Ok(());
+                } if got == offer && representation == id && size == offset => {
+                    self.end_channel_with_floor(channel, slot.deadline_floor).await?;
+                    return Ok(stored);
                 }
                 ContentMsg::RepresentationFailed {
                     offer: got,
@@ -507,6 +535,7 @@ impl Remote {
         }
     }
     fn open_until(&self, id: RepresentationId, deadline: Option<std::time::Instant>) -> io::Result<FileReader> {
+        let native = super::native_read::remote_read();
         let trace = ReadTrace::new(
             read_stage::REMOTE_OPEN,
             ReadContext {
@@ -536,7 +565,21 @@ impl Remote {
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 return Err(unavailable(Unavailable::NoProgress));
             }
+            if native.as_ref().is_some_and(|read| read.remaining().is_zero()) {
+                self.native_timeout(id, None, native.as_ref().unwrap());
+                return Err(unavailable(Unavailable::NoProgress));
+            }
             let slot = self.request(id);
+            #[cfg(test)]
+            if let Some(read) = &native {
+                let weak = Arc::downgrade(&slot);
+                read.wake_on_advance(move || {
+                    if let Some(slot) = weak.upgrade() {
+                        let _result = slot.result.lock().unwrap();
+                        slot.ready.notify_all();
+                    }
+                });
+            }
             let wait = ReadTrace::new(
                 read_stage::SLOT_WAIT,
                 ReadContext {
@@ -546,10 +589,31 @@ impl Remote {
                 },
             );
             let mut result = slot.result.lock().unwrap();
-            while result.is_none() {
-                result = if let Some(deadline) = deadline {
-                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+            loop {
+                if let Some(read) = &native
+                    && read.remaining().is_zero()
+                {
+                    drop(result);
+                    self.native_timeout(id, Some(&slot), read);
+                    return Err(unavailable(Unavailable::NoProgress));
+                }
+                if result.is_some() {
+                    break;
+                }
+                let remaining = deadline.map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
+                let remaining = match (&native, remaining) {
+                    (Some(read), Some(left)) => Some(left.min(read.remaining())),
+                    (Some(read), None) => Some(read.remaining()),
+                    (None, left) => left,
+                };
+                result = if let Some(left) = remaining {
                     if left.is_zero() {
+                        drop(result);
+                        if let Some(read) = &native
+                            && read.remaining().is_zero()
+                        {
+                            self.native_timeout(id, Some(&slot), read);
+                        }
                         return Err(unavailable(Unavailable::NoProgress));
                     }
                     slot.ready.wait_timeout(result, left).unwrap().0
@@ -564,16 +628,59 @@ impl Remote {
             // acquisition must not keep an executor worker waiting on disk.
             drop(result);
             completed.map_err(unavailable)?;
-            let read = self.0.batch.read_lease()?;
-            let file = std::fs::File::open(self.0.batch.path().join(format!("r-{}", id.0)))?;
-            Ok(Box::new(LocalReader {
-                file,
-                _batch: self.0.batch.clone(),
-                _read: read,
-            }))
+            self.0
+                .representations
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(memory::Bytes::reader)
+                .ok_or_else(|| unavailable(Unavailable::ReadFailed))
         });
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| reason(error) == Unavailable::Cancelled)
+            && let Some(read) = &native
+        {
+            read.cancelled();
+        }
         trace.io(&result);
         result
+    }
+    fn native_timeout(&self, id: RepresentationId, slot: Option<&Arc<Slot>>, read: &super::native_read::Read) {
+        if let Some(slot) = slot {
+            // Serialize detachment and completion with request(): a late task
+            // cannot publish bytes into a replacement request's cache entry.
+            let mut slots = self.0.slots.lock().unwrap();
+            let mut result = slot.result.lock().unwrap();
+            // The async watchdog can complete with NoProgress just before
+            // the native waiter wakes at the same deadline. That failed slot
+            // must also be detached so the next paste can retry.
+            if result.is_none() || *result == Some(Err(Unavailable::NoProgress)) {
+                *result = Some(Err(Unavailable::NoProgress));
+                if let Some(abort) = slot.abort.get() {
+                    // Dropping the unfinished BulkChannel cancels its Low stream
+                    // at the source, including a pending source read.
+                    abort.abort();
+                }
+                if slots.get(&id).is_some_and(|current| Arc::ptr_eq(current, slot)) {
+                    slots.remove(&id);
+                }
+                slot.ready.notify_all();
+                slot.changed.notify_waiters();
+            }
+        }
+        if !super::native_read::timed_out() {
+            read.timed_out();
+            tracing::warn!(
+                clipboard_offer = self.0.inventory.id.clip.seq,
+                clipboard_generation = self.0.inventory.id.generation,
+                clipboard_representation = id.0,
+                bytes_received = slot.map_or(0, |slot| slot.received.load(Ordering::Acquire)),
+                elapsed_ms = read.elapsed().as_millis() as u64,
+                "native clipboard read timed out"
+            );
+        }
     }
 }
 impl Provider for Remote {
@@ -589,9 +696,6 @@ impl Provider for Remote {
         }
         self.open_until(id, Some(std::time::Instant::now() + timeout))
     }
-    fn local_batch(&self) -> Option<Batch> {
-        Some(self.0.batch.clone())
-    }
     fn translator(&self) -> Arc<dyn Translator> {
         Arc::new(NoTranslation)
     }
@@ -600,65 +704,65 @@ impl Provider for Remote {
             .then(|| Arc::new(self.clone()) as Arc<dyn namespace::Namespace>)
     }
 }
-struct LocalReader {
-    file: std::fs::File,
-    _read: crate::cache::SourceLease,
-    _batch: Batch,
-}
-impl Read for LocalReader {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.file.read(buffer)
-    }
-}
-struct Incoming {
-    rx: tokio::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
-    bytes: io::Cursor<Vec<u8>>,
-    failed: bool,
-    finished: bool,
-}
-impl Read for Incoming {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        if self.failed {
-            return Err(unavailable(Unavailable::ReadFailed));
-        }
-        if self.finished {
-            return Ok(0);
-        }
-        loop {
-            let n = self.bytes.read(buffer)?;
-            if n != 0 {
-                return Ok(n);
-            }
-            match self.rx.blocking_recv() {
-                Some(Ok(bytes)) if bytes.is_empty() => {
-                    self.finished = true;
-                    return Ok(0);
-                }
-                Some(Ok(bytes)) => self.bytes = io::Cursor::new(bytes),
-                Some(Err(error)) => {
-                    self.failed = true;
-                    return Err(error);
-                }
-                None => {
-                    self.failed = true;
-                    return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;
+    #[test]
+    fn native_retry_has_budget_without_resetting_file_watchdog() {
+        use super::super::native_read::{Callback, TestClock, tests::Harness};
+        let mut harness = Harness::new(ClipPlatform::Mac, false);
+        let expired = tokio::time::Instant::now() - Duration::from_millis(NO_PROGRESS_MS + 1);
+        *harness.remote.0.last_progress.lock().unwrap() = expired;
+        let clock = Arc::new(TestClock::default());
+        let expiry = harness.expire_when_waiting(clock.clone());
+        clock.scope(|| {
+            let _callback = Callback::begin();
+            assert!(harness.remote.open(RepresentationId(1)).is_err());
+        });
+        expiry.join().unwrap();
+        assert_eq!(*harness.remote.0.last_progress.lock().unwrap(), expired);
+        harness.allow_retry();
+        // Model a later paste after the prior transfer watchdog has expired,
+        // without spending wall time or changing the offer's identity.
+        *harness.remote.0.last_progress.lock().unwrap() =
+            tokio::time::Instant::now() - Duration::from_millis(NO_PROGRESS_MS + 1);
+        let callback = Callback::begin();
+        assert_eq!(
+            read_all(&mut harness.remote.open(RepresentationId(1)).unwrap()).unwrap(),
+            harness.bytes
+        );
+        callback.served();
+    }
+    #[test]
+    fn timeout_detaches_a_slot_even_when_the_async_watchdog_completed_first() {
+        use super::super::native_read::{self, Callback, tests::Harness};
+        let harness = Harness::new(ClipPlatform::Mac, false);
+        let _callback = Callback::begin();
+        let read = native_read::remote_read().unwrap();
+        let slot = harness.remote.request(RepresentationId(1));
+        // Reproduce the ordering where the async timer wins just before the
+        // synchronous callback wakes. This must not cache a permanent failure.
+        *slot.result.lock().unwrap() = Some(Err(Unavailable::NoProgress));
+        harness.remote.native_timeout(RepresentationId(1), Some(&slot), &read);
+        assert!(
+            !harness
+                .remote
+                .0
+                .slots
+                .lock()
+                .unwrap()
+                .contains_key(&RepresentationId(1))
+        );
+        assert!(!harness.remote.0.cancelled.load(Ordering::Acquire));
+    }
     #[tokio::test]
     async fn aborting_an_unpolled_download_wakes_its_native_reader() {
         let slot = Arc::new(Slot {
             diagnostic: ReadContext::default(),
             hover: false,
+            abort: std::sync::OnceLock::new(),
+            received: Default::default(),
+            deadline_floor: None,
             drop_requested: AtomicBool::new(false),
             result: Mutex::new(None),
             ready: Condvar::new(),

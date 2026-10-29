@@ -32,6 +32,8 @@ pub(crate) struct State {
     wake: tokio::sync::Notify,
     #[cfg(test)]
     lease_clock: OnceLock<Mutex<Instant>>,
+    #[cfg(test)]
+    wall_offset_ms: std::sync::atomic::AtomicI64,
 }
 #[derive(Default)]
 struct Control {
@@ -49,6 +51,7 @@ struct Control {
     gesture: Option<Gesture>,
     gestures: BTreeMap<DeviceId, Instant>,
     input_gesture: bool,
+    refusal_log: Option<Instant>,
 }
 struct Preview {
     layout: Layout,
@@ -104,6 +107,23 @@ fn lease_now(node: &Node, now: Instant) -> Instant {
     }
     let _ = node;
     now
+}
+
+// Absolute timestamps remain sender-local metadata; tests can model unsynchronised peers.
+fn preview_wall_now(node: &Node) -> u64 {
+    let now = crate::layout_sync::now_ms();
+    #[cfg(test)]
+    return now.saturating_add_signed(
+        node.inner
+            .projection
+            .wall_offset_ms
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    #[cfg(not(test))]
+    {
+        let _ = node;
+        now
+    }
 }
 
 fn emit_status(node: &Node) {
@@ -167,7 +187,7 @@ fn preview_locked(
     let message = Action::Arrangement {
         sequence: c.sequence,
         lease_ms: LEASE.as_millis() as u32,
-        expires_ms: crate::layout_sync::now_ms() + LEASE.as_millis() as u64,
+        expires_ms: preview_wall_now(node) + LEASE.as_millis() as u64,
         snapshot: Some(snapshot.clone()),
     };
     if !message.valid() {
@@ -203,6 +223,9 @@ pub(crate) fn preview_ui_arrangement(
     let mut c = lock(&node.inner.projection.control);
     if gesture < c.ui_latest || gesture <= c.ui_closed {
         return Ok(());
+    }
+    if gesture != c.ui_latest || ended {
+        tracing::info!(gesture, ended, placements = placements.len(), "projection UI request");
     }
     c.ui_latest = gesture;
     if ended {
@@ -246,12 +269,24 @@ pub(crate) fn preview_ui_arrangement(
     Ok(())
 }
 
+// A malformed or obsolete frame can arrive at preview frequency. Bound refusal
+// diagnostics globally; lifecycle transitions below log once per preview.
+fn refusal(c: &mut Control, peer: DeviceId, reason: &'static str, now: Instant) {
+    if c.refusal_log
+        .is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(5))
+    {
+        tracing::info!(?peer, reason, "projection preview refused");
+        c.refusal_log = Some(now);
+    }
+}
+
 fn receive(node: &Node, peer: DeviceId, msg: Action, now: Instant) {
     let now = lease_now(node, now);
+    let mut c = lock(&node.inner.projection.control);
     if !msg.valid() {
+        refusal(&mut c, peer, "invalid_payload", now);
         return;
     }
-    let mut c = lock(&node.inner.projection.control);
     let was_editing = c.mode.is_some();
     match msg {
         Action::Arrangement {
@@ -260,29 +295,38 @@ fn receive(node: &Node, peer: DeviceId, msg: Action, now: Instant) {
             expires_ms,
             snapshot,
         } => {
-            let wall_now = crate::layout_sync::now_ms();
-            if expires_ms <= wall_now
-                || expires_ms > wall_now.saturating_add(u64::from(lease_ms) + 250)
-                || c.seen.get(&peer).is_some_and(|old| *old >= sequence)
-            {
+            // Peer wall clocks are not synchronised. A forward skew of only
+            // 250 ms used to reject every Windows-originated preview on Macs.
+            // Bound residence using the sender's remaining TTL and our monotonic
+            // clock; sequence fencing prevents cleared/older frames from reviving.
+            if c.seen.get(&peer).is_some_and(|old| *old >= sequence) {
+                refusal(&mut c, peer, "stale_sequence", now);
                 return;
             }
             c.seen.insert(peer, sequence);
-            c.remote.remove(&peer);
+            let was_visible = c.remote.remove(&peer).is_some();
             if let Some(snapshot) = snapshot {
                 let applied = node.link_config().expect("started config").applied();
                 let Ok((layout, _)) = arrangement::render(&snapshot, &applied.layout, &applied.owners) else {
+                    refusal(&mut c, peer, "render_validation", now);
                     return;
                 };
+                if !was_visible {
+                    tracing::info!(?peer, sequence, lease_ms,
+                        sender_expiry_delta_ms = %(i128::from(expires_ms) - i128::from(crate::layout_sync::now_ms())),
+                        "projection remote preview accepted");
+                }
                 c.remote.insert(
                     peer,
                     Preview {
                         layout,
                         arrangement: Some(snapshot),
                         affected: vec![],
-                        expires: now + Duration::from_millis((expires_ms - wall_now).min(u64::from(lease_ms))),
+                        expires: now + Duration::from_millis(u64::from(lease_ms)),
                     },
                 );
+            } else if was_visible {
+                tracing::info!(?peer, sequence, "projection remote preview cleared");
             }
         }
         Action::Preview {
@@ -451,7 +495,14 @@ fn expire_previews(c: &mut Control, now: Instant) {
     if c.local.as_ref().is_some_and(|p| p.expires <= now) && c.gesture.is_none() {
         clear_locked(c);
     }
-    c.remote.retain(|_, p| p.expires > now);
+    c.remote.retain(|peer, p| {
+        if p.expires <= now {
+            tracing::info!(?peer, "projection remote lease expired");
+            false
+        } else {
+            true
+        }
+    });
 }
 
 fn tick(node: &Node, now: Instant, heartbeat: bool) -> Vec<Action> {
@@ -487,10 +538,6 @@ fn tick(node: &Node, now: Instant, heartbeat: bool) -> Vec<Action> {
             && let Some(p) = c.local.as_mut()
         {
             p.expires = expiry;
-            if let Some(Action::Arrangement { expires_ms, .. }) = c.pending.pending.as_mut() {
-                *expires_ms =
-                    crate::layout_sync::now_ms() + expiry.saturating_duration_since(lease_now).as_millis() as u64;
-            }
         }
     }
     let active_gesture = c.gesture.is_some() || !c.gestures.is_empty();
@@ -501,8 +548,18 @@ fn tick(node: &Node, now: Instant, heartbeat: bool) -> Vec<Action> {
         }
     }
     let mut messages = std::mem::take(&mut c.immediate);
-    if let Some(message) = c.pending.take(now) {
-        messages.push(message);
+    if let Some(mut message) = c.pending.take(now) {
+        if let Action::Arrangement {
+            lease_ms, expires_ms, ..
+        } = &mut message
+        {
+            let remaining = c.local.as_ref().map_or(0, |p| remaining_lease_ms(p.expires, lease_now));
+            *lease_ms = remaining;
+            *expires_ms = preview_wall_now(node) + u64::from(remaining);
+        }
+        if message.valid() {
+            messages.push(message);
+        }
     }
     drop(c);
     if changed {
@@ -606,27 +663,60 @@ fn view(node: &Node, online: &BTreeSet<DeviceId>) -> View {
     }
 }
 
+// Only live previews and stream retries need a clock; commands and arrivals wake the owner.
+fn next_tick(control: &Control, now: Instant, retry: Option<Instant>) -> Option<Instant> {
+    let active = control.mode.is_some()
+        || control.local.is_some()
+        || !control.remote.is_empty()
+        || control.gesture.is_some()
+        || !control.gestures.is_empty()
+        || control.pending.pending.is_some()
+        || !control.immediate.is_empty()
+        || control.input_gesture;
+    if active {
+        Some(retry.map_or(now + INTERVAL, |retry| retry.min(now + INTERVAL)))
+    } else {
+        retry
+    }
+}
+
+async fn wait_tick(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending().await,
+    }
+}
+
 pub(crate) fn start(node: Node, mut port: ModulePort, native: bool) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let links = node.links()?;
     let group = node.link_config()?;
-    if native && let Some(surface) = ProjectionOverlay::platform() {
-        let _ = node.inner.projection.surface.set(surface);
+    if native {
+        if let Some(surface) = ProjectionOverlay::platform() {
+            let _ = node.inner.projection.surface.set(surface);
+            tracing::info!("projection native renderer started");
+        } else {
+            tracing::info!("projection native renderer unavailable");
+        }
     }
     let mut streams = ProjectionStreams::new(links.clone(), group.clone());
     let wake = streams.wake();
     let mut changes = group.subscribe();
     let mut stop = node.stop_receiver();
     Ok(tokio::spawn(async move {
-        let mut interval = tokio::time::interval(INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_heartbeat = Instant::now();
         let mut last_draw = Instant::now() - HEARTBEAT;
         let mut drawn = false;
+        let mut send_outcomes = BTreeMap::new();
         let mut online = BTreeSet::from([node.id()]);
         loop {
+            let deadline = next_tick(
+                &lock(&node.inner.projection.control),
+                Instant::now(),
+                streams.deadline(),
+            );
             tokio::select! {
                 _ = stop.changed() => break,
-                _ = interval.tick() => {},
+                _ = wait_tick(deadline) => {},
                 _ = node.inner.projection.wake.notified() => {},
                 _ = wake.notified() => {},
                 change = changes.next() => match change {
@@ -637,6 +727,7 @@ pub(crate) fn start(node: Node, mut port: ModulePort, native: bool) -> anyhow::R
                     Some(ModuleEvent::LinkReady { link, peer }) => { streams.link_ready(link, peer); online.insert(peer); },
                     Some(ModuleEvent::LinkLost { link, peer, reason }) => {
                         streams.link_lost(link, peer, reason); online.remove(&peer);
+                        send_outcomes.remove(&peer);
                         let mut c = lock(&node.inner.projection.control);
                         c.remote.remove(&peer); c.seen.remove(&peer); c.gestures.remove(&peer);
                         let closed_mode = c.mode.is_some_and(|(id, _)| id.owner == peer);
@@ -672,12 +763,24 @@ pub(crate) fn start(node: Node, mut port: ModulePort, native: bool) -> anyhow::R
                         .iter()
                         .filter_map(|action| encode_for_peer(&node, peer, action).transpose())
                         .collect::<v1::Result<Vec<_>>>();
-                    let (Ok(opening), Ok(Some(message))) = (opening, encode_for_peer(&node, peer, message)) else {
-                        tracing::warn!("invalid local projection state");
+                    let encoded = encode_for_peer(&node, peer, message);
+                    let outcome = match (&opening, &encoded) {
+                        (Err(_), _) | (_, Err(_)) => "invalid_local_state",
+                        (_, Ok(None)) => "unsupported_preview",
+                        _ => "ready",
+                    };
+                    let (Ok(opening), Ok(Some(message))) = (opening, encoded) else {
+                        if send_outcomes.insert(peer, outcome) != Some(outcome) {
+                            tracing::info!(?peer, outcome, "projection send refused");
+                        }
                         continue;
                     };
                     streams.set_opening(peer, opening);
-                    let _ = streams.send(peer, &message, now);
+                    let result = streams.send(peer, &message, now);
+                    let outcome = if result.is_ok() { "queued" } else { "failed" };
+                    if send_outcomes.insert(peer, outcome) != Some(outcome) {
+                        tracing::info!(?peer, ?result, "projection send state");
+                    }
                 }
             }
             let active = {
@@ -704,6 +807,10 @@ pub(crate) fn start(node: Node, mut port: ModulePort, native: bool) -> anyhow::R
         }
     }))
 }
+fn remaining_lease_ms(expires: Instant, now: Instant) -> u32 {
+    expires.saturating_duration_since(now).min(LEASE).as_millis() as u32
+}
+
 fn current_messages(node: &Node) -> Vec<Action> {
     let c = lock(&node.inner.projection.control);
     let mut messages = Vec::new();
@@ -712,14 +819,14 @@ fn current_messages(node: &Node) -> Vec<Action> {
     {
         messages.push(Action::Mode { id, enabled: true });
     }
-    if let Some(p) = &c.local {
+    if let Some(p) = &c.local
+        && let remaining = remaining_lease_ms(p.expires, lease_now(node, Instant::now()))
+        && remaining > 0
+    {
         messages.push(Action::Arrangement {
             sequence: c.sequence,
-            lease_ms: LEASE.as_millis() as u32,
-            expires_ms: crate::layout_sync::now_ms()
-                + p.expires
-                    .saturating_duration_since(lease_now(node, Instant::now()))
-                    .as_millis() as u64,
+            lease_ms: remaining,
+            expires_ms: preview_wall_now(node) + u64::from(remaining),
             snapshot: p.arrangement.clone(),
         });
     }
@@ -803,6 +910,72 @@ fn encode_selected(
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+    #[tokio::test]
+    #[ignore = "isolated resource benchmark; run with --ignored --nocapture"]
+    async fn resource_projection_idle_benchmark() {
+        let control = Control::default();
+        let started = Instant::now();
+        let mut ticks = 0;
+        let stop = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(stop);
+        loop {
+            tokio::select! {
+                _ = &mut stop => break,
+                _ = wait_tick(next_tick(&control, Instant::now(), None)) => ticks += 1,
+            }
+        }
+        println!(
+            "idle_projection_ticks={ticks} elapsed_us={}",
+            started.elapsed().as_micros()
+        );
+        // Keep the original fixed interval as a matched reference, including its first tick.
+        let mut original = tokio::time::interval(INTERVAL);
+        original.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let stop = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(stop);
+        let mut original_ticks = 0;
+        loop {
+            tokio::select! {
+                _ = &mut stop => break,
+                _ = original.tick() => original_ticks += 1,
+            }
+        }
+        println!("original_fixed_interval_ticks={original_ticks}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_projection_has_no_timer_and_retry_still_wakes() {
+        use std::future::Future;
+        let now = tokio::time::Instant::now().into_std();
+        let control = Control::default();
+        let mut idle = Box::pin(wait_tick(next_tick(&control, now, None)));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(idle.as_mut().poll(&mut cx).is_pending());
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(idle.as_mut().poll(&mut cx).is_pending());
+        let retry = now + Duration::from_secs(3601);
+        assert_eq!(next_tick(&control, now, Some(retry)), Some(retry));
+        wait_tick(Some(retry)).await;
+        assert_eq!(tokio::time::Instant::now().into_std(), retry);
+    }
+
+    #[test]
+    fn projection_keeps_clock_for_pending_clear_and_gesture_expiry() {
+        let now = Instant::now();
+        let mut control = Control::default();
+        control.pending.push(Action::Preview {
+            screens: None,
+            sequence: 1,
+            affected: vec![],
+        });
+        assert_eq!(next_tick(&control, now, None), Some(now + INTERVAL));
+        control.pending.barrier();
+        control.gestures.insert(DeviceId([2; 32]), now + LEASE);
+        assert_eq!(next_tick(&control, now, None), Some(now + INTERVAL));
+        control.gestures.clear();
+        assert_eq!(next_tick(&control, now, None), None);
+    }
+
     #[test]
     fn abandoned_previews_expire_without_renewing_the_ui_lease() {
         let now = Instant::now();
@@ -1056,7 +1229,16 @@ mod integration_tests {
 
     #[test]
     fn general_preview_native_group_visibility_and_shared_dto_are_ephemeral() {
-        crate::test_watchdog::run(module_path!(), "general arrangement preview", Some(6), async {
+        general_preview_scenario(false);
+    }
+
+    #[test]
+    fn general_preview_waits_for_catalog_handoff_before_committing_native_observation() {
+        general_preview_scenario(true);
+    }
+
+    fn general_preview_scenario(delay_catalog: bool) {
+        crate::test_watchdog::run(module_path!(), "general arrangement preview", Some(6), async move {
             use oink_foundation::{Point, Rect, Size};
             use std::sync::Arc;
             let ad = tempfile::tempdir().unwrap();
@@ -1086,11 +1268,40 @@ mod integration_tests {
                 None,
             )
             .await;
+            // This scenario checks catalog/commit ordering, not lease expiry.
+            // Disk writes and cross-thread scheduling can outlive the real 2s
+            // lease under load. Freeze only lease time; stream pacing, catalog
+            // handoff and the native observation still run asynchronously.
+            for node in [&a, &b] {
+                node.inner
+                    .projection
+                    .lease_clock
+                    .set(Mutex::new(Instant::now()))
+                    .unwrap();
+            }
+            let source_default = crate::layout_profiles::model::default_id(a.group_id().unwrap().into());
+            a.inner
+                .profiles
+                .defer_catalogs
+                .store(delay_catalog, std::sync::atomic::Ordering::SeqCst);
             common::pair(&a, &b).await;
             common::until("three retained screens", || {
                 a.layout().0.screens.len() == 3 && a.layout().0 == b.layout().0
             })
             .await;
+            let nodes = [&a, &b];
+            let mut handoff = std::pin::pin!(common::profile_handoff(&nodes, &source_default));
+            if delay_catalog {
+                let observed =
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(handoff.as_mut(), cx)))
+                        .await;
+                assert!(observed.is_pending(), "screen geometry alone cannot admit a saved edit");
+                a.inner
+                    .profiles
+                    .defer_catalogs
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            handoff.await;
             let config = a.link_config().unwrap();
             assert!(config.peer_agreement(b.id()).unwrap().contains("oink.layout.preview/1"));
             let live = a.layout().0;
@@ -1189,15 +1400,15 @@ mod integration_tests {
                 a.id(),
                 Action::Arrangement {
                     sequence: 1001,
-                    lease_ms: 2000,
-                    expires_ms: crate::layout_sync::now_ms() - 1,
+                    lease_ms: 0,
+                    expires_ms: crate::layout_sync::now_ms() + 2000,
                     snapshot: Some(Box::new(snapshot.clone())),
                 },
                 Instant::now(),
             );
             assert!(
                 view(&b, &online).projections.is_empty(),
-                "expired input cannot replace the preview"
+                "zero remaining lease cannot replace the preview"
             );
             preview_ui(&a, 1, vec![], vec![], true).unwrap();
             // Directly fence the artificial high sequence used above.
@@ -1243,7 +1454,17 @@ mod integration_tests {
                     .unwrap()
                     .initialize_displays(observed_displays)
                     .unwrap();
-                author.save_layout(placements).unwrap();
+                let result = author.save_layout(placements);
+                let catalog = lock(&author.inner.profiles.data)
+                    .catalog
+                    .as_ref()
+                    .map(|c| (c.group, c.version.clone()));
+                assert!(
+                    result.is_ok(),
+                    "save after native observation: {result:?}; group={:?}; catalog={catalog:?}; profile_state={:?}",
+                    author.group_id(),
+                    author.layout_profile_command(crate::layout_profiles::types::Command::Query),
+                );
             });
             while !commit.is_finished() {
                 assert_eq!(view(&b, &online), released);
@@ -1371,10 +1592,41 @@ mod integration_tests {
                 nodes.iter().all(|node| view(node, &online) == View::default())
             })
             .await;
-            preview_ui(upper, 2, placements, vec![], false).unwrap();
+            // A Windows-like pixel desktop must project on both receivers even
+            // when its wall clock leads (observed regression) or trails theirs.
+            for (gesture, offset) in [(2, 1000), (3, -60_000)] {
+                upper
+                    .inner
+                    .projection
+                    .wall_offset_ms
+                    .store(offset, std::sync::atomic::Ordering::Relaxed);
+                preview_ui(upper, gesture, placements.clone(), vec![], false).unwrap();
+                common::until("clock-skewed preview reaches both receivers", || {
+                    [left, right]
+                        .iter()
+                        .all(|node| view(node, &online).projections.len() == 2)
+                })
+                .await;
+                preview_ui(upper, gesture, vec![], vec![], true).unwrap();
+                common::until("clock-skewed preview end hides all screens", || {
+                    nodes.iter().all(|node| view(node, &online) == View::default())
+                })
+                .await;
+            }
+            preview_ui(upper, 4, placements, vec![], false).unwrap();
             let expires = lock(&upper.inner.projection.control).local.as_ref().unwrap().expires;
             *lock(upper.inner.projection.lease_clock.get().unwrap()) = expires - Duration::from_millis(1);
-            tick(upper, Instant::now(), true);
+            let messages = tick(upper, Instant::now() + INTERVAL, true);
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| matches!(m, Action::Arrangement { lease_ms: 1, .. }))
+            );
+            assert!(
+                current_messages(upper)
+                    .iter()
+                    .any(|m| matches!(m, Action::Arrangement { lease_ms: 1, .. }))
+            );
             assert!(!view(upper, &online).projections.is_empty());
             *lock(upper.inner.projection.lease_clock.get().unwrap()) = expires;
             tick(upper, Instant::now(), false);
@@ -1383,6 +1635,24 @@ mod integration_tests {
                 View::default(),
                 "heartbeats cannot keep an abandoned UI preview visible"
             );
+            assert!(
+                current_messages(upper).is_empty(),
+                "expired preview cannot seed a reopened stream"
+            );
+            // Receiver TTL is monotonic and duplicates cannot renew it.
+            let snapshot = arrangement::capture(&upper.layout().0, &upper.link_config().unwrap().applied().owners);
+            let frame = Action::Arrangement {
+                sequence: 10000,
+                lease_ms: 100,
+                expires_ms: 1,
+                snapshot: Some(Box::new(snapshot)),
+            };
+            receive(left, upper.id(), frame.clone(), Instant::now());
+            let expiry = lock(&left.inner.projection.control).remote[&upper.id()].expires;
+            *lock(left.inner.projection.lease_clock.get().unwrap()) = expiry;
+            tick(left, Instant::now(), false);
+            receive(left, upper.id(), frame, Instant::now());
+            assert!(!lock(&left.inner.projection.control).remote.contains_key(&upper.id()));
             for node in nodes {
                 node.shutdown().await;
             }
@@ -1427,6 +1697,19 @@ mod integration_tests {
         common::pair(&a, &b).await;
         common::until("same layout", || {
             a.layout().0 == b.layout().0 && a.layout().0.screens.len() == 2
+        })
+        .await;
+        // Role baselines are persisted independently after membership/layout
+        // convergence. Let that setup finish before testing preview durability.
+        common::until("owner role baselines settled", || {
+            [&a, &b].into_iter().all(|node| {
+                let config = lock(&node.inner.config);
+                let claims = config.owner().claims(node.group_id().unwrap());
+                let microphone = config.owner().microphone_claims(node.group_id().unwrap());
+                [a.id(), b.id()].into_iter().all(|id| {
+                    claims.records.iter().any(|r| r.owner == id) && microphone.records.iter().any(|r| r.owner == id)
+                })
+            })
         })
         .await;
         let online = BTreeSet::from([a.id(), b.id()]);

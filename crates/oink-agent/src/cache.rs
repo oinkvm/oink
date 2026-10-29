@@ -4,6 +4,7 @@ use crate::{
     node::{Node, lock},
 };
 use oink_clipboard::cache::{CacheCategory, CacheClear, CacheSize, CacheUsage};
+mod debounce;
 mod wire;
 use oink_foundation::DeviceId;
 use oink_foundation::session::Boot;
@@ -128,6 +129,19 @@ async fn local(
             removed += freed;
             usage.incomplete |= incomplete;
         }
+        let (fulfilled, incomplete) =
+            oink_clipboard::content::grants::cache_usage(&clipboard.data_dir().join("source-file-links"));
+        if let Some(snapshots) = usage
+            .categories
+            .iter_mut()
+            .find(|size| size.category == fulfilled.category)
+        {
+            snapshots.bytes = snapshots.bytes.saturating_add(fulfilled.bytes);
+            snapshots.kept_bytes = snapshots.kept_bytes.saturating_add(fulfilled.kept_bytes);
+        } else {
+            usage.categories.push(fulfilled);
+        }
+        usage.incomplete |= incomplete;
         // Native deliveries live exclusively in the content store. These
         // categories have no independent storage producer in this build.
         for category in [
@@ -321,6 +335,7 @@ pub(crate) fn start(node: Node, mut port: ModulePort) -> tokio::task::JoinHandle
         let changed = node.inner.cache.changed.clone();
         let mut peers = HashMap::new();
         let mut jobs = tokio::task::JoinSet::new();
+        let mut debounce = debounce::Debounce::default();
         let _ = local(&node, false, None).await;
         loop {
             tokio::select! {
@@ -328,7 +343,7 @@ pub(crate) fn start(node: Node, mut port: ModulePort) -> tokio::task::JoinHandle
                 _ = changed.notified() => for (&peer, &link) in &peers { jobs.spawn(publish(node.clone(), peer, link)); },
                 event = changes.recv() => {
                     let relevant = match event {
-                        Ok(root) => root.starts_with(node.cache_dir()) || {
+                        Ok(root) => root.starts_with(node.cache_dir()) || root.starts_with(node.data_dir().join("source-file-links")) || {
                             #[cfg(target_os = "macos")] { node.inner.cache.native && oink_clipboard::file_provider::is_cache_root(&root) }
                             #[cfg(not(target_os = "macos"))] { false }
                         },
@@ -336,11 +351,17 @@ pub(crate) fn start(node: Node, mut port: ModulePort) -> tokio::task::JoinHandle
                         Err(_) => break,
                     };
                     if relevant {
-                        while changes.try_recv().is_ok() {}
-                        let _ = local(&node, false,None).await;
-                        let snapshot_node=node.clone();
-                        if let Ok(Ok(usage))=tokio::task::spawn_blocking(move || {use crate::api::AgentApi;snapshot_node.received_files_usage()}).await {node.emit(ApiEvent::ReceivedFilesUsage(usage));}
+                        debounce.changed(tokio::time::Instant::now());
                     }
+                },
+                _ = debounce.wait() => {
+                    debounce.scanned();
+                    let _ = local(&node, false, None).await;
+                    let snapshot_node = node.clone();
+                    if let Ok(Ok(usage)) = tokio::task::spawn_blocking(move || {
+                        use crate::api::AgentApi;
+                        snapshot_node.received_files_usage()
+                    }).await { node.emit(ApiEvent::ReceivedFilesUsage(usage)); }
                 },
                 _ = jobs.join_next(), if !jobs.is_empty() => {},
                 event = port.next() => match event {

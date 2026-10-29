@@ -18,6 +18,7 @@ struct LaunchState {
     version: String,
     build: String,
     pending: Option<LaunchAction>,
+    reset_token: Option<String>,
 }
 
 fn plan_launch(data: &Path, version: &str, build: &str) -> anyhow::Result<Option<LaunchState>> {
@@ -56,11 +57,31 @@ fn plan_launch(data: &Path, version: &str, build: &str) -> anyhow::Result<Option
     } else {
         LaunchAction::Recover
     };
+    // A fresh-data reset is retried with the same identity even if the manager
+    // completed but the host died before committing its launch marker. Otherwise
+    // a retry could wipe new local files created after the native reset finished.
+    let reset_token = if action == LaunchAction::Reset {
+        match previous
+            .as_ref()
+            .filter(|s| s.pending == Some(LaunchAction::Reset))
+            .and_then(|s| s.reset_token.clone())
+        {
+            Some(token) => Some(token),
+            None => {
+                let mut bytes = [0u8; 16];
+                getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("reset identity: {e}"))?;
+                Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
+            }
+        }
+    } else {
+        None
+    };
     let state = LaunchState {
         schema: 1,
         version: version.into(),
         build: build.into(),
         pending: Some(action),
+        reset_token,
     };
     // Persist before OS work: a failed fresh reset must remain a reset even if
     // the rest of the app creates its identity while File Provider is unavailable.
@@ -76,11 +97,24 @@ fn finish_launch(
     // An installer may already have reconnected the replaced bundle. Quiesce
     // that domain before changing LS/PlugInKit registrations: macOS 26 can
     // otherwise open both extension generations against the same database.
-    run(LaunchAction::Suspend)?;
-    run(LaunchAction::Register)?;
-    run(state.pending.expect("planned launch action"))?;
-    // Recover includes namespace stabilization, not just reconnect's ACK. A
-    // timeout must leave this intent durable so the same build retries on launch.
+    for action in [
+        LaunchAction::Suspend,
+        LaunchAction::Register,
+        state.pending.expect("planned launch action"),
+    ] {
+        tracing::info!(?action, "File Provider launch preparation");
+        let started = std::time::Instant::now();
+        let result = run(action);
+        tracing::info!(
+            ?action,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            success = result.is_ok(),
+            "File Provider launch stage completed"
+        );
+        result?;
+    }
+    // Recover verifies namespace readiness without waiting for retained content
+    // transfers. Failed preparation must leave this intent durable.
     state.pending = None;
     oink_foundation::storage::atomic_write(&data.join(MARKER), &serde_json::to_vec(&state)?)?;
     Ok(())
@@ -99,9 +133,37 @@ fn prepare_launch(
     Ok(())
 }
 
-static FAILURE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+static FAILURE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 pub(super) fn failure() -> Option<String> {
-    FAILURE.get().cloned().flatten()
+    FAILURE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+#[cfg(target_os = "macos")]
+fn set_failure(failure: Option<String>) {
+    let mut previous = FAILURE.lock().unwrap_or_else(|e| e.into_inner());
+    if *previous != failure {
+        *previous = failure;
+        oink_clipboard::file_provider::demand_changed().notify_one();
+    }
+}
+
+// Only Recover may reach this path, after Suspend and Register succeeded.
+// Rechecking must neither disconnect a live domain nor replay a fresh-data reset.
+fn recheck_recovery(
+    result: anyhow::Result<()>,
+    mut check: impl FnMut() -> anyhow::Result<()>,
+    mut wait: impl FnMut() -> anyhow::Result<()>,
+    mut pending: impl FnMut(&anyhow::Error),
+) -> anyhow::Result<()> {
+    let Err(error) = result else { return Ok(()) };
+    pending(&error);
+    loop {
+        match check() {
+            Ok(()) => return Ok(()),
+            Err(error) => pending(&error),
+        }
+        wait()?;
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -162,7 +224,7 @@ pub(crate) fn prepare(data: &Path) -> anyhow::Result<Option<Worker>> {
                     format!("File Provider launch recovery failed: {error}. Quit and reopen Oink to retry.")
                 });
                 let success = failure.is_none();
-                let _ = FAILURE.set(failure);
+                set_failure(failure);
                 oink_clipboard::file_provider::finish_launch_preparation(success);
                 tracing::info!(success, "File Provider launch preparation completed");
             })
@@ -178,8 +240,8 @@ fn prepare_native(data: &Path, state: LaunchState, current: &dyn Fn() -> bool) -
     let installed = Path::new("/Applications/Oink.app/Contents/MacOS");
     let app = installed.parent().unwrap().parent().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(85);
+    let reset_token = state.reset_token.clone();
     finish_launch(data, state, |action| {
-        tracing::info!(?action, "File Provider launch preparation");
         match action {
             LaunchAction::Suspend => {
                 let (status, _) = run(
@@ -203,29 +265,70 @@ fn prepare_native(data: &Path, state: LaunchState, current: &dyn Fn() -> bool) -
             ),
             LaunchAction::Reset | LaunchAction::Recover => {
                 let command = if action == LaunchAction::Reset {
-                    "remove-domain"
+                    "reset-store"
                 } else {
                     "recover-launch"
                 };
-                let end = if action == LaunchAction::Reset {
-                    deadline
-                } else {
-                    std::time::Instant::now() + std::time::Duration::from_secs(15)
-                };
-                loop {
-                    let output = run(&installed.join("oink-file-provider"), &[command.as_ref()], end, current)?;
-                    if output.0.success() {
-                        break Ok(());
-                    }
-                    // A just-moved bundle can be elected before FileProvider has
-                    // accepted it. Retry only provider-not-found, within the bound.
-                    anyhow::ensure!(
-                        output.0.code() == Some(6),
-                        "File Provider {command} failed ({})",
-                        output.0
-                    );
-                    pause(end, current)?;
+                let end = deadline;
+                let mut arguments = vec![std::ffi::OsStr::new(command)];
+                if action == LaunchAction::Reset {
+                    arguments.push(std::ffi::OsStr::new(
+                        reset_token
+                            .as_deref()
+                            .ok_or_else(|| anyhow::anyhow!("missing reset identity"))?,
+                    ));
                 }
+                let result = (|| {
+                    loop {
+                        let output = run(&installed.join("oink-file-provider"), &arguments, end, current)?;
+                        if output.0.success() {
+                            return Ok(());
+                        }
+                        // Registration may still be settling after a bundle move.
+                        anyhow::ensure!(
+                            output.0.code() == Some(6),
+                            "File Provider {command} failed ({})",
+                            output.0
+                        );
+                        pause(end, current)?;
+                    }
+                })();
+                if action == LaunchAction::Reset {
+                    return result;
+                }
+                let mut interval = std::time::Duration::from_secs(5);
+                recheck_recovery(
+                    result,
+                    || {
+                        let (status, _) = run(
+                            &installed.join("oink-file-provider"),
+                            &["check-launch".as_ref()],
+                            std::time::Instant::now() + std::time::Duration::from_secs(15),
+                            current,
+                        )?;
+                        anyhow::ensure!(status.success(), "File Provider readiness check failed ({status})");
+                        tracing::info!("File Provider launch readiness recovered");
+                        Ok(())
+                    },
+                    || {
+                        let until = std::time::Instant::now() + interval;
+                        loop {
+                            anyhow::ensure!(current(), "File Provider readiness check cancelled");
+                            let remaining = until.saturating_duration_since(std::time::Instant::now());
+                            if remaining.is_zero() {
+                                break;
+                            }
+                            std::thread::sleep(remaining.min(std::time::Duration::from_millis(100)));
+                        }
+                        interval = (interval * 2).min(std::time::Duration::from_secs(30));
+                        Ok(())
+                    },
+                    |error| {
+                        set_failure(Some(format!(
+                            "File Provider launch recovery delayed: {error}. Checking domain readiness automatically."
+                        )));
+                    },
+                )
             }
         }
     })
@@ -244,11 +347,12 @@ pub(crate) fn run(
         "File Provider launch operation timed out"
     );
     let mut output = tempfile::tempfile()?;
+    let mut errors = tempfile::tempfile()?;
     let mut child = std::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(output.try_clone()?)
-        .stderr(std::process::Stdio::null())
+        .stderr(errors.try_clone()?)
         .spawn()?;
     let status = loop {
         match child.try_wait() {
@@ -269,6 +373,13 @@ pub(crate) fn run(
     std::io::Seek::rewind(&mut output)?;
     let mut bytes = String::new();
     output.take(1024 * 1024).read_to_string(&mut bytes)?;
+    if !status.success() {
+        std::io::Seek::rewind(&mut errors)?;
+        let mut detail = Vec::new();
+        errors.take(4096).read_to_end(&mut detail)?;
+        tracing::warn!(tool = ?program.file_name(), %status, stderr = %String::from_utf8_lossy(&detail).trim(),
+            "File Provider launch tool failed");
+    }
     Ok((status, bytes))
 }
 
@@ -385,6 +496,92 @@ fn register_provider_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uncertain_recover_rechecks_readiness_without_repeating_registration_or_needing_content() {
+        use std::cell::{Cell, RefCell};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("device.key"), [0; 32]).unwrap();
+        let state = plan_launch(dir.path(), "0.3.0", "59").unwrap().unwrap();
+        let bridge_started = Cell::new(false);
+        let retained_reads = Cell::new(109);
+        let checks = Cell::new(0);
+        let waits = Cell::new(0);
+        let errors = RefCell::new(vec![]);
+        let mut actions = vec![];
+        finish_launch(dir.path(), state, |action| {
+            actions.push(action);
+            if action != LaunchAction::Recover {
+                return Ok(());
+            }
+            recheck_recovery(
+                Err(anyhow::anyhow!("helper timed out after reconnect")),
+                || {
+                    let marker: LaunchState = serde_json::from_slice(&std::fs::read(dir.path().join(MARKER))?)?;
+                    assert_eq!(marker.pending, Some(LaunchAction::Recover));
+                    assert!(!bridge_started.get());
+                    assert_eq!(retained_reads.get(), 109);
+                    checks.set(checks.get() + 1);
+                    // The native domain first reports disconnected, then has
+                    // flags but no root URL, then becomes genuinely usable.
+                    match checks.get() {
+                        1 => anyhow::bail!("disconnected"),
+                        2 => anyhow::bail!("root URL unavailable"),
+                        _ => Ok(()),
+                    }
+                },
+                || {
+                    waits.set(waits.get() + 1);
+                    Ok(())
+                },
+                |error| errors.borrow_mut().push(error.to_string()),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            actions,
+            [LaunchAction::Suspend, LaunchAction::Register, LaunchAction::Recover]
+        );
+        assert_eq!(waits.get(), 2);
+        assert_eq!(checks.get(), 3);
+        assert_eq!(errors.borrow().len(), 3);
+        assert!(plan_launch(dir.path(), "0.3.0", "59").unwrap().is_none());
+        // Completion releases the bridge despite outstanding work, so that
+        // work can now consume it. No daemon reset or process relaunch occurred.
+        bridge_started.set(true);
+        retained_reads.set(retained_reads.get() - 1);
+        assert!(bridge_started.get() && retained_reads.get() == 108);
+    }
+
+    #[test]
+    fn cancelled_readiness_recheck_keeps_recover_marker_and_does_not_claim_success() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("device.key"), [0; 32]).unwrap();
+        let state = plan_launch(dir.path(), "0.3.0", "59").unwrap().unwrap();
+        let result = finish_launch(dir.path(), state, |action| {
+            if action != LaunchAction::Recover {
+                return Ok(());
+            }
+            recheck_recovery(
+                Err(anyhow::anyhow!("timeout")),
+                || anyhow::bail!("still unavailable"),
+                || anyhow::bail!("host stopped"),
+                |_| {},
+            )
+        });
+        assert_eq!(result.unwrap_err().to_string(), "host stopped");
+        assert_eq!(
+            plan_launch(dir.path(), "0.3.0", "59").unwrap().unwrap().pending,
+            Some(LaunchAction::Recover)
+        );
+        recheck_recovery(
+            Ok(()),
+            || panic!("successful recovery rechecked"),
+            || panic!("successful recovery delayed"),
+            |_| panic!("successful recovery reported an error"),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn already_selected_installed_provider_is_not_registered_again() {
@@ -629,6 +826,23 @@ mod tests {
             [LaunchAction::Suspend, LaunchAction::Register, LaunchAction::Reset]
         );
         assert!(plan_launch(dir.path(), "0.1.0-beta.1", "19").unwrap().is_none());
+    }
+
+    #[test]
+    fn fresh_reset_identity_survives_host_loss_after_native_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = plan_launch(dir.path(), "0.1.0-beta.1", "19").unwrap().unwrap();
+        let token = first.reset_token.unwrap();
+        assert_eq!(token.len(), 32);
+        std::fs::write(dir.path().join("device.key"), [0; 32]).unwrap();
+        // The native manager may have completed. Until finish_launch commits,
+        // another host must send the same token, not request another wipe.
+        let retry = plan_launch(dir.path(), "0.1.0-beta.1", "19").unwrap().unwrap();
+        assert_eq!(retry.reset_token.as_deref(), Some(token.as_str()));
+        finish_launch(dir.path(), retry, |_| Ok(())).unwrap();
+        std::fs::remove_file(dir.path().join("device.key")).unwrap();
+        let next = plan_launch(dir.path(), "0.1.0-beta.1", "19").unwrap().unwrap();
+        assert_ne!(next.reset_token.as_deref(), Some(token.as_str()));
     }
 
     #[test]

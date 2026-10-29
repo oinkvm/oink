@@ -158,7 +158,9 @@ impl Harness {
         let snapshots = InputSnapshots {
             mode_switch_in_callback: true,
             capture_reports_key_repeat: false,
+            local_input_transform: oink_foundation::input_transform::InputTransform::initial(std::env::consts::OS),
             layout: Arc::new(Snapshot::new(RouterLayout {
+                application_focus_enabled: false,
                 group: oink_foundation::GroupId([0; 16]),
                 owners: Arc::default(),
                 version: fixture_version(),
@@ -1326,6 +1328,7 @@ fn config_geometry_and_input_pair_availability_commute() {
         // This scenario explicitly starts without any adopted geometry.
         let empty = Arc::new(oink_display::layout::Layout::default());
         h.driver.snapshots.layout.publish(RouterLayout {
+            application_focus_enabled: false,
             group: oink_foundation::GroupId([0; 16]),
             owners: Arc::default(),
             version: fixture_version(),
@@ -1342,6 +1345,7 @@ fn config_geometry_and_input_pair_availability_commute() {
                 BTreeSet::from([local])
             };
             h.driver.snapshots.layout.publish(RouterLayout {
+                application_focus_enabled: false,
                 group: oink_foundation::GroupId([0; 16]),
                 owners: Arc::default(),
                 version: fixture_version(),
@@ -1791,54 +1795,6 @@ fn screen_identification_uses_attached_input_stream_and_obeys_pause() {
 }
 
 #[test]
-fn permission_grant_waits_for_capture_result_and_only_failed_attempts_alert() {
-    use oink_foundation::input::{InputPermissions, PermissionState as P};
-    let mut h = Harness::new();
-    let missing = InputPermissions {
-        accessibility: P::NotGranted,
-        input_monitoring: P::NotDetermined,
-        secure_input_active: false,
-    };
-    // Deterministic permission source: this sample includes AX's effective
-    // listening grant even though the independent IOHID entry is unchanged.
-    let granted = InputPermissions {
-        accessibility: P::Granted,
-        input_monitoring: P::Granted,
-        ..missing
-    };
-    let alerts = |driver: &Driver, permissions: &InputPermissions| {
-        crate::agent_api::capture_unavailable(permissions, &driver.shared.status.load(), false)
-    };
-    h.driver.command(InputCommand::Controllable(false));
-    h.driver.publish();
-    assert!(!alerts(&h.driver, &missing));
-    // The permission observer emits Overview before Controllable is consumed.
-    // The native handle is still detached here; no attempt has failed.
-    assert!(!alerts(&h.driver, &granted));
-    h.driver.command(InputCommand::Controllable(true));
-    h.driver.publish();
-    assert!(!alerts(&h.driver, &granted));
-    h.driver.capture_available(true);
-    assert!(!alerts(&h.driver, &granted));
-    // Intentional withdrawal must not leave a stale error for the next grant.
-    h.driver.capture_detached();
-    h.driver.command(InputCommand::Controllable(false));
-    h.driver.publish();
-    assert!(!alerts(&h.driver, &missing));
-    assert!(!alerts(&h.driver, &granted));
-    h.driver.command(InputCommand::Controllable(true));
-    h.driver.publish();
-    assert!(!alerts(&h.driver, &granted));
-    // A completed failed native attempt still publishes a real error immediately.
-    h.driver.capture_available(false);
-    assert!(alerts(&h.driver, &granted));
-    assert!(h.driver.shared.status.load().capture_failed);
-    h.driver.capture_available(true);
-    assert!(!alerts(&h.driver, &granted));
-    assert!(!h.driver.shared.status.load().capture_failed);
-}
-
-#[test]
 fn intentional_capture_withdrawal_keeps_keyboard_health_known() {
     use oink_protocol::v1::dto::ResourceFaultCode as Fault;
     let mut h = Harness::new();
@@ -1849,7 +1805,6 @@ fn intentional_capture_withdrawal_keeps_keyboard_health_known() {
     let status = h.driver.shared.status.load();
     assert!(status.paused);
     assert!(!status.keyboard_disabled);
-    assert!(!status.capture_failed);
     assert_eq!(status.resource_faults.keyboard, Some(Fault::None));
     // An intentional withdrawal also retires a previous failed attempt.
     h.driver.capture_available(false);
@@ -2052,8 +2007,10 @@ fn stale_keyboard_disable_cannot_cross_an_emergency() {
     let (reply, result) = mpsc::sync_channel(1);
     h.driver.command(InputCommand::ApplyOwnerPreferences {
         expected_emergency_sequence: 0,
-        routing: (*h.driver.settings).clone(),
-        keyboard_disabled: true,
+        routing: oink_routing::RoutingSettings {
+            keyboard_mode: oink_foundation::input::InputMode::Disabled,
+            ..(*h.driver.settings).clone()
+        },
         input_transform: oink_foundation::input_transform::InputTransform::initial("macos"),
         accept_contacts: false,
         reply,
@@ -2225,6 +2182,10 @@ fn migration_peer_facts_before_opening_preserve_caps_tap_mapping() {
             peer_os: initial_os, // Unknown when admission preceded the first DeviceFacts.
         });
         h.driver.command(InputCommand::PeerFacts {
+            application_modes: (
+                oink_foundation::input::InputMode::Shared,
+                oink_foundation::input::InputMode::Shared,
+            ),
             boot: fixture_boot(peer()),
             os: Os::Windows,
             displays: Vec::new(),
@@ -3005,13 +2966,16 @@ fn target_cursor_no_reconciliation_for_game_relative_motion() {
     h.driver
         .message(peer(), Message::Input(InputMsg::Motion { seq: 1, dx: 1., dy: 0. }));
     assert!(h.driver.cursor.pending.is_none());
-    assert!(!cursor::motion(&Message::Input(InputMsg::RelativeMotion {
-        epoch: 2,
-        generation: 1,
-        seq: 1,
-        x: 1.,
-        y: 0.
-    })));
+    assert!(!cursor::pointer_motion(
+        &Message::Input(InputMsg::RelativeMotion {
+            epoch: 2,
+            generation: 1,
+            seq: 1,
+            x: 1.,
+            y: 0.
+        }),
+        false
+    ));
 }
 
 #[test]
@@ -3071,7 +3035,6 @@ fn stale_mouse_disable_cannot_cross_safety_release() {
     h.driver.command(InputCommand::ApplyOwnerPreferences {
         expected_emergency_sequence: 0,
         routing,
-        keyboard_disabled: false,
         input_transform: oink_foundation::input_transform::InputTransform::initial("macos"),
         accept_contacts: false,
         reply,
@@ -3082,3 +3045,262 @@ fn stale_mouse_disable_cannot_cross_safety_release() {
     );
     assert!(!h.driver.adapter.router().mouse_disabled());
 }
+
+#[test]
+fn application_focus_cancel_invalidates_park_already_queued_to_stalled_native_owner() {
+    use oink_routing::{
+        ApplicationFocusCommand as C,
+        application_focus::{Claim, ParkRequest},
+    };
+    let mut h = Harness::new();
+    let request = ParkRequest {
+        claim: Claim {
+            epoch: 1,
+            pointer: fixture_boot(peer()),
+            scope: oink_routing::control::FocusScope {
+                members: vec![(h.driver.local, h.driver.adapter.routing_session()), (peer(), [2; 16])],
+            },
+        },
+        revision: 1,
+        operation: 1,
+        target: fixture_boot(h.driver.local),
+        expected: oink_foundation::application_focus::ObservationStamp {
+            generation: 1,
+            sequence: 1,
+        },
+    };
+    h.driver.application_focus_command(C::Park(request.clone()));
+    // The ordinary UI owner has not consumed its queue when cancellation runs.
+    h.driver.application_focus_command(C::Cancel(request.clone()));
+    let queued = h
+        ._main
+        .try_iter()
+        .find_map(|command| match command {
+            MainCommand::ApplicationFocus {
+                command: C::Park(queued),
+                permit,
+            } if queued == request => permit,
+            _ => None,
+        })
+        .expect("queued park permit");
+    assert!(!queued.valid(), "late native dispatch must not activate a window");
+    h.driver.application_focus_command(C::Park(ParkRequest {
+        operation: 2,
+        ..request
+    }));
+    let current = h
+        ._main
+        .try_iter()
+        .find_map(|command| match command {
+            MainCommand::ApplicationFocus {
+                command: C::Park(_),
+                permit,
+            } => permit,
+            _ => None,
+        })
+        .unwrap();
+    h.driver.application_focus_command(C::Dismiss(None));
+    assert!(!current.valid(), "disable also retires already queued native work");
+}
+
+#[test]
+fn passive_game_escape_readback_starts_on_hold_and_stops_on_release() {
+    let (mut h, _, _) = target_cursor_fixture();
+    h.driver.command(InputCommand::GameMode(GameMode::On));
+    let relative = |seq| {
+        Message::Input(InputMsg::RelativeMotion {
+            epoch: 2,
+            generation: 1,
+            seq,
+            x: seq as f64,
+            y: 0.,
+        })
+    };
+    h.driver.message(peer(), relative(1));
+    assert!(h.driver.cursor.pending.is_none());
+    h.driver
+        .message(peer(), Message::Control(ControlMsg::LockEscape { held: true }));
+    h.driver.message(peer(), relative(2));
+    assert!(
+        h.driver.cursor.pending.is_some(),
+        "held escape reads the real cursor before relative motion"
+    );
+    target_cursor_replace_read(&mut h)
+        .send(target_cursor_sample(&h, 500.))
+        .unwrap();
+    h.driver.cursor_resume();
+    assert!(h.driver.cursor.pending.is_none());
+    h.driver
+        .message(peer(), Message::Control(ControlMsg::LockEscape { held: false }));
+    h.driver.message(peer(), relative(3));
+    assert!(
+        h.driver.cursor.pending.is_none(),
+        "release stops extra readback immediately"
+    );
+}
+
+fn passive_game_stream(h: &mut Harness) -> (u64, u64) {
+    h.driver.command(InputCommand::GameMode(GameMode::On));
+    drain(h._target_outbound.as_mut().unwrap())
+        .into_iter()
+        .rev()
+        .find_map(|msg| match msg {
+            Message::Control(ControlMsg::GameMode {
+                epoch,
+                generation,
+                active: true,
+                ..
+            }) => Some((epoch, generation)),
+            _ => None,
+        })
+        .expect("target announces current relative-stream generation")
+}
+
+#[test]
+fn passive_game_fresh_native_edge_crosses_but_timeout_and_recenter_do_not() {
+    for outcome in ["edge", "timeout", "recenter"] {
+        let (mut h, backend, _) = target_cursor_fixture();
+        let (epoch, generation) = passive_game_stream(&mut h);
+        h.driver
+            .message(peer(), Message::Control(ControlMsg::LockEscape { held: true }));
+        // A stale predicted edge must not be enough if the native read times out.
+        h.driver
+            .adapter
+            .router_mut()
+            .set_cursor(oink_foundation::Point::new(999., 100.));
+        backend.take_injected();
+        h.driver.message(
+            peer(),
+            Message::Input(InputMsg::RelativeMotion {
+                epoch,
+                generation,
+                seq: 1,
+                x: 0.1,
+                y: 0.,
+            }),
+        );
+        assert!(h.driver.cursor.pending.is_some());
+        if outcome == "timeout" {
+            let _withheld = target_cursor_replace_read(&mut h);
+            h.driver.now = h.driver.cursor.pending.as_ref().unwrap().at + cursor::MAX_WAIT;
+            h.driver.cursor_resume();
+        } else {
+            let x = if outcome == "edge" { 999. } else { 500. };
+            target_cursor_replace_read(&mut h)
+                .send(target_cursor_sample(&h, x))
+                .unwrap();
+            h.driver.cursor_resume();
+        }
+        let focus = h.driver.adapter.router().focus();
+        assert_eq!(focus.holder == peer(), outcome == "edge", "{outcome}");
+        assert!(h.driver.cursor.pending.is_none());
+    }
+}
+
+#[test]
+fn display_enumeration_notice_waits_for_persistence_and_resets_on_recovery() {
+    use oink_protocol::v1::dto::ResourceFaultCode as Fault;
+    let mut h = Harness::new();
+    let start = h.driver.now;
+    for command in [InputCommand::LocalDisplayFailure, InputCommand::LocalDisplays(vec![])] {
+        h.driver.command(command);
+        h.driver.publish();
+        assert_eq!(h.driver.shared.status.load().display_enumeration_fault, None);
+    }
+    h.driver.now = start + Duration::from_millis(2999);
+    h.driver.publish();
+    assert_eq!(h.driver.shared.status.load().display_enumeration_fault, None);
+    h.driver.now = start + Duration::from_secs(3);
+    h.driver.publish();
+    assert_eq!(
+        h.driver.shared.status.load().display_enumeration_fault,
+        Some(Fault::DeviceUnavailable)
+    );
+    // A successful observation clears the timer; a later failure gets a new window.
+    h.driver.command(InputCommand::LocalDisplays(vec![fixture_display()]));
+    h.driver.publish();
+    assert_eq!(h.driver.shared.status.load().display_enumeration_fault, None);
+    h.driver.now += Duration::from_secs(10);
+    h.driver.command(InputCommand::LocalDisplayFailure);
+    h.driver.publish();
+    assert_eq!(h.driver.shared.status.load().display_enumeration_fault, None);
+    h.driver.now += Duration::from_secs(3);
+    h.driver.publish();
+    assert_eq!(
+        h.driver.shared.status.load().display_enumeration_fault,
+        Some(Fault::BackendFailed)
+    );
+}
+
+#[test]
+fn display_enumeration_transient_failure_does_not_latch_a_notice() {
+    let mut h = Harness::new();
+    h.driver.command(InputCommand::LocalDisplayFailure);
+    h.driver.publish();
+    h.driver.now += Duration::from_millis(2999);
+    h.driver.command(InputCommand::LocalDisplays(vec![fixture_display()]));
+    h.driver.publish();
+    h.driver.now += Duration::from_secs(30);
+    h.driver.publish();
+    assert_eq!(h.driver.shared.status.load().display_enumeration_fault, None);
+}
+
+#[test]
+fn application_focus_remote_commit_publishes_without_unrelated_native_work() {
+    use oink_foundation::input::InputMode;
+    use oink_routing::application_focus as a;
+    let mut h = Harness::new();
+    let (_reader, _) = h.outbound(1);
+    let (writer, _) = h.inbound(1);
+    let remote = remote();
+    opening(&writer, &remote, true);
+    h.attach();
+    h.driver.message(
+        peer(),
+        Message::Control(ControlMsg::FocusState {
+            lock_state: None,
+            epoch: 5,
+            holder: peer(),
+            scope: Some(input_scope(&h.driver)),
+            session: Some(remote.router().routing_session()),
+        }),
+    );
+    let local = fixture_boot(h.driver.local);
+    let router = h.driver.adapter.router_mut();
+    for boot in [local, fixture_boot(peer())] {
+        router.set_application_focus_participation(boot, true, (InputMode::Shared, InputMode::Shared), 0);
+    }
+    router.set_application_focus_enabled(true, 0);
+    h.driver.outputs(None);
+    h.driver.publish();
+    assert!(!h.driver.status_dirty);
+    let before = h.driver.shared.status.load();
+    let mut committed = h.driver.adapter.router().application_focus().unwrap().clone();
+    assert_eq!(committed.claim.pointer, fixture_boot(peer()));
+    committed.keyboard = Some(fixture_boot(peer()));
+    committed.phase = a::Phase::Active;
+    committed.reason = a::Reason::Ready;
+    committed.revision += 1;
+    h.driver.message(
+        peer(),
+        Message::Control(ControlMsg::ApplicationFocus(a::Message {
+            claim: committed.claim.clone(),
+            action: a::Action::Commit(committed.clone()),
+        })),
+    );
+    assert_eq!(h.driver.adapter.router().application_focus(), Some(&committed));
+    h.driver.publish();
+    assert_eq!(
+        h.driver.shared.status.load().application_focus.as_ref(),
+        Some(&committed)
+    );
+    assert_ne!(before.application_focus.as_ref(), Some(&committed));
+    let published = h.driver.shared.status.load();
+    h.driver.publish();
+    assert!(
+        Arc::ptr_eq(&published, &h.driver.shared.status.load()),
+        "unchanged state should retain its snapshot"
+    );
+}
+
+mod reconnect;

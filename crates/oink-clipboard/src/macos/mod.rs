@@ -10,12 +10,20 @@
 //! - 远端文件：File Provider 占位 URL，粘贴读取时由系统触发内容拉取。
 //! - 监听：macOS 没有剪贴板变化通知，后台线程每 200 ms 轮询 `changeCount`。
 
+mod clipboard_key;
 mod content;
 pub(crate) mod dnd;
 pub mod file_provider;
 mod files;
 mod pasteboard;
+#[cfg(all(test, debug_assertions))]
+mod test_pasteboard;
 mod thumbnail;
+
+#[cfg(all(test, debug_assertions))]
+pub(crate) fn run_native_linked_promise_tests() {
+    dnd::proxy::linked_tests::run();
+}
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,7 +38,6 @@ use crate::{
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 pub(crate) fn backend() -> Result<Box<dyn ClipboardBackend>, ClipboardError> {
-    file_provider::warm_up();
     Ok(Box::new(MacClipboard {
         name: None,
         watcher: Mutex::new(None),
@@ -48,6 +55,9 @@ struct MacClipboard {
 }
 
 impl ClipboardBackend for MacClipboard {
+    fn clipboard_key(&self) -> std::io::Result<[u8; 32]> {
+        clipboard_key::current(self.name.as_deref())
+    }
     fn initialize_store(&self, data: std::path::PathBuf) {
         file_provider::initialize(data);
     }
@@ -68,17 +78,21 @@ impl ClipboardBackend for MacClipboard {
     }
     fn write_native_guarded(
         &self,
-        spec: crate::NativeSpec,
+        mut spec: crate::NativeSpec,
         guard: crate::content::ReaderGuard,
     ) -> Result<u64, ClipboardError> {
         let before = self.change_count();
+        spec.prepare_promises()
+            .map_err(|error| ClipboardError::ContentUnavailable(crate::content::reason(&error)))?;
         let registration = if spec.files.is_empty() || spec.file_contents.is_none() {
             None
         } else {
             let source = spec.file_contents.clone().ok_or(ClipboardError::Unsupported)?;
             Some(
-                file_provider::publish(&spec.files, source, Duration::from_secs(12))
-                    .map_err(|_| ClipboardError::FileProviderUnavailable)?,
+                file_provider::publish(&spec.files, source, Duration::from_secs(12)).map_err(|error| match error {
+                    ClipboardError::FileProvider(_) | ClipboardError::ContentUnavailable(_) => error,
+                    _ => ClipboardError::FileProviderUnavailable,
+                })?,
             )
         };
         if self.change_count() != before {

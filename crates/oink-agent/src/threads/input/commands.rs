@@ -10,7 +10,7 @@ use std::sync::{
 };
 
 const ACTION_CAPACITY: usize = 1024;
-const LOCAL_STATE_CAPACITY: usize = 22;
+const LOCAL_STATE_CAPACITY: usize = 23;
 const STATE_CAPACITY: usize = LOCAL_STATE_CAPACITY + 2 * oink_protocol::v1::limits::MEMBERS;
 
 type StateKey = (u8, Option<oink_foundation::DeviceId>);
@@ -18,6 +18,10 @@ type StateKey = (u8, Option<oink_foundation::DeviceId>);
 fn state_key(command: &InputCommand) -> Option<StateKey> {
     use InputCommand::*;
     let kind = match command {
+        DndPrepared(_) => return None,
+        #[cfg(debug_assertions)]
+        DndWatchdogSnapshotForTest(_) => return None,
+        ApplicationFocusObserved { .. } => 22,
         ProjectionGesture(_) => 21,
         Paused(_) => 0,
         Overlay(_) => 1,
@@ -41,6 +45,7 @@ fn state_key(command: &InputCommand) -> Option<StateKey> {
         Stop => 15,
         PeerFacts { boot, .. } => return Some((16, Some(boot.device_id))),
         ReceiveEmergency { .. }
+        | ApplicationFocusApplied { .. }
         | TriggerEmergency { .. }
         | ApplyOwnerPreferences { .. }
         | ApplyOwnerPause { .. }
@@ -49,6 +54,7 @@ fn state_key(command: &InputCommand) -> Option<StateKey> {
         | CommitUpdate { .. }
         | AbortUpdate { .. }
         | LockFocusTo { .. }
+        | MovePointerTo(_)
         | ReturnPointerHome
         | IdentifyScreens(_)
         | DiagnosticsSnapshot
@@ -73,6 +79,10 @@ impl Clone for StateCommand {
         use InputCommand::*;
         // Stream handles and drag actions are never put in the replacement batch.
         let command = match &self.0 {
+            ApplicationFocusObserved { claim, observation } => ApplicationFocusObserved {
+                claim: claim.clone(),
+                observation: *observation,
+            },
             ProjectionGesture(v) => ProjectionGesture(*v),
             Paused(v) => Paused(*v),
             Overlay(v) => Overlay(*v),
@@ -105,11 +115,13 @@ impl Clone for StateCommand {
             DndAvailable(v) => DndAvailable(*v),
             Stop => Stop,
             PeerFacts {
+                application_modes,
                 boot,
                 os,
                 displays,
                 transform,
             } => PeerFacts {
+                application_modes: *application_modes,
                 boot: *boot,
                 os: *os,
                 displays: displays.clone(),
@@ -265,6 +277,10 @@ mod tests {
         for id in 0..oink_protocol::v1::limits::MEMBERS as u8 {
             let peer = oink_foundation::DeviceId([id; 32]);
             commands.push(InputCommand::PeerFacts {
+                application_modes: (
+                    oink_foundation::input::InputMode::Shared,
+                    oink_foundation::input::InputMode::Shared,
+                ),
                 boot: boot(peer),
                 displays: vec![],
                 transform: None,
@@ -273,12 +289,20 @@ mod tests {
             commands.push(InputCommand::RetirePeer(boot(peer)));
         }
         commands.push(InputCommand::PeerFacts {
+            application_modes: (
+                oink_foundation::input::InputMode::Shared,
+                oink_foundation::input::InputMode::Shared,
+            ),
             boot: boot(oink_foundation::DeviceId([200; 32])),
             displays: vec![],
             transform: None,
             os: oink_routing::Os::Windows,
         });
         commands.push(InputCommand::PeerFacts {
+            application_modes: (
+                oink_foundation::input::InputMode::Shared,
+                oink_foundation::input::InputMode::Shared,
+            ),
             boot: boot(oink_foundation::DeviceId([0; 32])),
             displays: vec![],
             transform: None,

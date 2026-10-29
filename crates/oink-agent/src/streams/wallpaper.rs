@@ -44,7 +44,15 @@ fn retry_delay(backoff: Duration) -> Duration {
     backoff.mul_f64(0.8 + 0.2 * f64::from(u16::from_ne_bytes(random)) / f64::from(u16::MAX))
 }
 
-async fn deliver(links: &LinkLayer, link: LinkId, local: &Snapshot<Option<WallpaperSet>>) -> bool {
+async fn deliver(
+    links: &LinkLayer,
+    link: LinkId,
+    config: &ConfigModule,
+    local: &Snapshot<Option<WallpaperSet>>,
+) -> bool {
+    if config.applied().paused {
+        return false;
+    }
     let max = v1::limits::LOW_FRAME as u64;
     let options = oink_network::LowOptions {
         send_max: max,
@@ -54,6 +62,11 @@ async fn deliver(links: &LinkLayer, link: LinkId, local: &Snapshot<Option<Wallpa
     let Ok(mut stream) = links.open_low(link, StreamKind::Wallpaper, options).await else {
         return false;
     };
+    // Admission may finish after pause is applied but before this owner's
+    // ConfigChange branch runs. Never read/send a new image through that gap.
+    if config.applied().paused {
+        return false;
+    }
     // Read after opening: a change during pool admission must send the latest set.
     let current = local.load();
     let Some(message) = current.as_ref() else {
@@ -133,7 +146,10 @@ impl WallpaperStreams {
     }
 
     fn send_to(&mut self, peer: DeviceId) {
+        // Image and config notifications arrive on independent select! branches.
+        // The applied snapshot fences sends even while our pause event is queued.
         if self.paused
+            || self.config.applied().paused
             || self.local.load().is_none()
             || !self
                 .config
@@ -149,13 +165,14 @@ impl WallpaperStreams {
             task.abort();
         }
         let links = self.links.clone();
+        let config = self.config.clone();
         let link = state.link;
         let local = self.local.clone();
         state.sending = Some(tokio::spawn(async move {
             let mut backoff = RETRY_INITIAL;
             loop {
                 // Bound a silent peer or stuck admission as well as explicit errors.
-                if tokio::time::timeout(DELIVERY_TIMEOUT, deliver(&links, link, &local))
+                if tokio::time::timeout(DELIVERY_TIMEOUT, deliver(&links, link, &config, &local))
                     .await
                     .unwrap_or(false)
                 {
@@ -299,6 +316,56 @@ mod lifecycle {
         })
         .await
         .expect("receiver's normal Low end acknowledges the stored set");
+    }
+
+    #[test]
+    fn applied_pause_blocks_wallpaper_before_owner_notification() {
+        crate::test_watchdog::run(
+            module_path!(),
+            "applied_pause_before_wallpaper_notification",
+            Some(4),
+            async {
+                use oink_protocol::v1::{
+                    RawValue, dto,
+                    schema::{WireDto, WireValue},
+                };
+                let fixture = Fixture::<DiagnosticsStreams>::start().await;
+                let (links, group) = fixture.context(0);
+                let peer = fixture.context(1).0.id();
+                let mut owner = WallpaperStreams::new(links.clone(), group.clone());
+                owner.link_ready(links.links().by_peer(peer).unwrap().link, peer);
+                let pause = dto::LocalPauseState::from_raw(
+                    [
+                        (1, RawValue::Bool(true)),
+                        (2, dto::PauseReason::LocalUser.write()),
+                        (3, 2u64.write()),
+                    ]
+                    .into(),
+                )
+                .unwrap();
+                group
+                    .publish_local_owner(group.local_facts().preferences().unwrap().unwrap().0, pause)
+                    .unwrap();
+                crate::test_watchdog::until("pause is durably applied", || group.applied().paused).await;
+                // Deliberately do not deliver pause_changed: the image callback and
+                // config notification are separate select! branches in the runtime.
+                assert!(!owner.paused);
+                owner.set_wallpapers(vec![]);
+                assert!(
+                    owner.peers[&peer].sending.is_none(),
+                    "an applied pause must prevent a new wallpaper send even before its notification"
+                );
+                let attempts = oink_network::link::testing::low_open_attempts(&links, StreamKind::Wallpaper);
+                assert!(!deliver(&links, owner.peers[&peer].link, &group, &owner.local).await);
+                assert_eq!(
+                    oink_network::link::testing::low_open_attempts(&links, StreamKind::Wallpaper),
+                    attempts,
+                    "a pending attempt must also observe the applied pause before opening Low"
+                );
+                drop(owner);
+                fixture.stop().await;
+            },
+        );
     }
 
     #[test]

@@ -348,6 +348,14 @@ fn create_normal(app: &AppHandle, view: View) -> tauri::Result<()> {
             .traffic_light_position(tauri::LogicalPosition::new(18.0 + gutter, 24.0 + gutter));
         #[cfg(windows)]
         let builder = builder.decorations(view == View::About).shadow(view != View::Main);
+        #[cfg(windows)]
+        let builder = if view == View::Main {
+            // Our receiver follows late/reparented browser HWNDs. Wry 0.57's
+            // one-shot registration races those windows on Windows 11.
+            builder.disable_drag_drop_handler()
+        } else {
+            builder
+        };
         let generation = app.state::<Shell>().window_ready.lock().unwrap().begin_creation(label);
         let builder = builder.initialization_script(format!(
             "Object.defineProperty(window, '__OINK_WINDOW_GENERATION__', {{value: {generation}}});"
@@ -360,10 +368,13 @@ fn create_normal(app: &AppHandle, view: View) -> tauri::Result<()> {
             }
         };
         #[cfg(windows)]
-        let _ = window;
+        if view == View::Main {
+            crate::local_drop_windows::attach(&window)?;
+        }
         #[cfg(target_os = "macos")]
         if view == View::Main {
             crate::main_window_macos::prepare(&window)?;
+            crate::local_drop::attach(&window)?;
         }
         // Keep the native window ordered out until React commits its initial
         // DOM/theme and fonts. No alpha-zero orderFront or WebKit rAF wait:
@@ -475,6 +486,7 @@ fn show_normal(_app: &AppHandle, window: &tauri::WebviewWindow) -> tauri::Result
     #[cfg(not(windows))]
     focus_window(window)?;
     tracing::info!(view = window.label(), "ready product window shown");
+    crate::live_views::refresh(_app);
     Ok(())
 }
 

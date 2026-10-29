@@ -7,6 +7,17 @@ use crate::aim::{
     text::{self, Pen, TextRaster},
 };
 
+fn surface_colors(style: Style) -> (Color, Color, Color) {
+    let rgb = |v: [u8; 3]| Color::rgb(v[0].into(), v[1].into(), v[2].into());
+    let pop = rgb(if style.dark { [49, 47, 44] } else { [255; 3] });
+    let fg = rgb(if style.dark { [244, 244, 246] } else { [27, 28, 34] });
+    let line = pop.mix(
+        if style.dark { rgb([255; 3]) } else { fg },
+        if style.dark { 0.15 } else { 0.14 },
+    );
+    (pop, fg, line)
+}
+
 fn shape(c: &mut Canvas, x: f64, y: f64, w: f64, h: f64, r: f64, color: Color) {
     let power = 2_f64.powf(1.75);
     for row in y.floor().max(0.) as usize..((y + h).ceil() as usize).min(c.h) {
@@ -46,14 +57,16 @@ fn lines(text: &str, font: &dyn TextRaster, cap: f64, width: f64, bold: bool, ma
     }
     result
 }
-pub(super) fn paint_button(
-    toast: &Toast,
-    style: Style,
-    width: f64,
-    scale: f64,
-    font: &dyn TextRaster,
-    button: (f64, f64),
-) -> (Vec<u32>, usize, usize) {
+pub(super) struct Layout {
+    pub logical_width: f64,
+    pub height: f64,
+    body: f64,
+    title: Vec<String>,
+    desc: Vec<String>,
+}
+
+/// Wrap once at the monitor's resting scale. Animation must not reflow lines.
+pub(super) fn layout(toast: &Toast, width: f64, scale: f64, font: &dyn TextRaster) -> Layout {
     let logical_width = width / toast.scale.max(0.5);
     let available = (logical_width - 16. * 2. - 42. - if toast.undo.is_some() { 84. } else { 0. }).max(28.);
     let title = lines(&toast.title, font, 14. * 0.72 * scale, available * scale, true, 3);
@@ -72,17 +85,34 @@ pub(super) fn paint_button(
             2. + desc.len() as f64 * 19.5
         };
     let height = 32. + body.max(32.);
+    Layout {
+        logical_width,
+        height,
+        body,
+        title,
+        desc,
+    }
+}
+
+pub(super) fn paint(
+    toast: &Toast,
+    style: Style,
+    layout: &Layout,
+    scale: f64,
+    font: &dyn TextRaster,
+    button: (f64, f64),
+) -> (Vec<u32>, usize, usize) {
+    let logical_width = layout.logical_width;
+    let height = layout.height;
+    let body = layout.body;
+    let title = &layout.title;
+    let desc = &layout.desc;
     let w = (logical_width * scale).ceil() as usize;
     let h = (height * scale).ceil() as usize;
     let mut c = Canvas::new(w, h);
     let rgb = |v: [u8; 3]| Color::rgb(v[0].into(), v[1].into(), v[2].into());
-    let pop = rgb(if style.dark { [49, 47, 44] } else { [255, 255, 255] });
-    let fg = rgb(if style.dark { [244, 244, 246] } else { [27, 28, 34] });
+    let (pop, fg, line) = surface_colors(style);
     let secondary = rgb(if style.dark { [174, 172, 168] } else { [95, 96, 106] });
-    let line = pop.mix(
-        if style.dark { rgb([255; 3]) } else { fg },
-        if style.dark { 0.15 } else { 0.14 },
-    );
     shape(&mut c, 0., 0., w as f64, h as f64, 29. * scale, line);
     shape(
         &mut c,
@@ -139,8 +169,8 @@ pub(super) fn paint_button(
     let mut y = (height - body) / 2. + 4.;
     for line in title {
         let size = 14. * 0.72 * scale;
-        let width = text::width(font, size, &line, true);
-        Pen::new(&mut c, font).centered(58. * scale + width / 2., y * scale, size, &line, true, fg);
+        let width = text::width(font, size, line, true);
+        Pen::new(&mut c, font).centered(58. * scale + width / 2., y * scale, size, line, true, fg);
         y += 20.3;
     }
     if !desc.is_empty() {
@@ -148,8 +178,8 @@ pub(super) fn paint_button(
     }
     for line in desc {
         let size = 13. * 0.72 * scale;
-        let width = text::width(font, size, &line, false);
-        Pen::new(&mut c, font).centered(58. * scale + width / 2., y * scale, size, &line, false, secondary);
+        let width = text::width(font, size, line, false);
+        Pen::new(&mut c, font).centered(58. * scale + width / 2., y * scale, size, line, false, secondary);
         y += 19.5;
     }
     if let Some(label) = &toast.undo {
@@ -176,37 +206,4 @@ pub(super) fn paint_button(
         );
     }
     (c.px, w, h)
-}
-
-/// Resample the whole premultiplied toast so layered HWNDs and AppKit implement
-/// the same CSS center-origin scale without changing their hit-test bounds.
-pub(super) fn resize(pixels: Vec<u32>, w: usize, h: usize, scale: f64) -> (Vec<u32>, usize, usize) {
-    let nw = (w as f64 * scale).round().max(1.) as usize;
-    let nh = (h as f64 * scale).round().max(1.) as usize;
-    if nw == w && nh == h {
-        return (pixels, w, h);
-    }
-    let mut out = vec![0; nw * nh];
-    for y in 0..nh {
-        for x in 0..nw {
-            let sx = (x as f64 + 0.5) * w as f64 / nw as f64 - 0.5;
-            let sy = (y as f64 + 0.5) * h as f64 / nh as f64 - 0.5;
-            let (fx, fy) = (sx - sx.floor(), sy - sy.floor());
-            let mut value = 0;
-            for shift in [0, 8, 16, 24] {
-                let at = |dx: isize, dy: isize| {
-                    let x = (sx.floor() as isize + dx).clamp(0, w as isize - 1) as usize;
-                    let y = (sy.floor() as isize + dy).clamp(0, h as isize - 1) as usize;
-                    f64::from((pixels[y * w + x] >> shift) & 255)
-                };
-                let channel = at(0, 0) * (1. - fx) * (1. - fy)
-                    + at(1, 0) * fx * (1. - fy)
-                    + at(0, 1) * (1. - fx) * fy
-                    + at(1, 1) * fx * fy;
-                value |= (channel.round() as u32) << shift;
-            }
-            out[y * nw + x] = value;
-        }
-    }
-    (out, nw, nh)
 }

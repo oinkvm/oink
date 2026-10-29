@@ -188,6 +188,70 @@ fn only_matching_pong_advances_heartbeat() {
         }
     )));
 }
+
+#[test]
+fn heartbeat_installation_wait_uses_only_the_installation_deadline() {
+    let mut r = Rig::new(2);
+    r.connect(0, 1);
+    let mut held = vec![];
+    r.pump_holding(&mut held, |_, effect| {
+        matches!(effect, Effect::Control { message, .. } if matches!(message.as_ref(), LinkMsg::PathInstalled(_)))
+    });
+    assert_eq!(held.len(), 1);
+    let pending = (0..2)
+        .find(|&n| r.nodes[n].links.values().any(|link| !link.installed))
+        .unwrap();
+    let id = r.link(pending, 1 - pending);
+    let deadline = r.nodes[pending].links[&id].installation_deadline;
+    let before_deadline = r.now + HEARTBEAT_TIMEOUT;
+    assert!(before_deadline < deadline);
+
+    r.nodes[pending].tick(before_deadline);
+    assert!(
+        r.nodes[pending].links.contains_key(&id),
+        "a path cannot miss heartbeats before it can send them"
+    );
+    assert_eq!(r.nodes[pending].next_deadline(), Some(deadline));
+    assert!(!r.nodes[pending].effects.iter().any(|effect| {
+        matches!(effect, Effect::Control { message, .. } if matches!(message.as_ref(), LinkMsg::Pulse(_)))
+    }));
+
+    // Holding Installed forever still obeys the existing installation budget.
+    r.nodes[pending].tick(deadline);
+    assert!(!r.nodes[pending].links.contains_key(&id));
+}
+
+#[test]
+fn heartbeat_installation_completion_starts_a_fresh_liveness_budget() {
+    let mut r = Rig::new(2);
+    r.connect(0, 1);
+    let mut held = vec![];
+    r.pump_holding(&mut held, |_, effect| {
+        matches!(effect, Effect::Control { message, .. } if matches!(message.as_ref(), LinkMsg::PathInstalled(_)))
+    });
+    assert_eq!(held.len(), 1);
+    let pending = (0..2)
+        .find(|&n| r.nodes[n].links.values().any(|link| !link.installed))
+        .unwrap();
+    let id = r.link(pending, 1 - pending);
+    r.now += HEARTBEAT_TIMEOUT + Duration::from_millis(100);
+    assert!(r.now < r.nodes[pending].links[&id].installation_deadline);
+    for (n, effect) in held {
+        r.nodes[n].effects.push_back(effect);
+    }
+    r.pump();
+    assert!(r.nodes[pending].links[&id].installed);
+
+    // No Pong is delivered after installation: the complete heartbeat budget
+    // must be available, and expiry must still occur at its original length.
+    r.nodes[pending].tick(r.now + HEARTBEAT_TIMEOUT - Duration::from_millis(1));
+    assert!(r.nodes[pending].links.contains_key(&id));
+    r.nodes[pending].tick(r.now + HEARTBEAT_TIMEOUT);
+    assert!(!r.nodes[pending].links.contains_key(&id));
+    assert!(r.nodes[pending].effects.iter().any(|effect| {
+        matches!(effect, Effect::Lost { link, reason: LinkLost::HeartbeatTimeout, .. } if *link == id)
+    }));
+}
 #[test]
 fn pending_relay_request_follows_direct_readiness_without_a_new_attempt() {
     // Both C0 endpoints can finish in either order, independently on each hop.

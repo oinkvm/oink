@@ -64,9 +64,21 @@ impl Handle {
         }
         self.files.cancel_all();
     }
-    pub(crate) fn execute_reported(&self, command: DndCmd, report: Option<crate::telemetry::Stamp>) -> Vec<DndEvent> {
+    pub(crate) fn execute_reported(
+        &self,
+        command: DndCmd,
+        report: Option<crate::telemetry::Stamp>,
+        released: Option<&dyn Fn()>,
+    ) -> Vec<DndEvent> {
         let glue = self.glue.lock().unwrap().clone();
-        glue.map_or_else(Vec::new, |glue| glue.execute_reported(command, report))
+        glue.map_or_else(Vec::new, |glue| glue.execute_reported(command, report, released))
+    }
+    pub(crate) fn defer_begin(&self, command: &DndCmd, input: Arc<InputThread>) -> bool {
+        self.glue
+            .lock()
+            .unwrap()
+            .clone()
+            .is_some_and(|glue| glue.defer_begin(command, input))
     }
 }
 #[derive(Clone)]
@@ -120,7 +132,15 @@ pub(crate) fn start_link_runtime(
                     Some(ConfigChange::State{..})=>{
                         let paused=group.applied().paused;streams.pause_changed(paused);files.pause_changed(paused);
                         if paused{pending.clear();outgoing.clear();files.cancel_all();}
-                        if let Some(glue)=shared.glue.lock().unwrap().as_ref(){glue.files.set_paused(paused);if paused{glue.cancel_targets();}}
+                        if let Some(glue)=shared.glue.lock().unwrap().as_ref(){
+                            glue.files.set_paused(paused);
+                            if paused {
+                                glue.cancel_targets();
+                                // The router may already be idle after failed source cleanup.
+                                // Local sharing-off must also retire an orphan native catcher.
+                                glue.backend.unprobe();
+                            }
+                        }
                     },Some(_)=>{},None=>break,
                 },
                 command=receive.recv()=>match command{

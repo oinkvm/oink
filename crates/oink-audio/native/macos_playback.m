@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 typedef struct {
     double sample_rate;
@@ -19,7 +20,8 @@ typedef struct {
     int32_t buffer_request_status;
     uint32_t lease_changed;
 } OinkOutputInfo;
-typedef void (*OinkRender)(void *, float *, size_t, uint32_t, uint32_t, uint32_t, uint64_t, uint64_t);
+typedef void (*OinkRender)(void *, float *, size_t, uint32_t, uint32_t, uint32_t, uint64_t, uint64_t, double);
+typedef void (*OinkRenderComplete)(void *, uint64_t);
 extern uint64_t oink_audio_service_generation(void);
 typedef struct {
     uint64_t service_generation;
@@ -28,6 +30,7 @@ typedef struct {
     AudioDeviceIOProcID io;
     bool started;
     OinkRender render;
+    OinkRenderComplete complete;
     void *context;
     OinkOutputInfo info;
     float *scratch;
@@ -106,7 +109,8 @@ static OSStatus render_io(AudioObjectID device, const AudioTimeStamp *now,
         ? host_ns(output, output_time->mHostTime) : 0;
     memset(output->scratch, 0, (size_t)frames * channels * sizeof(float));
     output->render(output->context, output->scratch, (size_t)frames * channels,
-                   (uint32_t)output->info.sample_rate, channels, frames, callback_ns, playback_ns);
+                   (uint32_t)output->info.sample_rate, channels, frames, callback_ns, playback_ns,
+                   output_time && (output_time->mFlags & kAudioTimeStampSampleTimeValid) ? output_time->mSampleTime : NAN);
     uint32_t channel_offset = 0;
     for (UInt32 b = 0; b < buffers->mNumberBuffers; ++b) {
         AudioBuffer *buffer = &buffers->mBuffers[b];
@@ -116,6 +120,7 @@ static OSStatus render_io(AudioObjectID device, const AudioTimeStamp *now,
                 destination[(size_t)f * buffer->mNumberChannels + c] = output->scratch[(size_t)f * channels + channel_offset + c];
         channel_offset += buffer->mNumberChannels;
     }
+    output->complete(output->context, host_ns(output, mach_absolute_time()) - callback_ns);
     return noErr;
 }
 
@@ -155,7 +160,7 @@ int32_t oink_audio_output_stop(void *opaque, bool *released) {
     return status;
 }
 
-void *oink_audio_output_start(const char *uid_utf8, uint32_t requested, OinkRender render,
+void *oink_audio_output_start(const char *uid_utf8, uint32_t requested, OinkRender render, OinkRenderComplete complete,
                                void *context, OinkOutputInfo *info, bool *retained, char *error, size_t error_size) {
     @autoreleasepool {
         *retained = false;
@@ -164,6 +169,7 @@ void *oink_audio_output_start(const char *uid_utf8, uint32_t requested, OinkRend
         output->service_generation = oink_audio_service_generation();
         atomic_init(&output->closing, false);
         output->render = render;
+    output->complete = complete;
         output->context = context;
         mach_timebase_info(&output->timebase);
         atomic_init(&output->failure, 0);

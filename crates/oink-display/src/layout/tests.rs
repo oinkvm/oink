@@ -196,7 +196,7 @@ fn auto_places_devices_side_by_side_and_syncs() {
     let m2 = l.screen(&sid(A, "m")).unwrap().clone();
     assert_eq!(m2.size_source, SizeSource::Estimated);
     assert_eq!(m2.local.w, 1800.0);
-    assert_eq!(m2.rect.x, m.rect.x);
+    assert_eq!(rect_of(&l, &sid(B, "w")), w.rect);
     assert!(near(m2.rect.w, m.rect.w * 1800.0 / 1512.0));
     assert!(near(m2.rect.right(), rect_of(&l, &sid(B, "w")).x) || near(m2.rect.bottom(), rect_of(&l, &sid(B, "w")).y));
     assert!(l.overlaps().is_empty());
@@ -1383,7 +1383,7 @@ fn overlapping_device_drop_moves_only_the_dragged_group_to_a_legal_edge() {
 }
 
 #[test]
-fn new_display_preserves_native_group_and_moves_only_colliding_computers() {
+fn new_display_preserves_native_group_and_moves_only_colliders() {
     let own = display(
         "own",
         Rect::new(0.0, 0.0, 1000.0, 600.0),
@@ -1406,10 +1406,122 @@ fn new_display_preserves_native_group_and_moves_only_colliding_computers() {
     );
     l.sync_device(A, &[own.clone(), second]);
     assert_eq!(l.screen(&sid(A, "own")), Some(&original[0]));
-    assert!(near(rect_of(&l, &sid(A, "second")).x, 300.0 / 686.0));
+    let retained = l.screen(&sid(A, "own")).unwrap().clone();
+    let moved_peer = l.screen(&sid(B, "peer")).unwrap().clone();
+    assert!(near(rect_of(&l, &sid(A, "second")).x - retained.rect.x, 300.0 / 686.0));
     assert_no_overlap(&l).unwrap();
     l.sync_device(A, &[own]);
-    assert_eq!(l.screen(&sid(A, "own")), Some(&original[0]));
+    assert_eq!(l.screen(&sid(A, "own")), Some(&retained));
+    assert_eq!(l.screen(&sid(B, "peer")), Some(&moved_peer));
+}
+
+#[test]
+fn native_addition_pins_its_owner_and_distinguishes_overlap_from_corner_contact() {
+    for corner in [false, true] {
+        for (changed, stationary) in [(A, B), (B, A)] {
+            let own = display("own", Rect::new(0.0, 0.0, 1000.0, 600.0), (1000, 600), None);
+            let peer = display("peer", own.bounds, (1000, 600), None);
+            let mut l = Layout::auto(&[(changed, vec![own.clone()]), (stationary, vec![peer])]);
+            l.place_device(changed, Point::default(), 0.001, false);
+            l.place_device(
+                stationary,
+                Point::new(1.0, if corner { 0.6 } else { 0.0 }),
+                0.001,
+                false,
+            );
+            let fixed = l.screen(&sid(stationary, "peer")).unwrap().clone();
+            let added = display("added", Rect::new(1000.0, 0.0, 1000.0, 600.0), (1000, 600), None);
+            l.sync_device(changed, &[own, added]);
+            assert_eq!(l.device_transform(changed).unwrap().0, Point::default());
+            assert!(l.overlaps().is_empty());
+            let added = rect_of(&l, &sid(changed, "added"));
+            if corner {
+                // A corner already is geometrically attached; it is not overlap
+                // and must not trigger an unrelated contact/compaction pass.
+                assert_eq!(l.screen(&sid(stationary, "peer")), Some(&fixed));
+            } else {
+                // The colliding peer moves up one height, the nearest free
+                // candidate (negative dy wins the equal-distance tie).
+                assert_eq!(l.screen(&sid(stationary, "peer")).unwrap().rect.bottom(), added.y);
+                assert_eq!(l.device_transform(stationary).unwrap().0, Point::new(1.0, -0.6));
+            }
+        }
+    }
+}
+
+#[test]
+fn native_addition_moves_only_the_colliding_neighbour() {
+    let own = display("own", Rect::new(0.0, 0.0, 1000.0, 10000.0), (1000, 10000), None);
+    let peer = display("peer", Rect::new(0.0, 0.0, 1000.0, 1000.0), (1000, 1000), None);
+    let mut l = Layout::auto(&[(A, vec![own.clone()]), (B, vec![peer.clone()]), (X, vec![peer])]);
+    l.place_device(A, Point::default(), 0.001, false);
+    l.place_device(B, Point::new(-1.0, 4.5), 0.001, false);
+    l.place_device(X, Point::new(1.0, 4.5), 0.001, false);
+    let before = l.clone();
+    // Only the right neighbour intersects the new screen. It moves right one
+    // width, without relocating either the owner or the left neighbour.
+    let added = display("added", Rect::new(1000.0, 0.0, 1000.0, 10000.0), (1000, 10000), None);
+    l.sync_device(A, &[own, added]);
+    assert_eq!(l.device_transform(B), before.device_transform(B));
+    assert_eq!(l.device_transform(X).unwrap().0, Point::new(2.0, 4.5));
+    assert_eq!(l.device_transform(A), before.device_transform(A));
+    assert!(l.overlaps().is_empty());
+}
+
+#[test]
+fn native_change_ignores_empty_desktop_notches_and_unrelated_existing_overlaps() {
+    let own = display("own", Rect::new(0.0, 0.0, 1000.0, 1000.0), (1000, 1000), None);
+    let mut l = Layout::auto(&[(A, vec![own.clone()]), (B, vec![own.clone()]), (X, vec![own.clone()])]);
+    l.place_device(A, Point::default(), 0.001, false);
+    l.place_device(B, Point::new(1.0, 1.0), 0.001, false);
+    l.place_device(X, Point::new(1.5, 1.5), 0.001, false);
+    let fixed = l
+        .screens
+        .iter()
+        .filter(|s| s.id.device != A)
+        .cloned()
+        .collect::<Vec<_>>();
+    let added = display("added", Rect::new(2000.0, 0.0, 1000.0, 1000.0), (1000, 1000), None);
+    l.sync_device(A, &[own, added]);
+    assert_eq!(l.device_transform(A).unwrap().0, Point::default());
+    assert_eq!(
+        l.screens
+            .iter()
+            .filter(|s| s.id.device != A)
+            .cloned()
+            .collect::<Vec<_>>(),
+        fixed
+    );
+}
+
+#[test]
+fn native_shrink_keeps_the_gap_without_auto_compacting() {
+    let mut own = display("own", Rect::new(0.0, 0.0, 1000.0, 1000.0), (1000, 1000), None);
+    let mut l = Layout::auto(&[(A, vec![own.clone()]), (B, vec![own.clone()])]);
+    l.place_device(A, Point::default(), 0.001, false);
+    l.place_device(B, Point::new(1.0, 0.0), 0.001, false);
+    let fixed = l.device_transform(B);
+    own.bounds.w = 500.0;
+    l.sync_device(A, &[own]);
+    assert_eq!(l.device_transform(A).unwrap(), (Point::default(), 0.001));
+    assert_eq!(l.device_transform(B), fixed);
+}
+
+#[test]
+fn native_shrink_leaves_a_gap_without_moving_any_computer() {
+    let mut own = display("own", Rect::new(0.0, 0.0, 3000.0, 1000.0), (3000, 1000), None);
+    let peer = display("peer", Rect::new(0.0, 0.0, 1000.0, 1000.0), (1000, 1000), None);
+    let mut l = Layout::auto(&[(A, vec![own.clone()]), (B, vec![peer.clone()]), (X, vec![peer])]);
+    l.place_device(A, Point::default(), 0.001, false);
+    l.place_device(B, Point::new(-1.0, 0.0), 0.001, false);
+    l.place_device(X, Point::new(3.0, 0.0), 0.001, false);
+    let before = l.clone();
+    own.bounds.w = 1000.0; // A width-1 unit cannot bridge a width-3 gap.
+    l.sync_device(A, &[own]);
+    assert_eq!(l.device_transform(A).unwrap().0, Point::default());
+    assert_eq!(l.device_transform(B), before.device_transform(B));
+    assert_eq!(l.device_transform(X), before.device_transform(X));
+    assert!(l.overlaps().is_empty());
 }
 
 #[test]
@@ -1973,7 +2085,7 @@ fn native_group_keeps_one_scale_and_native_origin_on_live_rearrange() {
 }
 
 #[test]
-fn moving_and_resizing_a_screen_transform_its_entire_computer() {
+fn moving_and_resizing_a_screen_transform_only_its_own_computer() {
     let device = DeviceId([32; 32]);
     let mut layout = Layout::default();
     for (name, x) in [("a", 0.0), ("b", 1000.0)] {
@@ -1987,11 +2099,17 @@ fn moving_and_resizing_a_screen_transform_its_entire_computer() {
             builtin: false,
         });
     }
+    // Other computers remain fixed targets; the backend must not add a global
+    // compaction pass to a manual move or resize submitted by the editor.
+    let untouched = screen(A, "fixed", Rect::new(-4.0, 2.0, 1.0, 0.6), 1000.0);
+    layout.screens.push(untouched.clone());
     let id = ScreenId::new(device, "b");
-    layout.move_screen(&id, Point::new(3.0, 2.0));
+    assert!(layout.move_screen(&id, Point::new(3.0, 2.0)));
+    assert_eq!(layout.screen(&untouched.id), Some(&untouched));
     assert_eq!(layout.screens[0].rect.x, 2.0);
     assert_eq!(layout.screens[0].rect.y, 2.0);
-    layout.resize_screen(&id, Size::new(2.0, 1.2));
+    assert!(layout.resize_screen(&id, Size::new(2.0, 1.2)));
+    assert_eq!(layout.screen(&untouched.id), Some(&untouched));
     assert_eq!(layout.screens[0].rect.w, 2.0);
     assert_eq!(layout.screens[1].rect.x - layout.screens[0].rect.x, 2.0);
 }
@@ -2076,4 +2194,30 @@ fn reconnecting_unchanged_native_geometry_never_repairs_retained_placements() {
         l.screens.iter().map(|s| (s.id.clone(), s.rect)).collect::<Vec<_>>(),
         before
     );
+}
+
+#[test]
+fn hotplug_keeps_owner_and_noncolliders_fixed_and_moves_colliding_rigid_computers() {
+    let own = display("own", Rect::new(0.0, 0.0, 1000.0, 600.0), (1000, 600), None);
+    let added = display("added", Rect::new(1000.0, 0.0, 1000.0, 600.0), (1000, 600), None);
+    let sibling = display("sibling", Rect::new(1000.0, 0.0, 1000.0, 600.0), (1000, 600), None);
+    let mut l = Layout::auto(&[
+        (A, vec![own.clone()]),
+        (B, vec![own.clone(), sibling]),
+        (X, vec![own.clone()]),
+    ]);
+    l.place_device(A, Point::default(), 0.001, false);
+    l.place_device(B, Point::new(1.0, 0.0), 0.001, false);
+    l.place_device(X, Point::new(1.0, -0.6), 0.001, false);
+    let before = l.clone();
+    l.sync_device(A, &[own, added]);
+    assert_eq!(l.screen(&sid(A, "own")), before.screen(&sid(A, "own")));
+    assert_eq!(l.screen(&sid(X, "own")), before.screen(&sid(X, "own")));
+    // The closer upper candidate is occupied by a noncollider, which stays fixed.
+    assert_eq!(l.device_transform(B).unwrap().0, Point::new(1.0, 0.6));
+    assert_eq!(
+        l.screen(&sid(B, "sibling")).unwrap().rect,
+        Rect::new(2.0, 0.6, 1.0, 0.6)
+    );
+    assert!(l.overlaps().is_empty());
 }

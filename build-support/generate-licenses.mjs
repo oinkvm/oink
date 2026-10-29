@@ -213,7 +213,8 @@ for (const c of native.components) {
     : c.id==='native:WixToolset.UI.wixext@5.0.2'
       ? ['packaging/windows/build.py','WIX_VERSION','UI_SHA256']
       : c.id==='native:WixToolset.Firewall.wixext@5.0.2'
-      ? ['packaging/windows/build.py','WIX_VERSION','FIREWALL_SHA256'] : null;
+      ? ['packaging/windows/build.py','WIX_VERSION','FIREWALL_SHA256']
+      : c.id==='native:VB-CABLE@45' ? ['packaging/windows/vbcable.py','VERSION','SHA256'] : null;
   if (packagingPin) {
     const source=read(packagingPin[0]);
     const constant=name=>source.match(new RegExp(`^${name} = ['"]([^'"]+)['"]`,'m'))?.[1];
@@ -233,6 +234,10 @@ for (const c of native.components) {
   if (['native:WixToolset.Firewall.wixext@5.0.2','native:WixToolset.UI.wixext@5.0.2'].includes(c.id) && c.selectedLicense==='MS-RL' && c.compatibilityReview) {
     const reviewed = c.id==='native:WixToolset.UI.wixext@5.0.2' ? '5ef2c707614b9f70b6bbadd2d4abcb4124efee215e9b16bfbc80113079a604c7' : 'c9a1c99afab82225127b34036b719dea6c98c451e21b341ae1c62a674d0ba5ef';
     if (c.archive?.sha256!==reviewed) throw Error('WiX review pin changed');
+  } else if (c.id==='native:libASPL@3.1.2+633e0f7' && c.selectedLicense==='MIT AND AML' && c.compatibilityReview) {
+    if (c.archive?.sha256!=='8583fb549419eab14b5c636ee4eb1f0b1df74c534eaf2f990d8bb0fb5de6e01b') throw Error('libASPL review pin changed');
+  } else if (c.id==='native:VB-CABLE@45' && c.selectedLicense==='LicenseRef-VB-CABLE-Donationware' && c.compatibilityReview) {
+    if (c.archive?.sha256!=='b950e39f01af1d04ea623c8f6d8eb9b6ea5c477c637295fabf20631c85116bfb') throw Error('VB-CABLE review pin changed');
   } else select(c.selectedLicense);
   const {archive,cargoPackage,packagePatterns,includedComponents,linkage,patentNotices,compatibilityReview,...common}=c;
   const value=base(common,texts);

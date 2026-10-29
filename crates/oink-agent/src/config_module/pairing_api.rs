@@ -348,7 +348,19 @@ impl Owner {
             self.remember(operation_key, key, &reply);
             return Ok(reply);
         }
+        let replaced_peers = self
+            .queries
+            .values()
+            .filter(|q| q.client == client)
+            .filter_map(|q| q.peer)
+            .collect::<Vec<_>>();
         self.queries.retain(|_, q| q.client != client);
+        // Replacing a client's result releases its prepared-peer reference just
+        // like explicit ReleaseQuery. Otherwise an unused nonmember C0 survives
+        // the replacement and a fresh query can reuse stale group/count metadata.
+        for peer in replaced_peers {
+            self.release_prepared_peer(peer);
+        }
         let query_id = format!("{:032x}", u128::from_le_bytes(random_id()?));
         self.queries.insert(
             query_id.clone(),

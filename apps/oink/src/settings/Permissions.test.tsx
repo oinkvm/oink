@@ -54,6 +54,7 @@ it.each(['en','ja','ko','zh-Hans'])('hides contacts settings without an injector
     agent.adopt('input', {contacts_injection_available:available} as unknown as InputSettings);
     const {container,unmount}=render(view(initial,'',vi.fn(),undefined,'win'));
     expect(!!container.querySelector('[data-item="touchpadInject"]')).toBe(available===true);
+    expect(!!container.querySelector('[data-item="nativeMultifinger"]')).toBe(available===true);
     expect(!!container.querySelector('[data-item="macScrollFeel"]')).toBe(available===true);
     unmount();
   }
@@ -67,7 +68,7 @@ it.each(['en','ja','ko','zh-Hans'])('places the default-on Mac scroll switch bel
     const {container,unmount}=render(view(initial,'',vi.fn(),undefined,'win',settings));
     const row=container.querySelector<HTMLElement>('[data-item="macScrollFeel"]');
     expect(row).not.toBeNull();
-    expect(container.querySelector('[data-item="touchpadInject"]')?.nextElementSibling).toBe(row);
+    expect(container.querySelector('[data-item="touchpadInject"]')?.nextElementSibling?.nextElementSibling).toBe(row);
     const control=within(row!).getByRole('switch') as HTMLInputElement;
     expect(control.checked).toBe(true);
     expect(control.disabled).toBe(!parent);
@@ -76,6 +77,28 @@ it.each(['en','ja','ko','zh-Hans'])('places the default-on Mac scroll switch bel
   const {container}=render(view());
   expect(container.querySelector('[data-item="macScrollFeel"]')).toBeNull();
   agent.adopt('input',null);
+});
+it.each(['en','ja','ko','zh-Hans'])('nests both default-on touchpad children and disables them with their parent in %s', language => {
+  setLanguage(language);
+  agent.adopt('input', {contacts_injection_available:true} as InputSettings);
+  for (const parent of [true,false]) {
+    const set=vi.fn();
+    const settings = {...prefs,set,prefs:{...DEFAULT_PREFS,touchpadInject:parent}};
+    const {container,unmount}=render(view(initial,'',vi.fn(),undefined,'win',settings));
+    for (const id of ['nativeMultifinger','macScrollFeel']) {
+      const row=container.querySelector<HTMLElement>(`[data-item="${id}"]`);
+      expect(row).not.toBeNull();
+      expect(row!.dataset.parent).toBe('touchpadInject');
+      const control=within(row!).getByRole('switch') as HTMLInputElement;
+      expect(control.checked).toBe(true);
+      expect(control.disabled).toBe(!parent);
+      control.click();
+      if(parent) expect(set).toHaveBeenLastCalledWith(id,false);
+      else expect(set).not.toHaveBeenCalled();
+    }
+    unmount();
+  }
+  agent.adopt('input', null);
 });
 describe('applicable independent permission rows', () => {
   it.each(['en', 'zh-Hans'] as const)('shows effective listening access through Accessibility without another grant in %s', language => {
@@ -224,13 +247,13 @@ describe('settings actions', () => {
 
 describe('renamed setting search aliases',()=>{
   it.each([
-    ['zh-Hans','同步私有格式','同步应用专有格式','本机保持屏幕点亮','保持屏幕常亮','音频录制','系统音频录制','诊断包保存位置'],
-    ['en','Sync private formats','Sync app-specific formats','Keep this screen awake','Keep this screen awake','Audio recording','System Audio Recording','Diagnostics folder'],
-    ['ja','独自フォーマットを同期','アプリ独自の形式を同期','このデバイスの画面をオンのままにする','画面をオンのままにする','システムオーディオ録音','システムオーディオの録音','診断パッケージの保存場所'],
-    ['ko','고유 형식 동기화','앱 전용 형식 동기화','이 기기의 화면 켜 두기','화면 켜 두기','오디오 녹음','시스템 오디오 녹음','진단 패키지 저장 위치'],
-  ])('finds both old and new names in %s',(language,oldFormats,newFormats,oldAwake,newAwake,oldAudio,newAudio,folder)=>{
+    ['zh-Hans','本机保持屏幕点亮','保持屏幕常亮','音频录制','系统音频录制','诊断包保存位置'],
+    ['en','Keep this screen awake','Keep this screen awake','Audio recording','System Audio Recording','Diagnostics folder'],
+    ['ja','このデバイスの画面をオンのままにする','画面をオンのままにする','システムオーディオ録音','システムオーディオの録音','診断パッケージの保存場所'],
+    ['ko','이 기기의 화면 켜 두기','화면 켜 두기','오디오 녹음','시스템 오디오 녹음','진단 패키지 저장 위치'],
+  ])('finds both old and new names in %s',(language,oldAwake,newAwake,oldAudio,newAudio,folder)=>{
     setLanguage(language);
-    for(const [id,section,queries] of [['clipPrivate','clipboard',[oldFormats,newFormats]],['keepAwake','input',[oldAwake,newAwake]],['perm-audio','permissions',[oldAudio,newAudio]],['bundle','diagnostics',[folder]]] as const){
+    for(const [id,section,queries] of [['keepAwake','general',[oldAwake,newAwake]],['perm-audio','permissions',[oldAudio,newAudio]],['bundle','diagnostics',[folder]]] as const){
       for(const query of queries){const found=searchSections('mac',query).get(section);expect(found==='all'||found?.has(id)).toBe(true);}
     }
   });
@@ -265,16 +288,55 @@ it.each(['en','ja','ko','zh-Hans'])('finds the localized Mac scroll setting thro
   expect(found==='all'||found?.has('macScrollFeel')).toBe(true);
 });
 
-it('disables only clipboard format rows when sending is off', () => {
+it.each(['en','ja','ko','zh-Hans'])('removes format toggles and retains other clipboard settings in %s', language => {
+  setLanguage(language);
+  for (const platform of ['mac', 'win'] as const) {
+    for (const clipSend of [false, true]) {
+      const settings = {...prefs,prefs:{...DEFAULT_PREFS,clipSend}};
+      const {container,unmount}=render(view(initial,'',vi.fn(),undefined,platform,settings));
+      const section = sectionsFor(platform).find(section=>section.id==='clipboard')!;
+      expect(section.items.map(item=>item.id)).toEqual([
+        'clipReceive','clipSend','receivedFiles','receivedCleanup','cache',
+        ...(platform==='mac'?['removeDsStore']:[]),
+      ]);
+      for (const key of ['clipText','clipRich','clipImage','clipFiles','clipPrivate']) {
+        expect(container.querySelector(`[data-item="${key}"]`)).toBeNull();
+      }
+      for (const key of ['clipReceive','clipSend',...(platform==='mac'?['removeDsStore']:[])]) {
+        const row=container.querySelector<HTMLElement>(`[data-item="${key}"]`)!;
+        expect((within(row).getByRole('switch') as HTMLInputElement).disabled).toBe(false);
+      }
+      unmount();
+    }
+  }
+});
+
+it.each(['en','ja','ko','zh-Hans'])('finds the localized native gesture child and keeps it Windows-only in %s', language=>{
+  setLanguage(language);
+  const item=sectionsFor('win').flatMap(s=>s.items).find(i=>i.id==='nativeMultifinger')!;
+  expect(item.parent).toBe('touchpadInject');
+  if(language!=='zh-Hans') {
+    expect(item.label).not.toBe('注入原生多指手势');
+    expect(item.desc).not.toBe('关闭后，缩放和多指手势改用快捷键映射；不影响双指滚动');
+  }
+  const found=searchSections('win','precision touchpad').get('input');
+  expect(found==='all'||found?.has('nativeMultifinger')).toBe(true);
+  expect(found==='all'||found?.has('touchpadInject')).toBe(true);
+  expect(sectionsFor('mac').flatMap(s=>s.items).some(i=>i.id==='nativeMultifinger')).toBe(false);
+});
+
+it('lists a digit shortcut for self alongside recall, and refreshes live device labels',()=>{
   setLanguage('en');
-  const settings = {...prefs,prefs:{...DEFAULT_PREFS,clipSend:false}};
-  const {container}=render(view(initial,'',vi.fn(),undefined,'mac',settings));
-  for (const key of ['clipText','clipRich','clipImage','clipFiles','clipPrivate']) {
-    const row=container.querySelector<HTMLElement>(`[data-item="${key}"]`)!;
-    expect((within(row).getByRole('switch') as HTMLInputElement).disabled).toBe(true);
-  }
-  for (const key of ['clipReceive','clipSend']) {
-    const row=container.querySelector<HTMLElement>(`[data-item="${key}"]`)!;
-    expect((within(row).getByRole('switch') as HTMLInputElement).disabled).toBe(false);
-  }
+  const input={hotkeys:[{action:'move_pointer_to',device:'self',keys:['Ctrl','Alt','1'],enabled:true}]} as InputSettings;
+  agent.adopt('input',input);
+  const cards=vi.spyOn(agent,'get').mockReturnValue({...agent.get(),input,cards:{cards:[{device:'self',name:'Test computer'}]} as never});
+  const settings={...prefs,prefs:{...DEFAULT_PREFS,shortcuts:{...DEFAULT_PREFS.shortcuts,'move:self':{on:true,keys:'Control+Alt+1'}}}};
+  const {container,rerender}=render(view(initial,'',vi.fn(),undefined,'mac',settings));
+  expect(container.querySelector('[data-item="sc-move:self"]')?.textContent).toContain('Move pointer to Test computer');
+  expect(container.querySelector('[data-item="sc-recall"]')).not.toBeNull();
+  cards.mockReturnValue({...agent.get(),input,cards:{cards:[{device:'self',name:'Renamed computer'}]} as never});
+  rerender(view(initial,'',vi.fn(),undefined,'mac',settings));
+  expect(container.querySelector('[data-item="sc-move:self"]')?.textContent).toContain('Move pointer to Renamed computer');
+  cards.mockRestore();
+  agent.adopt('input',null);
 });

@@ -15,12 +15,12 @@ import zipfile
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'build-support'))
 from identity import signpath_configuration, windows_product_version
 from provenance import verify, digest
+import package_notes
 from payload import copy_notices
-from report_manifest import write_manifest, image_identity
+from report_manifest import write_manifest, image_identity, pdb_identity
 import xml.etree.ElementTree as ET
 
 from versioning import release_version
-import embedded_release_notes
 
 ROOT = Path(__file__).resolve().parents[2]
 I = json.loads((ROOT / 'packaging/identity.json').read_text())
@@ -114,7 +114,8 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--tool-cache', type=Path, required=True)
     p.add_argument('--version', default=I['version'])
-    p.add_argument('--source-commit', help='Full source commit for a local commit-labelled version')
+    p.add_argument('--update-notes-file', type=Path, help='Prepared embedded package notes')
+    p.add_argument('--source-commit', help='Full source commit for a in-house build-labelled version')
     p.add_argument('--build', type=int, required=True)
     p.add_argument('--source-tree-sha256', required=True)
     p.add_argument('--windows-update-test-feed', help='Explicit matching qualification-build origin; never public')
@@ -126,7 +127,7 @@ def main():
     if a.version != I['version']:
         p.error('version must match packaging/identity.json')
     try:
-        a.version = release_version(a.version, a.source_commit)
+        a.version = release_version(a.version, a.source_commit, a.build)
     except ValueError as error:
         p.error(str(error))
     provenance = verify(a.binaries, a.source_tree_sha256, a.version, 'x86_64-pc-windows-msvc', a.build, a.source_commit)
@@ -167,6 +168,9 @@ def main():
             pdb = a.binaries / (name + '.pdb')
         if not pdb.is_file():
             raise RuntimeError('Private PDB missing for ' + name)
+        identity = image_identity(payload / (name + '.exe'))
+        if pdb_identity(pdb) != {key: identity[key] for key in ('debug_id', 'debug_age')}:
+            raise RuntimeError('PDB identity does not match linked image: ' + name)
         shutil.copy2(pdb, symbols / pdb.name)
         symbol_records.append({'image': name + '.exe', **image_identity(payload / (name + '.exe')),
                                'pdb': pdb.name, 'pdb_sha256': digest(pdb)})
@@ -178,7 +182,8 @@ def main():
                   collector_included=has_collector, update_test_feed=a.windows_update_test_feed,
                   update_test_fail_health=provenance.get('update_test_fail_health', False),
                   signing='unsigned', report_manifest=report)
-    notice_files = copy_notices(payload)
+    from vbcable import bundle, verify_extracted, verify_cleanup, cleanup_header
+    notice_files = copy_notices(payload) + bundle(a.tool_cache.resolve(), payload)
     (payload / I['metadata_file']).write_text(json.dumps(record, indent=2) + '\n')
     (payload / w['receipt']).write_text(json.dumps(installed_receipt(record), indent=2) + '\n')
     # ProductVersion's MSI fields are 8/8/16 bits. Encode build, not display
@@ -187,11 +192,15 @@ def main():
     product_code = str(uuid.uuid5(uuid.UUID(w['upgrade_code']), str(a.build))).upper()
     license_rtf = a.output / 'license.rtf'
     write_license_rtf(license_rtf)
-    notes_file = embedded_release_notes.write(ROOT, a.output / 'embedded-update-notes.json', a.build, a.source_commit)
+    notes_file = a.update_notes_file or a.output / 'embedded-update-notes.json'
+    if a.update_notes_file:
+        package_notes.read(notes_file, a.build, a.source_commit, ROOT)
+    else:
+        package_notes.write(notes_file, package_notes.generate(ROOT, a.build, a.source_commit, a.output.parent.parent))
     values = {'UpdateNotesFile': str(notes_file), 'LicenseRtf': str(license_rtf),
               'DialogBmp': str(ROOT / 'packaging/windows/installer-background.bmp'),
               'BannerBmp': str(ROOT / 'packaging/windows/installer-banner.bmp'), 'ProductName': I['name'], 'Manufacturer': I['publisher'], 'ProductVersion': msi_version,
-              'ProductCode': product_code, 'UpgradeCode': w['upgrade_code'],
+              'SourceTreeSha256': a.source_tree_sha256, 'ProductCode': product_code, 'UpgradeCode': w['upgrade_code'],
               'MinimumWindowsBuild': str(I['minimumWindowsBuild']),
               'InstallDirectory': w['install_directory'], 'ServiceName': w['service_name'],
               'ServiceDisplayName': w['service_display_name'], 'RegistryKey': w['registry_key'],
@@ -211,6 +220,7 @@ def main():
         'MAINTENANCE_LOCK': w['maintenance_lock'], 'PRODUCT_CODE': product_code,
         'UPGRADE_CODE': '{' + w['upgrade_code'] + '}'}.items()) + '\n'
     (a.output / 'identity.h').write_text(header)
+    (a.output / 'microphone-cleanup.h').write_text(cleanup_header((ROOT / 'packaging/windows/Microphone.ps1').read_text()))
     # Use existing MSVC build tools only. /MT avoids a VC runtime prerequisite.
     if not shutil.which('cl.exe'):
         vswhere = Path(os.environ['ProgramFiles(x86)']) / 'Microsoft Visual Studio/Installer/vswhere.exe'
@@ -237,14 +247,22 @@ def main():
             if not dependencies or any(re.match(forbidden, name, re.IGNORECASE) for name in dependencies):
                 raise RuntimeError('Unexpected external CRT dependency in ' + b[role])
             (a.output / (b[role] + '-dependencies.txt')).write_text(imports)
-    run('cl.exe', '/nologo', '/LD', '/EHsc', '/std:c++17', '/W4', '/WX', '/MT',
+    run('cl.exe', '/nologo', '/LD', '/Z7', '/experimental:deterministic', f'/pathmap:{ROOT}=oink', f'/pathmap:{a.output}=oink/generated', '/EHsc', '/std:c++17', '/W4', '/WX', '/MT',
         '/DUNICODE', '/D_UNICODE', f'/I{a.output}', ROOT / 'packaging/windows/InstallerCA.cpp',
-        f'/Fo{a.output}/InstallerCA.obj', '/link', f'/OUT:{a.output}/InstallerCA.dll', f'/IMPLIB:{a.output}/InstallerCA.lib',
+        f'/Fo{a.output}/InstallerCA.obj', '/link', '/DEBUG:FULL', f'/PDB:{symbols}/InstallerCA.pdb', '/PDBALTPATH:%_PDB%', f'/OUT:{a.output}/InstallerCA.dll', f'/IMPLIB:{a.output}/InstallerCA.lib',
         'msi.lib', 'advapi32.lib', 'shell32.lib', 'ole32.lib', 'bcrypt.lib', 'user32.lib', 'userenv.lib')
-    for test in ('AuthorizationTests', 'QuiescenceTests', 'MaintenanceCleanupTests', 'CloudFilesCleanupTests', 'FinishInstallTests', 'GracefulStopTests', 'UserDataCleanupTests'):
+    ca_identity = image_identity(a.output / 'InstallerCA.dll')
+    if pdb_identity(symbols / 'InstallerCA.pdb') != {key: ca_identity[key] for key in ('debug_id', 'debug_age')}:
+        raise RuntimeError('Installer custom action PDB identity mismatch')
+    symbol_records.append({'image': 'InstallerCA.dll', **ca_identity, 'pdb': 'InstallerCA.pdb',
+                           'pdb_sha256': digest(symbols / 'InstallerCA.pdb')})
+    (symbols / 'manifest.json').write_text(json.dumps({'source_tree_sha256': a.source_tree_sha256,
+                                                     'images': symbol_records}, indent=2) + '\n')
+    for test in ('AuthorizationTests', 'QuiescenceTests', 'MaintenanceCleanupTests', 'CloudFilesCleanupTests', 'FinishInstallTests', 'GracefulStopTests', 'UserDataCleanupTests', 'EmbeddedPowerShellTests'):
         run('cl.exe', '/nologo', '/EHsc', '/std:c++17', '/W4', '/WX', '/MT', ROOT / f'packaging/windows/{test}.cpp',
             f'/Fo{a.output}/{test}.obj', f'/Fe{a.output}/{test}.exe', 'advapi32.lib', 'user32.lib')
         run(a.output / f'{test}.exe')
+    run('powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ROOT / 'packaging/windows/MicrophoneTests.ps1')
     notices = a.output / 'notices.wxs'
     write_notices(notices, payload, notice_files)
     run('node', ROOT / 'build-support/check-package-licenses.mjs', payload, 'windows-x64', cwd=ROOT)
@@ -261,8 +279,12 @@ def main():
     from content import verify_msi
     from tables import read_content_tables
     tables = read_content_tables(msi)
-    embedded_release_notes.verify_windows(tables, notes_file)
+    from bridge_022 import verify_file_table
+    verify_file_table(tables)
+    package_notes.verify_windows_embedding(tables, notes_file)
     (a.output / 'content-tables.json').write_text(json.dumps(tables, indent=2) + '\n')
+    verify_extracted(a.output / 'decompiled.wxs', a.output / 'extracted')
+    verify_cleanup(tables)
     record['embedded_executables'] = verify_msi(a.output / 'decompiled.wxs', a.output / 'extracted', I, tables)
     record.update(product_code=product_code, msi_version=msi_version, signing='unsigned',
                   artifacts=[dict(name=msi.name, size=msi.stat().st_size, sha256=hashlib.sha256(msi.read_bytes()).hexdigest())])

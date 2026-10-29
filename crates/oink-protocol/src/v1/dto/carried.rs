@@ -18,8 +18,15 @@ open_enum!(SizeSource {Reported=0,Estimated=1,Manual=3});
 open_enum!(KeyPreset {WinFeel=0,MacFeel=1,Custom=2,None=3});
 wire_map!(KeyMapping,no_validation,{1=>from:u32=required;2=>to:u32=required;});
 wire_map!(CapsTapHold,validate_caps,{1=>tap:u32=required;2=>hold:u32=required;});
+// Inert editor memory: old readers ignore KeyboardMapping field 4. Keep active
+// outputs in fields 1-3 so preset execution stays compatible with those readers.
+wire_map!(SavedCustomKeymap,no_validation,{
+    1=>table:List<KeyMapping,256>=required;2=>caps_hold:Option<u32>=optional;
+    3=>caps_split:bool=required;4=>allow_fn:bool=required;
+});
 wire_map!(KeyboardMapping,validate_keyboard_mapping,{
     1=>preset:KeyPreset=required;2=>table:List<KeyMapping,256>=required;3=>caps_tap_hold:Option<CapsTapHold>=optional;
+    4=>saved_custom:Option<SavedCustomKeymap>=optional;
 });
 wire_map!(TargetTransform,no_validation,{1=>reverse_wheel:bool=required;2=>keyboard:KeyboardMapping=required;});
 wire_map!(TargetOverride,no_validation,{1=>target:DeviceId=required;2=>reverse_wheel:Option<bool>=optional;3=>keyboard:Option<KeyboardMapping>=optional;});
@@ -75,6 +82,7 @@ wire_map!(Snapshot,super::diagnostic_values::validate_snapshot,{
     10=>button_handoff:Option<DiagButtonHandoffValue>=optional;11=>reference_screen:Option<Text<128>>=optional;12=>injection_failures:u64=required;
     13=>session_locked:Option<bool>=optional;14=>backend_uiaccess:Option<bool>=optional;15=>crash_report:DiagCrashSummary=required;
     16=>layout:Option<CompleteLayout>=optional;
+    17=>application_focus:Option<DiagApplicationFocus>=optional;
 });
 wire_map!(NamedScalar,super::diagnostic_values::validate_scalar,{1=>name:Text<256>=required;2=>value:crate::v1::RawValue=required;});
 wire_map!(DiagnosticEvent,super::diagnostic_values::validate_event,{1=>kind:Ascii<96>=required;2=>fields:RawMap=required;});
@@ -108,6 +116,10 @@ wire_map!(LifecycleObservation,no_validation,{
     1=>success:Option<bool>=optional;2=>reason:Option<u32>=optional;3=>remote:Option<bool>=optional;4=>hidden:Option<bool>=optional;
     5=>duration_us:Option<u64>=optional;6=>count:Option<u64>=optional;7=>native_error:Option<u32>=optional;
     8=>generation:Option<u64>=optional;9=>requested:Option<Point>=optional;10=>observed:Option<Point>=optional;11=>clip:Option<Rect>=optional;
+    12=>cursor_showing:Option<bool>=optional;13=>park:Option<Point>=optional;14=>marker:Option<u64>=optional;
+    15=>normalized:Option<Point>=optional;16=>desktop:Option<Rect>=optional;17=>chain_result:Option<i64>=optional;
+    18=>cursor_before:Option<Point>=optional;19=>cursor_after_move:Option<Point>=optional;
+    20=>hidden_before:Option<bool>=optional;21=>steps:Option<u32>=optional;
 });
 open_enum!(LifecycleKind {
     HookInstall=4,HookRemove=5,HookReinstall=6,Mode=7,Hide=8,Show=9,Park=10,
@@ -118,7 +130,8 @@ open_enum!(LifecycleKind {
     ParkInputSenderUnavailable=32,ParkInputSendRejected=33,ParkInputHookNotObserved=34,
     ParkInputTargetMismatch=35,ParkInputHideLost=36,ParkInputHookChainRejected=37,
     ParkInputReadbackMismatch=38,ParkInputCompletionUnavailable=39,
-    ContactCapture=40,ContactInjection=41
+    ContactCapture=40,ContactInjection=41,
+    MarkerSubmission=42,MarkerHookDecision=43,MarkerChainResult=44,MarkerReadback=45,RestoreSafetyReset=46,MouseKeysCompensation=47
 });
 wire_map!(DepartureClamp,no_validation,{1=>requested:Point=required;2=>applied:Point=required;3=>bounds:Rect=required;4=>display_revision:u64=required;});
 wire_map!(FeelProfile,no_validation,{
@@ -161,7 +174,9 @@ fn validate_device_gain(raw: &RawMap) -> crate::v1::Result<()> {
 fn validate_caps(raw: &RawMap) -> crate::v1::Result<()> {
     let supported = oink_foundation::input_transform::candidate_keys();
     for key in [1, 2] {
-        if !supported.contains(&oink_foundation::input::KeyCode(required::<u32>(raw, key)?)) {
+        if required::<u32>(raw, key)? != 0
+            && !supported.contains(&oink_foundation::input::KeyCode(required::<u32>(raw, key)?))
+        {
             return Err(crate::v1::ErrorCode::UnsupportedValue.into());
         }
     }
@@ -193,3 +208,9 @@ impl LayoutValue {
         Ok(List(screens))
     }
 }
+
+wire_map!(DiagApplicationFocus,no_validation,{
+    1=>pointer:Text<128>=required;2=>keyboard:Option<Text<128>>=optional;
+    3=>epoch:u64=required;4=>revision:u64=required;
+    5=>phase:ApplicationFocusPhase=required;6=>reason:ApplicationFocusReason=required;
+});

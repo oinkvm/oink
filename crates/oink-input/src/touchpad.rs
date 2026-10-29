@@ -5,6 +5,20 @@
 //! The model was checked against native output on Windows 11 build 26200.9457;
 //! the recognizer is not a documented cross-version contract.
 use oink_foundation::input::ScrollPhase;
+use std::time::Duration;
+
+/// Bridge Ended to the optional source momentum without a synthetic re-touch.
+pub(crate) const MOMENTUM_GRACE: Duration = Duration::from_millis(32);
+
+#[derive(Debug, Default, PartialEq, Eq)]
+enum Phase {
+    #[default]
+    Idle,
+    Fingers,
+    AwaitMomentum,
+    Momentum,
+    Wheel,
+}
 
 const ORIGIN: i32 = 500_000;
 const LIMIT: i32 = 450_000;
@@ -51,6 +65,7 @@ pub(crate) struct Pan {
     fraction: (f64, f64),
     tick: u32,
     active: bool,
+    phase: Phase,
 }
 
 impl Default for Pan {
@@ -60,6 +75,7 @@ impl Default for Pan {
             fraction: (0.0, 0.0),
             tick: 1,
             active: false,
+            phase: Phase::Idle,
         }
     }
 }
@@ -67,6 +83,18 @@ impl Default for Pan {
 impl Pan {
     pub fn active(&self) -> bool {
         self.active
+    }
+
+    pub fn awaiting_momentum(&self) -> bool {
+        self.active && self.phase == Phase::AwaitMomentum
+    }
+
+    pub fn idle_timeout(&self) -> Duration {
+        if self.awaiting_momentum() {
+            MOMENTUM_GRACE
+        } else {
+            Duration::from_millis(500)
+        }
     }
 
     fn send(&mut self, sink: &mut impl Sink, x: i32, y: i32, elapsed: u32, cancel: bool) -> bool {
@@ -84,6 +112,7 @@ impl Pan {
     }
 
     pub fn cancel(&mut self, sink: &mut impl Sink) -> bool {
+        self.phase = Phase::Idle;
         if !self.active {
             return true;
         }
@@ -100,6 +129,22 @@ impl Pan {
         stopped && cancelled
     }
 
+    pub fn expire(&mut self, sink: &mut impl Sink) -> bool {
+        let fingers = self.phase == Phase::Fingers;
+        let tail = matches!(self.phase, Phase::AwaitMomentum | Phase::Momentum);
+        let ok = self.cancel(sink);
+        if fingers {
+            // Retain the existing recovery for fingers paused beyond the idle
+            // watchdog: a later Changed can resume the physical finger scroll.
+            self.phase = Phase::Fingers;
+        } else if tail {
+            // Network scheduling can delay MomentumBegan past the short bridge.
+            // Preserve those deltas via wheel fallback, never another contact DOWN.
+            self.phase = Phase::Wheel;
+        }
+        ok
+    }
+
     /// Return unsubmitted fractions of the source event for exact wheel fallback.
     /// A successful native event returns (0,0). Priming never consumes source data.
     pub fn scroll(
@@ -109,8 +154,27 @@ impl Pan {
         pixels_per_himetric: f64,
         phase: ScrollPhase,
     ) -> (f64, f64) {
-        if phase == ScrollPhase::Began && !self.cancel(sink) {
+        if phase == ScrollPhase::Began {
+            if !self.cancel(sink) {
+                return (1.0, 1.0);
+            }
+            self.phase = Phase::Fingers;
+        } else if phase == ScrollPhase::Cancelled {
+            self.cancel(sink);
+            return (0.0, 0.0);
+        } else if self.phase == Phase::Wheel {
+            if phase == ScrollPhase::MomentumEnded {
+                self.phase = Phase::Idle;
+            }
             return (1.0, 1.0);
+        } else {
+            match phase {
+                ScrollPhase::MomentumBegan if self.awaiting_momentum() => self.phase = Phase::Momentum,
+                ScrollPhase::Momentum | ScrollPhase::MomentumEnded if self.phase == Phase::Momentum => {}
+                ScrollPhase::Changed | ScrollPhase::Ended if self.phase == Phase::Fingers => {}
+                // Interrupted/late momentum cannot create contacts or end a new touch.
+                _ => return (0.0, 0.0),
+            }
         }
         if !pixels.0.is_finite() || !pixels.1.is_finite() {
             self.cancel(sink);
@@ -120,20 +184,27 @@ impl Pan {
             self.cancel(sink);
             return (1.0, 1.0);
         }
+        if !self.active {
+            self.position = (ORIGIN, ORIGIN);
+        }
         let delta = (
             inverse(pixels.0, pixels_per_himetric),
             inverse(pixels.1, pixels_per_himetric),
         );
         if delta.0 != 0.0 || delta.1 != 0.0 {
-            // Recenter only at a device boundary; no unbounded integer conversion.
+            // Bound conversions, without re-touching inside a gesture.
             if delta.0.abs().max(delta.1.abs()) > f64::from(LIMIT) {
                 self.cancel(sink);
+                self.phase = Phase::Wheel;
                 return (1.0, 1.0);
             }
-            if ((f64::from(self.position.0 - ORIGIN) + delta.0).abs() > f64::from(LIMIT)
-                || (f64::from(self.position.1 - ORIGIN) + delta.1).abs() > f64::from(LIMIT))
-                && !self.cancel(sink)
+            if (f64::from(self.position.0 - ORIGIN) + delta.0).abs() > f64::from(LIMIT)
+                || (f64::from(self.position.1 - ORIGIN) + delta.1).abs() > f64::from(LIMIT)
             {
+                // Never recenter/re-touch inside an active fling. Use the wheel
+                // fallback for the rest of an exceptionally long gesture.
+                self.cancel(sink);
+                self.phase = Phase::Wheel;
                 return (1.0, 1.0);
             }
             if !self.active {
@@ -164,10 +235,9 @@ impl Pan {
                 return (1.0, 1.0);
             }
         }
-        if matches!(
-            phase,
-            ScrollPhase::Ended | ScrollPhase::Cancelled | ScrollPhase::MomentumEnded
-        ) {
+        if phase == ScrollPhase::Ended {
+            self.phase = Phase::AwaitMomentum;
+        } else if phase == ScrollPhase::MomentumEnded {
             self.cancel(sink);
         }
         (0.0, 0.0)
@@ -196,20 +266,130 @@ mod tests {
             self.stops += 1;
         }
     }
-    #[test]
-    fn lift_cancels_and_source_momentum_starts_fresh_without_generated_tail() {
-        let (mut pan, mut sink) = (Pan::default(), Recorder::default());
-        pan.scroll(&mut sink, (0.0, -20.0), SCALE, ScrollPhase::Began);
-        assert!(pan.active());
-        pan.scroll(&mut sink, (0.0, 0.0), SCALE, ScrollPhase::Ended);
-        assert!(sink.frames.last().unwrap().cancel);
-        assert!(!pan.active());
-        pan.scroll(&mut sink, (0.0, -10.0), SCALE, ScrollPhase::MomentumBegan);
-        assert!(pan.active());
-        pan.scroll(&mut sink, (0.0, 0.0), SCALE, ScrollPhase::MomentumEnded);
-        assert!(!pan.active());
-        assert!(sink.frames.last().unwrap().cancel);
+    fn start_fling(pan: &mut Pan, sink: &mut Recorder) {
+        pan.scroll(sink, (0., -20.), SCALE, ScrollPhase::Began);
+        pan.scroll(sink, (0., 0.), SCALE, ScrollPhase::Ended);
+        pan.scroll(sink, (0., -10.), SCALE, ScrollPhase::MomentumBegan);
     }
+    fn starts(frames: &[Frame]) -> usize {
+        frames
+            .iter()
+            .enumerate()
+            .filter(|(i, f)| !f.cancel && (*i == 0 || frames[*i - 1].cancel))
+            .count()
+    }
+    #[test]
+    fn continuous_fling_has_one_contact_sequence() {
+        let (mut pan, mut sink) = (Pan::default(), Recorder::default());
+        start_fling(&mut pan, &mut sink);
+        pan.scroll(&mut sink, (0., -2.), SCALE, ScrollPhase::Momentum);
+        pan.scroll(&mut sink, (0., 0.), SCALE, ScrollPhase::MomentumEnded);
+        assert_eq!(starts(&sink.frames), 1);
+        assert_eq!(sink.frames.iter().filter(|f| f.cancel).count(), 1);
+        assert!(!pan.active());
+    }
+    #[test]
+    fn continuous_fling_never_touches_down_during_momentum() {
+        let (mut pan, mut sink) = (Pan::default(), Recorder::default());
+        pan.scroll(&mut sink, (0., -20.), SCALE, ScrollPhase::Began);
+        pan.scroll(&mut sink, (0., 0.), SCALE, ScrollPhase::Ended);
+        let before = sink.frames.len();
+        pan.scroll(&mut sink, (0., -10.), SCALE, ScrollPhase::MomentumBegan);
+        assert_eq!(
+            sink.frames.len(),
+            before + 1,
+            "momentum is one movement frame, not a new DOWN/lead-in"
+        );
+        assert!(sink.frames[before].y < sink.frames[before - 1].y);
+    }
+    #[test]
+    fn continuous_fling_lifts_at_accumulated_end_coordinates() {
+        let (mut pan, mut sink) = (Pan::default(), Recorder::default());
+        start_fling(&mut pan, &mut sink);
+        for amount in [5., 1., 0.2, 0.01] {
+            pan.scroll(&mut sink, (0., -amount), SCALE, ScrollPhase::Momentum);
+        }
+        let end = *sink.frames.last().unwrap();
+        pan.scroll(&mut sink, (0., 0.), SCALE, ScrollPhase::MomentumEnded);
+        let lift = sink.frames.last().unwrap();
+        assert!(lift.cancel);
+        assert_eq!((lift.x, lift.y), (end.x, end.y));
+        let expected = f64::from(ORIGIN)
+            - LEAD_IN
+            - [20., 10., 5., 1., 0.2, 0.01]
+                .into_iter()
+                .map(|d| inverse(d, SCALE))
+                .sum::<f64>();
+        assert!((f64::from(lift.y) - expected).abs() <= 0.5);
+        assert!(sink.frames.windows(2).all(|w| w[1].y <= w[0].y));
+    }
+    #[test]
+    fn continuous_fling_new_touch_stops_tail_without_retouch() {
+        let (mut pan, mut sink) = (Pan::default(), Recorder::default());
+        start_fling(&mut pan, &mut sink);
+        let last = *sink.frames.last().unwrap();
+        pan.scroll(&mut sink, (0., 0.), SCALE, ScrollPhase::Began);
+        assert!(!pan.active());
+        assert_eq!(sink.frames.last().unwrap().y, last.y);
+        let stopped = sink.frames.len();
+        for phase in [ScrollPhase::Momentum, ScrollPhase::MomentumEnded] {
+            pan.scroll(&mut sink, (0., -2.), SCALE, phase);
+        }
+        assert_eq!(sink.frames.len(), stopped, "old momentum cannot revive after touch");
+        assert!(!pan.active());
+    }
+
+    #[test]
+    fn no_momentum_expires_promptly_and_late_tail_never_retouches() {
+        let (mut pan, mut sink) = (Pan::default(), Recorder::default());
+        pan.scroll(&mut sink, (0., -20.), SCALE, ScrollPhase::Began);
+        pan.scroll(&mut sink, (0., 0.), SCALE, ScrollPhase::Ended);
+        assert!(pan.awaiting_momentum());
+        assert_eq!(pan.idle_timeout(), Duration::from_millis(32));
+        let last = *sink.frames.last().unwrap();
+        pan.expire(&mut sink);
+        assert!(!pan.active());
+        assert_eq!(sink.frames.last().unwrap().y, last.y);
+        let count = sink.frames.len();
+        assert_eq!(
+            pan.scroll(&mut sink, (0., -5.), SCALE, ScrollPhase::MomentumBegan),
+            (1., 1.)
+        );
+        assert_eq!(sink.frames.len(), count);
+    }
+    #[test]
+    fn new_finger_scroll_ignores_old_momentum_end_and_cancel_never_revives() {
+        let (mut pan, mut sink) = (Pan::default(), Recorder::default());
+        start_fling(&mut pan, &mut sink);
+        pan.scroll(&mut sink, (0., 0.), SCALE, ScrollPhase::Began);
+        pan.scroll(&mut sink, (0., 10.), SCALE, ScrollPhase::Changed);
+        let count = sink.frames.len();
+        pan.scroll(&mut sink, (0., 0.), SCALE, ScrollPhase::MomentumEnded);
+        assert_eq!(sink.frames.len(), count);
+        assert!(pan.active());
+        pan.scroll(&mut sink, (0., 0.), SCALE, ScrollPhase::Cancelled);
+        let count = sink.frames.len();
+        pan.scroll(&mut sink, (0., -10.), SCALE, ScrollPhase::MomentumBegan);
+        assert_eq!(sink.frames.len(), count);
+        assert!(!pan.active());
+    }
+
+    #[test]
+    fn idle_fingers_can_resume_but_idle_momentum_never_retouches() {
+        let (mut pan, mut sink) = (Pan::default(), Recorder::default());
+        pan.scroll(&mut sink, (0., -20.), SCALE, ScrollPhase::Began);
+        pan.expire(&mut sink);
+        pan.scroll(&mut sink, (0., -5.), SCALE, ScrollPhase::Changed);
+        assert!(pan.active());
+        pan.scroll(&mut sink, (0., 0.), SCALE, ScrollPhase::Ended);
+        pan.scroll(&mut sink, (0., -3.), SCALE, ScrollPhase::MomentumBegan);
+        pan.expire(&mut sink);
+        let count = sink.frames.len();
+        assert_eq!(pan.scroll(&mut sink, (0., -1.), SCALE, ScrollPhase::Momentum), (1., 1.));
+        assert_eq!(sink.frames.len(), count);
+        assert!(!pan.active());
+    }
+
     #[test]
     fn reversal_and_horizontal_preserve_displacement_and_fraction() {
         let (mut pan, mut sink) = (Pan::default(), Recorder::default());

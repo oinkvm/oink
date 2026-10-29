@@ -51,6 +51,22 @@ enum DiagnosticsCmd {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Internal continuation; requires the installed elevated executable on Windows.
+    #[cfg(windows)]
+    #[command(hide = true)]
+    ApproveLocalUpdate { path: String, sha256: String },
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    CompleteLocalUpdate {
+        stage: PathBuf,
+        destination: PathBuf,
+        parent: u32,
+        socket: PathBuf,
+    },
+    /// Internal continuation; UAC authorizes only a fixed microphone action.
+    #[cfg(windows)]
+    #[command(hide = true)]
+    CompleteMicrophoneInstallation { action: String, token: String },
     /// Set machine update policy from this already-elevated installed CLI.
     #[cfg(windows)]
     UpdatePolicy(update_admin::Args),
@@ -74,6 +90,11 @@ enum Cmd {
     MotionFrequency {
         #[arg(value_enum)]
         frequency: Option<MotionFrequency>,
+    },
+    /// Show or set experimental group application focus (default: off; CLI only).
+    ApplicationFocus {
+        #[arg(value_enum)]
+        state: Option<OnOff>,
     },
     /// Show or set native contact acceptance on this device (default: on).
     AcceptContacts {
@@ -233,10 +254,7 @@ enum FilesCmd {
     Status,
     Fetch,
     Cancel,
-    Settings {
-        #[arg(long)]
-        enabled: Option<OnOff>,
-    },
+    Settings,
 }
 
 #[derive(Subcommand, Debug)]
@@ -327,16 +345,32 @@ fn execute() -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::from(error.exit_code() as u8));
         }
     };
+    // The elevated installer must not read/write the user's Oink state or start
+    // networking, logging, desktop backends or ordinary CLI configuration.
+    #[cfg(windows)]
+    if let Cmd::CompleteMicrophoneInstallation { action, token } = &cli.cmd {
+        oink_agent::microphone_plugin::complete_windows_installation(action, token).map_err(anyhow::Error::msg)?;
+        return Ok(ExitCode::SUCCESS);
+    }
     if let Some(home) = &cli.home {
         // SAFETY: 单线程启动阶段，尚未创建其他线程。
         unsafe { std::env::set_var("OINK_HOME", home) };
     }
-    // The background role also writes ordinary log files; commands use stderr and the UI ring.
-    if matches!(cli.cmd, Cmd::Run) {
+    #[cfg(target_os = "macos")]
+    let replacing = matches!(cli.cmd, Cmd::CompleteLocalUpdate { .. });
+    #[cfg(not(target_os = "macos"))]
+    let replacing = false;
+    // The replacement helper survives the backend and flushes its own file on
+    // return. Finder-launched backends do not retain a useful inherited stderr.
+    let _update_log_guard = if replacing {
+        oink_agent::logs::init_update()
+    } else if matches!(cli.cmd, Cmd::Run) {
         oink_agent::logs::init_service();
+        None
     } else {
         oink_agent::logs::init();
-    }
+        None
+    };
     run(cli)
 }
 
@@ -374,6 +408,25 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let mut cfg = AgentConfig::load()?;
     match cli.cmd {
         #[cfg(windows)]
+        Cmd::CompleteMicrophoneInstallation { .. } => unreachable!("handled before CLI state initialization"),
+        #[cfg(windows)]
+        Cmd::ApproveLocalUpdate { path, sha256 } => {
+            match oink_winsvc::update::request(oink_update::ipc::Request::ApproveLocal { path, sha256 })? {
+                oink_update::ipc::Reply::Error { error } => return Err(error.into()),
+                oink_update::ipc::Reply::Status { .. } => {}
+                _ => anyhow::bail!("local approval rejected"),
+            }
+        }
+        #[cfg(target_os = "macos")]
+        Cmd::CompleteLocalUpdate {
+            stage,
+            destination,
+            parent,
+            socket,
+        } => {
+            oink_agent::update::local_mac::complete(&stage, &destination, parent, &socket)?;
+        }
+        #[cfg(windows)]
         Cmd::UpdatePolicy(args) => update_admin::run(args)?,
         #[cfg(windows)]
         Cmd::InputService { cmd } => windows_service_test::run(cmd)?,
@@ -402,6 +455,12 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 })?;
             }
             print(&settings.event_frequency)?;
+        }
+        Cmd::ApplicationFocus { state } => {
+            print(&oink_agent::backend::cli::application_focus(
+                &cfg.data_dir,
+                state.map(|s| matches!(s, OnOff::On)),
+            )?)?;
         }
         Cmd::AcceptContacts { state } => {
             let c = client()?;
@@ -620,16 +679,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 FilesCmd::Status => print(&c.call(Request::ClipboardTransfer)?)?,
                 FilesCmd::Fetch => print(&c.call(Request::FetchClipboardFiles)?)?,
                 FilesCmd::Cancel => print(&c.call(Request::CancelClipboardFiles)?)?,
-                FilesCmd::Settings { enabled } => {
-                    let mut s: api::ClipboardSettings = serde_json::from_value(c.call(Request::ClipboardSettings)?)?;
-                    if let Some(v) = enabled {
-                        s.files = matches!(v, OnOff::On);
-                        c.call(Request::SetClipboardSettings {
-                            settings: serde_json::from_value(serde_json::json!({"files":s.files}))?,
-                        })?;
-                    }
-                    print(&s)?;
-                }
+                FilesCmd::Settings => print(&c.call(Request::ClipboardSettings)?)?,
             }
         }
         Cmd::FileProvider { cmd } => {
@@ -942,6 +992,24 @@ mod tests {
     #[test]
     fn retired_mac_scroll_experiment_is_not_a_command() {
         assert!(Cli::try_parse_from(["oink-agent", "test-mac-scroll"]).is_err());
+    }
+    #[test]
+    fn application_focus_cli_parses_query_and_on_off() {
+        assert!(matches!(
+            Cli::try_parse_from(["oink-agent", "application-focus"]).unwrap().cmd,
+            Cmd::ApplicationFocus { state: None }
+        ));
+        for (arg, expected) in [("on", true), ("off", false)] {
+            let Cmd::ApplicationFocus { state: Some(state) } =
+                Cli::try_parse_from(["oink-agent", "application-focus", arg])
+                    .unwrap()
+                    .cmd
+            else {
+                panic!("wrong command")
+            };
+            assert_eq!(matches!(state, OnOff::On), expected);
+        }
+        assert!(Cli::try_parse_from(["oink-agent", "application-focus", "maybe"]).is_err());
     }
     #[test]
     fn accept_contacts_cli_parses_query_and_on_off() {

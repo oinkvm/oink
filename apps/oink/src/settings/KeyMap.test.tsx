@@ -36,7 +36,47 @@ describe('native Caps mapping presentation', () => {
     const { container } = render(<Mapping observed={null} initial={initial} />);
     fireEvent.click(screen.getByRole('radio', { name: 'Custom' }));
     expect(container.querySelector('[data-key="caps"] .kmap__to')?.textContent).toBe('Caps Lock');
-    fireEvent.click(screen.getByRole('switch'));
+    fireEvent.click(screen.getAllByRole('switch')[0]);
     expect(container.querySelector('[data-key="caps"] .kmap__to')?.textContent).toBe('Caps Lock / Caps Lock');
+  });
+});
+
+describe('custom None and Fn choices', () => {
+  it('keeps a custom Caps/Fn choice even when no key menu was edited', () => {
+    setLanguage('en');
+    const { container } = render(<Mapping observed={false} />);
+    fireEvent.click(screen.getByRole('radio', { name: 'Custom' }));
+    fireEvent.click(screen.getAllByRole('switch')[0]);
+    fireEvent.click(screen.getByRole('switch', { name: 'Allow mapping the Fn key' }));
+    fireEvent.click(screen.getByRole('radio', { name: 'Windows feel' }));
+    fireEvent.click(screen.getByRole('radio', { name: 'Custom' }));
+    expect(container.querySelector('[data-key="caps"] .kmap__to')?.textContent).toBe('Caps Lock / Caps Lock');
+    expect(container.querySelector('button[data-key="fn"]')).toBeTruthy();
+  });
+  it.each([
+    ['zh-Hans', '允许为短按和长按 Caps Lock 映射不同功能'],
+    ['en', 'Map different functions to short and long Caps Lock presses'],
+    ['ja', 'Caps Lock の短押しと長押しに異なる機能を割り当てられます'],
+    ['ko', 'Caps Lock을 짧게 누를 때와 길게 누를 때 서로 다른 기능을 매핑할 수 있습니다'],
+  ] as const)('presents the Caps description in a standard settings row in %s', (language, description) => {
+    setLanguage(language);
+    const { container } = render(<Mapping observed={false} initial={{...DEFAULT_PREFS,keyPreset:'custom'}} />);
+    const rows = container.querySelectorAll('.kmap__options > .ok-row');
+    expect(rows).toHaveLength(2);
+    expect(rows[0].querySelector('.ok-row__desc')?.textContent).toBe(description);
+    expect(rows[1].querySelector('.ok-row__label')).toBeTruthy();
+    expect(rows[1].querySelector('.ok-row__desc')?.textContent).toContain('Fn /');
+    expect(rows[1].querySelector('[role="switch"]')).toBeTruthy();
+  });
+  it('only exposes the Fn key when enabled and offers None and sided modifiers', () => {
+    setLanguage('en');
+    const { container } = render(<Mapping observed={false} initial={{...DEFAULT_PREFS,keyPreset:'custom'}} />);
+    expect(container.querySelector('button[data-key="fn"]')).toBeNull();
+    fireEvent.click(screen.getByRole('switch', { name: 'Allow mapping the Fn key' }));
+    fireEvent.click(container.querySelector('button[data-key="fn"]')!);
+    expect(screen.getByRole('menuitemradio', { name: 'None' })).toBeTruthy();
+    expect(screen.getByRole('menuitemradio', { name: 'Right Ctrl' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('menuitemradio', { name: 'None' }));
+    expect(container.querySelector('[data-key="fn"] .kmap__to')?.textContent).toBe('None');
   });
 });

@@ -95,6 +95,29 @@ pub enum Kind {
     /// extra: submitted frame count; success: native receiver result.
     /// reason: 0=submission, 1=remote capture, 2=mode transition, 3=desktop unavailable.
     ContactInjection,
+    /// Windows marker boundary stages. Data.marker is the native input tag;
+    /// extra is its full transition sequence (0 when an obsolete tag is unknown).
+    /// reason: 0=mode marker, 1=cover park input, 2=unidentified/stale marker.
+    MarkerSubmission,
+    /// success means our hook passed this input, not that Windows applied it.
+    MarkerHookDecision,
+    /// chain_result preserves CallNextHookEx's signed result; nonzero rejects input.
+    MarkerChainResult,
+    /// success means SendInput inserted the input. cursor is actual readback;
+    /// hidden is the inverse of native cursor_showing, not the cover's requested state.
+    MarkerReadback,
+    /// Bounded own-cover recovery. reason=1 parked uncover refusal, 2=250ms
+    /// deadline; extra=transition generation. steps: 1 SetCursorPos attempted,
+    /// 2 API accepted, 4 readback left park, 8 own uncover requested,
+    /// 16 own uncover acknowledged, 32 native visibility verified.
+    RestoreSafetyReset,
+    /// Windows session Mouse Keys compensation: message=1 enabled, 2 retained
+    /// until logoff (original OFF restoration deferred), 3 user ownership change.
+    /// Legacy message=0 was an OFF attempt; it is no longer produced. Reason codes
+    /// 0=periodic,1=sharing,2=create,3=inject,4=destroy,5=device-change,6=local,
+    /// 7=real mouse,8=pause,9=exit,10=crash recovery,11=ownership lost.
+    /// flags=SM_MOUSEPRESENT before, extra=after; success=setter/present result.
+    MouseKeysCompensation,
 }
 
 /// A failed park remains covered and is not retried within the same generation.
@@ -144,6 +167,16 @@ pub struct Data {
     /// Mode: 0=in hook, 1=marker, 2=fallback timer. Hook: 0=mouse, 1=keyboard.
     pub reason: u32,
     pub success: Option<bool>,
+    pub marker: Option<u64>,
+    /// Normalized absolute input coordinates, each in 0..=65535.
+    pub normalized: Option<[i32; 2]>,
+    /// Virtual desktop physical-pixel bounds [left, top, right, bottom], half-open.
+    pub desktop: Option<[i32; 4]>,
+    pub chain_result: Option<i64>,
+    pub cursor_before: Option<[i32; 2]>,
+    pub cursor_after_move: Option<[i32; 2]>,
+    pub hidden_before: Option<bool>,
+    pub steps: Option<u32>,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Record {

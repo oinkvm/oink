@@ -24,7 +24,12 @@ impl Router {
     }
 
     /// Select WHERE independently from WHAT; first matching manual segment wins on every OS.
-    fn damping_rule(&self, p: &ScreenPos, n: (f64, f64), target: DeviceId) -> Option<(Option<usize>, DampingProfile)> {
+    fn damping_rule(
+        &self,
+        p: &ScreenPos,
+        n: (f64, f64),
+        target: Option<&ScreenId>,
+    ) -> Option<(Option<usize>, DampingProfile)> {
         if !self.cfg.settings.damping.rules.is_empty() {
             let config = &self.cfg.settings.damping;
             let edge = screen_edge(n);
@@ -35,15 +40,20 @@ impl Router {
                 (p.local.x - b.x) / b.w
             };
             for (index, rule) in config.rules.iter().enumerate() {
-                if rule
-                    .segment
-                    .matches(p.screen.device, target, &p.screen.display, edge, fraction)
-                {
+                if rule.segment.matches(
+                    p.screen.device,
+                    target.map_or(self.me(), |s| s.device),
+                    &p.screen.display,
+                    edge,
+                    fraction,
+                ) {
                     return Some((Some(index), rule.profile));
                 }
             }
         }
-        (self.cfg.os == Os::MacOS && self.reserved_edge(p, n)).then(|| (None, self.cfg.settings.edge_damping_profile()))
+        (target.is_some_and(|screen| screen != &p.screen && self.protected_entry(screen))
+            || (self.cfg.os == Os::MacOS && self.reserved_edge(p, n)))
+        .then(|| (None, self.cfg.settings.edge_damping_profile()))
     }
 
     fn reserved_edge(&self, p: &ScreenPos, n: (f64, f64)) -> bool {
@@ -105,11 +115,15 @@ impl Router {
     /// Keep a gesture on the same active portal or protected gap edge segment.
     /// Tangential motion does not add energy.
     pub(super) fn retain_resistance(&mut self, p: &ScreenPos, origin: DeviceId, delta: (f64, f64)) {
+        if self.pointer_lock_escape_held() {
+            self.resistance = None;
+            return;
+        }
         let Some(r) = &self.resistance else { return };
         let n = r.normal;
         let valid = p.screen == r.screen
             && self
-                .damping_rule(p, n, r.target.as_ref().map_or(self.me(), |target| target.device))
+                .damping_rule(p, n, r.target.as_ref())
                 .is_some_and(|(rule, _)| rule == r.rule)
             && origin == r.origin
             && !self.leave_blocked()
@@ -180,10 +194,14 @@ impl Router {
         delta: (f64, f64),
         now: Micros,
     ) -> bool {
+        if self.pointer_lock_escape_held() {
+            self.resistance = None;
+            return true;
+        }
         let Some(normal) = self.exit_normal(at, delta) else {
             return true;
         };
-        let Some((rule, profile)) = self.damping_rule(at, normal, dst.map_or(self.me(), |p| p.screen.device)) else {
+        let Some((rule, profile)) = self.damping_rule(at, normal, dst.map(|p| &p.screen)) else {
             self.resistance = None;
             return true;
         };
@@ -191,10 +209,11 @@ impl Router {
             return true;
         };
         // An internal system seam cannot activate Dock/menu/hot corners.
-        if self
-            .displays
-            .iter()
-            .any(|d| d.key != at.screen.display && native_seam(bounds, d.bounds, at.local, normal))
+        if !dst.is_some_and(|p| self.protected_entry(&p.screen))
+            && self
+                .displays
+                .iter()
+                .any(|d| d.key != at.screen.display && native_seam(bounds, d.bounds, at.local, normal))
         {
             return true;
         }

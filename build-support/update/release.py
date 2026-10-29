@@ -26,6 +26,14 @@ def release_context(config):
     return source, tag, int(run)
 
 
+def minimum_updater_schema(version):
+    # The bridge and all earlier public packages must remain selectable by
+    # capability-1 clients. New Windows releases require archive inspection.
+    match = re.fullmatch(r'(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)', version)
+    feed.require(match is not None, 'release_version')
+    return 1 if tuple(map(int, match.groups())) <= (0, 2, 2) else 2
+
+
 def sign_package(config, folder, output):
     source, tag, run = release_context(config)
     # Published preparation binds this exact artifact to its tag/source tree.
@@ -54,7 +62,7 @@ def sign_package(config, folder, output):
     feed.verify(raw, package['ed25519'], epoch['public_key'])
     release = {'build': record['build'], 'version': record['version'], 'tag': tag, 'sourceTreeSha256': source,
                'architecture': 'x64', 'minimumWindowsBuild': record['minimumWindowsBuild'],
-               'protocolBaseline': 1, 'minimumUpdaterSchema': 1, **annotations, 'package': package}
+               'protocolBaseline': 1, 'minimumUpdaterSchema': minimum_updater_schema(record['version']), **annotations, 'package': package}
     feed.write(output, {'schema': 1, 'approved': True, 'published': False, 'source_tree_sha256': source,
                         'workflow_run_id': run, 'signing_policy': 'authenticode-and-manifest' if epoch.get('authenticode_spki_sha256') else 'manifest-ed25519', 'release': release})
 

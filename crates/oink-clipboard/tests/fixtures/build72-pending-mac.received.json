@@ -1,0 +1,21 @@
+{
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-2": {
+    "record": {
+      "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-2",
+      "parent": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-slot-folder-0",
+      "name": "body",
+      "directory": false,
+      "size": 3,
+      "modified": null,
+      "node": 2,
+      "version": 5,
+      "children": null,
+      "created": 1700000000000
+    },
+    "received_at": 1700000000,
+    "handed_off": true,
+    "materialized": true,
+    "deleted": false,
+    "fetching": 0
+  }
+}

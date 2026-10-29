@@ -21,15 +21,28 @@ fn sources(dir: &Path, visit: &mut impl FnMut(&Path, &str)) {
 }
 
 #[test]
-fn windows_cursor_placement_never_uses_untaggable_set_cursor_pos() {
+fn untaggable_windows_placement_is_only_the_authorized_restore_safety_reset() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/windows");
+    let mut primitives = 0;
+    let mut callers = 0;
     sources(&root, &mut |path, code| {
-        assert!(
-            !code.contains("SetCursorPos("),
-            "untagged cursor input in {}",
-            path.display()
-        );
+        if code.contains("SetCursorPos(") {
+            assert_eq!(path.file_name().unwrap(), "warp.rs");
+            primitives += code.matches("SetCursorPos(").count();
+        }
+        if code.contains("::restore_synchronously") {
+            assert_eq!(path.strip_prefix(&root).unwrap(), Path::new("hook/restore.rs"));
+            callers += code.matches("::restore_synchronously").count();
+        }
     });
+    assert_eq!(
+        primitives, 1,
+        "only the registered synchronous boundary may use SetCursorPos"
+    );
+    assert_eq!(
+        callers, 1,
+        "only bounded Local own-cover recovery may bypass tagged input"
+    );
 }
 
 #[test]
@@ -37,7 +50,7 @@ fn every_windows_native_warp_uses_the_accounting_boundary() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/windows");
     let mut calls = 0;
     sources(&root, &mut |path, code| {
-        for primitive in ["ClipCursor(Some", "SendInput("] {
+        for primitive in ["ClipCursor(Some", "SendInput(", "SetCursorPos("] {
             if code.contains(primitive) {
                 assert_eq!(
                     path.file_name().unwrap(),
@@ -49,7 +62,7 @@ fn every_windows_native_warp_uses_the_accounting_boundary() {
             }
         }
     });
-    assert_eq!(calls, 2, "keep the native-boundary inventory current");
+    assert_eq!(calls, 3, "keep the native-boundary inventory current");
 }
 
 #[test]

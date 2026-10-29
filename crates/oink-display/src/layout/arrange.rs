@@ -91,8 +91,8 @@ impl Layout {
         layout
     }
 
-    /// Refresh OS-owned geometry, preserving the native-origin placement and
-    /// uniform scale. Live rearranges never normalize or move another computer.
+    /// Refresh OS-owned geometry at the retained scale/origin, repairing actual
+    /// collisions by translating only this computer. Never close a new gap.
     pub fn sync_device(&mut self, device: DeviceId, displays: &[DisplayInfo]) {
         let placement = self.device_transform(device);
         let mut fresh = arrange_device(device, displays);
@@ -108,6 +108,11 @@ impl Layout {
             || fresh
                 .iter()
                 .any(|s| !old.iter().any(|o| o.id == s.id && o.local == s.local));
+        let added = fresh
+            .iter()
+            .filter(|s| !old.iter().any(|o| o.id == s.id))
+            .map(|s| s.id.clone())
+            .collect::<Vec<_>>();
         let (origin, scale) = placement.unwrap_or_else(|| {
             let group = bbox(fresh.iter().map(|s| s.rect));
             let existing = bbox(self.screens.iter().filter(|s| s.id.device != device).map(|s| s.rect));
@@ -146,14 +151,10 @@ impl Layout {
             }
         });
         self.screens.extend(fresh);
-        if geometry_changed
-            && let Some(id) = self
-                .screens
-                .iter()
-                .find(|s| s.id.device == device)
-                .map(|s| s.id.clone())
-        {
-            self.repair_overlaps_around(&id);
+        if !added.is_empty() {
+            self.repair_new_screens(device, &added);
+        } else if geometry_changed {
+            self.repair_native_change(device);
         }
     }
 

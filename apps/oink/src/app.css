@@ -670,7 +670,6 @@ body:has(.oink-app:is([data-view="main"], [data-view="panel"])) { background: tr
   box-shadow: inset 0 0 0 1px var(--ok-line-2), inset 0 1.5px 0 var(--ok-hi);
 }
 .native-panel > .devmenu { width: 100%; box-sizing: border-box; }
-.backend-notice { position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 70; display: flex; align-items: center; gap: 8px; max-width: 90%; background: var(--ok-card); color: var(--ok-text-2); padding: 8px 12px; border-radius: var(--ok-r-2); box-shadow: var(--ok-shadow-lg); font-size: 12px; }
 .about__license-link { border: 0; background: transparent; padding: 0; font: inherit; color: inherit; text-align: start; cursor: pointer; min-width: 0; }
 .license-text { white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.5 var(--ok-font-mono); }
 
@@ -727,15 +726,17 @@ body:has(.oink-app:is([data-view="main"], [data-view="panel"])) { background: tr
 .lpm-panel { display: grid; gap: 10px; justify-items: start; width: 100%; }
 .lpm-panel > .lpm { width: 100%; }
 
-/* Windows sliders: oink-ui's 42×28 pill thumb reads as an oversized white pill
-   among Windows' denser controls (user report, 2026-10-21). Every slider in the
-   Windows build uses a compact thumb and a thinner track, scaled through the
-   component's own --tw/--th variables so fill, ticks and thumb stay aligned. */
-.oink-app[data-platform="win"] .ok-slider { --tw: 26px; --th: 18px; }
-.oink-app[data-platform="win"] .ok-slider__track { height: 4px; border-radius: 4px; }
-.oink-app[data-platform="win"] .ok-slider__ticks { height: 4px; }
-.oink-app[data-platform="win"] .ok-slider__ticks i { top: .5px; }
-
 /* Main window text is not selectable, except the Settings page and editable fields. */
 .win:not(.about) { user-select: none; -webkit-user-select: none; }
 .win:not(.about) :is(.setp, input, textarea, [contenteditable="true"]) { user-select: text; -webkit-user-select: text; }
+
+/* A package drag replaces the content while retaining the native window chrome. */
+.package-drop { --drop-top: 44px; position: absolute; inset: var(--drop-top) 0 0; z-index: 100; background: var(--ok-surface); padding: 0 16px 16px; box-sizing: border-box; }
+.package-drop[data-platform="win"] { --drop-top: 48px; }
+.package-drop__area { corner-shape: var(--ok-corner); --ok-shape: var(--ok-corner); height: 100%; box-sizing: border-box; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; outline: 2px dashed color-mix(in oklab, var(--ok-accent) 70%, transparent); outline-offset: -2px; border-radius: 24px; background: color-mix(in oklab, var(--ok-accent) 8%, var(--ok-surface)); text-align: center; padding: 24px; }
+.package-drop__area > .ok-icon { width: 40px; height: 40px; color: var(--ok-accent); }
+.package-drop__area strong { font-size: 20px; line-height: 1.4; color: var(--ok-text); }
+.package-drop__area span { font-size: 14px; line-height: 1.5; color: var(--ok-text-3); }
+.oink-app[data-package-drag] .win__titlebar { z-index: 102; }
+.oink-app[data-package-drag] .win__cover-bar { left: 100px; right: auto; color: var(--ok-text-2); font-weight: 600; font-size: 14px; }
+.oink-app[data-package-drag][data-platform="win"] .win__cover-bar { left: 16px; }

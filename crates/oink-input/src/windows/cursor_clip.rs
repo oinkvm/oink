@@ -41,11 +41,11 @@ pub(super) fn application() -> windows::core::Result<Option<Rect>> {
     };
     Ok(owner.application(rect(clip), desktop))
 }
-pub(super) fn acquire(clip: RECT) -> windows::core::Result<()> {
-    let mut owner = owner().lock().unwrap_or_else(|e| e.into_inner());
-    super::warp::clip(clip)?;
-    owner.acquired(rect(clip));
-    Ok(())
+/// A remote-game source lease hides our cursor, not the application's retained
+/// confinement. Keep the underlying clip so another owner's game mode cannot
+/// clear this device's passive-lock entry protection while focus is away.
+pub(super) fn acquire(clip: RECT, previous: RECT) -> windows::core::Result<()> {
+    acquire_confinement(clip, previous)
 }
 pub(super) fn acquire_confinement(clip: RECT, previous: RECT) -> windows::core::Result<()> {
     let mut owner = owner().lock().unwrap_or_else(|e| e.into_inner());

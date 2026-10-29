@@ -129,9 +129,9 @@ class MsiContent(unittest.TestCase):
                                     'UILevel = 5 AND NOT Installed AND NOT WIX_UPGRADE_DETECTED AND NOT OINK_DESKTOP_SHORTCUT', '997'],
                                    ['AppSearch', '', '400'], ['ShowDesktopChoice', '', '998'],
                                    ['OinkWelcomeDlg', 'NOT Installed', '999'], ['CostFinalize', '', '1000'],
-                                   ['ExecuteAction', '', '1300']]
-        acl['CustomAction'].append(['PrepareUserSessions', '257', 'InstallerCA', 'PrepareUserSessions'])
-        acl['InstallUISequence'].append(['PrepareUserSessions', 'UILevel = 5 AND NOT UPGRADINGPRODUCTCODE', '1298'])
+                                   ['MaintenanceWelcomeDlg', 'Installed AND NOT RESUME AND NOT Preselected AND NOT PATCH', '1298'],
+                                   ['ProgressDlg', '', '1299'], ['ExecuteAction', '', '1300']]
+        acl['CustomAction'].append(['PrepareUserSessions', '1', 'InstallerCA', 'PrepareUserSessions'])
         acl['InstallExecuteSequence'] += [['PrepareUserSessions', 'NOT UPGRADINGPRODUCTCODE', '1399'],
                                           ['CheckInstallPath', '', '1499']]
         ET.SubElement(xml, 'Launch', Condition='Installed OR WEBVIEW2RUNTIME')
@@ -195,13 +195,15 @@ class MsiContent(unittest.TestCase):
                 with self.subTest(table=table, name=name), self.assertRaises(RuntimeError):
                     C.verify_install_ui(changed)
 
-    def test_running_session_quit_is_client_first_at_every_ui_level(self):
+    def test_running_session_quit_is_execute_only_at_every_ui_level(self):
         with tempfile.TemporaryDirectory() as temp:
             _, _, tables = self.fixture(Path(temp))
             C.verify_user_session_ui(tables)
             for table, name, column, value in [
                     ('CustomAction', 'PrepareUserSessions', 1, '3073'),
-                    ('InstallUISequence', 'PrepareUserSessions', 2, '1301'),
+                    ('CustomAction', 'PrepareUserSessions', 1, '257'),
+                    ('InstallUISequence', 'ProgressDlg', 2, '1301'),
+                    ('InstallUISequence', 'MaintenanceWelcomeDlg', 2, '1301'),
                     ('InstallExecuteSequence', 'PrepareUserSessions', 1, 'UILevel = 5'),
                     ('InstallExecuteSequence', 'PrepareUserSessions', 2, '1401'),
                     ('Property', 'MSIRESTARTMANAGERCONTROL', 1, '')]:
@@ -211,6 +213,18 @@ class MsiContent(unittest.TestCase):
                     C.verify_user_session_ui(changed)
             changed = copy.deepcopy(tables)
             changed['Property'].append(['OINK_GRACEFUL_STOP', '1'])
+            with self.assertRaises(RuntimeError):
+                C.verify_user_session_ui(changed)
+            # WiX linked the old Before=ExecuteAction row at 1296, ahead of the
+            # first maintenance dialog (1298), despite the fresh welcome (999).
+            for name in ('PrepareUserSessions', 'AliasedStop'):
+                changed = copy.deepcopy(tables)
+                changed['CustomAction'].append([name, '1', 'InstallerCA', 'PrepareUserSessions'])
+                changed['InstallUISequence'].append([name, 'UILevel = 5 AND NOT UPGRADINGPRODUCTCODE', '1296'])
+                with self.subTest(name=name), self.assertRaises(RuntimeError):
+                    C.verify_user_session_ui(changed)
+            changed = copy.deepcopy(tables)
+            changed['ControlEvent'].append(['OinkWelcomeDlg', 'Install', 'DoAction', 'PrepareUserSessions', '1', '1'])
             with self.assertRaises(RuntimeError):
                 C.verify_user_session_ui(changed)
 
@@ -356,11 +370,11 @@ class MsiContent(unittest.TestCase):
                     with self.assertRaises(RuntimeError):
                         C.verify_msi(manifest, extracted, IDENTITY, changed)
 
-    def test_commit_label_is_accepted_as_arp_and_receipt_version(self):
+    def test_build_label_is_accepted_as_arp_and_receipt_version(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             xml, extracted, tables = self.fixture(root)
-            display = '0.2.2-inhouse.0123abcd'
+            display = f"{IDENTITY['inhouse_version']}-inhouse.1"
             for name in ('installed.json', 'oink-build.json'):
                 path = extracted / 'File' / name
                 receipt = json.loads(path.read_text())

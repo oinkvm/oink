@@ -20,12 +20,13 @@
 //! - 写入：带 `local_path` 的 `ClipData::Files` 写成 `CF_HDROP`（只写顶层条目）+ `Preferred DropEffect` = 复制；
 //! - 虚拟文件：[`ClipboardBackend::write_virtual_files`]，`OleSetClipboard` + 自定义 `IDataObject`。
 
+mod clipboard_key;
 pub(crate) mod cloud;
 mod content;
 pub(crate) mod dnd;
 mod drag_image;
 mod files;
-mod html;
+pub(crate) mod html;
 mod image;
 #[cfg(all(test, debug_assertions))]
 mod settle_tests;
@@ -71,15 +72,14 @@ struct WinClipboard {
 }
 
 impl ClipboardBackend for WinClipboard {
+    fn clipboard_key(&self) -> std::io::Result<[u8; 32]> {
+        clipboard_key::current()
+    }
     fn initialize_store(&self, cache: PathBuf) {
         *self.cloud.lock().unwrap() = cloud::initialize(cache);
     }
     fn change_count(&self) -> u64 {
-        let count = self.worker.run(|_| vfile::change_count()).unwrap_or_else(|_| {
-            // SAFETY: worker 失去响应时仍可查询系统计数，避免屏蔽真实复制。
-            u64::from(unsafe { GetClipboardSequenceNumber() })
-        });
-        self.observer.logical(count)
+        self.observer.logical(self.worker.change_count())
     }
 
     fn read(&self) -> Result<ClipSnapshot, ClipboardError> {
@@ -106,10 +106,11 @@ impl ClipboardBackend for WinClipboard {
         Ok(snap)
     }
 
-    fn capture(&self, _data: &std::path::Path) -> Result<crate::CapturedClipboard, ClipboardError> {
+    fn capture(&self, data: &std::path::Path) -> Result<crate::CapturedClipboard, ClipboardError> {
         let owner = self.worker.clone();
         let observer = self.observer.clone();
-        self.reader.run(move |_| content::capture(owner, observer))?
+        let root = data.to_path_buf();
+        self.reader.run(move |_| content::capture(owner, observer, root))?
     }
 
     fn write_native(&self, spec: crate::NativeSpec) -> Result<u64, ClipboardError> {

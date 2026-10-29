@@ -48,6 +48,8 @@ pub enum RecoveryOutcome {
     AlreadyOriginal,
     UserOverride,
     EndpointUnavailable,
+    /// The OS no longer has this endpoint or its persisted mute state.
+    EndpointRemoved,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -72,12 +74,15 @@ struct Entry {
 struct Record {
     version: u32,
     entry: Option<Entry>,
+    #[serde(default)]
+    deferred: Vec<Entry>,
 }
 impl Default for Record {
     fn default() -> Self {
         Self {
             version: FORMAT_VERSION,
             entry: None,
+            deferred: Vec::new(),
         }
     }
 }
@@ -86,7 +91,11 @@ impl Record {
         if self.version != FORMAT_VERSION {
             return Err("unsupported audio recovery journal version".into());
         }
-        if let Some(entry) = &self.entry {
+        let mut endpoints = std::collections::BTreeSet::new();
+        for entry in self.entry.iter().chain(&self.deferred) {
+            if !endpoints.insert(&entry.original.endpoint) {
+                return Err("duplicate endpoint in audio recovery journal".into());
+            }
             entry.original.validate()?;
             entry.expected.validate()?;
             if entry.expected.endpoint != entry.original.endpoint
@@ -105,8 +114,14 @@ impl Record {
 /// (WASAPI event context; CoreAudio serialized value/readback observation).
 /// It must not change volume, default devices, or any other endpoint.
 pub trait EndpointBackend {
-    /// `None` means the exact endpoint is temporarily unavailable.
+    /// `None` means the exact endpoint is unavailable; `permanently_removed`
+    /// distinguishes deletion from a device that may return.
     fn read(&self, endpoint: &str) -> Result<Option<EndpointState>, String>;
+    /// True only when the endpoint and its persisted controls were deleted,
+    /// never for disabled, unplugged or not-present devices.
+    fn permanently_removed(&self, _endpoint: &str) -> Result<bool, String> {
+        Ok(false)
+    }
     fn set_mute(&self, endpoint: &str, muted: bool) -> Result<(), String>;
     /// An event-driven latch, not a comparison of current endpoint values.
     fn ownership_lost(&self) -> bool;
@@ -188,21 +203,90 @@ impl Journal {
         self.record.entry.as_ref().map(|entry| entry.original.endpoint.as_str())
     }
 
-    pub fn has_pending_restore(&self) -> bool {
+    pub fn has_active_pending_restore(&self) -> bool {
         self.record.entry.as_ref().is_some_and(|entry| entry.owned)
+    }
+
+    pub fn has_pending_restore(&self) -> bool {
+        self.record
+            .entry
+            .iter()
+            .chain(&self.record.deferred)
+            .any(|entry| entry.owned)
+    }
+
+    /// Visit saved endpoints under the same process lock. Platform recovery
+    /// binds an observer to each exact ID; a replacement default is never used.
+    pub fn endpoints(&self) -> Vec<String> {
+        self.record
+            .entry
+            .iter()
+            .chain(&self.record.deferred)
+            .map(|entry| entry.original.endpoint.clone())
+            .collect()
+    }
+
+    pub fn select_endpoint(&mut self, endpoint: &str) -> Result<(), String> {
+        if self.endpoint() == Some(endpoint) {
+            return Ok(());
+        }
+        let index = self
+            .record
+            .deferred
+            .iter()
+            .position(|entry| entry.original.endpoint == endpoint)
+            .ok_or("saved audio endpoint not found")?;
+        let mut record = self.record.clone();
+        let selected = record.deferred.remove(index);
+        if let Some(old) = record.entry.replace(selected)
+            && old.owned
+        {
+            record.deferred.push(old);
+        }
+        self.persist(&record)?;
+        self.record = record;
+        Ok(())
+    }
+
+    /// Called only after a read proved the current endpoint unavailable. Keep
+    /// that lease durable without preventing a lease on another output. Storage
+    /// errors still fail closed, and the same endpoint cannot be leased twice.
+    pub fn defer_unavailable(&mut self) -> Result<(), String> {
+        let mut record = self.record.clone();
+        if let Some(entry) = record.entry.take() {
+            record.deferred.push(entry);
+        }
+        self.persist(&record)?;
+        self.record = record;
+        Ok(())
+    }
+
+    pub fn has_pending_restore_for(&self, endpoint: &str) -> bool {
+        self.record
+            .entry
+            .iter()
+            .chain(&self.record.deferred)
+            .any(|entry| entry.owned && entry.original.endpoint == endpoint)
     }
 
     /// Persist the original and intended state before any call to SetMute.
     /// An unresolved older lease cannot be overwritten by a new capture session.
     pub fn prepare(&mut self, original: EndpointState) -> Result<(), String> {
         original.validate()?;
-        if self.has_pending_restore() {
+        if self.record.entry.as_ref().is_some_and(|entry| entry.owned)
+            || self
+                .record
+                .deferred
+                .iter()
+                .any(|entry| entry.owned && entry.original.endpoint == original.endpoint)
+        {
             return Err("an earlier audio mute restoration is pending".into());
         }
         let mut expected = original.clone();
         expected.muted = true;
         let record = Record {
             version: FORMAT_VERSION,
+            deferred: self.record.deferred.clone(),
             entry: Some(Entry {
                 original,
                 expected,
@@ -228,6 +312,12 @@ impl Journal {
     /// event was seen. Exact volume comparison is conservative: a tiny mismatch
     /// leaves user state untouched. A missing endpoint retains the journal.
     pub fn recover<B: EndpointBackend>(&mut self, backend: &B, after_crash: bool) -> Result<RecoveryReport, String> {
+        if self.record.entry.is_none()
+            && let Some(entry) = self.record.deferred.first()
+        {
+            let endpoint = entry.original.endpoint.clone();
+            self.select_endpoint(&endpoint)?;
+        }
         let Some(entry) = self.record.entry.clone() else {
             return Ok(RecoveryReport {
                 outcome: RecoveryOutcome::NothingToRecover,
@@ -246,6 +336,10 @@ impl Journal {
             return Ok(report(RecoveryOutcome::UserOverride, false));
         }
         let Some(current) = backend.read(&entry.original.endpoint)? else {
+            if backend.permanently_removed(&entry.original.endpoint)? {
+                self.clear()?;
+                return Ok(report(RecoveryOutcome::EndpointRemoved, false));
+            }
             return Ok(report(RecoveryOutcome::EndpointUnavailable, after_crash));
         };
         if current == entry.original {
@@ -263,13 +357,28 @@ impl Journal {
             self.revoke()?;
             return Ok(report(RecoveryOutcome::UserOverride, false));
         }
-        backend.set_mute(&entry.original.endpoint, entry.original.muted)?;
+        if let Err(error) = backend.set_mute(&entry.original.endpoint, entry.original.muted) {
+            // A driver can disappear between the readback and the tagged write.
+            // Classify that race by the exact endpoint, never by error text.
+            if backend.read(&entry.original.endpoint)?.is_none() {
+                if backend.permanently_removed(&entry.original.endpoint)? {
+                    self.clear()?;
+                    return Ok(report(RecoveryOutcome::EndpointRemoved, false));
+                }
+                return Ok(report(RecoveryOutcome::EndpointUnavailable, after_crash));
+            }
+            return Err(error);
+        }
         // An external event arriving during SetMute wins ownership from now on.
         if backend.ownership_lost() {
             self.revoke()?;
             return Ok(report(RecoveryOutcome::UserOverride, false));
         }
         let Some(actual) = backend.read(&entry.original.endpoint)? else {
+            if backend.permanently_removed(&entry.original.endpoint)? {
+                self.clear()?;
+                return Ok(report(RecoveryOutcome::EndpointRemoved, false));
+            }
             return Ok(report(RecoveryOutcome::EndpointUnavailable, after_crash));
         };
         if actual != entry.original {
@@ -278,6 +387,25 @@ impl Journal {
         }
         self.clear()?;
         Ok(report(RecoveryOutcome::Restored, after_crash))
+    }
+
+    /// Retain an unavailable endpoint independently of the next source lease.
+    /// IO/ownership/storage errors remain errors; only proven unavailability
+    /// defers restoration, and proven deletion resolves it entirely.
+    pub fn recover_or_defer<B: EndpointBackend>(
+        &mut self,
+        backend: &B,
+        after_crash: bool,
+    ) -> Result<RecoveryReport, String> {
+        let report = self.recover(backend, after_crash)?;
+        if report.outcome == RecoveryOutcome::EndpointUnavailable {
+            self.defer_unavailable()?;
+            tracing::warn!(
+                ?report,
+                "old audio endpoint unavailable; mute restoration deferred until reconnect"
+            );
+        }
+        Ok(report)
     }
 
     /// On a live level-only override, undo our mute without restoring volume.
@@ -300,13 +428,17 @@ impl Journal {
     }
 
     fn clear(&mut self) -> Result<(), String> {
-        let record = Record::default();
+        let record = Record {
+            entry: None,
+            ..self.record.clone()
+        };
         self.persist(&record)?;
         self.record = record;
         Ok(())
     }
 
     fn persist(&self, record: &Record) -> Result<(), String> {
+        record.validate()?;
         atomic_json(&self.path, record).map_err(|e| format!("persist audio recovery journal: {e}"))
     }
 }
@@ -314,6 +446,9 @@ impl Journal {
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
     let bytes = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
+    if bytes.len() > 32 * 1024 {
+        return Err("audio recovery journal is too large".into());
+    }
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true);
     #[cfg(unix)]
@@ -361,12 +496,21 @@ mod tests {
 
     struct Fake {
         state: Mutex<Option<EndpointState>>,
+        vanish_on_restore: AtomicBool,
+        removed: AtomicBool,
+        removal_error: AtomicBool,
         changed: AtomicBool,
         mute_changed: AtomicBool,
         writes: AtomicUsize,
         journal: PathBuf,
     }
     impl EndpointBackend for Fake {
+        fn permanently_removed(&self, _: &str) -> Result<bool, String> {
+            if self.removal_error.load(Ordering::SeqCst) {
+                return Err("endpoint lookup failed".into());
+            }
+            Ok(self.removed.load(Ordering::SeqCst))
+        }
         fn read(&self, endpoint: &str) -> Result<Option<EndpointState>, String> {
             Ok(self
                 .state
@@ -377,6 +521,10 @@ mod tests {
                 .cloned())
         }
         fn set_mute(&self, endpoint: &str, muted: bool) -> Result<(), String> {
+            if !muted && self.vanish_on_restore.load(Ordering::SeqCst) {
+                self.state.lock().unwrap().take();
+                return Err("endpoint vanished during mute write".into());
+            }
             let disk: Record = serde_json::from_slice(&std::fs::read(&self.journal).unwrap()).unwrap();
             let record = disk.entry.unwrap();
             assert!(record.owned, "OS mutation requires durable write-ahead ownership");
@@ -409,6 +557,9 @@ mod tests {
         };
         let fake = Fake {
             state: Mutex::new(Some(before.clone())),
+            vanish_on_restore: AtomicBool::new(false),
+            removed: AtomicBool::new(false),
+            removal_error: AtomicBool::new(false),
             changed: AtomicBool::new(false),
             mute_changed: AtomicBool::new(false),
             writes: AtomicUsize::new(0),
@@ -624,6 +775,112 @@ mod tests {
             RecoveryOutcome::Restored
         );
         assert_eq!(backend.read("headphones-1").unwrap(), Some(before));
+    }
+
+    #[test]
+    fn permanently_deleted_endpoint_resolves_on_stop_and_restart_without_os_write() {
+        for after_crash in [false, true] {
+            let (dir, mut journal, backend, before) = setup();
+            apply(&mut journal, &backend, before);
+            backend.state.lock().unwrap().take();
+            backend.removed.store(true, Ordering::SeqCst);
+            if after_crash {
+                drop(journal);
+                journal = Journal::open(dir.path()).unwrap();
+            }
+            let report = journal.recover(&backend, after_crash).unwrap();
+            assert_eq!(report.outcome, RecoveryOutcome::EndpointRemoved);
+            assert!(!report.crash_intent_uncertain);
+            assert!(!journal.has_pending_restore());
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+            drop(journal);
+            assert!(!Journal::open(dir.path()).unwrap().has_pending_restore());
+        }
+    }
+
+    #[test]
+    fn unplugged_lease_does_not_block_replacement_and_recovers_after_replug() {
+        let (dir, mut journal, backend, before) = setup();
+        apply(&mut journal, &backend, before.clone());
+        let old_muted = backend.state.lock().unwrap().take().unwrap();
+        assert_eq!(
+            journal.recover_or_defer(&backend, false).unwrap().outcome,
+            RecoveryOutcome::EndpointUnavailable
+        );
+        assert!(
+            journal.prepare(before.clone()).is_err(),
+            "same endpoint cannot overwrite pending restoration"
+        );
+        let replacement = EndpointState {
+            endpoint: "new-default".into(),
+            muted: false,
+            volume: 0.6,
+        };
+        *backend.state.lock().unwrap() = Some(replacement.clone());
+        journal.prepare(replacement.clone()).unwrap();
+        backend.set_mute("new-default", true).unwrap();
+        drop(journal); // both independent records survive a crash
+        let mut journal = Journal::open(dir.path()).unwrap();
+        assert_eq!(journal.endpoints().len(), 2);
+        assert_eq!(
+            journal.recover(&backend, true).unwrap().outcome,
+            RecoveryOutcome::Restored
+        );
+        assert_eq!(*backend.state.lock().unwrap(), Some(replacement));
+        assert!(journal.has_pending_restore());
+        assert_eq!(
+            journal.recover(&backend, true).unwrap().outcome,
+            RecoveryOutcome::EndpointUnavailable
+        );
+        assert_eq!(
+            backend.writes.load(Ordering::SeqCst),
+            3,
+            "no write to replacement for old lease"
+        );
+        *backend.state.lock().unwrap() = Some(old_muted);
+        assert_eq!(
+            journal.recover(&backend, true).unwrap().outcome,
+            RecoveryOutcome::Restored
+        );
+        assert_eq!(*backend.state.lock().unwrap(), Some(before));
+        assert!(!journal.has_pending_restore());
+    }
+
+    #[test]
+    fn removal_between_read_and_restore_write_is_classified_without_faulting_source() {
+        for permanently_removed in [false, true] {
+            let (_dir, mut journal, backend, before) = setup();
+            apply(&mut journal, &backend, before);
+            backend.vanish_on_restore.store(true, Ordering::SeqCst);
+            backend.removed.store(permanently_removed, Ordering::SeqCst);
+            let report = journal.recover_or_defer(&backend, false).unwrap();
+            assert_eq!(
+                report.outcome,
+                if permanently_removed {
+                    RecoveryOutcome::EndpointRemoved
+                } else {
+                    RecoveryOutcome::EndpointUnavailable
+                }
+            );
+            assert_eq!(journal.has_pending_restore(), !permanently_removed);
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn deletion_requires_proof_and_durable_resolution() {
+        let (dir, mut journal, backend, before) = setup();
+        apply(&mut journal, &backend, before);
+        backend.state.lock().unwrap().take();
+        backend.removal_error.store(true, Ordering::SeqCst);
+        assert!(journal.recover(&backend, false).is_err());
+        assert!(journal.has_pending_restore());
+        backend.removal_error.store(false, Ordering::SeqCst);
+        backend.removed.store(true, Ordering::SeqCst);
+        std::fs::create_dir(dir.path().join("audio-mute-recovery.tmp")).unwrap();
+        assert!(journal.recover(&backend, false).is_err());
+        assert!(journal.has_pending_restore());
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
     }
 
     #[test]

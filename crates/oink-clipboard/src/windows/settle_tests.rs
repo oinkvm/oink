@@ -17,14 +17,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::w;
 
-struct PrivateStation {
+pub(super) struct PrivateStation {
     previous: HWINSTA,
     previous_desktop: HDESK,
     station: HWINSTA,
     desktop: HDESK,
 }
 impl PrivateStation {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         // SAFETY: this is the only test in a fresh child. No windows/hooks/clipboard
         // APIs run before switching to an owned station; no desktop is activated.
         unsafe {
@@ -173,6 +173,7 @@ fn multi_step_writer_settles_on_private_window_station() {
         reader: Arc::new(worker::Worker::spawn().unwrap()),
         observer: Arc::new(content::current::Observer::default()),
     };
+    sequence_query_does_not_wait_for_the_publication_sta(&reader, &writer);
     let (changed, changes) = mpsc::channel();
     reader
         .watch(Arc::new(move || {
@@ -389,24 +390,112 @@ fn multi_step_writer_settles_on_private_window_station() {
     successive_lazy_reads(&reader, &writer);
     native_provider_bumps_and_failures(&reader, &writer);
     multi_representation_image_has_no_source_store(&reader, &writer);
-    virtual_clipboard_files_read_current_object_without_store(&reader, &writer);
+    virtual_clipboard_files_fulfil_once_on_content_demand(&reader, &writer);
     eprintln!(
         "NATIVE_SETTLE windows: staged transactions, reannounce, open contention, delayed rendering passed; private station only"
     );
 }
 
-fn multi_representation_image_has_no_source_store(reader: &WinClipboard, writer: &worker::Worker) {
-    writer
+fn sequence_query_does_not_wait_for_the_publication_sta(reader: &WinClipboard, writer: &worker::Worker) {
+    struct NoFiles;
+    impl FileContents for NoFiles {
+        fn open(&self, _: usize) -> std::io::Result<crate::FileReader> {
+            unreachable!("metadata queries cannot read contents")
+        }
+    }
+    let publish = |worker: &worker::Worker| {
+        worker
+            .run(|_| {
+                vfile::set_clipboard(vfile::Spec {
+                    cloud: None,
+                    descriptors: files::descriptors(&[]),
+                    fixed: vec![(13, vec![88, 0, 0, 0])],
+                    contents: Arc::new(NoFiles),
+                    cf_descriptor: formats().file_descriptor,
+                    cf_contents: formats().file_contents,
+                })
+                .unwrap()
+            })
+            .unwrap()
+    };
+    let published = publish(&reader.worker);
+    reader
+        .worker
         .run(|hwnd| {
-            let rgba = image::Rgba {
-                pixels_per_meter: None,
-                width: 3468,
-                height: 3174,
-                data: vec![0x7f; 3468 * 3174 * 4],
-            };
-            let png = image::encode_png(&rgba).unwrap();
-            let dib32 = image::rgba_to_dibv5(&rgba);
-            let dib24 = image::rgba_to_dib24(&rgba);
+            let _open = OpenGuard::open(hwnd).unwrap();
+            // Rendering an already-owned format bumps the physical sequence
+            // without assigning a new owner or publishing a different object.
+            set_bytes(13, &[88, 0, 0, 0]).unwrap();
+        })
+        .unwrap();
+    assert_ne!(native_sequence(), published);
+    assert_eq!(sequence_while_sta_blocked(reader), published);
+    let replacement = publish(&reader.worker);
+    assert_ne!(replacement, published);
+    assert_eq!(
+        reader.change_count(),
+        replacement,
+        "same-STA republication is a new identity"
+    );
+    let other = publish(writer);
+    assert_ne!(other, replacement);
+    assert_eq!(
+        sequence_while_sta_blocked(reader),
+        other,
+        "another OLE STA is not our previous publication"
+    );
+    writer
+        .run(|hwnd| write_on_worker(hwnd, &[(13, vec![89, 0, 0, 0])]).unwrap())
+        .unwrap();
+    let changed = sequence_while_sta_blocked(reader);
+    assert_ne!(changed, replacement);
+    assert_eq!(
+        changed,
+        native_sequence(),
+        "another owner is visible before the STA resumes"
+    );
+}
+
+fn sequence_while_sta_blocked(reader: &WinClipboard) -> u64 {
+    let (entered, waiting) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    reader
+        .worker
+        .post(move |_| {
+            entered.send(()).unwrap();
+            let _ = gate.recv();
+        })
+        .unwrap();
+    waiting.recv().unwrap();
+    let completed = std::thread::scope(|scope| {
+        let (done, result) = mpsc::channel();
+        scope.spawn(move || done.send(reader.change_count()).unwrap());
+        // This is a watchdog, not a product timeout: the query must finish while
+        // the STA gate is still closed. Always release it before asserting.
+        let completed = result.recv_timeout(Duration::from_secs(1));
+        release.send(()).unwrap();
+        if completed.is_err() {
+            result.recv().unwrap();
+        }
+        completed
+    });
+    completed.expect("metadata must not queue behind a native data callback")
+}
+
+fn multi_representation_image_has_no_source_store(reader: &WinClipboard, writer: &worker::Worker) {
+    // Pixel generation is CPU work, not a native clipboard operation. Keep it
+    // outside Worker::run's UI deadline, including on BelowNormal test workers.
+    let rgba = image::Rgba {
+        pixels_per_meter: None,
+        width: 3468,
+        height: 3174,
+        data: vec![0x7f; 3468 * 3174 * 4],
+    };
+    let png = image::encode_png(&rgba).unwrap();
+    let dib32 = image::rgba_to_dibv5(&rgba);
+    let dib24 = image::rgba_to_dib24(&rgba);
+    writer
+        .run(move |hwnd| {
             let _open = OpenGuard::open(hwnd).unwrap();
             // SAFETY: private station; OS assumes ownership of the successfully set bitmap.
             unsafe {
@@ -496,7 +585,7 @@ fn successive_lazy_reads(reader: &WinClipboard, writer: &worker::Worker) {
     assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
 }
 
-fn virtual_clipboard_files_read_current_object_without_store(reader: &WinClipboard, writer: &worker::Worker) {
+fn virtual_clipboard_files_fulfil_once_on_content_demand(reader: &WinClipboard, writer: &worker::Worker) {
     use std::sync::atomic::AtomicUsize;
     struct Files(Arc<AtomicUsize>);
     impl crate::FileContents for Files {
@@ -509,6 +598,7 @@ fn virtual_clipboard_files_read_current_object_without_store(reader: &WinClipboa
         }
         fn metadata(&self, _: usize) -> std::io::Result<Option<crate::FileMetadata>> {
             Ok(Some(crate::FileMetadata {
+                exec_bits: None,
                 size: 1024 * 1024 + 3,
                 modified_ms: None,
             }))
@@ -540,13 +630,40 @@ fn virtual_clipboard_files_read_current_object_without_store(reader: &WinClipboa
     let capture = reader.capture(root.path()).unwrap();
     let source = capture.content.unwrap();
     assert_eq!(reads.load(Ordering::Acquire), 0, "copy must not read any FileContents");
+    assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
     let files = source.namespace().unwrap();
     let id = files.roots()[0].id;
     let node = files.select(id).unwrap();
     let mut input = files.open(id, node.version, 0).unwrap();
     let bytes = crate::content::read_all(&mut input).unwrap();
     assert_eq!(bytes, vec![9; 1024 * 1024 + 3]);
-    assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
+    assert_eq!(reads.load(Ordering::Acquire), 1);
+    assert!(root.path().join("source-snapshots").is_dir());
+    for offset in [0, 1024 * 1024, 0] {
+        let selected = files.select(id).unwrap();
+        let mut replay = files.open(id, selected.version, offset).unwrap();
+        assert_eq!(
+            crate::content::read_all(&mut replay).unwrap(),
+            vec![9; 1024 * 1024 + 3 - offset as usize]
+        );
+    }
+    assert_eq!(
+        reads.load(Ordering::Acquire),
+        1,
+        "one-shot replay must not ask IDataObject again"
+    );
+    let key = reader.clipboard_key().unwrap();
+    assert_eq!(files.clipboard_key().unwrap(), Some(key));
+    assert_eq!(files.one_shot_roots(), vec![id]);
+    let peer = DeviceId([3; 32]);
+    let grants = crate::content::grants::SourceGrants::load(&root.path().join("grants"), [(peer, [4; 32])]).unwrap();
+    let token = grants.issue(peer, files.as_ref(), &[id]).unwrap();
+    let receipt = grants.fulfilled_roots(peer, token).unwrap().remove(0);
+    assert_eq!(
+        reads.load(Ordering::Acquire),
+        1,
+        "grant must reuse the fulfilled native source"
+    );
     reader
         .write(
             &[ClipData::Text("peer placeholder replaced source".into())],
@@ -557,6 +674,14 @@ fn virtual_clipboard_files_read_current_object_without_store(reader: &WinClipboa
         crate::content::reason(&files.select(id).err().unwrap()),
         crate::model::Unavailable::Superseded
     );
+    assert_ne!(reader.clipboard_key().unwrap(), key);
+    let owned = grants.open(peer, token).unwrap();
+    let node = owned.select(id).unwrap();
+    let mut replay = owned.open(id, node.version, 0).unwrap();
+    assert_eq!(crate::content::read_all(&mut replay).unwrap(), bytes);
+    drop(replay);
+    grants.sent(peer, token, receipt.node).unwrap();
+    assert!(owned.select(id).is_err());
 }
 
 fn native_provider_bumps_and_failures(reader: &WinClipboard, writer: &worker::Worker) {
@@ -645,7 +770,6 @@ fn native_provider_bumps_and_failures(reader: &WinClipboard, writer: &worker::Wo
                             standard: None,
                             data: RepresentationData::Reader {
                                 size: ContentSize::Unknown,
-                                hash: None,
                             },
                         }],
                     }],

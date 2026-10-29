@@ -21,7 +21,10 @@ struct Device {
     uid: String,
     name: String,
     output: bool,
+    input: bool,
     is_default: bool,
+    is_default_input: bool,
+    transport: u32,
 }
 struct Cache {
     loaded: Option<u64>,
@@ -83,6 +86,16 @@ fn snapshot() -> Result<Vec<Device>, String> {
         .unwrap_or_else(|e| e.into_inner());
     cache.get(generation(), read)
 }
+pub fn inputs() -> Result<Vec<crate::microphone::InputDevice>, String> {
+    Ok(snapshot()?
+        .into_iter()
+        .filter(|d| d.input)
+        .map(|d| crate::microphone::InputDevice {
+            id: format!("coreaudio:{}", d.uid),
+            name: d.name,
+        })
+        .collect())
+}
 pub fn outputs() -> Result<Vec<OutputDevice>, String> {
     Ok(snapshot()?
         .into_iter()
@@ -102,6 +115,40 @@ pub fn service_generation() -> u64 {
 pub(super) fn set_wake(wake: extern "C" fn()) {
     // SAFETY: process-lifetime function, with no borrowed callback context.
     unsafe { oink_audio_devices_set_wake(wake) };
+}
+
+pub fn default_input() -> Result<Option<crate::microphone::InputDevice>, String> {
+    Ok(snapshot()?
+        .into_iter()
+        .find(|d| d.input && d.is_default_input)
+        .map(|d| crate::microphone::InputDevice {
+            id: format!("coreaudio:{}", d.uid),
+            name: d.name,
+        }))
+}
+pub fn input_candidates() -> Result<Vec<crate::microphone::InputCandidate>, String> {
+    Ok(snapshot()?
+        .into_iter()
+        .filter(|d| d.input)
+        .map(|d| {
+            let built_in = d.transport == u32::from_be_bytes(*b"bltn");
+            let physical = [
+                *b"bltn", *b"usb ", *b"blue", *b"blea", *b"pci ", *b"1394", *b"thun", *b"hdmi", *b"dprt",
+            ]
+            .into_iter()
+            .any(|t| d.transport == u32::from_be_bytes(t));
+            crate::microphone::InputCandidate {
+                input: crate::microphone::InputDevice {
+                    id: format!("coreaudio:{}", d.uid),
+                    name: d.name,
+                },
+                physical,
+                built_in,
+                forwarding_loopback: d.uid == crate::microphone::MAC_INPUT_UID
+                    || d.uid == "com.across.microphone.input.v1",
+            }
+        })
+        .collect())
 }
 
 #[cfg(test)]

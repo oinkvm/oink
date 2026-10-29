@@ -1,11 +1,13 @@
+import { microphoneMode } from './DeviceList';
 import { tr } from '../i18n';
 import { Fragment, useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent, MouseEvent, PointerEvent, ReactNode } from 'react';
-import { ContextMenu, Icon, MenuCheckboxItem, MenuItem, MenuRadioGroup, MenuRadioItem, MenuSeparator, MenuSub, NumberInput, Segmented, Tooltip } from 'oink-ui';
+import { ContextMenu, Icon, MenuCheckboxItem, MenuItem, MenuRadioGroup, MenuRadioItem, MenuSeparator, MenuSub, Segmented, Tooltip } from 'oink-ui';
+import { PermissionHint } from '../permissions/PermissionHint';
 import { Glyph } from './icons';
 import type { GlyphName } from './icons';
 import type { Device, GameMode } from './types';
-import type { SpeakerAction } from './VolumeRow';
+import { VolumeRow, type SpeakerAction, type MicrophoneAction } from './VolumeRow';
 import { faultReason, screenValue } from './data';
 import type { ShareKind, ShareValue } from './data';
 import type { IncomingRequest, Peer } from '../pairing/data';
@@ -123,54 +125,20 @@ const LeaveIcon = <Icon><path d="M8.2 3.6H5.4a1.8 1.8 0 0 0-1.8 1.8v9.2a1.8 1.8 
 const BlockIcon = <Icon><circle cx="10" cy="10" r="6.6"/><path d="M5.3 5.3l9.4 9.4"/></Icon>;
 const UnlockIcon = <Icon><rect x="4.5" y="9" width="11" height="7.5" rx="2"/><path d="M7.2 9V6.6a2.8 2.8 0 0 1 5.5-.7"/></Icon>;
 const EyeOffIcon = <Icon><path d="M3 10s2.6-5 7-5 7 5 7 5-2.6 5-7 5-7-5-7-5Z"/><circle cx="10" cy="10" r="2.2"/><path d="M4 4l12 12"/></Icon>;
-/** Commit a burst of stepper presses (holding a button repeats) as one save. */
-const GAIN_SETTLE_MS = 300;
-
-/** The screen menu's pointer gain: 0.1 per button press, 0.01 when typed, same
- * 0.1–5 range as Settings. Stepping shows the value at once and saves once the
- * presses settle, or when the menu closes. */
-function ScreenGainRow({ name, gain, onCommit }: { name: string; gain: number; onCommit: (gain: number) => void }) {
-    const [draft, setDraft] = useState<number | null>(null);
-    const pending = useRef<number | null>(null);
-    const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-    const commit = useRef(onCommit);
-    commit.current = onCommit;
-    const flush = () => {
-        clearTimeout(timer.current);
-        const v = pending.current;
-        pending.current = null;
-        if (v !== null) commit.current(v);
-    };
-    useEffect(() => flush, []);
-    // The saved value arrives with the next layout; until then keep showing the draft.
-    useEffect(() => { if (pending.current === null) setDraft(null); }, [gain]);
-    const change = (v: number) => {
-        setDraft(v);
-        pending.current = v;
-        clearTimeout(timer.current);
-        timer.current = setTimeout(flush, GAIN_SETTLE_MS);
-    };
-    return <div className="devmenu__row devmenu__gain" onKeyDown={e => e.stopPropagation()}>
-      <span className="devmenu__label">{glyph('mouse')}{tr('指针速度')}</span>
-      <NumberInput size="sm" className="devmenu__gain-input" aria-label={tr('{0}的远程指针速度', name)} min={0.1} max={5} step={0.1} precision={2} rollValue={false}
-        value={draft ?? gain} onChange={change} format={v => `${v.toFixed(2)}x`}/>
-    </div>;
-}
-
 export interface SideContextMenuProps {
     devices: Device[];
     /** Every screen, hidden ones included: a device's Hide/Show all screens reads them. */
-    screens?: { id: string; device: string; name: string; hidden: boolean; gain: number }[];
+    screens?: { id: string; device: string; name: string; hidden: boolean }[];
     /** Canvas screen context: hide that one screen. */
     onHideScreen: (id: string) => void;
-    /** Canvas screen context: the screen's remote pointer gain, the same value as Settings. */
-    onScreenGain: (id: string, gain: number) => void;
     /** Device menu: hide all of its screens, or show them all again when any is hidden. */
     onScreensHidden: (deviceId: string, hidden: boolean) => void;
     screenEditPending?: boolean;
     requests: IncomingRequest[];
     nearby: Peer[];
     onShare: (id: string, kind: ShareKind, value: ShareValue) => void;
+    onMicrophone?: (id:string,action:MicrophoneAction)=>void;
+    onGrantPermission?: (id:string,kind:'input_monitoring'|'microphone')=>void;
     onGameMode: (id: string, mode: GameMode) => void;
     onPause: (id: string, paused: boolean) => void;
     onLeave: (id: string) => void;
@@ -187,7 +155,7 @@ export interface SideContextMenuProps {
     children: ReactNode;
     standalone?: boolean;
 }
-export function SideContextMenu({ devices, screens = [], onHideScreen, onScreenGain, onScreensHidden, screenEditPending = false, requests, nearby, onShare, onGameMode, onPause, onLeave, onEditAddress, onShowWindow, onAbout, onQuit, onAccept, onReject, onPair, onBlock, onOpenChange, children, standalone = false }: SideContextMenuProps) {
+export function SideContextMenu({ devices, screens = [], onHideScreen, onScreensHidden, screenEditPending = false, requests, nearby, onShare, onMicrophone, onGrantPermission, onGameMode, onPause, onLeave, onEditAddress, onShowWindow, onAbout, onQuit, onAccept, onReject, onPair, onBlock, onOpenChange, children, standalone = false }: SideContextMenuProps) {
     const [ctx, setCtx] = useState<Ctx | null>(null);
     const [open, setOpenState] = useState(false);
     const ctxRef = useRef<Ctx | null>(null);
@@ -208,6 +176,8 @@ export function SideContextMenu({ devices, screens = [], onHideScreen, onScreenG
             return;
         const root = e.currentTarget;
         const active = document.activeElement as HTMLElement | null;
+        // Up/Down adjust a focused volume slider; Tab still moves between menu controls.
+        if ((e.target as HTMLElement).getAttribute('role') === 'slider' && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) return;
         const back = e.key === 'ArrowUp' || (e.key === 'Tab' && e.shiftKey);
         const fwd = e.key === 'ArrowDown' || (e.key === 'Tab' && !e.shiftKey);
         if (!back && !fwd)
@@ -232,8 +202,10 @@ export function SideContextMenu({ devices, screens = [], onHideScreen, onScreenG
         const leave = self ? tr('离开设备组') : tr('踢出设备组');
         const locked = d.cursor === 'locked';
         const anyHidden = d.screenSharing === false || d.screen === 'disabled' || screens.some(s => s.device === d.id && s.hidden);
-        const exit = devices.find(x => x.group !== 'offline' && x.speaker.mode === 'exit');
-        const unavailable = (kind: ShareKind) => d.pending || d.unknown || d.actionability?.[kind] === 'unavailable';
+        const exit = devices.find(x => x.group !== 'offline' && (x.speaker.configuredMode === 'receiver' || x.speaker.mode === 'exit'));
+        const speakerReceiver = d.speaker.configuredMode === 'receiver' || d.speaker.mode === 'exit';
+        const speakerSource = d.speaker.configuredMode === 'source' || d.speaker.mode === 'forwarding';
+        const unavailable = (kind: ShareKind) => d.unknown || d.actionability?.[kind] === 'unavailable';
         const leaveItem = <MenuItem icon={LeaveIcon} tone="danger" onSelect={() => onLeave(d.id)}>{leave}</MenuItem>;
         body = <Fragment key={`${tray ? 'tray' : 'device'}:${d.id}`}>
           {ro ? <><MenuItem icon="edit" onSelect={() => onEditAddress(d.id)}>{tr('编辑 IP')}</MenuItem><MenuSeparator/>{leaveItem}</> : <>
@@ -243,19 +215,33 @@ export function SideContextMenu({ devices, screens = [], onHideScreen, onScreenG
               <div className="devmenu__inputs" onKeyDownCapture={onKeyDownCapture} onKeyDown={e => {if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') e.stopPropagation();}}>
               {ROWS.filter(r => r.kind === 'keyboard' || r.kind === 'mouse').sort((a) => a.kind === 'keyboard' ? -1 : 1).map(r => <div className="devmenu__row" data-stop="" key={r.kind}>
                 <span className="devmenu__label" id={`devmenu-${r.kind}-${d.id}`}>{glyph(r.glyph)}{r.label}</span>
-                {valueOf(d,r.kind) === 'fault' ? <span className="devmenu__na">{faultReason(d,r.kind as ShareKind)}</span> : <Segmented<string> size="sm" className="devmenu__seg" disabled={unavailable(r.kind as ShareKind)} aria-labelledby={`devmenu-${r.kind}-${d.id}`} options={segOptions(r.options).map(o => ({...o, disabled: r.kind === 'mouse' && o.value === 'disabled' && !d.canDisableMouse}))} value={valueOf(d,r.kind)} onChange={v => onShare(d.id,r.kind as ShareKind,v as ShareValue)}/>}
+                <PermissionGate missing={!!d.inputPermissionMissing} local={d.group==='self'} kind="input_monitoring" onGrant={onGrantPermission?()=>onGrantPermission(d.id,'input_monitoring'):undefined}>
+                {valueOf(d,r.kind) === 'fault' && !d.inputPermissionMissing ? <span className="devmenu__na">{faultReason(d,r.kind as ShareKind)}</span> : <Segmented<string> size="sm" className="devmenu__seg" disabled={!!d.inputPermissionMissing||unavailable(r.kind as ShareKind)} aria-labelledby={`devmenu-${r.kind}-${d.id}`} options={segOptions(r.options).map(o => ({...o, disabled: r.kind === 'mouse' && o.value === 'disabled' && !d.canDisableMouse}))} value={valueOf(d,r.kind)} onChange={v => onShare(d.id,r.kind as ShareKind,v as ShareValue)}/>}
+                </PermissionGate>
               </div>)}
+              <div className="devmenu__row" data-stop="">
+                <span className="devmenu__label" data-tone={d.microphone?.mode==='source'?'accent':undefined} id={`devmenu-microphone-${d.id}`}>{glyph('microphone')}{tr('麦克风')}</span>
+                  <Segmented<string> size="sm" className="devmenu__seg" aria-labelledby={`devmenu-microphone-${d.id}`} disabled={!onMicrophone}
+                    options={[{value:'local',label:<span className="devmenu__opt">{tr('本地')}</span>},{value:'receive',label:<span className="devmenu__opt">{tr('接收')}</span>,disabled:!d.microphone?.virtualReady},{value:'shared',label:<span className="devmenu__opt">{tr('发送')}</span>,disabled:!d.microphone?.permissionGranted}]}
+                    value={microphoneMode(d)==='source'?'shared':microphoneMode(d)==='receiver'?'receive':'local'}
+                    onChange={value=>onMicrophone?.(d.id,value as 'shared'|'local'|'receive')}/>
+
+              </div>
+              {d.microphone?.mode==='source' && onMicrophone && <div className="devmenu__vol" data-stop="">
+                <VolumeRow d={d} microphone open tabbable onSpeaker={action=>onMicrophone(d.id,action)}/>
+              </div>}
               </div>
             </MenuSub>
             <MenuSub label={tr('游戏模式')} icon={glyph('game')}>
               <MenuRadioGroup aria-label={tr('游戏模式')} value={d.gameMode ?? ''} onChange={v => onGameMode(d.id,v as GameMode)}>
-                {ROWS.find(r => r.kind === 'game')!.options.map(o => <MenuRadioItem key={o.value} value={o.value} closeOnSelect disabled={d.pending || d.unknown}>{o.label}</MenuRadioItem>)}
+                {ROWS.find(r => r.kind === 'game')!.options.map(o => <MenuRadioItem key={o.value} value={o.value} closeOnSelect disabled={d.unknown}>{o.label}</MenuRadioItem>)}
               </MenuRadioGroup>
             </MenuSub>
-            <MenuItem icon={glyph('speaker')} disabled={d.pending || (unavailable('speaker') && !d.speaker.canMakeExit)} onSelect={() => onShare(d.id,'speaker',d.speaker.mode === 'exit' ? 'unused' : 'exit')}>{d.speaker.mode === 'exit' ? tr('关闭音频出口') : tr('设为音频出口')}</MenuItem>
-            {exit && exit.id !== d.id && <MenuCheckboxItem closeOnSelect disabled={unavailable('speaker')} checked={d.speaker.mode === 'forwarding'} onCheckedChange={on => onShare(d.id,'speaker',on ? 'forwarding' : 'unused')}>{tr('转发音频到 {0}',exit.name)}</MenuCheckboxItem>}
+            <MenuItem icon={glyph('speaker')} disabled={(unavailable('speaker') && !d.speaker.canMakeExit)} onSelect={() => onShare(d.id,'speaker',speakerReceiver ? 'unused' : 'exit')}>{speakerReceiver ? tr('关闭音频出口') : tr('设为音频出口')}</MenuItem>
+            {exit && exit.id !== d.id && <MenuCheckboxItem closeOnSelect disabled={unavailable('speaker')} checked={speakerSource} onCheckedChange={on => onShare(d.id,'speaker',on ? 'forwarding' : 'unused')}>{tr('转发音频到 {0}',exit.name)}</MenuCheckboxItem>}
+            {!exit && speakerSource && <MenuItem icon={glyph('speaker')} disabled={unavailable('speaker')} onSelect={() => onShare(d.id,'speaker','unused')}>{tr('停止共享')}</MenuItem>}
             <MenuSeparator/>
-            <MenuItem icon={d.paused ? 'play' : PauseIcon} disabled={d.pending || d.canPause === false} onSelect={() => onPause(d.id,!d.paused)}>{d.paused ? tr('恢复共享') : tr('暂停共享')}</MenuItem>
+            <MenuItem icon={d.paused ? 'play' : PauseIcon} disabled={d.canPause === false} onSelect={() => onPause(d.id,!d.paused)}>{d.paused ? tr('恢复共享') : tr('暂停共享')}</MenuItem>
             {leaveItem}
           </>}
           {tray && <><MenuSeparator/><MenuItem icon="external" onSelect={onShowWindow}>{tr('显示界面')}</MenuItem><MenuItem icon="info" onSelect={onAbout}>{tr('关于 Oink')}</MenuItem><MenuItem icon={PowerIcon} onSelect={onQuit}>{tr('退出 Oink')}</MenuItem></>}
@@ -264,8 +250,6 @@ export function SideContextMenu({ devices, screens = [], onHideScreen, onScreenG
     else if (screen) {
         body = <Fragment key={`screen:${screen.id}`}>
           <MenuItem icon={EyeOffIcon} disabled={screenEditPending} onSelect={() => onHideScreen(screen.id)}>{tr('隐藏此屏幕')}</MenuItem>
-          <MenuSeparator/>
-          <ScreenGainRow key={screen.id} name={screen.name} gain={screen.gain} onCommit={gain => onScreenGain(screen.id, gain)}/>
         </Fragment>;
     }
     else if (request) {
@@ -312,4 +296,11 @@ export function SideContextMenu({ devices, screens = [], onHideScreen, onScreenG
     return (<ContextMenu open={open} onOpenChange={setOpen} menu={lastBody.current} className="devmenu">
       <div className="side-ctx" onContextMenu={pick} onPointerDown={pickTouch}>{children}</div>
     </ContextMenu>);
+}
+
+function PermissionGate({missing,local,kind,onGrant,children}:{missing:boolean;local:boolean;kind:'input_monitoring'|'microphone';onGrant?:()=>void;children:ReactNode}) {
+    return <PermissionHint kind={kind} local={local} onGrant={onGrant} disabled={!missing}>{({ label, onGrant: grant }) => <div className="devmenu__permission">
+        {children}
+        {missing && grant && <button type="button" className="devmenu__grant ok-focusable" aria-label={label} onClick={grant}/>}
+    </div>}</PermissionHint>;
 }

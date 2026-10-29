@@ -19,9 +19,14 @@
     "oink.input.gestures/1",
     "oink.input.contacts/1",
     "oink.input.trail/1",
+    "oink.input.application-focus/1",
     "oink.audio/1",
     "oink.audio.pcm/1",
     "oink.audio.state/1",
+    "oink.audio.microphone/1",
+    "oink.audio.media-health/1",
+    "oink.files.safe-symlinks/1",
+    "oink.files.exec-bits/1",
     "oink.aim/1",
     "oink.wallpaper/1",
     "oink.cache/1",
@@ -35,12 +40,22 @@
     "oink.input.accessibility/1",
     "oink.audio.exit-volume/1",
     "oink.notify/1",
+    "oink.notify.microphone/1",
     "oink.layout.profiles/1",
     "oink.layout.arrangement/1",
     "oink.layout.preview/1",
     "oink.layout.profiles/2",
     "oink.layout.profiles/3",
-    "oink.audio.local-output/1"
+    "oink.layout.topology/1",
+    "oink.audio.local-output/1",
+    "oink.input.touchpad-options/1",
+    "oink.input.scroll-pixels/1",
+    "oink.pointer.move/1",
+    "oink.pointer.lock-escape/1",
+    "oink.input.keymap-none/1",
+    "oink.pointer.entry-protection/1",
+    "oink.power/1",
+    "oink.cloud-file-links/1"
   ],
   "diagnostic_events": [
     "protocol-violation/1",
@@ -77,6 +92,163 @@
     "source-routing/1"
   ],
   "enums": [
+    [
+      "ApplicationFocusActionKind",
+      [
+        [
+          0,
+          "Observe"
+        ],
+        [
+          1,
+          "Prepare"
+        ],
+        [
+          2,
+          "Commit"
+        ],
+        [
+          3,
+          "Applied"
+        ],
+        [
+          4,
+          "Snapshot"
+        ],
+        [
+          5,
+          "Retire"
+        ],
+        [
+          6,
+          "Sample"
+        ],
+        [
+          7,
+          "Cancel"
+        ]
+      ]
+    ],
+    [
+      "ApplicationForeground",
+      [
+        [
+          0,
+          "Hidden"
+        ],
+        [
+          1,
+          "Windowed"
+        ],
+        [
+          2,
+          "Fullscreen"
+        ],
+        [
+          3,
+          "OrdinaryUnknown"
+        ],
+        [
+          4,
+          "Unclassified"
+        ],
+        [
+          5,
+          "Unavailable"
+        ]
+      ]
+    ],
+    [
+      "ApplicationParkResult",
+      [
+        [
+          0,
+          "Confirmed"
+        ],
+        [
+          1,
+          "FullscreenExempt"
+        ],
+        [
+          2,
+          "UnknownExempt"
+        ],
+        [
+          3,
+          "Denied"
+        ],
+        [
+          4,
+          "Stale"
+        ],
+        [
+          5,
+          "Unavailable"
+        ]
+      ]
+    ],
+    [
+      "ApplicationFocusPhase",
+      [
+        [
+          0,
+          "Off"
+        ],
+        [
+          1,
+          "Preparing"
+        ],
+        [
+          2,
+          "Active"
+        ],
+        [
+          3,
+          "Suspended"
+        ]
+      ]
+    ],
+    [
+      "ApplicationFocusReason",
+      [
+        [
+          0,
+          "Disabled"
+        ],
+        [
+          1,
+          "Ready"
+        ],
+        [
+          2,
+          "NoPointer"
+        ],
+        [
+          3,
+          "PointerNotParticipating"
+        ],
+        [
+          4,
+          "AwaitingApplication"
+        ],
+        [
+          5,
+          "DesktopUnavailable"
+        ],
+        [
+          6,
+          "Drag"
+        ],
+        [
+          7,
+          "Game"
+        ],
+        [
+          8,
+          "CounterExhausted"
+        ]
+      ]
+    ],
     [
       "MouseButtonKind",
       [
@@ -1109,6 +1281,38 @@
         [
           8,
           "Cancelled"
+        ],
+        [
+          9,
+          "ItemMissing"
+        ],
+        [
+          10,
+          "ItemUnsupportedType"
+        ],
+        [
+          11,
+          "ItemKindMismatch"
+        ],
+        [
+          12,
+          "ItemTargetMismatch"
+        ],
+        [
+          13,
+          "ItemIdentityMismatch"
+        ],
+        [
+          14,
+          "ItemMetadataMismatch"
+        ],
+        [
+          15,
+          "ItemAccessDenied"
+        ],
+        [
+          16,
+          "ItemMetadataUnreadable"
         ]
       ]
     ],
@@ -1860,6 +2064,10 @@
         [
           1,
           "Directory"
+        ],
+        [
+          2,
+          "Symlink"
         ]
       ]
     ],
@@ -1877,6 +2085,48 @@
         [
           2,
           "Drop"
+        ]
+      ]
+    ],
+    [
+      "AudioMediaKind",
+      [
+        [
+          0,
+          "Speaker"
+        ],
+        [
+          1,
+          "Microphone"
+        ]
+      ]
+    ],
+    [
+      "MicrophonePermission",
+      [
+        [
+          0,
+          "Granted"
+        ],
+        [
+          1,
+          "NotDetermined"
+        ],
+        [
+          2,
+          "Denied"
+        ],
+        [
+          3,
+          "Restricted"
+        ],
+        [
+          4,
+          "SystemControlled"
+        ],
+        [
+          5,
+          "Unsupported"
         ]
       ]
     ],
@@ -2177,6 +2427,34 @@
         [
           21,
           "SyncSystemArrangement"
+        ],
+        [
+          26,
+          "TouchpadInjection"
+        ],
+        [
+          27,
+          "NativeMultifinger"
+        ],
+        [
+          28,
+          "MacScrollFeel"
+        ],
+        [
+          22,
+          "MicrophoneShareClaim"
+        ],
+        [
+          23,
+          "MicrophoneControls"
+        ],
+        [
+          24,
+          "MicrophoneReceiveMuted"
+        ],
+        [
+          25,
+          "MicrophoneInput"
         ]
       ]
     ],
@@ -2831,6 +3109,30 @@
         [
           41,
           "ContactInjection"
+        ],
+        [
+          42,
+          "MarkerSubmission"
+        ],
+        [
+          43,
+          "MarkerHookDecision"
+        ],
+        [
+          44,
+          "MarkerChainResult"
+        ],
+        [
+          45,
+          "MarkerReadback"
+        ],
+        [
+          46,
+          "RestoreSafetyReset"
+        ],
+        [
+          47,
+          "MouseKeysCompensation"
         ]
       ]
     ],
@@ -3336,6 +3638,10 @@
         [
           9,
           "BackendFailed"
+        ],
+        [
+          10,
+          "MicrophoneLoopback"
         ]
       ]
     ],
@@ -3379,6 +3685,10 @@
         [
           1,
           "Lines"
+        ],
+        [
+          2,
+          "Pixels"
         ]
       ]
     ],
@@ -4980,6 +5290,12 @@
             "key": 102,
             "name": "capture_time_us",
             "shape": "Option<u32>"
+          },
+          {
+            "absence": "optional",
+            "key": 103,
+            "name": "application_route",
+            "shape": "Option<ApplicationKeyRoute>"
           }
         ],
         "name": "InputKey"
@@ -5148,6 +5464,18 @@
             "key": 102,
             "name": "capture_time_us",
             "shape": "Option<u32>"
+          },
+          {
+            "absence": "optional",
+            "key": 103,
+            "name": "application_route",
+            "shape": "Option<ApplicationKeyRoute>"
+          },
+          {
+            "absence": "optional",
+            "key": 104,
+            "name": "application_keys",
+            "shape": "Option<List<ApplicationHeldKey,256>>"
           }
         ],
         "name": "InputHeldSync"
@@ -5198,6 +5526,12 @@
             "key": 102,
             "name": "capture_time_us",
             "shape": "Option<u32>"
+          },
+          {
+            "absence": "optional",
+            "key": 103,
+            "name": "application_route",
+            "shape": "Option<ApplicationKeyRoute>"
           }
         ],
         "name": "InputKeyRepeat"
@@ -5564,12 +5898,6 @@
           },
           {
             "absence": "required",
-            "key": 5,
-            "name": "content_digest",
-            "shape": "Digest"
-          },
-          {
-            "absence": "required",
             "key": 6,
             "name": "inventory",
             "shape": "Inventory"
@@ -5821,12 +6149,6 @@
             "key": 3,
             "name": "size",
             "shape": "u64"
-          },
-          {
-            "absence": "required",
-            "key": 4,
-            "name": "hash",
-            "shape": "Digest"
           }
         ],
         "name": "ContentRepresentationEnd"
@@ -6191,12 +6513,6 @@
             "shape": "u64"
           },
           {
-            "absence": "optional",
-            "key": 5,
-            "name": "check",
-            "shape": "Option<Digest>"
-          },
-          {
             "absence": "required",
             "key": 6,
             "name": "demand",
@@ -6253,12 +6569,6 @@
             "key": 4,
             "name": "offset",
             "shape": "u64"
-          },
-          {
-            "absence": "required",
-            "key": 5,
-            "name": "hash",
-            "shape": "Digest"
           },
           {
             "absence": "required",
@@ -7267,6 +7577,273 @@
     },
     {
       "capabilities": [
+        "oink.audio/1",
+        "oink.audio.microphone/1"
+      ],
+      "id": 1555,
+      "name": "MicrophoneDemand",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 5,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "session",
+            "shape": "MicrophoneSession"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "formats",
+            "shape": "List<AudioDescriptor,8>"
+          }
+        ],
+        "name": "MicrophoneDemand"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.audio/1",
+        "oink.audio.microphone/1"
+      ],
+      "id": 1556,
+      "name": "MicrophonePrepared",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 5,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "session",
+            "shape": "MicrophoneSession"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "stream_id",
+            "shape": "u64"
+          },
+          {
+            "absence": "required",
+            "key": 3,
+            "name": "descriptor",
+            "shape": "AudioDescriptor"
+          }
+        ],
+        "name": "MicrophonePrepared"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.audio/1",
+        "oink.audio.microphone/1"
+      ],
+      "id": 1557,
+      "name": "MicrophoneReady",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 5,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "session",
+            "shape": "MicrophoneSession"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "stream_id",
+            "shape": "u64"
+          }
+        ],
+        "name": "MicrophoneReady"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.audio/1",
+        "oink.audio.microphone/1"
+      ],
+      "id": 1558,
+      "name": "MicrophoneRenew",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 5,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "session",
+            "shape": "MicrophoneSession"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "stream_id",
+            "shape": "u64"
+          }
+        ],
+        "name": "MicrophoneRenew"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.audio/1",
+        "oink.audio.microphone/1"
+      ],
+      "id": 1559,
+      "name": "MicrophoneStop",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 5,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "session",
+            "shape": "MicrophoneSession"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "reason",
+            "shape": "ControlFailure"
+          }
+        ],
+        "name": "MicrophoneStop"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.audio/1",
+        "oink.audio.microphone/1"
+      ],
+      "id": 1560,
+      "name": "MicrophonePacket",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 5,
+          "transport": "Datagram"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "stream_id",
+            "shape": "u64"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "sequence",
+            "shape": "u64"
+          },
+          {
+            "absence": "required",
+            "key": 3,
+            "name": "burst",
+            "shape": "u64"
+          },
+          {
+            "absence": "required",
+            "key": 4,
+            "name": "source_time_ns",
+            "shape": "u64"
+          },
+          {
+            "absence": "required",
+            "key": 5,
+            "name": "silent",
+            "shape": "bool"
+          },
+          {
+            "absence": "required",
+            "key": 6,
+            "name": "payload",
+            "shape": "Bytes<960>"
+          }
+        ],
+        "name": "MicrophonePacket"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.audio/1",
+        "oink.audio.microphone/1"
+      ],
+      "id": 1561,
+      "name": "MicrophoneSleep",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 5,
+          "transport": "Datagram"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "stream_id",
+            "shape": "u64"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "burst",
+            "shape": "u64"
+          },
+          {
+            "absence": "required",
+            "key": 3,
+            "name": "sequence",
+            "shape": "u64"
+          }
+        ],
+        "name": "MicrophoneSleep"
+      }
+    },
+    {
+      "capabilities": [
         "oink.aim/1"
       ],
       "id": 1792,
@@ -7915,12 +8492,6 @@
             "key": 4,
             "name": "raw_length",
             "shape": "u32"
-          },
-          {
-            "absence": "required",
-            "key": 5,
-            "name": "digest",
-            "shape": "Digest"
           }
         ],
         "name": "DiagnosticsSegmentEnd"
@@ -9954,6 +10525,12 @@
             "key": 23,
             "name": "accessibility_granted",
             "shape": "Option<bool>"
+          },
+          {
+            "absence": "optional",
+            "key": 24,
+            "name": "microphone_claim_watermark",
+            "shape": "Option<AudioExitClaim>"
           }
         ],
         "name": "DeviceFacts"
@@ -11445,6 +12022,12 @@
             "key": 8,
             "name": "kind",
             "shape": "u8"
+          },
+          {
+            "absence": "optional",
+            "key": 9,
+            "name": "microphone_muted",
+            "shape": "Option<bool>"
           }
         ],
         "name": "NotifyShow"
@@ -11579,12 +12162,6 @@
             "key": 1,
             "name": "group",
             "shape": "Id16"
-          },
-          {
-            "absence": "required",
-            "key": 2,
-            "name": "digest",
-            "shape": "Hash32"
           },
           {
             "absence": "required",
@@ -11851,12 +12428,6 @@
           },
           {
             "absence": "required",
-            "key": 2,
-            "name": "digest",
-            "shape": "Hash32"
-          },
-          {
-            "absence": "required",
             "key": 3,
             "name": "accepted",
             "shape": "bool"
@@ -11977,12 +12548,6 @@
           },
           {
             "absence": "required",
-            "key": 2,
-            "name": "digest",
-            "shape": "Hash32"
-          },
-          {
-            "absence": "required",
             "key": 3,
             "name": "accepted",
             "shape": "bool"
@@ -11990,9 +12555,575 @@
         ],
         "name": "LayoutProfilesReceipt"
       }
+    },
+    {
+      "capabilities": [
+        "oink.input/1",
+        "oink.input.application-focus/1"
+      ],
+      "id": 269,
+      "name": "ApplicationFocus",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 3,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "claim",
+            "shape": "ApplicationFocusClaim"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "action",
+            "shape": "ApplicationFocusAction"
+          }
+        ],
+        "name": "ApplicationFocusRecord"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.input/1",
+        "oink.pointer.move/1"
+      ],
+      "id": 4864,
+      "name": "ControlMovePointer",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 3,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "epoch",
+            "shape": "u64"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "target",
+            "shape": "DeviceId"
+          }
+        ],
+        "name": "ControlMovePointer"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.input/1",
+        "oink.pointer.lock-escape/1"
+      ],
+      "id": 270,
+      "name": "ControlLockEscape",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 3,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "held",
+            "shape": "bool"
+          }
+        ],
+        "name": "ControlLockEscape"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.input/1",
+        "oink.pointer.entry-protection/1"
+      ],
+      "id": 271,
+      "name": "ControlEntryProtection",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 3,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "locked",
+            "shape": "bool"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "game",
+            "shape": "bool"
+          },
+          {
+            "absence": "required",
+            "key": 3,
+            "name": "passive_displays",
+            "shape": "List<Text<512>,64>"
+          }
+        ],
+        "name": "ControlEntryProtection"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.group/1",
+        "oink.power/1"
+      ],
+      "id": 272,
+      "name": "ControlPowerState",
+      "pause": "Allow",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 2,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "available",
+            "shape": "bool"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "display",
+            "shape": "bool"
+          },
+          {
+            "absence": "required",
+            "key": 3,
+            "name": "system",
+            "shape": "bool"
+          },
+          {
+            "absence": "required",
+            "key": 4,
+            "name": "activity",
+            "shape": "bool"
+          }
+        ],
+        "name": "ControlPowerState"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.clipboard/1",
+        "oink.low/1",
+        "oink.cloud-file-links/1"
+      ],
+      "id": 820,
+      "name": "CloudLinkRequest",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 4,
+          "transport": "Low"
+        },
+        {
+          "extra_capabilities": [
+            "oink.drag/1"
+          ],
+          "kind": 10,
+          "transport": "Low"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "offer",
+            "shape": "OfferId"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "roots",
+            "shape": "List<u64,65535>"
+          },
+          {
+            "absence": "required",
+            "key": 3,
+            "name": "demand",
+            "shape": "Demand"
+          }
+        ],
+        "name": "CloudLinkRequest"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.clipboard/1",
+        "oink.low/1",
+        "oink.cloud-file-links/1"
+      ],
+      "id": 821,
+      "name": "CloudLinkOffer",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 4,
+          "transport": "Low"
+        },
+        {
+          "extra_capabilities": [
+            "oink.drag/1"
+          ],
+          "kind": 10,
+          "transport": "Low"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "offer",
+            "shape": "OfferId"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "token",
+            "shape": "Hash32"
+          },
+          {
+            "absence": "required",
+            "key": 3,
+            "name": "roots",
+            "shape": "List<FileNode,65535>"
+          },
+          {
+            "absence": "optional",
+            "key": 4,
+            "name": "fulfilled",
+            "shape": "Option<List<FulfilledRoot,65535>>"
+          },
+          {
+            "absence": "optional",
+            "key": 5,
+            "name": "native",
+            "shape": "Option<NativeFileMetadata>"
+          }
+        ],
+        "name": "CloudLinkOffer"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.clipboard/1",
+        "oink.low/1",
+        "oink.cloud-file-links/1"
+      ],
+      "id": 822,
+      "name": "CloudLinkUnavailable",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 4,
+          "transport": "Low"
+        },
+        {
+          "extra_capabilities": [
+            "oink.drag/1"
+          ],
+          "kind": 10,
+          "transport": "Low"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "offer",
+            "shape": "OfferId"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "reason",
+            "shape": "ContentUnavailable"
+          }
+        ],
+        "name": "CloudLinkUnavailable"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.clipboard/1",
+        "oink.low/1",
+        "oink.cloud-file-links/1"
+      ],
+      "id": 823,
+      "name": "CloudLinkList",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 4,
+          "transport": "Low"
+        },
+        {
+          "extra_capabilities": [
+            "oink.drag/1"
+          ],
+          "kind": 10,
+          "transport": "Low"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "offer",
+            "shape": "OfferId"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "token",
+            "shape": "Hash32"
+          },
+          {
+            "absence": "required",
+            "key": 3,
+            "name": "node",
+            "shape": "u64"
+          },
+          {
+            "absence": "optional",
+            "key": 4,
+            "name": "cursor",
+            "shape": "Option<DirectoryCursor>"
+          }
+        ],
+        "name": "CloudLinkList"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.clipboard/1",
+        "oink.low/1",
+        "oink.cloud-file-links/1"
+      ],
+      "id": 824,
+      "name": "CloudLinkSelect",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 4,
+          "transport": "Low"
+        },
+        {
+          "extra_capabilities": [
+            "oink.drag/1"
+          ],
+          "kind": 10,
+          "transport": "Low"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "offer",
+            "shape": "OfferId"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "token",
+            "shape": "Hash32"
+          },
+          {
+            "absence": "required",
+            "key": 3,
+            "name": "node",
+            "shape": "u64"
+          }
+        ],
+        "name": "CloudLinkSelect"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.clipboard/1",
+        "oink.low/1",
+        "oink.cloud-file-links/1"
+      ],
+      "id": 825,
+      "name": "CloudLinkRead",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 4,
+          "transport": "Low"
+        },
+        {
+          "extra_capabilities": [
+            "oink.drag/1"
+          ],
+          "kind": 10,
+          "transport": "Low"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "offer",
+            "shape": "OfferId"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "token",
+            "shape": "Hash32"
+          },
+          {
+            "absence": "required",
+            "key": 3,
+            "name": "node",
+            "shape": "u64"
+          },
+          {
+            "absence": "required",
+            "key": 4,
+            "name": "version",
+            "shape": "u64"
+          },
+          {
+            "absence": "required",
+            "key": 5,
+            "name": "offset",
+            "shape": "u64"
+          }
+        ],
+        "name": "CloudLinkRead"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.audio/1",
+        "oink.audio.media-health/1"
+      ],
+      "id": 1562,
+      "name": "AudioMediaState",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 5,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "kind",
+            "shape": "AudioMediaKind"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "stream_id",
+            "shape": "u64"
+          },
+          {
+            "absence": "required",
+            "key": 3,
+            "name": "burst",
+            "shape": "u64"
+          },
+          {
+            "absence": "required",
+            "key": 4,
+            "name": "sleeping",
+            "shape": "bool"
+          }
+        ],
+        "name": "AudioMediaState"
+      }
     }
   ],
   "open_enums": [
+    [
+      "ApplicationFocusAction",
+      "ApplicationFocusActionKind",
+      [
+        [
+          0,
+          "ApplicationFocusObservation"
+        ],
+        [
+          1,
+          "ApplicationFocusPrepare"
+        ],
+        [
+          2,
+          "ApplicationFocusSnapshot"
+        ],
+        [
+          3,
+          "ApplicationFocusApplied"
+        ],
+        [
+          4,
+          "ApplicationFocusSnapshot"
+        ],
+        [
+          5,
+          "ApplicationFocusRetire"
+        ],
+        [
+          6,
+          null
+        ],
+        [
+          7,
+          "ApplicationFocusPrepare"
+        ]
+      ]
+    ],
     [
       "MouseButton",
       "MouseButtonKind",
@@ -12474,6 +13605,14 @@
     [
       2,
       "LayoutValue"
+    ],
+    [
+      8,
+      "ApplicationFocusSettings"
+    ],
+    [
+      4865,
+      "PointerShortcutSlots"
     ]
   ],
   "reserved_capabilities": [
@@ -12763,6 +13902,577 @@
   ],
   "revision": "2026-10-15-ui-freeze",
   "schemas": [
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "available",
+          "shape": "bool"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "display",
+          "shape": "bool"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "system",
+          "shape": "bool"
+        },
+        {
+          "absence": "required",
+          "key": 4,
+          "name": "activity",
+          "shape": "bool"
+        }
+      ],
+      "name": "ControlPowerState"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "offer",
+          "shape": "OfferId"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "roots",
+          "shape": "List<u64,65535>"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "demand",
+          "shape": "Demand"
+        }
+      ],
+      "name": "CloudLinkRequest"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "offer",
+          "shape": "OfferId"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "token",
+          "shape": "Hash32"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "roots",
+          "shape": "List<FileNode,65535>"
+        },
+        {
+          "absence": "optional",
+          "key": 4,
+          "name": "fulfilled",
+          "shape": "Option<List<FulfilledRoot,65535>>"
+        },
+        {
+          "absence": "optional",
+          "key": 5,
+          "name": "native",
+          "shape": "Option<NativeFileMetadata>"
+        }
+      ],
+      "name": "CloudLinkOffer"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "offer",
+          "shape": "OfferId"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "reason",
+          "shape": "ContentUnavailable"
+        }
+      ],
+      "name": "CloudLinkUnavailable"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "offer",
+          "shape": "OfferId"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "token",
+          "shape": "Hash32"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "node",
+          "shape": "u64"
+        },
+        {
+          "absence": "optional",
+          "key": 4,
+          "name": "cursor",
+          "shape": "Option<DirectoryCursor>"
+        }
+      ],
+      "name": "CloudLinkList"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "offer",
+          "shape": "OfferId"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "token",
+          "shape": "Hash32"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "node",
+          "shape": "u64"
+        }
+      ],
+      "name": "CloudLinkSelect"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "offer",
+          "shape": "OfferId"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "token",
+          "shape": "Hash32"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "node",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 4,
+          "name": "version",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 5,
+          "name": "offset",
+          "shape": "u64"
+        }
+      ],
+      "name": "CloudLinkRead"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "windows",
+          "shape": "List<WindowsFileDescriptor,65535>"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "promises",
+          "shape": "List<MacPromiseGroup,65535>"
+        }
+      ],
+      "name": "NativeFileMetadata"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "root",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "node",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "index",
+          "shape": "u32"
+        },
+        {
+          "absence": "optional",
+          "key": 4,
+          "name": "wide",
+          "shape": "Option<Bytes<72>>"
+        },
+        {
+          "absence": "optional",
+          "key": 5,
+          "name": "ansi",
+          "shape": "Option<Bytes<332>>"
+        }
+      ],
+      "name": "WindowsFileDescriptor"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "anchor",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "roots",
+          "shape": "List<u64,65535>"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "indices",
+          "shape": "List<u32,65535>"
+        },
+        {
+          "absence": "optional",
+          "key": 4,
+          "name": "controls",
+          "shape": "Option<List<MacPromiseControl,64>>"
+        }
+      ],
+      "name": "MacPromiseGroup"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "name",
+          "shape": "Text<4096>"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "bytes",
+          "shape": "Bytes<65536>"
+        }
+      ],
+      "name": "MacPromiseControl"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "node",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "id",
+          "shape": "Id16"
+        }
+      ],
+      "name": "FulfilledRoot"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "claim",
+          "shape": "ApplicationFocusClaim"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "action",
+          "shape": "ApplicationFocusAction"
+        }
+      ],
+      "name": "ApplicationFocusRecord"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "epoch",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "pointer",
+          "shape": "Boot"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "scope",
+          "shape": "FocusScope"
+        }
+      ],
+      "name": "ApplicationFocusClaim"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "generation",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "sequence",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "foreground",
+          "shape": "ApplicationForeground"
+        },
+        {
+          "absence": "required",
+          "key": 4,
+          "name": "hidden_lost",
+          "shape": "bool"
+        },
+        {
+          "absence": "optional",
+          "key": 5,
+          "name": "park_operation",
+          "shape": "Option<u64>"
+        }
+      ],
+      "name": "ApplicationFocusObservation"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "revision",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "operation",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "target",
+          "shape": "Boot"
+        },
+        {
+          "absence": "required",
+          "key": 4,
+          "name": "generation",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 5,
+          "name": "sequence",
+          "shape": "u64"
+        }
+      ],
+      "name": "ApplicationFocusPrepare"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "request",
+          "shape": "ApplicationFocusPrepare"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "result",
+          "shape": "ApplicationParkResult"
+        }
+      ],
+      "name": "ApplicationFocusApplied"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "revision",
+          "shape": "u64"
+        },
+        {
+          "absence": "optional",
+          "key": 2,
+          "name": "keyboard",
+          "shape": "Option<Boot>"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "phase",
+          "shape": "ApplicationFocusPhase"
+        },
+        {
+          "absence": "required",
+          "key": 4,
+          "name": "reason",
+          "shape": "ApplicationFocusReason"
+        },
+        {
+          "absence": "required",
+          "key": 5,
+          "name": "participants",
+          "shape": "List<Boot,16>"
+        }
+      ],
+      "name": "ApplicationFocusSnapshot"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "revision",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "destination",
+          "shape": "Boot"
+        }
+      ],
+      "name": "ApplicationFocusRetire"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "epoch",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "pointer",
+          "shape": "Boot"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "revision",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 4,
+          "name": "destination",
+          "shape": "Boot"
+        },
+        {
+          "absence": "required",
+          "key": 5,
+          "name": "press_id",
+          "shape": "u64"
+        }
+      ],
+      "name": "ApplicationKeyRoute"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "epoch",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "target",
+          "shape": "DeviceId"
+        }
+      ],
+      "name": "ControlMovePointer"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "entries",
+          "shape": "List<PointerShortcutSlot,16>"
+        }
+      ],
+      "name": "PointerShortcutSlots"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "device",
+          "shape": "DeviceId"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "membership_epoch",
+          "shape": "u64"
+        },
+        {
+          "absence": "optional",
+          "key": 3,
+          "name": "slot",
+          "shape": "Option<u8>"
+        }
+      ],
+      "name": "PointerShortcutSlot"
+    },
     {
       "fields": [
         {
@@ -13062,6 +14772,18 @@
           "key": 7,
           "name": "default_group",
           "shape": "Option<Id16>"
+        },
+        {
+          "absence": "optional",
+          "key": 8,
+          "name": "physical_topology",
+          "shape": "Option<List<LayoutPhysicalDevice,16>>"
+        },
+        {
+          "absence": "optional",
+          "key": 9,
+          "name": "physical_topology_revision",
+          "shape": "Option<ConfigVersion>"
         }
       ],
       "name": "LayoutProfile"
@@ -13105,6 +14827,70 @@
         }
       ],
       "name": "LayoutProfileDeviceState"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "device",
+          "shape": "DeviceId"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "screens",
+          "shape": "List<LayoutPhysicalScreen,256>"
+        }
+      ],
+      "name": "LayoutPhysicalDevice"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "id",
+          "shape": "Text<512>"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "bounds",
+          "shape": "Rect"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "pixel_width",
+          "shape": "u32"
+        },
+        {
+          "absence": "required",
+          "key": 4,
+          "name": "pixel_height",
+          "shape": "u32"
+        },
+        {
+          "absence": "required",
+          "key": 5,
+          "name": "scale",
+          "shape": "f64"
+        },
+        {
+          "absence": "required",
+          "key": 6,
+          "name": "rotation",
+          "shape": "u16"
+        },
+        {
+          "absence": "required",
+          "key": 7,
+          "name": "primary",
+          "shape": "bool"
+        }
+      ],
+      "name": "LayoutPhysicalScreen"
     },
     {
       "fields": [
@@ -13368,6 +15154,12 @@
           "key": 8,
           "name": "kind",
           "shape": "u8"
+        },
+        {
+          "absence": "optional",
+          "key": 9,
+          "name": "microphone_muted",
+          "shape": "Option<bool>"
         }
       ],
       "name": "NotifyShow"
@@ -17636,12 +19428,6 @@
           "key": 1,
           "name": "size",
           "shape": "ContentSize"
-        },
-        {
-          "absence": "optional",
-          "key": 2,
-          "name": "hash",
-          "shape": "Option<Digest>"
         }
       ],
       "name": "RepresentationReader"
@@ -17815,6 +19601,18 @@
           "key": 7,
           "name": "modified_ms",
           "shape": "Option<i64>"
+        },
+        {
+          "absence": "optional",
+          "key": 8,
+          "name": "symlink_target",
+          "shape": "Option<Text<4096>>"
+        },
+        {
+          "absence": "optional",
+          "key": 9,
+          "name": "exec_bits",
+          "shape": "Option<u16>"
         }
       ],
       "name": "FileNode"
@@ -19206,6 +21004,260 @@
         {
           "absence": "required",
           "key": 1,
+          "name": "id",
+          "shape": "Text<512>"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "name",
+          "shape": "Text<256>"
+        }
+      ],
+      "name": "MicrophoneInput"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "permission",
+          "shape": "MicrophonePermission"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "virtual_ready",
+          "shape": "bool"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "inputs",
+          "shape": "List<MicrophoneInput,64>"
+        },
+        {
+          "absence": "optional",
+          "key": 4,
+          "name": "input",
+          "shape": "Option<Text<512>>"
+        },
+        {
+          "absence": "required",
+          "key": 5,
+          "name": "consumer_active",
+          "shape": "bool"
+        },
+        {
+          "absence": "required",
+          "key": 6,
+          "name": "capture_active",
+          "shape": "bool"
+        },
+        {
+          "absence": "optional",
+          "key": 7,
+          "name": "receiving_from",
+          "shape": "Option<DeviceId>"
+        },
+        {
+          "absence": "optional",
+          "key": 8,
+          "name": "fault",
+          "shape": "Option<ResourceFault>"
+        }
+      ],
+      "name": "MicrophoneObservation"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "source",
+          "shape": "Boot"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "receiver_output",
+          "shape": "ReceiverOutputBinding"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "share_claim",
+          "shape": "ExitClaimStamp"
+        },
+        {
+          "absence": "required",
+          "key": 4,
+          "name": "request",
+          "shape": "Id16"
+        }
+      ],
+      "name": "MicrophoneSession"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "session",
+          "shape": "MicrophoneSession"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "formats",
+          "shape": "List<AudioDescriptor,8>"
+        }
+      ],
+      "name": "MicrophoneDemand"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "session",
+          "shape": "MicrophoneSession"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "stream_id",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "descriptor",
+          "shape": "AudioDescriptor"
+        }
+      ],
+      "name": "MicrophonePrepared"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "session",
+          "shape": "MicrophoneSession"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "stream_id",
+          "shape": "u64"
+        }
+      ],
+      "name": "MicrophoneReady"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "session",
+          "shape": "MicrophoneSession"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "stream_id",
+          "shape": "u64"
+        }
+      ],
+      "name": "MicrophoneRenew"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "session",
+          "shape": "MicrophoneSession"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "reason",
+          "shape": "ControlFailure"
+        }
+      ],
+      "name": "MicrophoneStop"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "stream_id",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "sequence",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "burst",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 4,
+          "name": "source_time_ns",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 5,
+          "name": "silent",
+          "shape": "bool"
+        },
+        {
+          "absence": "required",
+          "key": 6,
+          "name": "payload",
+          "shape": "Bytes<960>"
+        }
+      ],
+      "name": "MicrophonePacket"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "stream_id",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "burst",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "sequence",
+          "shape": "u64"
+        }
+      ],
+      "name": "MicrophoneSleep"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
           "name": "codec",
           "shape": "AlgorithmId"
         },
@@ -19480,6 +21532,35 @@
         {
           "absence": "required",
           "key": 1,
+          "name": "kind",
+          "shape": "AudioMediaKind"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "stream_id",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "burst",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 4,
+          "name": "sleeping",
+          "shape": "bool"
+        }
+      ],
+      "name": "AudioMediaState"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
           "name": "codec",
           "shape": "AlgorithmId"
         },
@@ -19632,12 +21713,6 @@
           "key": 4,
           "name": "sensitivity",
           "shape": "Sensitivity"
-        },
-        {
-          "absence": "required",
-          "key": 5,
-          "name": "content_digest",
-          "shape": "Digest"
         },
         {
           "absence": "required",
@@ -20255,12 +22330,6 @@
         },
         {
           "absence": "required",
-          "key": 5,
-          "name": "hash",
-          "shape": "Digest"
-        },
-        {
-          "absence": "required",
           "key": 6,
           "name": "bytes",
           "shape": "Bytes<1048576>"
@@ -20427,12 +22496,6 @@
           "shape": "u64"
         },
         {
-          "absence": "optional",
-          "key": 5,
-          "name": "check",
-          "shape": "Option<Digest>"
-        },
-        {
           "absence": "required",
           "key": 6,
           "name": "demand",
@@ -20530,12 +22593,6 @@
           "key": 3,
           "name": "size",
           "shape": "u64"
-        },
-        {
-          "absence": "required",
-          "key": 4,
-          "name": "hash",
-          "shape": "Digest"
         }
       ],
       "name": "ContentRepresentationEnd"
@@ -20864,6 +22921,40 @@
     {
       "fields": [],
       "name": "ControlUserActivity"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "held",
+          "shape": "bool"
+        }
+      ],
+      "name": "ControlLockEscape"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "locked",
+          "shape": "bool"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "game",
+          "shape": "bool"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "passive_displays",
+          "shape": "List<Text<512>,64>"
+        }
+      ],
+      "name": "ControlEntryProtection"
     },
     {
       "fields": [
@@ -21214,6 +23305,12 @@
           "key": 23,
           "name": "accessibility_granted",
           "shape": "Option<bool>"
+        },
+        {
+          "absence": "optional",
+          "key": 24,
+          "name": "microphone_claim_watermark",
+          "shape": "Option<AudioExitClaim>"
         }
       ],
       "name": "DeviceFacts"
@@ -21596,12 +23693,6 @@
           "key": 4,
           "name": "raw_length",
           "shape": "u32"
-        },
-        {
-          "absence": "required",
-          "key": 5,
-          "name": "digest",
-          "shape": "Digest"
         }
       ],
       "name": "DiagnosticsSegmentEnd"
@@ -22177,6 +24268,58 @@
     {
       "fields": [
         {
+          "absence": "false",
+          "key": 1,
+          "name": "enabled",
+          "shape": "bool"
+        }
+      ],
+      "name": "ApplicationFocusSettings"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "pointer",
+          "shape": "Text<128>"
+        },
+        {
+          "absence": "optional",
+          "key": 2,
+          "name": "keyboard",
+          "shape": "Option<Text<128>>"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "epoch",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 4,
+          "name": "revision",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 5,
+          "name": "phase",
+          "shape": "ApplicationFocusPhase"
+        },
+        {
+          "absence": "required",
+          "key": 6,
+          "name": "reason",
+          "shape": "ApplicationFocusReason"
+        }
+      ],
+      "name": "DiagApplicationFocus"
+    },
+    {
+      "fields": [
+        {
           "absence": "required",
           "key": 1,
           "name": "group",
@@ -22396,9 +24539,38 @@
           "key": 102,
           "name": "capture_time_us",
           "shape": "Option<u32>"
+        },
+        {
+          "absence": "optional",
+          "key": 103,
+          "name": "application_route",
+          "shape": "Option<ApplicationKeyRoute>"
+        },
+        {
+          "absence": "optional",
+          "key": 104,
+          "name": "application_keys",
+          "shape": "Option<List<ApplicationHeldKey,256>>"
         }
       ],
       "name": "InputHeldSync"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "code",
+          "shape": "u32"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "press_id",
+          "shape": "u64"
+        }
+      ],
+      "name": "ApplicationHeldKey"
     },
     {
       "fields": [
@@ -22437,6 +24609,12 @@
           "key": 102,
           "name": "capture_time_us",
           "shape": "Option<u32>"
+        },
+        {
+          "absence": "optional",
+          "key": 103,
+          "name": "application_route",
+          "shape": "Option<ApplicationKeyRoute>"
         }
       ],
       "name": "InputKey"
@@ -22472,6 +24650,12 @@
           "key": 102,
           "name": "capture_time_us",
           "shape": "Option<u32>"
+        },
+        {
+          "absence": "optional",
+          "key": 103,
+          "name": "application_route",
+          "shape": "Option<ApplicationKeyRoute>"
         }
       ],
       "name": "InputKeyRepeat"
@@ -22876,6 +25060,12 @@
           "key": 3,
           "name": "caps_tap_hold",
           "shape": "Option<CapsTapHold>"
+        },
+        {
+          "absence": "optional",
+          "key": 4,
+          "name": "saved_custom",
+          "shape": "Option<SavedCustomKeymap>"
         }
       ],
       "name": "KeyboardMapping"
@@ -22970,6 +25160,66 @@
           "key": 11,
           "name": "clip",
           "shape": "Option<Rect>"
+        },
+        {
+          "absence": "optional",
+          "key": 12,
+          "name": "cursor_showing",
+          "shape": "Option<bool>"
+        },
+        {
+          "absence": "optional",
+          "key": 13,
+          "name": "park",
+          "shape": "Option<Point>"
+        },
+        {
+          "absence": "optional",
+          "key": 14,
+          "name": "marker",
+          "shape": "Option<u64>"
+        },
+        {
+          "absence": "optional",
+          "key": 15,
+          "name": "normalized",
+          "shape": "Option<Point>"
+        },
+        {
+          "absence": "optional",
+          "key": 16,
+          "name": "desktop",
+          "shape": "Option<Rect>"
+        },
+        {
+          "absence": "optional",
+          "key": 17,
+          "name": "chain_result",
+          "shape": "Option<i64>"
+        },
+        {
+          "absence": "optional",
+          "key": 18,
+          "name": "cursor_before",
+          "shape": "Option<Point>"
+        },
+        {
+          "absence": "optional",
+          "key": 19,
+          "name": "cursor_after_move",
+          "shape": "Option<Point>"
+        },
+        {
+          "absence": "optional",
+          "key": 20,
+          "name": "hidden_before",
+          "shape": "Option<bool>"
+        },
+        {
+          "absence": "optional",
+          "key": 21,
+          "name": "steps",
+          "shape": "Option<u32>"
         }
       ],
       "name": "LifecycleObservation"
@@ -25375,6 +27625,12 @@
           "key": 7,
           "name": "game",
           "shape": "Option<GameObservation>"
+        },
+        {
+          "absence": "optional",
+          "key": 8,
+          "name": "microphone",
+          "shape": "Option<MicrophoneObservation>"
         }
       ],
       "name": "ResourceFacts"
@@ -25770,6 +28026,12 @@
           "key": 16,
           "name": "layout",
           "shape": "Option<CompleteLayout>"
+        },
+        {
+          "absence": "optional",
+          "key": 17,
+          "name": "application_focus",
+          "shape": "Option<DiagApplicationFocus>"
         }
       ],
       "name": "Snapshot"
@@ -25924,6 +28186,35 @@
         }
       ],
       "name": "WallpaperSet"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "table",
+          "shape": "List<KeyMapping,256>"
+        },
+        {
+          "absence": "optional",
+          "key": 2,
+          "name": "caps_hold",
+          "shape": "Option<u32>"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "caps_split",
+          "shape": "bool"
+        },
+        {
+          "absence": "required",
+          "key": 4,
+          "name": "allow_fn",
+          "shape": "bool"
+        }
+      ],
+      "name": "SavedCustomKeymap"
     }
   ],
   "streams": [

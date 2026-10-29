@@ -190,18 +190,21 @@ pub async fn shell_uninstall(
     app: AppHandle,
     window: tauri::WebviewWindow,
     messages: crate::uninstall::Messages,
-) -> Result<(), crate::uninstall::Step> {
+) -> Result<(), crate::uninstall::Failure> {
     if window.label() != "main" {
-        return Err(crate::uninstall::Step::InstalledApp);
+        return Err(crate::uninstall::Step::InstalledApp.into());
     }
     let state = app.state::<crate::app::Backend>();
-    let remote = state.remote.clone().ok_or(crate::uninstall::Step::StopBackend)?;
+    let remote = state
+        .remote
+        .clone()
+        .ok_or(crate::uninstall::Failure::from(crate::uninstall::Step::StopBackend))?;
     let active = state.uninstalling.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         crate::uninstall::preparing(&active, || crate::uninstall::start(&remote, messages))
     })
     .await
-    .map_err(|_| crate::uninstall::Step::Finalizer)?;
+    .map_err(|_| crate::uninstall::Failure::from(crate::uninstall::Step::Finalizer))?;
     if let Err(step) = result {
         tracing::warn!(?step, "uninstall preparation failed; normal quit handling restored");
         return Err(step);

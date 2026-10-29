@@ -7,8 +7,6 @@ use crate::api::{ApiEvent, FileProviderState as Phase, FileProviderStatus};
 use crate::node::{Node, lock};
 use oink_clipboard::FileProviderReason as Reason;
 
-const PROMPT_MARKER: &str = "file-provider-enable-offered";
-
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod startup;
 
@@ -55,19 +53,34 @@ pub(crate) fn set_placeholder_pool(node: &Node, enabled: bool) -> crate::api::Ap
     Ok(())
 }
 
+/// A disabled domain never hands a doomed file URL or promise to the target.
+/// Ordinary representations in the same drag remain available.
+pub(crate) fn without_files(
+    mut spec: oink_clipboard::dnd::DragSpec,
+) -> Result<Option<oink_clipboard::dnd::DragSpec>, oink_clipboard::ClipboardError> {
+    spec.items = oink_clipboard::policy::items_without_files(spec.items);
+    spec.files = None;
+    if let Some(native) = spec.native.take() {
+        spec.native = native
+            .without_files()
+            .map_err(|_| oink_clipboard::ClipboardError::Unsupported)?;
+    }
+    Ok((spec.native.is_some() || !spec.items.is_empty()).then_some(spec))
+}
+
 pub(crate) struct State {
     status: FileProviderStatus,
     reported: Option<FileProviderStatus>,
     reported_reason: Option<Reason>,
-    automatic_attempted: bool,
+    required_drag: Option<oink_foundation::content::ClipId>,
     pending_open: bool,
     open_error: Option<String>,
     startup_error: Option<String>,
 }
 
 impl State {
-    pub(crate) fn new(data_dir: &Path) -> Self {
-        let mut state = Self::with_attempted(data_dir.join(PROMPT_MARKER).exists());
+    pub(crate) fn new(_data_dir: &Path) -> Self {
+        let mut state = Self::fresh();
         state.startup_error = startup::failure();
         if state.startup_error.is_some() {
             state.observe(Phase::Error, None, false);
@@ -75,7 +88,7 @@ impl State {
         state
     }
 
-    fn with_attempted(automatic_attempted: bool) -> Self {
+    fn fresh() -> Self {
         Self {
             status: FileProviderStatus {
                 state: Phase::Checking,
@@ -83,7 +96,7 @@ impl State {
             },
             reported: None,
             reported_reason: None,
-            automatic_attempted,
+            required_drag: None,
             pending_open: false,
             open_error: None,
             startup_error: None,
@@ -94,7 +107,7 @@ impl State {
         self.status.clone()
     }
 
-    /// A caller can retry a failed/declined automatic offer. Duplicate requests coalesce.
+    /// Only a toast/Settings action requests Finder. Duplicate requests coalesce.
     pub(crate) fn request_open(&mut self) {
         if self.startup_error.is_some() {
             return;
@@ -140,17 +153,21 @@ impl State {
         if !safe_to_open || self.status.state == Phase::Available {
             return false;
         }
-        let automatic = self.status.needed
-            && !self.automatic_attempted
-            && matches!(self.status.state, Phase::Unregistered | Phase::NotEnabled);
-        if !self.pending_open && !automatic {
+        if !self.pending_open {
             return false;
         }
         self.pending_open = false;
-        self.automatic_attempted = true;
         self.status.opening = true;
         self.open_error = None;
         self.status.detail = None;
+        true
+    }
+
+    pub(crate) fn require_drag(&mut self, id: oink_foundation::content::ClipId) -> bool {
+        if self.required_drag == Some(id) {
+            return false;
+        }
+        self.required_drag = Some(id);
         true
     }
 
@@ -183,11 +200,32 @@ fn classify(domain: Option<oink_clipboard::file_provider::DomainStatus>) -> (Pha
     let phase = match domain {
         None => Phase::Unregistered,
         Some(d) if d.disconnected => Phase::Disconnected,
-        Some(d) if !d.hidden => Phase::Error,
+        Some(d) if !d.hidden => {
+            tracing::warn!(
+                operation = "classify_domain",
+                cause = "domain_not_hidden",
+                "File Provider domain rejected"
+            );
+            return (Phase::Error, Some("File Provider domain_not_hidden".into()));
+        }
         Some(d) if !d.user_enabled => Phase::NotEnabled,
         Some(_) => Phase::Available,
     };
-    (phase, Some(reason(phase).detail()))
+    let detail = if phase == Phase::Available {
+        oink_clipboard::file_provider::diagnostic()
+    } else {
+        reason(phase).detail()
+    };
+    (phase, Some(detail))
+}
+
+fn classify_observation(
+    status: &Result<Option<oink_clipboard::file_provider::DomainStatus>, String>,
+) -> (Phase, Option<String>) {
+    match status {
+        Ok(domain) => classify(domain.clone()),
+        Err(cause) => (Phase::Error, Some(cause.clone())),
+    }
 }
 
 pub(crate) fn report(node: &Node) {
@@ -200,7 +238,9 @@ pub(crate) fn report(node: &Node) {
             state.reported_reason = state.status.reason;
             if let Some(reason) = state.status.reason {
                 if reason.unavailable() {
-                    tracing::warn!(%reason, "File Provider unavailable; file drags degraded or preparation failed");
+                    // Details come from fixed launch stages/domain checks or
+                    // code-only NSError diagnostics, never localized userInfo.
+                    tracing::warn!(%reason, detail = state.status.detail.as_deref(), "File Provider unavailable; file representations withheld");
                 } else {
                     tracing::info!(%reason, "File Provider availability changed");
                 }
@@ -237,6 +277,15 @@ pub(crate) fn spawn(node: &Node) -> tokio::task::JoinHandle<()> {
             let ready = oink_clipboard::file_provider::demand_changed().notified();
             tokio::pin!(ready);
             ready.as_mut().enable();
+            if let Some(inner) = weak.upgrade() {
+                let node = Node { inner };
+                {
+                    let mut state = lock(&node.inner.file_provider);
+                    state.startup_error = startup::failure();
+                    state.observe(Phase::Checking, None, false);
+                }
+                report(&node);
+            }
             if !oink_clipboard::file_provider::launch_preparation_pending() {
                 break;
             }
@@ -265,6 +314,8 @@ pub(crate) fn spawn(node: &Node) -> tokio::task::JoinHandle<()> {
                     Err(_) => break,
                 },
                 _ = &mut first_query_timeout, if domain_status.is_none() => {
+                    tracing::warn!(operation = "get_domains", cause = "callback_timeout", timeout_ms = 3000,
+                        "File Provider observation failed");
                     domain_status = Some(Err("File Provider status query timed out".into()));
                 },
                 _ = oink_clipboard::file_provider::demand_changed().notified() => domains.refresh(),
@@ -277,8 +328,7 @@ pub(crate) fn spawn(node: &Node) -> tokio::task::JoinHandle<()> {
             let node = Node { inner };
             node.inner.reports.refresh_file_provider();
             let (phase, detail) = match &domain_status {
-                Some(Ok(domain)) => classify(domain.clone()),
-                Some(Err(_)) => (Phase::Error, Some(Reason::RegistrationFailed.detail())),
+                Some(status) => classify_observation(status),
                 None => (Phase::Checking, None),
             };
             let (available, phase) = {
@@ -303,11 +353,6 @@ pub(crate) fn spawn(node: &Node) -> tokio::task::JoinHandle<()> {
             let open = lock(&node.inner.file_provider).take_open(safe);
             report(&node);
             if open {
-                // Persist before the side effect: a crash or declined prompt must not keep
-                // stealing focus after restart. Explicit UI requests remain available.
-                if let Err(e) = std::fs::write(node.data_dir().join(PROMPT_MARKER), b"1\n") {
-                    tracing::warn!(%e, "could not persist File Provider enablement offer");
-                }
                 let result = tokio::task::spawn_blocking(oink_clipboard::file_provider::open_enable)
                     .await
                     .map_err(|e| e.to_string())
@@ -328,8 +373,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn observation_failure_preserves_the_specific_cause_in_status() {
+        let cause = "get_domains: NSCocoaErrorDomain code=4097 <- NSPOSIXErrorDomain code=13";
+        let (phase, detail) = classify_observation(&Err(cause.into()));
+        let mut state = State::fresh();
+        state.observe(phase, detail, false);
+        assert_eq!(state.snapshot().reason, Some(Reason::RegistrationFailed));
+        assert_eq!(state.snapshot().detail.as_deref(), Some(cause));
+    }
+
+    #[test]
     fn launch_failure_remains_visible_despite_enabled_domain_notifications() {
-        let mut state = State::with_attempted(false);
+        let mut state = State::fresh();
         state.startup_error = Some("Launch recovery failed; reopen Oink".into());
         assert!(!state.observe(Phase::Available, None, true));
         assert_eq!(state.snapshot().state, Phase::Error);
@@ -341,11 +396,17 @@ mod tests {
         state.request_open();
         assert!(!state.take_open(true));
         assert!(state.snapshot().detail.is_some());
+        // Only the launch owner's successful native readiness recheck clears
+        // this error. A domain flag notification alone cannot bypass migration.
+        state.startup_error = None;
+        assert!(state.observe(Phase::Available, None, true));
+        assert_eq!(state.snapshot().state, Phase::Available);
+        assert!(state.snapshot().detail.is_none());
     }
 
     #[test]
     fn deferred_launch_failure_retires_an_enable_request_made_while_checking() {
-        let mut state = State::with_attempted(false);
+        let mut state = State::fresh();
         state.request_open();
         assert!(state.snapshot().opening);
         state.startup_error = Some("Launch preparation failed".into());
@@ -417,29 +478,71 @@ mod tests {
     }
 
     #[test]
-    fn first_demand_waits_for_idle_and_only_opens_once() {
-        let mut s = State::with_attempted(false);
-        s.observe(Phase::NotEnabled, None, false);
-        assert!(!s.take_open(true)); // startup and settings inspection are not demand
-        s.observe(Phase::NotEnabled, None, true);
-        assert!(!s.take_open(false)); // do not disrupt the fallback drag
-        assert!(s.take_open(true));
-        s.opened(Ok(()));
-        s.observe(Phase::NotEnabled, None, true);
-        assert!(!s.take_open(true)); // user has not clicked Enable yet
-        let mut restarted = State::with_attempted(true);
-        restarted.observe(Phase::NotEnabled, None, true);
-        assert!(!restarted.take_open(true));
-        s.request_open();
-        s.request_open();
-        assert!(s.take_open(true));
-        s.opened(Ok(()));
-        assert!(!s.take_open(true));
+    fn disabled_file_drag_is_refused_and_mixed_text_is_kept() {
+        use oink_clipboard::{
+            ClipData,
+            dnd::{DragOperation, DragOps, DragSpec},
+        };
+        let make = |mixed| {
+            let mut items = vec![ClipData::Files(vec![oink_clipboard::FileEntry {
+                path: "file.txt".into(),
+                is_dir: false,
+                size: 1,
+                modified_ms: None,
+                local_path: None,
+            }])];
+            if mixed {
+                items.push(ClipData::Text("text".into()));
+            }
+            DragSpec {
+                native: None,
+                operation: DragOperation::new(),
+                at: oink_foundation::Point::new(0.0, 0.0),
+                items,
+                files: None,
+                ops: DragOps::COPY,
+            }
+        };
+        assert!(without_files(make(false)).unwrap().is_none());
+        let spec = without_files(make(true)).unwrap().unwrap();
+        assert_eq!(spec.items, vec![ClipData::Text("text".into())]);
+        assert!(spec.files.is_none() && spec.native.is_none());
+    }
+
+    #[test]
+    fn enable_notice_is_emitted_once_per_drag_session() {
+        let mut state = State::fresh();
+        let mut drag = oink_foundation::content::ClipId {
+            origin: oink_foundation::DeviceId([1; 32]),
+            seq: 3,
+        };
+        assert!(state.require_drag(drag));
+        assert!(!state.require_drag(drag));
+        state.observe(Phase::NotEnabled, None, true);
+        assert!(!state.require_drag(drag));
+        drag.seq += 1;
+        assert!(state.require_drag(drag));
+        assert!(!state.require_drag(drag));
+    }
+
+    #[test]
+    fn file_demand_never_opens_finder_without_an_explicit_action() {
+        for phase in [Phase::NotEnabled, Phase::Unregistered] {
+            let mut state = State::fresh();
+            state.observe(phase, None, true);
+            assert!(!state.take_open(false));
+            assert!(!state.take_open(true));
+            state.request_open();
+            assert!(!state.take_open(false));
+            assert!(state.take_open(true));
+            state.opened(Ok(()));
+            assert!(!state.take_open(true));
+        }
     }
 
     #[test]
     fn availability_changes_emit_once_and_reenable_can_resume() {
-        let mut s = State::with_attempted(false);
+        let mut s = State::fresh();
         assert!(s.changed().is_some());
         assert!(s.changed().is_none());
         s.observe(Phase::NotEnabled, None, true);
@@ -456,8 +559,9 @@ mod tests {
 
     #[test]
     fn open_errors_stay_visible_and_manual_retry_clears_them() {
-        let mut s = State::with_attempted(false);
+        let mut s = State::fresh();
         s.observe(Phase::Unregistered, None, true);
+        s.request_open();
         assert!(s.take_open(true));
         s.opened(Err("Finder failed".into()));
         s.observe(Phase::NotEnabled, None, true);

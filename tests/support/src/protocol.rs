@@ -213,6 +213,25 @@ pub fn sample(schema: Schema) -> RawMap {
             raw.insert(5, V::Bool(false));
             raw.insert(6, v1::retained::register_digest(&raw).unwrap().write());
         }
+        "WindowsFileDescriptor" => {
+            raw.insert(4, V::Bytes(vec![0; 72]));
+            raw.insert(5, V::Bytes(vec![0; 332]));
+        }
+        "MacPromiseGroup" => {
+            raw.insert(1, V::Uint(2));
+            raw.insert(2, V::Array(vec![V::Uint(1)]));
+            raw.insert(3, V::Array(vec![V::Uint(0)]));
+        }
+        "NativeFileMetadata" => {
+            raw.insert(1, V::Array(vec![V::Map(sample_named("WindowsFileDescriptor"))]));
+            raw.insert(2, V::Array(vec![V::Map(sample_named("MacPromiseGroup"))]));
+        }
+        "CloudLinkRequest" => {
+            raw.insert(2, V::Array(vec![V::Uint(1)]));
+        }
+        "CloudLinkOffer" => {
+            raw.insert(3, V::Array(vec![V::Map(sample_named("FileNode"))]));
+        }
         "Advert" => {
             raw.insert(9, V::from("unknown"));
             raw.insert(7, V::Array(vec![V::Map(sample_named("ProtocolOffer"))]));

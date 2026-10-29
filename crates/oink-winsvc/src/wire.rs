@@ -14,6 +14,8 @@ pub enum Command {
         dy: i32,
     },
     Ping,
+    /// Sanitized read-only per-process power request query. Ordinary lane only.
+    PowerSnapshot,
     Release,
     Position,
     Move {
@@ -55,6 +57,7 @@ impl Command {
             Self::DragRelease { x, y } => (10, x, y, 0),
             Self::Heartbeat => (9, 0, 0, 0),
             Self::Ping => (0, 0, 0, 0),
+            Self::PowerSnapshot => (11, 0, 0, 0),
             Self::Release => (1, 0, 0, 0),
             Self::Position => (2, 0, 0, 0),
             Self::Move { x, y } => (3, x, y, 0),
@@ -95,6 +98,7 @@ impl Command {
             1 if a | b | c == 0 => Self::Release,
             2 if a | b | c == 0 => Self::Position,
             9 if a | b | c == 0 => Self::Heartbeat,
+            11 if a | b | c == 0 => Self::PowerSnapshot,
             3 if a <= 65535 && b <= 65535 && c == 0 => Self::Move {
                 x: a as i32,
                 y: b as i32,
@@ -155,7 +159,8 @@ impl Request {
         let ordinary = meta >> 31 != 0;
         let id = meta & 0x7fff_ffff;
         if (id == 0) != (command == Command::Heartbeat)
-            || ordinary && !matches!(command, Command::Ping | Command::Position)
+            || command == Command::PowerSnapshot && !ordinary
+            || ordinary && !matches!(command, Command::Ping | Command::Position | Command::PowerSnapshot)
         {
             return None;
         }
@@ -176,6 +181,31 @@ impl Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn power_snapshot_is_fixed_and_only_admitted_on_the_ordinary_lane() {
+        let request = Request {
+            id: 7,
+            ordinary: true,
+            command: Command::PowerSnapshot,
+        };
+        assert_eq!(Request::decode(&request.encode()), Some(request));
+        assert!(
+            Request::decode(
+                &Request {
+                    ordinary: false,
+                    ..request
+                }
+                .encode()
+            )
+            .is_none()
+        );
+        assert!(Request::decode(&Request { id: 0, ..request }.encode()).is_none());
+        for offset in [8, 12, 16] {
+            let mut frame = request.encode();
+            frame[offset] = 1;
+            assert!(Request::decode(&frame).is_none());
+        }
+    }
     #[test]
     fn correlated_lanes_keep_payload_and_reject_ordinary_mutations() {
         for ordinary in [false, true] {

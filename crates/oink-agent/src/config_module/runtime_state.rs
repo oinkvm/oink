@@ -1,5 +1,13 @@
 use super::*;
 impl Owner {
+    pub(crate) fn set_application_focus_enabled(&mut self, enabled: bool) -> ApiResult<()> {
+        let mut stored = self.stored.clone();
+        if stored.set_application_focus_enabled(enabled).map_err(internal)? {
+            self.commit(State::verify(stored.state, self.state.roster().anchor()).map_err(internal)?)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn receive_revocation(&mut self, candidate: State) -> v1::Result<()> {
         self.commit(candidate).map_err(|_| v1::ErrorCode::StateConflict)?;
         let links = self.sessions.keys().copied().collect::<Vec<_>>();
@@ -53,25 +61,73 @@ impl Owner {
         if changes_group {
             let mut config = self.config.lock().map_err(internal)?;
             let group = candidate.roster().anchor().group;
+            let merging = self
+                .state
+                .roster()
+                .members()
+                .all(|member| candidate.roster().contains(member.device));
+            let switch = |owner: &mut crate::config::owner::OwnerStore| {
+                if merging {
+                    owner.merge_group(group, self.identity.id())
+                } else {
+                    owner.switch_group(group, self.identity.id())
+                }
+            };
             let mut next_owner = config.owner().clone();
-            next_owner.switch_group(group, self.identity.id()).map_err(internal)?;
+            switch(&mut next_owner).map_err(internal)?;
             let mut next_facts = self.local.clone();
             next_facts
                 .group(group, &next_owner, self.identity.id())
                 .map_err(internal)?;
-            config
-                .update_owner(|owner| owner.switch_group(group, self.identity.id()))
-                .map_err(internal)?;
+            config.update_owner(switch).map_err(internal)?;
             self.local = next_facts;
         }
         self.state = candidate;
+        // Revoke synchronously before publishing the new membership. A failed
+        // journal write also revokes live readers; the store fails closed.
+        self.reconcile_source_grants();
+        self.pointer_shortcuts_pending = true;
         self.publish_nearby();
         self.stored = stored;
         self.needs_apply = true;
         let _ = self.refresh_diagnostics();
-        self.finish_apply()
+        self.finish_apply()?;
+        self.reconcile_pointer_shortcuts()
+    }
+    /// Membership allocation is a separate durable edit, after the exact signed
+    /// merge projection. It completes before accepting the next serial join.
+    pub(crate) fn reconcile_pointer_shortcuts(&mut self) -> ApiResult<()> {
+        if !self.pointer_shortcuts_pending
+            || self.needs_apply
+            || !self.state.roster().contains(self.identity.id())
+            || self.journal.pending_projection().map_err(internal)?.is_some()
+        {
+            return Ok(());
+        }
+        let next = self
+            .state
+            .reconcile_pointer_slots(self.identity.id())
+            .map_err(internal)?;
+        if next.digest().map_err(internal)? != self.state.digest().map_err(internal)? {
+            self.commit(next)?;
+        }
+        self.pointer_shortcuts_pending = false;
+        Ok(())
+    }
+    fn reconcile_source_grants(&self) {
+        if let Some(grants) = &self.shared.source_grants
+            && grants
+                .reconcile_members(self.state.roster().members().map(|m| (m.device, m.add)))
+                .is_err()
+        {
+            tracing::warn!(
+                reason = "source_links_persist_failed",
+                "persistent source files unavailable"
+            );
+        }
     }
     fn finish_apply(&mut self) -> ApiResult<()> {
+        self.reconcile_source_grants();
         self.application.apply_state(&self.stored).map_err(internal)?;
         self.local
             .edit(|raw| {
@@ -94,13 +150,45 @@ impl Owner {
         }
         Ok(())
     }
+    pub(crate) fn observe_display_layout_dependency(
+        &mut self,
+        group: GroupId,
+        version: dto::ConfigVersion,
+    ) -> ApiResult<()> {
+        if group != self.state.roster().anchor().group {
+            return Err(invalid("layout dependency belongs to another group"));
+        }
+        if !self.display_layout_pending()?
+            || self
+                .display_layout_dependency
+                .as_ref()
+                .is_some_and(|(_, current)| v1::retained::version_cmp(current, &version).is_ok_and(|o| o.is_lt()))
+        {
+            self.display_layout_dependency = Some((group, version));
+        }
+        Ok(())
+    }
+    fn display_layout_pending(&mut self) -> ApiResult<bool> {
+        let Some((group, version)) = &self.display_layout_dependency else {
+            return Ok(false);
+        };
+        let current = self.state.layout().and_then(|r| r.version()).map_err(internal)?;
+        if *group == self.state.roster().anchor().group
+            && v1::retained::version_cmp(&current, version).map_err(internal)?.is_lt()
+        {
+            return Ok(true);
+        }
+        self.display_layout_dependency = None;
+        Ok(false)
+    }
     fn reconcile_observed_displays(&mut self) -> ApiResult<()> {
         // A whole-layout LWW winner can contain this owner's old native bounds
         // when two owners observe displays concurrently. No new OS callback will
         // follow: the actual displays already changed. Re-publish our observed
-        // native geometry against the winning register, preserving its device
-        // transforms and other owners. The second commit is stable, so this does
-        // not create a publication loop or issue any native display write.
+        // native geometry against the winning register, preserving the hotplug
+        // owner and moving only colliding computers when screens were added. The second commit
+        // is stable, so this does not create a publication loop or issue any
+        // native display write.
         // An unenumerated startup is not an observation of zero displays, and a
         // signed merge projection must remain exact until its journal is settled.
         if !self.displays_observed
@@ -109,34 +197,24 @@ impl Owner {
         {
             return Ok(());
         }
+        if self.display_layout_pending()? {
+            return Ok(());
+        }
         let register = self.state.layout().map_err(internal)?;
         let layout = dto::LayoutValue::from_raw(register.value().map_err(internal)?).map_err(internal)?;
-        let update =
-            layout_wire::sync_local_displays(&layout, self.identity.id(), &self.displays, &self.detached, now_ms())
-                .map_err(internal)?;
-        let Some(local) = update
-            .layout
-            .devices()
-            .map_err(internal)?
-            .0
-            .into_iter()
-            .find(|d| d.device().and_then(|id| wire::read_device(&id)) == Ok(self.identity.id()))
-        else {
-            return Ok(());
-        };
-        // The ordinary display-change path may repair collisions. This path is
-        // only restoring lost owner facts: never normalize a remote canvas edit
-        // or move another computer while correcting native geometry.
-        let mut groups = layout.devices().map_err(internal)?.0;
-        if let Some(group) = groups.iter_mut().find(|g| g.device() == local.device()) {
-            let mut retained = group.raw().clone();
-            retained.insert(4, local.screens().map_err(internal)?.write());
-            *group = dto::DevicePlacement::from_raw(retained).map_err(internal)?;
-        } else {
-            groups.push(local);
-        }
-        let mut raw = layout.raw().clone();
-        raw.insert(1, RawValue::Array(groups.iter().map(WireValue::write).collect()));
+        let members = self.state.roster().members().map(|m| m.device).collect::<Vec<_>>();
+        let update = layout_wire::sync_local_displays(
+            &layout,
+            self.identity.id(),
+            &members,
+            &self.displays,
+            &self.detached,
+            now_ms(),
+        )
+        .map_err(internal)?;
+        // Native observation repair may also translate computers intersecting a
+        // newly attached screen. Publish that complete patch, not just the owner.
+        let raw = update.layout.raw().clone();
         if &raw == layout.raw() {
             return Ok(());
         }
@@ -205,6 +283,7 @@ impl Owner {
         self.journal.projected(digest).map_err(internal)?;
         self.projection_retry = None;
         self.projection_announced = None;
+        self.reconcile_pointer_shortcuts()?;
         Ok(true)
     }
     pub(crate) fn publish(&mut self) -> ApiResult<()> {
@@ -291,7 +370,9 @@ impl Owner {
                 .collect()
         };
         let version = register.version().map_err(internal)?;
+        let application_focus_enabled = self.stored.application_focus_enabled().map_err(internal)?;
         let router = RouterLayout {
+            application_focus_enabled,
             group: self.state.roster().anchor().group,
             version: version.clone(),
             layout: layout.clone(),
@@ -319,8 +400,10 @@ impl Owner {
         }
         let drawing_owners = Arc::new(drawing_owners);
         self.shared.applied.publish(AppliedState {
+            application_focus_enabled,
             group: self.state.roster().anchor().group,
             roster_digest: self.state.roster().digest().map_err(internal)?,
+            pointer_slots: self.state.pointer_slots().map_err(internal)?,
             members: members.clone(),
             layout: layout.clone(),
             owners: drawing_owners.clone(),
@@ -512,7 +595,7 @@ impl Owner {
         self.publish_facts()
     }
     pub(crate) fn device_control(&mut self, peer: DeviceId, message: Message) -> ApiResult<()> {
-        if !(0x0d23..=0x0d30).contains(&message.type_id()) {
+        if !(0x0d23..=0x0d30).contains(&message.type_id()) && message.type_id() != 0x0110 {
             return Err(invalid("invalid device control message"));
         }
         let id = self
@@ -522,6 +605,17 @@ impl Owner {
                 (s.ready && s.peer_boot.device_id == peer && self.state.roster().contains(peer)).then_some(*id)
             })
             .ok_or_else(stopped)?;
+        if message.type_id() == 0x0110
+            && !self
+                .links
+                .links()
+                .links
+                .iter()
+                .find(|l| l.link == id)
+                .is_some_and(|l| l.agreement.contains("oink.power/1"))
+        {
+            return Err(invalid("power capability was not negotiated"));
+        }
         if (0x0d2c..=0x0d2e).contains(&message.type_id())
             && !self.links.links().links.iter().find(|l| l.link == id).is_some_and(|l| {
                 l.state == oink_network::link::LinkState::Ready && l.agreement.contains("oink.notify/1")
@@ -549,6 +643,23 @@ impl Owner {
         }
         self.send(link, Message::ProtocolError(error)).map_err(internal)
     }
+    pub(crate) fn edit_layout_if_current(
+        &mut self,
+        expected: &AppliedState,
+        edit: Box<dyn FnOnce(&mut Layout) + Send>,
+        source: dto::LayoutSource,
+    ) -> ApiResult<bool> {
+        // Durable state can be ahead of the published snapshot while native
+        // application is deferred. Guard the register we are about to edit.
+        if self.state.roster().anchor().group != expected.group
+            || self.state.roster().digest().map_err(internal)? != expected.roster_digest
+            || self.state.layout().map_err(internal)?.version().map_err(internal)? != expected.version
+        {
+            return Ok(false);
+        }
+        self.edit_layout(edit, source)?;
+        Ok(true)
+    }
     pub(crate) fn edit_layout(
         &mut self,
         edit: Box<dyn FnOnce(&mut Layout) + Send>,
@@ -573,10 +684,28 @@ impl Owner {
         self.displays = displays.clone();
         self.observe_display_facts()?;
         let _ = self.refresh_diagnostics();
+        // Low can deliver a saved catalog before its C0 manual layout. Importing
+        // hotplug into the old register would create a competing LWW edit and
+        // discard that known manual placement. Facts remain immediate; applying
+        // the dependency later reconciles these observations over its geometry.
+        if self.display_layout_pending()? {
+            self.publish_displays()?;
+            self.publish()?;
+            self.shared.emit(ConfigChange::LocalDisplays);
+            return Ok(());
+        }
         let register = self.state.layout().map_err(internal)?;
         let before = dto::LayoutValue::from_raw(register.value().map_err(internal)?).map_err(internal)?;
-        let update = layout_wire::sync_local_displays(&before, self.identity.id(), &displays, &self.detached, now_ms())
-            .map_err(internal)?;
+        let members = self.state.roster().members().map(|m| m.device).collect::<Vec<_>>();
+        let update = layout_wire::sync_local_displays(
+            &before,
+            self.identity.id(),
+            &members,
+            &displays,
+            &self.detached,
+            now_ms(),
+        )
+        .map_err(internal)?;
         detached::save(&self.data_dir.join(detached::DETACHED_FILE), &update.detached).map_err(internal)?;
         self.detached = update.detached;
         if update.changed {

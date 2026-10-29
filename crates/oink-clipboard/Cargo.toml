@@ -8,6 +8,12 @@ license.workspace = true
 publish.workspace = true
 repository.workspace = true
 
+# Recompile the private production path on AppKit's main thread without libtest.
+[[test]]
+name = "native_linked_promise"
+path = "src/lib.rs"
+harness = false
+
 [dependencies]
 oink-foundation.workspace = true
 oink-protocol.workspace = true
@@ -25,7 +31,7 @@ tokio.workspace = true
 libc = "0.2"
 block2 = "0.6"
 dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
-objc2 = "0.6"
+objc2 = { version = "0.6", features = ["exception"] }
 objc2-foundation = "0.3"
 objc2-core-foundation = "0.3"
 objc2-image-io = { version = "0.3", default-features = false, features = ["std", "CGImageSource", "CGImageDestination", "objc2-core-graphics"] }
@@ -36,13 +42,17 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["std", 
 
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Globalization", "Win32_Storage_CloudFilters", "Win32_Storage_FileSystem", "Win32_System_SystemInformation", "Win32_System_CorrelationVector", "Win32_System_LibraryLoader", "Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography_Catalog", "Win32_Security_Cryptography_Sip", "Win32_Security_WinTrust", "Win32_Security_Cryptography", "Win32_System_IO"] }
+# Shell's native .url serializer writes a bounded temporary file.
+tempfile = "3"
+windows-sys = { version = "0.61", features = ["Win32_Globalization", "Win32_Storage_CloudFilters", "Win32_Storage_FileSystem", "Win32_System_SystemInformation", "Win32_System_CorrelationVector", "Win32_System_LibraryLoader", "Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography_Catalog", "Win32_Security_Cryptography_Sip", "Win32_Security_WinTrust", "Win32_Security_Cryptography", "Win32_System_IO", "Win32_System_Threading"] }
 png = "0.18"
-image = { version = "0.25", default-features = false, features = ["bmp", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "tiff"] }
 # `#[implement]` 生成的代码引用 `::windows_core`
 windows-core = "0.62"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Security_Authentication_Identity",
+    "Win32_System_StationsAndDesktops",
     "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
@@ -64,7 +74,10 @@ windows = { version = "0.62", features = [
 ] }
 
 [dev-dependencies]
-image = { version = "0.25", default-features = false, features = ["bmp", "jpeg"] }
+# Match other integration crates: scanner-held atomic publication may outlast
+# the product deadline under concurrent tests; release behavior stays unchanged.
+oink-foundation = { workspace = true, features = ["test-storage-retries"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "tiff"] }
 png = "0.18"
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"

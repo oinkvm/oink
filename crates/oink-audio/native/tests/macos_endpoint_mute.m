@@ -55,9 +55,12 @@ static void *observer(void){
     char error[512]={0};void *o=oink_audio_endpoint_open("test-output",error,sizeof(error));assert(o&&subscriptions==3);return o;
 }
 static void close_observer(void *o){oink_audio_endpoint_close(o);for(unsigned i=0;i<3;i++){blocks[i]=nil;queues[i]=nil;}}
+static void wake_owner(void *context){ ++*(unsigned *)context; }
 int main(void){@autoreleasepool{
     char error[512]={0};float volume;bool muted;
     void *o=observer();
+    unsigned wakes=0;
+    oink_audio_endpoint_on_change(o,wake_owner,&wakes);
     assert(!oink_audio_endpoint_set_mute(o,true,false,error,sizeof(error)));
     assert(oink_audio_endpoint_flags(o)==0&&writes==1);
     assert(oink_audio_endpoint_read(o,&volume,&muted,error,sizeof(error))==1&&muted&&volume==0.375f);
@@ -65,8 +68,9 @@ int main(void){@autoreleasepool{
     assert(oink_audio_endpoint_flags(o)==0); // Duplicate same-state echo.
     // Own echo never acts like a user volume key. A real level event revokes
     // the full lease; release-only may undo mute without touching that level.
+    unsigned prior_wakes=wakes;
     level=0.75f;notify(0,kAudioDevicePropertyVolumeScalar);flush(o);
-    assert(oink_audio_endpoint_flags(o)==1);
+    assert(oink_audio_endpoint_flags(o)==1 && wakes == prior_wakes + 1);
     assert(oink_audio_endpoint_set_mute(o,false,false,error,sizeof(error)));
     assert(!oink_audio_endpoint_set_mute(o,false,true,error,sizeof(error)));
     assert(!is_muted&&level==0.75f&&writes==2);close_observer(o);

@@ -385,8 +385,19 @@ pub(crate) fn preflight_diagnostic_event(d: &mut minicbor::Decoder<'_>, depth: u
 }
 
 macro_rules! wire_map {
-    ($name:ident, $validate:path, { $($key:literal => $field:ident : $ty:ty = $default:tt;)* }) => {
-        #[derive(Clone, Debug, PartialEq)]
+    ($name:ident, $validate:path, redacted, $fields:tt) => {
+        $crate::v1::schema::wire_map!(@define [Clone, PartialEq] $name, $validate, $fields);
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(stringify!($name))
+            }
+        }
+    };
+    ($name:ident, $validate:path, $fields:tt) => {
+        $crate::v1::schema::wire_map!(@define [Clone, Debug, PartialEq] $name, $validate, $fields);
+    };
+    (@define [$($derive:path),*] $name:ident, $validate:path, { $($key:literal => $field:ident : $ty:ty = $default:tt;)* }) => {
+        #[derive($($derive),*)]
         pub struct $name($crate::v1::RawMap);
         impl $crate::v1::schema::WireDto for $name {
             const SCHEMA: $crate::v1::schema::Schema = $crate::v1::schema::Schema {

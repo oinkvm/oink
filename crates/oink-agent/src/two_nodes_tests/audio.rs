@@ -55,10 +55,11 @@ fn concurrent_exit_selections_converge_after_directional_group_merge() {
             }
             common::active(&nodes).await;
             assert!(nodes.iter().all(|node| node.group_id() == Some(target_group)));
-            wait_for_audio("destination exit survives group merge", &nodes, |resolutions| {
-                resolutions
-                    .iter()
-                    .all(|resolution| resolution.owner() == Some(a.node.id()))
+            wait_for_audio("one selected exit survives group merge", &nodes, |resolutions| {
+                let winner = resolutions[0];
+                winner.available()
+                    && matches!(winner.owner(),Some(owner) if owner==a.node.id() || owner==b.node.id())
+                    && resolutions.iter().all(|resolution| *resolution == winner)
             })
             .await;
             assert!(
@@ -69,14 +70,14 @@ fn concurrent_exit_selections_converge_after_directional_group_merge() {
                     .iter()
                     .any(|record| record.owner == b.node.id() && record.claim.is_some())
             );
-            tokio::join!(select_exit(&ap.node), select_exit(&b.node));
+            tokio::join!(select_exit(&ap.node), select_exit(&bp.node));
             wait_for_audio(
                 "concurrent exit selections converge across merged members",
                 &nodes,
                 |resolutions| {
                     let resolution = resolutions[0];
                     resolution.available()
-                        && matches!(resolution.owner(), Some(owner) if owner == ap.node.id() || owner == b.node.id())
+                        && matches!(resolution.owner(), Some(owner) if owner == ap.node.id() || owner == bp.node.id())
                         && resolutions.iter().all(|current| *current == resolution)
                 },
             )

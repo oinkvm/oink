@@ -53,6 +53,15 @@ impl Identity {
             }),
         })
     }
+    pub fn clipboard_key(&self) -> io::Result<[u8; 32]> {
+        self.check()?;
+        if self.state.lock().unwrap().reading {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        let key = super::super::clipboard_key::current()?;
+        self.check()?;
+        Ok(key)
+    }
     pub fn check(&self) -> io::Result<()> {
         if self.state.lock().unwrap().sequence == sequence() {
             Ok(())
@@ -124,65 +133,4 @@ fn same_formats(left: &Inventory, right: &Inventory) -> bool {
                             == (right.id, &right.format, right.medium, right.aspect, right.index)
                     })
         })
-}
-
-/// Bounded transport buffers only; no cache, snapshot, or replayable source copy.
-pub(super) fn pipe(skip: u64) -> (PipeWriter, crate::FileReader) {
-    let (tx, rx) = std::sync::mpsc::sync_channel(2);
-    (
-        PipeWriter { tx, skip },
-        Box::new(PipeReader {
-            rx,
-            bytes: io::Cursor::new(Vec::new()),
-            done: false,
-        }),
-    )
-}
-pub(super) struct PipeWriter {
-    tx: std::sync::mpsc::SyncSender<io::Result<Vec<u8>>>,
-    skip: u64,
-}
-impl PipeWriter {
-    pub fn finish(self, result: io::Result<()>) {
-        let _ = self.tx.send(result.map(|()| Vec::new()));
-    }
-}
-impl io::Write for PipeWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let skip = self.skip.min(bytes.len() as u64) as usize;
-        self.skip -= skip as u64;
-        for chunk in bytes[skip..].chunks(64 * 1024) {
-            self.tx
-                .send(Ok(chunk.to_vec()))
-                .map_err(|_| content::unavailable(Unavailable::Cancelled))?;
-        }
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-struct PipeReader {
-    rx: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
-    bytes: io::Cursor<Vec<u8>>,
-    done: bool,
-}
-impl io::Read for PipeReader {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        if bytes.is_empty() {
-            return Ok(0);
-        }
-        loop {
-            let n = self.bytes.read(bytes)?;
-            if n > 0 || self.done {
-                return Ok(n);
-            }
-            let next = self
-                .rx
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .map_err(|_| content::unavailable(Unavailable::NoProgress))??;
-            self.done = next.is_empty();
-            self.bytes = io::Cursor::new(next);
-        }
-    }
 }

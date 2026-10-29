@@ -13,6 +13,60 @@ static HRESULT WINAPI unregister_ok(LPCWSTR path) {
     return HRESULT_FROM_WIN32(ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT);
 }
 static HRESULT WINAPI unregister_denied(LPCWSTR) { ++calls; return E_ACCESSDENIED; }
+// Both generations can remain registered after the linked-file cutover.
+static std::vector<std::wstring> root_calls;
+static std::wstring denied_root;
+static HRESULT WINAPI unregister_tracked(LPCWSTR path) {
+    root_calls.emplace_back(path);
+    const auto local = std::filesystem::path(path).parent_path().parent_path();
+    assert(std::filesystem::exists(local / L"device.key"));
+    assert(std::filesystem::exists(local.parent_path().parent_path() / L"Roaming\\Oink\\settings.json"));
+    return denied_root == path ? E_ACCESSDENIED : S_OK;
+}
+static void both_roots(const std::wstring& base) {
+    const auto home = base + L"\\root-user";
+    const auto local = home + L"\\AppData\\Local\\Oink";
+    const auto roaming = home + L"\\AppData\\Roaming\\Oink";
+    const std::vector<std::wstring> roots = {
+        local + L"\\Cache\\CloudLinkedFiles", local + L"\\Cache\\CloudFiles"};
+    auto create = [&](const std::vector<std::wstring>& paths) {
+        for (const auto& path : paths) {
+            std::filesystem::create_directories(path);
+            std::ofstream{std::filesystem::path(path) / L"resident.txt"} << "private fixture";
+        }
+        std::filesystem::create_directories(roaming);
+        std::ofstream{std::filesystem::path(local) / L"device.key"} << "private identity";
+        std::ofstream{std::filesystem::path(roaming) / L"settings.json"} << "{}";
+        root_calls.clear(); denied_root.clear();
+    };
+    for (const auto& present : {std::vector<std::wstring>{roots[0]}, std::vector<std::wstring>{roots[1]}, roots}) {
+        create(present);
+        assert(user_cleanup::profile(home, L"Oink", unregister_tracked));
+        assert(root_calls == present); // New, old, or both, in that order.
+        assert(!std::filesystem::exists(local) && !std::filesystem::exists(roaming));
+    }
+    // One failed unregister must not suppress the other root's attempt or erase
+    // identity/settings. Every failed root reports its exact path and HRESULT.
+    for (const auto& failed : roots) {
+        create(roots); denied_root = failed;
+        std::vector<std::wstring> failures;
+        assert(!user_cleanup::profile(home, L"Oink", unregister_tracked,
+            [&](const std::wstring& path, const wchar_t* operation, DWORD error) {
+                assert(std::wstring(operation) == L"CfUnregisterSyncRoot HRESULT");
+                assert(error == static_cast<DWORD>(E_ACCESSDENIED)); failures.push_back(path);
+            }));
+        assert(root_calls == roots && failures == std::vector<std::wstring>{failed});
+        assert(std::filesystem::exists(failed + L"\\resident.txt"));
+        assert(std::filesystem::exists(local + L"\\device.key"));
+        assert(std::filesystem::exists(roaming + L"\\settings.json"));
+        denied_root.clear(); root_calls.clear();
+        assert(user_cleanup::profile(home, L"Oink", unregister_tracked));
+        assert(root_calls == std::vector<std::wstring>{failed});
+    }
+    root_calls.clear();
+    assert(user_cleanup::profile(home, L"Oink", unregister_tracked));
+    assert(root_calls.empty()); // An already removed profile is idempotent.
+}
 // Match files written by foundation's protected, owner-only atomic writer.
 // The MSI runs as SYSTEM rather than the owner. Disable backup/restore in an
 // isolated thread token so an SSH build token cannot accidentally hide this.
@@ -104,6 +158,7 @@ int wmain() {
     CloseHandle(handle);
     assert(length > 7 && length < 32768 && wcsncmp(final, L"\\\\?\\", 4) == 0);
     const auto base = std::wstring(final + 4) + L"\\oink-data-cleanup-" + std::to_wstring(GetCurrentProcessId());
+    both_roots(base);
     const auto home = base + L"\\user";
     const auto local = home + L"\\AppData\\Local\\Oink";
     const auto roaming = home + L"\\AppData\\Roaming\\Oink";

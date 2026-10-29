@@ -10,6 +10,28 @@ use oink_protocol::v1::{
 use std::collections::HashMap;
 
 const CAPABILITY: &str = "oink.notify/1";
+const MICROPHONE_CAPABILITY: &str = "oink.notify.microphone/1";
+/// A rendering host keeps one slot per state family, independent of origin device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Family {
+    Game,
+    Pointer,
+    Keyboard,
+    Mouse,
+    Microphone,
+}
+impl Family {
+    fn of(kind: u8) -> Option<Self> {
+        match kind {
+            1 | 2 => Some(Self::Game),
+            3 | 6 => Some(Self::Pointer),
+            4 => Some(Self::Keyboard),
+            5 => Some(Self::Mouse),
+            7 | 8 => Some(Self::Microphone),
+            _ => None,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Undo {
     GameOff,
@@ -34,9 +56,15 @@ struct Origin {
     boot: Option<Boot>,
     id: u64,
 }
+#[derive(Clone, Debug)]
+struct FamilySlot {
+    surface: u64,
+    origin: Origin,
+}
 #[derive(Debug, Default)]
 pub(super) struct Notifications {
     stopped: bool,
+    microphone_requests: HashMap<String, bool>,
     overlay: Option<NotificationOverlay>,
     next: u64,
     pending: HashMap<u64, Pending>,
@@ -48,6 +76,9 @@ pub(super) struct Notifications {
     mouse: bool,
     game_id: Option<u64>,
     pointer_id: Option<u64>,
+    // Retain bounded slot identities through clicks/expiry so a replacement can
+    // retire a still-exiting frame without stacking or restarting its exit.
+    families: HashMap<Family, FamilySlot>,
     keyboard_id: Option<u64>,
     mouse_id: Option<u64>,
 }
@@ -59,6 +90,32 @@ impl Notifications {
 }
 
 impl Node {
+    pub(crate) fn track_microphone_notice(&self, id: &str, muted: bool) {
+        lock(&self.inner.notifications)
+            .microphone_requests
+            .insert(id.into(), muted);
+    }
+    pub(crate) fn complete_microphone_notice(&self, id: &str, result: &crate::device_cards::DeviceControlResult) {
+        let muted = lock(&self.inner.notifications).microphone_requests.remove(id);
+        if let Some(muted) = muted
+            && matches!(
+                result,
+                crate::device_cards::DeviceControlResult::Applied | crate::device_cards::DeviceControlResult::NoChange
+            )
+        {
+            let kind = if muted { 7 } else { 8 };
+            let request = Notification {
+                level: NotificationLevel::Info,
+                title: copy(self.notification_language(), kind).into(),
+                description: String::new(),
+                persistent: false,
+                screen: None,
+            };
+            if let Err(error) = self.raise_notification(request, None, kind) {
+                tracing::warn!(%error, "shared microphone notification failed");
+            }
+        }
+    }
     fn notification_overlay(&self, state: &mut Notifications) -> NotificationOverlay {
         state
             .overlay
@@ -198,7 +255,7 @@ impl Node {
                 message: "invalid notification screen".into(),
             });
         }
-        if kind != 0 {
+        if kind != 0 && !matches!(kind, 7 | 8) {
             // Keyboard events are local and pointer/game events identify their
             // owner below. Never route these notices through the generic API's
             // group-pointer default, even when another member requested the edit.
@@ -207,6 +264,16 @@ impl Node {
             request.screen = self.default_notification_screen();
         }
         let group = self.inner.group.get();
+        // Microphone success follows current pointer focus. Unsupported peers
+        // remain silent rather than showing a duplicate on the pressing device.
+        if matches!(kind, 7 | 8)
+            && let Some(screen) = request.screen.as_ref().filter(|s| s.device.0 != self.id())
+            && !group
+                .and_then(|g| g.peer_agreement(screen.device.0))
+                .is_some_and(|a| a.contains(CAPABILITY) && a.contains(MICROPHONE_CAPABILITY))
+        {
+            return Ok(None);
+        }
         let remote = request
             .screen
             .as_ref()
@@ -224,7 +291,7 @@ impl Node {
             state.next
         };
         if let Some(screen) = remote {
-            let raw = [
+            let mut raw: oink_protocol::v1::RawMap = [
                 (1, id.write()),
                 (2, V::Text(screen.display.clone())),
                 (3, level_number(request.level).write()),
@@ -232,9 +299,12 @@ impl Node {
                 (5, V::Text(request.description.clone())),
                 (6, request.persistent.write()),
                 (7, action.is_some().write()),
-                (8, kind.write()),
+                (8, if matches!(kind, 7 | 8) { 0u8 } else { kind }.write()),
             ]
             .into();
+            if matches!(kind, 7 | 8) {
+                raw.insert(9, (kind == 7).write());
+            }
             let message =
                 Message::NotifyShow(
                     dto::NotifyShow::from_raw(raw).map_err(|_| api::ApiError::InvalidArgument {
@@ -259,6 +329,9 @@ impl Node {
             }
             lock(&self.inner.notifications).pending.remove(&id);
         }
+        if matches!(kind, 7 | 8) && request.screen.as_ref().is_some_and(|s| s.device.0 != self.id()) {
+            return Ok(None);
+        }
         let displays = self.current_displays().map_err(|error| api::ApiError::Internal {
             message: error.to_string(),
         })?;
@@ -282,25 +355,22 @@ impl Node {
             device: self.id().into(),
             display: display.key.clone(),
         };
-        let overlay = self.notification_overlay(&mut state);
-        let local = overlay.push(Toast {
+        let toast = Toast {
             title: request.title,
             description: request.description,
             undo: action.map(|_| copy(self.notification_language(), 0).into()),
             persistent: request.persistent,
             scale: notification::scale_for(&display),
             display,
-        });
-        state.origins.insert(
-            local,
-            Origin {
-                level: request.level,
-                expires: (!request.persistent).then(|| Instant::now() + notification::LIFETIME),
-                peer: self.id(),
-                boot: None,
-                id,
-            },
-        );
+        };
+        let origin = Origin {
+            level: request.level,
+            expires: (!request.persistent).then(|| Instant::now() + notification::LIFETIME),
+            peer: self.id(),
+            boot: None,
+            id,
+        };
+        let (local, retired) = self.insert_notification(&mut state, toast, kind, origin);
         state.pending.insert(
             id,
             Pending {
@@ -313,6 +383,7 @@ impl Node {
             },
         );
         drop(state);
+        self.retire_notification_origin(retired);
         self.apply_notification_preferences();
         Ok(Some(NotificationReceipt {
             id: id.to_string(),
@@ -320,21 +391,65 @@ impl Node {
             remote: false,
         }))
     }
+    fn insert_notification(
+        &self,
+        state: &mut Notifications,
+        toast: Toast,
+        kind: u8,
+        origin: Origin,
+    ) -> (u64, Option<Origin>) {
+        let family = Family::of(kind);
+        let previous = family.and_then(|family| state.families.get(&family).cloned());
+        if let Some(previous) = &previous {
+            state.origins.remove(&previous.surface);
+            if previous.origin.peer == self.id() {
+                // A click may have removed the route while its owner edit waits
+                // on a transaction. Replacement must retire that pending Undo too.
+                state.pending.remove(&previous.origin.id);
+            }
+        }
+        let overlay = self.notification_overlay(state);
+        let local = match &previous {
+            Some(previous) => overlay.replace(previous.surface, toast),
+            None => overlay.push(toast),
+        };
+        if let Some(family) = family {
+            state.families.insert(
+                family,
+                FamilySlot {
+                    surface: local,
+                    origin: origin.clone(),
+                },
+            );
+        }
+        state.origins.insert(local, origin);
+        (local, previous.map(|slot| slot.origin))
+    }
+    fn retire_notification_origin(&self, origin: Option<Origin>) {
+        if let Some(origin) = origin.filter(|origin| origin.peer != self.id()) {
+            // A replacement is a dismissal, never an Undo. Retire the sender's
+            // pending action over the existing authenticated action channel.
+            self.complete_notification_origin(origin, false);
+        }
+    }
     fn notification_language(&self) -> crate::config::UiLanguage {
         self.settings().ui_language.resolve(&system_language())
     }
     fn notification_click(&self, click: Click) {
         let origin = { lock(&self.inner.notifications).origins.remove(&click.id) };
         let Some(origin) = origin else { return };
+        self.complete_notification_origin(origin, click.undo);
+    }
+    fn complete_notification_origin(&self, origin: Origin, undo: bool) {
         if origin.peer == self.id() {
-            self.perform_notification_action(origin.id, click.undo, self.id());
+            self.perform_notification_action(origin.id, undo, self.id());
         } else if let Some(group) = self.inner.group.get()
             && group.peer_boot(origin.peer) == origin.boot
             && group
                 .peer_agreement(origin.peer)
                 .is_some_and(|a| a.contains(CAPABILITY))
         {
-            let message = dto::NotifyAction::from_raw([(1, origin.id.write()), (2, click.undo.write())].into())
+            let message = dto::NotifyAction::from_raw([(1, origin.id.write()), (2, undo.write())].into())
                 .expect("typed notification action");
             let _ = group.send_device_control(origin.peer, Message::NotifyAction(message));
         }
@@ -387,13 +502,42 @@ impl Node {
         }
     }
     fn dismiss_notification(&self, id: u64) {
+        self.dismiss_notification_with_motion(id, false);
+    }
+    fn dismiss_notification_immediately(&self, id: u64) {
+        self.dismiss_notification_with_motion(id, true);
+    }
+    fn dismiss_notification_with_motion(&self, id: u64, immediate: bool) {
         let pending = { lock(&self.inner.notifications).pending.remove(&id) };
-        let Some(p) = pending else { return };
+        let Some(p) = pending else {
+            if immediate {
+                let mut state = lock(&self.inner.notifications);
+                // Undo consumes Pending before its authoritative restore event.
+                // Keep the family slot long enough to remove that exiting frame,
+                // but never remove a newer notice from another owner.
+                if let Some(surface) = state
+                    .families
+                    .values()
+                    .find(|slot| slot.origin.peer == self.id() && slot.origin.id == id)
+                    .map(|slot| slot.surface)
+                {
+                    state.origins.remove(&surface);
+                    if let Some(overlay) = &state.overlay {
+                        overlay.remove(surface);
+                    }
+                }
+            }
+            return;
+        };
         if let Some(local) = p.surface {
             let mut state = lock(&self.inner.notifications);
             state.origins.remove(&local);
             if let Some(overlay) = &state.overlay {
-                overlay.dismiss(local);
+                if immediate {
+                    overlay.remove(local);
+                } else {
+                    overlay.dismiss(local);
+                }
             }
         } else if let Some(group) = self.inner.group.get()
             && group.peer_boot(p.destination) == p.boot
@@ -430,7 +574,11 @@ impl Node {
                     for local in locals {
                         state.origins.remove(&local);
                         if let Some(overlay) = &state.overlay {
-                            overlay.dismiss(local);
+                            if state.families.values().any(|slot| slot.surface == local) {
+                                overlay.remove(local);
+                            } else {
+                                overlay.dismiss(local);
+                            }
                         }
                     }
                 }
@@ -446,11 +594,22 @@ impl Node {
                         m.persistent()?,
                         m.undo()?,
                         m.kind()?,
+                        m.microphone_muted()?,
                     ))
                 };
-                let Ok((id, key, level, mut title, description, persistent, undo, kind)) = read() else {
+                let Ok((id, key, level, mut title, description, persistent, undo, mut kind, microphone_muted)) = read()
+                else {
                     return;
                 };
+                if let Some(muted) = microphone_muted {
+                    if !group
+                        .peer_agreement(peer)
+                        .is_some_and(|a| a.contains(MICROPHONE_CAPABILITY))
+                    {
+                        return;
+                    }
+                    kind = if muted { 7 } else { 8 };
+                }
                 let level = match level {
                     0 => NotificationLevel::Notice,
                     1 => NotificationLevel::Info,
@@ -480,26 +639,24 @@ impl Node {
                 {
                     return;
                 }
-                let overlay = self.notification_overlay(&mut state);
-                let local = overlay.push(Toast {
+                let toast = Toast {
                     title,
                     description,
                     undo: undo.then(|| copy(language, 0).into()),
                     persistent,
                     scale: notification::scale_for(&display),
                     display,
-                });
-                state.origins.insert(
-                    local,
-                    Origin {
-                        level,
-                        expires: (!persistent).then(|| Instant::now() + notification::LIFETIME),
-                        peer,
-                        boot: group.peer_boot(peer),
-                        id,
-                    },
-                );
+                };
+                let origin = Origin {
+                    level,
+                    expires: (!persistent).then(|| Instant::now() + notification::LIFETIME),
+                    peer,
+                    boot: group.peer_boot(peer),
+                    id,
+                };
+                let (_, retired) = self.insert_notification(&mut state, toast, kind, origin);
                 drop(state);
+                self.retire_notification_origin(retired);
                 self.apply_notification_preferences();
             }
             _ => {}
@@ -523,7 +680,7 @@ impl Node {
     pub(super) fn notification_status(&self, event: &StatusEvent) {
         let (kind, on) = match event {
             StatusEvent::LocalGameMode(active) => (1, *active),
-            StatusEvent::FocusLock { holder } => (3, *holder == Some(self.id())),
+            StatusEvent::LocalPointerLock(locked) => (3, *locked),
             StatusEvent::KeyboardDisabled(disabled) => (4, *disabled),
             StatusEvent::MouseDisabled(disabled) => (5, *disabled),
             _ => return,
@@ -560,13 +717,19 @@ impl Node {
                 None
             }
         };
-        if let Some(id) = dismiss {
-            self.dismiss_notification(id);
-        }
-        if !on && kind != 1 {
+        if !on && !matches!(kind, 1 | 3) {
+            if let Some(id) = dismiss {
+                self.dismiss_notification_immediately(id);
+            }
             return;
         }
-        let notice = if kind == 1 && !on { 2 } else { kind };
+        // Kind 6 is owner-local, like kind 5: it never changes the frozen wire
+        // notification kind vocabulary (owner notices select a local screen).
+        let notice = match (kind, on) {
+            (1, false) => 2,
+            (3, false) => 6,
+            _ => kind,
+        };
         let action = match notice {
             1 => Some(Undo::GameOff),
             3 => Some(Undo::PointerUnlock),
@@ -583,9 +746,15 @@ impl Node {
             title: copy(self.notification_language(), notice).into(),
             description: disable_hint(self.notification_language(), notice, cfg!(target_os = "macos")),
             screen: None,
-            persistent: notice >= 3,
+            persistent: matches!(notice, 4 | 5),
         };
-        if let Ok(Some(receipt)) = self.raise_notification(request, action, notice)
+        let result = self.raise_notification(request, action, notice);
+        if !matches!(result, Ok(Some(_)))
+            && let Some(id) = dismiss
+        {
+            self.dismiss_notification_immediately(id);
+        }
+        if let Ok(Some(receipt)) = result
             && let Ok(id) = receipt.id.parse()
         {
             let mut state = lock(&self.inner.notifications);
@@ -629,39 +798,51 @@ fn disable_hint(language: crate::config::UiLanguage, kind: u8, mac: bool) -> Str
 
 fn copy(language: crate::config::UiLanguage, kind: u8) -> &'static str {
     use crate::config::UiLanguage::*;
-    let index = usize::from(kind.min(5));
+    let index = usize::from(kind.min(8));
     match language {
         SimplifiedChinese => [
             "撤销",
             "已进入游戏模式",
             "已退出游戏模式",
             "已锁定指针",
-            "已禁用键盘",
-            "已禁用鼠标",
+            "已禁用本机键盘",
+            "已禁用本机鼠标",
+            "指针锁定已解除",
+            "共享麦克风已静音",
+            "共享麦克风已解除静音",
         ][index],
         Japanese => [
             "元に戻す",
             "ゲームモードが有効になりました",
             "ゲームモードが無効になりました",
             "ポインターをロックしました",
-            "キーボードを無効にしました",
-            "マウスを無効にしました",
+            "このデバイスのキーボードを無効にしました",
+            "このデバイスのマウスを無効にしました",
+            "ポインターのロックを解除しました",
+            "共有マイクをミュートしました",
+            "共有マイクのミュートを解除しました",
         ][index],
         Korean => [
             "실행 취소",
             "게임 모드가 켜졌습니다",
             "게임 모드가 꺼졌습니다",
             "포인터가 잠겼습니다",
-            "키보드가 비활성화되었습니다",
-            "마우스가 비활성화되었습니다",
+            "이 기기의 키보드가 비활성화되었습니다",
+            "이 기기의 마우스가 비활성화되었습니다",
+            "포인터 잠금이 해제되었습니다",
+            "공유 마이크가 음소거되었습니다",
+            "공유 마이크의 음소거가 해제되었습니다",
         ][index],
         _ => [
             "Undo",
             "Entered game mode",
             "Left game mode",
             "Pointer locked",
-            "Keyboard disabled",
-            "Mouse disabled",
+            "This device's keyboard disabled",
+            "This device's mouse disabled",
+            "Pointer lock released",
+            "Shared microphone muted",
+            "Shared microphone unmuted",
         ][index],
     }
 }
@@ -818,6 +999,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn microphone_receipts_replace_one_transient_info_family() {
+        use crate::device_cards::{DeviceControlFailure, DeviceControlResult as Result};
+        let home = tempfile::tempdir().unwrap();
+        let node = Node::prepare(options(home.path())).unwrap();
+        node.track_microphone_notice("mute", true);
+        assert!(lock(&node.inner.notifications).pending.is_empty());
+        node.complete_microphone_notice("mute", &Result::Applied);
+        let first = lock(&node.inner.notifications).families[&Family::Microphone].surface;
+        node.track_microphone_notice("unmute", false);
+        node.complete_microphone_notice("unmute", &Result::Applied);
+        let state = lock(&node.inner.notifications);
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.origins.len(), 1);
+        assert_ne!(state.families[&Family::Microphone].surface, first);
+        let pending = state.pending.values().next().unwrap();
+        assert_eq!(pending.level, NotificationLevel::Info);
+        assert!(pending.expires.is_some());
+        assert!(pending.action.is_none());
+        let id = state.families[&Family::Microphone].origin.id;
+        drop(state);
+        node.complete_microphone_notice("unmute", &Result::Applied);
+        node.track_microphone_notice("failed", true);
+        node.complete_microphone_notice("failed", &Result::refused(DeviceControlFailure::InvalidValue));
+        assert_eq!(
+            lock(&node.inner.notifications).families[&Family::Microphone].origin.id,
+            id
+        );
+        assert!(lock(&node.inner.notifications).microphone_requests.is_empty());
+    }
+
+    #[test]
+    fn microphone_notice_copy_covers_all_languages() {
+        use crate::config::UiLanguage::*;
+        for (language, muted, unmuted) in [
+            (English, "Shared microphone muted", "Shared microphone unmuted"),
+            (SimplifiedChinese, "共享麦克风已静音", "共享麦克风已解除静音"),
+            (
+                Japanese,
+                "共有マイクをミュートしました",
+                "共有マイクのミュートを解除しました",
+            ),
+            (
+                Korean,
+                "공유 마이크가 음소거되었습니다",
+                "공유 마이크의 음소거가 해제되었습니다",
+            ),
+        ] {
+            assert_eq!(copy(language, 7), muted);
+            assert_eq!(copy(language, 8), unmuted);
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_retires_an_undo_even_after_its_click_route_was_taken() {
+        let home = tempfile::tempdir().unwrap();
+        let node = Node::prepare(options(home.path())).unwrap();
+        node.notification_status(&StatusEvent::LocalPointerLock(true));
+        let (id, surface) = {
+            let mut state = lock(&node.inner.notifications);
+            let id = state.pointer_id.unwrap();
+            let surface = state.pending[&id].surface.unwrap();
+            // A click has been dequeued, but its owner transaction is still pending.
+            state.origins.remove(&surface);
+            (id, surface)
+        };
+        node.notification_status(&StatusEvent::LocalPointerLock(false));
+        let state = lock(&node.inner.notifications);
+        assert!(!state.pending.contains_key(&id));
+        assert!(!state.origins.contains_key(&surface));
+        assert_eq!(state.pending.len(), 1);
+        assert!(state.pending.values().next().unwrap().action.is_none());
+    }
+
+    #[tokio::test]
+    async fn different_families_and_custom_notices_remain_independent() {
+        let home = tempfile::tempdir().unwrap();
+        let node = Node::prepare(options(home.path())).unwrap();
+        for event in [
+            StatusEvent::LocalGameMode(true),
+            StatusEvent::LocalPointerLock(true),
+            StatusEvent::KeyboardDisabled(true),
+            StatusEvent::MouseDisabled(true),
+        ] {
+            node.notification_status(&event);
+        }
+        assert_eq!(lock(&node.inner.notifications).origins.len(), 4);
+        node.notify(request()).unwrap();
+        node.notify(request()).unwrap();
+        node.notification_status(&StatusEvent::LocalGameMode(false));
+        node.notification_status(&StatusEvent::LocalPointerLock(false));
+        assert_eq!(lock(&node.inner.notifications).origins.len(), 6);
+        node.notification_status(&StatusEvent::KeyboardDisabled(false));
+        node.notification_status(&StatusEvent::MouseDisabled(false));
+        assert_eq!(lock(&node.inner.notifications).origins.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn state_families_replace_in_both_directions_without_retaining_old_undo() {
+        for game in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let node = Node::prepare(options(home.path())).unwrap();
+            let event = |on| {
+                if game {
+                    StatusEvent::LocalGameMode(on)
+                } else {
+                    StatusEvent::LocalPointerLock(on)
+                }
+            };
+            let mut retired = Vec::new();
+            for on in [true, false, true, false, true] {
+                node.notification_status(&event(on));
+                let state = lock(&node.inner.notifications);
+                assert_eq!(state.pending.len(), 1, "only the latest family notice keeps an action");
+                assert_eq!(
+                    state.origins.len(),
+                    1,
+                    "only the latest family notice keeps a click route"
+                );
+                let (&surface, origin) = state.origins.iter().next().unwrap();
+                assert!(retired.iter().all(|id| !state.origins.contains_key(id)));
+                assert_eq!(state.pending[&origin.id].action.is_some(), on);
+                retired.push(surface);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn game_banners_ignore_pointer_departure_and_return() {
         use oink_routing::{GameMode, Packet, control::ControlMsg};
         for auto in [false, true] {
@@ -947,6 +1255,7 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn game_undo_persists_off_and_publishes_live_owner_state() {
+        use crate::snapshot_tests::until;
         let home = tempfile::tempdir().unwrap();
         let node = Node::start(options(home.path())).await.unwrap();
         let n = node.clone();
@@ -956,11 +1265,13 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        let receipt = node
-            .raise_notification(request(), Some(Undo::GameOff), 1)
-            .unwrap()
-            .unwrap();
-        let id = receipt.id.parse().unwrap();
+        // Use the authoritative owner notice. Raising a competing notice here
+        // races the async input status event, which correctly retires its Undo.
+        until("game enabled notice", || {
+            lock(&node.inner.notifications).game_id.is_some()
+        })
+        .await;
+        let id = lock(&node.inner.notifications).game_id.unwrap();
         let n = node.clone();
         tokio::task::spawn_blocking(move || n.perform_notification_action(id, true, n.id()))
             .await
@@ -983,16 +1294,51 @@ mod tests {
         node.shutdown().await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn persistent_lock_body_dismiss_and_undo_have_distinct_effects() {
+    async fn pointer_lock_toast_expires_without_unlocking_or_leaving_a_live_undo() {
         use crate::snapshot_tests::until;
         let home = tempfile::tempdir().unwrap();
         let node = Node::start(options(home.path())).await.unwrap();
         node.set_focus_locked(true).unwrap();
+        until("timed pointer lock notice", || {
+            lock(&node.inner.notifications).pointer_id.is_some()
+                && node.input_status().unwrap().locked_device == Some(node.id())
+        })
+        .await;
+        let id = {
+            let mut state = lock(&node.inner.notifications);
+            let id = state.pointer_id.unwrap();
+            let expiry = state.pending[&id]
+                .expires
+                .expect("lock notice must use normal toast lifetime");
+            state.prune(expiry - Duration::from_nanos(1));
+            assert!(state.pending.contains_key(&id));
+            state.prune(expiry);
+            assert!(!state.pending.contains_key(&id));
+            assert!(state.origins.is_empty());
+            id
+        };
+        node.perform_notification_action(id, true, node.id());
+        assert_eq!(node.input_status().unwrap().locked_device, Some(node.id()));
+        node.shutdown().await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lock_body_dismiss_and_undo_have_distinct_effects() {
+        use crate::snapshot_tests::until;
+        let home = tempfile::tempdir().unwrap();
+        let node = Node::start(options(home.path())).await.unwrap();
+        node.set_focus_locked(true).unwrap();
+        // Ordered notification transitions can arrive before the input owner
+        // publishes its latest status. Observe both before testing click effects.
         until("pointer lock notice", || {
             lock(&node.inner.notifications).pointer_id.is_some()
+                && node.input_status().unwrap().locked_device == Some(node.id())
         })
         .await;
         let id = lock(&node.inner.notifications).pointer_id.unwrap();
+        assert!(
+            lock(&node.inner.notifications).pending[&id].expires.is_some(),
+            "pointer lock toast must expire"
+        );
         let surface = lock(&node.inner.notifications).pending[&id].surface.unwrap();
         node.notification_click(Click {
             id: surface,
@@ -1009,6 +1355,7 @@ mod tests {
             lock(&node.inner.notifications)
                 .pointer_id
                 .is_some_and(|next| next != id)
+                && node.input_status().unwrap().locked_device == Some(node.id())
         })
         .await;
         let id = lock(&node.inner.notifications).pointer_id.unwrap();
@@ -1043,17 +1390,80 @@ mod tests {
             id: surface,
             undo: true,
         });
-        assert!(!node.settings().keyboard_disabled);
+        assert!(node.settings().routing.keyboard_mode != oink_foundation::input::InputMode::Disabled);
         node.shutdown().await;
     }
+    #[tokio::test]
+    async fn pointer_notice_survives_focus_departure_and_return() {
+        let home = tempfile::tempdir().unwrap();
+        let node = Node::prepare(options(home.path())).unwrap();
+        let (mut router, peer) = game_notice_router(&node);
+        game_notice_focus_away(&mut router, peer);
+        router.return_pointer_home();
+        router.set_locked(true);
+        game_notice_outputs(&node, &mut router);
+        let id = lock(&node.inner.notifications).pointer_id.unwrap();
+        let expiry = lock(&node.inner.notifications).pending[&id].expires;
+        router.move_pointer_to(peer).unwrap();
+        game_notice_outputs(&node, &mut router);
+        assert!(lock(&node.inner.notifications).pending.contains_key(&id));
+        router.return_pointer_home();
+        game_notice_outputs(&node, &mut router);
+        let state = lock(&node.inner.notifications);
+        assert_eq!(state.pointer_id, Some(id));
+        assert_eq!(state.pending[&id].expires, expiry);
+    }
+
+    #[tokio::test]
+    async fn pointer_release_is_timed_deduplicated_and_retires_old_undo() {
+        for expired in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let node = Node::prepare(options(home.path())).unwrap();
+            node.notification_status(&StatusEvent::LocalPointerLock(true));
+            let id = lock(&node.inner.notifications).pointer_id.unwrap();
+            let old_surface = lock(&node.inner.notifications).families[&Family::Pointer].surface;
+            if expired {
+                let mut state = lock(&node.inner.notifications);
+                let expiry = state.pending[&id].expires.unwrap();
+                state.prune(expiry);
+            }
+            node.notification_status(&StatusEvent::LocalPointerLock(false));
+            node.notification_status(&StatusEvent::LocalPointerLock(false));
+            node.perform_notification_action(id, true, node.id());
+            let state = lock(&node.inner.notifications);
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(state.origins.len(), 1);
+            assert!(!state.pending.contains_key(&id));
+            assert!(!state.origins.contains_key(&old_surface));
+            assert!(state.pointer_id.is_none());
+            assert_ne!(state.families[&Family::Pointer].surface, old_surface);
+            let release = state.pending.values().next().unwrap();
+            assert_eq!(release.level, NotificationLevel::Notice);
+            assert_eq!(release.destination, node.id());
+            assert!(release.action.is_none());
+            assert!(release.expires.is_some());
+        }
+    }
+
+    #[test]
+    fn pointer_release_copy_is_localized() {
+        use crate::config::UiLanguage::*;
+        for (language, expected) in [
+            (SimplifiedChinese, "指针锁定已解除"),
+            (English, "Pointer lock released"),
+            (Japanese, "ポインターのロックを解除しました"),
+            (Korean, "포인터 잠금이 해제되었습니다"),
+        ] {
+            assert_eq!(copy(language, 6), expected);
+        }
+    }
+
     #[tokio::test]
     async fn ordered_cause_release_dismisses_only_its_banner_and_stale_undo() {
         let home = tempfile::tempdir().unwrap();
         let node = Node::prepare(options(home.path())).unwrap();
         let keyboard = StatusEvent::KeyboardDisabled(true);
-        let pointer = StatusEvent::FocusLock {
-            holder: Some(node.id()),
-        };
+        let pointer = StatusEvent::LocalPointerLock(true);
         node.notification_status(&keyboard);
         node.notification_status(&pointer);
         let keyboard_id = lock(&node.inner.notifications).keyboard_id.unwrap();
@@ -1080,11 +1490,15 @@ mod tests {
             undo: true,
         });
         assert!(lock(&node.inner.notifications).pending.contains_key(&next));
-        node.notification_status(&StatusEvent::FocusLock { holder: None });
+        node.notification_status(&StatusEvent::LocalPointerLock(false));
         assert!(!lock(&node.inner.notifications).pending.contains_key(&pointer_id));
         node.notification_status(&StatusEvent::KeyboardDisabled(false));
-        assert!(lock(&node.inner.notifications).pending.is_empty());
-        assert!(lock(&node.inner.notifications).origins.is_empty());
+        let state = lock(&node.inner.notifications);
+        assert_eq!(state.pending.len(), 1, "only the timed pointer-release notice remains");
+        assert_eq!(state.origins.len(), 1);
+        let release = state.pending.values().next().unwrap();
+        assert!(release.action.is_none());
+        assert!(release.expires.is_some());
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mouse_undo_restores_and_persists_shared_source_mode() {
@@ -1276,8 +1690,18 @@ mod remote_tests {
                     .unwrap()
                     .0;
                 b.notification_click(Click { id: local, undo: true });
-                until("remote keyboard undo", || !a.settings().keyboard_disabled).await;
-                assert!(!AgentConfig::load_from(a.data_dir()).unwrap().settings.keyboard_disabled);
+                until("remote keyboard undo", || {
+                    a.settings().routing.keyboard_mode != oink_foundation::input::InputMode::Disabled
+                })
+                .await;
+                assert!(
+                    !(AgentConfig::load_from(a.data_dir())
+                        .unwrap()
+                        .settings
+                        .routing
+                        .keyboard_mode
+                        == oink_foundation::input::InputMode::Disabled)
+                );
             }
             a.shutdown().await;
             b.shutdown().await;
@@ -1294,6 +1718,12 @@ mod owner_tests {
     use oink_test_support::input::FakeInput;
 
     async fn owners(notify_supported: bool) -> (tempfile::TempDir, tempfile::TempDir, Node, Node) {
+        owners_with_microphone(notify_supported, true).await
+    }
+    async fn owners_with_microphone(
+        notify_supported: bool,
+        microphone_supported: bool,
+    ) -> (tempfile::TempDir, tempfile::TempDir, Node, Node) {
         let home_a = tempfile::tempdir().unwrap();
         let home_b = tempfile::tempdir().unwrap();
         let input_a = Arc::new(FakeInput::new());
@@ -1305,6 +1735,9 @@ mod owner_tests {
         let mut profile = Node::offer_profile();
         if !notify_supported {
             profile.capabilities.retain(|cap| cap != CAPABILITY);
+        }
+        if !microphone_supported {
+            profile.capabilities.retain(|cap| cap != MICROPHONE_CAPABILITY);
         }
         b.start_sharing_with_profile(profile).await.unwrap();
         pair(&a, &b).await;
@@ -1348,6 +1781,57 @@ mod owner_tests {
         (home_a, home_b, a, b)
     }
 
+    #[tokio::test]
+    async fn microphone_notice_follows_focus_and_replaces_across_origins() {
+        use crate::device_cards::DeviceControlResult;
+        let (_ha, _hb, focus, pressing) = owners(true).await;
+        pressing.track_microphone_notice("mute", true);
+        pressing.complete_microphone_notice("mute", &DeviceControlResult::Applied);
+        until("microphone notice reaches focus", || {
+            lock(&focus.inner.notifications)
+                .families
+                .contains_key(&Family::Microphone)
+        })
+        .await;
+        assert!(lock(&pressing.inner.notifications).origins.is_empty());
+        let surface = lock(&focus.inner.notifications).families[&Family::Microphone].surface;
+        focus.track_microphone_notice("unmute", false);
+        focus.complete_microphone_notice("unmute", &DeviceControlResult::Applied);
+        {
+            let state = lock(&focus.inner.notifications);
+            assert_eq!(state.origins.len(), 1);
+            assert_ne!(state.families[&Family::Microphone].surface, surface);
+            assert_eq!(state.families[&Family::Microphone].origin.peer, focus.id());
+        }
+        until("replacement retires source route", || {
+            lock(&pressing.inner.notifications).pending.is_empty()
+        })
+        .await;
+        focus.shutdown().await;
+        pressing.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn microphone_notice_is_silent_with_older_notify_peer() {
+        use crate::device_cards::DeviceControlResult;
+        let (_ha, _hb, focus, pressing) = owners_with_microphone(true, false).await;
+        assert!(
+            !pressing
+                .link_config()
+                .unwrap()
+                .peer_agreement(focus.id())
+                .unwrap()
+                .contains(MICROPHONE_CAPABILITY)
+        );
+        pressing.track_microphone_notice("mute", true);
+        pressing.complete_microphone_notice("mute", &DeviceControlResult::Applied);
+        assert!(lock(&pressing.inner.notifications).pending.is_empty());
+        assert!(lock(&pressing.inner.notifications).origins.is_empty());
+        assert!(lock(&focus.inner.notifications).origins.is_empty());
+        focus.shutdown().await;
+        pressing.shutdown().await;
+    }
+
     fn assert_only_owner(requester: &Node, owner: &Node, id: u64, undo: Undo) -> u64 {
         let state = lock(&owner.inner.notifications);
         let pending = &state.pending[&id];
@@ -1377,6 +1861,164 @@ mod owner_tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    fn send_legacy_keyboard_notice(source: &Node, host: &Node) -> u64 {
+        // Exercise the existing incoming typed-notification protocol. Current
+        // builtins render on their owner; older senders can target another host.
+        let group = source.link_config().unwrap();
+        let id = {
+            let mut state = lock(&source.inner.notifications);
+            state.next += 1;
+            let id = state.next;
+            state.pending.insert(
+                id,
+                Pending {
+                    level: NotificationLevel::Notice,
+                    action: Some(Undo::KeyboardUnlock),
+                    destination: host.id(),
+                    boot: group.peer_boot(host.id()),
+                    surface: None,
+                    expires: None,
+                },
+            );
+            id
+        };
+        let message = dto::NotifyShow::from_raw(
+            [
+                (1, id.write()),
+                (2, V::Text("right".into())),
+                (3, 0u8.write()),
+                (4, V::Text("Keyboard disabled".into())),
+                (5, V::Text(String::new())),
+                (6, true.write()),
+                (7, true.write()),
+                (8, 4u8.write()),
+            ]
+            .into(),
+        )
+        .unwrap();
+        group
+            .send_device_control(host.id(), Message::NotifyShow(message))
+            .unwrap();
+        id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn family_replacement_ignores_origin_and_routes_only_the_visible_undo() {
+        let (_home_a, _home_b, source, host) = owners(true).await;
+        for node in [&source, &host] {
+            call(
+                node,
+                api::Request::SetKeyboardDisabled {
+                    device: node.id().into(),
+                    disabled: true,
+                },
+            )
+            .await;
+        }
+        until("local keyboard notices", || {
+            [&source, &host]
+                .into_iter()
+                .all(|node| lock(&node.inner.notifications).keyboard_id.is_some())
+        })
+        .await;
+        let old_local = lock(&host.inner.notifications).families[&Family::Keyboard].surface;
+        let remote_id = send_legacy_keyboard_notice(&source, &host);
+        until("remote family replacement", || {
+            let state = lock(&host.inner.notifications);
+            state
+                .origins
+                .values()
+                .any(|origin| origin.peer == source.id() && origin.id == remote_id)
+        })
+        .await;
+        let remote_surface = {
+            let state = lock(&host.inner.notifications);
+            assert_eq!(state.origins.len(), 1);
+            assert!(!state.origins.contains_key(&old_local));
+            state.families[&Family::Keyboard].surface
+        };
+        host.notification_click(Click {
+            id: old_local,
+            undo: true,
+        });
+        assert_eq!(
+            host.settings().routing.keyboard_mode,
+            oink_foundation::input::InputMode::Disabled
+        );
+        call(
+            &host,
+            api::Request::SetKeyboardDisabled {
+                device: host.id().into(),
+                disabled: false,
+            },
+        )
+        .await;
+        until("local restore observed", || {
+            lock(&host.inner.notifications).keyboard_id.is_none()
+        })
+        .await;
+        assert!(
+            lock(&host.inner.notifications).origins.contains_key(&remote_surface),
+            "an old owner's restore must not remove a newer remote notice"
+        );
+        call(
+            &host,
+            api::Request::SetKeyboardDisabled {
+                device: host.id().into(),
+                disabled: true,
+            },
+        )
+        .await;
+        until("local replaces remote and retires its pending action", || {
+            let state = lock(&host.inner.notifications);
+            state.keyboard_id.is_some()
+                && !state.origins.contains_key(&remote_surface)
+                && !lock(&source.inner.notifications).pending.contains_key(&remote_id)
+        })
+        .await;
+        host.notification_click(Click {
+            id: remote_surface,
+            undo: true,
+        });
+        assert!(
+            (source.settings().routing.keyboard_mode == oink_foundation::input::InputMode::Disabled),
+            "replacement acknowledges dismissal, never Undo"
+        );
+        let local = lock(&host.inner.notifications).families[&Family::Keyboard].surface;
+        let target = host.clone();
+        tokio::task::spawn_blocking(move || target.notification_click(Click { id: local, undo: true }))
+            .await
+            .unwrap();
+        until("visible local undo", || {
+            host.settings().routing.keyboard_mode != oink_foundation::input::InputMode::Disabled
+                && lock(&host.inner.notifications).keyboard_id.is_none()
+        })
+        .await;
+        assert_eq!(
+            source.settings().routing.keyboard_mode,
+            oink_foundation::input::InputMode::Disabled
+        );
+        let remote_id = send_legacy_keyboard_notice(&source, &host);
+        until("new visible remote undo", || {
+            lock(&host.inner.notifications)
+                .origins
+                .values()
+                .any(|origin| origin.id == remote_id && origin.peer == source.id())
+        })
+        .await;
+        let surface = lock(&host.inner.notifications).families[&Family::Keyboard].surface;
+        host.notification_click(Click {
+            id: surface,
+            undo: true,
+        });
+        until("visible remote undo reaches its source", || {
+            source.settings().routing.keyboard_mode != oink_foundation::input::InputMode::Disabled
+        })
+        .await;
+        source.shutdown().await;
+        host.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1422,7 +2064,10 @@ mod owner_tests {
                 .await;
                 let id = lock(&owner.inner.notifications).keyboard_id.unwrap();
                 let surface = assert_only_owner(&requester, &owner, id, Undo::KeyboardUnlock);
-                assert!(owner.settings().keyboard_disabled);
+                assert_eq!(
+                    owner.settings().routing.keyboard_mode,
+                    oink_foundation::input::InputMode::Disabled
+                );
                 let target = owner.clone();
                 tokio::task::spawn_blocking(move || {
                     target.notification_click(Click {
@@ -1434,14 +2079,19 @@ mod owner_tests {
                 .unwrap();
                 until(
                     &format!("owner keyboard undo persisted and retired: {supported}/{operation}"),
-                    || !owner.settings().keyboard_disabled && lock(&owner.inner.notifications).keyboard_id.is_none(),
+                    || {
+                        owner.settings().routing.keyboard_mode != oink_foundation::input::InputMode::Disabled
+                            && lock(&owner.inner.notifications).keyboard_id.is_none()
+                    },
                 )
                 .await;
                 assert!(
-                    !AgentConfig::load_from(home_b.path())
+                    AgentConfig::load_from(home_b.path())
                         .unwrap()
                         .settings
-                        .keyboard_disabled
+                        .routing
+                        .keyboard_mode
+                        != oink_foundation::input::InputMode::Disabled
                 );
                 assert!(lock(&requester.inner.notifications).origins.is_empty());
             }
@@ -1484,9 +2134,15 @@ mod owner_tests {
                         .into_iter()
                         .all(|node| node.input_status().unwrap().locked_device.is_none())
                         && lock(&owner.inner.notifications).pointer_id.is_none()
+                        && lock(&owner.inner.notifications)
+                            .pending
+                            .values()
+                            .any(|p| p.action.is_none())
                 })
                 .await;
                 assert!(lock(&requester.inner.notifications).origins.is_empty());
+                let release = *lock(&owner.inner.notifications).pending.keys().next().unwrap();
+                owner.dismiss_notification(release);
             }
             requester.shutdown().await;
             owner.shutdown().await;
@@ -1498,9 +2154,7 @@ mod owner_tests {
         let (_home_a, _home_b, requester, owner) = owners(true).await;
         // Ordered transition work can precede the observer's latest pointer
         // metadata. Neither a lock nor game transition may follow that snapshot.
-        owner.notification_status(&StatusEvent::FocusLock {
-            holder: Some(owner.id()),
-        });
+        owner.notification_status(&StatusEvent::LocalPointerLock(true));
         let id = lock(&owner.inner.notifications).pointer_id.unwrap();
         assert_only_owner(&requester, &owner, id, Undo::PointerUnlock);
         assert_eq!(
@@ -1508,7 +2162,10 @@ mod owner_tests {
             NotificationLevel::Notice
         );
         owner.dismiss_notification(id);
-        owner.notification_status(&StatusEvent::FocusLock { holder: None });
+        owner.notification_status(&StatusEvent::LocalPointerLock(false));
+        let release = *lock(&owner.inner.notifications).pending.keys().next().unwrap();
+        assert!(lock(&owner.inner.notifications).pending[&release].action.is_none());
+        owner.dismiss_notification(release);
         owner.notification_status(&StatusEvent::LocalGameMode(true));
         let id = lock(&owner.inner.notifications).game_id.unwrap();
         assert_only_owner(&requester, &owner, id, Undo::GameOff);

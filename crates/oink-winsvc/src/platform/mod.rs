@@ -4,6 +4,7 @@ mod backend_stop;
 mod broker;
 pub mod client;
 mod pipe_io;
+mod power;
 mod security;
 mod server;
 mod service_peer;

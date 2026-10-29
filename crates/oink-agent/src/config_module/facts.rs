@@ -230,6 +230,24 @@ impl Facts {
             Ok(())
         })
     }
+    pub fn microphone(
+        &mut self,
+        observation: dto::MicrophoneObservation,
+        watermark: Option<dto::AudioExitClaim>,
+    ) -> v1::Result<bool> {
+        self.edit(|raw| {
+            let mut resources = raw
+                .get(&16)
+                .map(RawValue::as_map)
+                .transpose()?
+                .cloned()
+                .unwrap_or_default();
+            resources.insert(8, observation.write());
+            raw.insert(16, RawValue::Map(resources));
+            raw.insert(24, watermark.write());
+            Ok(())
+        })
+    }
     pub fn audio(
         &mut self,
         permission: dto::CapturePermission,
@@ -362,6 +380,25 @@ pub(super) fn for_local_output_capability(facts: dto::DeviceFacts, supported: bo
     dto::DeviceFacts::from_raw(raw)
 }
 
+/// Hide new owner values and revisions from peers that did not negotiate them.
+/// LocalOption 19 remains the released two-state preference for those peers.
+pub(super) fn for_touchpad_capability(facts: dto::DeviceFacts, supported: bool) -> v1::Result<dto::DeviceFacts> {
+    if supported {
+        return Ok(facts);
+    }
+    let mut raw = facts.into_raw();
+    let keep = |item: &RawValue| !matches!(item, RawValue::Map(item) if item.get(&1).and_then(|v| v.as_u64().ok()).is_some_and(|n| matches!(n, 26..=28)));
+    if let Some(RawValue::Array(preferences)) = raw.get_mut(&18) {
+        preferences.retain(keep);
+    }
+    if let Some(RawValue::Map(resources)) = raw.get_mut(&16)
+        && let Some(RawValue::Array(revisions)) = resources.get_mut(&6)
+    {
+        revisions.retain(keep);
+    }
+    dto::DeviceFacts::from_raw(raw)
+}
+
 /// AX is an owner observation in ConfigFacts, never inferred from resource faults.
 pub(super) fn for_accessibility_capability(facts: dto::DeviceFacts, supported: bool) -> v1::Result<dto::DeviceFacts> {
     if supported {
@@ -375,6 +412,78 @@ pub(super) fn for_accessibility_capability(facts: dto::DeviceFacts, supported: b
 #[cfg(test)]
 mod mouse_mode_tests {
     use super::*;
+    #[test]
+    fn touchpad_owner_facts_strip_only_unnegotiated_options_and_revisions() {
+        let mut facts = Facts::new(
+            Boot {
+                device_id: oink_foundation::DeviceId([1; 32]),
+                nonce: [2; 16],
+            },
+            GroupId([3; 16]),
+            "owner",
+            "windows",
+            &OfferProfile::default(),
+        )
+        .unwrap()
+        .value()
+        .clone();
+        facts
+            .edit(|raw| {
+                raw.insert(
+                    18,
+                    RawValue::Array(
+                        [19, 26, 27, 28, 900]
+                            .into_iter()
+                            .map(|n| {
+                                RawValue::Map([(1, RawValue::Uint(n)), (2, 1u64.write()), (3, true.write())].into())
+                            })
+                            .collect(),
+                    ),
+                );
+                raw.insert(
+                    16,
+                    RawValue::Map(
+                        [(
+                            6,
+                            RawValue::Array(
+                                [19, 26, 27, 28, 900]
+                                    .into_iter()
+                                    .map(|n| RawValue::Map([(1, RawValue::Uint(n)), (2, 1u64.write())].into()))
+                                    .collect(),
+                            ),
+                        )]
+                        .into(),
+                    ),
+                );
+            })
+            .unwrap();
+        assert_eq!(for_touchpad_capability(facts.clone(), true).unwrap(), facts);
+        let legacy = for_touchpad_capability(facts, false).unwrap();
+        assert_eq!(
+            legacy
+                .preferences()
+                .unwrap()
+                .unwrap()
+                .0
+                .iter()
+                .map(|p| p.option().unwrap().number())
+                .collect::<Vec<_>>(),
+            [19, 900]
+        );
+        assert_eq!(
+            legacy
+                .resources()
+                .unwrap()
+                .unwrap()
+                .option_revisions()
+                .unwrap()
+                .0
+                .iter()
+                .map(|r| r.option().unwrap().number())
+                .collect::<Vec<_>>(),
+            [19, 900]
+        );
+    }
     #[test]
     fn accessibility_facts_are_explicit_optional_and_capability_gated() {
         let mut facts = Facts::new(
@@ -518,5 +627,265 @@ mod mouse_mode_tests {
         assert_eq!(preferences.0.len(), 1);
         assert_eq!(preferences.0[0].option().unwrap(), dto::LocalOption::KeyboardMode);
         assert_eq!(legacy.fact_sequence().unwrap(), original.fact_sequence().unwrap());
+    }
+}
+
+/// The owner keeps its full settings. Each C0 publication gets an old-compatible
+/// copy unless this exact peer negotiated the None/Fn representation.
+pub(super) fn for_keymap_capability(facts: dto::DeviceFacts, supported: bool) -> v1::Result<dto::DeviceFacts> {
+    if supported {
+        return Ok(facts);
+    }
+    fn keyboard(value: &mut RawValue) {
+        let RawValue::Map(raw) = value else { return };
+        if let Some(RawValue::Array(table)) = raw.get_mut(&2) {
+            table.retain(|entry| {
+                !matches!(entry, RawValue::Map(m)
+                if m.get(&2) == Some(&RawValue::Uint(0))
+                    || m.get(&1) == Some(&RawValue::Uint(oink_foundation::input::KeyCode::APPLE_FN.0.into())))
+            });
+        }
+        // The old CapsTapHold validator rejects either empty output. Omit the
+        // entire split, rather than inventing a different tap/hold relationship.
+        if raw.get(&3).is_some_and(|v| {
+            matches!(v, RawValue::Map(c)
+            if c.get(&1) == Some(&RawValue::Uint(0)) || c.get(&2) == Some(&RawValue::Uint(0)))
+        }) {
+            raw.remove(&3);
+        }
+    }
+    let mut raw = facts.into_raw();
+    if let Some(RawValue::Array(preferences)) = raw.get_mut(&18) {
+        for preference in preferences {
+            let RawValue::Map(preference) = preference else {
+                continue;
+            };
+            if preference.get(&1) != Some(&dto::LocalOption::InputTransform.write()) {
+                continue;
+            }
+            let Some(RawValue::Map(transform)) = preference.get_mut(&3) else {
+                continue;
+            };
+            for key in [1, 2] {
+                if let Some(RawValue::Map(target)) = transform.get_mut(&key)
+                    && let Some(mapping) = target.get_mut(&2)
+                {
+                    keyboard(mapping);
+                }
+            }
+            if let Some(RawValue::Array(overrides)) = transform.get_mut(&3) {
+                for item in overrides {
+                    if let RawValue::Map(item) = item
+                        && let Some(mapping) = item.get_mut(&3)
+                    {
+                        keyboard(mapping);
+                    }
+                }
+            }
+        }
+    }
+    dto::DeviceFacts::from_raw(raw)
+}
+
+#[cfg(test)]
+mod keymap_compatibility_tests {
+    use super::*;
+    use oink_foundation::{DeviceId, input::KeyCode, input_transform::*};
+
+    // Freeze the pre-extension owner's acceptance contract. Decoding with the
+    // current DTO alone would miss the old CapsTapHold validator rejecting zero.
+    fn legacy_owner_accepts(facts: &dto::DeviceFacts) -> bool {
+        facts.preferences().unwrap().unwrap().0.iter().all(|p| {
+            if p.option().unwrap() != dto::LocalOption::InputTransform {
+                return true;
+            }
+            let transform =
+                crate::config::read_transform(dto::InputTransformValue::read(&p.value().unwrap()).unwrap()).unwrap();
+            let supported = candidate_keys();
+            [&transform.macos.keyboard, &transform.windows.keyboard]
+                .into_iter()
+                .chain(transform.overrides.iter().filter_map(|o| o.keyboard.as_ref()))
+                .all(|k| {
+                    k.table
+                        .iter()
+                        .all(|m| supported.contains(&m.from) && supported.contains(&m.to))
+                        && k.caps_tap_hold
+                            .is_none_or(|c| supported.contains(&c.tap) && supported.contains(&c.hold))
+                })
+        })
+    }
+    fn source_facts() -> dto::DeviceFacts {
+        let mut facts = Facts::new(
+            Boot {
+                device_id: DeviceId([1; 32]),
+                nonce: [2; 16],
+            },
+            GroupId([3; 16]),
+            "source",
+            "macos",
+            &OfferProfile::default(),
+        )
+        .unwrap();
+        let keyboard = KeyboardMapping {
+            saved_custom: None,
+            preset: KeyPreset::Custom,
+            table: vec![
+                KeyMapping {
+                    from: KeyCode::LEFT_CTRL,
+                    to: KeyCode::NONE,
+                },
+                KeyMapping {
+                    from: KeyCode::APPLE_FN,
+                    to: KeyCode::RIGHT_ALT,
+                },
+                KeyMapping {
+                    from: KeyCode::LEFT_GUI,
+                    to: KeyCode::RIGHT_CTRL,
+                },
+            ],
+            caps_tap_hold: Some(CapsTapHold {
+                tap: KeyCode::NONE,
+                hold: KeyCode::LEFT_SHIFT,
+            }),
+        };
+        let transform = InputTransform {
+            macos: TargetTransform {
+                reverse_wheel: true,
+                keyboard: keyboard.clone(),
+            },
+            windows: TargetTransform {
+                reverse_wheel: false,
+                keyboard: keyboard.clone(),
+            },
+            overrides: vec![TargetOverride {
+                target: DeviceId([4; 32]),
+                reverse_wheel: Some(true),
+                keyboard: Some(keyboard),
+            }],
+        };
+        let mut value = crate::config::write_transform(&transform);
+        if let RawValue::Map(raw) = &mut value {
+            raw.insert(900, RawValue::Text("retained".into()));
+        }
+        facts
+            .edit(|raw| {
+                raw.insert(
+                    18,
+                    RawValue::Array(vec![
+                        RawValue::Map([(1, 13u32.write()), (2, 77u64.write()), (3, value)].into()),
+                        RawValue::Map([(1, 16u32.write()), (2, 3u64.write()), (3, RawValue::from("source"))].into()),
+                    ]),
+                );
+                Ok(())
+            })
+            .unwrap();
+        facts.value().clone()
+    }
+    #[test]
+    fn keymap_legacy_peer_accepts_projected_publication_and_modern_peer_keeps_none() {
+        let original = source_facts();
+        assert!(!legacy_owner_accepts(&original));
+        assert_eq!(for_keymap_capability(original.clone(), true).unwrap(), original);
+        let legacy = for_keymap_capability(original.clone(), false).unwrap();
+        assert!(
+            legacy_owner_accepts(&legacy),
+            "a legacy owner must accept the complete ConfigFacts publication"
+        );
+        let frame = v1::frame::encode(&v1::Message::ConfigFacts(legacy.clone()), v1::limits::CONFIG_FRAME).unwrap();
+        // Optional external probe: feed these actual publications to the
+        // pre-feature codec/owner validator without adding a second product codec.
+        if let Ok(directory) = std::env::var("OINK_KEYMAP_COMPAT_FRAMES") {
+            let directory = std::path::Path::new(&directory);
+            std::fs::write(directory.join("legacy-facts.bin"), &frame).unwrap();
+            std::fs::write(
+                directory.join("modern-facts.bin"),
+                v1::frame::encode(&v1::Message::ConfigFacts(original.clone()), v1::limits::CONFIG_FRAME).unwrap(),
+            )
+            .unwrap();
+        }
+        let v1::Message::ConfigFacts(decoded) = v1::frame::OpaqueFrame::parse_exact(&frame, v1::limits::CONFIG_FRAME)
+            .unwrap()
+            .decode()
+            .unwrap()
+        else {
+            panic!("facts")
+        };
+        assert!(legacy_owner_accepts(&decoded));
+        assert_eq!(decoded.fact_sequence().unwrap(), original.fact_sequence().unwrap());
+        let preferences = decoded.preferences().unwrap().unwrap().0;
+        assert_eq!(preferences[0].revision().unwrap(), 77);
+        assert_eq!(preferences[1], original.preferences().unwrap().unwrap().0[1]);
+        assert_eq!(
+            preferences[0].value().unwrap().as_map().unwrap()[&900],
+            RawValue::from("retained")
+        );
+        let transform =
+            crate::config::read_transform(dto::InputTransformValue::read(&preferences[0].value().unwrap()).unwrap())
+                .unwrap();
+        for keyboard in [&transform.macos.keyboard, &transform.windows.keyboard]
+            .into_iter()
+            .chain(transform.overrides.iter().filter_map(|o| o.keyboard.as_ref()))
+        {
+            assert_eq!(
+                keyboard.table,
+                [KeyMapping {
+                    from: KeyCode::LEFT_GUI,
+                    to: KeyCode::RIGHT_CTRL
+                }]
+            );
+            assert_eq!(keyboard.caps_tap_hold, None);
+        }
+        assert!(transform.macos.reverse_wheel);
+        assert_eq!(transform.overrides[0].reverse_wheel, Some(true));
+        assert!(
+            !legacy_owner_accepts(&original),
+            "projection must not mutate the author's durable facts"
+        );
+    }
+    #[test]
+    fn keymap_projection_only_removes_caps_split_with_empty_outputs() {
+        for (tap, hold) in [
+            (KeyCode::NONE, KeyCode::NONE),
+            (KeyCode::NONE, KeyCode::LEFT_SHIFT),
+            (KeyCode::LEFT_SHIFT, KeyCode::NONE),
+            (KeyCode::LEFT_SHIFT, KeyCode::CAPS_LOCK),
+        ] {
+            let mut original = source_facts().into_raw();
+            let RawValue::Array(preferences) = original.get_mut(&18).unwrap() else {
+                panic!("preferences")
+            };
+            let RawValue::Map(preference) = &mut preferences[0] else {
+                panic!("preference")
+            };
+            let mut transform =
+                crate::config::read_transform(dto::InputTransformValue::read(&preference[&3]).unwrap()).unwrap();
+            let caps = CapsTapHold { tap, hold };
+            transform.macos.keyboard.caps_tap_hold = Some(caps);
+            transform.windows.keyboard.caps_tap_hold = Some(caps);
+            transform.overrides[0].keyboard.as_mut().unwrap().caps_tap_hold = Some(caps);
+            preference.insert(3, crate::config::write_transform(&transform));
+            let legacy = for_keymap_capability(dto::DeviceFacts::from_raw(original).unwrap(), false).unwrap();
+            assert!(legacy_owner_accepts(&legacy));
+            let value = legacy.preferences().unwrap().unwrap().0[0].value().unwrap();
+            let transform = crate::config::read_transform(dto::InputTransformValue::read(&value).unwrap()).unwrap();
+            let expected = (tap != KeyCode::NONE && hold != KeyCode::NONE).then_some(caps);
+            for k in [&transform.macos.keyboard, &transform.windows.keyboard]
+                .into_iter()
+                .chain(transform.overrides.iter().filter_map(|o| o.keyboard.as_ref()))
+            {
+                assert_eq!(k.caps_tap_hold, expected);
+            }
+        }
+    }
+    #[test]
+    fn keymap_capability_is_offered_without_becoming_required() {
+        let profile = crate::node::Node::offer_profile();
+        assert!(profile.capabilities.iter().any(|c| c == "oink.input.keymap-none/1"));
+        assert!(
+            !profile
+                .required_capabilities
+                .iter()
+                .any(|c| c == "oink.input.keymap-none/1")
+        );
     }
 }

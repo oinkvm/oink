@@ -32,6 +32,16 @@ pub trait BulkLink: Send + Sync + 'static {
         Box::pin(std::future::pending())
     }
 
+    /// Persistent namespaces reopen using current membership and connection,
+    /// independently of the original offer and source process. Static adapters
+    /// must opt in explicitly; unsupported peers cannot use a legacy fallback.
+    fn bind_persistent(self: Arc<Self>, _peer: DeviceId) -> io::Result<Arc<dyn BulkLink>> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    fn supports_cloud_links(&self) -> bool {
+        false
+    }
+
     fn supports_namespace(&self) -> bool {
         true
     }

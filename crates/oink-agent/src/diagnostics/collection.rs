@@ -560,13 +560,6 @@ impl Context {
                             && e.compressed_length()? as usize == payload.len()
                             && e.raw_length()? as usize <= MAX_SEGMENT_RAW,
                     )?;
-                    let digest = e.digest()?;
-                    self.check(
-                        link,
-                        0x0a05,
-                        digest.algorithm()?.0 == "sha256"
-                            && digest.bytes()?.0.as_slice() == v1::retained::sha256(&payload).0,
-                    )?;
                     lock(&snapshot).receive_expanded(e.raw_length()? as usize)?;
                     let bytes = std::mem::take(&mut payload);
                     let compression = compression.clone();
@@ -924,10 +917,6 @@ impl Collector {
                 trace.work.messages += 1;
                 trace.sample(&stream);
             }
-            let digest = dto::<w::Digest>([
-                ("algorithm", RawValue::from("sha256")),
-                ("bytes", v1::retained::sha256(&bytes).write()),
-            ])?;
             self.context
                 .progress(
                     stream.send(&Message::DiagnosticsSegmentEnd(dto::<w::DiagnosticsSegmentEnd>([
@@ -935,7 +924,6 @@ impl Collector {
                         ("segment_id", (segment_id as u64).wire()?),
                         ("compressed_length", (bytes.len() as u32).wire()?),
                         ("raw_length", (raw_len as u32).wire()?),
-                        ("digest", digest.write()),
                     ])?)),
                 )
                 .await?;
@@ -1727,11 +1715,6 @@ mod tests {
                     ))
                     .await
                     .unwrap();
-                let digest = dto::<w::Digest>([
-                    ("algorithm", RawValue::from("sha256")),
-                    ("bytes", v1::retained::sha256(&bytes).write()),
-                ])
-                .unwrap();
                 operation
                     .stream
                     .send(&Message::DiagnosticsSegmentEnd(
@@ -1740,7 +1723,6 @@ mod tests {
                             ("segment_id", 0u64.write()),
                             ("compressed_length", (bytes.len() as u32).write()),
                             ("raw_length", (bytes.len() as u32).write()),
-                            ("digest", digest.write()),
                         ])
                         .unwrap(),
                     ))

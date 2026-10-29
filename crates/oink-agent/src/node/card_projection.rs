@@ -34,6 +34,7 @@ impl Node {
                 }],
                 focus,
                 exit_baseline: false,
+                microphone_resolution: Default::default(),
                 local_exit_selection_ready: false,
                 selected_exit: None,
                 exit_claim: None,
@@ -125,6 +126,12 @@ impl Node {
             members,
             focus,
             exit_baseline,
+            microphone_resolution: self
+                .inner
+                .audio
+                .get()
+                .map(|audio| audio.status().microphone_resolution)
+                .unwrap_or_default(),
             local_exit_selection_ready,
             selected_exit,
             exit_claim,
@@ -155,6 +162,30 @@ impl Node {
             .snapshot()
             .map(|snapshot| (*snapshot).clone())
             .ok_or_else(sharing_not_started)
+    }
+
+    pub(crate) fn device_card_signals(&self, sampled_at_ms: u64) -> Option<DeviceCardSignals> {
+        let cards = lock(&self.inner.cards).snapshot()?;
+        let links = self.links().ok().map(|links| links.links());
+        Some(DeviceCardSignals {
+            stream: cards.stream.clone(),
+            revision: cards.revision,
+            sampled_at_ms,
+            signals: cards
+                .cards
+                .iter()
+                .filter(|card| matches!(card.connection, CardConnection::Online { .. }))
+                .map(|card| DeviceCardSignal {
+                    device: card.device,
+                    rtt_ms: links
+                        .as_ref()
+                        .and_then(|table| table.by_peer(card.device.0))
+                        .filter(|link| link.state == oink_network::link::LinkState::Ready)
+                        .and_then(|link| link.rtt)
+                        .map(|rtt| rtt.as_secs_f64() * 1000.),
+                })
+                .collect(),
+        })
     }
 }
 

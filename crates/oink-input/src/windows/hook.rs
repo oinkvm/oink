@@ -45,6 +45,7 @@ mod external;
 #[cfg(all(test, debug_assertions))]
 mod external_tests;
 mod observations;
+mod restore;
 
 pub(crate) use external::physical_keys;
 
@@ -70,13 +71,14 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC_EX, MapVirtualKeyW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-    GetSystemMetrics, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED,
-    MSG, MSLLHOOKSTRUCT, PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassExW, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_TIMER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW,
+    CURSOR_SHOWING, CURSORINFO, CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetCursorInfo, GetCursorPos, GetMessageW, GetSystemMetrics, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, KillTimer,
+    LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, PostMessageW, PostQuitMessage,
+    PostThreadMessageW, RegisterClassExW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_APP, WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_TIMER, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    WNDCLASSEXW,
 };
 use windows::core::w;
 
@@ -97,11 +99,15 @@ const WM_APP_PARK_COMPLETE: u32 = WM_APP + 6;
 /// 鼠标钩子回调重入、事件没经过截获就放行的次数（检测日志）。
 static REENTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const WATCHDOG_TIMER: usize = 1;
+const MOUSE_KEYS_TIMER: usize = 5;
+const TOUCHPAD_END_TIMER: usize = 3;
 const WATCHDOG_MS: u32 = 1000;
 /// Raw Input 有输入、而钩子超过这么久没被调用 → 认为钩子被卸载了。
 const HOOK_SILENT: Duration = Duration::from_millis(1000);
 /// 回调耗时超过这个值时记录警告（系统超时约 300 ms）。
 const SLOW_HANDLER: Duration = Duration::from_millis(50);
+
+pub(crate) type RestoreCompletion = Box<dyn FnOnce(bool) + Send>;
 
 pub(crate) enum Command {
     DragAnchor(Option<oink_foundation::dnd::DragAnchor>, mpsc::SyncSender<bool>),
@@ -113,7 +119,7 @@ pub(crate) enum Command {
         reply: mpsc::SyncSender<Result<(), InputError>>,
     },
     SetMode(CaptureMode, mpsc::SyncSender<Option<Marker>>),
-    RestoreLocal(Point, mpsc::SyncSender<Option<Marker>>),
+    RestoreLocal(Point, Option<RestoreCompletion>, mpsc::SyncSender<Option<Marker>>),
     Touchpad(
         (f64, f64),
         u32,
@@ -312,6 +318,8 @@ struct State {
     restoring_from_marker: Option<POINT>,
     /// 模式切换的序号（推迟撤掉遮罩时核对：其间又切换过就不撤）。
     transitions: u64,
+    local_restore: Option<restore::LocalRestore>,
+    restore_complete: Option<(u64, RestoreCompletion)>,
     /// 本线程的消息窗口（兜底定时器）。
     hwnd: HWND,
     raw: RawTracker,
@@ -391,12 +399,29 @@ pub(crate) fn touchpad_here(
     phase: oink_foundation::input::ScrollPhase,
 ) -> Result<(f64, f64), InputError> {
     with_state(|st| {
-        if matches!(st.mode, CaptureMode::Local) && st.pending.is_none() {
+        let remaining = if matches!(st.mode, CaptureMode::Local) && st.pending.is_none() {
             st.touchpad.scroll(pixels, dpi, phase)
         } else {
             st.touchpad.cancel_all();
             (0.0, 0.0)
+        };
+        // Only arm the short bridge timer while Ended is waiting for momentum.
+        // No recurring high-frequency timer is needed during ordinary scrolling.
+        // SAFETY: the window and its timers belong to this hook thread.
+        unsafe {
+            let _ = KillTimer(Some(st.hwnd), TOUCHPAD_END_TIMER);
+            if st.touchpad.awaiting_momentum()
+                && SetTimer(
+                    Some(st.hwnd),
+                    TOUCHPAD_END_TIMER,
+                    crate::touchpad::MOMENTUM_GRACE.as_millis() as u32,
+                    None,
+                ) == 0
+            {
+                st.touchpad.finish_scroll();
+            }
         }
+        remaining
     })
     .ok_or(InputError::NotStarted)
 }
@@ -441,8 +466,12 @@ pub(crate) fn apply_mode_here(mode: CaptureMode) -> Result<(), InputError> {
 }
 
 /// 在截获线程上回到 `Local` 并把光标放到 `at`（执行时机同 [`apply_mode_here`]）。
-pub(crate) fn restore_local_here(at: Point) -> Result<(), InputError> {
-    request_here(Transition::restore(at))
+pub(crate) fn restore_local_here(at: Point, complete: Option<RestoreCompletion>) -> Result<(), InputError> {
+    let marker = with_state(|st| st.request_restore(at, complete)).ok_or(InputError::NotStarted)?;
+    if let Some(marker) = marker {
+        dispatch_marker(marker);
+    }
+    Ok(())
 }
 
 fn request_here(t: Transition) -> Result<(), InputError> {
@@ -604,9 +633,9 @@ impl HookHandle {
         }
     }
 
-    pub(crate) fn restore_local(&self, at: Point) -> Result<(), InputError> {
+    pub(crate) fn restore_local(&self, at: Point, complete: Option<RestoreCompletion>) -> Result<(), InputError> {
         let (tx, rx) = mpsc::sync_channel(1);
-        self.post(Command::RestoreLocal(at, tx))?;
+        self.post(Command::RestoreLocal(at, complete, tx))?;
         Self::finish_request(&rx)
     }
 
@@ -640,7 +669,23 @@ impl HookHandle {
 }
 
 fn report_capture_install_result(installed: bool, desktop_available: bool) {
-    crate::capture_loop::capture_available(installed && desktop_available);
+    if installed && !desktop_available {
+        crate::capture_loop::capture_detached();
+    } else {
+        crate::capture_loop::capture_available(installed);
+    }
+}
+
+fn report_capture_desktop(available: bool, desktop_changed: bool) {
+    // UAC's secure desktop intentionally withdraws this desktop's source.
+    // Keep the routing/key-release boundary without reporting a failed hook
+    // installation. Hook installation failures use capture_available(false).
+    if desktop_changed || !available {
+        crate::capture_loop::capture_detached();
+    }
+    if available {
+        crate::capture_loop::capture_available(true);
+    }
 }
 
 fn run(
@@ -651,6 +696,7 @@ fn run(
     observations: Option<std::sync::Arc<observations::State>>,
 ) {
     IS_HOOK_THREAD.with(|c| c.set(true));
+    let mouse_keys = super::mouse_keys::Worker::new();
     let _dpi = ThreadDpiGuard::per_monitor_v2();
     // Numeric scheduling/status records leave through snapshots; formatting must never
     // run on this realtime capture owner, including inside the unchanged router code.
@@ -743,6 +789,8 @@ fn run(
                 restore_watch: None,
                 restoring_from_marker: None,
                 transitions: 0,
+                local_restore: None,
+                restore_complete: None,
                 hwnd,
                 raw: RawTracker::default(),
                 keys: HashMap::new(),
@@ -774,6 +822,7 @@ fn run(
             observations.set_window(Some(hwnd));
         }
         SetTimer(Some(hwnd), WATCHDOG_TIMER, WATCHDOG_MS, None);
+        mouse_keys.sharing(pacing.is_none());
         let _ = ready.send(Ok(GetCurrentThreadId()));
 
         let mut msg = MSG::default();
@@ -789,6 +838,7 @@ fn run(
                 }
                 resume_hotkey.update(crate::capture_loop::paused_hotkey());
                 let requested = crate::capture_loop::capture_requested();
+                mouse_keys.sharing(requested);
                 let mut capture_attempt = None;
                 let (active, desktop_available) = with_state(|st| {
                     if requested && !st.capture_enabled && now >= capture_retry {
@@ -808,6 +858,7 @@ fn run(
                                 observations.set_capturing(false);
                             }
                             st.capture_enabled = false;
+                            st.cancel_restore();
                             st.transitions += 1;
                             st.pending = None;
                             st.park_marker = None;
@@ -878,7 +929,9 @@ fn run(
         drop(_desktop_trace);
         // 清理：卸载钩子、恢复光标、注销 Raw Input
         let _ = KillTimer(Some(hwnd), WATCHDOG_TIMER);
+        let _ = KillTimer(Some(hwnd), TOUCHPAD_END_TIMER);
         if let Some(mut st) = STATE.with(|s| s.borrow_mut().take()) {
+            st.cancel_restore();
             st.raw_capture.update(false, st.park);
             st.uninstall_hooks();
             st.hider.show();
@@ -908,17 +961,7 @@ fn process_commands() {
                 let _ = reply.send(contacts_here(&frame));
             }
             Some(Command::Touchpad(pixels, dpi, phase, reply)) => {
-                let remaining = with_state(|st| {
-                    if matches!(st.mode, CaptureMode::Local) && st.pending.is_none() {
-                        st.touchpad.scroll(pixels, dpi, phase)
-                    } else {
-                        // A queued event must not restart a pan after handoff.
-                        // Routing also discards the interrupted sequence.
-                        st.touchpad.cancel_all();
-                        (0.0, 0.0)
-                    }
-                })
-                .unwrap_or((1.0, 1.0));
+                let remaining = touchpad_here(pixels, dpi, phase).unwrap_or((1.0, 1.0));
                 let _ = reply.send(remaining);
             }
             Some(Command::CancelTouchpad(reply)) => {
@@ -954,12 +997,13 @@ fn process_commands() {
                 let marker = with_state(|st| st.request(Transition::of_mode(mode))).flatten();
                 let _ = reply.send(marker);
             }
-            Some(Command::RestoreLocal(at, reply)) => {
-                let marker = with_state(|st| st.request(Transition::restore(at))).flatten();
+            Some(Command::RestoreLocal(at, complete, reply)) => {
+                let marker = with_state(|st| st.request_restore(at, complete)).flatten();
                 let _ = reply.send(marker);
             }
             Some(Command::Stop) => {
                 with_state(|st| {
+                    st.cancel_restore();
                     st.touchpad.cancel_all();
                     st.raw_capture.update(false, st.park);
                     st.pending = None;
@@ -976,6 +1020,24 @@ fn process_commands() {
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        windows::Win32::UI::WindowsAndMessaging::WM_DEVICECHANGE
+        | windows::Win32::UI::WindowsAndMessaging::WM_INPUT_DEVICE_CHANGE => {
+            super::mouse_keys::edge(crate::mouse_keys::Reason::DeviceChange);
+            // Device removal can finish asynchronously after the notification.
+            // SAFETY: timer belongs to this message window.
+            unsafe {
+                SetTimer(Some(hwnd), MOUSE_KEYS_TIMER, 50, None);
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == MOUSE_KEYS_TIMER => {
+            // SAFETY: this window owns the one-shot device timer.
+            unsafe {
+                let _ = KillTimer(Some(hwnd), MOUSE_KEYS_TIMER);
+            }
+            super::mouse_keys::edge(crate::mouse_keys::Reason::DeviceChange);
+            LRESULT(0)
+        }
         desktop_trace::WM_CAPTURE_DESKTOP => {
             capture_availability_changed(true);
             LRESULT(0)
@@ -1044,12 +1106,35 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(0)
         }
         WM_APP_COVER_HIDDEN => {
-            with_state(|st| st.hider.finish_show(wparam.0 as u64));
+            with_state(|st| {
+                st.hider.finish_show(wparam.0 as u64);
+                st.check_restore_completion();
+            });
+            LRESULT(0)
+        }
+        restore::MESSAGE => {
+            with_state(|st| st.reset_restore(wparam.0 as u64, 1));
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == restore::TIMER => {
+            with_state(State::restore_deadline);
             LRESULT(0)
         }
         WM_APP_UNCOVER => {
             with_state(|st| {
                 st.uncover(wparam.0 as u64);
+            });
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == TOUCHPAD_END_TIMER => {
+            with_state(|st| {
+                st.touchpad.expire();
+                if !st.touchpad.awaiting_momentum() {
+                    // SAFETY: timer belongs to this hook thread/window.
+                    unsafe {
+                        let _ = KillTimer(Some(hwnd), TOUCHPAD_END_TIMER);
+                    }
+                }
             });
             LRESULT(0)
         }
@@ -1252,6 +1337,7 @@ impl State {
     /// 请求一次模式切换：钩子回调里立即执行，返回 `None`；否则记下，返回应注入的标记事件，
     /// 在标记的钩子回调里执行（见模块说明）。标记必须由其他线程注入。
     fn request(&mut self, t: Transition) -> Option<Marker> {
+        self.cancel_restore();
         if !self.capture_enabled {
             self.pending = None;
             self.execute(Transition::Local(None), Via::Timer);
@@ -1313,6 +1399,9 @@ impl State {
 
     /// 执行模式切换（在钩子回调里调用；兜底定时器除外）。
     fn execute(&mut self, t: Transition, via: Via) {
+        if matches!(t, Transition::Local(_)) {
+            super::mouse_keys::edge(crate::mouse_keys::Reason::Local);
+        }
         if crate::native_lifecycle::lifecycle_enabled() {
             crate::native_lifecycle::emit(
                 crate::native_lifecycle::Kind::Mode,
@@ -1331,6 +1420,7 @@ impl State {
         };
         match t {
             Transition::Remote(p) => {
+                self.cancel_restore();
                 let from = cursor_pos();
                 self.raw_capture.update(false, self.park);
                 // GiveFeedback can replace SetCursor(NULL). The live catcher
@@ -1371,6 +1461,7 @@ impl State {
                 }
                 let was_hidden = self.hider.is_hidden();
                 self.mode = CaptureMode::Local;
+                self.begin_restore(at);
                 if at.is_some() && self.hider.is_hidden() {
                     if via != Via::Marker {
                         // 光标已经放到落点（遮罩之外）。遮罩等回调返回之后再撤：光标位置在回调返回后才对其他程序
@@ -1607,18 +1698,37 @@ impl State {
         // old park point. Read back placement before handing visibility to the cover.
         if let Some(watch) = &self.restore_watch
             && watch.at != self.park
-            && cursor_pos() == self.park
         {
-            super::trace::action(
-                crate::native_lifecycle::Kind::UncoverRequest,
-                Some(watch.at),
-                2,
-                Some(false),
-            );
-            return false;
+            let actual = cursor_pos_checked().ok();
+            if actual == Some(self.park) {
+                crate::native_lifecycle::emit_lifecycle(
+                    crate::native_lifecycle::Kind::UncoverRequest,
+                    crate::native_lifecycle::Data {
+                        point: Some([watch.at.x, watch.at.y]),
+                        cursor: actual.map(|p| [p.x, p.y]),
+                        park: Some([self.park.x, self.park.y]),
+                        extra: sequence,
+                        reason: 2,
+                        hidden: Some(self.hider.is_hidden()),
+                        success: Some(false),
+                        ..Default::default()
+                    },
+                );
+                if IN_HOOK.with(Cell::get) {
+                    // SAFETY: wake our owner window; generation is checked again
+                    // outside the low-level callback before any synchronous placement.
+                    unsafe {
+                        let _ = PostMessageW(Some(self.hwnd), restore::MESSAGE, WPARAM(sequence as usize), LPARAM(0));
+                    }
+                } else {
+                    self.reset_restore(sequence, 1);
+                }
+                return false;
+            }
         }
         self.restoring_from_marker = None;
         self.hider.show_moved_away();
+        self.check_restore_completion();
         true
     }
 
@@ -1952,6 +2062,38 @@ fn marker_completed(marker: Marker, inserted: bool) {
     }
 }
 
+// Boundary-only observations share the bounded lifecycle queue with Mode and
+// UncoverRequest. No text formatting, input payload or window identity is retained.
+fn marker_data(marker: Option<Marker>, extra: usize, target: POINT) -> crate::native_lifecycle::Data {
+    crate::native_lifecycle::Data {
+        extra: marker.map_or(0, |marker| marker.sequence),
+        marker: Some(extra as u64),
+        reason: marker.map_or(2, |marker| u32::from(marker.park_generation.is_some())),
+        point: Some([target.x, target.y]),
+        cursor: cursor_pos_checked().ok().map(|p| [p.x, p.y]),
+        ..Default::default()
+    }
+}
+
+fn trace_marker_hook(
+    kind: crate::native_lifecycle::Kind,
+    marker: Option<Marker>,
+    info: &MSLLHOOKSTRUCT,
+    passed: bool,
+    chain_result: Option<i64>,
+) {
+    if crate::native_lifecycle::lifecycle_enabled() {
+        crate::native_lifecycle::emit(
+            kind,
+            crate::native_lifecycle::Data {
+                success: Some(passed),
+                chain_result,
+                ..marker_data(marker, info.dwExtraInfo, info.pt)
+            },
+        );
+    }
+}
+
 /// Inject from the caller, never the hook thread; see the module comment.
 fn send_marker(marker: Marker) {
     let p = marker.target;
@@ -1966,9 +2108,41 @@ fn send_marker(marker: Marker) {
         );
         let mut input = inject::move_abs(inject::normalize(p.x, vx, vw), inject::normalize(p.y, vy, vh));
         input.Anonymous.mi.dwExtraInfo = marker.extra;
+        if crate::native_lifecycle::lifecycle_enabled() {
+            let data = marker_data(Some(marker), marker.extra, p);
+            crate::native_lifecycle::emit(
+                crate::native_lifecycle::Kind::MarkerSubmission,
+                crate::native_lifecycle::Data {
+                    normalized: Some([input.Anonymous.mi.dx, input.Anonymous.mi.dy]),
+                    desktop: Some([vx, vy, vx.saturating_add(vw), vy.saturating_add(vh)]),
+                    ..data
+                },
+            );
+        }
         SetLastError(WIN32_ERROR(0));
-        if super::warp::send(&[input]) != 1 {
-            let error = GetLastError().0;
+        let inserted = super::warp::send(&[input]) == 1;
+        let error = if inserted { 0 } else { GetLastError().0 };
+        if crate::native_lifecycle::lifecycle_enabled() {
+            let mut info = CURSORINFO {
+                cbSize: size_of::<CURSORINFO>() as u32,
+                ..Default::default()
+            };
+            let showing = GetCursorInfo(&mut info)
+                .ok()
+                .map(|()| info.flags.0 & CURSOR_SHOWING.0 != 0);
+            let data = marker_data(Some(marker), marker.extra, p);
+            crate::native_lifecycle::emit(
+                crate::native_lifecycle::Kind::MarkerReadback,
+                crate::native_lifecycle::Data {
+                    flags: error,
+                    success: Some(inserted),
+                    hidden: showing.map(|showing| !showing),
+                    cursor_showing: showing,
+                    ..data
+                },
+            );
+        }
+        if !inserted {
             park_failure(
                 marker,
                 crate::native_lifecycle::ParkInputFailure::SendRejected,
@@ -1979,7 +2153,6 @@ fn send_marker(marker: Marker) {
             marker_completed(marker, false);
             return;
         }
-        tracing::debug!(sequence = marker.sequence, target = ?p, cursor = ?cursor_pos(), "mode-switch marker send completed");
         marker_completed(marker, true);
     }
 }
@@ -2034,21 +2207,29 @@ pub(super) fn cursor_pos_checked() -> windows::core::Result<POINT> {
 }
 
 fn clamp_to_monitor(p: POINT) -> POINT {
-    // SAFETY: 查询离该点最近的显示器并读取其矩形。
+    clamp_to_monitor_checked(p).unwrap_or(p)
+}
+
+fn clamp_to_monitor_checked(p: POINT) -> Option<POINT> {
+    #[cfg(all(test, debug_assertions))]
+    if super::cursor::test_native::active() {
+        return Some(p);
+    }
+    // SAFETY: read-only nearest-monitor query under the hook owner's PMv2 context.
     unsafe {
-        let m = MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST);
-        let mut mi = MONITORINFO {
+        let monitor = MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
             cbSize: size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
-        if !GetMonitorInfoW(m, &mut mi).as_bool() {
-            return p;
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return None;
         }
-        let r = mi.rcMonitor;
-        POINT {
-            x: p.x.clamp(r.left, r.right - 1),
-            y: p.y.clamp(r.top, r.bottom - 1),
-        }
+        let rect = info.rcMonitor;
+        (rect.left < rect.right && rect.top < rect.bottom).then(|| POINT {
+            x: p.x.clamp(rect.left, rect.right - 1),
+            y: p.y.clamp(rect.top, rect.bottom - 1),
+        })
     }
 }
 
@@ -2127,12 +2308,7 @@ fn capture_availability_changed(desktop_changed: bool) {
     // A queued switch can arrive after a rapid Winlogon -> Default round trip.
     // Reclaim/release on that discontinuity too, before rebuilding any modifiers.
     // No event from the credential desktop is read or forwarded.
-    if desktop_changed || !available {
-        crate::capture_loop::capture_available(false);
-    }
-    if available {
-        crate::capture_loop::capture_available(true);
-    }
+    report_capture_desktop(available, desktop_changed);
     for event in events {
         let disposition = crate::diagnostics::with_capture(
             crate::diagnostics::CaptureMetadata {
@@ -2244,6 +2420,7 @@ fn mouse_proc_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
 }
 
 fn mouse_proc_with_next(code: i32, wparam: WPARAM, lparam: LPARAM, next: impl FnOnce() -> LRESULT) -> LRESULT {
+    let mut marker_context = None;
     if code >= 0 {
         // SAFETY: HC_ACTION 时 lparam 指向系统提供的 MSLLHOOKSTRUCT，回调期间有效。
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
@@ -2278,7 +2455,24 @@ fn mouse_proc_with_next(code: i32, wparam: WPARAM, lparam: LPARAM, next: impl Fn
             st.last_mouse_hook = now;
             st.pipeline.mouse_callbacks += 1;
             if is_marker(info.dwExtraInfo) {
-                return st.prepare_marker(info.pt, info.dwExtraInfo);
+                marker_context = st
+                    .pending
+                    .map(|pending| pending.marker)
+                    .filter(|marker| marker.extra == info.dwExtraInfo)
+                    .or_else(|| {
+                        st.park_marker
+                            .map(|(_, marker)| marker)
+                            .filter(|marker| marker.extra == info.dwExtraInfo)
+                    });
+                let prepared = st.prepare_marker(info.pt, info.dwExtraInfo);
+                trace_marker_hook(
+                    crate::native_lifecycle::Kind::MarkerHookDecision,
+                    marker_context,
+                    info,
+                    matches!(prepared, Prepared::Pass),
+                    None,
+                );
+                return prepared;
             }
             let msg = wparam.0 as u32;
             let ours = info.dwExtraInfo == INJECT_TAG;
@@ -2311,6 +2505,13 @@ fn mouse_proc_with_next(code: i32, wparam: WPARAM, lparam: LPARAM, next: impl Fn
                 // A reentrant callback could not validate the pending sequence.
                 // It must not commit an unvalidated absolute marker. The normal
                 // transition fallback remains responsible for that request.
+                trace_marker_hook(
+                    crate::native_lifecycle::Kind::MarkerHookDecision,
+                    None,
+                    info,
+                    false,
+                    None,
+                );
                 return LRESULT(1);
             }
             // 状态正被外层使用：钩子回调重入了（外层在等跨线程的窗口调用时，本线程处理了新的钩子消息）。
@@ -2361,6 +2562,13 @@ fn mouse_proc_with_next(code: i32, wparam: WPARAM, lparam: LPARAM, next: impl Fn
         // SAFETY: the hook input remains valid until this callback returns.
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
         if is_marker(info.dwExtraInfo) {
+            trace_marker_hook(
+                crate::native_lifecycle::Kind::MarkerChainResult,
+                marker_context,
+                info,
+                result.0 == 0,
+                Some(result.0 as i64),
+            );
             with_state(|st| st.park_chain_result(info.dwExtraInfo, result.0 == 0));
         }
     }
@@ -2546,14 +2754,17 @@ mod tests {
     #[test]
     fn initial_hook_install_and_retry_publish_keyboard_capture_health() {
         use std::sync::{Arc, Mutex};
-        struct Owner(Arc<Mutex<Vec<bool>>>);
+        struct Owner(Arc<Mutex<Vec<Option<bool>>>>);
         impl crate::capture_loop::CaptureLoop for Owner {
             fn set_wake(&mut self, _: crate::capture_loop::Wake) {}
             fn event(&mut self, _: &CapturedEvent) -> Disposition {
                 Disposition::Pass
             }
             fn capture_available(&mut self, available: bool) {
-                self.0.lock().unwrap().push(available);
+                self.0.lock().unwrap().push(Some(available));
+            }
+            fn capture_detached(&mut self) {
+                self.0.lock().unwrap().push(None);
             }
             fn poll(&mut self, _: Instant) -> Option<Instant> {
                 None
@@ -2566,11 +2777,30 @@ mod tests {
         crate::capture_loop::install(Box::new(Owner(observed.clone())), Arc::new(|| {}));
         // A successful first installation, failed retry, inaccessible desktop,
         // and successful retry must each publish an authoritative outcome.
-        for (installed, desktop_available) in [(true, true), (false, true), (true, false), (true, true)] {
+        for (installed, desktop_available) in [(true, true), (false, true), (true, false), (false, false), (true, true)]
+        {
             report_capture_install_result(installed, desktop_available);
         }
+        report_capture_desktop(false, true);
+        report_capture_desktop(true, true);
+        // A coalesced round trip still withdraws before restoring the source.
+        report_capture_desktop(true, true);
         crate::capture_loop::clear();
-        assert_eq!(*observed.lock().unwrap(), [true, false, false, true]);
+        assert_eq!(
+            *observed.lock().unwrap(),
+            [
+                Some(true),
+                Some(false),
+                None,
+                Some(false),
+                Some(true),
+                None,
+                None,
+                Some(true),
+                None,
+                Some(true)
+            ]
+        );
     }
 
     #[test]
@@ -2756,6 +2986,8 @@ mod tests {
             restore_watch: None,
             restoring_from_marker: None,
             transitions: 0,
+            local_restore: None,
+            restore_complete: None,
             hwnd: HWND::default(),
             raw: RawTracker::default(),
             raw_capture: super::super::raw_capture::RawCapture::default(),
@@ -3033,6 +3265,35 @@ mod tests {
     }
 
     #[test]
+    fn stuck_park_restore_resets_our_cover_to_a_visible_cursor_once() {
+        use super::super::cursor::test_native as native;
+        let from = p(3700, 900);
+        let park = p(1920, 1080);
+        let entry = p(3839, 900);
+        let _native = native::Guard::at(from);
+        let mut st = remote_state();
+        st.hider = native::hider();
+        st.execute(Transition::Remote(park), Via::Marker);
+        native::set_showing(false);
+        let departure = st.cover_acknowledged(1).unwrap();
+        native_park_applies(&mut st, departure);
+        let marker = st.request(Transition::Local(Some(entry))).unwrap();
+        assert!(matches!(st.prepare_marker(entry, marker.extra), Prepared::Pass));
+        // Windows accepted the matching hook target, but its position never applied.
+        assert_eq!(cursor_pos(), park);
+        st.uncover(marker.sequence);
+        st.hider.finish_show(2);
+        assert!(
+            !st.hider.is_hidden(),
+            "a refused uncover must reset our own hidden state"
+        );
+        assert_eq!(cursor_pos(), entry);
+        assert_eq!(native::hidden(), Some(false));
+        st.uncover(marker.sequence);
+        assert_eq!(cursor_pos(), entry);
+    }
+
+    #[test]
     fn every_departure_path_waits_for_hide_and_return_commits_before_uncover() {
         use super::super::cursor::test_native as native;
         for via in [Via::InHook, Via::Marker, Via::Timer] {
@@ -3059,7 +3320,10 @@ mod tests {
             native_park_applies(&mut st, park_marker);
             let marker = st.request(Transition::Local(Some(entry))).unwrap();
             assert!(matches!(st.prepare_marker(entry, marker.extra), Prepared::Pass));
-            assert!(!st.uncover(marker.sequence), "restore input has not applied yet");
+            {
+                let _callback = InHook::enter();
+                assert!(!st.uncover(marker.sequence), "restore input has not applied yet");
+            }
             assert!(st.hider.is_hidden());
             native::warp(entry);
             assert!(st.uncover(marker.sequence));

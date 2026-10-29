@@ -691,6 +691,180 @@ fn clock_offset_and_merged_timeline_retain_original_time() {
     }
 }
 #[test]
+fn arrangement_read_failures_retain_codes_counts_and_call_sites() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let temp = tempfile::tempdir().unwrap();
+    let recorder = isolated(temp.path().into(), DeviceId([85; 32]), None, true).unwrap();
+    recorder.wait_recovery();
+    let subscriber = tracing_subscriber::registry().with(trace::scoped(&recorder));
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::warn!(target: "oink_arrangement", operation="query", win32_error=5_u32,
+            display_paths=1_u32, display_modes=2_u32, query_flags=18_u32,
+            error="private-platform-error");
+        tracing::warn!(target: "oink_arrangement", call_site="observer", error="private-owner-error");
+    });
+    let bundle = recorder.save(Reason::Manual).unwrap();
+    let rows = timeline(&bundle.path, "merged.ndjson");
+    recorder.shutdown();
+    let logs: Vec<_> = rows.iter().filter_map(|row| row["event"].get("Log")).collect();
+    assert_eq!(logs.len(), 2);
+    let fields = logs[0]["fields"].as_array().unwrap();
+    for (name, value) in [
+        ("win32_error", 5.0),
+        ("display_paths", 1.0),
+        ("display_modes", 2.0),
+        ("query_flags", 18.0),
+    ] {
+        assert!(
+            fields.iter().any(|f| f[0] == name && f[1].as_f64() == Some(value)),
+            "{name}"
+        );
+    }
+    assert_eq!(logs[0]["labels"], serde_json::json!([["operation", "query"]]));
+    assert_eq!(logs[1]["labels"], serde_json::json!([["call_site", "observer"]]));
+    let text = serde_json::to_string(&rows).unwrap();
+    assert!(!text.contains("private-platform-error"));
+    assert!(!text.contains("private-owner-error"));
+}
+
+#[test]
+fn audio_pipeline_debug_samples_reach_retained_segments() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let temp = tempfile::tempdir().unwrap();
+    let recorder = isolated(temp.path().into(), DeviceId([83; 32]), None, true).unwrap();
+    recorder.wait_recovery();
+    let subscriber = tracing_subscriber::registry().with(trace::scoped(&recorder));
+    tracing::subscriber::with_default(subscriber, || {
+        // Exercise the real recorder admission, not just the scalar visitor.
+        // The periodic output sample has no `concealed` field (the receiver does).
+        tracing::debug!(target: "oink_audio_diagnostics", kind="audio_pipeline_sample",
+            sample_mono_us=3_603_000_000_i64, output_deadline_misses=0_u64,
+            callback_over_budget=1_u64, callback_max_work_us=12_515_u64,
+            callback_min_margin_us=Some(-9_849_i64), native_gap_frames=Some(612_u64),
+            pcm="private-payload", device="private-endpoint");
+        tracing::debug!(target: "oink_audio_diagnostics", count=987654_u64, "unreviewed debug");
+    });
+    let bundle = recorder.save(Reason::Manual).unwrap();
+    let rows = timeline(&bundle.path, "merged.ndjson");
+    recorder.shutdown();
+    let logs: Vec<_> = rows.iter().filter_map(|row| row["event"].get("Log")).collect();
+    assert_eq!(logs.len(), 1, "output deadline evidence must survive DEBUG admission");
+    let fields = logs[0]["fields"].as_array().unwrap();
+    for (name, value) in [
+        ("callback_over_budget", 1.0),
+        ("callback_max_work_us", 12_515.0),
+        ("callback_min_margin_us", -9_849.0),
+        ("native_gap_frames", 612.0),
+    ] {
+        assert!(fields.iter().any(|f| f[0] == name && f[1].as_f64() == Some(value)));
+    }
+    let text = serde_json::to_string(&rows).unwrap();
+    for private in ["private-payload", "private-endpoint", "987654"] {
+        assert!(!text.contains(private));
+    }
+}
+
+#[test]
+fn callback_incident_report_retains_correlated_phases_and_work_counts() {
+    use oink_audio::playback::{CallbackIncident, CallbackWork, PlaybackMetrics};
+    use tracing_subscriber::layer::SubscriberExt;
+    let temp = tempfile::tempdir().unwrap();
+    let recorder = isolated(temp.path().into(), DeviceId([84; 32]), None, true).unwrap();
+    recorder.wait_recovery();
+    let subscriber = tracing_subscriber::registry().with(trace::scoped(&recorder));
+    tracing::subscriber::with_default(subscriber, || {
+        crate::audio::report::callback_incidents(&PlaybackMetrics {
+            callback_incidents: vec![CallbackIncident {
+                sequence: 7,
+                at_us: 3_603_000_000,
+                frames: 128,
+                rate: 48_000,
+                budget_ns: 2_666_666,
+                elapsed_ns: 12_515_000,
+                gap_us: 2667,
+                native_gap_frames: Some(612),
+                phase_ns: [5_000, 12_490_000, 12_500_000, 12_510_000],
+                work: CallbackWork {
+                    sources: 2,
+                    scan_steps: 4,
+                    codec_calls: 2,
+                    plc_frames: 1,
+                    decode_errors: 1,
+                    work_limited: 0,
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+    });
+    let bundle = recorder.save(Reason::Manual).unwrap();
+    let rows = timeline(&bundle.path, "merged.ndjson");
+    recorder.shutdown();
+    let logs: Vec<_> = rows.iter().filter_map(|row| row["event"].get("Log")).collect();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(
+        logs[0]["labels"][0],
+        serde_json::json!(["kind", "audio_callback_incident"])
+    );
+    let fields = logs[0]["fields"].as_array().unwrap();
+    assert_eq!(fields.len(), 21, "no phase/count silently lost at the scalar limit");
+    for (name, value) in [
+        ("sample_mono_us", 3_603_000_000.),
+        ("callback_sequence", 7.),
+        ("callback_ingress_us", 5.),
+        ("callback_pull_us", 12_485.),
+        ("callback_output_us", 10.),
+        ("callback_publish_us", 10.),
+        ("callback_adapter_us", 5.),
+        ("callback_sources", 2.),
+        ("callback_scan_steps", 4.),
+        ("callback_codec_calls", 2.),
+        ("callback_plc_frames", 1.),
+        ("callback_decode_errors", 1.),
+        ("callback_work_limited", 0.),
+        ("callback_fault", 0.),
+    ] {
+        assert!(
+            fields.iter().any(|f| f[0] == name && f[1].as_f64() == Some(value)),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn audio_permission_query_duration_is_retained_without_permission_detail_text() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let temp = tempfile::tempdir().unwrap();
+    let recorder = isolated(temp.path().into(), DeviceId([85; 32]), None, true).unwrap();
+    recorder.wait_recovery();
+    let subscriber = tracing_subscriber::registry().with(trace::scoped(&recorder));
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::debug!(target: "oink_audio_diagnostics", kind="audio_permission_sample",
+            sample_mono_us=123_i64, permission_query_us=456_u64,
+            permission_query_ok=true, permission_right=Some(2_u64), detail="private-error");
+    });
+    let bundle = recorder.save(Reason::Manual).unwrap();
+    let rows = timeline(&bundle.path, "merged.ndjson");
+    recorder.shutdown();
+    let logs: Vec<_> = rows.iter().filter_map(|row| row["event"].get("Log")).collect();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(
+        logs[0]["labels"][0],
+        serde_json::json!(["kind", "audio_permission_sample"])
+    );
+    assert_eq!(
+        logs[0]["fields"],
+        serde_json::json!([
+            ["sample_mono_us", 123.],
+            ["permission_query_us", 456.],
+            ["permission_query_ok", 1.],
+            ["permission_right", 2.],
+        ])
+    );
+    assert!(!serde_json::to_string(&rows).unwrap().contains("private-error"));
+}
+
+#[test]
 fn diagnostic_trace_ignores_file_filter_and_sensitive_dynamic_fields() {
     use tracing_subscriber::layer::SubscriberExt;
     let temp = tempfile::tempdir().unwrap();
@@ -738,7 +912,7 @@ fn killed_process_child() {
     }
 }
 #[test]
-fn killed_process_recovers_durable_rows() {
+fn killed_process_recovers_published_rows() {
     use std::io::BufRead;
     let dir = tempfile::tempdir().unwrap();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -760,7 +934,13 @@ fn killed_process_recovers_durable_rows() {
     child.wait().unwrap();
     let r = isolated(dir.path().into(), DeviceId([21; 32]), Some(GroupId([22; 16])), true).unwrap();
     r.wait_recovery();
-    assert_eq!(r.list().unwrap()[0].reason, Reason::RecoveredCrash);
+    let recovered = r.list().unwrap();
+    assert_eq!(recovered[0].reason, Reason::RecoveredCrash);
+    assert!(
+        timeline(&recovered[0].path, "merged.ndjson")
+            .iter()
+            .any(|row| row["event"]["Input"].is_object())
+    );
     assert!(r.status().segments > 0);
     r.shutdown();
 }
@@ -2992,4 +3172,140 @@ fn baseline_collection_omits_rich_layout_and_keeps_typed_availability() {
         value: f64::NAN,
     };
     assert!(super::wire_values::segment(&segment, true).is_err());
+}
+
+#[test]
+fn application_keyboard_owner_is_exported_only_as_diagnostic_alias() {
+    use oink_protocol::v1::schema::WireDto;
+    let anon = Anonymizer::new(oink_foundation::GroupId([9; 16]));
+    let pointer = oink_foundation::DeviceId([1; 32]);
+    let keyboard = oink_foundation::DeviceId([2; 32]);
+    let snapshot = Snapshot {
+        application_focus: Some(super::store::ApplicationFocus {
+            pointer: anon.device(pointer),
+            keyboard: Some(anon.device(keyboard)),
+            epoch: 1,
+            revision: 2,
+            phase: oink_routing::application_focus::Phase::Active,
+            reason: oink_routing::application_focus::Reason::Ready,
+        }),
+        ..Snapshot::current_build()
+    };
+    let wire = super::wire_values::snapshot(&snapshot, false).unwrap();
+    let focus = wire.application_focus().unwrap().unwrap();
+    assert_eq!(focus.keyboard().unwrap().unwrap().0, anon.device(keyboard));
+    let json = serde_json::to_string(&snapshot).unwrap();
+    assert!(!json.contains(&keyboard.to_hex()));
+    assert!(!json.contains(&pointer.to_hex()));
+    assert!(wire.raw().contains_key(&17));
+}
+
+#[test]
+fn application_focus_numeric_evidence_exports_without_realtime_tracing_or_raw_identities() {
+    use oink_foundation::application_focus::{Foreground, Observation, ObservationStamp};
+    use oink_routing::{application_focus as a, router::RoutingDiagnostics};
+    let temp = tempfile::tempdir().unwrap();
+    let me = DeviceId([11; 32]);
+    let peer = DeviceId([12; 32]);
+    let recorder = isolated(temp.path().into(), me, None, true).unwrap();
+    recorder.wait_recovery();
+    let trace = input_trace::InputTrace::for_recorder(&recorder);
+    let records = [
+        a::Diagnostic::State {
+            epoch: 8,
+            revision: 3,
+            pointer: me,
+            keyboard: Some(peer),
+            phase: a::Phase::Active,
+            reason: a::Reason::Ready,
+        },
+        a::Diagnostic::Observation {
+            epoch: 8,
+            observer: me,
+            observation: Observation {
+                stamp: ObservationStamp {
+                    generation: 1,
+                    sequence: 4,
+                },
+                foreground: Foreground::Hidden,
+                hidden_lost: false,
+                park_operation: Some(7),
+            },
+            accepted: true,
+        },
+        a::Diagnostic::Key {
+            epoch: 8,
+            revision: 2,
+            destination: peer,
+            stage: a::KeyStage::Rejected(a::KeyRefusal::Generation),
+        },
+        a::Diagnostic::Dismiss { epoch: 8 },
+    ];
+    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+        for record in records {
+            RoutingDiagnostics::application_focus(&*trace, record);
+        }
+    });
+    for record in records {
+        let event = application_focus::export(record, &recorder);
+        assert!(event.network(false).is_ok());
+        assert!(event.network(true).is_ok());
+    }
+    trace.drain(&recorder);
+    let bundle = recorder.save_range(None).unwrap();
+    let rows = timeline(&bundle.path, "merged.ndjson");
+    let focus: Vec<_> = rows
+        .iter()
+        .filter(|row| row["event"]["Log"]["module"] == "oink_application_focus")
+        .collect();
+    assert_eq!(focus.len(), records.len());
+    let json = serde_json::to_string(&focus).unwrap();
+    assert!(!json.contains(&me.to_hex()));
+    assert!(!json.contains(&peer.to_hex()));
+    assert!(json.contains("Rejected(Generation)"));
+}
+
+#[test]
+#[ignore = "controlled recorder publication profile"]
+fn resource_recorder_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut recorder = store(dir.path());
+    let profile = std::env::var_os("OINK_RESOURCE_PROFILE").is_some();
+    let count = if profile { 1500 } else { 100 };
+    let began = Instant::now();
+    for n in 0..count {
+        recorder.append(vec![motion(n)], 0).unwrap();
+        if profile {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    assert_eq!(recorder.segments.len(), count as usize);
+    for meta in &recorder.segments {
+        assert_eq!(store::decode(&recorder.read(meta).unwrap()).unwrap().rows.len(), 1);
+    }
+    eprintln!("RECORDER,segments={count},us={}", began.elapsed().as_micros());
+}
+
+#[test]
+fn rejected_provider_item_causes_roundtrip_the_existing_diagnostic_scalar_and_status() {
+    use oink_clipboard::FileProviderReason as R;
+    for reason in [
+        R::ItemMissing,
+        R::ItemUnsupportedType,
+        R::ItemKindMismatch,
+        R::ItemTargetMismatch,
+        R::ItemIdentityMismatch,
+        R::ItemMetadataMismatch,
+        R::ItemAccessDenied,
+        R::ItemMetadataUnreadable,
+    ] {
+        let availability = ProviderAvailability::from(reason);
+        assert!(!availability.available);
+        assert_eq!(
+            ProviderAvailability::from_code(availability.code()).unwrap().reason,
+            reason
+        );
+        let encoded = serde_json::to_value(availability).unwrap();
+        assert_eq!(encoded["reason"], reason.to_string());
+    }
 }

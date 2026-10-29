@@ -5,6 +5,28 @@ import OSLog
 
 private let enumerationLog = Logger(subsystem: providerLogSubsystem, category: "enumeration")
 
+private enum FullFetchFailure: Error { case sourceVersionChanged }
+
+private func itemError(_ error: Error, for identifier: NSFileProviderItemIdentifier) -> Error {
+    let native = error as NSError
+    if native.domain == NSFileProviderErrorDomain && native.code == NSFileProviderError.noSuchItem.rawValue {
+        return NSError.fileProviderErrorForNonExistentItem(withIdentifier: identifier)
+    }
+    return error
+}
+
+private func fullFetchError(_ error: Error, for identifier: NSFileProviderItemIdentifier) -> Error {
+    let native = error as NSError
+    if error is FullFetchFailure ||
+        (native.domain == NSFileProviderErrorDomain && native.code == NSFileProviderError.versionNoLongerAvailable.rawValue) {
+        // -2009 belongs to strict partial fetching. macOS wraps it as "Extension
+        // internal error" on this full-fetch callback, failing Finder's move even
+        // if a later daemon retry succeeds. Use a transient full-file read error.
+        return CocoaError(.fileReadUnknown, userInfo: [NSUnderlyingErrorKey: NSFileProviderError(.versionNoLongerAvailable)])
+    }
+    return itemError(error, for: identifier)
+}
+
 // Numeric scopes make recovery verifiable without names, paths or identifiers.
 private func enumerationScope(_ identifier: NSFileProviderItemIdentifier) -> Int {
     if identifier == .workingSet { return 1 }
@@ -34,7 +56,7 @@ func makeEnumerator(_ identifier: NSFileProviderItemIdentifier, rootURL: @escapi
         return Enumerator(identifier, rootURL: rootURL, signal: signal)
     } catch {
         enumerationResult("open", scope: enumerationScope(identifier), error: error)
-        throw error
+        throw itemError(error, for: identifier)
     }
 }
 
@@ -67,7 +89,7 @@ final class Enumerator: NSObject, NSFileProviderEnumerator {
         do {
             if identifier != .rootContainer && identifier != .workingSet,
                let catalog = try catalogs(in: rootURL()).first(where: { $0.records.contains { $0.id == identifier.rawValue } }),
-               let record = catalog.records.first(where: { $0.id == identifier.rawValue }), record.directory, record.node != nil {
+               let record = catalog.records.first(where: { $0.id == identifier.rawValue }), record.directory, record.node != nil, try !receivedLocallyModified(record, in: rootURL()) {
                 guard !isPreparedPlaceholder(record) else { throw NSFileProviderError(.noSuchItem) }
                 let cursor: DirectoryCursor?
                 if page.rawValue == NSFileProviderPage.initialPageSortedByName as Data || page.rawValue == NSFileProviderPage.initialPageSortedByDate as Data {
@@ -81,17 +103,22 @@ final class Enumerator: NSObject, NSFileProviderEnumerator {
                 // delayed directory yields an actual page, never empty completion.
                 DispatchQueue.global(qos: .userInitiated).async {
                     do {
-                        let listing = try self.directory(catalog, record, cursor)
+                        let sourceListing = try self.directory(catalog, record, cursor)
+                        let listing = try receivedDirectoryListing(sourceListing, directory: record, in: self.rootURL())
                         guard !self.lock.withLock({ self.invalidated }) else { throw CocoaError(.userCancelled) }
                         let next = try listing.next.map { NSFileProviderPage(try JSONEncoder().encode(DirectoryPageToken(directory: self.identifier.rawValue, cursor: $0))) }
-                        if listing.next == nil {try receivedHandoff(record,in:self.rootURL())}
+                        if listing.next == nil { try receivedDirectoryHandoff(record, in: self.rootURL()) }
                         observer.didEnumerate(listing.records.map(Item.init))
                         enumerationResult("items-finished", scope: enumerationScope(self.identifier), count: listing.records.count)
                         observer.finishEnumerating(upTo: next)
                         self.signal()
                     } catch {
-                        enumerationResult("items-finished", scope: enumerationScope(self.identifier), error: error)
-                        observer.finishEnumeratingWithError(error)
+                        let failure: Error
+                        do { failure = try receivedSourceFailure(error, for: record.id, in: self.rootURL()) }
+                        catch { failure = error }
+                        if let root = try? self.rootURL() { notifyReceived("received-failed", record: record, in: root) }
+                        enumerationResult("items-finished", scope: enumerationScope(self.identifier), error: failure)
+                        observer.finishEnumeratingWithError(failure)
                     }
                 }
                 return
@@ -173,144 +200,211 @@ final class OinkFileProvider: NSObject, NSFileProviderReplicatedExtension {
     #if DEBUG
     convenience init(domain:NSFileProviderDomain,root:URL) {self.init(domain:domain);catalogRoot={root};receivedSignals=false}
     #endif
-    required init(domain: NSFileProviderDomain) { self.domain = domain; super.init(); ReportCapture.refresh() }
+    required init(domain: NSFileProviderDomain) {
+        self.domain = domain
+        super.init()
+        // Never serve the abandoned build 48 domain or another registration.
+        // Explicit uninstall is the only path that removes those registrations.
+        if domain.identifier.rawValue != providerDomain {
+            catalogRoot = { throw NSFileProviderError(.notAuthenticated) }
+            receivedSignals = false
+        } else { ReportCapture.refresh() }
+    }
     func invalidate() {}
     func item(for identifier: NSFileProviderItemIdentifier, request: NSFileProviderRequest, completionHandler: @escaping (NSFileProviderItem?, Error?) -> Void) -> Progress {
         do {
+            _ = try catalogRoot()
             if identifier == .rootContainer { completionHandler(rootItem(), nil) }
             else if identifier == .trashContainer { completionHandler(Item(Record(id:identifier.rawValue,parent:NSFileProviderItemIdentifier.rootContainer.rawValue,name:"Trash",directory:true,size:nil,modified:nil,node:nil)),nil) }
             else if let record = try catalogs(in:catalogRoot()).flatMap({ $0.records }).first(where: { $0.id == identifier.rawValue }) { completionHandler(Item(record), nil) }
-            else { completionHandler(nil, NSFileProviderError(.noSuchItem)) }
-        } catch { completionHandler(nil, error) }
+            else { completionHandler(nil, NSError.fileProviderErrorForNonExistentItem(withIdentifier: identifier)) }
+        } catch { completionHandler(nil, itemError(error, for: identifier)) }
         return Progress(totalUnitCount: 0)
     }
     func fetchContents(for identifier: NSFileProviderItemIdentifier, version requestedVersion: NSFileProviderItemVersion?, request: NSFileProviderRequest, completionHandler: @escaping (URL?, NSFileProviderItem?, Error?) -> Void) -> Progress {
         let outcome=request.isSystemRequest ? 0 : request.isFileViewerRequest ? 1 : request.requestingExecutable == nil ? 3 : 2
         enumerationLog.notice("operation=received-reader classification=\(outcome) count=1")
-        return fetchContents(for: identifier, progress: downloadProgress(), catalogRoot: catalogRoot,
+        return fetchContents(for: identifier, progress: downloadProgress(), requestedVersion: requestedVersion, catalogRoot: catalogRoot,
                       temporaryRoot: contentTemporaryDirectory, completionHandler: completionHandler)
     }
     // Keep the actual streaming path testable with private fixture roots, without
     // registering a system domain or opening the user's provider cache.
     func fetchContents(for identifier: NSFileProviderItemIdentifier, progress: Progress,
-                       catalogRoot: @escaping () throws -> URL, temporaryRoot: @escaping () throws -> URL,
+                       requestedVersion: NSFileProviderItemVersion? = nil, catalogRoot: @escaping () throws -> URL, temporaryRoot: @escaping () throws -> URL,
                        completionHandler: @escaping (URL?, NSFileProviderItem?, Error?) -> Void) -> Progress {
         DispatchQueue.global(qos: .userInitiated).async {
-            var temporary: URL?
-            do {
-                guard let catalog = try catalogs(in: catalogRoot()).first(where: { $0.records.contains { $0.id == identifier.rawValue } }),
-                      let record = catalog.records.first(where: { $0.id == identifier.rawValue }), !record.directory, !isPreparedPlaceholder(record) else { throw NSFileProviderError(.noSuchItem) }
-                if try readReceived(String(record.id.split(separator:"-").first ?? ""),in:catalogRoot())[record.id]?.modified_locally == true {throw NSFileProviderError(.versionNoLongerAvailable)}
-                try receivedBegin(record,in:catalogRoot())
-                progress.totalUnitCount = record.size.map { Int64(clamping: $0) } ?? -1
-                let staging = try temporaryRoot()
-                var stagingLease: TemporaryRootLease? = try TemporaryRootLease(staging)
-                var url = staging.appendingPathComponent(UUID().uuidString)
-                temporary = url
-                guard FileManager.default.createFile(atPath: url.path, contents: nil) else { throw CocoaError(.fileWriteUnknown) }
-                let output = try FileHandle(forWritingTo: url)
-                guard flock(output.fileDescriptor, LOCK_EX) == 0 else { throw CocoaError(.fileWriteUnknown) }
-                stagingLease = nil
-                _ = stagingLease
-                defer { try? output.close() }
-                let fd = socket(AF_INET, SOCK_STREAM, 0)
-                guard fd >= 0 else { throw NSFileProviderError(.serverUnreachable) }
-                defer { close(fd) }
-                var timeout = timeval(tv_sec: 1, tv_usec: 0)
-                setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout.size(ofValue: timeout)))
-                var noSigPipe: Int32 = 1
-                setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout.size(ofValue: noSigPipe)))
-                var address = sockaddr_in()
-                address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-                address.sin_family = sa_family_t(AF_INET)
-                address.sin_port = catalog.port.bigEndian
-                address.sin_addr.s_addr = inet_addr("127.0.0.1")
-                let connected = withUnsafePointer(to: &address) { p in p.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
-                guard connected == 0 else { throw NSFileProviderError(.serverUnreachable) }
-                let request = try bridgeRequest("read", catalog: catalog, record: record)
-                try request.withUnsafeBytes { bytes in
-                    var offset = 0
-                    while offset < bytes.count {
-                        let n = Darwin.write(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
-                        guard n > 0 else { throw NSFileProviderError(.serverUnreachable) }
-                        offset += n
+            // A latest-version request can restart after a source mutation. Each
+            // attempt owns a fresh file/socket and must unwind its receipt before
+            // restarting; never append bytes from a newer source to an old prefix.
+            for attempt in 0..<3 {
+                var temporary: URL?
+                var began = false
+                do {
+                    if progress.isCancelled { throw CocoaError(.userCancelled) }
+                    guard let catalog = try catalogs(in: catalogRoot()).first(where: { $0.records.contains { $0.id == identifier.rawValue } }),
+                          let record = catalog.records.first(where: { $0.id == identifier.rawValue }), !record.directory, !isPreparedPlaceholder(record) else { throw NSFileProviderError(.noSuchItem) }
+                    if try readReceived(String(record.id.split(separator:"-").first ?? ""),in:catalogRoot())[record.id]?.modified_locally == true {throw NSFileProviderError(.versionNoLongerAvailable)}
+                    try receivedBegin(record,in:catalogRoot())
+                    began = true
+                    if let target = record.symlink_target {
+                        try validateReceivedSymlink(record, records: catalog.records)
+                        if let requestedVersion, requestedVersion.contentVersion != Item(record).itemVersion.contentVersion {
+                            throw NSFileProviderError(.versionNoLongerAvailable)
+                        }
+                        let staging = try temporaryRoot()
+                        var lease: TemporaryRootLease? = try TemporaryRootLease(staging)
+                        let url = staging.appendingPathComponent("handoff-" + record.id + "-" + UUID().uuidString)
+                        temporary = url
+                        try FileManager.default.createSymbolicLink(atPath: url.path, withDestinationPath: target)
+                        cacheStorageChanged()
+                        lease = nil; _ = lease
+                        progress.totalUnitCount = 0; progress.completedUnitCount = 0; progress.fileCompletedCount = 1
+                        try receivedHandoff(record, in: catalogRoot())
+                        completionHandler(url, Item(record), nil)
+                        return
                     }
-                }
-                // Framed stream: 4-byte BE length, bytes. Zero terminates successfully;
-                // UInt32.max is failure. EOF without a terminator is never success.
-                func readExactly(_ count: Int) throws -> Data {
-                    var data = Data(count: count)
-                    var lastRead = Date()
-                    try data.withUnsafeMutableBytes { bytes in
+                    progress.totalUnitCount = record.size.map { Int64(clamping: $0) } ?? -1
+                    let staging = try temporaryRoot()
+                    var stagingLease: TemporaryRootLease? = try TemporaryRootLease(staging)
+                    var url = staging.appendingPathComponent(UUID().uuidString)
+                    temporary = url
+                    guard FileManager.default.createFile(atPath: url.path, contents: nil) else { throw CocoaError(.fileWriteUnknown) }
+                    let output = try FileHandle(forWritingTo: url)
+                    guard flock(output.fileDescriptor, LOCK_EX) == 0 else { throw CocoaError(.fileWriteUnknown) }
+                    stagingLease = nil
+                    _ = stagingLease
+                    defer { try? output.close() }
+                    let fd = socket(AF_INET, SOCK_STREAM, 0)
+                    guard fd >= 0 else { throw NSFileProviderError(.serverUnreachable) }
+                    defer { close(fd) }
+                    var timeout = timeval(tv_sec: 1, tv_usec: 0)
+                    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout.size(ofValue: timeout)))
+                    var noSigPipe: Int32 = 1
+                    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout.size(ofValue: noSigPipe)))
+                    var address = sockaddr_in()
+                    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+                    address.sin_family = sa_family_t(AF_INET)
+                    address.sin_port = catalog.port.bigEndian
+                    address.sin_addr.s_addr = inet_addr("127.0.0.1")
+                    let connected = withUnsafePointer(to: &address) { p in p.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+                    guard connected == 0 else { throw NSFileProviderError(.serverUnreachable) }
+                    let request = try bridgeRequest("read", catalog: catalog, record: record)
+                    try request.withUnsafeBytes { bytes in
                         var offset = 0
-                        while offset < count {
-                            if progress.isCancelled { throw CocoaError(.userCancelled) }
-                            let n = Darwin.read(fd, bytes.baseAddress!.advanced(by: offset), count - offset)
-                            if n < 0 && (errno == EAGAIN || errno == EINTR) && Date().timeIntervalSince(lastRead) < 310 { continue }
+                        while offset < bytes.count {
+                            let n = Darwin.write(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
                             guard n > 0 else { throw NSFileProviderError(.serverUnreachable) }
                             offset += n
-                            lastRead = Date()
                         }
                     }
-                    return data
-                }
-                var metadata: CurrentMetadata?
-                while true {
-                    let header = try readExactly(4)
-                    let count = header.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
-                    if count == 0 {
-                        guard let metadata, metadata.size == UInt64(progress.completedUnitCount) else { throw NSFileProviderError(.cannotSynchronize) }
-                        break
+                    // Framed stream: 4-byte BE length, bytes. Zero terminates successfully;
+                    // UInt32.max is failure. EOF without a terminator is never success.
+                    func readExactly(_ count: Int) throws -> Data {
+                        var data = Data(count: count)
+                        var lastRead = Date()
+                        try data.withUnsafeMutableBytes { bytes in
+                            var offset = 0
+                            while offset < count {
+                                if progress.isCancelled { throw CocoaError(.userCancelled) }
+                                let n = Darwin.read(fd, bytes.baseAddress!.advanced(by: offset), count - offset)
+                                if n < 0 && (errno == EAGAIN || errno == EINTR) && Date().timeIntervalSince(lastRead) < 310 { continue }
+                                guard n > 0 else { throw NSFileProviderError(.serverUnreachable) }
+                                offset += n
+                                lastRead = Date()
+                            }
+                        }
+                        return data
                     }
-                    if count == UInt32.max - 1 {
-                        guard metadata == nil, progress.completedUnitCount == 0 else { throw NSFileProviderError(.cannotSynchronize) }
-                        let length = try readExactly(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
-                        guard length <= 4096 else { throw NSFileProviderError(.cannotSynchronize) }
-                        metadata = try JSONDecoder().decode(CurrentMetadata.self, from: readExactly(Int(length)))
-                        progress.totalUnitCount = Int64(clamping: metadata!.size)
-                        continue
+                    var metadata: CurrentMetadata?
+                    while true {
+                        let header = try readExactly(4)
+                        let count = header.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+                        if count == 0 {
+                            guard let metadata, metadata.size == UInt64(progress.completedUnitCount) else { throw NSFileProviderError(.cannotSynchronize) }
+                            break
+                        }
+                        if count == UInt32.max - 1 {
+                            guard metadata == nil, progress.completedUnitCount == 0 else { throw NSFileProviderError(.cannotSynchronize) }
+                            let length = try readExactly(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+                            guard length <= 4096 else { throw NSFileProviderError(.cannotSynchronize) }
+                            metadata = try JSONDecoder().decode(CurrentMetadata.self, from: readExactly(Int(length)))
+                            // The bridge selects and persists the current source version.
+                            // An explicit request may accept only that content version;
+                            // metadata-only changes do not invalidate the requested bytes.
+                            if let requestedVersion,
+                               requestedVersion.contentVersion != Item(record.updating(metadata!)).itemVersion.contentVersion {
+                                self.signalReceived()
+                                throw NSFileProviderError(.versionNoLongerAvailable)
+                            }
+                            progress.totalUnitCount = Int64(clamping: metadata!.size)
+                            continue
+                        }
+                        if count == UInt32.max {
+                            switch try readExactly(1).first! {
+                            case 1: throw NSFileProviderError(.serverUnreachable)
+                            case 2: throw NSFileProviderError(.noSuchItem)
+                            case 3: throw FullFetchFailure.sourceVersionChanged
+                            case 4: throw CocoaError(.userCancelled)
+                            case 6: throw CocoaError(.fileReadNoPermission)
+                            default: throw NSFileProviderError(.cannotSynchronize)
+                            }
+                        }
+                        guard metadata != nil, count <= 1024 * 1024 else { throw NSFileProviderError(.cannotSynchronize) }
+                        let bytes = try readExactly(Int(count))
+                        try output.write(contentsOf: bytes)
+                        progress.completedUnitCount += Int64(bytes.count)
+                        progress.totalUnitCount = max(progress.totalUnitCount, progress.completedUnitCount)
                     }
-                    if count == UInt32.max {
-                        switch try readExactly(1).first! {
-                        case 1: throw NSFileProviderError(.serverUnreachable)
-                        case 2: throw NSFileProviderError(.noSuchItem)
-                        case 3: throw NSFileProviderError(.versionNoLongerAvailable)
-                        case 4: throw CocoaError(.userCancelled)
-                        default: throw NSFileProviderError(.cannotSynchronize)
+                    try applyExecutableBits(metadata?.exec_bits, descriptor: output.fileDescriptor)
+                    try output.synchronize()
+                    guard let metadata else { throw NSFileProviderError(.cannotSynchronize) }
+                    let current = record.updating(metadata)
+                    let handoff = url.deletingLastPathComponent().appendingPathComponent("handoff-" + record.id + "-" + url.lastPathComponent)
+                    try FileManager.default.moveItem(at: url, to: handoff)
+                    url = handoff
+                    temporary = handoff
+                    // The completion transfers ownership to File Provider. It may
+                    // consume the URL before returning, so a deferred close leaves
+                    // that consumer racing our exclusive writer lock. Mark handoff
+                    // before closing to keep cache cleanup from claiming the file.
+                    try output.close()
+                    cacheStorageChanged()
+                    progress.totalUnitCount = progress.completedUnitCount
+                    progress.fileCompletedCount = 1
+                    try receivedHandoff(current,in:catalogRoot())
+                    completionHandler(url, Item(current), nil)
+                    return
+                } catch {
+                    if let temporary { try? FileManager.default.removeItem(at: temporary); cacheStorageChanged() }
+                    var failure = error
+                    if began, let root=try? catalogRoot() {
+                        do {try receivedFetchFailed(identifier.rawValue,in:root)}
+                        catch {failure = error}
+                    }
+                    if failure is FullFetchFailure {
+                        self.signalReceived()
+                        if requestedVersion == nil && attempt < 2 && !progress.isCancelled {
+                            progress.completedUnitCount = 0
+                            enumerationLog.notice("operation=received-fetch-restart attempt=\(attempt + 1) result=3")
+                            continue
                         }
                     }
-                    guard metadata != nil, count <= 1024 * 1024 else { throw NSFileProviderError(.cannotSynchronize) }
-                    let bytes = try readExactly(Int(count))
-                    try output.write(contentsOf: bytes)
-                    progress.completedUnitCount += Int64(bytes.count)
-                    progress.totalUnitCount = max(progress.totalUnitCount, progress.completedUnitCount)
+                    if let root = try? catalogRoot(), let record = try? catalogs(in: root).flatMap({ $0.records }).first(where: { $0.id == identifier.rawValue }) {
+                        notifyReceived("received-failed", record: record, in: root)
+                    }
+                    completionHandler(nil, nil, progress.isCancelled ? CocoaError(.userCancelled) : fullFetchError(failure, for: identifier))
+                    return
                 }
-                try output.synchronize()
-                guard let metadata else { throw NSFileProviderError(.cannotSynchronize) }
-                let current = record.updating(metadata)
-                let handoff = url.deletingLastPathComponent().appendingPathComponent("handoff-" + record.id + "-" + url.lastPathComponent)
-                try FileManager.default.moveItem(at: url, to: handoff)
-                url = handoff
-                temporary = handoff
-                // The completion transfers ownership to File Provider. It may
-                // consume the URL before returning, so a deferred close leaves
-                // that consumer racing our exclusive writer lock. Mark handoff
-                // before closing to keep cache cleanup from claiming the file.
-                try output.close()
-                progress.totalUnitCount = progress.completedUnitCount
-                progress.fileCompletedCount = 1
-                try receivedHandoff(current,in:catalogRoot())
-                completionHandler(url, Item(current), nil)
-            } catch {
-                if let temporary { try? FileManager.default.removeItem(at: temporary) }
-                if let root=try? catalogRoot() {try? receivedFetchFailed(identifier.rawValue,in:root)}
-                completionHandler(nil, nil, error)
             }
         }
         return progress
     }
     func createItem(basedOn itemTemplate: NSFileProviderItem, fields: NSFileProviderItemFields, contents: URL?, options: NSFileProviderCreateItemOptions, request: NSFileProviderRequest, completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void) -> Progress {
-        completionHandler(nil, [], false, CocoaError(.fileWriteNoPermission)); return Progress(totalUnitCount: 0)
+        do {
+            let record = try receivedCreate(itemTemplate, fields: fields, contents: contents, options: options, in: catalogRoot())
+            completionHandler(Item(record), [], false, nil); signalReceived()
+        } catch { completionHandler(nil, [], false, error) }
+        return Progress(totalUnitCount: 0)
     }
     func modifyItem(_ item: NSFileProviderItem, baseVersion version: NSFileProviderItemVersion, changedFields: NSFileProviderItemFields, contents: URL?, options: NSFileProviderModifyItemOptions, request: NSFileProviderRequest, completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void) -> Progress {
         do {
@@ -333,7 +427,8 @@ final class OinkFileProvider: NSObject, NSFileProviderReplicatedExtension {
         Task {try? await manager.signalEnumerator(for:.workingSet)}
     }
     func enumerator(for containerItemIdentifier: NSFileProviderItemIdentifier, request: NSFileProviderRequest) throws -> NSFileProviderEnumerator {
-        try makeEnumerator(containerItemIdentifier, signal: { [domain] in
+        _ = try catalogRoot()
+        return try makeEnumerator(containerItemIdentifier, signal: { [domain] in
             guard let manager = NSFileProviderManager(for: domain) else {
                 enumerationLog.error("operation=signal scope=1 result=1 count=0")
                 return

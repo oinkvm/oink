@@ -124,6 +124,13 @@ impl Receipt<'_> {
     pub fn wait(self) -> Result<(), InputError> {
         self.started.map_or(Ok(()), |started| self.motion.wait(started))
     }
+    /// Held-source transitions require a real delivery observer. An accepted
+    /// post without an active tap cannot authorize the next native phase.
+    pub fn wait_observed(self) -> Result<(), InputError> {
+        self.started
+            .ok_or_else(|| InputError::Platform("held source event has no delivery observer".into()))
+            .and_then(|started| self.motion.wait(started))
+    }
 }
 
 /// Shared only with the session tap. Its callback never locks Injector.state.
@@ -536,6 +543,16 @@ fn own_button(ty: u32, source: i64, pid: i64, own_pid: u32) -> bool {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+    #[test]
+    fn held_source_requires_observed_delivery_not_just_an_accepted_post() {
+        let motion = Motion::default();
+        let receipt = Receipt {
+            motion: &motion,
+            started: None,
+            position: None,
+        };
+        assert!(receipt.wait_observed().is_err());
+    }
     #[test]
     fn native_button_source_identity_excludes_echo_without_rewriting_user_data() {
         let motion = Motion::default();

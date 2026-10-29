@@ -196,8 +196,19 @@ pub fn activate_prepared(
     current: Arc<dyn Fn() -> bool + Send + Sync>,
 ) -> Result<Registration, ClipboardError> {
     let _foreground = placeholders::Foreground::enter();
-    if activation.key != prepared.key || namespace.roots() != prepared.admission.roots {
-        return Err(error("prepared metadata or identity changed"));
+    if activation.key != prepared.key {
+        tracing::warn!(cause = 36, "File Provider prepared item identity rejected");
+        return Err(ClipboardError::FileProvider(FileProviderReason::ItemIdentityMismatch));
+    }
+    namespace.prepare().map_err(error)?;
+    let roots = namespace.roots();
+    // FILEGROUPDESCRIPTOR announcements can have unknown sizes and version zero.
+    // Fulfilling their grant supplies sizes/versions (also for directories).
+    // The prepared URLs bind ordered node identities and names, not those early
+    // content observations. Validate after prepare, which can complete the grant.
+    if !same_root_identities(&prepared.admission.roots, &roots) {
+        tracing::warn!(cause = 36, "File Provider prepared item identity rejected");
+        return Err(ClipboardError::FileProvider(FileProviderReason::ItemIdentityMismatch));
     }
     let pin = namespace.local_batch();
     let result = {
@@ -209,8 +220,24 @@ pub fn activate_prepared(
             if state.retired {
                 return Err(io::ErrorKind::Interrupted.into());
             }
-            state.catalog.batch = pin.as_ref().map(crate::store::Batch::id);
-            state.persist(&prepared.registration.batch.catalog)
+            let mut next = state.catalog.clone();
+            for root in &roots {
+                let record = next
+                    .records
+                    .iter_mut()
+                    .find(|record| record.node == Some(root.id.0))
+                    .ok_or(io::ErrorKind::InvalidData)?;
+                record.size = match root.size {
+                    ContentSize::Known(size) => Some(size),
+                    ContentSize::Unknown => None,
+                };
+                record.modified = root.modified_ms;
+                record.version = root.version;
+            }
+            next.source = namespace.source_link();
+            save_catalog(&prepared.registration.batch.catalog, &next)?;
+            state.catalog = next;
+            Ok(())
         })
     };
     if let Err(e) = result {
@@ -227,18 +254,28 @@ pub fn activate_prepared(
             },
         );
     }
-    let weak = Arc::downgrade(&prepared.admission);
-    namespace.on_stored(Box::new(move |local| {
-        let Some(admission) = weak.upgrade() else { return };
-        admission.stored(activation, local);
-        if let Some(root) = CONTAINER.get() {
-            crate::cache::changed(root);
-        }
-    }));
+    native::bind(&prepared.registration.batch, &namespace).map_err(error)?;
+    if CONTAINER.get().is_some() {
+        signal_changes();
+    }
     let mut registration = prepared.registration.clone();
+    for (entry, root) in registration.entries.iter_mut().zip(&roots) {
+        entry.size = match root.size {
+            ContentSize::Known(size) => size,
+            ContentSize::Unknown => 0,
+        };
+        entry.modified_ms = root.modified_ms;
+    }
     registration._content_pin = pin;
     prepared.trace.activated(activation.holder.epoch);
     Ok(registration)
+}
+
+fn same_root_identities(announced: &[FileNode], granted: &[FileNode]) -> bool {
+    announced.len() == granted.len()
+        && announced.iter().zip(granted).all(|(old, new)| {
+            new.valid() && old.id == new.id && old.parent == new.parent && old.name == new.name && old.kind == new.kind
+        })
 }
 
 /// Stop new admissions and retire the catalog/working-set identity. Readers
@@ -262,11 +299,10 @@ impl FileContents for MetadataContents {
 struct Lease {
     namespace: Arc<dyn Namespace>,
     current: Current,
-    stored: Arc<AtomicBool>,
 }
 impl Lease {
     fn check(&self) -> io::Result<()> {
-        if self.stored.load(Ordering::Acquire) || (self.current)() {
+        if self.namespace.source_link().is_some_and(|source| !source.provisional) || (self.current)() {
             Ok(())
         } else {
             Err(io::ErrorKind::PermissionDenied.into())
@@ -275,7 +311,7 @@ impl Lease {
 }
 enum State {
     Prepared,
-    Active { activation: Activation, lease: Lease },
+    Active { lease: Lease },
     Retired,
 }
 pub(super) struct Admission {
@@ -303,7 +339,7 @@ impl Admission {
     }
     fn activate(
         &self,
-        activation: Activation,
+        _activation: Activation,
         namespace: Arc<dyn Namespace>,
         current: Current,
         persist: impl FnOnce() -> io::Result<()>,
@@ -324,12 +360,7 @@ impl Admission {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
         *state = State::Active {
-            activation,
-            lease: Lease {
-                namespace,
-                current,
-                stored: Arc::new(AtomicBool::new(false)),
-            },
+            lease: Lease { namespace, current },
         };
         Ok(())
     }
@@ -361,25 +392,33 @@ impl Admission {
     fn is_prepared_or_retired(&self) -> bool {
         !matches!(*self.state.lock().unwrap(), State::Active { .. })
     }
-    fn stored(&self, expected: Activation, local: crate::content::Completed) {
-        let mut state = self.state.lock().unwrap();
-        if let State::Active { activation, lease } = &mut *state
-            && *activation == expected
-        {
-            lease.namespace = Arc::new(local);
-            // Verified owned bytes no longer need a live source lease. Existing
-            // readers share this flag while retaining their independently pinned
-            // Remote, whose Stored state also permits completed local reads.
-            lease.stored.store(true, Ordering::Release);
-        }
-    }
 }
 impl Namespace for Admission {
+    fn native_open(&self, node: NodeId, offset: u64) -> Option<io::Result<crate::FileReader>> {
+        let lease = match self.admit() {
+            Ok(lease) => lease,
+            Err(error) => return Some(Err(error)),
+        };
+        lease.namespace.native_open(node, offset).map(|reader| {
+            let reader = reader?;
+            lease.check()?;
+            Ok(Box::new(AuthorizedReader { lease, reader }) as crate::FileReader)
+        })
+    }
+    fn source_link(&self) -> Option<crate::content::linked::Descriptor> {
+        let State::Active { lease, .. } = &*self.state.lock().unwrap() else {
+            return None;
+        };
+        lease.namespace.source_link()
+    }
     fn origin(&self) -> Option<oink_foundation::DeviceId> {
         *self.origin.lock().unwrap()
     }
     fn roots(&self) -> Vec<FileNode> {
-        self.roots.clone()
+        match &*self.state.lock().unwrap() {
+            State::Active { lease } => lease.namespace.roots(),
+            _ => self.roots.clone(),
+        }
     }
     fn list(&self, node: NodeId, cursor: Option<DirectoryCursor>) -> io::Result<crate::model::DirectoryPage> {
         let lease = self.admit()?;
@@ -410,6 +449,12 @@ impl Namespace for Admission {
             return None;
         };
         lease.namespace.local_batch()
+    }
+    fn cache_batch(&self) -> Option<crate::store::Batch> {
+        let State::Active { lease, .. } = &*self.state.lock().unwrap() else {
+            return None;
+        };
+        lease.namespace.cache_batch()
     }
 }
 struct AuthorizedReader {
@@ -459,6 +504,7 @@ mod tests {
     fn roots() -> Vec<FileNode> {
         vec![
             FileNode {
+                exec_bits: None,
                 id: NodeId(1),
                 parent: None,
                 name: "actual-name.txt".into(),
@@ -468,6 +514,7 @@ mod tests {
                 modified_ms: None,
             },
             FileNode {
+                exec_bits: None,
                 id: NodeId(2),
                 parent: None,
                 name: "actual-directory".into(),
@@ -493,6 +540,10 @@ mod tests {
         }
     }
     impl Namespace for Contents {
+        fn native_open(&self, _: NodeId, _: u64) -> Option<io::Result<crate::FileReader>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Some(Ok(Box::new(io::Cursor::new(b"received-copy".to_vec()))))
+        }
         fn roots(&self) -> Vec<FileNode> {
             self.roots.clone()
         }
@@ -520,6 +571,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn received_reader_delegates_to_committed_native_namespace_without_source_open() {
+        let admission = Admission::new(roots()).unwrap();
+        assert!(admission.native_open(NodeId(1), 0).unwrap().is_err());
+        let contents = Contents::new(roots());
+        admission
+            .activate(activation(key()), contents.clone(), Arc::new(|| true), || Ok(()))
+            .unwrap();
+        let mut reader = admission.native_open(NodeId(1), 0).unwrap().unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"received-copy");
+        assert_eq!(contents.calls.load(Ordering::SeqCst), 1);
+        admission.revoke();
+        assert!(admission.native_open(NodeId(1), 0).unwrap().is_err());
+    }
     #[test]
     fn returning_to_source_and_reannouncing_preserves_second_typed_parent() {
         fn take(pool: &mut placeholders::Pool, owner: PublicationOwner) -> Option<placeholders::Ready> {
@@ -611,6 +678,7 @@ mod tests {
             batches: Mutex::new(HashMap::from([("fixture".into(), batch.clone())])),
         });
         let registration = Registration {
+            diagnostic_publication: (Instant::now(), false),
             key: "fixture".into(),
             bridge: Arc::downgrade(&bridge),
             batch,
@@ -660,7 +728,6 @@ mod tests {
         assert_eq!(state.catalog.records[1].name, "actual-name.txt");
         assert_eq!(state.catalog.records[1].size, None); // unknown is not a known zero
         assert_eq!(state.catalog.records[2].children, None); // no invented empty listing
-        assert!(state.catalog.batch.is_none());
         drop(state);
         assert!(prepared.admission.select(NodeId(1)).is_err());
         assert!(prepared.admission.open(NodeId(1), 3, 0).is_err());
@@ -708,6 +775,182 @@ mod tests {
         drop(prepared);
         assert!(registration.batch.contents.lock().unwrap().select(NodeId(1)).is_ok());
         registration.cancel();
+    }
+
+    #[test]
+    fn virtual_descriptor_grants_refine_metadata_without_replacing_prepared_urls() {
+        // tools/dnd-held-source/fixture-windows.cpp FILEGROUPDESCRIPTORW:
+        // folder, folder\\first.bin (no FD_FILESIZE), second.bin (3072), empty.
+        // No FD_WRITESTIME. The nested file is discovered after activation.
+        let harness = vec![
+            FileNode {
+                exec_bits: None,
+                id: NodeId(1),
+                parent: None,
+                name: "folder".into(),
+                kind: NodeKind::Directory,
+                size: ContentSize::Unknown,
+                version: 0,
+                modified_ms: None,
+            },
+            FileNode {
+                exec_bits: None,
+                id: NodeId(3),
+                parent: None,
+                name: "second.bin".into(),
+                kind: NodeKind::File,
+                size: ContentSize::Known(3072),
+                version: 0,
+                modified_ms: None,
+            },
+            FileNode {
+                exec_bits: None,
+                id: NodeId(4),
+                parent: None,
+                name: "empty".into(),
+                kind: NodeKind::Directory,
+                size: ContentSize::Unknown,
+                version: 0,
+                modified_ms: None,
+            },
+        ];
+        let image = FileNode {
+            exec_bits: None,
+            id: NodeId(1),
+            parent: None,
+            name: "image.png".into(),
+            kind: NodeKind::File,
+            size: ContentSize::Unknown,
+            version: 0,
+            modified_ms: None,
+        };
+        for announced in [harness, vec![image]] {
+            let (_root, _bridge, prepared) = prepared(announced.clone());
+            let urls = prepared.registration.top_level_urls();
+            let mut granted = announced;
+            for node in &mut granted {
+                node.version = 1;
+                if node.kind == NodeKind::File {
+                    node.size = ContentSize::Known(3072);
+                }
+            }
+            let registration = activate_prepared(
+                &prepared,
+                activation(key()),
+                Contents::new(granted.clone()),
+                Arc::new(|| true),
+            )
+            .unwrap();
+            assert_eq!(registration.top_level_urls(), urls);
+            assert_eq!(prepared.admission.roots(), granted);
+            let catalog: Catalog =
+                serde_json::from_slice(&std::fs::read(&registration.batch.catalog).unwrap()).unwrap();
+            for node in &granted {
+                let record = catalog
+                    .records
+                    .iter()
+                    .find(|record| record.node == Some(node.id.0))
+                    .unwrap();
+                assert_eq!(record.version, node.version);
+                assert_eq!(record.size, if node.kind == NodeKind::File { Some(3072) } else { None });
+            }
+            for (entry, node) in registration.entries.iter().zip(granted) {
+                assert_eq!(entry.size, if node.kind == NodeKind::File { 3072 } else { 0 });
+            }
+            registration.cancel();
+        }
+    }
+
+    #[test]
+    fn mac_promise_and_readonly_app_metadata_refine_existing_urls() {
+        use crate::content::namespace::Local;
+        struct Completing {
+            early: Vec<FileNode>,
+            granted: Vec<FileNode>,
+            ready: AtomicBool,
+        }
+        impl Namespace for Completing {
+            fn prepare(&self) -> io::Result<()> {
+                self.ready.store(true, Ordering::Release);
+                Ok(())
+            }
+            fn roots(&self) -> Vec<FileNode> {
+                if self.ready.load(Ordering::Acquire) {
+                    self.granted.clone()
+                } else {
+                    self.early.clone()
+                }
+            }
+            fn list(&self, _: NodeId, _: Option<DirectoryCursor>) -> io::Result<DirectoryPage> {
+                unreachable!()
+            }
+            fn select(&self, _: NodeId) -> io::Result<FileNode> {
+                unreachable!()
+            }
+            fn open(&self, _: NodeId, _: u64, _: u64) -> io::Result<crate::FileReader> {
+                unreachable!()
+            }
+        }
+        let files = tempfile::tempdir().unwrap();
+        let image = files.path().join("promised.png");
+        std::fs::write(&image, b"synthetic promised bytes").unwrap();
+        let app = files.path().join("Fixture.app");
+        std::fs::create_dir_all(app.join("Contents")).unwrap();
+        std::fs::write(app.join("Contents/Info.plist"), b"synthetic bundle metadata").unwrap();
+        let mut permissions = std::fs::metadata(&app).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&app, permissions).unwrap();
+        for (path, promise) in [(image, true), (app.clone(), false)] {
+            let local = Local::new(vec![(NodeId(1), path)]).unwrap();
+            let mut granted = local.roots();
+            let mut early = granted.clone();
+            if promise {
+                // Named NSFilePromiseProvider inventory before its write callback.
+                early[0].size = ContentSize::Unknown;
+                early[0].version = 0;
+                early[0].modified_ms = None;
+            } else {
+                // Native readonly package roots initially have version zero;
+                // a fulfilled directory uses its actual enumeration version.
+                assert_eq!(early[0].kind, NodeKind::Directory);
+                assert_eq!(early[0].version, 0);
+                granted[0].version = local.list(NodeId(1), None).unwrap().version;
+            }
+            assert_ne!(early, granted);
+            let (_root, _bridge, prepared) = prepared(early.clone());
+            let urls = prepared.registration.top_level_urls();
+            let contents = Arc::new(Completing {
+                early,
+                granted: granted.clone(),
+                ready: AtomicBool::new(false),
+            });
+            let registration = activate_prepared(&prepared, activation(key()), contents, Arc::new(|| true)).unwrap();
+            assert_eq!(registration.top_level_urls(), urls);
+            assert_eq!(prepared.admission.roots(), granted);
+            let catalog: Catalog =
+                serde_json::from_slice(&std::fs::read(&registration.batch.catalog).unwrap()).unwrap();
+            let root = catalog.records.iter().find(|r| r.node == Some(1)).unwrap();
+            assert_eq!(root.modified, granted[0].modified_ms);
+            assert_eq!(root.version, granted[0].version);
+            registration.cancel();
+        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(app, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn refined_metadata_cannot_replace_the_announced_tree() {
+        let original = roots();
+        let mut cases = vec![original.clone(); 6];
+        cases[0][0].id = NodeId(20);
+        cases[1][0].parent = Some(NodeId(2));
+        cases[2][0].name = "renamed".into();
+        cases[3][0].kind = NodeKind::Directory;
+        cases[4].reverse();
+        cases[5].pop();
+        for changed in cases {
+            assert!(!same_root_identities(&original, &changed));
+        }
     }
 
     #[test]
@@ -828,28 +1071,6 @@ mod tests {
         assert!(!path.exists());
     }
 
-    struct Stores(crate::content::Completed);
-    impl Namespace for Stores {
-        fn roots(&self) -> Vec<FileNode> {
-            self.0.roots()
-        }
-        fn list(&self, node: NodeId, cursor: Option<DirectoryCursor>) -> io::Result<DirectoryPage> {
-            self.0.list(node, cursor)
-        }
-        fn select(&self, node: NodeId) -> io::Result<FileNode> {
-            self.0.select(node)
-        }
-        fn open(&self, node: NodeId, version: u64, offset: u64) -> io::Result<crate::FileReader> {
-            self.0.open(node, version, offset)
-        }
-        fn local_batch(&self) -> Option<crate::store::Batch> {
-            Namespace::local_batch(&self.0)
-        }
-        fn on_stored(&self, ready: Box<dyn FnOnce(crate::content::Completed) + Send>) {
-            ready(self.0.clone());
-        }
-    }
-
     #[test]
     fn activation_never_waits_for_another_publications_os_wait() {
         let (_root, _bridge, prepared) = prepared(roots());
@@ -867,51 +1088,6 @@ mod tests {
         let (_prepared, registration) = worker.join().unwrap();
         assert!(activated.unwrap());
         registration.unwrap().cancel();
-    }
-
-    #[test]
-    fn completed_bytes_shed_remote_grant_but_explicit_retirement_still_blocks_new_readers() {
-        let data = tempfile::tempdir().unwrap();
-        let owned = crate::content::Completed::test_single_file(data.path());
-        let local = crate::content::Completed::restore(data.path(), owned.id()).unwrap();
-        let (_root, _bridge, prepared) = prepared(local.roots());
-        let contents = Arc::new(Stores(local));
-        let live = Arc::new(AtomicBool::new(true));
-        let current = live.clone();
-        let registration = activate_prepared(
-            &prepared,
-            activation(key()),
-            contents,
-            Arc::new(move || current.load(Ordering::Acquire)),
-        )
-        .unwrap();
-        assert_eq!(
-            prepared.registration.batch.state.lock().unwrap().catalog.batch,
-            Some(owned.id())
-        );
-        live.store(false, Ordering::Release);
-        let mut reader = prepared.admission.open(NodeId(1), 7, 0).unwrap();
-        drop(prepared);
-        registration.cancel();
-        // A delayed completion notification after retirement cannot republish
-        // this namespace or open a fresh capability.
-        registration.admission.as_ref().unwrap().stored(
-            activation(key()),
-            crate::content::Completed::restore(data.path(), owned.id()).unwrap(),
-        );
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).unwrap();
-        assert_eq!(bytes, b"cached");
-        assert!(
-            registration
-                .batch
-                .contents
-                .lock()
-                .unwrap()
-                .open(NodeId(1), 7, 0)
-                .is_err()
-        );
-        assert!(!registration.batch.catalog.exists());
     }
 
     #[test]

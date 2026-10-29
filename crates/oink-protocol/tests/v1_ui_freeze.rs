@@ -14,6 +14,41 @@ fn roundtrip(name: &str, raw: RawMap) {
     assert_eq!(v1::cbor::decode_map(&bytes, v1::limits::CONFIG_FRAME).unwrap(), raw);
 }
 #[test]
+fn saved_custom_is_optional_metadata_and_does_not_replace_active_wire_fields() {
+    let mut raw: RawMap = [
+        (1, KeyPreset::MacFeel.write()),
+        (
+            2,
+            V::Array(vec![V::Map([(1, V::Uint(0x700e0)), (2, V::Uint(0x700e3))].into())]),
+        ),
+    ]
+    .into();
+    let old = KeyboardMapping::from_raw(raw.clone()).unwrap();
+    assert!(old.saved_custom().unwrap().is_none());
+    let saved = SavedCustomKeymap::from_raw(
+        [
+            (
+                1,
+                V::Array(vec![V::Map([(1, V::Uint(0xff0003)), (2, V::Uint(0))].into())]),
+            ),
+            (2, V::Uint(0)),
+            (3, V::Bool(true)),
+            (4, V::Bool(true)),
+            (900, support::synthetic_unknown()),
+        ]
+        .into(),
+    )
+    .unwrap();
+    raw.insert(4, saved.write());
+    let modern = KeyboardMapping::from_raw(raw.clone()).unwrap();
+    assert_eq!(modern.preset(), old.preset());
+    assert_eq!(modern.table(), old.table());
+    assert_eq!(modern.caps_tap_hold(), old.caps_tap_hold());
+    assert_eq!(modern.saved_custom().unwrap().unwrap().caps_hold().unwrap(), Some(0));
+    assert_eq!(modern.saved_custom().unwrap(), Some(saved));
+    roundtrip("KeyboardMapping", raw);
+}
+#[test]
 fn caps_tap_hold_is_custom_only_and_conflicts_with_plain_caps_mapping() {
     let mut raw = support::sample_named("KeyboardMapping");
     let mut caps = support::sample_named("CapsTapHold");
@@ -35,7 +70,7 @@ fn caps_tap_hold_is_custom_only_and_conflicts_with_plain_caps_mapping() {
     );
     assert!(KeyboardMapping::from_raw(raw.clone()).is_err());
     let mut invalid = support::sample_named("CapsTapHold");
-    invalid.insert(1, V::Uint(0));
+    invalid.insert(1, V::Uint(0xffff_ffff));
     assert!(CapsTapHold::from_raw(invalid).is_err());
     raw.remove(&3);
     assert!(
@@ -286,4 +321,21 @@ fn remote_screen_gain_defaults_without_reinterpreting_old_gain_and_retains_facts
         invalid.insert(4, V::F64(gain));
         assert!(ScreenPreference::from_raw(invalid).is_err());
     }
+}
+
+#[test]
+fn none_mapping_uses_existing_u32_destination_and_caps_fields() {
+    let caps: RawMap = [(1, V::Uint(0)), (2, V::Uint(0))].into();
+    assert_eq!(CapsTapHold::from_raw(caps.clone()).unwrap().tap().unwrap(), 0);
+    roundtrip("CapsTapHold", caps.clone());
+    let raw: RawMap = [
+        (1, V::Uint(2)),
+        (
+            2,
+            V::Array(vec![V::Map([(1, V::Uint(0xff0003)), (2, V::Uint(0))].into())]),
+        ),
+        (3, V::Map(caps)),
+    ]
+    .into();
+    roundtrip("KeyboardMapping", raw);
 }

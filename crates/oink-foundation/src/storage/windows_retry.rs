@@ -2,6 +2,18 @@ use std::{io, time::Duration};
 
 pub(super) const ACCESS_DENIED: i32 = 0xc0000022u32 as i32;
 const DEADLINE: Duration = Duration::from_secs(5);
+const TEST_DEADLINE: Duration = Duration::from_secs(60);
+
+pub(super) fn native_deadline() -> Duration {
+    // cfg(test) does not reach dependencies of agent/network integration tests.
+    // Their dev-dependencies opt in explicitly. Release products retain 5 s even
+    // if a test feature is accidentally unified into a release build.
+    if cfg!(test) || cfg!(all(debug_assertions, feature = "test-storage-retries")) {
+        TEST_DEADLINE
+    } else {
+        DEADLINE
+    }
+}
 
 pub(super) struct RenameError {
     pub error: io::Error,
@@ -14,7 +26,8 @@ pub(super) struct Outcome {
     pub elapsed: Duration,
 }
 
-pub(super) fn publish(
+pub(super) fn publish_with_deadline(
+    deadline: Duration,
     mut rename: impl FnMut() -> Result<(), RenameError>,
     mut retry_allowed: impl FnMut() -> bool,
     now: impl Fn() -> Duration,
@@ -28,7 +41,7 @@ pub(super) fn publish(
         loop {
             // Check again after sleeping: scheduler delays cannot admit a late
             // attempt. An in-flight synchronous native call cannot be cancelled.
-            if attempts > 0 && now().saturating_sub(started) >= DEADLINE {
+            if attempts > 0 && now().saturating_sub(started) >= deadline {
                 return Err(original.expect("only access denial admits another attempt"));
             }
             attempts += 1;
@@ -40,10 +53,10 @@ pub(super) fn publish(
                     }
                     original.get_or_insert(failure.error);
                     let elapsed = now().saturating_sub(started);
-                    if elapsed >= DEADLINE {
+                    if elapsed >= deadline {
                         return Err(original.expect("the first access denial is retained"));
                     }
-                    sleep(backoff.min(DEADLINE - elapsed));
+                    sleep(backoff.min(deadline - elapsed));
                     backoff = (backoff * 2).min(Duration::from_millis(250));
                 }
                 Err(failure) => return Err(failure.error),
@@ -58,6 +71,16 @@ pub(super) fn publish(
 }
 
 #[cfg(test)]
+fn publish(
+    rename: impl FnMut() -> Result<(), RenameError>,
+    retry_allowed: impl FnMut() -> bool,
+    now: impl Fn() -> Duration,
+    sleep: impl FnMut(Duration),
+) -> Outcome {
+    publish_with_deadline(DEADLINE, rename, retry_allowed, now, sleep)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
@@ -67,6 +90,28 @@ mod tests {
             error: io::Error::from_raw_os_error(5),
             status: ACCESS_DENIED,
         }
+    }
+
+    #[test]
+    fn publication_recovers_after_test_scanner_hold_beyond_product_deadline() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let outcome = publish_with_deadline(
+            native_deadline(),
+            || {
+                if elapsed.get() < Duration::from_secs(6) {
+                    Err(denied())
+                } else {
+                    Ok(())
+                }
+            },
+            || true,
+            || elapsed.get(),
+            |delay| elapsed.set(elapsed.get() + delay),
+        );
+        assert!(
+            outcome.result.is_ok(),
+            "test-only retry budget must tolerate a six-second scanner hold"
+        );
     }
 
     #[test]

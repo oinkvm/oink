@@ -5,9 +5,11 @@ import { speed } from 'oink-ui';
 type View = { key: string; children: ReactNode };
 
 /** Keep the last usable view while its replacement is connecting. */
-export function Morph({ viewKey, pending = false, children }: {
+export function Morph({ viewKey, pending = false, immediate = false, children }: {
     viewKey: string;
     pending?: boolean;
+    /** Terminal errors replace stale content without an outgoing overlay. */
+    immediate?: boolean;
     children: ReactNode;
 }) {
     const [view, setView] = useState<View & { previous?: View }>({ key: viewKey, children });
@@ -17,8 +19,8 @@ export function Morph({ viewKey, pending = false, children }: {
     const outgoing = useRef<HTMLDivElement>(null);
     const height = useRef(0);
     const waiting = view.key !== viewKey;
-    if (waiting && !pending) {
-        setView({ key: viewKey, children, previous: latest.current });
+    if ((waiting && !pending) || (immediate && view.previous)) {
+        setView({ key: viewKey, children, previous: immediate ? undefined : latest.current });
     }
     useLayoutEffect(() => {
         if (!waiting) latest.current = { key: viewKey, children };

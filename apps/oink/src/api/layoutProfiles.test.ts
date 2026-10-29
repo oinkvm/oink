@@ -115,7 +115,7 @@ describe('layout profile fixture contract', () => {
     const offlineId = f.state().active_profile_id!;
     f.setOnline(device, true);
     expect(f.state().profiles.map(p => p.id)).toEqual([offlineId, defaultId]);
-    expect(f.state().profiles.map(p => p.exact_match)).toEqual([false, true]);
+    expect(f.state().profiles.map(p => p.exact_match)).toEqual([true, true]);
     await f.api.createLayoutProfile({ request_id: 'online', expected_token: f.state().token, name: 'Online' });
     const onlineId = f.state().active_profile_id!;
     expect(f.state().profiles.map(p => p.id)).toEqual([onlineId, offlineId, defaultId]);

@@ -6,14 +6,14 @@ use crate::geom::Point;
 use serde::{Deserialize, Serialize};
 
 /// Policy of this device's physical input sources, independent of group focus.
-/// Keyboard disable is a separate runtime guard, never an InputMode value.
+/// Keyboard and mouse share the same source-mode lifecycle.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputMode {
     #[default]
     Shared,
     Local,
-    /// Mouse-only guard. Keyboard disable keeps its independent release lifecycle.
+    /// Consume this source locally until enabled or released by safety/startup.
     Disabled,
 }
 
@@ -39,6 +39,9 @@ impl CaptureTime {
 pub struct KeyCode(pub u32);
 
 impl KeyCode {
+    /// Empty custom mapping destination. Never a physical key or injected event.
+    pub const NONE: Self = Self(0);
+    pub const APPLE_FN: Self = Self::new(0xff, 3);
     pub const PAGE_KEYBOARD: u16 = 0x07;
     pub const PAGE_CONSUMER: u16 = 0x0C;
 
@@ -330,8 +333,9 @@ pub enum InjectEvent {
         repeat: bool,
         modifiers: u8,
     },
-    /// Local Windows touchpad delivery in reference motion.
-    /// `pixels_per_reference` describes the destination, and `wheel` supplies line delivery
+    /// Local Windows touchpad delivery. Source-pixel input uses a factor of 1;
+    /// legacy reference input uses destination pixels per reference unit.
+    /// `wheel` supplies line delivery
     /// for missing APIs, secure desktops and injection failures. Never sent on the wire.
     TouchpadScroll {
         dx: f64,

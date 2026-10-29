@@ -91,14 +91,25 @@ pub(super) fn list(root: &Path, group: GroupKey) -> Result<Vec<Join>> {
     Ok(out)
 }
 pub(super) fn awaiting_catalog(root: &Path, group: GroupKey) -> Result<Option<Catalog>> {
-    for join in list(root, group)? {
-        if join.joining_member {
-            return store::load(root, join.source)?
-                .map(Some)
-                .ok_or_else(|| failure("retained source catalog unavailable"));
+    let mut group = group;
+    let mut visited = std::collections::HashSet::new();
+    while visited.insert(group) {
+        let Some(join) = list(root, group)?.into_iter().find(|join| join.joining_member) else {
+            return if visited.len() == 1 {
+                Ok(None)
+            } else {
+                Err(failure("retained source catalog unavailable"))
+            };
+        };
+        if let Some(catalog) = store::load(root, join.source)? {
+            return Ok(Some(catalog));
         }
+        // Membership may advance again before this observer receives the
+        // intermediate catalog. Keep its last durable list read-only while
+        // waiting for the newest group's authoritative catalog.
+        group = join.source;
     }
-    Ok(None)
+    Err(failure("cyclic retained catalog handoff"))
 }
 impl Node {
     pub(crate) fn prepare_profile_join(&self, intent: &dto::MergeIntent) -> Result<()> {
@@ -141,15 +152,16 @@ impl Node {
             .gate
             .try_lock()
             .map_err(|_| ProfileError::new(ErrorCode::Busy, "Profile operation in progress"))?;
-        let expected = if joining_member { source } else { target };
-        // Joining transfers the already-saved list, not a live arrangement.
-        // Owner facts can be missing until admission completes; observing them
-        // here would defer projection and the queued commit/admission messages
-        // needed to make those facts available. The profile gate fences saves,
-        // so read the durable list directly, including during startup recovery.
-        let current =
-            store::load(&self.inner.data_dir, expected)?.ok_or_else(|| failure("pre-join catalog unavailable"))?;
-        let catalog = (initiator.0 == self.id()).then_some(current);
+        // Only the source initiator transmits a saved list. A target or observer
+        // can still be awaiting a previous join's catalog when this merge commits.
+        // Requiring that catalog here would block projection and admission, which
+        // are needed before the new members can exchange the missing catalog.
+        // Persist their join binding without inventing or replacing a saved list.
+        let catalog = if initiator.0 == self.id() {
+            Some(store::load(&self.inner.data_dir, source)?.ok_or_else(|| failure("pre-join catalog unavailable"))?)
+        } else {
+            None
+        };
         save(
             &self.inner.data_dir,
             &Join {

@@ -1,0 +1,12 @@
+{
+  "name": "libASPL",
+  "version": "3.1.2+633e0f7",
+  "revision": "633e0f70203edd87d320fc5a3cae901e1363aac5",
+  "source": "https://github.com/gavv/libASPL",
+  "archive_sha256": "8583fb549419eab14b5c636ee4eb1f0b1df74c534eaf2f990d8bb0fb5de6e01b",
+  "licenses": {
+    "LICENSE": { "spdx": "MIT", "sha256": "bdb64a0bea4af109148b48446a9026be5d1f22dc14d18920cfcd52bf3f3e2347" },
+    "LICENSE.apple2012": { "spdx": "AML", "sha256": "9b2b45280cf33d7f726840a53283723c87b2295ff84d1cf3982c96b5bc4c50a9" },
+    "LICENSE.apple2020": { "spdx": "MIT", "sha256": "2b33b4cadf8e88c15e8808950913acf8bd84bac10d6312e9fb128163850d22d0" }
+  }
+}

@@ -1,5 +1,5 @@
-//! Local observations only: physical user activity comes from the host's existing
-//! group broadcast, audio from endpoint media. None of these observations is sent.
+//! Local observations only: group activity comes from the host's existing input/
+//! audio pulses, audio from endpoint media. This tracker itself sends no messages.
 use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,

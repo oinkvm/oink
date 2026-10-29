@@ -52,9 +52,8 @@ impl Snapshot {
                 }
             };
             rep.data = match batch.snapshot(rep.id.0, &mut reader) {
-                Ok((size, hash)) => RepresentationData::Reader {
+                Ok(size) => RepresentationData::Reader {
                     size: ContentSize::Known(size),
-                    hash: Some(hash),
                 },
                 Err(error) => RepresentationData::Unavailable(reason(&error)),
             };

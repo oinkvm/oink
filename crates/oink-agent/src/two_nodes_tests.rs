@@ -39,6 +39,10 @@ struct Dev {
 
 async fn start(name: &str, port: u16) -> Dev {
     let dir = tempfile::tempdir().unwrap();
+    start_in(dir, name, port).await
+}
+
+async fn start_in(dir: tempfile::TempDir, name: &str, port: u16) -> Dev {
     let input = FakeInput::new();
     input.set_cursor(Point::new(800.0, 500.0));
     let clip = Arc::new(FakeClipboard::new());
@@ -54,9 +58,6 @@ async fn start(name: &str, port: u16) -> Dev {
     })
     .await
     .unwrap();
-    let mut settings = node.clipboard_settings().unwrap();
-    settings.files = true;
-    node.set_clipboard_settings(settings.into()).unwrap();
     Dev {
         node,
         input,
@@ -219,6 +220,132 @@ fn key(input: &FakeInput, code: KeyCode, pressed: bool) {
     });
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn saved_fn_mapping_retires_on_function_row_after_source_restart() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "saved_fn_mapping_retires_on_function_row_after_source_restart",
+        Some(4),
+        async {
+            use oink_foundation::input_transform::{KeyMapping, KeyPreset, KeyboardMapping};
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = crate::config::AgentConfig::load_from(dir.path()).unwrap();
+            config
+                .update(|settings| {
+                    let mapping = KeyboardMapping {
+                        preset: KeyPreset::Custom,
+                        table: vec![KeyMapping {
+                            from: KeyCode::APPLE_FN,
+                            to: KeyCode::LEFT_CTRL,
+                        }],
+                        ..Default::default()
+                    };
+                    // Both fake nodes run on macOS. Exercise the same source
+                    // policy as a Mac -> Windows map, with a Mac target too.
+                    settings.input_transform.windows.keyboard = mapping.clone();
+                    settings.input_transform.macos.keyboard = mapping;
+                })
+                .unwrap();
+            drop(config);
+            let source = start_in(dir, "fn-source", 0).await;
+            let target = start("fn-target", 0).await;
+            common::pair(&source.node, &target.node).await;
+            common::active(&[&source.node, &target.node]).await;
+            let destination = target.node.id();
+            api(&source.node, move |node| node.lock_focus_to(destination.into()))
+                .await
+                .unwrap();
+            wait_for("target focus", 5., || {
+                [&source.node, &target.node]
+                    .iter()
+                    .all(|node| node.focus().is_some_and(|f| f.device.0 == destination))
+            })
+            .await;
+            target.input.take_injected();
+            key(&source.input, KeyCode::APPLE_FN, true);
+            wait_for("saved Fn mapping reaches the target", 3., || {
+                target.input.injected().contains(&InjectEvent::Key {
+                    code: KeyCode::LEFT_CTRL,
+                    pressed: true,
+                })
+            })
+            .await;
+            let row = KeyCode::keyboard(0x3a);
+            key(&source.input, row, true);
+            wait_for("function row reaches the target", 3., || {
+                target.input.injected().contains(&InjectEvent::Key {
+                    code: row,
+                    pressed: true,
+                })
+            })
+            .await;
+            let events: Vec<_> = target
+                .input
+                .take_injected()
+                .into_iter()
+                .filter_map(|event| match event {
+                    InjectEvent::Key { code, pressed } => Some((code, pressed)),
+                    _ => None,
+                })
+                .collect();
+            // Real capture logs show physical Fn, then ordinary F-row Down/Up
+            // while Fn stays held; no settings edit takes place after startup.
+            assert_eq!(
+                events,
+                [(KeyCode::LEFT_CTRL, true), (KeyCode::LEFT_CTRL, false), (row, true)]
+            );
+            key(&source.input, row, false);
+            let marker = KeyCode::keyboard(4);
+            key(&source.input, marker, true);
+            key(&source.input, marker, false);
+            wait_for("typing while Fn remains held", 3., || {
+                target.input.injected().contains(&InjectEvent::Key {
+                    code: marker,
+                    pressed: false,
+                })
+            })
+            .await;
+            assert_eq!(
+                target
+                    .input
+                    .take_injected()
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        InjectEvent::Key { code, pressed } => Some((code, pressed)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                [(row, false), (marker, true), (marker, false)]
+            );
+            key(&source.input, KeyCode::APPLE_FN, false);
+            key(&source.input, KeyCode::APPLE_FN, true);
+            key(&source.input, KeyCode::APPLE_FN, false);
+            wait_for("new Fn press releases its mapping", 3., || {
+                target.input.injected().contains(&InjectEvent::Key {
+                    code: KeyCode::LEFT_CTRL,
+                    pressed: false,
+                })
+            })
+            .await;
+            assert_eq!(
+                target
+                    .input
+                    .take_injected()
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        InjectEvent::Key { code, pressed } => Some((code, pressed)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                [(KeyCode::LEFT_CTRL, true), (KeyCode::LEFT_CTRL, false)]
+            );
+            source.node.shutdown().await;
+            target.node.shutdown().await;
+        },
+    );
+}
+
 #[test]
 fn pair_route_clipboard_layout_disconnect() {
     crate::test_watchdog::run(
@@ -281,7 +408,9 @@ async fn pair_route_clipboard_layout_disconnect_scenario() {
 
     // ---- 布局：两边独立自动排列，结果一致；B 在 A 的哪一边由设备 ID 决定。
     wait_for("layouts include both devices", 5.0, || {
-        an.layout().0.screens.len() == 2 && bn.layout().0.screens.len() == 2
+        [&an, &bn]
+            .iter()
+            .all(|node| node.layout().0.screens.len() == 2 && common::profile_layout_ready(node))
     })
     .await;
     assert_eq!(an.layout().0, bn.layout().0);
@@ -456,7 +585,8 @@ async fn pair_route_clipboard_layout_disconnect_scenario() {
     }
     wait_for("large offer manifest on B", 10.0, || bc.items() == many).await;
 
-    // ---- File sharing: real QUIC file streams, actual source/received files, fake platform clipboard.
+    // ---- Native file admission and authority across real node connections.
+    // This backend has no OS received store and must refuse file publication.
     let source = an.data_dir().join("source.bin");
     let bytes: Vec<u8> = (0..2_000_000u32).map(|i| (i * 11 % 251) as u8).collect();
     std::fs::write(&source, &bytes).unwrap();
@@ -469,44 +599,37 @@ async fn pair_route_clipboard_layout_disconnect_scenario() {
     }];
     let previous = bn.clipboard_transfer().unwrap().map(|transfer| transfer.id);
     a.clip.copy(vec![ClipData::Files(files.clone())], Sensitivity::Normal);
-    wait_for("file demand available", 5.0, || {
-        bn.clipboard_transfer()
-            .unwrap()
-            .is_some_and(|p| Some(p.id) != previous && p.phase == crate::api::FileTransferPhase::Pending)
+    wait_for("file provider refusal", 5.0, || {
+        bn.clipboard_transfer().unwrap().is_some_and(|p| {
+            Some(p.id) != previous
+                && p.phase == crate::api::FileTransferPhase::Failed
+                && p.message.as_deref() == Some("File provider unavailable")
+        })
     })
     .await;
-    // This fake clipboard has no native lazy provider. The receiver must make
-    // an explicit request; focus changes are no longer a download trigger.
-    bn.fetch_clipboard_files().unwrap();
-    wait_for("files on B", 10.0, || {
-    bc.items().iter().any(|d| matches!(d, ClipData::Files(f) if f.iter().any(|e| e.local_path.as_ref().is_some_and(|p| p != &source && p.is_file()))))
-}).await;
-    let received = bc
-        .items()
-        .into_iter()
-        .find_map(|d| match d {
-            ClipData::Files(f) => f[0].local_path.clone(),
-            _ => None,
-        })
-        .unwrap();
-    assert_eq!(std::fs::read(received).unwrap(), bytes);
-    assert!(bn.clipboard_transfer().unwrap().is_some());
+    assert_eq!(bc.items(), many, "failed publication must preserve the prior clipboard");
+    assert!(!bn.data_dir().join("completed-deliveries").exists());
+    assert_eq!(std::fs::read(&source).unwrap(), bytes);
+
+    // The remaining assertions exercise publication/policy lifecycle only. A
+    // synthetic virtual object accepts metadata, but does not claim OS hydration.
+    bc.set_virtual_files(true);
 
     // A disabled receiver must not download, and a later sensitive local copy must defeat old pending work.
     let mut settings = bn.clipboard_settings().unwrap();
-    settings.files = false;
-    bn.set_clipboard_settings(settings.into()).unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
     a.clip
         .copy(vec![ClipData::Text("reset file hash".into())], Sensitivity::Normal);
     wait_for("intervening text", 5.0, || {
         bc.items() == vec![ClipData::Text("reset file hash".into())]
     })
     .await;
+    settings.receive = false;
+    bn.set_clipboard_settings(settings.into()).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
     a.clip.copy(vec![ClipData::Files(files.clone())], Sensitivity::Normal);
     tokio::time::sleep(Duration::from_millis(700)).await;
     assert_eq!(bc.items(), vec![ClipData::Text("reset file hash".into())]);
-    settings.files = true;
+    settings.receive = true;
     bn.set_clipboard_settings(settings.into()).unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     a.clip
@@ -1614,12 +1737,12 @@ fn remote_pause_and_emergency_clear_only_owner_disables_and_publish_release() {
                     let settings = a.node.settings();
                     pause.paused
                         && !pause.settling
-                        && !settings.keyboard_disabled
+                        && settings.routing.keyboard_mode != oink_foundation::input::InputMode::Disabled
                         && settings.routing.mouse_mode == InputMode::Shared
                 })
                 .await;
                 let disk = crate::config::AgentConfig::load_from(a._dir.path()).unwrap();
-                assert!(!disk.settings.keyboard_disabled);
+                assert!(disk.settings.routing.keyboard_mode != oink_foundation::input::InputMode::Disabled);
                 assert_eq!(disk.settings.routing.mouse_mode, InputMode::Shared);
                 wait_for("release reaches requester facts", 5., || {
                     b.node.group().unwrap().members.iter().any(|member| {
@@ -1641,4 +1764,143 @@ fn remote_pause_and_emergency_clear_only_owner_disables_and_publish_release() {
             b.node.shutdown().await;
         },
     );
+}
+
+#[test]
+fn shared_microphone_hotkey_dispatches_to_source_and_no_source_notice_stays_local() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "shared_microphone_hotkey_dispatches_to_source_and_no_source_notice_stays_local",
+        Some(4),
+        async {
+            use crate::api::ApiEvent;
+            use oink_protocol::v1::{
+                RawValue, dto,
+                schema::{WireDto, WireValue},
+            };
+            let a = start("mic-source", 0).await;
+            let b = start("mic-shortcut", 0).await;
+            common::pair(&a.node, &b.node).await;
+            common::active(&[&a.node, &b.node]).await;
+            let notices = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let remote_notices = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            for (node, count) in [(&a.node, remote_notices.clone()), (&b.node, notices.clone())] {
+                node.subscribe(Arc::new(move |event| {
+                    if matches!(event, ApiEvent::NoSharedMicrophone) {
+                        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }));
+            }
+            api(&b.node, |node| node.on_hotkey("toggle_microphone_mute")).await;
+            assert_eq!(notices.load(std::sync::atomic::Ordering::Relaxed), 1);
+            assert_eq!(remote_notices.load(std::sync::atomic::Ordering::Relaxed), 0);
+            // Supply only simulated capture observations/resolution. Native microphone
+            // capture is never started; token generation, dispatch, QUIC owner edits,
+            // persistence, and published preferences below are the actual code paths.
+            for (observer, muted) in [(&b.node, true), (&a.node, false)] {
+                // Persisting settings precedes publishing owner facts. Waiting only
+                // for settings lets the next toggle read the old value/revision.
+                // Subscribe before dispatch and wait for the real causal receipt.
+                let (completed, mut receipts) = tokio::sync::mpsc::unbounded_channel();
+                let subscription = observer.subscribe(Arc::new(move |event| {
+                    if let ApiEvent::DeviceControlCompleted(result) = event {
+                        completed.send(result.clone()).unwrap();
+                    }
+                }));
+                let source = a.node.id();
+                let result = api(observer, move |node| {
+                    let mut inputs = node.card_inputs();
+                    inputs.microphone_resolution = oink_audio::claims::Resolution::Exit {
+                        stamp: oink_audio::claims::Stamp {
+                            owner: source,
+                            counter: 1,
+                        },
+                        available: true,
+                    };
+                    let member = inputs
+                        .members
+                        .iter_mut()
+                        .find(|member| member.device.0 == source)
+                        .unwrap();
+                    let mut raw = member.facts.as_ref().unwrap().raw().clone();
+                    let RawValue::Map(resources) = raw.get_mut(&16).unwrap() else {
+                        panic!("resources");
+                    };
+                    resources.insert(
+                        8,
+                        RawValue::Map(
+                            [
+                                (1, dto::MicrophonePermission::Granted.write()),
+                                (2, true.write()),
+                                (3, RawValue::Array(vec![])),
+                                (5, false.write()),
+                                (6, false.write()),
+                            ]
+                            .into_iter()
+                            .collect(),
+                        ),
+                    );
+                    member.facts = Some(Arc::new(dto::DeviceFacts::from_raw(raw).unwrap()));
+                    let view = node.inner.cards.lock().unwrap().update(&inputs, 1).unwrap();
+                    let source_card = view
+                        .cards
+                        .iter()
+                        .find(|card| card.device.0 == source)
+                        .unwrap()
+                        .status
+                        .as_ref()
+                        .unwrap();
+                    assert_eq!(source_card.microphone.mode, crate::device_cards::MicrophoneMode::Source);
+                    assert!(source_card.microphone.controls_token.is_some());
+                    assert_eq!(source_card.microphone.forwarding.as_ref().unwrap().muted, !muted);
+                    node.apply_shared_microphone_mute(&view)
+                })
+                .await;
+                result.unwrap();
+                crate::test_watchdog::phase("microphone forwarding mute control receipt");
+                let receipt = receipts.recv().await.expect("control completion subscription");
+                observer.unsubscribe(subscription);
+                assert_eq!(receipt.result, crate::device_cards::DeviceControlResult::Applied);
+                assert_eq!(a.node.settings().microphone.muted, muted);
+                assert!(!b.node.settings().microphone.muted);
+                assert_eq!(a.node.settings().microphone.volume_percent, 100);
+            }
+            a.node.shutdown().await;
+            b.node.shutdown().await;
+        },
+    );
+}
+
+#[test]
+fn a_member_awaiting_its_catalog_can_accept_another_pairing() {
+    crate::test_watchdog::run(module_path!(), "pair into a member awaiting catalog", Some(4), async {
+        let a = start("pending-target", 0).await;
+        let b = start("original-target", 0).await;
+        let c = start("new-source", 0).await;
+        a.node
+            .inner
+            .profiles
+            .defer_catalogs
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        common::pair(&a.node, &b.node).await;
+        let group = a.node.group().unwrap().id.unwrap();
+        assert!(
+            crate::layout_profiles::store::load(a._dir.path(), group)
+                .unwrap()
+                .is_none()
+        );
+        // Membership completion is independent of the saved catalog arriving.
+        // A remains a valid target when the catalog's sender goes offline.
+        b.node.shutdown().await;
+        common::pair(&c.node, &a.node).await;
+        assert_eq!(c.node.group().unwrap().id, Some(group));
+        assert!(
+            crate::layout_profiles::store::load(a._dir.path(), group)
+                .unwrap()
+                .is_none(),
+            "membership completion must not manufacture a target catalog"
+        );
+        a.node.shutdown().await;
+        c.node.shutdown().await;
+    });
 }

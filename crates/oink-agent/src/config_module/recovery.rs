@@ -37,6 +37,7 @@ fn pair_context(pair: PairId) -> v1::Result<dto::ObjectContext> {
 }
 impl Owner {
     pub(crate) fn lookup(&mut self, link: LinkId) -> v1::Result<()> {
+        self.require_known_member(link)?;
         let source = self.state.roster().anchor();
         // Greeting recovery and a historical decision can request the same
         // proof concurrently. There is one reply slot per link and source root;
@@ -139,7 +140,7 @@ impl Owner {
                     // A previously admitted member may repeat its history proof
                     // while the adopted group is awaiting admission. Keep the
                     // locally validated anchor; the peer's greeting alone never
-                    // grants this lane. The signed endpoints are checked below.
+                    // grants this lane. The locally bound endpoints are checked below.
                     self.sessions[&id].admitted_anchor.ok_or(v1::ErrorCode::NotReady)?
                 };
                 self.expect_proof(id, reference, group_context(source)?, Purpose::Adoption(source))?;
@@ -335,7 +336,7 @@ impl Owner {
                         self.journal
                             .adopt(&bundle, &self.state, apply)
                             .map_err(|_| v1::ErrorCode::StateConflict)?;
-                        self.lookups.remove(&id);
+                        let looked_up = self.lookups.remove(&id).is_some();
                         let receipt = Message::ConfigMergeReceipt(dto::MergeReceipt::from_raw(
                             [
                                 (1, intent.merge_id()?.write()),
@@ -343,7 +344,13 @@ impl Owner {
                             ]
                             .into(),
                         )?);
-                        if apply {
+                        // Another recovery can project the target while this C0's
+                        // lookup reply is in flight. The signed state is installed,
+                        // but this link still needs admission. Merely acknowledging
+                        // its proof would remove the lookup's last deadline and
+                        // leave both ends waiting on a Connected link forever.
+                        // Unsolicited repeats of installed history do not restart admission.
+                        if apply || (looked_up && !self.sessions[&id].ready) {
                             self.migration(source, Some(target), api::MigrationPhase::Adopting, None);
                             // A live member's greeting may predate even its last
                             // admission. Its validated source anchor lets us re-admit
@@ -487,7 +494,11 @@ impl Owner {
             .max_by_key(|r| r.decision)
     }
     pub(crate) fn expire_recovery(&mut self, now: Instant) {
-        if let Ok(recoveries) = self.journal.recoveries() {
+        // Retaining an empty retry table cannot remove anything. Avoid decoding
+        // every historical plan/proof on otherwise idle owner ticks.
+        if !self.recovery_due.is_empty()
+            && let Ok(recoveries) = self.journal.recoveries()
+        {
             self.recovery_due.retain(|pair, _| {
                 recoveries.iter().any(|r| {
                     r.pair == *pair
@@ -540,10 +551,11 @@ impl Owner {
     pub(crate) fn reconcile_peer(&mut self, link: LinkId) -> v1::Result<()> {
         let peer = self.sessions[&link].peer_boot.device_id;
         let now = Instant::now();
-        for recovery in self.journal.recoveries().map_err(|_| v1::ErrorCode::StateConflict)? {
-            if recovery.receipt || recovery.target != peer || recovery.source != self.identity.id() {
-                continue;
-            }
+        for recovery in self
+            .journal
+            .unreceipted_recoveries(peer)
+            .map_err(|_| v1::ErrorCode::StateConflict)?
+        {
             if self
                 .pairs
                 .view(recovery.pair)

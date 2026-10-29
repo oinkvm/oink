@@ -1,9 +1,32 @@
 """Developer ID selection and notarization with no certificate subject output."""
+from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import time
+
+
+@contextmanager
+def awake_for_signing():
+    # The local notary profile is a data-protection keychain item: idle display
+    # lock makes it unreadable to notarytool. Hold display/system idle assertions
+    # through signing, smoke and notarization; never change keychain protection.
+    # -w also releases the assertions if the packaging process unexpectedly dies.
+    awake = subprocess.Popen(['/usr/bin/caffeinate', '-d', '-i', '-w', str(os.getpid())])
+    try:
+        if awake.poll() is not None:
+            raise RuntimeError('Cannot keep the display awake for signing/notarization')
+        yield
+    finally:
+        if awake.poll() is None:
+            awake.terminate()
+            try:
+                awake.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                awake.kill()
+                awake.wait()
 
 
 def private_run(*args, check=True, timeout=None):

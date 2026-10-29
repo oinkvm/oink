@@ -360,6 +360,74 @@ mod tests {
         assert_eq!(fake.0.borrow().1, 1);
     }
     #[test]
+    fn unsupported_endpoint_can_refuse_or_fail_after_a_successful_native_write() {
+        let unsupported = Fault {
+            status: ExitVolumeStatus::Unsupported,
+            native_code: None,
+        };
+        let (mut owner, _) = setup();
+        owner.bind(claim(1), None, Err(unsupported)).unwrap();
+        let command = request(&owner, 1, 20);
+        let result = owner.set(&boot(9), command);
+        assert_eq!(result.outcome().unwrap(), ControlOutcome::Refused);
+        assert_eq!(result.reason().unwrap(), ControlFailure::VolumeUnsupported);
+
+        struct Partial {
+            fake: Fake,
+            fail_readback: bool,
+            written: bool,
+        }
+        impl Endpoint for Partial {
+            fn changed(&self) -> bool {
+                false
+            }
+            fn read(&mut self) -> Result<Reading, Fault> {
+                if self.written && self.fail_readback {
+                    Err(Fault {
+                        status: ExitVolumeStatus::Unsupported,
+                        native_code: None,
+                    })
+                } else {
+                    self.fake.read()
+                }
+            }
+            fn write(&mut self, reading: Reading) -> Result<(), Fault> {
+                self.fake.write(reading)?;
+                self.written = true;
+                if self.fail_readback {
+                    Ok(())
+                } else {
+                    Err(Fault {
+                        status: ExitVolumeStatus::Unsupported,
+                        native_code: None,
+                    })
+                }
+            }
+        }
+        // A native setter may partially succeed and return Unsupported, or its
+        // readback may fail after a successful write. Neither implies no effect.
+        for fail_readback in [false, true] {
+            let (mut owner, fake) = setup();
+            owner
+                .bind(
+                    claim(1),
+                    Some("synthetic-output".into()),
+                    Ok(Box::new(Partial {
+                        fake: fake.clone(),
+                        fail_readback,
+                        written: false,
+                    })),
+                )
+                .unwrap();
+            let command = request(&owner, 1, 20);
+            let result = owner.set(&boot(9), command);
+            assert_eq!(result.outcome().unwrap(), ControlOutcome::Failed);
+            assert_eq!(result.reason().unwrap(), ControlFailure::VolumeUnsupported);
+            assert_eq!(fake.0.borrow().0.percent, 20);
+            assert_eq!(fake.0.borrow().1, 1);
+        }
+    }
+    #[test]
     fn physical_changes_increment_revision_and_reject_stale_absolute_set() {
         let (mut owner, fake) = setup();
         let request = request(&owner, 1, 20);

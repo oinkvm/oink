@@ -15,7 +15,9 @@ use std::thread::ThreadId;
 use std::time::Duration;
 
 use windows::Win32::Foundation::{ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::DataExchange::{AddClipboardFormatListener, RemoveClipboardFormatListener};
+use windows::Win32::System::DataExchange::{
+    AddClipboardFormatListener, GetClipboardOwner, GetClipboardSequenceNumber, RemoveClipboardFormatListener,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -49,6 +51,23 @@ struct Shared {
     listening: AtomicBool,
     /// 剪贴板线程已 `OleInitialize`。
     ole: AtomicBool,
+    /// Only this STA publishes through its internal OLE owner window. Updated
+    /// after each successful publication and cleared before ordinary writes.
+    publication: Mutex<Option<(isize, u64)>>,
+}
+
+pub(super) fn publication_changed(count: Option<u64>) {
+    let publication = count.and_then(|count| {
+        // SAFETY: window-station metadata; no COM object or data rendering is queried.
+        unsafe { GetClipboardOwner() }
+            .ok()
+            .map(|owner| (owner.0 as isize, count))
+    });
+    STATE.with(|state| {
+        if let Some(state) = state.borrow().as_ref() {
+            *state.shared.publication.lock().unwrap() = publication;
+        }
+    });
 }
 
 pub(crate) struct Worker {
@@ -70,6 +89,31 @@ impl std::fmt::Debug for Worker {
 }
 
 impl Worker {
+    /// Observe metadata without queueing behind a synchronous GetData callback.
+    /// In particular the clipboard actor must be able to serve/fail remote reads
+    /// while this STA is waiting for a different remote representation.
+    pub(crate) fn change_count(&self) -> u64 {
+        let publication = self.shared.publication.lock().unwrap();
+        // OleSetClipboard assigns an internal OLE owner HWND. All publications
+        // on this STA pass through vfile::publish, so the HWND plus our latest
+        // successful publication distinguishes own delayed rendering from a new
+        // copy. Another owner is visible immediately, even if WM_CLIPBOARDUPDATE
+        // is still queued behind GetData. No apartment-bound IDataObject escapes.
+        // Native gated-STA/owner replacement tests cover Windows 11 build 26200.
+        // https://learn.microsoft.com/windows/win32/api/ole2/nf-ole2-olesetclipboard
+        // SAFETY: both calls only inspect the calling process's window station.
+        unsafe {
+            if let Some((owner, count)) = *publication
+                && GetClipboardOwner()
+                    .ok()
+                    .is_some_and(|current| current.0 as isize == owner)
+            {
+                return count;
+            }
+            u64::from(GetClipboardSequenceNumber())
+        }
+    }
+
     pub(crate) fn spawn() -> Result<Self, ClipboardError> {
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let (notify_tx, notify_rx) = mpsc::channel::<()>();

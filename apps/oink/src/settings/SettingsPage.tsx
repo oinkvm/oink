@@ -8,17 +8,19 @@ import { ACCENT_SWATCHES, DEFAULT_ACCENT } from './appearance';
 import type { ReceivedFilesCleanup } from '../api/types';
 import { api as backend, shell } from '../api/client';
 import { agent, useAgent } from '../api/store';
+import { MicrophoneInput } from './MicrophoneInput';
 import { ScreenPointerGains } from './ScreenPointerGains';
+import { VirtualMicrophoneDescription, VirtualMicrophone, MicrophonePermission } from './VirtualMicrophone';
 import { GainControl } from './GainControl';
 import { KeyMapControl } from './KeyMap';
 import { AudioQualityChart } from './AudioQualityChart';
-import { LatencyChart } from './LatencyChart';
+import { ChartSpanToggle, LatencyChart, spanDescription, useChartSpan } from './LatencyChart';
 import { PermissionRow } from '../permissions/PermissionRow';
 import { PermissionControl } from '../permissions/PermissionControl';
 import { useGrant } from './useGrant';
 import { UninstallControl } from './UninstallControl';
 import { UpdateCheck, UpdatePreferences, manualUpdates } from './UpdatePreferences';
-import { SHORTCUTS, ShortcutRecorder, spokenKeys } from './Shortcuts';
+import { SHORTCUTS, deviceShortcuts, ShortcutRecorder, spokenKeys } from './Shortcuts';
 import type { ShortcutId } from './Shortcuts';
 import type { LogLevel, PermissionId, Prefs, PrefsApi } from './prefs';
 import { searchSections, sectionsFor, text } from './schema';
@@ -83,7 +85,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
     // This device's own system-arrangement preference; hidden where the owner cannot write it at all.
     const arrangement = agentState.layoutProfiles?.devices.find(d => d.device === agentState.overview?.this_device.id);
     const [syncPending, setSyncPending] = useState(false);
-    const applicable = (item: ItemMeta) => (item.id !== 'perm-network' || perms.network !== 'not_required') && (!['touchpadInject','macScrollFeel'].includes(item.id) || agentState.input?.contacts_injection_available === true)
+    const applicable = (item: ItemMeta) => (item.id !== 'perm-network' || perms.network !== 'not_required') && (!['touchpadInject','nativeMultifinger','macScrollFeel'].includes(item.id) || agentState.input?.contacts_injection_available === true)
         && (item.id !== 'syncSystemArrangement' || arrangement?.availability !== 'unsupported');
     const setSync = async (enabled: boolean, label: string) => {
         if (!arrangement) return;
@@ -95,8 +97,9 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
             toast.danger({ title: tr('无法更改「{0}」', label), description: e instanceof LayoutProfileFailure ? profileErrorText(e.problem) : tr('不可用') });
         } finally { setSyncPending(false); }
     };
-    const sections = sectionsFor(platform).map(s => ({ ...s, items: s.items.filter(applicable) }));
-    const found = searchSections(platform, query);
+    const shortcuts = [...SHORTCUTS, ...deviceShortcuts(agentState.input?.hotkeys ?? [], agentState.cards?.cards ?? [])];
+    const sections = sectionsFor(platform, shortcuts).map(s => ({ ...s, items: s.items.filter(applicable) }));
+    const found = searchSections(platform, query, shortcuts);
     const shown = sections.filter((s) => {
         const keep = found.get(s.id);
         return keep === 'all' || (keep && s.items.some(i => keep.has(i.id)));
@@ -199,6 +202,9 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
         return () => window.clearTimeout(t);
     }, [scError]);
     const [saving, setSaving] = useState(false);
+    // Each chart keeps its own window while the app runs; not persisted.
+    const [latencySpan, setLatencySpan] = useChartSpan('latency');
+    const [audioSpan, setAudioSpan] = useChartSpan('audioQuality');
     const openDir = () => { void shell.openDiagnosticsFolder().catch(() => agent.fail('unavailable')); };
     const saveBundle = async (minutes: number | null) => {
         setSaving(true);
@@ -220,6 +226,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
         desc?: ReactNode;
         /** Show the control inside a collapsed disclosure under the label. */
         panel?: boolean;
+        className?: string;
     } => {
         const sw = (k: keyof Prefs) => ({ node: <Switch aria-label={label} checked={prefs[k] as boolean} onChange={toggle(k, label)}/> });
         switch (item.id) {
@@ -245,15 +252,11 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
             case 'pointerTrail':
             case 'keepLocalPlayback':
             case 'diagnostics':
+            case 'removeDsStore':
             case 'clipReceive':
             case 'clipSend':
                 return sw(item.id);
-            case 'clipText':
-            case 'clipRich':
-            case 'clipImage':
-            case 'clipFiles':
-            case 'clipPrivate':
-                return { node: <Switch aria-label={label} checked={prefs[item.id]} onChange={toggle(item.id,label)} disabled={!prefs.clipSend}/> };
+            case 'nativeMultifinger': return { node: <Switch aria-label={label} checked={prefs.nativeMultifinger} onChange={toggle('nativeMultifinger',label)} disabled={!prefs.touchpadInject}/> };
             case 'macScrollFeel': return { node: <Switch aria-label={label} checked={prefs.macScrollFeel} onChange={toggle('macScrollFeel',label)} disabled={!prefs.touchpadInject}/> };
             case 'hideSponsor': return { node: <Switch aria-label={label} checked={api.presentation?.hide_sponsor ?? false} onChange={v => api.savePresentation({ hide_sponsor: v })}/> };
             case 'onboarding': return { node: <Button size="sm" onClick={onOnboarding}>{tr('显示')}</Button> };
@@ -342,6 +345,9 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
             case 'screenPointerGains': return { node: <ScreenPointerGains/>, panel: true };
             case 'pointerGain':
                 return { node: <GainControl label={label} value={prefs.pointerGain} onChange={(v) => set('pointerGain', v)} onCommit={(v) => onLog(tr('被控时指针速度增益 → {0}x', v.toFixed(2)))}/> };
+            case 'virtualMicrophone': return {desc:<VirtualMicrophoneDescription windows={platform==='win'}/>,node:<VirtualMicrophone windows={platform==='win'} active={open}/>};
+            case 'microphoneInput': return {node:<MicrophoneInput/>};
+            case 'microphonePermission': return {node:<MicrophonePermission/>};
             case 'audioDevice': {
                 const list = agentState.audio?.devices.find(d => d.device.map(v => v.toString(16).padStart(2, '0')).join('') === agentState.overview?.this_device.id)?.outputs ?? [];
                 return {
@@ -395,14 +401,16 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                     </span>),
                 };
             case 'audioQuality':
-                return {node: <AudioQualityChart active={open}/>, stack:true};
+                return { desc: hl(spanDescription('audioQuality', audioSpan), query), className: 'setp__row--chart', stack: true,
+                    node: <><ChartSpanToggle label={label} value={audioSpan} onChange={setAudioSpan}/><AudioQualityChart active={open} span={audioSpan}/></> };
             case 'latency':
-                return { node: <LatencyChart active={open}/>, stack: true };
+                return { desc: hl(spanDescription('latency', latencySpan), query), className: 'setp__row--chart', stack: true,
+                    node: <><ChartSpanToggle label={label} value={latencySpan} onChange={setLatencySpan}/><LatencyChart active={open} span={latencySpan}/></> };
         }
         if (item.id.startsWith('sc-')) {
             const id = item.id.slice(3) as ShortcutId;
-            const sc = prefs.shortcuts[id];
-            const clash = sc.on && sc.keys ? SHORTCUTS.find((o) => o.id !== id && prefs.shortcuts[o.id].on && prefs.shortcuts[o.id].keys === sc.keys) : undefined;
+            const sc = prefs.shortcuts[id] ?? {on:false, keys:''};
+            const clash = sc.on && sc.keys ? shortcuts.find((o) => o.id !== id && prefs.shortcuts[o.id]?.on && prefs.shortcuts[o.id]?.keys === sc.keys) : undefined;
             const err = scError?.id === id ? scError.text : clash ? tr('和「{0}」的快捷键重复', clash.label) : null;
             const setSc = (patch: Partial<typeof sc>) => set('shortcuts', { ...prefs.shortcuts, [id]: { ...sc, ...patch } });
             return {
@@ -410,7 +418,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                     ? <span className="setp__sc-err"><Icon name="alert"/>{err}</span>
                     : hl(text(item.desc, platform), query),
                 node: (<span className="setp__sc">
-            <ShortcutRecorder platform={platform} label={label} value={sc.keys} disabled={!sc.on} invalid={!!clash} onChange={(v) => { setScError(null); setSc({ keys: v }); onLog(tr('快捷键「{0}」→ {1}', label, spokenKeys(platform, v))); }} onReject={(reason) => setScError({ id, text: reason })}/>
+            <ShortcutRecorder singleKey={id === 'lockEscape'} platform={platform} label={label} value={sc.keys} disabled={!sc.on} invalid={!!clash} onChange={(v) => { setScError(null); setSc({ keys: v }); onLog(tr('快捷键「{0}」→ {1}', label, spokenKeys(platform, v))); }} onReject={(reason) => setScError({ id, text: reason })}/>
             <Switch aria-label={tr('启用「{0}」快捷键', label)} checked={sc.on} onChange={(v) => { setSc({ on: v }); onLog(tr('快捷键「{0}」：{1}', label, v ? tr('开') : tr('关'))); }}/>
           </span>),
             };
@@ -439,12 +447,12 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                     const c = control(i, label);
                     const desc = c.desc ?? (i.desc ? hl(text(i.desc, platform), query) : undefined);
                     const node = api.canEdit(i.id) ? c.node : <span className="setp__note">{tr('不可用')}</span>;
-                    const marks = { 'data-item': i.id, 'data-flash': flash?.id === i.id ? flash.n : undefined, onAnimationEnd: () => setFlash(null) };
+                    const marks = { id: i.id === 'virtualMicrophone' ? 'settings-virtual-microphone' : undefined, 'data-item': i.id, 'data-parent': i.parent, 'data-flash': flash?.id === i.id ? flash.n : undefined, onAnimationEnd: () => setFlash(null) };
                     if (c.panel)
                         return (<Accordion key={i.id} {...marks} variant="plain" headingLevel={3} className="setp__row setp__acc" items={[{ value: i.id, content: node,
                             title: <span className="ok-row__text"><span className="ok-row__label">{hl(label, query)}</span>{desc && <span className="ok-row__desc">{desc}</span>}</span> }]}/>);
                     const ItemRow = i.id.startsWith('perm-') ? PermissionRow : Row;
-                    return (<ItemRow key={i.id} {...marks} className="setp__row" label={hl(label, query)} description={desc} stack={c.stack}>
+                    return (<ItemRow key={i.id} {...marks} className={c.className ? `setp__row ${c.className}` : 'setp__row'} label={hl(label, query)} description={desc} stack={c.stack}>
                       {node}
                     </ItemRow>);
                 })}

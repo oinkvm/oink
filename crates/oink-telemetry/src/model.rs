@@ -61,6 +61,19 @@ closed!(StartBoundary {
     ApiBeginAccepted,
     Unobserved
 });
+closed!(TargetStartBoundary {
+    AppkitSessionReturned,
+    OleCallEnter
+});
+closed!(SourceStage {
+    ProbeRecognition,
+    NativeRead,
+    MetadataCompletion,
+    Inventory,
+    InventoryToLearned,
+    LearnedToNotice,
+    RecognizedToNotice
+});
 closed!(SetupResult {
     Ready,
     Failed,
@@ -74,7 +87,19 @@ closed!(PrepareStage {
     NativePreparation,
     ParentVisible,
     ChildrenEnumerated,
-    FirstUrl
+    FirstUrl,
+    Metadata,
+    EntryToBegin,
+    TargetPreparation,
+    PreparationQueue,
+    BeginDispatch,
+    PendingWindow,
+    SourcePress,
+    NativeAcknowledgement,
+    WritersPreview,
+    NativeBegin,
+    Preview,
+    Namespace
 });
 closed!(SetupStage {
     Dial,
@@ -93,8 +118,84 @@ closed!(Family {
     Drag,
     Link,
     Input,
-    Audio
+    Audio,
+    Clipboard
 });
+closed!(OperationResult {
+    Completed,
+    Failed,
+    TimedOut,
+    Cancelled
+});
+closed!(TransferFailure {
+    None,
+    Unavailable,
+    Permission,
+    InvalidData,
+    ResourceLimit,
+    Io,
+    Cancelled,
+    Timeout
+});
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SizeBucket {
+    #[serde(rename = "unknown")]
+    Unknown,
+    #[serde(rename = "empty")]
+    Empty,
+    #[serde(rename = "le_64_kib")]
+    UpTo64KiB,
+    #[serde(rename = "le_1_mib")]
+    UpTo1MiB,
+    #[serde(rename = "le_16_mib")]
+    UpTo16MiB,
+    #[serde(rename = "le_256_mib")]
+    UpTo256MiB,
+    #[serde(rename = "gt_256_mib")]
+    Larger,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ThroughputBucket {
+    #[serde(rename = "unknown")]
+    Unknown,
+    #[serde(rename = "lt_1_mib_s")]
+    Below1MiBps,
+    #[serde(rename = "le_10_mib_s")]
+    UpTo10MiBps,
+    #[serde(rename = "le_100_mib_s")]
+    UpTo100MiBps,
+    #[serde(rename = "gt_100_mib_s")]
+    Above100MiBps,
+}
+impl SizeBucket {
+    pub fn from_bytes(bytes: u64) -> Self {
+        match bytes {
+            0 => Self::Empty,
+            1..=65_536 => Self::UpTo64KiB,
+            65_537..=1_048_576 => Self::UpTo1MiB,
+            1_048_577..=16_777_216 => Self::UpTo16MiB,
+            16_777_217..=268_435_456 => Self::UpTo256MiB,
+            _ => Self::Larger,
+        }
+    }
+}
+impl ThroughputBucket {
+    pub fn measured(bytes: u64, elapsed_us: u64) -> Self {
+        if bytes == 0 || elapsed_us == 0 {
+            return Self::Unknown;
+        }
+        let rate = u128::from(bytes) * 1_000_000 / u128::from(elapsed_us);
+        if rate < 1_048_576 {
+            Self::Below1MiBps
+        } else if rate <= 10_485_760 {
+            Self::UpTo10MiBps
+        } else if rate <= 104_857_600 {
+            Self::UpTo100MiBps
+        } else {
+            Self::Above100MiBps
+        }
+    }
+}
 closed!(HistogramSchema {
     Duration14,
     Audio8,
@@ -192,20 +293,65 @@ pub struct PlatformPair {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "metric", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Metric {
-    DragStart { boundary: StartBoundary },
+    ClipboardPublish,
+    ClipboardApply {
+        result: OperationResult,
+    },
+    NativeRepresentationRead {
+        result: OperationResult,
+    },
+    ClipboardTransfer {
+        result: OperationResult,
+        reason: TransferFailure,
+    },
+    FileFirstByte {
+        size: SizeBucket,
+    },
+    FileComplete {
+        result: OperationResult,
+        reason: TransferFailure,
+        size: SizeBucket,
+        throughput: ThroughputBucket,
+    },
+    DragDropAccepted {
+        result: OperationResult,
+    },
+    DragTransfer {
+        result: OperationResult,
+        reason: TransferFailure,
+    },
+    DragStart {
+        boundary: StartBoundary,
+    },
+    DragTargetStart {
+        boundary: TargetStartBoundary,
+    },
+    DragSourceStage {
+        stage: SourceStage,
+    },
     DragQueueWait,
     DragBeginWorker,
-    DragPrepareStage { stage: PrepareStage },
-    LinkSetup { result: SetupResult },
-    LinkSetupStage { stage: SetupStage },
-    LowSetup { stage: SetupStage },
+    DragPrepareStage {
+        stage: PrepareStage,
+    },
+    LinkSetup {
+        result: SetupResult,
+    },
+    LinkSetupStage {
+        stage: SetupStage,
+    },
+    LowSetup {
+        stage: SetupStage,
+    },
     InputReceiveToNativeComplete,
     InputQueueWaitWindowMax,
     InputCaptureCallbackWindowMax,
     InputOldestPending,
     InputIngressVariation,
     InputDispatchVariation,
-    AudioBuffered { stage: AudioStage },
+    AudioBuffered {
+        stage: AudioStage,
+    },
     AudioReceiveDispatch,
     AudioDispatchInsert,
     AudioPushToPresentationEstimate,
@@ -215,9 +361,14 @@ pub enum Metric {
 impl Metric {
     pub fn family(self) -> Family {
         match self {
-            Self::DragStart { .. } | Self::DragQueueWait | Self::DragBeginWorker | Self::DragPrepareStage { .. } => {
-                Family::Drag
-            }
+            Self::DragDropAccepted { .. }
+            | Self::DragTransfer { .. }
+            | Self::DragStart { .. }
+            | Self::DragTargetStart { .. }
+            | Self::DragSourceStage { .. }
+            | Self::DragQueueWait
+            | Self::DragBeginWorker
+            | Self::DragPrepareStage { .. } => Family::Drag,
             Self::LinkSetup { .. } | Self::LinkSetupStage { .. } | Self::LowSetup { .. } | Self::NetworkRtt => {
                 Family::Link
             }
@@ -227,13 +378,29 @@ impl Metric {
             | Self::InputOldestPending
             | Self::InputIngressVariation
             | Self::InputDispatchVariation => Family::Input,
+            Self::ClipboardPublish
+            | Self::ClipboardApply { .. }
+            | Self::NativeRepresentationRead { .. }
+            | Self::ClipboardTransfer { .. }
+            | Self::FileFirstByte { .. }
+            | Self::FileComplete { .. } => Family::Clipboard,
             _ => Family::Audio,
         }
     }
     pub fn interval(self) -> bool {
         matches!(
             self,
-            Self::DragStart { .. }
+            Self::ClipboardPublish
+                | Self::ClipboardApply { .. }
+                | Self::NativeRepresentationRead { .. }
+                | Self::ClipboardTransfer { .. }
+                | Self::FileFirstByte { .. }
+                | Self::FileComplete { .. }
+                | Self::DragDropAccepted { .. }
+                | Self::DragTransfer { .. }
+                | Self::DragStart { .. }
+                | Self::DragTargetStart { .. }
+                | Self::DragSourceStage { .. }
                 | Self::DragQueueWait
                 | Self::DragBeginWorker
                 | Self::DragPrepareStage {
@@ -241,6 +408,18 @@ impl Metric {
                         | PrepareStage::Normalization
                         | PrepareStage::Registration
                         | PrepareStage::NativePreparation
+                        | PrepareStage::Metadata
+                        | PrepareStage::EntryToBegin
+                        | PrepareStage::TargetPreparation
+                        | PrepareStage::PreparationQueue
+                        | PrepareStage::BeginDispatch
+                        | PrepareStage::PendingWindow
+                        | PrepareStage::SourcePress
+                        | PrepareStage::NativeAcknowledgement
+                        | PrepareStage::WritersPreview
+                        | PrepareStage::NativeBegin
+                        | PrepareStage::Preview
+                        | PrepareStage::Namespace
                 }
                 | Self::LinkSetup { .. }
                 | Self::LinkSetupStage { .. }
@@ -267,7 +446,17 @@ impl Metric {
     }
     pub fn name(self) -> &'static str {
         match self {
+            Self::ClipboardPublish => "clipboard_publish",
+            Self::ClipboardApply { .. } => "clipboard_apply",
+            Self::NativeRepresentationRead { .. } => "native_representation_read",
+            Self::ClipboardTransfer { .. } => "clipboard_transfer",
+            Self::FileFirstByte { .. } => "file_first_byte",
+            Self::FileComplete { .. } => "file_complete",
+            Self::DragDropAccepted { .. } => "drag_drop_accepted",
+            Self::DragTransfer { .. } => "drag_transfer",
             Self::DragStart { .. } => "drag_start",
+            Self::DragTargetStart { .. } => "drag_target_start",
+            Self::DragSourceStage { .. } => "drag_source_stage",
             Self::DragQueueWait => "drag_queue_wait",
             Self::DragBeginWorker => "drag_begin_worker",
             Self::DragPrepareStage { .. } => "drag_prepare_stage",
@@ -304,6 +493,7 @@ impl MeasurementContext {
         let family = self.metric.family();
         if (self.codec.is_some() && family != Family::Audio)
             || (self.transport.is_some() && family != Family::Input)
+            || (family == Family::Clipboard && (self.platform_pair.is_some() || self.network_path.is_some()))
             || (matches!(self.metric, Metric::InputCaptureCallbackWindowMax)
                 && (self.platform_pair.is_some() || self.network_path.is_some() || self.transport.is_some()))
         {
@@ -319,6 +509,9 @@ pub enum Frame {
         image: ImageSlot,
         offset: u64,
         debug_id: [u8; 16],
+        debug_age: u32,
+        code_id: Option<u64>,
+        image_size: u64,
     },
     Script {
         script: ScriptSlot,
@@ -419,7 +612,12 @@ impl Report {
         match self {
             Self::SafeCrash(c) => {
                 if c.frames().any(|f| match f {
-                    Frame::Native { debug_id, .. } => *debug_id == [0; 16],
+                    Frame::Native {
+                        debug_id,
+                        offset,
+                        image_size,
+                        ..
+                    } => *debug_id == [0; 16] || *image_size == 0 || *offset >= *image_size,
                     Frame::Script { line, .. } => *line == 0,
                 }) {
                     return Err(Error::Invalid);
@@ -555,5 +753,37 @@ mod revision_tests {
         ] {
             assert_eq!(source_revision(version, display, build, source), None);
         }
+    }
+}
+
+#[cfg(test)]
+mod transfer_bucket_tests {
+    use super::*;
+    #[test]
+    fn sizes_and_rates_have_fixed_coarse_boundaries() {
+        assert_eq!(SizeBucket::from_bytes(0), SizeBucket::Empty);
+        assert_eq!(SizeBucket::from_bytes(65_536), SizeBucket::UpTo64KiB);
+        assert_eq!(SizeBucket::from_bytes(65_537), SizeBucket::UpTo1MiB);
+        assert_eq!(SizeBucket::from_bytes(16_777_216), SizeBucket::UpTo16MiB);
+        assert_eq!(SizeBucket::from_bytes(u64::MAX), SizeBucket::Larger);
+        assert_eq!(ThroughputBucket::measured(1, 0), ThroughputBucket::Unknown);
+        assert_eq!(ThroughputBucket::measured(0, 1), ThroughputBucket::Unknown);
+        assert_eq!(
+            ThroughputBucket::measured(1_048_575, 1_000_000),
+            ThroughputBucket::Below1MiBps
+        );
+        assert_eq!(
+            ThroughputBucket::measured(1_048_576, 1_000_000),
+            ThroughputBucket::UpTo10MiBps
+        );
+        assert_eq!(
+            ThroughputBucket::measured(10_485_760, 1_000_000),
+            ThroughputBucket::UpTo10MiBps
+        );
+        assert_eq!(
+            ThroughputBucket::measured(104_857_600, 1_000_000),
+            ThroughputBucket::UpTo100MiBps
+        );
+        assert_eq!(ThroughputBucket::measured(u64::MAX, 1), ThroughputBucket::Above100MiBps);
     }
 }

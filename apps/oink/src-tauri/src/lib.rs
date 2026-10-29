@@ -12,6 +12,10 @@ mod foreground_windows;
 mod icon_render;
 #[cfg(any(windows, test))]
 pub mod installer_finish;
+#[cfg(target_os = "macos")]
+mod local_drop;
+#[cfg(windows)]
+mod local_drop_windows;
 #[cfg(any(windows, test))]
 mod menu_icons_windows;
 pub mod service;
@@ -23,6 +27,8 @@ mod tray_windows;
 #[cfg(any(target_os = "macos", test))]
 mod uninstall;
 mod update_window;
+#[cfg(any(target_os = "macos", windows, test))]
+mod window_activity;
 #[cfg(any(windows, test))]
 mod windows_hotkey;
 

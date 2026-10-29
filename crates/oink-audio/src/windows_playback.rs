@@ -5,6 +5,7 @@
 //! retains the legacy default-buffer baseline. A failed IAudioClient3 request
 //! falls back to a fresh IAudioClient and records the original HRESULT.
 
+use crate::wasapi_timing::observe_shared_render;
 use crate::windows_timer::TimerResolution;
 use serde::Serialize;
 use std::sync::{
@@ -30,10 +31,12 @@ use windows::core::{GUID, Interface, PCWSTR, w};
 
 #[derive(Clone, Copy, Debug)]
 pub struct NativeOutputTiming {
+    pub period_frames: u32,
+    pub native_gap_frames: Option<u64>,
     pub callback_at: Instant,
     /// Padding-based first-frame engine queue estimate, validated by a live
     /// audio clock. Not a measured DAC/speaker timestamp. None during startup,
-    /// zero padding/underrun (next engine handoff is unknown), stale clock, or
+    /// zero padding (next engine handoff is unknown), stale clock, or
     /// when the estimate is already past. See info().timing_method.
     pub playback_at: Option<Instant>,
     pub sample_rate: u32,
@@ -72,7 +75,7 @@ pub struct NativeOutputInfo {
     pub timing_method: String,
 }
 
-type RenderCallback = Box<dyn FnMut(&mut [f32], NativeOutputTiming) + Send>;
+type RenderCallback = Box<dyn crate::playback::NativeRender>;
 
 #[derive(Debug)]
 pub struct NativePlayback {
@@ -129,8 +132,12 @@ impl NativePlayback {
         }
     }
 
-    pub fn take_schedule(&mut self) -> Result<crate::realtime::Schedule, String> {
-        crate::realtime::Schedule::device(0, 0)
+    pub fn shutdown(&mut self) -> bool {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        true // this joined thread was the only callback executor
     }
     pub fn info(&self) -> NativeOutputInfo {
         self.info.clone()
@@ -317,7 +324,7 @@ fn run(
         timer_resolution_request_succeeded: false,
         timer_resolution_error: None,
         timing_method:
-            "GetCurrentPadding_queue_estimate_validated_by_IAudioClock_QPC; zero_padding_unknown; excludes_unreported_hardware_latency; not_DAC_measurement"
+            "GetCurrentPadding_queue_estimate_validated_by_IAudioClock_QPC; zero_padding_unknown; excludes_unreported_hardware_latency; not_DAC_measurement; native_continuity_unknown"
                 .into(),
     };
     let _timer_resolution = if requested.is_some() {
@@ -419,76 +426,64 @@ fn run(
     let clock: Option<IAudioClock> = unsafe { client.GetService() }.ok();
     let qpc = Qpc::new();
     let mut scratch = vec![0.0f32; info.queue_target_frames as usize * channels as usize];
+    // All owning metadata and scratch are prepared before MMCSS. One real
+    // registration covers initial pull/prime and every later event callback.
+    info.mmcss_enabled = true;
+    let ready_report = info.clone();
     let mut task_index = 0;
-    // SAFETY: affects only current thread, reverted by guard on this thread.
-    let mmcss = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index) };
-    let mmcss = match mmcss {
-        Ok(handle) => {
-            info.mmcss_enabled = true;
-            Some(Mmcss(handle))
+    // SAFETY: applies only to this dedicated thread; guard reverts before errors.
+    let handle = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index) }
+        .map_err(|error| api_error("register render MMCSS", error))?;
+    let mmcss = Mmcss(handle);
+    let mut ready_published = false;
+    let result = (|| -> Result<(), RenderFailure> {
+        render_once(
+            &client,
+            &render,
+            None,
+            qpc.as_ref(),
+            &info,
+            encoding,
+            &mut scratch,
+            &mut callback,
+        )?;
+        // SAFETY: live initialized client with a primed render buffer.
+        let status = unsafe { (Interface::vtable(&client).Start)(Interface::as_raw(&client)) };
+        if status.is_err() {
+            return Err(RenderFailure("Start render", status.0));
         }
-        Err(e) => {
-            info.mmcss_error = Some(api_error("AvSetMmThreadCharacteristicsW", e));
-            None
+        if ready.send(Ok(ready_report)).is_err() {
+            return Err(RenderFailure("render startup caller disconnected", -1));
         }
-    };
-    // Registration is probed for the public startup report. Resume ordinary
-    // scheduling before publishing that heap-owning report through mpsc.
+        ready_published = true;
+        while !stop.load(Ordering::Acquire) {
+            // SAFETY: event lives until after client Stop.
+            match unsafe { WaitForSingleObject(event.0, 50) } {
+                WAIT_OBJECT_0 => render_once(
+                    &client,
+                    &render,
+                    clock.as_ref(),
+                    qpc.as_ref(),
+                    &info,
+                    encoding,
+                    &mut scratch,
+                    &mut callback,
+                )?,
+                WAIT_TIMEOUT => continue,
+                _ => return Err(RenderFailure("wait render event", -1)),
+            }
+        }
+        Ok(())
+    })();
     drop(mmcss);
-    render_once(
-        &client,
-        &render,
-        None,
-        qpc.as_ref(),
-        &info,
-        encoding,
-        &mut scratch,
-        &mut callback,
-    )
-    .map_err(RenderFailure::message)?;
-    // SAFETY: buffer primed and event configured before starting the stream.
-    unsafe { client.Start() }.map_err(|e| api_error("Start render", e))?;
     let _running = Running(client.clone());
-    ready
-        .send(Ok(info.clone()))
-        .map_err(|_| "render startup caller disconnected".to_string())?;
-    // All memory, COM services and reporting are prepared before registration.
-    // AvRevert invalidated the probe's task index. Reusing it fails with
-    // ERROR_INVALID_TASK_INDEX (1551); ask for a fresh registration with zero.
-    task_index = 0;
-    // SAFETY: only this worker is registered and the guard reverts on it.
-    let registration = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index) };
-    let result = match registration {
-        Ok(handle) => {
-            let mmcss = Mmcss(handle);
-            let result = (|| -> Result<(), RenderFailure> {
-                while !stop.load(Ordering::Acquire) {
-                    // SAFETY: event stays alive through loop and stream shutdown.
-                    match unsafe { WaitForSingleObject(event.0, 50) } {
-                        WAIT_OBJECT_0 => render_once(
-                            &client,
-                            &render,
-                            clock.as_ref(),
-                            qpc.as_ref(),
-                            &info,
-                            encoding,
-                            &mut scratch,
-                            &mut callback,
-                        )?,
-                        WAIT_TIMEOUT => continue,
-                        _ => return Err(RenderFailure("wait render event", -1)),
-                    }
-                }
-                Ok(())
-            })();
-            drop(mmcss);
-            result.map_err(RenderFailure::message)
-        }
-        Err(error) => Err(api_error("register render MMCSS", error)),
-    };
+    let result = result.map_err(RenderFailure::message);
     if let Err(error) = result {
+        if !ready_published {
+            return Err(error);
+        }
         // This thread is ordinary again. Publish failure before waiting for the
-        // owner to join its auxiliary feeder; only then release native services.
+        // owner to retire callback-owned DSP; only then release native services.
         on_error(error);
         while !stop.load(Ordering::Acquire) {
             thread::sleep(Duration::from_millis(1));
@@ -562,6 +557,7 @@ fn render_once(
     scratch: &mut [f32],
     callback: &mut RenderCallback,
 ) -> Result<(), RenderFailure> {
+    let began = Instant::now();
     let clock_at = clock.zip(qpc).and_then(|(clock, qpc)| qpc.clock_instant(clock));
     let padding_at = Instant::now();
     // SAFETY: initialized client on the owning render thread.
@@ -579,22 +575,17 @@ fn render_once(
     if frames == 0 {
         return Ok(());
     }
-    let playback_at = clock_at.filter(|_| padding != 0).and_then(|clock_at| {
-        // Padding was sampled later than the clock position's QPC timestamp.
-        // Advance that timestamp to the padding query, then add queued frames.
-        // This is intentionally a padding estimate, not frames_available and
-        // not a cumulative-written-frame estimate that breaks after underruns.
-        let padding_time = clock_at.checked_add(padding_at.checked_duration_since(clock_at)?)?;
-        padding_time.checked_add(Duration::from_secs_f64(padding as f64 / info.sample_rate as f64))
-    });
     let samples = frames as usize * info.channels as usize;
     scratch[..samples].fill(0.0);
     let callback_at = Instant::now();
-    callback(
+    let observation = observe_shared_render(clock_at, padding_at, callback_at, padding, info.sample_rate);
+    callback.fill(
         &mut scratch[..samples],
         NativeOutputTiming {
+            period_frames: info.actual_period_frames,
+            native_gap_frames: observation.native_gap_frames,
             callback_at,
-            playback_at: playback_at.filter(|predicted| *predicted > callback_at),
+            playback_at: observation.playback_at,
             sample_rate: info.sample_rate,
             channels: info.channels,
             padding_frames: padding,
@@ -641,5 +632,6 @@ fn render_once(
             return Err(RenderFailure("ReleaseBuffer render", status.0));
         }
     }
+    callback.complete(began.elapsed());
     Ok(())
 }

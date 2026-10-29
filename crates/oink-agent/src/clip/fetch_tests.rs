@@ -1,4 +1,4 @@
-//! Explicit file demand survives slow native publication and provider refusal.
+//! Provider refusal remains explicit, even when download was requested during publication.
 use super::*;
 use crate::snapshot_tests::{Displays, common, start_with_clip};
 use oink_clipboard::{ChangeHandler, ClipData, ClipSnapshot, ClipboardError};
@@ -49,26 +49,36 @@ impl ClipboardBackend for GatedProvider {
     }
 }
 #[test]
-fn file_download_requested_during_native_preparation_survives_provider_refusal() {
+fn file_download_during_preparation_does_not_bypass_provider_refusal() {
     crate::test_watchdog::run(
         module_path!(),
-        "file_download_requested_during_native_preparation_survives_provider_refusal",
+        "file_download_during_preparation_does_not_bypass_provider_refusal",
         Some(4),
-        file_fetch_scenario(false),
+        file_fetch_scenario(false, false),
     );
 }
 
 #[test]
-fn file_download_requested_behind_previous_publication_survives_provider_refusal() {
+fn file_download_behind_previous_publication_does_not_bypass_provider_refusal() {
     crate::test_watchdog::run(
         module_path!(),
-        "file_download_requested_behind_previous_publication_survives_provider_refusal",
+        "file_download_behind_previous_publication_does_not_bypass_provider_refusal",
         Some(4),
-        file_fetch_scenario(true),
+        file_fetch_scenario(true, false),
     );
 }
 
-async fn file_fetch_scenario(after_publish: bool) {
+#[test]
+fn provider_refusal_notifies_and_preserves_mixed_text() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "provider_refusal_notifies_and_preserves_mixed_text",
+        Some(4),
+        file_fetch_scenario(false, true),
+    );
+}
+
+async fn file_fetch_scenario(after_publish: bool, mixed: bool) {
     use crate::api::AgentApi;
     let root = tempfile::tempdir().unwrap();
     let source = Arc::new(FakeClipboard::new());
@@ -92,6 +102,13 @@ async fn file_fetch_scenario(after_publish: bool) {
         })),
     )
     .await;
+    let notices = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = notices.clone();
+    let subscription = b.subscribe(Arc::new(move |event| {
+        if matches!(event, crate::api::ApiEvent::FileProviderRequired) {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
     common::pair(&a, &b).await;
     common::active(&[&a, &b]).await;
     let mut preparing = Some(preparing);
@@ -111,16 +128,17 @@ async fn file_fetch_scenario(after_publish: bool) {
     let file = a.data_dir().join("source.bin");
     let expected = vec![0x5a; 2_000_000];
     std::fs::write(&file, &expected).unwrap();
-    source.copy(
-        vec![ClipData::Files(vec![oink_clipboard::FileEntry {
-            path: "传输.bin".into(),
-            is_dir: false,
-            size: expected.len() as u64,
-            modified_ms: None,
-            local_path: Some(file),
-        }])],
-        oink_clipboard::Sensitivity::Normal,
-    );
+    let mut items = vec![ClipData::Files(vec![oink_clipboard::FileEntry {
+        path: "传输.bin".into(),
+        is_dir: false,
+        size: expected.len() as u64,
+        modified_ms: None,
+        local_path: Some(file),
+    }])];
+    if mixed {
+        items.push(ClipData::Text("unaffected text".into()));
+    }
+    source.copy(items, oink_clipboard::Sensitivity::Normal);
     if let Some(preparing) = preparing {
         tokio::time::timeout(Duration::from_secs(5), preparing)
             .await
@@ -137,14 +155,24 @@ async fn file_fetch_scenario(after_publish: bool) {
     b.fetch_clipboard_files().unwrap();
     b.inner.clip.get().unwrap().settle().await;
     release.send(()).unwrap();
-    common::until("explicit demand materialized after native provider refusal", || {
-            b.clipboard_transfer().unwrap().is_some_and(|transfer| transfer.phase == FileTransferPhase::Ready)
-                && matches!(target.items().as_slice(), [ClipData::Files(files)] if files.len() == 1 && files[0].local_path.is_some())
-        }).await;
-    let ClipData::Files(files) = &target.items()[0] else {
-        panic!("materialized file");
-    };
-    assert_eq!(std::fs::read(files[0].local_path.as_ref().unwrap()).unwrap(), expected);
+    common::until("native provider refusal reported without cache fallback", || {
+        b.clipboard_transfer()
+            .unwrap()
+            .is_some_and(|transfer| transfer.phase == FileTransferPhase::Failed)
+    })
+    .await;
+    assert!(!b.data_dir().join("completed-deliveries").exists());
+    assert!(!matches!(target.items().as_slice(), [ClipData::Files(_)]));
+    if cfg!(target_os = "macos") {
+        common::until("enablement notice", || notices.load(Ordering::SeqCst) > 0).await;
+        assert_eq!(notices.load(Ordering::SeqCst), 1);
+    } else {
+        assert_eq!(notices.load(Ordering::SeqCst), 0);
+    }
+    if mixed {
+        assert!(target.items().contains(&ClipData::Text("unaffected text".into())));
+    }
+    b.unsubscribe(subscription);
     a.shutdown().await;
     b.shutdown().await;
 }

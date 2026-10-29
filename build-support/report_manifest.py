@@ -14,6 +14,7 @@ def unpack(data, fmt, offset):
 
 def image_identity(path):
     data = Path(path).read_bytes()
+    debug_age, code_id = 0, None
     if data[:4] == b'\xcf\xfa\xed\xfe':
         cpu, _, _, count, size, _, _ = unpack(data, 'iiIIIII', 4)
         if cpu != 0x100000c or size > len(data) - 32:
@@ -55,11 +56,15 @@ def image_identity(path):
                       if rva <= debug_rva and debug_rva + debug_size <= rva + size), None)
         if debug is None or debug_size % 28:
             raise ValueError('PE debug directory is missing or malformed')
+        timestamp, = unpack(data, 'I', pe + 8)
+        image_size, = unpack(data, 'I', optional + 56)
+        code_id = (timestamp << 32) | image_size
         identifiers = []
         for at in range(debug, debug + debug_size, 28):
             kind, size, _, pointer = unpack(data, 'IIII', at + 12)
             if kind == 2 and size >= 24 and data[pointer:pointer + 4] == b'RSDS':
                 identifiers.append(uuid.UUID(bytes_le=data[pointer + 4:pointer + 20]).bytes)
+                debug_age, = unpack(data, 'I', pointer + 20)
         if len(identifiers) != 1:
             raise ValueError('Expected one PE CodeView GUID')
         identifier = identifiers[0]
@@ -69,7 +74,7 @@ def image_identity(path):
         raise ValueError('Native image UUID or executable text range missing')
     # Crash offsets are image-relative, so this is the executable range's upper
     # bound, including the PE section RVA, rather than the .text byte count.
-    return {'debug_id': list(identifier), 'text_size': text_size}
+    return {'debug_id': list(identifier), 'debug_age': debug_age, 'code_id': code_id, 'text_size': text_size}
 
 
 def write_manifest(path, source_tree, version, build, images):
@@ -82,3 +87,37 @@ def write_manifest(path, source_tree, version, build, images):
         raise ValueError('Report manifest exceeds the runtime bound')
     Path(path).write_text(encoded)
     return value
+
+
+def pdb_identity(path):
+    """MSF 7 PDB info stream: identity only, never source paths or symbol names."""
+    data = Path(path).read_bytes()
+    if not data.startswith(b'Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0'):
+        raise ValueError('Expected an MSF 7 PDB')
+    block_size, _, blocks, directory_size, _, block_map = unpack(data, 'IIIIII', 32)
+    if block_size not in (512, 1024, 2048, 4096) or blocks * block_size != len(data):
+        raise ValueError('Invalid PDB block map')
+    count = (directory_size + block_size - 1) // block_size
+    if count * 4 > block_size:
+        raise ValueError('PDB directory too large')
+    def block(number):
+        if number >= blocks:
+            raise ValueError('PDB block outside file')
+        return data[number * block_size:(number + 1) * block_size]
+    directory = b''.join(block(number) for number in unpack(block(block_map), 'I' * count, 0))[:directory_size]
+    streams, = unpack(directory, 'I', 0)
+    if streams < 2 or streams > 65536:
+        raise ValueError('Invalid PDB streams')
+    sizes = unpack(directory, 'I' * streams, 4)
+    cursor = 4 + streams * 4
+    for index, size in enumerate(sizes):
+        pages = 0 if size == 0xffffffff else (size + block_size - 1) // block_size
+        numbers = unpack(directory, 'I' * pages, cursor)
+        cursor += pages * 4
+        if index == 1:
+            info = b''.join(block(number) for number in numbers)[:size]
+            age, = unpack(info, 'I', 8)
+            if len(info) < 28:
+                raise ValueError('Truncated PDB identity')
+            return {'debug_id': list(uuid.UUID(bytes_le=info[12:28]).bytes), 'debug_age': age}
+    raise ValueError('PDB info stream missing')

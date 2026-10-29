@@ -100,7 +100,6 @@ fn every_foreign_binding_remains_readable_after_an_earlier_candidate_fails() {
                 rep.data = if i == 0 {
                     RepresentationData::Reader {
                         size: ContentSize::Unknown,
-                        hash: None,
                     }
                 } else {
                     RepresentationData::Inline(match kind {
@@ -123,7 +122,7 @@ fn every_foreign_binding_remains_readable_after_an_earlier_candidate_fails() {
                 StandardFormat::Rtf => "public.rtf",
                 _ => "public.png",
             };
-            let board = NSPasteboard::pasteboardWithUniqueName();
+            let board = crate::macos::test_pasteboard::new();
             write(Some(&board.name().to_string()), &spec, &HashMap::new(), &|| Ok(())).unwrap();
             let read = |item: &NSPasteboardItem| {
                 item.dataForType(&NSString::from_str(name))
@@ -320,7 +319,7 @@ fn html_rtf_and_opaque_same_os_conversion_pairs() {
             MacTranslator.standard(&representation("public.rtf"), rtf).unwrap(),
             vec![ClipData::Rtf(rtf.to_vec())]
         );
-        let source = NSPasteboard::pasteboardWithUniqueName();
+        let source = crate::macos::test_pasteboard::new();
         let item = NSPasteboardItem::new();
         for (name, bytes) in [
             ("public.utf8-plain-text", b"text".as_slice()),
@@ -388,7 +387,7 @@ fn compressed_image_dimensions_are_bounded_before_pixel_decoding() {
 #[test]
 fn same_os_native_aliases_publish_independently_with_source_values() {
     autoreleasepool(|_| {
-        let source = NSPasteboard::pasteboardWithUniqueName();
+        let source = crate::macos::test_pasteboard::new();
         let item = NSPasteboardItem::new();
         for name in [
             "public.utf8-plain-text",
@@ -423,5 +422,22 @@ fn same_os_native_aliases_publish_independently_with_source_values() {
             }
         }
         source.clearContents();
+    });
+}
+
+#[test]
+fn approved_tiff_preserves_pixel_color_and_alpha() {
+    autoreleasepool(|_| {
+        let original = png();
+        let tiff = png_to_tiff(&original).unwrap();
+        let decode = |bytes: &[u8]| {
+            let rep = objc2_app_kit::NSBitmapImageRep::imageRepWithData(&NSData::with_bytes(bytes)).unwrap();
+            let mut pixel = [0usize; 4];
+            // SAFETY: the fixture has four samples per pixel; the output is large enough.
+            unsafe { rep.getPixel_atX_y(std::ptr::NonNull::new(pixel.as_mut_ptr()).unwrap(), 0, 0) };
+            (rep.pixelsWide(), rep.pixelsHigh(), pixel)
+        };
+        assert_eq!(decode(&original), decode(&tiff));
+        assert!(png_to_tiff(b"not an image").is_err());
     });
 }

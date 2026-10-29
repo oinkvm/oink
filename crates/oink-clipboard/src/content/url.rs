@@ -182,6 +182,10 @@ pub(crate) fn names(item: &ContentItem, target: ClipPlatform) -> Vec<String> {
         .representations
         .iter()
         .any(|r| r.standard == Some(StandardFormat::Text) && !matches!(r.data, RepresentationData::Unavailable(_)));
+    let has_html = item
+        .representations
+        .iter()
+        .any(|r| r.standard == Some(StandardFormat::Html));
     let mut names = match target {
         ClipPlatform::Mac => vec!["public.url"],
         ClipPlatform::Windows => vec!["UniformResourceLocatorW", "UniformResourceLocator"],
@@ -194,6 +198,13 @@ pub(crate) fn names(item: &ContentItem, target: ClipPlatform) -> Vec<String> {
             "text/x-moz-url"
         });
     }
+    if has_title && !has_html {
+        names.push(if target == ClipPlatform::Mac {
+            "public.html"
+        } else {
+            "HTML Format"
+        });
+    }
     if !has_text {
         names.push(if target == ClipPlatform::Mac {
             "public.utf8-plain-text"
@@ -204,6 +215,19 @@ pub(crate) fn names(item: &ContentItem, target: ClipPlatform) -> Vec<String> {
     names.into_iter().map(str::to_owned).collect()
 }
 impl Link {
+    fn anchor(&self) -> io::Result<String> {
+        fn escape(value: &str) -> String {
+            value
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;")
+                .replace('\'', "&#39;")
+        }
+        let title = self.title.as_ref().ok_or_else(invalid)?;
+        Ok(format!("<a href=\"{}\">{}</a>", escape(&self.url), escape(title)))
+    }
+
     pub(crate) fn encode(&self) -> io::Result<Vec<u8>> {
         self.validate()?;
         serde_json::to_vec(self).map_err(|_| invalid())
@@ -230,6 +254,9 @@ impl Link {
             (ClipPlatform::Mac, "public.url-name") => {
                 self.title.as_ref().map(|s| s.as_bytes().to_vec()).ok_or_else(invalid)
             }
+            (ClipPlatform::Mac, "public.html") => Ok(self.anchor()?.into_bytes()),
+            #[cfg(windows)]
+            (ClipPlatform::Windows, "HTML Format") => Ok(crate::windows::html::encode_cf_html(&self.anchor()?)),
             (ClipPlatform::Windows, "UniformResourceLocatorW" | "CF_UNICODETEXT") => Ok(to_wide(&self.url)),
             (ClipPlatform::Windows, "UniformResourceLocator") => ansi(&self.url),
             (ClipPlatform::Windows, "text/x-moz-url") => self
@@ -244,7 +271,7 @@ impl Link {
 fn to_wide(text: &str) -> Vec<u8> {
     text.encode_utf16().chain(Some(0)).flat_map(u16::to_le_bytes).collect()
 }
-fn ansi(text: &str) -> io::Result<Vec<u8>> {
+pub(crate) fn ansi(text: &str) -> io::Result<Vec<u8>> {
     #[cfg(windows)]
     {
         use windows::Win32::Globalization::{CP_ACP, GetACP, WC_NO_BEST_FIT_CHARS, WideCharToMultiByte};
@@ -378,6 +405,44 @@ pub(crate) mod tests {
     fn projected(source: &Memory, id: u32, target: ClipPlatform) -> Link {
         let bytes = content::read_all(&mut content::open_for(source, RepresentationId(id), target).unwrap()).unwrap();
         Link::decode(&bytes).unwrap()
+    }
+    #[test]
+    fn approved_anchor_preserves_url_and_escapes_title_without_replacing_html() {
+        let mut source = source(
+            ClipPlatform::Mac,
+            &[
+                ("public.url", b"https://example.invalid/?a=1&b=2".to_vec()),
+                ("public.url-name", b"<Title> & \"quoted\"".to_vec()),
+            ],
+        );
+        let item = &source.inventory.items[0];
+        assert!(names(item, ClipPlatform::Mac).contains(&"public.html".into()));
+        assert!(names(item, ClipPlatform::Windows).contains(&"HTML Format".into()));
+        let link = projected(&source, 1, ClipPlatform::Windows);
+        assert_eq!(
+            link.render(ClipPlatform::Mac, "public.html").unwrap(),
+            b"<a href=\"https://example.invalid/?a=1&amp;b=2\">&lt;Title&gt; &amp; &quot;quoted&quot;</a>"
+        );
+        let mut html = source.inventory.items[0].representations[0].clone();
+        html.id = RepresentationId(3);
+        html.format = NativeFormat::Mac("public.html".into());
+        html.standard = Some(StandardFormat::Html);
+        source.inventory.items[0].representations.push(html);
+        assert!(!names(&source.inventory.items[0], ClipPlatform::Mac).contains(&"public.html".into()));
+        assert!(!names(&source.inventory.items[0], ClipPlatform::Windows).contains(&"HTML Format".into()));
+    }
+    #[test]
+    fn approved_anchor_requires_title_and_never_accepts_header_injection() {
+        let source = source(
+            ClipPlatform::Mac,
+            &[("public.url", b"https://example.invalid/".to_vec())],
+        );
+        assert!(!names(&source.inventory.items[0], ClipPlatform::Mac).contains(&"public.html".into()));
+        let invalid_link = Link {
+            url: "https://example.invalid/\r\nURL=other".into(),
+            title: Some("title".into()),
+        };
+        assert!(invalid_link.render(ClipPlatform::Mac, "public.html").is_err());
     }
     #[test]
     fn paired_url_wire_bytes_are_exact_and_title_is_item_local() {
@@ -533,33 +598,5 @@ pub(crate) mod tests {
         }
         assert!(!source.inventory.automatic_pull(ClipPlatform::Windows));
         assert!(source.inventory.automatic_pull(ClipPlatform::Mac));
-    }
-    #[test]
-    fn url_and_titles_follow_text_filter_without_suppressing_privacy() {
-        let mut source = source(
-            ClipPlatform::Mac,
-            &[
-                ("public.url", b"https://example.invalid/".to_vec()),
-                ("public.url-name", b"Title".to_vec()),
-                ("org.nspasteboard.ConcealedType", vec![]),
-            ],
-        );
-        source.inventory.items[0].representations[2].standard = Some(StandardFormat::Privacy);
-        let enabled = crate::policy::FormatFilters {
-            custom: false,
-            ..Default::default()
-        }
-        .inventory(source.inventory.clone());
-        assert_eq!(enabled.items[0].representations.len(), 3);
-        let disabled = crate::policy::FormatFilters {
-            text: false,
-            ..Default::default()
-        }
-        .inventory(source.inventory);
-        assert_eq!(disabled.items[0].representations.len(), 1);
-        assert_eq!(
-            disabled.items[0].representations[0].standard,
-            Some(StandardFormat::Privacy)
-        );
     }
 }

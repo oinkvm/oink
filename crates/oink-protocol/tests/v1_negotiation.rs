@@ -356,3 +356,210 @@ fn acceptor_profile_v3_messages_require_v3_on_both_endpoints() {
         }
     }
 }
+
+#[test]
+fn pointer_move_is_optional_and_old_peers_keep_baseline_focus() {
+    for new_peer in [false, true] {
+        let (mut a, mut b) = offers();
+        add_cap(&mut a, "oink.pointer.move/1", 4);
+        if new_peer {
+            add_cap(&mut b, "oink.pointer.move/1", 4);
+        }
+        let negotiated = admission::negotiate(&bytes(a), &bytes(b), registry::CAPABILITIES, false).unwrap();
+        let agreement = admission::Agreement::new(negotiated.enabled().unwrap().0.into_iter().map(|v| v.0)).unwrap();
+        let context = admission::Context {
+            kind: 3,
+            transport: registry::Transport::Reliable,
+            phase: admission::Phase::Member,
+            agreement: &agreement,
+            direct: true,
+            old_member_lane: false,
+        };
+        let message = Message::ControlMovePointer(
+            ControlMovePointer::from_raw(support::sample_named("ControlMovePointer")).unwrap(),
+        );
+        let encoded = frame::encode(&message, 16384).unwrap();
+        assert_eq!(
+            context
+                .decode(frame::OpaqueFrame::parse_exact(&encoded, 16384).unwrap())
+                .is_ok(),
+            new_peer
+        );
+        let baseline = Message::ControlFocusEnter(
+            ControlFocusEnter::from_raw(support::sample_named("ControlFocusEnter")).unwrap(),
+        );
+        let encoded = frame::encode(&baseline, 16384).unwrap();
+        assert!(
+            context
+                .decode(frame::OpaqueFrame::parse_exact(&encoded, 16384).unwrap())
+                .is_ok()
+        );
+    }
+    assert!(!registry::BASELINE.contains(&"oink.pointer.move/1"));
+}
+
+#[test]
+fn lock_escape_is_optional_and_requires_both_peers() {
+    for new_peer in [false, true] {
+        let (mut a, mut b) = offers();
+        add_cap(&mut a, "oink.pointer.lock-escape/1", 4);
+        if new_peer {
+            add_cap(&mut b, "oink.pointer.lock-escape/1", 4);
+        }
+        let negotiated = admission::negotiate(&bytes(a), &bytes(b), registry::CAPABILITIES, false).unwrap();
+        let agreement = admission::Agreement::new(negotiated.enabled().unwrap().0.into_iter().map(|v| v.0)).unwrap();
+        let context = admission::Context {
+            kind: 3,
+            transport: registry::Transport::Reliable,
+            phase: admission::Phase::Member,
+            agreement: &agreement,
+            direct: true,
+            old_member_lane: false,
+        };
+        let message = Message::ControlLockEscape(
+            ControlLockEscape::from_raw(support::sample_named("ControlLockEscape")).unwrap(),
+        );
+        let encoded = frame::encode(&message, 16384).unwrap();
+        assert_eq!(
+            context
+                .decode(frame::OpaqueFrame::parse_exact(&encoded, 16384).unwrap())
+                .is_ok(),
+            new_peer
+        );
+    }
+    assert!(!registry::BASELINE.contains(&"oink.pointer.lock-escape/1"));
+}
+
+#[test]
+fn keymap_none_capability_is_optional_and_requires_both_peers() {
+    for modern in [false, true] {
+        let (mut a, mut b) = offers();
+        add_cap(&mut a, "oink.input.keymap-none/1", 4);
+        if modern {
+            add_cap(&mut b, "oink.input.keymap-none/1", 4);
+        }
+        let negotiated = admission::negotiate(&bytes(a), &bytes(b), registry::CAPABILITIES, false).unwrap();
+        let agreement = admission::Agreement::new(negotiated.enabled().unwrap().0.into_iter().map(|c| c.0)).unwrap();
+        assert_eq!(agreement.contains("oink.input.keymap-none/1"), modern);
+        assert!(agreement.contains("oink.core/1"));
+    }
+    assert!(!registry::BASELINE.contains(&"oink.input.keymap-none/1"));
+}
+
+#[test]
+fn entry_protection_is_optional_and_requires_both_peers() {
+    for new_peer in [false, true] {
+        let (mut a, mut b) = offers();
+        add_cap(&mut a, "oink.pointer.entry-protection/1", 4);
+        if new_peer {
+            add_cap(&mut b, "oink.pointer.entry-protection/1", 4);
+        }
+        let negotiated = admission::negotiate(&bytes(a), &bytes(b), registry::CAPABILITIES, false).unwrap();
+        let agreement = admission::Agreement::new(negotiated.enabled().unwrap().0.into_iter().map(|v| v.0)).unwrap();
+        let context = admission::Context {
+            kind: 3,
+            transport: registry::Transport::Reliable,
+            phase: admission::Phase::Member,
+            agreement: &agreement,
+            direct: true,
+            old_member_lane: false,
+        };
+        let message = Message::ControlEntryProtection(
+            ControlEntryProtection::from_raw(support::sample_named("ControlEntryProtection")).unwrap(),
+        );
+        let encoded = frame::encode(&message, 16384).unwrap();
+        assert_eq!(
+            context
+                .decode(frame::OpaqueFrame::parse_exact(&encoded, 16384).unwrap())
+                .is_ok(),
+            new_peer
+        );
+    }
+    assert!(!registry::BASELINE.contains(&"oink.pointer.entry-protection/1"));
+}
+
+#[test]
+fn power_is_optional_and_never_admitted_by_released_peer() {
+    for supported in [false, true] {
+        let (mut a, mut b) = offers();
+        add_cap(&mut a, "oink.power/1", 4);
+        if supported {
+            add_cap(&mut b, "oink.power/1", 4);
+        }
+        let negotiated = admission::negotiate(&bytes(a), &bytes(b), registry::CAPABILITIES, false).unwrap();
+        let agreement = admission::Agreement::new(negotiated.enabled().unwrap().0.into_iter().map(|v| v.0)).unwrap();
+        let context = admission::Context {
+            kind: 2,
+            transport: registry::Transport::Reliable,
+            phase: admission::Phase::Member,
+            agreement: &agreement,
+            direct: true,
+            old_member_lane: false,
+        };
+        let raw = [
+            (1, true.write()),
+            (2, false.write()),
+            (3, true.write()),
+            (4, false.write()),
+        ]
+        .into();
+        let message = Message::ControlPowerState(ControlPowerState::from_raw(raw).unwrap());
+        let encoded = frame::encode(&message, 16384).unwrap();
+        assert_eq!(
+            context
+                .decode(frame::OpaqueFrame::parse_exact(&encoded, 16384).unwrap())
+                .is_ok(),
+            supported
+        );
+    }
+    assert!(!registry::BASELINE.contains(&"oink.power/1"));
+    assert!(
+        ControlPowerState::from_raw(
+            [
+                (1, false.write()),
+                (2, true.write()),
+                (3, false.write()),
+                (4, false.write())
+            ]
+            .into()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn microphone_notifications_negotiate_independently_and_preserve_legacy_payloads() {
+    let capability = "oink.notify.microphone/1";
+    assert!(!registry::BASELINE.contains(&capability));
+    for supported in [false, true] {
+        let (mut a, mut b) = offers();
+        for offer in [&mut a, &mut b] {
+            add_cap(offer, "oink.notify/1", 4);
+        }
+        add_cap(&mut a, capability, 4);
+        if supported {
+            add_cap(&mut b, capability, 4);
+        }
+        let selected = admission::negotiate(&bytes(a), &bytes(b), registry::CAPABILITIES, false).unwrap();
+        assert_eq!(
+            selected.enabled().unwrap().0.iter().any(|cap| cap.0 == capability),
+            supported
+        );
+    }
+    let legacy = support::sample_named("NotifyShow");
+    assert_eq!(
+        NotifyShow::from_raw(legacy.clone())
+            .unwrap()
+            .microphone_muted()
+            .unwrap(),
+        None
+    );
+    for muted in [true, false] {
+        let mut raw = legacy.clone();
+        raw.insert(9, muted.write());
+        let notice = NotifyShow::from_raw(raw).unwrap();
+        let decoded = NotifyShow::decode(&notice.encode(16384).unwrap(), 16384).unwrap();
+        assert_eq!(decoded.microphone_muted().unwrap(), Some(muted));
+        assert_eq!(decoded.kind().unwrap(), notice.kind().unwrap());
+    }
+}

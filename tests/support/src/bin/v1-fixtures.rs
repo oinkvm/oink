@@ -340,6 +340,71 @@ fn append_compatible() -> Result<(), Box<dyn std::error::Error>> {
             append_value(&directory, &mut manifest, &file, "enum", name, value)?;
         }
     }
+    if !directory.join("dto-FileNode-exec-bits.hex").exists() {
+        let mut file = support::sample_named("FileNode");
+        file.insert(9, RawValue::Uint(0o111));
+        registry::validate_schema("FileNode", &file)?;
+        append_value(
+            &directory,
+            &mut manifest,
+            "dto-FileNode-exec-bits.hex",
+            "dto",
+            "FileNode",
+            RawValue::Map(file),
+        )?;
+    }
+    if !directory.join("dto-FileNode-batch-root-link.hex").exists() {
+        let mut link = support::sample_named("FileNode");
+        link.remove(&2);
+        link.insert(4, RawValue::Uint(2));
+        link.insert(
+            5,
+            RawValue::Map(
+                [
+                    (1, RawValue::Uint(1)),
+                    (2, RawValue::Map([(1, RawValue::Uint(10))].into())),
+                ]
+                .into(),
+            ),
+        );
+        link.insert(8, RawValue::Text("Other/file".into()));
+        registry::validate_schema("FileNode", &link)?;
+        append_value(
+            &directory,
+            &mut manifest,
+            "dto-FileNode-batch-root-link.hex",
+            "dto",
+            "FileNode",
+            RawValue::Map(link),
+        )?;
+    }
+    // Additive Mac link metadata: keep every existing v1 byte vector intact.
+    if !directory.join("dto-FileNode-safe-symlink.hex").exists() {
+        let mut link = support::sample_named("FileNode");
+        link.insert(1, RawValue::Uint(2));
+        link.insert(2, RawValue::Uint(1));
+        link.insert(4, RawValue::Uint(2));
+        link.insert(
+            5,
+            RawValue::Map(
+                [
+                    (1, RawValue::Uint(1)),
+                    (2, RawValue::Map([(1, RawValue::Uint(18))].into())),
+                ]
+                .into(),
+            ),
+        );
+        link.insert(8, RawValue::Text("nested/content.txt".into()));
+        registry::validate_schema("FileNode", &link)?;
+        append_value(
+            &directory,
+            &mut manifest,
+            "dto-FileNode-safe-symlink.hex",
+            "dto",
+            "FileNode",
+            RawValue::Map(link),
+        )?;
+    }
     // Explicit forward-compatibility witness: the released retaining Facts
     // decoder must preserve both the new token and the new owner option.
     let file = "dto-DeviceFacts-layout-profiles.hex";
@@ -391,6 +456,97 @@ fn append_compatible() -> Result<(), Box<dyn std::error::Error>> {
                 RawValue::Map(facts),
             )?;
         }
+    }
+    for enabled in [false, true] {
+        let file = format!("dto-DeviceFacts-touchpad-options-{enabled}.hex");
+        if !directory.join(&file).exists() {
+            let mut facts = support::sample_named("DeviceFacts");
+            facts.insert(7, RawValue::Text("windows".into()));
+            facts.insert(
+                18,
+                RawValue::Array(
+                    [26, 27, 28]
+                        .into_iter()
+                        .map(|option| {
+                            RawValue::Map(
+                                [
+                                    (1, RawValue::Uint(option)),
+                                    (2, RawValue::Uint(1)),
+                                    (3, RawValue::Bool(enabled)),
+                                ]
+                                .into(),
+                            )
+                        })
+                        .collect(),
+                ),
+            );
+            registry::validate_schema("DeviceFacts", &facts)?;
+            append_value(
+                &directory,
+                &mut manifest,
+                &file,
+                "dto",
+                "DeviceFacts",
+                RawValue::Map(facts),
+            )?;
+        }
+    }
+    for (name, display, system, activity) in [
+        ("clear", false, false, false),
+        ("display", true, false, false),
+        ("system", false, true, false),
+        ("activity", false, false, true),
+    ] {
+        let file = format!("dto-ControlPowerState-{name}.hex");
+        if !directory.join(&file).exists() {
+            let raw = [
+                (1, RawValue::Bool(true)),
+                (2, RawValue::Bool(display)),
+                (3, RawValue::Bool(system)),
+                (4, RawValue::Bool(activity)),
+            ]
+            .into();
+            registry::validate_schema("ControlPowerState", &raw)?;
+            append_value(
+                &directory,
+                &mut manifest,
+                &file,
+                "dto",
+                "ControlPowerState",
+                RawValue::Map(raw),
+            )?;
+        }
+    }
+    let file = "dto-CloudLinkOffer-fulfilled.hex";
+    if !directory.join(file).exists() {
+        let mut raw = support::sample_named("CloudLinkOffer");
+        raw.insert(
+            4,
+            RawValue::Array(vec![RawValue::Map(support::sample_named("FulfilledRoot"))]),
+        );
+        registry::validate_schema("CloudLinkOffer", &raw)?;
+        append_value(
+            &directory,
+            &mut manifest,
+            file,
+            "dto",
+            "CloudLinkOffer",
+            RawValue::Map(raw),
+        )?;
+    }
+    let file = "dto-CloudLinkOffer-native-files.hex";
+    if !directory.join(file).exists() {
+        let mut raw = support::sample_named("CloudLinkOffer");
+        raw.insert(5, RawValue::Map(support::sample_named("NativeFileMetadata")));
+        registry::validate_schema("CloudLinkOffer", &raw)?;
+        append_value(
+            &directory,
+            &mut manifest,
+            file,
+            "dto",
+            "CloudLinkOffer",
+            RawValue::Map(raw),
+        )?;
     }
     manifest["schema_sha256"] = support::schema_hash().into();
     std::fs::write(

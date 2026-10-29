@@ -126,6 +126,7 @@ fn handoff_scheduled(immediate: bool, local_mouse: bool, freeze_poll_clock: bool
         (peer(), vec![display]),
     ]));
     h.driver.snapshots.layout.publish(RouterLayout {
+        application_focus_enabled: false,
         group: oink_foundation::GroupId([0; 16]),
         owners: Arc::default(),
         version: fixture_version(),
@@ -313,10 +314,10 @@ fn owner_apply_ack_waits_for_native_work_and_publishes_owner_preference() {
     let mut routing = (*h.driver.settings).clone();
     routing.game_mode_preference = GameMode::On;
     routing.mouse_mode = oink_foundation::input::InputMode::Local;
+    routing.keyboard_mode = oink_foundation::input::InputMode::Disabled;
     h.driver.command(InputCommand::ApplyOwnerPreferences {
         expected_emergency_sequence: 0,
         routing,
-        keyboard_disabled: true,
         input_transform: oink_foundation::input_transform::InputTransform::initial("macos"),
         accept_contacts: false,
         reply,

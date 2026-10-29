@@ -143,10 +143,7 @@ fn each_member_exports_its_current_runtime_environment_without_a_local_save() {
             common::pair(&a, &b).await;
             common::pair(&a, &c).await;
             common::active(&[&a, &b, &c]).await;
-            wait("three-screen environments", || {
-                [&a, &b, &c].iter().all(|n| n.layout().0.screens.len() == 3)
-            })
-            .await;
+            common::editable_layouts(&[&a, &b, &c], 3).await;
             // Change AFTER startup/rekey. A startup-only snapshot must not pass,
             // nor may peers inherit the exporter's settings during collection.
             for round in 0..2 {
@@ -377,10 +374,7 @@ async fn local_recording_three_member_save_offline_pause_emergency_and_privacy_s
         [&a, &b, &c].map(diagnostic_low_attempts),
         "recording sends no diagnostics Low requests"
     );
-    wait("three-screen facts", || {
-        [&a, &b, &c].iter().all(|n| n.layout().0.screens.len() == 3)
-    })
-    .await;
+    common::editable_layouts(&[&a, &b, &c], 3).await;
     let placements = [&a, &b, &c]
         .iter()
         .enumerate()

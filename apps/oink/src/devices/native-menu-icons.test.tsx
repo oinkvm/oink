@@ -58,7 +58,7 @@ async function open(device: Device) {
   setLanguage('en');
   render(<OinkProvider defaultMotion="reduced"><SideContextMenu devices={[device]} requests={[]} nearby={[]}
     onShare={noop} onGameMode={noop} onPause={noop} onLeave={noop} onEditAddress={noop}
-    onShowWindow={noop} onAbout={noop} onQuit={noop} onSpeaker={noop} onHideScreen={noop} onScreenGain={noop} onScreensHidden={noop}
+    onShowWindow={noop} onAbout={noop} onQuit={noop} onSpeaker={noop} onHideScreen={noop} onScreensHidden={noop}
     onAccept={noop} onReject={noop} onPair={noop} onBlock={noop}>
     <button data-ctx="tray:self">Target</button>
   </SideContextMenu></OinkProvider>);

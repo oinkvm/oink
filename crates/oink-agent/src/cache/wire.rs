@@ -25,7 +25,6 @@ fn category(value: CacheCategory) -> u64 {
         CacheCategory::DeliveredFiles => 5,
         CacheCategory::SourceSnapshots => 6,
         CacheCategory::PromiseExports => 7,
-        CacheCategory::CompletedDeliveries => 8,
         CacheCategory::Other => unreachable!("UI-only aggregate"),
     }
 }
@@ -39,7 +38,7 @@ fn local_category(value: u32) -> CacheCategory {
         5 => CacheCategory::DeliveredFiles,
         6 => CacheCategory::SourceSnapshots,
         7 => CacheCategory::PromiseExports,
-        8 => CacheCategory::CompletedDeliveries,
+        8 => CacheCategory::Other,
         _ => CacheCategory::Other,
     }
 }
@@ -177,7 +176,7 @@ mod tests {
     fn accounting_rejects_inconsistent_totals_and_known_categories_roundtrip() {
         let usage = CacheUsage {
             categories: vec![CacheSize {
-                category: CacheCategory::CompletedDeliveries,
+                category: CacheCategory::PromiseExports,
                 bytes: 100,
                 kept_bytes: 30,
             }],

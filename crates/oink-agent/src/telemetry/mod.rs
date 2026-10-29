@@ -1,5 +1,6 @@
 //! Per-user owner. Producers get only fixed numeric ingress; the authenticated
 //! agent API owns consent. No peer/group protocol or diagnostic records enter here.
+mod clipboard;
 #[cfg(target_os = "macos")]
 mod inbox;
 pub mod projections;
@@ -39,6 +40,11 @@ pub struct ReportStatus {
     pub rust_crash: Coverage,
     pub native_crash: Coverage,
     pub file_provider: Coverage,
+    /// Local IPC only; never part of a telemetry report.
+    #[serde(default)]
+    pub local_diagnostics_instance: Option<[u8; 12]>,
+    #[serde(default)]
+    pub local_diagnostics_generation: u64,
 }
 pub use oink_crash::capsule::fatal_boundary;
 pub use oink_telemetry::realtime::Stamp;
@@ -161,8 +167,10 @@ pub struct Owner {
     inbox: Arc<Mutex<Option<inbox::Inbox>>>,
     #[cfg(windows)]
     collector: Mutex<Option<oink_crash::collector::Collector>>,
+    #[cfg(windows)]
+    local_capture: Mutex<(u64, Option<oink_crash::local::Target>)>,
 }
-fn packaged_manifest() -> (AppVersion, Option<Manifest>) {
+pub(crate) fn packaged_manifest() -> (AppVersion, Option<Manifest>) {
     let version = env!("OINK_RELEASE_VERSION")
         .split(['-', '+'])
         .next()
@@ -232,11 +240,18 @@ impl Owner {
             inbox: Arc::new(Mutex::new(None)),
             #[cfg(windows)]
             collector: Mutex::new(None),
+            #[cfg(windows)]
+            local_capture: Mutex::new((0, None)),
         };
         if owner.endpoint.is_some() {
             let _ = PRODUCER.set(owner.ingress.clone());
             oink_clipboard::dnd::set_native_timing_enabled(|| producer().is_some_and(|p| p.generation().is_some()));
             oink_clipboard::dnd::set_preparation_observer(projections::drag_preparation);
+            oink_clipboard::content::native_read::set_native_read_observer(clipboard::native_read);
+            oink_clipboard::timing::set_observer(oink_clipboard::timing::Observer {
+                enabled: || producer().is_some_and(|p| p.generation().is_some()),
+                record: clipboard::record,
+            });
             oink_audio::playback::set_presentation_observer(
                 || producer().is_some_and(|p| p.generation().is_some()),
                 projections::audio_presentation,
@@ -245,6 +260,53 @@ impl Owner {
         }
         owner.start();
         owner
+    }
+    #[cfg(windows)]
+    pub(crate) fn set_local_capture(&self, target: Option<oink_crash::local::Target>) {
+        let _guard = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = {
+            let mut local = self.local_capture.lock().unwrap_or_else(|e| e.into_inner());
+            local.0 = local.0.saturating_add(1);
+            std::mem::replace(&mut local.1, target.clone())
+        };
+        // Stop the collector before erasing its local storage on diagnostic disable.
+        self.collector.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if target.is_none()
+            && let Some(previous) = previous
+        {
+            let _ = std::fs::remove_dir_all(&previous.root);
+            if let Some(parent) = previous.root.parent() {
+                let _ = std::fs::remove_dir_all(parent.join("crash-ui"));
+            }
+        }
+        let consent = self.state.lock().unwrap_or_else(|e| e.into_inner()).consent;
+        self.start_native(consent);
+    }
+    #[cfg(windows)]
+    fn start_native(&self, consent: ReportConsent) {
+        let consent = native_consent(consent, self.endpoint.is_some());
+        let mut slot = self.collector.lock().unwrap_or_else(|e| e.into_inner());
+        slot.take();
+        let local = self.local_capture.lock().unwrap_or_else(|e| e.into_inner()).1.clone();
+        let Some(manifest) = self.manifest.as_ref() else {
+            return;
+        };
+        if let Ok(executable) = std::env::current_exe()
+            && let Some(parent) = executable.parent()
+        {
+            // Installing the native filter does not arm a panic upload capsule.
+            oink_crash::capsule::Capture::install();
+            *slot = oink_crash::collector::Collector::start_with_local(
+                &parent.join("oink-crash-collector.exe"),
+                &self.dir.join("raw"),
+                consent,
+                self.ingress.build,
+                manifest,
+                Component::Agent,
+                local,
+            )
+            .ok();
+        }
     }
     pub fn submit_crash(&self, generation: u64, mut crash: SafeCrash, collected_at: u64) -> Result<()> {
         if !matches!(crash.component, Component::UiRust | Component::UiWebview) {
@@ -269,6 +331,8 @@ impl Owner {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let queue = state.store.as_ref().map(Store::status);
         let configured = self.endpoint.is_some();
+        #[cfg(windows)]
+        let local = self.local_capture.lock().unwrap_or_else(|e| e.into_inner());
         ReportStatus {
             consent: state.consent,
             configured,
@@ -288,10 +352,51 @@ impl Owner {
             } else {
                 Coverage::NumericCapsule
             },
+            local_diagnostics_instance: {
+                #[cfg(windows)]
+                {
+                    local
+                        .1
+                        .as_ref()
+                        .and_then(|t| oink_crash::local::instance_bytes(&t.instance))
+                }
+                #[cfg(not(windows))]
+                {
+                    None
+                }
+            },
+            local_diagnostics_generation: {
+                #[cfg(windows)]
+                {
+                    local.0
+                }
+                #[cfg(not(windows))]
+                {
+                    0
+                }
+            },
             file_provider: Coverage::Unavailable,
         }
     }
     pub fn set(
+        &self,
+        expected: u64,
+        choice: Choice,
+        policy: u16,
+        persist: impl FnOnce(ReportConsent) -> Result<()>,
+    ) -> Result<()> {
+        let result = self.set_inner(expected, choice, policy, persist);
+        #[cfg(windows)]
+        if result.is_err() {
+            // A report-consent storage failure closes reporting, but must not
+            // silently disable separately enabled local diagnostics capture.
+            let _guard = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            let consent = self.state.lock().unwrap_or_else(|e| e.into_inner()).consent;
+            self.start_native(consent);
+        }
+        result
+    }
+    fn set_inner(
         &self,
         expected: u64,
         choice: Choice,
@@ -361,6 +466,8 @@ impl Owner {
     fn start(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let consent = state.consent;
+        #[cfg(windows)]
+        self.start_native(consent);
         if !consent.granted() || state.store.is_none() {
             return;
         }
@@ -415,7 +522,7 @@ impl Owner {
                         let _ = store.complete(&submission, result);
                     }
                 }
-                tokio::select! {biased; _=cancel.changed()=>break, _=ingress.wake.notified()=>{}, _=tokio::time::sleep(Duration::from_secs(60)),if pending=>{}}
+                tokio::select! {biased; _=cancel.changed()=>break, _=wait_for_report_batch(&ingress.wake, pending)=>{}}
             }
         });
         *self.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
@@ -453,20 +560,6 @@ impl Owner {
             && let Some(store) = &mut state.store
         {
             let _ = store.observe(consent.generation, Report::SafeCrash(crash), at, now());
-        }
-        #[cfg(windows)]
-        if let Ok(executable) = std::env::current_exe()
-            && let Some(parent) = executable.parent()
-        {
-            *self.collector.lock().unwrap_or_else(|e| e.into_inner()) = oink_crash::collector::Collector::start(
-                &parent.join("oink-crash-collector.exe"),
-                &self.dir.join("raw"),
-                consent,
-                self.ingress.build,
-                manifest,
-                Component::Agent,
-            )
-            .ok();
         }
         let capture = oink_crash::capsule::Capture::install();
         if capture
@@ -508,6 +601,19 @@ impl Owner {
         if let Some(task) = self.task.lock().unwrap_or_else(|e| e.into_inner()).take() {
             task.abort();
         }
+        // Abort schedules cancellation; it does not wait for the task. Taking
+        // the store under the same mutex fences any running store operation and
+        // leaves a late HTTP completion with no store to mutate. Flush and release
+        // it synchronously before returning, even while Owner itself stays alive.
+        if !std::thread::panicking() {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(mut store) = state.store.take() {
+                while let Some(observation) = self.ingress.queue.pop() {
+                    let _ = store.observe(observation.generation, observation.report, observation.at, now());
+                }
+                let _ = store.checkpoint();
+            }
+        }
         if !std::thread::panicking() {
             if let Some(c) = self.capture.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 c.disarm();
@@ -524,6 +630,24 @@ impl Owner {
         }
     }
 }
+async fn wait_for_report_batch(wake: &tokio::sync::Notify, pending: bool) {
+    tokio::select! {
+        _ = wake.notified() => {},
+        _ = tokio::time::sleep(Duration::from_secs(60)), if pending => return,
+    }
+    // A Notify is a work hint, not a checkpoint boundary. Separate realtime
+    // measurements otherwise wake this owner just far enough apart to fsync
+    // every packet. Bound batching to one second (not a sliding debounce), and
+    // retain the existing bounded ingress. Crash admission and upload budgets
+    // are persisted synchronously by Store; only performance draining waits.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Coalesce hints received during the batch window before draining the queue.
+    // A new submission after this point leaves a permit for the next batch.
+    let notified = wake.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+}
+
 fn state_consent_off(next: ReportConsent) -> ReportConsent {
     ReportConsent {
         choice: Choice::Denied,
@@ -536,9 +660,99 @@ impl Drop for Owner {
     }
 }
 
+// Native report eligibility shares the configured endpoint gate with admission.
+#[cfg(any(windows, test))]
+fn native_consent(mut consent: ReportConsent, configured: bool) -> ReportConsent {
+    if !configured {
+        consent.choice = Choice::Denied;
+    }
+    consent
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unconfigured_native_capture_cannot_inherit_a_stored_report_grant() {
+        let grant = ReportConsent {
+            choice: Choice::Granted,
+            policy_version: POLICY_VERSION,
+            generation: 7,
+        };
+        assert!(!native_consent(grant, false).granted());
+        assert_eq!(native_consent(grant, true), grant);
+    }
+    #[test]
+    fn shutdown_persists_performance_waiting_in_the_batch_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = Owner::new(directory.path(), ReportConsent::default());
+        let consent = ReportConsent {
+            choice: Choice::Granted,
+            policy_version: POLICY_VERSION,
+            generation: 1,
+        };
+        let mut state = owner.state.lock().unwrap();
+        state.consent = consent;
+        state.store = Some(Store::open(&owner.dir, consent, now()).unwrap());
+        drop(state);
+        owner
+            .ingress
+            .queue
+            .push(Observation {
+                generation: 1,
+                at: now(),
+                report: Report::MeasuredInterval(MeasuredInterval {
+                    context: owner.ingress.context(Metric::AudioPushToPresentationEstimate),
+                    elapsed_us: 1000,
+                }),
+            })
+            .unwrap();
+        // Cancellation cannot be polled on this runtime during synchronous
+        // shutdown. A task retaining State must not retain its writer lease.
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let shared = owner.state.clone();
+        *owner.task.lock().unwrap() = Some(runtime.spawn(async move {
+            std::future::pending::<()>().await;
+            drop(shared);
+        }));
+        owner.shutdown();
+        let restored = Store::open(&owner.dir, consent, now()).unwrap();
+        assert!(
+            restored.has_work(),
+            "normal shutdown must not discard the pending performance batch"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn performance_arrivals_form_one_bounded_batch_without_an_idle_timer() {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn({
+            let wake = wake.clone();
+            async move { wait_for_report_batch(&wake, false).await }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(!task.is_finished(), "no periodic work with an empty queue");
+        wake.notify_one();
+        tokio::task::yield_now().await;
+        for _ in 0..99 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            wake.notify_one();
+            tokio::task::yield_now().await;
+            assert!(
+                !task.is_finished(),
+                "individual measurements must not fsync a checkpoint"
+            );
+        }
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            task.is_finished(),
+            "continuous arrivals cannot postpone the bounded batch"
+        );
+        task.await.unwrap();
+    }
+
     #[test]
     fn consent_is_default_off_stale_updates_fail_and_disk_failure_stays_off() {
         // These builds deliberately have no vendor configuration.

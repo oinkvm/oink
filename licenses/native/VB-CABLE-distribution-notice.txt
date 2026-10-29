@@ -1,0 +1,12 @@
+VB-CABLE is a VB-Audio product, distributed unchanged as a separate optional driver.
+Official website, license terms and donations: https://www.vb-cable.com/
+VB-CABLE is donationware; users are invited to donate/pay for their license.
+
+Distribution review (2026-10-22):
+https://vb-audio.com/Services/licensing.htm permits bundling the standard VB-CABLE
+package and silent installation when users can identify VB-Audio and pay/donate.
+Professional deployments where users cannot do so require purchased licenses.
+The additional A+B and C+D packages are not included and cannot be redistributed.
+The bundled readme requires author agreement for installer integration; this
+review relies on the author's published distribution permission at the URL above.
+The driver remains proprietary; Oink does not relicense or link it into GPL code.

@@ -91,8 +91,10 @@ impl Device {
             let handle = create(&params);
             if handle.is_null() {
                 tracing::warn!(error = ?windows::core::Error::from_thread(), count, "synthetic touchpad creation rejected");
+                super::mouse_keys::edge(crate::mouse_keys::Reason::DeviceCreate);
                 return Err(ContactInitError::DeviceCreationRejected);
             }
+            super::mouse_keys::edge(crate::mouse_keys::Reason::DeviceCreate);
             Ok(Self {
                 handle,
                 inject,
@@ -126,6 +128,7 @@ impl Sink for Device {
         });
         // SAFETY: device owns this handle; two initialized frames live for call.
         let ok = unsafe { (self.inject)(self.handle, pointers.as_ptr(), 2) != 0 };
+        super::mouse_keys::edge(crate::mouse_keys::Reason::DeviceInject);
         if !ok {
             self.failed = true;
         }
@@ -145,6 +148,7 @@ impl Drop for Device {
     fn drop(&mut self) {
         // SAFETY: sole owner, destroyed once, on the creating hook thread.
         unsafe { (self.destroy)(self.handle) };
+        super::mouse_keys::edge(crate::mouse_keys::Reason::DeviceDestroy);
     }
 }
 
@@ -190,9 +194,16 @@ impl ScrollContext {
         }
     }
     pub fn cancel(&mut self) {
+        self.finish(false);
+    }
+    fn finish(&mut self, expired: bool) {
         let was_active = self.pan.active();
         if let Some(device) = &mut self.device {
-            self.pan.cancel(device);
+            if expired {
+                self.pan.expire(device);
+            } else {
+                self.pan.cancel(device);
+            }
         }
         if was_active {
             self.ended = Some(Instant::now());
@@ -219,11 +230,8 @@ impl ScrollContext {
         }
     }
     pub fn expire(&mut self) {
-        if self
-            .last_input
-            .is_some_and(|t| t.elapsed() > Duration::from_millis(500))
-        {
-            self.cancel();
+        if self.last_input.is_some_and(|t| t.elapsed() >= self.pan.idle_timeout()) {
+            self.finish(true);
         }
     }
     pub fn scroll(&mut self, pixels: (f64, f64), dpi: u32, phase: ScrollPhase) -> (f64, f64) {
@@ -293,14 +301,12 @@ impl Drop for ScrollContext {
 
 pub(super) struct Touchpad {
     contact: ScrollContext,
-    momentum: ScrollContext,
     raw: Raw,
 }
 impl Touchpad {
     pub fn new() -> Self {
         Self {
             contact: ScrollContext::new(),
-            momentum: ScrollContext::new(),
             raw: Raw::new(),
         }
     }
@@ -308,7 +314,6 @@ impl Touchpad {
     pub fn unavailable() -> Self {
         Self {
             contact: ScrollContext::unavailable(),
-            momentum: ScrollContext::unavailable(),
             raw: Raw::unavailable(),
         }
     }
@@ -317,18 +322,16 @@ impl Touchpad {
     }
     pub fn cancel_all(&mut self) {
         self.contact.cancel();
-        self.momentum.cancel();
         self.raw.cancel();
     }
     pub fn expire(&mut self) {
         self.contact.expire();
-        self.momentum.expire();
     }
     pub fn owns_ambiguous_wheel(&self, now: Instant) -> bool {
-        self.raw.owns_wheel(now) || self.contact.owns_ambiguous_wheel(now) || self.momentum.owns_ambiguous_wheel(now)
+        self.raw.owns_wheel(now) || self.contact.owns_ambiguous_wheel(now)
     }
     pub fn wheel_tail_age(&self, now: Instant) -> Option<Duration> {
-        if self.raw.receiver.active() || self.contact.pan.active() || self.momentum.pan.active() {
+        if self.raw.receiver.active() || self.contact.pan.active() {
             return None;
         }
         self.raw
@@ -336,18 +339,18 @@ impl Touchpad {
             .map(|t| now.saturating_duration_since(t))
             .into_iter()
             .chain(self.contact.wheel_tail_age(now))
-            .chain(self.momentum.wheel_tail_age(now))
             .min()
     }
     pub fn scroll(&mut self, pixels: (f64, f64), dpi: u32, phase: ScrollPhase) -> (f64, f64) {
-        // Native traces include an old momentum tail interleaved with a new finger scroll.
-        // A new Began must not reset that tail's synthetic device or Pan clock.
-        match phase {
-            ScrollPhase::MomentumBegan | ScrollPhase::Momentum | ScrollPhase::MomentumEnded => {
-                self.momentum.scroll(pixels, dpi, phase)
-            }
-            _ => self.contact.scroll(pixels, dpi, phase),
-        }
+        self.contact.scroll(pixels, dpi, phase)
+    }
+    pub fn finish_scroll(&mut self) {
+        // Timer-arm failure must release promptly, but a late source tail can
+        // still use wheel fallback rather than silently losing displacement.
+        self.contact.finish(true);
+    }
+    pub fn awaiting_momentum(&self) -> bool {
+        self.contact.pan.awaiting_momentum()
     }
 }
 
@@ -437,6 +440,7 @@ impl crate::contacts::Sink for NativeContacts {
         if !ok {
             tracing::warn!(error = ?windows::core::Error::from_thread(), "raw touchpad injection rejected");
         }
+        super::mouse_keys::edge(crate::mouse_keys::Reason::DeviceInject);
         ok
     }
     fn close(&mut self) {

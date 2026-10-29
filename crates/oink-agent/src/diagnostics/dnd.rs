@@ -293,6 +293,7 @@ impl InputTrace {
                 DndEvent::SourceEffectFailed { .. } => "SourceEffectFailed",
                 DndEvent::HostReleaseFailed { .. } => "HostReleaseUnconfirmed",
                 DndEvent::SourceHeld { .. } => "SourceHeld",
+                DndEvent::SourceResumed { .. } => "SourceResumed",
                 DndEvent::SourceEnded { .. } => "SourceEnded",
                 DndEvent::SourceCatcherLost { .. } => "SourceCatcherLost",
                 DndEvent::SourceCancelRetired { .. } => "SourceCancelRetired",
@@ -302,13 +303,19 @@ impl InputTrace {
                 DndEvent::Detected { .. } | DndEvent::DetectedWithImage { .. } => "Detected",
                 DndEvent::HostLeft { .. } => "Released",
                 DndEvent::Ended { .. } => "Ended",
+                DndEvent::BeginFailed { .. } => "BeginFailed",
             },
         );
         match event {
-            DndEvent::HostReleaseFailed { id, epoch } => {
+            DndEvent::HostReleaseFailed { id, epoch } | DndEvent::BeginFailed { id, epoch } => {
                 raw.id = Some(*id);
                 raw.epoch = Some(*epoch);
                 raw.success = Some(false);
+            }
+            DndEvent::SourceResumed { id, epoch } => {
+                raw.id = Some(*id);
+                raw.epoch = Some(*epoch);
+                raw.success = Some(true);
             }
             DndEvent::SourceHeld { id, epoch, ok } => {
                 raw.id = Some(*id);

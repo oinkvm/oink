@@ -103,7 +103,7 @@ export function Signal({ latency, offline }: {
       {offline && <path className="dev-signal__slash" d="M1.5 1.5 12.5 12"/>}
     </svg>);
 }
-export type GlyphName = 'screen' | 'game' | 'mouse' | 'keyboard' | 'clipboard' | 'speaker';
+export type GlyphName = 'screen' | 'game' | 'mouse' | 'keyboard' | 'clipboard' | 'speaker' | 'microphone';
 export function Glyph({ name, waves = 0, muted = false }: {
     name: GlyphName;
     waves?: number;
@@ -137,6 +137,9 @@ export function Glyph({ name, waves = 0, muted = false }: {
           <path d="M5.6 2.9H4.4a1.7 1.7 0 0 0-1.7 1.7v8.2a1.7 1.7 0 0 0 1.7 1.7h7.2a1.7 1.7 0 0 0 1.7-1.7V4.6a1.7 1.7 0 0 0-1.7-1.7h-1.2"/>
           <rect x="5.6" y="1.6" width="4.8" height="2.6" rx="1"/>
         </svg>);
+        case 'microphone':
+            // Match the mouse silhouette bounds (7.6 × 12.6) in the shared 16px viewport.
+            return <svg viewBox="0 0 16 16" aria-hidden><rect x="5.7" y="1.7" width="4.6" height="8" rx="2.3"/><path d="M4.2 7.4v.7a3.8 3.8 0 0 0 7.6 0v-.7M8 11.9v2.4M5.9 14.3h4.2"/></svg>;
         case 'speaker': {
             // Muted keeps the level visible but dimmed; the caller swaps the corner
             // badge for a cross (Badge 'mute'), the same rule as the microphone.
@@ -151,7 +154,7 @@ export function Glyph({ name, waves = 0, muted = false }: {
         }
     }
 }
-export type BadgeName = 'wifi' | 'lock' | 'warning' | 'receive' | 'mute';
+export type BadgeName = 'wifi' | 'ban' | 'warning' | 'receive' | 'send' | 'mute';
 export function Badge({ name }: {
     name: BadgeName;
 }) {
@@ -160,14 +163,18 @@ export function Badge({ name }: {
         case 'wifi':
             body = <><path d="M1.6 4.6a4.8 4.8 0 0 1 6.8 0"/><path d="M3.2 6.2a2.5 2.5 0 0 1 3.6 0"/><circle className="fill" cx="5" cy="8" r=".95"/></>;
             break;
-        case 'lock':
-            body = <><path d="M3.1 4.7V3.5a1.9 1.9 0 0 1 3.8 0v1.2"/><rect className="fill" x="1.9" y="4.5" width="6.2" height="4.6" rx="1.1"/></>;
+        case 'ban':
+            body = <><circle cx="5" cy="5" r="3.7"/><path d="M2.4 2.4l5.2 5.2"/></>;
             break;
         case 'warning':
             body = <><path className="fill warn-body" d="M5 1 9.4 8.8H.6z"/><path className="warn-mark" d="M5 3.9v2.2M5 7.5v.01"/></>;
             break;
         case 'receive':
             body = <><path d="M5 1.2v4.6M3 3.9 5 5.9l2-2"/><path d="M1.6 6.6v1.4h6.8V6.6"/></>;
+            break;
+        case 'send':
+            // The exit badge ('receive') mirrored: the sharing microphone sends out.
+            body = <><path d="M5 5.9V1.3M3 3.3 5 1.3l2 2"/><path d="M1.6 6.6v1.4h6.8V6.6"/></>;
             break;
         case 'mute':
             body = <path d="M2.6 2.6l4.8 4.8M7.4 2.6l-4.8 4.8"/>;

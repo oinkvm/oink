@@ -115,14 +115,16 @@ impl OrdinaryActivity {
             .ok_or_else(|| InputError::Platform("CGEventCreate idle activity failed".into()))?;
         CGEvent::set_type(Some(&event), CGEventType::Null);
         CGEvent::set_integer_value_field(Some(&event), CGEventField::EventSourceUserData, super::inject::MAGIC);
-        // DeclareUserActivity 点亮屏幕，但不重置 HIDIdleTime，MDM 屏保仍会按 HID 空闲到点触发。
+        // DeclareUserActivity 点亮屏幕，但不重置 HIDIdleTime。loginwindow 的屏保计时
+        // 另由 idle_pulse 刷新 CGS session idle；不能用 HIDIdleTime 代替它。
         // 因此声明后在 HID 层补一个 Null：不移动光标，也没有 hover/按键/按钮语义；来源 PID
         // 和 MAGIC 使它不算物理输入、不回流成组内活动。上面的会话检查禁止在锁屏/屏保期间投递。
-        // 不持续持有 PreventUserIdleDisplaySleep：它只压住触发，HID 空闲仍累积；托管 Mac 实测
-        // 释放后约 12 秒便进入屏保。按真实活动补 Null 后，停止操作就从最后一次活动自然计时。
+        // 不持续持有 PreventUserIdleDisplaySleep：它只压住触发，CGS 空闲仍累积；托管 Mac 实测
+        // 释放后约 12 秒便进入屏保。idle_pulse 按真实输入刷新 CGS，停止操作后自然计时。
         // macOS 26 探针验证 HID 重置、坐标/隐藏光标不变；macOS 14.7.8 已签名服务验证 HID 重置。
         // The observed lock-screen behavior is not guaranteed across all OS versions.
         CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+        super::idle_pulse::request();
         st.last_idle = Some(now);
         tracing::debug!("posted group idle activity (tagged HID Null event)");
         Ok(true)

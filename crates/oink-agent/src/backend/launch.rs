@@ -185,28 +185,7 @@ pub fn reopen_entry(entry: &Path, data_dir: &Path) -> std::io::Result<()> {
             .and_then(Path::parent)
             .filter(|p| p.extension().is_some_and(|e| e == "app"));
         let bundle = bundle.ok_or_else(|| std::io::Error::other("重新打开需要 macOS 应用包"))?;
-        let mut home = std::ffi::OsString::from("OINK_HOME=");
-        home.push(data_dir);
-        let status = Command::new("/usr/bin/open")
-            .arg("-n")
-            .arg(bundle)
-            .args([
-                "--stdin",
-                "/dev/null",
-                "--stdout",
-                "/dev/null",
-                "--stderr",
-                "/dev/null",
-                "--env",
-            ])
-            .arg(home)
-            .arg("--env")
-            .arg(format!("{}=0", oink_autostart::LOGIN_LAUNCH_ENV))
-            .args(["--args", super::REOPEN_FLAG])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
+        let status = mac_reopen_command(bundle, data_dir).status()?;
         if !status.success() {
             return Err(std::io::Error::other(format!("LaunchServices 启动失败：{status}")));
         }
@@ -228,4 +207,34 @@ pub fn reopen_entry(entry: &Path, data_dir: &Path) -> std::io::Result<()> {
         )?;
         Ok(())
     }
+}
+
+/// LaunchServices does not inherit the caller's environment. Every explicit
+/// reopen, including a local package replacement, must preserve its data root
+/// and clear the login-item marker so the main window appears.
+#[cfg(target_os = "macos")]
+pub(crate) fn mac_reopen_command(bundle: &Path, data_dir: &Path) -> Command {
+    let mut home = std::ffi::OsString::from("OINK_HOME=");
+    home.push(data_dir);
+    let mut command = Command::new("/usr/bin/open");
+    command
+        .arg("-n")
+        .arg(bundle)
+        .args([
+            "--stdin",
+            "/dev/null",
+            "--stdout",
+            "/dev/null",
+            "--stderr",
+            "/dev/null",
+            "--env",
+        ])
+        .arg(home)
+        .arg("--env")
+        .arg(format!("{}=0", oink_autostart::LOGIN_LAUNCH_ENV))
+        .args(["--args", super::REOPEN_FLAG])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
 }

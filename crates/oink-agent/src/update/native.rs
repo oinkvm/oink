@@ -107,6 +107,11 @@ extern "C" fn event(kind: u32, build: u64, size: u64, progress: u32, version: *c
         return;
     };
     let mut state = lock(&node.inner.update);
+    // A separately authenticated local candidate owns this presentation. A
+    // scheduled Sparkle callback cannot replace its preview or install intent.
+    if state.local_mode {
+        return;
+    }
     state.status.progress = Some(progress.min(100) as u8);
     match kind {
         0 => {
@@ -138,12 +143,13 @@ extern "C" fn event(kind: u32, build: u64, size: u64, progress: u32, version: *c
                 return;
             };
             state.status.candidate = Some(Candidate {
+                local_package: false,
                 build,
                 version,
                 size,
                 published_at: None,
                 severity: oink_update::feed::Severity::Normal,
-                notes,
+                notes: Some(notes),
             });
             state.status.phase = Phase::Available;
             state.status.error = None;

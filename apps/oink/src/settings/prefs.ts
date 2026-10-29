@@ -16,7 +16,7 @@ export const KEY_NAMES: Record<Platform, Record<string, {
 }>> = {
     mac: {
         control: { name: 'control', sym: '⌃' }, option: { name: 'option', sym: '⌥' }, command: { name: 'command', sym: '⌘' },
-        shift: { name: 'shift', sym: '⇧' }, caps: { name: 'caps lock', sym: '⇪' },
+        fn: { name: 'Fn', sym: '🌐' }, shift: { name: 'shift', sym: '⇧' }, caps: { name: 'caps lock', sym: '⇪' },
     },
     win: { ctrl: { name: 'Ctrl' }, win: { name: 'Win' }, alt: { name: 'Alt' }, shift: { name: 'Shift' }, caps: { name: 'Caps Lock' } },
 };
@@ -41,23 +41,22 @@ export interface Prefs {
     language: string;
     keyPreset: KeyPreset;
     keyCustom: Record<Platform, KeyMap>;
+    /** Initialized Custom memory, including option-only edits before any key menu edit. */
     keyCustomTouched: Record<Platform, boolean>;
     capsSplit: boolean;
+    allowFnMapping: boolean;
     pollLimit: '125' | 'none';
     scrollInvert: boolean;
     pointerGain: number;
     keepAwake: boolean;
     touchpadInject: boolean;
+    nativeMultifinger: boolean;
     macScrollFeel: boolean;
     forwardInjectedInput: boolean;
     pointerTrail: boolean;
     clipReceive: boolean;
     clipSend: boolean;
-    clipText: boolean;
-    clipRich: boolean;
-    clipImage: boolean;
-    clipFiles: boolean;
-    clipPrivate: boolean;
+    removeDsStore: boolean;
     audioDevice: string;
     keepLocalPlayback: boolean;
     shortcuts: Record<ShortcutId, ShortcutPref>;
@@ -78,21 +77,19 @@ export const DEFAULT_PREFS: Prefs = {
     keyCustom: { mac: presetMap('mac', 'mac', false), win: presetMap('win', 'win', false) },
     keyCustomTouched: { mac: false, win: false },
     capsSplit: false,
+    allowFnMapping: false,
     pollLimit: '125',
     scrollInvert: false,
     pointerGain: 1,
     keepAwake: true,
     touchpadInject: true,
+    nativeMultifinger: true,
     macScrollFeel: true,
     forwardInjectedInput: false,
     pointerTrail: true,
     clipReceive: true,
     clipSend: true,
-    clipText: true,
-    clipRich: true,
-    clipImage: true,
-    clipFiles: true,
-    clipPrivate: true,
+    removeDsStore: true,
     audioDevice: 'default',
     keepLocalPlayback: false,
     shortcuts: DEFAULT_SHORTCUTS,

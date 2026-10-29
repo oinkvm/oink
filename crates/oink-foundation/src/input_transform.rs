@@ -15,6 +15,7 @@ pub enum KeyPreset {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyMapping {
     pub from: KeyCode,
+    /// `KeyCode::NONE` drops both edges; it is never a source key.
     pub to: KeyCode,
 }
 
@@ -26,6 +27,16 @@ pub struct CapsTapHold {
 }
 pub const CAPS_HOLD_US: u64 = 500_000;
 
+/// Editor memory, independent of the active preset and never used for routing.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavedCustomKeymap {
+    pub table: Vec<KeyMapping>,
+    pub caps_hold: Option<KeyCode>,
+    pub caps_split: bool,
+    pub allow_fn: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KeyboardMapping {
@@ -33,6 +44,9 @@ pub struct KeyboardMapping {
     pub table: Vec<KeyMapping>,
     /// Custom mapping. MacFeel resolves its conditional default at the source.
     pub caps_tap_hold: Option<CapsTapHold>,
+    /// Absent in released 0.2.x settings; retain the existing active map on load.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_custom: Option<SavedCustomKeymap>,
 }
 impl KeyboardMapping {
     pub fn preset(preset: KeyPreset, source_os: &str, target_os: &str) -> Self {
@@ -56,6 +70,7 @@ impl KeyboardMapping {
             preset,
             table: pairs.iter().map(|&(from, to)| KeyMapping { from, to }).collect(),
             caps_tap_hold: None,
+            saved_custom: None,
         }
     }
     pub fn caps_tap_hold(&self, source_os: &str, target_os: &str, mac_caps_switch: bool) -> Option<CapsTapHold> {
@@ -78,27 +93,46 @@ impl KeyboardMapping {
             if self.preset != KeyPreset::Custom {
                 return Err("Caps Lock 短按 / 长按请使用自定义预设".into());
             }
-            if [caps.tap, caps.hold].iter().any(|k| !candidate_keys().contains(k)) {
+            if [caps.tap, caps.hold]
+                .iter()
+                .any(|k| *k != KeyCode::NONE && !candidate_keys().contains(k))
+            {
                 return Err("Caps Lock 短按 / 长按需要支持的 HID 目标键".into());
             }
             if self.table.iter().any(|m| m.from == KeyCode::CAPS_LOCK) {
                 return Err("Caps Lock 不能同时设置普通映射与短按 / 长按".into());
             }
         }
-        if self.table.len() > 256 {
-            return Err("键映射最多 256 项".into());
-        }
-        let mut seen = std::collections::BTreeSet::new();
-        for m in &self.table {
-            if !seen.insert(m.from) {
-                return Err("同一物理键只能映射一次".into());
-            }
-            if [m.from, m.to].iter().any(|k| !candidate_keys().contains(k)) {
-                return Err("自定义映射需要支持的 HID 物理键".into());
+        validate_table(&self.table)?;
+        if let Some(saved) = &self.saved_custom {
+            validate_table(&saved.table)?;
+            if saved
+                .caps_hold
+                .is_some_and(|k| k != KeyCode::NONE && !candidate_keys().contains(&k))
+                || (saved.caps_split && saved.caps_hold.is_none())
+                || (saved.allow_fn && !saved.table.iter().any(|m| m.from == KeyCode::APPLE_FN))
+            {
+                return Err("保存的自定义键映射选项无效".into());
             }
         }
         Ok(())
     }
+}
+
+fn validate_table(table: &[KeyMapping]) -> Result<(), String> {
+    if table.len() > 256 {
+        return Err("键映射最多 256 项".into());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for m in table {
+        if !seen.insert(m.from) {
+            return Err("同一物理键只能映射一次".into());
+        }
+        if !candidate_keys().contains(&m.from) || (m.to != KeyCode::NONE && !candidate_keys().contains(&m.to)) {
+            return Err("自定义映射需要支持的 HID 物理键".into());
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,6 +246,62 @@ pub fn mac_local_mapping_hint(mapping: KeyMapping) -> Option<&'static str> {
 mod tests {
     use super::*;
     #[test]
+    fn saved_custom_is_persisted_editor_memory_not_an_active_mapping() {
+        let mut keyboard = KeyboardMapping::preset(KeyPreset::MacFeel, "macos", "windows");
+        keyboard.saved_custom = Some(SavedCustomKeymap {
+            table: vec![
+                KeyMapping {
+                    from: KeyCode::LEFT_CTRL,
+                    to: KeyCode::NONE,
+                },
+                KeyMapping {
+                    from: KeyCode::APPLE_FN,
+                    to: KeyCode::NONE,
+                },
+            ],
+            caps_hold: Some(KeyCode::NONE),
+            caps_split: true,
+            allow_fn: true,
+        });
+        assert!(keyboard.validate().is_ok());
+        assert_eq!(keyboard.map(KeyCode::LEFT_CTRL), KeyCode::LEFT_GUI);
+        assert_eq!(keyboard.map(KeyCode::APPLE_FN), KeyCode::APPLE_FN);
+        assert_eq!(keyboard.caps_tap_hold("macos", "windows", false), None);
+        assert_eq!(
+            serde_json::from_str::<KeyboardMapping>(&serde_json::to_string(&keyboard).unwrap()).unwrap(),
+            keyboard
+        );
+        let mut invalid = keyboard.clone();
+        invalid.saved_custom.as_mut().unwrap().table[0].from = KeyCode::NONE;
+        assert!(invalid.validate().is_err());
+        let mut invalid = keyboard.clone();
+        invalid.saved_custom.as_mut().unwrap().caps_hold = None;
+        assert!(invalid.validate().is_err());
+        keyboard.saved_custom.as_mut().unwrap().table.pop();
+        assert!(keyboard.validate().is_err());
+    }
+    #[test]
+    fn released_0_2_keyboard_without_saved_custom_loads_without_rewriting_it() {
+        // The v0.2.0 KeyboardMapping fields and enum spellings are unchanged.
+        let json =
+            r#"{"preset":"custom","table":[{"from":458976,"to":458982}],"caps_tap_hold":{"tap":458977,"hold":458809}}"#;
+        let keyboard: KeyboardMapping = serde_json::from_str(json).unwrap();
+        assert_eq!(keyboard.saved_custom, None);
+        assert_eq!(keyboard.map(KeyCode::LEFT_CTRL), KeyCode::RIGHT_ALT);
+        assert_eq!(
+            keyboard.caps_tap_hold("macos", "windows", false),
+            Some(CapsTapHold {
+                tap: KeyCode::LEFT_SHIFT,
+                hold: KeyCode::CAPS_LOCK
+            })
+        );
+        assert!(keyboard.validate().is_ok());
+        assert_eq!(
+            serde_json::to_value(&keyboard).unwrap(),
+            serde_json::from_str::<serde_json::Value>(json).unwrap()
+        );
+    }
+    #[test]
     fn defaults_presets_and_component_inheritance() {
         let source = InputTransform::initial("macos");
         assert!(source.macos.keyboard.table.is_empty());
@@ -278,6 +368,7 @@ mod caps_tests {
             hold: KeyCode::ESCAPE,
         };
         let keyboard = KeyboardMapping {
+            saved_custom: None,
             preset: KeyPreset::Custom,
             caps_tap_hold: Some(caps),
             table: vec![],
@@ -309,5 +400,31 @@ mod caps_tests {
         assert!(bad.validate().is_err());
         let old: KeyboardMapping = serde_json::from_str(r#"{"preset":"custom","table":[]}"#).unwrap();
         assert_eq!(old.caps_tap_hold, None);
+    }
+}
+
+#[cfg(test)]
+mod empty_mapping_tests {
+    use super::*;
+    #[test]
+    fn none_is_a_destination_only_and_roundtrips_in_tables_and_caps() {
+        let mut transform = InputTransform::default();
+        transform.windows.keyboard = KeyboardMapping {
+            saved_custom: None,
+            preset: KeyPreset::Custom,
+            table: vec![KeyMapping {
+                from: KeyCode::APPLE_FN,
+                to: KeyCode::NONE,
+            }],
+            caps_tap_hold: Some(CapsTapHold {
+                tap: KeyCode::NONE,
+                hold: KeyCode::NONE,
+            }),
+        };
+        assert!(transform.validate().is_ok());
+        let json = serde_json::to_string(&transform).unwrap();
+        assert_eq!(serde_json::from_str::<InputTransform>(&json).unwrap(), transform);
+        transform.windows.keyboard.table[0].from = KeyCode::NONE;
+        assert!(transform.validate().is_err());
     }
 }

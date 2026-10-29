@@ -22,6 +22,8 @@ static AudioObjectPropertyAddress service = {kAudioHardwarePropertyServiceRestar
     NSString *uid;
     dispatch_queue_t queue;
     AudioObjectPropertyListenerBlock listener;
+    void (*wake_owner)(void *);
+    void *wake_context;
     bool subscribed[3];
     float initial_volume;
     _Atomic bool expected_mute;
@@ -64,6 +66,19 @@ static OSStatus endpoint_default(AudioDeviceID *device) {
     return AudioObjectGetPropertyData(kAudioObjectSystemObject, &defaults, 0, NULL, &size, device);
 }
 
+// Read only: absence of a UID does not prove permanent removal. CoreAudio may
+// retain hardware mute preferences under that UID for a later reconnect.
+int oink_audio_endpoint_exists(const char *uid, char *error, size_t capacity) {
+    @autoreleasepool {
+        NSString *value = uid ? [NSString stringWithUTF8String:uid] : nil;
+        if (!value) { snprintf(error, capacity, "Invalid source endpoint UID"); return -1; }
+        AudioDeviceID device = kAudioObjectUnknown;
+        OSStatus status = endpoint_lookup(value, &device);
+        if (status) { snprintf(error, capacity, "Look up source endpoint: Core Audio status %d", (int)status); return -1; }
+        return device != kAudioObjectUnknown;
+    }
+}
+
 // 1 exact endpoint exists, 0 absent/reset, -1 query error. IDs are never persisted
 // or reused after service reset: journal identity is the stable device UID.
 int oink_audio_endpoint_read(void *opaque, float *volume, bool *muted, char *error, size_t capacity) {
@@ -94,6 +109,13 @@ void oink_audio_endpoint_close(void *opaque) {
     // HAL retains its registered block. It holds only a weak observer reference,
     // so even failed deregistration cannot leave a dangling callback context.
     if (!failed) o->listener = nil;
+}
+
+// Registration and callbacks share the serial notification queue. Close drains
+// it before Rust drops the retained Thread context, including failed removal.
+void oink_audio_endpoint_on_change(void *opaque, void (*wake)(void *), void *context) {
+    OinkMuteObserver *o = (__bridge OinkMuteObserver *)opaque;
+    dispatch_sync(o->queue, ^{ o->wake_owner = wake; o->wake_context = context; });
 }
 
 void *oink_audio_endpoint_open(const char *raw_uid, char *error, size_t capacity) {
@@ -141,6 +163,7 @@ void *oink_audio_endpoint_open(const char *raw_uid, char *error, size_t capacity
                     } else observe_controls(o, v, m);
                 }
             }
+            if (o->wake_owner) o->wake_owner(o->wake_context);
         };
         const AudioObjectPropertyAddress *addresses[] = {&controls, &defaults, &service};
         const AudioObjectID objects[] = {o->device, kAudioObjectSystemObject, kAudioObjectSystemObject};

@@ -256,6 +256,7 @@ pub(crate) fn group_view(node: &Node) -> ApiResult<GroupView> {
                 let mode = |mode: Option<dto::SharingMode>| match mode {
                     Some(dto::SharingMode::Shared) => Some(oink_foundation::input::InputMode::Shared),
                     Some(dto::SharingMode::Local) => Some(oink_foundation::input::InputMode::Local),
+                    Some(dto::SharingMode::Unknown(2)) => Some(oink_foundation::input::InputMode::Disabled),
                     _ => None,
                 };
                 Member {
@@ -274,11 +275,17 @@ pub(crate) fn group_view(node: &Node) -> ApiResult<GroupView> {
                             .as_ref()
                             .and_then(|resources| resources.mouse_mode().ok().flatten()),
                     ),
-                    keyboard_mode: mode(
-                        resources
-                            .as_ref()
-                            .and_then(|resources| resources.keyboard_mode().ok().flatten()),
-                    ),
+                    keyboard_mode: if options.as_ref().and_then(|options| options.keyboard_disabled().ok())
+                        == Some(true)
+                    {
+                        Some(oink_foundation::input::InputMode::Disabled)
+                    } else {
+                        mode(
+                            resources
+                                .as_ref()
+                                .and_then(|resources| resources.keyboard_mode().ok().flatten()),
+                        )
+                    },
                     keyboard_disabled: options.as_ref().and_then(|options| options.keyboard_disabled().ok()),
                     sharing: sharing_state(node, m.device),
                     link: if m.is_self { None } else { link_info(node, m.device) },
@@ -326,9 +333,9 @@ fn platform_permission_kinds(os: Os, macos_major: i64) -> &'static [PermissionKi
     match os {
         // Local Network privacy and its Settings pane were introduced in macOS 15.
         // Earlier releases must not ask users to grant a permission that does not exist.
-        Os::Macos if macos_major >= 15 => &[Accessibility, InputMonitoring, LocalNetwork],
-        Os::Macos => &[Accessibility, InputMonitoring],
-        Os::Windows => &[Firewall, SystemService],
+        Os::Macos if macos_major >= 15 => &[Accessibility, InputMonitoring, LocalNetwork, Microphone],
+        Os::Macos => &[Accessibility, InputMonitoring, Microphone],
+        Os::Windows => &[Firewall, SystemService, Microphone],
         Os::Linux | Os::Other => &[],
     }
 }
@@ -369,7 +376,10 @@ fn permission_request_action(
         PermissionRequestOutcome::Unavailable => open_settings(),
         PermissionRequestOutcome::MayPrompt
             if before == PermissionState::Denied
-                && matches!(kind, PermissionKind::LocalNetwork | PermissionKind::AudioCapture) =>
+                && matches!(
+                    kind,
+                    PermissionKind::LocalNetwork | PermissionKind::AudioCapture | PermissionKind::Microphone
+                ) =>
         {
             // A prior, observed decision cannot be re-prompted by these APIs.
             // A denial resulting from THIS request must not take this branch.
@@ -389,10 +399,16 @@ pub(crate) fn permission_items(node: &Node) -> Vec<PermissionItem> {
         } else {
             crate::windows_permissions::Observation::UNKNOWN
         };
-        return observed.items(
+        let mut items = observed.items(
             node.links()
                 .is_ok_and(|links| links.links().ready_count() > 0 && links.tcp_inbound_verified()),
         );
+        items.push(PermissionItem {
+            kind: PermissionKind::Microphone,
+            state: PermissionState::Granted,
+            required: false,
+        });
+        return items;
     }
     platform_permission_kinds(os, major)
         .iter()
@@ -405,9 +421,19 @@ pub(crate) fn permission_items(node: &Node) -> Vec<PermissionItem> {
                 PermissionKind::InputMonitoring => p.input_monitoring,
                 #[cfg(target_os = "macos")]
                 PermissionKind::LocalNetwork if node.inner.native_services => mac_permissions::local_network_state(),
+                PermissionKind::Microphone if node.inner.native_services => {
+                    match oink_audio::microphone::permission() {
+                        oink_audio::microphone::Permission::Granted
+                        | oink_audio::microphone::Permission::SystemControlled => PermissionState::Granted,
+                        oink_audio::microphone::Permission::Denied | oink_audio::microphone::Permission::Restricted => {
+                            PermissionState::Denied
+                        }
+                        _ => PermissionState::NotDetermined,
+                    }
+                }
                 _ => PermissionState::NotDetermined,
             },
-            required: kind != PermissionKind::SystemService,
+            required: !matches!(kind, PermissionKind::SystemService | PermissionKind::Microphone),
         })
         .collect()
 }
@@ -497,23 +523,6 @@ fn alerts(node: &Node) -> Vec<Alert> {
     if let Some(alert) = missing_permission_alert(permissions, capture, now) {
         out.push(alert);
     }
-    // capture_active=false only means detached. During a grant the permission
-    // observer publishes before the capture owner has handled Controllable and
-    // installed its tap, so treating that Boolean as a failure produced a toast
-    // on every successful transition. Only the owner's completed failed attempt
-    // is a capture error; its successful attempt clears it immediately.
-    if node
-        .input_status()
-        .is_ok_and(|status| capture_unavailable(&input, &status, node.fully_paused()))
-    {
-        out.push(Alert {
-            id: "capture-unavailable".into(),
-            level: AlertLevel::Error,
-            kind: AlertKind::CaptureUnavailable,
-            problem: problem(Code::CaptureUnavailable),
-            at_ms: now,
-        });
-    }
     let pause = node.pause_status();
     if pause.paused
         && pause.emergency
@@ -536,38 +545,13 @@ fn alerts(node: &Node) -> Vec<Alert> {
             at_ms: now,
         });
     }
-    // Layout survives disconnects and can arrive before peer Facts. Missing
-    // Facts/displays are pending state, never a completed native failure. Read
-    // explicit screen outcomes from the current peer boot, once per device.
-    let devices: std::collections::BTreeSet<_> = node.group_members().into_iter().chain([node.id()]).collect();
-    for device in devices {
-        let facts = node.device_facts(device).filter(|facts| {
-            if device == node.id() {
-                return true;
-            }
-            node.links().is_ok_and(|links| links.links().ready(device))
-                && node
-                    .link_config()
-                    .ok()
-                    .and_then(|group| group.peer_boot(device))
-                    .is_some_and(|boot| {
-                        facts.boot().ok().is_some_and(|fact| {
-                            fact.device_id()
-                                .ok()
-                                .and_then(|id| oink_network::wire_identity::read_device(&id).ok())
-                                == Some(boot.device_id)
-                                && fact.nonce().ok().is_some_and(|nonce| nonce.0 == boot.nonce)
-                        })
-                    })
-        });
-        let fault = facts
-            .and_then(|facts| facts.resources().ok().flatten())
-            .and_then(|resources| resources.faults().ok().flatten())
-            .and_then(|faults| faults.screen().ok().flatten())
-            .and_then(|fault| fault.code().ok());
-        if let Some(alert) = display_failure_alert(device, fault, now) {
-            out.push(alert);
-        }
+    // Shared screen resource faults also describe injection/session/cleanup
+    // failures. They are not display enumeration outcomes, and peer failures
+    // belong to that device's resource card, never to a local display toast.
+    if let Ok(status) = node.input_status()
+        && let Some(alert) = display_failure_alert(node.id(), &status, now)
+    {
+        out.push(alert);
     }
     let mut current = lock(&node.inner.current_alerts);
     for alert in &mut out {
@@ -583,15 +567,8 @@ fn alerts(node: &Node) -> Vec<Alert> {
     out
 }
 
-pub(crate) fn capture_unavailable(
-    input: &oink_input::InputPermissions,
-    status: &crate::threads::input::InputStatus,
-    paused: bool,
-) -> bool {
-    status.capture_failed && !paused && crate::node::capture_permitted(input)
-}
-
-fn display_failure_alert(device: DeviceId, fault: Option<dto::ResourceFaultCode>, now: i64) -> Option<Alert> {
+fn display_failure_alert(device: DeviceId, status: &crate::threads::input::InputStatus, now: i64) -> Option<Alert> {
+    let fault = status.display_enumeration_fault;
     if !matches!(
         fault,
         Some(dto::ResourceFaultCode::DeviceUnavailable | dto::ResourceFaultCode::BackendFailed)
@@ -740,17 +717,20 @@ fn screen_id(k: &ScreenKey) -> dl::ScreenId {
 pub(crate) fn default_hotkeys() -> Vec<Hotkey> {
     let k = |a, keys: &[&str]| Hotkey {
         action: a,
+        device: None,
         keys: keys.iter().map(|s| s.to_string()).collect(),
-        // Default bindings are enabled and consume matching key combinations.
-        enabled: true,
+        // Microphone mute is opt-in; existing default bindings stay enabled.
+        enabled: a != HotkeyAction::ToggleMicrophoneMute,
     };
     vec![
         k(HotkeyAction::LockFocus, &["Ctrl", "Alt", "L"]),
+        k(HotkeyAction::LockEscape, &["Alt"]),
         k(HotkeyAction::ReturnPointerHome, &["Ctrl", "Alt", "H"]),
         k(HotkeyAction::ToggleSharing, &["Ctrl", "Alt", "P"]),
         k(HotkeyAction::PauseAll, &["Ctrl", "Alt", "Shift", "P"]),
         k(HotkeyAction::OpenWindow, &["Ctrl", "Alt", "A"]),
         k(HotkeyAction::ToggleGameMode, &["Ctrl", "Alt", "G"]),
+        k(HotkeyAction::ToggleMicrophoneMute, &["Ctrl", "Alt", "M"]),
     ]
 }
 
@@ -761,10 +741,15 @@ pub(crate) fn input_settings(node: &Node) -> InputSettings {
     let speed_mode = s.speed_mode;
     let contacts_injection_available = node.contacts_injection_available();
     InputSettings {
+        application_focus_enabled: node
+            .link_config()
+            .map(|c| c.applied().application_focus_enabled)
+            .unwrap_or(false),
         mac_caps_switches_input_source: node.input_backend().caps_lock_switches_input_source(),
         key_support: KeySupport::default(),
         event_frequency: s.event_frequency,
-        accept_contacts: s.accept_contacts && contacts_injection_available,
+        accept_contacts: s.routing.touchpad_injection && contacts_injection_available,
+        native_multifinger: s.routing.native_multifinger,
         contacts_injection_available,
         mac_scroll_feel: s.routing.mac_scroll_feel,
         forward_injected_input: s.routing.forward_injected_input,
@@ -784,7 +769,7 @@ pub(crate) fn input_settings(node: &Node) -> InputSettings {
             },
             drag_across_devices: r.button_handoff == ButtonHandoff::Allow,
         },
-        hotkeys: crate::hotkeys::configured(s.hotkeys.clone()),
+        hotkeys: node.effective_hotkeys(),
         gestures_enabled: r.forward_gestures,
         return_pointer_on_display_sleep: r.return_pointer_on_display_sleep,
         wake_displays_on_input: r.wake_displays_on_input,
@@ -1084,6 +1069,13 @@ impl AgentApi for Node {
             .ok_or_else(|| unavailable("音频尚未启动"))?
             .refresh_devices()
             .map_err(unavailable)
+    }
+    fn set_microphone_input(&self, input: Option<String>) -> ApiResult<()> {
+        self.edit_device_option(
+            self.id().into(),
+            dto::LocalOption::MicrophoneInput,
+            input.map(oink_protocol::v1::schema::Text::<512>).write(),
+        )
     }
     fn set_audio_settings(&self, settings: PreferencePatch<oink_audio::Settings>) -> ApiResult<()> {
         let audio = self.inner.audio.get().ok_or_else(|| unavailable("音频尚未启动"))?;
@@ -1390,18 +1382,27 @@ impl AgentApi for Node {
         // InputSettings is flat; explicit local overrides use the durable routing path.
         // Preserve an explicit choice equal to the default without pinning siblings.
         let mut local_patch = patch.value();
-        let mut routing_patch = serde_json::Map::new();
-        for name in ["mac_scroll_feel", "forward_injected_input"] {
-            if let Some(value) = local_patch.as_object_mut().and_then(|p| p.remove(name)) {
-                routing_patch.insert(name.into(), value);
-            }
+        if let Some(object) = local_patch.as_object_mut() {
+            object.remove("application_focus_enabled");
         }
-        if !routing_patch.is_empty() {
-            local_patch["routing"] = routing_patch.into();
+        if let Some(value) = local_patch
+            .as_object_mut()
+            .and_then(|p| p.remove("forward_injected_input"))
+        {
+            local_patch["routing"] = serde_json::json!({"forward_injected_input":value});
+        }
+        let slots = self.link_config()?.applied().pointer_slots.clone();
+        let saved_hotkeys = crate::hotkeys::save_overrides(&s.hotkeys, self.settings().hotkeys, &slots);
+        if local_patch.get("hotkeys").is_some() {
+            local_patch["hotkeys"] = serde_json::to_value(&saved_hotkeys).map_err(|e| invalid(e.to_string()))?;
         }
         self.edit_local_input_settings(&local_patch, |candidate| {
             let routing = &mut candidate.routing;
             routing.mac_scroll_feel = s.mac_scroll_feel;
+            routing.native_multifinger = s.native_multifinger;
+            if edits_contacts {
+                routing.touchpad_injection = s.accept_contacts;
+            }
             routing.forward_injected_input = s.forward_injected_input;
             routing.remote_scroll_speed = s.scroll.speed;
             routing.fixed_reference_display = match s.pointer.reference {
@@ -1420,20 +1421,23 @@ impl AgentApi for Node {
             candidate.cursor_trail_duration_ms = s.cursor_trail_duration_ms;
             candidate.event_frequency = s.event_frequency;
             candidate.emergency_hold_ms = emergency_hold;
-            if edits_contacts {
-                candidate.accept_contacts = s.accept_contacts;
-            }
             candidate.screen_preferences.device_gain = s.device_gain;
             candidate.speed_mode = match s.pointer.scaling {
                 PointerScaling::Physical => SpeedMode::Physical,
                 PointerScaling::Proportional => SpeedMode::ScreenProportional,
             };
-            candidate.hotkeys = Some(s.hotkeys);
+            candidate.hotkeys = Some(saved_hotkeys);
         })?;
         drop(_gate);
-        if Node::layout(self).0.settings.gap_travel != s.gap_travel {
+        if patch.value().get("application_focus_enabled").is_some() {
             self.link_config()?
-                .edit_settings(Box::new(move |settings| settings.gap_travel = s.gap_travel))?;
+                .set_application_focus_enabled(s.application_focus_enabled)?;
+        }
+        if patch.value().get("gap_travel").is_some() {
+            self.commit_manual_layout(move |layout| {
+                layout.settings.gap_travel = s.gap_travel;
+                Ok(())
+            })?;
         }
         Ok(())
     }
@@ -1488,7 +1492,8 @@ impl AgentApi for Node {
         Ok(match self.clipboard() {
             Some(c) => c.settings(),
             None => self.settings().clipboard.unwrap_or_else(crate::clip::default_settings),
-        })
+        }
+        .into())
     }
 
     fn set_clipboard_settings(&self, patch: PreferencePatch<ClipboardSettings>) -> ApiResult<()> {
@@ -1496,11 +1501,11 @@ impl AgentApi for Node {
         let s = patch.apply(&self.clipboard_settings()?)?;
         lock(&self.inner.config)
             .update_local(&serde_json::json!({"clipboard":patch.value()}), |settings| {
-                settings.clipboard = Some(s)
+                settings.clipboard = Some(s.into())
             })
             .map_err(|error| unavailable(error.to_string()))?;
         if let Some(clipboard) = self.clipboard() {
-            clipboard.set_settings(s);
+            clipboard.set_settings(s.into());
         }
         self.emit(ApiEvent::ClipboardSettings(s));
         Ok(())
@@ -1533,6 +1538,9 @@ impl AgentApi for Node {
     fn file_provider_status(&self) -> ApiResult<FileProviderStatus> {
         #[cfg(target_os = "macos")]
         {
+            // Reading the IPC snapshot also requests a current read-only domain
+            // observation. The worker owns native calls; this never opens Finder.
+            self.inner.file_provider_wake.notify_one();
             Ok(lock(&self.inner.file_provider).snapshot())
         }
         #[cfg(not(target_os = "macos"))]
@@ -1655,6 +1663,10 @@ impl AgentApi for Node {
                 .map_err(|e| ApiError::Internal { message: e.to_string() })?;
         }
         let applied = d.recorder.set_enabled(enabled);
+        #[cfg(windows)]
+        if self.inner.native_services {
+            self.inner.reports.set_local_capture(d.recorder.crash_target());
+        }
         // A filesystem failure can leave the durable preference enabled while
         // the recorder is safely off. Native observations follow actual state.
         oink_input::native_lifecycle::set_lifecycle(d.recorder.enabled());
@@ -1664,6 +1676,8 @@ impl AgentApi for Node {
             input.send(crate::threads::input::InputCommand::DiagnosticsSnapshot);
         }
         d.recorder.refresh_environment();
+        #[cfg(windows)]
+        self.emit(ApiEvent::ReportStatusChanged(self.inner.reports.status()));
         Ok(())
     }
 
@@ -1672,6 +1686,40 @@ impl AgentApi for Node {
         let items = permission_items(self);
         self.emit(ApiEvent::Permissions(items.clone()));
         Ok(items)
+    }
+
+    fn restart_system(&self) -> ApiResult<()> {
+        #[cfg(windows)]
+        if self.inner.native_services {
+            return crate::restart_system::restart().map_err(|message| ApiError::Internal { message });
+        }
+        Err(ApiError::Unsupported {
+            message: "System restart unavailable".into(),
+        })
+    }
+    fn microphone_plugin_status(&self) -> ApiResult<crate::microphone_plugin::MicrophonePluginStatus> {
+        Ok(if self.inner.native_services {
+            crate::microphone_plugin::status()
+        } else {
+            crate::microphone_plugin::MicrophonePluginStatus::default()
+        })
+    }
+    fn microphone_plugin_action(
+        &self,
+        action: crate::microphone_plugin::Action,
+    ) -> ApiResult<crate::microphone_plugin::MicrophonePluginStatus> {
+        if !self.inner.native_services {
+            return Err(ApiError::Unsupported {
+                message: "Native installation unavailable".into(),
+            });
+        }
+        let audio = self.inner.audio.get().ok_or_else(|| ApiError::Internal {
+            message: "Audio owner unavailable".into(),
+        })?;
+        let result = crate::microphone_plugin::request_with_audio(action, audio)
+            .map_err(|message| ApiError::Internal { message })?;
+        let _ = self.refresh_audio_devices();
+        Ok(result)
     }
 
     fn request_permission(&self, kind: PermissionKind) -> ApiResult<()> {
@@ -1710,6 +1758,13 @@ impl AgentApi for Node {
                     let granted = match kind {
                         PermissionKind::Accessibility => mac_permissions::request_accessibility(),
                         PermissionKind::InputMonitoring => mac_permissions::request_input_monitoring(),
+                        PermissionKind::Microphone => {
+                            if let Err(error) = oink_audio::microphone::request_permission() {
+                                tracing::warn!(%error, "microphone authorization request unavailable");
+                                return Unavailable;
+                            }
+                            oink_audio::microphone::permission() == oink_audio::microphone::Permission::Granted
+                        }
                         PermissionKind::AudioCapture => {
                             if let Err(error) = oink_audio::request_capture_permission() {
                                 tracing::warn!(%error, "system audio authorization request unavailable");
@@ -1857,7 +1912,10 @@ pub(crate) fn status_view(node: &Node) -> ApiResult<StatusView> {
     let o = overview(node)?;
     let (settings_issues, accept_contacts) = {
         let config = lock(&node.inner.config);
-        (config.settings_issues.clone(), config.settings.accept_contacts)
+        (
+            config.settings_issues.clone(),
+            config.settings.routing.touchpad_injection,
+        )
     };
     Ok(StatusView {
         network: oink_network::udp_send_status(),
@@ -1942,6 +2000,31 @@ mod permission_tests {
     use super::*;
     use PermissionKind::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn file_provider_status_requests_fresh_observation_without_requesting_enablement() {
+        crate::test_watchdog::run(module_path!(), "file_provider_status_refresh", Some(2), async {
+            let dir = tempfile::tempdir().unwrap();
+            // Fake platform has no native provider worker to consume the signal.
+            let node = crate::snapshot_tests::start_with_clip(
+                &oink_test_support::network_config(dir.path().into(), "provider-status", 0),
+                &crate::snapshot_tests::Displays::new("provider-status"),
+                None,
+            )
+            .await;
+            let before = lock(&node.inner.file_provider).snapshot();
+            let observed = node.inner.file_provider_wake.notified();
+            tokio::pin!(observed);
+            observed.as_mut().enable();
+            assert_eq!(node.file_provider_status().unwrap(), before);
+            tokio::time::timeout(std::time::Duration::from_secs(1), observed)
+                .await
+                .expect("status query must wake a read-only refresh");
+            assert!(!lock(&node.inner.file_provider).snapshot().opening);
+            node.shutdown().await;
+        });
+    }
+
     #[test]
     fn display_alerts_require_completed_failure_not_pending_peer_facts() {
         use dto::ResourceFaultCode as Fault;
@@ -1949,14 +2032,28 @@ mod permission_tests {
         // Fake source stages during connect: no Facts, no resource observation,
         // then successful native enumeration. Cached layout screen count is irrelevant.
         for source in [None, Some(Fault::Unknown(99)), Some(Fault::None)] {
-            assert!(
-                devices
-                    .iter()
-                    .all(|device| display_failure_alert(*device, source, 0).is_none())
-            );
+            assert!(devices.iter().all(|device| {
+                display_failure_alert(
+                    *device,
+                    &crate::threads::input::InputStatus {
+                        display_enumeration_fault: source,
+                        ..Default::default()
+                    },
+                    0,
+                )
+                .is_none()
+            }));
         }
         for failure in [Fault::BackendFailed, Fault::DeviceUnavailable] {
-            let alert = display_failure_alert(devices[0], Some(failure), 10).unwrap();
+            let alert = display_failure_alert(
+                devices[0],
+                &crate::threads::input::InputStatus {
+                    display_enumeration_fault: Some(failure),
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
             assert_eq!(alert.id, format!("display-info:{}", devices[0].to_hex()));
             assert_eq!(
                 alert.kind,
@@ -1967,6 +2064,18 @@ mod permission_tests {
             let encoded = serde_json::to_value(&alert).unwrap();
             assert_eq!(serde_json::from_value::<Alert>(encoded).unwrap(), alert);
         }
+    }
+
+    #[test]
+    fn input_injection_screen_fault_is_not_a_display_enumeration_failure() {
+        let status = crate::threads::input::InputStatus {
+            resource_faults: crate::threads::input::ResourceFaults {
+                screen: Some(dto::ResourceFaultCode::BackendFailed),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(display_failure_alert(DeviceId([1; 32]), &status, 0).is_none());
     }
 
     #[test]
@@ -2013,15 +2122,18 @@ mod permission_tests {
 
     #[test]
     fn platform_permission_sets_match_existing_os_permissions() {
-        assert_eq!(platform_permission_kinds(Os::Windows, 0), &[Firewall, SystemService]);
+        assert_eq!(
+            platform_permission_kinds(Os::Windows, 0),
+            &[Firewall, SystemService, Microphone]
+        );
         assert_eq!(
             platform_permission_kinds(Os::Macos, 14),
-            &[Accessibility, InputMonitoring]
+            &[Accessibility, InputMonitoring, Microphone]
         );
         for major in [15, 26] {
             assert_eq!(
                 platform_permission_kinds(Os::Macos, major),
-                &[Accessibility, InputMonitoring, LocalNetwork]
+                &[Accessibility, InputMonitoring, LocalNetwork, Microphone]
             );
         }
         for os in [Os::Linux, Os::Other] {

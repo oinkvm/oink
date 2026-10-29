@@ -31,6 +31,7 @@ fn large_items() -> Vec<ClipData> {
     vec![ClipData::FileRoots(
         (0..2000)
             .map(|n| FileNode {
+                exec_bits: None,
                 id: NodeId(n + 1),
                 parent: None,
                 name: format!("file-{n}-{}", "x".repeat(100)),
@@ -391,6 +392,7 @@ fn exported_browser_artwork_larger_than_i0_does_not_detach_or_lose_focus() {
     drain(&mut read);
     while h._main.try_recv().is_ok() {}
     let items = vec![ClipData::FileRoots(vec![oink_foundation::content::FileNode {
+        exec_bits: None,
         id: oink_foundation::content::NodeId(1),
         parent: None,
         name: "image.png".into(),

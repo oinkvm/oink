@@ -5,7 +5,9 @@ use super::{
     Click, Feedback, Frame, Surface,
     interaction::{HitState, Input},
 };
-use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained};
+use objc2::{
+    AnyThread, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained,
+};
 use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSColor, NSEvent, NSPanel, NSPopUpMenuWindowLevel, NSScreen, NSTrackingArea,
     NSTrackingAreaOptions, NSView, NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask,
@@ -38,11 +40,19 @@ define_class!(
     #[unsafe(super(NSView))] #[thread_kind=MainThreadOnly] #[name="OinkNotificationView"] #[ivars=Hit]
     struct ToastView;
     impl ToastView {
+        #[unsafe(method(hitTest:))]
+        fn hit_test(&self, point: NSPoint) -> Option<&NSView> {
+            let point = Point::new(point.x, self.bounds().size.height - point.y);
+            self.ivars().state.borrow().contains(point).then(|| self.as_super())
+        }
         #[unsafe(method(acceptsFirstMouse:))] fn first_mouse(&self,_event:Option<&NSEvent>)->bool {true}
         #[unsafe(method(mouseEntered:))] fn entered(&self,event:&NSEvent) { self.pointer(event, Input::Move); }
         #[unsafe(method(mouseMoved:))] fn moved(&self,event:&NSEvent) { self.pointer(event, Input::Move); }
         #[unsafe(method(mouseDragged:))] fn dragged(&self,event:&NSEvent) { self.pointer(event, Input::Move); }
-        #[unsafe(method(mouseExited:))] fn exited(&self,_event:&NSEvent) { self.input(Input::Leave); }
+        #[unsafe(method(mouseExited:))] fn exited(&self,_event:&NSEvent) {
+            self.input(Input::Leave);
+            if let Some(window)=self.window() { set_passthrough(&window, true); }
+        }
         #[unsafe(method(mouseDown:))] fn down(&self,event:&NSEvent) { self.pointer(event, Input::Down); }
         #[unsafe(method(mouseUp:))] fn up(&self,event:&NSEvent) { self.pointer(event, Input::Up); }
     }
@@ -50,12 +60,17 @@ define_class!(
 );
 impl ToastView {
     fn input(&self, input: Input) {
-        let (feedback, click) = self.ivars().state.borrow_mut().input(input);
-        self.ivars()
-            .feedback
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(feedback);
+        let mut state = self.ivars().state.borrow_mut();
+        let before = state.feedback();
+        let (feedback, click) = state.input(input);
+        drop(state);
+        if feedback != before {
+            self.ivars()
+                .feedback
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(feedback);
+        }
         if let Some(click) = click {
             self.ivars()
                 .clicks
@@ -72,6 +87,9 @@ impl ToastView {
         }
         let p = Point::new(p.x, self.bounds().size.height - p.y);
         self.input(input(p));
+        if let Some(window) = self.window() {
+            set_passthrough(&window, !self.ivars().state.borrow().contains(p));
+        }
     }
 }
 define_class!(
@@ -87,6 +105,23 @@ struct Window {
     panel: Retained<Panel>,
     layer: Retained<CALayer>,
     view: Retained<ToastView>,
+}
+impl Window {
+    fn pointer(&self, screen: NSPoint) {
+        let local = self.panel.convertPointFromScreen(screen);
+        let local = self.view.convertPoint_fromView(local, None);
+        let point = Point::new(local.x, self.view.bounds().size.height - local.y);
+        self.view.input(Input::Move(point));
+        set_passthrough(&self.panel, !self.view.ivars().state.borrow().contains(point));
+    }
+}
+fn set_passthrough(window: &objc2_app_kit::NSWindow, ignore: bool) {
+    // Repeating this setter dirties WindowServer/CA state even when unchanged
+    // (macOS 14.7.8 profile, macOS 26 native probe). Keep re-entry polling, but
+    // only change native input routing when the hit rectangle actually changes.
+    if window.ignoresMouseEvents() != ignore {
+        window.setIgnoresMouseEvents(ignore);
+    }
 }
 impl Drop for Window {
     fn drop(&mut self) {
@@ -163,6 +198,24 @@ impl Surface for Backend {
         std::mem::take(&mut *self.clicks.lock().unwrap_or_else(|e| e.into_inner()))
     }
     fn feedback(&mut self) -> Vec<Feedback> {
+        // AppKit's CALayer alpha and hitTest:nil do not exclude transparent
+        // padding from WindowServer's input rectangle (macOS 26 native probe).
+        // Use the documented whole-window pass-through switch at the pointer,
+        // updated by local moves and this worker's 16ms poll for re-entry. This
+        // avoids private shape APIs/global input hooks and does not activate,
+        // capture, warp or inject input. Reduced-motion/idle frames still poll.
+        on_main(|| {
+            WINDOWS.with(|slot| {
+                let windows = slot.borrow();
+                if windows.is_empty() {
+                    return;
+                }
+                let point = NSEvent::mouseLocation();
+                for window in windows.iter() {
+                    window.pointer(point);
+                }
+            })
+        });
         std::mem::take(&mut *self.feedback.lock().unwrap_or_else(|e| e.into_inner()))
     }
     fn reduced_motion(&self) -> bool {
@@ -278,8 +331,8 @@ fn apply(mtm: MainThreadMarker, frames: Vec<Frame>, clicks: Clicks, feedback: Fe
             };
             w.layer
                 .setFrame(CGRect::new(CGPoint::new(0., 0.), CGSize::new(b.w, b.h)));
-            w.view.ivars().state.borrow_mut().update(f.id, f.undo, f.interactive);
-            w.panel.setIgnoresMouseEvents(!f.interactive);
+            w.view.ivars().state.borrow_mut().update_frame(&f);
+            w.pointer(NSEvent::mouseLocation());
             w.panel.orderFrontRegardless();
         }
         CATransaction::commit();

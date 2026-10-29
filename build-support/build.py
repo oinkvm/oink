@@ -45,7 +45,7 @@ def main():
     p.add_argument('--source-tree-sha256', required=True)
     p.add_argument('--source-inventory', type=Path)
     p.add_argument('--version', default=IDENTITY['version'])
-    p.add_argument('--source-commit', help='Full source commit for a local commit-labelled version')
+    p.add_argument('--source-commit', help='Full source commit for a in-house build-labelled version')
     p.add_argument('--build', required=True)
     p.add_argument('--sparkle-cache', type=Path)
     p.add_argument('--windows-update-test-feed', help='TEST ONLY: compile a literal HTTP loopback feed and public TEST key')
@@ -78,7 +78,7 @@ def main():
     if a.version != IDENTITY['version']:
         p.error('version must match packaging/identity.json and the Cargo/npm manifests')
     try:
-        display_version = release_version(a.version, a.source_commit)
+        display_version = release_version(a.version, a.source_commit, a.build)
     except ValueError as error:
         p.error(str(error))
     inventory = json.loads(a.source_inventory.read_text())['files'] if a.source_inventory else None

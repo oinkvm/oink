@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 struct Application {
     fail: AtomicBool,
     state: Mutex<Option<group_store::StoredGroupState>>,
+    apply_hook: Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
 impl ConfigApplication for Application {
     fn apply_state(&self, state: &group_store::StoredGroupState) -> Result<(), String> {
@@ -15,6 +16,9 @@ impl ConfigApplication for Application {
             return Err("synthetic native apply failure".into());
         }
         *self.state.lock().unwrap() = Some(state.clone());
+        if let Some(hook) = self.apply_hook.lock().unwrap().as_mut() {
+            hook();
+        }
         Ok(())
     }
 }
@@ -43,6 +47,60 @@ pub(crate) fn display(key: &str) -> DisplayInfo {
         is_builtin: false,
         is_virtual: false,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_automatic_restore_preserves_a_newer_manual_layout_and_source() {
+    let nodes = start(fresh(1)).await;
+    let group = &nodes[0].group;
+    group.edit_layout(Box::new(|_| {}), dto::LayoutSource::Default).unwrap();
+    let observed = group.applied();
+    // Even an equal-geometry manual publication must fence an older restore.
+    group.edit_layout(Box::new(|_| {}), dto::LayoutSource::Manual).unwrap();
+    let manual = group.applied();
+    assert_eq!(manual.layout, observed.layout);
+    assert_ne!(manual.version, observed.version);
+    assert!(
+        !group
+            .edit_layout_if_current(
+                observed,
+                Box::new(|_| panic!("stale restore must not edit the retained register")),
+                dto::LayoutSource::Default
+            )
+            .unwrap()
+    );
+    assert_eq!(group.applied().as_ref(), manual.as_ref());
+    assert!(
+        group
+            .edit_layout_if_current(
+                manual,
+                Box::new(|layout| layout.settings.gap_travel = !layout.settings.gap_travel),
+                dto::LayoutSource::Default
+            )
+            .unwrap()
+    );
+    assert_eq!(group.applied().layout_source, dto::LayoutSource::Default);
+    let observed = group.applied();
+    set_application_failure(&nodes[0], true);
+    assert!(group.edit_layout(Box::new(|_| {}), dto::LayoutSource::Manual).is_err());
+    assert_eq!(
+        group.applied().as_ref(),
+        observed.as_ref(),
+        "published state lags the durable edit"
+    );
+    assert!(
+        !group
+            .edit_layout_if_current(
+                observed,
+                Box::new(|_| panic!("a deferred manual publication must still fence restore")),
+                dto::LayoutSource::Default
+            )
+            .unwrap()
+    );
+    set_application_failure(&nodes[0], false);
+    group.edit_layout(Box::new(|_| {}), dto::LayoutSource::Manual).unwrap();
+    assert_eq!(group.applied().layout_source, dto::LayoutSource::Manual);
+    stop(&nodes).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -88,6 +146,29 @@ async fn native_observation_is_visible_before_an_unrelated_publication() {
         "unchanged native observations must remain idempotent"
     );
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_recovery_schedule_still_expires_proof_lookups() {
+    let nodes = start(fresh(1)).await;
+    nodes[0]
+        .group
+        .call(|owner| {
+            let now = Instant::now();
+            assert!(owner.recovery_due.is_empty());
+            let source = owner.state.roster().anchor();
+            let expired = LinkId(u64::MAX);
+            let pending = LinkId(u64::MAX - 1);
+            owner.lookups.insert(expired, (source, now));
+            owner.lookups.insert(pending, (source, now + Duration::from_secs(10)));
+            owner.expire_recovery(now);
+            assert!(!owner.lookups.contains_key(&expired));
+            assert!(owner.lookups.contains_key(&pending));
+            assert!(owner.recovery_due.is_empty());
+            Ok(())
+        })
+        .unwrap();
+    stop(&nodes).await;
+}
+
 fn identities(count: u8) -> Vec<Arc<Identity>> {
     (1..=count).map(|n| Arc::new(Identity::from_seed([n; 32]))).collect()
 }
@@ -117,6 +198,32 @@ pub(crate) fn same_group(count: u8) -> Vec<group_store::StoredGroupState> {
 }
 pub(crate) async fn start(states: Vec<group_store::StoredGroupState>) -> Vec<Running> {
     start_with_hints(states, None).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_profile_negotiates_mac_file_tree_metadata() {
+    // Use application_profile through the actual C0/LinkLayer handshake. Codec
+    // registry-only fixtures previously hid missing production advertisements.
+    let nodes = start(same_group(2)).await;
+    assert!(until(|| ready(&nodes)).await);
+    for (source, target) in [(&nodes[0], &nodes[1]), (&nodes[1], &nodes[0])] {
+        let peer = target.identity.id();
+        let link = source.links.links().by_peer(peer).unwrap().clone();
+        let files = crate::streams::clipboard::files::FileLinks::new(
+            source.links.clone(),
+            oink_protocol::frame::StreamKind::Dnd,
+        );
+        files.set_log_config(source.group.clone());
+        // Link admission precedes live Facts; the synthetic roster's OS is
+        // "test" until the normal Facts publication arrives.
+        assert!(until(|| files.peer_os(peer).as_deref() == Some(std::env::consts::OS)).await);
+        for cap in ["oink.files.safe-symlinks/1", "oink.files.exec-bits/1"] {
+            assert_eq!(link.agreement.contains(cap), cfg!(target_os = "macos"), "{cap}");
+        }
+        assert_eq!(files.peer_safe_symlinks(peer, link.link), cfg!(target_os = "macos"));
+        assert_eq!(files.peer_exec_bits(peer, link.link), cfg!(target_os = "macos"));
+    }
+    stop(&nodes).await;
 }
 async fn start_with_hints(
     states: Vec<group_store::StoredGroupState>,
@@ -474,6 +581,16 @@ async fn real_pairing_is_explicit_directional_and_undo_removes_only_the_peer() {
     complete(&nodes[0], &nodes[1], &id).await;
     assert_eq!(nodes[0].group.applied().group, target);
     assert_eq!(nodes[1].group.applied().group, target);
+    assert!(
+        until(|| {
+            let a = nodes[0].group.applied();
+            let b = nodes[1].group.applied();
+            a.pointer_slots.len() == 2 && a.pointer_slots == b.pointer_slots
+        })
+        .await
+    );
+    assert_eq!(nodes[0].group.applied().pointer_slots[&nodes[1].identity.id()], Some(0));
+    assert_eq!(nodes[0].group.applied().pointer_slots[&nodes[0].identity.id()], Some(1));
     assert!(nodes.iter().all(|node| node.group.nearby().rows.is_empty()));
     let event = nodes[0]
         .group
@@ -559,6 +676,32 @@ async fn pending_capacity_wrong_code_and_cancel_are_independent_on_one_c0() {
     submit(&nodes[1], &ids[0], 2, code);
     complete(&nodes[0], &nodes[1], &ids[0]).await;
     stop(&nodes).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_pending_request_has_no_local_durable_failure() {
+    let nodes = start(fresh(2)).await;
+    let id = request(&nodes[0], &nodes[1], [1; 16]).await;
+    assert!(until(|| nodes[1].group.pairings().requests.iter().any(|r| r.id == id)).await);
+    assert!(matches!(
+        nodes[1].group.block(operation().0, nodes[0].identity.id()).unwrap(),
+        crate::device_cards::BlockReply::Edited(_)
+    ));
+    assert!(nodes[1].group.pairings().requests.is_empty());
+    assert!(
+        until(
+            || nodes[0].group.subscribe_pairing_events(0).unwrap().iter().any(|event| {
+                matches!(event, api::PairingEvent::PairingFailed { pair_id, problem, .. }
+            if pair_id == &id && problem.code == 13)
+            })
+        )
+        .await
+    );
+    let local_events = nodes[1].group.subscribe_pairing_events(0).unwrap();
+    stop(&nodes).await;
+    assert!(
+        local_events.is_empty(),
+        "Block must not journal a local PairingFailed: {local_events:?}"
+    );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocked_identity_is_hidden_automatically_but_manual_queries_remain_usable() {
@@ -801,9 +944,15 @@ async fn concurrent_owner_display_observations_survive_a_whole_layout_lww_winner
         assert_eq!(
             actual[0].device_transform(id),
             transform,
-            "preserve the shared device transform"
+            "native shrink preserves the existing transform without compaction"
         );
     }
+    assert!(actual[0].overlaps().is_empty());
+    // Both desktops shrink horizontally. Reconciliation preserves the gap,
+    // regardless of which concurrent whole-layout publication wins.
+    let a = actual[0].device_bounds(nodes[0].identity.id()).unwrap();
+    let b = actual[0].device_bounds(nodes[1].identity.id()).unwrap();
+    assert!(a.right() + 1e-9 < b.x || b.right() + 1e-9 < a.x);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1649,7 +1798,25 @@ fn member_retry_clock_picks_up_reachability_within_five_seconds_after_many_timeo
 }
 
 #[test]
-fn larger_id_waits_only_on_its_initial_round_and_rejections_keep_slow_backoff() {
+fn transient_failures_retry_within_five_seconds() {
+    let local = DeviceId([2; 32]);
+    let peer = DeviceId([1; 32]);
+    for reason in [DialFailure::Unreachable, DialFailure::Refused, DialFailure::Stopped] {
+        let mut dial = Dial::default();
+        let mut now = Instant::now();
+        for attempt in 0..20 {
+            dial.failed(reason, now);
+            let delay = Duration::from_millis([500, 1000, 2000, 4000, 5000][attempt.min(4)]);
+            assert_eq!(dial.after.unwrap() - now, delay, "{reason:?}, attempt {attempt}");
+            assert!(!dial.due(local, peer, now + delay - Duration::from_nanos(1)));
+            assert!(dial.due(local, peer, now + delay));
+            now += delay;
+        }
+    }
+}
+
+#[test]
+fn larger_id_waits_only_on_its_initial_round_and_identity_rejection_keeps_slow_backoff() {
     let now = Instant::now();
     let smaller = DeviceId([1; 32]);
     let larger = DeviceId([2; 32]);
@@ -1659,20 +1826,51 @@ fn larger_id_waits_only_on_its_initial_round_and_rejections_keep_slow_backoff() 
     assert!(dial.due(larger, smaller, now + Duration::from_secs(1)));
     dial.failed(DialFailure::Unreachable, now);
     assert!(dial.due(larger, smaller, now + Duration::from_millis(500)));
-    for reason in [DialFailure::IdentityChanged, DialFailure::Refused, DialFailure::Stopped] {
-        let mut dial = Dial::default();
-        for expected in [5, 15, 60, 300, 300] {
-            dial.failed(reason, now);
-            assert_eq!(dial.after.unwrap() - now, Duration::from_secs(expected));
-        }
-        dial.reset(now);
-        assert_eq!(dial.failures, 0);
-        assert!(dial.due(larger, smaller, now));
+    let mut dial = Dial::default();
+    for expected in [5, 15, 60, 300, 300] {
+        dial.failed(DialFailure::IdentityChanged, now);
+        assert_eq!(dial.after.unwrap() - now, Duration::from_secs(expected));
     }
+    dial.reset(now);
+    assert_eq!(dial.failures, 0);
+    assert!(dial.due(larger, smaller, now));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn lost_network_change_and_wake_reset_member_retry_immediately() {
+async fn pre_ready_losses_preserve_admission_backoff() {
+    let nodes = start(fresh(1)).await;
+    nodes[0]
+        .group
+        .call(|owner| {
+            let peer = DeviceId([99; 32]);
+            for (attempt, delay) in [500, 1000, 2000, 4000, 5000, 5000].into_iter().enumerate() {
+                // Connected can succeed at TLS/path installation while the peer
+                // rejects C0 (e.g. its config owner is sleeping). close() may
+                // already have removed the session before Lost is delivered.
+                owner.dials.entry(peer).or_default().active = true;
+                let before = Instant::now();
+                owner.network(ConfigEvent::Lost {
+                    link: LinkId(100 + attempt as u64),
+                    peer,
+                    path: LinkPath::Direct,
+                    reason: oink_network::link::LinkLost::ConnectionLost,
+                });
+                let dial = owner.dials.get_mut(&peer).unwrap();
+                assert_eq!(dial.failures, attempt + 1, "path installation is not C0 success");
+                let deadline = dial.after.unwrap();
+                assert!(deadline >= before + Duration::from_millis(delay));
+                assert!(deadline <= Instant::now() + Duration::from_millis(delay));
+                assert!(!dial.due(owner.identity.id(), peer, deadline - Duration::from_nanos(1)));
+                assert!(dial.due(owner.identity.id(), peer, deadline));
+            }
+            Ok(())
+        })
+        .unwrap();
+    stop(&nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ready_loss_network_change_and_wake_reset_member_retry_immediately() {
     let nodes = start(fresh(1)).await;
     nodes[0]
         .group
@@ -1685,9 +1883,13 @@ async fn lost_network_change_and_wake_reset_member_retry_immediately() {
                         reason: DialFailure::Refused,
                     });
                 }
-                assert!(owner.dials[&peer].after.unwrap() > Instant::now() + Duration::from_secs(60));
+                assert!(owner.dials[&peer].after.unwrap() > Instant::now() + Duration::from_secs(4));
+                assert!(owner.dials[&peer].after.unwrap() <= Instant::now() + Duration::from_secs(5));
             };
             fail(owner);
+            // Only a link that completed C0 earns immediate recovery. The
+            // readiness marker survives close() removing its session first.
+            owner.dials.get_mut(&peer).unwrap().ready_link = Some(LinkId(u64::MAX));
             owner.network(ConfigEvent::Lost {
                 link: LinkId(u64::MAX),
                 peer,
@@ -1943,4 +2145,321 @@ async fn own_retry_recovery(peer_owner_delay: Duration) {
     eprintln!(
         "own retry after 20 timeouts reached Ready in {elapsed:?} (stage budget {recovery_budget:?}, peer owner delay {peer_owner_delay:?})"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_trust_unknown_peer_cannot_self_admit_through_greeting_request_reply_or_recovery() {
+    use oink_network::negotiation::Selected;
+    let nodes = start(fresh(2)).await;
+    let _ = query(&nodes[0], &nodes[1], [42; 16]).await;
+    let local_id = nodes[0].identity.id();
+    let peer_id = nodes[1].identity.id();
+    let mine = nodes[1]
+        .group
+        .call(move |owner| {
+            Ok(owner
+                .sessions
+                .values()
+                .find(|s| s.peer_boot.device_id == local_id)
+                .unwrap()
+                .peer
+                .clone()
+                .unwrap())
+        })
+        .unwrap();
+    let results = nodes[0]
+        .group
+        .call(move |owner| {
+            let link = *owner
+                .sessions
+                .iter()
+                .find(|(_, s)| s.peer_boot.device_id == peer_id)
+                .unwrap()
+                .0;
+            let local = owner.links.boot();
+            let peer = owner.sessions[&link].peer_boot;
+            let prior = owner.sessions[&link].peer.clone().unwrap();
+            // Hold synthetic replies locally so the real peer cannot close the
+            // transport while this single actor turn exercises hostile frames.
+            let (tx, _held) = oink_network::link::testing::reliable_pair(
+                link,
+                owner.sessions[&link].tx.id().tag,
+                oink_network::link::QueueSpec::reliable(oink_protocol::frame::StreamKind::Config).0,
+            );
+            let original_tx = std::mem::replace(&mut owner.sessions.get_mut(&link).unwrap().tx, tx);
+            let anchor = owner.state.roster().anchor();
+            let original = owner.state.digest().unwrap();
+            let claimed = owner
+                .state
+                .with_roster(
+                    &owner
+                        .state
+                        .roster()
+                        .add(&owner.identity, peer_id, "peer", "test", 2)
+                        .unwrap(),
+                )
+                .unwrap();
+            let hash = prior.hash().unwrap();
+            let selected = Selected {
+                peer_boot: peer,
+                connection: wire::read_connection(&mine.greeting.offer().unwrap().connection_id().unwrap()).unwrap(),
+                agreement: prior.agreement.clone(),
+                negotiated: prior.negotiated.clone(),
+                local_offer: v1::frame::encode(
+                    &Message::ConnectionOffer(mine.greeting.offer().unwrap()),
+                    v1::limits::CONFIG_FRAME,
+                )
+                .unwrap(),
+                peer_offer: v1::frame::encode(
+                    &Message::ConnectionOffer(prior.greeting.offer().unwrap()),
+                    v1::limits::CONFIG_FRAME,
+                )
+                .unwrap(),
+            };
+            let reverse = Selected {
+                peer_boot: local,
+                local_offer: selected.peer_offer.clone(),
+                peer_offer: selected.local_offer.clone(),
+                ..selected.clone()
+            };
+            let now = Instant::now();
+            let (greeting, hello) = admission::GreetingSession::new(
+                local,
+                peer,
+                true,
+                owner.links.profile().clone(),
+                Some(selected),
+                None,
+                owner.advert.borrow().clone(),
+                anchor,
+                owner.state.roster().digest().unwrap(),
+                now,
+            )
+            .unwrap();
+            let (mut remote, _) = admission::GreetingSession::new(
+                peer,
+                local,
+                false,
+                owner.links.profile().clone(),
+                Some(reverse),
+                None,
+                Advert::local(peer_id, "synthetic".into(), anchor.group, 2, 47470, "test".into()),
+                anchor,
+                claimed.roster().digest().unwrap(),
+                now,
+            )
+            .unwrap();
+            let info = remote.receive(&hello.unwrap(), now).unwrap().unwrap();
+            let session = owner.sessions.get_mut(&link).unwrap();
+            session.peer = None;
+            session.greeting = greeting;
+            session.direction = Direction::Outbound;
+            let greeting_ok = owner.control(link, &info).is_err() && owner.sessions[&link].sent.is_none();
+            let begin_rejected = owner.begin_admission(link).is_err();
+            let lookup_rejected = owner.lookup(link).is_err() && !owner.lookups.contains_key(&link);
+            let request = admission::request(&claimed, peer_id, hash, 0).unwrap();
+            let request_error = owner
+                .control(link, &v1::frame::encode(&request, v1::limits::CONFIG_FRAME).unwrap())
+                .is_err();
+            let request_rejected =
+                request_error && owner.sessions[&link].accepted.is_none() && owner.state.digest().unwrap() == original;
+            // A previously sent request must not let Reply bypass current local trust.
+            owner.sessions.get_mut(&link).unwrap().sent = Some(owner.state.clone());
+            let reply = admission::reply(&claimed, peer_id, hash, 0).unwrap();
+            let reply_rejected = owner
+                .control(link, &v1::frame::encode(&reply, v1::limits::CONFIG_FRAME).unwrap())
+                .is_err()
+                && owner.state.digest().unwrap() == original;
+            let ready_rejected = owner.ready(link).is_err() && !owner.sessions[&link].ready;
+            owner.sessions.get_mut(&link).unwrap().tx = original_tx;
+            Ok([
+                greeting_ok,
+                begin_rejected,
+                lookup_rejected,
+                request_rejected,
+                reply_rejected,
+                ready_rejected,
+            ])
+        })
+        .unwrap();
+    stop(&nodes).await;
+    assert_eq!(results, [true; 6], "greeting, begin, lookup, request, reply, ready");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_trust_unknown_announcement_does_not_dial_and_refused_peer_retries_after_membership_update() {
+    let keys = identities(2);
+    let base = State::create(&keys[0], "a", "test", 1).unwrap();
+    let joined = base
+        .with_roster(&base.roster().add(&keys[0], keys[1].id(), "c", "test", 2).unwrap())
+        .unwrap();
+    let states = vec![
+        group_store::StoredGroupState::new(keys[0].id(), base.wire().clone()).unwrap(),
+        group_store::StoredGroupState::new(keys[1].id(), joined.wire().clone()).unwrap(),
+    ];
+    let nodes = start_with_hints(states, Some(&[])).await;
+    let a = keys[0].id();
+    let c = keys[1].id();
+    let address_a = nodes[0].links.local_addr();
+    let address_c = nodes[1].links.local_addr();
+    nodes[0]
+        .group
+        .call(move |owner| {
+            owner.sighting(Sighting {
+                advert: Advert::local(
+                    c,
+                    "c".into(),
+                    owner.state.roster().anchor().group,
+                    2,
+                    address_c.port(),
+                    "test".into(),
+                ),
+                addrs: vec![address_c],
+                source: oink_network::discovery::Source::Mdns,
+            });
+            owner.tick();
+            assert!(!owner.dials.contains_key(&c), "discovery must not authorize a dial");
+            assert!(owner.sessions.is_empty());
+            Ok(())
+        })
+        .unwrap();
+    nodes[1]
+        .group
+        .call(move |owner| {
+            owner.address_book.remember(a, address_a).unwrap();
+            owner.dials.entry(a).or_default().reset(Instant::now());
+            owner.tick();
+            Ok(())
+        })
+        .unwrap();
+    let refused = until(|| {
+        nodes[1]
+            .group
+            .call(move |owner| {
+                Ok(owner.dials.get(&a).is_some_and(|dial| dial.failures > 0) && owner.sessions.is_empty())
+            })
+            .unwrap()
+    })
+    .await;
+    assert!(refused, "unknown same-root inbound C0 must close before admission");
+    nodes[1]
+        .group
+        .call(move |owner| {
+            let retry = owner.dials[&a].after.unwrap();
+            assert!(retry <= Instant::now() + Duration::from_secs(5));
+            Ok(())
+        })
+        .unwrap();
+    nodes[0]
+        .group
+        .call(move |owner| {
+            // Model delivery of the addition by a locally trusted member. Prevent
+            // A's outbound dial so this assertion specifically exercises C's retry.
+            owner.commit(joined)?;
+            owner.dials.entry(c).or_default().active = true;
+            Ok(())
+        })
+        .unwrap();
+    let recovered = until(|| ready(&nodes)).await;
+    let inbound = nodes[0]
+        .group
+        .call(move |owner| {
+            Ok(owner
+                .sessions
+                .values()
+                .any(|s| s.peer_boot.device_id == c && s.ready && s.direction == Direction::Inbound))
+        })
+        .unwrap();
+    stop(&nodes).await;
+    assert!(
+        recovered && inbound,
+        "C's own capped retry must admit after the roster update"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_membership_cycles_pair_rejoin_and_revoke_one_device_across_three_owners() {
+    let keys = identities(3);
+    let a = keys[0].id();
+    let d = keys[2].id();
+    let base = State::create(&keys[0], "a", "test", 1).unwrap();
+    let base = base
+        .with_roster(&base.roster().add(&keys[0], keys[1].id(), "b", "test", 2).unwrap())
+        .unwrap();
+    let mut states = vec![
+        group_store::StoredGroupState::new(a, base.wire().clone()).unwrap(),
+        group_store::StoredGroupState::new(keys[1].id(), base.wire().clone()).unwrap(),
+    ];
+    states.push(fresh(3).pop().unwrap());
+    let mut nodes = start(states).await;
+    let anchor = base.roster().anchor();
+    let mut prior_removal: Option<State> = None;
+    for (cycle, epoch) in [(0u8, 1), (1, 3)] {
+        // D joins through B; A must learn the new membership from its member B.
+        let id = request(&nodes[2], &nodes[1], [60 + cycle; 16]).await;
+        let code = accept(&nodes[2], &nodes[1], &id).await;
+        submit(&nodes[1], &id, 1, code);
+        complete(&nodes[2], &nodes[1], &id).await;
+        assert!(until(|| ready(&nodes)).await);
+        if let Some(removed) = prior_removal.take() {
+            // Reconnect after the second Add, forcing A's greeting gate to run
+            // with both current membership and older removal history present.
+            restart(&mut nodes[2]).await;
+            assert!(until(|| ready(&nodes)).await);
+            nodes[2]
+                .group
+                .call(move |owner| {
+                    let link = owner.selected_session(a).unwrap().0;
+                    let bytes =
+                        v1::frame::encode(&Message::ConfigState(removed.wire().clone()), v1::limits::CONFIG_FRAME)
+                            .unwrap();
+                    // Deliver an older member's queued revocation on a real,
+                    // currently authenticated C0 and wait for actual consumption.
+                    owner.control(link, &bytes).unwrap();
+                    assert_eq!(owner.state.roster().anchor(), anchor);
+                    assert_eq!(owner.state.roster().member(d).unwrap().epoch, epoch);
+                    assert!(owner.sessions[&link].ready);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        for node in &nodes {
+            node.group
+                .call(move |owner| {
+                    assert_eq!(owner.state.roster().anchor(), anchor);
+                    assert_eq!(owner.state.roster().member(d).unwrap().epoch, epoch);
+                    if owner.identity.id() == a {
+                        let (_, session) = owner.selected_session(d).unwrap();
+                        assert!(
+                            session.ready && session.deadline.is_none(),
+                            "current member must bypass revocation-only C0"
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+        // Offline D cannot consume the online removal broadcast. On return it
+        // must use the removed-history admission exception, in both cycles.
+        nodes[2].group.stop().await;
+        nodes[2].links.stop().await;
+        nodes[0].group.remove_member(d).unwrap();
+        assert!(until(|| nodes[1].group.members().members.len() == 2).await);
+        let removed = nodes[0]
+            .group
+            .call(move |owner| {
+                assert!(!owner.state.roster().contains(d));
+                assert_eq!(owner.state.roster().next_epoch(d).unwrap(), epoch + 2);
+                Ok(owner.state.clone())
+            })
+            .unwrap();
+        restart(&mut nodes[2]).await;
+        assert!(
+            until(|| nodes[2].group.applied().group != anchor.group && nodes[2].group.members().members.len() == 1)
+                .await
+        );
+        assert!(nodes[..2].iter().all(|node| node.group.applied().group == anchor.group));
+        prior_removal = Some(removed);
+    }
+    stop(&nodes).await;
 }

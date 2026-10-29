@@ -1,5 +1,4 @@
-import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import conformance from '../../../../crates/oink-display/tests/facing-conformance.json';
 import { describe, expect, it } from 'vitest';
 import { edgeProjections, facing, sameProjections, tolerance } from './facing';
 import { freeGroup } from './groups';
@@ -51,14 +50,12 @@ describe('shared facing definition', () => {
                 cases.push({ rects: scaled(rs, k) });
             }
         }
-        const output = execFileSync('cargo', ['run', '-j2', '--quiet', '-p', 'oink-display', '--example', 'layout_conformance'], {
-            cwd: fileURLToPath(new URL('../../../../', import.meta.url)),
-            env: { ...process.env, CARGO_INCREMENTAL: '0', CARGO_PROFILE_DEV_DEBUG: '0', CARGO_PROFILE_TEST_DEBUG: '0' },
-            input: JSON.stringify(cases), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 120000,
-        });
-        const results = JSON.parse(output) as { projections: ReturnType<typeof edgeProjections> }[];
+        // Both language suites validate this corpus against their production
+        // geometry. UI tests never build Rust or wait on another Cargo process.
+        const results = conformance as { rects: Rect[]; projections: ReturnType<typeof edgeProjections> }[];
+        expect(results.map(({ rects }) => ({ rects }))).toEqual(cases);
         cases.forEach(({ rects }, i) => {
             expect(sameProjections(edgeProjections(rects), results[i].projections, tolerance(rects)), `pairs case ${i}`).toBe(true);
         });
-    }, 125000);
+    });
 });

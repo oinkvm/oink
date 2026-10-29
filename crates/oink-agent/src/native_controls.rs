@@ -28,10 +28,11 @@ fn label(language: UiLanguage, id: &str) -> &'static str {
         "keyboard" => ["Keyboard", "键盘", "キーボード", "키보드"],
         "mouse" => ["Mouse", "鼠标", "マウス", "마우스"],
         "game" => ["Game mode", "游戏模式", "ゲームモード", "게임 모드"],
+        "microphone" => ["Microphone", "麦克风", "マイク", "마이크"],
         "audio" => ["Audio", "音频", "オーディオ", "오디오"],
         "keyboard-disabled" | "mouse-disabled" => ["Disabled", "禁用", "無効", "비활성화"],
-        "keyboard-local" | "mouse-local" | "audio-local" => ["Local", "本地", "ローカル", "로컬"],
-        "keyboard-shared" | "mouse-shared" => ["Shared", "共享", "共有", "공유"],
+        "keyboard-local" | "mouse-local" | "audio-local" | "microphone-local" => ["Local", "本地", "ローカル", "로컬"],
+        "keyboard-shared" | "mouse-shared" | "microphone-shared" => ["Shared", "共享", "共有", "공유"],
         "game-auto" => ["Automatic", "自动", "自動", "자동"],
         "game-on" => ["On", "开启", "オン", "켜기"],
         "game-off" => ["Off", "关闭", "オフ", "끄기"],
@@ -100,7 +101,6 @@ pub fn model(view: &DeviceCardsView, language: UiLanguage) -> Model {
         });
         let action = status.map(|s| match mode {
             SharingMode::Disabled => &s.actions.keyboard_disabled,
-            _ if s.keyboard.disabled == Some(true) => &s.actions.keyboard_enabled,
             SharingMode::Local => &s.actions.keyboard_local,
             SharingMode::Shared => &s.actions.keyboard_shared,
         });
@@ -191,6 +191,23 @@ pub fn model(view: &DeviceCardsView, language: UiLanguage) -> Model {
                 ],
             ),
             group("audio", audio),
+            group(
+                "microphone",
+                vec![
+                    entry(
+                        "microphone-local",
+                        Some(status.is_some_and(|s| {
+                            s.microphone.permission_granted && s.microphone.mode != MicrophoneMode::Source
+                        })),
+                        invokable(status.map(|s| &s.microphone.local_action)),
+                    ),
+                    entry(
+                        "microphone-shared",
+                        Some(status.is_some_and(|s| s.microphone.mode == MicrophoneMode::Source)),
+                        invokable(status.map(|s| &s.microphone.share_action)),
+                    ),
+                ],
+            ),
         ],
         tasks: vec![
             entry(
@@ -250,6 +267,8 @@ pub fn launch_command(args: impl IntoIterator<Item = String>) -> Option<String> 
             | "audio-local"
             | "audio-forward"
             | "audio-exit"
+            | "microphone-local"
+            | "microphone-shared"
             | "lock"
             | "unlock"
             | "show"
@@ -296,14 +315,6 @@ pub fn dispatch(api: &dyn crate::api::AgentApi, id: &str) -> crate::api::ApiResu
         api.set_focus_locked(false)?;
         return Ok(None);
     }
-    if matches!(id, "keyboard-local" | "keyboard-shared")
-        && card.status.as_ref().is_some_and(|s| s.keyboard.disabled == Some(true))
-    {
-        // Unlock preserves the saved mode. An explicit mode selection then sets
-        // its requested mode using a fresh owner revision rather than a stale token.
-        api.set_keyboard_disabled(card.device, false)?;
-        view = api.device_cards()?;
-    }
     if id == "audio-local"
         && view
             .cards
@@ -338,6 +349,8 @@ pub fn dispatch(api: &dyn crate::api::AgentApi, id: &str) -> crate::api::ApiResu
         "game-auto" => status.map(|s| &s.game.actions.auto),
         "game-on" => status.map(|s| &s.game.actions.on),
         "game-off" => status.map(|s| &s.game.actions.off),
+        "microphone-local" => status.map(|s| &s.microphone.local_action),
+        "microphone-shared" => status.map(|s| &s.microphone.share_action),
         "audio-exit" => status.map(|s| &s.speaker.make_exit_action),
         "audio-forward" => status.map(|s| &s.actions.forwarding_enabled),
         "audio-local" => status.map(|s| {
@@ -393,6 +406,7 @@ mod tests {
             }],
             focus: FocusObservation::default(),
             exit_baseline: false,
+            microphone_resolution: Default::default(),
             local_exit_selection_ready: false,
             selected_exit: None,
             exit_claim: None,
@@ -413,7 +427,7 @@ mod tests {
         let model = model(&cards(), UiLanguage::English);
         assert_eq!(
             model.groups.iter().map(|g| g.id).collect::<Vec<_>>(),
-            ["keyboard", "mouse", "game", "audio"]
+            ["keyboard", "mouse", "game", "audio", "microphone"]
         );
         for id in [
             "keyboard-disabled",
@@ -482,7 +496,7 @@ mod tests {
         let menu = model(&view, UiLanguage::SimplifiedChinese);
         assert_eq!(
             menu.groups.iter().map(|g| g.label.as_str()).collect::<Vec<_>>(),
-            ["键盘", "鼠标", "游戏模式", "音频"]
+            ["键盘", "鼠标", "游戏模式", "音频", "麦克风"]
         );
         assert_eq!(item(&menu, "audio-forward").label, "转发");
         assert!(!item(&menu, "audio-forward").enabled);
@@ -551,7 +565,7 @@ mod dispatch_tests {
         })
         .await;
         // This node deliberately has no native output. The durable exit choice
-        // remains selected, while an unavailable primary action stays disabled.
+        // remains selected, while Local remains an available recovery action.
         let menu = model(&node.device_cards().unwrap(), UiLanguage::English);
         let local = menu
             .groups
@@ -559,15 +573,17 @@ mod dispatch_tests {
             .flat_map(|g| &g.items)
             .find(|i| i.id == "audio-local")
             .unwrap();
-        assert!(!local.enabled);
+        assert!(local.enabled);
         let n = node.clone();
-        assert!(
-            tokio::task::spawn_blocking(move || dispatch(&n, "audio-local"))
-                .await
-                .unwrap()
-                .is_err()
-        );
-        assert!(node.audio_status().unwrap().settings.forwarding_enabled);
+        tokio::task::spawn_blocking(move || dispatch(&n, "audio-local"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!node.audio_status().unwrap().settings.forwarding_enabled);
+        until("failed exit released", || {
+            node.audio_status().unwrap().resolution.owner().is_none()
+        })
+        .await;
         node.shutdown().await;
     }
 
@@ -631,9 +647,14 @@ mod dispatch_tests {
             })
             .await;
             match id {
-                "keyboard-disabled" => assert!(node.settings().keyboard_disabled),
+                "keyboard-disabled" => {
+                    assert_eq!(
+                        node.settings().routing.keyboard_mode,
+                        oink_foundation::input::InputMode::Disabled
+                    )
+                }
                 "keyboard-local" => {
-                    assert!(!node.settings().keyboard_disabled);
+                    assert!(node.settings().routing.keyboard_mode != oink_foundation::input::InputMode::Disabled);
                     assert_eq!(
                         node.settings().routing.keyboard_mode,
                         oink_foundation::input::InputMode::Local

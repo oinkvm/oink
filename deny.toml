@@ -63,3 +63,9 @@ allow = ["MPL-2.0"]
 name = "minicbor"
 version = "=2.3.0"
 allow = ["BlueOak-1.0.0"]
+
+# Native HAL dependency; audited separately by the native inventory generator.
+[[licenses.exceptions]]
+name = "libASPL"
+version = "=3.1.2"
+allow = ["AML"]

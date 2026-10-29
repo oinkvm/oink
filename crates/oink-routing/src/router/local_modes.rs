@@ -166,7 +166,12 @@ impl Router {
     }
     pub(super) fn apply_source_modes(&mut self, mouse: InputMode, keyboard: InputMode) {
         if keyboard != self.cfg.settings.keyboard_mode {
+            let was_disabled = self.keyboard_disabled();
             self.retire_source_keyboard();
+            self.cfg.settings.keyboard_mode = keyboard;
+            if was_disabled || keyboard == InputMode::Disabled {
+                self.keyboard_mode_changed(keyboard == InputMode::Disabled);
+            }
         }
         if mouse != self.cfg.settings.mouse_mode {
             self.out

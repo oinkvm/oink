@@ -121,6 +121,14 @@ pub(crate) fn mouse(dx: i32, dy: i32, data: i32, flags: MOUSE_EVENT_FLAGS) -> IN
     }
 }
 
+pub(crate) fn move_relative(dx: i32, dy: i32) -> INPUT {
+    // User-tested on Windows 11 build 26200: Endfield's camera Y inverted
+    // with NOCOALESCE, but MOVE with the OINK tag kept the correct direction.
+    // The game-side cause is unknown. Keep signed deltas and echo filtering;
+    // absolute movement is separate. See docs/design/game-mode.md.
+    mouse(dx, dy, 0, MOUSEEVENTF_MOVE)
+}
+
 pub(crate) fn move_abs(nx: i32, ny: i32) -> INPUT {
     mouse(
         nx,
@@ -230,6 +238,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn game_relative_input_uses_only_move_and_keeps_echo_tag() {
+        for (dx, dy) in [(7, -11), (-7, 11), (0, 0)] {
+            let event = move_relative(dx, dy);
+            assert_eq!(event.r#type, INPUT_MOUSE);
+            // SAFETY: move_relative initializes INPUT_MOUSE's mi member; no input is sent.
+            let mouse = unsafe { event.Anonymous.mi };
+            assert_eq!((mouse.dx, mouse.dy), (dx, dy));
+            assert_eq!(mouse.dwFlags, MOUSEEVENTF_MOVE);
+            assert_eq!(mouse.dwExtraInfo, INJECT_TAG);
+            assert_eq!((mouse.mouseData, mouse.time), (0, 0));
+        }
+    }
+
+    #[test]
     fn portal_edge_clamp_readback_matches_the_submitted_windows_pixel() {
         use crate::cursor_reconciliation::{Decision, Expected, Observation, Reconciler};
         use oink_foundation::{Point, Rect};
@@ -309,6 +331,27 @@ mod tests {
                 origin + extent - 1
             );
         }
+    }
+
+    #[test]
+    fn exact_primary_edges_with_negative_origin_portrait_display() {
+        // Primary [0,3840) x [0,2160), portrait [-1440,0) x [-139,2421).
+        // The two reported restore targets are the last primary pixel, not 3840.
+        let origin = (-1440, -139);
+        let extent = (5280, 2560);
+        for (x, y) in [
+            (3839, 1244),
+            (3839, 1066),
+            (3838, 1244),
+            (0, 0),
+            (3839, 2159),
+            (-1440, -139),
+            (-1, 2420),
+        ] {
+            let target = absolute_target(oink_foundation::Point::new(f64::from(x), f64::from(y)), origin, extent);
+            assert_eq!(target, oink_foundation::Point::new(f64::from(x), f64::from(y)));
+        }
+        assert_eq!(normalize(3839, origin.0, extent.0), 65524);
     }
 
     #[test]

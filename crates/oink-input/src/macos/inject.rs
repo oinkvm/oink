@@ -30,6 +30,7 @@
 //!   不能用普通 `FlagsChanged` 代替（见 `capslock` 模块）。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -107,12 +108,48 @@ struct PendingPosition {
 struct ButtonSubmission {
     acknowledgement: Result<(), InputError>,
 }
+
+#[derive(Clone, Copy)]
+enum ButtonModifiers {
+    Ordinary,
+    SourceRelease,
+}
+impl ButtonModifiers {
+    fn for_button(held_source: bool, button: MouseButton, pressed: bool) -> Self {
+        if held_source && button == MouseButton::Left && !pressed {
+            Self::SourceRelease
+        } else {
+            Self::Ordinary
+        }
+    }
+    fn resolve(self, flags: CGEventFlags) -> CGEventFlags {
+        match self {
+            Self::Ordinary => flags,
+            Self::SourceRelease => CGEventFlags::empty(),
+        }
+    }
+}
+/// Keep the injector serialized across the ACK, while the caller releases its
+/// cursor transition lock so capture can deliver that ACK.
+pub(super) struct HeldSubmission<'a> {
+    receipt: super::cursor_reveal::Receipt<'a>,
+    _state: std::sync::MutexGuard<'a, State>,
+}
+impl HeldSubmission<'_> {
+    pub fn wait_observed(self) -> Result<(), InputError> {
+        self.receipt.wait_observed()
+    }
+}
 impl ButtonSubmission {
     fn acknowledged(self) -> Result<(), InputError> {
         self.acknowledgement
     }
 }
 impl PendingPosition {
+    fn committed(self, current: CGPoint, epoch: u64) -> bool {
+        self.epoch != epoch || current == self.at
+    }
+
     fn resolve(self, current: CGPoint, epoch: u64) -> CGPoint {
         if self.epoch == epoch && (current == self.before || current == self.predecessor) {
             self.at
@@ -124,6 +161,7 @@ impl PendingPosition {
 
 #[derive(Default)]
 struct State {
+    held_source: Option<u64>,
     gesture_trace: crate::gesture_trace::Tracker,
     /// 按下的按钮（按钮编号的位）。
     buttons: u32,
@@ -255,6 +293,10 @@ impl State {
     }
 }
 
+fn source_motion_admitted(held: Option<u64>, admitted_epoch: u64, current_epoch: u64) -> bool {
+    held.is_none() && admitted_epoch == current_epoch
+}
+
 pub(crate) struct Injector {
     safety: Option<Arc<crate::session_gate::SessionGate>>,
     gestures: Mutex<super::gesture_diagnostics::Tracker>,
@@ -265,9 +307,69 @@ pub(crate) struct Injector {
     caps: CapsInjector,
     activity: UserActivity,
     capture_refresh: super::cursor_refresh::Observer,
+    hold_epoch: AtomicU64,
 }
 
 impl Injector {
+    pub(crate) fn freeze_source(
+        &self,
+        generation: u64,
+        freeze: impl FnOnce() -> Result<(), InputError>,
+        publish: impl FnOnce(oink_foundation::dnd::DragAnchor),
+    ) -> Result<oink_foundation::dnd::DragAnchor, InputError> {
+        let mut st = self.lock_state()?;
+        self.check_session(false)?;
+        if st.held_source.is_some() || !st.position_ready(self.motion.position_context()) {
+            return Err(InputError::Platform(
+                "source freeze has an active hold or unconfirmed input".into(),
+            ));
+        }
+        self.hold_epoch.fetch_add(1, Ordering::AcqRel);
+        st.held_source = Some(generation);
+        let pending = st.pending_position;
+        let epoch = self.motion.position_epoch();
+        let result = super::drag_hold::freeze_anchor(generation, freeze, || {
+            // A Session tap receipt precedes WindowServer's cursor commit.
+            // Drain that already-submitted endpoint while physical motion is
+            // dissociated and this ledger excludes further injected movement.
+            // The deadline only fails the hold; it never establishes readiness
+            // and does not post or retry an event.
+            let deadline = Instant::now() + std::time::Duration::from_millis(250);
+            loop {
+                let at = checked_location()?;
+                let cg = CGPoint::new(at.x, at.y);
+                if pending.is_none_or(|p| p.committed(cg, epoch)) {
+                    return Ok(at);
+                }
+                if Instant::now() >= deadline {
+                    return Err(InputError::Platform(
+                        "source freeze: prior injected position did not commit".into(),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        match result {
+            Ok(anchor) => {
+                st.pending_position = None;
+                st.last_pos = Some(CGPoint::new(anchor.at.x, anchor.at.y));
+                publish(anchor);
+                Ok(anchor)
+            }
+            Err(error) => {
+                st.held_source = None;
+                self.hold_epoch.fetch_add(1, Ordering::AcqRel);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn clear_source_hold(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.held_source = None;
+        self.hold_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
     pub(crate) fn new(safety: Arc<crate::session_gate::SessionGate>) -> Result<Self, InputError> {
         let mut injector = Self::with_activity(UserActivity::new()?)?;
         injector.safety = Some(safety);
@@ -290,6 +392,7 @@ impl Injector {
             gestures: Mutex::new(super::gesture_diagnostics::Tracker::default()),
             caps: CapsInjector::default(),
             activity,
+            hold_epoch: AtomicU64::new(0),
         })
     }
 
@@ -298,6 +401,7 @@ impl Injector {
         // releases. Never carry an unacknowledged position, click count or
         // fractional motion/scroll into a resumed input session.
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = State::default();
+        self.hold_epoch.fetch_add(1, Ordering::AcqRel);
         *self.gestures.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         self.physical_buttons.reset();
         self.capture_refresh.boundary();
@@ -320,6 +424,7 @@ impl Injector {
     }
 
     pub(crate) fn inject(&self, event: &InjectEvent) -> Result<(), InputError> {
+        let hold_epoch = self.hold_epoch.load(Ordering::Acquire);
         self.check_session(matches!(
             event,
             InjectEvent::Key { pressed: false, .. } | InjectEvent::Button { pressed: false, .. }
@@ -364,6 +469,16 @@ impl Injector {
             return result;
         }
         let mut st = self.lock_state()?;
+        if matches!(
+            event,
+            InjectEvent::MoveRelative { .. } | InjectEvent::MoveTo { .. } | InjectEvent::MoveToWithDelta { .. }
+        ) && !source_motion_admitted(st.held_source, hold_epoch, self.hold_epoch.load(Ordering::Acquire))
+        {
+            // The ordinary queue may already contain motion from before the
+            // handoff. It must not relocate a frozen third-party drag. Explicit
+            // held-source refresh/move/return calls use their generation instead.
+            return Ok(());
+        }
         // Recheck after acquiring the ledger: another native call may have
         // blocked across a pause while holding this mutex.
         self.check_session(matches!(
@@ -507,12 +622,13 @@ impl Injector {
     pub(crate) fn release_physical_drag(&self) -> Result<(), InputError> {
         self.activity.request();
         let mut st = self.lock_state()?;
-        self.button(
+        self.button_with_modifiers(
             &mut st,
             MouseButton::Left,
             false,
             CGEventTapLocation::SessionEventTap,
             None,
+            ButtonModifiers::SourceRelease,
         )
         .and_then(ButtonSubmission::acknowledged)
     }
@@ -537,19 +653,20 @@ impl Injector {
     }
     /// The physical UP may already have been swallowed, so st.buttons can be
     /// zero. Force the event type without creating DOWN or changing ownership.
-    pub(crate) fn move_held_drag(&self, at: Point, posted: &dyn Fn(Point)) -> Result<(), InputError> {
+    pub(crate) fn submit_held_drag(&self, at: Point, posted: &dyn Fn(Point)) -> Result<HeldSubmission<'_>, InputError> {
         let mut st = self.lock_state()?;
         self.check_session(false)?;
-        self.move_with_buttons_observed(&mut st, at, None, false, 1, posted)
+        let receipt = self.submit_move_with_buttons(&mut st, at, None, false, 1, Some(posted))?;
+        Ok(HeldSubmission { receipt, _state: st })
     }
 
-    pub(crate) fn nudge_held_drag(
+    pub(crate) fn submit_held_nudge(
         &self,
         at: Point,
         button: MouseButton,
         posted: &dyn Fn(oink_foundation::dnd::ImageNudgePost),
-    ) -> Result<(), InputError> {
-        self.with_image_nudge(at, button, |event| {
+    ) -> Result<HeldSubmission<'_>, InputError> {
+        self.with_image_nudge(at, button, |event, st| {
             // macOS can leave destination image changes unapplied until source
             // drag tracking handles another mouse event; our frozen cursor
             // supplies none, so the old image remains visible. One
@@ -578,20 +695,20 @@ impl Injector {
             });
             // Capture accounts the marked absolute placement once. Do not touch
             // last_pos, pending_position, delta_rem, or the button/key ledger here.
-            receipt.wait()
+            Ok(HeldSubmission { receipt, _state: st })
         })
     }
 
-    fn with_image_nudge(
-        &self,
+    fn with_image_nudge<'a, T>(
+        &'a self,
         at: Point,
         button: MouseButton,
-        submit: impl FnOnce(&CGEvent) -> Result<(), InputError>,
-    ) -> Result<(), InputError> {
+        submit: impl FnOnce(&CGEvent, std::sync::MutexGuard<'a, State>) -> Result<T, InputError>,
+    ) -> Result<T, InputError> {
         let st = self.lock_state()?;
         self.check_session(false)?;
         let event = image_nudge_event(self.src(), at, button, self.flags(&st))?;
-        submit(&event)
+        submit(&event, st)
     }
 
     pub(crate) fn rebase_pointer_motion(&self) -> Result<Point, InputError> {
@@ -657,18 +774,19 @@ impl Injector {
         relative: bool,
         buttons: u32,
     ) -> Result<(), InputError> {
-        self.move_with_buttons_observed(st, pos, delta, relative, buttons, &|_| {})
+        self.submit_move_with_buttons(st, pos, delta, relative, buttons, None)?
+            .wait()
     }
 
-    fn move_with_buttons_observed(
+    fn submit_move_with_buttons(
         &self,
         st: &mut State,
         pos: Point,
         delta: Option<(f64, f64)>,
         relative: bool,
         buttons: u32,
-        posted: &dyn Fn(Point),
-    ) -> Result<(), InputError> {
+        posted: Option<&dyn Fn(Point)>,
+    ) -> Result<super::cursor_reveal::Receipt<'_>, InputError> {
         let (ty, button, num) = drag_type(buttons);
         let ev = motion_event(self.src(), ty, quartz_point(pos), button)?;
         // Track the actual posted drag endpoint, including native lookup
@@ -704,11 +822,13 @@ impl Injector {
                 epoch,
             });
             st.last_pos = Some(p);
-            return receipt.wait();
+            return Ok(receipt);
         }
         let receipt = self.motion.submit_cg(&ev, CGEventTapLocation::HIDEventTap)?;
         st.last_move_native = false;
-        posted(Point::new(p.x, p.y));
+        if let Some(posted) = posted {
+            posted(Point::new(p.x, p.y));
+        }
         // Absolute drag delivery has the same cursor-commit lag as a native
         // move. Its immediately following UP must retain the accepted endpoint.
         if !relative {
@@ -720,7 +840,7 @@ impl Injector {
             });
         }
         st.last_pos = Some(p);
-        receipt.wait()
+        Ok(receipt)
     }
 
     pub(super) fn last_cursor_target(&self) -> Option<(Point, f64)> {
@@ -749,6 +869,19 @@ impl Injector {
         tap: CGEventTapLocation,
         at: Option<Point>,
     ) -> Result<ButtonSubmission, InputError> {
+        let modifiers = ButtonModifiers::for_button(st.held_source.is_some(), button, pressed);
+        self.button_with_modifiers(st, button, pressed, tap, at, modifiers)
+    }
+
+    fn button_with_modifiers(
+        &self,
+        st: &mut State,
+        button: MouseButton,
+        pressed: bool,
+        tap: CGEventTapLocation,
+        at: Option<Point>,
+        modifiers: ButtonModifiers,
+    ) -> Result<ButtonSubmission, InputError> {
         let num = button_number(button);
         if pressed && at.is_none() && !st.position_ready(self.motion.position_context()) {
             return Err(InputError::Platform(
@@ -770,7 +903,16 @@ impl Injector {
         };
         let now = Instant::now();
         let count = st.click_count(num, pressed, p, now, system::double_click_interval());
-        let flags = self.flags(st);
+        // This source UP commits a Copy into Oink's catcher, independently of
+        // the remote target's COPY/MOVE modifier. HID flags still include a
+        // physical Ctrl whose FlagsChanged event was swallowed and forwarded.
+        // Reusing those flags on UP makes AppKit change Copy to None, bypassing
+        // performDragOperation and cancelling the source before its authority
+        // reply commits. Native macOS 26.6.2 file-drag A/B: Ctrl UP rejects,
+        // neutral UP accepts. Do not release keys or change their ledger: the
+        // target must keep its modifier until its real key-up. Ordinary pointer
+        // events, held positioning, and return-to-source keep their modifiers.
+        let flags = modifiers.resolve(self.flags(st));
         super::keyboard_diagnostics::button_flags(flags.0);
         // A drag returning to its input device needs a new AppKit DOWN while
         // the source button is still held at HID (its first DOWN was routed
@@ -1183,6 +1325,36 @@ pub(crate) fn cg_phases(p: ScrollPhase) -> (i64, i64) {
 
 #[cfg(all(test, debug_assertions))]
 mod tests {
+    #[test]
+    fn source_freeze_waits_for_exact_posted_endpoint_or_a_newer_physical_epoch() {
+        use super::*;
+        let pending = PendingPosition {
+            before: CGPoint::new(100., 4.),
+            predecessor: CGPoint::new(100., 2.),
+            at: CGPoint::new(100., 0.),
+            epoch: 7,
+        };
+        assert!(!pending.committed(pending.before, 7));
+        assert!(!pending.committed(pending.predecessor, 7));
+        assert!(!pending.committed(CGPoint::new(101., 1.), 7));
+        assert!(pending.committed(pending.at, 7));
+        assert!(pending.committed(CGPoint::new(101., 1.), 8));
+    }
+
+    #[test]
+    fn source_hold_fences_delayed_injection_through_return_without_blocking_fresh_motion() {
+        // Admission is sampled before waiting for the injector ledger. A move
+        // already waiting when freeze commits must not cross either boundary.
+        let before_hold = 0;
+        let after_freeze = 1;
+        let after_return = 2;
+        assert!(!super::source_motion_admitted(Some(42), before_hold, after_freeze));
+        assert!(!super::source_motion_admitted(Some(42), after_freeze, after_freeze));
+        assert!(!super::source_motion_admitted(None, before_hold, after_return));
+        assert!(!super::source_motion_admitted(None, after_freeze, after_return));
+        assert!(super::source_motion_admitted(None, after_return, after_return));
+    }
+
     use super::*;
 
     #[test]
@@ -1254,20 +1426,21 @@ mod tests {
             });
         }
         let mut count = 0;
-        let result = injector.with_image_nudge(Point::new(at.x, at.y), MouseButton::Right, |event| {
-            count += 1;
-            assert_eq!(CGEvent::r#type(Some(event)), CGEventType::RightMouseDragged);
-            assert_eq!(
-                CGEvent::integer_value_field(Some(event), CGEventField::MouseEventDeltaX),
-                0
-            );
-            assert_eq!(
-                CGEvent::integer_value_field(Some(event), CGEventField::MouseEventDeltaY),
-                0
-            );
-            assert!(CGEvent::flags(Some(event)).contains(CGEventFlags::MaskCommand));
-            Err(InputError::Platform("fake lost ACK".into()))
-        });
+        let result: Result<(), InputError> =
+            injector.with_image_nudge(Point::new(at.x, at.y), MouseButton::Right, |event, _state| {
+                count += 1;
+                assert_eq!(CGEvent::r#type(Some(event)), CGEventType::RightMouseDragged);
+                assert_eq!(
+                    CGEvent::integer_value_field(Some(event), CGEventField::MouseEventDeltaX),
+                    0
+                );
+                assert_eq!(
+                    CGEvent::integer_value_field(Some(event), CGEventField::MouseEventDeltaY),
+                    0
+                );
+                assert!(CGEvent::flags(Some(event)).contains(CGEventFlags::MaskCommand));
+                Err(InputError::Platform("fake lost ACK".into()))
+            });
         assert!(result.is_err());
         assert_eq!(count, 1);
         let st = injector.state.lock().unwrap();
@@ -1513,6 +1686,34 @@ mod tests {
                 bit
             );
         }
+    }
+
+    #[test]
+    fn held_source_up_does_not_reintroduce_forwarded_modifiers() {
+        // HID may still contain Ctrl after capture forwards its FlagsChanged;
+        // injected modifiers can also remain while another device drives this
+        // source. Neither is the Copy destination's keyboard state.
+        let injected = HashSet::from([0x3A, 0x37]); // Option and Command
+        let flags = compose_flags(&injected, CGEventFlags::MaskControl.0, true);
+        assert!(flags.contains(CGEventFlags::MaskControl));
+        assert!(flags.contains(CGEventFlags::MaskAlternate));
+        assert!(flags.contains(CGEventFlags::MaskCommand));
+        for held in [false, true] {
+            for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+                for pressed in [false, true] {
+                    let actual = ButtonModifiers::for_button(held, button, pressed).resolve(flags);
+                    if held && button == MouseButton::Left && !pressed {
+                        assert_eq!(actual, CGEventFlags::empty());
+                    } else {
+                        assert_eq!(actual, flags, "ordinary/return events retain their modifiers");
+                    }
+                }
+            }
+        }
+        // A dedicated source-release command stays neutral after a lost hold;
+        // neither route releases keys or mutates the injected key ledger.
+        assert_eq!(ButtonModifiers::SourceRelease.resolve(flags), CGEventFlags::empty());
+        assert_eq!(injected, HashSet::from([0x3A, 0x37]));
     }
 
     #[test]

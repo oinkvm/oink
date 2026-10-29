@@ -441,3 +441,87 @@ fn target_contacts_off_reaches_windows_shortcut_mapper() {
     }
     assert_eq!(actions, vec![WinAction::CtrlWheel(1)]);
 }
+
+#[test]
+fn touchpad_options_matrix_reaches_windows_mapper_for_non_scroll_gestures() {
+    use oink_foundation::input::{Gesture, GesturePhase, SwipeAxis};
+    use oink_input::win_actions::{GestureMapper, WinAction};
+    for parent in [false, true] {
+        for native in [false, true] {
+            for mac in [false, true] {
+                for gesture in [
+                    Gesture::Magnify {
+                        phase: GesturePhase::Began,
+                        amount: 0.2,
+                    },
+                    Gesture::Rotate {
+                        phase: GesturePhase::Began,
+                        degrees: 30.,
+                    },
+                    Gesture::SmartMagnify,
+                    Gesture::DockSwipe {
+                        axis: SwipeAxis::Horizontal,
+                        phase: GesturePhase::Ended,
+                        progress: 0.2,
+                        velocity: 0.,
+                    },
+                ] {
+                    let (source, mut target) = pair_target(Os::Windows);
+                    target.set_touchpad_contacts(Some(5));
+                    target.set_peer_os(source.device(), Os::MacOS, 0);
+                    target.set_peer_touchpad_options(source.device(), true);
+                    let mut settings = target.config().settings.clone();
+                    settings.touchpad_injection = parent;
+                    settings.native_multifinger = native;
+                    settings.mac_scroll_feel = mac;
+                    target.set_settings(settings);
+                    target.drain_outputs();
+                    // A committed Dock swipe is not a start; send its Began first.
+                    if let Gesture::DockSwipe { axis, .. } = gesture {
+                        target.input_message(
+                            source.device(),
+                            Message::Input(oink_routing::input::InputMsg::Gesture {
+                                source: SourceKind::Touchpad,
+                                gesture: Gesture::DockSwipe {
+                                    axis,
+                                    phase: GesturePhase::Began,
+                                    progress: 0.,
+                                    velocity: 0.,
+                                },
+                            }),
+                            0,
+                        );
+                        target.drain_outputs();
+                    }
+                    target.input_message(
+                        source.device(),
+                        Message::Input(oink_routing::input::InputMsg::Gesture {
+                            source: SourceKind::Touchpad,
+                            gesture,
+                        }),
+                        0,
+                    );
+                    let mut mapper = GestureMapper::default();
+                    let mut mapped = false;
+                    let mut actions = Vec::new();
+                    for out in target.drain_outputs() {
+                        if let Output::Inject(InjectEvent::Gesture(g)) = out {
+                            mapped = true;
+                            actions.extend(mapper.map(&g));
+                        }
+                    }
+                    assert_eq!(mapped, !parent || !native, "{parent} {native} {mac} {gesture:?}");
+                    if !parent || !native {
+                        match gesture {
+                            Gesture::Magnify { .. } => assert_eq!(actions, [WinAction::CtrlWheel(2)]),
+                            Gesture::DockSwipe { .. } => {
+                                assert!(matches!(actions.as_slice(), [WinAction::Shortcut(_)]))
+                            }
+                            _ => assert!(actions.is_empty()),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

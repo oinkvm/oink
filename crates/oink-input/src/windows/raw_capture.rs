@@ -169,7 +169,7 @@ impl RawCapture {
                     {
                         lease.armed = true;
                         // SAFETY: a one-pixel rectangle at the existing covered park point.
-                        let result = super::cursor_clip::acquire(lease.owned);
+                        let result = super::cursor_clip::acquire(lease.owned, lease.previous);
                         super::trace::clip_action(lease.owned, 1, result.is_ok());
                         if result.is_ok() {
                             tracing::info!(active = true, "remote game raw capture ready");

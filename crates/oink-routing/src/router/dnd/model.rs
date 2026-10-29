@@ -552,6 +552,7 @@ fn group_metadata() -> Vec<ClipData> {
     use oink_foundation::content::{ContentSize, FileNode, NodeId, NodeKind};
     vec![
         ClipData::FileRoots(vec![FileNode {
+            exec_bits: None,
             id: NodeId(1),
             parent: None,
             name: "model.txt".into(),

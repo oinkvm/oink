@@ -161,7 +161,6 @@ export function createLayoutProfilesFixture(options: LayoutProfilesFixtureOption
   const work = new Set<Promise<void>>();
   const now = () => { clock = [clock + 1n, BigInt(Math.floor((options.now ?? Date.now)()))].reduce((a, b) => a > b ? a : b); return clock; };
   const match = () => JSON.stringify(devices.map(d => ({ device: d.device,
-    online: d.availability !== 'offline',
     screens: snapshot.native.find(n => n.device === d.device)?.screens.map(s => s.screen.display).sort() ?? null,
   })).sort((a, b) => compare(a.device, b.device)));
   let profiles: Profile[] = [{ id: snapshot.active_profile_id, name: { kind: 'default' },

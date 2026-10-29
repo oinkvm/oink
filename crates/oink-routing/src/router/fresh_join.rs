@@ -20,6 +20,12 @@ impl Router {
         self.claim = self.me();
         self.rejoin = false;
         self.focus_lock = None;
+        self.set_owner_pointer_locked(false);
+        self.lock_escape_sources.clear();
+        self.lock_escape_keys.clear();
+        self.last_lock_escape = false;
+        self.lock_escape_target = None;
+        self.entry_protection = Default::default();
         self.peers.clear();
     }
 

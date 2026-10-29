@@ -119,6 +119,15 @@ pub enum PreparationStage {
     SourceRead,
     Normalization,
     NativePreparation,
+    Metadata,
+    PendingWindow,
+    SourcePress,
+    NativeAcknowledgement,
+    WritersPreview,
+    NativeBegin,
+    Preview,
+    Namespace,
+    Registration,
 }
 static PREPARATION_OBSERVER: std::sync::OnceLock<fn(PreparationStage, std::time::Instant, std::time::Instant)> =
     std::sync::OnceLock::new();
@@ -156,6 +165,40 @@ impl NativeBeginTiming {
     }
 }
 
+/// One bounded native operation slot. An old callback cannot consume a replacement.
+#[derive(Default, Debug)]
+pub struct TargetStartObservation(Option<(DragOperation, NativeBeginTiming)>);
+impl TargetStartObservation {
+    pub fn arm(&mut self, operation: DragOperation, timing: NativeBeginTiming) {
+        self.0 = Some((operation, timing));
+    }
+    pub fn take(&mut self, operation: DragOperation) -> Option<NativeBeginTiming> {
+        if self.0.as_ref().is_some_and(|(current, _)| *current == operation) {
+            self.0.take().map(|(_, timing)| timing)
+        } else {
+            None
+        }
+    }
+}
+/// Native source boundaries on one host; no content or cross-host clock.
+#[derive(Clone, Copy, Debug)]
+pub struct SourceTiming {
+    pub operation: DragOperation,
+    pub probed_at: Option<std::time::Instant>,
+    pub recognized_at: std::time::Instant,
+    pub native_read_at: std::time::Instant,
+    pub inventory_at: std::time::Instant,
+}
+static SOURCE_OBSERVER: std::sync::OnceLock<fn(SourceTiming)> = std::sync::OnceLock::new();
+pub fn set_source_observer(observer: fn(SourceTiming)) {
+    let _ = SOURCE_OBSERVER.set(observer);
+}
+pub(crate) fn source_timing(timing: SourceTiming) {
+    if let Some(observer) = SOURCE_OBSERVER.get() {
+        observer(timing);
+    }
+}
+
 /// 平台事件的接收者（可能在任意线程调用，必须很快返回）。
 pub type DndSink = Arc<dyn Fn(PlatformDndEvent) + Send + Sync>;
 
@@ -177,6 +220,21 @@ pub type SourceImageNudge = Arc<
         + Send
         + Sync,
 >;
+
+/// Native Mac source transitions share the input owner's serialized ledger.
+pub type SourceReturn = Arc<dyn Fn(DragOperation, Point, &dyn Fn(Point)) -> Result<(), String> + Send + Sync>;
+
+/// Callbacks owned by the input backend for one native source's transitions.
+pub struct SourceHoldInput {
+    pub freeze: Arc<dyn Fn(DragOperation) -> Result<oink_foundation::dnd::DragAnchor, String> + Send + Sync>,
+    pub relocate: Arc<dyn Fn(DragOperation, Point) -> Result<(), String> + Send + Sync>,
+    pub return_to: SourceReturn,
+}
+impl std::fmt::Debug for SourceHoldInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceHoldInput").finish_non_exhaustive()
+    }
+}
 
 /// Numeric once-per-native-Begin summary, including early failures. No native
 /// window handle, application identity or per-motion record is exported.
@@ -239,6 +297,11 @@ pub trait DndBackend: Send + Sync {
     fn set_source_press(&self, _press: SourcePress) {}
     fn set_source_start(&self, _start: SourceStart) {}
     fn set_source_image_nudge(&self, _nudge: SourceImageNudge) {}
+    fn set_source_hold_input(&self, _input: SourceHoldInput) {}
+    /// Mac commits its input anchor before it hides source artwork.
+    fn source_hold_installs_anchor(&self) -> bool {
+        false
+    }
     /// Arm deferred artwork refreshes after the input anchor has been installed.
     fn source_hold_ready(&self, _operation: DragOperation) {}
     /// Revoke queued artwork events before any source-button release.
@@ -275,6 +338,10 @@ pub trait DndBackend: Send + Sync {
     /// Resume the original source session. Never inject Down or call begin.
     fn resume_source(&self, _operation: DragOperation) -> bool {
         false
+    }
+    /// Restore the logical routing point while the native source is still hidden.
+    fn resume_source_at(&self, operation: DragOperation, _at: Option<Point>) -> bool {
+        self.resume_source(operation)
     }
     /// Attach the router's exact numeric inputs to this native hold's summary.
     fn observe_source_cancel_geometry(
@@ -353,6 +420,9 @@ pub trait DndBackend: Send + Sync {
         false
     }
 
+    /// Detection only: a target release is about to be submitted. Must not wait.
+    fn observe_target_drop(&self, _operation: DragOperation) {}
+
     /// 发起拖拽（放小窗、注入左键按下、开始系统拖拽）。失败时平台自己注入抬起（如果注入过按下）。
     fn begin(&self, spec: DragSpec) -> Result<(), ClipboardError>;
     /// Observe AppKit willBegin or Windows OLE loop entry without waiting.
@@ -366,6 +436,9 @@ pub trait DndBackend: Send + Sync {
     ) {
         callback(None);
     }
+
+    /// Arm before Begin. The backend completes at AppKit API return / OLE call entry.
+    fn target_start_timing(&self, _operation: DragOperation, _timing: Option<NativeBeginTiming>) {}
 
     fn observe_native_timing(&self, _operation: DragOperation, _wait: bool, _timing: NativeBeginTiming) {}
 
@@ -484,5 +557,35 @@ mod cancel_order_tests {
             ));
             assert_eq!(*events.lock().unwrap(), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod target_start_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+    static RECORDED: AtomicU64 = AtomicU64::new(0);
+    fn record(_: u64, start: Instant, end: Instant) {
+        RECORDED.fetch_add(end.duration_since(start).as_micros() as u64, Ordering::Relaxed);
+    }
+    #[test]
+    fn target_start_is_once_only_keyed_and_retired_on_replacement() {
+        let at = Instant::now();
+        let first = DragOperation::new();
+        let next = DragOperation::new();
+        let timing = NativeBeginTiming {
+            generation: 7,
+            queued_at: at,
+            record,
+        };
+        let mut slot = TargetStartObservation::default();
+        slot.arm(first, timing);
+        assert!(slot.take(next).is_none());
+        slot.arm(next, timing);
+        assert!(slot.take(first).is_none());
+        slot.take(next).unwrap().complete(Some(at + Duration::from_micros(42)));
+        assert!(slot.take(next).is_none());
+        assert_eq!(RECORDED.load(Ordering::Relaxed), 42);
     }
 }

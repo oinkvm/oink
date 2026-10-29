@@ -395,7 +395,10 @@ impl Capture {
 }
 fn event(sample: Sample) -> CapturedEvent {
     CapturedEvent {
-        physical: false,
+        // Nonempty validated snapshots come from the hardware contact callback.
+        // Empty lift attestations and corruption/overflow sentinels can also be
+        // synthesized by Delivery; those must never renew group activity.
+        physical: sample.valid() && sample.len != 0,
         source: SourceKind::Touchpad,
         time_us: sample.time_us,
         cursor: None,
@@ -422,6 +425,32 @@ impl Drop for Capture {
 mod tests {
     use super::*;
     static REMOTE: AtomicBool = AtomicBool::new(true);
+    #[test]
+    fn hardware_contact_activity_excludes_delivery_lifts_and_faults() {
+        let mut sample = Sample {
+            device: 1,
+            surface: Surface {
+                width: 15000,
+                height: 9000,
+            },
+            len: 1,
+            ..Default::default()
+        };
+        sample.contacts[0] = oink_foundation::contacts::Contact {
+            id: 1,
+            x: 5000,
+            y: 4000,
+        };
+        assert!(event(sample).physical);
+        sample.len = 0;
+        assert!(!event(sample).physical);
+        sample.len = 255;
+        assert!(!event(sample).physical);
+        sample.len = 1;
+        sample.contacts[0].id = 0;
+        assert!(!event(sample).physical);
+    }
+
     #[test]
     fn capture_fault_preserves_full_lift_and_reports_subsequent_faults() {
         let shared = Shared {

@@ -133,7 +133,9 @@ fn pause_resume_injection(delay_initial_injection: bool) {
     let snapshots = InputSnapshots {
         mode_switch_in_callback: true,
         capture_reports_key_repeat: false,
+        local_input_transform: oink_foundation::input_transform::InputTransform::initial(std::env::consts::OS),
         layout: Arc::new(Snapshot::new(RouterLayout {
+            application_focus_enabled: false,
             group: oink_foundation::GroupId([0; 16]),
             owners: Arc::default(),
             version: fixture_version(),
@@ -303,6 +305,7 @@ fn physical_input_driving_a_peer_declares_local_activity_with_group_wake_disable
         (peer(), vec![display]),
     ]));
     h.driver.snapshots.layout.publish(RouterLayout {
+        application_focus_enabled: false,
         group: oink_foundation::GroupId([0; 16]),
         owners: Arc::default(),
         version: fixture_version(),
@@ -510,4 +513,34 @@ fn ordinary_input_backlog_is_guarded_and_old_work_cannot_age_a_resumed_session()
     h.driver.check_backlog(at + Duration::from_secs(10));
     assert!(!h.driver.paused);
     drop(old);
+}
+
+#[test]
+fn session_idle_refresh_rechecks_pause_sleep_wake_setting_and_input_safety() {
+    let fake = Arc::new(oink_test_support::input::FakeInput::new());
+    let mut h = Harness::with_backend(fake.clone());
+    h.driver.command(InputCommand::Paused(false));
+    assert!(h.driver.idle_refresh_allowed());
+    let mut settings = (*h.driver.snapshots.settings.load()).clone();
+    settings.wake_displays_on_input = false;
+    h.driver.snapshots.settings.publish(settings.clone());
+    assert!(!h.driver.idle_refresh_allowed(), "setting takes effect before polling");
+    settings.wake_displays_on_input = true;
+    h.driver.snapshots.settings.publish(settings);
+    assert!(h.driver.idle_refresh_allowed());
+    h.driver.command(InputCommand::Paused(true));
+    assert!(!h.driver.idle_refresh_allowed());
+    h.driver.command(InputCommand::Paused(false));
+    wait(|| {
+        h.poll();
+        h.driver.idle_refresh_allowed()
+    });
+    Arc::make_mut(&mut h.driver.environment).system_sleeping = true;
+    assert!(!h.driver.idle_refresh_allowed());
+    Arc::make_mut(&mut h.driver.environment).system_sleeping = false;
+    fake.set_input_paused(true);
+    assert!(
+        !h.driver.idle_refresh_allowed(),
+        "native safety revocation wins before the next owner poll"
+    );
 }

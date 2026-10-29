@@ -1,5 +1,61 @@
 use super::*;
 #[test]
+fn tiff_only_data_object_projects_pixels_to_mac_and_retains_windows_bytes() {
+    super::tests::sta(|| {
+        struct NoFiles;
+        impl crate::FileContents for NoFiles {
+            fn open(&self, _: usize) -> io::Result<crate::FileReader> {
+                unreachable!()
+            }
+        }
+        let pixels = [255, 0, 30, 255, 0, 210, 40, 255, 20, 30, 255, 255, 80, 140, 210, 128];
+        let mut tiff = io::Cursor::new(Vec::new());
+        image::codecs::tiff::TiffEncoder::new(&mut tiff)
+            .encode(&pixels, 2, 2, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let tiff = tiff.into_inner();
+        let formats = super::super::formats();
+        let (object, _) = super::super::vfile::build(
+            super::super::vfile::Spec {
+                cloud: None,
+                descriptors: super::super::files::descriptors(&[]),
+                fixed: vec![(6, tiff.clone())],
+                contents: Arc::new(NoFiles),
+                cf_descriptor: formats.file_descriptor,
+                cf_contents: formats.file_contents,
+            },
+            false,
+        );
+        let id = crate::content::tests::fixture().inventory().id;
+        let captured = inventory(&object, id).unwrap();
+        let wanted: Vec<_> = captured.wanted(ClipPlatform::Mac).collect();
+        assert_eq!(wanted.len(), 1, "a CF_TIFF-only drag must publish a Mac image item");
+        let rep = wanted[0];
+        assert_eq!(rep.format, NativeFormat::WindowsPredefined(6));
+        assert_eq!(rep.standard, Some(StandardFormat::Png));
+        let dir = tempfile::tempdir().unwrap();
+        let source = snapshot(&object, dir.path(), id).unwrap();
+        let projected =
+            content::read_all(&mut content::open_for(source.as_ref(), rep.id, ClipPlatform::Mac).unwrap()).unwrap();
+        let decoded = content::decode_standard(rep, &projected).unwrap();
+        let [ClipData::Png(png)] = decoded.as_slice() else {
+            panic!("TIFF must project to an image")
+        };
+        let actual = super::super::image::decode_png(png).unwrap();
+        assert_eq!((actual.width, actual.height), (2, 2));
+        assert_eq!(actual.data, pixels);
+        assert_eq!(
+            content::read_all(&mut content::open_for(source.as_ref(), rep.id, ClipPlatform::Windows).unwrap()).unwrap(),
+            tiff
+        );
+        assert_eq!(
+            content::reason(&WindowsTranslator.standard(rep, b"invalid TIFF").unwrap_err()),
+            Unavailable::InvalidData
+        );
+    });
+}
+
+#[test]
 fn all_registered_standard_names_match_case_and_png_mime_variants() {
     for (name, expected) in [
         ("html format", StandardFormat::Html),
@@ -63,7 +119,6 @@ fn foreign_target_retains_later_candidates_for_every_standard_binding() {
                 rep.data = if i == 0 {
                     RepresentationData::Reader {
                         size: ContentSize::Unknown,
-                        hash: None,
                     }
                 } else {
                     RepresentationData::Inline(match kind {
@@ -82,7 +137,14 @@ fn foreign_target_retains_later_candidates_for_every_standard_binding() {
             })
             .unwrap();
             let formats = target.formats();
-            assert_eq!(formats.len(), if kind == StandardFormat::Png { 3 } else { 1 });
+            assert_eq!(
+                formats.len(),
+                match kind {
+                    StandardFormat::Png => 3,
+                    StandardFormat::Text => 4,
+                    _ => 1,
+                }
+            );
             for f in formats {
                 let mut medium = target
                     .get(&f, || diagnostics::Publication::new().observe(Some(false)))

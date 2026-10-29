@@ -11,6 +11,7 @@ pub use oink_foundation::input::{
     InputPermissions, KeyCode, MouseButton, PermissionState, ScrollPhase, ScrollUnit, SourceKind, SwipeAxis,
 };
 
+pub mod application_focus;
 pub mod capture_continuity;
 #[cfg(any(target_os = "macos", all(test, debug_assertions)))]
 mod contact_capture;
@@ -21,6 +22,7 @@ mod deferred_activity;
 #[cfg(any(target_os = "macos", all(test, debug_assertions)))]
 mod mt_contacts;
 pub mod mt_trace;
+pub mod power;
 pub use contact_status::{ContactInitError, ContactInjectionStatus};
 pub mod button_diagnostics;
 pub mod capture_loop;
@@ -118,6 +120,45 @@ pub type EventHandler = Arc<dyn Fn(&CapturedEvent) -> Disposition + Send + Sync>
 /// - 切到 `Remote` 时先隐藏再停靠 / 冻结：光标不能在别处露出来。
 /// - 所有方法可以从任意线程调用。
 pub trait InputBackend: Send + Sync {
+    /// A fake platform may drive application-focus deadlines explicitly. This
+    /// hook is absent from releases and defaults to the production wall clock.
+    #[cfg(debug_assertions)]
+    fn application_focus_test_clock(&self) -> Option<oink_foundation::application_focus::TestClock> {
+        None
+    }
+    /// Ordinary-thread application-focus interface. Backends marshal native UI
+    /// work onto their window owner; the capture thread never calls these methods.
+    fn application_focus_supported(&self) -> bool {
+        false
+    }
+    /// Install on the native owner. Each callback captures its pointer claim at
+    /// registration; callers must never relabel queued observations.
+    fn application_focus_watch(&self, _observer: Option<application_focus::Observer>) {}
+    /// Explicit sampling must return a fresh stamp even when the foreground is
+    /// unchanged: a new pointer claim cannot reuse an old claim's evidence.
+    fn application_focus_sample(&self) -> oink_foundation::application_focus::Observation {
+        use oink_foundation::application_focus::{Foreground, Observation, ObservationStamp};
+        Observation {
+            stamp: ObservationStamp {
+                generation: 1,
+                sequence: 1,
+            },
+            foreground: Foreground::Unavailable,
+            hidden_lost: false,
+            park_operation: None,
+        }
+    }
+    fn application_focus_park(
+        &self,
+        _expected: oink_foundation::application_focus::ObservationStamp,
+        _operation: u64,
+        _permit: application_focus::Permit,
+    ) -> oink_foundation::application_focus::ParkResult {
+        oink_foundation::application_focus::ParkResult::Unavailable
+    }
+    fn application_focus_cancel(&self, _operation: u64) {}
+    /// Dismiss our hidden window; this never restores a saved application.
+    fn application_focus_dismiss(&self) {}
     /// Atomic only: no native permission query on capture/injection threads.
     fn input_safety(&self) -> session_gate::InputSafety {
         Default::default()
@@ -195,6 +236,16 @@ pub trait InputBackend: Send + Sync {
     fn set_drag_anchor(&self, _anchor: Option<oink_foundation::dnd::DragAnchor>) -> Result<(), InputError> {
         Err(InputError::Unsupported)
     }
+    /// Freeze the Mac source and publish the position sampled in that same
+    /// transition. Fence ordinary injected motion until the anchor is cleared.
+    fn freeze_drag_anchor(&self, _generation: u64) -> Result<oink_foundation::dnd::DragAnchor, InputError> {
+        Err(InputError::Unsupported)
+    }
+    /// One acknowledged move of an already hidden source. Requires the exact
+    /// current anchor and commits the new anchor/frozen ledger together.
+    fn relocate_drag_anchor(&self, _generation: u64, _at: Point) -> Result<(), InputError> {
+        Err(InputError::Unsupported)
+    }
     /// Send one tagged left-dragged event to the held Mac source before cancel.
     /// Preserve button ownership, frozen cursor state and the motion ledger.
     fn move_held_drag(&self, _generation: u64, _at: Point) -> Result<(), InputError> {
@@ -225,13 +276,28 @@ pub trait InputBackend: Send + Sync {
     ///
     /// 平台实现应在截获线程上**原子地**完成「光标仍隐藏时放到 `at` → 切到 `Local` → 显示」，保证：
     /// 光标不会先在停靠点露出来；这期间的物理移动不会把光标拉回停靠点；之后的第一个移动从 `at` 出发。
-    /// 与 `set_mode` 一样可以在截获回调里调用。
+    /// 与 `set_mode` 一样可以在截获回调里调用。Windows 的有限安全复位例外：
+    /// 若原生恢复未完成而本进程仍持有遮罩，可同步定位并撤罩；定位仍失败时允许可见的停靠点。
+    /// 完成可见性核验通过 `restore_local_with_completion` 报告，提交请求成功本身不代表恢复完成。
     ///
     /// 默认实现（不原子）：注入 `MoveTo`、切到 `Local`、再注入一次 `MoveTo`。
     fn restore_local(&self, at: Point) -> Result<(), InputError> {
         self.inject(&InjectEvent::MoveTo { pos: at })?;
         self.set_mode(CaptureMode::Local)?;
         self.inject(&InjectEvent::MoveTo { pos: at })
+    }
+    /// Report restoration after native position/visibility completion. Acceptance
+    /// of an asynchronous request alone must not be reported as completion.
+    /// On an immediate error the callback is not called; superseded accepted
+    /// requests complete with false. Callbacks must not block the capture owner.
+    fn restore_local_with_completion(
+        &self,
+        at: Point,
+        complete: Box<dyn FnOnce(bool) + Send>,
+    ) -> Result<(), InputError> {
+        self.restore_local(at)?;
+        complete(true);
+        Ok(())
     }
     /// 注入一个事件到本机。
     ///
@@ -361,5 +427,8 @@ pub fn platform_backend() -> Result<Box<dyn InputBackend>, InputError> {
     Err(InputError::Unsupported)
 }
 
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+mod mouse_keys;
 #[cfg(any(windows, all(test, debug_assertions)))]
 mod touchpad;

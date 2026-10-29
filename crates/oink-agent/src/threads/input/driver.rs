@@ -62,6 +62,7 @@ pub(super) struct Driver {
     owner_acks: Vec<PendingOwnerApply>,
     capture_fault: Option<oink_protocol::v1::dto::ResourceFaultCode>,
     display_fault: Option<oink_protocol::v1::dto::ResourceFaultCode>,
+    display_failure_since: Option<Instant>,
     update_hold: Option<(u64, Instant)>,
     update_committed: bool,
     local: DeviceId,
@@ -115,6 +116,10 @@ pub(super) struct Driver {
     )>,
     trail_suppressed_sent: Option<bool>,
     status_dirty: bool,
+    application_park: Option<(
+        oink_routing::application_focus::ParkRequest,
+        oink_input::application_focus::Permit,
+    )>,
     input_time: Option<CaptureTime>,
     input_report: Option<crate::telemetry::Stamp>,
     jitter_sources: HashMap<(DeviceId, DeviceId, bool), (oink_input::jitter::Estimator, oink_input::jitter::Estimator)>,
@@ -200,10 +205,22 @@ impl Driver {
         config.capture_reports_key_repeat = snapshots.capture_reports_key_repeat;
         let online = BTreeSet::from([local]);
         let mut router = Router::new(config, Arc::new(layout.topology.with_online(online.clone())));
+        router.set_local_input_transform(snapshots.local_input_transform.clone());
         router.enable_system_clip_recheck(os == Os::Windows);
         router.set_volume_notifications_probe(Arc::new(oink_audio::device_notifications::recent_windows_notifications));
         router.set_settings((*settings).clone());
         let native = inject.backend();
+        #[cfg(debug_assertions)]
+        if let Some(clock) = native.application_focus_test_clock() {
+            router.set_application_focus_test_clock(clock);
+        }
+        router.set_application_focus_enabled(layout.application_focus_enabled, 0);
+        router.set_application_focus_participation(
+            boot,
+            native.application_focus_supported(),
+            (settings.mouse_mode, settings.keyboard_mode),
+            0,
+        );
         router.set_local_feel(native.feel_profile());
         let trail = super::trail::Trail::new();
         trail.duration(settings.cursor_trail_duration_ms);
@@ -228,6 +245,7 @@ impl Driver {
             owner_acks: Vec::new(),
             capture_fault: None,
             display_fault: None,
+            display_failure_since: None,
             update_hold: startup_hold.map(|generation| (generation, now + Duration::from_secs(600))),
             update_committed: startup_hold.is_some(),
             local,
@@ -277,6 +295,7 @@ impl Driver {
             trail_pointer_sent: None,
             trail_suppressed_sent: None,
             status_dirty: true,
+            application_park: None,
             input_time: None,
             input_report: None,
             jitter_sources: HashMap::new(),
@@ -292,7 +311,11 @@ impl Driver {
         let layout = self.snapshots.layout.load();
         if !Arc::ptr_eq(&layout, &self.layout) {
             let focus = self.adapter.router().focus().holder;
-            if focus != self.local && !layout.devices.contains(&focus) {
+            // Input claims can arrive before the ordinary config owner publishes
+            // reconnect availability. Repeated absence in its snapshots is not
+            // a removal: recalling here would broadcast a newer local claim and
+            // pull the whole group's pointer to this otherwise idle member.
+            if focus != self.local && self.layout.devices.contains(&focus) && !layout.devices.contains(&focus) {
                 self.adapter.router_mut().return_pointer_home();
             }
             // Periodic facts may republish an identical snapshot. Reinstalling it
@@ -300,6 +323,10 @@ impl Driver {
             let changed = layout.devices != self.layout.devices
                 || layout.layout != self.layout.layout
                 || layout.owners != self.layout.owners;
+            let now = self.micros();
+            self.adapter
+                .router_mut()
+                .set_application_focus_enabled(layout.application_focus_enabled, now);
             self.layout = layout;
             self.sync_layout(changed);
         }
@@ -324,7 +351,27 @@ impl Driver {
                         .main
                         .send(MainCommand::TrailDuration(settings.cursor_trail_duration_ms));
                 }
+                let disabling_keyboard = settings.keyboard_mode == oink_foundation::input::InputMode::Disabled
+                    && !self.paused
+                    && !self.adapter.router().keyboard_disabled();
+                let held = if disabling_keyboard {
+                    self.inject.backend().held_session_keys()
+                } else {
+                    Vec::new()
+                };
                 self.adapter.router_mut().set_settings((*settings).clone());
+                if disabling_keyboard {
+                    self.adapter.router_mut().release_session_keys(&held);
+                }
+                let boot = self.adapter.router().config().boot;
+                let capable = self.inject.backend().application_focus_supported();
+                let now = self.micros();
+                self.adapter.router_mut().set_application_focus_participation(
+                    boot,
+                    capable,
+                    (settings.mouse_mode, settings.keyboard_mode),
+                    now,
+                );
             }
             self.settings = settings;
             let relative = self.adapter.router().game_mode().active
@@ -384,6 +431,22 @@ impl Driver {
             self.adapter.router_mut().set_layout(Arc::new(topology));
             self.online = online;
         }
+    }
+    fn observe_display_fault(&mut self, fault: oink_protocol::v1::dto::ResourceFaultCode) {
+        self.display_fault = Some(fault);
+        if fault == oink_protocol::v1::dto::ResourceFaultCode::None {
+            self.display_failure_since = None;
+        } else {
+            self.display_failure_since.get_or_insert(self.now);
+        }
+    }
+    fn display_enumeration_fault(&self) -> Option<oink_protocol::v1::dto::ResourceFaultCode> {
+        // Display reconfiguration can briefly yield an error or an empty list.
+        // Preserve immediate resource facts for routing; only the local notice
+        // requires three continuous seconds of failed enumeration.
+        self.display_failure_since
+            .filter(|since| self.now.saturating_duration_since(*since) >= Duration::from_secs(3))
+            .and(self.display_fault)
     }
     fn resource_faults(&self) -> super::ResourceFaults {
         use oink_protocol::v1::dto::ResourceFaultCode;
@@ -452,6 +515,9 @@ impl Driver {
         let status = self.shared.status.load();
         let router = self.adapter.router();
         if !self.status_dirty
+            // Remote commits and timer transitions can change application focus
+            // without a native command or an ordinary routing Status event.
+            && status.application_focus.as_ref() == router.application_focus()
             && status.update_held_input == router.update_input_held()
             && status.update_remote_control == router.update_remote_control(self.micros())
             && status.update_locked == (self.session_locked != Some(false) || self.environment.secure_input)
@@ -469,6 +535,7 @@ impl Driver {
             && status.mouse_mode == router.config().settings.mouse_mode
             && status.keyboard_mode == router.config().settings.keyboard_mode
             && status.resource_faults == self.resource_faults()
+            && status.display_enumeration_fault == self.display_enumeration_fault()
         {
             return;
         }
@@ -498,6 +565,7 @@ impl Driver {
             .collect();
         peers.sort_by_key(|peer| peer.peer);
         let status = InputStatus {
+            application_focus: router.application_focus().cloned(),
             update_held_input: router.update_input_held(),
             update_remote_control: router.update_remote_control(self.micros()),
             update_locked: self.session_locked != Some(false) || self.environment.secure_input,
@@ -509,7 +577,7 @@ impl Driver {
             keyboard_disabled: self.adapter.router().keyboard_disabled(),
             caps_lock_switches_input_source: self.inject.backend().caps_lock_switches_input_source(),
             resource_faults: self.resource_faults(),
-            capture_failed: self.capture_fault == Some(oink_protocol::v1::dto::ResourceFaultCode::CaptureUnavailable),
+            display_enumeration_fault: self.display_enumeration_fault(),
             source_modes_revision: self.source_modes_revision,
             mouse_mode: self.adapter.router().config().settings.mouse_mode,
             keyboard_mode: self.adapter.router().config().settings.keyboard_mode,
@@ -672,6 +740,18 @@ impl Driver {
                 | InputCommand::SendMessage { .. }
         );
         match command {
+            InputCommand::ApplicationFocusObserved { claim, observation } => {
+                let now = self.micros();
+                self.adapter
+                    .router_mut()
+                    .application_focus_observed(&claim, observation, now);
+            }
+            InputCommand::ApplicationFocusApplied { request, result } => {
+                let now = self.micros();
+                self.adapter
+                    .router_mut()
+                    .application_focus_park_completed(&request, result, now);
+            }
             InputCommand::ReceiveEmergency { reply } => {
                 let failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
                 self.inject
@@ -697,12 +777,12 @@ impl Driver {
             InputCommand::ApplyOwnerPreferences {
                 expected_emergency_sequence,
                 mut routing,
-                keyboard_disabled,
                 input_transform,
                 accept_contacts,
                 reply,
             } => {
-                let disabling = keyboard_disabled || routing.mouse_mode == oink_foundation::input::InputMode::Disabled;
+                let disabling =
+                    [routing.keyboard_mode, routing.mouse_mode].contains(&oink_foundation::input::InputMode::Disabled);
                 if disabling && expected_emergency_sequence != self.emergency_sequence {
                     let _ = reply.try_send(Err(oink_protocol::v1::dto::ControlFailure::StaleRevision));
                     return;
@@ -713,7 +793,6 @@ impl Driver {
                 routing.accept_contacts = accept_contacts;
                 self.snapshots.settings.publish(routing);
                 self.refresh();
-                self.command(InputCommand::KeyboardDisabled(keyboard_disabled));
                 self.adapter.router_mut().set_local_input_transform(input_transform);
                 self.owner_fence(reply, failures, false, disabling.then_some(expected_emergency_sequence));
             }
@@ -849,6 +928,9 @@ impl Driver {
                 let result = self.adapter.router_mut().lock_focus_to(target);
                 let _ = reply.try_send(result);
             }
+            InputCommand::MovePointerTo(target) => {
+                let _ = self.adapter.router_mut().move_pointer_to(target);
+            }
             InputCommand::ReturnPointerHome => self.adapter.router_mut().return_pointer_home(),
             InputCommand::PeerAdmission(admission) => {
                 let peer = admission.boot.device_id;
@@ -867,6 +949,12 @@ impl Driver {
                     self.adapter.clear_received(peer);
                 }
                 self.adapter.router_mut().admit_boot(admission.boot);
+                let now = self.micros();
+                self.adapter.router_mut().set_application_focus_capability(
+                    admission.boot,
+                    admission.application_focus(),
+                    now,
+                );
                 self.pairs.entry(peer).or_default().admission = Some(admission);
             }
             InputCommand::RetirePeer(boot) => {
@@ -915,7 +1003,7 @@ impl Driver {
             InputCommand::TrailPinned(pinned) => self.adapter.router_mut().set_trail_pinned(pinned),
             InputCommand::LocalFeel(feel) => self.adapter.router_mut().set_local_feel(feel),
             InputCommand::LocalDisplays(displays) => {
-                self.display_fault = Some(if displays.is_empty() {
+                self.observe_display_fault(if displays.is_empty() {
                     oink_protocol::v1::dto::ResourceFaultCode::DeviceUnavailable
                 } else {
                     oink_protocol::v1::dto::ResourceFaultCode::None
@@ -933,9 +1021,10 @@ impl Driver {
                 }
             }
             InputCommand::LocalDisplayFailure => {
-                self.display_fault = Some(oink_protocol::v1::dto::ResourceFaultCode::BackendFailed);
+                self.observe_display_fault(oink_protocol::v1::dto::ResourceFaultCode::BackendFailed);
             }
             InputCommand::PeerFacts {
+                application_modes,
                 boot,
                 os,
                 displays,
@@ -954,6 +1043,17 @@ impl Driver {
                     self.adapter.router_mut().set_peer_os(boot.device_id, os, now);
                     self.adapter.router_mut().set_peer_displays(boot.device_id, displays);
                     self.adapter.router_mut().set_peer_input_transform(boot, transform);
+                    let capable = self
+                        .pairs
+                        .get(&boot.device_id)
+                        .and_then(|p| p.admission.as_ref())
+                        .is_some_and(|p| p.application_focus());
+                    self.adapter.router_mut().set_application_focus_participation(
+                        boot,
+                        capable,
+                        application_modes,
+                        now,
+                    );
                 }
             }
             InputCommand::DiagnosticsSnapshot => {
@@ -1083,6 +1183,18 @@ impl Driver {
                 }
             }
 
+            #[cfg(debug_assertions)]
+            InputCommand::DndWatchdogSnapshotForTest(reply) => {
+                let snapshot = format!(
+                    "{}\ncursor_read_pending={} capture_motion_pending={} declarations={} injection_oldest={:?}",
+                    self.adapter.router().dnd_watchdog_snapshot_for_test(),
+                    self.cursor.pending.is_some(),
+                    self.motion.is_some(),
+                    self.declarations.len(),
+                    self.inject.oldest_pending().map(|at| at.elapsed()),
+                );
+                let _ = reply.try_send(snapshot);
+            }
             InputCommand::DndContentDemand {
                 peer,
                 offer,
@@ -1115,6 +1227,33 @@ impl Driver {
                         .router_mut()
                         .on_dnd_delivery_receipt(peer, delivery, success),
                 );
+            }
+            InputCommand::DndPrepared(command) => {
+                // A release/leave/pause may overtake metadata readiness. Never
+                // synthesize a late Down for that retired target.
+                if let oink_routing::DndCmd::Begin {
+                    ref grant, id, epoch, ..
+                } = command
+                {
+                    if grant.begin_current() {
+                        self.dispatch_dnd(command);
+                    } else {
+                        // Up may arrive after the worker cached its result but
+                        // before this command. Retire readers on the ordinary
+                        // owner and report failure even though native Begin
+                        // never ran; otherwise source and cache remain hosted.
+                        self.dispatch_dnd(oink_routing::DndCmd::Cancel {
+                            id,
+                            epoch,
+                            physical: false,
+                        });
+                        self.command(InputCommand::DndEvent(DndEvent::Ended {
+                            id,
+                            epoch,
+                            dropped: false,
+                        }));
+                    }
+                }
             }
             InputCommand::DndEvent(event) => {
                 self.refresh_system_cursor_clip();
@@ -1223,6 +1362,7 @@ impl Driver {
             return;
         }
         let eligible = router.has_pointer_focus() && !router.paused();
+        let capture_eligible = eligible && !router.dnd_pointer_active();
         let suppressed = router.has_pointer_focus() && hidden;
         self.trail.suppress(suppressed);
         if self.trail_suppressed_sent != Some(suppressed) {
@@ -1238,13 +1378,14 @@ impl Driver {
                     && sample.position.y < b.y + b.h - 8.
             })
         });
-        if router.paused() {
+        if router.paused() || router.dnd_pointer_active() {
             self.capture_detector = Default::default();
         }
         let detected = self.capture_detector.update(
             (focus.epoch, focus.holder),
             sample,
-            eligible && (sample.is_none_or(|s| s.windows.is_none()) || router.game_mode().mode == GameMode::Auto),
+            capture_eligible
+                && (sample.is_none_or(|s| s.windows.is_none()) || router.game_mode().mode == GameMode::Auto),
             interior,
             now,
         );
@@ -1407,6 +1548,9 @@ impl Driver {
         let _ = self.main.send(MainCommand::Attachment { peer, stream, message });
     }
     fn received(&mut self, peer: DeviceId, message: Message, arrived: Instant, lossy: bool) {
+        if let Message::Control(ControlMsg::FocusEnter { epoch, .. }) = &message {
+            self.adapter.router_mut().observe_dnd_focus_entry(peer, *epoch, arrived);
+        }
         let (message, time) = match message {
             Message::TimedInput { time, input } => (Message::Input(input), Some(time)),
             message => (message, None),
@@ -1549,6 +1693,39 @@ impl Driver {
         self.outputs(source);
         self.attach(peer);
     }
+    fn application_focus_command(&mut self, command: oink_routing::ApplicationFocusCommand) {
+        use oink_routing::ApplicationFocusCommand as C;
+        let invalidate = match &command {
+            C::Park(_) | C::Dismiss(_) => true,
+            C::Cancel(request) => self
+                .application_park
+                .as_ref()
+                .is_some_and(|(pending, _)| pending == request),
+            C::Sample(claim) => self
+                .application_park
+                .as_ref()
+                .is_some_and(|(pending, _)| pending.claim != *claim),
+        };
+        if invalidate && let Some((_, permit)) = self.application_park.take() {
+            permit.revoke();
+        }
+        let permit = if let C::Park(request) = &command {
+            let lifetime = Duration::from_millis(250);
+            #[cfg(debug_assertions)]
+            let permit = match self.inject.backend().application_focus_test_clock() {
+                Some(clock) => oink_input::application_focus::Permit::new_for_test(lifetime, clock),
+                None => oink_input::application_focus::Permit::new(lifetime),
+            };
+            #[cfg(not(debug_assertions))]
+            let permit = oink_input::application_focus::Permit::new(lifetime);
+            self.application_park = Some((request.clone(), permit.clone()));
+            Some(permit)
+        } else {
+            None
+        };
+        let _ = self.main.send(MainCommand::ApplicationFocus { command, permit });
+    }
+
     fn outputs(&mut self, from: Option<DeviceId>) {
         self.outputs_at(from, ModeDispatch::Queued);
     }
@@ -1713,6 +1890,7 @@ impl Driver {
                     });
                 }
                 Output::Send { to, msg, delivery: _ } => self.send_from(to, msg, from),
+                Output::ApplicationFocus(command) => self.application_focus_command(command),
                 Output::Inject(event @ InjectEvent::Volume { .. }) => {
                     if let Some(work) = self.inject.ordinary_input(self.input_safety) {
                         let _ = self.main.send(MainCommand::Media { event, work });
@@ -2064,7 +2242,18 @@ impl Driver {
             self.fault(peer, Which::Outbound, false, StreamCode::Invalid);
             return;
         };
-        self.post_bytes(peer, &buffer[..len], false);
+        if self.post_bytes(peer, &buffer[..len], false) {
+            let notice = match &message {
+                oink_protocol::v1::Message::DndNotice(notice) => crate::dnd::wire::notice_header(notice).ok(),
+                oink_protocol::v1::Message::AttachmentHead(head) => {
+                    crate::dnd::wire::attachment_notice_header(head).ok()
+                }
+                _ => None,
+            };
+            if let Some(notice) = notice.filter(|notice| notice.key.offer.clip.origin == self.local) {
+                crate::dnd::timing::notice(notice.key.offer.clip, notice.state, Instant::now());
+            }
+        }
     }
     fn post(&mut self, peer: DeviceId, message: Message, datagram: bool) {
         if matches!(
@@ -2102,10 +2291,15 @@ impl Driver {
             trace.control(self.local, peer, true, &message);
             trace.dnd_message(peer, true, &message);
         }
-        if self.post_bytes(peer, &buffer[..len], datagram)
-            && let Some(trace) = &self.inject.trace
-        {
-            trace.sent_held_sync(self.local, peer, &message);
+        if self.post_bytes(peer, &buffer[..len], datagram) {
+            if let Message::Dnd(DndMsg::Notice(notice)) = &message
+                && notice.key.offer.clip.origin == self.local
+            {
+                crate::dnd::timing::notice(notice.key.offer.clip, notice.state, Instant::now());
+            }
+            if let Some(trace) = &self.inject.trace {
+                trace.sent_held_sync(self.local, peer, &message);
+            }
         }
     }
     fn post_bytes(&mut self, peer: DeviceId, encoded: &[u8], datagram: bool) -> bool {
@@ -2157,6 +2351,9 @@ impl CaptureLoop for Driver {
         let focus = self.adapter.router().focus();
         Some((focus.holder, focus.epoch))
     }
+    fn idle_refresh_allowed(&self) -> bool {
+        self.capture_requested() && self.snapshots.settings.load().wake_displays_on_input
+    }
     fn capture_requested(&self) -> bool {
         self.inject.backend().input_safety().active()
             && self.capture_initialized
@@ -2165,6 +2362,11 @@ impl CaptureLoop for Driver {
             && !self.environment.system_sleeping
             && self.controllable
             && !self.stopping
+    }
+    fn pointer_holder(&self) -> bool {
+        self.capture_requested()
+            && self.adapter.router().focus().holder == self.local
+            && !self.adapter.router().game_mode().active
     }
     fn keyboard_remote(&self) -> Option<bool> {
         let router = self.adapter.router();
@@ -2444,6 +2646,11 @@ impl CaptureLoop for Driver {
         self.deadline = self
             .input_deadline()
             .into_iter()
+            .chain(
+                self.display_failure_since
+                    .map(|since| since + Duration::from_secs(3))
+                    .filter(|due| *due > now),
+            )
             .chain(Some(self.read_back_at))
             .chain(Some(self.backlog_check))
             .chain(
@@ -2460,6 +2667,9 @@ impl CaptureLoop for Driver {
 }
 impl Drop for Driver {
     fn drop(&mut self) {
+        if let Some((_, permit)) = self.application_park.take() {
+            permit.revoke();
+        }
         self.shared.stopped.store(true, Ordering::Release);
         self.notices.closed.store(true, Ordering::Release);
         self.notices.changed.notify_one();
@@ -2506,7 +2716,7 @@ fn timed(message: Message, time: Option<CaptureTime>) -> Message {
 fn captured_input(input: &InputMsg) -> bool {
     match input {
         InputMsg::Forwarded { msg, .. } => captured_input(msg),
-        InputMsg::HeldSync { .. } | InputMsg::VolumeKeyOrigin { .. } => false,
+        InputMsg::HeldSync { .. } | InputMsg::ApplicationHeldSync { .. } | InputMsg::VolumeKeyOrigin { .. } => false,
         _ => true,
     }
 }

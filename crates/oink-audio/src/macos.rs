@@ -110,6 +110,7 @@ impl Drop for SourceMute {
 }
 
 unsafe extern "C" {
+    fn oink_audio_capture_omitted_silent_frames(capture: *mut c_void) -> u64;
     fn oink_audio_capture_events(
         capture: *mut c_void,
         events: *mut events::NativeEvent,
@@ -175,6 +176,7 @@ pub struct Capture {
     worker: Option<JoinHandle<()>>,
     error: Arc<Mutex<Option<String>>>,
     restart: Arc<Mutex<Option<String>>>,
+    omitted_silent_frames: Arc<CaptureProgress>,
 }
 
 impl Capture {
@@ -236,6 +238,12 @@ impl Capture {
         self.restart.lock().ok().and_then(|reason| reason.clone())
     }
 
+    /// Frames the live native tap deliberately omitted after its digital-zero tail.
+    /// Read live progress, independently of the ordinary owner's health polling.
+    pub fn omitted_silent_frames(&self) -> u64 {
+        self.omitted_silent_frames.frames()
+    }
+
     pub fn diagnostics(&self) -> serde_json::Value {
         self.info.diagnostics.clone()
     }
@@ -275,6 +283,8 @@ impl Capture {
         let worker_cleanup = cleanup_error.clone();
         let restart = Arc::new(Mutex::new(None));
         let worker_restart = restart.clone();
+        let omitted_silent_frames = Arc::new(CaptureProgress::default());
+        let worker_omitted = omitted_silent_frames.clone();
         let forwarding_stop = crate::media_pause::CaptureStop::default();
         let worker_forwarding_stop = forwarding_stop.clone();
         let stop = Arc::new(AtomicBool::new(false));
@@ -333,7 +343,7 @@ impl Capture {
                     return;
                 }
                 // An RAII guard also stops the tap if worker code unwinds.
-                let mut native = NativeCapture(raw);
+                let mut native = NativeCapture::new(raw, worker_omitted);
                 let pause_before_restore = crate::media_pause::BeforeRestore(worker_forwarding_stop);
                 let mut native_info = NativeInfo::default();
                 // SAFETY: NativeInfo matches the bridge's C layout; handle is live.
@@ -380,7 +390,7 @@ impl Capture {
                         }
                     }
                     events.drain(native.0, &clock);
-                    if last_check.elapsed() >= Duration::from_millis(250) {
+                    if last_check.elapsed() >= Duration::from_secs(1) {
                         let check_started = Instant::now();
                         // SAFETY: The native handle is live and error is writable
                         // for its full length. A failed check writes a C string.
@@ -422,7 +432,9 @@ impl Capture {
                         if let Ok(mut state) = worker_error.lock() { *state = Some(format!("audio capture realtime worker stopped: {}", realtime.error())); }
                         break;
                     }
-                    thread::sleep(Duration::from_millis(1));
+                    // PCM onset wakes the encoder independently. Endpoint observers
+                    // unpark this owner immediately; only health/diagnostics need a timer.
+                    thread::park_timeout(Duration::from_secs(1));
                 }
                 realtime.stop();
                 pause_before_restore.0.finish();
@@ -456,6 +468,7 @@ impl Capture {
                 worker: Some(worker),
                 error: error_state,
                 restart,
+                omitted_silent_frames,
             }),
             result => {
                 let _ = worker.join();
@@ -485,6 +498,7 @@ impl Capture {
     pub fn finish(&mut self) -> Option<String> {
         self.stop.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
             let _ = worker.join();
         }
         self.cleanup_error.lock().ok().and_then(|error| error.clone())
@@ -625,7 +639,7 @@ impl HostClock {
 
 // The ordinary owner keeps native alive and must join this guard before any
 // pause/restore or HAL close, including unwind and device-change paths.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct CaptureReader(*mut c_void);
 // SAFETY: only the RT child calls read/wait. Ordinary owner may wake and query
 // health/events; those fields are immutable or independent atomic SPSC state.
@@ -672,6 +686,7 @@ impl RealtimeCapture {
             std::sync::atomic::AtomicI32::new(0),
         ]);
         let status = state.clone();
+        let owner = thread::current();
         let worker = thread::Builder::new()
             .name("oink-audio-encode".into())
             .spawn(move || {
@@ -744,6 +759,7 @@ impl RealtimeCapture {
                         }
                     }
                 }
+                owner.unpark();
                 (encoder, resampler, output, schedule)
             })
             .map_err(|e| format!("start capture realtime worker: {e}"))?;
@@ -794,9 +810,29 @@ impl Drop for RealtimeCapture {
     }
 }
 
-struct NativeCapture(*mut c_void);
+/// Only ordinary control/teardown threads take this lock; the HAL callback and
+/// encoder never do. A 1s health-poll mirror can be stale past the watchdog's
+/// 500ms deadline even while callbacks continuously omit healthy digital zeros.
+#[derive(Debug, Default)]
+struct CaptureProgress(Mutex<Option<CaptureReader>>);
+impl CaptureProgress {
+    fn frames(&self) -> u64 {
+        let native = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        native.as_ref().map_or(0, |reader| {
+            // SAFETY: NativeCapture invalidates this slot under the same lock
+            // before stopping/freeing HAL, including error and unwind paths.
+            unsafe { oink_audio_capture_omitted_silent_frames(reader.raw()) }
+        })
+    }
+}
+
+struct NativeCapture(*mut c_void, Arc<CaptureProgress>);
 
 impl NativeCapture {
+    fn new(raw: *mut c_void, progress: Arc<CaptureProgress>) -> Self {
+        *progress.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(CaptureReader(raw));
+        Self(raw, progress)
+    }
     fn finish(&mut self) -> Result<(), String> {
         self.finish_with(|raw| {
             let mut error = [0 as c_char; 1024];
@@ -818,6 +854,9 @@ impl NativeCapture {
     }
 
     fn finish_with(&mut self, shutdown: impl FnOnce(*mut c_void) -> Result<(), String>) -> Result<(), String> {
+        // Wait for any in-flight atomic read, then prevent all future native
+        // reads before cleanup. Even a retained/failed HAL context is retired.
+        *self.1.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let raw = std::mem::replace(&mut self.0, std::ptr::null_mut());
         if raw.is_null() { Ok(()) } else { shutdown(raw) }
     }
@@ -1039,6 +1078,51 @@ mod tests {
     use super::{NativeCapture, StereoResampler, capture_exit};
 
     #[test]
+    fn silent_callback_progress_is_visible_without_the_one_second_health_poll() {
+        use super::*;
+        unsafe extern "C" {
+            fn oink_audio_capture_test_silent_new() -> *mut c_void;
+            fn oink_audio_capture_test_silent_callback(raw: *mut c_void);
+            fn oink_audio_capture_test_silent_free(raw: *mut c_void);
+        }
+        let capture = Capture {
+            forwarding_stop: Default::default(),
+            muted_owned: Arc::new(AtomicBool::new(false)),
+            local_controls_changed: Arc::new(AtomicBool::new(false)),
+            default_output_changed: Arc::new(AtomicBool::new(false)),
+            cleanup_error: Arc::new(Mutex::new(None)),
+            info: NativeInfo::default().into_info(None),
+            stop: Arc::new(AtomicBool::new(false)),
+            worker: None,
+            error: Arc::new(Mutex::new(None)),
+            restart: Arc::new(Mutex::new(None)),
+            omitted_silent_frames: Arc::new(CaptureProgress::default()),
+        };
+        // SAFETY: the fixture allocates a ring/semaphore only, without a HAL
+        // device, permission request, mute lease or settings change.
+        let raw = unsafe { oink_audio_capture_test_silent_new() };
+        assert!(!raw.is_null());
+        let mut native = NativeCapture::new(raw, capture.omitted_silent_frames.clone());
+        // No owner health/diagnostics poll runs between these callbacks and reads.
+        // The watchdog's 500ms deadline is shorter than that owner's 1s poll.
+        let mut observed = Vec::new();
+        for _ in 1..=400 {
+            // SAFETY: owned fixture; invokes the production exact-zero callback.
+            unsafe { oink_audio_capture_test_silent_callback(raw) };
+            observed.push(capture.omitted_silent_frames());
+        }
+        native
+            .finish_with(|raw| {
+                // SAFETY: no HAL lifetime; destroy only this fixture's ring/semaphore.
+                unsafe { oink_audio_capture_test_silent_free(raw) };
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(capture.omitted_silent_frames(), 0);
+        assert_eq!(observed, (1..=400).map(|step| step * 128).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn muted_capture_requires_durable_recovery_before_any_native_call() {
         let (encoder, _) = crate::source::channel(crate::dsp::Config::low_latency_opus(), 100, false).unwrap();
         let error = super::Capture::start_encoded(encoder, true, super::MacCaptureOptions::default()).unwrap_err();
@@ -1144,7 +1228,8 @@ mod tests {
         // Rust-owned memory and an injected closure: no CoreAudio call occurs.
         for fail in [false, true] {
             let raw = Box::into_raw(Box::new(0_u8)).cast();
-            let mut native = NativeCapture(raw);
+            let progress = std::sync::Arc::new(super::CaptureProgress::default());
+            let mut native = NativeCapture::new(raw, progress.clone());
             let result = native.finish_with(|handle| {
                 assert_eq!(handle, raw);
                 // SAFETY: The test allocated this pointer immediately above.
@@ -1152,6 +1237,7 @@ mod tests {
                 if fail { Err("HAL cleanup failed".into()) } else { Ok(()) }
             });
             assert_eq!(result.is_err(), fail);
+            assert!(progress.0.lock().unwrap().is_none());
             native.finish_with(|_| panic!("cleanup repeated")).unwrap();
             // Drop sees the consumed handle, including after the error path.
             drop(native);

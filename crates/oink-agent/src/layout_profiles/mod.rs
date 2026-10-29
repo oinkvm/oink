@@ -15,4 +15,5 @@ pub mod store;
 pub(crate) mod sync;
 #[cfg(test)]
 mod tests;
+pub mod topology;
 pub mod wire;

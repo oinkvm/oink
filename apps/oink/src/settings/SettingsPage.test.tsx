@@ -8,7 +8,7 @@ import { api as backend, shell } from '../api/client';
 import { setLanguage } from '../i18n';
 import { SettingsPage, type PermState } from './SettingsPage';
 import { DEFAULT_PREFS, type PermissionId, type PrefsApi } from './prefs';
-import { searchSections } from './schema';
+import { sectionsFor, searchSections } from './schema';
 import { createLayoutProfilesFixture } from '../api/layoutProfiles.fixture';
 import type { UpdateStatus } from '../api/update';
 beforeAll(() => {
@@ -20,7 +20,7 @@ beforeAll(() => {
 afterEach(() => { toast.dismiss(); cleanup(); vi.restoreAllMocks(); agent.adopt('overview', null); agent.adopt('receivedFiles',null); });
 const prefs = { prefs: DEFAULT_PREFS, set() {}, canEdit: () => true } as unknown as PrefsApi;
 const perms: Record<PermissionId, PermState> = { accessibility: 'granted', input: 'granted', network: 'not_required', files: 'granted', audio: 'granted' };
-const view = () => <OinkProvider defaultMotion="reduced"><SettingsPage open platform="mac" api={prefs} capsIme={false} query="" jump={null} onActive={() => {}} version="test" upgrade={{available:false,next:''}} perms={perms} onGrant={() => {}} onLog={() => {}} onAbout={() => {}} onBlocklist={() => {}}/><Toaster/></OinkProvider>;
+const view = (platform: 'mac' | 'win' = 'mac') => <OinkProvider defaultMotion="reduced"><SettingsPage open platform={platform} api={prefs} capsIme={false} query="" jump={null} onActive={() => {}} version="test" upgrade={{available:false,next:''}} perms={perms} onGrant={() => {}} onLog={() => {}} onAbout={() => {}} onBlocklist={() => {}}/><Toaster/></OinkProvider>;
 const usage = (total: number) => ({ categories: [], total_bytes: total, incomplete: true });
 
 it.each(['en', 'zh-Hans', 'ja', 'ko'] as const)('shows cached files without an incomplete note or an open-folder button in %s', async language => {
@@ -200,4 +200,34 @@ it.each([['received','收到 7 天后'],['last_used','7 天未使用']] as const
 });
 it.each([['en','received files'],['zh-Hans','收到'],['ja','受信'],['ko','받은']] as const)('received rows are searchable in %s', (language,query)=>{
  setLanguage(language);const found=searchSections('mac',query).get('clipboard');expect(found==='all'||found?.has('receivedFiles')).toBe(true);
+});
+
+it('uses a standard microphone row with secondary copy and a stable anchor', async () => {
+  setLanguage('zh-Hans');
+  vi.spyOn(backend, 'microphonePluginStatus').mockResolvedValue({state:'not_installed',operation:'idle',input_loaded:false,error_kind:null,last_operation_succeeded:null,last_operation:null});
+  const { container } = render(view());
+  const row = container.querySelector<HTMLElement>('[data-item="virtualMicrophone"]')!;
+  expect(row.querySelector('.ok-row__desc')?.textContent).toBe('安装后，在应用中选择 Oink Microphone，即可使用其他设备共享的麦克风');
+  expect(row.id).toBe('settings-virtual-microphone');
+  expect(row.classList.contains('ok-row--stack')).toBe(false);
+  await waitFor(() => expect(within(row).getByRole('button', {name:'安装'}).hasAttribute('disabled')).toBe(false));
+});
+
+it.each(['zh-Hans','en','ja','ko'] as const)('places the default-on DS_Store switch last in macOS Clipboard in %s', language => {
+  setLanguage(language);
+  const {container} = render(view());
+  const section = container.querySelector('[data-section="clipboard"]')!;
+  const rows = section.querySelectorAll('[data-item]');
+  const row = rows[rows.length - 1];
+  expect(row.getAttribute('data-item')).toBe('removeDsStore');
+  expect((within(row as HTMLElement).getByRole('switch') as HTMLInputElement).checked).toBe(true);
+  expect(row.textContent).toContain('.DS_Store');
+  expect(sectionsFor('win').find(section=>section.id==='clipboard')!.items.some(item=>item.id==='removeDsStore')).toBe(false);
+  expect(searchSections('win','.DS_Store').get('clipboard')).toBeUndefined();
+});
+
+it('does not render the DS_Store switch on Windows',()=>{
+  setLanguage('zh-Hans');
+  const {container}=render(view('win'));
+  expect(container.querySelector('[data-item="removeDsStore"]')).toBeNull();
 });

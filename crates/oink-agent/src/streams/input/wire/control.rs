@@ -34,7 +34,7 @@ fn read_mode(value: w::GameMode) -> v1::Result<GameMode> {
         _ => Err(v1::ErrorCode::UnsupportedValue.into()),
     }
 }
-fn scope(value: Option<&FocusScope>) -> v1::Result<w::FocusScope> {
+pub(super) fn scope(value: Option<&FocusScope>) -> v1::Result<w::FocusScope> {
     let members = value
         .map_or(&[][..], |scope| scope.members.as_slice())
         .iter()
@@ -42,7 +42,7 @@ fn scope(value: Option<&FocusScope>) -> v1::Result<w::FocusScope> {
         .collect::<v1::Result<Vec<_>>>()?;
     w::FocusScope::from_raw(map([(1, List::<_, 16>(members).write())]))
 }
-fn read_scope(value: w::FocusScope) -> v1::Result<FocusScope> {
+pub(super) fn read_scope(value: w::FocusScope) -> v1::Result<FocusScope> {
     let mut members = Vec::new();
     for member in value.members()?.0 {
         let id = read_device(member.device()?)?;
@@ -131,6 +131,13 @@ fn read_trail(value: w::TrailContinuation) -> v1::Result<TrailContinuation> {
 
 pub(super) fn encode(value: &ControlMsg) -> v1::Result<Message> {
     Ok(match value {
+        ControlMsg::ApplicationFocus(value) => super::application_focus::encode(value)?,
+        ControlMsg::MovePointer { epoch, target } => {
+            Message::ControlMovePointer(w::ControlMovePointer::from_raw(map([
+                (1, epoch.write()),
+                (2, device(*target).write()),
+            ]))?)
+        }
         ControlMsg::Feel { profile } => {
             Message::ControlFeel(w::ControlFeel::from_raw(map([(1, feel(profile)?.write())]))?)
         }
@@ -169,6 +176,19 @@ pub(super) fn encode(value: &ControlMsg) -> v1::Result<Message> {
                 (2, locked.write()),
                 (3, target.map(device).write()),
             ]))?)
+        }
+        ControlMsg::EntryProtection { state } => {
+            Message::ControlEntryProtection(w::ControlEntryProtection::from_raw(map([
+                (1, state.locked.write()),
+                (2, state.game.write()),
+                (
+                    3,
+                    List::<_, 64>(state.passive_displays.iter().cloned().map(Text::<512>).collect()).write(),
+                ),
+            ]))?)
+        }
+        ControlMsg::LockEscape { held } => {
+            Message::ControlLockEscape(w::ControlLockEscape::from_raw(map([(1, held.write())]))?)
         }
         ControlMsg::FocusLock { state } => {
             Message::ControlFocusLock(w::ControlFocusLock::from_raw(map([(1, lock(state)?.write())]))?)
@@ -228,6 +248,11 @@ pub(super) fn encode(value: &ControlMsg) -> v1::Result<Message> {
 }
 pub(super) fn decode(value: Message) -> v1::Result<ControlMsg> {
     Ok(match value {
+        Message::ApplicationFocus(value) => ControlMsg::ApplicationFocus(super::application_focus::decode(value)?),
+        Message::ControlMovePointer(v) => ControlMsg::MovePointer {
+            epoch: v.epoch()?,
+            target: read_device(v.target()?)?,
+        },
         Message::ControlFeel(v) => ControlMsg::Feel {
             profile: read_feel(v.profile()?)?,
         },
@@ -253,6 +278,14 @@ pub(super) fn decode(value: Message) -> v1::Result<ControlMsg> {
             locked: v.locked()?,
             target: v.target()?.map(read_device).transpose()?,
         },
+        Message::ControlEntryProtection(v) => ControlMsg::EntryProtection {
+            state: oink_routing::control::EntryProtection {
+                locked: v.locked()?,
+                game: v.game()?,
+                passive_displays: v.passive_displays()?.0.into_iter().map(|v| v.0).collect(),
+            },
+        },
+        Message::ControlLockEscape(v) => ControlMsg::LockEscape { held: v.held()? },
         Message::ControlFocusLock(v) => ControlMsg::FocusLock {
             state: read_lock(v.state()?)?,
         },

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use oink_agent::api::{self, AgentApi, ApiError, ApiEvent, Reply, Request};
 #[cfg(windows)]
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Manager, State};
 
 use oink_agent::remote::RemoteApi;
 
@@ -17,8 +17,14 @@ fn frontend_error(message: String) {
     tracing::warn!(%message, "界面脚本错误");
 }
 
+/// 原先显示在窗口底部中央的提示，现在只写进日志。
+#[tauri::command]
+fn frontend_notice(code: String) {
+    tracing::warn!(%code, "界面提示");
+}
+
 /// 推给前端的事件名；载荷为 [`ApiEvent`]（`{"type": ..., "data": ...}`）。
-const EVENT: &str = "agent-event";
+pub(crate) const EVENT: &str = "agent-event";
 
 pub(crate) struct Backend {
     #[cfg(target_os = "macos")]
@@ -115,6 +121,14 @@ fn boot_info(window: tauri::WebviewWindow, state: State<'_, Backend>) -> BootInf
 async fn api_call(
     window: tauri::WebviewWindow,
     state: State<'_, Backend>,
+    request: serde_json::Value,
+) -> Result<Reply, ApiError> {
+    execute_api_call(window, state, crate::update_window::decode(request)?).await
+}
+
+async fn execute_api_call(
+    window: tauri::WebviewWindow,
+    state: State<'_, Backend>,
     request: Request,
 ) -> Result<Reply, ApiError> {
     if crate::shell_policy::View::from_label(window.label()).is_none() {
@@ -138,14 +152,52 @@ async fn api_call(
     let close = window.app_handle().clone();
     let recover = close.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        if let Request::Update { command } = &request {
+            // Do not log OpenLocal's path. This boundary precedes both the
+            // status precheck and backend dispatch, so a missing install entry
+            // can be distinguished from a shell/precheck refusal.
+            let command_type = match command {
+                oink_agent::api::UpdateCommand::OpenLocal { .. } => "open_local",
+                oink_agent::api::UpdateCommand::Install { .. } => "install",
+                oink_agent::api::UpdateCommand::Cancel => "cancel",
+                oink_agent::api::UpdateCommand::Check => "check",
+                oink_agent::api::UpdateCommand::Download => "download",
+                oink_agent::api::UpdateCommand::Skip { .. } => "skip",
+                oink_agent::api::UpdateCommand::Defer { .. } => "defer",
+                oink_agent::api::UpdateCommand::SetPreferences { .. } => "set_preferences",
+            };
+            tracing::info!(command_type, step = "ui_update_received", "update IPC");
+        }
+        let local_install = if installing {
+            let status = api.update_status().inspect_err(|error| {
+                tracing::warn!(
+                    step = "install_status_precheck",
+                    code = error.code(),
+                    reason = error.message(),
+                    "update IPC rejected"
+                );
+            })?;
+            status.candidate.is_some_and(|candidate| candidate.local_package)
+        } else {
+            false
+        };
         crate::update_window::dispatch(
             installing,
             || {
                 owner.begin();
+                // A local Windows install still needs UAC. Keep its ordinary
+                // progress UI visible and the backend live until actual drain.
+                // ExitForUpdate later closes the UI for both local platforms.
+                if local_install {
+                    return Ok(());
+                }
                 let (done, wait) = std::sync::mpsc::sync_channel(1);
                 on_main(&close, move |app| {
                     let result = app.get_webview_window("main").map_or(Ok(()), |window| window.hide());
                     tracing::info!(target:"oink_update_timing",phase="main_window_hidden", "update window boundary");
+                    if let Err(error) = &result {
+                        tracing::warn!(step = "install_hide_window", %error, "update IPC rejected");
+                    }
                     let _ = done.send(result.map_err(|error| ApiError::Internal {
                         message: error.to_string(),
                     }));
@@ -154,7 +206,19 @@ async fn api_call(
                     message: error.to_string(),
                 })?
             },
-            || api::dispatch(api.as_ref(), request),
+            || {
+                api::dispatch(api.as_ref(), request).inspect_err(|error| {
+                    if installing {
+                        tracing::warn!(
+                            step = "install_dispatch",
+                            code = error.code(),
+                            reason = error.message(),
+                            ?error,
+                            "update IPC rejected"
+                        );
+                    }
+                })
+            },
             || {
                 if owner.failure() {
                     show_main(&recover);
@@ -170,7 +234,7 @@ async fn api_call(
 /// launches Finder/Explorer in the interactive user's session.
 #[tauri::command]
 async fn open_diagnostics_folder(window: tauri::WebviewWindow, state: State<'_, Backend>) -> Result<(), ApiError> {
-    let Reply::DiagnosticsFolder(path) = api_call(window, state, Request::DiagnosticsFolder).await? else {
+    let Reply::DiagnosticsFolder(path) = execute_api_call(window, state, Request::DiagnosticsFolder).await? else {
         unreachable!("diagnostics folder reply");
     };
     crate::commands::open_folder(path.into())
@@ -279,6 +343,7 @@ pub fn run() {
             boot_info,
             open_diagnostics_folder,
             frontend_error,
+            frontend_notice,
             api_call,
             crate::sponsor::shell_sponsor_list,
             crate::live_views::live_views,
@@ -306,6 +371,18 @@ pub fn run() {
                 crate::native_menu::install(app.handle(), oink_agent::config::UiLanguage::Auto)?;
                 app.on_menu_event(|app, event| {
                     use oink_agent::native_controls::ShellAction;
+                    let focused = || app.webview_windows().into_values().find(|w| w.is_focused().unwrap_or(false));
+                    match event.id().as_ref() {
+                        "shell-close-window" => {
+                            if let Some(window) = focused() { let _ = window.close(); }
+                            return;
+                        }
+                        "shell-minimize" => {
+                            if let Some(window) = focused() { let _ = window.minimize(); }
+                            return;
+                        }
+                        _ => {}
+                    }
                     let action = match event.id().as_ref() {
                         "shell-about" => ShellAction::About,
                         "shell-main" => ShellAction::Show,
@@ -552,7 +629,7 @@ fn forward_events(app: &AppHandle) {
             apply_report_status(&handle, status);
         }
         if !matches!(ev, ApiEvent::Stats(_)) || crate::live_views::stats_enabled(&handle) {
-            let _ = handle.emit(EVENT, ev);
+            crate::live_views::forward(&handle, ev);
         }
         if let ApiEvent::UpdateStatusChanged(status) = ev
             && matches!(

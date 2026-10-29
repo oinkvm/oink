@@ -60,15 +60,18 @@ export function CreateProfileDialog({ open, state, container, onClose, onSubmit 
   const [typed, setTyped] = useState(false);
   const [refusal, setRefusal] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
-  useEffect(() => { if (open) { setName(''); setTyped(false); setRefusal(null); } }, [open]);
-  const problem = nameProblem(name, takenNames(state));
+  const [created, setCreated] = useState(false);
+  useEffect(() => { if (open) { setName(''); setTyped(false); setRefusal(null); setCreated(false); } }, [open]);
+  // The created profile reaches `state` before the dialog finishes closing; its own
+  // name must not then read as a duplicate. Validate only while the name is editable.
+  const problem = pending || created ? null : nameProblem(name, takenNames(state));
   const submit = async () => {
     setTyped(true);
-    if (problem || pending) return;
+    if (problem || pending || created) return;
     setPending(true);
     try {
       const refused = await onSubmit(name.trim());
-      if (refused) setRefusal(refused); else onClose();
+      if (refused) setRefusal(refused); else { setCreated(true); onClose(); }
     } finally { setPending(false); }
   };
   return <Dialog {...contained} open={open} onOpenChange={o => { if (!o) onClose(); }} container={container} size={400} as="form" onSubmit={() => { void submit(); }}
@@ -81,10 +84,9 @@ export function CreateProfileDialog({ open, state, container, onClose, onSubmit 
 }
 
 /** Settings › Layout: the profiles in MRU order with the current one marked; rename
- * inline, delete after confirmation (never the last one), and create. */
-export function ProfileList({ state, onCreate, onRename, onDelete }: {
+ * inline and delete after confirmation (never the last one). */
+export function ProfileList({ state, onRename, onDelete }: {
   state: LayoutProfilesState | null;
-  onCreate: () => void;
   onRename: (profile: ProfileSummary, name: string) => Promise<string | null>;
   onDelete: (profile: ProfileSummary) => Promise<void>;
 }) {
@@ -137,6 +139,5 @@ export function ProfileList({ state, onCreate, onRename, onDelete }: {
         </li>;
       })}
     </ul>
-    <Button size="sm" className="lpm__create" leading={<Icon name="plus"/>} disabled={!ready || !state?.create_enabled} onClick={onCreate}>{tr('新建布局')}</Button>
   </div>;
 }

@@ -12,7 +12,6 @@ pub enum CacheCategory {
     DeliveredFiles,
     SourceSnapshots,
     PromiseExports,
-    CompletedDeliveries,
     Other,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +47,47 @@ pub fn subscribe() -> broadcast::Receiver<PathBuf> {
 }
 pub(crate) fn changed(root: &Path) {
     let _ = CHANGES.get_or_init(|| broadcast::channel(128).0).send(root.into());
+    #[cfg(all(test, debug_assertions))]
+    MUTATIONS.with(|changes| {
+        if let Some(changes) = changes.borrow_mut().as_mut() {
+            changes.push(root.into());
+        }
+    });
+}
+
+/// Invalidate after an owned mutation finishes, including partial failure.
+/// Declare before file/lock guards so consumers see the closed/committed state.
+pub(crate) struct Mutation<'a>(pub &'a Path);
+impl Drop for Mutation<'_> {
+    fn drop(&mut self) {
+        changed(self.0);
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+thread_local! {
+    static MUTATIONS: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(all(test, debug_assertions))]
+pub(crate) fn assert_mutation<T>(root: &Path, operation: impl FnOnce() -> T) -> T {
+    MUTATIONS.with(|changes| *changes.borrow_mut() = Some(Vec::new()));
+    let result = operation();
+    assert!(
+        MUTATIONS.with(|changes| changes.borrow_mut().take().unwrap().iter().any(|path| path == root)),
+        "owner returned without publishing a cache change"
+    );
+    result
+}
+
+#[cfg(all(test, debug_assertions))]
+pub(crate) fn assert_no_mutation<T>(root: &Path, operation: impl FnOnce() -> T) -> T {
+    MUTATIONS.with(|changes| *changes.borrow_mut() = Some(Vec::new()));
+    let result = operation();
+    assert!(
+        !MUTATIONS.with(|changes| changes.borrow_mut().take().unwrap().iter().any(|path| path == root)),
+        "unchanged accounting metadata must not schedule another scan"
+    );
+    result
 }
 
 pub fn is_link(meta: &fs::Metadata) -> bool {
@@ -139,15 +179,8 @@ pub fn tree_bytes(path: &Path) -> io::Result<u64> {
 }
 // Shared source files can themselves reside in an Oink provider/cache root.
 // Source publications and each live serving task own these leases.
-static SOURCE_FILES: OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, SourcePins>>> = OnceLock::new();
-// Both purposes use this same lifetime mutex. Expiry may ignore publication
-// owners, but never readers; manual cache clearing continues to respect both.
-#[derive(Default)]
-pub(crate) struct SourcePins {
-    owners: usize,
-    pub(crate) readers: usize,
-}
-pub struct SourceLease(PathBuf, bool, bool);
+static SOURCE_FILES: OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>> = OnceLock::new();
+pub struct SourceLease(PathBuf, bool);
 impl std::fmt::Debug for SourceLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SourceLease")
@@ -155,50 +188,34 @@ impl std::fmt::Debug for SourceLease {
 }
 impl SourceLease {
     pub(crate) fn new(path: PathBuf) -> Self {
-        Self::acquire(path, true, false)
+        Self::acquire(path, true)
     }
     /// Scoped protection for a freshly read current system clipboard.
     pub fn current(path: PathBuf) -> Self {
-        Self::acquire(path, false, false)
-    }
-    pub(crate) fn create_directory(create: impl FnOnce() -> io::Result<PathBuf>) -> io::Result<Self> {
-        Self::create_pinned(create, true)
+        Self::acquire(path, false)
     }
     pub(crate) fn create_owner(create: impl FnOnce() -> io::Result<PathBuf>) -> io::Result<Self> {
-        Self::create_pinned(create, false)
-    }
-    fn create_pinned(create: impl FnOnce() -> io::Result<PathBuf>, reader: bool) -> io::Result<Self> {
         let mut sources = source_guard();
         let path = create()?;
-        let pins = sources.entry(path.clone()).or_default();
-        if reader {
-            pins.readers += 1;
-        } else {
-            pins.owners += 1;
-        }
+        *sources.entry(path.clone()).or_default() += 1;
         drop(sources);
         source_changed(&path);
-        Ok(Self(path, true, reader))
+        Ok(Self(path, true))
     }
     pub(crate) fn path(&self) -> &Path {
         &self.0
     }
     pub(crate) fn reading(path: PathBuf) -> Self {
-        Self::acquire(path, true, true)
+        Self::acquire(path, true)
     }
-    fn acquire(path: PathBuf, publish: bool, reader: bool) -> Self {
+    fn acquire(path: PathBuf, publish: bool) -> Self {
         let mut sources = source_guard();
-        let pins = sources.entry(path.clone()).or_default();
-        if reader {
-            pins.readers += 1;
-        } else {
-            pins.owners += 1;
-        }
+        *sources.entry(path.clone()).or_default() += 1;
         drop(sources);
         if publish {
             source_changed(&path);
         }
-        Self(path, publish, reader)
+        Self(path, publish)
     }
 }
 impl Drop for SourceLease {
@@ -208,12 +225,8 @@ impl Drop for SourceLease {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(count) = sources.get_mut(&self.0) {
-            if self.2 {
-                count.readers -= 1;
-            } else {
-                count.owners -= 1;
-            }
-            if count.readers == 0 && count.owners == 0 {
+            *count -= 1;
+            if *count == 0 {
                 sources.remove(&self.0);
             }
         }
@@ -250,7 +263,7 @@ fn source_changed(path: &Path) {
     }
 }
 
-pub(crate) fn source_guard() -> std::sync::MutexGuard<'static, std::collections::HashMap<PathBuf, SourcePins>> {
+pub(crate) fn source_guard() -> std::sync::MutexGuard<'static, std::collections::HashMap<PathBuf, usize>> {
     SOURCE_FILES
         .get_or_init(Default::default)
         .lock()

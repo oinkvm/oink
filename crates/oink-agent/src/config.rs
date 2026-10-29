@@ -41,6 +41,8 @@ pub struct Settings {
     pub diagnostics_enabled: bool,
     pub audio: oink_audio::Settings,
     #[serde(skip)]
+    pub microphone: oink_audio::microphone::Settings,
+    #[serde(skip)]
     pub device_name: Option<String>,
     pub routing: RoutingSettings,
     pub event_frequency: oink_display::layout::EventFrequency,
@@ -48,7 +50,7 @@ pub struct Settings {
     /// Confirmation only; the operating system owns the actual login-item state.
     pub launch_at_login_configured: bool,
     pub hotkeys: Option<Vec<crate::api::Hotkey>>,
-    pub clipboard: Option<crate::api::ClipboardSettings>,
+    pub clipboard: Option<oink_clipboard::policy::Settings>,
     pub file_provider_placeholder_pool: bool,
     pub received_files_cleanup: crate::api::ReceivedFilesCleanup,
     pub log_level: LogLevel,
@@ -62,8 +64,6 @@ pub struct Settings {
     pub emergency_hold_ms: EmergencyHoldMs,
     #[serde(skip)]
     pub clipboard_enabled: bool,
-    #[serde(skip)]
-    pub keyboard_disabled: bool,
     #[serde(skip)]
     pub screen_shared: bool,
     #[serde(skip)]
@@ -88,6 +88,7 @@ impl Default for Settings {
             reports: Default::default(),
             diagnostics_enabled: true,
             audio: Default::default(),
+            microphone: Default::default(),
             device_name: None,
             routing: RoutingSettings::default(),
             event_frequency: Default::default(),
@@ -107,7 +108,6 @@ impl Default for Settings {
             confirm_quit: true,
             emergency_hold_ms: EmergencyHoldMs::default(),
             clipboard_enabled: true,
-            keyboard_disabled: false,
             screen_shared: true,
             screen_preferences: ScreenPreferences::default(),
             speed_mode: SpeedMode::Physical,
@@ -153,7 +153,7 @@ impl AgentConfig {
             Err(error) => return Err(error.into()),
         };
         let mut reader = read::Reader::default();
-        let (envelope, mut settings, mut owner) = if let Some(bytes) = bytes {
+        let (mut envelope, mut settings, mut owner) = if let Some(bytes) = bytes {
             let envelope: serde_json::Value = serde_json::from_slice(&bytes)?;
             anyhow::ensure!(
                 envelope.get("schema").and_then(serde_json::Value::as_u64) == Some(1),
@@ -178,10 +178,58 @@ impl AgentConfig {
             let owner = owner::OwnerStore::new(projection::values(&settings))?;
             (serde_json::json!({"schema":1,"local":{}}), settings, owner)
         };
-        let extended = owner.ensure_option(
+        let mut extended = owner.ensure_option(
             oink_protocol::v1::dto::LocalOption::SyncSystemArrangement,
             oink_protocol::v1::RawValue::Bool(false),
         )?;
+        // Upgrade the old receiver choice without changing its behavior: an
+        // old OFF becomes parent ON + mapped gestures + the existing scroll feel.
+        // Keep LocalOption 19's released meaning for sources without the new capability.
+        let legacy = owner
+            .value(oink_protocol::v1::dto::LocalOption::AcceptContacts)
+            .and_then(|value| {
+                if let oink_protocol::v1::RawValue::Bool(v) = value {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(true);
+        for (option, value) in [
+            (oink_protocol::v1::dto::LocalOption::TouchpadInjection, true),
+            (oink_protocol::v1::dto::LocalOption::NativeMultifinger, legacy),
+            (
+                oink_protocol::v1::dto::LocalOption::MacScrollFeel,
+                // The old scroll checkbox had no effect while raw contacts
+                // were OFF: synthetic scrolling always preserved the Mac curve.
+                !legacy || settings.routing.mac_scroll_feel,
+            ),
+        ] {
+            extended |= owner.ensure_option(option, oink_protocol::v1::RawValue::Bool(value))?;
+        }
+        if let Some(local) = envelope
+            .get_mut("local")
+            .and_then(|v| v.get_mut("routing"))
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for field in ["mac_scroll_feel", "touchpad_injection", "native_multifinger"] {
+                extended |= local.remove(field).is_some();
+            }
+        }
+        for (option, value) in projection::values(&Settings::default())
+            .into_iter()
+            .filter(|(option, _)| {
+                matches!(
+                    option,
+                    oink_protocol::v1::dto::LocalOption::MicrophoneShareClaim
+                        | oink_protocol::v1::dto::LocalOption::MicrophoneControls
+                        | oink_protocol::v1::dto::LocalOption::MicrophoneReceiveMuted
+                        | oink_protocol::v1::dto::LocalOption::MicrophoneInput
+                )
+            })
+        {
+            extended |= owner.ensure_option(option, value)?;
+        }
         projection::apply(&owner, &mut settings)?;
         for issue in &reader.issues {
             if issue.kind != SettingsIssueKind::UnknownKey {
@@ -387,6 +435,115 @@ mod tests {
         schema::WireDto,
     };
     #[test]
+    fn saved_custom_keymap_survives_owner_projection_and_restart_under_a_preset() {
+        use oink_protocol::v1::{dto, schema::WireValue};
+        let home = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::load_from_with_device_name(home.path(), "source".into()).unwrap();
+        let mut raw = write_transform(&oink_foundation::input_transform::InputTransform::initial("macos"));
+        let saved = RawValue::Map(
+            [
+                (
+                    1,
+                    RawValue::Array(vec![
+                        RawValue::Map([(1, RawValue::Uint(0xff0003)), (2, RawValue::Uint(0))].into()),
+                        RawValue::Map([(1, RawValue::Uint(0x700e0)), (2, RawValue::Uint(0x700e6))].into()),
+                        RawValue::Map([(1, RawValue::Uint(0x70039)), (2, RawValue::Uint(0))].into()),
+                    ]),
+                ),
+                (2, RawValue::Uint(0)),
+                (3, RawValue::Bool(true)),
+                (4, RawValue::Bool(true)),
+            ]
+            .into(),
+        );
+        let RawValue::Map(transform) = &mut raw else {
+            unreachable!()
+        };
+        let RawValue::Map(target) = transform.get_mut(&2).unwrap() else {
+            unreachable!()
+        };
+        let RawValue::Map(keyboard) = target.get_mut(&2).unwrap() else {
+            unreachable!()
+        };
+        keyboard.insert(4, saved);
+        let typed = read_transform(dto::InputTransformValue::read(&raw).unwrap()).unwrap();
+        assert_eq!(
+            write_transform(&typed),
+            raw,
+            "saved custom data must survive the typed owner projection"
+        );
+        config.update(|s| s.input_transform = typed).unwrap();
+        let reloaded = AgentConfig::load_from_with_device_name(home.path(), "source".into()).unwrap();
+        assert_eq!(write_transform(&reloaded.settings.input_transform), raw);
+        assert_eq!(reloaded.owner().value(LocalOption::InputTransform), Some(raw));
+        let saved = reloaded.settings.input_transform.windows.keyboard.saved_custom.clone();
+        let mut switched = reloaded;
+        for preset in [
+            oink_foundation::input_transform::KeyPreset::WinFeel,
+            oink_foundation::input_transform::KeyPreset::MacFeel,
+        ] {
+            switched
+                .update(|s| {
+                    let active = oink_foundation::input_transform::KeyboardMapping::preset(preset, "macos", "windows");
+                    s.input_transform.windows.keyboard.preset = active.preset;
+                    s.input_transform.windows.keyboard.table = active.table;
+                })
+                .unwrap();
+            switched = AgentConfig::load_from_with_device_name(home.path(), "source".into()).unwrap();
+            assert_eq!(switched.settings.input_transform.windows.keyboard.saved_custom, saved);
+        }
+        // Subsequent custom edits use keyed patches inside the retained snapshot,
+        // including removing an optional hold while keeping a disabled Fn choice.
+        switched
+            .update(|s| {
+                let saved = s.input_transform.windows.keyboard.saved_custom.as_mut().unwrap();
+                saved.table[0].to = oink_foundation::input::KeyCode::RIGHT_ALT;
+                saved.table[1].to = oink_foundation::input::KeyCode::NONE;
+                saved.caps_hold = None;
+                saved.caps_split = false;
+                saved.allow_fn = false;
+            })
+            .unwrap();
+        let restarted = AgentConfig::load_from_with_device_name(home.path(), "source".into()).unwrap();
+        assert_eq!(restarted.settings.input_transform, switched.settings.input_transform);
+        let saved = restarted
+            .settings
+            .input_transform
+            .windows
+            .keyboard
+            .saved_custom
+            .unwrap();
+        assert_eq!(saved.table[0].to, oink_foundation::input::KeyCode::RIGHT_ALT);
+        assert_eq!(saved.table[1].to, oink_foundation::input::KeyCode::NONE);
+        assert_eq!(saved.caps_hold, None);
+        assert!(!saved.caps_split && !saved.allow_fn);
+    }
+    #[test]
+    fn released_keymap_without_saved_custom_survives_owner_store_reload() {
+        let home = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::load_from_with_device_name(home.path(), "source".into()).unwrap();
+        let keyboard: oink_foundation::input_transform::KeyboardMapping = serde_json::from_str(
+            r#"{"preset":"custom","table":[{"from":458976,"to":458982}],"caps_tap_hold":{"tap":458977,"hold":458809}}"#,
+        )
+        .unwrap();
+        config
+            .update(|s| s.input_transform.windows.keyboard = keyboard.clone())
+            .unwrap();
+        let raw = config.owner().value(LocalOption::InputTransform);
+        let restarted = AgentConfig::load_from_with_device_name(home.path(), "source".into()).unwrap();
+        assert_eq!(restarted.settings.input_transform.windows.keyboard, keyboard);
+        assert_eq!(restarted.owner().value(LocalOption::InputTransform), raw);
+        assert!(
+            restarted
+                .settings
+                .input_transform
+                .windows
+                .keyboard
+                .saved_custom
+                .is_none()
+        );
+    }
+    #[test]
     fn received_cleanup_is_local_never_by_default_and_survives_restart() {
         use crate::api::ReceivedFilesCleanup as C;
         let home = tempfile::tempdir().unwrap();
@@ -504,6 +661,88 @@ mod tests {
     }
 
     #[test]
+    fn touchpad_owner_options_default_on_persist_independently_and_project_legacy() {
+        use oink_protocol::v1::{dto::LocalOption as O, schema::WireValue};
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::load_from(dir.path()).unwrap();
+        for option in [O::TouchpadInjection, O::NativeMultifinger, O::MacScrollFeel] {
+            assert_eq!(config.owner().value(option), Some(true.write()));
+        }
+        for parent in [false, true] {
+            for native in [false, true] {
+                for mac in [false, true] {
+                    for (option, enabled) in [
+                        (O::TouchpadInjection, parent),
+                        (O::NativeMultifinger, native),
+                        (O::MacScrollFeel, mac),
+                    ] {
+                        config
+                            .edit_owner(option, config.owner().revision(option).unwrap(), enabled.write())
+                            .unwrap();
+                    }
+                    config = AgentConfig::load_from(dir.path()).unwrap();
+                    let s = &config.settings;
+                    assert_eq!(
+                        (
+                            s.routing.touchpad_injection,
+                            s.routing.native_multifinger,
+                            s.routing.mac_scroll_feel
+                        ),
+                        (parent, native, mac)
+                    );
+                    assert_eq!(s.accept_contacts, parent && native);
+                    for field in ["mac_scroll_feel", "native_multifinger", "touchpad_injection"] {
+                        assert!(stored(dir.path())["local"]["routing"].get(field).is_none());
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn touchpad_upgrade_preserves_old_off_and_legacy_scroll_choice() {
+        use base64::Engine;
+        use oink_protocol::v1::{RawValue, dto::LocalOption as O, schema::WireValue};
+        for (legacy, mac) in [(false, false), (false, true), (true, false), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = AgentConfig::load_from(dir.path()).unwrap();
+            config.save().unwrap();
+            let mut raw = stored(dir.path());
+            let mut owner = oink_protocol::v1::cbor::decode(&config.owner().encode().unwrap(), 4 * 1024 * 1024)
+                .unwrap()
+                .as_map()
+                .unwrap()
+                .clone();
+            if let Some(RawValue::Array(items)) = owner.get_mut(&2) {
+                items.retain(|item| {
+                    !item
+                        .as_map()
+                        .ok()
+                        .and_then(|m| m.get(&1))
+                        .and_then(|value| value.as_u64().ok())
+                        .is_some_and(|n| (26..=28).contains(&n))
+                });
+                for item in items {
+                    if let RawValue::Map(m) = item
+                        && m.get(&1) == Some(&19u32.write())
+                    {
+                        m.insert(3, legacy.write());
+                    }
+                }
+            }
+            raw["device_options_cbor"] = base64::engine::general_purpose::STANDARD
+                .encode(RawValue::Map(owner).encode(4 * 1024 * 1024).unwrap())
+                .into();
+            raw["local"]["routing"]["mac_scroll_feel"] = mac.into();
+            std::fs::write(config.settings_path(), serde_json::to_vec(&raw).unwrap()).unwrap();
+            let reloaded = AgentConfig::load_from(dir.path()).unwrap();
+            assert!(reloaded.settings.routing.touchpad_injection);
+            assert_eq!(reloaded.settings.routing.native_multifinger, legacy);
+            assert_eq!(reloaded.settings.routing.mac_scroll_feel, !legacy || mac);
+            assert_eq!(reloaded.owner().value(O::AcceptContacts), Some(legacy.write()));
+            assert!(stored(dir.path())["local"]["routing"].get("mac_scroll_feel").is_none());
+        }
+    }
+    #[test]
     fn mac_scroll_feel_defaults_on_and_ignores_retired_test_key() {
         for legacy in [None, Some(false), Some(true)] {
             let dir = tempfile::tempdir().unwrap();
@@ -549,6 +788,65 @@ mod tests {
             let mut raw = stored(dir.path());
             raw.as_object_mut().unwrap().remove("local");
             assert!(!raw.to_string().contains("forward_injected_input"));
+        }
+    }
+
+    #[test]
+    fn old_clipboard_format_keys_do_not_disable_formats_or_other_preferences() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::load_from(dir.path()).unwrap();
+        config.save().unwrap();
+        let mut raw = stored(dir.path());
+        raw["local"]["clipboard"] = serde_json::json!({
+            "text":false,"rich_text":false,"images":false,"files":false,"custom":false,
+            "receive":false,"send":true,"remove_ds_store":false
+        });
+        std::fs::write(config.settings_path(), serde_json::to_vec(&raw).unwrap()).unwrap();
+        let mut loaded = AgentConfig::load_from(dir.path()).unwrap();
+        let local = loaded.settings.clipboard.unwrap();
+        assert!(!local.receive);
+        assert!(local.send);
+        assert!(!local.remove_ds_store);
+        let wire = serde_json::to_value(crate::api::ClipboardSettings::from(local)).unwrap();
+        let typed_local = serde_json::to_value(local).unwrap();
+        for key in ["text", "rich_text", "images", "files", "custom"] {
+            assert_eq!(wire[key], true);
+            assert!(typed_local.get(key).is_none());
+            assert!(
+                loaded
+                    .settings_issues
+                    .iter()
+                    .any(|issue| issue.path == format!("settings.clipboard.{key}")
+                        && issue.kind == SettingsIssueKind::UnknownKey)
+            );
+        }
+        loaded.update(|s| s.confirm_quit = false).unwrap();
+        let reloaded = AgentConfig::load_from(dir.path()).unwrap();
+        assert_eq!(reloaded.settings.clipboard, Some(local));
+        assert!(!reloaded.settings.confirm_quit);
+        assert_eq!(stored(dir.path())["schema"], 1);
+    }
+
+    #[test]
+    fn ds_store_filter_defaults_on_and_persists_only_locally() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::load_from(dir.path()).unwrap();
+        assert!(config.settings.clipboard.unwrap().remove_ds_store);
+        for enabled in [false, true] {
+            config
+                .update_local(
+                    &serde_json::json!({"clipboard":{"remove_ds_store":enabled}}),
+                    |settings| {
+                        settings.clipboard.as_mut().unwrap().remove_ds_store = enabled;
+                    },
+                )
+                .unwrap();
+            let reloaded = AgentConfig::load_from(dir.path()).unwrap();
+            assert_eq!(reloaded.settings.clipboard.unwrap().remove_ds_store, enabled);
+            assert_eq!(stored(dir.path())["local"]["clipboard"]["remove_ds_store"], enabled);
+            let mut raw = stored(dir.path());
+            raw.as_object_mut().unwrap().remove("local");
+            assert!(!raw.to_string().contains("remove_ds_store"));
         }
     }
 
@@ -650,9 +948,15 @@ mod tests {
         assert!(
             s.clipboard
                 .as_ref()
-                .is_some_and(|s| s.text && s.rich_text && s.images && s.files && s.custom)
+                .is_some_and(|s| s.receive && s.send && s.remove_ds_store)
         );
-        assert!(s.hotkeys.as_ref().unwrap().iter().all(|h| h.enabled));
+        let hotkeys = s.hotkeys.as_ref().unwrap();
+        assert_eq!(hotkeys, &crate::agent_api::default_hotkeys());
+        assert!(
+            hotkeys
+                .iter()
+                .all(|h| { h.enabled == (h.action != crate::api::HotkeyAction::ToggleMicrophoneMute) })
+        );
         assert!(s.show_status_icon);
         assert!(s.accept_contacts);
         assert_eq!(s.game_mode, GameModePreference::Auto);
@@ -917,5 +1221,50 @@ mod tests {
         invalid.routing.remote_scroll_speed = 0.0;
         assert!(config.preview_preferences(&invalid).is_err());
         assert_eq!(config.owner(), &before);
+    }
+    #[test]
+    fn per_device_hotkey_overrides_persist_with_distinct_target_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::load_from(dir.path()).unwrap();
+        let mut keys: Vec<_> = [1u8, 2]
+            .into_iter()
+            .map(|seed| crate::api::Hotkey {
+                action: crate::api::HotkeyAction::MovePointerTo,
+                device: Some(oink_foundation::DeviceId([seed; 32]).into()),
+                keys: vec!["Ctrl".into(), "Alt".into(), seed.to_string()],
+                enabled: true,
+            })
+            .collect();
+        config
+            .update_local(&serde_json::json!({"hotkeys":&keys}), |s| {
+                s.hotkeys = Some(keys.clone())
+            })
+            .unwrap();
+        keys[1].keys[2] = "8".into();
+        config
+            .update_local(&serde_json::json!({"hotkeys":&keys}), |s| {
+                s.hotkeys = Some(keys.clone())
+            })
+            .unwrap();
+        assert_eq!(stored(dir.path())["local"]["hotkeys"], serde_json::json!(&keys));
+        let bytes = std::fs::read(config.settings_path()).unwrap();
+        let mut loaded = AgentConfig::load_from(dir.path()).unwrap();
+        assert_eq!(loaded.settings.hotkeys.as_ref(), Some(&keys));
+        assert_eq!(
+            std::fs::read(config.settings_path()).unwrap(),
+            bytes,
+            "loading must not rewrite config"
+        );
+        let projected = crate::hotkeys::effective(loaded.settings.hotkeys.clone(), &Default::default());
+        assert!(
+            projected
+                .iter()
+                .any(|h| h.action == crate::api::HotkeyAction::ToggleMicrophoneMute && !h.enabled)
+        );
+        loaded
+            .update_local(&serde_json::json!({"confirm_quit":false}), |s| s.confirm_quit = false)
+            .unwrap();
+        assert_eq!(stored(dir.path())["local"]["hotkeys"], serde_json::json!(&keys));
+        assert_eq!(AgentConfig::load_from(dir.path()).unwrap().settings.hotkeys, Some(keys));
     }
 }

@@ -70,6 +70,14 @@ impl Bursts {
         self.highest.store(sequence, Ordering::Release);
         self.sleeping.store(true, Ordering::Release);
     }
+    /// A timeout is missing media, not proof of source silence. Only a validated
+    /// Sleep event suppresses transport health checks.
+    pub fn media_missing(&self, now: Instant, timeout: Duration) -> bool {
+        !self.sleeping.load(Ordering::Acquire)
+            && now.saturating_duration_since(
+                self.epoch + Duration::from_nanos(self.last_packet_ns.load(Ordering::Acquire)),
+            ) > timeout
+    }
     pub fn asleep(&self, now: Instant) -> bool {
         self.sleeping.load(Ordering::Acquire)
             || now.saturating_duration_since(

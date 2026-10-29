@@ -7,14 +7,104 @@ use super::{
 use oink_foundation::{DeviceId, Point, Rect, Size};
 
 impl Layout {
+    /// Newly attached screens pin their owner. Only computers intersecting a new
+    /// screen in the initial import may move; siblings follow their rigid unit.
+    /// Visit colliders by device identity, choosing the nearest free translation
+    /// against every other actual screen (including still-unrepaired colliders).
+    /// Ties use dx, then dy. No cascading pushes or attachment compaction.
+    pub fn repair_new_screens(&mut self, owner: DeviceId, added: &[ScreenId]) {
+        let new = self
+            .screens
+            .iter()
+            .filter(|s| added.contains(&s.id) && s.is_valid())
+            .map(|s| s.rect)
+            .collect::<Vec<_>>();
+        let colliders = self
+            .screens
+            .iter()
+            .filter(|s| {
+                s.id.device != owner
+                    && s.is_valid()
+                    && new.iter().any(|r| overlaps(s.rect, *r, tolerance(&[s.rect, *r])))
+            })
+            .map(|s| s.id.device)
+            .collect::<std::collections::BTreeSet<_>>();
+        for device in colliders {
+            self.repair_native_change(device);
+        }
+    }
+
+    /// Translate an overlapping native desktop to its nearest free position.
+    /// Preserve its native geometry/scale and every other computer. Native
+    /// changes never restore lost contact: a gap is not a collision.
+    pub fn repair_native_change(&mut self, device: DeviceId) {
+        let group = self
+            .screens
+            .iter()
+            .filter(|s| s.id.device == device && s.is_valid())
+            .map(|s| s.rect)
+            .collect::<Vec<_>>();
+        if group.is_empty() {
+            return;
+        }
+        let obstacles = self
+            .screens
+            .iter()
+            .filter(|s| s.id.device != device && s.is_valid())
+            .map(|s| s.rect)
+            .collect::<Vec<_>>();
+        let moved = |r: Rect, x, y| Rect::new(r.x + x, r.y + y, r.w, r.h);
+        let fits = |x, y| {
+            group.iter().all(|a| {
+                obstacles.iter().all(|b| {
+                    let a = moved(*a, x, y);
+                    !overlaps(a, *b, tolerance(&[a, *b]))
+                })
+            })
+        };
+        if fits(0.0, 0.0) {
+            return;
+        }
+        // The feasible translation region is bounded by actual screen edges.
+        // Include both axes' edge differences: a nearest free position may be
+        // diagonal and constrained by two different stationary computers.
+        let mut xs = vec![0.0];
+        let mut ys = vec![0.0];
+        for a in &group {
+            for b in &obstacles {
+                xs.extend([b.x - a.right(), b.right() - a.x]);
+                ys.extend([b.y - a.bottom(), b.bottom() - a.y]);
+            }
+        }
+        xs.sort_by(f64::total_cmp);
+        xs.dedup();
+        ys.sort_by(f64::total_cmp);
+        ys.dedup();
+        let mut best: Option<(f64, f64, f64)> = None;
+        for x in xs {
+            for &y in &ys {
+                let cost = x * x + y * y;
+                if best.is_some_and(|(c, _, _)| cost >= c) || !fits(x, y) {
+                    continue;
+                }
+                best = Some((cost, x, y));
+            }
+        }
+        if let Some((_, dx, dy)) = best {
+            for s in self.screens.iter_mut().filter(|s| s.id.device == device) {
+                s.translate(dx, dy);
+            }
+        }
+    }
+
     /// Separate actual inter-computer collisions without closing intentional gaps.
     pub fn repair_overlaps(&mut self) {
         self.normalize_pinned(None);
     }
 
-    /// Repair collisions while keeping the specified screen anchored. Native
-    /// refresh and API resizes use this; neither is a canvas edit, and contact
-    /// compaction belongs to the canvas editor alone.
+    /// Repair collisions while keeping the specified screen anchored. Explicit
+    /// API resizes use this; native observations use `repair_native_change`.
+    /// Contact compaction belongs to the canvas editor alone.
     pub fn repair_overlaps_around(&mut self, id: &ScreenId) {
         let pin = self.screens.iter().position(|s| &s.id == id);
         self.normalize_pinned(pin);

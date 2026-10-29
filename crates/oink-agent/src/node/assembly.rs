@@ -24,15 +24,18 @@ impl Node {
         crate::config_module::group_store::load(
             &self.inner.data_dir.join(crate::config_module::group_store::STATE_FILE),
             self.id(),
-        )?;
-        let initial_displays = self.current_displays()?;
+        )
+        .context("read group state before sharing")?;
+        let initial_displays = self.current_displays().context("read initial displays")?;
         {
             let _gate = self.owner_gate();
-            lock(&self.inner.config).seed_screen_preferences(
-                initial_displays
-                    .iter()
-                    .map(|display| (display.key.as_str(), display.is_virtual)),
-            )?;
+            lock(&self.inner.config)
+                .seed_screen_preferences(
+                    initial_displays
+                        .iter()
+                        .map(|display| (display.key.as_str(), display.is_virtual)),
+                )
+                .context("persist initial screen preferences")?;
         }
         let (links, config_port) = LinkLayer::start(LinkConfig {
             profile,
@@ -43,7 +46,8 @@ impl Node {
             // The network owner still enforces every class/round time budget.
             tier: Tier::Realtime,
         })
-        .await?;
+        .await
+        .context("bind backend network")?;
         if self.inner.native_surfaces {
             if let Some(trail) = oink_locator::CursorTrail::platform() {
                 let _ = self.inner.cursor_trail.set(trail);
@@ -82,7 +86,8 @@ impl Node {
                 application: Arc::new(Application(Arc::downgrade(&self.inner))),
             },
             self.inner.network.clone(),
-        )?;
+        )
+        .context("start configuration owner")?;
         self.inner
             .group
             .set(group.clone())
@@ -92,11 +97,23 @@ impl Node {
         self.publish_local_options();
         self.publish_local_permissions();
         let initial_group = group.clone();
-        tokio::task::spawn_blocking(move || initial_group.initialize_displays(initial_displays)).await??;
+        tokio::task::spawn_blocking(move || initial_group.initialize_displays(initial_displays))
+            .await
+            .context("join display initialization")?
+            .context("initialize group displays")?;
         // Preserve the initial list before exposing the started Node to callers,
         // including a crash before a later profile handoff callback.
         let node = self.clone();
-        let _ = tokio::task::spawn_blocking(move || node.refresh_layout_profiles()).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            // Publish the first native observation before issuing a ready profile
+            // token. Leaving it to the observer lets an unchanged desktop acquire
+            // its first native token between the UI query and commit, spuriously
+            // rejecting the edit as stale. Failed/unsupported reads still leave
+            // rigid editing available; the observer retains its normal retries.
+            let _ = node.observe_native_arrangement("startup");
+            node.refresh_layout_profiles();
+        })
+        .await;
         let applied = group.applied();
         let settings = self.settings();
         let directory = self.log_dir().join("Diagnostics");
@@ -106,10 +123,17 @@ impl Node {
             Some(applied.group),
             settings.diagnostics_enabled,
             applied.paused,
-            Some(crate::diagnostics::collection::Context::for_node(self)?),
-        )?;
+            Some(crate::diagnostics::collection::Context::for_node(self).context("prepare diagnostic context")?),
+        )
+        .context("start diagnostic recorder")?;
+        #[cfg(windows)]
+        if self.inner.native_services {
+            self.inner.reports.set_local_capture(recorder.crash_target());
+        }
         let mut recovery_guard = crate::diagnostics::StartupRecoveryGuard(Some(recorder.clone()));
-        group.observe_layout(&recorder)?;
+        group
+            .observe_layout(&recorder)
+            .context("observe initial diagnostic layout")?;
         recorder.install_native_clock();
         oink_input::native_lifecycle::set_lifecycle(settings.diagnostics_enabled);
         let trace = crate::diagnostics::input_trace::InputTrace::for_recorder(&recorder);
@@ -129,7 +153,8 @@ impl Node {
             self.inner.input_backend.clone(),
             Box::new(|_| {}),
             Some(trace.clone()),
-        )?;
+        )
+        .context("start input injector")?;
         let (main, receive) = crate::threads::main_channel();
         let _ = self.inner.main_commands.set(main.clone());
         let trace_wake = main.notifier();
@@ -140,20 +165,22 @@ impl Node {
             InputSnapshots {
                 mode_switch_in_callback: self.inner.mode_switch_in_callback,
                 capture_reports_key_repeat: self.inner.capture_reports_key_repeat,
+                local_input_transform: settings.input_transform.clone(),
                 layout: group.router_layout(),
                 settings: self.inner.input_settings.clone(),
                 environment: self.inner.input_environment.clone(),
             },
             inject,
             main,
-        )?;
+        )
+        .context("start input owner")?;
         let input = Arc::new(input);
         self.inner
             .input
             .set(input.clone())
             .map_err(|_| anyhow::anyhow!("input already started"))?;
         input.send(InputCommand::Hotkeys(crate::hotkeys::bindings(
-            &crate::hotkeys::configured(settings.hotkeys),
+            &self.effective_hotkeys(),
         )));
         input.send(InputCommand::LocalFeel(self.inner.input_backend.feel_profile()));
         input.send(InputCommand::EventFrequency(settings.event_frequency));
@@ -166,27 +193,27 @@ impl Node {
             input_port,
         )];
         if let Some(backend) = &self.inner.clipboard_backend {
-            tasks.push(crate::clip::start_link_runtime(
-                self.clone(),
-                clip_port,
-                backend.clone(),
-            )?);
+            tasks.push(
+                crate::clip::start_link_runtime(self.clone(), clip_port, backend.clone())
+                    .context("start clipboard owner")?,
+            );
         }
-        let (audio, audio_task) = crate::audio::start_link_runtime(self.clone(), audio_port)?;
+        let (audio, audio_task) =
+            crate::audio::start_link_runtime(self.clone(), audio_port).context("start audio owner")?;
         self.inner
             .audio
             .set(audio)
             .map_err(|_| anyhow::anyhow!("audio already started"))?;
         tasks.push(audio_task);
         tasks.push(crate::cache::start(self.clone(), cache_port));
-        tasks.push(crate::display_overlay::start(self.clone())?);
-        tasks.push(crate::aim::start_link_runtime(self.clone(), aim_port)?);
-        tasks.push(crate::projection::start(
-            self.clone(),
-            projection_port,
-            self.inner.native_surfaces,
-        )?);
-        tasks.push(crate::wallpaper::start_link_runtime(self.clone(), wallpaper_port)?);
+        tasks.push(crate::display_overlay::start(self.clone()).context("start display overlay")?);
+        tasks.push(crate::aim::start_link_runtime(self.clone(), aim_port).context("start aim owner")?);
+        tasks.push(
+            crate::projection::start(self.clone(), projection_port, self.inner.native_surfaces)
+                .context("start projection owner")?,
+        );
+        tasks
+            .push(crate::wallpaper::start_link_runtime(self.clone(), wallpaper_port).context("start wallpaper owner")?);
         tasks.push(crate::layout_profiles::sync::start(self.clone(), profiles_port));
         let (diagnostics, diagnostics_task) =
             crate::diagnostics::collection::start_link_runtime(self.clone(), diagnostics_port, recorder)?;
@@ -286,16 +313,26 @@ fn application_profile() -> oink_network::negotiation::OfferProfile {
                 "oink.input.gestures/1",
                 "oink.input.contacts/1",
                 "oink.input.trail/1",
+                "oink.input.application-focus/1",
+                "oink.pointer.move/1",
+                "oink.pointer.lock-escape/1",
+                "oink.pointer.entry-protection/1",
                 "oink.input.edge-trigger/1",
                 "oink.device-resources/1",
                 "oink.device-options/1",
                 "oink.input.mouse-disabled/1",
                 "oink.input.accessibility/1",
+                "oink.input.touchpad-options/1",
+                "oink.input.keymap-none/1",
+                "oink.input.scroll-pixels/1",
                 "oink.aim/1",
                 "oink.notify/1",
+                "oink.notify.microphone/1",
+                "oink.power/1",
                 "oink.wallpaper/1",
                 "oink.layout.projection/1",
                 "oink.layout.profiles/3",
+                "oink.layout.topology/1",
                 "oink.layout.arrangement/1",
                 "oink.layout.preview/1",
                 "oink.diagnostics.collect/1",

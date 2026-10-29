@@ -125,6 +125,14 @@ impl Journal {
         Ok(result)
     }
     pub fn recoveries(&self) -> Result<Vec<Recovery>> {
+        self.recoveries_matching(None)
+    }
+    /// Retry candidates for this local source and peer. Filter retained receipts
+    /// before decoding their immutable plans/bundles on periodic owner ticks.
+    pub fn unreceipted_recoveries(&self, peer: DeviceId) -> Result<Vec<Recovery>> {
+        self.recoveries_matching(Some(peer))
+    }
+    fn recoveries_matching(&self, retry_peer: Option<DeviceId>) -> Result<Vec<Recovery>> {
         let mut result = Vec::new();
         for value in array(&self.raw, 3)? {
             let row = value.as_map()?;
@@ -133,6 +141,11 @@ impl Journal {
             }
             let source = wire::read_device(&get::<dto::DeviceId>(row, 2)?)?;
             let target = wire::read_device(&get::<dto::DeviceId>(row, 3)?)?;
+            if let Some(peer) = retry_peer
+                && (source != self.local || target != peer || get::<bool>(row, 9)?)
+            {
+                continue;
+            }
             let pair = wire::read_pair(&get::<dto::PairId>(row, 1)?)?;
             let plan = get::<dto::MergePlan>(row, 4)?;
             let decision = get(row, 5)?;
@@ -992,6 +1005,86 @@ mod tests {
         let seed = group_merge::seed(&source, target.roster().anchor(), 1).unwrap();
         let plan = group_merge::prepare(&source, &target, &context, &seed, 2).unwrap();
         (a, b, source, target, plan)
+    }
+    fn source_journal(path: &Path) -> (Journal, Identity, Identity, State, dto::MergeTransferBundle) {
+        let (a, b, source, target, plan) = fixture();
+        let mut journal = Journal::load(path, a.id()).unwrap();
+        if a.id() < b.id() {
+            journal.permit(&plan).unwrap();
+        }
+        journal.prepare(&plan, 1, Role::Source, Some(source.wire())).unwrap();
+        let proof = group_merge::commit(
+            &b,
+            source.roster(),
+            &target,
+            &plan,
+            group_merge::authorization(&a, &plan, 1).unwrap(),
+            1,
+        )
+        .unwrap();
+        (journal, a, b, source, proof)
+    }
+    #[test]
+    fn retry_candidates_preserve_pending_and_committed_until_receipt_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let (mut journal, a, b, source, proof) = source_journal(&path);
+        let pending = journal.unreceipted_recoveries(b.id()).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(pending[0].outcome, Decision::Pending));
+        assert!(journal.unreceipted_recoveries(a.id()).unwrap().is_empty());
+        journal.commit(&proof, &source).unwrap();
+        assert!(matches!(
+            journal.unreceipted_recoveries(b.id()).unwrap()[0].outcome,
+            Decision::Committed(_)
+        ));
+        journal
+            .receipt(pending[0].pair, 1, [(1, RawValue::from("completed"))].into())
+            .unwrap();
+        let journal = Journal::load(&path, a.id()).unwrap();
+        assert_eq!(journal.recoveries().unwrap().len(), 1, "retain the durable proof");
+        assert!(journal.unreceipted_recoveries(b.id()).unwrap().is_empty());
+    }
+    #[test]
+    #[ignore = "controlled retained-proof retry comparison"]
+    fn resource_recovery_scan_benchmark() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut journal, a, b, source, proof) = source_journal(&dir.path().join(FILE));
+        journal.commit(&proof, &source).unwrap();
+        let pair = journal.recoveries().unwrap()[0].pair;
+        journal
+            .receipt(pair, 1, [(1, RawValue::from("completed"))].into())
+            .unwrap();
+        let profile = std::env::var_os("OINK_RESOURCE_PROFILE").is_some();
+        let count = if profile { 1500 } else { 1000 };
+        for filtered in [false, true] {
+            if let Ok(mode) = std::env::var("OINK_RESOURCE_FILTERED")
+                && filtered != (mode == "1")
+            {
+                continue;
+            }
+            let began = std::time::Instant::now();
+            for _ in 0..count {
+                let candidates = if filtered {
+                    journal.unreceipted_recoveries(b.id()).unwrap()
+                } else {
+                    journal
+                        .recoveries()
+                        .unwrap()
+                        .into_iter()
+                        .filter(|r| !r.receipt && r.target == b.id() && r.source == a.id())
+                        .collect()
+                };
+                assert!(std::hint::black_box(candidates).is_empty());
+                if profile {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            eprintln!(
+                "RECOVERY,filtered={filtered},scans={count},us={}",
+                began.elapsed().as_micros()
+            );
+        }
     }
     #[test]
     fn committed_projection_and_receipt_survive_restart_without_duplicate_outcome() {

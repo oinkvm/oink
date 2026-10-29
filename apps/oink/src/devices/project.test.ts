@@ -2,10 +2,14 @@
 import { describe, expect, it } from 'vitest';
 import type { DeviceCard, DeviceCardsView, ResourceCard, SharingMode } from '../api/cards';
 import { createAgentStore } from '../api/store';
-import { presentCards } from './project';
+import { presentCards, presentControls, resourceAction } from './project';
+import { ControlActions } from './controlActions';
+import { controlObservation } from './controlPlan';
 import { screenValue } from './data';
 import { setLanguage, problemText } from '../i18n';
 import { indicators } from './DeviceList';
+import { captureNotices } from '../api/notices.fixture';
+const notices = captureNotices();
 
 const unavailable = {kind:'unavailable',reason:'state_unknown'} as const;
 const resource = (): ResourceCard<SharingMode> => ({configuredMode:'shared',icon:'shared',fault:{code:'none',unknownCode:null,problem:null},condition:'ready',action:unavailable});
@@ -20,6 +24,20 @@ const card = (): DeviceCard => ({
   },
 });
 const view = (device:DeviceCard):DeviceCardsView => ({schema:1,stream:'test',revision:'1',group:null,generatedAtMs:0,exitVolume:null,emergencyDelivery:null,cards:[device]});
+function controlStore() {
+  const store=createAgentStore();
+  let id='';
+  const controls=new ControlActions({read:(device,action)=>controlObservation(store.get().cards,device,action),
+    send:async requestId=>{id=requestId;return {type:'device_control_accepted',data:{requestId}};},
+    show:()=>{},refresh:async()=>{},fail:store.fail});
+  store.onEvent(event=>event.type==='device_control_completed'&&controls.complete(event.data.requestId,event.data.result));
+  return {...store,controls,
+    intent:(device:string,resource:'screen'|'mouse',desired:string)=>controls.set(device,{kind:'card',resource,desired}),
+    complete:(result:import('../api/cards').DeviceControlResult)=>store.controlReply({type:'device_control_completed',data:{requestId:id,result}}),
+    shown:()=>presentControls(store.get().cards,controls.targets()),
+    receive:(event:import('../api/store').ProductEvent)=>{store.receive(event);controls.snapshot();},
+  };
+}
 describe('owner card presentation',()=>{
   it('uses only explicit remote AX reports, leaving legacy faults and Windows alone',()=>{
     const owner=card();owner.os='macos';
@@ -42,6 +60,16 @@ describe('owner card presentation',()=>{
     }
   });
 
+  it('uses local Input Monitoring permission before a capture fault without applying it to peers',()=>{
+    const owner=card();owner.os='macos';owner.isSelf=true;
+    const denied=[{kind:'input_monitoring' as const,state:'Denied' as const,required:true}];
+    expect(presentCards(view(owner),[],denied)[0].inputPermissionMissing).toBe(true);
+    owner.isSelf=false;
+    expect(presentCards(view(owner),[],denied)[0].inputPermissionMissing).toBe(false);
+    owner.status!.mouse.fault={code:'permission_denied',unknownCode:null,problem:null};
+    expect(presentCards(view(owner),[],denied)[0].inputPermissionMissing).toBe(true);
+  });
+
   it('offers mouse disable only when the owner supplies an invokable action',()=>{
     const device=card();
     expect(presentCards(view(device),[])[0].canDisableMouse).toBe(false);
@@ -52,13 +80,13 @@ describe('owner card presentation',()=>{
   });
   it.each(['shared','disabled'] as const)('reconciles Locked to %s after owner completion and focus facts in either order',desired=>{
     for (const completionFirst of [true,false]) {
-      const store=createAgentStore(), original=card();
+      const store=controlStore(), original=card();
       original.status!.cursor={icon:'locked',focusDevice:original.device,focusName:original.name,lockedDevice:original.device,context:'group'};
       store.receive({type:'device_cards',data:view(original)});
-      store.pending({requestId:'screen',device:original.device,resource:'screen',desired});
-      const shown=()=>screenValue(presentCards(store.get().cards,store.get().pending)[0]);
+      store.intent(original.device,'screen',desired);
+      const shown=()=>screenValue(store.shown()[0]);
       expect(shown()).toBe(desired);
-      const completion=()=>store.controlReply({type:'device_control_completed',data:{requestId:'screen',result:{outcome:desired==='shared'?'no_change':'applied'}}});
+      const completion=()=>store.complete({outcome:desired==='shared'?'no_change':'applied'});
       const facts=()=>{
         const unlocked=card();
         unlocked.status!.cursor={...original.status!.cursor,icon:'local',lockedDevice:null};
@@ -67,21 +95,21 @@ describe('owner card presentation',()=>{
       };
       if(completionFirst){completion();expect(shown()).toBe(desired);facts();}
       else {facts();expect(shown()).toBe(desired);completion();}
-      expect(store.get().pending).toEqual([]);
+      expect(store.controls.targets().size).toBe(0);
       expect(shown()).toBe(desired);
       store.receive({type:'device_cards',data:view(original)});
       expect(shown()).toBe(desired);
     }
   });
   it('restores Locked and the typed reason when a screen command is refused',()=>{
-    const store=createAgentStore(), original=card();
+    const store=controlStore(), original=card();
     original.status!.cursor.icon='locked';
     store.receive({type:'device_cards',data:view(original)});
-    store.pending({requestId:'screen',device:original.device,resource:'screen',desired:'disabled'});
-    expect(screenValue(presentCards(store.get().cards,store.get().pending)[0])).toBe('disabled');
-    store.controlReply({type:'device_control_completed',data:{requestId:'screen',result:{outcome:'refused',reason:'stale_revision',unknownCode:null}}});
-    expect(screenValue(presentCards(store.get().cards,store.get().pending)[0])).toBe('locked');
-    expect(store.get().error).toBe('stale_revision');
+    store.intent(original.device,'screen','disabled');
+    expect(screenValue(store.shown()[0])).toBe('disabled');
+    store.complete({outcome:'refused',reason:'apply_failed',unknownCode:null});
+    expect(screenValue(store.shown()[0])).toBe('locked');
+    expect(notices()).toContain('apply_failed');
   });
   it.each([true,false])('maps readable local output for self=%s and preserves null',isSelf=>{
     const owner=card();owner.isSelf=isSelf;
@@ -96,12 +124,12 @@ describe('owner card presentation',()=>{
     expect(device.speaker.canSetVolume).toBe(false); expect(device.gameMode).toBeNull(); expect(device.gameActive).toBeNull();
   });
   it.each(['refused','failed'] as const)('rolls optimistic remote state back on %s completion',outcome=>{
-    const store=createAgentStore(), original=card();
+    const store=controlStore(), original=card();
     store.receive({type:'device_cards',data:view(original)});
-    store.pending({requestId:'request',device:original.device,resource:'mouse',desired:'local'});
-    expect(presentCards(store.get().cards,store.get().pending)[0].mouse).toBe('local');
-    store.receive({type:'device_control_completed',data:{requestId:'request',result:{outcome,reason:outcome==='failed'?'outcome_unknown':'stale_revision',unknownCode:null}}});
-    expect(presentCards(store.get().cards,store.get().pending)[0].mouse).toBe('shared');
+    store.intent(original.device,'mouse','local');
+    expect(store.shown()[0].mouse).toBe('local');
+    store.complete({outcome,reason:outcome==='failed'?'outcome_unknown':'apply_failed',unknownCode:null});
+    expect(store.shown()[0].mouse).toBe('shared');
   });
   it('shows one prospective exit and restores the existing exit after refusal',()=>{
     const old=card(),next=card();next.device='3'.repeat(64);
@@ -124,8 +152,9 @@ describe('unavailable resource presentation',()=>{
     setLanguage(language);
     const missing=card();missing.status=null;
     const state=indicators(presentCards(view(missing),[])[0]);
-    expect(state).toHaveLength(3);
-    for(const indicator of state) {
+    expect(state).toHaveLength(4);
+    expect(state[3]).toMatchObject({glyph:"microphone",tone:"muted",badge:"mute"});
+    for(const indicator of state.slice(0,3)) {
       expect(indicator.tone).toBe('warn');
       expect(indicator.badge).toBe('warning');
       expect(indicator.label).toContain(language==='en'?'unavailable':'不可用');
@@ -185,4 +214,83 @@ it.each([
   expect(absent.badge).toBe('warning');
   expect(absent.tip).toContain(absentText);
   expect(absent.tip).not.toContain(unavailableText);
+});
+
+it.each(['en','zh-Hans'] as const)('keeps an unresolved exit distinct from no exit in %s', language => {
+  setLanguage(language);
+  const source=card();
+  source.status!.speaker={...source.status!.speaker,configuredMode:'source',icon:'forwarding',forwardingEnabled:true,
+    activity:'unknown',receiverDevice:null};
+  const device=presentCards(view(source),[])[0];
+  const indicator=indicators(device,true).find(i=>i.glyph==='speaker')!;
+  expect(device.speaker.mode).toBe('forwarding');
+  expect(indicator.badge).toBe('warning');
+  expect(indicator.tip).toContain(language==='en'?'Waiting for an audio exit':'等待音频出口');
+});
+
+it.each(['mouse','keyboard','microphone','speaker','mute','volume'])('projects %s without pending presentation', resource => {
+  const owner=card();
+  const projected=presentCards(view(owner),[{requestId:'pending',device:owner.device,resource,desired:resource==='volume'?80:resource==='mute'?true:'shared'}])[0];
+  expect('pending' in projected).toBe(false);
+  expect('pending' in projected.speaker).toBe(false);
+});
+
+it('releases a failed receiver using its claim action, not the forwarding preference',()=>{
+  const c=card();
+  c.status!.speaker={...c.status!.speaker,configuredMode:'receiver',icon:'fault',action:{kind:'invoke',token:'release',command:'clear_audio_exit'}};
+  expect(resourceAction(c,'speaker','unused')).toBe(c.status!.speaker.action);
+  expect(presentCards(view(c),[])[0].speaker.configuredMode).toBe('receiver');
+});
+
+it('updates configured roles in optimistic speaker controls, including a failed old exit',()=>{
+  const old=card(), next=card();next.device='3'.repeat(64);
+  old.status!.speaker={...old.status!.speaker,configuredMode:'receiver',icon:'fault'};
+  const facts={...view(old),cards:[old,next]};
+  const shown=presentControls(facts,new Map([[next.device,[{kind:'speaker',mode:'exit'}]]]));
+  expect(shown.map(d=>d.speaker.configuredMode)).toEqual(['unused','receiver']);
+  const stopped=presentControls(view(old),new Map([[old.device,[{kind:'speaker',mode:'unused'}]]]));
+  expect(stopped[0].speaker.configuredMode).toBe('unused');
+});
+
+
+it.each(['shared','local'] as const)('keeps the frozen guard unlock command when selecting keyboard %s', desired => {
+  const c=card();
+  c.status!.keyboard.disabled=true;
+  const action={kind:'invoke',token:'unlock',command:'set_local_option'} as const;
+  c.status!.actions.keyboardEnabled=action;
+  expect(resourceAction(c,'keyboard',desired)).toBe(action);
+});
+
+it('projects microphone faults and keeps internal capture/consumer activity out of card text', () => {
+  setLanguage('zh-Hans');
+  const owner = card();
+  owner.status!.microphone = {
+    mode:'source', permissionGranted:true, virtualReady:true, captureActive:false, consumerActive:false, receivingActive:false,
+    sourceDevice:owner.device, sourceName:owner.name, shareAction:unavailable, localAction:unavailable,
+    receiveAction:unavailable, controlsToken:'controls', forwarding:{volumePercent:100,volumeBars:3,muted:false},
+    fault:{code:'backend_failed',unknownCode:null,problem:null},
+  };
+  let projected = presentCards(view(owner),[])[0];
+  expect(projected.microphone).toMatchObject({captureActive:false,consumerActive:false,fault:{code:'backend_failed'}});
+  expect(indicators(projected)[3]).toMatchObject({tone:'warn',badge:'warning'});
+  owner.status!.microphone!.fault = null;
+  projected = presentCards(view(owner),[])[0];
+  expect(indicators(projected)[3].label).toBe('麦克风：发送');
+  owner.status!.microphone!.captureActive = true;
+  projected = presentCards(view(owner),[])[0];
+  expect(indicators(projected)[3].label).toContain('发送');
+  owner.status!.microphone!.mode = 'receiver';
+  owner.status!.microphone!.captureActive = false;
+  projected = presentCards(view(owner),[])[0];
+  expect(indicators(projected)[3].label).toBe('麦克风：接收');
+});
+
+it.each(['preparing','sound_sleep','sleeping','paused'] as const)('speaker %s is an internal state: role badge and forwarding text stay', activity => {
+  setLanguage('zh-Hans');
+  const owner=card();
+  Object.assign(owner.status!.speaker,{configuredMode:'source',icon:'forwarding',activity,receiverDevice:'3'.repeat(64),forwarding:{volumePercent:100,volumeBars:3,muted:false}});
+  const projected=presentCards(view(owner),[])[0];
+  expect(indicators(projected)[2].label).toContain('正在转发');
+  // The role badge stays; activity is described in the label/tooltip only.
+  expect(indicators(projected)[2].badge).toBe('send');
 });

@@ -27,6 +27,7 @@ pub mod low;
 mod pipe;
 mod probe_socket;
 mod queue;
+mod realtime_datagram;
 mod runtime;
 pub mod snapshot;
 pub mod stream;

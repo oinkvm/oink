@@ -144,7 +144,13 @@ pub(super) fn attach(node: &Node) {
                     }
                     let changed = lock(&node.inner.update).status != status;
                     if changed {
-                        lock(&node.inner.update).status = status.clone();
+                        let mut current = lock(&node.inner.update);
+                        if current.local_mode {
+                            continue;
+                        }
+                        current.status = status.clone();
+                        drop(current);
+                        tracing::info!(phase=?status.phase,error=?status.error,"Windows update service status changed");
                         node.emit(ApiEvent::UpdateStatusChanged(status));
                     }
                 }

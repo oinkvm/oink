@@ -127,6 +127,7 @@ mod tests {
             }],
             focus: FocusObservation::default(),
             exit_baseline: false,
+            microphone_resolution: Default::default(),
             local_exit_selection_ready: false,
             selected_exit: None,
             exit_claim: None,

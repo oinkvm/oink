@@ -57,7 +57,7 @@ fn exercise(type_id: u16, fields: &[(u32, V<'_>)]) {
     let agreement = v1::admission::Agreement::new(v1::registry::CAPABILITIES.iter().map(|s| (*s).to_owned())).unwrap();
     let context = v1::admission::Context {
         kind: if type_id >= 0x0600 { 5 } else { 3 },
-        transport: if matches!(type_id, 0x0209 | 0x0604 | 0x0606) {
+        transport: if matches!(type_id, 0x0209 | 0x0604 | 0x0606 | 0x0618 | 0x0619) {
             v1::registry::Transport::Datagram
         } else {
             v1::registry::Transport::Reliable
@@ -172,6 +172,19 @@ fn exercise(type_id: u16, fields: &[(u32, V<'_>)]) {
                 ));
             }
             hot::Message::AudioSleep(v) => {
+                black_box((v.stream_id().unwrap(), v.burst().unwrap(), v.sequence().unwrap()));
+            }
+            hot::Message::MicrophonePacket(v) => {
+                black_box((
+                    v.stream_id().unwrap(),
+                    v.sequence().unwrap(),
+                    v.burst().unwrap(),
+                    v.source_time_ns().unwrap(),
+                    v.silent().unwrap(),
+                    v.payload().unwrap(),
+                ));
+            }
+            hot::Message::MicrophoneSleep(v) => {
                 black_box((v.stream_id().unwrap(), v.burst().unwrap(), v.sequence().unwrap()));
             }
         }
@@ -296,6 +309,21 @@ fn every_input_and_media_capture_encode_decode_and_typed_access_is_allocation_fr
         0x0606,
         &[(1, V::Uint(u64::MAX)), (2, V::Uint(u64::MAX)), (3, V::Uint(u64::MAX))],
     );
+    exercise(
+        0x0618,
+        &[
+            (1, V::Uint(u64::MAX)),
+            (2, V::Uint(u64::MAX)),
+            (3, V::Uint(u64::MAX)),
+            (4, V::Uint(u64::MAX)),
+            (5, V::Bool(false)),
+            (6, V::Bytes(&[0; 960])),
+        ],
+    );
+    exercise(
+        0x0619,
+        &[(1, V::Uint(u64::MAX)), (2, V::Uint(u64::MAX)), (3, V::Uint(u64::MAX))],
+    );
 }
 #[test]
 fn borrowed_profile_and_semantics_reject_malformed_before_dispatch() {
@@ -333,7 +361,8 @@ fn borrowed_profile_and_semantics_reject_malformed_before_dispatch() {
 fn every_hot_golden_including_nested_unknowns_uses_same_schema_and_zero_allocations() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1");
     let ids = [
-        0x0201, 0x0202, 0x0203, 0x0204, 0x0205, 0x0207, 0x0208, 0x0209, 0x020a, 0x020b, 0x020c, 0x0604, 0x0606,
+        0x0201, 0x0202, 0x0203, 0x0204, 0x0205, 0x0207, 0x0208, 0x0209, 0x020a, 0x020b, 0x020c, 0x0604, 0x0606, 0x0618,
+        0x0619,
     ];
     for id in ids {
         for suffix in ["", "-future"] {

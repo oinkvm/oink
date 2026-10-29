@@ -122,6 +122,22 @@ impl Chord {
     }
 }
 
+/// A hold binding is exactly one physical key. Modifier names accept either side,
+/// matching the existing shortcut vocabulary (Meta = Cmd on Mac, Win on Windows).
+pub fn single_key<S: AsRef<str>>(keys: &[S]) -> Result<KeyCode, ChordError> {
+    let [name] = keys else {
+        return Err(ChordError::Unsupported("single key required".into()));
+    };
+    let name = name.as_ref();
+    match name {
+        "Ctrl" => Ok(KeyCode::LEFT_CTRL),
+        "Alt" => Ok(KeyCode::LEFT_ALT),
+        "Shift" => Ok(KeyCode::LEFT_SHIFT),
+        "Meta" => Ok(KeyCode::LEFT_GUI),
+        _ => key_code(name).ok_or_else(|| ChordError::UnknownKey(name.into())),
+    }
+}
+
 /// 一条快捷键绑定。`action` 是界面 API 的动作名（例如 `"lock_focus"`），焦点锁由路由在物理按下时立即处理；其余动作交给 agent。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HotkeyBinding {
@@ -155,7 +171,7 @@ impl Hotkeys {
         }
         self.bindings
             .iter()
-            .find(|b| b.chord.key == key && b.chord.mods == held)
+            .find(|b| b.action != "lock_escape" && b.chord.key == key && b.chord.mods == held)
             .map(|b| b.action.as_str())
     }
 }

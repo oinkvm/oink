@@ -68,8 +68,35 @@ static void concurrent_ring(void) {
     assert(seen + lost == 100000);
     free(capture);
 }
+static void silence_keeps_the_first_nonzero_buffer(void) {
+    OinkCapture *capture = make_capture();
+    assert(semaphore_create(mach_task_self(), &capture->wake, SYNC_POLICY_FIFO, 0) == KERN_SUCCESS);
+    float input[256] = {0}, output[256];
+    AudioBufferList buffers = {.mNumberBuffers = 1, .mBuffers = {{2, sizeof(input), input}}};
+    uint64_t host, callback, sequence;
+    for (unsigned i = 0; i < 2000; ++i) {
+        capture_io(0, NULL, &buffers, NULL, NULL, NULL, capture);
+        if (atomic_load(&capture->wake_pending)) oink_audio_capture_wait(capture);
+        oink_audio_capture_read(capture, output, 128, &host, &callback, &sequence);
+    }
+    capture_io(0, NULL, &buffers, NULL, NULL, NULL, capture);
+    assert(!atomic_load(&capture->wake_pending));
+    assert(oink_audio_capture_read(capture, output, 128, &host, &callback, &sequence) == 0);
+    // Even a subnormal in the last channel must wake and keep the entire onset.
+    input[255] = 0x1p-140f;
+    capture_io(0, NULL, &buffers, NULL, NULL, NULL, capture);
+    assert(atomic_load(&capture->wake_pending));
+    oink_audio_capture_wait(capture);
+    assert(oink_audio_capture_read(capture, output, 128, &host, &callback, &sequence) == 128);
+    assert(sequence == 2001 * 128 && memcmp(input, output, sizeof(input)) == 0);
+    input[255] = 0;
+    capture_io(0, NULL, &buffers, NULL, NULL, NULL, capture);
+    assert(atomic_load(&capture->wake_pending)); // preserve the tail of a live burst
+    capture_free(capture);
+}
 int main(void) {
     audio_is_independent_of_diagnostic_drain();
     concurrent_ring();
+    silence_keeps_the_first_nonzero_buffer();
     return 0;
 }

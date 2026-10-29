@@ -1,10 +1,9 @@
-//! Local format selection and live revocation of existing clipboard readers.
+//! Local clipboard preferences and live revocation of existing readers.
 use crate::content::{self, Provider, Translator, namespace::Namespace};
 #[cfg(test)]
-use crate::model::{ContentItem, ContentSize, ItemId, Medium, NativeFormat};
+use crate::model::{ContentItem, ContentSize, ItemId, Medium, NativeFormat, Representation, StandardFormat};
 use crate::model::{
-    DirectoryCursor, DirectoryPage, FileNode, Inventory, NodeId, Representation, RepresentationData, RepresentationId,
-    StandardFormat, Unavailable,
+    DirectoryCursor, DirectoryPage, FileNode, Inventory, NodeId, RepresentationData, RepresentationId, Unavailable,
 };
 use crate::{ClipData, FileReader};
 #[cfg(test)]
@@ -16,97 +15,72 @@ use std::{
     time::Duration,
 };
 
-/// Private formats are representations without a recognised standard meaning.
-/// Privacy markers have a recognised meaning and are independent of this filter.
+/// Device-local direction and source preferences. All format classes are shared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FormatFilters {
+pub struct Settings {
     /// Device-local direction switches; omitted by pre-0.2 settings.
     #[serde(default = "enabled_by_default")]
     pub receive: bool,
     #[serde(default = "enabled_by_default")]
     pub send: bool,
-    pub text: bool,
-    pub rich_text: bool,
-    pub images: bool,
-    pub files: bool,
-    pub custom: bool,
+    /// Local source preference; never part of the group configuration.
+    #[serde(default = "enabled_by_default")]
+    pub remove_ds_store: bool,
 }
 fn enabled_by_default() -> bool {
     true
 }
-impl Default for FormatFilters {
+impl Default for Settings {
     fn default() -> Self {
         Self {
             receive: true,
             send: true,
-            text: true,
-            rich_text: true,
-            images: true,
-            files: true,
-            custom: true,
+            remove_ds_store: true,
         }
     }
 }
-impl FormatFilters {
-    fn representation(self, rep: &Representation) -> bool {
-        if matches!(rep.data, RepresentationData::File(_) | RepresentationData::Promise(..)) {
-            return self.files;
-        }
-        if crate::content::url::title_format(&rep.format) {
-            return self.text;
-        }
-        match rep.standard {
-            Some(StandardFormat::Text | StandardFormat::Url) => self.text,
-            Some(StandardFormat::Html | StandardFormat::Rtf) => self.rich_text,
-            Some(StandardFormat::Png) => self.images,
-            Some(StandardFormat::Privacy) => true,
-            None => self.custom,
-        }
+impl Settings {
+    /// Only this source Mac's folder children are filtered for a different OS.
+    pub fn omit_ds_store_for(self, source_os: &str, target_os: &str) -> bool {
+        self.remove_ds_store && source_os == "macos" && !target_os.is_empty() && target_os != "macos"
     }
-    pub fn items(self, items: Vec<ClipData>) -> Vec<ClipData> {
-        items
-            .into_iter()
-            .filter_map(|mut data| {
-                let keep = match &mut data {
-                    ClipData::Text(_) => self.text,
-                    ClipData::Html(_) | ClipData::Rtf(_) => self.rich_text,
-                    ClipData::Png(_) => self.images,
-                    ClipData::Files(_) | ClipData::FileRoots(_) => self.files,
-                    ClipData::Custom { platform, name, .. } => {
-                        crate::formats::is_marker(*platform, name) || self.custom
-                    }
-                    ClipData::Native { item, .. } => {
-                        item.representations.retain(|rep| self.representation(rep));
-                        if !self.files {
-                            item.file = None;
-                        }
-                        !item.representations.is_empty()
-                    }
-                };
-                keep.then_some(data)
-            })
-            .collect()
+}
+
+/// Remove file representations only when native file delivery is unavailable.
+/// This is a capability projection, independent of clipboard preferences.
+pub fn without_files(mut inventory: Inventory) -> Inventory {
+    for item in &mut inventory.items {
+        item.representations.retain(|rep| !file_representation(rep));
+        item.file = None;
     }
-    pub fn inventory(self, mut inventory: Inventory) -> Inventory {
-        for item in &mut inventory.items {
-            item.representations.retain(|rep| self.representation(rep));
-            if !self.files {
-                item.file = None;
-            }
-        }
-        inventory.items.retain(|item| !item.representations.is_empty());
-        if !self.files {
-            inventory.roots.clear();
-        }
-        inventory
-    }
+    inventory.items.retain(|item| !item.representations.is_empty());
+    inventory.roots.clear();
+    inventory
+}
+fn file_representation(rep: &crate::model::Representation) -> bool {
+    matches!(rep.data, RepresentationData::File(_) | RepresentationData::Promise(..))
+}
+pub fn items_without_files(items: Vec<ClipData>) -> Vec<ClipData> {
+    items
+        .into_iter()
+        .filter_map(|mut data| {
+            let keep = match &mut data {
+                ClipData::Files(_) | ClipData::FileRoots(_) => false,
+                ClipData::Native { item, .. } => {
+                    item.representations.retain(|rep| !file_representation(rep));
+                    item.file = None;
+                    !item.representations.is_empty()
+                }
+                _ => true,
+            };
+            keep.then_some(data)
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
 struct State {
     enabled: bool,
-    filters: FormatFilters,
     epoch: Arc<()>,
 }
 /// Shared by the owner switch, source advertisements and readers already handed
@@ -114,28 +88,25 @@ struct State {
 #[derive(Clone, Debug)]
 pub struct SharingPolicy(Arc<RwLock<State>>);
 impl SharingPolicy {
-    pub fn new(enabled: bool, filters: FormatFilters) -> Self {
+    pub fn new(enabled: bool) -> Self {
         Self(Arc::new(RwLock::new(State {
             enabled,
-            filters,
             epoch: Arc::new(()),
         })))
     }
     pub fn enabled(&self) -> bool {
         self.0.read().unwrap().enabled
     }
-    pub fn update(&self, enabled: bool, filters: FormatFilters) {
-        let mut state = self.0.write().unwrap();
-        if state.enabled != enabled || state.filters != filters {
-            *state = State {
-                enabled,
-                filters,
-                epoch: Arc::new(()),
-            };
-        }
+    /// Reconfiguration retires readers in both directions, even when only the
+    /// other direction or the source's .DS_Store preference changed.
+    pub fn update(&self, enabled: bool) {
+        *self.0.write().unwrap() = State {
+            enabled,
+            epoch: Arc::new(()),
+        };
     }
     /// A deferred publication cannot regain permission after disable/re-enable
-    /// or a filter change, even when its payload was already prepared.
+    /// even when its payload was already prepared.
     pub fn publication_guard(&self) -> content::ReaderGuard {
         let epoch = self.0.read().unwrap().epoch.clone();
         let policy = self.clone();
@@ -154,26 +125,16 @@ impl SharingPolicy {
             policy: self.clone(),
         })
     }
-    fn inventory(&self, inventory: Inventory) -> Inventory {
+    fn inventory(&self, mut inventory: Inventory) -> Inventory {
         let state = self.0.read().unwrap();
-        let mut inventory = state.filters.inventory(inventory);
         if !state.enabled {
             inventory.items.clear();
             inventory.roots.clear();
         }
         inventory
     }
-    fn representation(&self, representation: &Representation) -> io::Result<()> {
-        let state = self.0.read().unwrap();
-        if state.enabled && state.filters.representation(representation) {
-            Ok(())
-        } else {
-            Err(content::unavailable(Unavailable::Permission))
-        }
-    }
-    fn files(&self) -> io::Result<()> {
-        let state = self.0.read().unwrap();
-        if state.enabled && state.filters.files {
+    fn check(&self) -> io::Result<()> {
+        if self.enabled() {
             Ok(())
         } else {
             Err(content::unavailable(Unavailable::Permission))
@@ -186,7 +147,7 @@ impl SharingPolicy {
             if !Arc::ptr_eq(&policy.0.read().unwrap().epoch, &epoch) {
                 return Err(content::unavailable(Unavailable::Permission));
             }
-            policy.files()
+            policy.check()
         })
     }
 }
@@ -219,10 +180,8 @@ impl Provider for Filtered {
     }
     fn reader_guard(&self, id: RepresentationId) -> io::Result<content::ReaderGuard> {
         let inventory = self.provider.inventory();
-        let representation = content::find(&inventory, id)
-            .ok_or_else(|| content::unavailable(Unavailable::NoSuchItem))?
-            .clone();
-        self.policy.representation(&representation)?;
+        content::find(&inventory, id).ok_or_else(|| content::unavailable(Unavailable::NoSuchItem))?;
+        self.policy.check()?;
         let epoch = self.policy.0.read().unwrap().epoch.clone();
         let inner = self.provider.reader_guard(id)?;
         let policy = self.policy.clone();
@@ -231,12 +190,12 @@ impl Provider for Filtered {
             if !Arc::ptr_eq(&policy.0.read().unwrap().epoch, &epoch) {
                 return Err(content::unavailable(Unavailable::Permission));
             }
-            policy.representation(&representation)
+            policy.check()
         }))
     }
 
     fn namespace(&self) -> Option<Arc<dyn Namespace>> {
-        self.policy.files().ok()?;
+        self.policy.check().ok()?;
         self.provider.namespace().map(|inner| {
             Arc::new(FilteredFiles {
                 inner,
@@ -256,6 +215,83 @@ struct FilteredFiles {
     policy: SharingPolicy,
 }
 impl Namespace for FilteredFiles {
+    fn release_fulfilled(&self, roots: &[NodeId]) {
+        self.inner.release_fulfilled(roots);
+    }
+    fn native_file_metadata(&self) -> content::native_metadata::NativeFileMetadata {
+        if self.policy.check().is_ok() {
+            self.inner.native_file_metadata()
+        } else {
+            Default::default()
+        }
+    }
+    fn clipboard_key(&self) -> io::Result<Option<[u8; 32]>> {
+        self.inner.clipboard_key()
+    }
+    fn one_shot_roots(&self) -> Vec<NodeId> {
+        if self.policy.check().is_ok() {
+            self.inner.one_shot_roots()
+        } else {
+            Vec::new()
+        }
+    }
+    fn requires_native_files(&self) -> bool {
+        self.inner.requires_native_files()
+    }
+    fn source_roots(&self) -> io::Result<Vec<content::grants::SourceRoot>> {
+        let guard = self.policy.files_guard();
+        guard()?;
+        let roots = self.inner.source_roots()?;
+        guard()?;
+        Ok(roots)
+    }
+    fn prepare(&self) -> io::Result<()> {
+        self.policy.check()?;
+        self.inner.prepare()
+    }
+    fn native_lease(&self) -> io::Result<content::namespace::NativeLease> {
+        self.policy.check()?;
+        self.inner.native_lease()
+    }
+    fn native_consumed(&self, nodes: &[crate::model::NodeId]) -> io::Result<()> {
+        self.policy.check()?;
+        self.inner.native_consumed(nodes)
+    }
+
+    fn bind_native(&self, native: std::sync::Weak<dyn content::namespace::NativeFiles>) -> io::Result<()> {
+        self.policy.check()?;
+        self.inner.bind_native(native)
+    }
+    fn native_list(&self, node: NodeId, cursor: Option<DirectoryCursor>) -> Option<io::Result<DirectoryPage>> {
+        let guard = self.policy.files_guard();
+        if let Err(error) = guard() {
+            return Some(Err(error));
+        }
+        self.inner.native_list(node, cursor).map(|page| {
+            let page = page?;
+            guard()?;
+            Ok(page)
+        })
+    }
+    fn native_open(&self, node: NodeId, offset: u64) -> Option<io::Result<FileReader>> {
+        let guard = self.policy.files_guard();
+        if let Err(error) = guard() {
+            return Some(Err(error));
+        }
+        self.inner
+            .native_open(node, offset)
+            .map(|reader| content::guarded(reader?, guard))
+    }
+    fn native_metadata(&self, node: NodeId) -> Option<io::Result<crate::FileMetadata>> {
+        if let Err(error) = self.policy.check() {
+            return Some(Err(error));
+        }
+        self.inner.native_metadata(node)
+    }
+    fn source_link(&self) -> Option<content::linked::Descriptor> {
+        self.policy.check().ok()?;
+        self.inner.source_link()
+    }
     fn origin(&self) -> Option<oink_foundation::DeviceId> {
         self.inner.origin()
     }
@@ -266,7 +302,7 @@ impl Namespace for FilteredFiles {
         self.inner.retain_files(retention);
     }
     fn roots(&self) -> Vec<FileNode> {
-        if self.policy.files().is_ok() {
+        if self.policy.check().is_ok() {
             self.inner.roots()
         } else {
             vec![]
@@ -296,19 +332,20 @@ impl Namespace for FilteredFiles {
         self.inner.cancel();
     }
     fn preparing(&self) {
-        if self.policy.files().is_ok() {
+        if self.policy.check().is_ok() {
             self.inner.preparing();
         }
     }
     fn in_use(&self) -> bool {
         self.inner.in_use()
     }
-    fn on_stored(&self, ready: Box<dyn FnOnce(content::Completed) + Send>) {
-        self.inner.on_stored(ready);
-    }
     fn local_batch(&self) -> Option<crate::store::Batch> {
-        self.policy.files().ok()?;
+        self.policy.check().ok()?;
         self.inner.local_batch()
+    }
+    fn cache_batch(&self) -> Option<crate::store::Batch> {
+        self.policy.check().ok()?;
+        self.inner.cache_batch()
     }
 }
 #[cfg(test)]
@@ -316,12 +353,12 @@ mod tests {
     #[test]
     fn clipboard_masters_default_on_for_existing_config_and_are_independent() {
         let old = r#"{"text":true,"rich_text":true,"images":true,"files":true,"custom":true}"#;
-        let settings: super::FormatFilters = serde_json::from_str(old).unwrap();
+        let settings: super::Settings = serde_json::from_str(old).unwrap();
         let mut value = serde_json::to_value(settings).unwrap();
         assert_eq!(value["receive"], true);
         assert_eq!(value["send"], true);
         value["send"] = false.into();
-        let decoded: super::FormatFilters = serde_json::from_value(value).unwrap();
+        let decoded: super::Settings = serde_json::from_value(value).unwrap();
         let value = serde_json::to_value(decoded).unwrap();
         assert_eq!(value["receive"], true);
         assert_eq!(value["send"], false);
@@ -365,7 +402,6 @@ mod tests {
                     standard,
                     data: RepresentationData::Reader {
                         size: ContentSize::Known(4),
-                        hash: None,
                     },
                 })
                 .collect(),
@@ -410,6 +446,7 @@ mod tests {
     }
     fn file() -> FileNode {
         FileNode {
+            exec_bits: None,
             id: NodeId(1),
             parent: None,
             name: "file".into(),
@@ -442,11 +479,11 @@ mod tests {
     }
     #[test]
     fn prepared_publication_does_not_regain_authority_after_reenable() {
-        let policy = SharingPolicy::new(true, FormatFilters::default());
+        let policy = SharingPolicy::new(true);
         let before = policy.publication_guard();
         assert!(before().is_ok());
-        policy.update(false, FormatFilters::default());
-        policy.update(true, FormatFilters::default());
+        policy.update(false);
+        policy.update(true);
         assert!(before().is_err());
         assert!(policy.publication_guard()().is_ok());
     }
@@ -456,12 +493,12 @@ mod tests {
             oink_foundation::clipboard::ClipPlatform::Mac,
             oink_foundation::clipboard::ClipPlatform::Windows,
         ] {
-            let policy = SharingPolicy::new(true, FormatFilters::default());
+            let policy = SharingPolicy::new(true);
             let source = policy.provider(Arc::new(Inline));
             let mut reader = content::open_for(source.as_ref(), RepresentationId(1), target).unwrap();
             assert_eq!(reader.read(&mut [0; 1]).unwrap(), 1);
-            policy.update(false, FormatFilters::default());
-            policy.update(true, FormatFilters::default());
+            policy.update(false);
+            policy.update(true);
             assert!(
                 reader.read(&mut [0; 1]).is_err(),
                 "an interrupted reader cannot resume with new permission"
@@ -473,8 +510,8 @@ mod tests {
         }
     }
     #[test]
-    fn file_filter_revokes_a_namespace_and_active_file_reader() {
-        let policy = SharingPolicy::new(true, FormatFilters::default());
+    fn disabling_sharing_revokes_a_namespace_and_active_file_reader() {
+        let policy = SharingPolicy::new(true);
         let files = FilteredFiles {
             inner: Arc::new(Files),
             policy: policy.clone(),
@@ -486,13 +523,7 @@ mod tests {
         );
         let mut reader = files.open(NodeId(1), 1, 0).unwrap();
         assert_eq!(reader.read(&mut [0; 1]).unwrap(), 1);
-        policy.update(
-            true,
-            FormatFilters {
-                files: false,
-                ..Default::default()
-            },
-        );
+        policy.update(false);
         assert!(files.roots().is_empty());
         assert!(files.select(NodeId(1)).is_err());
         assert!(files.list(NodeId(1), None).is_err());
@@ -500,94 +531,39 @@ mod tests {
         assert!(reader.read(&mut [0; 1]).is_err());
     }
     #[test]
-    fn every_filter_removes_inventory_and_existing_reads_are_revoked() {
-        let defaults = FormatFilters::default();
-        let policy = SharingPolicy::new(true, defaults);
-        let source = policy.provider(Arc::new(Source));
-        for (index, disabled) in [
-            FormatFilters {
-                text: false,
-                ..defaults
-            },
-            FormatFilters {
-                rich_text: false,
-                ..defaults
-            },
-            FormatFilters {
-                images: false,
-                ..defaults
-            },
-            FormatFilters {
-                custom: false,
-                ..defaults
-            },
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            policy.update(true, defaults);
-            let id = RepresentationId([1, 2, 4, 6][index]);
-            let mut reader = source.open(id).unwrap();
-            policy.update(true, disabled);
-            assert!(content::find(&source.inventory(), id).is_none());
-            assert!(source.open(id).is_err(), "an old offer cannot bypass the new filter");
-            assert!(reader.read(&mut [0; 1]).is_err(), "an active reader must stop");
-            assert!(
-                content::find(&source.inventory(), RepresentationId(5)).is_some(),
-                "privacy markers remain recognised"
-            );
+    fn all_formats_and_files_are_available_despite_old_stored_filters() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"text":false,"rich_text":false,"images":false,"files":false,"custom":false}"#)
+                .unwrap();
+        assert_eq!(settings, Settings::default());
+        let stored = serde_json::to_value(settings).unwrap();
+        for key in ["text", "rich_text", "images", "files", "custom"] {
+            assert!(stored.get(key).is_none());
         }
-        policy.update(true, defaults);
+        let policy = SharingPolicy::new(settings.send);
+        let source = policy.provider(Arc::new(Source));
+        assert_eq!(source.inventory(), inventory());
+        for id in 1..=6 {
+            let mut bytes = Vec::new();
+            source
+                .open(RepresentationId(id))
+                .unwrap()
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert_eq!(bytes, b"data");
+        }
+        let files = FilteredFiles {
+            inner: Arc::new(Files),
+            policy: policy.clone(),
+        };
+        assert_eq!(files.roots(), vec![file()]);
+        let mut bytes = Vec::new();
+        files.open(NodeId(1), 1, 0).unwrap().read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"file");
         let mut reader = source.open(RepresentationId(1)).unwrap();
-        policy.update(false, defaults);
+        policy.update(false);
         assert!(source.inventory().items.is_empty());
         assert!(source.open(RepresentationId(1)).is_err());
         assert!(reader.read(&mut [0; 1]).is_err());
-    }
-    #[test]
-    fn file_controls_are_files_and_private_formats_are_unrecognised() {
-        let defaults = FormatFilters::default();
-        let mut inventory = inventory();
-        inventory.items[0].representations.push(Representation {
-            id: RepresentationId(7),
-            format: NativeFormat::Mac("public.file-url".into()),
-            medium: Medium::Bytes,
-            aspect: 1,
-            index: -1,
-            standard: None,
-            data: RepresentationData::File(NodeId(1)),
-        });
-        let filtered = FormatFilters {
-            custom: false,
-            ..defaults
-        }
-        .inventory(inventory.clone());
-        assert!(content::find(&filtered, RepresentationId(7)).is_some());
-        assert!(content::find(&filtered, RepresentationId(6)).is_none());
-        let filtered = FormatFilters {
-            files: false,
-            ..defaults
-        }
-        .inventory(inventory);
-        assert!(content::find(&filtered, RepresentationId(7)).is_none());
-        assert!(content::find(&filtered, RepresentationId(6)).is_some());
-        let privacy = ClipData::Custom {
-            platform: ClipPlatform::Mac,
-            name: crate::formats::MAC_MARKERS[1].into(),
-            bytes: vec![],
-        };
-        let unknown = ClipData::Custom {
-            platform: ClipPlatform::Mac,
-            name: "example.private".into(),
-            bytes: vec![1],
-        };
-        assert_eq!(
-            FormatFilters {
-                custom: false,
-                ..defaults
-            }
-            .items(vec![privacy.clone(), unknown]),
-            vec![privacy]
-        );
     }
 }

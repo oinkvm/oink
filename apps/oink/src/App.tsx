@@ -4,19 +4,21 @@ import { Button, Confirmer, Icon, OinkProvider, Toaster, Tooltip, VisuallyHidden
 import { ApiFailure, api, shell } from './api/client';
 import { agent, start, useAgent } from './api/store';
 import { inTauri } from './api/transport';
-import { presentCards, resourceAction } from './devices/project';
+import { presentControls, resourceAction } from './devices/project';
 import { useGrant } from './settings/useGrant';
 import { DeviceList } from './devices/DeviceList';
 import { PauseGlyph } from './devices/icons';
 import { SideContextMenu, type SideContextMenuProps } from './devices/DeviceMenu';
-import { toggleShare } from './devices/data';
+import type { DeviceControlFailure, DeviceControlReply } from './api/cards';
+import { ControlActions, type ControlAction } from './devices/controlActions';
+import { controlCommand, controlObservation, volumeFacts } from './devices/controlPlan';
+import { canDisableInput, toggleShare } from './devices/data';
 import type { ShareKind, ShareValue } from './devices/data';
-import type { SpeakerAction } from './devices/VolumeRow';
-import { SpeakerControls, type SpeakerTarget } from './devices/speakerControls';
-import { mergeVisibleGroups } from './arrange/groups';
+import type { SpeakerAction, MicrophoneAction } from './devices/VolumeRow';
+import { freeGroup, mergeVisibleGroups } from './arrange/groups';
 import { Arrangement, type ScreenMove } from './arrange/Arrangement';
 import type { DeviceKey, Rect } from './api/types';
-import type { Screen } from './arrange/geometry';
+import { bounds, type Screen } from './arrange/geometry';
 import { useHistory } from './arrange/useHistory';
 import { RENDER_SCALE, renderLayout, layoutPlacements, presentScreens, visibleScreens } from './arrange/adapter';
 import { effectiveSystemSync, LayoutProfileFailure, type ArrangementSnapshot, type CommitRequest, type LayoutOperation, type OperationReply, type PreviewReply, type ProfileSummary } from './api/layoutProfiles';
@@ -34,6 +36,7 @@ import { FileProviderDialog, useFileProviderExplainer } from './permissions/File
 import { QuitDialog } from './window/QuitDialog';
 import { AboutWindow } from './window/AboutWindow';
 import { UpgradeButton, UpgradeDialog } from './window/Upgrade';
+import { PackageDropArea, usePackageDrag } from './window/PackageDrop';
 import { PromoArea } from './window/PromoArea';
 import { StatusNotices } from './window/StatusNotices';
 import { observePanel } from './window/panel';
@@ -69,39 +72,54 @@ const mergeMeta = (a: StepMeta | undefined, b: StepMeta | undefined): StepMeta |
 const UNKNOWN_TOAST = 'layout-operation-unknown';
 export function App() {
     const state = useAgent();
+    const packageDrag = usePackageDrag();
     const language = useLanguage();
     const prefs = usePreferences();
     const view = new URLSearchParams(location.search).get('view') ?? 'main';
     const pairing = usePairing(view === 'main');
     const platform = state.boot?.platform === 'windows' ? 'win' : 'mac';
-    // Live sidebar volume: positions show at once; sends are coalesced per device.
-    const [speakerTargets, setSpeakerTargets] = useState<ReadonlyMap<string, SpeakerTarget>>(() => new Map());
-    const [speakerControls] = useState(() => new SpeakerControls({
-        read: device => {
-            const cards = agent.get().cards, exit = cards?.exitVolume;
-            if (exit?.receiverDevice === device)
-                return exit.canSet && exit.versionToken && exit.volumePercent != null && exit.muted != null
-                    ? { token: exit.versionToken, volume: exit.volumePercent, muted: exit.muted, exit: true } : null;
-            const speaker = cards?.cards.find(c => c.device === device)?.status?.speaker;
-            return speaker?.forwardingControlsToken && speaker.forwarding
-                ? { token: speaker.forwardingControlsToken, volume: speaker.forwarding.volumePercent, muted: speaker.forwarding.muted, exit: false } : null;
+    const [controlTargets,setControlTargets]=useState<ReadonlyMap<string,ControlAction[]>>(()=>new Map());
+    const [controls]=useState(()=>new ControlActions({
+        read:(device,action)=>controlObservation(agent.get().cards,device,action),
+        send:async(requestId,device,action)=>{
+            const cards=agent.get().cards,card=cards?.cards.find(c=>c.device===device);
+            const refused=(reason:DeviceControlFailure):DeviceControlReply=>({type:'device_control_completed',data:{requestId,result:{outcome:'refused',reason,unknownCode:null}}});
+            if(!card)return refused('offline');
+            if(action.kind==='card'&&action.resource==='screen'&&action.desired==='locked'){
+                await api.lockFocusTo(device);
+                return {type:'device_control_completed',data:{requestId,result:{outcome:'applied'}}};
+            }
+            if(action.kind==='speakerVolume'||action.kind==='microphoneVolume'){
+                const facts=volumeFacts(cards,device,action.kind==='microphoneVolume');
+                if(!facts)return refused('stale_revision'); // rebase if facts changed since observation
+                if(action.kind==='speakerVolume'?facts.exit!==action.output:card.status?.microphone?.mode!=='source')return refused('route_changed');
+                return facts.exit?api.setExitVolume(requestId,facts.token,action.volume,action.muted)
+                    :api.setForwardingControls(requestId,facts.token,action.volume,action.muted,action.deferPersistence===true);
+            }
+            const command=controlCommand(card,action);
+            if(command?.kind!=='invoke') {
+                if(action.kind!=='microphone')return refused('unsupported');
+                const reason=command?.kind==='unavailable'?command.reason:'state_unknown';
+                return refused(reason==='state_unknown'||reason==='state_stale'?'state_conflict':reason==='remote_fault'?'resource_fault':reason);
+            }
+            return api.invokeCard(requestId,command.token);
         },
-        send: (requestId, facts, target, deferPersistence) => facts.exit
-            ? api.setExitVolume(requestId, facts.token, target.volume, target.muted)
-            : api.setForwardingControls(requestId, facts.token, target.volume, target.muted, deferPersistence),
-        onTargets: setSpeakerTargets,
-        onFailure: reason => {
-            agent.fail(reason);
-            if (reason === 'outcome_unknown') void agent.query('cards', api.deviceCards).catch(() => agent.fail('unavailable'));
+        refresh:()=>agent.query('cards',api.deviceCards),show:setControlTargets,fail:(reason,action)=>{
+            if(action.kind==='microphone'||action.kind==='microphoneVolume') {
+                toast.danger({title:tr('无法更改麦克风设置'),description:problemText(reason)});
+            } else agent.fail(reason);
         },
     }));
-    useEffect(() => agent.onEvent(event => { if (event.type === 'device_control_completed') return speakerControls.complete(event.data.requestId, event.data.result); }), [speakerControls]);
-    useEffect(() => () => speakerControls.dispose(), [speakerControls]);
-    useEffect(() => { speakerControls.refresh(); }, [state.cards, speakerControls]);
-    const devices = presentCards(state.cards, state.pending, state.permissions).map(d => {
-        const target = speakerTargets.get(d.id);
-        return target ? { ...d, speaker: { ...d.speaker, volume: target.volume, muted: target.muted } } : d;
-    });
+    useEffect(()=>agent.onEvent(event=>{
+        if(event.type==='emergency_stop'){controls.clear();return;}
+        return event.type==='device_control_completed'&&controls.complete(event.data.requestId,event.data.result);
+    }),[controls]);
+    useEffect(()=>()=>controls.dispose(),[controls]);
+    useEffect(()=>{controls.snapshot();},[state.cards,controls]);
+    const devices=presentControls(state.cards,controlTargets,state.permissions);
+    // Native/menu callbacks may run again before React renders. Always build the
+    // next toggle from the newest intent, never a captured render's old value.
+    const currentDevices=()=>presentControls(agent.get().cards,controls.targets(),agent.get().permissions);
     const self = devices.find(d => d.group === 'self');
     const [navOpen, setNavOpen] = useState(true);
     const [maximized,setMaximized] = useState(false);
@@ -228,19 +246,20 @@ export function App() {
     }, [state.boot?.platform,prefs.local?.show_status_icon]);
     useEffect(() => {if(prefs.local)void shell.setLogLevel(prefs.local.log_level).catch(()=>agent.fail('unavailable'));},[prefs.local?.log_level]);
     useEffect(() => {if(prefs.local)void shell.setLanguage(prefs.local.ui_language).catch(()=>agent.fail('unavailable'));},[prefs.local?.ui_language]);
-    useEffect(() => {void shell.liveViews({stats:false,group_quality:view==='main'||view==='panel',audio_quality:view==='main'&&navMode==='settings'&&(section==='diagnostics'||query.trim().length>0),diagnostics:false}).catch(()=>agent.fail('unavailable'));},[view,navMode,section,query]);
+    useEffect(() => {
+        const quality = view==='main'&&navMode==='settings'&&(section==='diagnostics'||query.trim().length>0);
+        void shell.liveViews({stats:false,card_signals:view==='main'||view==='panel',group_quality:quality,audio_quality:quality,diagnostics:false}).catch(()=>agent.fail('unavailable'));
+    },[view,navMode,section,query]);
+    /** @deprecated Legacy bottom-centred notice. New code must use the in-app oink-ui toast instead. */
     const fail = (e: unknown) => agent.fail(e instanceof ApiFailure ? e.problem.code : 'unavailable');
     const permissionPage = () => { setNavMode('settings'); setNavOpen(true); setJump({ section: 'permissions', n: Date.now() }); };
     const invoke = async (id: string, resource: string, desired: string | boolean | number) => {
-        const card = state.cards?.cards.find(c => c.device === id);
+        const card = agent.get().cards?.cards.find(c => c.device === id);
+        if (resource === 'speaker') {
+            controls.set(id,{kind:'speaker',mode:desired as 'unused'|'forwarding'|'exit'});return;
+        }
         if (resource === 'screen' && desired === 'locked') {
-            try {
-                await api.lockFocusTo(id);
-            }
-            catch (e) {
-                fail(e);
-            }
-            return;
+            controls.set(id,{kind:'card',resource:'screen',desired});return;
         }
         if (!card)
             return;
@@ -254,7 +273,7 @@ export function App() {
             return;
         }
         if (resource === 'screen' && (desired === 'shared' || desired === 'disabled')
-            && !(desired === 'shared' && card.status?.screen.configuredMode === 'shared' && card.status?.cursor.lockedDevice === id)) {
+            && !(desired === 'shared' && (currentDevices().find(d=>d.id===id)?.cursor==='locked' || card.status?.cursor.lockedDevice===id))) {
             const present = history.value;
             if (!present || savingLayout) return;
             const patch = { device: id, shared: desired === 'shared' };
@@ -263,33 +282,60 @@ export function App() {
                 { placements: present.placements, native_plan_tokens: [], disabled: [], screen_shared: [patch] }, []);
             return;
         }
-        const requestId = crypto.randomUUID();
-        if (!agent.pending({ requestId, device: id, resource, desired })) return;
-        const send = async () => {
-            try {
-                const result = await api.invokeCard(requestId, action.token);
-                agent.controlReply(result);
-            } catch { agent.reject(requestId, 'outcome_unknown'); void agent.query('cards', api.deviceCards).catch(fail); }
-        };
-        await send();
+        controls.set(id,{kind:'card',resource:resource as Extract<ControlAction,{kind:'card'}>['resource'],desired});
     };
     const changeShare = (id: string, kind: ShareKind, desired: ShareValue) => { void invoke(id, kind, desired); };
-    const toggle = (id: string, kind: ShareKind) => {
-        const d = devices.find(d => d.id === id);
+    const toggle = (id: string, kind: ShareKind, click: 'single' | 'double' = 'single') => {
+        const d = currentDevices().find(d => d.id === id);
         if (!d) return;
-        const next = toggleShare(d, kind);
-        if (!next) { permissionPage(); return; }
-        void invoke(id, kind, (kind === 'speaker' ? next.speaker.mode : next[kind]) as ShareValue);
-    };
-    const speaker = (id: string, action: SpeakerAction) => {
-        const now = speakerControls.current(id);
-        if (!now) {
-            agent.fail('unsupported');
+        if (kind === 'speaker') {
+            controls.set(id, {kind:'speaker', mode:click==='double'?(d.speaker.mode==='exit'?'unused':'exit'):d.speaker.mode==='unused'?'forwarding':'unused'});
             return;
         }
-        // Changing the volume also unmutes, as the owner's controls pair the two.
-        if (action.type === 'mute') speakerControls.set(id, { volume: now.volume, muted: !now.muted }, true);
-        else speakerControls.set(id, { volume: action.value, muted: false }, action.final === true, action.dragging === true);
+        if (click === 'double' && (kind === 'keyboard' || kind === 'mouse')) {
+            if (canDisableInput(d, kind)) void invoke(id, kind, 'disabled');
+            return;
+        }
+        const next = toggleShare(d, kind);
+        if (!next) { permissionPage(); return; }
+        void invoke(id, kind, next[kind] as ShareValue);
+    };
+    const speaker = (id: string, action: SpeakerAction) => {
+        const d=currentDevices().find(d=>d.id===id);
+        if(!d)return;
+        controls.set(id,{kind:'speakerVolume',output:d.speaker.mode==='exit',volume:action.type==='mute'?d.speaker.volume:action.value,
+            muted:action.type==='mute'?!d.speaker.muted:false,final:action.type==='mute'||action.final===true,
+            deferPersistence:action.type==='volume'&&action.dragging===true&&d.speaker.mode!=='exit'});
+    };
+    const microphone = (id:string,action:MicrophoneAction)=>{
+        const d=currentDevices().find(d=>d.id===id);
+        if(!d)return;
+        const install=()=>{setNavMode('settings');setNavOpen(true);setJump({section:'audio',item:'virtualMicrophone',n:Date.now()});};
+        if(action==='install') {if(d.group==='self')install();return;}
+        if(action==='receive' && !d.microphone?.virtualReady || action==='shared' && !d.microphone?.permissionGranted) {
+            const receive=action==='receive';
+            // Settings only manage this device, so a remote fix names the device instead of offering a button.
+            if(d.group!=='self') {
+                toast.warning({title:receive?tr('请在 {0} 上安装虚拟麦克风',d.name):tr('请在 {0} 上授予麦克风权限',d.name)});
+                return;
+            }
+            toast.warning({title:receive?tr('未安装虚拟麦克风'):tr('未获取麦克风权限'),
+                action:{label:receive?tr('安装'):tr('授权'),onClick:receive?install:()=>grantDevicePermission(id,'microphone')}});
+            return;
+        }
+        if(action==='shared'||action==='local'||action==='receive') {
+            controls.set(id,{kind:'microphone',mode:action==='shared'?'source':action==='local'?'muted':'receiver'});return;
+        }
+        if(!d.microphone)return;
+        controls.set(id,{kind:'microphoneVolume',volume:action.type==='mute'?d.microphone.volume:action.value,
+            muted:action.type==='mute'?!d.microphone.muted:false,final:action.type==='mute'||action.final===true});
+    };
+    const grantDevicePermission=(id:string,kind:'input_monitoring'|'microphone')=>{
+        if(!state.cards?.cards.some(c=>c.device===id&&c.isSelf))return;
+        void api.requestPermission(kind).then(()=>agent.query('permissions',api.permissions)).catch(error=>{
+            if(kind==='microphone')toast.danger({title:tr('无法更改麦克风设置'),description:problemText(error instanceof ApiFailure?error.problem.code:'backend_failed')});
+            else fail(error);
+        });
     };
     const deviceName = (device: DeviceKey) => devices.find(d => d.id === device)?.name ?? device.slice(0, 8);
     /** Owner refusals of an operation, one line per computer. */
@@ -473,7 +519,16 @@ export function App() {
         if (!draftGeometry) { setScreenPreview(null); return; }
         const draft = presentScreens(renderLayout(draftGeometry, state.wallpapers, placements), devices);
         const visibleIds = new Set(visible.map(s => s.id));
-        const next = move.compact ? compactScreens(draft, draft.filter(s => visibleIds.has(s.id)), new Set([move.id])) : draft;
+        // A native preview constrains this computer's internal geometry. Resolve
+        // canvas collisions on release just like a rigid drag, before compaction:
+        // move this computer (including hidden siblings), keeping every peer fixed.
+        const shown = draft.filter(s => visibleIds.has(s.id));
+        const group = shown.filter(s => s.device === screen.device), from = bounds(group);
+        const free = freeGroup(group, from, from, shown.filter(s => s.device !== screen.device));
+        const dx = free.x - from.x, dy = free.y - from.y;
+        const releasedScreens = draft.map(s => s.device === screen.device && (dx !== 0 || dy !== 0)
+            ? { ...s, x: s.x + dx, y: s.y + dy } : s);
+        const next = move.compact ? compactScreens(releasedScreens, releasedScreens.filter(s => visibleIds.has(s.id)), new Set([move.id])) : releasedScreens;
         const after = snapshotFromScreens(released, draft, next);
         // Stage the complete native result, including the original gesture and
         // compaction, then commit it through the same manual-history boundary.
@@ -494,7 +549,11 @@ export function App() {
     // One-shot refreshes on navigation/activation; ongoing observations are backend events.
     useEffect(() => {
         if (view !== 'main') return;
-        const refresh = () => { if (document.visibilityState !== 'hidden') void agent.query('permissions', api.permissions).catch(() => {}); };
+        const refresh = () => {
+            if (document.visibilityState === 'hidden') return;
+            void agent.query('permissions', api.permissions).catch(() => {});
+            void agent.query('fileProvider', api.fileProviderStatus).catch(() => {});
+        };
         refresh();
         window.addEventListener('focus', refresh);
         document.addEventListener('visibilitychange', refresh);
@@ -503,6 +562,13 @@ export function App() {
     // Enabling the File Provider is explained first; only OK opens Finder.
     const fileProvider = useFileProviderExplainer();
     const enableFileProvider = async () => { if (await fileProvider.ask()) await api.openFileProviderEnable(); };
+    useEffect(() => agent.onEvent(event => {
+        if (event.type !== 'file_provider_required') return;
+        toast.warning({ id: 'file-provider-required', title: tr('需要启用文件提供服务'),
+            action: { label: tr('启用'), onClick: () => { void enableFileProvider().catch(error =>
+                toast.danger({ title: tr('启用文件提供服务'), description: problemText(error instanceof ApiFailure ? error.problem.code : 'unavailable') })); } } });
+        return true;
+    }));
     const grant = async (id: PermissionId) => {
         if (id === 'files')
             await enableFileProvider();
@@ -520,18 +586,13 @@ export function App() {
     const menuScreens = (geometry?.geometry.screens ?? []).map(s => {
         const sharing = history.value?.screen_shared?.find(d => d.device === s.key.device);
         const own = history.value?.disabled.find(d => d.screen.device === s.key.device && d.screen.display === s.key.display)?.disabled ?? s.hidden;
-        return { id: `${s.key.device}:${s.key.display}`, key: s.key, device: s.key.device, name: s.display.name, gain: s.remote_gain ?? 1, hidden: own || (sharing ? !sharing.shared : s.device_disabled) };
+        return { id: `${s.key.device}:${s.key.display}`, key: s.key, device: s.key.device, name: s.display.name, hidden: own || (sharing ? !sharing.shared : s.device_disabled) };
     });
     const hiddenScreens = new Map<string, number>();
     for (const s of menuScreens) if (s.hidden) hiddenScreens.set(s.device, (hiddenScreens.get(s.device) ?? 0) + 1);
     const menu: Omit<SideContextMenuProps, 'children'> = {
         devices, screens: menuScreens,
         screenEditPending: savingLayout,
-        onScreenGain: (id, gain) => {
-            const key = menuScreens.find(s => s.id === id)?.key;
-            if (!key) return;
-            void api.setScreenRemoteGain(key, gain).then(() => agent.query('layout', api.layout)).catch(() => agent.fail('unavailable'));
-        },
         onHideScreen: id => {
             const present = history.value;
             const key = menuScreens.find(s => s.id === id)?.key;
@@ -558,7 +619,7 @@ export function App() {
                 { placements: present.placements, native_plan_tokens: [], disabled: patches, ...(off ? { screen_shared: sharing } : {}) }, []);
         },
         requests: pairing.requests, nearby: pairing.nearby, onShare: changeShare,
-        onGameMode: (id, mode) => { void invoke(id, 'game', mode); }, onSpeaker: speaker,
+        onGameMode: (id, mode) => { void invoke(id, 'game', mode); }, onSpeaker: speaker, onMicrophone: microphone, onGrantPermission: grantDevicePermission,
         onPause: (id, paused) => { void invoke(id, 'pause', paused); }, onLeave: setLeaveId,
         onEditAddress: id => { const device=devices.find(d=>d.id===id); if(device)void address.open(device); },
         onShowWindow: () => { void shell.open('main').catch(fail); }, onAbout: () => { void shell.open('about').catch(fail); },
@@ -570,14 +631,11 @@ export function App() {
         const sharing = history.value?.screen_shared?.find(s => s.device === d.id);
         return sharing ? { ...d, screenSharing: sharing.shared, screen: sharing.shared ? 'shared' : 'disabled' } : d;
     })),[screens,geometry,devices,history.value]);
-    // Exactly one identity-ordered pass, including this computer, in one edit.
+    // A device-local preference; geometry changes only after a manual gesture.
     const toggleCompact = () => {
         if (savingLayout) return;
         const on = !compactLayout;
         prefs.savePresentation({ compact_layout: on });
-        if (!on) return;
-        const next = compactScreens(screens, visible);
-        void saveScreens(next, tr('自动靠拢'));
     };
     useEffect(()=>{if(selected&&!visible.some(s=>s.id===selected)){setSelected(null);setSelection([]);}},[visible,selected]);
     const permissions: Record<PermissionId, PermState> = {
@@ -590,7 +648,8 @@ export function App() {
     // Only show this row after the backend has advertised its applicability.
     // Otherwise macOS 14 can briefly show it while the initial query is pending.
     if (!state.permissions.some(p => p.kind === 'local_network')) permissions.network = 'not_required';
-    if (state.overview?.alerts.some(a => a.kind.type === 'capture_unavailable')) {
+    const localStatus = state.cards?.cards.find(card => card.section === 'this_device')?.status;
+    if ([localStatus?.mouse.fault?.code, localStatus?.keyboard.fault?.code].includes('capture_unavailable')) {
         if (permissions.accessibility === 'granted') permissions.accessibility = 'restart_required';
         if (permissions.input === 'granted') permissions.input = 'restart_required';
     }
@@ -602,8 +661,8 @@ export function App() {
         : view === 'quit' ? <QuitDialog open container={null} onCancel={() => { void shell.close(); }} onQuit={() => { void shell.quit().catch(fail); }}/>
                 : view === 'panel' ? <div className="native-panel" ref={setWinEl}><SideContextMenu {...menu} standalone>{null}</SideContextMenu></div>
                     : <SideContextMenu {...menu}>
-      <DesktopWindow ref={mergeRefs(setWinEl)} platform={platform} covered={onboarding && onboard !== 'leaving'} coverBar={onboarding && <OnboardingLanguage value={prefs.prefs.language} leaving={onboard === 'leaving'} onChange={v => prefs.set('language', v)}/>}
-        cover={onboarding && <Onboarding key={onboardKey} platform={platform} pairing={pairing} perms={permissions} onGrant={grant} onOpenSettings={openPermissionSettings} preferences={prefs} container={winEl} leaving={onboard === 'leaving'} version={state.boot?.version ?? version} connected={devices.some(d => d.group === 'online')} onSkip={finishOnboarding} onFinish={finishOnboarding}/>}
+      <DesktopWindow ref={mergeRefs(setWinEl)} platform={platform} covered={packageDrag || onboarding && onboard !== 'leaving'} coverBar={packageDrag ? <span className="package-drop-title">Oink</span> : onboarding && <OnboardingLanguage value={prefs.prefs.language} leaving={onboard === 'leaving'} onChange={v => prefs.set('language', v)}/>}
+        cover={packageDrag ? <PackageDropArea platform={platform}/> : onboarding && <Onboarding key={onboardKey} platform={platform} pairing={pairing} perms={permissions} onGrant={grant} onOpenSettings={openPermissionSettings} preferences={prefs} container={winEl} leaving={onboard === 'leaving'} version={state.boot?.version ?? version} connected={devices.some(d => d.group === 'online')} onSkip={finishOnboarding} onFinish={finishOnboarding}/>}
         state={{ maximized, minimized: false, closed: false }} active={windowActive} title={tr('显示器排列')} onMinimize={() => { void windowAction('minimize'); }} onToggleMaximize={() => { void windowAction('toggleMaximize'); }} onClose={() => { void windowAction('close'); }} onActivate={() => { }} navOpen={navOpen} onSideBlank={clearSelection} onToggleNav={() => { if (navOpen) clearSelection(); setNavOpen(!navOpen); if (navMode !== 'devices')
                         setNavMode('devices'); }} pages={{ add: navMode === 'add', settings: navMode === 'settings' }} onSideAction={action => { if (action === 'quit') {
                         if (prefs.prefs.confirmQuit)
@@ -614,10 +673,10 @@ export function App() {
                     else {
                         setNavOpen(true);
                         setNavMode(navMode === action ? 'devices' : action);
-                    } }} version={state.boot?.version ?? version} sideExtra={navMode === 'add' ? <SelfInfo container={winEl}/> : null} titleEnd={<>{state.update?.candidate && state.update.phase !== 'disabled' && <UpgradeButton/>}<PromoArea sponsor={!prefs.presentation.hide_sponsor} container={winEl}/></>} titleCenter={self?.paused ? <span className="win__paused"><PauseGlyph/>{tr('共享已暂停')}</span> : null} navBack={platform === 'win' && navMode !== 'devices' ? { title: navMode === 'add' ? tr('添加设备') : tr('设置'), label: tr('返回设备列表'), onBack: () => setNavMode('devices') } : null} nav={collapsed => <>
+                    } }} version={state.boot?.version ?? version} sideExtra={navMode === 'add' ? <SelfInfo container={winEl}/> : null} titleEnd={<><UpgradeButton/><PromoArea sponsor={!prefs.presentation.hide_sponsor} container={winEl}/></>} titleCenter={self?.paused ? <span className="win__paused"><PauseGlyph/>{tr('共享已暂停')}</span> : null} navBack={platform === 'win' && navMode !== 'devices' ? { title: navMode === 'add' ? tr('添加设备') : tr('设置'), label: tr('返回设备列表'), onBack: () => setNavMode('devices') } : null} nav={collapsed => <>
           <div className="nav-stack">
             {platform === 'win' && <RequestsGroup pairing={pairing} collapsed={collapsed} onExpand={() => setNavOpen(true)} hidden={navMode === 'settings'}/>}
-            <div className="nav-view" key={navMode} data-view={navMode} data-anim={navSwitched ? '' : undefined}>{platform === 'mac' && <><AddHead open={navMode !== 'devices'} title={navMode === 'add' ? tr('添加设备') : tr('设置')} onBack={() => setNavMode('devices')}/><RequestsGroup pairing={pairing} collapsed={collapsed} onExpand={() => setNavOpen(true)} hidden={navMode === 'settings'}/></>}{navMode === 'add' ? <AddPanel pairing={pairing}/> : navMode === 'settings' ? <SettingsNav platform={platform} query={query} onQuery={setQuery} active={section} onJump={id => setJump({ section: id, n: Date.now() })}/> : <DeviceList onGrantAccessibility={() => { void accessibilityGrant.grant('accessibility'); }} devices={devices} selectedId={selectedDevice} onSelect={id => { setNavOpen(true); selectDevice(id); }} onToggle={toggle} onPause={menu.onPause} onSpeaker={menu.onSpeaker} hiddenScreens={hiddenScreens} collapsed={collapsed} now={Date.now()}/>}</div>
+            <div className="nav-view" key={navMode} data-view={navMode} data-anim={navSwitched ? '' : undefined}>{platform === 'mac' && <><AddHead open={navMode !== 'devices'} title={navMode === 'add' ? tr('添加设备') : tr('设置')} onBack={() => setNavMode('devices')}/><RequestsGroup pairing={pairing} collapsed={collapsed} onExpand={() => setNavOpen(true)} hidden={navMode === 'settings'}/></>}{navMode === 'add' ? <AddPanel pairing={pairing}/> : navMode === 'settings' ? <SettingsNav platform={platform} query={query} onQuery={setQuery} active={section} onJump={id => setJump({ section: id, n: Date.now() })}/> : <DeviceList onGrantPermission={grantDevicePermission} onGrantAccessibility={() => { void accessibilityGrant.grant('accessibility'); }} devices={devices} selectedId={selectedDevice} onSelect={id => { setNavOpen(true); selectDevice(id); }} onToggle={toggle} onPause={menu.onPause} onSpeaker={menu.onSpeaker} onMicrophone={microphone} hiddenScreens={hiddenScreens} collapsed={collapsed} now={Date.now()}/>}</div>
           </div>
         </>}>
         <div className="disp" data-hidden={navMode === 'settings' ? '' : undefined} aria-hidden={navMode === 'settings' || undefined} inert={navMode === 'settings'}>
@@ -636,21 +695,20 @@ export function App() {
             <Arrangement platform={platform} screens={visible} geometryScreens={screens} onProjection={previewScreens} onScreensChange={(next, change) => { void saveScreens(next, change.label, change.merge); }} selectedId={selected} onSelect={selectScreen} settings={{ showHotZones: false, snapping: true, compact: compactLayout, padding: navOpen ? 24 : 48, step: 10 }} keyScope={canvas} hintId={hint} selectedGroup={!screenOnly && selectedDevice ? new Set(screens.filter(s => s.device === selectedDevice).map(s => s.id)) : selection.length > 1 ? new Set(selection) : undefined} contextFor={s => `screen:${s.id}`} screenEditable={s => !!s.device && editable.has(s.device) && independent(s)} screenPreview={screenPreview} onScreenMove={move => { void moveScreen(move); }}/>
           </div>
         </div>
-        {settingsMounted && <SettingsPage open={navMode === 'settings'} platform={platform} api={prefs} capsIme={state.input?.mac_caps_switches_input_source ?? null} query={query} jump={jump} onActive={setSection} version={state.boot?.version ?? version} upgrade={{ available: false, next: '' }} perms={permissions} onGrant={grant} onOpenPermissionSettings={openPermissionSettings} onLog={() => { }} onAbout={menu.onAbout} onBlocklist={() => setBlockedOpen(true)} layoutProfiles={<ProfileList state={profiles} onCreate={() => setCreateOpen(true)} onRename={renameProfile} onDelete={deleteProfile}/>} onOnboarding={replayOnboarding}/>}
+        {settingsMounted && <SettingsPage open={navMode === 'settings'} platform={platform} api={prefs} capsIme={state.input?.mac_caps_switches_input_source ?? null} query={query} jump={jump} onActive={setSection} version={state.boot?.version ?? version} upgrade={{ available: false, next: '' }} perms={permissions} onGrant={grant} onOpenPermissionSettings={openPermissionSettings} onLog={() => { }} onAbout={menu.onAbout} onBlocklist={() => setBlockedOpen(true)} layoutProfiles={<ProfileList state={profiles} onRename={renameProfile} onDelete={deleteProfile}/>} onOnboarding={replayOnboarding}/>}
       </DesktopWindow>
     </SideContextMenu>;
     // oink-ui ships built-in component strings (default aria labels, key names)
     // in zh-CN and en-US only; Japanese and Korean use its English strings.
     return <OinkProvider locale={language === 'zh-Hans' ? 'zh-CN' : 'en-US'} defaultAccent={DEFAULT_ACCENT.value}>
-    <AppearanceSync local={prefs.local} presentation={prefs.presentation}/><div className="oink-app" data-view={view} data-platform={platform} data-edge-to-edge={maximized ? '' : undefined}>
+    <AppearanceSync local={prefs.local} presentation={prefs.presentation}/><div className="oink-app" data-package-drag={view==='main'&&packageDrag?'':undefined} data-view={view} data-platform={platform} data-edge-to-edge={maximized ? '' : undefined}>
       {view === 'main' && <div className="win-shadow" aria-hidden="true"><div className="win-shadow__shape"/></div>}
-      {body}{view === 'main' && !maximized && <ResizeEdges platform={platform}/>}{(view==='main'||view==='panel')&&<StatusNotices/>}
-      {(view==='main'||view==='panel') && state.error && <div role="alert" className="backend-notice"><Icon name="alert"/>{problemText(state.error)}<Button size="sm" variant="ghost" onClick={() => agent.fail('')}>{tr('关闭')}</Button></div>}
-      {winEl && <>{!onboarding && <PairDialog pairing={pairing} container={winEl}/>}<BlockListDialog loading={state.blocked === null && !state.error} pending={unblocking} error={blockError ?? (!state.blocked && state.error ? problemText(state.error) : null)} open={blockedOpen} blocked={pairing.blocked} container={winEl} onClose={() => setBlockedOpen(false)} onRemove={p => { setBlockError(null); setUnblocking(ids => [...ids,p.id]); void pairing.actions.unblock(p).catch(() => setBlockError(problemText('unavailable'))).finally(() => setUnblocking(ids => ids.filter(id => id !== p.id))); }}/>
+      {body}{view === 'main' && !maximized && <ResizeEdges platform={platform}/>}{(view==='main'||view==='panel')&&!packageDrag&&<StatusNotices/>}
+      {winEl && <>{!onboarding && <PairDialog pairing={pairing} container={winEl}/>}<BlockListDialog loading={state.blocked === null} pending={unblocking} error={blockError} open={blockedOpen} blocked={pairing.blocked} container={winEl} onClose={() => setBlockedOpen(false)} onRemove={p => { setBlockError(null); setUnblocking(ids => [...ids,p.id]); void pairing.actions.unblock(p).catch(() => setBlockError(problemText('unavailable'))).finally(() => setUnblocking(ids => ids.filter(id => id !== p.id))); }}/>
         {view === 'main' && <UpgradeDialog container={winEl}/>}
         {view === 'main' && <CreateProfileDialog open={createOpen} state={profiles} container={winEl} onClose={() => setCreateOpen(false)} onSubmit={createProfile}/>}
         <FileProviderDialog {...fileProvider.dialog} container={winEl}/>
-        <QuitDialog pendingOperations={state.pending.length} open={quitAsk} container={winEl} onCancel={() => setQuitAsk(false)} onQuit={() => { void shell.quit().catch(fail); }}/>
+        <QuitDialog pendingOperations={[...controlTargets.values()].reduce((count,actions)=>count+actions.length,0)} open={quitAsk} container={winEl} onCancel={() => setQuitAsk(false)} onQuit={() => { void shell.quit().catch(fail); }}/>
         <LeaveDialog device={devices.find(d => d.id === leaveId) ?? null} container={winEl} onCancel={() => setLeaveId(null)} onConfirm={() => { const d = devices.find(d => d.id === leaveId); if (d)
             void (d.group === 'self' ? api.leaveGroup() : api.removeMember(d.id)).then(() => setLeaveId(null)).catch(fail); }}/>
       </>}

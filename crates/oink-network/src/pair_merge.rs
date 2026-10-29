@@ -922,7 +922,7 @@ mod tests {
                         hash,
                     )
                     .unwrap();
-                    let Message::ConfigDone(done) = admission::done(&accepted, hash).unwrap() else {
+                    let Message::ConfigDone(done) = admission::done(&accepted.acknowledged, hash).unwrap() else {
                         panic!()
                     };
                     admission::receive_done(&sides[1].state, &done, hash).unwrap();

@@ -245,3 +245,14 @@ pub enum DndMsg {
         binding: PreviewBinding,
     },
 }
+
+/// Numeric local observer; no content, routing decision or wire fields are added.
+static SOURCE_LEARNED_OBSERVER: std::sync::OnceLock<fn(ClipId, std::time::Instant)> = std::sync::OnceLock::new();
+pub fn set_source_learned_observer(observer: fn(ClipId, std::time::Instant)) {
+    let _ = SOURCE_LEARNED_OBSERVER.set(observer);
+}
+pub(crate) fn source_learned_timing(id: ClipId) {
+    if let Some(observer) = SOURCE_LEARNED_OBSERVER.get() {
+        observer(id, std::time::Instant::now());
+    }
+}

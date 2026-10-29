@@ -73,6 +73,8 @@ const DRAG_SLOP = 3;
 interface Interaction {
     id: string;
     group: Screen[];
+    geometry: Screen[];
+    visibleIds: string[];
     snapSuppressed: boolean;
     mode: 'move' | 'resize' | 'screen';
     corner?: Corner;
@@ -184,14 +186,19 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
     useLayoutEffect(() => {
         const interaction = drag.current;
         if (interaction) {
-            const current = members(interaction.id);
-            if (current.length !== interaction.group.length || current.some(s => {
-                const initial = interaction.group.find(m => m.id === s.id);
+            const current = geometryScreens;
+            if (screens.length !== interaction.visibleIds.length || screens.some(s => !interaction.visibleIds.includes(s.id)) || members(interaction.id).length !== interaction.group.length || current.length !== interaction.geometry.length || current.some(s => {
+                const initial = interaction.geometry.find(m => m.id === s.id);
                 return !initial || !sameRect(s, initial);
             })) {
-                // A native desktop change invalidates the gesture's anchor.
+                // Any factual geometry change invalidates this gesture and its compaction plan.
                 // Let current backend geometry retarget all screen springs.
                 drag.current = null;
+                setPressed(false);
+                setLingering(false);
+                clearTimeout(projectionTimer.current);
+                if (interaction.mode === 'screen') onScreenMove?.({ type: 'end', id: interaction.id, cancelled: true });
+                projectionCallback.current?.(null);
                 feedback.reset();
                 setActive(null);
             }
@@ -290,7 +297,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
     };
     /** A manual edit is the only compaction trigger. New props (hotplug, hidden
      * screens, connectivity, remote layouts) only retarget the springs above.
-     * Only the edited computer moves; hidden screens are not in `screens`. */
+     * Only edited computers move; hidden screens are not in `screens`. */
     const settle = (id: string, r: Rect) => {
         const group = members(id), from = bounds(group);
         const transformed = transformGroup(group, from, r);
@@ -338,7 +345,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
             camera.jump({ zoom, ox, oy });
             feedback.reset();
             drag.current = {
-                id: s.id, group: members(s.id), mode: 'screen', pointerId: e.pointerId, origin: own, snapSuppressed: false,
+                id: s.id, group: members(s.id), geometry: geometryScreens, visibleIds: screens.map(s => s.id), mode: 'screen', pointerId: e.pointerId, origin: own, snapSuppressed: false,
                 grab: { x: p.x - shown.x, y: p.y - shown.y }, start: { x: e.clientX, y: e.clientY }, moved: false, live: own,
                 pointer: { x: e.clientX, y: e.clientY }, wasSelected, view: visibleArrangement({ zoom, ox, oy }, size, settings.padding),
             };
@@ -366,7 +373,7 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
         }
         feedback.reset(edges);
         drag.current = {
-            id: s.id, group: members(s.id), mode, corner, pointerId: e.pointerId, origin: pickRect(s),
+            id: s.id, group: members(s.id), geometry: geometryScreens, visibleIds: screens.map(s => s.id), mode, corner, pointerId: e.pointerId, origin: pickRect(s),
             snapSuppressed: e.shiftKey,
             grab: { x: p.x - ref.x, y: p.y - ref.y }, start: { x: e.clientX, y: e.clientY }, moved: false, live: pickRect(s),
             pointer: { x: e.clientX, y: e.clientY }, wasSelected, collapse,
@@ -638,7 +645,9 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
     // solid ring on the screen, dashed bounding rectangle for its computer.
     const selectedScreen = screens.find(m => m.id === selectedId);
     const screenSelection = selectedScreen && editingScreen(selectedScreen) ? selectedScreen : undefined;
-    return (<div ref={root} className="arr" data-hotzones={settings.showHotZones ? '' : undefined} data-interacting={active ? active.mode : undefined} data-corner={active?.corner} onPointerDown={onRootPointerDown}>
+    // Screen movement belongs to Pointer Events. Cancel a browser content drag
+    // before it can take ownership and cancel the in-progress pointer gesture.
+    return (<div ref={root} className="arr" data-hotzones={settings.showHotZones ? '' : undefined} data-interacting={active ? active.mode : undefined} data-corner={active?.corner} onPointerDown={onRootPointerDown} onDragStart={e => e.preventDefault()}>
       {screens.map((s) => {
             const r = springs.get(s.id) ?? s;
             const ra = springs.get('r:' + s.id) ?? { x: R, y: R, w: R, h: R };

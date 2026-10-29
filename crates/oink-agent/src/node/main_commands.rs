@@ -3,6 +3,10 @@ use super::*;
 use crate::threads::{MainCommand, input::InputCommand};
 
 impl Node {
+    #[cfg(all(test, debug_assertions))]
+    pub(crate) fn main_sender_for_test(&self) -> crate::threads::MainSender {
+        self.inner.main_commands.get().unwrap().clone()
+    }
     fn accept_ordinary_input(&self, work: &crate::threads::inject::OrdinaryInput) -> bool {
         if !self.input_backend().input_safety().accepts(work.safety) {
             return false;
@@ -28,6 +32,7 @@ impl Node {
             .name("oink-main-commands".into())
             .spawn(move || {
                 receive.bind();
+                let mut application_focus_started = false;
                 loop {
                     receive.begin_turn();
                     let Some(inner) = weak.upgrade() else { break };
@@ -37,12 +42,27 @@ impl Node {
                         if let Some(dnd) = inner.dnd.get() {
                             dnd.stop_native();
                         }
+                        if application_focus_started {
+                            let backend = &inner.input_backend;
+                            backend.application_focus_watch(None);
+                            backend.application_focus_dismiss();
+                        }
                         break;
                     }
                     let node = Node { inner };
                     node.drain_input_trace();
                     match receive.try_recv() {
-                        Ok(command) => node.main_command(command),
+                        Ok(command) => {
+                            if let MainCommand::ApplicationFocus { command, .. } = &command {
+                                use oink_routing::ApplicationFocusCommand as C;
+                                match command {
+                                    C::Dismiss(None) => application_focus_started = false,
+                                    C::Cancel(_) => {}
+                                    _ => application_focus_started = true,
+                                }
+                            }
+                            node.main_command(command);
+                        }
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
                             drop(node);
                             receive.wait();
@@ -58,6 +78,16 @@ impl Node {
     pub(crate) fn drain_input_trace(&self) {
         let diagnostics = self.inner.diagnostics.get();
         let dropped = oink_input::native_lifecycle::drain(|record| {
+            if record.kind == oink_input::native_lifecycle::Kind::RestoreSafetyReset {
+                // Formatting belongs here, never on the realtime capture owner.
+                tracing::warn!(
+                    generation = record.data.extra,
+                    trigger = record.data.reason,
+                    steps = record.data.steps,
+                    success = record.data.success,
+                    "Windows cursor restore safety reset; field cause remains unresolved"
+                );
+            }
             if let Some(observation) = record.mt_contacts {
                 if let Some(diagnostics) = diagnostics {
                     diagnostics
@@ -179,6 +209,20 @@ impl Node {
                     return;
                 };
                 let Ok(input) = self.input_thread() else { return };
+                if matches!(&command, oink_routing::DndCmd::Begin { .. })
+                    && let Some(work) = _completion.work.as_ref()
+                {
+                    crate::telemetry::projections::drag_target_stage(
+                        oink_telemetry::PrepareStage::BeginDispatch,
+                        work.queued_at(),
+                        std::time::Instant::now(),
+                    );
+                }
+                if dnd.defer_begin(&command, input.clone()) {
+                    // Drop the input completion now. Readiness returns through
+                    // the input owner and acquires a fresh native Begin fence.
+                    return;
+                }
                 // The backend dispatches only window work to its native event loop.
                 // Release/Begin/Cancel wait for that loop's callbacks, so running the
                 // whole operation on AppKit's main queue starves its own completion.
@@ -210,9 +254,10 @@ impl Node {
                         },
                     )
                 });
+                let released = || _completion.release_input();
                 let result = match &owner {
-                    Some(trace) => trace.scope(|| dnd.execute_reported(command, report)),
-                    None => dnd.execute_reported(command, report),
+                    Some(trace) => trace.scope(|| dnd.execute_reported(command, report, Some(&released))),
+                    None => dnd.execute_reported(command, report, Some(&released)),
                 };
                 if let Some(trace) = owner {
                     trace.result(0);
@@ -239,7 +284,7 @@ impl Node {
             }
             MainCommand::DndArtwork(command) => {
                 if let Some(dnd) = self.inner.dnd.get() {
-                    let _ = dnd.execute_reported(command, None);
+                    let _ = dnd.execute_reported(command, None, None);
                 }
             }
             MainCommand::DndPreview { peer, stream, message } => {
@@ -269,6 +314,80 @@ impl Node {
                     }
                     oink_routing::Output::CursorTrailDepart { exit } => trail.depart(exit),
                     _ => tracing::warn!("input owner sent an unexpected native decoration"),
+                }
+            }
+            MainCommand::ApplicationFocus { mut command, permit } => {
+                use oink_routing::ApplicationFocusCommand as C;
+                let routing = &self.settings().routing;
+                let parkable = routing.mouse_mode == oink_foundation::input::InputMode::Shared
+                    && routing.keyboard_mode == oink_foundation::input::InputMode::Shared;
+                if !parkable
+                    || !self
+                        .link_config()
+                        .is_ok_and(|config| config.applied().application_focus_enabled)
+                {
+                    // A queued sample/park may outlive the settings update. Do
+                    // not create a native observer/window after withdrawal.
+                    if matches!(command, C::Sample(_) | C::Park(_)) {
+                        if let Some(permit) = permit {
+                            permit.revoke();
+                        }
+                        return;
+                    }
+                    if matches!(command, C::Dismiss(_)) {
+                        command = C::Dismiss(None);
+                    }
+                }
+                let Ok(input) = self.input_thread() else { return };
+                let backend = self.input_backend();
+                match command {
+                    C::Sample(claim) => {
+                        let observer_input = Arc::downgrade(&input);
+                        let observer_claim = claim.clone();
+                        backend.application_focus_watch(Some(Arc::new(move |observation| {
+                            if let Some(input) = observer_input.upgrade() {
+                                input.send(InputCommand::ApplicationFocusObserved {
+                                    claim: observer_claim.clone(),
+                                    observation,
+                                });
+                            }
+                        })));
+                        let observation = backend.application_focus_sample();
+                        input.send(InputCommand::ApplicationFocusObserved { claim, observation });
+                    }
+                    C::Park(request) => {
+                        let result = if let Some(permit) = permit.filter(|permit| permit.valid()) {
+                            backend.application_focus_park(request.expected, request.operation, permit)
+                        } else {
+                            oink_foundation::application_focus::ParkResult::Stale
+                        };
+                        // Sample the resulting foreground with the same claim;
+                        // never relabel this work with a later pointer epoch.
+                        let observation = backend.application_focus_sample();
+                        input.send(InputCommand::ApplicationFocusObserved {
+                            claim: request.claim.clone(),
+                            observation,
+                        });
+                        input.send(InputCommand::ApplicationFocusApplied { request, result });
+                    }
+                    C::Cancel(request) => backend.application_focus_cancel(request.operation),
+                    C::Dismiss(claim) => {
+                        let observer = claim.map(|claim| {
+                            let input = Arc::downgrade(&input);
+                            Arc::new(move |observation| {
+                                if let Some(input) = input.upgrade() {
+                                    input.send(InputCommand::ApplicationFocusObserved {
+                                        claim: claim.clone(),
+                                        observation,
+                                    });
+                                }
+                            }) as oink_input::application_focus::Observer
+                        });
+                        // Suspension closes the sink but keeps observation alive
+                        // so desktop recovery can be reported. Opt-out stops it.
+                        backend.application_focus_watch(observer);
+                        backend.application_focus_dismiss();
+                    }
                 }
             }
             MainCommand::TrailDuration(ms) => {
@@ -420,7 +539,7 @@ impl Node {
     fn routing_status(&self, status: StatusEvent) {
         self.notification_status(&status);
         match status {
-            StatusEvent::FocusLock { .. } | StatusEvent::LocalGameMode(_) => {}
+            StatusEvent::FocusLock { .. } | StatusEvent::LocalGameMode(_) | StatusEvent::LocalPointerLock(_) => {}
             StatusEvent::TouchpadContacts {
                 mode,
                 frames,
@@ -509,7 +628,18 @@ mod tests {
                     before,
                     "permission projection blocked the drag command owner on COM/SCM queries"
                 );
-                assert!(items.iter().all(|item| item.state == PermissionState::NotDetermined));
+                assert!(
+                    items
+                        .iter()
+                        .filter(|item| item.kind != crate::api::PermissionKind::Microphone)
+                        .all(|item| item.state == PermissionState::NotDetermined)
+                );
+                let microphone = items
+                    .iter()
+                    .find(|item| item.kind == crate::api::PermissionKind::Microphone)
+                    .unwrap();
+                assert_eq!(microphone.state, PermissionState::Granted);
+                assert!(!microphone.required);
                 node.inner
                     .windows_access
                     .publish(crate::windows_permissions::Observation {

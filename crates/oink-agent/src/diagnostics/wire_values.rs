@@ -264,7 +264,7 @@ unit!(oink_input::pointer_transition::PlacementKind=>w::DiagPlacementKind{Owner=
 unit!(oink_input::button_diagnostics::Layer=>w::DiagButtonLayer{HidTap=>HidTap,SessionTap=>SessionTap,WindowsHook=>WindowsHook});
 unit!(oink_input::button_diagnostics::TimestampUnit=>w::DiagTimestampUnit{Nanoseconds=>Nanoseconds,Milliseconds=>Milliseconds});
 unit!(oink_input::timing::CallClass=>w::DiagCallClass{Motion=>Motion,Button=>Button,Key=>Key,Scroll=>Scroll,Gesture=>Gesture,Mode=>Mode,Release=>Release,Other=>Other});
-unit!(oink_clipboard::FileProviderReason=>w::DiagFileProviderReason{Checking=>Checking,DomainEnabled=>DomainEnabled,UrlsReady=>UrlsReady,DomainDisabled=>DomainDisabled,ExtensionNotRegistered=>ExtensionNotRegistered,DomainDisconnected=>DomainDisconnected,RegistrationFailed=>RegistrationFailed,BoundExpired=>BoundExpired,Cancelled=>Cancelled});
+unit!(oink_clipboard::FileProviderReason=>w::DiagFileProviderReason{Checking=>Checking,DomainEnabled=>DomainEnabled,UrlsReady=>UrlsReady,DomainDisabled=>DomainDisabled,ExtensionNotRegistered=>ExtensionNotRegistered,DomainDisconnected=>DomainDisconnected,RegistrationFailed=>RegistrationFailed,BoundExpired=>BoundExpired,Cancelled=>Cancelled,ItemMissing=>ItemMissing,ItemUnsupportedType=>ItemUnsupportedType,ItemKindMismatch=>ItemKindMismatch,ItemTargetMismatch=>ItemTargetMismatch,ItemIdentityMismatch=>ItemIdentityMismatch,ItemMetadataMismatch=>ItemMetadataMismatch,ItemAccessDenied=>ItemAccessDenied,ItemMetadataUnreadable=>ItemMetadataUnreadable});
 unit!(oink_clipboard::provider_preparation::PreparationPath=>w::DiagPreparationPath{Spare=>Spare,NewParent=>NewParent,DegradedPromise=>DegradedPromise,Failed=>Failed,Placeholder=>Placeholder});
 unit!(oink_clipboard::provider_preparation::PlaceholderFallback=>w::DiagPlaceholderFallback{Off=>Off,None=>None,NotReady=>NotReady,Capacity=>Capacity,UnknownSize=>UnknownSize,PreparationFailed=>PreparationFailed,PublicationFailed=>PublicationFailed,DisabledDuringPublication=>DisabledDuringPublication,DeferredToEnter=>DeferredToEnter});
 unit!(super::ProviderDragPath=>w::DiagProviderDragPath{Provider=>Provider,DegradedPromise=>DegradedPromise,Failed=>Failed});
@@ -369,7 +369,8 @@ unit!(oink_input::native_lifecycle::Kind=>w::LifecycleKind{
     ParkInputSenderUnavailable=>ParkInputSenderUnavailable,ParkInputSendRejected=>ParkInputSendRejected,ParkInputHookNotObserved=>ParkInputHookNotObserved,
     ParkInputTargetMismatch=>ParkInputTargetMismatch,ParkInputHideLost=>ParkInputHideLost,ParkInputHookChainRejected=>ParkInputHookChainRejected,
     ParkInputReadbackMismatch=>ParkInputReadbackMismatch,ParkInputCompletionUnavailable=>ParkInputCompletionUnavailable,
-    ContactCapture=>ContactCapture,ContactInjection=>ContactInjection
+    ContactCapture=>ContactCapture,ContactInjection=>ContactInjection,
+    MarkerSubmission=>MarkerSubmission,MarkerHookDecision=>MarkerHookDecision,MarkerChainResult=>MarkerChainResult,MarkerReadback=>MarkerReadback,RestoreSafetyReset=>RestoreSafetyReset,MouseKeysCompensation=>MouseKeysCompensation
 });
 fn named_scalars<T: Value>(values: impl IntoIterator<Item = (String, T)>) -> v1::Result<RawValue> {
     let mut values = values.into_iter().collect::<Vec<_>>();
@@ -659,15 +660,18 @@ impl Event {
                 epoch,
             } => {
                 let point = |p: Option<[i32; 2]>| p.map(|p| Point::new(f64::from(p[0]), f64::from(p[1])));
-                let clip = data.clip.map(|r| {
-                    Rect::new(
-                        f64::from(r[0]),
-                        f64::from(r[1]),
-                        (i64::from(r[2]) - i64::from(r[0])) as f64,
-                        (i64::from(r[3]) - i64::from(r[1])) as f64,
-                    )
-                });
+                let rect = |bounds: Option<[i32; 4]>| {
+                    bounds.map(|r| {
+                        Rect::new(
+                            f64::from(r[0]),
+                            f64::from(r[1]),
+                            (i64::from(r[2]) - i64::from(r[0])) as f64,
+                            (i64::from(r[3]) - i64::from(r[1])) as f64,
+                        )
+                    })
+                };
                 let observation = dto::<w::LifecycleObservation>([
+                    ("success", data.success.wire()?),
                     ("reason", data.reason.wire()?),
                     ("remote", data.remote.wire()?),
                     ("hidden", data.hidden.wire()?),
@@ -676,7 +680,17 @@ impl Event {
                     ("generation", data.extra.wire()?),
                     ("requested", point(data.point).wire()?),
                     ("observed", point(data.cursor).wire()?),
-                    ("clip", clip.wire()?),
+                    ("clip", rect(data.clip).wire()?),
+                    ("cursor_showing", data.cursor_showing.wire()?),
+                    ("park", point(data.park).wire()?),
+                    ("marker", data.marker.wire()?),
+                    ("normalized", point(data.normalized).wire()?),
+                    ("desktop", rect(data.desktop).wire()?),
+                    ("chain_result", data.chain_result.wire()?),
+                    ("cursor_before", point(data.cursor_before).wire()?),
+                    ("cursor_after_move", point(data.cursor_after_move).wire()?),
+                    ("hidden_before", data.hidden_before.wire()?),
+                    ("steps", data.steps.wire()?),
                 ])?;
                 (
                     "input-lifecycle/1",
@@ -788,6 +802,10 @@ impl Event {
         raw_fields::<w::DiagnosticEvent>([("kind", RawValue::from(kind)), ("fields", RawValue::Map(fields))])
     }
 }
+unit!(oink_routing::application_focus::Phase=>w::ApplicationFocusPhase{Off=>Off,Preparing=>Preparing,Active=>Active,Suspended=>Suspended});
+unit!(oink_routing::application_focus::Reason=>w::ApplicationFocusReason{Disabled=>Disabled,Ready=>Ready,NoPointer=>NoPointer,PointerNotParticipating=>PointerNotParticipating,AwaitingApplication=>AwaitingApplication,DesktopUnavailable=>DesktopUnavailable,Drag=>Drag,Game=>Game,CounterExhausted=>CounterExhausted});
+structure!(super::store::ApplicationFocus=>w::DiagApplicationFocus{pointer,keyboard,epoch,revision,phase,reason});
+
 pub(super) fn snapshot(value: &Snapshot, rich: bool) -> v1::Result<w::Snapshot> {
     let layout = value.layout.as_ref();
     let omitted = if rich {
@@ -819,6 +837,7 @@ pub(super) fn snapshot(value: &Snapshot, rich: bool) -> v1::Result<w::Snapshot> 
         .transpose()?;
     let mut fields = vec![
         ("group_state", excerpt.write()),
+        ("application_focus", value.application_focus.wire()?),
         ("version", value.version.wire()?),
         ("source_tree_sha256", value.source_tree_sha256.wire()?),
         ("os", value.os.wire()?),

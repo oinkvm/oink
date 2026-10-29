@@ -54,7 +54,7 @@ fn devices(hwnd: HWND, flags: windows::Win32::UI::Input::RAWINPUTDEVICE_FLAGS) -
 }
 
 pub(crate) fn register(hwnd: HWND) -> Result<(), String> {
-    let devs = devices(hwnd, RIDEV_INPUTSINK);
+    let devs = devices(hwnd, RIDEV_INPUTSINK | windows::Win32::UI::Input::RIDEV_DEVNOTIFY);
     // SAFETY: 设备数组在调用期间有效，cbSize 为单个结构大小。
     unsafe { RegisterRawInputDevices(&devs, size_of::<RAWINPUTDEVICE>() as u32) }.map_err(|e| e.to_string())
 }

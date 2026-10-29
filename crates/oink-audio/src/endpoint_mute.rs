@@ -31,9 +31,15 @@ impl<B: EndpointBackend> Lease<B> {
         }
         let mut expected = before;
         expected.muted = true;
-        if self.backend.ownership_lost() || self.backend.read(&expected.endpoint)? != Some(expected) {
+        let observed = self.backend.read(&expected.endpoint)?;
+        if self.backend.ownership_lost() || observed.as_ref().is_some_and(|state| state != &expected) {
             self.journal.revoke()?;
             return Err("source controls changed while muting; user state takes priority".into());
+        }
+        if observed.is_none() {
+            // Disappearance is not a user override. Drop must resolve deletion
+            // or retain our original mute for a reconnect during acquisition.
+            return Err("source output disappeared while muting".into());
         }
         Ok(self)
     }
@@ -60,13 +66,10 @@ impl<B: EndpointBackend> Lease<B> {
             // writing the user's new level; a mute override is never undone.
             self.journal.release_after_volume_change(&self.backend)?;
         }
-        let report = self.journal.recover(&self.backend, false)?;
+        let report = self.journal.recover_or_defer(&self.backend, false)?;
         if report.outcome == RecoveryOutcome::UserOverride {
             // Also cover ownership discovered by recover's final readback.
             self.journal.release_after_volume_change(&self.backend)?;
-        }
-        if report.outcome == RecoveryOutcome::EndpointUnavailable {
-            return Err("muted source output unavailable; recovery journal retained for next start".into());
         }
         self.finished = true;
         tracing::info!(?report, "source output mute lease finished");
@@ -91,11 +94,16 @@ mod tests {
     struct Fake {
         state: RefCell<Option<EndpointState>>,
         writes: Cell<usize>,
+        disappear_on_mute: Cell<bool>,
+        removed: Cell<bool>,
         changed: Cell<bool>,
         mute_changed: Cell<bool>,
         journal: std::path::PathBuf,
     }
     impl EndpointBackend for Rc<Fake> {
+        fn permanently_removed(&self, _: &str) -> Result<bool, String> {
+            Ok(self.removed.get())
+        }
         fn read(&self, id: &str) -> Result<Option<EndpointState>, String> {
             Ok(self.state.borrow().clone().filter(|s| s.endpoint == id))
         }
@@ -105,6 +113,9 @@ mod tests {
             assert_eq!(entry["entry"]["owned"], true, "write-ahead before OS change");
             self.state.borrow_mut().as_mut().unwrap().muted = mute;
             self.writes.set(self.writes.get() + 1);
+            if mute && self.disappear_on_mute.get() {
+                self.state.borrow_mut().take();
+            }
             Ok(())
         }
         fn ownership_lost(&self) -> bool {
@@ -129,6 +140,8 @@ mod tests {
                 volume: 0.375,
             })),
             writes: Cell::new(0),
+            disappear_on_mute: Cell::new(false),
+            removed: Cell::new(false),
             changed: Cell::new(false),
             mute_changed: Cell::new(false),
             journal: dir.path().join("audio-mute-recovery.json"),
@@ -183,11 +196,40 @@ mod tests {
         assert_eq!(b.writes.get(), 1);
     }
     #[test]
+    fn disappearance_during_mute_setup_is_not_mistaken_for_user_takeover() {
+        for removed in [false, true] {
+            let (dir, b) = setup(false);
+            b.disappear_on_mute.set(true);
+            b.removed.set(removed);
+            let error = Lease::start(Journal::open(dir.path()).unwrap(), b.clone(), "test-output")
+                .err()
+                .unwrap();
+            assert!(error.contains("disappeared"));
+            let journal = Journal::open(dir.path()).unwrap();
+            assert_eq!(journal.has_pending_restore(), !removed);
+            assert!(
+                !journal.has_active_pending_restore(),
+                "unavailable endpoints are deferred rather than a cleanup fault"
+            );
+        }
+    }
+    #[test]
+    fn removed_endpoint_finishes_lease_and_clears_durable_ownership() {
+        let (dir, b) = setup(false);
+        let mut lease = start(dir.path(), &b);
+        b.state.borrow_mut().take();
+        b.removed.set(true);
+        lease.finish().unwrap();
+        drop(lease);
+        assert!(!Journal::open(dir.path()).unwrap().has_pending_restore());
+        assert_eq!(b.writes.get(), 1);
+    }
+    #[test]
     fn missing_old_device_retains_recovery_and_never_changes_replacement() {
         let (dir, b) = setup(false);
         let mut lease = start(dir.path(), &b);
         let old = b.state.borrow_mut().take().unwrap();
-        assert!(lease.finish().is_err());
+        lease.finish().unwrap();
         drop(lease);
         let mut journal = Journal::open(dir.path()).unwrap();
         assert!(journal.has_pending_restore());

@@ -11,7 +11,6 @@ wire_map!(LayoutProfilesState, no_validation, {
 });
 wire_map!(LayoutProfilesReceipt, no_validation, {
     1 => group: Id16 = required;
-    2 => digest: Hash32 = required;
     3 => accepted: bool = required;
 });
 wire_map!(LayoutProfileCatalog, no_validation, {
@@ -30,6 +29,8 @@ wire_map!(LayoutProfile, no_validation, {
     5 => content: LayoutProfileSnapshot = required;
     6 => state: LayoutProfileDeviceState = required;
     7 => default_group: Option<Id16> = optional;
+    8 => physical_topology: Option<List<LayoutPhysicalDevice,16>> = optional;
+    9 => physical_topology_revision: Option<ConfigVersion> = optional;
 });
 wire_map!(LayoutProfileRecency, no_validation, {
     1 => logical_ms: u64 = required;
@@ -159,4 +160,19 @@ wire_map!(LayoutProfilesJoin, no_validation, {
     1 => group: Id16 = required;
     2 => merge_id: Hash32 = required;
     3 => catalog: LayoutProfileCatalogV3 = required;
+});
+
+// Presence, names and native observation tokens are intentionally absent.
+wire_map!(LayoutPhysicalDevice, no_validation, {
+    1 => device: DeviceId = required;
+    2 => screens: List<LayoutPhysicalScreen,256> = required;
+});
+wire_map!(LayoutPhysicalScreen, no_validation, {
+    1 => id: Text<512> = required;
+    2 => bounds: Rect = required;
+    3 => pixel_width: u32 = required;
+    4 => pixel_height: u32 = required;
+    5 => scale: f64 = required;
+    6 => rotation: u16 = required;
+    7 => primary: bool = required;
 });

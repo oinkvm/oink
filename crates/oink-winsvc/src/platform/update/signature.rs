@@ -1,6 +1,6 @@
 use super::super::wide;
 use super::protected;
-use oink_update::{Error, feed::hex, trust::Roots};
+use oink_update::{Error, feed::hex};
 use sha2::{Digest, Sha256};
 use std::{os::windows::io::AsRawHandle, path::Path, ptr};
 use windows_sys::Win32::{
@@ -8,10 +8,11 @@ use windows_sys::Win32::{
     Security::{Cryptography::*, WinTrust::*},
 };
 
-pub(super) fn verify(path: &Path, roots: &Roots) -> Result<(), Error> {
-    // The signed manifest/package hash is always required by our callers. An
+pub(super) fn verify(path: &Path, pins: &[String]) -> Result<(), Error> {
+    // Callers require either a signed feed hash or elevated local consent bound
+    // to the protected package hash. An
     // Authenticode root, when supplied, is an additional release restriction.
-    if roots.signer_spki_sha256.is_empty() {
+    if pins.is_empty() {
         return Ok(());
     }
     let file = protected::open(path).map_err(|_| Error::Storage)?;
@@ -36,7 +37,7 @@ pub(super) fn verify(path: &Path, roots: &Roots) -> Result<(), Error> {
     // SAFETY: all backing structs, file handle and wide path remain live; no UI is permitted.
     let result = unsafe { WinVerifyTrust(INVALID_HANDLE_VALUE, &mut action, ptr::addr_of_mut!(data).cast()) };
     let pinned = if result == 0 {
-        pin(data.hWVTStateData, roots)
+        pin(data.hWVTStateData, pins)
     } else {
         Err(Error::Signature)
     };
@@ -47,7 +48,7 @@ pub(super) fn verify(path: &Path, roots: &Roots) -> Result<(), Error> {
     }
     pinned
 }
-fn pin(state: windows_sys::Win32::Foundation::HANDLE, roots: &Roots) -> Result<(), Error> {
+fn pin(state: windows_sys::Win32::Foundation::HANDLE, pins: &[String]) -> Result<(), Error> {
     // SAFETY: state belongs to a successful WinVerifyTrust call and remains open
     // throughout these read-only provider/certificate queries.
     unsafe {
@@ -97,7 +98,7 @@ fn pin(state: windows_sys::Win32::Foundation::HANDLE, roots: &Roots) -> Result<(
         }
         encoded.truncate(length as usize);
         let hash = hex(&Sha256::digest(&encoded));
-        if !roots.signer_spki_sha256.contains(&hash) {
+        if !pins.contains(&hash) {
             return Err(Error::Signature);
         }
         Ok(())

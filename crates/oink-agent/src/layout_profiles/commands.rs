@@ -268,6 +268,32 @@ impl Node {
             Err(e) => error_reply(e),
         }
     }
+    fn recorded_profile_reply(&self, command: &Command, digest: &str) -> Result<Option<serde_json::Value>> {
+        let Some(id) = command.request_id() else {
+            return Ok(None);
+        };
+        {
+            let data = lock(&self.inner.profiles.data);
+            if let Some((_, old, response)) = data.replies.iter().find(|(key, _, _)| key == id) {
+                return if old == digest {
+                    Ok(Some(response.clone()))
+                } else {
+                    Err(stale())
+                };
+            }
+            if !data.operations.iter().any(|op| op.id == id) {
+                return Ok(None);
+            }
+            if data.operation_digests.get(id).map(String::as_str) != Some(digest) {
+                return Err(stale());
+            }
+        }
+        json(OperationReply {
+            operation_id: id.into(),
+            state: self.profile_snapshot()?,
+        })
+        .map(Some)
+    }
     fn run_profile_command(&self, command: Command) -> Result<serde_json::Value> {
         if matches!(command, Command::Query) {
             return json(self.profile_snapshot()?);
@@ -283,6 +309,18 @@ impl Node {
                 .ok_or_else(|| ProfileError::new(ErrorCode::ProfileNotFound, "Operation is unavailable"))?;
             return json(OperationQuery { operation, state });
         }
+        let digest = model::hash(&command);
+        if let Some(id) = command.request_id()
+            && (id.is_empty() || id.len() > 128 || id.chars().any(char::is_control))
+        {
+            return Err(ProfileError::new(ErrorCode::InvalidGeometry, "Invalid request ID"));
+        }
+        // Recovery publishes its durable receipt before releasing command_gate.
+        // Reading that receipt must also work during the resolver's final event
+        // publication (or an unrelated command); it does not admit another write.
+        if let Some(reply) = self.recorded_profile_reply(&command, &digest)? {
+            return Ok(reply);
+        }
         let _operation = self
             .inner
             .profiles
@@ -297,37 +335,13 @@ impl Node {
             .gate
             .lock()
             .map_err(|_| ProfileError::new(ErrorCode::Busy, "Profile owner unavailable"))?;
-        let digest = model::hash(&command);
-        if let Some(id) = command.request_id() {
-            if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
-                return Err(ProfileError::new(ErrorCode::InvalidGeometry, "Invalid request ID"));
-            }
-            if let Some((_, old, response)) = lock(&self.inner.profiles.data)
-                .replies
-                .iter()
-                .find(|(key, _, _)| key == id)
-            {
-                return if *old == digest {
-                    Ok(response.clone())
-                } else {
-                    Err(stale())
-                };
-            }
+        // Recheck after acquiring the gates: a command may have completed since
+        // the first lookup, and its ID must never admit a second mutation.
+        if let Some(reply) = self.recorded_profile_reply(&command, &digest)? {
+            return Ok(reply);
         }
         let request_id = command.request_id().map(str::to_owned);
         let state = self.profile_snapshot()?;
-        if let Some(id) = &request_id {
-            let data = lock(&self.inner.profiles.data);
-            if let Some(op) = data.operations.iter().find(|op| &op.id == id) {
-                if data.operation_digests.get(id) != Some(&digest) {
-                    return Err(stale());
-                }
-                return json(OperationReply {
-                    operation_id: op.id.clone(),
-                    state: state.clone(),
-                });
-            }
-        }
         if !matches!(command, Command::Operation(_) | Command::Preview(_))
             && state
                 .operation
@@ -346,13 +360,20 @@ impl Node {
             Command::Query => unreachable!(),
             Command::Create(v) => {
                 check(&v.expected_token, &state.token)?;
-                self.persist_catalog(catalog.save(
+                let mut saved = catalog.save(
                     self.id().into(),
                     &current,
                     self.observe_profiles()?.device_state,
                     Some(&v.name),
                     now,
-                )?)?;
+                )?;
+                saved
+                    .profiles
+                    .iter_mut()
+                    .find(|p| p.id == saved.active_profile_id)
+                    .unwrap()
+                    .saved_topology = self.observe_profiles()?.physical_topology;
+                self.persist_catalog(saved)?;
                 json(self.profile_snapshot()?)?
             }
             Command::Rename(v) => {
@@ -627,17 +648,17 @@ impl Node {
             .expect("placement");
         placement.origin.x += anchor.x * p.scale;
         placement.origin.y += anchor.y * p.scale;
-        let mut order = vec![v.device];
-        order.extend(current.placements.iter().map(|p| p.device).filter(|d| *d != v.device));
-        let mut adjustments = Vec::new();
-        model::repair_collisions(&mut current, &order, &mut adjustments)?;
+        // This preview constrains native geometry only. Manual canvas collision
+        // release and compaction belong to the frontend, which translates the
+        // edited computer against fixed peers before committing its placement.
+        // Load's ordered multi-device repair would instead move unedited peers.
         let plan_token = model::hash(&(&state.token, &native, &current.placements));
         let reply = PreviewReply {
             sequence: v.sequence,
             native,
             placements: current.placements,
             plan_token: plan_token.clone(),
-            adjustments,
+            adjustments: Vec::new(),
         };
         let mut data = lock(&self.inner.profiles.data);
         if data.previews.len() >= 128 {
@@ -650,7 +671,19 @@ impl Node {
         {
             let mut data = lock(&self.inner.profiles.data);
             let mut catalog = data.catalog.clone().expect("catalog initialized");
+            let old_version = catalog.version.clone();
             Self::autosave_operation(&mut catalog, &mut operation, self.id().into())?;
+            if catalog.version != old_version {
+                let topology = self.observe_profiles()?.physical_topology;
+                if let Some(save) = &operation.manual_save {
+                    catalog
+                        .profiles
+                        .iter_mut()
+                        .find(|p| p.id == save.profile_id)
+                        .unwrap()
+                        .saved_topology = topology;
+                }
+            }
             let mut operations = data.operations.clone();
             if let Some(old) = operations.iter_mut().find(|old| old.id == operation.id) {
                 *old = operation.clone();

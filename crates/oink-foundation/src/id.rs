@@ -41,30 +41,68 @@ impl GroupId {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    let mut text = vec![0; bytes.len() * 2];
+    encode_hex(bytes, &mut text);
+    String::from_utf8(text).expect("hex is ASCII")
+}
+
+fn encode_hex(bytes: &[u8], text: &mut [u8]) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let (pairs, _) = text.as_chunks_mut::<2>();
+    for (byte, pair) in bytes.iter().zip(pairs) {
+        *pair = [DIGITS[(byte >> 4) as usize], DIGITS[(byte & 15) as usize]];
+    }
+}
+
+fn hex_text<'a>(bytes: &[u8], text: &'a mut [u8]) -> &'a str {
+    encode_hex(bytes, text);
+    std::str::from_utf8(text).expect("hex is ASCII")
 }
 
 impl fmt::Debug for DeviceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "DeviceId({})", self.to_hex())
+        write!(f, "DeviceId({})", hex_text(&self.0, &mut [0; 64]))
     }
 }
 
 impl fmt::Display for DeviceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_hex())
+        f.write_str(hex_text(&self.0, &mut [0; 64]))
     }
 }
 
 impl fmt::Debug for GroupId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "GroupId({})", &self.to_hex()[..8])
+        write!(f, "GroupId({})", hex_text(&self.0[..4], &mut [0; 8]))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hex_preserves_all_bytes_and_debug_formats() {
+        let bytes: Vec<_> = (0..=255).collect();
+        let expected: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(hex(&bytes), expected);
+        assert_eq!(hex(&[]), "");
+        let group = GroupId([0xab; 16]);
+        assert_eq!(group.to_hex(), "ab".repeat(16));
+        assert_eq!(format!("{group:?}"), "GroupId(abababab)");
+    }
+
+    #[test]
+    #[ignore = "isolated resource benchmark; run with --ignored --nocapture"]
+    fn resource_identity_format_benchmark() {
+        let id = std::hint::black_box(DeviceId([0xab; 32]));
+        let started = std::time::Instant::now();
+        for _ in 0..100_000 {
+            std::hint::black_box(id.to_hex());
+            std::hint::black_box(format!("{id:?}"));
+        }
+        println!("identity_pairs=100000 elapsed_us={}", started.elapsed().as_micros());
+    }
 
     #[test]
     fn fingerprint_uses_exactly_the_first_sixty_bits() {

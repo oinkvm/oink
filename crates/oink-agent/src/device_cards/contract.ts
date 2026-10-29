@@ -40,7 +40,7 @@ export type ResourceFaultCode =
   | "none" | "permission_required" | "permission_denied"
   | "capture_unavailable" | "injection_unavailable" | "secure_input"
   | "device_unavailable" | "cleanup_failed" | "unsupported"
-  | "backend_failed" | "unrecognized";
+  | "backend_failed" | "microphone_loopback" | "unrecognized";
 export interface ResourceFault {
   code: ResourceFaultCode;
   unknownCode: number | null; // u32 only for unrecognized
@@ -93,6 +93,22 @@ export interface SpeakerCard extends ResourceCard<
     muted: boolean; // forwarding mute, independent of gain/OS mute
   } | null;
 }
+export interface MicrophoneCard {
+  fault: ResourceFault | null;
+  receivingActive: boolean;
+  mode: "unavailable" | "idle" | "source" | "receiver" | "muted";
+  permissionGranted: boolean;
+  virtualReady: boolean;
+  captureActive: boolean;
+  consumerActive: boolean;
+  sourceDevice: DeviceKey | null;
+  sourceName: string | null;
+  shareAction: CardAction;
+  localAction: CardAction;
+  receiveAction: CardAction;
+  controlsToken: string | null;
+  forwarding: SpeakerCard["forwarding"];
+}
 export interface ClipboardCard extends ResourceCard<SharingMode> {}
 export interface DeviceCardActions {
   screenShared: CardAction;
@@ -119,6 +135,7 @@ export interface DeviceCardStatus {
     disabled: boolean | null;
   };
   speaker: SpeakerCard;
+  microphone?: MicrophoneCard; // absent on older local backends
   clipboard: ClipboardCard;
   game: { preference: "auto" | "on" | "off" | null; active: boolean | null;
           detected: boolean | null; actions: Record<"auto" | "on" | "off", CardAction> };
@@ -164,7 +181,7 @@ export interface EmergencyDeliveryCard {
 export interface DeviceCardsView {
   schema: 1;
   stream: string; // opaque random token for this backend/projection incarnation
-  revision: DecimalU64; // monotonic within stream, starts at 1
+  revision: DecimalU64; // semantic state only; RTT measurements do not advance it
   group: GroupId | null; // null in unreadable-group recovery
   generatedAtMs: UtcMs;
   exitVolume: ExitVolumeCard | null; // current unique exit, unavailable identity retained
@@ -217,10 +234,13 @@ export type BlockedDeviceRequest =
   | { method: "block"; params: { operation_id: string; device: DeviceKey } }
   | { method: "unblock"; params: { operation_id: string; device: DeviceKey } };
 
+export type UpdateError = 'package_unavailable'|'verification_timeout'|'wrong_product'|'wrong_architecture'|'downgrade'|'corrupt_package'|'not_notarized'|'not_writable'|'elevation'| 'metadata'|'signature'|'expired_feed'|'replay'|'clock'|'url'|'limit'|'policy'|'os_unsupported'|'busy'|'transaction'|'repair_required'|'storage'|'not_configured'|'network';
+
 export interface ApiError {
-  code: "unavailable" | "not_found" | "invalid_argument" | "invalid_state"
+  code: "update_failed" | "unavailable" | "not_found" | "invalid_argument" | "invalid_state"
     | "network" | "unsupported" | "internal" | "invalid_address" | "not_member" | "persistence_failed" | "network_stopped";
   problem: UserFacingProblem;
+  update_error?: UpdateError; // updater refusal preserved across both IPC hops
 }
 
 // blocked_devices returns the snapshot; mutations return the correlated edit.
@@ -256,3 +276,11 @@ export type PauseRequest =
   | { method: "set_device_paused"; params: { requestId: string; token: string; paused: boolean } }
   | { method: "pause_all"; params: { requestId: string } };
 export interface PauseAllAccepted { requestId: string; eventToken: string }
+
+/** Measurement-only update; stream/revision match the semantic card snapshot. */
+export interface DeviceCardSignals {
+  stream: string;
+  revision: DecimalU64;
+  sampledAtMs: number;
+  signals: { device: string; rttMs: number | null }[];
+}

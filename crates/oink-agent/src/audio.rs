@@ -1,6 +1,6 @@
 //! Audio worker: platform calls never run on the input-routing task.
 mod link;
-pub(crate) use link::{Handle as LinkHandle, start_link_runtime};
+pub(crate) use link::{DriverChangeGuard, Handle as LinkHandle, start_link_runtime};
 
 #[derive(Clone, Debug)]
 pub(crate) struct OwnerOptionApplied {
@@ -14,7 +14,7 @@ pub(crate) struct OwnerOptionApplied {
 use oink_audio::diagnostics::Cadence;
 mod discovery;
 mod local_output;
-mod report;
+pub(crate) mod report;
 mod timing;
 use crate::node::lock;
 use discovery::{DeviceDiscovery, DeviceSnapshot};
@@ -51,6 +51,10 @@ struct Negotiated {
 
 // Private seams keep lifecycle tests entirely independent of OS audio and sockets.
 trait CaptureStream {
+    /// Native frames intentionally omitted from PCM delivery during digital silence.
+    fn omitted_silent_frames(&self) -> u64 {
+        0
+    }
     fn finish(&mut self) -> Option<String> {
         None
     }
@@ -73,6 +77,16 @@ trait CaptureStream {
     fn error(&self) -> Option<String>;
 }
 impl CaptureStream for Capture {
+    fn omitted_silent_frames(&self) -> u64 {
+        #[cfg(target_os = "macos")]
+        {
+            Capture::omitted_silent_frames(self)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            0
+        }
+    }
     fn finish(&mut self) -> Option<String> {
         #[cfg(any(windows, target_os = "macos"))]
         {

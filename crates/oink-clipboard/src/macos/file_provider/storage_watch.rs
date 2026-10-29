@@ -1,3 +1,14 @@
+//! Supplemental, best-effort invalidation for external writes.
+//! Owned store/provider mutations invalidate at commit/close independently.
+//! On macOS 26.6.2 (25G83), a just-notified file had no modify callback for
+//! at least 40s under filesystem load with dispatch or RunLoop scheduling. Separate-
+//! process load also reproduced missed callbacks (10s observation). FlushSync,
+//! fsync and latency changes did not establish delivery.
+//! Observed in late-callback, RunLoop and separate-process traces.
+//! Therefore long-held external writes before close and same-user tampering with
+//! private catalog/staging/store paths have only this best-effort signal. No
+//! polling or per-operation FSEvents deadline is part of the accounting contract.
+//!
 //! Native cache invalidation. SDK contract: CoreServices.framework/Frameworks/
 //! FSEvents.framework/Headers/FSEvents.h (FSEventStreamContext, create flags,
 //! FSEventStreamSetDispatchQueue, FSEventStreamInvalidate).
@@ -96,10 +107,12 @@ unsafe extern "C-unwind" fn release_root(info: *const c_void) {
 }
 
 fn changes_cache(flags: FSEventStreamEventFlags) -> bool {
-    // Preserve the old backend's Create/Modify/Remove translation, including
-    // renames, metadata, and mount/root changes. HistoryDone and rescan/type-only
-    // notifications did not produce those kinds (nor Any) in that backend.
-    let changes = kFSEventStreamEventFlagRootChanged
+    // Coalesced/dropped events require the same whole-root reconciliation as
+    // concrete file mutations (FSEvents.h MustScanSubDirs contract).
+    let changes = kFSEventStreamEventFlagMustScanSubDirs
+        | kFSEventStreamEventFlagKernelDropped
+        | kFSEventStreamEventFlagUserDropped
+        | kFSEventStreamEventFlagRootChanged
         | kFSEventStreamEventFlagMount
         | kFSEventStreamEventFlagUnmount
         | kFSEventStreamEventFlagItemCreated
@@ -137,41 +150,11 @@ unsafe extern "C-unwind" fn storage_events(
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn create_modify_remove_nested_files_publish_cache_changes() {
+    #[test]
+    fn existing_root_starts_and_stops_watch() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        std::fs::create_dir_all(root.join("nested/deeper")).unwrap();
-        let file = root.join("nested/deeper/file");
-        let watch = StorageWatch::new(root).unwrap();
-        let mut changes = crate::cache::subscribe();
-        for operation in ["create", "modify", "rename", "remove"] {
-            // End the previous batch before the next operation, so an earlier
-            // coalesced notification cannot satisfy the next assertion.
-            // SAFETY: watch owns a started stream on its separate dispatch queue.
-            unsafe { FSEventStreamFlushSync(watch.stream) };
-            while changes.try_recv().is_ok() {}
-            match operation {
-                "create" => std::fs::write(&file, b"first").unwrap(),
-                "modify" => std::fs::write(&file, b"changed contents").unwrap(),
-                "rename" => std::fs::rename(&file, file.with_extension("renamed")).unwrap(),
-                "remove" => std::fs::remove_file(file.with_extension("renamed")).unwrap(),
-                _ => unreachable!(),
-            }
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    match changes.recv().await {
-                        Ok(changed) if changed == root => break,
-                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(error) => panic!("cache changes closed: {error}"),
-                    }
-                }
-            })
-            .await
-            .unwrap_or_else(|_| panic!("no cache change after {operation}"));
-        }
+        let watch = StorageWatch::new(temp.path()).unwrap();
+        drop(watch);
     }
 
     #[test]
@@ -186,6 +169,8 @@ mod tests {
     #[test]
     fn event_flags_preserve_create_modify_remove_filter() {
         for flag in [
+            kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagKernelDropped,
+            kFSEventStreamEventFlagUserDropped,
             kFSEventStreamEventFlagItemCreated,
             kFSEventStreamEventFlagItemModified,
             kFSEventStreamEventFlagItemRemoved,
@@ -203,7 +188,6 @@ mod tests {
         for flag in [
             kFSEventStreamEventFlagNone,
             kFSEventStreamEventFlagItemIsDir,
-            kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagKernelDropped,
             kFSEventStreamEventFlagHistoryDone | kFSEventStreamEventFlagItemCreated,
         ] {
             assert!(!changes_cache(flag));

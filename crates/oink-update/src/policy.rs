@@ -103,12 +103,14 @@ pub enum Scope {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Candidate {
+    #[serde(default)]
+    pub local_package: bool,
     pub build: u64,
     pub version: String,
     pub size: u64,
     pub published_at: Option<i64>,
     pub severity: Severity,
-    pub notes: crate::feed::ReleaseNotes,
+    pub notes: Option<crate::feed::ReleaseNotes>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateStatus {
@@ -130,6 +132,7 @@ pub struct UpdateStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
+    OpenLocal { path: String },
     Check,
     Download,
     Install { expected_build: u64 },

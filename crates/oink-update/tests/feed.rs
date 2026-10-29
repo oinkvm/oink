@@ -118,12 +118,13 @@ fn release_notes_are_bounded_and_preserved_in_candidates() {
         assert_eq!(notes.for_language(language), "Fix a problem.");
     }
     let candidate = oink_update::policy::Candidate {
+        local_package: false,
         build: 20,
         version: "1.0.1".into(),
         size: 3,
         published_at: None,
         severity: Severity::Normal,
-        notes: notes.clone(),
+        notes: Some(notes.clone()),
     };
     let value = serde_json::to_value(&candidate).unwrap();
     assert_eq!(value["notes"], payload()["releases"][0]["notes"]);

@@ -298,6 +298,20 @@ fn status(reply: Reply) -> io::Result<ServiceStatus> {
     })
 }
 
+/// Dedicated fixed summary; incompatible helpers fail without aggregate fallback.
+pub fn power_snapshot() -> io::Result<crate::power::Summary> {
+    let reply = owner()?
+        .request(Command::PowerSnapshot, true, false)?
+        .ok_or_else(|| io::Error::other("missing power reply"))?;
+    if reply.0[..4] != [0; 4] || reply.0[4] != 1 || reply.0[5] != 1 || reply.0[6] > 1 || reply.0[7] > 1 {
+        return Err(io::Error::other("power request observation unavailable"));
+    }
+    Ok(crate::power::Summary {
+        display: reply.0[6] != 0,
+        system: reply.0[7] != 0,
+    })
+}
+
 #[cfg(test)]
 pub(super) fn private_pipe_client(pipe: Handle) -> io::Result<Client> {
     // Only private test pipes. Production construction always calls connect()

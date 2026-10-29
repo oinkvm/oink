@@ -69,7 +69,7 @@ pub struct RoutingSettings {
     pub heartbeat_interval_ms: u32,
     pub heartbeat_timeout_ms: u32,
     pub button_handoff: ButtonHandoff,
-    /// 一行的物理高度（plane），用于行滚动与像素滚动互换（「行 × 源机典型行高」）。
+    /// Legacy serialized setting; scrolling now uses a fixed 32 pixels/line, independent of display size.
     pub line_height_ratio: f64,
     /// 本机作为目标时注入滚动的单位；`None` 按系统：macOS 像素、Windows 行（滚轮格）。
     pub scroll_output: Option<ScrollUnit>,
@@ -96,6 +96,10 @@ pub struct RoutingSettings {
     /// Retired test_mac_scroll is intentionally ignored by local settings readers:
     /// the promoted preference defaults on, independently of the old experiment.
     pub mac_scroll_feel: bool,
+    /// Receiver owner options; used only for capable Mac sources. Legacy
+    /// sources keep AcceptContacts and today's synthetic scroll behavior.
+    pub touchpad_injection: bool,
+    pub native_multifinger: bool,
     /// Windows capture-local opt-in to legacy forwarding of other apps' injected input.
     pub forward_injected_input: bool,
     /// Runtime projection of this device owner's persistent game preference.
@@ -142,6 +146,8 @@ impl Default for RoutingSettings {
             forward_gestures: true,
             accept_contacts: true,
             mac_scroll_feel: true,
+            touchpad_injection: true,
+            native_multifinger: true,
             forward_injected_input: false,
             game_mode_preference: crate::GameMode::Auto,
             return_pointer_on_display_sleep: true,

@@ -192,7 +192,7 @@ impl Trace {
     fn emit(&self, edge: u8) {
         let (thread, main, apartment) = thread_info();
         let c = self.context;
-        tracing::info!(target: "oink_dnd_read",
+        tracing::debug!(target: "oink_dnd_read",
             dr_schema=1_u8, dr_stage=self.stage, dr_edge=edge,
             dr_id=c.call, dr_parent=self.parent,
             dr_request0=c.request[0], dr_request1=c.request[1], dr_request2=c.request[2], dr_request3=c.request[3],
@@ -282,6 +282,7 @@ mod tests {
         let output = Writer(Arc::default());
         let writer = output.clone();
         let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
             .without_time()
             .with_ansi(false)
             .with_writer(move || writer.clone())

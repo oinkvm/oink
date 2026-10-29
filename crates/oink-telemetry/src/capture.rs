@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub struct Image {
     pub slot: ImageSlot,
     pub debug_id: [u8; 16],
+    pub debug_age: u32,
+    pub code_id: Option<u64>,
     pub text_size: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -96,11 +98,18 @@ impl Manifest {
                 image,
                 offset,
                 debug_id,
+                debug_age,
+                code_id,
+                image_size,
             }) = frame
-                && !self
-                    .images
-                    .iter()
-                    .any(|i| i.slot == *image && i.debug_id == *debug_id && *offset < i.text_size)
+                && !self.images.iter().any(|i| {
+                    i.slot == *image
+                        && i.debug_id == *debug_id
+                        && i.debug_age == *debug_age
+                        && i.code_id == *code_id
+                        && i.text_size == *image_size
+                        && *offset < i.text_size
+                })
             {
                 *frame = None;
             }
@@ -125,16 +134,16 @@ mod tests {
             build: 7,
         };
         let tree = "a".repeat(64);
-        let valid = serde_json::json!({"schema":1,"source_tree_sha256":tree,"version":expected,"images":[{"slot":"agent","debug_id":vec![1u8;16],"text_size":4096}]});
+        let valid = serde_json::json!({"schema":1,"source_tree_sha256":tree,"version":expected,"images":[{"slot":"agent","debug_id":vec![1u8;16],"debug_age":0,"code_id":null,"text_size":4096}]});
         std::fs::write(&path, serde_json::to_vec(&valid).unwrap()).unwrap();
         let manifest = Manifest::load(&executable, expected, &tree).unwrap();
         assert_eq!(manifest.images[0].debug_id, [1; 16]);
         let mut complete = valid.clone();
         complete["images"] = serde_json::json!([
-            {"slot":"agent","debug_id":vec![1u8;16],"text_size":4096},
-            {"slot":"agent","debug_id":vec![2u8;16],"text_size":4096},
-            {"slot":"ui_rust","debug_id":vec![1u8;16],"text_size":4096},
-            {"slot":"file_provider","debug_id":vec![3u8;16],"text_size":4096}
+            {"slot":"agent","debug_id":vec![1u8;16],"debug_age":0,"code_id":null,"text_size":4096},
+            {"slot":"agent","debug_id":vec![2u8;16],"debug_age":0,"code_id":null,"text_size":4096},
+            {"slot":"ui_rust","debug_id":vec![1u8;16],"debug_age":0,"code_id":null,"text_size":4096},
+            {"slot":"file_provider","debug_id":vec![3u8;16],"debug_age":0,"code_id":null,"text_size":4096}
         ]);
         std::fs::write(&path, serde_json::to_vec(&complete).unwrap()).unwrap();
         let manifest = Manifest::load(&executable, expected, &tree).unwrap();
@@ -144,10 +153,9 @@ mod tests {
         );
         for slot in ["agent", "ui_rust", "file_provider"] {
             let mut invalid = complete.clone();
-            invalid["images"]
-                .as_array_mut()
-                .unwrap()
-                .push(serde_json::json!({"slot":slot,"debug_id":vec![4u8;16],"text_size":4096}));
+            invalid["images"].as_array_mut().unwrap().push(
+                serde_json::json!({"slot":slot,"debug_id":vec![4u8;16],"debug_age":0,"code_id":null,"text_size":4096}),
+            );
             std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
             assert!(Manifest::load(&executable, expected, &tree).is_none());
         }

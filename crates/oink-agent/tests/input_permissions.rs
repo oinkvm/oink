@@ -373,10 +373,6 @@ fn permission_alert(n: &Node, kind: PermissionKind) -> Option<oink_agent::api::A
         .find(|a| matches!(&a.kind, AlertKind::PermissionMissing { permissions } if permissions.iter().any(|p| p.kind == kind)))
 }
 
-fn has_alert(n: &Node, id: &str) -> bool {
-    n.overview().unwrap().alerts.iter().any(|a| a.id == id)
-}
-
 #[test]
 fn missing_permissions_block_then_recover_without_restart() {
     common::watchdog::run(
@@ -443,8 +439,10 @@ async fn missing_permissions_block_then_recover_without_restart_scenario() {
         oink_agent::device_cards::UserFacingCode::PermissionDenied
     );
     assert!(permission_alert(&an, PermissionKind::InputMonitoring).is_some());
-    assert!(!an.input_status().unwrap().capture_failed);
-    assert!(!has_alert(&an, "capture-unavailable"));
+    assert_ne!(
+        an.input_status().unwrap().resource_faults.keyboard,
+        Some(oink_protocol::v1::dto::ResourceFaultCode::CaptureUnavailable)
+    );
     let b2 = bn.clone();
     let aid = an.id();
     let remote_ax = || {
@@ -500,8 +498,10 @@ async fn missing_permissions_block_then_recover_without_restart_scenario() {
     assert!(permission_alert(&an, PermissionKind::Accessibility).is_none());
     assert!(permission_alert(&an, PermissionKind::InputMonitoring).is_none());
     wait_for("target capture is active", 3., || an.capture_active() == Some(true)).await;
-    assert!(!an.input_status().unwrap().capture_failed);
-    assert!(!has_alert(&an, "capture-unavailable"));
+    assert_ne!(
+        an.input_status().unwrap().resource_faults.keyboard,
+        Some(oink_protocol::v1::dto::ResourceFaultCode::CaptureUnavailable)
+    );
     let b2 = bn.clone();
     push(&b_input, to_a, || {
         b2.input_status().unwrap().focus_info.clone().unwrap().holder == aid
@@ -553,7 +553,7 @@ async fn missing_permissions_block_then_recover_without_restart_scenario() {
     assert!(!an.pause_status().paused);
 
     // Regrant with a completed native attach failure, not a withheld capture
-    // request: only the former warrants the existing recovery/reopen guidance.
+    // request: the resource card retains the actionable failure.
     gated.fail_start.store(true, Ordering::Release);
     gated.update(|p| {
         p.accessibility = PermissionState::Granted;
@@ -561,11 +561,15 @@ async fn missing_permissions_block_then_recover_without_restart_scenario() {
     });
     let a2 = an.clone();
     changes
-        .wait_for("completed native failure produces recovery alert", || {
-            has_alert(&a2, "capture-unavailable")
+        .wait_for("completed native failure reaches resource status", || {
+            a2.input_status().unwrap().resource_faults.keyboard
+                == Some(oink_protocol::v1::dto::ResourceFaultCode::CaptureUnavailable)
         })
         .await;
-    assert!(an.input_status().unwrap().capture_failed);
+    assert_eq!(
+        an.input_status().unwrap().resource_faults.keyboard,
+        Some(oink_protocol::v1::dto::ResourceFaultCode::CaptureUnavailable)
+    );
     assert!(an.capture_active() != Some(true));
     assert_eq!(an.overview().unwrap().service, ServiceState::Degraded);
 
@@ -583,7 +587,10 @@ async fn missing_permissions_block_then_recover_without_restart_scenario() {
         .wait_for("all alerts cleared", || a2.overview().unwrap().alerts.is_empty())
         .await;
     assert_eq!(an.overview().unwrap().service, ServiceState::Running);
-    assert!(!an.input_status().unwrap().capture_failed);
+    assert_ne!(
+        an.input_status().unwrap().resource_faults.keyboard,
+        Some(oink_protocol::v1::dto::ResourceFaultCode::CaptureUnavailable)
+    );
 
     // Permission/capture recovery precedes the asynchronous new I0 opening.
     // Wait for both fresh stream pairs before feeding the finite edge gesture.
@@ -657,7 +664,6 @@ async fn input_monitoring_not_determined_or_stale_scenario() {
         permission_alert(&n2, PermissionKind::InputMonitoring).is_some_and(|a| a.level == AlertLevel::Error)
     })
     .await;
-    assert!(!has_alert(&n, "capture-unavailable"));
     wait_for("missing grant remains a permission card fault", 5.0, || {
         n.device_cards().unwrap().cards.iter().any(|card| {
             card.is_self

@@ -89,7 +89,12 @@ export const api = {
 
   openFileProviderEnable: () => call<null>("open_file_provider_enable"),
 
+  setMicrophoneInput: (input: string | null) => call<null>("set_microphone_input", {input}),
   audioStatus: () => call<T.AudioStatus>("audio_status"),
+  // Call only after the user confirms the restart dialog.
+  restartSystem: () => call<null>("restart_system"),
+  microphonePluginStatus: () => call<T.MicrophonePluginStatus>("microphone_plugin_status"),
+  microphonePluginAction: (action:'install'|'uninstall') => call<T.MicrophonePluginStatus>("microphone_plugin_action",{action}),
   refreshAudioDevices: () => call<null>("refresh_audio_devices"),
 
   setAudioSettings: (settings: Partial<T.AudioSettings>) => call<null>("set_audio_settings", { settings }),
@@ -131,6 +136,7 @@ export const shell = {
   attribution: (path: string) => transport.shell<string>('read_attribution', { path }),
   setLanguage: (language: import('../i18n').LanguageChoice) => transport.shell<void>('shell_set_language', {language}),
   setLogLevel: (level: string) => transport.shell<void>('shell_set_log_level', {level}),
+  logNotice: (code: string) => transport.shell<void>('frontend_notice', {code}),
   setStatusIcon: (visible: boolean) => transport.shell<void>('shell_set_status_icon', {visible}),
   openCacheFolder: () => transport.shell<void>('open_cache_folder'),
   openDiagnosticsFolder: () => transport.shell<void>('open_diagnostics_folder'),

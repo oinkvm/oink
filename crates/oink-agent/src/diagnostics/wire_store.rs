@@ -216,6 +216,190 @@ impl Store {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+    #[test]
+    fn native_marker_lifecycle_fields_survive_peer_package_export() {
+        use oink_input::native_lifecycle::{Data, Kind};
+        let base = Data {
+            extra: 603,
+            marker: Some(0x0032_4e57),
+            point: Some([3839, 1244]),
+            cursor: Some([1920, 1080]),
+            ..Data::default()
+        };
+        let cases = [
+            (
+                Kind::MarkerSubmission,
+                Data {
+                    normalized: Some([65524, 35405]),
+                    desktop: Some([-1440, -139, 3840, 2421]),
+                    ..base
+                },
+            ),
+            (
+                Kind::MarkerHookDecision,
+                Data {
+                    success: Some(true),
+                    ..base
+                },
+            ),
+            (
+                Kind::MarkerHookDecision,
+                Data {
+                    success: Some(false),
+                    ..base
+                },
+            ),
+            (
+                Kind::MarkerChainResult,
+                Data {
+                    success: Some(false),
+                    chain_result: Some(-1),
+                    ..base
+                },
+            ),
+            (
+                Kind::MarkerChainResult,
+                Data {
+                    success: Some(true),
+                    chain_result: Some(0),
+                    ..base
+                },
+            ),
+            // Successful insertion is deliberately paired with park readback:
+            // it must not become a successful restoration in the exported data.
+            (
+                Kind::MarkerReadback,
+                Data {
+                    success: Some(true),
+                    hidden: Some(true),
+                    cursor_showing: Some(false),
+                    ..base
+                },
+            ),
+            (
+                Kind::MarkerReadback,
+                Data {
+                    success: Some(false),
+                    flags: 5,
+                    cursor: None,
+                    hidden: None,
+                    cursor_showing: None,
+                    ..base
+                },
+            ),
+            (
+                Kind::UncoverRequest,
+                Data {
+                    success: Some(false),
+                    hidden: Some(true),
+                    park: Some([1920, 1080]),
+                    reason: 2,
+                    ..base
+                },
+            ),
+            (
+                Kind::RestoreSafetyReset,
+                Data {
+                    reason: 1,
+                    cursor_before: Some([1920, 1080]),
+                    cursor_after_move: Some([3839, 1244]),
+                    hidden_before: Some(true),
+                    cursor: Some([3839, 1244]),
+                    cursor_showing: Some(true),
+                    hidden: Some(false),
+                    success: Some(true),
+                    steps: Some(63),
+                    park: Some([1920, 1080]),
+                    ..base
+                },
+            ),
+        ];
+        for rich in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut local = Store::open(dir.path().into(), "a".repeat(24), true).unwrap();
+            local.recover_for_test().unwrap();
+            let mut local = local.export_snapshot().unwrap();
+            let peer = Segment {
+                schema: SCHEMA,
+                device: "b".repeat(24),
+                instance: "c".repeat(24),
+                seq: 1,
+                dropped: 0,
+                snapshot: Snapshot::current_build(),
+                clock_samples: vec![],
+                rows: cases
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(kind, data))| Row {
+                        mono_us: 10 + i as u64,
+                        clock_id: 0,
+                        utc_us: 10 + i as i64,
+                        event: Event::NativeInputLifecycle {
+                            at_us: 9 + i as u64,
+                            sequence: 12 + i as u64,
+                            kind,
+                            data,
+                            holder: Some("d".repeat(24)),
+                            epoch: Some(1219),
+                        },
+                    })
+                    .collect(),
+            };
+            // Exercise the peer projection and retained CBOR archive, not local
+            // serde JSON (which cannot detect fields omitted by the wire projection).
+            let projected = super::super::super::wire_values::segment(&peer, rich).unwrap();
+            let bytes = projected.encode(MAX_SEGMENT_RAW).unwrap();
+            local
+                .add_network(&peer.device, &bytes, &segment(&bytes).unwrap())
+                .unwrap();
+            let name = format!("devices/device-B/segments/{}", local.segments.back().unwrap().name());
+            let bundle = local.export(Reason::Manual, 0, 0).unwrap();
+            let mut archive = zip::ZipArchive::new(File::open(bundle.path).unwrap()).unwrap();
+            let mut bytes = Vec::new();
+            archive.by_name(&name).unwrap().read_to_end(&mut bytes).unwrap();
+            let retained = w::DiagnosticSegment::decode(&bytes, MAX_SEGMENT_RAW).unwrap();
+            let rows = retained.rows().unwrap().0;
+            assert_eq!(rows.len(), cases.len());
+            let point = |p: Option<w::Point>| p.map(|p| [p.x().unwrap() as i32, p.y().unwrap() as i32]);
+            for (row, &(kind, data)) in rows.iter().zip(&cases) {
+                let event = row.event().unwrap();
+                assert_eq!(event.kind().unwrap().0, "input-lifecycle/1");
+                let lifecycle = w::InputLifecycle::from_raw(event.fields().unwrap()).unwrap();
+                assert_eq!(
+                    lifecycle.kind().unwrap().write(),
+                    super::super::super::wire_values::Value::wire(&kind).unwrap()
+                );
+                assert_eq!(lifecycle.epoch().unwrap(), Some(1219));
+                let observation = lifecycle.observation().unwrap();
+                assert_eq!(observation.generation().unwrap(), Some(603));
+                assert_eq!(observation.marker().unwrap(), data.marker);
+                assert_eq!(observation.reason().unwrap(), Some(data.reason));
+                assert_eq!(observation.native_error().unwrap(), Some(data.flags));
+                assert_eq!(observation.success().unwrap(), data.success);
+                assert_eq!(point(observation.requested().unwrap()), data.point);
+                assert_eq!(point(observation.observed().unwrap()), data.cursor);
+                assert_eq!(point(observation.normalized().unwrap()), data.normalized);
+                assert_eq!(point(observation.park().unwrap()), data.park);
+                assert_eq!(observation.hidden().unwrap(), data.hidden);
+                assert_eq!(observation.cursor_showing().unwrap(), data.cursor_showing);
+                assert_eq!(observation.chain_result().unwrap(), data.chain_result);
+                assert_eq!(point(observation.cursor_before().unwrap()), data.cursor_before);
+                assert_eq!(point(observation.cursor_after_move().unwrap()), data.cursor_after_move);
+                assert_eq!(observation.hidden_before().unwrap(), data.hidden_before);
+                assert_eq!(observation.steps().unwrap(), data.steps);
+                let desktop = observation.desktop().unwrap().map(|r| {
+                    [
+                        r.x().unwrap() as i32,
+                        r.y().unwrap() as i32,
+                        (r.x().unwrap() + r.w().unwrap()) as i32,
+                        (r.y().unwrap() + r.h().unwrap()) as i32,
+                    ]
+                });
+                assert_eq!(desktop, data.desktop);
+            }
+        }
+    }
+
     fn archive_collection_end(ranges: usize) {
         let dir = tempfile::tempdir().unwrap();
         let mut local = Store::open(dir.path().into(), "a".repeat(24), true).unwrap();

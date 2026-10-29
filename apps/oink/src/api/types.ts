@@ -38,7 +38,6 @@ export interface Focus {
 
 export type AlertLevel = "info" | "warning" | "error";
 export type AlertKind =
-  | { type: "capture_unavailable" }
   | { type: "display_info_unavailable"; screen: ScreenKey }
   | { type: "display_enumeration_failed"; device: DeviceKey }
   | { type: "permission_missing"; permissions: PermissionItem[] }
@@ -111,8 +110,8 @@ export interface Member {
   facts_fresh: boolean;
   input_transform: InputTransform | null;
   keyboard_disabled: boolean | null;
-  mouse_mode: "shared" | "local" | null;
-  keyboard_mode: "shared" | "local" | null;
+  mouse_mode: "shared" | "local" | "disabled" | null;
+  keyboard_mode: "shared" | "local" | "disabled" | null;
   screen_disabled: boolean | null;
   screen_local_input: boolean | null;
   sharing: SharingState;
@@ -174,7 +173,8 @@ export interface Layout {
 
 export type KeyPreset = "win_feel" | "mac_feel" | "custom" | "none";
 export interface KeyMapping { from: number; to: number }
-export interface KeyboardMapping { preset: KeyPreset; table: KeyMapping[]; caps_tap_hold?: { tap: number; hold: number } | null }
+export interface SavedCustomKeymap { table: KeyMapping[]; caps_hold?: number | null; caps_split: boolean; allow_fn: boolean }
+export interface KeyboardMapping { preset: KeyPreset; table: KeyMapping[]; caps_tap_hold?: { tap: number; hold: number } | null; saved_custom?: SavedCustomKeymap | null }
 export interface TargetTransform { reverse_wheel: boolean; keyboard: KeyboardMapping }
 export interface InputLocalExclusion { scope: string; target: DeviceKey | null; mapping: KeyMapping; reason: string }
 export interface InputTransform { local_exclusions?: InputLocalExclusion[]; macos: TargetTransform; windows: TargetTransform; overrides: { target: DeviceKey; reverse_wheel: boolean | null; keyboard: KeyboardMapping | null }[] }
@@ -182,8 +182,8 @@ export interface ScrollSettings { speed: number }
 export type PointerReference = { type: "last_screen" } | { type: "fixed"; display: string };
 export type PointerScaling = "physical" | "proportional";
 export interface PointerSettings { reference: PointerReference; scaling: PointerScaling; drag_across_devices: boolean }
-export type HotkeyAction = "lock_focus" | "return_pointer_home" | "toggle_sharing" | "open_window" | "toggle_game_mode" | "pause_all";
-export interface Hotkey { action: HotkeyAction; keys: string[]; enabled: boolean }
+export type HotkeyAction = "toggle_microphone_mute" | "lock_escape" | "lock_focus" | "return_pointer_home" | "toggle_sharing" | "open_window" | "toggle_game_mode" | "pause_all" | "move_pointer_to";
+export interface Hotkey { action: HotkeyAction; device?: DeviceKey; keys: string[]; enabled: boolean }
 export type EventFrequency = "hz125" | "unlimited";
 export interface KeySupport { macos: number[]; windows: number[] }
 export interface InputSettings {
@@ -192,6 +192,7 @@ export interface InputSettings {
   /** Local normal pointer-motion rate; persisted by the settings owner. */
   event_frequency: EventFrequency;
   accept_contacts: boolean;
+  native_multifinger: boolean;
   contacts_injection_available: boolean;
   mac_scroll_feel: boolean;
   /** Windows capture-local opt-in; false keeps other apps' injected input local. */
@@ -206,6 +207,7 @@ export interface InputSettings {
   return_pointer_on_display_sleep: boolean;
   wake_displays_on_input: boolean;
 
+  application_focus_enabled: boolean;
   cursor_trail: boolean;
   cursor_trail_duration_ms: number;
   /** Group setting, stored and shared with the layout. */
@@ -218,8 +220,9 @@ export interface CacheDevice { device: DeviceKey; usage: CacheUsage }
 export interface CacheDeviceClear { device: DeviceKey; result: { removed_bytes: number; kept_bytes: number; usage: CacheUsage } }
 
 export interface ClipboardSettings {
-  receive?: boolean; send?: boolean;
-  text: boolean; rich_text: boolean; images: boolean; files: boolean; custom: boolean;
+  receive?: boolean; send?: boolean; remove_ds_store?: boolean;
+  // Retained settings IPC fields; every format class is always enabled.
+  text: true; rich_text: true; images: true; files: true; custom: true;
 }
 export type ClipKind = "text" | "html" | "rtf" | "image" | "files" | "custom";
 export type ClipOutcome =
@@ -279,7 +282,7 @@ export interface DiagnosticsBundle {
   missing_device_count: number | null;
 }
 
-export type PermissionKind = "accessibility" | "input_monitoring" | "local_network" | "firewall" | "system_service" | "audio_capture";
+export type PermissionKind = "accessibility" | "input_monitoring" | "local_network" | "firewall" | "system_service" | "audio_capture" | "microphone";
 export type PermissionState = "Granted" | "Denied" | "NotDetermined" | "NotApplicable" | "NotGranted";
 export interface PermissionItem { kind: PermissionKind; state: PermissionState; required: boolean }
 
@@ -331,6 +334,7 @@ export interface AimStatus {
 }
 
 export type ApiEvent =
+  | { type: "no_shared_microphone" }
   | import('./layoutProfiles').LayoutProfilesEvent
   | { type: "connection_quality"; data: ConnectionQuality }
   | { type: "audio_quality"; data: AudioQuality }
@@ -356,6 +360,7 @@ export type ApiEvent =
   | { type: "clipboard_settings"; data: ClipboardSettings }
   | { type: "clip_activity"; data: ClipActivity }
   | { type: "file_provider_status"; data: FileProviderStatus }
+  | { type: "file_provider_required" }
   | { type: "permissions"; data: PermissionItem[] }
   | { type: "stats"; data: PeerStatus[] }
   | { type: "log"; data: LogLine }
@@ -555,6 +560,8 @@ export interface AudioCaptureLevels {
 export interface AudioClaimStamp {counter:number;owner:AudioDeviceId}
 export interface AudioProblem {code:number;native_code:number|null;retry_after_ms:number|null}
 export interface AudioStatus {
+  microphone_input?: string | null;
+  microphone_inputs?: {id:string;name:string}[];
   /** This node's 3s Low pacing audio hold; speaker silence is excluded. */
   audio_activity: boolean;
   settings: AudioSettings;
@@ -600,10 +607,15 @@ export type DiagnosticStatistics = Pick<DiagnosticRecorderStatus,
   "bytes" | "queued" | "dropped" | "errors" | "segments" |
   "oldest_utc_us" | "newest_utc_us" | "corrupt_segments" | "evicted_segments">;
 
-export interface LiveViews { stats: boolean; group_quality: boolean; audio_quality: boolean; diagnostics: boolean }
+export interface LiveViews { stats: boolean; card_signals: boolean; group_quality: boolean; audio_quality: boolean; diagnostics: boolean }
 
 export interface QualitySample { at_ms: number; rtt_ms: number | null }
+/** Existing scalar statistics cover one minute; stats_5m covers five minutes. */
+export interface LatencyWindowStats { p50_ms: number | null; p90_ms: number | null; p99_ms: number | null; max_ms: number | null }
+export interface AudioWindowStats { buffer_avg_ms: number | null; bitrate_kbps: number; interruptions: number; output_interruptions: number; discontinuities: number; concealed_ms: number; late_packets: number }
+export interface OutputWindowStats { interruptions: number; discontinuities: number; missing_ms: number; callbacks?: number; callback_over_budget?: number; callback_max_work_us?: number; callback_min_margin_us?: number | null; native_timing_callbacks?: number; native_gap_frames?: number }
 export interface PeerQuality {
+  stats_5m: LatencyWindowStats;
   device: string;
   name: string;
   path: LinkKind;
@@ -626,15 +638,32 @@ export interface Notification {
 }
 export interface NotificationReceipt { id: string; screen: ScreenKey | null; remote: boolean }
 
-export interface AudioDropoutBucket { at_ms: number; interruptions: number; concealed_ns: number; missing_ns: number; late_packets: number; silence_interruptions: number; concealment_interruptions: number; discontinuities: number }
+export interface AudioDropoutBucket { at_ms: number; interruptions: number; concealed_ns: number; missing_ns: number; late_packets: number; silence_interruptions: number; concealment_interruptions: number; discontinuities: number; output_interruptions?: number }
 export interface AudioQualitySample { at_ms: number; buffer_ms: number | null }
 export interface AudioSourceQuality {
+  stats_5m: AudioWindowStats;
+  kind?: "speaker" | "microphone";
   device: DeviceKey; name: string; samples: AudioQualitySample[];
   buffer_avg_ms: number | null;
-  bitrate_kbps: number; interruptions: number; concealed_ms: number; late_packets: number; glitches: AudioDropoutBucket[];
+  bitrate_kbps: number; interruptions: number; output_interruptions: number; discontinuities: number; concealed_ms: number; late_packets: number; glitches: AudioDropoutBucket[];
 }
-export interface AudioOutputQuality { interruptions: number; missing_ms: number; glitches: AudioDropoutBucket[] }
+export interface AudioOutputQuality extends OutputWindowStats { stats_5m: OutputWindowStats; interruptions: number; discontinuities: number; missing_ms: number; glitches: AudioDropoutBucket[] }
 export interface AudioQuality { revision: number; sampled_at_ms: number; sources: AudioSourceQuality[]; output: AudioOutputQuality | null }
 
 export type ReceivedFilesCleanup = "never" | "days7" | "days30";
 export interface ReceivedFilesUsage { materialized_bytes:number; incomplete:boolean; time_basis:"received"|"last_used"; cleanup:ReceivedFilesCleanup }
+
+export interface MicrophonePluginStatus {
+  state: 'unsupported'|'not_installed'|'unmanaged'|'installed'|'version_mismatch'|'not_loaded'|'error';
+  operation:'idle'|'installing'|'uninstalling';
+  refreshing?:boolean;
+  step?:'verify'|'extract'|'install_driver'|'uninstall_driver'|'copy_plugin'|'remove_plugin'|'restart_audio'|'finish'|null;
+  step_started_at_ms?:number|null;
+  restart_required?:boolean;
+  last_operation:'install'|'uninstall'|null;
+  detail?:string|null;
+  input_loaded:boolean;
+  managed?:boolean;
+  error_kind:string|null;
+  last_operation_succeeded:boolean|null;
+}

@@ -1,10 +1,11 @@
 use super::*;
-use crate::store::{Batch, BatchId, StoreKind, usage};
-const KIND: StoreKind = StoreKind::CompletedDelivery;
+use crate::store::{BatchId, StoreKind, usage};
+const KIND: StoreKind = StoreKind::SourceSnapshot;
 fn complete(data: &Path) -> PathBuf {
-    let batch = Batch::create(data, KIND, BatchId([91; 16])).unwrap();
-    batch.complete().unwrap();
-    batch.path().to_owned()
+    let path = data.join(KIND.directory()).join(BatchId([91; 16]).name());
+    fs::create_dir_all(&path).unwrap();
+    fs::write(path.join(".oink-content-v1"), br#"{"version":1,"kind":"SourceSnapshot","state":"Complete","external_writers":false,"snapshot_bytes":0,"completed_at":1}"#).unwrap();
+    path
 }
 #[test]
 fn cache_accounts_nested_sidecars_and_clears_only_owned_batches() {

@@ -47,6 +47,8 @@ pub struct DndTarget {
     pub input: oink_foundation::DeviceId,
     pub revision: u64,
     state: Arc<AtomicU8>,
+    preparation_deadline: std::time::Instant,
+    entered_at: Option<std::time::Instant>,
 }
 impl PartialEq for DndTarget {
     fn eq(&self, other: &Self) -> bool {
@@ -61,7 +63,26 @@ impl DndTarget {
             input,
             revision,
             state: Arc::new(AtomicU8::new(0)),
+            entered_at: None,
+            preparation_deadline: std::time::Instant::now() + std::time::Duration::from_secs(3),
         }
+    }
+    /// Local accepted FocusEnter, preserved across deferred metadata and Begin retries.
+    /// No timestamp is serialized or used to change routing/deadlines.
+    pub fn with_entered_at(mut self, at: std::time::Instant) -> Self {
+        self.entered_at = Some(at);
+        self
+    }
+    pub fn entered_at(&self) -> Option<std::time::Instant> {
+        self.entered_at
+    }
+    /// Target-local execution deadline, never a wire clock or a transfer timeout.
+    pub fn with_preparation_remaining(mut self, remaining: std::time::Duration) -> Self {
+        self.preparation_deadline = std::time::Instant::now() + remaining;
+        self
+    }
+    pub fn preparation_deadline(&self) -> std::time::Instant {
+        self.preparation_deadline
     }
     pub fn begin_current(&self) -> bool {
         self.preparation.current() && self.state.load(Ordering::Acquire) & (RELEASED | REVOKED) == 0
@@ -146,6 +167,16 @@ mod tests {
             1,
             DeviceId([1; 32]),
         )
+    }
+    #[test]
+    fn target_entry_survives_clone_and_preparation_rescheduling() {
+        let entered = std::time::Instant::now() - std::time::Duration::from_millis(25);
+        let grant = target().with_entered_at(entered);
+        let resumed = grant
+            .clone()
+            .with_preparation_remaining(std::time::Duration::from_secs(1));
+        assert_eq!(resumed.entered_at(), Some(entered));
+        assert_eq!(target().entered_at(), None);
     }
     #[test]
     fn release_before_down_and_release_during_down_have_distinct_debts() {

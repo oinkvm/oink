@@ -93,7 +93,6 @@
       </Dialog>
       <InstallUISequence>
         <Show Dialog="OinkWelcomeDlg" Before="CostFinalize" Condition="NOT Installed" />
-        <Custom Action="PrepareUserSessions" Before="ExecuteAction" Condition="UILevel = 5 AND NOT UPGRADINGPRODUCTCODE" />
         <Show Dialog="OinkExitDlg" OnExit="success" />
       </InstallUISequence>
     </UI>

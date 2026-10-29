@@ -15,7 +15,7 @@ use windows_sys::Win32::{
     Foundation::*,
     Security::*,
     Storage::FileSystem::WriteFile,
-    System::{Diagnostics::Debug::*, Pipes::PeekNamedPipe, Threading::*},
+    System::{Diagnostics::Debug::*, JobObjects::*, Pipes::PeekNamedPipe, Threading::*},
 };
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,6 +23,8 @@ struct Config {
     schema: u16,
     pid: u32,
     generation: u64,
+    report_generation: u64,
+    local: Option<crate::local::Target>,
     component: Component,
     root: PathBuf,
     build: BuildContext,
@@ -48,7 +50,19 @@ impl Collector {
         manifest: &Manifest,
         component: Component,
     ) -> Result<Self> {
-        if !consent.granted()
+        Self::start_with_local(executable, root, consent, build, manifest, component, None)
+    }
+    pub fn start_with_local(
+        executable: &Path,
+        root: &Path,
+        consent: ReportConsent,
+        build: BuildContext,
+        manifest: &Manifest,
+        component: Component,
+        local: Option<crate::local::Target>,
+    ) -> Result<Self> {
+        if !crate::local::local_path(root)
+            || (!consent.granted() && local.is_none())
             || !matches!(component, Component::Agent | Component::UiRust)
             || !allowed_process(std::process::id())
         {
@@ -57,7 +71,9 @@ impl Collector {
         let config = Config {
             schema: 1,
             pid: std::process::id(),
-            generation: consent.generation,
+            generation: consent.generation.max(1),
+            report_generation: if consent.granted() { consent.generation } else { 0 },
+            local,
             component,
             root: root.to_path_buf(),
             build,
@@ -79,7 +95,7 @@ impl Collector {
         let output = collector.child.stdout.take().ok_or(Error::Io)?;
         input.write_all(&bytes).map_err(|_| Error::Io)?;
         *signal = Some(Signal { input, output });
-        GENERATION.store(consent.generation, Ordering::Release);
+        GENERATION.store(consent.generation.max(1), Ordering::Release);
         Ok(collector)
     }
 }
@@ -122,6 +138,14 @@ pub(crate) fn capture(info: *const EXCEPTION_POINTERS) {
     request[..8].copy_from_slice(&generation.to_le_bytes());
     // SAFETY: current thread ID has no ownership or pointer preconditions.
     request[8..12].copy_from_slice(&unsafe { GetCurrentThreadId() }.to_le_bytes());
+    if !info.is_null() {
+        // SAFETY: the exception filter forwards the platform-owned live record.
+        let record = unsafe { (*info).ExceptionRecord };
+        if !record.is_null() {
+            // SAFETY: same live exception record; fixed numeric fallback only.
+            request[12..16].copy_from_slice(&(unsafe { (*record).ExceptionCode } as u32).to_le_bytes());
+        }
+    }
     request[16..24].copy_from_slice(&(info as usize as u64).to_le_bytes());
     request[24..32].copy_from_slice(&now().to_le_bytes());
     let mut written = 0;
@@ -222,8 +246,33 @@ pub fn allowed_process(pid: u32) -> bool {
     // SAFETY: both SID pointers remain owned by live token-query buffers.
     unsafe { EqualSid(sid, (*own.as_ptr().cast::<TOKEN_USER>()).User.Sid) != 0 }
 }
+fn memory_job() -> Result<Handle> {
+    // SAFETY: unnamed job and initialized limit structure. The process holds this
+    // guard for its entire lifetime; job assignment/limit failures fail closed.
+    unsafe {
+        let job = Handle(CreateJobObjectW(std::ptr::null(), std::ptr::null()));
+        if job.0.is_null() {
+            return Err(Error::Io);
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        limits.ProcessMemoryLimit = 512 * 1024 * 1024;
+        if SetInformationJobObject(
+            job.0,
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of_val(&limits) as u32,
+        ) == 0
+            || AssignProcessToJobObject(job.0, GetCurrentProcess()) == 0
+        {
+            return Err(Error::Io);
+        }
+        Ok(job)
+    }
+}
 /// Binary entry point. Errors have fixed exit status and no payload/path logging.
 pub fn run() -> Result<()> {
+    let _memory_limit = memory_job()?;
     let mut input = std::io::stdin().lock();
     let mut config = Vec::new();
     for _ in 0..8193 {
@@ -239,7 +288,9 @@ pub fn run() -> Result<()> {
     }
     let config: Config = serde_json::from_slice(&config).map_err(|_| Error::Invalid)?;
     if config.schema != 1
+        || !crate::local::local_path(&config.root)
         || config.generation == 0
+        || config.local.as_ref().is_some_and(|target| !target.valid())
         || !matches!(config.component, Component::Agent | Component::UiRust)
         || config.build.app_version != config.manifest.version
         || !allowed_process(config.pid)
@@ -265,17 +316,30 @@ pub fn run() -> Result<()> {
         return Err(Error::Stale);
     }
     let thread = u32::from_le_bytes(request[8..12].try_into().unwrap());
+    let exception_code = u32::from_le_bytes(request[12..16].try_into().unwrap());
     let pointer = u64::from_le_bytes(request[16..24].try_into().unwrap());
     let at = u64::from_le_bytes(request[24..32].try_into().unwrap());
     if pointer == 0 || at > now() || now().saturating_sub(at) > 10 {
         return Err(Error::Invalid);
     }
     let lease = crate::staging::Lease {
-        generation,
+        generation: config.report_generation,
         collected_at: at,
         build: config.build,
         component: config.component,
     };
+    if let Some(local) = config.local.as_ref() {
+        let mut crash = SafeCrash::empty(
+            lease.build,
+            config.component,
+            CrashKind::NativeException,
+            crate::dump::exception_class(exception_code),
+        );
+        crash.exception_code = Some(exception_code);
+        // Commit the numeric exception before dump work so watchdog/IO failure
+        // still leaves a real crash summary for the next diagnostics archive.
+        let _ = crate::local::write(local, crash, at, thread);
+    }
     restrict_directory(&config.root)?;
     let mut writer = crate::staging::Writer::reserve(&config.root, lease)?;
     let exception = MINIDUMP_EXCEPTION_INFORMATION {
@@ -287,6 +351,12 @@ pub fn run() -> Result<()> {
         CallbackRoutine: Some(write_callback),
         CallbackParam: (&mut writer as *mut crate::staging::Writer).cast(),
     };
+    // Time budget complements the OS memory limit. Kernel delete-on-close owns
+    // cleanup independently of this thread, including abort/OOM/forced kills.
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(15));
+        std::process::exit(2);
+    });
     // SAFETY: exact held process, exception pointer belongs to it (ClientPointers),
     // synchronous callback and writer live throughout. All writes use capped IO.
     let ok = unsafe {
@@ -300,10 +370,27 @@ pub fn run() -> Result<()> {
             &callback,
         )
     };
-    if ok != 0 {
-        let _ = writer.project(&config.manifest);
-    }
+    // The target only waits for dump capture, never for stack processing.
     let _ = std::io::stdout().write_all(&[1]);
+    let projected = if ok != 0 {
+        writer.project_with_local(&config.manifest, config.local.as_ref(), thread)
+    } else {
+        // project also deletes failed/partial raw material.
+        let _ = writer.project(&config.manifest);
+        Err(Error::Io)
+    };
+    if projected.is_err()
+        && let Some(local) = config.local.as_ref()
+    {
+        let mut crash = SafeCrash::empty(
+            lease.build,
+            config.component,
+            CrashKind::NativeException,
+            crate::dump::exception_class(exception_code),
+        );
+        crash.exception_code = Some(exception_code);
+        let _ = crate::local::write(local, crash, at, thread);
+    }
     Ok(())
 }
 unsafe extern "system" fn write_callback(
@@ -349,7 +436,7 @@ unsafe extern "system" fn write_callback(
 
 /// A protected inheritable DACL for the actual process user. Raw staging must
 /// remain private even when a downstream profile chooses a shared parent folder.
-fn restrict_directory(path: &Path) -> Result<()> {
+pub(crate) fn restrict_directory(path: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     std::fs::create_dir_all(path).map_err(|_| Error::Io)?;
     // SAFETY: current-process pseudo handle is valid and not owned by this call.

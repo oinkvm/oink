@@ -242,7 +242,7 @@ fn mask_bit(t: u32) -> CGEventMask {
 /// 吞掉；Dock 轻扫、捏合、旋转、智能缩放翻译成 `InputEvent::Gesture`，`sysevent`）。
 fn event_mask() -> CGEventMask {
     [
-        1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 14, 22, 25, 26, 27, 18, 19, 20, 29, 30, 31, 32,
+        0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 14, 22, 25, 26, 27, 18, 19, 20, 29, 30, 31, 32,
     ]
     .into_iter()
     .map(mask_bit)
@@ -442,15 +442,99 @@ impl Tap {
         wake(s);
     }
 
-    pub(crate) fn set_drag_anchor(&self, anchor: Option<oink_foundation::dnd::DragAnchor>) {
-        *self.shared.drag_anchor.lock().unwrap_or_else(|e| e.into_inner()) = anchor;
+    pub(crate) fn set_drag_anchor(
+        &self,
+        anchor: Option<oink_foundation::dnd::DragAnchor>,
+        injector: &super::inject::Injector,
+    ) -> Result<(), InputError> {
+        let s = self.shared;
+        let _guard = s.cursor_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(anchor) = anchor {
+            if *s.drag_anchor.lock().unwrap_or_else(|e| e.into_inner()) != Some(anchor) {
+                return Err(InputError::Platform("source anchor was not atomically frozen".into()));
+            }
+        } else {
+            // Clear injection admission under the same native-transition lock.
+            // A motion waiting through the hold also has an obsolete epoch.
+            injector.clear_source_hold();
+            *s.drag_anchor.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            drop(_guard);
+            self.schedule_apply();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn freeze_drag_anchor(
+        &self,
+        generation: u64,
+        injector: &super::inject::Injector,
+    ) -> Result<oink_foundation::dnd::DragAnchor, InputError> {
+        let s = self.shared;
+        let _guard = s.cursor_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if !s.capture_permitted() || s.drag_anchor.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+            return Err(InputError::Platform(
+                "source freeze is unavailable or already held".into(),
+            ));
+        }
+        s.hold_motion.store(true, Ordering::Release);
+        let result = injector.freeze_source(generation, cursor::freeze_checked, |anchor| {
+            *s.drag_anchor.lock().unwrap_or_else(|e| e.into_inner()) = Some(anchor);
+            *s.hidden.lock().unwrap_or_else(|e| e.into_inner()) = HiddenCursor::frozen(anchor.at);
+            s.warp_fix.lock().unwrap_or_else(|e| e.into_inner()).enter_remote();
+            s.motion.reset_position_context();
+        });
+        s.hold_motion.store(false, Ordering::Release);
+        drop(_guard);
+        if result.is_err() {
+            self.schedule_apply();
+        }
+        result
+    }
+
+    pub(crate) fn relocate_drag_anchor(
+        &self,
+        generation: u64,
+        at: Point,
+        injector: &super::inject::Injector,
+    ) -> Result<(), InputError> {
+        let s = self.shared;
+        let _guard = s.cursor_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if !s.capture_permitted() {
+            return Err(InputError::NotStarted);
+        }
+        let anchor = *s.drag_anchor.lock().unwrap_or_else(|e| e.into_inner());
+        let current = super::inject::checked_location()?;
+        let hidden = *s.hidden.lock().unwrap_or_else(|e| e.into_inner());
+        let HiddenCursor::Frozen { at: frozen, .. } = hidden else {
+            return Err(InputError::Platform("source relocation is no longer frozen".into()));
+        };
+        if image_nudge_location(anchor, generation, frozen, current).is_none() {
+            return Err(InputError::Platform(
+                "source relocation has a stale or displaced anchor".into(),
+            ));
+        }
+        s.hold_motion.store(true, Ordering::Release);
+        let receipt = injector.submit_held_drag(at, &|posted| {
+            // An accepted post may outlive a missing tap receipt. Keep both
+            // ledgers at the exact submitted endpoint and never replay it.
+            *s.drag_anchor.lock().unwrap_or_else(|e| e.into_inner()) = Some(oink_foundation::dnd::DragAnchor {
+                generation,
+                at: posted,
+                surface: 0,
+            });
+            *s.hidden.lock().unwrap_or_else(|e| e.into_inner()) = HiddenCursor::frozen(posted);
+            s.motion.reset_position_context();
+        });
+        s.hold_motion.store(false, Ordering::Release);
+        super::drag_hold::wait_unlocked(_guard, receipt?, |receipt| receipt.wait_observed())
     }
 
     pub(crate) fn move_held_drag(
         &self,
         generation: u64,
         at: Point,
-        inject: &dyn Fn() -> Result<(), InputError>,
+        injector: &super::inject::Injector,
+        posted: &dyn Fn(Point),
     ) -> Result<(), InputError> {
         let s = self.shared;
         let _guard = s.cursor_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -469,7 +553,7 @@ impl Tap {
         // which registers the delivered coordinate in the shared HID ledger.
         // Even a zero-distance event is needed to update the native session.
         s.hold_motion.store(true, Ordering::Release);
-        let result = inject();
+        let receipt = injector.submit_held_drag(at, posted);
         // A missing tap ACK does not mean CGEventPost was not delivered. Keep
         // the freeze bookkeeping at the submitted target; never replay/warp.
         s.motion.reset_position_context();
@@ -477,13 +561,15 @@ impl Tap {
             *s.hidden.lock().unwrap_or_else(|e| e.into_inner()) = HiddenCursor::frozen(at);
         }
         s.hold_motion.store(false, Ordering::Release);
-        result
+        super::drag_hold::wait_unlocked(_guard, receipt?, |receipt| receipt.wait_observed())
     }
 
     pub(crate) fn nudge_held_drag(
         &self,
         generation: u64,
-        inject: &dyn Fn(Point) -> Result<(), InputError>,
+        injector: &super::inject::Injector,
+        button: MouseButton,
+        posted: &dyn Fn(oink_foundation::dnd::ImageNudgePost),
     ) -> Result<(), InputError> {
         let s = self.shared;
         let _guard = s.cursor_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -504,7 +590,8 @@ impl Tap {
             .ok_or_else(|| InputError::Platform("stale or relocated held drag image nudge".into()))?;
         // The zero-distance marked post goes through the ordinary tap ACK and
         // placement path. It cannot rebase motion, reveal, warp or refreeze.
-        inject(at)
+        let receipt = injector.submit_held_nudge(at, button, posted)?;
+        super::drag_hold::wait_unlocked(_guard, receipt, |receipt| receipt.wait_observed())
     }
 
     /// 回到 Local，光标出现在 `at`（`InputBackend::restore_local`）：与模式切换一起在 `apply_mode` 里执行。
@@ -619,6 +706,13 @@ fn apply_mode_locked(s: &'static Shared, hidden: &mut HiddenCursor) {
         return;
     }
     let stop = s.stop.load(Ordering::Acquire);
+    if !stop && !s.remote.load(Ordering::Acquire) && s.drag_anchor.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+        // HoldSource freezes before SourceHeld changes routing mode. A queued
+        // Local reconciliation must not unfreeze that preparation interval or
+        // a return still awaiting its native callback. Keep restore_pending
+        // intact until clipboard clears the anchor after native return/end.
+        return;
+    }
     let posts = s.owner_posts_snapshot();
     if (!s.remote.load(Ordering::Acquire) || stop) && posts.count != 0 {
         // CGEventPost changes the global pointer before even an active HID tap can reject it.
@@ -695,9 +789,9 @@ fn freeze_clear_of_zones(s: &'static Shared) -> Point {
     let cur = current_location();
     let cur = Point::new(cur.x, cur.y);
     if s.drag_anchor.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
-        // AppKit must keep hitting the same native destination until real Drop
-        // or return. The catcher already shields the active edge. Freeze in
-        // place: the ordinary Dock/edge relocation would cause draggingExited.
+        // Clipboard owns the same catcher through hold/return and commits its
+        // return through the serialized input transition. Ordinary Dock/edge
+        // relocation must not move an active native source behind its back.
         return cur;
     }
     let displays = cursor::display_bounds();
@@ -1028,6 +1122,7 @@ fn run(
     // Always retain button-only provenance while capture is installed. Recording
     // and system-state reads remain gated by the flight recorder's enabled flag.
     let hid_observer = button_evidence::install(&rl, s);
+    super::idle_pulse::install(&rl);
     rl.add_source(Some(&source), common);
     CGEvent::tap_enable(&port, true);
     s.port.store(CFRetained::as_ptr(&port).as_ptr(), Ordering::Release);
@@ -1235,6 +1330,7 @@ fn run(
         crate::capture_loop::clear();
     }
     drop(pacing);
+    super::idle_pulse::remove(&rl);
     if let Some(observer) = hid_observer {
         button_evidence::remove(&rl, observer);
     }
@@ -1309,6 +1405,7 @@ fn install_capture(
         observations.set_port(Some(port.clone()));
     }
     let observer = button_evidence::install(run_loop, s);
+    super::idle_pulse::install(run_loop);
     // MultitouchSupport is a separate subscription from the Quartz event tap.
     // macOS 26.6.2 can deliver recognized gestures with no native contact frames
     // unless we start that subscription on the actual capture owner as well.
@@ -1324,6 +1421,7 @@ fn install_capture(
     })
 }
 fn withdraw_capture(s: &Shared, run_loop: &CFRunLoop, capture: InstalledCapture) {
+    super::idle_pulse::remove(run_loop);
     if let Some(observations) = &s.observations {
         observations.set_port(None);
     }
@@ -1712,6 +1810,31 @@ fn without_blocked_pointer_modifiers(flags: CGEventFlags, blocked: &[KeyCode]) -
     CGEventFlags(flags.0 & !mask)
 }
 
+fn owner_modifier_flags(
+    flags: CGEventFlags,
+    keyboard_remote: bool,
+    mapping: &[(KeyCode, KeyCode)],
+    injected: &[KeyCode],
+) -> CGEventFlags {
+    if !keyboard_remote {
+        return flags;
+    }
+    let mask = (0xe0..=0xe7)
+        .filter_map(|usage| keymap::hid_to_mac(KeyCode::keyboard(usage)))
+        .filter_map(modifier_flags)
+        .fold(0, |mask, (aggregate, side)| mask | aggregate.0 | side);
+    let local = mapping
+        .iter()
+        .map(|(_, to)| to)
+        .chain(injected)
+        .copied()
+        .filter(|key| key.is_modifier())
+        .filter_map(keymap::hid_to_mac)
+        .filter_map(modifier_flags)
+        .fold(0, |bits, (aggregate, side)| bits | aggregate.0 | side);
+    CGEventFlags((flags.0 & !mask) | local)
+}
+
 fn marked_own_event(ev: &CGEvent) -> bool {
     let tag = CGEvent::integer_value_field(Some(ev), CGEventField::EventSourceUserData);
     tag == MAGIC || cursor::owner::event_generation(tag).is_some()
@@ -1737,6 +1860,14 @@ unsafe extern "C-unwind" fn callback(
     let (s, ev) = unsafe { (&*(user_info as *const Shared), event.as_ref()) };
     let entry = now_event_ns() / 1000;
     let pass = event.as_ptr();
+    if let Some(forward) = super::idle_pulse::at_session(ty, ev, || {
+        s.capture_permitted()
+            && crate::capture_loop::idle_refresh_allowed()
+            && super::session::idle_refresh_unshielded()
+            && !system::secure_input_active()
+    }) {
+        return if forward { pass } else { std::ptr::null_mut() };
+    }
     if !s.capture_permitted() {
         wake(s);
         return pass;
@@ -1824,6 +1955,26 @@ unsafe extern "C-unwind" fn callback(
             return std::ptr::null_mut();
         }
         if is_motion(ty) {
+            // A cursor-owner placement is local UI work, not forwarded input.
+            // Its HID source can carry a Ctrl pressed only on the remote screen.
+            // macOS 26.6.2 source-end tracing showed this move reached Annotated
+            // after the neutral source UP and set CombinedSession/AppKit Ctrl;
+            // swallowing the subsequent forwarded key-up left that state set.
+            // Rebuild chord modifiers from the CURRENT local routing ledger:
+            // mapping includes identity keys already passed locally, and injected
+            // holds belong here too. Merely stripping currently blocked keys
+            // misses a queued placement arriving after their physical key-up.
+            // Keep local-keyboard mode, Caps/Fn and event metadata unchanged.
+            let (mapping, injected) = crate::capture_loop::local_modifier_mapping();
+            CGEvent::set_flags(
+                Some(ev),
+                owner_modifier_flags(
+                    CGEvent::flags(Some(ev)),
+                    s.keyboard_remote.load(Ordering::Acquire),
+                    &mapping,
+                    &injected,
+                ),
+            );
             cursor::owner::event_consumed(s, generation);
             account_cursor_placement(s, ev, crate::pointer_transition::PlacementKind::Owner, None);
         }
@@ -2050,8 +2201,11 @@ unsafe extern "C-unwind" fn callback(
         }
         (*dx, *dy) = decision.routed;
     }
-    if remote && let Some(e) = &mut t.event {
-        // Remote：光标冻结不动、事件位置也不是光标位置，不上报（接口约定）。
+    if (remote || s.drag_anchor.lock().unwrap_or_else(|e| e.into_inner()).is_some())
+        && let Some(e) = &mut t.event
+    {
+        // Native hold positions are never routing coordinates, including the
+        // Local intervals before SourceHeld and while return is unconfirmed.
         e.cursor = None;
     }
 
@@ -2177,8 +2331,10 @@ unsafe extern "C-unwind" fn callback(
         // for clicks/scrolls too, not the hardware event's stale location.
         CGEvent::set_location(Some(ev), objc2_core_foundation::CGPoint::new(at.x, at.y));
     }
-    let routed_swallow =
-        ((remote || crate::capture_loop::mouse_disabled()) && t.pointer) || disposition == Disposition::Swallow;
+    let source_motion = is_motion(ty) && s.drag_anchor.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    let routed_swallow = source_motion
+        || ((remote || crate::capture_loop::mouse_disabled()) && t.pointer)
+        || disposition == Disposition::Swallow;
     // Keep the existing local HIToolbox path and LocalGuard behavior. Only the
     // capture source changes: forwarding NX Caps must not also forward FlagsChanged.
     let native_caps = ty.0 == sysevent::TYPE_SYSDEFINED && sysevent::read_aux_key(ev).is_some_and(|key| key.key == 4);
@@ -2320,7 +2476,13 @@ fn reverse_wheel_event(ev: &CGEvent) {
 }
 fn transformed_injected_flags(ev: &CGEvent, mapping: &[(KeyCode, KeyCode)], injected: &[KeyCode]) -> CGEventFlags {
     let flags = CGEvent::flags(Some(ev));
-    if super::sysevent::read_aux_key(ev).is_some_and(|key| matches!(key.key, 0 | 1 | 7)) {
+    // Source cleanup deliberately posts an entirely neutral left UP. Ordinary
+    // CG button flags always include NonCoalesced; native HID buttons use their
+    // own acknowledgement path. Do not add mapped/injected keys back to this
+    // explicit neutral UP: AppKit would reject the catcher's Copy again. The
+    // event remains marked and acknowledged normally; no key ledger is changed.
+    let source_up = CGEvent::r#type(Some(ev)) == CGEventType::LeftMouseUp && flags.is_empty();
+    if source_up || super::sysevent::read_aux_key(ev).is_some_and(|key| matches!(key.key, 0 | 1 | 7)) {
         flags
     } else {
         transformed_modifier_flags(flags, mapping, injected)
@@ -2761,8 +2923,9 @@ fn translate(ty: CGEventType, ev: &CGEvent) -> Translated {
 }
 
 /// 系统定义事件：发往正在操作的那台电脑的媒体键（`keymap::nx_to_hid`）翻译成 Consumer 页的按键，
-/// 按下 / 抬起 / 重复与普通键一样处理（重复只在源机产生、逐个转发）。其余（键盘背光、电源、
-/// 弹出等、其他 subtype）不上报、原样放行。Caps 的明确方向也在这里采集，
+/// 按下 / 抬起 / 重复与普通键一样处理（重复只在源机产生、逐个转发）。亮度 / 键盘背光仅上报供
+/// 路由取消同一手势的 Fn 映射，仍原样放行；其余（电源、弹出等、其他 subtype）不上报。
+/// Caps 的明确方向也在这里采集，
 /// 但原生事件仍放行给本机，保持 LocalGuard 的既有行为。
 fn translate_aux(ev: &CGEvent) -> Translated {
     let pass = Translated {
@@ -2778,7 +2941,10 @@ fn translate_aux(ev: &CGEvent) -> Translated {
     let Some(code) = (if aux.key == 4 {
         Some(KeyCode::keyboard(0x39))
     } else {
-        keymap::nx_to_hid(aux.key)
+        // These controls still act natively on the source. Observation lets the
+        // router release Fn's mapped modifier before a translated F-row action;
+        // it does not add a HID->NX injection path or intercept the local action.
+        keymap::nx_to_hid(aux.key).or_else(|| keymap::local_brightness_key(aux.key))
     }) else {
         tracing::trace!("system-defined key stays local");
         return pass;
@@ -2865,6 +3031,123 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remote_control_source_end_owner_move_and_release_do_not_create_a_local_modifier() {
+        let routed = Arc::new(Mutex::new(Vec::new()));
+        let seen = routed.clone();
+        let shared = fake_shared(Arc::new(move |event| {
+            if let InputEvent::Key { code, pressed } = event.event {
+                seen.lock().unwrap().push((code, pressed));
+            }
+            Disposition::Swallow
+        }));
+        shared.keyboard_remote.store(true, Ordering::Release);
+        shared.owner_generation.store(42, Ordering::Release);
+        PRESSED.with(|keys| keys.borrow_mut().clear());
+        KEY_DISPOSITION.with(|keys| keys.borrow_mut().clear());
+        let invoke = |ty, flags, tag| {
+            let event = CGEvent::new(None).unwrap();
+            CGEvent::set_type(Some(&event), ty);
+            CGEvent::set_flags(Some(&event), flags);
+            CGEvent::set_integer_value_field(Some(&event), CGEventField::KeyboardEventKeycode, 0x3b);
+            CGEvent::set_integer_value_field(Some(&event), CGEventField::EventSourceUnixProcessID, 1234);
+            CGEvent::set_integer_value_field(Some(&event), CGEventField::EventSourceUserData, tag);
+            // SAFETY: unposted event and isolated state stay alive through the
+            // production callback. No native input or event tap is installed.
+            let result = unsafe {
+                callback(
+                    std::ptr::null_mut(),
+                    ty,
+                    NonNull::from(&*event),
+                    (&shared as *const Shared).cast_mut().cast(),
+                )
+            };
+            assert_eq!(result.is_null(), ty == CGEventType::FlagsChanged);
+            CGEvent::flags(Some(&event))
+        };
+        let control = CGEventFlags::MaskControl | CGEventFlags(device_bits::LCTL);
+        invoke(CGEventType::FlagsChanged, control, 0);
+        assert!(PRESSED.with(|keys| keys.borrow().contains(&KeyCode::LEFT_CTRL)));
+        assert_eq!(invoke(CGEventType::LeftMouseUp, CGEventFlags::empty(), MAGIC).0, 0);
+        let owner = cursor::owner::event_tag(42);
+        assert_eq!(invoke(CGEventType::MouseMoved, control, owner).0 & control.0, 0);
+        invoke(CGEventType::FlagsChanged, CGEventFlags::empty(), 0);
+        assert!(!PRESSED.with(|keys| keys.borrow().contains(&KeyCode::LEFT_CTRL)));
+        // A queued placement may still carry its pre-release HID snapshot.
+        assert_eq!(invoke(CGEventType::MouseMoved, control, owner).0 & control.0, 0);
+        assert_eq!(
+            *routed.lock().unwrap(),
+            [(KeyCode::LEFT_CTRL, true), (KeyCode::LEFT_CTRL, false)]
+        );
+        KEY_DISPOSITION.with(|keys| keys.borrow_mut().clear());
+    }
+
+    #[test]
+    fn remote_owner_move_preserves_only_locally_routed_chord_modifiers() {
+        let metadata = CGEventFlags::MaskAlphaShift
+            | CGEventFlags::MaskSecondaryFn
+            | CGEventFlags::MaskNonCoalesced
+            | CGEventFlags(0x2000_0000);
+        let stale = CGEventFlags((0xe0..=0xe7).fold(metadata.0, |bits, usage| {
+            let (aggregate, side) = modifier_flags(keymap::hid_to_mac(KeyCode::keyboard(usage)).unwrap()).unwrap();
+            bits | aggregate.0 | side
+        }));
+        assert_eq!(owner_modifier_flags(stale, false, &[], &[]), stale, "local keyboard");
+        assert_eq!(owner_modifier_flags(stale, true, &[], &[]), metadata);
+        for usage in 0xe0..=0xe7 {
+            let key = KeyCode::keyboard(usage);
+            let (aggregate, side) = modifier_flags(keymap::hid_to_mac(key).unwrap()).unwrap();
+            let expected = CGEventFlags(metadata.0 | aggregate.0 | side);
+            // Identity keys passed before crossing remain local native holds.
+            assert_eq!(owner_modifier_flags(stale, true, &[(key, key)], &[]), expected);
+            // A local remap may come from either a modifier or an ordinary key.
+            for from in [KeyCode::LEFT_GUI, KeyCode::keyboard(4)] {
+                assert_eq!(owner_modifier_flags(stale, true, &[(from, key)], &[]), expected);
+            }
+            assert_eq!(owner_modifier_flags(stale, true, &[], &[key]), expected);
+            assert_eq!(
+                owner_modifier_flags(metadata, true, &[], &[key]),
+                expected,
+                "an injected hold must not depend on the old HID snapshot"
+            );
+        }
+        let flags = owner_modifier_flags(
+            stale,
+            true,
+            &[(KeyCode::LEFT_CTRL, KeyCode::LEFT_CTRL)],
+            &[KeyCode::RIGHT_ALT],
+        );
+        assert_eq!(
+            flags,
+            CGEventFlags(
+                metadata.0
+                    | CGEventFlags::MaskControl.0
+                    | device_bits::LCTL
+                    | CGEventFlags::MaskAlternate.0
+                    | device_bits::RALT
+            )
+        );
+    }
+
+    #[test]
+    fn source_release_up_stays_neutral_through_local_modifier_mapping() {
+        let ev = CGEvent::new(None).unwrap();
+        CGEvent::set_type(Some(&ev), CGEventType::LeftMouseUp);
+        CGEvent::set_flags(Some(&ev), CGEventFlags::empty());
+        let mapping = [(KeyCode::keyboard(0xe3), KeyCode::keyboard(0xe0))];
+        let injected = [KeyCode::keyboard(0xe2)];
+        assert_eq!(
+            transformed_injected_flags(&ev, &mapping, &injected),
+            CGEventFlags::empty()
+        );
+        // The ordinary CG carrier retains its existing modifier mapping.
+        CGEvent::set_flags(Some(&ev), CGEventFlags::MaskNonCoalesced);
+        assert!(transformed_injected_flags(&ev, &mapping, &injected).contains(CGEventFlags::MaskAlternate));
+        CGEvent::set_type(Some(&ev), CGEventType::LeftMouseDown);
+        CGEvent::set_flags(Some(&ev), CGEventFlags::empty());
+        assert!(transformed_injected_flags(&ev, &mapping, &injected).contains(CGEventFlags::MaskAlternate));
+    }
+
+    #[test]
     fn tagged_volume_keeps_explicit_fine_step_flags_across_local_remapping() {
         let ev = CGEvent::new(None).unwrap();
         CGEvent::set_type(Some(&ev), CGEventType(14));
@@ -2949,6 +3232,63 @@ mod tests {
             freeze_check_ns: AtomicU64::new(0),
             caps_guard: LocalGuard::new(),
         }
+    }
+
+    #[test]
+    fn idle_pulses_bypass_business_handler_and_preserve_captured_modifier_ledger() {
+        let shared = fake_shared(Arc::new(|_| panic!("idle pulse entered remote routing")));
+        for held in [false, true] {
+            PRESSED.with(|keys| {
+                keys.borrow_mut().clear();
+                if held {
+                    keys.borrow_mut().insert(KeyCode::LEFT_SHIFT);
+                }
+            });
+            for flags in [0, CGEventFlags::MaskShift.0 | 2] {
+                let event = CGEvent::new(None).unwrap();
+                CGEvent::set_type(Some(&event), CGEventType::FlagsChanged);
+                CGEvent::set_integer_value_field(
+                    Some(&event),
+                    CGEventField::EventSourceUserData,
+                    super::super::idle_pulse::TAG,
+                );
+                CGEvent::set_flags(Some(&event), CGEventFlags(flags | 0x2000_0000));
+                // SAFETY: shared/event remain valid throughout this synchronous
+                // callback; marked events return before native routing/OS work.
+                let result = unsafe {
+                    callback(
+                        std::ptr::null_mut(),
+                        CGEventType::FlagsChanged,
+                        NonNull::from(&*event),
+                        &shared as *const Shared as *mut c_void,
+                    )
+                };
+                assert!(result.is_null(), "a reentered pulse must never reach local delivery");
+                assert_eq!(PRESSED.with(|keys| keys.borrow().contains(&KeyCode::LEFT_SHIFT)), held);
+            }
+        }
+        PRESSED.with(|keys| keys.borrow_mut().clear());
+    }
+
+    #[test]
+    fn held_source_defers_logical_restore_until_native_return_clears_anchor() {
+        let shared = Box::leak(Box::new(fake_shared(Arc::new(|_| Disposition::Pass))));
+        let interior = Point::new(800., 500.);
+        *shared.drag_anchor.lock().unwrap() = Some(oink_foundation::dnd::DragAnchor {
+            generation: 9,
+            at: interior,
+            surface: 0,
+        });
+        shared.remote.store(false, Ordering::Release);
+        shared.restore_pending.store(true, Ordering::Release);
+        shared.restore_x.store(400_f64.to_bits(), Ordering::Release);
+        shared.restore_y.store(0_f64.to_bits(), Ordering::Release);
+        let mut hidden = HiddenCursor::frozen(interior);
+        let before = hidden;
+        apply_mode_locked(shared, &mut hidden);
+        assert_eq!(hidden, before);
+        assert!(shared.restore_pending.load(Ordering::Acquire));
+        assert_eq!(f64::from_bits(shared.restore_x.load(Ordering::Acquire)), 400.);
     }
 
     #[test]
@@ -3262,6 +3602,8 @@ mod tests {
         // 合成事件只有与设备无关的位。
         assert_eq!(modifier_pressed(0x37, CGEventFlags::MaskCommand), Some(true));
         assert_eq!(modifier_pressed(0x39, CGEventFlags::MaskAlphaShift), None);
+        assert_eq!(modifier_pressed(63, CGEventFlags::MaskSecondaryFn), Some(true));
+        assert_eq!(modifier_pressed(63, CGEventFlags(0)), Some(false));
     }
 
     #[test]
@@ -3582,8 +3924,8 @@ mod tests {
 mod brightness_tests {
     use super::*;
     #[test]
-    fn brightness_down_up_and_repeat_are_never_reported() {
-        for key in [2, 3] {
+    fn brightness_down_up_and_repeat_are_observed_for_fn_chords() {
+        for key in [2, 3, 21, 22, 23] {
             for (pressed, repeat) in [(true, false), (true, true), (false, false)] {
                 let ev = CGEvent::new(None).unwrap();
                 CGEvent::set_type(Some(&ev), CGEventType(sysevent::TYPE_SYSDEFINED));
@@ -3594,11 +3936,13 @@ mod brightness_tests {
                     keymap::AuxKey { key, pressed, repeat }.data1(),
                 );
                 let translated = translate_aux(&ev);
-                assert!(translated.event.is_none());
-                assert!(translated.disp_key.is_none());
+                assert!(matches!(translated.event.as_ref().map(|e| &e.event),
+                    Some(InputEvent::Key { code, pressed: direction })
+                        if Some(*code) == keymap::local_brightness_key(key) && *direction == pressed));
                 assert!(translated.repeat_of.is_none());
                 assert!(translated.release_first.is_none());
-                assert!(keymap::hid_to_nx(KeyCode::new(12, if key == 2 { 0x6f } else { 0x70 })).is_none());
+                assert!(keymap::hid_to_nx(keymap::local_brightness_key(key).unwrap()).is_none());
+                track_keys(translated.event.as_ref().unwrap(), translated.disp_key);
             }
         }
     }

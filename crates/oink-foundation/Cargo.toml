@@ -8,6 +8,10 @@ license.workspace = true
 publish.workspace = true
 repository.workspace = true
 
+[features]
+# Explicit opt-in for debug test dependencies; never changes release policy.
+test-storage-retries = []
+
 [dependencies]
 serde = { workspace = true, features = ["rc"] }
 thiserror.workspace = true

@@ -49,11 +49,11 @@ impl Subscriber {
         }
         match event {
             ApiEvent::ReportStatusChanged(status) => {
-                if self
-                    .reports
-                    .as_ref()
-                    .is_some_and(|old| old.consent.generation > status.consent.generation)
-                {
+                if self.reports.as_ref().is_some_and(|old| {
+                    old.consent.generation > status.consent.generation
+                        || (old.consent.generation == status.consent.generation
+                            && old.local_diagnostics_generation > status.local_diagnostics_generation)
+                }) {
                     return false;
                 }
                 changed(&mut self.reports, *status)
@@ -63,6 +63,7 @@ impl Subscriber {
                 advanced(&mut self.blocked_devices, &snapshot.stream, snapshot.revision.0)
             }
             ApiEvent::ConnectionQuality(_) => self.views.group_quality,
+            ApiEvent::DeviceCardSignals(_) => self.views.card_signals,
             ApiEvent::Stats(_) | ApiEvent::InputStats(_) => self.views.stats || self.views.group_quality,
             ApiEvent::AudioStats(_) | ApiEvent::AudioQuality(_) => self.views.audio_quality,
             ApiEvent::DiagnosticsStats(_) => self.views.diagnostics,
@@ -110,6 +111,8 @@ mod tests {
             delivery_disabled: true,
             rust_crash: Coverage::Unavailable,
             native_crash: Coverage::Unavailable,
+            local_diagnostics_instance: None,
+            local_diagnostics_generation: 0,
             file_provider: Coverage::Unavailable,
         };
         status.consent.generation = 2;
@@ -153,6 +156,27 @@ mod tests {
     fn hidden_clients_receive_state_changes_but_not_quality_only_changes() {
         let mut hidden = Subscriber::new(1, Arc::new(|_| {}), LiveViews::default());
         let mut visible = Subscriber::new(2, Arc::new(|_| {}), LiveViews::ALL);
+        let signals = ApiEvent::DeviceCardSignals(crate::device_cards::DeviceCardSignals {
+            stream: "cards".into(),
+            revision: crate::device_cards::DecimalU64(1),
+            sampled_at_ms: 1000,
+            signals: vec![],
+        });
+        assert!(!hidden.accepts(&signals));
+        assert!(visible.accepts(&signals));
+        let mut home = Subscriber::new(
+            3,
+            Arc::new(|_| {}),
+            LiveViews {
+                card_signals: true,
+                ..Default::default()
+            },
+        );
+        assert!(home.accepts(&signals));
+        assert!(!home.accepts(&ApiEvent::Stats(vec![])));
+        assert!(!home.accepts(&ApiEvent::ConnectionQuality(
+            crate::connection_quality::History::default().view(0)
+        )));
         let mut group = test_group();
         for client in [&mut hidden, &mut visible] {
             assert!(client.accepts(&ApiEvent::Group(group.clone())));

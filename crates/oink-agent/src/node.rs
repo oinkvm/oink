@@ -6,6 +6,7 @@ mod card_projection;
 mod main_commands;
 mod notifications;
 mod observers;
+mod power;
 #[cfg(all(test, debug_assertions))]
 mod startup_store_tests;
 use crate::api::{self, ApiEvent, EventSink, SubscriptionId};
@@ -13,6 +14,7 @@ use crate::clip::ClipHandle;
 use crate::config::AgentConfig;
 use crate::layout_sync::{Source, Version};
 use crate::threads::input::Environment;
+use anyhow::Context as _;
 use oink_clipboard::ClipboardBackend;
 use oink_display::{DisplayBackend, layout::Layout};
 use oink_foundation::{DeviceId, display::DisplayInfo, snapshot::Snapshot};
@@ -99,6 +101,7 @@ pub(crate) struct Inner {
     input_environment: Arc<Snapshot<Environment>>,
     cursor_trail: OnceLock<oink_locator::CursorTrail>,
     notifications: Mutex<notifications::Notifications>,
+    power: Mutex<power::Power>,
     native_surfaces: bool,
     system_dark: AtomicBool,
     pub(crate) native_services: bool,
@@ -241,9 +244,9 @@ impl Node {
     }
 
     async fn start_with_services(opts: NodeOptions, native_services: bool) -> anyhow::Result<Self> {
-        let node = Self::prepare_with_services(opts, native_services)?;
+        let node = Self::prepare_with_services(opts, native_services).context("prepare backend")?;
         if lock(&node.inner.group_unreadable).is_none() {
-            node.start_sharing().await?;
+            node.start_sharing().await.context("start backend sharing")?;
         }
         Ok(node)
     }
@@ -257,11 +260,13 @@ impl Node {
 
     fn prepare_with_services(mut opts: NodeOptions, native_services: bool) -> anyhow::Result<Self> {
         let data_dir = opts.net.data_dir.clone();
-        let mut config = AgentConfig::load_from_with_device_name(&data_dir, opts.net.device_name.clone())?;
+        let mut config = AgentConfig::load_from_with_device_name(&data_dir, opts.net.device_name.clone())
+            .context("load backend settings")?;
         if let Some(name) = &config.settings.device_name {
             opts.net.device_name = name.clone();
         }
-        let identity = Arc::new(oink_network::identity::Identity::load_or_create(&data_dir)?);
+        let identity =
+            Arc::new(oink_network::identity::Identity::load_or_create(&data_dir).context("load backend identity")?);
         tracing::info!("backend identity and settings ready");
         let me = identity.id();
         let boot = oink_foundation::session::Boot {
@@ -274,7 +279,9 @@ impl Node {
         };
         // This new backend Boot releases both previous input disables before
         // capture or any local owner facts can be published.
-        config.update_owner(|owner| owner.clear_input_disables_on_start())?;
+        config
+            .update_owner(|owner| owner.clear_input_disables_on_start())
+            .context("persist startup input state")?;
         let unreadable =
             crate::config_module::group_store::load(&data_dir.join(crate::config_module::group_store::STATE_FILE), me)
                 .err()
@@ -282,6 +289,7 @@ impl Node {
         let settings = config.settings.clone();
         if native_services {
             oink_clipboard::received::configure(settings.received_files_cleanup);
+            crate::microphone_plugin::start();
         }
         let native = opts.cursor_trail;
         let node = Self {
@@ -309,6 +317,7 @@ impl Node {
                 input_environment: Arc::new(Snapshot::default()),
                 cursor_trail: OnceLock::new(),
                 notifications: Mutex::default(),
+                power: Mutex::default(),
                 system_dark: AtomicBool::new(false),
                 native_surfaces: native,
                 native_services,
@@ -624,6 +633,12 @@ impl Node {
         if let Ok(snapshot) = self.device_cards_snapshot() {
             self.deliver_initial(id, ApiEvent::DeviceCards(snapshot));
         }
+        if views.card_signals
+            && let Some(signals) =
+                self.device_card_signals(crate::connection_quality::now_ms_at(std::time::Instant::now()))
+        {
+            self.deliver_initial(id, ApiEvent::DeviceCardSignals(signals));
+        }
         self.deliver_initial(id, ApiEvent::ReportStatusChanged(self.inner.reports.status()));
         SubscriptionId(id)
     }
@@ -657,6 +672,12 @@ impl Node {
         // Opening a view receives a current snapshot even if another subscriber
         // has already seen the same value. It never waits for a periodic change.
         let mut events = Vec::new();
+        if views.card_signals
+            && let Some(signals) =
+                self.device_card_signals(crate::connection_quality::now_ms_at(std::time::Instant::now()))
+        {
+            events.push(ApiEvent::DeviceCardSignals(signals));
+        }
         if views.stats || views.group_quality {
             events.push(ApiEvent::Stats(crate::agent_api::peer_statuses(self)));
         }

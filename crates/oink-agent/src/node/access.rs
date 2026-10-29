@@ -198,7 +198,13 @@ impl Node {
         ));
         let observation = InputObservation(
             mode(status.mouse_mode),
-            mode(status.keyboard_mode),
+            // v1 keyboard resource modes remain Shared/Local; its existing
+            // summary bool above carries the derived Disabled observation.
+            mode(if status.keyboard_mode == oink_foundation::input::InputMode::Disabled {
+                oink_foundation::input::InputMode::Shared
+            } else {
+                status.keyboard_mode
+            }),
             faults,
             options,
             game,

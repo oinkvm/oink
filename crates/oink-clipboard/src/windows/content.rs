@@ -23,6 +23,7 @@ use windows::{
 pub(crate) mod current;
 pub(super) mod diagnostics;
 mod medium;
+mod shortcut;
 pub(super) mod target;
 pub(super) mod virtual_files;
 
@@ -63,7 +64,7 @@ fn standard(format: &NativeFormat) -> Option<StandardFormat> {
     }
     match format {
         NativeFormat::WindowsPredefined(1 | 7 | 13) => Some(StandardFormat::Text),
-        NativeFormat::WindowsPredefined(2 | 8 | 17) => Some(StandardFormat::Png),
+        NativeFormat::WindowsPredefined(2 | 6 | 8 | 17) => Some(StandardFormat::Png),
         NativeFormat::WindowsRegistered(name) => match name.as_str() {
             n if n.eq_ignore_ascii_case("HTML Format") => Some(StandardFormat::Html),
             n if n.eq_ignore_ascii_case("Rich Text Format") => Some(StandardFormat::Rtf),
@@ -76,7 +77,7 @@ fn standard(format: &NativeFormat) -> Option<StandardFormat> {
 }
 fn is_file(format: &NativeFormat) -> bool {
     matches!(format, NativeFormat::WindowsPredefined(15))
-        || matches!(format, NativeFormat::WindowsRegistered(n) if ["FileGroupDescriptorW", "FileGroupDescriptor", "FileContents"].iter().any(|name|n.eq_ignore_ascii_case(name)))
+        || matches!(format, NativeFormat::WindowsRegistered(n) if ["FileGroupDescriptorW", "FileGroupDescriptor", "FileContents", "Shell IDList Array", "FileNameW", "FileName"].iter().any(|name|n.eq_ignore_ascii_case(name)))
 }
 
 pub(super) fn inventory(data: &IDataObject, id: OfferId) -> io::Result<Inventory> {
@@ -136,7 +137,6 @@ pub(super) fn inventory(data: &IDataObject, id: OfferId) -> io::Result<Inventory
                 } else {
                     RepresentationData::Reader {
                         size: ContentSize::Unknown,
-                        hash: None,
                     }
                 };
                 representations.push(Representation {
@@ -209,14 +209,13 @@ pub(super) fn snapshot(data: &IDataObject, root: &Path, id: OfferId) -> io::Resu
         rep.data = match result.and_then(|bytes| {
             batch
                 .snapshot(rep.id.0, &mut io::Cursor::new(&bytes))
-                .map(|(size, hash)| (bytes, size, hash))
+                .map(|size| (bytes, size))
         }) {
-            Ok((bytes, size, _)) if rep.standard == Some(StandardFormat::Privacy) && size <= 65536 => {
+            Ok((bytes, size)) if rep.standard == Some(StandardFormat::Privacy) && size <= 65536 => {
                 RepresentationData::Inline(bytes)
             }
-            Ok((_, size, hash)) => RepresentationData::Reader {
+            Ok((_, size)) => RepresentationData::Reader {
                 size: ContentSize::Known(size),
-                hash: Some(hash),
             },
             Err(error) => RepresentationData::Unavailable(content::reason(&error)),
         };
@@ -226,6 +225,7 @@ pub(super) fn snapshot(data: &IDataObject, root: &Path, id: OfferId) -> io::Resu
 pub(super) fn capture(
     owner: Arc<super::worker::Worker>,
     observer: Arc<current::Observer>,
+    root: std::path::PathBuf,
 ) -> Result<CapturedClipboard, ClipboardError> {
     let count = current::sequence();
     // SAFETY: called on the clipboard worker's initialized STA.
@@ -279,7 +279,7 @@ pub(super) fn capture(
             }
             virtual_files::Virtual::metadata(&data)
                 .map_err(|error| ClipboardError::ContentUnavailable(content::reason(&error)))?
-                .map(|files| files.current(worker.clone(), owner.clone(), identity.clone(), inventory.clone()))
+                .map(|files| files.current(worker.clone(), owner.clone(), identity.clone(), inventory.clone(), root))
         }
     };
     let check_identity = identity.clone();
@@ -442,6 +442,8 @@ impl Translator for WindowsTranslator {
                 if matches!(&rep.format,NativeFormat::WindowsRegistered(n) if png_name(n)) {
                     super::image::decode_png(bytes).map_err(|e| content::unavailable(e.reason()))?;
                     ClipData::Png(bytes.to_vec())
+                } else if rep.format == NativeFormat::WindowsPredefined(6) {
+                    ClipData::Png(super::image::tiff_to_png(bytes).map_err(|e| content::unavailable(e.reason()))?)
                 } else if rep.medium == Medium::Bitmap {
                     ClipData::Png(super::image::bitmap_to_png(bytes).map_err(|e| content::unavailable(e.reason()))?)
                 } else {
@@ -470,6 +472,80 @@ mod tests {
             Ole::{OleInitialize, OleUninitialize},
         },
     };
+    #[test]
+    fn real_drop_snapshot_keeps_surviving_hdrop_anchor_after_skipping_link() {
+        sta(|| {
+            use crate::content::{
+                Deferred,
+                namespace::{Local, Namespace},
+            };
+            struct NoBytes;
+            impl crate::FileContents for NoBytes {
+                fn open(&self, _: usize) -> io::Result<crate::FileReader> {
+                    panic!("only CF_HDROP metadata is captured")
+                }
+            }
+            for internal in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let good = temp.path().join("ordinary.bin");
+                let link = temp.path().join("link");
+                std::fs::write(&good, b"ordinary surviving contents\n").unwrap();
+                std::os::windows::fs::symlink_file(
+                    if internal {
+                        good.clone()
+                    } else {
+                        temp.path().join("absent")
+                    },
+                    &link,
+                )
+                .unwrap();
+                let paths = vec![link, good];
+                let formats = super::super::formats();
+                let (object, _) = super::super::vfile::build(
+                    super::super::vfile::Spec {
+                        cloud: None,
+                        descriptors: super::super::files::descriptors(&[]),
+                        fixed: vec![(15, super::super::files::build_hdrop(&paths))],
+                        contents: Arc::new(NoBytes),
+                        cf_descriptor: formats.file_descriptor,
+                        cf_contents: formats.file_contents,
+                    },
+                    false,
+                );
+                let id = crate::content::url::tests::source(ClipPlatform::Windows, &[])
+                    .inventory
+                    .id;
+                let source = Deferred::new(inventory(&object, id).unwrap(), Arc::new(WindowsTranslator)).unwrap();
+                let files = Local::new(
+                    paths
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, path)| (NodeId(index as u64 + 1), path))
+                        .collect(),
+                )
+                .unwrap();
+                assert!(source.attach_files(files.clone()));
+                assert_eq!(source.inventory().items[0].file, Some(NodeId(2)));
+                let drop = snapshot(&object, temp.path(), id).unwrap();
+                assert!(drop.namespace().is_none(), "real Drop snapshots non-file formats only");
+                assert_eq!(
+                    drop.inventory().items[0].file,
+                    Some(NodeId(1)),
+                    "raw COM anchor is unchanged"
+                );
+                assert!(
+                    source.complete(drop),
+                    "real Drop must reconcile the captured selection before comparison"
+                );
+                let node = files.select(NodeId(2)).unwrap();
+                assert_eq!(
+                    content::read_all(&mut files.open(node.id, node.version, 0).unwrap()).unwrap(),
+                    b"ordinary surviving contents\n"
+                );
+            }
+        });
+    }
+
     #[test]
     fn url_formats_have_portable_link_semantics() {
         for name in ["UniformResourceLocatorW", "UniformResourceLocator", "text/x-moz-url"] {
@@ -587,7 +663,6 @@ mod tests {
                     medium: Medium::HGlobal,
                     data: RepresentationData::Reader {
                         size: ContentSize::Unknown,
-                        hash: None,
                     },
                     ..representations[0].clone()
                 });

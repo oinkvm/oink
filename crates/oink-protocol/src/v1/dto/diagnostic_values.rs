@@ -86,7 +86,7 @@ open_enum!(DiagPlacementKind {Owner=0,Tagged=1,NativeButton=2,NativeMotion=3});
 open_enum!(DiagButtonLayer {HidTap=0,SessionTap=1,WindowsHook=2});
 open_enum!(DiagTimestampUnit {Nanoseconds=0,Milliseconds=1});
 open_enum!(DiagCallClass {Motion=0,Button=1,Key=2,Scroll=3,Gesture=4,Mode=5,Release=6,Other=7});
-open_enum!(DiagFileProviderReason {Checking=0,DomainEnabled=1,UrlsReady=2,DomainDisabled=3,ExtensionNotRegistered=4,DomainDisconnected=5,RegistrationFailed=6,BoundExpired=7,Cancelled=8});
+open_enum!(DiagFileProviderReason {Checking=0,DomainEnabled=1,UrlsReady=2,DomainDisabled=3,ExtensionNotRegistered=4,DomainDisconnected=5,RegistrationFailed=6,BoundExpired=7,Cancelled=8,ItemMissing=9,ItemUnsupportedType=10,ItemKindMismatch=11,ItemTargetMismatch=12,ItemIdentityMismatch=13,ItemMetadataMismatch=14,ItemAccessDenied=15,ItemMetadataUnreadable=16});
 open_enum!(DiagPreparationPath {Spare=0,NewParent=1,DegradedPromise=2,Failed=3,Placeholder=4});
 open_enum!(DiagPlaceholderFallback {Off=0,None=1,NotReady=2,Capacity=3,UnknownSize=4,PreparationFailed=5,PublicationFailed=6,DisabledDuringPublication=7,DeferredToEnter=8});
 open_enum!(DiagProviderDragPath {Provider=0,DegradedPromise=1,Failed=2});

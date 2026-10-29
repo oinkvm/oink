@@ -4,7 +4,12 @@
   <Package Name="$(var.ProductName)" Manufacturer="$(var.Manufacturer)"
            Version="$(var.ProductVersion)" ProductCode="$(var.ProductCode)"
            UpgradeCode="$(var.UpgradeCode)" Scope="perMachine" InstallerVersion="500">
+    <Binary Id="OinkLocalUpdateNotes" SourceFile="$(var.UpdateNotesFile)" />
     <Icon Id="OinkIcon.ico" SourceFile="$(var.AppIcon)" />
+    <!-- MSI database metadata used for read-only local-drop preflight; UAC authorizes it. -->
+    <Property Id="OINK_VERSION" Value="$(var.DisplayVersion)" />
+    <Property Id="OINK_SOURCE_TREE" Value="$(var.SourceTreeSha256)" />
+    <Property Id="OINK_MINIMUM_WINDOWS_BUILD" Value="$(var.MinimumWindowsBuild)" />
     <Property Id="ARPPRODUCTICON" Value="OinkIcon.ico" />
     <!-- Private UI properties never cross to the elevated execute sequence. -->
     <Property Id="OinkLaunch" Value="1" />
@@ -148,21 +153,27 @@
                        Value="1" Type="integer" KeyPath="yes" />
       </Component>
     </StandardDirectory>
-    <Binary Id="OinkLocalUpdateNotes" SourceFile="$(var.UpdateNotesFile)" />
     <Binary Id="InstallerCA" SourceFile="$(var.CustomAction)" />
     <CustomAction Id="CheckInstallPath" BinaryRef="InstallerCA" DllEntry="CheckInstallPath" Execute="immediate" Return="check" />
     <CustomAction Id="CheckProtectedState" BinaryRef="InstallerCA" DllEntry="CheckProtectedState" Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="CheckQuiescence" BinaryRef="InstallerCA" DllEntry="CheckQuiescence" Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="CleanupMicrophone" BinaryRef="InstallerCA" DllEntry="CleanupMicrophone" Execute="commit" Impersonate="no" Return="ignore" />
     <CustomAction Id="CleanupUserData" BinaryRef="InstallerCA" DllEntry="CleanupUserData" Execute="commit" Impersonate="no" Return="ignore" />
     <CustomAction Id="CleanupMaintenance" BinaryRef="InstallerCA" DllEntry="CleanupMaintenance" Execute="commit" Impersonate="no" Return="ignore" />
     <!-- Commit-only: a failed uninstall must not silently disable autostart. -->
     <CustomAction Id="RemoveLoginEntry" BinaryRef="InstallerCA" DllEntry="RemoveLoginEntry" Execute="commit" Impersonate="no" Return="check" />
     <!-- Called only by the successful full-UI Finish button, in the client. -->
     <CustomAction Id="FinishInstall" BinaryRef="InstallerCA" DllEntry="FinishInstall" Execute="immediate" Return="check" />
-    <!-- Request normal Quit before files-in-use detection at every UI level.
+    <!-- Execute sequence only: full UI must return from its final Install/
+         repair/remove confirmation and show ProgressDlg before requesting Quit.
+         A UI action Before ExecuteAction can be linked before the maintenance
+         welcome dialog, disconnecting a user controlling Windows through Oink.
+         Immediate impersonating code retains the caller token and runs before
+         InstallValidate files-in-use detection, including /qn and ARP removal.
          The post-StopServices gate also waits for the existing SCM notification
-         to drain other sessions. No Restart Manager force-close or process kill. -->
-    <CustomAction Id="PrepareUserSessions" BinaryRef="InstallerCA" DllEntry="PrepareUserSessions" Execute="firstSequence" Return="check" />
+         to drain other sessions. Nested old-product removal skips the request.
+         No Restart Manager force-close or process kill. -->
+    <CustomAction Id="PrepareUserSessions" BinaryRef="InstallerCA" DllEntry="PrepareUserSessions" Execute="immediate" Return="check" />
     <InstallExecuteSequence>
       <Custom Action="PrepareUserSessions" Before="InstallValidate" Condition="NOT UPGRADINGPRODUCTCODE" />
       <!-- RegisterProduct writes the numeric upgrade version to ARP. Apply the
@@ -180,6 +191,7 @@
       <Custom Action="CheckQuiescence" After="StopServices" />
       <!-- Commit-only: never destroy user data if MSI rolls back. Cloud Files
            unregister happens inside this action before deleting any data tree. -->
+      <Custom Action="CleanupMicrophone" Before="CleanupUserData" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="CleanupUserData" Before="CleanupMaintenance" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="CleanupMaintenance" Before="InstallFinalize" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="RemoveLoginEntry" Before="RemoveRegistryValues" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />

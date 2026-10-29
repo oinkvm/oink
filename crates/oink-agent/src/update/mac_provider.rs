@@ -1,4 +1,4 @@
-//! A temporary provider disconnect belongs to the Sparkle replacement attempt.
+//! A temporary provider disconnect belongs to an approved replacement attempt.
 //! Abort reconnects only a domain we disconnected; new-host launch recovery
 //! reconnects after successful replacement. Never enable an inactive domain.
 use oink_update::Error;
@@ -45,6 +45,10 @@ impl Suspension {
         };
         Ok(result)
     }
+    /// The next host owns the persisted reconnect after a committed shutdown.
+    pub(super) fn commit(&mut self) {
+        self.prepared = false;
+    }
     fn restore(&mut self) -> Result<(), Error> {
         if self.prepared {
             let result = run(&self.manager, "finish-update", Instant::now() + COMMAND_BUDGET, &|| {
@@ -88,6 +92,18 @@ mod tests {
         std::fs::write(&path, format!("#!/bin/sh\necho \"$1\" >> \"$0.calls\"\ncase \"$1\" in\ninspect) echo '[{{\"id\":\"oink-files\",\"hidden\":true,\"userEnabled\":true,\"disconnected\":{disconnected}}}]';;\nprepare-update) if [ '{response}' = failed ]; then exit 1; fi; echo '{response}';;\nfinish-update) echo connected;;\nesac\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         path
+    }
+    #[test]
+    fn committed_shutdown_leaves_reconnect_to_the_new_host() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = manager(directory.path(), "prepared");
+        let mut guard = Suspension::prepare(path.clone(), Instant::now() + Duration::from_secs(16), &|| true).unwrap();
+        guard.commit();
+        drop(guard);
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("calls")).unwrap(),
+            "inspect\nprepare-update\n"
+        );
     }
     #[test]
     fn inspect_and_disconnect_share_the_preparation_deadline() {

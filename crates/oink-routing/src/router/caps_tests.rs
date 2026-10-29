@@ -301,6 +301,7 @@ fn caps_mapping_is_chosen_at_down_and_outputs_are_not_mapped_again() {
     let (mut s, mut t) = pair();
     let mut settings = InputTransform::default();
     settings.windows.keyboard = KeyboardMapping {
+        saved_custom: None,
         preset: KeyPreset::Custom,
         table: vec![KeyMapping {
             from: KeyCode::RIGHT_SHIFT,
@@ -315,6 +316,7 @@ fn caps_mapping_is_chosen_at_down_and_outputs_are_not_mapped_again() {
         target: PC,
         reverse_wheel: None,
         keyboard: Some(KeyboardMapping {
+            saved_custom: None,
             preset: KeyPreset::Custom,
             table: settings.windows.keyboard.table.clone(),
             caps_tap_hold: Some(CapsTapHold {
@@ -497,4 +499,58 @@ fn caps_focus_handoff_between_remote_targets_releases_only_the_original_target()
     )));
     key(&mut s, KeyCode::CAPS_LOCK, false, 700_000);
     assert!(s.caps_press.is_none());
+}
+
+#[test]
+fn custom_caps_none_tap_and_hold_never_send_empty_key_events() {
+    for (tap, hold) in [
+        (KeyCode::NONE, KeyCode::LEFT_CTRL),
+        (KeyCode::LEFT_SHIFT, KeyCode::NONE),
+        (KeyCode::NONE, KeyCode::NONE),
+    ] {
+        for long in [false, true] {
+            let (mut s, mut t) = pair();
+            let mut mapping = s.input_transforms[&ME].clone();
+            mapping.windows.keyboard.caps_tap_hold = Some(oink_foundation::input_transform::CapsTapHold { tap, hold });
+            s.set_input_transforms([(ME, mapping.clone())].into());
+            t.set_input_transforms([(ME, mapping)].into());
+            key(&mut s, KeyCode::CAPS_LOCK, true, 10);
+            let mut output = deliver(&mut s, &mut t);
+            if long {
+                s.tick(500_010);
+                output.extend(deliver(&mut s, &mut t));
+            }
+            key(&mut s, KeyCode::CAPS_LOCK, false, if long { 600_010 } else { 100 });
+            output.extend(deliver(&mut s, &mut t));
+            let mapped = if long { hold } else { tap };
+            let expected = if mapped == KeyCode::NONE {
+                vec![]
+            } else {
+                vec![(mapped, true), (mapped, false)]
+            };
+            assert_eq!(output, expected);
+            assert!(t.key_refs.is_empty());
+        }
+    }
+}
+
+#[test]
+fn fn_crossing_releases_windows_modifier_before_the_physical_up() {
+    let (mut s, mut t) = pair();
+    let mut mapping = InputTransform::initial("macos");
+    mapping.windows.keyboard.preset = oink_foundation::input_transform::KeyPreset::Custom;
+    mapping.windows.keyboard.table = vec![oink_foundation::input_transform::KeyMapping {
+        from: KeyCode::APPLE_FN,
+        to: KeyCode::RIGHT_ALT,
+    }];
+    s.set_input_transforms([(ME, mapping.clone())].into());
+    t.set_input_transforms([(ME, mapping)].into());
+    key(&mut s, KeyCode::APPLE_FN, true, 10);
+    assert_eq!(deliver(&mut s, &mut t), [(KeyCode::RIGHT_ALT, true)]);
+    s.holder = ME;
+    s.retarget_modifiers();
+    assert_eq!(deliver(&mut s, &mut t), [(KeyCode::RIGHT_ALT, false)]);
+    assert!(t.key_refs.is_empty());
+    key(&mut s, KeyCode::APPLE_FN, false, 100);
+    assert!(deliver(&mut s, &mut t).is_empty());
 }

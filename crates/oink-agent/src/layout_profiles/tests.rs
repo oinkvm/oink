@@ -811,3 +811,143 @@ fn old_saved_profiles_load_unchanged_and_obsolete_fields_are_ignored() {
             .any(|k| wire::catalog(&loaded).unwrap().raw().contains_key(k))
     );
 }
+
+#[test]
+fn automatic_repair_cannot_complete_an_unfinished_manual_save() {
+    let before = snapshot();
+    let original = catalog(&before);
+    let mut intended = before.clone();
+    intended.placements[0].origin.x += 10.0;
+    let mut actual = before.clone();
+    // Recovery after a crash sees a hotplug repair, not the requested move.
+    actual.placements[0].origin.x += 40.0;
+    let saved = original
+        .autosave_manual(device(1), &original.active_profile_id, &before, &intended, &actual, 20)
+        .unwrap();
+    assert_eq!(saved, original);
+}
+
+#[test]
+fn automatic_native_change_cannot_complete_an_unfinished_manual_save() {
+    let before = snapshot();
+    let original = catalog(&before);
+    let mut intended = before.clone();
+    intended.native[0].screens[1].origin.y += 10.0;
+    let mut actual = before.clone();
+    actual.native[0].screens[1].origin.y += 40.0;
+    let saved = original
+        .autosave_manual(device(1), &original.active_profile_id, &before, &intended, &actual, 20)
+        .unwrap();
+    assert_eq!(saved, original);
+}
+
+fn physical(s: &ArrangementSnapshot) -> super::topology::PhysicalTopology {
+    s.native
+        .iter()
+        .map(|n| super::topology::PhysicalDevice {
+            device: n.device,
+            screens: n
+                .screens
+                .iter()
+                .map(|s| super::topology::PhysicalScreen {
+                    id: s.screen.display.clone(),
+                    bounds: oink_foundation::Rect::new(s.origin.x, s.origin.y, s.size.w, s.size.h),
+                    pixel_width: s.size.w as u32 * 2,
+                    pixel_height: s.size.h as u32 * 2,
+                    scale: 2.0,
+                    rotation: 0,
+                    primary: s.screen == n.primary,
+                })
+                .collect(),
+        })
+        .collect()
+}
+#[test]
+fn topology_return_restores_once_and_manual_save_cancels_prior_excursion() {
+    let before = snapshot();
+    let mut c = catalog(&before);
+    let mut tracker = super::topology::RestoreTracker::default();
+    let saved = physical(&before);
+    // Profiles from older builds are inert, even after a topology excursion.
+    let mut other = saved.clone();
+    other[0].screens.pop();
+    assert!(!tracker.observe(c.active(), Some(&other)));
+    assert!(!tracker.observe(c.active(), Some(&saved)));
+    c.profiles[0].saved_topology = Some(saved.clone());
+    assert!(!tracker.observe(c.active(), Some(&saved)));
+    for change in 0..7 {
+        let mut other = saved.clone();
+        match change {
+            0 => {
+                other[0].screens.pop();
+            }
+            1 => other[0].screens[0].id.push_str("-replacement"),
+            2 => other[0].screens[0].bounds.w += 1.0,
+            3 => other[0].screens[0].pixel_width += 1,
+            4 => other[0].screens[0].scale += 0.5,
+            5 => other[0].screens[0].rotation = 90,
+            _ => other[0].screens[0].primary = !other[0].screens[0].primary,
+        }
+        assert!(!tracker.observe(c.active(), Some(&other)));
+        assert!(!tracker.observe(c.active(), None)); // incomplete facts aren't an empty topology
+        assert!(tracker.observe(c.active(), Some(&saved)));
+        assert!(!tracker.observe(c.active(), Some(&saved))); // duplicate observations/restore echoes
+    }
+    assert!(!tracker.observe(c.active(), Some(&other)));
+    c.profiles[0].content_revision.counter += 1;
+    assert!(!tracker.observe(c.active(), Some(&saved))); // newer manual edit cancels excursion
+    assert!(!tracker.observe(c.active(), Some(&other)));
+    tracker.manual_layout(c.active()); // manual register arrived before its catalog
+    assert!(!tracker.observe(c.active(), Some(&other))); // periodic ticks cannot re-arm stale content
+    assert!(!tracker.observe(c.active(), Some(&saved)));
+    c.profiles[0].content_revision.counter += 1;
+    assert!(!tracker.observe(c.active(), Some(&other)));
+    assert!(tracker.observe(c.active(), Some(&saved))); // companion save enables future excursions
+    let wire = wire::catalog(&c).unwrap();
+    assert_eq!(wire::read_catalog(wire).unwrap(), c);
+    let encoded = serde_json::to_string(&c.active().saved_topology).unwrap();
+    assert!(!encoded.contains("online"));
+}
+
+#[test]
+fn profile_match_and_new_saved_state_do_not_track_presence() {
+    let s = snapshot();
+    let mut offline = state(&s);
+    offline.online_devices.clear();
+    assert!(state(&s).exact(&offline));
+    let c = catalog(&s);
+    assert!(c.active().match_state.online_devices.is_empty());
+    assert!(c.summaries(&offline)[0].exact_match);
+    let saved = c.save(device(1), &s, state(&s), None, 30).unwrap();
+    assert!(saved.active().match_state.online_devices.is_empty());
+}
+
+#[test]
+fn older_writer_cannot_rebind_retained_physical_topology() {
+    use oink_protocol::v1::{RawValue as V, dto, schema::WireValue};
+    let s = snapshot();
+    let mut c = catalog(&s);
+    c.profiles[0].saved_topology = Some(physical(&s));
+    let old_revision = wire::catalog(&c).unwrap().profiles().unwrap().0[0]
+        .content_revision()
+        .unwrap()
+        .write();
+    c.version.counter += 1;
+    c.profiles[0].content_revision = c.version.clone();
+    c.profiles[0].content.placements[0].origin.x += 10.0;
+    let mut raw = wire::catalog(&c).unwrap().into_raw();
+    let V::Array(profiles) = raw.get_mut(&5).unwrap() else {
+        panic!("profiles")
+    };
+    let V::Map(profile) = &mut profiles[0] else {
+        panic!("profile")
+    };
+    // An older build updates content/revision but preserves unknown metadata.
+    profile.insert(9, old_revision);
+    let received = wire::read_catalog(dto::LayoutProfileCatalogV3::from_raw(raw).unwrap()).unwrap();
+    assert!(received.active().saved_topology.is_none());
+    assert_eq!(received.active().content, c.active().content);
+    let encoded = wire::catalog(&received).unwrap();
+    assert!(!encoded.profiles().unwrap().0[0].raw().contains_key(&8));
+    assert!(!encoded.profiles().unwrap().0[0].raw().contains_key(&9));
+}

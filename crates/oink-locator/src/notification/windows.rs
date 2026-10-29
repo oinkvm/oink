@@ -23,6 +23,7 @@ use windows::{
 thread_local! {
     static HITS: RefCell<HashMap<usize, HitState>> = RefCell::new(HashMap::new());
     static CLICKS: RefCell<Vec<Click>> = const { RefCell::new(Vec::new()) };
+    static SCALES: RefCell<Vec<(u64, f64)>> = const { RefCell::new(Vec::new()) };
     static FEEDBACK: RefCell<Vec<Feedback>> = const { RefCell::new(Vec::new()) };
 }
 struct Dib {
@@ -105,6 +106,7 @@ impl Window {
         Self::create()
     }
     fn create() -> Option<Self> {
+        let _dpi = DpiContext::enter()?;
         // SAFETY: Registered process-local class; this renderer owns the HWND on
         // its message-pumping thread. The shared system cursor is not owned here.
         unsafe {
@@ -148,10 +150,7 @@ impl Window {
     }
     fn present(&mut self, f: Frame) {
         HITS.with(|h| {
-            h.borrow_mut()
-                .entry(self.hwnd.0 as usize)
-                .or_default()
-                .update(f.id, f.undo, f.interactive);
+            h.borrow_mut().entry(self.hwnd.0 as usize).or_default().update_frame(&f);
         });
         self.set_interactive(f.interactive);
         if self.dib.as_ref().is_none_or(|d| d.w != f.width || d.h != f.height) {
@@ -177,6 +176,9 @@ impl Window {
         // SAFETY: This thread owns HWND/DC and the DIB has exactly width*height
         // initialized pixels. Show and reordering explicitly forbid activation.
         unsafe {
+            // ULW_ALPHA's native per-pixel hit shape lets alpha-zero padding
+            // pass through across process boundaries; HTTRANSPARENT alone only
+            // searches this thread's windows.
             std::ptr::copy_nonoverlapping(f.pixels.as_ptr(), dib.bits, f.pixels.len());
             if let Err(e) = UpdateLayeredWindow(
                 self.hwnd,
@@ -243,7 +245,12 @@ impl Backend {
     pub fn new() -> Option<Self> {
         // SAFETY: Only the notification worker changes its own DPI context. Bounds and
         // uploads remain physical pixels; sizes use each target monitor's scale.
-        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        if unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
+            .0
+            .is_null()
+        {
+            return None;
+        }
         Some(Self { windows: Vec::new() })
     }
 }
@@ -269,6 +276,9 @@ impl Surface for Backend {
         }
         CLICKS.with(|c| std::mem::take(&mut *c.borrow_mut()))
     }
+    fn scales(&mut self) -> Vec<(u64, f64)> {
+        SCALES.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
     fn feedback(&mut self) -> Vec<Feedback> {
         FEEDBACK.with(|f| std::mem::take(&mut *f.borrow_mut()))
     }
@@ -287,8 +297,35 @@ impl Surface for Backend {
     }
 }
 unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    if msg == WM_NCHITTEST && !HITS.with(|h| h.borrow().get(&(hwnd.0 as usize)).is_some_and(|h| h.interactive)) {
-        return LRESULT(HTTRANSPARENT as isize);
+    if msg == WM_DPICHANGED {
+        // A scale-only change need not change DisplayInfo's physical bounds.
+        // Repaint through the queue even when the display watcher sees no change.
+        // Do not accept the suggested rect: the queue owns toast stack placement.
+        let dpi = (w.0 & 0xffff) as u32;
+        if dpi > 0 {
+            HITS.with(|h| {
+                if let Some(hit) = h.borrow().get(&(hwnd.0 as usize)) {
+                    SCALES.with(|s| s.borrow_mut().push((hit.id, f64::from(dpi) / 96.)));
+                }
+            });
+        }
+        return LRESULT(0);
+    }
+    if msg == WM_NCHITTEST {
+        let mut point = POINT {
+            x: (l.0 as u16 as i16) as i32,
+            y: ((l.0 >> 16) as u16 as i16) as i32,
+        };
+        // SAFETY: owned HWND and initialized screen point from WM_NCHITTEST.
+        unsafe {
+            let _ = ScreenToClient(hwnd, &mut point);
+        }
+        let hit = HITS.with(|h| {
+            h.borrow()
+                .get(&(hwnd.0 as usize))
+                .is_some_and(|h| h.contains(Point::new(point.x.into(), point.y.into())))
+        });
+        return LRESULT(if hit { HTCLIENT as isize } else { HTTRANSPARENT as isize });
     }
     if msg == WM_MOUSEACTIVATE {
         return LRESULT(MA_NOACTIVATE as isize);
@@ -330,24 +367,199 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> L
     unsafe { DefWindowProcW(hwnd, msg, w, l) }
 }
 
-pub(super) fn scale_for(display: &oink_foundation::display::DisplayInfo) -> f64 {
-    let point = POINT {
-        x: (display.bounds.x + display.bounds.w / 2.).floor() as i32,
-        y: (display.bounds.y + display.bounds.h / 2.).floor() as i32,
-    };
-    let mut x = 96;
-    let mut y = 96;
-    // SAFETY: passive monitor lookup and two valid DPI outputs, without input changes.
-    unsafe {
-        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
-        let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut x, &mut y);
+/// Scope awareness to the calling thread; never change the host process policy.
+struct DpiContext(DPI_AWARENESS_CONTEXT);
+impl DpiContext {
+    fn enter() -> Option<Self> {
+        // SAFETY: only this thread's context is changed and restored in Drop.
+        let old = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        (!old.0.is_null()).then_some(Self(old))
     }
-    f64::from(x) / 96.
+}
+impl Drop for DpiContext {
+    fn drop(&mut self) {
+        // SAFETY: previously returned valid thread context on the same thread.
+        unsafe { SetThreadDpiAwarenessContext(self.0) };
+    }
+}
+
+pub(super) fn scale_for(display: &oink_foundation::display::DisplayInfo) -> f64 {
+    monitor_scale(display).unwrap_or_else(|| {
+        tracing::warn!("notification monitor DPI query failed");
+        1.
+    })
+}
+
+fn monitor_scale(display: &oink_foundation::display::DisplayInfo) -> Option<f64> {
+    let _dpi = DpiContext::enter()?;
+    // GetDpiForMonitor depends on the HOST PROCESS awareness (96/system DPI in
+    // unaware/system-aware hosts), even though our toast worker is PMv2. Query
+    // a PMv2 HWND on the target monitor instead. STATIC is a system class; this
+    // 1px probe is never shown, activated, or added to the desktop input path.
+    // https://learn.microsoft.com/windows/win32/api/shellscalingapi/nf-shellscalingapi-getdpiformonitor
+    // SAFETY: owned hidden top-level HWND, created/destroyed on this thread.
+    unsafe {
+        let hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            w!("STATIC"),
+            w!(""),
+            WS_POPUP,
+            (display.bounds.x + display.bounds.w / 2.).floor() as i32,
+            (display.bounds.y + display.bounds.h / 2.).floor() as i32,
+            1,
+            1,
+            None,
+            None,
+            None,
+            None,
+        )
+        .ok()?;
+        let dpi = GetDpiForWindow(hwnd);
+        let _ = DestroyWindow(hwnd);
+        (dpi > 0).then_some(f64::from(dpi) / 96.)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dpi_monitor_query_restores_an_unaware_caller() {
+        // SAFETY: scoped context on this test thread; no process policy changes.
+        let previous = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE) };
+        let restore = DpiContext(previous);
+        let window = Window::new().expect("hidden DPI reference");
+        let display = oink_foundation::display::DisplayInfo {
+            key: "test".into(),
+            name: String::new(),
+            bounds: Rect::new(0., 0., 1., 1.),
+            pixel_width: 1,
+            pixel_height: 1,
+            reference_extent: None,
+            rotation_deg: 0,
+            is_primary: true,
+            is_builtin: false,
+            is_virtual: false,
+        };
+        let scale = monitor_scale(&display).expect("target monitor DPI");
+        // SAFETY: read-only queries of this test's hidden PMv2 HWND and thread.
+        unsafe {
+            assert_eq!(scale, f64::from(GetDpiForWindow(window.hwnd)) / 96.);
+            assert!(
+                AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), DPI_AWARENESS_CONTEXT_UNAWARE).as_bool()
+            );
+        }
+        drop(window);
+        drop(restore);
+    }
+
+    #[test]
+    fn dpi_window_context_and_scale_change_are_independent_of_host_awareness() {
+        // SAFETY: changes only this test thread; restore guard resets it below.
+        // Hidden windows only: never call present/ShowWindow or inject input.
+        let previous = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE) };
+        let restore = DpiContext(previous);
+        let window = Window::new().expect("hidden PMv2 toast");
+        // SAFETY: read-only queries on our owned hidden window and test thread.
+        unsafe {
+            assert!(
+                AreDpiAwarenessContextsEqual(
+                    GetWindowDpiAwarenessContext(window.hwnd),
+                    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+                )
+                .as_bool()
+            );
+            assert!(
+                AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), DPI_AWARENESS_CONTEXT_UNAWARE).as_bool(),
+                "creating a toast must restore its caller context"
+            );
+        }
+        HITS.with(|h| {
+            h.borrow_mut()
+                .entry(window.hwnd.0 as usize)
+                .or_default()
+                .update(42, None, true)
+        });
+        for dpi in [96usize, 120, 144, 192] {
+            // SAFETY: synthetic DPI notification to our hidden window only.
+            unsafe {
+                SendMessageW(window.hwnd, WM_DPICHANGED, Some(WPARAM(dpi | (dpi << 16))), None);
+            }
+            assert_eq!(
+                SCALES.with(|s| std::mem::take(&mut *s.borrow_mut())),
+                vec![(42, dpi as f64 / 96.)]
+            );
+        }
+        drop(window);
+        drop(restore);
+    }
+
+    #[test]
+    fn native_hit_messages_exclude_transparent_corners() {
+        let window = Window::new().expect("hidden toast HWND");
+        let mut pixels = vec![0; 100];
+        // The alpha mask, rather than the bounding rectangle, owns input.
+        for y in 4..10 {
+            for x in 0..8 {
+                pixels[y * 10 + x] = 0xff_ff_ff_ff;
+            }
+        }
+        let frame = Frame {
+            id: 9,
+            bounds: Rect::new(0., 0., 10., 10.),
+            card: Rect::new(0., 4., 8., 6.),
+            width: 10,
+            height: 10,
+            pixels,
+            undo: Some(Rect::new(5., 5., 2., 2.)),
+            interactive: true,
+        };
+        HITS.with(|h| {
+            h.borrow_mut()
+                .entry(window.hwnd.0 as usize)
+                .or_default()
+                .update_frame(&frame)
+        });
+        let message_point = |point: Point, screen: bool| {
+            let mut point = POINT {
+                x: point.x as i32,
+                y: point.y as i32,
+            };
+            if screen {
+                // SAFETY: hidden owned HWND and initialized client point.
+                unsafe {
+                    let _ = ClientToScreen(window.hwnd, &mut point);
+                }
+            }
+            LPARAM(((point.y as u16 as u32) << 16 | point.x as u16 as u32) as isize)
+        };
+        for (point, expected, undo) in [
+            (Point::new(1., 1.), HTTRANSPARENT as isize, false),
+            (Point::new(2., 7.), HTCLIENT as isize, false),
+            (Point::new(8., 2.), HTTRANSPARENT as isize, false),
+            (Point::new(6., 6.), HTCLIENT as isize, true),
+        ] {
+            // SAFETY: direct messages to our hidden HWND; no desktop input.
+            unsafe {
+                assert_eq!(
+                    SendMessageW(window.hwnd, WM_NCHITTEST, None, Some(message_point(point, true))).0,
+                    expected
+                );
+                SendMessageW(window.hwnd, WM_LBUTTONDOWN, None, Some(message_point(point, false)));
+                SendMessageW(window.hwnd, WM_LBUTTONUP, None, Some(message_point(point, false)));
+            }
+            let clicks = CLICKS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+            assert_eq!(
+                clicks,
+                if expected == HTCLIENT as isize {
+                    vec![Click { id: 9, undo }]
+                } else {
+                    vec![]
+                }
+            );
+        }
+    }
 
     #[test]
     fn toast_cursor_and_hit_testing_follow_interactivity_without_activation() {
@@ -417,6 +629,7 @@ mod tests {
                 FEEDBACK.with(|f| f.borrow_mut().pop()).unwrap(),
                 Feedback {
                     id: 7,
+                    toast_hovered: true,
                     hovered: true,
                     pressed: false
                 }
@@ -426,6 +639,7 @@ mod tests {
                 FEEDBACK.with(|f| f.borrow_mut().pop()).unwrap(),
                 Feedback {
                     id: 7,
+                    toast_hovered: true,
                     hovered: true,
                     pressed: true
                 }
@@ -435,6 +649,7 @@ mod tests {
                 FEEDBACK.with(|f| f.borrow_mut().pop()).unwrap(),
                 Feedback {
                     id: 7,
+                    toast_hovered: false,
                     hovered: false,
                     pressed: false
                 }

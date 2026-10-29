@@ -26,7 +26,7 @@ export function PairDialog({ pairing, container }: {
         e.stopPropagation();
         void actions.cancel().catch(()=>agent.fail('unavailable'));
     } }} actions={<Button onClick={() => {void actions.cancel().catch(()=>agent.fail('unavailable'));}} disabled={s?.status === 'success'}>{failed ? tr('关闭') : tr('取消')}</Button>}>
-      <Morph viewKey={manual ? `m${dialog.key}` : `p${s?.key ?? ''}-${failed ? 'failed' : s?.status === 'connecting' ? 'connecting' : 'code'}`} pending={s?.status === 'connecting' && s.source === 'manual'}>
+      <Morph immediate={failed} viewKey={manual ? `m${dialog.key}` : `p${s?.key ?? ''}-${failed ? 'failed' : s?.status === 'connecting' ? 'connecting' : 'code'}`} pending={s?.status === 'connecting' && s.source === 'manual'}>
         {manual ? <ManualSearch key={dialog.key} pairing={pairing}/> : s ? <PairBody session={s} pairing={pairing}/> : null}
       </Morph>
     </Dialog>);
@@ -107,7 +107,7 @@ export function ManualSearch({ pairing, autoFocus = true }: {
           <div>
             <div className="manual__found">
               
-              <ContextMenu menu={<><MenuItem icon="plus" onSelect={() => {void actions.pairFound(found).catch(()=>{});}}>{tr('配对')}</MenuItem><MenuSeparator/><MenuItem icon="block" tone="danger" onSelect={() => {void actions.block(found).catch(()=>agent.fail('persistence_failed'));}}>{tr('屏蔽')}</MenuItem></>}><NearbyRow peer={found} sub={found.deviceId} onConnect={() => actions.pairFound(found)}/></ContextMenu>
+              <ContextMenu menu={<><MenuItem icon="plus" onSelect={() => {void actions.pairFound(found).catch(()=>{});}}>{tr('配对')}</MenuItem><MenuSeparator/><MenuItem icon="block" tone="danger" onSelect={() => {void actions.block(found).catch(()=>agent.fail('persistence_failed'));}}>{tr('屏蔽')}</MenuItem></>}><div><NearbyRow peer={found} sub={found.deviceId} onConnect={() => actions.pairFound(found)}/></div></ContextMenu>
             </div>
           </div>
         </div>)}

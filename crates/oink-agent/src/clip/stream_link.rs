@@ -16,12 +16,19 @@ use std::{
 };
 use tokio::sync::watch;
 
+#[path = "local_source.rs"]
+mod local_source;
+#[cfg(all(test, debug_assertions))]
+#[path = "local_source_tests.rs"]
+mod local_source_tests;
+
 #[derive(Debug)]
 struct Peer {
     link: LinkId,
     boot: Boot,
     inbound: Option<StreamId>,
     interrupted: watch::Sender<bool>,
+    persistent_interrupted: watch::Sender<bool>,
 }
 #[derive(Debug)]
 struct Binding {
@@ -39,6 +46,7 @@ impl Binding {
 struct State {
     paused: bool,
     input_independent: bool,
+    local: Option<local_source::Source>,
     peers: HashMap<DeviceId, Peer>,
     offers: HashMap<(DeviceId, ClipId), Arc<Binding>>,
 }
@@ -68,6 +76,47 @@ impl FileLinks {
     }
     pub(crate) fn set_log_config(&self, config: crate::config_module::ConfigModule) {
         *self.log_config.lock().unwrap() = Some(config);
+    }
+    pub(crate) fn set_local_source(&self, device: DeviceId, registry: Arc<oink_clipboard::content::Registry>) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(previous) = state.local.take() {
+            previous.interrupted.send_replace(true);
+        }
+        state.local = Some(local_source::Source::new(device, registry, state.paused));
+    }
+    pub(crate) fn peer_cloud_links(&self, peer: DeviceId, link: LinkId) -> bool {
+        self.links
+            .links()
+            .by_peer(peer)
+            .is_some_and(|entry| entry.link == link && entry.agreement.contains("oink.cloud-file-links/1"))
+    }
+    pub(crate) fn peer_safe_symlinks(&self, peer: DeviceId, link: LinkId) -> bool {
+        cfg!(target_os = "macos")
+            && self.peer_os(peer).as_deref() == Some("macos")
+            && self
+                .links
+                .links()
+                .by_peer(peer)
+                .is_some_and(|entry| entry.link == link && entry.agreement.contains("oink.files.safe-symlinks/1"))
+    }
+    pub(crate) fn peer_exec_bits(&self, peer: DeviceId, link: LinkId) -> bool {
+        cfg!(target_os = "macos")
+            && self.peer_os(peer).as_deref() == Some("macos")
+            && self
+                .links
+                .links()
+                .by_peer(peer)
+                .is_some_and(|entry| entry.link == link && entry.agreement.contains("oink.files.exec-bits/1"))
+    }
+    pub(crate) fn peer_os(&self, peer: DeviceId) -> Option<String> {
+        self.log_config.lock().unwrap().as_ref().and_then(|config| {
+            config
+                .members()
+                .members
+                .iter()
+                .find(|member| member.device == peer)
+                .map(|member| member.os.clone())
+        })
     }
     pub fn peer_formats(&self, peer: DeviceId, link: LinkId) -> Option<dto::FormatSupport> {
         self.links
@@ -121,6 +170,7 @@ impl State {
         }
         if let Some(old) = state.peers.remove(&peer) {
             old.interrupted.send_replace(true);
+            old.persistent_interrupted.send_replace(true);
         }
         state.peers.insert(
             peer,
@@ -129,6 +179,7 @@ impl State {
                 boot,
                 inbound: None,
                 interrupted: watch::channel(state.paused || !state.input_independent).0,
+                persistent_interrupted: watch::channel(state.paused).0,
             },
         );
     }
@@ -162,6 +213,7 @@ impl State {
         }
         let old = state.peers.remove(&peer).unwrap();
         old.interrupted.send_replace(true);
+        old.persistent_interrupted.send_replace(true);
         if !download_resumable(reason) {
             for binding in state.offers.values().filter(|binding| binding.peer == peer) {
                 binding.cancel();
@@ -174,7 +226,17 @@ impl State {
             return;
         }
         state.paused = paused;
+        if let Some(local) = &mut state.local {
+            local.interrupted.send_replace(true);
+            if !paused {
+                local.interrupted = watch::channel(false).0;
+            }
+        }
         for peer in state.peers.values_mut() {
+            peer.persistent_interrupted.send_replace(true);
+            if !paused {
+                peer.persistent_interrupted = watch::channel(false).0;
+            }
             peer.interrupted.send_replace(true);
             if !paused && (state.input_independent || peer.inbound.is_some()) {
                 peer.interrupted = watch::channel(false).0;
@@ -242,11 +304,30 @@ impl BulkLink for FileLinks {
                 .filter(|e| e.peer_boot == b.boot)
                 .and_then(|e| e.peer_formats.clone())
         });
+        let cloud_links = binding.as_ref().is_some_and(|binding| {
+            self.links.links().by_peer(peer).is_some_and(|entry| {
+                entry.peer_boot == binding.boot && entry.agreement.contains("oink.cloud-file-links/1")
+            })
+        });
         Arc::new(BoundLink {
             links: self,
             binding,
             source_formats,
+            cloud_links,
         })
+    }
+    fn bind_persistent(self: Arc<Self>, peer: DeviceId) -> io::Result<Arc<dyn BulkLink>> {
+        if self
+            .state
+            .lock()
+            .unwrap()
+            .local
+            .as_ref()
+            .is_some_and(|source| source.device == peer)
+        {
+            return Ok(Arc::new(local_source::Link::new(self, peer)));
+        }
+        Ok(Arc::new(PersistentLink { links: self, peer }))
     }
     fn open(&self, _: DeviceId) -> BoxFuture<'_, io::Result<Box<dyn BulkChannel>>> {
         Box::pin(async { Err(io::Error::other("file link must be bound to an accepted offer")) })
@@ -256,6 +337,7 @@ struct BoundLink {
     links: Arc<FileLinks>,
     binding: Option<Arc<Binding>>,
     source_formats: Option<dto::FormatSupport>,
+    cloud_links: bool,
 }
 impl BoundLink {
     async fn open_stream(
@@ -321,6 +403,15 @@ impl BoundLink {
     }
 }
 impl BulkLink for BoundLink {
+    fn supports_cloud_links(&self) -> bool {
+        self.cloud_links
+    }
+    fn bind_persistent(self: Arc<Self>, peer: DeviceId) -> io::Result<Arc<dyn BulkLink>> {
+        if self.binding.as_ref().is_none_or(|b| b.peer != peer) || !self.cloud_links {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        self.links.clone().bind_persistent(peer)
+    }
     fn supports_namespace(&self) -> bool {
         self.source_formats.as_ref().is_some_and(|source| {
             oink_clipboard::negotiation::namespace_supported(source, &oink_clipboard::negotiation::formats())
@@ -379,6 +470,135 @@ impl BulkLink for BoundLink {
             trace.io(&result);
             result
         })
+    }
+}
+// Durable file authority outlives B0/I0 and old offers, but each opened Low
+// operation retains the exact current connection and pause generation.
+struct PersistentLink {
+    links: Arc<FileLinks>,
+    peer: DeviceId,
+}
+impl BulkLink for PersistentLink {
+    fn peer_label(&self, peer: DeviceId) -> String {
+        self.links.peer_label(peer)
+    }
+    fn bind(self: Arc<Self>, _: DeviceId, _: ClipId) -> Arc<dyn BulkLink> {
+        self
+    }
+    fn bind_persistent(self: Arc<Self>, peer: DeviceId) -> io::Result<Arc<dyn BulkLink>> {
+        if peer != self.peer {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        Ok(self)
+    }
+    fn supports_cloud_links(&self) -> bool {
+        true
+    }
+    fn open(&self, _: DeviceId) -> BoxFuture<'_, io::Result<Box<dyn BulkChannel>>> {
+        Box::pin(async { Err(io::Error::other("file operation requires its byte budget")) })
+    }
+    fn open_with_options(
+        &self,
+        peer: DeviceId,
+        options: LowOptions,
+    ) -> BoxFuture<'_, io::Result<Box<dyn BulkChannel>>> {
+        Box::pin(async move {
+            if peer != self.peer {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            let activity = oink_foundation::maintenance::process()
+                .enter(oink_foundation::maintenance::ActivityKind::FileTransfer)
+                .ok_or(io::ErrorKind::WouldBlock)?;
+            let (scope, mut permission) = {
+                let state = self.links.state.lock().unwrap();
+                let current = state
+                    .peers
+                    .get(&peer)
+                    .filter(|_| !state.paused)
+                    .ok_or(io::ErrorKind::NotConnected)?;
+                (current.link, current.persistent_interrupted.subscribe())
+            };
+            // The manager can retire/replace a connection before the clipboard
+            // actor handles its lifecycle event. That gap is transport loss, not
+            // a permanent capability rejection of the received file's reader.
+            let current = self.links.links.links();
+            let entry = current
+                .by_peer(peer)
+                .filter(|entry| entry.link == scope)
+                .ok_or(io::ErrorKind::NotConnected)?;
+            if !entry.agreement.contains("oink.cloud-file-links/1") {
+                return Err(io::ErrorKind::Unsupported.into());
+            }
+            let stream = tokio::select! {
+                result = self.links.links.open_low(scope, self.links.kind, options) => result.map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e))?,
+                _ = revoked(&mut permission) => return Err(io::ErrorKind::ConnectionAborted.into()),
+            };
+            if *permission.borrow() {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            Ok(Box::new(PersistentBulk {
+                _activity: activity,
+                stream,
+                permission,
+            }) as Box<dyn BulkChannel>)
+        })
+    }
+}
+async fn revoked(permission: &mut watch::Receiver<bool>) {
+    while !*permission.borrow_and_update() {
+        if permission.changed().await.is_err() {
+            return;
+        }
+    }
+}
+struct PersistentBulk {
+    _activity: oink_foundation::maintenance::Lease,
+    stream: LowStream,
+    permission: watch::Receiver<bool>,
+}
+impl BulkChannel for PersistentBulk {
+    fn diagnostic_id(&self) -> [u8; 16] {
+        self.stream.diagnostic_id()
+    }
+    fn pacing_observer(&self) -> oink_clipboard::sync::files::PacingObserver {
+        file_pacing_observer(&self.stream)
+    }
+    fn transfer_path(&self) -> &'static str {
+        match self.stream.path() {
+            oink_network::link::LinkPath::Direct => "direct",
+            _ => "relayed",
+        }
+    }
+    fn effect_validity(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let permission = self.permission.clone();
+        let operation = self.stream.effect_validity();
+        Arc::new(move || !*permission.borrow() && operation())
+    }
+    fn send<'a>(&'a mut self, frame: &'a ContentMsg) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move {
+            if !frame.persistent_request() {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            let wire = oink_clipboard::wire::content(frame).map_err(io::Error::other)?;
+            tokio::select! {
+                biased;
+                _ = revoked(&mut self.permission) => { self.stream.cancel(); Err(io::ErrorKind::ConnectionAborted.into()) },
+                result = self.stream.send(&wire) => result.map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e)),
+            }
+        })
+    }
+    fn recv(&mut self) -> BoxFuture<'_, io::Result<Option<ContentMsg>>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = revoked(&mut self.permission) => { self.stream.cancel(); Err(io::ErrorKind::ConnectionAborted.into()) },
+                result = self.stream.recv() => result.map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e))?
+                    .map(oink_clipboard::wire::local_content).transpose().map_err(io::Error::other),
+            }
+        })
+    }
+    fn finish(&mut self) {
+        self.stream.finish();
     }
 }
 async fn interrupted(permission: &mut watch::Receiver<bool>, cancelled: &mut watch::Receiver<bool>) {
@@ -474,6 +694,60 @@ mod tests {
     use super::*;
     use oink_network::link::{Disconnect, StreamDir};
     use oink_protocol::frame::StreamTag;
+    #[test]
+    fn persistent_reopen_before_clipboard_link_lost_is_transport_loss() {
+        crate::test_watchdog::run(
+            module_path!(),
+            "persistent_reopen_before_clipboard_link_lost_is_transport_loss",
+            Some(4),
+            async {
+                use crate::streams::{clipboard::ClipboardStreams, lifecycle_tests::Fixture};
+                use std::time::Duration;
+
+                let fixture = Fixture::<ClipboardStreams>::start().await;
+                let (source, _) = fixture.context(0);
+                let (target, _) = fixture.context(1);
+                let peer = source.id();
+                let old = target.links().by_peer(peer).unwrap().link;
+                let files = FileLinks::new(target.clone(), StreamKind::Clipboard);
+                files.link_ready(peer, old, source.boot());
+                assert!(files.peer_cloud_links(peer, old));
+                let persistent = files.clone().bind_persistent(peer).unwrap();
+
+                // Deliberately do not deliver LinkLost/LinkReady to FileLinks:
+                // the reader can reopen before the clipboard actor drains them.
+                target.disconnect(old, Disconnect::ControlStreamFailed);
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while target.links().by_peer(peer).is_some_and(|entry| entry.link == old) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(files.state.lock().unwrap().peers[&peer].link, old);
+                let result = persistent
+                    .open_with_options(
+                        peer,
+                        LowOptions {
+                            send_max: 512,
+                            receive_max: 512,
+                            operation_max: 1024,
+                        },
+                    )
+                    .await;
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("retired link must not open a stream"),
+                };
+                assert_eq!(
+                    error.kind(),
+                    io::ErrorKind::NotConnected,
+                    "a delayed clipboard lifecycle update must not permanently reject a persistent reader"
+                );
+                fixture.stop().await;
+            },
+        );
+    }
     const PEER: DeviceId = DeviceId([1; 32]);
     fn stream(link: u64, ordinal: u32) -> StreamId {
         StreamId {
@@ -497,6 +771,30 @@ mod tests {
         state.inbound(PEER, stream(1, 1));
         state.accept(PEER, ClipId { origin: PEER, seq: 1 });
         state
+    }
+    #[test]
+    fn persistent_permission_survives_input_changes_but_not_pause_or_connection_replacement() {
+        let mut state = State::default();
+        state.link_ready(PEER, LinkId(1), boot(1));
+        let first = state.peers[&PEER].persistent_interrupted.subscribe();
+        assert!(!*first.borrow(), "cloud reads do not need an inbound I0");
+        state.inbound(PEER, stream(1, 1));
+        state.stream_closed(PEER, stream(1, 1));
+        assert!(!*first.borrow());
+        state.pause_changed(true);
+        state.pause_changed(false);
+        assert!(*first.borrow(), "resume cannot revive a deferred old write");
+        let resumed = state.peers[&PEER].persistent_interrupted.subscribe();
+        assert!(!*resumed.borrow());
+        state.link_ready(PEER, LinkId(2), boot(2));
+        assert!(*resumed.borrow());
+        let restarted = state.peers[&PEER].persistent_interrupted.subscribe();
+        assert!(
+            !*restarted.borrow(),
+            "fresh token requests can use the restarted source"
+        );
+        state.link_lost(PEER, LinkId(2), LinkLost::PeerRestarted);
+        assert!(*restarted.borrow());
     }
     #[test]
     fn drag_content_ignores_input_pair_replacement_but_preserves_pause_and_boot_fences() {

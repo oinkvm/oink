@@ -44,6 +44,28 @@ pub(super) fn submit(job: impl FnOnce() + Send + 'static) {
     reporter().submit(Box::new(job));
 }
 
+/// Ordinary reporter only. Each native sink retains at most 16 exceptional
+/// callbacks between polls; queue overflow is counted instead of backpressure.
+pub(crate) fn callback_incidents(output: &oink_audio::playback::PlaybackMetrics) {
+    for incident in &output.callback_incidents {
+        let [ingress, pull, output, publish, adapter] = incident.phase_us();
+        tracing::debug!(target: "oink_audio_diagnostics", kind="audio_callback_incident",
+            sample_mono_us=incident.at_us, callback_sequence=incident.sequence,
+            callback_frames=incident.frames, callback_rate=incident.rate,
+            callback_budget_us=incident.budget_ns / 1000,
+            callback_work_us=incident.elapsed_ns / 1000,
+            callback_gap_us=incident.gap_us, native_gap_frames=incident.native_gap_frames,
+            callback_ingress_us=ingress, callback_pull_us=pull,
+            callback_output_us=output, callback_publish_us=publish, callback_adapter_us=adapter,
+            callback_sources=incident.work.sources, callback_scan_steps=incident.work.scan_steps,
+            callback_codec_calls=incident.work.codec_calls, callback_plc_frames=incident.work.plc_frames,
+            callback_decode_errors=incident.work.decode_errors,
+            callback_work_limited=incident.work.work_limited,
+            callback_missing_frames=incident.missing_frames, callback_fault=incident.fault,
+            "exceptional native audio callback; phase times include preemption");
+    }
+}
+
 pub(super) fn capture_levels(source: oink_foundation::DeviceId, levels: oink_audio::CaptureLevels) {
     submit(move || {
         let pre = levels.before_gain;

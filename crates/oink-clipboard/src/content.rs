@@ -17,18 +17,18 @@ use std::{
 };
 
 pub(crate) mod clipboard;
-mod completed;
 mod deferred;
-mod manifest;
-pub use completed::Completed;
-pub(crate) use completed::batch_delivered;
 pub use deferred::Deferred;
 mod progress;
 #[cfg(any(target_os = "macos", all(test, debug_assertions)))]
 pub(crate) mod promise;
 mod remote;
 pub use progress::{Phase as TransferPhase, Progress as TransferProgress};
+pub mod grants;
+pub mod linked;
 pub mod namespace;
+pub mod native_metadata;
+pub mod native_read;
 mod snapshot;
 mod transfer;
 pub(crate) mod url;

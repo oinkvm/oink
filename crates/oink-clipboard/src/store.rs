@@ -11,7 +11,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const RETENTION_SECS: u64 = 24 * 60 * 60;
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -25,22 +24,19 @@ const RECORD: &str = ".oink-content-v1";
 pub enum StoreKind {
     SourceSnapshot,
     PromiseExport,
-    CompletedDelivery,
 }
 impl StoreKind {
-    pub const ALL: [Self; 3] = [Self::SourceSnapshot, Self::PromiseExport, Self::CompletedDelivery];
+    pub const ALL: [Self; 2] = [Self::SourceSnapshot, Self::PromiseExport];
     pub fn directory(self) -> &'static str {
         match self {
             Self::SourceSnapshot => "source-snapshots",
             Self::PromiseExport => "promise-exports",
-            Self::CompletedDelivery => "completed-deliveries",
         }
     }
     pub fn category(self) -> CacheCategory {
         match self {
             Self::SourceSnapshot => CacheCategory::SourceSnapshots,
             Self::PromiseExport => CacheCategory::PromiseExports,
-            Self::CompletedDelivery => CacheCategory::CompletedDeliveries,
         }
     }
 }
@@ -58,7 +54,6 @@ struct Record {
     state: State,
     external_writers: bool,
     snapshot_bytes: u64,
-    manifest_hash: Option<[u8; 32]>,
     completed_at: Option<u64>,
 }
 
@@ -82,7 +77,7 @@ impl BatchId {
         getrandom::fill(&mut bytes).map_err(|_| io::Error::other("content identity unavailable"))?;
         Ok(Self(bytes))
     }
-    fn name(self) -> String {
+    pub(crate) fn name(self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
     }
 }
@@ -110,10 +105,9 @@ impl Drop for BatchInner {
     }
 }
 fn disposable(record: &Record) -> bool {
-    !record.external_writers && (record.kind != StoreKind::CompletedDelivery || record.state != State::Complete)
+    !record.external_writers
 }
 enum Cleanup {
-    Watch(std::path::PathBuf),
     Remove(std::path::PathBuf, StoreKind),
     #[cfg(all(test, debug_assertions))]
     Barrier(std::sync::mpsc::Sender<()>),
@@ -125,26 +119,8 @@ fn cleanup() -> &'static std::sync::mpsc::Sender<Cleanup> {
         std::thread::Builder::new()
             .name("oink-content-cleanup".into())
             .spawn(move || {
-                let mut roots = std::collections::HashSet::new();
-                let interval = std::time::Duration::from_secs(60);
-                let mut next = std::time::Instant::now() + interval;
-                loop {
-                    if std::time::Instant::now() >= next {
-                        roots.retain(|root: &std::path::PathBuf| root.is_dir());
-                        for root in &roots {
-                            sweep(root);
-                        }
-                        next = std::time::Instant::now() + interval;
-                    }
-                    let job = match receive.recv_timeout(next.saturating_duration_since(std::time::Instant::now())) {
-                        Ok(job) => job,
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    };
+                while let Ok(job) = receive.recv() {
                     match job {
-                        Cleanup::Watch(data) => {
-                            roots.insert(data);
-                        }
                         Cleanup::Remove(path, kind) => {
                             let sources = cache::source_guard();
                             if !sources.keys().any(|p| p.starts_with(&path) || path.starts_with(p))
@@ -179,12 +155,10 @@ fn cleanup() -> &'static std::sync::mpsc::Sender<Cleanup> {
 /// hold lifetime pins and are excluded below. Nothing in a user directory is
 /// traversed or removed. Unpinned source snapshots are disposable as well.
 pub fn recover(data: &Path) {
-    // Clipboard/drag owners are not reconstructed yet. Expire old bytes now;
-    // the periodic sweep can also retire consumed bytes after owners recover.
-    sweep_inner(data, unix_now(), false);
-    cleanup().send(Cleanup::Watch(data.to_owned())).ok();
+    // Receiver cut-over runs under the provider admission gate. This recovery
+    // owns source batches only and must not bypass that transaction.
     let sources = cache::source_guard();
-    for kind in StoreKind::ALL {
+    for kind in [StoreKind::SourceSnapshot, StoreKind::PromiseExport] {
         let root = data.join(kind.directory());
         let Ok(entries) = directory(&root).and_then(|_| fs::read_dir(&root)) else {
             continue;
@@ -194,76 +168,17 @@ pub fn recover(data: &Path) {
             if sources.keys().any(|p| p.starts_with(&path) || path.starts_with(p)) {
                 continue;
             }
-            if let Ok(record) = load(&path, kind) {
-                if kind == StoreKind::PromiseExport || disposable(&record) {
-                    let _ = cache::tree_bytes(&path).and_then(|_| remove_owned(&path));
-                } else if kind == StoreKind::CompletedDelivery {
-                    // A published directory is installed only after all files
-                    // finish. A crash can leave this private staging directory;
-                    // the lifetime lock proves no materializer still owns it.
-                    let partial = path.join("published.part");
-                    if fs::symlink_metadata(&partial).is_ok_and(|m| m.is_dir() && !cache::is_link(&m))
-                        && fs::remove_dir_all(partial).is_ok()
-                    {
-                        cache::changed(&root);
-                    }
-                }
+            if let Ok(record) = load(&path, kind)
+                && (kind == StoreKind::PromiseExport || disposable(&record))
+            {
+                let _ = cache::tree_bytes(&path).and_then(|_| remove_owned(&path));
             }
         }
     }
 }
 
-/// Sweep with the same lifetime lock used to acquire every owned batch/read.
-/// Owners protect early eviction; only actual reads can defer the absolute limit.
-pub fn sweep(data: &Path) {
-    sweep_at(data, unix_now());
-}
-pub(crate) fn sweep_at(data: &Path, now: u64) {
-    sweep_inner(data, now, true);
-}
-fn sweep_inner(data: &Path, now: u64, consumed: bool) {
-    #[cfg(target_os = "macos")]
-    crate::file_provider::retire_unavailable(data, now);
-    #[cfg(target_os = "macos")]
-    let _publications = crate::file_provider::retention_pins();
-    let root = data.join(StoreKind::CompletedDelivery.directory());
-    let sources = cache::source_guard();
-    let Ok(entries) = directory(&root).and_then(|_| fs::read_dir(&root)) else {
-        return;
-    };
-    let mut changed = false;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(record) = load(&path, StoreKind::CompletedDelivery) else {
-            continue;
-        };
-        if record.state != State::Complete || record.external_writers {
-            continue;
-        }
-        let expired = record
-            .completed_at
-            .is_some_and(|at| now.saturating_sub(at) >= RETENTION_SECS);
-        let protected = sources
-            .iter()
-            .any(|(p, pins)| (p.starts_with(&path) || path.starts_with(p)) && (!expired || pins.readers > 0));
-        if !protected
-            && (expired
-                || (consumed
-                    && (path.join(".delivered").is_file()
-                        || crate::content::batch_delivered(&path, record.manifest_hash))))
-        {
-            changed |= cache::tree_bytes(&path).and_then(|_| remove_owned(&path)).is_ok();
-        }
-    }
-    drop(sources);
-    if changed {
-        #[cfg(target_os = "macos")]
-        crate::file_provider::retire_unavailable(data, now);
-        cache::changed(&root);
-    }
-}
-
 fn remove_owned(path: &Path) -> io::Result<()> {
+    let _mutation = cache::Mutation(path.parent().unwrap());
     for child in fs::read_dir(path)? {
         let child = child?;
         if child.file_name() == RECORD {
@@ -329,18 +244,6 @@ fn load(path: &Path, kind: StoreKind) -> io::Result<Record> {
     Ok(record)
 }
 
-#[cfg(target_os = "macos")]
-pub(crate) fn publication_available(data: &Path, id: BatchId, now: u64) -> bool {
-    let path = data.join(StoreKind::CompletedDelivery.directory()).join(id.name());
-    load(&path, StoreKind::CompletedDelivery).is_ok_and(|record| match record.state {
-        State::Receiving => true,
-        State::Abandoned => false,
-        State::Complete => record
-            .completed_at
-            .is_some_and(|at| now.saturating_sub(at) < RETENTION_SECS),
-    })
-}
-
 pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -373,6 +276,7 @@ pub(crate) fn replace(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 fn save(path: &Path, record: &Record) -> io::Result<()> {
+    let _mutation = cache::Mutation(path.parent().unwrap());
     let temporary = path.join(".oink-content-next");
     let mut file = create_file(&temporary)?;
     let result = (|| {
@@ -391,7 +295,9 @@ fn save(path: &Path, record: &Record) -> io::Result<()> {
 impl Batch {
     /// Caller holds this batch's pin throughout writing. Names are generated
     /// from numeric node IDs, never from a peer-provided relative path.
+    #[cfg(windows)]
     pub(crate) fn commit_file(&self, node: crate::model::NodeId) -> io::Result<()> {
+        let _mutation = cache::Mutation(self.path().parent().unwrap());
         let record = self.0.record.lock().unwrap();
         if record.state != State::Receiving {
             return Err(invalid());
@@ -403,30 +309,6 @@ impl Batch {
         sync_directory(self.path())?;
         cache::changed(self.path().parent().unwrap());
         Ok(())
-    }
-    pub(crate) fn commit_manifest(&self, bytes: &[u8]) -> io::Result<[u8; 32]> {
-        if bytes.len() > 64 * 1024 * 1024 {
-            return Err(invalid());
-        }
-        let mut record = self.0.record.lock().unwrap();
-        if record.state != State::Receiving || record.external_writers {
-            return Err(invalid());
-        }
-        let part = self.path().join("manifest.part");
-        let mut file = create_file(&part)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        replace(&part, &self.path().join("manifest"))?;
-        sync_directory(self.path())?;
-        let mut next = record.clone();
-        next.state = State::Complete;
-        next.completed_at = Some(unix_now());
-        next.manifest_hash = Some(*blake3::hash(bytes).as_bytes());
-        save(self.path(), &next)?;
-        *record = next;
-        cache::changed(self.path().parent().unwrap());
-        Ok(*blake3::hash(bytes).as_bytes())
     }
     /// Create and pin before publishing any path to a reader or external writer.
     pub fn create(data: &Path, kind: StoreKind, id: BatchId) -> io::Result<Self> {
@@ -444,7 +326,6 @@ impl Batch {
             state: State::Receiving,
             external_writers: false,
             snapshot_bytes: 0,
-            manifest_hash: None,
             completed_at: None,
         };
         let lease = SourceLease::create_owner(|| {
@@ -466,121 +347,13 @@ impl Batch {
             snapshots: Mutex::new(()),
         })))
     }
-    /// Only complete target batches survive as readable content across restart.
-    /// Acquisition and cache clear are serialized by SourceLease's same lock.
-    pub fn restore(data: &Path, id: BatchId) -> io::Result<Self> {
-        Self::restore_at(data, id, unix_now())
-    }
-    fn restore_at(data: &Path, id: BatchId, now: u64) -> io::Result<Self> {
-        let root = data.join(StoreKind::CompletedDelivery.directory());
-        let path = root.join(id.name());
-        let mut record = None;
-        let lease = SourceLease::create_owner(|| {
-            directory(&root)?;
-            let loaded = load(&path, StoreKind::CompletedDelivery)?;
-            if loaded.state != State::Complete || loaded.external_writers {
-                return Err(invalid());
-            }
-            if loaded
-                .completed_at
-                .is_some_and(|at| now.saturating_sub(at) >= RETENTION_SECS)
-            {
-                return Err(io::Error::new(io::ErrorKind::NotFound, "completed delivery expired"));
-            }
-            record = Some(loaded);
-            Ok(path)
-        })?;
-        Ok(Self(Arc::new(BatchInner {
-            id,
-            lease: Some(lease),
-            record: Mutex::new(record.unwrap()),
-            snapshots: Mutex::new(()),
-        })))
-    }
-    /// Native placeholder caches must not extend an already completed delivery's
-    /// absolute retention. Receiving batches acquire their deadline on commit.
-    #[cfg(windows)]
-    pub(crate) fn remaining_retention(&self) -> Option<std::time::Duration> {
-        let record = self.0.record.lock().unwrap();
-        (record.kind == StoreKind::CompletedDelivery && record.state == State::Complete)
-            .then(|| {
-                record.completed_at.map(|at| {
-                    std::time::Duration::from_secs(RETENTION_SECS.saturating_sub(unix_now().saturating_sub(at)))
-                })
-            })
-            .flatten()
-    }
-    /// Pin an actual read, including acquisition, under the cleanup lifetime lock.
-    pub(crate) fn read_lease(&self) -> io::Result<SourceLease> {
-        self.read_lease_with(unix_now)
-    }
-    fn read_lease_with(&self, now: impl FnOnce() -> u64) -> io::Result<SourceLease> {
-        SourceLease::create_directory(|| {
-            let record = self.0.record.lock().unwrap();
-            if record.kind == StoreKind::CompletedDelivery
-                && record.state == State::Complete
-                && now().saturating_sub(record.completed_at.ok_or_else(invalid)?) >= RETENTION_SECS
-            {
-                return Err(io::Error::new(io::ErrorKind::NotFound, "completed delivery expired"));
-            }
-            directory(self.path())?;
-            Ok(self.path().to_owned())
-        })
-    }
     // Consumption markers do not acquire a new payload capability. A reader
     // admitted before expiry may finish and mark EOF while holding its lease.
-    fn marker_lease(&self) -> io::Result<SourceLease> {
-        SourceLease::create_directory(|| {
-            directory(self.path())?;
-            Ok(self.path().to_owned())
-        })
-    }
-    pub(crate) fn delivered(&self) -> io::Result<()> {
-        let _read = self.marker_lease()?;
-        match create_file(&self.path().join(".delivered")) {
-            Ok(file) => {
-                file.sync_all()?;
-                sync_directory(self.path())
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-    pub(crate) fn node_delivered(&self, node: u64) -> io::Result<()> {
-        let _read = self.marker_lease()?;
-        match create_file(&self.path().join(format!(".delivered-{node}"))) {
-            Ok(file) => {
-                file.sync_all()?;
-                sync_directory(self.path())
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
     pub fn path(&self) -> &Path {
         self.0.lease.as_ref().unwrap().path()
     }
     pub fn id(&self) -> BatchId {
         self.0.id
-    }
-    /// A receipt covers the complete inventory, not merely the existence of a
-    /// directory. Restore never revives a partial or altered manifest.
-    pub(crate) fn manifest(&self) -> io::Result<Vec<u8>> {
-        let record = self.0.record.lock().unwrap();
-        if record.state != State::Complete || record.kind != StoreKind::CompletedDelivery {
-            return Err(invalid());
-        }
-        let expected = record.manifest_hash.ok_or_else(invalid)?;
-        let path = self.path().join("manifest");
-        let metadata = fs::symlink_metadata(&path)?;
-        if cache::is_link(&metadata) || !metadata.is_file() || metadata.len() > 64 * 1024 * 1024 {
-            return Err(invalid());
-        }
-        let bytes = fs::read(path)?;
-        if blake3::hash(&bytes).as_bytes() != &expected {
-            return Err(invalid());
-        }
-        Ok(bytes)
     }
     fn update(&self, change: impl FnOnce(&mut Record) -> io::Result<()>) -> io::Result<()> {
         let mut record = self.0.record.lock().unwrap_or_else(|e| e.into_inner());
@@ -630,7 +403,7 @@ impl Batch {
     /// Snapshot one NON-FILE representation through EOF. The byte after an exact
     /// limit distinguishes valid complete data from oversized data; nothing is
     /// published on failure. File content uses the transfer's separate budget.
-    pub fn snapshot(&self, representation: u32, reader: &mut dyn Read) -> io::Result<(u64, [u8; 32])> {
+    pub fn snapshot(&self, representation: u32, reader: &mut dyn Read) -> io::Result<u64> {
         self.snapshot_with_limits(representation, reader, REPRESENTATION_BYTES, SNAPSHOT_BYTES)
     }
     fn snapshot_with_limits(
@@ -639,7 +412,7 @@ impl Batch {
         reader: &mut dyn Read,
         per_rep: u64,
         total: u64,
-    ) -> io::Result<(u64, [u8; 32])> {
+    ) -> io::Result<u64> {
         // Serialize writers for the aggregate budget, but never hold the batch
         // metadata lock while reading a native/network source. A reader of an
         // already stored representation needs that lock to acquire its lease.
@@ -659,9 +432,9 @@ impl Batch {
         if destination.try_exists()? {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists));
         }
+        let _mutation = cache::Mutation(self.path().parent().unwrap());
         let mut file = create_file(&part)?;
         let result = (|| {
-            let mut hash = blake3::Hasher::new();
             let mut buffer = vec![0; 1024 * 1024];
             let mut bytes = 0_u64;
             loop {
@@ -677,7 +450,6 @@ impl Batch {
                     ));
                 }
                 file.write_all(&buffer[..n])?;
-                hash.update(&buffer[..n]);
                 bytes += n as u64;
             }
             file.sync_all()?;
@@ -694,7 +466,7 @@ impl Batch {
             save(self.path(), &next)?;
             *record = next;
             cache::changed(self.path().parent().unwrap());
-            Ok((bytes, *hash.finalize().as_bytes()))
+            Ok(bytes)
         })();
         if result.is_err() {
             let _ = fs::remove_file(part);

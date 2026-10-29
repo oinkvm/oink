@@ -26,6 +26,8 @@ pub enum CardOptionEdit {
     ScreenShared(bool),
     GameModePreference(GamePreference),
     AudioExitClaim(bool),
+    MicrophoneShareClaim(bool),
+    MicrophoneReceiveMuted(bool),
 }
 impl CardOptionEdit {
     pub fn number(&self) -> u32 {
@@ -38,6 +40,8 @@ impl CardOptionEdit {
             Self::ScreenShared(_) => 6,
             Self::GameModePreference(_) => 18,
             Self::AudioExitClaim(_) => 20,
+            Self::MicrophoneShareClaim(_) => oink_protocol::v1::dto::LocalOption::MicrophoneShareClaim.number(),
+            Self::MicrophoneReceiveMuted(_) => oink_protocol::v1::dto::LocalOption::MicrophoneReceiveMuted.number(),
         }
     }
     pub fn command(&self) -> CardCommand {
@@ -67,6 +71,7 @@ pub enum TokenOperation {
     /// A source slider supplies absolute gain/mute; this is an option15 fence,
     /// not an icon's fixed desired operation.
     ForwardingControls,
+    MicrophoneControls,
     /// The selected exit, output generation and claim form one indivisible fence.
     ExitVolume {
         output_id: String,

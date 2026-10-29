@@ -4,7 +4,7 @@ import { afterEach, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import { App } from './App';
 import { agent } from './api/store';
 import type { DeviceCardsView } from './api/cards';
-import type { Layout, Placement } from './api/types';
+import type { Layout } from './api/types';
 import { profileHarness } from './arrange/profileHarness';
 import { setLanguage } from './i18n';
 
@@ -64,42 +64,25 @@ afterEach(() => { backend.harness!.stop(); cleanup(); agent.reset(); localStorag
 
 const toggle = () => screen.getByRole('button', { name: 'Auto-compact' });
 const flip = async () => { await act(async () => { fireEvent.click(toggle()); }); await backend.harness!.settle(); };
-const origin = (placements: Placement[], device: string) => placements.find(p => p.device === device)!.origin;
-
-it('moves the floating computer straight down onto the row below when auto-compact is turned on', async () => {
+it('keeps the floating computer and the row unchanged when auto-compact is turned on', async () => {
   render(<App/>);
-  await flip(); // off
-  await flip(); // on
-  const commits = backend.harness!.of('commit_arrangement').map(r => r.params!.placements as Placement[]);
-  expect(commits).toHaveLength(1);
-  // It stops on the left computer's top edge: 0.804 − 0.406.
-  expect(origin(commits[0], TOP).x).toBeCloseTo(.566, 9);
-  expect(origin(commits[0], TOP).y + .722 * 2160 / 3840).toBeCloseTo(.804, 9);
-  expect(origin(commits[0], SELF)).toEqual({ x: .749, y: .852 });
-  expect(origin(commits[0], LEFT)).toEqual({ x: .127, y: .804 });
+  const before = structuredClone(backend.harness!.fixture.state().snapshot);
+  await flip(); await flip();
+  expect(backend.harness!.of('commit_arrangement')).toEqual([]);
+  expect(backend.harness!.fixture.state().snapshot).toEqual(before);
+  expect(screen.getByRole('button', { name: 'Undo' }).hasAttribute('disabled')).toBe(true);
 });
 
-it('compacts on the first turn-on even when the stored preference was off', async () => {
+it('only updates the preference on the first turn-on when the stored preference was off', async () => {
   localStorage.setItem('oink:prefs', JSON.stringify({ compact_layout: false }));
   render(<App/>);
   expect(toggle().getAttribute('aria-pressed')).toBe('false');
   await flip();
-  expect(backend.harness!.of('commit_arrangement')).toHaveLength(1);
-});
-
-it('records the complete global pass in one undo entry and leaves the toggle on', async () => {
-  render(<App/>);
-  const before = structuredClone(backend.harness!.fixture.state().snapshot);
-  await flip(); await flip();
-  expect(backend.harness!.of('commit_arrangement')).toHaveLength(1);
-  await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Undo' })); });
-  await backend.harness!.settle();
-  expect(backend.harness!.of('replay_arrangement')).toHaveLength(1);
-  expect(backend.harness!.fixture.state().snapshot!.placements).toEqual(before!.placements);
   expect(toggle().getAttribute('aria-pressed')).toBe('true');
+  expect(backend.harness!.of('commit_arrangement')).toEqual([]);
 });
 
-it.each([{ sync: false, editable: false }, { sync: true, editable: true }, { sync: true, editable: false }])('compacts a multi-screen computer rigidly with sync=$sync editable=$editable in one undoable placement edit', async ({ sync, editable }) => {
+it.each([{ sync: false, editable: false }, { sync: true, editable: true }, { sync: true, editable: false }])('leaves multi-screen geometry unchanged on turn-on with sync=$sync editable=$editable', async ({ sync, editable }) => {
   backend.harness!.stop();
   const initial = structuredClone(backend.harness!.fixture.state().snapshot!);
   const [a, b] = initial.native;
@@ -120,13 +103,7 @@ it.each([{ sync: false, editable: false }, { sync: true, editable: true }, { syn
   await flip(); await flip();
   const previews = h.of('preview_system_arrangement');
   expect(previews).toHaveLength(0);
-  expect(h.of('commit_arrangement')).toHaveLength(1);
-  expect(h.of('commit_arrangement')[0].params!.native_plan_tokens).toEqual([]);
-  expect(h.fixture.state().snapshot!.native.map(n => n.screens)).toEqual(initial.native.map(n => n.screens));
-  expect(h.fixture.state().snapshot!.placements[0].origin.x).toBe(0);
-  expect(Math.abs(h.fixture.state().snapshot!.placements[0].origin.y - .07)).toBeLessThanOrEqual(2 ** -30);
-  await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Undo' })); });
-  await h.settle();
+  expect(h.of('commit_arrangement')).toEqual([]);
   expect(h.fixture.state().snapshot!.placements).toEqual(initial.placements);
   expect(h.fixture.state().snapshot!.native.map(n => n.screens)).toEqual(initial.native.map(n => n.screens));
   expect(screen.getByRole('button', { name: 'Undo' }).hasAttribute('disabled')).toBe(true);

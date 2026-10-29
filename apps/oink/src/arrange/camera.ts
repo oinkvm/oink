@@ -1,5 +1,5 @@
 import { presets } from 'oink-ui';
-import { bounds, sameRect } from './geometry';
+import { sameRect } from './geometry';
 import type { Camera, Rect } from './geometry';
 
 const KEYS = ['zoom', 'ox', 'oy'] as const;
@@ -17,11 +17,15 @@ export function visibleArrangement(camera: Camera, viewport: { w: number; h: num
 
 /** Expand gradually: refitting immediately would push an outside pointer ever farther away. */
 export function growArrangementView(view: Rect, live: Rect, zoom: number, padding: number, dt: number): Rect {
-    // A screen may enter the margin before reaching the edge of the canvas.
-    const mx = Math.min(padding / zoom, live.w / 2);
-    const my = Math.min(padding / zoom, live.h / 2);
-    const inner = { x: live.x + mx, y: live.y + my, w: live.w - 2 * mx, h: live.h - 2 * my };
-    const need = bounds([view, inner]);
+    // A screen may enter the margin; once it crosses the edge of the canvas, that
+    // side targets the whole screen. Targeting only the part past the edge would
+    // start from zero speed, and the growth would show only once it was far out.
+    const m = padding / zoom;
+    const x0 = live.x < view.x - m ? live.x : view.x;
+    const y0 = live.y < view.y - 56 / zoom ? live.y : view.y;
+    const x1 = live.x + live.w > view.x + view.w + m ? live.x + live.w : view.x + view.w;
+    const y1 = live.y + live.h > view.y + view.h + m ? live.y + live.h : view.y + view.h;
+    const need = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
     if (dt <= 0 || sameRect(need, view, .5)) return view;
     const k = 1 - Math.exp(-dt * 6);
     return {

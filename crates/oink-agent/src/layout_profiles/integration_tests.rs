@@ -14,10 +14,12 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
-#[derive(Debug)]
 struct Displays {
     state: Mutex<NativeConfiguration>,
     calls: AtomicUsize,
+    reads: AtomicUsize,
+    read_fail: std::sync::atomic::AtomicBool,
+    watchers: Mutex<Vec<ChangeHandler>>,
     fail: std::sync::atomic::AtomicBool,
 }
 impl Displays {
@@ -42,8 +44,16 @@ impl Displays {
                 ],
             }),
             calls: AtomicUsize::new(0),
+            reads: AtomicUsize::new(0),
+            read_fail: std::sync::atomic::AtomicBool::new(false),
+            watchers: Mutex::new(Vec::new()),
             fail: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+    fn changed(&self) {
+        for watcher in lock(&self.watchers).clone() {
+            watcher();
+        }
     }
 }
 impl DisplayBackend for Displays {
@@ -65,10 +75,16 @@ impl DisplayBackend for Displays {
             })
             .collect())
     }
-    fn watch(&self, _: ChangeHandler) -> std::result::Result<(), DisplayError> {
+    fn watch(&self, watcher: ChangeHandler) -> std::result::Result<(), DisplayError> {
+        lock(&self.watchers).push(watcher);
         Ok(())
     }
     fn native_configuration(&self) -> std::result::Result<NativeConfiguration, DisplayError> {
+        let fail = self.read_fail.load(Ordering::SeqCst);
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        if fail {
+            return Err(DisplayError::Platform("Injected native read failure".into()));
+        }
         Ok(lock(&self.state).clone())
     }
     fn apply_native_origins(
@@ -161,6 +177,53 @@ async fn enable(node: &Node, device: crate::api::DeviceKey, id: &str) {
     .await;
 }
 #[test]
+fn failed_native_observations_are_logged_without_retrying_or_writing() {
+    crate::test_watchdog::run(module_path!(), "native observation diagnostics", Some(4), async {
+        let dir = tempfile::tempdir().unwrap();
+        let displays = Displays::new();
+        let node = start(dir.path(), displays.clone()).await;
+        node.hold_platform_sensor_clock().await;
+        displays.read_fail.store(true, Ordering::SeqCst);
+        let reads = displays.reads.load(Ordering::SeqCst);
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let writer = output.reopen().unwrap();
+        let n = node.clone();
+        let backend = displays.clone();
+        tokio::task::spawn_blocking(move || {
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(Mutex::new(writer))
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                for site in ["startup", "observer"] {
+                    let error = n.observe_native_arrangement(site).unwrap_err();
+                    assert_eq!(error.code, ErrorCode::FactsUnavailable);
+                    assert!(error.message.contains("Injected native read failure"));
+                }
+                backend.read_fail.store(false, Ordering::SeqCst);
+                lock(&backend.state).displays[0].primary = false;
+                let error = n.observe_native_arrangement("observer").unwrap_err();
+                assert_eq!(error.code, ErrorCode::FactsUnavailable);
+                assert_eq!(error.message, "Main screen unavailable");
+            });
+        })
+        .await
+        .unwrap();
+        assert_eq!(displays.reads.load(Ordering::SeqCst), reads + 3);
+        assert_eq!(displays.calls.load(Ordering::SeqCst), 0);
+        node.resume_platform_sensor_clock();
+        node.shutdown().await;
+        let logs = std::fs::read_to_string(output.path()).unwrap();
+        assert_eq!(logs.matches("native arrangement observation failed").count(), 3);
+        for site in ["startup", "observer"] {
+            assert!(logs.contains(&format!("call_site=\"{site}\"")), "{logs}");
+        }
+        assert!(logs.contains("Injected native read failure"), "{logs}");
+        assert!(logs.contains("operation=\"native_state\" display_paths=2"), "{logs}");
+    });
+}
+#[test]
 fn completed_native_observation_keeps_save_tokens_current() {
     crate::test_watchdog::run(module_path!(), "native observation publication", Some(4), async {
         let dir = tempfile::tempdir().unwrap();
@@ -215,6 +278,76 @@ fn completed_native_observation_keeps_save_tokens_current() {
         node.shutdown().await;
     });
 }
+#[test]
+fn native_screen_preview_leaves_other_computers_fixed_for_frontend_release() {
+    crate::test_watchdog::run(module_path!(), "native preview collision ownership", Some(6), async {
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let da = Displays::new();
+        let db = Displays::new();
+        let a = start(dirs[0].path(), da.clone()).await;
+        let b = start(dirs[1].path(), db.clone()).await;
+        let source_default = query(&a).await.active_profile_id.unwrap();
+        common::pair(&a, &b).await;
+        common::profile_handoff(&[&a, &b], &source_default).await;
+        enable(&a, a.id().into(), "enable-native-edit").await;
+        let state = query(&a).await;
+        let mut placements = state.snapshot.as_ref().unwrap().placements.clone();
+        let own = placements.iter().find(|p| p.device == a.id().into()).unwrap().clone();
+        // The peer starts just below the second screen, outside today's desktop.
+        placements
+            .iter_mut()
+            .find(|p| p.device == b.id().into())
+            .unwrap()
+            .origin = Point::new(own.origin.x + 100.0 * own.scale, own.origin.y + 100.0 * own.scale);
+        let _: OperationReply = call(
+            &a,
+            Request::CommitArrangement(CommitRequest {
+                request_id: "place-peer".into(),
+                expected_token: state.token,
+                placements: placements.clone(),
+                native_plan_tokens: Vec::new(),
+                disabled: Vec::new(),
+                screen_shared: Vec::new(),
+            }),
+        )
+        .await;
+        let state = query(&a).await;
+        let preview: PreviewReply = call(
+            &a,
+            Request::PreviewSystemArrangement(PreviewRequest {
+                sequence: "1".into(),
+                expected_token: state.token,
+                device: a.id().into(),
+                moved_screen: crate::api::ScreenKey {
+                    device: a.id().into(),
+                    display: "second".into(),
+                },
+                desired_canvas_origin: Point::new(own.origin.x + 100.0 * own.scale, own.origin.y + 50.0 * own.scale),
+            }),
+        )
+        .await;
+        assert_eq!(
+            preview
+                .native
+                .screens
+                .iter()
+                .find(|s| s.screen.display == "second")
+                .unwrap()
+                .origin,
+            Point::new(100.0, 50.0)
+        );
+        assert_eq!(
+            preview.placements, placements,
+            "canvas collision release belongs to the frontend and must preserve unedited computers"
+        );
+        assert!(preview.adjustments.is_empty());
+        assert_eq!(da.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(db.calls.load(Ordering::SeqCst), 0);
+        a.shutdown().await;
+        b.shutdown().await;
+    });
+}
+
 #[test]
 fn profile_ipc_native_edit_dedup_load_undo_and_restart() {
     crate::test_watchdog::run(module_path!(), "profile IPC owner", Some(4), async {
@@ -521,13 +654,9 @@ fn multi_owner_load_returns_actual_partial_state_without_compensation() {
         let db = Displays::new();
         let a = start(dirs[0].path(), da.clone()).await;
         let b = start(dirs[1].path(), db.clone()).await;
+        let source_default = query(&a).await.active_profile_id.unwrap();
         common::pair(&a, &b).await;
-        common::until("catalog import converged", || {
-            let ca = lock(&a.inner.profiles.data).catalog.clone();
-            let cb = lock(&b.inner.profiles.data).catalog.clone();
-            ca.as_ref().is_some_and(|c| c.profiles.len() == 1) && ca == cb
-        })
-        .await;
+        common::profile_handoff(&[&a, &b], &source_default).await;
         enable(&a, a.id().into(), "enable-a").await;
         enable(&a, b.id().into(), "enable-b").await;
         let state = query(&a).await;
@@ -742,7 +871,31 @@ fn requester_restart_resolves_durable_pending_without_a_second_write() {
         .await;
         assert_eq!(result.operation.status, OperationStatus::Applied);
         assert!(result.operation.history_required);
-        let _: OperationReply = call(&restarted, Request::CommitArrangement(commit)).await;
+        let n = restarted.clone();
+        tokio::task::spawn_blocking(move || {
+            // Recovery publishes its durable result before it drops command_gate.
+            // Freeze that window: a duplicate is a receipt read, even while the
+            // resolver or another command still owns the mutation gate.
+            let _command = lock(&n.inner.profiles.command_gate);
+            let reply = dispatch(&n, Request::CommitArrangement(commit.clone())).unwrap();
+            let reply = serde_json::to_value(reply).unwrap();
+            assert_eq!(reply["operation_id"], "crash-step", "{reply}");
+            assert_eq!(reply["state"]["operation"]["status"], "applied");
+
+            let mut changed = commit.clone();
+            changed.placements[0].origin.x += 1.0;
+            let reply = dispatch(&n, Request::CommitArrangement(changed)).unwrap();
+            let reply = serde_json::to_value(reply).unwrap();
+            assert_eq!(reply["error"]["code"], "stale_state", "{reply}");
+
+            let mut fresh = commit;
+            fresh.request_id = "another-write".into();
+            let reply = dispatch(&n, Request::CommitArrangement(fresh)).unwrap();
+            let reply = serde_json::to_value(reply).unwrap();
+            assert_eq!(reply["error"]["code"], "busy", "{reply}");
+        })
+        .await
+        .unwrap();
         assert_eq!(displays.calls.load(Ordering::SeqCst), 1);
         restarted.shutdown().await;
     });
@@ -1320,6 +1473,71 @@ fn rapid_second_pairing_converges_three_real_nodes_without_import_proofs() {
 }
 
 #[test]
+fn manual_layout_fixture_waits_for_target_catalog_after_screen_facts() {
+    crate::test_watchdog::run(module_path!(), "manual fixture catalog readiness", Some(6), async {
+        use crate::api::AgentApi;
+
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let a = start(dirs[0].path(), Displays::new()).await;
+        let b = start(dirs[1].path(), Displays::new()).await;
+        // Hold both publication paths until after facts and input admission.
+        // This forces the ordering that used to flake in diagnostics setup.
+        a.inner.profiles.defer_catalogs.store(true, Ordering::SeqCst);
+        b.inner.profiles.defer_joins.store(true, Ordering::SeqCst);
+        common::pair(&a, &b).await;
+        let nodes = [&a, &b];
+        common::until("screen facts before target catalog", || {
+            nodes.iter().all(|n| n.layout().0.screens.len() == 4)
+                && a.profile_snapshot().is_ok_and(|s| s.readiness == Readiness::Syncing)
+        })
+        .await;
+        // The command fence is intentional: a real caller must wait for ready
+        // state rather than auto-saving target visibility into a source list.
+        let node = a.clone();
+        let peer = b.id().into();
+        let error = tokio::task::spawn_blocking(move || node.set_screen_disabled(peer, true))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(&error, crate::api::ApiError::InvalidState { message }
+                if message == "Waiting for the target group catalog"),
+            "{error:?}"
+        );
+
+        let mut ready = std::pin::pin!(common::editable_layouts(&nodes, 4));
+        let observed =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(ready.as_mut(), cx))).await;
+        assert!(
+            observed.is_pending(),
+            "screen facts alone admitted a manual layout fixture"
+        );
+
+        a.inner.profiles.defer_catalogs.store(false, Ordering::SeqCst);
+        b.inner.profiles.defer_joins.store(false, Ordering::SeqCst);
+        ready.await;
+        let node = a.clone();
+        tokio::task::spawn_blocking(move || node.set_screen_disabled(peer, true))
+            .await
+            .unwrap()
+            .unwrap();
+        common::until("visibility edit after catalog publication", || {
+            nodes.iter().all(|n| {
+                n.link_config()
+                    .unwrap()
+                    .applied()
+                    .owners
+                    .get(&peer.0)
+                    .is_some_and(|owner| !owner.screen_shared)
+            })
+        })
+        .await;
+        a.shutdown().await;
+        b.shutdown().await;
+    });
+}
+
+#[test]
 fn awaiting_target_catalog_never_mutates_retained_source_profiles() {
     crate::test_watchdog::run(module_path!(), "awaiting catalog mutation fence", Some(6), async {
         let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
@@ -1479,3 +1697,573 @@ fn catalog_publication_cannot_be_overwritten_by_snapshot_initialization() {
         },
     );
 }
+
+#[test]
+fn hotplug_fixture_waits_for_handoff_even_when_provisional_catalogs_match() {
+    crate::test_watchdog::run(module_path!(), "hotplug fixture handoff fence", Some(6), async {
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let a = start(dirs[0].path(), Displays::new()).await;
+        let b = start(dirs[1].path(), Displays::new()).await;
+        let source_default = query(&a).await.active_profile_id.unwrap();
+        b.inner.profiles.defer_joins.store(true, Ordering::SeqCst);
+        common::pair(&a, &b).await;
+        common::until("provisional catalogs match before handoff", || {
+            let ca = lock(&a.inner.profiles.data).catalog.clone();
+            let cb = lock(&b.inner.profiles.data).catalog.clone();
+            ca.as_ref().is_some_and(|c| {
+                c.group.0 == b.group_id().unwrap() && c.profiles.len() == 1 && c.completed_joins.is_empty()
+            }) && ca == cb
+                && [&a, &b].iter().all(|n| common::profile_layout_ready(n))
+        })
+        .await;
+        let nodes = [&a, &b];
+        let mut handoff = std::pin::pin!(common::profile_handoff(&nodes, &source_default));
+        let observed =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(handoff.as_mut(), cx))).await;
+        assert!(
+            observed.is_pending(),
+            "equal provisional catalogs are not a completed profile handoff"
+        );
+        b.inner.profiles.defer_joins.store(false, Ordering::SeqCst);
+        handoff.await;
+        for node in [&a, &b] {
+            let catalog = lock(&node.inner.profiles.data).catalog.clone().unwrap();
+            assert!(!catalog.completed_joins.is_empty());
+            assert_eq!(catalog.active_profile_id, source_default);
+        }
+        a.shutdown().await;
+        b.shutdown().await;
+    });
+}
+
+#[test]
+fn physical_topology_ignores_online_state_and_profile_restores_plug_unplug_once() {
+    crate::test_watchdog::run(module_path!(), "physical topology restore", Some(6), async {
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let da = Displays::new();
+        let db = Displays::new();
+        let a = start(dirs[0].path(), da.clone()).await;
+        let b = start(dirs[1].path(), db.clone()).await;
+        let source_default = query(&a).await.active_profile_id.unwrap();
+        common::pair(&a, &b).await;
+        common::profile_handoff(&[&a, &b], &source_default).await;
+        let n = a.clone();
+        let peer = b.id();
+        tokio::task::spawn_blocking(move || {
+            n.commit_manual_layout(|layout| {
+                layout.place_device(n.id(), Point::default(), 0.01, true);
+                layout.place_device(peer, Point::new(2.0, 0.0), 0.01, true);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let state = query(&a).await;
+        let _: LayoutProfilesState = call(
+            &a,
+            Request::CreateLayoutProfile(Create {
+                request_id: "topology-save".into(),
+                expected_token: state.token,
+                name: "Physical desktop".into(),
+            }),
+        )
+        .await;
+        let saved = lock(&a.inner.profiles.data).catalog.clone().unwrap();
+        assert!(saved.active().saved_topology.is_some());
+        common::until("saved topology propagated", || {
+            lock(&b.inner.profiles.data).catalog.as_ref() == Some(&saved)
+        })
+        .await;
+        // Keep the second replica on the saved geometry while the writer
+        // processes the excursion. Equal content alone must not count as the
+        // restore echo: this replica still has the pre-hotplug register.
+        b.link_config().unwrap().hold_incoming_config_states(true);
+        let mut members = (*a.link_config().unwrap().members()).clone();
+        let physical = super::topology::from_facts(&members);
+        for member in &mut members.members {
+            member.online = !member.online;
+        }
+        assert_eq!(super::topology::from_facts(&members), physical);
+
+        let extra = NativeDisplay {
+            key: "extra".into(),
+            bounds: Rect::new(200., 0., 100., 100.),
+            primary: false,
+            mirror_of: None,
+            mode: "extra-mode".into(),
+        };
+        lock(&da.state).displays.push(extra);
+        da.changed();
+        common::until("hotplug moves peer but not profile", || {
+            let observed = a.observe_profiles().unwrap();
+            observed
+                .snapshot
+                .native
+                .iter()
+                .any(|n| n.device.0 == a.id() && n.screens.len() == 3)
+                && observed.snapshot.placements != saved.active().content.placements
+        })
+        .await;
+        let n = a.clone();
+        tokio::task::spawn_blocking(move || n.refresh_layout_profiles())
+            .await
+            .unwrap();
+        assert_eq!(lock(&a.inner.profiles.data).catalog.as_ref(), Some(&saved));
+        lock(&da.state).displays.pop();
+        da.changed();
+        common::until("saved placements restored on both replicas", || {
+            [&a, &b].iter().all(|n| {
+                n.observe_profiles()
+                    .is_ok_and(|o| model::same_content(&o.snapshot, &saved.active().content))
+            })
+        })
+        .await;
+        assert_ne!(
+            a.link_config().unwrap().applied().version,
+            b.link_config().unwrap().applied().version,
+            "matching saved geometry can precede the restore register"
+        );
+        b.link_config().unwrap().hold_incoming_config_states(false);
+        common::until("restored content and register converged", || {
+            let version = a.link_config().unwrap().applied().version.clone();
+            [&a, &b].iter().all(|node| {
+                node.link_config().unwrap().applied().version == version
+                    && node.observe_profiles().is_ok_and(|o| {
+                        o.layout_version == version && model::same_content(&o.snapshot, &saved.active().content)
+                    })
+            })
+        })
+        .await;
+        let versions = [
+            a.link_config().unwrap().applied().version.clone(),
+            b.link_config().unwrap().applied().version.clone(),
+        ];
+        for _ in 0..4 {
+            for node in [&a, &b] {
+                let n = node.clone();
+                tokio::task::spawn_blocking(move || n.refresh_layout_profiles())
+                    .await
+                    .unwrap();
+                assert_eq!(lock(&node.inner.profiles.data).catalog.as_ref(), Some(&saved));
+            }
+        }
+        assert_eq!(a.link_config().unwrap().applied().version, versions[0]);
+        assert_eq!(b.link_config().unwrap().applied().version, versions[1]);
+        assert_eq!(da.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(db.calls.load(Ordering::SeqCst), 0);
+        a.shutdown().await;
+        b.shutdown().await;
+    });
+}
+
+#[test]
+fn legacy_gap_travel_edit_autosaves_active_profile_and_physical_topology() {
+    use crate::api::AgentApi;
+    crate::test_watchdog::run(module_path!(), "legacy topology autosave", Some(4), async {
+        let dir = tempfile::tempdir().unwrap();
+        let node = start(dir.path(), Displays::new()).await;
+        let initial = query(&node).await;
+        let _: LayoutProfilesState = call(
+            &node,
+            Request::CreateLayoutProfile(Create {
+                request_id: "legacy-topology".into(),
+                expected_token: initial.token,
+                name: "Desktop".into(),
+            }),
+        )
+        .await;
+        let before = lock(&node.inner.profiles.data).catalog.clone().unwrap();
+        let gap_travel = !before.active().content.topology.gap_travel;
+        let n = node.clone();
+        tokio::task::spawn_blocking(move || {
+            n.set_input_settings(serde_json::from_value(serde_json::json!({"gap_travel": gap_travel})).unwrap())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(node.layout().0.settings.gap_travel, gap_travel);
+        let saved = lock(&node.inner.profiles.data).catalog.clone().unwrap();
+        assert_ne!(
+            saved.active().content_revision,
+            before.active().content_revision,
+            "the legacy manual topology edit must save a new profile revision"
+        );
+        assert_eq!(saved.active().content.topology.gap_travel, gap_travel);
+        assert_eq!(
+            saved.active().saved_topology,
+            node.observe_profiles().unwrap().physical_topology
+        );
+        assert_eq!(
+            super::store::load(dir.path(), saved.group).unwrap().as_ref(),
+            Some(&saved)
+        );
+        let n = node.clone();
+        tokio::task::spawn_blocking(move || {
+            n.set_input_settings(serde_json::from_value(serde_json::json!({"gap_travel": gap_travel})).unwrap())
+                .unwrap();
+            n.set_input_settings(serde_json::from_value(serde_json::json!({"cursor_trail": true})).unwrap())
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            lock(&node.inner.profiles.data).catalog.as_ref(),
+            Some(&saved),
+            "an unchanged topology choice or unrelated input preference must not save again"
+        );
+        node.shutdown().await;
+    });
+}
+
+#[test]
+fn native_tokens_refresh_on_display_events_without_idle_polling_and_retry_failures() {
+    crate::test_watchdog::run(module_path!(), "event-driven native tokens", Some(12), async {
+        let dir = tempfile::tempdir().unwrap();
+        let displays = Displays::new();
+        let node = start(dir.path(), displays.clone()).await;
+        common::until("initial platform observation", || {
+            node.inner.platform_ready.load(Ordering::Acquire)
+        })
+        .await;
+        let token = || {
+            node.link_config()
+                .unwrap()
+                .local_facts()
+                .native_arrangement_token()
+                .unwrap()
+        };
+        let initial = token();
+        let reads = displays.reads.load(Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(4200)).await;
+        assert_eq!(
+            displays.reads.load(Ordering::SeqCst),
+            reads,
+            "idle nodes must not enumerate native configuration every two seconds"
+        );
+
+        // Mode identity can change while DisplayInfo bounds/pixels stay equal.
+        lock(&displays.state).displays[0].mode.push_str("-changed");
+        displays.changed();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while token() == initial {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("display callback must refresh the native token promptly");
+        let next = token();
+        let reads = displays.reads.load(Ordering::SeqCst);
+        displays.read_fail.store(true, Ordering::SeqCst);
+        lock(&displays.state).displays[0].mode.push_str("-recovered");
+        displays.changed();
+        common::until("failed native enumeration observed", || {
+            displays.reads.load(Ordering::SeqCst) > reads
+        })
+        .await;
+        displays.read_fail.store(false, Ordering::SeqCst);
+        // Some platforms send no second notification after a transient error.
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while token() == next {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("failed event read must retry without another callback");
+        node.shutdown().await;
+    });
+}
+
+#[test]
+fn remote_hotplug_returns_to_the_manually_saved_profile_without_saving_repairs() {
+    remote_hotplug_profile_return(false);
+}
+
+#[test]
+fn remote_unplug_with_catalog_ahead_of_manual_layout_preserves_the_manual_placement() {
+    remote_hotplug_profile_return(true);
+}
+
+fn remote_hotplug_profile_return(delay_manual_layout: bool) {
+    use crate::api::AgentApi;
+    use oink_protocol::v1::schema::WireDto;
+    crate::test_watchdog::run(module_path!(), "remote hotplug profile return", Some(6), async {
+        let dirs = [
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        ];
+        let da = Displays::new();
+        let db = Displays::new();
+        lock(&da.state).displays.pop();
+        lock(&db.state).displays.pop();
+        let a = start(dirs[0].path(), da.clone()).await;
+        let b = start(dirs[1].path(), db.clone()).await;
+        // Force the old-register unplug to win the concurrent LWW tie. This
+        // turns the release-gate timing failure into a deterministic ordering.
+        let (a, b, da, db) = if delay_manual_layout && a.id() > b.id() {
+            (b, a, db, da)
+        } else {
+            (a, b, da, db)
+        };
+        let source_default = query(&a).await.active_profile_id.unwrap();
+        common::pair(&a, &b).await;
+        common::profile_handoff(&[&a, &b], &source_default).await;
+        let c = start(dirs[2].path(), Displays::new()).await;
+        common::pair(&a, &c).await;
+        common::active(&[&a, &b, &c]).await;
+        common::profile_handoff(&[&a, &b, &c], &source_default).await;
+        let leaving = c.clone();
+        tokio::task::spawn_blocking(move || leaving.leave_group())
+            .await
+            .unwrap()
+            .unwrap();
+        common::until("departed computer leaves the active roster", || {
+            [&a, &b]
+                .iter()
+                .all(|n| n.link_config().unwrap().members().members.len() == 2)
+        })
+        .await;
+        common::profile_handoff(&[&a, &b], &source_default).await;
+        let peer_observation_settled = || {
+            let token = model::hash(&*lock(&db.state));
+            let version = a.link_config().unwrap().applied().version.clone();
+            [&a, &b].iter().all(|node| {
+                node.link_config().unwrap().applied().version == version
+                    && node.observe_profiles().is_ok_and(|o| {
+                        o.devices
+                            .iter()
+                            .any(|d| d.device.0 == b.id() && d.native_token.as_ref() == Some(&token))
+                            && o.physical_topology
+                                .as_ref()
+                                .is_some_and(|t| super::topology::matches_native(t, &o.snapshot))
+                    })
+            })
+        };
+        common::until("initial native observations published", peer_observation_settled).await;
+        let state = query(&a).await;
+        let mut placements = state.snapshot.as_ref().unwrap().placements.clone();
+        for p in &mut placements {
+            p.scale = 0.01;
+            p.origin = if p.device.0 == a.id() {
+                Point::new(1.0, -1.0)
+            } else {
+                Point::default()
+            };
+        }
+        // Use the same IPC manual edit as the canvas; no Create/reset to re-arm
+        // the tracker after the last user edit.
+        let edited: OperationReply = call(
+            &a,
+            Request::CommitArrangement(CommitRequest {
+                request_id: "manual-before-remote-hotplug".into(),
+                expected_token: state.token,
+                placements,
+                native_plan_tokens: vec![],
+                disabled: vec![],
+                screen_shared: vec![],
+            }),
+        )
+        .await;
+        assert_eq!(edited.state.operation.unwrap().status, OperationStatus::Applied);
+        let expected = edited.state.snapshot.unwrap();
+        let saved = lock(&a.inner.profiles.data).catalog.clone().unwrap();
+        assert_eq!(saved.active().content_revision.writer.0, a.id());
+        assert!(saved.active().saved_topology.is_some());
+        // The real installation retained placements for several departed members.
+        // Membership removal hides them from the applied layout, not the register.
+        let stored = crate::config_module::group_store::load(
+            &a.inner.data_dir.join(crate::config_module::group_store::STATE_FILE),
+            a.id(),
+        )
+        .unwrap()
+        .unwrap();
+        let value =
+            oink_protocol::v1::dto::LayoutValue::from_raw(stored.layout_register().unwrap().value().unwrap()).unwrap();
+        let retained = crate::config_module::layout_wire::from_wire(&value).unwrap();
+        assert!(retained.screens.iter().any(|s| s.id.device == c.id()));
+        assert!(!a.layout().0.screens.iter().any(|s| s.id.device == c.id()));
+        common::until("manual save propagated", || {
+            lock(&b.inner.profiles.data).catalog.as_ref() == Some(&saved)
+        })
+        .await;
+        let extra = NativeDisplay {
+            key: "extra".into(),
+            bounds: Rect::new(100.0, -100.0, 100.0, 100.0),
+            primary: false,
+            mirror_of: None,
+            mode: "extra-mode".into(),
+        };
+        lock(&db.state).displays.push(extra.clone());
+        db.changed();
+        common::until("remote hotplug pushes the overlapping computer", || {
+            a.observe_profiles().is_ok_and(|o| {
+                o.snapshot
+                    .native
+                    .iter()
+                    .any(|n| n.device.0 == b.id() && n.screens.len() == 2)
+                    && o.snapshot.placements != expected.placements
+            })
+        })
+        .await;
+        // The kind-2 layout can arrive before its physical Facts. The logical
+        // restore clock must observe a coherent departure before we unplug;
+        // sleeping for the installed incident's duration cannot establish that.
+        common::until(
+            "remote hotplug native facts and layout converged",
+            peer_observation_settled,
+        )
+        .await;
+        let writer = a.clone();
+        tokio::task::spawn_blocking(move || writer.refresh_layout_profiles())
+            .await
+            .unwrap();
+        common::until("writer recorded the remote topology departure", || {
+            // Probe a clone: returning to the saved topology must consume the
+            // departure, without consuming the live tracker's pending return.
+            lock(&a.inner.profiles.data)
+                .restore_tracker
+                .clone()
+                .observe(saved.active(), saved.active().saved_topology.as_ref())
+        })
+        .await;
+        for node in [&a, &b] {
+            assert_eq!(lock(&node.inner.profiles.data).catalog.as_ref(), Some(&saved));
+            assert_eq!(
+                node.link_config().unwrap().applied().layout_source,
+                oink_protocol::v1::dto::LayoutSource::Default
+            );
+        }
+        lock(&db.state).displays.pop();
+        db.changed();
+        common::until("remote unplug restores saved geometry on both replicas", || {
+            // Matching content is insufficient when a replica still has an
+            // earlier register. Finish this excursion before another manual edit.
+            peer_observation_settled()
+                && [&a, &b].iter().all(|n| {
+                    n.observe_profiles()
+                        .is_ok_and(|o| model::same_content(&o.snapshot, &expected))
+                })
+        })
+        .await;
+        for node in [&a, &b] {
+            assert_eq!(lock(&node.inner.profiles.data).catalog.as_ref(), Some(&saved));
+        }
+
+        // Save a new manual layout while plugged in. Unplugging now has no
+        // matching saved topology: removing the only contact must keep the gap,
+        // not attach the floating computer to a corner or compact either unit.
+        // Layout publication and native-token/facts publication are separate;
+        // finish the first excursion before starting another manual command.
+        common::until("unplugged native observations published", peer_observation_settled).await;
+        lock(&db.state).displays.push(extra);
+        db.changed();
+        common::until("second remote plug repaired", || {
+            peer_observation_settled()
+                && a.observe_profiles().is_ok_and(|o| {
+                    o.snapshot
+                        .native
+                        .iter()
+                        .any(|n| n.device.0 == b.id() && n.screens.len() == 2)
+                        && o.snapshot.placements != expected.placements
+                })
+        })
+        .await;
+        let plugged = query(&a).await;
+        let mut placements = plugged.snapshot.as_ref().unwrap().placements.clone();
+        placements.iter_mut().find(|p| p.device.0 == a.id()).unwrap().origin = Point::new(1.0, -2.0);
+        if delay_manual_layout {
+            b.link_config().unwrap().hold_incoming_config_states(true);
+        }
+        let manual: OperationReply = call(
+            &a,
+            Request::CommitArrangement(CommitRequest {
+                request_id: "manual-while-plugged".into(),
+                expected_token: plugged.token,
+                placements,
+                native_plan_tokens: vec![],
+                disabled: vec![],
+                screen_shared: vec![],
+            }),
+        )
+        .await;
+        assert_eq!(manual.state.operation.unwrap().status, OperationStatus::Applied);
+        let unmatched = manual.state.snapshot.unwrap();
+        let saved_plugged = lock(&a.inner.profiles.data).catalog.clone().unwrap();
+        assert_ne!(saved_plugged.active().content_revision, saved.active().content_revision);
+        common::until("plugged manual save propagated", || {
+            lock(&b.inner.profiles.data).catalog.as_ref() == Some(&saved_plugged)
+        })
+        .await;
+        if delay_manual_layout {
+            assert_ne!(
+                b.observe_profiles().unwrap().snapshot.placements,
+                unmatched.placements,
+                "the saved catalog must arrive while its manual C0 layout is still held"
+            );
+        }
+        lock(&db.state).displays.pop();
+        db.changed();
+        if delay_manual_layout {
+            common::until(
+                "unplug native observation reaches the owner before C0 is released",
+                || {
+                    b.link_config()
+                        .unwrap()
+                        .members()
+                        .members
+                        .iter()
+                        .find(|m| m.is_self)
+                        .and_then(|m| m.facts.as_ref())
+                        .is_some_and(|f| f.displays().is_ok_and(|d| d.0.len() == 1))
+                },
+            )
+            .await;
+            b.link_config().unwrap().hold_incoming_config_states(false);
+        }
+        common::until("unmatched unplug observed on both replicas", || {
+            [&a, &b].iter().all(|n| {
+                n.observe_profiles().is_ok_and(|o| {
+                    o.snapshot
+                        .native
+                        .iter()
+                        .any(|n| n.device.0 == b.id() && n.screens.len() == 1)
+                })
+            })
+        })
+        .await;
+        common::until(
+            "unmatched unplug native facts and layout converged",
+            peer_observation_settled,
+        )
+        .await;
+        // Drive the ordinary logical observation directly, including repeated
+        // ticks, instead of guessing when a background clock was scheduled.
+        for _ in 0..4 {
+            for node in [&a, &b] {
+                let n = node.clone();
+                tokio::task::spawn_blocking(move || n.refresh_layout_profiles())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    node.observe_profiles().unwrap().snapshot.placements,
+                    unmatched.placements,
+                    "unmatched unplug must preserve every remaining computer's placement"
+                );
+                assert_eq!(lock(&node.inner.profiles.data).catalog.as_ref(), Some(&saved_plugged));
+                assert_eq!(
+                    node.link_config().unwrap().applied().layout_source,
+                    oink_protocol::v1::dto::LayoutSource::Default
+                );
+            }
+        }
+        assert_eq!(da.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(db.calls.load(Ordering::SeqCst), 0);
+        a.shutdown().await;
+        b.shutdown().await;
+        c.shutdown().await;
+    });
+}
+
+#[path = "join_order_tests.rs"]
+mod join_order_tests;

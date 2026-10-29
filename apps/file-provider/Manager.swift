@@ -3,6 +3,8 @@ import FileProvider
 import AppKit
 import Darwin
 
+private var nativeWatchdog: DispatchSourceTimer?
+
 @main struct Manager {
     @MainActor static func main() {
         let command = CommandLine.arguments.dropFirst().first ?? "status"
@@ -12,14 +14,24 @@ import Darwin
             do { try finishOinkUninstall(); exit(0) }
             catch { exit(1) }
         }
+        let native = ["received-read", "received-stat", "received-link", "received-download", "received-move"].contains(command)
+        let activity = NativeActivity()
+        if native {
+            let timer = DispatchSource.makeTimerSource(queue: .global())
+            timer.schedule(deadline: .now() + 1, repeating: 1)
+            timer.setEventHandler { if activity.expired() { exit(2) } }
+            timer.resume()
+            // The process exits after this one command; keep its watchdog alive.
+            nativeWatchdog = timer
+        }
         // Bound system callbacks even when the extension is disabled or authorization is pending.
         // Whole-domain deletion may take longer than an item operation, especially
         // with multiple domains. A timeout remains a failure, never a removal ACK.
-        DispatchQueue.global().asyncAfter(deadline: .now() + (command == "remove-domain" ? 60 : command == "stop-uninstall-workers" ? 20 : 12)) {
+        if !native { DispatchQueue.global().asyncAfter(deadline: .now() + (["remove-domain", "reset-store", "recover-launch", "container"].contains(command) ? 60 : command == "stop-uninstall-workers" ? 20 : 12)) {
             fputs(command == "remove-domain" ? "File Provider domain removal timed out\n" :
                   "File Provider operation timed out; retry opening the Oink location in Finder\n", stderr)
             exit(2)
-        }
+        } }
         Task {
             do {
                 if command == "stop-uninstall-workers" {
@@ -37,19 +49,18 @@ import Darwin
                     try await unregisterOinkLoginItem()
                     print("unregistered"); exit(0)
                 }
-                if command == "container" { print(try container().path); exit(0) }
                 let id = NSFileProviderDomainIdentifier(providerDomain)
-                var domains = try await NSFileProviderManager.domains()
+                let registered = try await NSFileProviderManager.domains()
+                var domains = registered.filter { $0.identifier == id }
                 if let action = ProviderRemovalAction(rawValue: command) {
                     let uninstall = Array(CommandLine.arguments.dropFirst(2)) == ["--uninstall"]
                     guard CommandLine.arguments.count == 2 || uninstall else { throw CocoaError(.fileReadInvalidFileName) }
-                    // Fresh-install domain resets also use remove-domain. Only
-                    // explicit uninstall may erase the extension's own home.
+                    // Only explicit uninstall may erase the extension's own home.
                     let app = try uninstall ? installedUninstallApp() : nil
                     func removeDomains() async throws -> String {
-                        try await action.perform(domains: domains, remove: { domain, mode in
+                        try await action.perform(domains: action.domains(registered, uninstall: uninstall), remove: { domain, mode in
                             try await NSFileProviderManager.remove(domain, mode: mode)
-                        }, remaining: { try await NSFileProviderManager.domains() })
+                        }, remaining: { action.domains(try await NSFileProviderManager.domains(), uninstall: uninstall) })
                     }
                     let result: String
                     if let app {
@@ -67,9 +78,24 @@ import Darwin
                     print(String(data: try JSONSerialization.data(withJSONObject: values, options: [.sortedKeys]), encoding: .utf8)!)
                     exit(0)
                 }
-                if command == "recover-launch" {
-                    guard CommandLine.arguments.count == 2 else { throw CocoaError(.fileReadInvalidFileName) }
+                if command == "check-launch" {
+                    // Read-only recovery of an uncertain Recover result. A
+                    // connected domain cannot bypass unfinished local migration.
+                    try ProviderUpgrade(group: appGroupContainer()).requireReady()
+                    guard let domain = domains.first, let manager = NSFileProviderManager(for: domain) else {
+                        throw NSFileProviderError(.providerNotFound)
+                    }
+                    try await verifyProviderLaunch(hidden: domain.isHidden, enabled: domain.userEnabled,
+                        disconnected: domain.isDisconnected,
+                        resolveRoot: { try await manager.getUserVisibleURL(for: .rootContainer) })
+                    print("connected"); exit(0)
+                }
+                if command == "recover-launch" || command == "reset-store" {
+                    guard CommandLine.arguments.count == (command == "reset-store" ? 3 : 2) else { throw CocoaError(.fileReadInvalidFileName) }
+                    let upgrade = ProviderUpgrade(group: try appGroupContainer())
+                    try upgrade.prepareLocal(resetToken: command == "reset-store" ? CommandLine.arguments[2] : nil)
                     guard let domain = domains.first(where: { $0.identifier == id }) else {
+                        try await finishProviderUpgrade(upgrade, domain: nil)
                         print("absent"); exit(0)
                     }
                     if !domain.userEnabled { print("inactive"); exit(0) }
@@ -78,7 +104,8 @@ import Darwin
                         disconnected: domain.isDisconnected, disconnect: { options in
                             try await manager.disconnect(reason: "Updating Oink", options: options)
                         }, reconnect: { try await manager.reconnect() },
-                        stabilize: { try await manager.waitForStabilization() })
+                        finishUpgrade: { _ = try await finishProviderUpgrade(upgrade, domain: domain, manager: manager) },
+                        resolveRoot: { try await manager.getUserVisibleURL(for: .rootContainer) })
                     print("connected"); exit(0)
                 }
                 if let action = ProviderUpdateAction(rawValue: command) {
@@ -103,6 +130,13 @@ import Darwin
                     print(action == .prepare ? "prepared" : "connected")
                     exit(0)
                 }
+                // No command that exposes or writes receiver data bypasses the
+                // durable cut-over. Inactive domains keep their user state and
+                // cannot publish until a later enabled launch completes reset.
+                if command != "inspect" && command != "open-enable" {
+                    try await finishProviderUpgrade(ProviderUpgrade(group: try appGroupContainer()), domain: domains.first)
+                }
+                if command == "container" { print(try container().path); exit(0) }
                 if !domains.contains(where: { $0.identifier == id }) && (command == "publish" || command == "initialize" || command == "open-enable") {
                     let domain = NSFileProviderDomain(identifier: id, displayName: providerDisplayName)
                     domain.isHidden = true
@@ -151,7 +185,7 @@ import Darwin
                             guard item.contentType != .folder else {continue}
                             let size = UInt64(max(0, metadata.st_blocks)) * 512
                             if clear && !busy && !protected {
-                                do { try await manager.evictItem(identifier: item.itemIdentifier); removed += size; evicted.insert(item.itemIdentifier.rawValue); continue }
+                                do { try await manager.evictItem(identifier: item.itemIdentifier); cacheStorageChanged(); removed += size; evicted.insert(item.itemIdentifier.rawValue); continue }
                                 catch {
                                     if let key=item.itemIdentifier.rawValue.split(separator:"-").first {protectedBatches.insert(String(key))}
                                 }
@@ -191,6 +225,11 @@ import Darwin
                       let manager = NSFileProviderManager(for: domain) else {
                     fputs("Oink file extension is not enabled\n", stderr); exit(3)
                 }
+                if native {
+                    try await nativeReceived(command, arguments: Array(CommandLine.arguments.dropFirst(2)),
+                                             manager: manager, activity: activity)
+                    exit(0)
+                }
                 if command == "status" || command == "initialize" {
                     print("domain enabled; item URL readiness is checked on publication"); exit(0)
                 }
@@ -208,18 +247,7 @@ import Darwin
                     let ledger = try JSONDecoder().decode(PlaceholderLedger.self, from: Data(contentsOf: ledgerURL))
                     // The catalog is already removed under the Rust storage lock.
                     // Only observe the OS namespace; never delete CloudStorage files.
-                    try await manager.signalEnumerator(for: .workingSet)
-                    // A signal ACK is only scheduling. Wait for both sides of
-                    // the domain to catch up before declaring a crashed or
-                    // cancelled preparer's paths retired (public macOS API).
-                    try await manager.waitForStabilization()
-                    let parent: URL
-                    if let known = ledger.parent { parent = URL(fileURLWithPath: known) }
-                    else {
-                        let root = try await manager.getUserVisibleURL(for: .rootContainer)
-                        parent = root.appendingPathComponent(".Oink-prepared-" + batch + ".noindex")
-                    }
-                    while visibleMetadata(parent) != nil { try await Task.sleep(nanoseconds: 10_000_000) }
+                    try await retirePlaceholder(batch: batch, ledger: ledger, manager: manager)
                     print("retired")
                     exit(0)
                 }
@@ -270,21 +298,17 @@ import Darwin
                     exit(0)
                 }
                 let requested = catalog.records.filter { $0.parent == batch + "-root" }
-                // Include the parent in the same bounded concurrent lookup. It adds
-                // no serial namespace wait before the existing child readiness rule.
-                let parent = catalog.records.filter { $0.id == batch + "-root" }
-                let urls = try await resolveItemURLs(parent + requested) { record in
-                    // Ordinary spares also change from a private parent to the
-                    // final source/batch path. An early URL can still describe
-                    // the old name or hidden flag on macOS 14/26; validate both
-                    // publication paths before handing URLs to other apps.
-                    if command == "prepare-placeholders" || command == "publish-placeholders" || command == "publish" {
-                        return try await resolveFinalItemURL(record) {
-                            try await manager.getUserVisibleURL(for: NSFileProviderItemIdentifier(record.id))
-                        }.path
-                    }
-                    return try await manager.getUserVisibleURL(for: NSFileProviderItemIdentifier(record.id)).path
+                guard let parent = catalog.records.first(where: { $0.id == batch + "-root" }) else {
+                    throw CocoaError(.fileReadCorruptFile)
                 }
+                let urls = try await resolvePublishedItemURLs(parent: parent, children: requested, resolve: { record in
+                    try await manager.getUserVisibleURL(for: NSFileProviderItemIdentifier(record.id))
+                }, rejected: { rejection in
+                    // Other in-flight SDK callbacks need not finish before a
+                    // definitive rejection. This helper owns one publication.
+                    fputs("File Provider item rejected cause=\(rejection.rawValue)\n", stderr)
+                    exit(rejection.rawValue)
+                })
                 if command == "publish-placeholders" {
                     let ledger = try JSONDecoder().decode(PlaceholderLedger.self, from: Data(contentsOf: try container().appendingPathComponent(batch + ".placeholder")))
                     // Unused slots and each consumed slot's old generic name must
@@ -292,19 +316,19 @@ import Darwin
                     // path; that path is then a validated final item, not surplus.
                     let final = Set(urls)
                     for old in ledger.urls where !final.contains(old) {
-                        while visibleMetadata(URL(fileURLWithPath: old)) != nil { try await Task.sleep(nanoseconds: 10_000_000) }
+                        try await waitForItemRemoval(URL(fileURLWithPath: old))
                     }
                 }
-                let childURLs = Array(urls.dropFirst(parent.count))
-                print(String(data: try JSONEncoder().encode(childURLs), encoding: .utf8)!)
+                print(String(data: try JSONEncoder().encode(urls), encoding: .utf8)!)
                 exit(0)
             } catch {
-                // NSError descriptions may include the file path or an endpoint.
-                if command == "remove-domain" {
-                    fputs("File Provider domain removal failed (domain \((error as NSError).domain), code \((error as NSError).code))\n", stderr)
-                } else {
-                    fputs("File Provider operation failed (code \((error as NSError).code))\n", stderr)
+                fputs(providerFailureDiagnostic(error) + "\n", stderr)
+                if ["publish", "prepare-spare", "prepare-placeholder-parent", "prepare-placeholders", "publish-placeholders", "retire-placeholders"].contains(command),
+                   let rejection = publicationRejection(error) {
+                    fputs("File Provider item rejected cause=\(rejection.rawValue)\n", stderr)
+                    exit(rejection.rawValue)
                 }
+                // NSError descriptions may include the file path or an endpoint.
                 // The host can retry a just-moved provider registration without
                 // retrying unrelated API failures or parsing localized messages.
                 exit((error as NSError).domain == NSFileProviderErrorDomain &&

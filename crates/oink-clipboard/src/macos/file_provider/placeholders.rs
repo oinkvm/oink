@@ -214,6 +214,8 @@ fn fill_catalog(key: &str, catalog: &mut Catalog) {
     for (directory, count) in [(false, FILES), (true, FOLDERS)] {
         for index in 0..count {
             catalog.records.push(Record {
+                exec_bits: None,
+                symlink_target: None,
                 id: slot_id(key, directory, index),
                 parent: format!("{key}-root"),
                 name: format!(".Oink-slot-{}-{index}", if directory { "folder" } else { "file" }),
@@ -227,6 +229,7 @@ fn fill_catalog(key: &str, catalog: &mut Catalog) {
                 version: 1,
                 children: None,
                 hidden: Some(true),
+                keep_local: None,
             });
         }
     }
@@ -589,6 +592,7 @@ mod tests {
         assert_eq!(state.catalog.records[2].size, Some(4));
         assert!(state.catalog.records[1..].iter().all(|r| r.hidden.is_none()));
         let child = FileNode {
+            exec_bits: None,
             id: NodeId(73),
             parent: Some(NodeId(1)),
             name: "nested.txt".into(),
@@ -637,13 +641,12 @@ mod tests {
         assert_eq!(state.catalog.records[1].id, "batch-slot-file-0");
     }
     #[test]
-    fn completed_restart_preserves_slot_urls_and_remote_node_identity() {
+    fn linked_restart_preserves_slot_urls_and_remote_node_identity() {
         let data = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let owned = crate::content::Completed::test_single_file(data.path());
-        let local = crate::content::Completed::restore(data.path(), owned.id()).unwrap();
+        let local = super::super::tests::linked_fixture();
         let path = root.path().join("batch.json");
-        let (batch, _) = prepare_batch(Arc::new(local), "batch", "old".into(), 1, path.clone()).unwrap();
+        let (batch, _) = prepare_batch(local, "batch", "old".into(), 1, path.clone()).unwrap();
         let original;
         {
             let mut state = batch.state.lock().unwrap();

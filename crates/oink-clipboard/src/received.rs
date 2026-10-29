@@ -11,6 +11,22 @@ use std::{
     },
     time::{SystemTime, UNIX_EPOCH},
 };
+/// Open an Oink received URL through its existing native reader. This may wait
+/// for the committed drop grant and OS hydration; call only on a background worker.
+/// None means the path is not in the live received catalog. A provider failure
+/// stays Some(Err): callers must never retry it as a raw placeholder read.
+pub fn open_file(path: &Path) -> Option<io::Result<crate::FileReader>> {
+    #[cfg(target_os = "macos")]
+    return crate::macos::file_provider::native::open_path(path);
+    #[cfg(windows)]
+    return crate::windows::cloud::native::open_path(path);
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 pub const DAY: u64 = 86_400_000;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -331,6 +347,21 @@ fn normalized_name(value: &str) -> String {
     {
         value.into()
     }
+}
+
+/// Apply only negotiated x bits to an already-open regular receiver file.
+/// Callers create the file or open with O_NOFOLLOW; no source mode is restored.
+#[cfg(target_os = "macos")]
+pub(crate) fn apply_exec_bits(file: &std::fs::File, bits: Option<u16>) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(bits) = bits else { return Ok(()) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || bits & !0o111 != 0 {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(
+        (metadata.permissions().mode() & 0o664) | u32::from(bits),
+    ))
 }
 
 #[cfg(test)]

@@ -140,6 +140,21 @@ impl OriginalPress {
     }
 }
 impl Router {
+    pub(in crate::router) fn dnd_returning_left(&self, input: Option<DeviceId>) -> bool {
+        let Some(offer) = self.dnd.native_source else {
+            return false;
+        };
+        self.dnd.sources.get(&offer).is_some_and(|source| {
+            source.phase == source::Phase::Local
+                && input.is_none_or(|input| input == source.input)
+                && self
+                    .dnd
+                    .presses
+                    .get(&offer)
+                    .is_some_and(|press| matches!(press.owner, Owner::Withheld(_)) && !press.up_seen())
+        })
+    }
+
     pub(super) fn dnd_take_source_press(&mut self, offer: OfferId, input: DeviceId) {
         let Some(source) = self.dnd.sources.get(&offer) else {
             return;
@@ -230,6 +245,35 @@ impl Router {
             self.dnd_button_notice(offer);
         }
     }
+    /// Retire the drag observation once the original route owns UP delivery,
+    /// including a release submitted after native return completed.
+    pub(super) fn dnd_original_route_released(&mut self, offer: OfferId) {
+        self.dnd_integrity_end(offer, IntegrityOutcome::OriginalRouteReleased);
+        if self
+            .dnd
+            .presses
+            .get(&offer)
+            .is_some_and(|p| matches!(p.owner, Owner::Ordinary { .. }))
+        {
+            self.dnd.presses.remove(&offer);
+        }
+        if let Some(source) = self.dnd.sources.get_mut(&offer) {
+            source.advance();
+        }
+        self.dnd_publish_state(
+            offer,
+            DragState::Revoked {
+                scope: RevokeScope::Drag,
+                reason: RevokeReason::NativeEnded,
+            },
+        );
+        self.dnd.sources.remove(&offer);
+        if self.dnd.native_source == Some(offer) {
+            self.dnd.native_source = None;
+        }
+        self.out.push(Output::Dnd(DndCmd::ForgetSource { id: offer.clip }));
+        self.out.push(Output::Dnd(DndCmd::ReleaseData { id: offer.clip }));
+    }
     /// Called at S before ordinary UP processing. I's original recorded route
     /// remains I→S throughout all holder changes; H/T never forward that UP.
     pub(in crate::router) fn dnd_original_up(&mut self, input: DeviceId) -> bool {
@@ -243,24 +287,7 @@ impl Router {
         };
         let press = self.dnd.presses.get_mut(&offer).unwrap();
         if !press.physical_up() {
-            self.dnd_integrity_end(offer, IntegrityOutcome::OriginalRouteReleased);
-            self.dnd.presses.remove(&offer);
-            if let Some(source) = self.dnd.sources.get_mut(&offer) {
-                source.advance();
-            }
-            self.dnd_publish_state(
-                offer,
-                DragState::Revoked {
-                    scope: RevokeScope::Drag,
-                    reason: RevokeReason::NativeEnded,
-                },
-            );
-            self.dnd.sources.remove(&offer);
-            if self.dnd.native_source == Some(offer) {
-                self.dnd.native_source = None;
-            }
-            self.out.push(Output::Dnd(DndCmd::ForgetSource { id: offer.clip }));
-            self.out.push(Output::Dnd(DndCmd::ReleaseData { id: offer.clip }));
+            self.dnd_original_route_released(offer);
             return false;
         }
         let mut commit = false;

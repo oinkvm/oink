@@ -10,7 +10,10 @@ impl super::link::Handle {
     ) -> anyhow::Result<()> {
         let input = node.input_thread()?;
         let backend: Arc<dyn DndBackend> = Arc::from(backend);
-        let files = Arc::new(DndFiles::new());
+        oink_clipboard::dnd::set_source_observer(super::timing::observed);
+        oink_routing::dnd::set_source_learned_observer(super::timing::learned);
+        oink_clipboard::dnd::set_preparation_observer(crate::telemetry::projections::drag_preparation);
+        let files = Arc::new(DndFiles::new(node.link_config()?.source_grants()));
         *files.input.lock().unwrap() = Some(input.clone());
         backend.set_content_store(node.cache_dir());
         files.set_paused(node.link_config()?.applied().paused);
@@ -32,6 +35,7 @@ impl super::link::Handle {
             update_targets: Mutex::new(HashMap::new()),
             #[cfg(target_os = "macos")]
             preparations: Mutex::new(HashMap::new()),
+            pending_begins: Mutex::new(HashMap::new()),
             active_source: Mutex::new(None),
             export_epoch: Mutex::new(None),
             source_epoch: AtomicU64::new(0),
@@ -141,6 +145,26 @@ impl super::link::Handle {
                 .nudge_held_drag(operation.sequence, button, posted)
                 .map_err(|error| error.to_string())
         }));
+        let freeze_input = input_backend.clone();
+        let relocate_input = input_backend.clone();
+        let return_input = input_backend.clone();
+        backend.set_source_hold_input(oink_clipboard::dnd::SourceHoldInput {
+            freeze: Arc::new(move |operation| {
+                freeze_input
+                    .freeze_drag_anchor(operation.sequence)
+                    .map_err(|error| error.to_string())
+            }),
+            relocate: Arc::new(move |operation, at| {
+                relocate_input
+                    .relocate_drag_anchor(operation.sequence, at)
+                    .map_err(|error| error.to_string())
+            }),
+            return_to: Arc::new(move |operation, at, posted| {
+                return_input
+                    .move_held_drag_observed(operation.sequence, at, posted)
+                    .map_err(|error| error.to_string())
+            }),
+        });
         let press_glue = Arc::downgrade(&glue);
         backend.set_source_press(Arc::new(move |operation, point| {
             let Some(glue) = press_glue.upgrade() else {

@@ -3,6 +3,16 @@
 //! - [`ClipboardBackend`]：读写本机系统剪贴板、监听变化。平台实现在 `src/macos`、`src/windows`。
 //! - [`sync`]：与平台无关的同步逻辑（通告、拉取、防回环、隐私标记透传）。
 
+// The AppKit harness compiles this crate with cfg(test) without libtest, whose
+// #[test] bodies are omitted. Their fixture helpers are consequently unused.
+#![cfg_attr(test, allow(dead_code, unused_imports))]
+
+#[cfg(test)]
+fn main() {
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    macos::run_native_linked_promise_tests();
+}
+
 pub mod cache;
 #[cfg(any(windows, test))]
 mod cloud_files;
@@ -11,6 +21,7 @@ pub mod model;
 pub mod negotiation;
 pub mod policy;
 pub mod received;
+pub mod timing;
 
 pub mod provider_preparation;
 use std::sync::Arc;
@@ -39,6 +50,22 @@ pub enum FileProviderReason {
     BoundExpired,
     #[error("cancelled")]
     Cancelled,
+    #[error("item_missing")]
+    ItemMissing,
+    #[error("item_unsupported_type")]
+    ItemUnsupportedType,
+    #[error("item_kind_mismatch")]
+    ItemKindMismatch,
+    #[error("item_target_mismatch")]
+    ItemTargetMismatch,
+    #[error("item_identity_mismatch")]
+    ItemIdentityMismatch,
+    #[error("item_metadata_mismatch")]
+    ItemMetadataMismatch,
+    #[error("item_access_denied")]
+    ItemAccessDenied,
+    #[error("item_metadata_unreadable")]
+    ItemMetadataUnreadable,
 }
 impl FileProviderReason {
     pub fn unavailable(self) -> bool {
@@ -47,11 +74,22 @@ impl FileProviderReason {
             Self::Checking | Self::DomainEnabled | Self::UrlsReady | Self::Cancelled
         )
     }
-    pub fn degraded_promise(self) -> bool {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn item_rejected(self) -> bool {
         matches!(
             self,
-            Self::DomainDisabled | Self::ExtensionNotRegistered | Self::DomainDisconnected | Self::RegistrationFailed
+            Self::ItemMissing
+                | Self::ItemUnsupportedType
+                | Self::ItemKindMismatch
+                | Self::ItemTargetMismatch
+                | Self::ItemIdentityMismatch
+                | Self::ItemMetadataMismatch
+                | Self::ItemAccessDenied
+                | Self::ItemMetadataUnreadable
         )
+    }
+    pub fn needs_enable(self) -> bool {
+        matches!(self, Self::DomainDisabled | Self::ExtensionNotRegistered)
     }
     pub fn detail(self) -> String {
         match self {
@@ -60,9 +98,15 @@ impl FileProviderReason {
             Self::UrlsReady => "最近一次文件 URL 发布成功；新批次仍需等待系统就绪 [urls_ready]".into(),
             Self::BoundExpired => "等待文件 URL 就绪超时，本次拖放已取消；请检查文件扩展后重试 [bound_expired]".into(),
             Self::Cancelled => "文件拖放准备已取消 [cancelled]".into(),
-            reason => format!(
-                "文件拖放已降级：仅支持 Finder 等文件承诺接收方，需要文件 URL 的应用不可用；请启用 Oink 文件扩展（必要时重新安装） [{reason}]"
-            ),
+            Self::ItemMissing
+            | Self::ItemUnsupportedType
+            | Self::ItemKindMismatch
+            | Self::ItemTargetMismatch
+            | Self::ItemIdentityMismatch
+            | Self::ItemMetadataMismatch
+            | Self::ItemAccessDenied
+            | Self::ItemMetadataUnreadable => format!("文件项准备被拒绝，本次拖放已取消 [{self}]"),
+            reason => format!("文件提供服务不可用；请在设置中检查或启用 Oink 文件扩展 [{reason}]"),
         }
     }
 }
@@ -78,6 +122,8 @@ mod macos;
 pub use macos::file_provider;
 pub mod store;
 pub mod sync;
+#[cfg(any(windows, target_os = "macos", test))]
+mod upgrade;
 #[cfg(windows)]
 mod windows;
 pub mod wire;
@@ -123,6 +169,47 @@ pub struct NativeSpec {
     pub file_contents: Option<Arc<dyn FileContents>>,
     pub sensitivity: Sensitivity,
 }
+impl NativeSpec {
+    /// Resolve promise containers on the native publication worker before
+    /// creating descriptor tables, placeholders, or target pasteboard items.
+    pub(crate) fn prepare_promises(&mut self) -> std::io::Result<()> {
+        if !self.inventory.items.iter().any(|item| {
+            item.file.is_none()
+                && item
+                    .representations
+                    .iter()
+                    .any(|rep| matches!(rep.data, crate::model::RepresentationData::Promise(..)))
+        }) {
+            return Ok(());
+        }
+        let namespace = self
+            .file_contents
+            .as_ref()
+            .and_then(|files| files.namespace())
+            .ok_or_else(|| content::unavailable(crate::model::Unavailable::InvalidData))?;
+        namespace.prepare()?;
+        self.inventory = content::native_metadata::project_inventory(
+            self.inventory.clone(),
+            namespace.roots(),
+            &namespace.native_file_metadata(),
+        )?;
+        let files = content::namespace::Files::new(namespace, crate::sync::files::TargetOs::current())?;
+        self.files = files.roots().to_vec();
+        self.file_contents = Some(files);
+        Ok(())
+    }
+    /// Keep usable non-file formats when native file publication is unavailable.
+    pub fn without_files(mut self) -> std::io::Result<Option<Self>> {
+        self.inventory = crate::policy::without_files(self.inventory);
+        self.files.clear();
+        self.file_contents = None;
+        if self.inventory.items.is_empty() {
+            return Ok(None);
+        }
+        self.contents = content::projected(self.contents, self.inventory.clone())?;
+        Ok(Some(self))
+    }
+}
 impl std::fmt::Debug for NativeSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeSpec")
@@ -138,6 +225,12 @@ pub trait ClipboardBackend: Send + Sync {
     fn initialize_store(&self, _data: std::path::PathBuf) {}
     /// 系统剪贴板的变化计数（macOS `changeCount`；Windows `GetClipboardSequenceNumber`）。
     fn change_count(&self) -> u64;
+    /// Metadata-only identity of the actual clipboard, scoped to this native
+    /// login/boot and clipboard. Unlike change_count it does not hide delayed
+    /// rendering. Called on a background worker, including while sharing pauses.
+    fn clipboard_key(&self) -> std::io::Result<[u8; 32]> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
     /// 读取当前内容中本项目支持的表示形式，并判断隐私级别（例如 macOS
     /// `org.nspasteboard.ConcealedType`、Windows `ExcludeClipboardContentFromMonitorProcessing`）。
     fn read(&self) -> Result<ClipSnapshot, ClipboardError>;
@@ -191,6 +284,7 @@ pub trait ClipboardBackend: Send + Sync {
 pub struct FileMetadata {
     pub size: u64,
     pub modified_ms: Option<i64>,
+    pub exec_bits: Option<u16>,
 }
 
 /// 按需提供文件内容；调用可能等待网络，只能在平台后台线程使用。
@@ -198,6 +292,11 @@ pub trait FileContents: Send + Sync {
     /// OLE calls this at its first descriptor GetData, never while advertising
     /// formats. The returned table remains immutable for this native object.
     fn descriptor_entries(&self) -> std::io::Result<Option<Vec<FileEntry>>> {
+        Ok(None)
+    }
+    /// Stable node identities in exactly the published descriptor index order.
+    /// Native catalogs persist this table without creating another file backing.
+    fn descriptor_nodes(&self) -> std::io::Result<Option<Vec<model::FileNode>>> {
         Ok(None)
     }
     fn descriptor_size_known(&self, _index: usize) -> bool {

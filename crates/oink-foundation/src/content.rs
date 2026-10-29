@@ -128,10 +128,9 @@ pub enum Unavailable {
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RepresentationData {
-    /// Snapshot bytes or an active provider; hash is absent until the complete EOF.
+    /// Snapshot bytes or an active provider.
     Reader {
         size: ContentSize,
-        hash: Option<[u8; 32]>,
     },
     Inline(#[serde(deserialize_with = "bounded::vec::<_, _, 65536>")] Vec<u8>),
     /// Reconstruct a target-local URL/HDROP/descriptor through the file service.
@@ -189,10 +188,49 @@ pub struct ContentItem {
     pub representations: Vec<Representation>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeKind {
     File,
     Directory,
+    /// A leaf. The relative target is metadata, never a content read request.
+    Symlink(#[serde(deserialize_with = "bounded::string::<_, 4096>")] String),
+}
+impl std::fmt::Debug for NodeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::File => "File",
+            Self::Directory => "Directory",
+            Self::Symlink(_) => "Symlink",
+        })
+    }
+}
+impl NodeKind {
+    pub fn symlink_target(&self) -> Option<&str> {
+        match self {
+            Self::Symlink(target) => Some(target),
+            _ => None,
+        }
+    }
+}
+/// Lexically resolve a relative link inside the materialized batch container.
+/// parent_depth includes the selected root; the container itself is not a target.
+pub fn safe_symlink_target(target: &str, mut parent_depth: usize) -> bool {
+    if target.is_empty() || target.len() > 4096 || target.starts_with('/') || target.contains('\0') {
+        return false;
+    }
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                let Some(depth) = parent_depth.checked_sub(1) else {
+                    return false;
+                };
+                parent_depth = depth;
+            }
+            _ => parent_depth += 1,
+        }
+    }
+    parent_depth > 0
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,6 +243,9 @@ pub struct FileNode {
     pub size: ContentSize,
     pub version: u64,
     pub modified_ms: Option<i64>,
+    /// Only the POSIX x bits; absent unless negotiated for a Mac file transfer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_bits: Option<u16>,
 }
 impl std::fmt::Debug for FileNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -222,5 +263,38 @@ impl FileNode {
             && self.name != ".."
             && !self.name.contains(['/', '\\', '\0'])
             && self.parent != Some(self.id)
+            && self
+                .exec_bits
+                .is_none_or(|bits| self.kind == NodeKind::File && bits & !0o111 == 0)
+            && self.kind.symlink_target().is_none_or(|target| {
+                safe_symlink_target(target, 256) && self.size == ContentSize::Known(target.len() as u64)
+            })
+    }
+}
+
+#[cfg(test)]
+mod symlink_tests {
+    use super::*;
+    #[test]
+    fn lexical_symlink_scope_rejects_every_escape_without_following_targets() {
+        for (target, depth, safe) in [
+            ("nested", 0, true),
+            ("nested/file", 0, true),
+            ("../Resources", 1, true),
+            ("../../outside", 1, false),
+            ("../outside", 0, false),
+            ("/absolute", 3, false),
+            ("//absolute", 3, false),
+            ("", 1, false),
+            ("bad\0target", 1, false),
+            (".", 0, false),
+            ("nested/../file", 0, true),
+            ("missing", 0, true),
+            ("a/../../outside", 0, false),
+        ] {
+            assert_eq!(safe_symlink_target(target, depth), safe, "target depth {depth}");
+        }
+        assert!(!safe_symlink_target(&"a".repeat(4097), 0));
+        assert_eq!(format!("{:?}", NodeKind::Symlink("private-target".into())), "Symlink");
     }
 }

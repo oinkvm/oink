@@ -116,8 +116,21 @@ impl DiscardCounts {
     }
 }
 
+/// Collection-local aliases only; never native application IDs or raw device IDs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ApplicationFocus {
+    pub pointer: String,
+    pub keyboard: Option<String>,
+    pub epoch: u64,
+    pub revision: u64,
+    pub phase: oink_routing::application_focus::Phase,
+    pub reason: oink_routing::application_focus::Reason,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub application_focus: Option<ApplicationFocus>,
     // Provider availability is projected from its typed scalar observation.
     #[serde(skip)]
     pub file_provider: Option<super::ProviderAvailability>,
@@ -240,7 +253,7 @@ impl Meta {
 }
 #[derive(Clone)]
 pub(crate) struct Store {
-    dir: PathBuf,
+    pub(super) dir: PathBuf,
     clock: Arc<clock::Clock>,
     export_source: Option<Arc<tempfile::TempDir>>,
     export_clock: Option<clock::Stamp>,
@@ -286,8 +299,8 @@ fn private_dir(path: &Path) -> std::io::Result<()> {
 fn atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     replace(path, bytes, true)
 }
-// Export staging is disposable. Only the completed zip and flight recorder need
-// durability; thousands of staging fsyncs compete with the live recorder's disk.
+// Markers and completed exports remain durable. Live ring segments and export
+// staging use atomic publication without forcing each file onto the device.
 fn replace(path: &Path, bytes: &[u8], durable: bool) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     let mut f = File::create(&tmp)?;
@@ -421,7 +434,7 @@ impl Store {
             s.previous_instance = fs::read_to_string(s.dir.join("running")).ok().filter(|v| token_ok(v));
         }
         // O(1) startup handoff: do not enumerate, read or decompress any segment
-        // here. The old directory remains durable if recovery is interrupted.
+        // here. The old directory remains available if recovery is interrupted.
         // New recordings use a fresh directory and can be flushed immediately.
         let old_domain = domain.as_deref().filter(|v| token_ok(v)).unwrap_or("discard");
         fs::rename(
@@ -592,7 +605,7 @@ impl Store {
         }
         snapshot.discarded.report();
         snapshot.segments.make_contiguous().sort_by_key(|m| m.last_us);
-        // Interrupted starts can leave several durable staging directories. Their
+        // Interrupted starts can leave several retained staging directories. Their
         // duplicated segments are deduplicated above; unique pre-start records
         // still obey the retention cap in the crash snapshot.
         while snapshot.bytes > snapshot.limit {
@@ -760,13 +773,18 @@ impl Store {
         anyhow::ensure!(s.device == self.device, "local recorder accepts only own events");
         let mut meta = Self::meta(s, bytes.len() as u64);
         meta.received_us = self.clock.now().utc_us;
-        atomic(
+        // The bounded diagnostic ring is best-effort across power loss. Closing
+        // and renaming makes completed segments recoverable after process death
+        // without an idle fsync per second. Keep marker/final ZIP fsyncs: those
+        // mark lifecycle and explicit save boundaries, not routine measurements.
+        replace(
             &self
                 .export_source
                 .as_ref()
                 .map_or_else(|| self.dir.join("buffer"), |dir| dir.path().into())
                 .join(meta.name()),
             bytes,
+            false,
         )?;
         self.bytes += meta.bytes;
         self.segments.push_back(meta);
@@ -1174,7 +1192,7 @@ impl Store {
                 serde_json::json!({"version":remote.version()?.0,"source_tree_sha256":remote.source_tree_sha256()?.0}),
             );
         }
-        let manifest = serde_json::json!({"schema":SCHEMA,"export_clock":{"device":self.device,"instance":self.instance,"clock_id":export_clock.clock_id,"utc_us":export_clock.utc_us},"cutoff_complete":cutoff_complete,"reason":reason,"at_ms":at_ms,"version":env!("OINK_RELEASE_VERSION"),"source_tree_sha256":env!("OINK_DIAGNOSTIC_SOURCE_TREE_SHA256"),"devices":aliases,"screens":screens,"versions":versions,"unrecognized_diagnostic_events":spool.unrecognized,"unrecognized_snapshot_fields":({let mut counts=spool.unknown_snapshot_fields.clone();for (_,snapshot) in self.network_environments.values(){for key in wire::unknown_snapshot_fields(snapshot){*counts.entry(key).or_insert(0u64)+=1;}}counts}),"normalized_peer_coverage":self.normalized_peer_coverage(export_clock.clock_id)?,"peer_ends":self.network_ends.iter().map(|(d,e)| (d.clone(),wire::json(&oink_protocol::v1::schema::WireValue::write(e)))).collect::<BTreeMap<_,_>>(),"coverage":self.segments,"dropped":dropped,"errors":errors,"evicted_segments":self.evicted,"corrupt_segments":self.corrupt,"missing_members":missing_members,"requested_range_us":self.requested_range.map(|(start,end)| (if start == i64::MIN {None} else {Some(start)},end)),"evicted_segments_by_device":({ let mut evicted = self.evicted_by_device.clone(); evicted.insert(self.device.clone(),self.evicted); evicted }),"missing":["Crash may lose the last flush interval and queued events.","Offline, unsupported, disabled, timed out or failed members contribute only completed segments; inspect missing_members and coverage.","Captured repeat follows router state; injected repeat provenance is unknown (null).","QUIC loss counters are unavailable on relay paths; initial session-lock state can be unknown.","Free-form log text and application identity are intentionally excluded; resolve callsite with source tree provenance.","Crash summaries contain typed exception classes and numeric timestamps; unavailable values are explicit."]});
+        let manifest = serde_json::json!({"schema":SCHEMA,"export_clock":{"device":self.device,"instance":self.instance,"clock_id":export_clock.clock_id,"utc_us":export_clock.utc_us},"cutoff_complete":cutoff_complete,"reason":reason,"at_ms":at_ms,"version":env!("OINK_RELEASE_VERSION"),"source_tree_sha256":env!("OINK_DIAGNOSTIC_SOURCE_TREE_SHA256"),"devices":aliases,"screens":screens,"versions":versions,"unrecognized_diagnostic_events":spool.unrecognized,"unrecognized_snapshot_fields":({let mut counts=spool.unknown_snapshot_fields.clone();for (_,snapshot) in self.network_environments.values(){for key in wire::unknown_snapshot_fields(snapshot){*counts.entry(key).or_insert(0u64)+=1;}}counts}),"normalized_peer_coverage":self.normalized_peer_coverage(export_clock.clock_id)?,"peer_ends":self.network_ends.iter().map(|(d,e)| (d.clone(),wire::json(&oink_protocol::v1::schema::WireValue::write(e)))).collect::<BTreeMap<_,_>>(),"coverage":self.segments,"dropped":dropped,"errors":errors,"evicted_segments":self.evicted,"corrupt_segments":self.corrupt,"missing_members":missing_members,"requested_range_us":self.requested_range.map(|(start,end)| (if start == i64::MIN {None} else {Some(start)},end)),"evicted_segments_by_device":({ let mut evicted = self.evicted_by_device.clone(); evicted.insert(self.device.clone(),self.evicted); evicted }),"missing":["Process termination may lose queued events since the last segment publication. Ring segments are not individually fsynced; power loss or OS failure may lose an OS-buffered tail of unknown duration.","Offline, unsupported, disabled, timed out or failed members contribute only completed segments; inspect missing_members and coverage.","Captured repeat follows router state; injected repeat provenance is unknown (null).","QUIC loss counters are unavailable on relay paths; initial session-lock state can be unknown.","Free-form log text and application identity are intentionally excluded; resolve callsite with source tree provenance.","Crash summaries contain typed exception classes and numeric timestamps; unavailable values are explicit."]});
         zip.start_file("manifest.json", options)?;
         {
             let mut entry = BufWriter::with_capacity(EXPORT_BUFFER, &mut zip);
@@ -1182,7 +1200,10 @@ impl Store {
             entry.flush()?;
         }
         zip.start_file("crash-report.json", options)?;
-        write_json(&mut zip, &super::crash_report::latest().export_view(at_ms))?;
+        write_json(
+            &mut zip,
+            &super::crash_report::latest_for(&self.dir, self.previous_instance.as_deref()).export_view(at_ms),
+        )?;
         zip.start_file("clock-samples.json", options)?;
         write_json(&mut zip, &self.clocks)?;
         for device in sources.keys() {

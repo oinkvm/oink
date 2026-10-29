@@ -92,6 +92,12 @@ fn layout_profiles_use_the_ui_dispatch_path_over_ipc() {
 struct RigidDisplays {
     native_supported: bool,
     writes: std::sync::atomic::AtomicUsize,
+    first_read_pause: Mutex<Option<NativeReadPause>>,
+}
+#[derive(Debug)]
+struct NativeReadPause {
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
 }
 impl oink_display::DisplayBackend for RigidDisplays {
     fn displays(&self) -> Result<Vec<DisplayInfo>, oink_display::DisplayError> {
@@ -103,6 +109,10 @@ impl oink_display::DisplayBackend for RigidDisplays {
     fn native_configuration(
         &self,
     ) -> Result<oink_display::arrangement::NativeConfiguration, oink_display::DisplayError> {
+        if let Some(pause) = self.first_read_pause.lock().unwrap().take() {
+            pause.entered.send(()).unwrap();
+            pause.resume.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
         if !self.native_supported {
             return Err(oink_display::DisplayError::Unsupported);
         }
@@ -126,27 +136,53 @@ impl oink_display::DisplayBackend for RigidDisplays {
     }
 }
 
-fn rigid_ui_edit(native_supported: bool) {
+fn rigid_ui_edit(native_supported: bool, pause_first_read: bool) {
     use oink_agent::api::{Request, dispatch};
     use oink_agent::layout_profiles::types::*;
     let dir = tempfile::tempdir().unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
+    let (entered, reading) = std::sync::mpsc::channel();
+    let (resume, resumed) = std::sync::mpsc::channel();
     let displays = Arc::new(RigidDisplays {
         native_supported,
         writes: Default::default(),
+        first_read_pause: Mutex::new(pause_first_read.then_some(NativeReadPause {
+            entered,
+            resume: resumed,
+        })),
     });
-    let node = rt
-        .block_on(Node::start_with_fake_platform(NodeOptions {
-            net: oink_test_support::network_config(dir.path().into(), "rigid", 0),
-            input: Arc::new(FakeInput::new()),
-            displays: vec![display()],
-            display_backend: Some(displays.clone()),
-            clipboard: None,
-            mode_switch_in_callback: true,
-            capture_reports_key_repeat: true,
-            cursor_trail: false,
-        }))
-        .unwrap();
+    let mut startup = rt.spawn(Node::start_with_fake_platform(NodeOptions {
+        net: oink_test_support::network_config(dir.path().into(), "rigid", 0),
+        input: Arc::new(FakeInput::new()),
+        displays: vec![display()],
+        display_backend: Some(displays.clone()),
+        clipboard: None,
+        mode_switch_in_callback: true,
+        capture_reports_key_repeat: true,
+        cursor_trail: false,
+    }));
+    // Force the first native observation to straddle startup, independently of
+    // host load. Before the startup fence, Node returned a ready profile while
+    // this read was still blocked, so publishing it invalidated the UI token.
+    let early = if pause_first_read {
+        reading.recv_timeout(Duration::from_secs(10)).unwrap();
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_millis(200), &mut startup)
+                .await
+                .ok()
+        })
+    } else {
+        None
+    };
+    let returned_before_observation = early.is_some();
+    let node = if let Some(early) = early {
+        early.unwrap().unwrap()
+    } else {
+        if pause_first_read {
+            resume.send(()).unwrap();
+        }
+        rt.block_on(startup).unwrap().unwrap()
+    };
     let server = rt.block_on(Server::start_on(node.clone(), 0)).unwrap();
     let client = Client::connect(dir.path()).unwrap();
     let query =
@@ -167,6 +203,21 @@ fn rigid_ui_edit(native_supported: bool) {
     }
     let state = query();
     assert_eq!(state.devices[0].sync_system_arrangement, !native_supported);
+    if returned_before_observation {
+        assert_eq!(state.devices[0].availability, Availability::Unavailable);
+        resume.send(()).unwrap();
+        wait("first native publication", || {
+            query().devices[0].availability == Availability::Ready
+        });
+        // Geometry and owner settings stayed equal; only the first read-only
+        // native token/availability changed after the UI obtained its token.
+        let observed = query();
+        assert_ne!(state.token, observed.token);
+        assert_eq!(
+            state.snapshot.as_ref().unwrap().placements,
+            observed.snapshot.as_ref().unwrap().placements
+        );
+    }
     let before = state.snapshot.unwrap();
     let mut placements = before.placements.clone();
     placements[0].origin.x += 0.2;
@@ -190,6 +241,10 @@ fn rigid_ui_edit(native_supported: bool) {
     .unwrap();
     let accepted: OperationReply =
         serde_json::from_value(reply.clone()).unwrap_or_else(|e| panic!("rigid UI commit refused: {e}; {reply}"));
+    assert!(
+        !returned_before_observation,
+        "startup exposed ready layout before its first native observation"
+    );
     let mut settled = None;
     wait("rigid edit terminal result", || {
         let value = query();
@@ -210,14 +265,8 @@ fn rigid_ui_edit(native_supported: bool) {
     assert!(op.native_restore_devices.is_empty());
     let after = op.after.unwrap();
     assert_eq!(after.placements, placements);
-    assert_eq!(after.native.len(), before.native.len());
-    for (actual, original) in after.native.iter().zip(&before.native) {
-        // The background observer may publish its first read-only token during
-        // the edit; origins, primary selection and sizes must remain identical.
-        assert_eq!(actual.device, original.device);
-        assert_eq!(actual.primary, original.primary);
-        assert_eq!(actual.screens, original.screens);
-    }
+    // Repeated read-only observations must preserve even the native tokens.
+    assert_eq!(after.native, before.native);
     assert_eq!(displays.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
     rt.block_on(server.close());
     rt.block_on(node.shutdown());
@@ -226,11 +275,16 @@ fn rigid_ui_edit(native_supported: bool) {
 
 #[test]
 fn rigid_ui_edit_with_system_arrangement_setting_off() {
-    rigid_ui_edit(true);
+    rigid_ui_edit(true, false);
 }
 #[test]
 fn rigid_ui_edit_with_unsupported_system_arrangement_writes() {
-    rigid_ui_edit(false);
+    rigid_ui_edit(false, false);
+}
+
+#[test]
+fn rigid_ui_edit_waits_for_initial_native_observation() {
+    rigid_ui_edit(true, true);
 }
 
 #[test]
@@ -317,7 +371,12 @@ fn partial_preference_commands_persist_only_explicit_local_choices() {
         .set_ui_preferences(serde_json::from_value(json!({"theme_accent":{"dark":"#112233"}})).unwrap())
         .unwrap();
     remote
-        .set_clipboard_settings(serde_json::from_value(json!({"files":false})).unwrap())
+        .set_clipboard_settings(
+            serde_json::from_value(
+                json!({"text":false,"rich_text":false,"images":false,"files":false,"custom":false,"send":false}),
+            )
+            .unwrap(),
+        )
         .unwrap();
     remote
         .set_clipboard_settings(serde_json::from_value(json!({"text":true})).unwrap())
@@ -335,14 +394,17 @@ fn partial_preference_commands_persist_only_explicit_local_choices() {
         applied["local"],
         json!({
             "show_status_icon":true,"confirm_quit":false,"theme_accent":{"dark":"#112233"},
-            "clipboard":{"files":false,"text":true},"audio":{"keep_local_playback":false,"receive_output":null},
+            "clipboard":{"send":false},"audio":{"keep_local_playback":false,"receive_output":null},
             "event_frequency":"hz125","emergency_hold_ms":5000
         })
     );
     assert_eq!(applied["device_options_cbor"], before["device_options_cbor"]);
     assert_eq!(remote.ui_preferences().unwrap().theme_accent.light.as_str(), "#FF6B8E");
-    assert!(!remote.clipboard_settings().unwrap().files);
-    assert!(remote.clipboard_settings().unwrap().images);
+    assert!(!remote.clipboard_settings().unwrap().send);
+    let wire = serde_json::to_value(remote.clipboard_settings().unwrap()).unwrap();
+    for key in ["text", "rich_text", "images", "files", "custom"] {
+        assert_eq!(wire[key], true);
+    }
     assert!(
         remote
             .set_ui_preferences(serde_json::from_value(json!({"confirm_quit":null})).unwrap())
@@ -380,7 +442,7 @@ fn partial_preference_commands_persist_only_explicit_local_choices() {
     let config = oink_agent::config::AgentConfig::load_from(dir.path()).unwrap();
     assert!(!config.settings.confirm_quit);
     assert!(config.settings.show_status_icon);
-    assert!(!config.settings.clipboard.unwrap().files);
+    assert!(!config.settings.clipboard.unwrap().send);
     rt.shutdown_timeout(Duration::from_millis(200));
 }
 

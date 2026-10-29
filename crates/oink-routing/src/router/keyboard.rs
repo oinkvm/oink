@@ -1,4 +1,4 @@
-//! Runtime-only source keyboard guard. Remote injection never enters this gate.
+//! Disabled keyboard source mode. Remote injection never enters this gate.
 use super::*;
 use std::collections::BTreeSet;
 
@@ -9,7 +9,6 @@ const RELEASE_KEY: KeyCode = KeyCode::keyboard(0x18);
 
 #[derive(Debug, Default)]
 pub(super) struct Keyboard {
-    disabled: bool,
     down: BTreeSet<KeyCode>,
     local_passed: BTreeSet<KeyCode>,
     pointer_seed: BTreeSet<KeyCode>,
@@ -54,6 +53,37 @@ impl Keyboard {
     }
 }
 impl Router {
+    pub(super) fn cancel_fn_for_function_row(&mut self) {
+        if self.cfg.os != Os::MacOS || !self.fn_sync_held || !self.keyboard.down.iter().copied().any(fn_row_key) {
+            return;
+        }
+        // macOS can translate the same F-row gesture into a function or NX media
+        // key before our session tap sees it. Retire only this source's mapped Fn
+        // contribution, before routing that key; do not synthesize native Fn UP
+        // or try to undo the system's local action. The dropped route keeps Fn
+        // repeats and crossings from restoring it until a fresh physical press.
+        self.fn_sync_held = false;
+        let targets = self.keys.remove(&KeyCode::APPLE_FN).unwrap_or_else(|| {
+            if (self.keyboard_local() || self.current_target() == Target::Local)
+                && self.map_key(self.me(), KeyCode::APPLE_FN) == KeyCode::APPLE_FN
+            {
+                vec![Target::Local]
+            } else {
+                vec![Target::Dropped]
+            }
+        });
+        let (native, mapped): (Vec<_>, Vec<_>) = targets.into_iter().partition(|t| *t == Target::Local);
+        self.release_local_key(KeyCode::APPLE_FN, mapped);
+        self.keys.insert(
+            KeyCode::APPLE_FN,
+            if native.is_empty() {
+                vec![Target::Dropped]
+            } else {
+                native
+            },
+        );
+    }
+
     /// Modifier flags on local physical pointer events must exclude blocked hardware
     /// modifiers, while preserving any modifier held by a remote injected source.
     pub fn keyboard_pointer_modifiers(&self) -> Vec<KeyCode> {
@@ -69,7 +99,7 @@ impl Router {
             .filter(|g| {
                 g.iter().any(|k| {
                     (self.keyboard.down.contains(k)
-                        || (self.keyboard.disabled && self.keyboard.pointer_seed.contains(k)))
+                        || (self.keyboard_disabled() && self.keyboard.pointer_seed.contains(k)))
                         && (self.keyboard_key_blocked(Some(*k))
                             || self.keys.get(k).is_some_and(|targets| {
                                 !targets.contains(&Target::Local) && !targets.contains(&Target::LocalInjected)
@@ -80,13 +110,13 @@ impl Router {
             .collect()
     }
     pub fn keyboard_disabled(&self) -> bool {
-        self.keyboard.disabled
+        self.cfg.settings.keyboard_mode == InputMode::Disabled
     }
     pub fn keyboard_key_blocked(&self, code: Option<KeyCode>) -> bool {
         if code.is_some_and(KeyCode::is_brightness) {
             return false;
         }
-        (!self.fully_paused && self.keyboard.disabled) || code.is_some_and(|k| self.keyboard.suppressed.contains(&k))
+        (!self.fully_paused && self.keyboard_disabled()) || code.is_some_and(|k| self.keyboard.suppressed.contains(&k))
     }
 
     pub fn release_session_keys(&mut self, keys: &[KeyCode]) {
@@ -114,25 +144,34 @@ impl Router {
         }
     }
     pub fn release_input_disables(&mut self) {
-        if !self.keyboard.disabled && !self.mouse_disabled() {
+        if !self.keyboard_disabled() && !self.mouse_disabled() {
             return;
         }
-        // The agent persists both preferences as one owner transaction. Publish
-        // release intent before the enabled observations for its safety fence.
         self.out.push(Output::Status(StatusEvent::InputDisablesReleased));
         self.keyboard.since = None;
-        self.set_keyboard_disabled(false);
-        if self.mouse_disabled() {
-            let mut settings = self.cfg.settings.clone();
-            settings.mouse_mode = oink_foundation::input::InputMode::Shared;
-            self.set_settings(settings);
+        let mut settings = self.cfg.settings.clone();
+        for mode in [&mut settings.keyboard_mode, &mut settings.mouse_mode] {
+            if *mode == InputMode::Disabled {
+                *mode = InputMode::Shared;
+            }
         }
+        self.set_settings(settings);
     }
+    /// Compatibility convenience command; the routing setting is the sole state.
     pub fn set_keyboard_disabled(&mut self, disabled: bool) {
-        if self.keyboard.disabled == disabled {
+        if self.keyboard_disabled() == disabled {
             return;
         }
-        self.keyboard.disabled = disabled;
+        let mut settings = self.cfg.settings.clone();
+        if disabled {
+            settings.keyboard_mode = InputMode::Disabled;
+        } else if settings.keyboard_mode == InputMode::Disabled {
+            settings.keyboard_mode = InputMode::Shared;
+        }
+        self.set_settings(settings);
+    }
+    pub(super) fn keyboard_mode_changed(&mut self, disabled: bool) {
+        self.publish_lock_escape();
         self.keyboard.since = None;
         self.keyboard.pointer_seed.clear();
         // Presses made under the guard (including its release chord) must be lifted
@@ -162,6 +201,7 @@ impl Router {
     }
 
     pub(super) fn retire_source_keyboard(&mut self) {
+        self.fn_sync_held = false;
         self.cancel_caps();
         self.mask_menu_keys();
         let keys: Vec<_> = self.keys.drain().collect();
@@ -177,7 +217,7 @@ impl Router {
         for code in native {
             self.keyboard.suppressed.insert(code);
             let mapped = self.local_mapped.get(&code).copied().unwrap_or(code);
-            if !self.key_refs.contains_key(&mapped) && released.insert(mapped) {
+            if mapped != KeyCode::NONE && !self.key_refs.contains_key(&mapped) && released.insert(mapped) {
                 self.out.push(Output::Inject(InjectEvent::Key {
                     code: mapped,
                     pressed: false,
@@ -190,9 +230,9 @@ impl Router {
     }
 
     /// Session transitions retire physical chord/tail observations, never the
-    /// saved guard. Credential input is not a source of presses for this tracker.
+    /// saved source mode. Credential input is not a source of presses for this tracker.
     pub fn keyboard_session_locked(&mut self, locked: Option<bool>) {
-        if (self.keyboard.disabled || self.mouse_disabled()) && locked.is_some() {
+        if (self.keyboard_disabled() || self.mouse_disabled()) && locked.is_some() {
             self.keyboard.since = None;
             self.keyboard.down.clear();
             self.keyboard.suppressed.clear();
@@ -204,7 +244,7 @@ impl Router {
         let InputEvent::Key { code, pressed } = ev.event else {
             return None;
         };
-        if self.keyboard.disabled && ev.physical && code.is_brightness() {
+        if self.keyboard_disabled() && ev.physical && code.is_brightness() {
             // Return Pass here, before suppression, transforms and forwarding.
             return Some(Disposition::Pass);
         }
@@ -222,7 +262,7 @@ impl Router {
         if !pressed {
             self.keyboard.suppressed.remove(&code);
         }
-        let disabled = self.keyboard.disabled || self.mouse_disabled();
+        let disabled = self.keyboard_disabled() || self.mouse_disabled();
         if disabled && !self.fully_paused && ev.physical {
             let exact = self.keyboard.exact();
             if !exact {
@@ -233,7 +273,7 @@ impl Router {
             // Mouse-only disable leaves ordinary typing alone. Swallow the key
             // completing the escape chord and its tail, without swallowing UPs
             // for modifiers already passed to the OS or another device.
-            if self.keyboard.disabled || exact {
+            if self.keyboard_disabled() || exact {
                 if pressed {
                     self.keyboard.suppressed.insert(code);
                 }
@@ -245,4 +285,11 @@ impl Router {
         }
         suppressed.then_some(Disposition::Swallow)
     }
+}
+
+fn fn_row_key(code: KeyCode) -> bool {
+    (code.page() == KeyCode::PAGE_KEYBOARD && matches!(code.usage(), 0x3a..=0x45))
+        || code.is_brightness()
+        || code.is_volume()
+        || (code.page() == KeyCode::PAGE_CONSUMER && matches!(code.usage(), 0xcd | 0xb3..=0xb6))
 }

@@ -15,13 +15,9 @@ use oink_protocol::{
         schema::{WireDto, WireValue},
     },
 };
-use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, time::Duration};
 const CAP: &str = "oink.layout.profiles/3";
 const BUDGET: u64 = (MAX_BYTES + 1024 * 1024) as u64;
-fn digest(c: &dto::LayoutProfileCatalogV3) -> oink_protocol::v1::Result<[u8; 32]> {
-    Ok(Sha256::digest(c.encode(MAX_BYTES)?).into())
-}
 impl Node {
     fn receive_profile_message(
         &self,
@@ -64,11 +60,21 @@ impl Node {
                     Some(c) => c.receive(&incoming, self.id().into())?,
                     None => incoming.clone(),
                 };
+                let accepts_dependency = current.as_ref().is_none_or(|c| incoming.version >= c.version);
+                let dependency = message.layout_version().map_err(wire::invalid)?;
+                if accepts_dependency && let Some(version) = &dependency {
+                    // Register the dependency before exposing the catalog: a
+                    // display callback may arrive as soon as that save is visible.
+                    self.link_config()
+                        .map_err(super::state::unavailable)?
+                        .observe_display_layout_dependency(group, version.clone())
+                        .map_err(super::state::unavailable)?;
+                }
                 if current.as_ref() != Some(&next) {
                     self.persist_catalog(next)?;
                 }
-                if current.as_ref().is_none_or(|c| incoming.version >= c.version) {
-                    lock(&self.inner.profiles.data).pending_layout = message.layout_version().map_err(wire::invalid)?;
+                if accepts_dependency {
+                    lock(&self.inner.profiles.data).pending_layout = dependency;
                 }
             }
             Message::LayoutProfilesJoin(message) => {
@@ -137,17 +143,16 @@ async fn deliver(node: &Node, link: LinkId, catalog: Catalog) -> bool {
     let Ok(catalog) = wire::catalog(&catalog) else {
         return false;
     };
-    let Ok(digest) = digest(&catalog) else { return false };
     let Ok(group) = catalog.group() else { return false };
     let Ok(message) =
         dto::LayoutProfilesStateV3::from_raw([(1, group.write()), (2, catalog.write()), (4, version.write())].into())
     else {
         return false;
     };
-    send(node, link, Message::LayoutProfilesStateV3(message), group, digest).await
+    send(node, link, Message::LayoutProfilesStateV3(message), group).await
 }
 
-async fn send(node: &Node, link: LinkId, message: Message, group: dto::Id16, digest: [u8; 32]) -> bool {
+async fn send(node: &Node, link: LinkId, message: Message, group: dto::Id16) -> bool {
     let Ok(links) = node.links() else {
         return false;
     };
@@ -166,21 +171,18 @@ async fn send(node: &Node, link: LinkId, message: Message, group: dto::Id16, dig
     let Ok(Some(Message::LayoutProfilesReceiptV3(receipt))) = stream.recv().await else {
         return false;
     };
-    if receipt.accepted() != Ok(true) || receipt.group() != Ok(group) || receipt.digest().map(|h| h.0) != Ok(digest) {
+    if receipt.accepted() != Ok(true) || receipt.group() != Ok(group) {
         return false;
     }
     matches!(stream.recv().await, Ok(None))
 }
 async fn receive(node: Node, mut incoming: InboundLow) {
-    let (catalog, group) = match &incoming.first {
-        Message::LayoutProfilesStateV3(m) => (m.catalog(), m.group()),
-        Message::LayoutProfilesJoin(m) => (m.catalog(), m.group()),
+    let group = match &incoming.first {
+        Message::LayoutProfilesStateV3(m) => m.group(),
+        Message::LayoutProfilesJoin(m) => m.group(),
         _ => return,
     };
-    let (Ok(catalog), Ok(group)) = (catalog, group) else {
-        return;
-    };
-    let Ok(hash) = digest(&catalog) else {
+    let Ok(group) = group else {
         return;
     };
     let peer = incoming.stream.peer();
@@ -205,9 +207,7 @@ async fn receive(node: Node, mut incoming: InboundLow) {
     })
     .await
     .is_ok_and(|v| v.is_ok());
-    let Ok(receipt) = dto::LayoutProfilesReceipt::from_raw(
-        [(1, group.write()), (2, V::Bytes(hash.to_vec())), (3, accepted.write())].into(),
-    ) else {
+    let Ok(receipt) = dto::LayoutProfilesReceipt::from_raw([(1, group.write()), (3, accepted.write())].into()) else {
         return;
     };
     if incoming
@@ -240,11 +240,10 @@ pub(crate) fn start(node: Node, mut port: ModulePort) -> tokio::task::JoinHandle
                                     for join in joins {
                                         let Some(source) = join.catalog else {continue;};
                                         let Ok(catalog) = wire::catalog(&source) else {continue;};
-                                        let Ok(hash) = digest(&catalog) else {continue;};
                                         let group = oink_protocol::v1::schema::FixedBytes(join.target.0.0);
                                         let Ok(id) = (0..join.id.len()).step_by(2).map(|i|u8::from_str_radix(&join.id[i..i+2],16)).collect::<std::result::Result<Vec<_>,_>>() else {continue;};
                                         let Ok(message) = dto::LayoutProfilesJoin::from_raw([(1,group.write()),(2,V::Bytes(id)),(3,catalog.write())].into()) else {continue;};
-                                        let _ = tokio::time::timeout(Duration::from_secs(30),send(&node,link,Message::LayoutProfilesJoin(message),group,hash)).await;
+                                        let _ = tokio::time::timeout(Duration::from_secs(30),send(&node,link,Message::LayoutProfilesJoin(message),group)).await;
                                     }
                                 }
                                 let catalog=lock(&node.inner.profiles.data).catalog.clone();
@@ -265,9 +264,9 @@ pub(crate) fn start(node: Node, mut port: ModulePort) -> tokio::task::JoinHandle
                 },
                 _=clock.tick()=>{
                     let node=node.clone();
-                    // Also refresh read-only native tokens after a display/mode
-                    // change; unsupported test backends simply have no token.
-                    let _=tokio::task::spawn_blocking(move ||{let _=node.refresh_native_arrangement();node.poll_profile_operations();node.refresh_layout_profiles();}).await;
+                    // Native tokens are refreshed by the platform display observer.
+                    // Keep only logical recovery/retry work on this clock.
+                    let _=tokio::task::spawn_blocking(move ||{node.poll_profile_operations();node.refresh_layout_profiles();}).await;
                 }
                 _=incoming.join_next(),if !incoming.is_empty()=>{}
                 _=outgoing.join_next(),if !outgoing.is_empty()=>{}

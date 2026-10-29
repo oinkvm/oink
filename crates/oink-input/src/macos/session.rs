@@ -13,7 +13,7 @@ static SHIELDED: AtomicBool = AtomicBool::new(false);
 /// Do not deliver idle input into a screen saver, password grace period, lock
 /// screen or another console session. Query also covers starting already locked.
 pub(crate) fn idle_refresh_allowed() -> bool {
-    if SHIELDED.load(Ordering::Acquire) || locked() == Some(true) {
+    if !idle_refresh_unshielded() {
         return false;
     }
     let Some(dict) = CGSessionCopyCurrentDictionary() else {
@@ -28,6 +28,16 @@ pub(crate) fn idle_refresh_allowed() -> bool {
     flag("kCGSSessionOnConsoleKey") == Some(true)
         && flag("kCGSessionLoginDoneKey") == Some(true)
         && flag("CGSSessionScreenIsLocked") != Some(true)
+}
+
+/// Callback-safe second gate. The ordinary request path already queried the
+/// console/login dictionary; never perform that synchronous query inside a tap.
+pub(crate) fn idle_refresh_unshielded() -> bool {
+    idle_session_permitted(SHIELDED.load(Ordering::Acquire), locked())
+}
+
+fn idle_session_permitted(shielded: bool, locked: Option<bool>) -> bool {
+    !shielded && locked != Some(true)
 }
 
 pub(crate) fn snapshot() -> u64 {
@@ -123,6 +133,14 @@ pub(crate) fn init() {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+    #[test]
+    fn screensaver_grace_and_lock_block_idle_pulses() {
+        assert!(idle_session_permitted(false, Some(false)));
+        for locked in [None, Some(false), Some(true)] {
+            assert!(!idle_session_permitted(true, locked));
+        }
+        assert!(!idle_session_permitted(false, Some(true)));
+    }
     #[test]
     fn simulated_notifications_preserve_unknown_and_signal_each_transition() {
         let initial = 0;

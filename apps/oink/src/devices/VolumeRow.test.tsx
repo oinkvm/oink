@@ -23,10 +23,10 @@ it.each([
   const {container} = render(<OinkProvider><VolumeRow d={{...device, speaker:{...device.speaker,...speaker}}} open tabbable onSpeaker={()=>{}}/></OinkProvider>);
   expect(container.querySelector('.dev__vol')).toBeNull();
 });
-it('keeps known volume visible while a command is pending', () => {
-  const {container} = render(<OinkProvider><VolumeRow d={{...device,pending:true}} open tabbable onSpeaker={()=>{}}/></OinkProvider>);
+it('keeps an optimistic volume visible and enabled', () => {
+  const {container} = render(<OinkProvider><VolumeRow d={device} open tabbable onSpeaker={()=>{}}/></OinkProvider>);
   expect(container.querySelector('[role="slider"]')?.getAttribute('aria-valuenow')).toBe('80');
-  expect(container.querySelector('[role="slider"]')?.getAttribute('aria-disabled')).toBe('true');
+  expect(container.querySelector('[role="slider"]')?.getAttribute('aria-disabled')).toBeNull();
 });
 
 describe('live volume', () => {
@@ -47,10 +47,10 @@ describe('live volume', () => {
     fireEvent.pointerMove(el, { clientX: 120, pointerId: 1 });
     fireEvent.pointerMove(el, { clientX: 120, pointerId: 1 });
     fireEvent.pointerMove(el, { clientX: 150, pointerId: 1 });
-    expect(el.getAttribute('aria-valuenow')).toBe('150');
+    expect(el.getAttribute('aria-valuenow')).toBe('148');
     fireEvent.pointerUp(el, { pointerId: 1 });
-    // max 200 over 200px: one percent per pixel; a repeated position is not resent.
-    expect(onSpeaker.mock.calls.map(([a]) => [a.value, a.final ?? false])).toEqual([[100, false], [120, false], [150, false], [150, true]]);
+    // Pointer gain is mapped around the 100% detent; repeated positions are not resent.
+    expect(onSpeaker.mock.calls.map(([a]) => [a.value, a.final ?? false])).toEqual([[100, false], [118, false], [148, false], [148, true]]);
   });
   it('applies keyboard and wheel steps at once', () => {
     const onSpeaker = vi.fn();
@@ -61,4 +61,22 @@ describe('live volume', () => {
     fireEvent.wheel(el, { deltaY: 4, shiftKey: true });
     expect(onSpeaker.mock.calls.map(([a]) => a.value)).toEqual([81, 82, 83, 73]);
   });
+});
+
+it('does not disable or remount audio controls when another device resource changes', () => {
+  const row = (local: boolean) => <OinkProvider><VolumeRow d={{...device,mouse:local?'local':'shared'}} open tabbable onSpeaker={()=>{}}/></OinkProvider>;
+  const {container,rerender} = render(row(false));
+  const button = container.querySelector('button')!;
+  const glyph = container.querySelector('.vol__glyph')!;
+  rerender(row(true));
+  expect(container.querySelector('button')).toBe(button);
+  expect(container.querySelector('.vol__glyph')).toBe(glyph);
+  expect(button.disabled).toBe(false);
+  expect(container.querySelector('[role="slider"]')?.getAttribute('aria-disabled')).toBeNull();
+});
+
+it.each([false,true])('keeps microphone controls enabled while its mute state changes (%s)', muted => {
+  const d:Device={...device,microphone:{mode:'source',permissionGranted:true,virtualReady:true,volume:100,muted,canSetVolume:true}};
+  const {container}=render(<OinkProvider><VolumeRow d={d} microphone open tabbable onSpeaker={()=>{}}/></OinkProvider>);
+  expect(container.querySelector('button')!.disabled).toBe(false);
 });

@@ -8,7 +8,7 @@ publish = false
 
 [features]
 default = ["clipboard", "input", "network"]
-network = ["dep:oink-network"]
+network = ["dep:oink-network", "dep:fs2"]
 clipboard = ["dep:oink-clipboard"]
 input = ["dep:oink-input"]
 protocol = ["dep:oink-protocol", "dep:serde_json"]
@@ -22,6 +22,7 @@ name = "v1-fixtures"
 required-features = ["protocol"]
 
 [dependencies]
+fs2 = { version = "0.4", optional = true }
 oink-network = { workspace = true, optional = true, features = ["test-support"] }
 oink-input = { path = "../../crates/oink-input", optional = true }
 oink-foundation = { path = "../../crates/oink-foundation" }

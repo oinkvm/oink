@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Shared post-gain activity and sleep threshold: -90 dBFS peak.
+/// Post-gain audio silence threshold for stream idling: -90 dBFS peak.
 pub const SOUND_THRESHOLD: f32 = 0.000_031_622_776;
 pub fn has_sound(samples: &[f32]) -> bool {
     samples.iter().any(|x| x.is_finite() && x.abs() > SOUND_THRESHOLD)
@@ -25,6 +25,9 @@ pub struct Stamp {
     pub first_sample_at: Option<Instant>,
     pub callback_at: Option<Instant>,
     pub delivered_at: Instant,
+    /// Native source position, in the backend's input-rate domain. A backend
+    /// supplying this must check its frame sequence and report any loss through
+    /// `discontinuity`; a synthetic count of delivered samples is not sufficient.
     pub source_frame_position: Option<u64>,
     pub discontinuity: bool,
 }
@@ -64,6 +67,7 @@ struct Shared {
     percent: AtomicU16,
     muted: AtomicBool,
     signal: AtomicBool,
+    frames: AtomicU64,
     asleep: AtomicBool,
     burst: AtomicU64,
     active: AtomicBool,
@@ -123,6 +127,11 @@ impl Encoded {
     }
     pub fn burst(&self) -> u64 {
         self.shared.burst.load(Ordering::Acquire)
+    }
+    /// Delivered PCM progress, including delivered digital silence. Native
+    /// backends may omit zero buffers, so this alone cannot detect callback stalls.
+    pub fn frames(&self) -> u64 {
+        self.shared.frames.load(Ordering::Acquire)
     }
     pub fn has_signal(&self) -> bool {
         self.shared.signal.load(Ordering::Acquire)
@@ -219,6 +228,7 @@ pub fn channel(config: dsp::Config, percent: u16, provisional: bool) -> Result<(
         percent: AtomicU16::new(percent.min(200)),
         muted: AtomicBool::new(false),
         signal: AtomicBool::new(false),
+        frames: AtomicU64::new(0),
         asleep: AtomicBool::new(false),
         burst: AtomicU64::new(1),
         active: AtomicBool::new(true),
@@ -352,6 +362,9 @@ impl Encoder {
         if samples.is_empty() || !samples.len().is_multiple_of(2) {
             return;
         }
+        self.shared
+            .frames
+            .fetch_add((samples.len() / 2) as u64, Ordering::Release);
         let mut signal = false;
         for frame in samples.as_chunks::<2>().0 {
             signal |= self.before_gain.frame(frame);
@@ -359,10 +372,19 @@ impl Encoder {
         if signal {
             self.shared.signal.store(true, Ordering::Release);
         }
+        // Native backends already check frame positions and discontinuity flags.
+        // A delivery gap is not missing PCM: Windows loopback can dequeue
+        // consecutive engine buffers together after >20 ms. Clearing lookahead
+        // inserts a 1 ms zero notch; clearing the partial codec frame loses PCM.
+        // Positions may be in the pre-resampling rate, so do not reconstruct
+        // their expected value from this 48 kHz slice. Fall back to delivery age
+        // only when the backend cannot establish native continuity.
+        let native_continuity_known = stamp.source_frame_position.is_some();
         if stamp.discontinuity
-            || self
-                .pre_roll_at
-                .is_some_and(|at| stamp.delivered_at.saturating_duration_since(at) > MAX_BACKLOG)
+            || (!native_continuity_known
+                && self
+                    .pre_roll_at
+                    .is_some_and(|at| stamp.delivered_at.saturating_duration_since(at) > MAX_BACKLOG))
         {
             self.gain.discard_pending();
             self.pre_roll.fill(0.0);
@@ -370,9 +392,10 @@ impl Encoder {
         }
         self.pre_roll_at = Some(stamp.delivered_at);
         if stamp.discontinuity
-            || self
-                .delivered_at
-                .is_some_and(|at| stamp.delivered_at.saturating_duration_since(at) > MAX_BACKLOG)
+            || (!native_continuity_known
+                && self
+                    .delivered_at
+                    .is_some_and(|at| stamp.delivered_at.saturating_duration_since(at) > MAX_BACKLOG))
         {
             self.len = 0;
             self.delivered_at = None;
@@ -567,6 +590,102 @@ mod tests {
             assert!(output.error().is_none());
         }
     }
+    fn assert_continuous_native_batch(block_frames: usize, config: dsp::Config) {
+        // Consecutive WASAPI buffers can arrive together after slightly over
+        // 20 ms. Delivery cadence must not alter the encoded audio.
+        let render = |batched: bool| {
+            let (mut encoder, mut output) = channel(config, 100, false).unwrap();
+            let origin = Instant::now();
+            let mut result = Vec::new();
+            for block in 0..8 {
+                let at = origin
+                    + Duration::from_micros(if batched {
+                        (block / 2) * 21_000 + (block % 2) * 100
+                    } else {
+                        block * 10_000
+                    });
+                encoder.supply(
+                    &vec![0.25; block_frames * 2],
+                    Stamp {
+                        first_sample_at: None,
+                        callback_at: None,
+                        delivered_at: at,
+                        source_frame_position: Some(block * block_frames as u64),
+                        discontinuity: false,
+                    },
+                );
+                while let Some(packet) = output.packets.pop().flatten() {
+                    result.extend_from_slice(&packet.payload[..packet.len]);
+                }
+            }
+            result
+        };
+        let actual = render(true);
+        let expected = render(false);
+        assert_eq!(actual.len(), expected.len(), "block_frames={block_frames}");
+        assert_eq!(
+            actual.iter().zip(&expected).position(|(a, b)| a != b),
+            None,
+            "batching must not change PCM, block_frames={block_frames}"
+        );
+    }
+    #[test]
+    fn continuous_native_frames_survive_batched_delivery_limiter_lookahead() {
+        for config in [
+            dsp::Config::low_latency_pcm(),
+            dsp::Config::low_latency_opus(),
+            dsp::Config::opus_10ms(),
+        ] {
+            assert_continuous_native_batch(480, config);
+        }
+    }
+    #[test]
+    fn continuous_native_frames_survive_batched_delivery_partial_codec_frame() {
+        for config in [
+            dsp::Config::low_latency_pcm(),
+            dsp::Config::low_latency_opus(),
+            dsp::Config::opus_10ms(),
+        ] {
+            assert_continuous_native_batch(441, config);
+        }
+    }
+
+    #[test]
+    fn native_discontinuity_and_unknown_position_still_discard_stale_audio() {
+        for known_position in [false, true] {
+            for discontinuity in [false, true] {
+                for gap_ms in [10, 21] {
+                    let (mut encoder, mut output) = channel(dsp::Config::low_latency_pcm(), 100, false).unwrap();
+                    let first = Stamp {
+                        source_frame_position: known_position.then_some(0),
+                        ..stamp()
+                    };
+                    encoder.supply(&[0.25; 260], first);
+                    assert_eq!(encoder.len, 20);
+                    output.packets.pop().unwrap();
+                    crate::allocation_audit::assert_no_heap(|| {
+                        encoder.supply(
+                            &[0.0; 240],
+                            Stamp {
+                                delivered_at: first.delivered_at + Duration::from_millis(gap_ms),
+                                source_frame_position: known_position.then_some(130),
+                                discontinuity,
+                                ..first
+                            },
+                        );
+                    });
+                    let discarded = discontinuity || (!known_position && gap_ms > 20);
+                    assert_eq!(encoder.len, if discarded { 0 } else { 20 });
+                    let packet = output.packets.pop().flatten().unwrap();
+                    assert_eq!(packet.payload[..packet.len].iter().all(|b| *b == 0), discarded);
+                    if discarded {
+                        assert!(encoder.pre_roll.iter().all(|sample| *sample == 0.0));
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn handoff_overflow_preserves_a_gap_in_encoded_ordinals() {
         let (mut encoder, mut output) = channel(dsp::Config::low_latency_pcm(), 100, false).unwrap();

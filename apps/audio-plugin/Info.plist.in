@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>OinkMicrophone</string>
+<key>CFBundleIdentifier</key><string>com.hachiwii.oink.microphone.driver</string>
+<key>CFBundleName</key><string>Oink Microphone</string>
+<key>CFBundlePackageType</key><string>BNDL</string>
+<key>OinkGitSHA</key><string>${OINK_PLUGIN_GIT_SHA}</string>
+<key>OinkPluginVersion</key><string>${OINK_PLUGIN_VERSION}</string>
+<key>CFBundleVersion</key><string>1</string>
+<key>CFBundleShortVersionString</key><string>0.1.0</string>
+<key>CFPlugInFactories</key><dict>
+<key>57E9D7E9-8D8F-4853-A421-4C57D2998421</key><string>OinkMicrophoneFactory</string>
+</dict>
+<key>CFPlugInTypes</key><dict>
+<key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key><array><string>57E9D7E9-8D8F-4853-A421-4C57D2998421</string></array>
+</dict>
+<key>AudioServerPlugIn_MachServices</key><array/>
+<key>AudioServerPlugIn_Network</key><false/>
+<key>sandboxSafe</key><true/>
+</dict></plist>

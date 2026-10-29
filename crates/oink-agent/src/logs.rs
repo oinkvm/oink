@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
@@ -89,6 +89,15 @@ pub fn init_ui() {
     install(configured_level(), file_writer("oink-ui"));
 }
 
+/// The local replacement continuation outlives the backend that launched it.
+/// Keep this guard in main until the command returns so its final outcome is
+/// flushed too; its inherited stderr may be /dev/null after a Finder launch.
+pub fn init_update() -> Option<WorkerGuard> {
+    let (writer, guard) = file_writer_parts("oink-update-worker").unzip();
+    install(configured_level(), writer);
+    guard
+}
+
 /// Ordinary logs and diagnostics share the platform log root and separate budgets.
 pub fn log_dir() -> PathBuf {
     oink_foundation::paths::log_dir()
@@ -96,6 +105,13 @@ pub fn log_dir() -> PathBuf {
 
 fn file_writer(prefix: &str) -> Option<NonBlocking> {
     static GUARD: OnceLock<WorkerGuard> = OnceLock::new();
+    let (writer, guard) = file_writer_parts(prefix)?;
+    // The long-lived service owns this writer until process exit.
+    GUARD.set(guard).ok()?;
+    Some(writer)
+}
+
+fn file_writer_parts(prefix: &str) -> Option<(NonBlocking, WorkerGuard)> {
     let dir = log_dir();
     std::fs::create_dir_all(&dir).ok()?;
     let appender = files::Writer::new(dir, prefix, || {
@@ -105,14 +121,51 @@ fn file_writer(prefix: &str) -> Option<NonBlocking> {
         )
     })
     .ok()?;
-    let (writer, guard) = tracing_appender::non_blocking(appender);
-    // 进程一直持有写线程（静态变量不析构：退出前最后几行可能来不及写入，可以接受）。
-    GUARD.set(guard).ok()?;
-    Some(writer)
+    Some(tracing_appender::non_blocking(appender))
 }
 
 fn local_log_metadata(metadata: &tracing::Metadata<'_>) -> bool {
     !crate::diagnostics::bundle_only_target(metadata.target())
+}
+
+fn local_log_filter<S: Subscriber>() -> impl tracing_subscriber::layer::Filter<S> {
+    LocalLogFilter(Mutex::new(DiagnosticBudget::default()))
+}
+
+#[derive(Default)]
+struct DiagnosticBudget {
+    began: Option<Instant>,
+    used: u32,
+}
+impl DiagnosticBudget {
+    fn admit(&mut self, now: Instant) -> bool {
+        if self
+            .began
+            .is_none_or(|began| now.duration_since(began) >= Duration::from_secs(60))
+        {
+            self.began = Some(now);
+            self.used = 0;
+        }
+        self.used = self.used.saturating_add(1);
+        self.used <= 128
+    }
+}
+
+struct LocalLogFilter(Mutex<DiagnosticBudget>);
+impl<S: Subscriber> tracing_subscriber::layer::Filter<S> for LocalLogFilter {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>, _: &Context<'_, S>) -> bool {
+        local_log_metadata(metadata)
+    }
+    fn event_enabled(&self, event: &Event<'_>, _: &Context<'_, S>) -> bool {
+        let metadata = event.metadata();
+        // These detailed per-step records also enter the independent bounded
+        // diagnostic recorder. Bound their ordinary text/ring copies even when
+        // an older peer floods incoming connections; never suppress faults.
+        if *metadata.level() > Level::WARN && matches!(metadata.target(), "oink_link_diagnostics" | "oink_dnd_read") {
+            return self.0.lock().unwrap_or_else(|e| e.into_inner()).admit(Instant::now());
+        }
+        true
+    }
 }
 
 fn install(directive: &str, file: Option<NonBlocking>) {
@@ -132,23 +185,17 @@ fn install(directive: &str, file: Option<NonBlocking>) {
         tracing_subscriber::fmt::layer()
             .with_ansi(false)
             .with_writer(w)
-            .with_filter(filter.and(tracing_subscriber::filter::filter_fn(local_log_metadata)))
+            .with_filter(filter.and(local_log_filter()))
     });
     let result = tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(std::io::stderr)
-                .with_filter(stderr_filter.and(tracing_subscriber::filter::filter_fn(local_log_metadata))),
+                .with_filter(stderr_filter.and(local_log_filter())),
         )
         .with(file_layer)
         .with(crate::diagnostics::DiagnosticsLayer)
-        .with(
-            RingLayer.with_filter(
-                ring_filter
-                    .and(LevelFilter::INFO)
-                    .and(tracing_subscriber::filter::filter_fn(local_log_metadata)),
-            ),
-        )
+        .with(RingLayer.with_filter(ring_filter.and(LevelFilter::INFO).and(local_log_filter())))
         .try_init();
     if result.is_ok() {
         let _ = LEVEL_RELOADERS.set(reloaders);
@@ -267,6 +314,56 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+    #[test]
+    fn diagnostic_burst_is_bounded_without_hiding_faults_or_other_layers() {
+        struct Observer(Arc<AtomicUsize>);
+        impl<S: Subscriber> Layer<S> for Observer {
+            fn on_event(&self, _: &Event<'_>, _: Context<'_, S>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = Writer(output.clone());
+        let observed = Arc::new(AtomicUsize::new(0));
+        let layer = tracing_subscriber::fmt::layer()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .with_filter(local_log_filter());
+        let subscriber = tracing_subscriber::registry()
+            .with(layer)
+            .with(Observer(observed.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            for attempt in 0..1000 {
+                tracing::info!(target: "oink_link_diagnostics", attempt, "connection attempt");
+            }
+            tracing::warn!("admission retry backed off");
+            tracing::error!(target: "oink_link_diagnostics", "link fault");
+        });
+        let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.lines().count() <= 130,
+            "ordinary logs must bound diagnostic bursts"
+        );
+        assert!(text.contains("admission retry backed off"));
+        assert!(text.contains("link fault"));
+        assert_eq!(
+            observed.load(Ordering::Relaxed),
+            1002,
+            "diagnostic layer retains its independent budget"
+        );
+    }
+    #[test]
+    fn diagnostic_budget_recovers_on_its_window_without_a_wall_clock() {
+        let now = Instant::now();
+        let mut budget = DiagnosticBudget::default();
+        for _ in 0..128 {
+            assert!(budget.admit(now));
+        }
+        assert!(!budget.admit(now));
+        assert!(!budget.admit(now + Duration::from_secs(59)));
+        assert!(budget.admit(now + Duration::from_secs(60)));
     }
     #[test]
     fn live_level_reload_filters_ordinary_output_without_filtering_other_layers() {

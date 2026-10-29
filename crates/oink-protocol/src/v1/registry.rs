@@ -88,9 +88,14 @@ pub const CAPABILITIES: &[&str] = &[
     "oink.input.gestures/1",
     "oink.input.contacts/1",
     "oink.input.trail/1",
+    "oink.input.application-focus/1",
     "oink.audio/1",
     "oink.audio.pcm/1",
     "oink.audio.state/1",
+    "oink.audio.microphone/1",
+    "oink.audio.media-health/1",
+    "oink.files.safe-symlinks/1",
+    "oink.files.exec-bits/1",
     "oink.aim/1",
     "oink.wallpaper/1",
     "oink.cache/1",
@@ -104,12 +109,22 @@ pub const CAPABILITIES: &[&str] = &[
     "oink.input.accessibility/1",
     "oink.audio.exit-volume/1",
     "oink.notify/1",
+    "oink.notify.microphone/1",
     "oink.layout.profiles/1",
     "oink.layout.arrangement/1",
     "oink.layout.preview/1",
     "oink.layout.profiles/2",
     "oink.layout.profiles/3",
+    "oink.layout.topology/1",
     "oink.audio.local-output/1",
+    "oink.input.touchpad-options/1",
+    "oink.input.scroll-pixels/1",
+    "oink.pointer.move/1",
+    "oink.pointer.lock-escape/1",
+    "oink.input.keymap-none/1",
+    "oink.pointer.entry-protection/1",
+    "oink.power/1",
+    "oink.cloud-file-links/1",
 ];
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Stream {
@@ -292,7 +307,11 @@ pub const RESERVED_MESSAGES: &[(u16, &str)] = &[
 ];
 pub const RESERVED_STREAMS: &[(u16, &str)] = &[(6, "K0")];
 pub const RESERVED_CAPABILITIES: &[&str] = &["oink.calibration/1"];
-pub const REGISTER_KINDS: &[(u32, &str)] = &[(2, "LayoutValue")];
+pub const REGISTER_KINDS: &[(u32, &str)] = &[
+    (2, "LayoutValue"),
+    (8, "ApplicationFocusSettings"),
+    (0x1301, "PointerShortcutSlots"),
+];
 pub const RESERVED_REGISTERS: &[u32] = &[1, 3, 4, 5, 6, 7];
 pub const RESERVED_ENUM_VALUES: &[(&str, &[u32])] = &[
     ("SizeSource", &[2]),
@@ -397,6 +416,20 @@ pub const ERRORS: &[(u16, &str)] = &[
 ];
 pub type OpenEnumAllocation = (&'static str, &'static str, &'static [(u32, Option<&'static str>)]);
 pub const OPEN_ENUMS: &[OpenEnumAllocation] = &[
+    (
+        "ApplicationFocusAction",
+        "ApplicationFocusActionKind",
+        &[
+            (0, Some("ApplicationFocusObservation")),
+            (1, Some("ApplicationFocusPrepare")),
+            (2, Some("ApplicationFocusSnapshot")),
+            (3, Some("ApplicationFocusApplied")),
+            (4, Some("ApplicationFocusSnapshot")),
+            (5, Some("ApplicationFocusRetire")),
+            (6, None),
+            (7, Some("ApplicationFocusPrepare")),
+        ],
+    ),
     (
         "MouseButton",
         "MouseButtonKind",
@@ -558,6 +591,9 @@ pub const OPEN_ENUMS: &[OpenEnumAllocation] = &[
 ];
 pub fn validate_open(name: &str, raw: &RawMap) -> Result<()> {
     match name {
+        "ApplicationFocusAction" => {
+            ApplicationFocusAction::from_raw(raw.clone())?;
+        }
         "MouseButton" => {
             MouseButton::from_raw(raw.clone())?;
         }

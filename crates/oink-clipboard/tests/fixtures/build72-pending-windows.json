@@ -1,0 +1,169 @@
+{
+  "deliveries": {
+    "1": [
+      {
+        "path": "source\\batch\\body",
+        "life": {
+          "received_at": 1700000000000,
+          "last_used": 1700000000000,
+          "materialized": true,
+          "shell": false,
+          "app": false,
+          "unknown": false,
+          "observation_gap": false
+        },
+        "directory": false,
+        "deleted": false,
+        "handed_off": true,
+        "length": 3
+      }
+    ]
+  },
+  "sources": {
+    "1": {
+      "descriptor": {
+        "offer": {
+          "clip": {
+            "origin": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "seq": 9223372036854775810
+          },
+          "generation": 9223372036854775810
+        },
+        "token": [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ],
+        "provisional": false,
+        "roots": [
+          {
+            "id": 1,
+            "parent": null,
+            "name": "body",
+            "kind": "File",
+            "size": {
+              "Known": 3
+            },
+            "version": 1,
+            "modified_ms": null
+          }
+        ],
+        "fulfilled": [
+          {
+            "node": 1,
+            "digest": [
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11,
+              11
+            ]
+          }
+        ]
+      },
+      "nodes": [
+        {
+          "id": 1,
+          "parent": null,
+          "name": "body",
+          "kind": "File",
+          "size": {
+            "Known": 3
+          },
+          "version": 1,
+          "modified_ms": null
+        }
+      ],
+      "base": "source\\batch"
+    }
+  }
+}

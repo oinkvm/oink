@@ -272,3 +272,23 @@ it('uses bounding rectangles for both the edited computer and multi-screen targe
     // Selecting both siblings visits the same computer only once.
     expect(compactScreens(all, all, new Set(['a1', 'a2']))).toEqual(next);
 });
+
+it('compacts only the edited computer and leaves other screens exactly in place', () => {
+    const screen = (id: string, x: number) => ({ ...box(x, 0), id, device: id, name: id, wallpaper: 0 });
+    const all = [screen('a', 0), screen('b', 30), screen('c', 100)];
+    const next = compactScreens(all, all, new Set(['c']));
+    expect(next.map(s => s.x)).toEqual([0, 30, 40]);
+    expect(next.slice(0, 2)).toEqual(all.slice(0, 2));
+    expect(compactScreens([...all].reverse(), [...all].reverse(), new Set(['c'])).reverse()).toEqual(next);
+    expect(compactScreens(all, all, new Set())).toEqual(all);
+});
+
+it('visits only selected computers in identity order, independent of input or selection order', () => {
+    const screen = (id: string, x: number) => ({ ...box(x, 0), id, device: id, name: id, wallpaper: 0 });
+    const all = [screen('a', 0), screen('b', 30), screen('c', 100), screen('d', 200)];
+    const next = compactScreens(all, all, new Set(['a', 'c']));
+    expect(next.map(s => s.x)).toEqual([20, 30, 40, 200]);
+    expect(next[1]).toEqual(all[1]);
+    expect(next[3]).toEqual(all[3]);
+    expect(compactScreens([...all].reverse(), [...all].reverse(), new Set(['c', 'a'])).reverse()).toEqual(next);
+});

@@ -16,54 +16,68 @@ fn options(data_dir: &std::path::Path) -> NodeOptions {
 }
 
 #[tokio::test]
-async fn new_boot_durably_releases_both_disables_before_starting_owners() {
-    let home = tempfile::tempdir().unwrap();
-    let mut config = AgentConfig::load_from(home.path()).unwrap();
-    config
-        .update(|settings| {
-            settings.keyboard_disabled = true;
-            settings.routing.mouse_mode = oink_foundation::input::InputMode::Disabled;
-        })
-        .unwrap();
-    let previous = config.owner().revision(LocalOption::KeyboardDisabled).unwrap();
-    let first = Node::prepare(options(home.path())).unwrap();
-    let first_boot = first.inner.boot.nonce;
-    for config in [
-        lock(&first.inner.config).clone(),
-        AgentConfig::load_from(home.path()).unwrap(),
-    ] {
-        assert!(!config.settings.keyboard_disabled);
-        assert_eq!(
-            config.settings.routing.mouse_mode,
-            oink_foundation::input::InputMode::Shared
-        );
-        assert_eq!(
-            config.owner().revision(LocalOption::KeyboardDisabled),
-            Some(previous + 1)
-        );
-    }
-    assert!(first.inner.input.get().is_none());
-    assert!(first.inner.links.get().is_none());
-    assert!(first.inner.group.get().is_none());
-    drop(first);
+async fn new_boot_restores_disabled_sources_to_shared_and_preserves_enabled_modes() {
+    use oink_foundation::input::InputMode;
+    use oink_protocol::v1::schema::WireValue;
 
-    let second = Node::prepare(options(home.path())).unwrap();
-    assert_ne!(second.inner.boot.nonce, first_boot);
-    let disk = AgentConfig::load_from(home.path()).unwrap();
-    assert!(!disk.settings.keyboard_disabled);
-    assert_eq!(
-        disk.settings.routing.mouse_mode,
-        oink_foundation::input::InputMode::Shared
-    );
-    assert_eq!(disk.owner().revision(LocalOption::KeyboardDisabled), Some(previous + 2));
-    assert_eq!(
-        lock(&second.inner.config)
-            .owner()
-            .revision(LocalOption::KeyboardDisabled),
-        Some(previous + 2)
-    );
-    assert!(second.inner.input.get().is_none());
-    assert!(second.inner.links.get().is_none());
+    for keyboard in [InputMode::Disabled, InputMode::Local, InputMode::Shared] {
+        for mouse in [InputMode::Disabled, InputMode::Local, InputMode::Shared] {
+            let home = tempfile::tempdir().unwrap();
+            let mut config = AgentConfig::load_from(home.path()).unwrap();
+            config
+                .update(|settings| {
+                    settings.routing.keyboard_mode = keyboard;
+                    settings.routing.mouse_mode = mouse;
+                })
+                .unwrap();
+            let revisions = [LocalOption::KeyboardMode, LocalOption::MouseMode]
+                .map(|option| config.owner().revision(option).unwrap());
+            let mut previous_boot = None;
+            for _ in 0..2 {
+                let node = Node::prepare(options(home.path())).unwrap();
+                assert_ne!(Some(node.inner.boot.nonce), previous_boot);
+                previous_boot = Some(node.inner.boot.nonce);
+                for config in [
+                    lock(&node.inner.config).clone(),
+                    AgentConfig::load_from(home.path()).unwrap(),
+                ] {
+                    for (option, before, actual, revision) in [
+                        (
+                            LocalOption::KeyboardMode,
+                            keyboard,
+                            config.settings.routing.keyboard_mode,
+                            revisions[0],
+                        ),
+                        (
+                            LocalOption::MouseMode,
+                            mouse,
+                            config.settings.routing.mouse_mode,
+                            revisions[1],
+                        ),
+                    ] {
+                        let expected = if before == InputMode::Disabled {
+                            InputMode::Shared
+                        } else {
+                            before
+                        };
+                        assert_eq!(actual, expected);
+                        assert_eq!(
+                            config.owner().value(option),
+                            Some((if expected == InputMode::Shared { 0u32 } else { 1u32 }).write())
+                        );
+                        assert_eq!(
+                            config.owner().revision(option),
+                            Some(revision + u64::from(before == InputMode::Disabled))
+                        );
+                    }
+                    assert_eq!(config.owner().value(LocalOption::KeyboardDisabled), Some(false.write()));
+                }
+                assert!(node.inner.input.get().is_none());
+                assert!(node.inner.links.get().is_none());
+                assert!(node.inner.group.get().is_none());
+            }
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -75,7 +89,7 @@ async fn persisted_disables_never_enter_started_input_or_published_owner_facts()
         let mut config = AgentConfig::load_from(home.path()).unwrap();
         config
             .update(|settings| {
-                settings.keyboard_disabled = true;
+                settings.routing.keyboard_mode = InputMode::Disabled;
                 settings.routing.mouse_mode = mouse;
             })
             .unwrap();
@@ -86,6 +100,7 @@ async fn persisted_disables_never_enter_started_input_or_published_owner_facts()
             InputMode::Local
         };
         assert!(!node.input_status().unwrap().keyboard_disabled);
+        assert_eq!(node.input_status().unwrap().keyboard_mode, InputMode::Shared);
         assert_eq!(node.input_status().unwrap().mouse_mode, expected);
         let preferences = node
             .link_config()
@@ -103,6 +118,15 @@ async fn persisted_disables_never_enter_started_input_or_published_owner_facts()
                 .value()
                 .unwrap(),
             false.write()
+        );
+        assert_eq!(
+            preferences
+                .iter()
+                .find(|p| p.option() == Ok(LocalOption::KeyboardMode))
+                .unwrap()
+                .value()
+                .unwrap(),
+            0u32.write()
         );
         assert_eq!(
             preferences

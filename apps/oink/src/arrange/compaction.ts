@@ -143,7 +143,8 @@ export function compactionUnits(screens: Screen[]): Unit[] {
     return devices.map(device => ({ device, rect: bounds(screens.filter(s => (s.device ?? s.id) === device)) }));
 }
 
-/** Apply a pass to complete geometry, carrying hidden members with their computer. */
+/** Compact only edited computers, carrying hidden members with their computer.
+ * Unedited computers are fixed targets. Omit `edited` for an explicit full pass. */
 export function compactScreens(all: Screen[], visible: Screen[], edited?: ReadonlySet<string>): Screen[] {
     const before = compactionUnits(visible);
     const after = compactUnits(before, u => {

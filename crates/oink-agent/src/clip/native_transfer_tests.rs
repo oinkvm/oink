@@ -87,7 +87,6 @@ async fn scenario() {
                 standard: None,
                 data: RepresentationData::Reader {
                     size: ContentSize::Known(bytes.len() as u64),
-                    hash: Some(*blake3::hash(&bytes).as_bytes()),
                 },
             }],
         }],
@@ -296,6 +295,92 @@ fn dnd_content_low_opens_when_input_status_precedes_link_notification() {
             channel.finish();
             response.finish();
             assert!(channel.recv().await.unwrap().is_none());
+            assert!(response.recv().await.unwrap().is_none());
+            fixture.stop().await;
+        },
+    );
+}
+
+#[test]
+fn persistent_cloud_read_uses_current_member_link_without_offer_or_input_stream() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "persistent_cloud_read_uses_current_member_link_without_offer_or_input_stream",
+        Some(4),
+        async {
+            use crate::streams::StreamModule;
+            use oink_clipboard::sync::files::BulkLink;
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("source-file");
+            std::fs::write(&path, b"cloud payload").unwrap();
+            let mut fixture = Fixture::<ClipboardStreams>::start().await;
+            let (source, config) = fixture.context(0);
+            let (target, _) = fixture.context(1);
+            let source_link = source.links().by_peer(target.id()).unwrap().link;
+            let target_link = target.links().by_peer(source.id()).unwrap().link;
+            let grants = config.source_grants().unwrap();
+            let files = content::namespace::Local::new(vec![(NodeId(1), path)]).unwrap();
+            let token = grants.issue(target.id(), files.as_ref(), &[NodeId(1)]).unwrap();
+            drop(files);
+            let entry = grants.open(target.id(), token).unwrap().select(NodeId(1)).unwrap();
+            let registry = Arc::new(content::Registry::with_source_grants(grants));
+            let links = FileLinks::new(target.clone(), StreamKind::Clipboard);
+            links.link_ready(source.id(), target_link, source.boot());
+            let persistent = links.bind_persistent(source.id()).unwrap();
+            let offer = OfferId {
+                clip: ClipId {
+                    origin: source.id(),
+                    seq: 99,
+                },
+                generation: 1,
+            };
+            // No accepted clipboard offer or inbound I0 exists in this adapter.
+            let mut channel = persistent
+                .open_with_options(
+                    source.id(),
+                    oink_foundation::transfer::LowOptions {
+                        send_max: 4096,
+                        receive_max: 8192,
+                        operation_max: 12288,
+                    },
+                )
+                .await
+                .unwrap();
+            channel
+                .send(&ContentMsg::CloudLinkRead {
+                    offer,
+                    token,
+                    node: entry.id,
+                    version: entry.version,
+                    offset: 0,
+                })
+                .await
+                .unwrap();
+            let operation = loop {
+                if let Some(ModuleEvent::InboundLow(op)) = fixture.port(0).next().await {
+                    break op;
+                }
+            };
+            let mut owner = ClipboardStreams::new(source.clone(), config);
+            owner.link_ready(source_link, target.id());
+            owner.inbound_low(*operation);
+            let operation = owner
+                .take_low()
+                .pop()
+                .expect("cloud Low request admitted by clipboard module");
+            let request = oink_clipboard::wire::local_content(operation.first).unwrap();
+            let mut response = runtime::LinkBulk(operation.stream);
+            registry.serve(target.id(), request, &mut response).await.unwrap();
+            response.finish();
+            assert!(
+                matches!(channel.recv().await.unwrap(), Some(ContentMsg::FileBlock { bytes, .. }) if bytes == b"cloud payload")
+            );
+            assert!(matches!(
+                channel.recv().await.unwrap(),
+                Some(ContentMsg::FileEnd { size: 13, .. })
+            ));
+            assert!(channel.recv().await.unwrap().is_none());
+            channel.finish();
             assert!(response.recv().await.unwrap().is_none());
             fixture.stop().await;
         },

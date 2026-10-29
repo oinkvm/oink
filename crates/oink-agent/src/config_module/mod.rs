@@ -36,7 +36,7 @@ pub const RECONNECT_BACKOFF: [Duration; 5] = [
     Duration::from_secs(4),
     Duration::from_secs(5),
 ];
-/// Authentication/selection rejection is not evidence of a transient outage.
+/// A different authenticated identity is not evidence of a transient outage.
 pub const HANDSHAKE_BACKOFF: [Duration; 4] = [
     Duration::from_secs(5),
     Duration::from_secs(15),
@@ -58,6 +58,8 @@ pub struct MemberInfo {
     pub name: String,
     pub os: String,
     pub online: bool,
+    /// Offline entries contain historical metadata with a neutral DTO shell,
+    /// not a retained live Boot, sequence, status, capability or claim baseline.
     pub facts: Option<Arc<dto::DeviceFacts>>,
     pub added_by: Option<DeviceId>,
     pub added_at_ms: u64,
@@ -72,8 +74,10 @@ pub struct MemberTable {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppliedState {
+    pub application_focus_enabled: bool,
     pub group: GroupId,
     pub roster_digest: [u8; 32],
+    pub pointer_slots: BTreeMap<DeviceId, Option<u8>>,
     pub members: Vec<DeviceId>,
     pub layout: Arc<Layout>,
     /// Drawing preferences include retained offline owners; routing uses RouterLayout.
@@ -92,6 +96,7 @@ pub struct LocalDisplays {
 }
 #[derive(Clone)]
 pub struct RouterLayout {
+    pub application_focus_enabled: bool,
     pub group: GroupId,
     pub version: dto::ConfigVersion,
     pub layout: Arc<Layout>,
@@ -119,6 +124,12 @@ pub enum ConfigChange {
     LocalDisplays,
     PairingEvent(Box<api::PairingEvent>),
     BlockedDevices,
+    PowerState {
+        group: GroupId,
+        boot: Boot,
+        received: std::time::Instant,
+        value: dto::ControlPowerState,
+    },
     DeviceControl {
         peer: DeviceId,
         message: v1::Message,
@@ -213,6 +224,9 @@ impl ConfigModule {
     pub fn local_facts(&self) -> Arc<dto::DeviceFacts> {
         self.shared.local_facts.load()
     }
+    pub(crate) fn source_grants(&self) -> Option<oink_clipboard::content::grants::SourceGrants> {
+        self.shared.source_grants.clone()
+    }
     pub fn applied(&self) -> Arc<AppliedState> {
         self.shared.applied.load()
     }
@@ -251,6 +265,13 @@ impl ConfigModule {
             .filter(|l| l.state == oink_network::link::LinkState::Ready)
             .map(|l| Arc::new(l.agreement.clone()))
     }
+    pub(crate) fn peer_supports(&self, device: DeviceId, capability: &str) -> bool {
+        self.links
+            .links()
+            .by_peer(device)
+            .filter(|l| l.state == oink_network::link::LinkState::Ready)
+            .is_some_and(|l| l.agreement.contains(capability))
+    }
     pub fn peer_formats(&self, device: DeviceId) -> Option<Arc<dto::FormatSupport>> {
         self.links
             .links()
@@ -286,6 +307,19 @@ impl ConfigModule {
     ) -> ApiResult<u64> {
         self.call(move |owner| {
             owner.local.clipboard(mode, fault).map_err(runtime::internal)?;
+            owner.publish_facts()
+        })
+    }
+    pub fn publish_local_microphone(
+        &self,
+        observation: dto::MicrophoneObservation,
+        watermark: Option<dto::AudioExitClaim>,
+    ) -> ApiResult<u64> {
+        self.call(move |owner| {
+            owner
+                .local
+                .microphone(observation, watermark)
+                .map_err(runtime::internal)?;
             owner.publish_facts()
         })
     }
@@ -348,6 +382,21 @@ impl ConfigModule {
     pub fn edit_layout(&self, edit: Box<dyn FnOnce(&mut Layout) + Send>, source: dto::LayoutSource) -> ApiResult<()> {
         self.call(move |owner| owner.edit_layout(edit, source))
     }
+    /// Compare in the actor before touching the retained register or its source.
+    /// Applied geometry excludes departed members, so it cannot be compared to
+    /// the unfiltered geometry received by an edit callback.
+    pub(crate) fn edit_layout_if_current(
+        &self,
+        expected: Arc<AppliedState>,
+        edit: Box<dyn FnOnce(&mut Layout) + Send>,
+        source: dto::LayoutSource,
+    ) -> ApiResult<bool> {
+        self.call(move |owner| owner.edit_layout_if_current(&expected, edit, source))
+    }
+    pub fn set_application_focus_enabled(&self, enabled: bool) -> ApiResult<()> {
+        self.call(move |owner| owner.set_application_focus_enabled(enabled))
+    }
+
     pub fn edit_settings(
         &self,
         edit: Box<dyn FnOnce(&mut oink_display::layout::LayoutSettings) + Send>,
@@ -395,6 +444,18 @@ impl ConfigModule {
     ) -> ApiResult<api::PairReply<api::Accepted>> {
         self.call(move |owner| owner.query_address(client, operation, generation, ip, port))
     }
+    pub(crate) fn observe_display_layout_dependency(
+        &self,
+        group: GroupId,
+        version: dto::ConfigVersion,
+    ) -> ApiResult<()> {
+        self.call(move |owner| owner.observe_display_layout_dependency(group, version))
+    }
+    #[cfg(test)]
+    pub(crate) fn hold_incoming_config_states(&self, hold: bool) {
+        self.call(move |owner| owner.hold_incoming_config_states(hold)).unwrap();
+    }
+
     #[cfg(test)]
     pub(crate) fn hold_periodic_facts(&self) {
         self.call(|owner| {

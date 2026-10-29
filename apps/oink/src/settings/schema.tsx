@@ -11,6 +11,7 @@ export interface ItemMeta {
     desc?: Text;
     keywords?: string;
     only?: Platform;
+    parent?: string;
 }
 export interface SectionMeta {
     id: SectionId;
@@ -58,6 +59,11 @@ export const SECTIONS: SectionMeta[] = [
                 get keywords() { return tr('菜单栏 托盘 图标 tray'); },
             },
             { id: 'notificationLevel', get label() { return tr('通知级别'); }, get desc() { return tr('选择本机显示的通知详细程度'); } },
+            { id: 'keepAwake', get label() {
+                    return tr('其他设备活动时，保持屏幕常亮');
+                }, get desc() {
+                    return tr('在其他设备上操作时，本机不会因为闲置而熄屏、锁屏');
+                }, get keywords() { return tr('休眠 熄屏 锁屏 唤醒 其它设备活动时，本机保持屏幕点亮 其他设备活动时，保持屏幕常亮'); } },
             { id: 'confirmQuit', get label() {
                     return tr('退出前确认');
                 }, get desc() {
@@ -154,17 +160,13 @@ export const SECTIONS: SectionMeta[] = [
                 }, get desc() {
                     return tr('在使用本机鼠标时，反转滚轮滚动方向');
                 }, get keywords() { return tr('滚动 方向 自然滚动'); } },
-            { id: 'keepAwake', get label() {
-                    return tr('其他设备活动时，保持屏幕常亮');
-                }, get desc() {
-                    return tr('在其他设备上操作时，本机不会因为闲置而熄屏、锁屏');
-                }, get keywords() { return tr('休眠 熄屏 锁屏 唤醒 其它设备活动时，本机保持屏幕点亮 其他设备活动时，保持屏幕常亮'); } },
             { id: 'touchpadInject', get label() {
-                    return tr('接受原生触摸板触点注入');
+                    return tr('注入原生触摸板事件');
                 }, get desc() {
-                    return tr('在本机注入其他设备的触摸板触点事件；关闭后改用系统快捷键映射');
+                    return tr('关闭后，手势改用快捷键映射，双指滚动改用鼠标滚轮');
                 }, get keywords() { return tr('触控板 手势 precision touchpad'); }, only: 'win' },
-            { id: 'macScrollFeel', get label() { return tr('模拟 Mac 触摸板滚动'); }, get desc() { return tr('被 Mac 的触摸板操控时，还原其双指滚动手感'); }, get keywords() { return tr('触控板 滚动 Mac macOS 双指 手感 惯性'); }, only: 'win' },
+            { id: 'nativeMultifinger', parent: 'touchpadInject', get label() { return tr('注入原生多指手势'); }, get desc() { return tr('关闭后，缩放和多指手势改用快捷键映射；不影响双指滚动'); }, get keywords() { return tr('触控板 多指 手势 缩放 捏合 快捷键 原生 precision touchpad'); }, only: 'win' },
+            { id: 'macScrollFeel', parent: 'touchpadInject', get label() { return tr('模拟 Mac 触摸板滚动'); }, get desc() { return tr('被 Mac 的触摸板操控时，还原其双指滚动手感'); }, get keywords() { return tr('触控板 滚动 Mac macOS 双指 手感 惯性'); }, only: 'win' },
             { id: 'pointerTrail', get label() {
                     return tr('快速画圈显示指针尾迹');
                 }, get desc() {
@@ -181,36 +183,12 @@ export const SECTIONS: SectionMeta[] = [
         items: [
             { id: 'clipReceive', get label() { return tr('接收其它设备复制的内容'); }, get desc() { return tr('在其它设备上复制的内容，可以在本机粘贴'); } },
             { id: 'clipSend', get label() { return tr('同步复制的内容给其它设备'); }, get desc() { return tr('本机复制的内容，可以在其它设备上粘贴'); } },
-            { id: 'clipText', get label() {
-                    return tr('同步文本');
-                }, get desc() {
-                    return tr('复制的纯文本');
-                }, get keywords() { return tr('文字 复制 粘贴'); } },
-            { id: 'clipRich', get label() {
-                    return tr('同步富文本');
-                }, get desc() {
-                    return tr('带格式的文字（HTML、RTF），粘贴时保留字体、颜色和链接');
-                }, get keywords() { return tr('格式 html rtf 复制 粘贴'); } },
-            { id: 'clipImage', get label() {
-                    return tr('同步图片');
-                }, get desc() {
-                    return tr('截图和复制的图片');
-                }, get keywords() { return tr('截图 图像 复制 粘贴'); } },
-            { id: 'clipFiles', get label() {
-                    return tr('同步文件与文件夹');
-                }, get desc() {
-                    return tr('在一台设备上复制文件，到另一台设备上粘贴');
-                }, get keywords() { return tr('文件 文件夹 复制 粘贴 拷贝'); } },
-            { id: 'clipPrivate', get label() {
-                    return tr('同步应用专有格式');
-                }, get desc() {
-                    return tr('第三方应用的自定义格式');
-                }, get keywords() { return tr('应用 自定义 格式 复制 粘贴 同步私有格式 同步应用专有格式'); } },
             {id:'receivedFiles',get label(){return tr('收到的文件');},get desc(){return tr('从其它设备粘贴或拖拽到本机的文件');},get keywords(){return tr('收到 接收 文件 文件夹 粘贴 拖拽 管理 删除 空间 Finder Explorer');}},
             {id:'receivedCleanup',get label(){return tr('自动清理收到的文件');},get desc(){return tr('节省磁盘空间，但未另存的文件可能丢失');},get keywords(){return tr('自动 清理 收到 文件 7天 30天 从不');}},
             { id: 'cache', get label() {
                     return tr('缓存文件');
                 }, get desc() { return tr('Oink 为传输临时保存的数据'); }, get keywords() { return tr('缓存 清理 空间 磁盘 cache 目录'); } },
+            { id: 'removeDsStore', only: 'mac', get label() { return tr('自动移除 .DS_Store'); }, get desc() { return tr('在向其它操作系统设备复制或拖拽文件夹时，移除其中的 .DS_Store'); } },
 
         ],
     },
@@ -229,8 +207,10 @@ export const SECTIONS: SectionMeta[] = [
             { id: 'keepLocalPlayback', get label() {
                     return tr('转发同时保持本机播放');
                 }, get desc() {
-                    return tr('声音转发到其他设备时，本机扬声器继续出声');
+                    return tr('音频发送到其他设备时，本机扬声器/耳机保持播放');
                 }, get keywords() { return tr('转发 声音 本机'); } },
+            { id: 'virtualMicrophone', get label() { return tr('虚拟麦克风'); }, get keywords() { return tr('麦克风'); } },
+            { id: 'microphoneInput', get label() { return tr('共享的麦克风'); }, get desc() { return tr('选择本机共享到其他设备的麦克风'); }, get keywords() { return tr('麦克风 输入 录音 来源 系统默认'); } },
         ],
     },
     {
@@ -268,6 +248,7 @@ export const SECTIONS: SectionMeta[] = [
                 }, get desc() {
                     return tr('用于向本机粘贴和拖拽文件');
                 }, get keywords() { return tr('权限 文件 隐私'); } },
+            { id: 'microphonePermission', get label() { return tr('麦克风'); }, get desc() { return tr('将本机麦克风共享给其他设备；仅在使用时采集'); } },
             { id: 'perm-audio', get label() {
                     return tr('系统音频录制');
                 }, get desc() {
@@ -311,19 +292,19 @@ export const SECTIONS: SectionMeta[] = [
             { id: 'latency', get label() {
                     return tr('连接质量');
                 }, get desc() {
-                    return tr('每台在线设备的延迟');
+                    return tr('最近 5 分钟每台在线设备的延迟');
                 }, get keywords() { return tr('延迟 网络 ping 图表 ms'); } },
-            { id: 'audioQuality', get label() { return tr('音频质量'); }, get desc() { return tr('最近 60 秒各来源的缓冲、播放断续、补音和迟到包'); }, get keywords() { return tr('音频 缓冲 码率 断音 图表'); } },
+            { id: 'audioQuality', get label() { return tr('音频质量'); }, get desc() { return tr('最近 5 分钟各来源的缓冲、播放断续、补音和迟到包'); }, get keywords() { return tr('音频 缓冲 码率 断音 图表'); } },
         ],
     },
 ];
-export const sectionsFor = (p: Platform) => SECTIONS.filter((s) => !s.only || s.only === p)
-    .map((s) => ({ ...s, items: s.items.filter((i) => !i.only || i.only === p) }));
+export const sectionsFor = (p: Platform, shortcuts = SHORTCUTS): SectionMeta[] => SECTIONS.filter((s) => !s.only || s.only === p)
+    .map((s) => ({ ...s, items: (s.id === 'shortcuts' ? shortcuts.map(row=>({id:`sc-${row.id}`,label:row.label,desc:row.desc,keywords:`${tr('快捷键 热键')} ${row.keywords}`})) : s.items).filter((i: ItemMeta) => !i.only || i.only === p) }));
 const norm = (s: string) => s.toLowerCase().replace(/\s+/g, '');
-export function searchSections(p: Platform, query: string): Map<SectionId, Set<string> | 'all'> {
+export function searchSections(p: Platform, query: string, shortcuts = SHORTCUTS): Map<SectionId, Set<string> | 'all'> {
     const q = norm(query);
     const out = new Map<SectionId, Set<string> | 'all'>();
-    for (const s of sectionsFor(p)) {
+    for (const s of sectionsFor(p, shortcuts)) {
         if (!q) {
             out.set(s.id, 'all');
             continue;
@@ -333,8 +314,13 @@ export function searchSections(p: Platform, query: string): Map<SectionId, Set<s
             continue;
         }
         const hit = s.items.filter((i) => [text(i.label, p), text(i.desc, p), i.keywords ?? ''].some((t) => norm(t).includes(q)));
-        if (hit.length)
-            out.set(s.id, new Set(hit.map((i) => i.id)));
+        if (hit.length) {
+            const matches = new Set(hit.map((i) => i.id));
+            // Keep dependent controls usable when search finds only a child.
+            for (const item of hit) if (item.parent) matches.add(item.parent);
+            for (const item of s.items) if (item.parent && matches.has(item.parent)) matches.add(item.id);
+            out.set(s.id, matches);
+        }
     }
     return out;
 }

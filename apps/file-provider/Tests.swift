@@ -10,9 +10,214 @@ private final class DisconnectedRemovalDomain: NSFileProviderDomain {
     override var userEnabled: Bool { false }
 }
 
+private final class RetirementDomain: ProviderItemDomain {
+    enum Failure: Error { case unrelatedDomainWork }
+    var signals = 0
+    var lookups = 0
+    var signalFailure: Error?
+    var resolve: (NSFileProviderItemIdentifier) throws -> URL = { _ in throw NSFileProviderError(.noSuchItem) }
+    func signalEnumerator(for identifier: NSFileProviderItemIdentifier) async throws {
+        precondition(identifier == .workingSet)
+        signals += 1
+        if let signalFailure { throw signalFailure }
+    }
+    // The retired batch can be gone while an unrelated upload prevents this
+    // testing-only barrier from completing. Retirement must not depend on it.
+    func waitForStabilization() async throws { throw Failure.unrelatedDomainWork }
+    func getUserVisibleURL(for identifier: NSFileProviderItemIdentifier) async throws -> URL {
+        lookups += 1
+        return try resolve(identifier)
+    }
+}
+
 @main
 struct Tests {
+    static func placeholderRetirementIsItemScoped() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let parent = root.appendingPathComponent(".Oink-prepared-batch.noindex")
+        func ledger(_ parent: URL?) throws -> PlaceholderLedger {
+            let object: [String: Any] = ["schema": 1, "parent": parent?.path as Any? ?? NSNull(), "urls": []]
+            return try JSONDecoder().decode(PlaceholderLedger.self, from: JSONSerialization.data(withJSONObject: object))
+        }
+        let retired = RetirementDomain()
+        try await retirePlaceholder(batch: "batch", ledger: ledger(parent), manager: retired,
+                                    pause: { preconditionFailure("already retired item waited") })
+        precondition(retired.signals == 1 && retired.lookups == 1)
+
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+        for _ in 0..<3 {
+            do {
+                try await retirePlaceholder(batch: "batch", ledger: ledger(parent), manager: retired,
+                                            pause: { throw CancellationError() })
+                preconditionFailure("identity deletion bypassed surviving namespace")
+            } catch { precondition(error is CancellationError) }
+        }
+        try FileManager.default.removeItem(at: parent)
+        try await retirePlaceholder(batch: "batch", ledger: ledger(parent), manager: retired,
+                                    pause: { preconditionFailure("retirement retry waited after removal") })
+        precondition(retired.signals == 5 && retired.lookups == 5)
+
+        // Signal ACK precedes asynchronous creation. The old path is absent,
+        // but the item still resolves (possibly under its activation name).
+        // First observe that identity disappear, then its actual disk path.
+        let late = root.appendingPathComponent("renamed-parent")
+        var phase = 0
+        let pending = RetirementDomain()
+        pending.resolve = { identifier in
+            if identifier == .rootContainer { return root }
+            precondition(identifier.rawValue == "batch-root")
+            if phase < 2 { return late }
+            throw NSFileProviderError(.noSuchItem)
+        }
+        try await retirePlaceholder(batch: "batch", ledger: ledger(nil), manager: pending, pause: {
+            switch phase {
+            case 0: try FileManager.default.createDirectory(at: late, withIntermediateDirectories: false)
+            case 1: break // provider identity is gone; filesystem deletion still pending
+            case 2: try FileManager.default.removeItem(at: late)
+            default: preconditionFailure("retirement did not finish after deletion")
+            }
+            phase += 1
+        })
+        precondition(phase == 3 && pending.signals == 1 && pending.lookups == 4)
+
+        for failure in [NSFileProviderError(.serverUnreachable) as Error, CocoaError(.fileReadNoSuchFile)] {
+            let failed = RetirementDomain()
+            failed.resolve = { _ in throw failure }
+            do {
+                try await retirePlaceholder(batch: "batch", ledger: ledger(parent), manager: failed)
+                preconditionFailure("lookup failure acknowledged as retirement")
+            } catch { precondition((error as NSError).domain == (failure as NSError).domain && (error as NSError).code == (failure as NSError).code) }
+        }
+        let denied = RetirementDomain()
+        do {
+            try await retirePlaceholder(batch: "batch", ledger: ledger(parent), manager: denied,
+                                        inspect: { _ in throw ItemRejection.accessDenied })
+            preconditionFailure("namespace access failure acknowledged as retirement")
+        } catch { precondition(error as? ItemRejection == .accessDenied) }
+        let unsignaled = RetirementDomain()
+        unsignaled.signalFailure = NSFileProviderError(.serverUnreachable)
+        do {
+            try await retirePlaceholder(batch: "batch", ledger: ledger(parent), manager: unsignaled)
+            preconditionFailure("failed signal acknowledged as retirement")
+        } catch { precondition(unsignaled.lookups == 0) }
+        let cancelled = RetirementDomain()
+        cancelled.resolve = { _ in parent }
+        do {
+            try await retirePlaceholder(batch: "batch", ledger: ledger(parent), manager: cancelled,
+                                        pause: { throw CancellationError() })
+            preconditionFailure("pending identity acknowledged before cancellation")
+        } catch { precondition(error is CancellationError && cancelled.signals == 1) }
+        print("Placeholder retirement: unrelated domain work, delayed creation/rename, strict removal, retries and failure gates passed")
+    }
+    static func failureDiagnosticsKeepCodesWithoutPrivateData() throws {
+        let underlying = NSError(domain: NSPOSIXErrorDomain, code: 13,
+            userInfo: [NSLocalizedDescriptionKey: "/private/secret-file token=secret"])
+        let error = NSError(domain: NSCocoaErrorDomain, code: 4097,
+            userInfo: [NSUnderlyingErrorKey: underlying, NSFilePathErrorKey: "/private/secret-file"])
+        let diagnostic = providerFailureDiagnostic(error)
+        precondition(diagnostic.contains("4097") && diagnostic.contains("13"))
+        precondition(diagnostic.contains(NSCocoaErrorDomain) && diagnostic.contains(NSPOSIXErrorDomain))
+        precondition(!diagnostic.contains("private") && !diagnostic.contains("secret"))
+        let unknown = providerFailureDiagnostic(NSError(domain: "/private/secret-domain", code: 9))
+        precondition(unknown.contains("other") && !unknown.contains("secret"))
+    }
+    static func publicationIncludesRootSymlinks() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let folder = root.appendingPathComponent("batch")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for name in ["first.txt", "other.txt"] { try Data("payload".utf8).write(to: folder.appendingPathComponent(name)) }
+        let linkURL = folder.appendingPathComponent("alias")
+        try FileManager.default.createSymbolicLink(atPath: linkURL.path, withDestinationPath: "first.txt")
+        let parent = Record(id: "batch-root", parent: ".root", name: "batch", directory: true, size: nil, modified: nil, node: nil)
+        let link = Record(id: "batch-1", parent: parent.id, name: "alias", directory: false, size: 9, modified: nil, node: 1, version: 1, symlink_target: "first.txt")
+        let files = ["first.txt", "other.txt"].enumerated().map { index, name in
+            Record(id: "batch-\(index + 2)", parent: parent.id, name: name, directory: false, size: 7, modified: nil, node: UInt64(index + 2))
+        }
+        precondition(finalItemMatches(link, url: linkURL, metadata: visibleMetadata(linkURL)), "ready root symlink rejected")
+        let records = [link] + files
+        let urls = try await resolvePublishedItemURLs(parent: parent, children: records, resolve: { record in
+            record.id == parent.id ? folder : folder.appendingPathComponent(record.name)
+        }, pause: { throw CocoaError(.userCancelled) })
+        precondition(urls == records.map { folder.appendingPathComponent($0.name).path })
+        let regular = Record(id: link.id, parent: parent.id, name: link.name, directory: false, size: 9, modified: nil, node: 1)
+        precondition(!finalItemMatches(regular, url: linkURL, metadata: visibleMetadata(linkURL)), "link accepted as a regular placeholder")
+        try FileManager.default.removeItem(at: linkURL)
+        try Data(repeating: 1, count: 9).write(to: linkURL)
+        precondition(!finalItemMatches(link, url: linkURL, metadata: visibleMetadata(linkURL)), "regular placeholder accepted as link")
+        try FileManager.default.removeItem(at: linkURL)
+        try FileManager.default.createSymbolicLink(atPath: linkURL.path, withDestinationPath: "other.txt")
+        precondition(!finalItemMatches(link, url: linkURL, metadata: visibleMetadata(linkURL)), "same-size wrong link accepted")
+        try FileManager.default.removeItem(at: linkURL)
+        try FileManager.default.createSymbolicLink(atPath: linkURL.path, withDestinationPath: "first.txt")
+        try FileManager.default.removeItem(at: folder.appendingPathComponent("first.txt"))
+        precondition(finalItemMatches(link, url: linkURL, metadata: visibleMetadata(linkURL)), "publication followed the link target")
+    }
+
+    static func publicationRejectsInvalidFinalItemsImmediately() async throws {
+        let file = Record(id: "batch-1", parent: "batch-root", name: "file", directory: false, size: 9, modified: nil, node: 1)
+        let link = Record(id: file.id, parent: file.parent, name: file.name, directory: false, size: 9, modified: nil, node: 1, symlink_target: "first.txt")
+        let url = URL(fileURLWithPath: "/fixture/file")
+        var pauses = 0
+        for (record, metadata, expected) in [
+            (file, nil, ItemRejection.missing),
+            (file, VisibleMetadata(directory: true, size: 9, hidden: false), .wrongKind),
+            (link, VisibleMetadata(directory: false, size: 9, hidden: false), .wrongKind),
+            (link, VisibleMetadata(directory: false, size: 9, hidden: false, symlinkTarget: "other.txt"), .wrongTarget)
+        ] {
+            do {
+                _ = try await resolveFinalItemURL(record, resolve: { url }, inspect: { _ in metadata }, pause: { pauses += 1; throw CocoaError(.userCancelled) })
+                preconditionFailure("rejected item became ready")
+            } catch { precondition(error as? ItemRejection == expected) }
+        }
+        do {
+            _ = try await resolveFinalItemURL(file, resolve: { throw NSError(domain: NSFileProviderErrorDomain, code: NSFileProviderError.noSuchItem.rawValue) }, pause: { pauses += 1 })
+            preconditionFailure("provider's missing item retried")
+        } catch { precondition(error as? ItemRejection == .missing) }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fifo = root.appendingPathComponent("file")
+        precondition(mkfifo(fifo.path, mode_t(0o600)) == 0)
+        do {
+            _ = try await resolveFinalItemURL(file, resolve: { fifo }, pause: { pauses += 1 })
+            preconditionFailure("unsupported item retried")
+        } catch { precondition(error as? ItemRejection == .unsupportedType) }
+        do {
+            try await waitForItemRemoval(fifo, pause: { pauses += 1 })
+            preconditionFailure("unsupported item treated as retired")
+        } catch { precondition(error as? ItemRejection == .unsupportedType) }
+        do {
+            try await waitForItemRemoval(url, inspect: { _ in throw ItemRejection.accessDenied }, pause: { pauses += 1 })
+            preconditionFailure("denied retirement retried")
+        } catch { precondition(error as? ItemRejection == .accessDenied) }
+        let parent = Record(id: "batch-root", parent: ".root", name: "fixture", directory: true, size: nil, modified: nil, node: nil)
+        var rejected: ItemRejection?
+        do {
+            _ = try await resolvePublishedItemURLs(parent: parent, children: [file], resolve: { record in
+                record.id == parent.id ? url.deletingLastPathComponent() : url
+            }, inspect: { _ in VisibleMetadata(directory: true, size: 0, hidden: false) }, rejected: { rejected = $0 }, pause: { pauses += 1 })
+            preconditionFailure("published item rejection was swallowed")
+        } catch { precondition(error as? ItemRejection == .wrongKind) }
+        precondition(rejected == .wrongKind, "manager must receive the rejection before its task group unwinds")
+        precondition(pauses == 0, "a definitive rejection entered the retry/deadline path")
+        // A cached generic name really is pending, and still honours cancellation.
+        do {
+            _ = try await resolveFinalItemURL(file, resolve: { url.appendingPathExtension("generic") }, inspect: { _ in nil }, pause: { pauses += 1; throw CocoaError(.userCancelled) })
+            preconditionFailure("pending callback ignored cancellation")
+        } catch { precondition((error as NSError).code == CocoaError.userCancelled.rawValue) }
+        precondition(pauses == 1)
+    }
+
     static func main() async throws {
+        try await placeholderRetirementIsItemScoped()
+        try failureDiagnosticsKeepCodesWithoutPrivateData()
+        try await publicationIncludesRootSymlinks()
+        try await publicationRejectsInvalidFinalItemsImmediately()
+
         try await testLaunchRecovery()
         try await testDomainRemoval()
         precondition(ProviderUpdateAction(rawValue: "publish") == nil)
@@ -56,6 +261,9 @@ struct Tests {
                 preconditionFailure("invalid local catalog accepted")
             } catch {}
         }
+        // The extension reads the catalog view. Durable source credentials
+        // belong to the Rust backend and must not become native item metadata.
+        _ = try JSONDecoder().decode(Catalog.self, from: Data(#"{"schema":1,"token":"bridge","port":1,"records":[],"urls":[],"source":{"provisional":false,"token":[]}}"#.utf8))
         _ = try JSONDecoder().decode(PlaceholderLedger.self, from: Data(#"{"schema":1,"parent":null,"urls":[]}"#.utf8))
         let finalFile = Record(id: "batch-slot-file-0", parent: "batch-root", name: "actual.png", directory: false,
                                size: 12345, modified: nil, node: 7)
@@ -77,8 +285,40 @@ struct Tests {
             return resolutions == 1 ? URL(fileURLWithPath: "/private-parent/generic.data") : expectedURL
         }, inspect: { _ in VisibleMetadata(directory: false, size: resolutions < 3 ? 0 : 12345, hidden: false) }, pause: {})
         precondition(confirmed == expectedURL && resolutions == 3)
+        // The child's final basename and metadata can precede its parent's
+        // rename. A parallel lookup used to hand out that now-stale child path.
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let privateParent = directory.appendingPathComponent("private-parent")
+        let finalParent = directory.appendingPathComponent("final-parent")
+        try FileManager.default.createDirectory(at: privateParent, withIntermediateDirectories: true)
+        try Data(repeating: 1, count: 12345).write(to: privateParent.appendingPathComponent(finalFile.name))
+        let parentRecord = Record(id: finalFile.parent, parent: ".root", name: "final-parent", directory: true,
+                                  size: nil, modified: nil, node: nil, version: 1)
+        var parentResolved = false
+        let published = try await resolvePublishedItemURLs(parent: parentRecord, children: [finalFile], resolve: { record in
+            if record.directory {
+                try FileManager.default.moveItem(at: privateParent, to: finalParent)
+                parentResolved = true
+                return finalParent
+            }
+            precondition(parentResolved, "child resolution raced the parent rename")
+            return finalParent.appendingPathComponent(record.name)
+        })
+        precondition(published == [finalParent.appendingPathComponent(finalFile.name).path])
+        precondition(FileManager.default.fileExists(atPath: published[0]))
+        // Matching basename/size in a different still-existing parent must not
+        // satisfy readiness either (e.g. a cached URL for a retired spare).
+        try FileManager.default.createDirectory(at: privateParent, withIntermediateDirectories: true)
+        try Data(repeating: 1, count: 12345).write(to: privateParent.appendingPathComponent(finalFile.name))
+        var childResolutions = 0
+        let inFinalParent = try await resolveFinalItemURL(finalFile, parent: finalParent, resolve: {
+            childResolutions += 1
+            return (childResolutions == 1 ? privateParent : finalParent).appendingPathComponent(finalFile.name)
+        }, pause: {})
+        precondition(childResolutions == 2 && inFinalParent.path == published[0])
         do {
-            _ = try await resolveFinalItemURL(finalFile, resolve: { expectedURL }, inspect: { _ in nil },
+            _ = try await resolveFinalItemURL(finalFile, resolve: { expectedURL.appendingPathExtension("generic") }, inspect: { _ in nil },
                                               pause: { throw CocoaError(.userCancelled) })
             preconditionFailure("cancelled rename became ready")
         } catch { precondition((error as NSError).code == CocoaError.userCancelled.rawValue) }
@@ -181,7 +421,7 @@ struct Tests {
         let writer = try FileHandle(forUpdating: active); defer { try? writer.close() }
         precondition(flock(writer.fileDescriptor, LOCK_EX) == 0)
         let before = try inspectTemporary(in: staging,clear:false,evicted:[])
-        let cleared = try inspectTemporary(in: staging,clear:true,evicted:[])
+        let cleared = try assertCacheMutation { try inspectTemporary(in: staging,clear:true,evicted:[]) }
         precondition(cleared.removed > 0 && before.bytes == cleared.bytes + cleared.removed)
         precondition(cleared.bytes == cleared.kept)
         precondition(FileManager.default.fileExists(atPath: active.path))
@@ -191,7 +431,7 @@ struct Tests {
         // not a substitute for a signed File Provider eviction test.
         let outside = root.appendingPathComponent("user-copy")
         precondition(clonefile(handoff.path,outside.path,0) == 0)
-        let second = try inspectTemporary(in:staging,clear:true,evicted:["item-0"])
+        let second = try assertCacheMutation { try inspectTemporary(in:staging,clear:true,evicted:["item-0"]) }
         precondition(second.removed > 0 && !FileManager.default.fileExists(atPath: handoff.path))
         let copiedData = try Data(contentsOf: outside)
         precondition(copiedData == Data(repeating:7,count:9000))
@@ -285,8 +525,9 @@ struct Tests {
                     disconnect: { options in
                         precondition(options == [.temporary]); calls.append("disconnect")
                     }, reconnect: { calls.append("reconnect") },
-                    stabilize: { calls.append("namespace-ready") })
-                precondition(calls == (!enabled ? [] : disconnected ? ["reconnect", "namespace-ready"] : ["disconnect", "reconnect", "namespace-ready"]),
+                    finishUpgrade: { calls.append("upgrade") },
+                    resolveRoot: { calls.append("namespace-ready"); return URL(fileURLWithPath: "/Oink") })
+                precondition(calls == (!enabled ? [] : disconnected ? ["reconnect", "upgrade", "namespace-ready"] : ["disconnect", "reconnect", "upgrade", "namespace-ready"]),
                              "reconnect acknowledgement must not bypass namespace readiness")
             }
         }
@@ -294,24 +535,67 @@ struct Tests {
             try await recoverProviderLaunch(hidden: true, enabled: true, disconnected: false,
                 disconnect: { _ in throw CocoaError(.fileWriteNoPermission) },
                 reconnect: { preconditionFailure("reconnected after failed disconnect") },
-                stabilize: { preconditionFailure("stabilized after failed disconnect") })
+                finishUpgrade: { preconditionFailure("upgrade after failed disconnect") },
+                resolveRoot: { preconditionFailure("root after failed disconnect") })
             preconditionFailure("recovery failure acknowledged")
         } catch {}
         var ready = false
         do {
             try await recoverProviderLaunch(hidden: true, enabled: true, disconnected: true,
                 disconnect: { _ in preconditionFailure("already suspended") }, reconnect: {},
-                stabilize: { throw CocoaError(.fileReadUnknown) })
+                finishUpgrade: {}, resolveRoot: { throw CocoaError(.fileReadUnknown) })
             ready = true
         } catch {}
         precondition(!ready, "a wedged namespace must leave launch recovery pending")
         do {
             try await recoverProviderLaunch(hidden: true, enabled: true, disconnected: false,
                 disconnect: { _ in }, reconnect: { throw CocoaError(.fileWriteNoPermission) },
-                stabilize: { preconditionFailure("stabilized after failed reconnect") })
+                finishUpgrade: { preconditionFailure("upgrade after failed reconnect") },
+                resolveRoot: { preconditionFailure("root after failed reconnect") })
             preconditionFailure("failed reconnect acknowledged")
         } catch {}
-        print("File Provider launch recovery ordering, disabled domains, interrupted reconnect and failures passed")
+        // Model the reported relaunch: retained work needs a new bridge, which
+        // the backend can start only after Recover returns. Native namespace
+        // readiness must not wait for that work (or its remote source) to finish.
+        final class RetainedDaemon {
+            var bridge = false
+            var pending = 109
+            var namespaceQueries = 0
+            func root() throws -> URL {
+                precondition(!bridge && pending == 109)
+                namespaceQueries += 1
+                return URL(fileURLWithPath: "/Oink")
+            }
+            func download() throws {
+                guard bridge else { throw NSFileProviderError(.serverUnreachable) }
+                pending -= 1
+            }
+        }
+        let daemon = RetainedDaemon()
+        do { try daemon.download(); preconditionFailure("old bridge was usable") } catch {}
+        try await recoverProviderLaunch(hidden: true, enabled: true, disconnected: true,
+            disconnect: { _ in preconditionFailure("already suspended") }, reconnect: {},
+            finishUpgrade: {}, resolveRoot: daemon.root)
+        precondition(daemon.namespaceQueries == 1 && daemon.pending == 109)
+        daemon.bridge = true
+        try daemon.download()
+        precondition(daemon.pending == 108, "recovery prevented content service from starting")
+        for flags in [(false, true, false), (true, false, false), (true, true, true)] {
+            do {
+                try await verifyProviderLaunch(hidden: flags.0, enabled: flags.1, disconnected: flags.2,
+                    resolveRoot: { preconditionFailure("unusable domain queried root") })
+                preconditionFailure("unusable domain passed readiness recheck")
+            } catch {}
+        }
+        // A local upgrade failure cannot be mistaken for mere readiness delay.
+        do {
+            try await recoverProviderLaunch(hidden: true, enabled: true, disconnected: true,
+                disconnect: { _ in }, reconnect: {},
+                finishUpgrade: { throw CocoaError(.fileWriteNoPermission) },
+                resolveRoot: { preconditionFailure("unfinished upgrade released startup") })
+            preconditionFailure("failed upgrade acknowledged")
+        } catch {}
+        print("File Provider launch recovery: ordering, root readiness, retained downloads without a bridge, inactive domains and failure gates passed")
     }
 
     static func testDomainRemoval() async throws {
@@ -319,6 +603,31 @@ struct Tests {
         for other in ["publish", "prepare-update", "finish-update", "remove", ""] {
             precondition(ProviderRemovalAction(rawValue: other) == nil)
         }
+        let current = NSFileProviderDomain(identifier: .init(providerDomain), displayName: "Oink")
+        precondition(providerDomain == "oink-files", "upgrade must preserve the existing domain identity")
+        let previousID = providerDomain + "-links"
+        let previous = NSFileProviderDomain(identifier: .init(previousID), displayName: "Oink")
+        let unrelated = NSFileProviderDomain(identifier: .init("unrelated-domain"), displayName: "Oink")
+        let registered = [previous, unrelated, current]
+        let removal = ProviderRemovalAction.remove
+        precondition(removal.domains(registered, uninstall: false).map { $0.identifier.rawValue } == [providerDomain],
+                     "ordinary operations must select the original single domain")
+        let uninstallDomains = removal.domains(registered, uninstall: true)
+        precondition(uninstallDomains.map { $0.identifier.rawValue } == [previousID, providerDomain],
+                     "uninstall must tolerate the abandoned build 48 domain")
+        var uninstallCalls: [String] = []
+        let uninstallResult = try await removal.perform(domains: uninstallDomains, remove: { domain, mode in
+            precondition(mode == .removeAll)
+            uninstallCalls.append(domain.identifier.rawValue)
+            return nil
+        }, remaining: { [] })
+        precondition(uninstallResult == "removed" && uninstallCalls == [previousID, providerDomain])
+        // A surviving previous domain must fail verification too.
+        do {
+            _ = try await removal.perform(domains: uninstallDomains, remove: { _, _ in nil },
+                remaining: { removal.domains([previous, unrelated], uninstall: true) })
+            preconditionFailure("previous registered domain acknowledged as removed")
+        } catch ProviderRemovalError.domainsRemain {}
         let absent = try await ProviderRemovalAction.remove.perform(domains: [], remove: { _, _ in
             preconditionFailure("absent domain was removed")
         }, remaining: { preconditionFailure("absent removal performed more work") })

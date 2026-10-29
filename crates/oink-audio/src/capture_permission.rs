@@ -40,9 +40,11 @@ fn query(symbol: &std::ffi::CStr) -> CapturePreflight {
     }
     let mut result = 0;
     let mut error = [0 as std::ffi::c_char; 512];
+    let started = std::time::Instant::now();
     // SAFETY: valid NUL-terminated symbol and writable out parameters; native
     // bridge writes a bounded NUL-terminated error on every failure path.
     let ok = unsafe { oink_audio_capture_preflight(symbol.as_ptr(), &mut result, error.as_mut_ptr(), error.len()) };
+    let query_us = started.elapsed().as_micros() as u64;
     let preflight = CapturePreflight::from_raw(if ok {
         Ok(result)
     } else {
@@ -51,13 +53,15 @@ fn query(symbol: &std::ffi::CStr) -> CapturePreflight {
             .to_string_lossy()
             .into_owned())
     });
-    let state = match &preflight {
-        CapturePreflight::Authorized => "authorized",
-        CapturePreflight::Denied => "denied",
-        CapturePreflight::NotDetermined | CapturePreflight::Unavailable(_) => "unknown",
-    };
-    tracing::info!(raw_right = ?ok.then_some(result), state, detail = ?preflight,
-        provider = "self_authorization", "system audio capture permission preflight");
+    // The permission observer polls every three seconds to detect revocation.
+    // This is a real TCC query on its own thread, not an audio callback; normal
+    // unchanged authorization must not produce an INFO line every poll.
+    // Keep start/duration in the bounded recorder to correlate a future stall;
+    // no permission cache, new timer, device enumeration or capture IO is added.
+    tracing::debug!(target: "oink_audio_diagnostics", kind="audio_permission_sample",
+        sample_mono_us=crate::diagnostics::monotonic_us(started),
+        permission_query_us=query_us, permission_query_ok=ok, permission_right=ok.then_some(result),
+        "system audio capture permission preflight");
     preflight
 }
 

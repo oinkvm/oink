@@ -23,11 +23,11 @@ use windows::Win32::System::Console::SetConsoleCtrlHandler;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CURSOR_SHOWING, CURSORINFO, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorInfo,
-    GetCursorPos, GetMessageW, HCURSOR, HWND_TOPMOST, IsWindowVisible, LWA_ALPHA, MA_NOACTIVATE, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SPI_SETCURSORS, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetCursor, SetLayeredWindowAttributes, SetWindowPos, ShowWindow,
-    SystemParametersInfoW, WM_APP, WM_CLOSE, WM_DESTROY, WM_MOUSEACTIVATE, WM_SETCURSOR, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WindowFromPoint,
+    GetCursorPos, GetMessageW, HCURSOR, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, LWA_ALPHA, LoadCursorW,
+    MA_NOACTIVATE, MSG, PostMessageW, PostQuitMessage, RegisterClassExW, SPI_SETCURSORS, SW_HIDE, SWP_NOACTIVATE,
+    SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetCursor, SetLayeredWindowAttributes, SetWindowPos,
+    ShowWindow, SystemParametersInfoW, WM_APP, WM_CLOSE, WM_DESTROY, WM_MOUSEACTIVATE, WM_SETCURSOR, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WindowFromPoint,
 };
 #[cfg(debug_assertions)]
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -50,6 +50,7 @@ struct CoverRequest {
     from: POINT,
     park: POINT,
     visible: bool,
+    safe_visibility: bool,
 }
 thread_local! {
     static COVER_REQUEST: RefCell<Option<Arc<Snapshot<Option<CoverRequest>>>>> = const { RefCell::new(None) };
@@ -88,6 +89,8 @@ pub(crate) struct Hider {
     strategy: Strategy,
     cover: Option<Cover>,
     hidden: bool,
+    show_pending: bool,
+    safe_show_pending: bool,
     /// 遮罩窗口停在哪里（`window` 方案隐藏时的停靠点，遮罩以它为中心）。
     covered: Option<POINT>,
     pending_park: Option<CoverRequest>,
@@ -332,6 +335,21 @@ unsafe extern "system" fn cover_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                         }
                     }
                 } else {
+                    // Only replace the NULL shape while OUR cover still owns the
+                    // point. Never change a third-party window's hidden cursor.
+                    if r.safe_visibility {
+                        let mut point = POINT::default();
+                        // SAFETY: the cover owner changes only its own hit-tested
+                        // NULL cursor before hiding its own window.
+                        unsafe {
+                            if GetCursorPos(&mut point).is_ok()
+                                && WindowFromPoint(point) == hwnd
+                                && let Ok(arrow) = LoadCursorW(None, IDC_ARROW)
+                            {
+                                SetCursor(Some(arrow));
+                            }
+                        }
+                    }
                     // SAFETY: own window, called only after the input owner authorizes uncover.
                     unsafe {
                         let _ = ShowWindow(hwnd, SW_HIDE);
@@ -398,6 +416,9 @@ impl Cover {
         );
         #[cfg(all(test, debug_assertions))]
         if test_native::active() {
+            if !request.visible && request.safe_visibility {
+                test_native::set_showing(true);
+            }
             return;
         }
         // SAFETY: only a wake message crosses threads; the latest complete request is in the snapshot.
@@ -414,6 +435,8 @@ impl Hider {
             strategy,
             cover: None,
             hidden: false,
+            show_pending: false,
+            safe_show_pending: false,
             covered: None,
             pending_park: None,
             generation: 0,
@@ -450,6 +473,8 @@ impl Hider {
         self.generation += 1;
         self.reply = reply;
         self.pending_park = None;
+        self.show_pending = false;
+        self.safe_show_pending = false;
         match self.strategy {
             Strategy::Window => {
                 let request = CoverRequest {
@@ -458,6 +483,7 @@ impl Hider {
                     park,
                     reply: reply.0 as usize,
                     visible: true,
+                    safe_visibility: false,
                 };
                 self.pending_park = Some(request);
                 self.hidden = true;
@@ -553,10 +579,33 @@ impl Hider {
         self.show_at(None);
     }
 
+    pub(crate) fn owns_cover(&self) -> bool {
+        self.strategy == Strategy::Window && self.cover.is_some() && (self.hidden || self.show_pending)
+    }
+    pub(crate) fn cover_owns_cursor(&self) -> bool {
+        #[cfg(all(test, debug_assertions))]
+        if let Some(owned) = test_native::own_cursor() {
+            return owned;
+        }
+        let Some(cover) = &self.cover else {
+            return false;
+        };
+        let Ok(point) = super::hook::cursor_pos_checked() else {
+            return false;
+        };
+        // SAFETY: read-only hit test; never infer ownership from global hidden state.
+        unsafe { IsWindowVisible(cover.hwnd).as_bool() && WindowFromPoint(point) == cover.hwnd }
+    }
+    pub(crate) fn show_safely(&mut self) {
+        self.show_at_kind(None, true);
+    }
     pub(crate) fn show_at(&mut self, at: Option<POINT>) {
+        self.show_at_kind(at, false);
+    }
+    fn show_at_kind(&mut self, at: Option<POINT>, safe_visibility: bool) {
         super::trace::action(crate::native_lifecycle::Kind::Show, at, 0, None);
         self.cancel_park();
-        if !self.hidden {
+        if !self.hidden && !(safe_visibility && self.show_pending) {
             return;
         }
         self.generation += 1;
@@ -564,12 +613,15 @@ impl Hider {
             Strategy::Window => {
                 if let Some(cover) = &self.cover {
                     let point = at.or(self.covered).unwrap_or_default();
+                    self.show_pending = true;
+                    self.safe_show_pending = safe_visibility;
                     cover.request(CoverRequest {
                         generation: self.generation,
                         reply: self.reply.0 as usize,
                         from: point,
                         park: self.covered.unwrap_or(point),
                         visible: false,
+                        safe_visibility,
                     });
                 }
             }
@@ -593,10 +645,12 @@ impl Hider {
         if self.hidden || generation != self.generation {
             return;
         }
-        let Some(covered) = self.covered.take() else { return };
-        let mut p = POINT::default();
-        // SAFETY: read current position after the cover owner hid its window.
-        let read = unsafe { GetCursorPos(&mut p) }.is_ok();
+        self.show_pending = false;
+        let safe_visibility = std::mem::take(&mut self.safe_show_pending);
+        let covered = self.covered.take();
+        let actual = super::hook::cursor_pos_checked();
+        let read = actual.is_ok();
+        let p = actual.unwrap_or_default();
         if crate::native_lifecycle::lifecycle_enabled() {
             crate::native_lifecycle::emit(
                 crate::native_lifecycle::Kind::Show,
@@ -610,7 +664,19 @@ impl Hider {
                 },
             );
         }
-        if read && (p.x - covered.x).abs() <= COVER / 2 && (p.y - covered.y).abs() <= COVER / 2 {
+        if read
+            && (safe_visibility
+                || covered.is_some_and(|covered| {
+                    (p.x - covered.x).abs() <= COVER / 2 && (p.y - covered.y).abs() <= COVER / 2
+                }))
+        {
+            // Recovery's synchronous SetCursorPos can leave our NULL shape until
+            // the newly underlying window receives a cursor query. Reuse the
+            // existing shape refresh AFTER cover ACK even away from park; sample
+            // the current point, never warp to a stale entry. Native WM_SETCURSOR
+            // still owns the shape, including a third-party choice to keep NULL.
+            // The recovery extension was verified with rejected restore markers
+            // and park confinement on Windows 11 26200.
             nudge(p);
         }
     }
@@ -757,6 +823,8 @@ pub(super) mod test_native {
         showing: bool,
         moves: Vec<(POINT, bool)>,
         refreshes: Vec<POINT>,
+        ignore_warps: bool,
+        foreign_cursor: bool,
     }
     thread_local! { static NATIVE: RefCell<Option<Recording>> = const { RefCell::new(None) }; }
     pub(super) fn refresh(p: POINT) -> bool {
@@ -778,7 +846,9 @@ pub(super) mod test_native {
             let mut n = n.borrow_mut();
             let Some(n) = n.as_mut() else { return false };
             n.moves.push((p, n.showing));
-            n.position = p;
+            if !n.ignore_warps {
+                n.position = p;
+            }
             true
         })
     }
@@ -816,13 +886,24 @@ pub(super) mod test_native {
                 request: Arc::new(Snapshot::new(None)),
             }),
             hidden: false,
+            show_pending: false,
+            safe_show_pending: false,
             covered: None,
             pending_park: None,
             generation: 0,
             reply: HWND::default(),
         }
     }
-    fn moves() -> Vec<(POINT, bool)> {
+    pub(in crate::windows) fn own_cursor() -> Option<bool> {
+        NATIVE.with(|n| n.borrow().as_ref().map(|n| !n.foreign_cursor))
+    }
+    pub(in crate::windows) fn foreign_cursor() {
+        NATIVE.with(|n| n.borrow_mut().as_mut().unwrap().foreign_cursor = true);
+    }
+    pub(in crate::windows) fn ignore_warps() {
+        NATIVE.with(|n| n.borrow_mut().as_mut().unwrap().ignore_warps = true);
+    }
+    pub(in crate::windows) fn moves() -> Vec<(POINT, bool)> {
         NATIVE.with(|n| n.borrow().as_ref().unwrap().moves.clone())
     }
 

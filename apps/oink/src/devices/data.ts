@@ -1,6 +1,13 @@
 import { tr } from '../i18n';
 import type { Device, ScreenState } from './types';
 export type ShareKind = 'screen' | 'mouse' | 'keyboard' | 'clipboard' | 'speaker';
+/** Match the input menu's capability and permission gates. */
+export function canDisableInput(d: Device, kind: 'keyboard' | 'mouse'): boolean {
+    return !d.unknown && !d.inputPermissionMissing && d.group !== 'offline'
+        && d[kind] !== 'fault' && d[kind] !== 'unknown'
+        && (!d.actionability?.[kind] || d.actionability[kind] === 'invoke')
+        && (kind === 'keyboard' || d.canDisableMouse === true);
+}
 export function toggleShare(d: Device, kind: ShareKind): Device | null {
     switch (kind) {
         case 'screen':
@@ -17,7 +24,7 @@ export function toggleShare(d: Device, kind: ShareKind): Device | null {
             if (v === 'fault' || v === 'unknown')
                 return null;
             if (v === 'disabled')
-                return { ...d, keyboard: d.keyboardBeforeLock ?? 'shared', keyboardBeforeLock: undefined };
+                return { ...d, keyboard: 'shared' };
             return { ...d, keyboard: v === 'shared' ? 'local' : 'shared' };
         }
         case 'speaker': {
@@ -46,8 +53,8 @@ export function toggleThird(devices: Device[], id: string, kind: ShareKind): Dev
         if (v === 'fault' || v === 'unknown')
             return null;
         const next: Device = v === 'disabled'
-            ? { ...d, keyboard: d.keyboardBeforeLock ?? 'shared', keyboardBeforeLock: undefined }
-            : { ...d, keyboard: 'disabled', keyboardBeforeLock: v };
+            ? { ...d, keyboard: 'shared' }
+            : { ...d, keyboard: 'disabled' };
         return devices.map((x) => (x.id === id ? next : x));
     }
     const mode = d.speaker.mode;

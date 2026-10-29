@@ -300,6 +300,10 @@ fn request_state(
     peer: DeviceId,
     hash: [u8; 32],
 ) -> v1::Result<dto::GroupState> {
+    // An incoming roster cannot establish trust in its own sender.
+    if !current.roster().contains(peer) {
+        return Err(v1::ErrorCode::AuthenticationFailed.into());
+    }
     let incoming = if let Some(state) = request.state()? {
         state
     } else if let Some(grant) = request.grant()? {
@@ -331,6 +335,13 @@ pub fn reply(state: &State, local: DeviceId, hash: [u8; 32], connected: u8) -> v
         .into(),
     )?))
 }
+/// The durable union and the exact peer snapshot acknowledged by Done.
+/// Local edits arriving after Request must survive without changing that acknowledgment.
+#[derive(Debug)]
+pub struct ReplyAcceptance {
+    pub merged: State,
+    pub acknowledged: State,
+}
 pub fn receive_reply(
     current: &State,
     sent: &State,
@@ -338,8 +349,11 @@ pub fn receive_reply(
     local: DeviceId,
     peer: DeviceId,
     hash: [u8; 32],
-) -> v1::Result<State> {
-    current.merge(&reply_state(current, sent, reply, peer, hash)?, peer, local)
+) -> v1::Result<ReplyAcceptance> {
+    let incoming = reply_state(current, sent, reply, peer, hash)?;
+    let merged = current.merge(&incoming, peer, local)?;
+    let acknowledged = State::verify(incoming, current.roster().anchor())?;
+    Ok(ReplyAcceptance { merged, acknowledged })
 }
 pub fn reply_revocation(
     current: &State,
@@ -370,6 +384,9 @@ fn reply_state(
     peer: DeviceId,
     hash: [u8; 32],
 ) -> v1::Result<dto::GroupState> {
+    if !current.roster().contains(peer) {
+        return Err(v1::ErrorCode::AuthenticationFailed.into());
+    }
     let result = reply.state()?;
     let incoming = match result.variant()? {
         v1::schema::Open::Known(dto::ReplyStateKind::State) => dto::ReplySnapshot::from_raw(result.body()?)?.state()?,
@@ -566,7 +583,7 @@ mod tests {
         let Message::ConfigRequest(request) = request(&joined, b.id(), hash, 0).unwrap() else {
             panic!()
         };
-        assert!(receive_request(&initial, &request, a.id(), b.id(), hash).is_ok());
+        assert!(receive_request(&joined, &request, a.id(), b.id(), hash).is_ok());
         let removed = joined
             .with_roster(&roster.remove(&a, b.id(), None, 3).unwrap())
             .unwrap();
@@ -578,5 +595,127 @@ mod tests {
         receive_done(&joined, &done, hash).unwrap();
         assert!(receive_done(&initial, &done, hash).is_err());
         assert!(receive_done(&joined, &done, [9; 32]).is_err());
+    }
+    #[test]
+    fn repeated_membership_cycles_ignore_old_revocations_and_apply_the_latest_epoch() {
+        let a = Identity::from_seed([1; 32]);
+        let b = Identity::from_seed([2; 32]);
+        let d = Identity::from_seed([3; 32]);
+        let base = State::create(&a, "a", "test", 1).unwrap();
+        let base = base
+            .with_roster(&base.roster().add(&a, b.id(), "b", "test", 2).unwrap())
+            .unwrap();
+        let mut current = base;
+        let hash = [8; 32];
+        let mut old_removals = Vec::new();
+        for (add_epoch, remove_epoch) in [(1, 2), (3, 4), (5, 6)] {
+            // B reintroduces D; A's older Remove records remain in the union.
+            current = current
+                .with_roster(&current.roster().add(&b, d.id(), "d", "test", 3).unwrap())
+                .unwrap();
+            assert_eq!(current.roster().member(d.id()).unwrap().epoch, add_epoch);
+            let Message::ConfigRequest(from_d) = request(&current, d.id(), hash, 0).unwrap() else {
+                panic!()
+            };
+            assert!(receive_request(&current, &from_d, a.id(), d.id(), hash).is_ok());
+            for removed in &old_removals {
+                // Use the CURRENT transcript hash so this exercises the epoch
+                // union, not just rejection of an old connection's transcript.
+                let Message::ConfigReply(reply) = reply(removed, a.id(), hash, 0).unwrap() else {
+                    panic!()
+                };
+                assert!(
+                    reply_revocation(&current, &current, &reply, d.id(), a.id(), hash)
+                        .unwrap()
+                        .is_none()
+                );
+                let accepted = receive_reply(&current, &current, &reply, d.id(), a.id(), hash).unwrap();
+                assert_eq!(accepted.merged.roster().member(d.id()).unwrap().epoch, add_epoch);
+                assert!(reply_revocation(&current, &current, &reply, d.id(), a.id(), [9; 32]).is_err());
+                let Message::ConfigRequest(request) = request(removed, a.id(), hash, 0).unwrap() else {
+                    panic!()
+                };
+                assert!(
+                    request_revocation(&current, &request, d.id(), a.id(), hash)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    receive_request(&current, &request, d.id(), a.id(), hash)
+                        .unwrap()
+                        .roster()
+                        .member(d.id())
+                        .unwrap()
+                        .epoch,
+                    add_epoch
+                );
+            }
+            let removed = current
+                .with_roster(&current.roster().remove(&a, d.id(), None, 4).unwrap())
+                .unwrap();
+            assert_eq!(removed.roster().next_epoch(d.id()).unwrap(), remove_epoch + 1);
+            assert!(receive_request(&removed, &from_d, a.id(), d.id(), hash).is_err());
+            let Message::ConfigReply(reply) = reply(&removed, a.id(), hash, 0).unwrap() else {
+                panic!()
+            };
+            let revoked = reply_revocation(&current, &current, &reply, d.id(), a.id(), hash)
+                .unwrap()
+                .expect("the current removal must revoke D");
+            assert!(!revoked.roster().contains(d.id()));
+            assert_eq!(revoked.roster().next_epoch(d.id()).unwrap(), remove_epoch + 1);
+            old_removals.push(removed.clone());
+            current = removed;
+        }
+    }
+    #[test]
+    fn full_trust_admission_requires_a_locally_known_peer_before_reading_its_roster() {
+        let (a, b, _, _) = boots();
+        let initial = State::create(&a, "a", "test", 1).unwrap();
+        let joined = initial
+            .with_roster(&initial.roster().add(&a, b.id(), "b", "test", 2).unwrap())
+            .unwrap();
+        let hash = [8; 32];
+        let Message::ConfigRequest(request) = request(&joined, b.id(), hash, 0).unwrap() else {
+            panic!()
+        };
+        let Message::ConfigReply(reply) = reply(&joined, b.id(), hash, 0).unwrap() else {
+            panic!()
+        };
+        // Even a well-formed, correctly signed self-including roster cannot
+        // bootstrap trust. Only our retained roster or PAKE can add this peer.
+        assert!(receive_request(&initial, &request, a.id(), b.id(), hash).is_err());
+        assert!(request_revocation(&initial, &request, a.id(), b.id(), hash).is_err());
+        assert!(receive_reply(&initial, &initial, &reply, a.id(), b.id(), hash).is_err());
+        assert!(reply_revocation(&initial, &initial, &reply, a.id(), b.id(), hash).is_err());
+        crate::identity::STRICT_VERIFICATIONS.with(|count| count.set(0));
+        assert!(receive_request(&joined, &request, a.id(), b.id(), hash).is_ok());
+        assert!(receive_reply(&joined, &joined, &reply, a.id(), b.id(), hash).is_ok());
+        crate::identity::STRICT_VERIFICATIONS.with(|count| assert_eq!(count.get(), 0));
+    }
+    #[test]
+    fn concurrent_pointer_slot_edit_does_not_change_the_reply_acknowledgment() {
+        let (a, b, _, _) = boots();
+        let initial = State::create(&a, "a", "test", 1).unwrap();
+        let joined = initial
+            .with_roster(&initial.roster().add(&a, b.id(), "b", "test", 2).unwrap())
+            .unwrap();
+        let hash = [8; 32];
+        let Message::ConfigReply(reply) = reply(&joined, b.id(), hash, 0).unwrap() else {
+            panic!()
+        };
+        // A retained local edit lands after Request, before the frozen Reply.
+        let current = joined.reconcile_pointer_slots(a.id()).unwrap();
+        assert_ne!(current.digest().unwrap(), joined.digest().unwrap());
+        let accepted = receive_reply(&current, &joined, &reply, a.id(), b.id(), hash).unwrap();
+        assert_eq!(accepted.merged.digest().unwrap(), current.digest().unwrap());
+        assert_eq!(accepted.acknowledged.digest().unwrap(), joined.digest().unwrap());
+        let Message::ConfigDone(wrong) = done(&accepted.merged, hash).unwrap() else {
+            panic!()
+        };
+        assert!(receive_done(&joined, &wrong, hash).is_err());
+        let Message::ConfigDone(done) = done(&accepted.acknowledged, hash).unwrap() else {
+            panic!()
+        };
+        receive_done(&joined, &done, hash).unwrap();
     }
 }

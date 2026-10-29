@@ -451,7 +451,7 @@ fn cross_process_thumbnail_replaces_old_shell_visual() {
                 native: Some(native),
                 ops: DragOps::COPY,
             };
-            let (data, _) = data_object(&spec).unwrap();
+            let (data, _, _) = data_object(&spec).unwrap();
             let helper = super::super::drag_image::initialize(&data, &spec.items, None).unwrap();
             // SAFETY: marshal this private IDataObject for a single local-process consumer.
             let bytes = unsafe {
@@ -770,7 +770,7 @@ fn live_drag_replaces_default_image_at_128_logical_pixels() {
             native: Some(native),
             ops: DragOps::COPY,
         };
-        let (data, _) = data_object(&spec).unwrap();
+        let (data, _, _) = data_object(&spec).unwrap();
         let helper = super::super::drag_image::initialize(&data, &spec.items, None).unwrap();
         LOCAL.with(|l| {
             l.borrow_mut().as_mut().unwrap().live_drag = Some(LiveDrag::new(operation, data.clone(), helper))

@@ -67,7 +67,12 @@ fn input(cmd: Command) -> Option<INPUT> {
             MOUSEINPUT {
                 dx,
                 dy,
-                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE,
+                // User-tested on Windows 11 build 26200: Endfield's camera Y
+                // inverted with NOCOALESCE; MOVE with the OINK tag worked.
+                // The game-side cause is unknown. Match the local builder,
+                // preserving signed deltas/echo filtering and leaving absolute moves separate.
+                // See docs/design/game-mode.md.
+                dwFlags: MOUSEEVENTF_MOVE,
                 dwExtraInfo: TAG,
                 ..Default::default()
             },
@@ -594,7 +599,19 @@ struct Ordinary {
     priority: std::sync::Arc<std::sync::atomic::AtomicI32>,
 }
 impl crate::helper::Query for Ordinary {
-    fn query(&mut self, _: Command) -> Reply {
+    fn query(&mut self, command: Command) -> Reply {
+        if command == Command::PowerSnapshot {
+            let mut reply = Reply([0; REPLY_SIZE]);
+            // Query-specific fixed payload: version, availability, two booleans.
+            // No desktop work and no native diagnostic strings in this reply.
+            reply.0[4] = 1;
+            if let Ok(state) = super::power::observe() {
+                reply.0[5] = 1;
+                reply.0[6] = u8::from(state.display);
+                reply.0[7] = u8::from(state.system);
+            }
+            return reply;
+        }
         let result = (|| {
             let next = open_desktop()?;
             // Ordinary queries attach ONLY their own thread, never the input
@@ -780,6 +797,25 @@ mod isolated_pipe_tests {
             os.lock().unwrap().held.is_empty(),
             "disconnect/native stop owns release"
         );
+    }
+}
+
+#[cfg(test)]
+mod relative_input_tests {
+    use super::*;
+
+    #[test]
+    fn game_relative_input_uses_only_move_and_keeps_echo_tag() {
+        for (dx, dy) in [(7, -11), (-7, 11), (0, 0)] {
+            let event = input(Command::MoveRelative { dx, dy }).unwrap();
+            assert_eq!(event.r#type, INPUT_MOUSE);
+            // SAFETY: MoveRelative initializes INPUT_MOUSE's mi member; no input is sent.
+            let mouse = unsafe { event.Anonymous.mi };
+            assert_eq!((mouse.dx, mouse.dy), (dx, dy));
+            assert_eq!(mouse.dwFlags, MOUSEEVENTF_MOVE);
+            assert_eq!(mouse.dwExtraInfo, TAG);
+            assert_eq!((mouse.mouseData, mouse.time), (0, 0));
+        }
     }
 }
 

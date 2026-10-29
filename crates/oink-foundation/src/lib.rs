@@ -3,6 +3,7 @@
 //! Shared types define the contracts between modules; changes must remain consistent
 //! across their producers and consumers.
 
+pub mod application_focus;
 pub mod clipboard;
 pub mod contacts;
 pub mod content;

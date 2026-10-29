@@ -1,6 +1,7 @@
 //! Audio control owns admitted v1 sessions; native workers alone consume M1.
 use oink_audio::{negotiation::Profile as StreamFormat, session::Prepared};
 pub(crate) mod transport;
+use oink_audio::media::Kind as MediaKind;
 use transport::{MediaReceiver, MediaSender};
 
 pub const KINDS: &[StreamKind] = &[StreamKind::Audio];
@@ -18,6 +19,7 @@ pub struct ForwardTo {
 /// One source this device plays.
 #[derive(Debug)]
 pub struct ForwardFrom {
+    pub admission: std::sync::Arc<ReceiveAdmission>,
     pub peer: DeviceId,
     pub stream_id: u64,
     pub format: StreamFormat,
@@ -25,6 +27,42 @@ pub struct ForwardFrom {
     /// False while this device is paused: packets are taken and dropped.
     pub playing: bool,
     pub packets: std::sync::Arc<dyn MediaReceiver>,
+}
+
+/// Control publishes identity once; callback only borrows this atomic gate.
+#[derive(Debug)]
+pub struct ReceiveAdmission {
+    active: std::sync::atomic::AtomicBool,
+    playing: std::sync::atomic::AtomicBool,
+}
+impl Default for ReceiveAdmission {
+    fn default() -> Self {
+        Self {
+            active: true.into(),
+            playing: true.into(),
+        }
+    }
+}
+fn publish_receive_table(target: &oink_foundation::snapshot::Snapshot<ForwardTable>, mut next: ForwardTable) {
+    use std::sync::{Arc, atomic::Ordering};
+    let old = target.load();
+    for source in &mut next.from {
+        if let Some(previous) = old.from.iter().find(|p| {
+            p.peer == source.peer
+                && p.stream_id == source.stream_id
+                && p.format == source.format
+                && p.packets.follows() == source.packets.follows()
+        }) {
+            source.admission = previous.admission.clone();
+        }
+        source.admission.playing.store(source.playing, Ordering::Release);
+    }
+    for previous in &old.from {
+        if !next.from.iter().any(|p| Arc::ptr_eq(&p.admission, &previous.admission)) {
+            previous.admission.active.store(false, Ordering::Release);
+        }
+    }
+    target.publish(next); // old owning snapshots are reclaimed only on control
 }
 
 /// Snapshot read by the audio realtime threads (`Snapshot<ForwardTable>`), produced by
@@ -61,6 +99,8 @@ struct Peer {
     rx: Option<RecvStream>,
     packets_tx: Option<DatagramSend>,
     packets_rx: Option<DatagramRecv>,
+    microphone_rx: Option<std::sync::Arc<dyn MediaReceiver>>,
+    speaker_rx: Option<std::sync::Arc<dyn MediaReceiver>>,
     wanted: bool,
     supported: bool,
     opening: Vec<Message>,
@@ -81,6 +121,11 @@ pub struct AudioStreams {
     source: Option<(DeviceId, Prepared)>,
     pending_opening: HashMap<DeviceId, Vec<Message>>,
     receivers: HashMap<DeviceId, Prepared>,
+    microphone_opening: HashMap<DeviceId, Vec<Message>>,
+    microphone_sources: HashMap<DeviceId, (u64, StreamFormat)>,
+    microphone_receiver: Option<(DeviceId, u64, StreamFormat)>,
+    microphone_forward: std::sync::Arc<oink_foundation::snapshot::Snapshot<ForwardTable>>,
+    media_reports: HashMap<(MediaKind, DeviceId), (u64, u64, bool, Instant)>,
     forwarding_enabled: bool,
     forwarding_gain: f32,
     forward: std::sync::Arc<oink_foundation::snapshot::Snapshot<ForwardTable>>,
@@ -101,6 +146,11 @@ impl AudioStreams {
             source: None,
             pending_opening: HashMap::new(),
             receivers: HashMap::new(),
+            microphone_opening: HashMap::new(),
+            microphone_sources: HashMap::new(),
+            microphone_receiver: None,
+            microphone_forward: Default::default(),
+            media_reports: HashMap::new(),
             forwarding_enabled: false,
             forwarding_gain: 1.0,
             forward: Default::default(),
@@ -126,20 +176,35 @@ impl AudioStreams {
     pub fn set_opening(&mut self, peer: DeviceId, messages: Vec<Message>) {
         assert!(messages.iter().all(Self::valid), "message belongs to another stream");
         self.pending_opening.insert(peer, messages.clone());
+        self.refresh_opening(peer);
+    }
+    pub fn set_microphone_opening(&mut self, peer: DeviceId, messages: Vec<Message>) {
+        assert!(messages.iter().all(Self::valid), "message belongs to another stream");
+        if messages.is_empty() {
+            self.microphone_opening.remove(&peer);
+        } else {
+            self.microphone_opening.insert(peer, messages);
+        }
+        self.refresh_opening(peer);
+    }
+    fn refresh_opening(&mut self, peer: DeviceId) {
         if let Some(state) = self.peers.get_mut(&peer) {
-            state.wanted |= !messages.is_empty();
-            state.opening = messages;
+            state.opening = self
+                .pending_opening
+                .get(&peer)
+                .into_iter()
+                .flatten()
+                .chain(self.microphone_opening.get(&peer).into_iter().flatten())
+                .cloned()
+                .collect();
+            state.wanted |= !state.opening.is_empty();
         }
     }
 
     /// Telemetry can open M0 between any audio-capable members, without M1
     /// admission. The negotiated capability replaces a separate support message.
     pub fn enable_state_reports(&mut self, peer: DeviceId) {
-        if self
-            .config
-            .peer_agreement(peer)
-            .is_some_and(|a| a.contains("oink.audio.state/1"))
-        {
+        if self.config.peer_supports(peer, "oink.audio.state/1") {
             if let Some(state) = self.peers.get_mut(&peer) {
                 state.wanted = true;
             }
@@ -155,14 +220,16 @@ impl AudioStreams {
                 | Message::AudioPrepareRefused(_)
                 | Message::AudioRouteFault(_)
                 | Message::AudioState(_)
+                | Message::AudioMediaState(_)
+                | Message::MicrophoneDemand(_)
+                | Message::MicrophonePrepared(_)
+                | Message::MicrophoneReady(_)
+                | Message::MicrophoneRenew(_)
+                | Message::MicrophoneStop(_)
         )
     }
     fn supported(&self, peer: DeviceId) -> bool {
-        self.config.applied().members.contains(&peer)
-            && self
-                .config
-                .peer_agreement(peer)
-                .is_some_and(|a| a.contains("oink.audio/1"))
+        self.config.applied().members.contains(&peer) && self.config.peer_supports(peer, "oink.audio/1")
     }
     fn context(agreement: &admission::Agreement, direct: bool) -> admission::Context<'_> {
         admission::Context {
@@ -271,16 +338,19 @@ impl AudioStreams {
             self.advance(peer, now);
             let mut invalid = None;
             let mut violation = None;
-            let direct = self
-                .links
-                .links()
-                .by_peer(peer)
-                .is_some_and(|link| matches!(link.path, oink_network::link::LinkPath::Direct));
-            let agreement = self.config.peer_agreement(peer);
+            // A maintenance poll usually has no M0 message. Borrow admission
+            // from the live snapshot instead of cloning every capability string
+            // on each 20 ms audio tick, including empty receive queues.
+            let links = self.links.links();
+            let link = links.by_peer(peer);
+            let direct = link.is_some_and(|link| matches!(link.path, oink_network::link::LinkPath::Direct));
+            let agreement = link
+                .filter(|link| link.state == oink_network::link::LinkState::Ready)
+                .map(|link| &link.agreement);
             let state = self.peers.get_mut(&peer).unwrap();
             if let Some(rx) = state.rx.as_mut() {
                 while let Ok(Some(bytes)) = rx.take() {
-                    let message = match agreement.as_ref().and_then(|agreement| {
+                    let message = match agreement.and_then(|agreement| {
                         let context = Self::context(agreement, direct);
                         let frame = match OpaqueFrame::parse_exact(&bytes, v1::limits::RELIABLE_FRAME) {
                             Ok(frame) => frame,
@@ -323,7 +393,8 @@ impl AudioStreams {
                 self.stream_closed(stream, StreamClosed::Local);
             }
         }
-        self.publish_forward();
+        // Route changes in advance/stream_closed publish at their mutation site.
+        // A maintenance poll must not churn ArcSwap tables read by RT workers.
         delivered
     }
 
@@ -352,15 +423,14 @@ impl StreamModule for AudioStreams {
             rx: None,
             packets_tx: None,
             packets_rx: None,
+            microphone_rx: None,
+            speaker_rx: None,
             wanted: false,
             supported,
             opening: Vec::new(),
         });
         state.supported = supported;
-        if let Some(opening) = self.pending_opening.get(&peer) {
-            state.opening = opening.clone();
-            state.wanted |= !opening.is_empty();
-        }
+        self.refresh_opening(peer);
         self.advance(peer, Instant::now());
     }
     fn link_lost(&mut self, link: LinkId, peer: DeviceId, _reason: LinkLost) {
@@ -368,6 +438,7 @@ impl StreamModule for AudioStreams {
             return;
         }
         self.forget_preparation(peer);
+        self.forget_microphone(peer);
         let state = self.peers.remove(&peer).unwrap();
         if let Some(rx) = state.rx {
             self.closed.push((peer, rx.id()));
@@ -396,10 +467,16 @@ impl StreamModule for AudioStreams {
             self.closed.push((stream.peer, old.id()));
         }
         self.receivers.remove(&stream.peer);
-        let (mut rx, packets) = stream.accept(
+        let (mut rx, lanes) = stream.accept_partitioned(
             QueueSpec::reliable(StreamKind::Audio).1,
             QueueSpec::datagram(StreamKind::Audio),
+            [
+                [MediaKind::Speaker.packet_id(), MediaKind::Speaker.sleep_id()],
+                [MediaKind::Microphone.packet_id(), MediaKind::Microphone.sleep_id()],
+            ],
         );
+        let (packets, microphone) =
+            lanes.map_or((None, None), |[speaker, microphone]| (Some(speaker), Some(microphone)));
         let wake = self.wake.clone();
         rx.set_wake(std::sync::Arc::new(move || wake.notify_one()));
         // Acceptance and wake installation can race the first network read.
@@ -414,6 +491,11 @@ impl StreamModule for AudioStreams {
                 }
             }));
         }
+        state.speaker_rx = packets
+            .as_ref()
+            .map(|packets| std::sync::Arc::new(packets.clone()) as std::sync::Arc<dyn MediaReceiver>);
+        state.microphone_rx =
+            microphone.map(|packets| std::sync::Arc::new(packets) as std::sync::Arc<dyn MediaReceiver>);
         state.packets_rx = packets;
         self.publish_forward();
     }
@@ -430,6 +512,8 @@ impl StreamModule for AudioStreams {
                 self.receivers.remove(&peer);
                 state.rx = None;
                 state.packets_rx = None;
+                state.speaker_rx = None;
+                state.microphone_rx = None;
                 self.closed.push((peer, stream));
             }
             StreamDir::Out if state.tx.as_ref().is_some_and(|s| s.id() == stream) => {
@@ -481,12 +565,21 @@ impl ForwardTable {
         table: std::sync::Arc<oink_foundation::snapshot::Snapshot<Self>>,
         started: Instant,
     ) -> std::sync::Arc<dyn Fn(&oink_audio::source::Packet) -> bool + Send + Sync> {
+        Self::source_writer_kind(table, started, MediaKind::Speaker)
+    }
+    pub fn source_writer_kind(
+        table: std::sync::Arc<oink_foundation::snapshot::Snapshot<Self>>,
+        started: Instant,
+        kind: MediaKind,
+    ) -> std::sync::Arc<dyn Fn(&oink_audio::source::Packet) -> bool + Send + Sync> {
         std::sync::Arc::new(move |packet| {
             let table = table.load();
             let mut sent = false;
             for destination in &table.to {
                 let mut bytes = [0; oink_audio::media::FRAME_CAPACITY];
-                if let Ok(len) = oink_audio::media::encode(packet, destination.stream_id, started, &mut bytes) {
+                if let Ok(len) =
+                    oink_audio::media::encode_kind(kind, packet, destination.stream_id, started, &mut bytes)
+                {
                     sent |= destination.packets.post(&bytes[..len]).is_ok();
                 }
             }
@@ -514,6 +607,50 @@ impl ForwardTable {
 }
 
 impl AudioStreams {
+    /// Send intent on reliable M0 as well as media on M1. This is bounded to
+    /// state changes plus one heartbeat per second, with current-stream fencing.
+    pub fn report_media(&mut self, kind: MediaKind, encoded: &oink_audio::source::Encoded, now: Instant) {
+        use v1::schema::{WireDto, WireValue};
+        let table = match kind {
+            MediaKind::Speaker => self.forward.load(),
+            MediaKind::Microphone => self.microphone_forward.load(),
+        };
+        let destinations: Vec<_> = table.to.iter().map(|d| (d.peer, d.stream_id)).collect();
+        drop(table);
+        self.media_reports
+            .retain(|(k, peer), _| *k != kind || destinations.iter().any(|(p, _)| p == peer));
+        let burst = encoded.burst();
+        let sleeping = encoded.sleeping();
+        for (peer, stream) in destinations {
+            if !self.config.peer_supports(peer, "oink.audio.media-health/1") {
+                continue;
+            }
+            let key = (kind, peer);
+            if self
+                .media_reports
+                .get(&key)
+                .is_some_and(|(old_stream, old_burst, old_sleep, at)| {
+                    (*old_stream, *old_burst, *old_sleep) == (stream, burst, sleeping)
+                        && now.saturating_duration_since(*at) < std::time::Duration::from_secs(1)
+                })
+            {
+                continue;
+            }
+            let state = v1::dto::AudioMediaState::from_raw(
+                [
+                    (1, kind.to_wire().write()),
+                    (2, stream.write()),
+                    (3, burst.write()),
+                    (4, sleeping.write()),
+                ]
+                .into(),
+            )
+            .expect("bounded media state");
+            if self.send(peer, &Message::AudioMediaState(state), now).is_ok() {
+                self.media_reports.insert(key, (stream, burst, sleeping, now));
+            }
+        }
+    }
     pub fn forward_table(&self) -> std::sync::Arc<oink_foundation::snapshot::Snapshot<ForwardTable>> {
         self.forward.clone()
     }
@@ -521,12 +658,15 @@ impl AudioStreams {
         self.source = None;
         self.receivers.clear();
         self.pending_opening.clear();
-        for peer in self.peers.values_mut() {
-            peer.opening.clear();
+        for peer in self.peers.keys().copied().collect::<Vec<_>>() {
+            self.refresh_opening(peer);
         }
         self.publish_forward();
     }
     pub fn set_forwarding(&mut self, enabled: bool, gain: f32) {
+        if self.forwarding_enabled == enabled && self.forwarding_gain == gain {
+            return;
+        }
         self.forwarding_enabled = enabled;
         self.forwarding_gain = gain;
         self.publish_forward();
@@ -537,9 +677,7 @@ impl AudioStreams {
             self.source = None;
         }
         self.receivers.remove(&peer);
-        if let Some(state) = self.peers.get_mut(&peer) {
-            state.opening.clear();
-        }
+        self.refresh_opening(peer);
         self.publish_forward();
     }
     /// Called only after the current source sent its successful PreparedAck.
@@ -552,17 +690,68 @@ impl AudioStreams {
         self.receivers.insert(peer, prepared);
         self.publish_forward();
     }
+    pub fn microphone_table(&self) -> std::sync::Arc<oink_foundation::snapshot::Snapshot<ForwardTable>> {
+        self.microphone_forward.clone()
+    }
+    pub fn admit_microphone_source(&mut self, peer: DeviceId, stream: u64, format: StreamFormat) {
+        self.microphone_sources.insert(peer, (stream, format));
+        self.publish_forward();
+    }
+    pub fn admit_microphone_receiver(&mut self, peer: DeviceId, stream: u64, format: StreamFormat) {
+        self.microphone_receiver = Some((peer, stream, format));
+        self.publish_forward();
+    }
+    pub fn forget_microphone(&mut self, peer: DeviceId) {
+        self.microphone_sources.remove(&peer);
+        if self.microphone_receiver.as_ref().is_some_and(|(p, _, _)| *p == peer) {
+            self.microphone_receiver = None;
+        }
+        self.microphone_opening.remove(&peer);
+        self.refresh_opening(peer);
+        self.publish_forward();
+    }
     fn publish_forward(&self) {
+        let mut microphone = ForwardTable::default();
+        for (peer, state) in &self.peers {
+            let receive = self.microphone_receiver.filter(|(p, _, _)| p == peer);
+            if let Some((_, stream_id, format)) = receive
+                && let Some(packets) = &state.microphone_rx
+            {
+                microphone.from.push(ForwardFrom {
+                    admission: Default::default(),
+                    peer: *peer,
+                    stream_id,
+                    format,
+                    gain: 1.0,
+                    playing: !self.paused,
+                    packets: packets.clone(),
+                });
+            }
+            if !self.paused
+                && let Some((stream_id, format)) = self.microphone_sources.get(peer)
+                && let Some(packets) = &state.packets_tx
+            {
+                microphone.to.push(ForwardTo {
+                    peer: *peer,
+                    stream_id: *stream_id,
+                    format: *format,
+                    gain: 1.0,
+                    packets: std::sync::Arc::new(packets.clone()),
+                });
+            }
+        }
+        publish_receive_table(&self.microphone_forward, microphone);
         let mut table = ForwardTable::default();
         for (peer, prepared) in &self.receivers {
-            if let Some(packets) = self.peers.get(peer).and_then(|p| p.packets_rx.as_ref()) {
+            if let Some(packets) = self.peers.get(peer).and_then(|p| p.speaker_rx.as_ref()) {
                 table.from.push(ForwardFrom {
+                    admission: Default::default(),
                     peer: *peer,
                     stream_id: prepared.stream_id(),
                     format: prepared.profile,
                     gain: 1.0,
                     playing: !self.paused,
-                    packets: std::sync::Arc::new(packets.clone()),
+                    packets: packets.clone(),
                 });
             }
         }
@@ -579,13 +768,14 @@ impl AudioStreams {
                 packets: std::sync::Arc::new(packets.clone()),
             });
         }
-        self.forward.publish(table);
+        publish_receive_table(&self.forward, table);
     }
 }
 
 impl Drop for AudioStreams {
     fn drop(&mut self) {
-        self.forward.publish(ForwardTable::default());
+        publish_receive_table(&self.forward, ForwardTable::default());
+        publish_receive_table(&self.microphone_forward, ForwardTable::default());
         for peer in self.peers.values_mut() {
             if let Some(stream) = peer.tx.take() {
                 self.links.close_stream(stream.id(), StreamCode::None);
@@ -601,9 +791,15 @@ impl Drop for AudioStreams {
 /// The dormant owner keeps these same admission facts and consumes from the same M1.
 pub struct MediaReader {
     pub quality_id: u64,
+    pub kind: MediaKind,
     pub dropouts: std::sync::Arc<oink_audio::sink::DropoutCounters>,
     payload_bytes: std::sync::atomic::AtomicU64,
-    table: std::sync::Arc<oink_foundation::snapshot::Snapshot<ForwardTable>>,
+    transport_failed: std::sync::atomic::AtomicBool,
+    // Ordinary control only; the realtime reader never touches this mutex.
+    expected_media: std::sync::Mutex<Option<(u64, bool, Instant)>>,
+    admission: std::sync::Arc<ReceiveAdmission>,
+    packets: Option<std::sync::Arc<dyn MediaReceiver>>,
+    activity_pending: std::sync::atomic::AtomicBool,
     peer: DeviceId,
     identity: Option<(StreamId, u64, StreamFormat)>,
     activity: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
@@ -617,24 +813,93 @@ impl MediaReader {
         peer: DeviceId,
         activity: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     ) -> Self {
+        Self::new_kind(table, peer, activity, MediaKind::Speaker)
+    }
+    pub fn new_kind(
+        table: std::sync::Arc<oink_foundation::snapshot::Snapshot<ForwardTable>>,
+        peer: DeviceId,
+        activity: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+        kind: MediaKind,
+    ) -> Self {
         static NEXT_QUALITY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let identity = table
-            .load()
-            .from
-            .iter()
-            .find(|source| source.peer == peer)
-            .map(|source| (source.packets.follows(), source.stream_id, source.format));
+        let snapshot = table.load();
+        let source = snapshot.from.iter().find(|source| source.peer == peer);
+        let identity = source.map(|source| (source.packets.follows(), source.stream_id, source.format));
+        let admission = source.map_or_else(
+            || {
+                std::sync::Arc::new(ReceiveAdmission {
+                    active: false.into(),
+                    playing: false.into(),
+                })
+            },
+            |source| {
+                source
+                    .admission
+                    .playing
+                    .store(source.playing, std::sync::atomic::Ordering::Release);
+                source.admission.clone()
+            },
+        );
+        let packets = source.map(|source| source.packets.clone());
         Self {
             quality_id: NEXT_QUALITY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            kind,
             dropouts: Default::default(),
             payload_bytes: Default::default(),
-            table,
+            transport_failed: false.into(),
+            expected_media: Default::default(),
+            admission,
+            packets,
+            activity_pending: false.into(),
             peer,
             identity,
             activity,
             bursts: Default::default(),
             owner: std::sync::atomic::AtomicU8::new(0),
         }
+    }
+    pub fn observe_media(&self, state: &v1::dto::AudioMediaState, now: Instant) {
+        if state.kind() != Ok(self.kind.to_wire()) || state.stream_id().ok() != self.identity.map(|i| i.1) {
+            return;
+        }
+        let (Ok(burst), Ok(sleeping)) = (state.burst(), state.sleeping()) else {
+            return;
+        };
+        if burst == 0 || burst < self.bursts.generation() {
+            return;
+        }
+        let mut expected = self.expected_media.lock().unwrap_or_else(|p| p.into_inner());
+        if expected.is_some_and(|(old, _, _)| burst < old) {
+            return;
+        }
+        if expected.is_none_or(|(old, asleep, _)| (old, asleep) != (burst, sleeping)) {
+            *expected = Some((burst, sleeping, now));
+        }
+    }
+    pub fn health_error(&self, now: Instant) -> Option<&'static str> {
+        use std::{sync::atomic::Ordering, time::Duration};
+        if !self.admission.active.load(Ordering::Acquire) || !self.admission.playing.load(Ordering::Acquire) {
+            return None;
+        }
+        if self.transport_failed.load(Ordering::Acquire) {
+            return Some("audio media channel failed");
+        }
+        // Five seconds of genuine quiet precede the encoder's Sleep. Allow that
+        // interval plus transport/startup slack, but do not reinterpret loss as
+        // the old thirty-second idle fallback. A reliable new burst wakes this
+        // check even when all wake media was blackholed after a previous Sleep.
+        let timeout = Duration::from_secs(8);
+        if let Some((burst, sleeping, since)) = *self.expected_media.lock().unwrap_or_else(|p| p.into_inner()) {
+            if sleeping && burst >= self.bursts.generation() {
+                return None;
+            }
+            if burst > self.bursts.generation() {
+                return (now.saturating_duration_since(since) > timeout).then_some("audio media wake timed out");
+            }
+        }
+        self.bursts
+            .media_missing(now, timeout)
+            .then_some("audio media delivery stalled")
     }
     pub fn payload_bytes(&self) -> u64 {
         self.payload_bytes.load(std::sync::atomic::Ordering::Relaxed)
@@ -650,7 +915,7 @@ impl MediaReader {
         use std::sync::atomic::Ordering;
         let _ = self.owner.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
     }
-    pub fn realtime(&self) -> (bool, Option<oink_audio::sink::Packet>) {
+    pub fn realtime(&self, budget: &mut usize) -> (bool, Option<oink_audio::sink::Packet>) {
         use std::sync::atomic::Ordering;
         if self
             .owner
@@ -661,27 +926,46 @@ impl MediaReader {
             // render its queued onset/tail before the device can drain to zero.
             return (true, None);
         }
-        let result = self.read();
+        let result = self.read_bounded(budget);
         self.owner.store(1, Ordering::Release);
         result
     }
+    pub fn poll_activity(&self) {
+        if self.activity_pending.swap(false, std::sync::atomic::Ordering::AcqRel)
+            && let Some(activity) = &self.activity
+        {
+            activity();
+        }
+    }
     pub fn read(&self) -> (bool, Option<oink_audio::sink::Packet>) {
-        let table = self.table.load();
-        let Some(source) = table.from.iter().find(|source| source.peer == self.peer) else {
-            return (false, None);
-        };
-        if self.identity != Some((source.packets.follows(), source.stream_id, source.format)) {
+        let result = self.read_bounded(&mut 8);
+        self.poll_activity();
+        result
+    }
+    fn read_bounded(&self, budget: &mut usize) -> (bool, Option<oink_audio::sink::Packet>) {
+        use std::sync::atomic::Ordering;
+        if !self.admission.active.load(Ordering::Acquire) {
             return (false, None);
         }
-        for _ in 0..8 {
+        let (Some(packets), Some((_, stream_id, format))) = (&self.packets, self.identity) else {
+            return (false, None);
+        };
+        let playing = self.admission.playing.load(Ordering::Acquire);
+        while *budget != 0 {
+            *budget -= 1;
             let mut bytes = [0; oink_audio::media::FRAME_CAPACITY];
-            let Ok(Some((len, arrived))) = source.packets.take_timed_into(&mut bytes) else {
-                break;
+            let (len, arrived) = match packets.take_timed_into(&mut bytes) {
+                Ok(Some(packet)) => packet,
+                Ok(None) => break,
+                Err(_) => {
+                    self.transport_failed.store(true, Ordering::Release);
+                    break;
+                }
             };
-            if !source.playing {
+            if !playing {
                 continue;
             }
-            match oink_audio::media::decode(&bytes[..len], source.stream_id, source.format) {
+            match oink_audio::media::decode_kind(self.kind, &bytes[..len], stream_id, format) {
                 Ok(oink_audio::media::Media::Sleep { burst, sequence }) => {
                     self.bursts.sleep(burst, sequence);
                 }
@@ -697,8 +981,8 @@ impl MediaReader {
                     if !self.bursts.media(burst, sequence, arrived) {
                         continue;
                     }
-                    if !silent && let Some(activity) = &self.activity {
-                        activity();
+                    if !silent {
+                        self.activity_pending.store(true, Ordering::Release);
                     }
                     let mut packet = oink_audio::sink::Packet {
                         burst,
@@ -715,7 +999,7 @@ impl MediaReader {
                 _ => {}
             }
         }
-        (source.playing, None)
+        (playing, None)
     }
 }
 
@@ -769,6 +1053,7 @@ mod direct_media_tests {
         ForwardTable {
             to: vec![],
             from: vec![ForwardFrom {
+                admission: Default::default(),
                 peer: PEER,
                 stream_id: 5,
                 format: StreamFormat::Pcm16_2p5ms,
@@ -778,6 +1063,206 @@ mod direct_media_tests {
             }],
         }
     }
+    #[test]
+    fn media_health_detects_blackholes_after_sleep_and_fences_old_streams() {
+        use std::time::Duration;
+        use v1::schema::{WireDto, WireValue};
+        let (send, recv) = datagram_pair(
+            LinkId(1),
+            StreamTag {
+                kind: StreamKind::Audio,
+                ordinal: 1,
+            },
+            QueueSpec {
+                messages: 16,
+                bytes: 16384,
+            },
+        );
+        let reader = MediaReader::new(Arc::new(Snapshot::new(table_from(recv, true))), PEER, None);
+        let now = Instant::now();
+        assert!(reader.health_error(now + Duration::from_secs(9)).is_some());
+        let mut sleep = packet(1);
+        sleep.sleep = true;
+        let mut bytes = [0; oink_audio::media::FRAME_CAPACITY];
+        let len = oink_audio::media::encode(&sleep, 5, now, &mut bytes).unwrap();
+        send.post(&bytes[..len]).unwrap();
+        assert!(reader.read().1.is_none());
+        assert_eq!(reader.health_error(now + Duration::from_secs(60)), None);
+        let state = |stream: u64, burst: u64, sleeping: bool| {
+            v1::dto::AudioMediaState::from_raw(
+                [
+                    (1, v1::dto::AudioMediaKind::Speaker.write()),
+                    (2, stream.write()),
+                    (3, burst.write()),
+                    (4, sleeping.write()),
+                ]
+                .into(),
+            )
+            .unwrap()
+        };
+        reader.observe_media(&state(4, 2, false), now); // retired stream cannot wake or fault this one
+        assert_eq!(reader.health_error(now + Duration::from_secs(60)), None);
+        reader.observe_media(&state(5, 2, false), now);
+        assert_eq!(reader.health_error(now + Duration::from_secs(1)), None);
+        reader.observe_media(&state(5, 1, true), now + Duration::from_secs(2)); // late sleep cannot hide a new burst
+        assert!(reader.health_error(now + Duration::from_secs(9)).is_some());
+        let mut sound = packet(1);
+        sound.burst = 2;
+        let len = oink_audio::media::encode(&sound, 5, now, &mut bytes).unwrap();
+        send.post(&bytes[..len]).unwrap();
+        assert!(reader.read().1.is_some());
+        assert_eq!(reader.health_error(Instant::now()), None);
+    }
+
+    #[test]
+    fn media_receive_error_is_not_an_empty_queue() {
+        #[derive(Debug)]
+        struct Closed(StreamId);
+        impl MediaReceiver for Closed {
+            fn follows(&self) -> StreamId {
+                self.0
+            }
+            fn dropped(&self) -> u64 {
+                0
+            }
+            fn take_timed_into(
+                &self,
+                _: &mut [u8],
+            ) -> Result<Option<(usize, Instant)>, oink_network::link::DatagramError> {
+                Err(oink_network::link::DatagramError::Closed)
+            }
+        }
+        let closed = Arc::new(Closed(StreamId {
+            link: LinkId(1),
+            tag: StreamTag {
+                kind: StreamKind::Audio,
+                ordinal: 1,
+            },
+            dir: StreamDir::In,
+        }));
+        let table = Arc::new(Snapshot::new(table_from(closed, true)));
+        let reader = MediaReader::new(table.clone(), PEER, None);
+        reader.give_realtime();
+        crate::allocation_audit::assert_no_heap(|| {
+            assert!(reader.realtime(&mut 8).1.is_none());
+        });
+        assert_eq!(reader.health_error(Instant::now()), Some("audio media channel failed"));
+        publish_receive_table(&table, ForwardTable::default());
+        assert_eq!(reader.health_error(Instant::now()), None); // retired queues do not fault their replacement
+    }
+
+    #[test]
+    fn real_m1_reader_has_one_scan_budget_and_no_heap_or_activity_notification() {
+        let (send, [recv, _mic]) = oink_network::link::testing::partitioned_datagram_pair(
+            LinkId(1),
+            StreamTag {
+                kind: StreamKind::Audio,
+                ordinal: 1,
+            },
+            QueueSpec {
+                messages: 32,
+                bytes: 32768,
+            },
+            [[0x0604, 0x0606], [0x0618, 0x0619]],
+        );
+        let table = Arc::new(Snapshot::new(table_from(Arc::new(recv), true)));
+        let activity = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = activity.clone();
+        let reader = MediaReader::new(
+            table.clone(),
+            PEER,
+            Some(Arc::new(move || {
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            })),
+        );
+        reader.give_realtime();
+        let mut bytes = [0; oink_audio::media::FRAME_CAPACITY];
+        for seq in 0..9 {
+            let mut media = packet(seq);
+            media.sleep = seq < 8;
+            let len = oink_audio::media::encode(&media, 5, media.encode_end, &mut bytes).unwrap();
+            send.post(&bytes[..len]).unwrap();
+        }
+        crate::allocation_audit::assert_no_heap(|| {
+            let mut budget = 8;
+            assert!(reader.realtime(&mut budget).1.is_none());
+            assert_eq!(budget, 0);
+            assert!(reader.realtime(&mut 8).1.is_some());
+        });
+        assert_eq!(activity.load(std::sync::atomic::Ordering::Relaxed), 0);
+        reader.poll_activity();
+        assert_eq!(activity.load(std::sync::atomic::Ordering::Relaxed), 1);
+        publish_receive_table(&table, ForwardTable::default());
+        crate::allocation_audit::assert_no_heap(|| {
+            assert!(matches!(reader.realtime(&mut 8), (false, None)));
+        });
+    }
+
+    #[test]
+    fn realtime_admission_reclaims_snapshots_on_control_and_pins_reader_until_retirement() {
+        #[derive(Debug)]
+        struct Observed {
+            inner: Arc<dyn MediaReceiver>,
+            destroyed: Arc<std::sync::atomic::AtomicBool>,
+            owner: std::thread::ThreadId,
+        }
+        impl MediaReceiver for Observed {
+            fn follows(&self) -> StreamId {
+                self.inner.follows()
+            }
+            fn dropped(&self) -> u64 {
+                self.inner.dropped()
+            }
+            fn take_timed_into(
+                &self,
+                out: &mut [u8],
+            ) -> Result<Option<(usize, Instant)>, oink_network::link::DatagramError> {
+                self.inner.take_timed_into(out)
+            }
+        }
+        impl Drop for Observed {
+            fn drop(&mut self) {
+                assert_eq!(self.owner, std::thread::current().id());
+                self.destroyed.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let (_send, recv) = datagram_pair(
+            LinkId(1),
+            StreamTag {
+                kind: StreamKind::Audio,
+                ordinal: 1,
+            },
+            QueueSpec {
+                messages: 8,
+                bytes: 8192,
+            },
+        );
+        let destroyed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let packets: Arc<dyn MediaReceiver> = Arc::new(Observed {
+            inner: recv,
+            destroyed: destroyed.clone(),
+            owner: std::thread::current().id(),
+        });
+        let table = Arc::new(Snapshot::new(table_from(packets, true)));
+        let old = Arc::downgrade(&table.load());
+        let reader = Arc::new(MediaReader::new(table.clone(), PEER, None));
+        reader.give_realtime();
+        publish_receive_table(&table, ForwardTable::default());
+        assert!(
+            old.upgrade().is_none(),
+            "callback must not retain owning ForwardTable snapshots"
+        );
+        let rt = reader.clone();
+        std::thread::spawn(move || {
+            assert!(matches!(rt.realtime(&mut 8), (false, None)));
+        })
+        .join()
+        .unwrap();
+        assert!(!destroyed.load(std::sync::atomic::Ordering::Acquire));
+        drop(reader); // control retirement owns the final destructor
+        assert!(destroyed.load(std::sync::atomic::Ordering::Acquire));
+    }
+
     #[test]
     fn media_uses_m1_without_an_ordinary_control_task_or_packet_handoff() {
         let (send, recv) = datagram_pair(
@@ -845,10 +1330,10 @@ mod direct_media_tests {
             })),
         );
         source.publish(table_to(send.clone(), 5));
-        sink.publish(table_from(recv.clone(), false));
+        publish_receive_table(&sink, table_from(recv.clone(), false));
         assert!(write(&packet(1)));
         assert!(matches!(read(), (false, None)));
-        sink.publish(table_from(recv, true));
+        publish_receive_table(&sink, table_from(recv, true));
         assert!(read().1.is_none(), "paused packet was consumed rather than delayed");
         assert!(write(&packet(2)));
         assert_eq!(read().1.unwrap().sequence, 2);
@@ -936,7 +1421,7 @@ mod direct_media_tests {
         reader.owner.store(1, Ordering::Release);
         assert!(reader.take_control());
         assert_eq!(reader.owner.load(Ordering::Acquire), 0);
-        let (playing, packet) = reader.realtime();
+        let (playing, packet) = reader.realtime(&mut 8);
         assert!(playing && packet.is_none());
     }
 }
@@ -949,3 +1434,6 @@ super::lifecycle_tests::owner_lifecycle_tests!(
         owner.set_opening(peer, vec![message]);
     }
 );
+
+#[cfg(test)]
+mod pull_tests;

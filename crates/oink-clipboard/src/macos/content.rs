@@ -1,6 +1,7 @@
 //! NSPasteboard items are inspected in their native order. Each representation
 //! is read from the current system board on demand; only native Drop takes a snapshot.
 use crate::content::{self, Provider, Snapshot, Translator};
+mod promises;
 use crate::model::{
     ContentItem, ContentSize, Inventory, ItemId, Medium, NativeFormat, NodeId, REPRESENTATION_BYTES, Representation,
     RepresentationData, RepresentationId, StandardFormat, Unavailable,
@@ -87,28 +88,59 @@ pub(super) fn file_path(item: &NSPasteboardItem) -> Option<PathBuf> {
 }
 pub(super) fn promise_type(name: &str) -> bool {
     static NATIVE: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+    let native = NATIVE.get_or_init(|| {
+        objc2_app_kit::NSFilePromiseReceiver::readableDraggedTypes()
+            .iter()
+            .map(|ty| ty.to_string())
+            .collect()
+    });
+    if promise_tag(name) || native.contains(name) {
+        return true;
+    }
+    if !name.starts_with("dyn.") {
+        return false;
+    }
+    // AppKit also advertises legacy promise controls as dynamic UTIs. On
+    // macOS 26, NSPromiseContentsPboardType requests every promised filename;
+    // its dynamic alias is also a fulfilment request, not companion bytes.
+    // Leave it to the native receiver; resolve the OS tag without reading data.
+    // Matching only readableDraggedTypes misses this additional native control.
+    use objc2_core_foundation::CFString;
+    #[allow(deprecated)] // NSPboardType's legacy tag class has no modern equivalent.
+    // SAFETY: both CFStrings are valid; the Copy result is retained by CFRetained.
+    unsafe {
+        objc2_core_services::UTTypeCopyPreferredTagWithClass(
+            &CFString::from_str(name),
+            objc2_core_services::kUTTagClassNSPboardType,
+        )
+        .is_some_and(|tag| promise_tag(&tag.to_string()) || native.contains(&tag.to_string()))
+    }
+}
+fn promise_tag(name: &str) -> bool {
     matches!(
         name,
         "com.apple.pasteboard.promised-file-url"
+            // AppKit's name requests participate in promise fulfillment. Leave
+            // these capabilities to NSFilePromiseReceiver; ordinary companion
+            // bytes and content-type metadata remain readable.
+            | "com.apple.pasteboard.promised-file-name"
+            | "com.apple.pasteboard.promised-suggested-file-name"
             | "com.apple.pasteboard.promised-file-content-type"
+            | "NSPromiseContentsPboardType"
             | "NSFilesPromisePboardType"
             | "Apple files promise pasteboard type"
             | "com.apple.NSFilePromiseItemMetaData"
             | "com.apple.pasteboard.NSFilePromiseID"
-    ) || NATIVE
-        .get_or_init(|| {
-            objc2_app_kit::NSFilePromiseReceiver::readableDraggedTypes()
-                .iter()
-                .map(|ty| ty.to_string())
-                .collect()
-        })
-        .contains(name)
+    )
 }
 pub(super) fn inventory_on_board(pb: &NSPasteboard, id: OfferId) -> Inventory {
-    inventory_on_board_with_promises(pb, id, false)
+    typed_inventory(pb, id)
 }
 pub(super) fn drag_inventory(pb: &NSPasteboard, id: OfferId) -> Inventory {
-    let mut inventory = inventory_on_board_with_promises(pb, id, true);
+    typed_inventory(pb, id)
+}
+fn typed_inventory(pb: &NSPasteboard, id: OfferId) -> Inventory {
+    let mut inventory = ordered_inventory(pb, id);
     let classes = NSArray::from_slice(&[objc2_app_kit::NSFilePromiseReceiver::class()]);
     // File types are native promise metadata; reading them does not receive it.
     // SAFETY: the requested class implements NSPasteboardReading.
@@ -144,7 +176,7 @@ pub(super) fn drag_inventory(pb: &NSPasteboard, id: OfferId) -> Inventory {
     }
     inventory
 }
-fn inventory_on_board_with_promises(pb: &NSPasteboard, id: OfferId, proxy: bool) -> Inventory {
+fn ordered_inventory(pb: &NSPasteboard, id: OfferId) -> Inventory {
     let mut next = 0_u32;
     let items = pb
         .pasteboardItems()
@@ -164,12 +196,11 @@ fn inventory_on_board_with_promises(pb: &NSPasteboard, id: OfferId, proxy: bool)
                                 && let Some(file) = file
                             {
                                 RepresentationData::File(file)
-                            } else if promise_type(&name) && proxy {
+                            } else if promise_type(&name) {
                                 if name == "com.apple.pasteboard.promised-file-content-type" {
                                     // Type/extension metadata is ordinary, ordered data.
                                     RepresentationData::Reader {
                                         size: ContentSize::Unknown,
-                                        hash: None,
                                     }
                                 } else {
                                     let metadata = if matches!(
@@ -185,12 +216,9 @@ fn inventory_on_board_with_promises(pb: &NSPasteboard, id: OfferId, proxy: bool)
                                     };
                                     RepresentationData::Promise(NodeId((1u64 << 32) + index as u64), metadata)
                                 }
-                            } else if promise_type(&name) {
-                                RepresentationData::Unavailable(Unavailable::Unsupported)
                             } else {
                                 RepresentationData::Reader {
                                     size: ContentSize::Unknown,
-                                    hash: None,
                                 }
                             };
                             Representation {
@@ -263,12 +291,11 @@ pub(super) fn snapshot_board(pb: &NSPasteboard, data: &Path, id: OfferId) -> io:
                     // borrow its storage across disk work using unchecked bytes.
                     let bytes = bytes.to_vec();
                     match batch.snapshot(rep.id.0, &mut io::Cursor::new(&bytes)) {
-                        Ok((size, _hash)) if rep.standard == Some(StandardFormat::Privacy) && size <= 65536 => {
+                        Ok(size) if rep.standard == Some(StandardFormat::Privacy) && size <= 65536 => {
                             RepresentationData::Inline(bytes.to_vec())
                         }
-                        Ok((size, hash)) => RepresentationData::Reader {
+                        Ok(size) => RepresentationData::Reader {
                             size: ContentSize::Known(size),
-                            hash: Some(hash),
                         },
                         Err(error) => RepresentationData::Unavailable(content::reason(&error)),
                     }
@@ -309,7 +336,7 @@ fn read_current(name: Option<&str>, count: u64, item: usize, ty: &str) -> io::Re
     })
 }
 
-pub(super) fn capture(name: Option<&str>, _data: &Path) -> Result<CapturedClipboard, ClipboardError> {
+pub(super) fn capture(name: Option<&str>, data: &Path) -> Result<CapturedClipboard, ClipboardError> {
     autoreleasepool(|_| {
         let pb = board(name);
         let count = pb.changeCount() as u64;
@@ -337,6 +364,7 @@ pub(super) fn capture(name: Option<&str>, _data: &Path) -> Result<CapturedClipbo
             .collect();
         let name = name.map(str::to_owned);
         let check_name = name.clone();
+        let promise_name = name.clone();
         let check: content::clipboard::Check = Arc::new(move || {
             autoreleasepool(|_| {
                 if board(check_name.as_deref()).changeCount() as u64 == count {
@@ -351,8 +379,16 @@ pub(super) fn capture(name: Option<&str>, _data: &Path) -> Result<CapturedClipbo
             .map(|types| types.iter().map(|n| n.to_string()).collect())
             .unwrap_or_default();
         let sensitivity = super::pasteboard::sensitivity_of(&names);
-        let files =
-            file_namespace(&pb, true).map_err(|error| ClipboardError::ContentUnavailable(content::reason(&error)))?;
+        let originals = file_paths(&pb);
+        let files = if originals.is_empty() {
+            None
+        } else {
+            Some(
+                content::namespace::Local::clipboard(originals.clone())
+                    .map_err(|error| ClipboardError::ContentUnavailable(content::reason(&error)))?
+                    as Arc<dyn content::namespace::Namespace>,
+            )
+        };
         let native = content::clipboard::Clipboard::new(
             inventory,
             Box::new(move |id| {
@@ -366,6 +402,11 @@ pub(super) fn capture(name: Option<&str>, _data: &Path) -> Result<CapturedClipbo
             files,
         )
         .map_err(|error| ClipboardError::ContentUnavailable(content::reason(&error)))?;
+        let native: Arc<dyn Provider> = if native.inventory().has_promises() {
+            promises::attach(native, promise_name, count, data.to_path_buf(), originals)
+        } else {
+            native
+        };
         if pb.changeCount() as u64 != count {
             return Err(ClipboardError::Busy);
         }
@@ -384,16 +425,7 @@ pub(super) fn file_namespace(
     pb: &NSPasteboard,
     clipboard: bool,
 ) -> io::Result<Option<Arc<dyn content::namespace::Namespace>>> {
-    let roots: Vec<_> = pb
-        .pasteboardItems()
-        .map(|items| {
-            items
-                .iter()
-                .enumerate()
-                .filter_map(|(index, item)| file_path(&item).map(|path| (NodeId(index as u64 + 1), path)))
-                .collect()
-        })
-        .unwrap_or_default();
+    let roots = file_paths(pb);
     if roots.is_empty() {
         return Ok(None);
     }
@@ -402,6 +434,18 @@ pub(super) fn file_namespace(
     } else {
         content::namespace::Local::new(roots)?
     }))
+}
+
+fn file_paths(pb: &NSPasteboard) -> Vec<(NodeId, PathBuf)> {
+    pb.pasteboardItems()
+        .map(|items| {
+            items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| file_path(&item).map(|path| (NodeId(index as u64 + 1), path)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Native UTF-16 defaults to this platform's byte order; a BOM overrides it.
@@ -498,6 +542,7 @@ define_class!(
     unsafe impl NSPasteboardItemDataProvider for DataProvider {
         #[unsafe(method(pasteboard:item:provideDataForType:))]
         fn provide(&self, _board: Option<&NSPasteboard>, item: &NSPasteboardItem, ty: &NSPasteboardType) {
+            let callback = content::native_read::Callback::begin();
             let name = ty.to_string();
             // Several source representations can project to the same native
             // type. AppKit registers that type once, but every candidate retains
@@ -507,18 +552,42 @@ define_class!(
                 let result = (|| {
                     let mut reader = self.ivars().source.open(*id)?;
                     let bytes = content::read_all(&mut reader)?;
-                    if !self.ivars().foreign {
-                        return Ok(bytes);
-                    }
                     let inventory = self.ivars().source.inventory();
                     let representation =
                         content::find(&inventory, *id).ok_or_else(|| content::unavailable(Unavailable::NoSuchItem))?;
+                    if !self.ivars().foreign && representation.format == NativeFormat::Mac(name.clone()) {
+                        return Ok(bytes);
+                    }
                     if representation.standard == Some(StandardFormat::Url) {
-                        let link = content::url::Link::decode(&bytes)?;
+                        let link = if self.ivars().foreign {
+                            content::url::Link::decode(&bytes)?
+                        } else {
+                            content::url::capture(
+                                self.ivars().source.as_ref(),
+                                &inventory,
+                                representation,
+                                &bytes,
+                                false,
+                            )?
+                        };
                         decoded_link = true;
                         return link.render(ClipPlatform::Mac, &name);
                     }
-                    let translated = content::decode_standard(representation, &bytes)?;
+                    let translated = if self.ivars().foreign {
+                        content::decode_standard(representation, &bytes)?
+                    } else {
+                        MacTranslator.standard_with_source(representation, &bytes, self.ivars().source.as_ref())?
+                    };
+                    if name == "public.tiff" {
+                        let png = translated
+                            .iter()
+                            .find_map(|data| match data {
+                                ClipData::Png(bytes) => Some(bytes),
+                                _ => None,
+                            })
+                            .ok_or_else(|| content::unavailable(Unavailable::Unsupported))?;
+                        return png_to_tiff(png);
+                    }
                     let data = crate::formats::for_platform(&translated, ClipPlatform::Mac, crate::Sensitivity::Normal);
                     for data in data {
                         let pair = mac_bytes(data);
@@ -530,9 +599,16 @@ define_class!(
                     }
                     Err(content::unavailable(Unavailable::Unsupported))
                 })();
+                // A translator may tolerate a missing sibling format; expiry
+                // still fails this entire callback, never a partial paste.
+                if callback.timed_out() {
+                    return;
+                }
                 match result {
                     Ok(bytes) => {
-                        item.setData_forType(&NSData::with_bytes(&bytes), ty);
+                        if item.setData_forType(&NSData::with_bytes(&bytes), ty) {
+                            callback.served();
+                        }
                         return;
                     }
                     Err(error) => {
@@ -574,6 +650,14 @@ impl DataProvider {
         // SAFETY: initialized NSObject subclass with valid Rust ivars.
         unsafe { msg_send![super(this), init] }
     }
+}
+fn png_to_tiff(png: &[u8]) -> io::Result<Vec<u8>> {
+    let image = objc2_app_kit::NSBitmapImageRep::imageRepWithData(&NSData::with_bytes(png))
+        .ok_or_else(|| content::unavailable(Unavailable::InvalidData))?;
+    image
+        .TIFFRepresentation()
+        .map(|data| data.to_vec())
+        .ok_or_else(|| content::unavailable(Unavailable::InvalidData))
 }
 fn mac_bytes(data: ClipData) -> Option<(String, Vec<u8>)> {
     Some(match data {
@@ -631,6 +715,7 @@ pub(super) fn writers(
 /// replaces that key with its native promise types; an empty URL is never
 /// published to the destination application.
 type NativeItem = (Option<NodeId>, Retained<NSPasteboardItem>);
+#[cfg(test)]
 pub(super) fn promise_items(spec: &NativeSpec) -> Result<Vec<NativeItem>, ClipboardError> {
     native_items(spec, None)
 }
@@ -677,6 +762,29 @@ fn native_items(spec: &NativeSpec, urls: Option<&HashMap<NodeId, String>>) -> Re
                 bindings.push((name, rep.id));
             }
         }
+        let original_names = names.clone();
+        for rep in original.representations.iter().filter(|r| wanted.contains(&r.id)) {
+            let addition = match rep.standard {
+                Some(StandardFormat::Png)
+                    if !original_names.contains("public.tiff") && !original_names.contains("NSTIFFPboardType") =>
+                {
+                    Some("public.tiff")
+                }
+                Some(StandardFormat::Url)
+                    if content::url::names(original, ClipPlatform::Mac)
+                        .iter()
+                        .any(|n| n == "public.html")
+                        && !original_names.contains("public.html") =>
+                {
+                    Some("public.html")
+                }
+                _ => None,
+            };
+            if let Some(name) = addition {
+                names.insert(name.into());
+                bindings.push((name.into(), rep.id));
+            }
+        }
         if !bindings.is_empty() {
             let mut registered = HashSet::new();
             let types: Vec<_> = bindings
@@ -688,20 +796,24 @@ fn native_items(spec: &NativeSpec, urls: Option<&HashMap<NodeId, String>>) -> Re
                 bindings.sort_by_key(|(_, id)| content::find(inventory, *id).map_or(0, content::url::priority));
             }
             let provider = DataProvider::new(spec.contents.clone(), bindings, foreign);
-            if !item.setDataProvider_forTypes(
-                ProtocolObject::from_ref(&*provider),
-                &NSArray::from_retained_slice(&types),
-            ) {
-                return Err(ClipboardError::Unsupported);
+            // Replacing a registered file-url with setString moves that type
+            // to the end on macOS. Register each slot once in source order,
+            // setting the target URL immediately at its original position.
+            // Raw companion types stay lazy; this reads no remote content.
+            for ty in &types {
+                let ok = if ty.to_string() == "public.file-url" && !file_values.is_empty() {
+                    item.setString_forType(&NSString::from_str(&file_values[0]), ty)
+                } else {
+                    item.setDataProvider_forTypes(
+                        ProtocolObject::from_ref(&*provider),
+                        &NSArray::from_retained_slice(std::slice::from_ref(ty)),
+                    )
+                };
+                if !ok {
+                    return Err(ClipboardError::Unsupported);
+                }
             }
             count += types.len();
-        }
-        // Register all types in native order before replacing file URLs with
-        // local target values; otherwise every file URL jumps to the front.
-        for url in file_values {
-            if !item.setString_forType(&NSString::from_str(&url), &NSString::from_str("public.file-url")) {
-                return Err(ClipboardError::Unsupported);
-            }
         }
         if count > 0 {
             out.push((if foreign { None } else { original.file }, item));
@@ -743,6 +855,13 @@ pub(super) fn write(
 ) -> Result<u64, ClipboardError> {
     autoreleasepool(|_| {
         let items = writers(spec, urls)?;
+        let items = if super::dnd::proxy::needed(spec) {
+            super::dnd::proxy::wrap(spec, items)
+                .map_err(|error| ClipboardError::ContentUnavailable(content::reason(&error)))?
+                .0
+        } else {
+            items
+        };
         guard().map_err(|_| ClipboardError::Busy)?;
         let pb = board(name);
         pb.clearContents();
@@ -756,11 +875,110 @@ pub(super) fn write(
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+    define_class!(
+        #[unsafe(super(NSObject))]
+        #[name = "OinkPromiseNameReadSpy"]
+        #[ivars = Arc<std::sync::atomic::AtomicUsize>]
+        struct PromiseNameReadSpy;
+        unsafe impl NSObjectProtocol for PromiseNameReadSpy {}
+        unsafe impl NSPasteboardItemDataProvider for PromiseNameReadSpy {
+            #[unsafe(method(pasteboard:item:provideDataForType:))]
+            fn provide(&self, _board: Option<&NSPasteboard>, item: &NSPasteboardItem, ty: &NSPasteboardType) {
+                self.ivars().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                item.setString_forType(&NSString::from_str("attachment.bin"), ty);
+            }
+        }
+    );
+
+    #[test]
+    fn drag_snapshot_does_not_request_native_promise_names_before_destination() {
+        autoreleasepool(|_| {
+            let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let spy = PromiseNameReadSpy::alloc().set_ivars(reads.clone());
+            // SAFETY: NSObject initializer on the allocated test subclass with initialized ivars.
+            let spy: Retained<PromiseNameReadSpy> = unsafe { msg_send![super(spy), init] };
+            let controls = [
+                "com.apple.pasteboard.promised-file-name",
+                "com.apple.pasteboard.promised-suggested-file-name",
+                // Actual AppKit alias for NSPromiseContentsPboardType, with
+                // its native conformance information (not just the tag's UTI).
+                "dyn.ah62d4rv4gu8y6y4usm1044pxqzb085xyqz1hk64uqm10c6xenv61a3k",
+            ];
+            let item = NSPasteboardItem::new();
+            assert!(item.setDataProvider_forTypes(
+                ProtocolObject::from_ref(&*spy),
+                &NSArray::from_retained_slice(&controls.map(NSString::from_str)),
+            ));
+            item.setString_forType(
+                &NSString::from_str("companion"),
+                &NSString::from_str("public.utf8-plain-text"),
+            );
+            // A non-promise dynamic alias remains ordinary opaque bytes.
+            item.setData_forType(
+                &NSData::with_bytes(&[0, 255, 7]),
+                &NSString::from_str("dyn.ah62d4rv4gu8zazwuqm10c6xemf1gq54uqm10c6xenv61a3k"),
+            );
+            let board = crate::macos::test_pasteboard::new();
+            assert!(board.writeObjects(&NSArray::from_retained_slice(&[ProtocolObject::from_retained(item)])));
+            let root = tempfile::tempdir().unwrap();
+            let id = OfferId {
+                clip: ClipId {
+                    origin: DeviceId([1; 32]),
+                    seq: 1,
+                },
+                generation: 1,
+            };
+            let snapshot = snapshot_board(&board, root.path(), id).unwrap();
+            assert_eq!(
+                reads.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "reading a promised name before AppKit installs the destination poisons the native receipt"
+            );
+            assert!(promise_type("NSPromiseContentsPboardType"));
+            let inventory = snapshot.inventory();
+            for rep in &inventory.items[0].representations[..controls.len()] {
+                assert!(matches!(rep.data, RepresentationData::Promise(..)));
+            }
+            assert_eq!(
+                content::read_all(&mut snapshot.open(RepresentationId(controls.len() as u32 + 1)).unwrap()).unwrap(),
+                b"companion"
+            );
+            assert_eq!(
+                content::read_all(&mut snapshot.open(RepresentationId(controls.len() as u32 + 2)).unwrap()).unwrap(),
+                [0, 255, 7]
+            );
+            // The spy is a live lazy native owner, not just stored test bytes.
+            board.dataForType(&NSString::from_str(controls[0])).unwrap();
+            assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+            board.clearContents();
+        });
+    }
+    #[test]
+    fn native_pasteboard_timeout_returns_nil_then_retries_same_item() {
+        use content::native_read::{NativeReadOutcome, TEST_OUTCOMES, TestClock, tests::Harness};
+        autoreleasepool(|_| {
+            let mut harness = Harness::new(ClipPlatform::Mac, false);
+            let clock = Arc::new(TestClock::default());
+            let expiry = harness.expire_when_waiting(clock.clone());
+            let items = promise_items(&harness.spec()).unwrap();
+            let item = &items[0].1;
+            let ty = NSString::from_str("public.utf8-plain-text");
+            // Real NSPasteboardItem invokes its registered Objective-C provider;
+            // this private item never changes the user's system pasteboard.
+            assert!(clock.scope(|| item.dataForType(&ty)).is_none());
+            expiry.join().unwrap();
+            TEST_OUTCOMES.with_borrow(|outcomes| assert_eq!(outcomes.last().unwrap().1, NativeReadOutcome::TimedOut));
+            harness.allow_retry();
+            assert_eq!(item.dataForType(&ty).unwrap().to_vec(), harness.bytes);
+            TEST_OUTCOMES.with_borrow(|outcomes| assert_eq!(outcomes.last().unwrap().1, NativeReadOutcome::Served));
+        });
+    }
+
     #[test]
     fn link_capture_and_drag_inventory_share_lazy_url_and_same_mac_bytes() {
         autoreleasepool(|_| {
-            let pb = NSPasteboard::pasteboardWithUniqueName();
-            let target = NSPasteboard::pasteboardWithUniqueName();
+            let pb = crate::macos::test_pasteboard::new();
+            let target = crate::macos::test_pasteboard::new();
             let item = NSPasteboardItem::new();
             for (name, text) in [
                 ("public.url", "https://example.invalid/"),
@@ -799,7 +1017,7 @@ mod tests {
             let item = target.pasteboardItems().unwrap().objectAtIndex(0);
             assert_eq!(
                 item.types().iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                ["public.url", "public.url-name"]
+                ["public.url", "public.url-name", "public.html"]
             );
             assert_eq!(
                 item.stringForType(&NSString::from_str("public.url-name"))
@@ -828,6 +1046,7 @@ mod tests {
                 let mut inventory = source.inventory();
                 inventory.roots = (1..=count)
                     .map(|id| crate::model::FileNode {
+                        exec_bits: None,
                         id: NodeId(id),
                         parent: None,
                         name: format!("image-{id}.png"),
@@ -903,7 +1122,7 @@ mod tests {
                         .map(|s| s.to_string());
                     assert_eq!(title.as_deref(), has_title.then_some("A link 猫"));
                 }
-                let target = NSPasteboard::pasteboardWithUniqueName();
+                let target = crate::macos::test_pasteboard::new();
                 write(Some(&target.name().to_string()), &spec, &HashMap::new(), &|| Ok(())).unwrap();
                 let item = target.pasteboardItems().unwrap().objectAtIndex(0);
                 assert_eq!(
@@ -972,10 +1191,10 @@ mod tests {
         });
     }
     #[test]
-    fn clipboard_image_preserves_plain_items_with_its_existing_promise_capability_boundary() {
+    fn clipboard_image_keeps_lazy_promise_capability_and_plain_items() {
         autoreleasepool(|_| {
-            let source = NSPasteboard::pasteboardWithUniqueName();
-            let target = NSPasteboard::pasteboardWithUniqueName();
+            let source = crate::macos::test_pasteboard::new();
+            let target = crate::macos::test_pasteboard::new();
             // A mixed browser image, deliberately with TIFF before JPEG. The
             // content-type metadata selects the original encoding; selecting
             // the first image representation instead changes the receiver's file.
@@ -1010,6 +1229,15 @@ mod tests {
             let inventory = provider.inventory();
             assert!(inventory.roots.is_empty());
             assert!(inventory.items.iter().all(|item| item.file.is_none()));
+            assert!(
+                inventory.has_promises(),
+                "clipboard inspection retains the unfulfilled capability"
+            );
+            assert_eq!(provider.namespace().unwrap().one_shot_roots().len(), 1);
+            assert!(
+                std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+                "metadata capture never fulfils promises"
+            );
             let foreign: Vec<_> = inventory
                 .wanted(ClipPlatform::Windows)
                 .map(|rep| rep.format.clone())
@@ -1029,7 +1257,10 @@ mod tests {
                 files: Vec::new(),
                 file_contents: None,
                 sensitivity: crate::Sensitivity::Normal,
-            };
+            }
+            .without_files()
+            .unwrap()
+            .unwrap();
             write(Some(&target.name().to_string()), &spec, &HashMap::new(), &|| Ok(())).unwrap();
             let items = target.pasteboardItems().unwrap();
             assert_eq!(
@@ -1042,17 +1273,19 @@ mod tests {
                     .collect::<Vec<_>>()
             );
             let target_item = items.objectAtIndex(0);
-            // Clipboard capture keeps its existing capability boundary. Native
-            // DnD uses drag_inventory and the separately tested promise proxy.
+            // This raw representation-only writer has no native file bridge.
+            // The platform clipboard writer resolves promises before calling it.
             let expected = [
                 "public.tiff",
                 "public.url",
                 "public.url-name",
                 "public.jpeg",
+                "com.apple.pasteboard.promised-file-content-type",
                 "org.chromium.image-html",
                 "com.apple.webarchive",
                 "org.chromium.chromium-initiated-drag",
                 "example.browser.private",
+                "public.html",
             ];
             assert_eq!(
                 target_item.types().iter().map(|ty| ty.to_string()).collect::<Vec<_>>(),
@@ -1071,7 +1304,7 @@ mod tests {
                     .iter()
                     .map(|ty| ty.to_string())
                     .collect::<Vec<_>>(),
-                ["public.png"]
+                ["public.png", "public.tiff"]
             );
             assert!(
                 target_item
@@ -1089,7 +1322,7 @@ mod tests {
     }
 
     fn current_fixture() -> (Retained<NSPasteboard>, tempfile::TempDir, Arc<dyn Provider>) {
-        let pb = NSPasteboard::pasteboardWithUniqueName();
+        let pb = crate::macos::test_pasteboard::new();
         pb.setData_forType(
             Some(&NSData::with_bytes(b"first")),
             &NSString::from_str("example.current"),
@@ -1141,7 +1374,7 @@ mod tests {
     fn missing_copied_file_is_a_content_error_not_a_backend_failure() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("missing-file");
-        let pb = NSPasteboard::pasteboardWithUniqueName();
+        let pb = crate::macos::test_pasteboard::new();
         let item = NSPasteboardItem::new();
         let url = NSURL::fileURLWithPath(&NSString::from_str(path.to_str().unwrap()));
         item.setString_forType(&url.absoluteString().unwrap(), &NSString::from_str("public.file-url"));
@@ -1155,16 +1388,110 @@ mod tests {
     }
 
     #[test]
+    fn deferred_drag_skips_broken_root_through_native_writer_and_source_drop() {
+        use crate::content::namespace::Files;
+        use crate::sync::files::TargetOs;
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("good"), b"payload").unwrap();
+        symlink("missing", temp.path().join("broken")).unwrap();
+        let pb = crate::macos::test_pasteboard::new();
+        let items: Vec<_> = ["broken", "good"]
+            .into_iter()
+            .map(|name| {
+                let item = NSPasteboardItem::new();
+                let url = NSURL::fileURLWithPath(&NSString::from_str(temp.path().join(name).to_str().unwrap()));
+                item.setString_forType(&url.absoluteString().unwrap(), &NSString::from_str("public.file-url"));
+                ProtocolObject::from_retained(item)
+            })
+            .collect();
+        assert!(pb.writeObjects(&NSArray::from_retained_slice(&items)));
+        let id = OfferId {
+            clip: ClipId {
+                origin: DeviceId([1; 32]),
+                seq: 1,
+            },
+            generation: 1,
+        };
+        let deferred = content::Deferred::new(drag_inventory(&pb, id), Arc::new(MacTranslator)).unwrap();
+        let files = file_namespace(&pb, false).unwrap().unwrap();
+        assert!(deferred.attach_files(files.clone()));
+        let contents = Files::new(files.clone(), TargetOs::MacOs).unwrap();
+        let spec = NativeSpec {
+            inventory: deferred.inventory(),
+            contents: deferred.clone(),
+            files: contents.roots().to_vec(),
+            file_contents: Some(contents),
+            sensitivity: crate::Sensitivity::Normal,
+        };
+        let urls = [(
+            NodeId(2),
+            super::super::pasteboard::file_url_string(&temp.path().join("good")),
+        )]
+        .into();
+        let writers = writers(&spec, &urls).expect("surviving URL must be writable");
+        assert_eq!(writers.len(), 1);
+        assert_eq!(spec.inventory.items.len(), 1);
+        assert_eq!(spec.inventory.items[0].id, ItemId(1));
+        assert_eq!(spec.inventory.items[0].file, Some(NodeId(2)));
+        let windows = Files::new(files, TargetOs::Windows).unwrap();
+        assert_eq!(windows.roots().len(), 1);
+        assert_eq!(
+            content::read_all(&mut crate::FileContents::open(windows.as_ref(), 0).unwrap()).unwrap(),
+            b"payload"
+        );
+        let snapshot = snapshot_board(&pb, temp.path(), id).unwrap();
+        assert!(
+            deferred.complete(snapshot),
+            "source Drop compares the filtered offer, preserving item/representation identities"
+        );
+        pb.clearContents();
+    }
+
+    #[test]
+    fn mixed_native_file_urls_skip_bad_root_and_capture_selected_symlink_content() {
+        use crate::model::NodeKind;
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("file"), b"payload").unwrap();
+        symlink("file", temp.path().join("alias")).unwrap();
+        let pb = crate::macos::test_pasteboard::new();
+        let items: Vec<_> = ["absent", "alias", "file"]
+            .into_iter()
+            .map(|name| {
+                let item = NSPasteboardItem::new();
+                let url = NSURL::fileURLWithPath(&NSString::from_str(temp.path().join(name).to_str().unwrap()));
+                item.setString_forType(&url.absoluteString().unwrap(), &NSString::from_str("public.file-url"));
+                ProtocolObject::from_retained(item)
+            })
+            .collect();
+        assert!(pb.writeObjects(&NSArray::from_retained_slice(&items)));
+        let captured = capture(Some(&pb.name().to_string()), temp.path()).unwrap();
+        let provider = captured.content.unwrap();
+        assert_eq!(provider.inventory().roots.len(), 2);
+        assert_eq!(provider.inventory().items.len(), 2);
+        let namespace = provider.namespace().unwrap();
+        assert_eq!(namespace.roots()[0].kind, NodeKind::Symlink("file".into()));
+        assert_eq!(namespace.roots()[1].kind, NodeKind::File);
+        pb.clearContents();
+    }
+
+    #[test]
     fn real_file_capture_survives_a_named_pasteboard_change_without_source_copy() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("original");
         std::fs::write(&path, b"old").unwrap();
         let cache = tempfile::tempdir().unwrap();
-        let pb = NSPasteboard::pasteboardWithUniqueName();
+        let pb = crate::macos::test_pasteboard::new();
         let item = NSPasteboardItem::new();
         let url = NSURL::fileURLWithPath(&NSString::from_str(path.to_str().unwrap()));
         item.setString_forType(&url.absoluteString().unwrap(), &NSString::from_str("public.file-url"));
         assert!(pb.writeObjects(&NSArray::from_retained_slice(&[ProtocolObject::from_retained(item)])));
+        let key = super::super::clipboard_key::current(Some(&pb.name().to_string())).unwrap();
+        assert_eq!(
+            super::super::clipboard_key::current(Some(&pb.name().to_string())).unwrap(),
+            key
+        );
         let captured = capture(Some(&pb.name().to_string()), cache.path()).unwrap();
         let provider = captured.content.unwrap();
         let files = provider.namespace().unwrap();
@@ -1180,6 +1507,10 @@ mod tests {
             Some(&NSData::with_bytes(b"another copy")),
             &NSString::from_str("public.utf8-plain-text"),
         );
+        assert_ne!(
+            super::super::clipboard_key::current(Some(&pb.name().to_string())).unwrap(),
+            key
+        );
         std::fs::write(&path, b"latest file").unwrap();
         let entry = files.select(NodeId(1)).unwrap();
         assert_eq!(entry.size, ContentSize::Known(11));
@@ -1193,7 +1524,7 @@ mod tests {
 
     #[test]
     fn clipboard_missing_lazy_data_fails_without_snapshot() {
-        let pb = NSPasteboard::pasteboardWithUniqueName();
+        let pb = crate::macos::test_pasteboard::new();
         // SAFETY: a private board with no promised owner; the declared type intentionally has no data.
         unsafe {
             pb.declareTypes_owner(
@@ -1215,8 +1546,8 @@ mod tests {
     #[test]
     fn same_system_copy_retains_each_native_item_and_raw_representation_in_order() {
         autoreleasepool(|_| {
-            let source = NSPasteboard::pasteboardWithUniqueName();
-            let target = NSPasteboard::pasteboardWithUniqueName();
+            let source = crate::macos::test_pasteboard::new();
+            let target = crate::macos::test_pasteboard::new();
             let one = NSPasteboardItem::new();
             one.setData_forType(
                 &NSData::with_bytes(&[0, 255, 0]),

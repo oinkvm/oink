@@ -47,6 +47,7 @@ pub fn datagram_pair(link: LinkId, tag: StreamTag, queue: QueueSpec) -> (Datagra
             queue: queue.clone(),
         },
         DatagramRecv {
+            partition: None,
             _owner: Arc::new(super::stream::DatagramOwner(queue.clone())),
             parent: None,
             follows: StreamId {
@@ -92,4 +93,47 @@ pub fn low_open_attempts(layer: &super::LinkLayer, kind: oink_protocol::frame::S
         .get(&(kind as u8))
         .copied()
         .unwrap_or(0)
+}
+
+/// Real partitioned receive lanes, with production fixed-copy admission.
+/// Total message/byte capacity is divided equally (odd remainder to lane zero).
+pub fn partitioned_datagram_pair(
+    link: LinkId,
+    tag: StreamTag,
+    spec: QueueSpec,
+    types: [[u16; 2]; 2],
+) -> (DatagramSend, [DatagramRecv; 2]) {
+    let queue = super::queue::DatagramQueue::new_partitioned(spec, types);
+    let owner = Arc::new(super::stream::DatagramOwner(queue.clone()));
+    let sender = DatagramSend {
+        _owner: Arc::new(super::stream::DatagramOwner(queue.clone())),
+        parent: None,
+        follows: StreamId {
+            link,
+            tag,
+            dir: StreamDir::Out,
+        },
+        queue: queue.clone(),
+    };
+    let readers = std::array::from_fn(|lane| DatagramRecv {
+        partition: Some(lane),
+        _owner: owner.clone(),
+        parent: None,
+        follows: StreamId {
+            link,
+            tag,
+            dir: StreamDir::In,
+        },
+        queue: queue.clone(),
+    });
+    (sender, readers)
+}
+
+/// Synthetic network arrival clock for deterministic production-queue simulation.
+pub fn post_datagram_at(
+    sender: &DatagramSend,
+    bytes: &[u8],
+    arrived: std::time::Instant,
+) -> Result<(), super::DatagramError> {
+    sender.queue.post_lossy_at(bytes, arrived)
 }

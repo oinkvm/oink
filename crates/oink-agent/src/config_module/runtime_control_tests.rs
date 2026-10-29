@@ -269,7 +269,7 @@ async fn repeat_signed_history(queue_current_state: bool) {
     let (reference, messages) =
         oink_network::pair_objects::transfer(context, dto::ObjectKind::Transfer, bundle.raw()).unwrap();
     let digest = reference.digest().unwrap().0;
-    let incoming = nodes[1].links.links().by_peer(nodes[0].identity.id()).unwrap().link;
+    let origin = nodes[0].identity.id();
     let header = Message::ConfigMergeTransfer(dto::MergeTransfer::from_raw([(1, reference.write())].into()).unwrap());
     let frames = std::iter::once(header)
         .chain(messages)
@@ -287,57 +287,91 @@ async fn repeat_signed_history(queue_current_state: bool) {
             })
             .unwrap()
     });
-    let (observation, processed) = nodes[1]
-        .group
-        .call(move |owner| {
-            let session = owner
-                .sessions
-                .get_mut(&incoming)
-                .ok_or_else(|| invalid("fixture C0 missing"))?;
-            let admitted = session.admitted_anchor.is_some();
-            let was_ready = session.ready;
-            // This is an injected owner state, not a real readmission. Keep
-            // the proof and its observations in one owner turn: live current-
-            // group State/Facts would correctly reject this artificial phase.
-            // Freezing periodic Facts or observing a prior marker cannot fence
-            // later admission/state traffic from the other live peers.
-            session.ready = false;
-            let replay = (|| {
-                owner.control(incoming, &frames[0]).map_err(internal)?;
-                let expected = owner.proof_expected.contains_key(&(incoming, digest));
-                for frame in &frames[1..] {
-                    owner.control(incoming, frame).map_err(internal)?;
-                }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (incoming, observation, processed) = loop {
+        let frames = frames.clone();
+        let queued = queued.clone();
+        let attempt = nodes[1]
+            .group
+            .call(move |owner| {
+                // Select and inject on one serial owner turn. The public link
+                // snapshot can retire a selected C0 between the ready check and
+                // this turn when additional shared registers are published.
+                let selected = owner.links.links().by_peer(origin).map(|link| link.link);
+                let incoming = owner.sessions.iter().find_map(|(id, session)| {
+                    (Some(*id) == selected
+                        && session.peer_boot.device_id == origin
+                        && session.ready
+                        && !session.departing)
+                        .then_some(*id)
+                });
+                let Some(incoming) = incoming else {
+                    return Ok(None);
+                };
                 let session = owner
                     .sessions
-                    .get(&incoming)
-                    .ok_or_else(|| invalid("proof retired fixture C0"))?;
-                Ok((
-                    admitted,
-                    was_ready,
-                    expected,
-                    owner.proof_expected.contains_key(&(incoming, digest)),
-                    session.ready,
-                    owner.state.roster().anchor().group,
-                ))
-            })();
-            // Force a current-state frame to arrive after proof processing but
-            // before inspecting the synthetic phase. The actor must not consume
-            // it until the fixture has restored the live admission state.
-            let processed = queued.map(|bytes| {
-                let (ack, processed) = tokio::sync::oneshot::channel();
-                owner
-                    .incoming_tx
-                    .send(Incoming::Control(incoming, Ok(bytes), ack))
-                    .unwrap();
-                processed
-            });
-            if let Some(session) = owner.sessions.get_mut(&incoming) {
-                session.ready = was_ready;
-            }
-            replay.map(|observation| (observation, processed))
-        })
-        .unwrap();
+                    .get_mut(&incoming)
+                    .ok_or_else(|| invalid("fixture C0 missing"))?;
+                let admitted = session.admitted_anchor.is_some();
+                let was_ready = session.ready;
+                // This is an injected owner state, not a real readmission. Keep
+                // the proof and its observations in one owner turn: live current-
+                // group State/Facts would correctly reject this artificial phase.
+                // Freezing periodic Facts or observing a prior marker cannot fence
+                // later admission/state traffic from the other live peers.
+                session.ready = false;
+                let replay = (|| {
+                    owner
+                        .control(incoming, &frames[0])
+                        .map_err(|e| internal(format!("history header: {e}")))?;
+                    let expected = owner.proof_expected.contains_key(&(incoming, digest));
+                    for frame in &frames[1..] {
+                        owner.control(incoming, frame).map_err(|e| {
+                            internal(format!(
+                                "history frame {:04x}: {e}",
+                                v1::frame::OpaqueFrame::parse_exact(frame, v1::limits::CONFIG_FRAME)
+                                    .unwrap()
+                                    .header
+                                    .type_id
+                            ))
+                        })?;
+                    }
+                    let session = owner
+                        .sessions
+                        .get(&incoming)
+                        .ok_or_else(|| invalid("proof retired fixture C0"))?;
+                    Ok((
+                        admitted,
+                        was_ready,
+                        expected,
+                        owner.proof_expected.contains_key(&(incoming, digest)),
+                        session.ready,
+                        owner.state.roster().anchor().group,
+                    ))
+                })();
+                // Force a current-state frame to arrive after proof processing but
+                // before inspecting the synthetic phase. The actor must not consume
+                // it until the fixture has restored the live admission state.
+                let processed = queued.map(|bytes| {
+                    let (ack, processed) = tokio::sync::oneshot::channel();
+                    owner
+                        .incoming_tx
+                        .send(Incoming::Control(incoming, Ok(bytes), ack))
+                        .unwrap();
+                    processed
+                });
+                if let Some(session) = owner.sessions.get_mut(&incoming) {
+                    session.ready = was_ready;
+                }
+                replay.map(|observation| Some((incoming, observation, processed)))
+            })
+            .unwrap();
+        if let Some(value) = attempt {
+            break value;
+        }
+        assert!(Instant::now() < deadline, "fixture never observed a ready selected C0");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     // Assertions belong on the test thread; a fixture failure must not panic
     // the ordinary config owner and obscure its cause as NetworkStopped.
     let (admitted, was_ready, expected, still_expected, became_ready, group) = observation;
@@ -563,6 +597,82 @@ async fn address_operations_are_scoped_to_the_client_and_release_only_idle_prepa
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_address_query_survives_retirement_before_its_greeting() {
+    let nodes = start(same_group(2)).await;
+    assert!(until(|| ready(&nodes)).await);
+    let peer = nodes[1].links.boot();
+    let mut events = nodes[0].group.subscribe();
+    let pending_survived = nodes[0]
+        .group
+        .call(move |owner| {
+            let link = owner.peer_link(peer).unwrap();
+            // TLS has identified the new probe, but its selected C0/greeting
+            // has not arrived. Retire the previous lifetime in this actor turn,
+            // before any replacement Connected event can be consumed.
+            let deadline = Instant::now() + oink_network::link::ADDRESS_QUERY_BUDGET;
+            for (id, boot) in [("pending", None), ("prepared", Some(peer))] {
+                owner.queries.insert(
+                    id.into(),
+                    Query {
+                        client: [0; 16],
+                        operation: id.into(),
+                        generation: 1,
+                        address: "127.0.0.1:47470".parse().unwrap(),
+                        peer: boot.map(|boot| boot.device_id),
+                        boot,
+                        deadline: boot.is_none().then_some(deadline),
+                        released: false,
+                    },
+                );
+            }
+            oink_network::link::testing::set_direct_blocked(&owner.links, peer.device_id, true);
+            owner.links.disconnect(link, Disconnect::HandshakeFailed);
+            oink_network::link::testing::flush_commands(&owner.links);
+            assert!(owner.links.links().by_peer(peer.device_id).is_none());
+            owner.probe_result("pending".into(), 1, Ok(peer.device_id));
+            assert_eq!(owner.queries["pending"].peer, Some(peer.device_id));
+            assert_eq!(owner.queries["pending"].boot, None);
+            owner.drop_link(link);
+            assert!(
+                owner.queries["prepared"].released,
+                "the retired prepared boot must be invalidated"
+            );
+            let pending = &owner.queries["pending"];
+            let survived = !pending.released && pending.deadline == Some(deadline);
+            // Waiting for a new greeting keeps the original total budget.
+            owner.expire_queries(deadline);
+            assert!(owner.queries["pending"].released);
+            Ok(survived)
+        })
+        .unwrap();
+    let mut results = Vec::new();
+    while let Ok(change) = events.0.try_recv() {
+        if let ConfigChange::PairingEvent(event) = change
+            && let api::PairingEvent::AddressQueryFinished {
+                operation_id,
+                result: api::AddressQueryResult::Problem { problem },
+                ..
+            } = *event
+        {
+            results.push((operation_id, problem.code));
+        }
+    }
+    results.sort();
+    stop(&nodes).await;
+    assert_eq!(
+        results,
+        vec![
+            ("pending".into(), dto::PairCode::ConnectTimeout.number()),
+            ("prepared".into(), dto::PairCode::PreparedPeerLost.number()),
+        ]
+    );
+    assert!(
+        pending_survived,
+        "an unbound query must await its own greeting or total deadline"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn foreign_boot_facts_close_only_the_offending_c0_and_current_boot_readmits() {
     let nodes = start(same_group(3)).await;
     assert!(until(|| ready(&nodes)).await);
@@ -664,11 +774,16 @@ async fn peer_send_selection_rejects_c0_retired_before_its_lost_event_is_consume
             owner.links.disconnect(link, Disconnect::HandshakeFailed);
             // Hold this owner turn while N0 publishes retirement. Its Lost
             // event is necessarily still queued, so the stale session exists.
-            let end = Instant::now() + Duration::from_secs(4);
-            while owner.links.links().by_peer(peer.device_id).is_some() {
-                assert!(Instant::now() < end, "N0 did not retire the requested C0");
-                std::thread::yield_now();
-            }
+            // Fence the command, not four seconds of scheduling or an empty
+            // peer slot: N0 may already have selected a replacement lifetime.
+            oink_network::link::testing::flush_commands(&owner.links);
+            assert!(
+                owner
+                    .links
+                    .links()
+                    .by_peer(peer.device_id)
+                    .is_none_or(|selected| selected.link != link)
+            );
             assert!(owner.sessions.contains_key(&link));
             Ok(owner.peer_link(peer).is_none())
         })
@@ -799,12 +914,72 @@ async fn online_removal_retires_authority_without_discarding_queued_revocation()
     assert!(until(|| ready(&nodes)).await);
     let peer = nodes[1].identity.id();
     let original = nodes[1].group.applied().group;
-    // Inspect within the removing owner's command, before a peer response can
-    // be consumed. The signed state is queued, so C0 must survive this command
-    // while ordinary business authority is already retired.
+    let receiver = nodes[1].group.clone();
+    let (entered, entering) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let stalled = tokio::task::spawn_blocking(move || {
+        receiver.call(move |_| {
+            entered.send(()).unwrap();
+            // Dropping release also unblocks this owner if an assertion fails.
+            let _ = released.recv();
+            Ok(())
+        })
+    });
+    tokio::task::spawn_blocking(move || entering.recv().unwrap())
+        .await
+        .unwrap();
+    // Keep the recipient from applying the queued revocation. Only in this
+    // ordering must C0 still exist when remove_member returns: preventing this
+    // owner's event loop from running does not stop the peer or transport.
     let draining = nodes[0]
         .group
         .call(move |owner| {
+            let link = owner.selected_session(peer).unwrap().0;
+            owner.remove_member(peer, None)?;
+            Ok(owner.selected_session(peer).is_none()
+                && owner
+                    .sessions
+                    .get(&link)
+                    .is_some_and(|s| s.departing && !s.ready && s.deadline.is_some()))
+        })
+        .unwrap();
+    release.send(()).unwrap();
+    stalled.await.unwrap().unwrap();
+    let delivered =
+        until(|| nodes[1].group.applied().group != original && nodes[1].group.members().members.len() == 1).await;
+    stop(&nodes).await;
+    assert!(draining, "removal must drain its signed revocation before closing C0");
+    assert!(delivered, "the retained C0 must deliver the signed revocation");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn online_removal_can_finish_revocation_before_shortcut_reconciliation() {
+    let nodes = start(same_group(2)).await;
+    assert!(until(|| ready(&nodes)).await);
+    let peer = nodes[1].identity.id();
+    let original = nodes[1].group.applied().group;
+    let links = nodes[0].links.clone();
+    let receiver = nodes[1].group.clone();
+    let application = nodes[0].application.clone();
+    let completed = Arc::new(AtomicBool::new(false));
+    let observed = completed.clone();
+    let closed = nodes[0]
+        .group
+        .call(move |owner| {
+            let mut applies = 0;
+            *application.apply_hook.lock().unwrap() = Some(Box::new(move || {
+                applies += 1;
+                if applies == 2 {
+                    // The revocation was sent by the first commit. Hold shortcut-slot
+                    // reconciliation until the recipient has applied it and closed C0.
+                    let end = Instant::now() + Duration::from_secs(10);
+                    while receiver.applied().group == original || links.links().by_peer(peer).is_some() {
+                        assert!(Instant::now() < end, "recipient did not finish revocation");
+                        std::thread::yield_now();
+                    }
+                    observed.store(true, Ordering::Release);
+                }
+            }));
             let link = owner
                 .sessions
                 .iter()
@@ -813,15 +988,24 @@ async fn online_removal_retires_authority_without_discarding_queued_revocation()
                 .0
                 .to_owned();
             owner.remove_member(peer, None)?;
-            Ok(owner
-                .sessions
-                .get(&link)
-                .is_some_and(|s| s.departing && !s.ready && s.deadline.is_some()))
+            application.apply_hook.lock().unwrap().take();
+            Ok(!owner.sessions.contains_key(&link) && owner.selected_session(peer).is_none())
         })
         .unwrap();
-    assert!(draining, "removal must drain its signed revocation before closing C0");
-    assert!(until(|| nodes[1].group.applied().group != original && nodes[1].group.members().members.len() == 1).await);
+    let delivered = nodes[1].group.applied().group != original && nodes[1].group.members().members.len() == 1;
     stop(&nodes).await;
+    assert!(
+        completed.load(Ordering::Acquire),
+        "fixture must force delivery before reconciliation"
+    );
+    assert!(
+        closed,
+        "a completed revocation may synchronously retire C0 during the same owner command"
+    );
+    assert!(
+        delivered,
+        "closing C0 is valid only after the recipient applied revocation"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -890,4 +1074,153 @@ async fn in_flight_old_group_frames_do_not_close_a_retired_member_lane() {
         .unwrap();
     stop(&nodes).await;
     assert!(result.iter().all(Result::is_ok), "old member frames: {result:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lookup_proof_after_target_projection_resumes_signed_admission() {
+    let nodes = start(fresh(2)).await;
+    let source_state = nodes[0].group.call(|owner| Ok(owner.state.clone())).unwrap();
+    let source = source_state.roster().anchor();
+    let pair = request(&nodes[0], &nodes[1], [11; 16]).await;
+    let code = accept(&nodes[0], &nodes[1], &pair).await;
+    submit(&nodes[1], &pair, 1, code);
+    complete(&nodes[0], &nodes[1], &pair).await;
+    assert!(until(|| ready(&nodes)).await);
+    let requester = nodes[0].identity.id();
+    let bundle = nodes[1]
+        .group
+        .call(move |owner| Ok(owner.journal.lookup(requester, source, None).unwrap().unwrap()))
+        .unwrap();
+    let context = dto::ObjectContext::from_raw(
+        [
+            (1, dto::ObjectContextKind::GroupRef.write()),
+            (
+                2,
+                RawValue::Map([(1, oink_network::group_merge::group_ref(source).write())].into()),
+            ),
+        ]
+        .into(),
+    )
+    .unwrap();
+    let (reference, messages) =
+        oink_network::pair_objects::transfer(context, dto::ObjectKind::Transfer, bundle.raw()).unwrap();
+    let header = Message::ConfigMergeTransfer(dto::MergeTransfer::from_raw([(1, reference.write())].into()).unwrap());
+    let frames = std::iter::once(header)
+        .chain(messages)
+        .map(|message| v1::frame::encode(&message, v1::limits::CONFIG_FRAME).unwrap())
+        .collect::<Vec<_>>();
+    let peer = nodes[1].links.boot();
+    let target_state = nodes[0].group.call(|owner| Ok(owner.state.clone())).unwrap();
+    // Reopen a real, unadmitted C0 with the source state. The target peer's
+    // lookup for its own root is refused until our pending projection wins.
+    nodes[0]
+        .group
+        .call(move |owner| {
+            owner.disconnect_all(Disconnect::LeavingGroup);
+            owner.commit(source_state)
+        })
+        .unwrap();
+    assert!(
+        until(|| nodes[1]
+            .group
+            .group_migration()
+            .as_ref()
+            .as_ref()
+            .is_some_and(|status| status.problem.is_some()))
+        .await
+    );
+    assert!(
+        until(|| nodes[0]
+            .group
+            .call(move |owner| {
+                Ok(owner.selected_session(peer.device_id).is_some_and(|(_, session)| {
+                    session.peer.is_some() && !session.ready && session.admitted_anchor.is_none()
+                }))
+            })
+            .unwrap())
+        .await
+    );
+    let (link, resumed) = nodes[0]
+        .group
+        .call(move |owner| {
+            let link = owner.peer_link(peer).unwrap();
+            // Force the ordering on one owner turn: this replacement C0 has
+            // an outstanding source lookup, then another recovery installs the
+            // signed target before the encoded reply reaches its control parser.
+            owner
+                .lookups
+                .insert(link, (source, Instant::now() + Duration::from_secs(10)));
+            owner.commit(target_state)?;
+            for frame in frames {
+                owner.control(link, &frame).map_err(internal)?;
+            }
+            let session = &owner.sessions[&link];
+            Ok((link, session.sent.is_some() && session.deadline.is_some()))
+        })
+        .unwrap();
+    let admitted = resumed && until(|| ready(&nodes)).await;
+    let same_link = nodes[0].links.links().by_peer(peer.device_id).map(|entry| entry.link) == Some(link);
+    let migration = nodes[0].group.group_migration();
+    stop(&nodes).await;
+    assert!(
+        resumed,
+        "a completed lookup must not leave a member C0 parked without admission or a deadline"
+    );
+    assert!(admitted, "the resumed signed admission must make both members ready");
+    assert!(same_link, "readmission must complete on the existing C0");
+    assert!(
+        migration
+            .as_ref()
+            .as_ref()
+            .is_some_and(|status| status.phase == api::MigrationPhase::Adopted && status.problem.is_none())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacing_prepared_query_after_member_removal_refreshes_pairing_context() {
+    let nodes = start(fresh(3)).await;
+    let pair = request(&nodes[0], &nodes[1], [1; 16]).await;
+    let code = accept(&nodes[0], &nodes[1], &pair).await;
+    submit(&nodes[1], &pair, 1, code);
+    complete(&nodes[0], &nodes[1], &pair).await;
+    assert!(until(|| ready(&nodes[..2])).await);
+    let _prepared = query(&nodes[2], &nodes[0], [2; 16]).await;
+    nodes[0].group.remove_member(nodes[1].identity.id()).unwrap();
+    assert!(until(|| nodes[0].group.members().members.len() == 1 && nodes[1].group.members().members.len() == 1).await);
+    let next = request(&nodes[2], &nodes[0], [2; 16]).await;
+    assert!(
+        until(|| nodes[0].group.pairings().requests.iter().any(|r| r.id == next)
+            || nodes[2]
+                .group
+                .pairings()
+                .sessions
+                .iter()
+                .any(|s| s.id == next && s.phase == 8))
+        .await
+    );
+    let outgoing = nodes[2].group.pairings();
+    let incoming = nodes[0].group.pairings();
+    assert!(
+        incoming.requests.iter().any(|r| r.id == next),
+        "outgoing={outgoing:?}; incoming={incoming:?}"
+    );
+    let code = accept(&nodes[2], &nodes[0], &next).await;
+    submit(&nodes[0], &next, 1, code);
+    complete(&nodes[2], &nodes[0], &next).await;
+    assert!(
+        until(|| nodes[0]
+            .group
+            .members()
+            .members
+            .iter()
+            .any(|m| m.device == nodes[2].identity.id() && m.online)
+            && nodes[2]
+                .group
+                .members()
+                .members
+                .iter()
+                .any(|m| m.device == nodes[0].identity.id() && m.online))
+        .await
+    );
+    stop(&nodes).await;
 }

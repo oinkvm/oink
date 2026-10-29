@@ -121,6 +121,12 @@ struct CurrentFiles {
     gate: Option<Arc<super::file_gate::State>>,
 }
 impl Namespace for CurrentFiles {
+    fn source_roots(&self) -> io::Result<Vec<content::grants::SourceRoot>> {
+        check(&self.inner, self.count)?;
+        let roots = self.files.source_roots()?;
+        check(&self.inner, self.count)?;
+        Ok(roots)
+    }
     fn roots(&self) -> Vec<FileNode> {
         self.files.roots()
     }
@@ -260,7 +266,6 @@ pub(super) fn capture(fake: &FakeClipboard, _data: &Path) -> Result<oink_clipboa
                     } else {
                         ContentSize::Known(size)
                     },
-                    hash: None,
                 },
             }],
         });

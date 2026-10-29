@@ -12,6 +12,7 @@
 //!   普通 token 的低级 hook 无法稳定采集高完整性窗口。UIAccess 后台只在 Default 采集，
 //!   安全桌面立即收回本机来源并释放已转发按压；现有 SYSTEM helper 的注入职责不变。
 
+mod application_focus;
 mod cursor;
 mod dpi;
 mod hook;
@@ -19,6 +20,7 @@ mod inject;
 use crate::win_keymap as keymap;
 mod cursor_clip;
 mod loop_timer;
+mod mouse_keys;
 mod pointer_capture;
 pub mod raw_capture;
 mod rawinput;
@@ -62,6 +64,7 @@ pub(crate) fn backend() -> Result<Box<dyn InputBackend>, InputError> {
 
 #[derive(Debug, Default)]
 struct WinInput {
+    application_focus: application_focus::Controller,
     safety: crate::session_gate::SessionGate,
     hook: Mutex<Option<hook::HookHandle>>,
     /// 滚轮小数部分的累积（水平、垂直），单位 1/120 格。
@@ -145,6 +148,29 @@ fn cursor_dpi() -> u32 {
 }
 
 impl InputBackend for WinInput {
+    fn application_focus_supported(&self) -> bool {
+        true
+    }
+    fn application_focus_watch(&self, observer: Option<crate::application_focus::Observer>) {
+        self.application_focus.watch(observer);
+    }
+    fn application_focus_sample(&self) -> oink_foundation::application_focus::Observation {
+        self.application_focus.sample()
+    }
+    fn application_focus_park(
+        &self,
+        expected: oink_foundation::application_focus::ObservationStamp,
+        operation: u64,
+        permit: crate::application_focus::Permit,
+    ) -> oink_foundation::application_focus::ParkResult {
+        let result = self.application_focus.park(expected, operation, permit);
+        tracing::info!(target: "oink_application_focus", operation, generation = expected.generation,
+            sequence = expected.sequence, ?result, "native park completed");
+        result
+    }
+    fn application_focus_dismiss(&self) {
+        self.application_focus.dismiss();
+    }
     fn start_injection_session(&self) -> Result<(), InputError> {
         service::initialize()
     }
@@ -295,7 +321,7 @@ impl InputBackend for WinInput {
             return self.set_mode(CaptureMode::Local);
         }
         if hook::on_hook_thread() {
-            return hook::restore_local_here(at);
+            return hook::restore_local_here(at, None);
         }
         let secure = service::optional(oink_winsvc::wire::Command::Ping)?.is_some_and(|s| s.desktop != "Default");
         let g = self.hook.lock().map_err(|_| InputError::Platform("锁已损坏".into()))?;
@@ -303,13 +329,41 @@ impl InputBackend for WinInput {
         if secure {
             hook.set_mode(CaptureMode::Local)?;
         } else {
-            hook.restore_local(at)?;
+            hook.restore_local(at, None)?;
         }
         drop(g);
         if secure {
             self.inject(&InjectEvent::MoveTo { pos: at })?;
         }
         Ok(())
+    }
+
+    fn restore_local_with_completion(
+        &self,
+        at: Point,
+        complete: Box<dyn FnOnce(bool) + Send>,
+    ) -> Result<(), InputError> {
+        if !self.input_safety().active() {
+            self.set_mode(CaptureMode::Local)?;
+            complete(false);
+            return Ok(());
+        }
+        if hook::on_hook_thread() {
+            return hook::restore_local_here(at, Some(complete));
+        }
+        let secure = service::optional(oink_winsvc::wire::Command::Ping)?.is_some_and(|s| s.desktop != "Default");
+        if secure {
+            self.restore_local(at)?;
+            complete(false); // This desktop cannot attest secure-desktop visibility.
+            return Ok(());
+        }
+        let hook = self
+            .hook
+            .lock()
+            .map_err(|_| InputError::Platform("capture lock poisoned".into()))?;
+        hook.as_ref()
+            .ok_or(InputError::NotStarted)?
+            .restore_local(at, Some(complete))
     }
 
     fn press_drag_at(&self, at: Point) -> Result<(), InputError> {
@@ -396,13 +450,7 @@ impl InputBackend for WinInput {
                 let x = inject::take_whole(&mut acc.0, *dx);
                 let y = inject::take_whole(&mut acc.1, *dy);
                 drop(acc); // Only fractional accounting is shared, never native/pipe latency.
-                send(&[inject::mouse(
-                    x,
-                    y,
-                    0,
-                    windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_MOVE
-                        | windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_MOVE_NOCOALESCE,
-                )])?;
+                send(&[inject::move_relative(x, y)])?;
                 pointer_capture::record_motion(x != 0 || y != 0);
                 Ok(())
             }

@@ -25,6 +25,45 @@ async fn execute(node: &Node, request: Message) -> dto::LocalEditResult {
 }
 
 #[test]
+fn frozen_v1_keyboard_mode_rejects_disabled_value() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "frozen_v1_keyboard_mode_rejects_disabled_value",
+        Some(4),
+        async {
+            let dir = tempfile::tempdir().unwrap();
+            let node = start_with_clip(
+                &oink_test_support::network_config(dir.path().join("owner"), "owner", 0),
+                &Displays::new("owner"),
+                None,
+            )
+            .await;
+            let binding = TokenBinding {
+                owner: OwnerVersion {
+                    group: node.link_config().unwrap().applied().group.into(),
+                    device: node.id().into(),
+                    boot_nonce: node.inner.boot.nonce,
+                    revision: lock(&node.inner.config)
+                        .owner()
+                        .revision(dto::LocalOption::KeyboardMode)
+                        .unwrap(),
+                },
+                operation: TokenOperation::OwnerOption { option: 2 },
+            };
+            let request = requests::option_request(&binding, &fresh_request_id(), 2, 2u32.write()).unwrap();
+            let receipt = execute(&node, request).await;
+            assert_eq!(receipt.reason().unwrap(), Failure::InvalidValue);
+            assert_eq!(
+                node.settings().routing.keyboard_mode,
+                oink_foundation::input::InputMode::Shared
+            );
+            assert!(!node.input_status().unwrap().keyboard_disabled);
+            node.shutdown().await;
+        },
+    );
+}
+
+#[test]
 fn owner_receipts_fence_replays_stale_revisions_and_failed_persistence() {
     crate::test_watchdog::run(
         module_path!(),

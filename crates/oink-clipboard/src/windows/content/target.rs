@@ -8,12 +8,14 @@ pub(super) struct Binding {
     alternatives: Vec<RepresentationId>,
     pub medium: Medium,
     pub foreign: bool,
+    derived: bool,
 }
 type RenderedFormats = std::cell::RefCell<std::collections::HashMap<(u16, u32, i32), Arc<Vec<u8>>>>;
 /// Owned remote data never contains apartment-bound COM pointers. Only this
 /// IDataObject (built on the native worker) constructs handles for GetData.
 pub(crate) struct Target {
     pub spec: NativeSpec,
+    pub(crate) shortcut: Option<Arc<dyn crate::FileContents>>,
     bindings: Vec<Binding>,
     rendered: Option<RenderedFormats>,
 }
@@ -31,8 +33,7 @@ impl Target {
             if matches!(rep.data, RepresentationData::File(_)) {
                 let original = format_id(&rep.format);
                 for (index, file) in files.iter().enumerate() {
-                    let matches = original.is_none_or(|cf| cf == file.cfFormat || cf == 15)
-                        || matches!(&rep.format, NativeFormat::WindowsRegistered(name) if name.eq_ignore_ascii_case("FileGroupDescriptor") && index == 0);
+                    let matches = original.is_none_or(|cf| cf == file.cfFormat || cf == 15);
                     if matches && !included[index] {
                         output.push(*file);
                         included[index] = true;
@@ -76,6 +77,9 @@ impl Target {
                 let result = self
                     .read_medium(f, binding, representation, &mut stage, &mut reason)
                     .inspect_err(|error| {
+                        if content::native_read::timed_out() {
+                            return;
+                        }
                         // Sample at the failure, not merely at entry: a blocking read may
                         // outlive this object's ownership of the clipboard. Never log COM
                         // pointers, source identity, format names, paths or error text.
@@ -96,8 +100,24 @@ impl Target {
                         );
                     });
                 match result {
-                    Ok(value) => return Ok(value),
-                    Err(error) => failure = error,
+                    Ok(mut value) => {
+                        if content::native_read::timed_out() {
+                            // A tolerant translator cannot turn an expired read
+                            // into a successful partial paste.
+                            // SAFETY: this callback exclusively owns the medium.
+                            unsafe {
+                                windows::Win32::System::Ole::ReleaseStgMedium(&mut value);
+                            }
+                            return Err(STG_E_READFAULT.into());
+                        }
+                        return Ok(value);
+                    }
+                    Err(error) => {
+                        if content::native_read::timed_out() {
+                            return Err(error);
+                        }
+                        failure = error;
+                    }
                 }
             }
         }
@@ -112,11 +132,11 @@ impl Target {
         reason: &mut u8,
     ) -> windows::core::Result<STGMEDIUM> {
         if f.cfFormat as u32 == super::super::formats().preferred_drop_effect
-            && self.spec.inventory.items.iter().any(|item| item.file.is_some())
+            && (self.spec.inventory.items.iter().any(|item| item.file.is_some()) || self.spec.inventory.has_promises())
         {
-            // Transfer semantics are COPY even when a source advertised a cut.
+            // Target effects apply to the received copy only; source completion stays COPY.
             *stage = Stage::RestoreMedium;
-            return medium::restore(Medium::HGlobal, &1u32.to_le_bytes());
+            return medium::restore(Medium::HGlobal, &3u32.to_le_bytes());
         }
         // Hover consumers may request text/HTML/URL on every DragOver. A
         // completed remote slot still opens a leased file and converts bytes;
@@ -150,7 +170,7 @@ impl Target {
             read.io(&result);
             drop(read);
             let bytes = result?;
-            if !binding.foreign {
+            if !binding.foreign && !binding.derived {
                 return Ok(bytes);
             }
             *stage = Stage::Decode;
@@ -162,9 +182,54 @@ impl Target {
                     Some(NativeFormat::WindowsPredefined(13)) => "CF_UNICODETEXT".into(),
                     _ => return Err(content::unavailable(Unavailable::Unsupported)),
                 };
-                return content::url::Link::decode(&bytes)?.render(ClipPlatform::Windows, &format_name);
+                let link = if binding.foreign {
+                    content::url::Link::decode(&bytes)?
+                } else {
+                    content::url::capture(
+                        self.spec.contents.as_ref(),
+                        &self.spec.inventory,
+                        representation,
+                        &bytes,
+                        false,
+                    )?
+                };
+                return link.render(ClipPlatform::Windows, &format_name);
             }
-            let standard = content::decode_standard(representation, &bytes)?;
+            let standard = if binding.foreign {
+                content::decode_standard(representation, &bytes)?
+            } else {
+                WindowsTranslator.standard_with_source(representation, &bytes, self.spec.contents.as_ref())?
+            };
+            if binding.derived && matches!(f.cfFormat, 1 | 7 | 16) {
+                let text = standard
+                    .iter()
+                    .find_map(|data| match data {
+                        ClipData::Text(text) => Some(text),
+                        _ => None,
+                    })
+                    .ok_or_else(|| content::unavailable(Unavailable::Unsupported))?;
+                let locale_rep = self
+                    .spec
+                    .inventory
+                    .items
+                    .iter()
+                    .flat_map(|item| &item.representations)
+                    .find(|rep| rep.format == NativeFormat::WindowsPredefined(16));
+                let locale = if let Some(rep) = locale_rep {
+                    let mut reader = self.spec.contents.open(rep.id)?;
+                    let bytes = content::read_all(&mut reader)?;
+                    Some(u32::from_le_bytes(
+                        bytes
+                            .get(..4)
+                            .ok_or_else(|| content::unavailable(Unavailable::InvalidData))?
+                            .try_into()
+                            .unwrap(),
+                    ))
+                } else {
+                    None
+                };
+                return legacy_text(text, f.cfFormat, locale);
+            }
             *stage = Stage::Convert;
             super::super::prepare(&standard, self.spec.sensitivity)
                 .into_iter()
@@ -178,8 +243,7 @@ impl Target {
         })?;
         if binding.medium == Medium::File {
             *stage = Stage::FileMedium;
-            let batch = self.spec.contents.local_batch().ok_or(STG_E_READFAULT)?;
-            return file_medium(batch, representation_id);
+            return file_medium(&bytes);
         }
         *stage = Stage::RestoreMedium;
         let medium = medium::restore(binding.medium, &bytes)?;
@@ -188,6 +252,66 @@ impl Target {
         }
         Ok(medium)
     }
+}
+/// Legacy text uses the LCID's code page, so CF_LOCALE and the bytes agree.
+/// Refuse substitutions: adding an equivalent format must not corrupt Unicode.
+fn legacy_text(text: &str, format: u16, locale: Option<u32>) -> io::Result<Vec<u8>> {
+    use windows::Win32::Globalization::*;
+    let invalid = || content::unavailable(Unavailable::Unsupported);
+    // SAFETY: thread locale lookup has no pointer arguments.
+    let locale = locale.unwrap_or_else(|| unsafe { GetThreadLocale() });
+    if format == 16 {
+        return Ok(locale.to_le_bytes().to_vec());
+    }
+    let kind = if format == 1 {
+        LOCALE_IDEFAULTANSICODEPAGE
+    } else {
+        LOCALE_IDEFAULTCODEPAGE
+    };
+    let mut number = [0u16; 16];
+    // SAFETY: writable UTF-16 output buffer, no LOCALE_RETURN_NUMBER flag.
+    let len = unsafe { GetLocaleInfoW(locale, kind, Some(&mut number)) };
+    if len <= 1 {
+        return Err(invalid());
+    }
+    let codepage: u32 = String::from_utf16(&number[..len as usize - 1])
+        .map_err(|_| invalid())?
+        .parse()
+        .map_err(|_| invalid())?;
+    if text.contains('\0') {
+        return Err(invalid());
+    }
+    let text = super::super::html::lf_to_crlf(text);
+    let wide: Vec<_> = text.encode_utf16().collect();
+    if wide.is_empty() {
+        return Ok(vec![0]);
+    }
+    let flags = if codepage == 65001 {
+        WC_ERR_INVALID_CHARS
+    } else {
+        WC_NO_BEST_FIT_CHARS
+    };
+    let mut used = windows::core::BOOL(0);
+    // UTF-8 forbids the default-character out pointer; exact roundtrip below
+    // applies to both UTF-8 and legacy code pages.
+    let default = if codepage == 65001 {
+        None
+    } else {
+        Some(&mut used as *mut _)
+    };
+    // SAFETY: query length, then allocate exactly that output size.
+    let n = unsafe { WideCharToMultiByte(codepage, flags, &wide, None, None, default) };
+    if n <= 0 {
+        return Err(invalid());
+    }
+    let mut bytes = vec![0; n as usize];
+    // SAFETY: bytes has exactly the length returned by the size query above.
+    let n = unsafe { WideCharToMultiByte(codepage, flags, &wide, Some(&mut bytes), None, default) };
+    if n <= 0 || used.as_bool() || super::super::decode_codepage(&bytes, codepage)? != text {
+        return Err(invalid());
+    }
+    bytes.push(0);
+    Ok(bytes)
 }
 fn foreign_ids(rep: &Representation) -> Vec<u16> {
     let formats = super::super::formats();
@@ -276,17 +400,67 @@ pub(crate) fn build(spec: NativeSpec) -> Result<Target, ClipboardError> {
                 alternatives: Vec::new(),
                 medium,
                 foreign,
+                derived: false,
+            });
+        }
+    }
+    // Append missing equivalents after every original representation. An
+    // original format wins even if its bytes are temporarily unavailable.
+    for rep in spec.inventory.wanted(ClipPlatform::Windows) {
+        let ids = match rep.standard {
+            Some(StandardFormat::Text) if foreign || rep.format == NativeFormat::WindowsPredefined(13) => {
+                vec![1, 7, 16]
+            }
+            Some(StandardFormat::Url) => {
+                let item = spec
+                    .inventory
+                    .items
+                    .iter()
+                    .find(|item| item.representations.iter().any(|r| r.id == rep.id))
+                    .ok_or(ClipboardError::Unsupported)?;
+                if content::url::names(item, ClipPlatform::Windows)
+                    .iter()
+                    .any(|n| n == "HTML Format")
+                {
+                    vec![super::super::formats().html as u16]
+                } else {
+                    vec![]
+                }
+            }
+            _ => vec![],
+        };
+        for cf in ids {
+            if let Some(existing) = bindings.iter_mut().find(|b| b.format.cfFormat == cf) {
+                if existing.derived {
+                    existing.alternatives.push(rep.id);
+                }
+                continue;
+            }
+            bindings.push(Binding {
+                format: FORMATETC {
+                    cfFormat: cf,
+                    ptd: std::ptr::null_mut(),
+                    dwAspect: DVASPECT_CONTENT.0,
+                    lindex: -1,
+                    tymed: TYMED_HGLOBAL.0 as u32,
+                },
+                representation: rep.id,
+                alternatives: vec![],
+                medium: Medium::HGlobal,
+                foreign,
+                derived: true,
             });
         }
     }
     Ok(Target {
+        shortcut: super::shortcut::Shortcut::for_spec(&spec),
         spec,
         bindings,
         rendered: None,
     })
 }
 pub(crate) fn set_clipboard_guarded(
-    spec: NativeSpec,
+    mut spec: NativeSpec,
     guard: crate::content::ReaderGuard,
 ) -> Result<u64, ClipboardError> {
     struct NoFiles;
@@ -295,11 +469,23 @@ pub(crate) fn set_clipboard_guarded(
             Err(content::unavailable(Unavailable::NoSuchItem))
         }
     }
+    spec.prepare_promises()
+        .map_err(|error| ClipboardError::ContentUnavailable(content::reason(&error)))?;
     let formats = super::super::formats();
     let with_files = !spec.files.is_empty();
     let cloud = spec.file_contents.as_ref().and_then(|contents| {
         super::super::cloud::Offer::new(spec.files.clone(), contents.clone(), Some(&spec.inventory))
     });
+    if with_files
+        && cloud.is_none()
+        && spec
+            .file_contents
+            .as_ref()
+            .and_then(|files| files.namespace())
+            .is_some_and(|files| files.requires_native_files())
+    {
+        return Err(ClipboardError::FileProviderUnavailable);
+    }
     let file_spec = vfile::Spec {
         cloud,
         descriptors: super::super::files::descriptors(&spec.files),
@@ -314,13 +500,12 @@ pub(crate) fn set_clipboard_guarded(
 }
 
 // With pUnkForRelease set, ReleaseStgMedium delegates TYMED_FILE cleanup to this
-// owner. The cache deletes the data file; OLE still frees the filename even with
-// pUnkForRelease set. This owner only pins the batch until native release.
+// owner. OLE frees the filename; this owner deletes the temporary medium file.
+// Its lifetime belongs to GetData/ReleaseStgMedium, not a received-file cache.
 // https://learn.microsoft.com/windows/win32/api/ole2/nf-ole2-releasestgmedium
 #[windows::core::implement(ISequentialStream, Agile = false)]
 struct FileOwner {
-    _read: crate::cache::SourceLease,
-    _batch: Batch,
+    _file: tempfile::TempPath,
 }
 impl ISequentialStream_Impl for FileOwner_Impl {
     fn Read(&self, _: *mut core::ffi::c_void, _: u32, _: *mut u32) -> windows::core::HRESULT {
@@ -330,32 +515,26 @@ impl ISequentialStream_Impl for FileOwner_Impl {
         windows::Win32::Foundation::E_NOTIMPL
     }
 }
-fn file_medium(batch: Batch, id: RepresentationId) -> windows::core::Result<STGMEDIUM> {
-    use std::{mem::ManuallyDrop, os::windows::ffi::OsStrExt};
+fn file_medium(bytes: &[u8]) -> windows::core::Result<STGMEDIUM> {
+    use std::{io::Write, mem::ManuallyDrop, os::windows::ffi::OsStrExt};
     use windows::core::{Interface, PWSTR};
-    let read = batch
-        .read_lease()
+    let mut file = tempfile::Builder::new()
+        .prefix("oink-medium-")
+        .tempfile()
         .map_err(|_| windows::core::Error::from(STG_E_READFAULT))?;
-    let wide: Vec<u16> = batch
-        .path()
-        .join(format!("r-{}", id.0))
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
+    file.write_all(bytes)
+        .map_err(|_| windows::core::Error::from(STG_E_READFAULT))?;
+    let file = file.into_temp_path();
+    let wide: Vec<u16> = file.as_os_str().encode_wide().chain(Some(0)).collect();
     // SAFETY: allocation includes the NUL terminator. FileOwner owns the
-    // backing file pin; ReleaseStgMedium owns the filename allocation.
+    // temporary file; ReleaseStgMedium owns the filename allocation.
     unsafe {
         let name = CoTaskMemAlloc(wide.len() * 2).cast::<u16>();
         if name.is_null() {
             return Err(windows::Win32::Foundation::E_OUTOFMEMORY.into());
         }
         std::ptr::copy_nonoverlapping(wide.as_ptr(), name, wide.len());
-        let owner: ISequentialStream = FileOwner {
-            _batch: batch,
-            _read: read,
-        }
-        .into();
+        let owner: ISequentialStream = FileOwner { _file: file }.into();
         Ok(STGMEDIUM {
             tymed: TYMED_FILE.0 as u32,
             u: STGMEDIUM_0 {
@@ -558,7 +737,7 @@ pub(crate) mod tests {
                 })
                 .unwrap();
                 let formats = target.formats();
-                assert_eq!(formats.len(), if has_title { 4 } else { 3 });
+                assert_eq!(formats.len(), if has_title { 5 } else { 3 });
                 for (format_name, expected) in [
                     ("UniformResourceLocatorW", wide_bytes("https://example.invalid/")),
                     ("UniformResourceLocator", b"https://example.invalid/\0".to_vec()),
@@ -665,92 +844,94 @@ pub(crate) mod tests {
                     unreachable!()
                 }
             }
-            let offered = [
-                "Oink.Order.A",
-                "FileGroupDescriptorW",
-                "Oink.Order.B",
-                "FileContents",
-                "Oink.Order.A",
-            ];
-            let representations = offered
-                .iter()
-                .enumerate()
-                .map(|(i, name)| Representation {
-                    id: RepresentationId(i as u32),
-                    format: NativeFormat::WindowsRegistered((*name).into()),
-                    medium: if *name == "FileContents" {
-                        Medium::Stream
-                    } else {
-                        Medium::HGlobal
+            for descriptor in ["FileGroupDescriptorW", "FileGroupDescriptor"] {
+                let offered = [
+                    "Oink.Order.A",
+                    descriptor,
+                    "Oink.Order.B",
+                    "FileContents",
+                    "Oink.Order.A",
+                ];
+                let representations = offered
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| Representation {
+                        id: RepresentationId(i as u32),
+                        format: NativeFormat::WindowsRegistered((*name).into()),
+                        medium: if *name == "FileContents" {
+                            Medium::Stream
+                        } else {
+                            Medium::HGlobal
+                        },
+                        aspect: DVASPECT_CONTENT.0,
+                        index: -1,
+                        standard: None,
+                        data: if *name == "FileContents" || *name == descriptor {
+                            RepresentationData::File(NodeId(1))
+                        } else {
+                            RepresentationData::Inline(vec![i as u8])
+                        },
+                    })
+                    .collect();
+                let inventory = Inventory {
+                    id: OfferId {
+                        clip: ClipId {
+                            origin: DeviceId([1; 32]),
+                            seq: 1,
+                        },
+                        generation: 1,
                     },
-                    aspect: DVASPECT_CONTENT.0,
-                    index: -1,
-                    standard: None,
-                    data: if *name == "FileContents" || *name == "FileGroupDescriptorW" {
-                        RepresentationData::File(NodeId(1))
-                    } else {
-                        RepresentationData::Inline(vec![i as u8])
-                    },
+                    platform: ClipPlatform::Windows,
+                    items: vec![ContentItem {
+                        virtual_files: false,
+                        id: ItemId(0),
+                        file: Some(NodeId(1)),
+                        representations,
+                    }],
+                    roots: vec![],
+                };
+                let root = tempfile::tempdir().unwrap();
+                let batch = Batch::create(root.path(), StoreKind::SourceSnapshot, BatchId::random().unwrap()).unwrap();
+                let snapshot =
+                    Snapshot::from_parts(inventory.clone(), batch, Arc::new(super::super::WindowsTranslator)).unwrap();
+                let target = build(NativeSpec {
+                    inventory,
+                    contents: snapshot,
+                    files: vec![],
+                    file_contents: None,
+                    sensitivity: crate::Sensitivity::Normal,
                 })
-                .collect();
-            let inventory = Inventory {
-                id: OfferId {
-                    clip: ClipId {
-                        origin: DeviceId([1; 32]),
-                        seq: 1,
-                    },
-                    generation: 1,
-                },
-                platform: ClipPlatform::Windows,
-                items: vec![ContentItem {
-                    virtual_files: false,
-                    id: ItemId(0),
-                    file: Some(NodeId(1)),
-                    representations,
-                }],
-                roots: vec![],
-            };
-            let root = tempfile::tempdir().unwrap();
-            let batch = Batch::create(root.path(), StoreKind::SourceSnapshot, BatchId::random().unwrap()).unwrap();
-            let snapshot =
-                Snapshot::from_parts(inventory.clone(), batch, Arc::new(super::super::WindowsTranslator)).unwrap();
-            let target = build(NativeSpec {
-                inventory,
-                contents: snapshot,
-                files: vec![],
-                file_contents: None,
-                sensitivity: crate::Sensitivity::Normal,
-            })
-            .unwrap();
-            let formats = super::super::super::formats();
-            let spec = vfile::Spec {
-                cloud: None,
-                descriptors: super::super::super::files::descriptors(&[]),
-                fixed: vec![],
-                contents: Arc::new(NoFiles),
-                cf_descriptor: formats.file_descriptor,
-                cf_contents: formats.file_contents,
-            };
-            let (data, _) = vfile::build_inner(spec, true, Some(target));
-            // SAFETY: this STA owns the object and output buffers.
-            let actual = unsafe {
-                let enumerator = data.EnumFormatEtc(DATADIR_GET.0 as u32).unwrap();
-                let mut entries = [FORMATETC::default(); 16];
-                let mut count = 0;
-                let _ = enumerator.Next(&mut entries, Some(&mut count));
-                entries[..count as usize]
-                    .iter()
-                    .map(|entry| name(entry.cfFormat).unwrap())
-                    .collect::<Vec<_>>()
-            };
-            assert_eq!(
-                actual,
-                offered
-                    .iter()
-                    .map(|name| NativeFormat::WindowsRegistered((*name).into()))
-                    .collect::<Vec<_>>()
-            );
-            drop(data);
+                .unwrap();
+                let formats = super::super::super::formats();
+                let spec = vfile::Spec {
+                    cloud: None,
+                    descriptors: super::super::super::files::descriptors(&[]),
+                    fixed: vec![],
+                    contents: Arc::new(NoFiles),
+                    cf_descriptor: formats.file_descriptor,
+                    cf_contents: formats.file_contents,
+                };
+                let (data, _) = vfile::build_inner(spec, true, Some(target));
+                // SAFETY: this STA owns the object and output buffers.
+                let actual = unsafe {
+                    let enumerator = data.EnumFormatEtc(DATADIR_GET.0 as u32).unwrap();
+                    let mut entries = [FORMATETC::default(); 16];
+                    let mut count = 0;
+                    let _ = enumerator.Next(&mut entries, Some(&mut count));
+                    entries[..count as usize]
+                        .iter()
+                        .map(|entry| name(entry.cfFormat).unwrap())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    actual,
+                    offered
+                        .iter()
+                        .map(|name| NativeFormat::WindowsRegistered((*name).into()))
+                        .collect::<Vec<_>>()
+                );
+                drop(data);
+            }
             // SAFETY: matches successful STA initialization above.
             unsafe {
                 windows::Win32::System::Ole::OleUninitialize();
@@ -824,7 +1005,6 @@ pub(crate) mod tests {
                     standard: Some(StandardFormat::Text),
                     data: RepresentationData::Reader {
                         size: ContentSize::Unknown,
-                        hash: None,
                     },
                 }],
             }],
@@ -984,6 +1164,7 @@ pub(crate) mod tests {
                 inventory
                     .wanted(ClipPlatform::Windows)
                     .map(|r| r.format.clone())
+                    .chain([1, 7, 16].map(NativeFormat::WindowsPredefined))
                     .collect::<Vec<_>>()
             );
             for (format, expected) in [(cf, vec![0, 255, 0, 128]), (13, vec![0x41, 0, 0, 0])] {
@@ -1003,28 +1184,24 @@ pub(crate) mod tests {
         .unwrap();
     }
     #[test]
-    fn serialized_file_medium_keeps_the_managed_batch_pinned_until_native_release() {
+    fn serialized_file_medium_owns_only_its_temporary_file_until_native_release() {
         std::thread::spawn(|| {
             // SAFETY: isolated STA, no clipboard publication or desktop input.
             unsafe {
                 windows::Win32::System::Ole::OleInitialize(None).unwrap();
             }
-            let dir = tempfile::tempdir().unwrap();
-            let batch = Batch::create(dir.path(), StoreKind::CompletedDelivery, BatchId([42; 16])).unwrap();
-            batch.snapshot(9, &mut io::Cursor::new(b"file medium")).unwrap();
-            let path = batch.path().to_owned();
-            let mut medium = file_medium(batch, RepresentationId(9)).unwrap();
-            crate::store::usage(dir.path(), StoreKind::CompletedDelivery, true);
+            let mut medium = file_medium(b"file medium").unwrap();
+            // SAFETY: this successful TYMED_FILE result owns a NUL-terminated filename.
+            let path = std::path::PathBuf::from(unsafe { medium.u.lpszFileName.to_string().unwrap() });
             assert!(path.exists());
             assert_eq!(
                 super::super::medium::serialize(&medium, Medium::File).unwrap(),
                 b"file medium"
             );
-            // SAFETY: one owned STGMEDIUM; its IUnknown releases the cache pin.
+            // SAFETY: one owned STGMEDIUM; its IUnknown deletes the temporary file.
             unsafe {
                 ReleaseStgMedium(&mut medium);
             }
-            crate::store::usage(dir.path(), StoreKind::CompletedDelivery, true);
             assert!(!path.exists());
             // SAFETY: matches successful initialization on this isolated thread.
             unsafe {
@@ -1033,5 +1210,26 @@ pub(crate) mod tests {
         })
         .join()
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod addition_tests {
+    use super::*;
+    #[test]
+    fn approved_legacy_text_is_exact_and_locale_is_present() {
+        assert_eq!(legacy_text("plain\ntext", 1, None).unwrap(), b"plain\r\ntext\0");
+        assert_eq!(legacy_text("plain\ntext", 7, None).unwrap(), b"plain\r\ntext\0");
+        assert_eq!(legacy_text("", 1, None).unwrap(), [0]);
+        assert_eq!(legacy_text("", 16, None).unwrap().len(), 4);
+        assert_eq!(legacy_text("é", 1, Some(0x0409)).unwrap(), [0xe9, 0]);
+        assert!(legacy_text("猫", 1, Some(0x0409)).is_err());
+        assert!(legacy_text("a\0b", 1, None).is_err());
+        // An unsupported scalar may fail, but may never turn into '?' or a best-fit character.
+        for format in [1, 7] {
+            if let Ok(bytes) = legacy_text("\u{1f984}", format, None) {
+                assert!(!bytes.contains(&b'?'));
+            }
+        }
     }
 }

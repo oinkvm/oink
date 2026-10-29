@@ -141,13 +141,13 @@ fn file_offer_has_initial_items_and_late_progress_cannot_restore_a_retired_offer
             let handle = b.inner.clip.get().unwrap();
             handle.settle().await;
             let status = b.clipboard_transfer().unwrap().unwrap();
-            assert_eq!(status.phase, FileTransferPhase::Pending);
+            assert_eq!(status.phase, FileTransferPhase::Failed);
             assert_eq!(status.files, 1);
             assert!(statuses.lock().unwrap().iter().all(|s| s.files > 0));
             let (id, batch, progress) = {
                 let current = handle.shared.native_target.lock().unwrap();
                 let (id, remote) = current.as_ref().unwrap();
-                (*id, remote.batch().id(), remote.progress().borrow().clone())
+                (*id, remote.batch_id(), remote.progress().borrow().clone())
             };
             target.copy(vec![ClipData::Text("local replacement".into())], Sensitivity::Normal);
             common::until("local copy retires file offer", || {
@@ -183,7 +183,69 @@ fn file_offer_has_initial_items_and_late_progress_cannot_restore_a_retired_offer
     );
 }
 
+// Model the native provider's final file and durable catalog. This fixture
+// exercises transport/publication ordering; it does not simulate a desktop API.
+struct NativeCopy {
+    namespace: Arc<dyn content::namespace::Namespace>,
+    directory: tempfile::TempDir,
+    stored: Mutex<Vec<content::namespace::StoredFile>>,
+}
+impl content::namespace::NativeFiles for NativeCopy {
+    fn persist_link(&self, descriptor: &content::linked::Descriptor) -> std::io::Result<()> {
+        oink_foundation::storage::atomic_write(
+            &self.directory.path().join("source.json"),
+            &serde_json::to_vec(descriptor)?,
+        )
+    }
+    fn open(&self, node: oink_clipboard::model::NodeId, offset: u64) -> std::io::Result<oink_clipboard::FileReader> {
+        use std::io::Seek;
+        let mut file = std::fs::File::open(self.directory.path().join(node.0.to_string()))?;
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        Ok(Box::new(file))
+    }
+    fn metadata(&self, node: oink_clipboard::model::NodeId) -> std::io::Result<oink_clipboard::FileMetadata> {
+        Ok(oink_clipboard::FileMetadata {
+            exec_bits: None,
+            size: std::fs::metadata(self.directory.path().join(node.0.to_string()))?.len(),
+            modified_ms: None,
+        })
+    }
+    fn download(
+        &self,
+        check: &content::ReaderGuard,
+        progress: &(dyn Fn(u64, u64) + Send + Sync),
+    ) -> std::io::Result<Vec<content::namespace::StoredFile>> {
+        let mut stored = self.stored.lock().unwrap();
+        if !stored.is_empty() {
+            return Ok(stored.clone());
+        }
+        let mut bytes = 0;
+        for root in self.namespace.roots() {
+            check()?;
+            let node = self.namespace.select(root.id)?;
+            let mut source = self.namespace.open(node.id, node.version, 0)?;
+            let mut output = std::fs::File::create(self.directory.path().join(node.id.0.to_string()))?;
+            let size = std::io::copy(&mut source, &mut output)?;
+            output.sync_all()?;
+            check()?;
+            bytes += size;
+            stored.push(content::namespace::StoredFile {
+                node: node.id,
+                version: node.version,
+                size,
+            });
+            progress(bytes, stored.len() as u64);
+        }
+        oink_foundation::storage::atomic_write(
+            &self.directory.path().join("stored.json"),
+            &serde_json::to_vec(&*stored)?,
+        )?;
+        Ok(stored.clone())
+    }
+}
+
 struct GatedFilePublication {
+    received: Mutex<Option<Arc<NativeCopy>>>,
     clipboard: Arc<FakeClipboard>,
     entered: Mutex<Option<oneshot::Sender<()>>>,
     release: Mutex<std::sync::mpsc::Receiver<()>>,
@@ -210,6 +272,23 @@ impl ClipboardBackend for GatedFilePublication {
         guard: content::ReaderGuard,
     ) -> Result<u64, ClipboardError> {
         if !spec.files.is_empty() {
+            let namespace = spec
+                .file_contents
+                .as_ref()
+                .and_then(|files| files.namespace())
+                .ok_or(ClipboardError::Unsupported)?;
+            namespace.prepare().expect("test native copy obtains source grant");
+            let received = Arc::new(NativeCopy {
+                namespace: namespace.clone(),
+                directory: tempfile::tempdir().map_err(|_| ClipboardError::Unsupported)?,
+                stored: Mutex::default(),
+            });
+            let native: Arc<dyn content::namespace::NativeFiles> = received.clone();
+            namespace
+                .bind_native(Arc::downgrade(&native))
+                .map_err(|_| ClipboardError::Unsupported)?;
+            *self.received.lock().unwrap() = Some(received);
+
             if let Some(entered) = self.entered.lock().unwrap().take() {
                 let _ = entered.send(());
             }
@@ -242,6 +321,7 @@ fn delayed_native_publication_cannot_reset_completed_delivery_to_waiting() {
                 &oink_test_support::network_config(root.path().join("b"), "b", 0),
                 &Displays::new("b"),
                 Some(Arc::new(GatedFilePublication {
+                    received: Mutex::default(),
                     clipboard: target,
                     entered: Mutex::new(Some(entered)),
                     release: Mutex::new(gate),

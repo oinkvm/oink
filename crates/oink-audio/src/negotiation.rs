@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 pub const CAPABILITIES: &[&str] = &[
     "oink.audio/1",
+    "oink.audio.microphone/1",
+    "oink.audio.media-health/1",
     "oink.audio.pcm/1",
     "oink.audio.state/1",
     "oink.audio.exit-volume/1",

@@ -59,7 +59,7 @@ impl Node {
         }
         let apply = self.apply_saved_input_owner(epoch);
         let publish = self.publish_owner_preferences();
-        self.apply_hotkeys(&crate::hotkeys::configured(self.settings().hotkeys));
+        self.apply_hotkeys(&self.effective_hotkeys());
         self.emit(crate::api::ApiEvent::InputSettings(crate::agent_api::input_settings(
             self,
         )));
@@ -76,7 +76,7 @@ impl Node {
             // ordinary pause can commit between them and a late release notice
             // can make its already completed receipt spuriously Busy again.
             let config = lock(&self.inner.config);
-            if !config.settings.keyboard_disabled
+            if config.settings.routing.keyboard_mode != oink_foundation::input::InputMode::Disabled
                 && config.settings.routing.mouse_mode != oink_foundation::input::InputMode::Disabled
             {
                 return;
@@ -193,7 +193,6 @@ impl Node {
         let (reply, result) = std::sync::mpsc::sync_channel(1);
         input.send(InputCommand::ApplyOwnerPreferences {
             routing: settings.routing.clone(),
-            keyboard_disabled: settings.keyboard_disabled,
             accept_contacts: settings.accept_contacts,
             input_transform: settings.input_transform.clone(),
             expected_emergency_sequence,
@@ -220,8 +219,15 @@ impl Node {
         let option = field(request.option())?;
         let expected = field(request.expected_revision())?;
         let patch = field(request.value())?;
-        if option == dto::LocalOption::AcceptContacts
-            && bool::read(&patch).map_err(|_| Failure::InvalidValue)?
+        // Frozen v1 KeyboardMode only accepts Shared/Local. Disable arrives as
+        // option 5 and is translated by the local owner into mode Disabled.
+        if option == dto::LocalOption::KeyboardMode && patch.as_u64().map_err(|_| Failure::InvalidValue)? > 1 {
+            return Err(Failure::InvalidValue);
+        }
+        if matches!(
+            option,
+            dto::LocalOption::AcceptContacts | dto::LocalOption::TouchpadInjection
+        ) && bool::read(&patch).map_err(|_| Failure::InvalidValue)?
             && !self.contacts_injection_available()
         {
             return Err(Failure::UnsupportedOption);
@@ -231,6 +237,10 @@ impl Node {
             dto::LocalOption::ForwardingEnabled
                 | dto::LocalOption::ForwardingControls
                 | dto::LocalOption::AudioExitClaim
+                | dto::LocalOption::MicrophoneShareClaim
+                | dto::LocalOption::MicrophoneControls
+                | dto::LocalOption::MicrophoneReceiveMuted
+                | dto::LocalOption::MicrophoneInput
         ) {
             let audio = self.inner.audio.get().ok_or(Failure::Offline)?;
             let item = if option == dto::LocalOption::AudioExitClaim {

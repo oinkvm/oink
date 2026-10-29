@@ -51,10 +51,20 @@ impl Deferred {
         true
     }
     pub fn complete(&self, provider: Arc<dyn Provider>) -> bool {
-        let received = provider.inventory();
-        let same = received.platform == self.inventory.platform
-            && received.items.len() == self.inventory.items.len()
-            && self.inventory.items.iter().zip(&received.items).all(|(old, new)| {
+        let mut received = provider.inventory();
+        // The native Drop snapshot captures non-file formats and can still have
+        // the original CF_HDROP first-root anchor. Reconcile it against the same
+        // captured namespace used to announce the offer; never recapture paths or
+        // renumber native slots. File reads remain bound to that namespace's identities.
+        if let Some(files) = self.files.lock().unwrap().as_ref() {
+            received = received.with_roots(files.roots());
+        }
+        // Metadata capture can skip individual broken roots before announcing
+        // this drag. Its real Drop must match that same filtered inventory.
+        let offered = self.inventory();
+        let same = received.platform == offered.platform
+            && received.items.len() == offered.items.len()
+            && offered.items.iter().zip(&received.items).all(|(old, new)| {
                 old.id == new.id
                     && old.file == new.file
                     && old.representations.len() == new.representations.len()
@@ -67,6 +77,9 @@ impl Deferred {
                     })
             });
         if !same {
+            tracing::warn!(reason = ?Unavailable::Superseded,
+                offered_items = offered.items.len(), received_items = received.items.len(),
+                "native drag Drop snapshot rejected: inventory mismatch");
             self.fail(Unavailable::Superseded);
             return false;
         }
@@ -95,7 +108,7 @@ impl Provider for Deferred {
     fn inventory(&self) -> Inventory {
         let mut inventory = self.inventory.clone();
         if let Some(files) = self.files.lock().unwrap().as_ref() {
-            inventory.roots = files.roots();
+            inventory = inventory.with_roots(files.roots());
         }
         inventory
     }

@@ -9,7 +9,10 @@
     "cut": "Cut",
     "copy": "Copy",
     "paste": "Paste",
-    "select_all": "Select All"
+    "select_all": "Select All",
+    "window": "Window",
+    "minimize": "Minimize",
+    "close_window": "Close Window"
   },
   "zh-Hans": {
     "about": "关于 Oink",
@@ -21,7 +24,10 @@
     "cut": "剪切",
     "copy": "复制",
     "paste": "粘贴",
-    "select_all": "全选"
+    "select_all": "全选",
+    "window": "窗口",
+    "minimize": "最小化",
+    "close_window": "关闭窗口"
   },
   "ja": {
     "about": "Oink について",
@@ -33,7 +39,10 @@
     "cut": "カット",
     "copy": "コピー",
     "paste": "ペースト",
-    "select_all": "すべてを選択"
+    "select_all": "すべてを選択",
+    "window": "ウインドウ",
+    "minimize": "しまう",
+    "close_window": "ウインドウを閉じる"
   },
   "ko": {
     "about": "Oink에 관하여",
@@ -45,6 +54,9 @@
     "cut": "오려두기",
     "copy": "복사하기",
     "paste": "붙여넣기",
-    "select_all": "전체 선택"
+    "select_all": "전체 선택",
+    "window": "윈도우",
+    "minimize": "최소화",
+    "close_window": "윈도우 닫기"
   }
 }

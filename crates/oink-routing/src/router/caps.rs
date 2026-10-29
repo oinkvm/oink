@@ -114,9 +114,15 @@ impl Router {
         self.send_caps(target, code, true);
     }
     fn send_caps(&mut self, target: Target, code: KeyCode, pressed: bool) {
+        if code == KeyCode::NONE {
+            return;
+        }
         match target {
             Target::Remote(d) => self.send(d, Message::Input(InputMsg::CapsKey { code, pressed })),
             Target::Local | Target::LocalInjected => {
+                if !self.keyboard_local() {
+                    self.application_key(self.me(), 0, code, Some(KeyCode::CAPS_LOCK), pressed);
+                }
                 self.target_mapped_key(self.me(), KeyCode::CAPS_LOCK, code, pressed)
             }
             Target::Dropped => {}

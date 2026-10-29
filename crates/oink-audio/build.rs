@@ -1,4 +1,6 @@
 fn main() {
+    println!("cargo:rerun-if-changed=native/pull_benchmark.c");
+    println!("cargo:rerun-if-changed=native/microphone.m");
     println!("cargo:rerun-if-changed=native/realtime.c");
     println!("cargo:rerun-if-changed=native/media_pause.m");
     println!("cargo:rerun-if-changed=native/macos.m");
@@ -9,6 +11,12 @@ fn main() {
     println!("cargo:rerun-if-changed=native/power.m");
     println!("cargo:rerun-if-changed=native/exit_volume.m");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        if std::env::var_os("CARGO_FEATURE_TEST_SUPPORT").is_some() {
+            cc::Build::new()
+                .file("native/pull_benchmark.c")
+                .flag("-std=c11")
+                .compile("oink_pull_benchmark");
+        }
         cc::Build::new()
             .file("native/realtime.c")
             .flag("-std=c11")
@@ -24,6 +32,7 @@ fn main() {
             .file("native/macos_playback.m")
             .file("native/macos_devices.m")
             .file("native/power.m")
+            .file("native/microphone.m")
             .file("native/exit_volume.m")
             .flag("-fobjc-arc")
             .flag("-std=c11")

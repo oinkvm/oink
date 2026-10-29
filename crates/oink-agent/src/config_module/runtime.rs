@@ -63,6 +63,7 @@ fn stopped() -> ApiError {
     ApiError::NetworkStopped
 }
 pub(super) struct Shared {
+    pub source_grants: Option<oink_clipboard::content::grants::SourceGrants>,
     pub members: Snapshot<MemberTable>,
     pub applied: Snapshot<AppliedState>,
     pub displays: Snapshot<LocalDisplays>,
@@ -142,19 +143,34 @@ struct Dial {
     active: bool,
     last_relayed: bool,
     started: bool,
+    // Keep readiness through close(), which removes the session before Lost.
+    ready_link: Option<LinkId>,
 }
 impl Dial {
+    fn lost(&mut self, link: LinkId, now: Instant) {
+        if self.ready_link.take() == Some(link) {
+            self.reset(now);
+        } else {
+            // TLS/path installation is not successful admission. In particular,
+            // a sleeping peer can accept TLS and reject C0 repeatedly; resetting
+            // here would redial at network round-trip speed with no backoff.
+            // Failed admission is transient and uses the capped member retry.
+            self.failed(DialFailure::Refused, now);
+        }
+    }
     fn failed(&mut self, reason: DialFailure, now: Instant) {
         self.active = false;
         self.started = true;
         self.failures = self.failures.saturating_add(1);
+        // Only a different authenticated identity needs the slow retry. Refusal,
+        // stopped networking and pre-Ready loss can all recover with the same peer.
         // LinkLayer forgets failed dials; it has no second reconnect schedule.
         // Timeouts/no route must keep probing even when the other side cannot
         // originate a connection (for example through the local router's NAT).
-        let backoff = if reason == DialFailure::Unreachable {
-            &RECONNECT_BACKOFF[..]
-        } else {
+        let backoff = if reason == DialFailure::IdentityChanged {
             &HANDSHAKE_BACKOFF[..]
+        } else {
+            &RECONNECT_BACKOFF[..]
         };
         self.after = Some(now + backoff[(self.failures - 1).min(backoff.len() - 1)]);
     }
@@ -188,6 +204,7 @@ pub(super) struct Owner {
     projection_announced: Option<[u8; 32]>,
     recovery_projected: Vec<(LinkId, Option<Message>, bool)>,
     state: State,
+    pointer_shortcuts_pending: bool,
     needs_apply: bool,
     stored: group_store::StoredGroupState,
     data_dir: PathBuf,
@@ -229,9 +246,12 @@ pub(super) struct Owner {
     network_checked: Instant,
     #[cfg(test)]
     pub(super) hold_facts: bool,
+    #[cfg(test)]
+    held_config_states: Option<Vec<(LinkId, dto::GroupState)>>,
     last_state: Instant,
     displays: Vec<DisplayInfo>,
     displays_observed: bool,
+    display_layout_dependency: Option<(GroupId, dto::ConfigVersion)>,
     detached: detached::DetachedScreens,
     discovery: Option<Arc<Discovery>>,
     advert: watch::Sender<Advert>,
@@ -337,9 +357,12 @@ impl Owner {
                 .update_owner(|owner| owner.switch_group(anchor.group, device))
                 .map_err(|e| fail(&e))?;
         }
+        let application_focus_enabled = stored.application_focus_enabled().map_err(|e| fail(&e))?;
         let applied = AppliedState {
+            application_focus_enabled,
             group: anchor.group,
             roster_digest: state.roster().digest().map_err(|e| fail(&e))?,
+            pointer_slots: state.pointer_slots().map_err(|e| fail(&e))?,
             members: state.roster().members().map(|m| m.device).collect(),
             layout: layout.clone(),
             owners: owners.clone(),
@@ -349,7 +372,25 @@ impl Owner {
             emergency: false,
         };
         let (stopped, _) = watch::channel(false);
+        // Authority comes directly from the verified signed roster, including
+        // membership incarnation. Obsolete journal layouts reset their authority
+        // in load; unreadable/inconsistent journals still disable cloud access
+        // without preventing group startup or ordinary text clipboard sharing.
+        let source_grants = match oink_clipboard::content::grants::SourceGrants::load(
+            &deps.data_dir.join("source-file-links"),
+            state.roster().members().map(|m| (m.device, m.add)),
+        ) {
+            Ok(grants) => Some(grants),
+            Err(_) => {
+                tracing::warn!(
+                    reason = "source_links_unavailable",
+                    "persistent source files unavailable"
+                );
+                None
+            }
+        };
         let shared = Arc::new(Shared {
+            source_grants,
             members: Snapshot::default(),
             applied: Snapshot::new(applied),
             displays: Snapshot::new(LocalDisplays {
@@ -358,6 +399,7 @@ impl Owner {
                 owners: owners.clone(),
             }),
             router: Arc::new(Snapshot::new(RouterLayout {
+                application_focus_enabled,
                 group: anchor.group,
                 version,
                 topology: TopologyLayout::from_effective(&layout.effective(&owners), |d| devices.contains(d)),
@@ -407,6 +449,7 @@ impl Owner {
             projection_announced: None,
             recovery_projected: Vec::new(),
             state,
+            pointer_shortcuts_pending: true,
             needs_apply: false,
             stored,
             data_dir: deps.data_dir,
@@ -448,9 +491,12 @@ impl Owner {
             network_checked: Instant::now() - Duration::from_secs(2),
             #[cfg(test)]
             hold_facts: false,
+            #[cfg(test)]
+            held_config_states: None,
             last_state: Instant::now(),
             displays: vec![],
             displays_observed: false,
+            display_layout_dependency: None,
             detached,
             discovery: None,
             advert,
@@ -694,9 +740,29 @@ impl Owner {
             }
             ConfigEvent::Lost { link, peer, path, .. } => {
                 self.drop_link(link);
+                // A delayed retirement must not change the replacement's retry
+                // state (including an inbound replacement still admitting C0).
+                if self
+                    .sessions
+                    .values()
+                    .any(|session| session.peer_boot.device_id == peer)
+                {
+                    return;
+                }
                 let dial = self.dials.entry(peer).or_default();
                 dial.last_relayed = matches!(path, LinkPath::Relayed { .. });
-                dial.reset(Instant::now());
+                let now = Instant::now();
+                dial.lost(link, now);
+                // Keep an ordinary diagnostic at exponential count intervals;
+                // verbose link records have their own bounded recorder. This
+                // remains bounded even when an old peer redials us while asleep.
+                if dial.failures.is_power_of_two() {
+                    tracing::warn!(
+                        failures = dial.failures,
+                        retry_after_ms = dial.after.unwrap().duration_since(now).as_millis() as u64,
+                        "Config admission failed; retry backed off"
+                    );
+                }
             }
             ConfigEvent::Ready { link, .. } => {
                 if self.sessions.get(&link).is_some_and(|s| s.ready) {
@@ -786,6 +852,15 @@ impl Owner {
                 .and_then(|session| links.by_peer(session.peer_boot.device_id))
                 .map(|link| &link.agreement);
             let supports = |cap| agreement.is_some_and(|agreement| agreement.contains(cap));
+            // Use this exact C0 negotiation, including retained member lanes;
+            // a newer selected link for the same device must not widen it.
+            let keymap_supported = self
+                .sessions
+                .get(&id)
+                .and_then(|s| s.peer.as_ref())
+                .is_some_and(|peer| peer.agreement.contains("oink.input.keymap-none/1"));
+            let facts = super::facts::for_keymap_capability(facts, keymap_supported)?;
+            let facts = super::facts::for_touchpad_capability(facts, supports("oink.input.touchpad-options/1"))?;
             let facts = super::facts::for_mouse_capability(facts, supports("oink.input.mouse-disabled/1"))?;
             let facts = super::facts::for_local_output_capability(facts, supports("oink.audio.local-output/1"))?;
             Message::ConfigFacts(super::facts::for_accessibility_capability(
@@ -856,11 +931,14 @@ impl Owner {
                 }) {
                     self.facts.remove(&link.peer_boot.device_id);
                 }
-                // A retired boot must not cancel a query already completed on
-                // a replacement. Pending queries can use its new greeting too.
+                // Only a prepared result is bound to this retired Boot. TLS
+                // can identify a new probe before its C0/greeting arrives,
+                // including while the old C0 retires with no selected replacement
+                // yet. Keep that unbound query pending under its original total
+                // deadline; it has not lost a prepared result.
                 self.fail_queries_matching(
                     link.peer_boot.device_id,
-                    replacement.map(|_| link.peer_boot),
+                    Some(link.peer_boot),
                     dto::PairCode::PreparedPeerLost,
                 );
             }
@@ -871,6 +949,20 @@ impl Owner {
         for link in self.sessions.keys().copied().collect::<Vec<_>>() {
             self.close(link, reason);
         }
+    }
+    #[cfg(test)]
+    pub(super) fn hold_incoming_config_states(&mut self, hold: bool) -> ApiResult<()> {
+        if hold {
+            assert!(self.held_config_states.is_none());
+            self.held_config_states = Some(Vec::new());
+        } else {
+            for (link, state) in self.held_config_states.take().unwrap() {
+                let frame =
+                    v1::frame::encode(&Message::ConfigState(state), v1::limits::CONFIG_FRAME).map_err(internal)?;
+                self.control(link, &frame).map_err(internal)?;
+            }
+        }
+        Ok(())
     }
     fn control(&mut self, id: LinkId, bytes: &[u8]) -> v1::Result<()> {
         if self.sessions.get(&id).is_some_and(|session| session.departing) {
@@ -932,11 +1024,24 @@ impl Owner {
                 };
                 let _ = self.address_book.remember(peer.device_id, listen);
             }
+            // Same-root membership claims are not authority. A newly introduced
+            // peer must retry after an already trusted member updates our roster.
+            // Different-root direct C0 remains available to the existing PAKE flow.
+            if same && !self.state.roster().contains(peer.device_id) {
+                if self.state.roster().next_epoch(peer.device_id)? == 1 {
+                    return Err(v1::ErrorCode::AuthenticationFailed.into());
+                }
+                // A locally recorded removed member still needs the existing
+                // bounded revocation reply to leave its stale group. This lane
+                // never consumes its state or waits for membership to arrive.
+                self.sessions.get_mut(&id).expect("link").deadline = Some(Instant::now() + Duration::from_millis(200));
+                return Ok(());
+            }
             self.finish_queries(peer.device_id);
             self.start_connecting(peer.device_id);
             self.reconcile_peer(id)?;
             let session = self.sessions.get(&id).ok_or(v1::ErrorCode::NotReady)?;
-            if same && session.direction == Direction::Outbound {
+            if same && session.direction == Direction::Outbound && self.state.roster().contains(peer.device_id) {
                 self.begin_admission(id)?;
             } else if !same && self.state.roster().contains(peer.device_id) {
                 self.lookup(id)?;
@@ -1000,6 +1105,11 @@ impl Owner {
         match message {
             Message::ConfigRequest(request) => {
                 if !self.state.roster().contains(peer.device_id) {
+                    if self.sessions[&id].peer.as_ref().expect("greeting").anchor()? != self.state.roster().anchor()
+                        || self.state.roster().next_epoch(peer.device_id)? == 1
+                    {
+                        return Err(v1::ErrorCode::AuthenticationFailed.into());
+                    }
                     self.send(
                         id,
                         admission::reply(
@@ -1037,6 +1147,7 @@ impl Owner {
                 )?;
             }
             Message::ConfigReply(reply) => {
+                self.require_known_member(id)?;
                 let sent = self.sessions[&id].sent.as_ref().ok_or(v1::ErrorCode::StateConflict)?;
                 if let Some(candidate) =
                     admission::reply_revocation(&self.state, sent, &reply, self.identity.id(), peer.device_id, hash)?
@@ -1044,17 +1155,22 @@ impl Owner {
                     self.receive_revocation(candidate)?;
                     return Ok(());
                 }
-                let candidate =
+                let accepted =
                     admission::receive_reply(&self.state, sent, &reply, self.identity.id(), peer.device_id, hash)?;
-                self.commit(candidate.clone())
-                    .map_err(|_| v1::ErrorCode::StateConflict)?;
+                self.commit(accepted.merged).map_err(|_| v1::ErrorCode::StateConflict)?;
                 // Done can reach the peer before this owner gets to ready().
                 // Its first Facts may then reach N0 immediately. Fence the
                 // verified reply's half-open phase before exposing Done, just
                 // as the responder fences this phase before exposing Reply.
                 self.links.set_half_open(id);
-                self.send(id, admission::done(&candidate, hash)?)?;
+                self.send(id, admission::done(&accepted.acknowledged, hash)?)?;
                 self.ready(id)?;
+                // Done acknowledges the peer's frozen Reply, while commit may
+                // preserve a newer local register or reconcile pointer slots.
+                // Publish that union only after ordered Done has made the peer ready.
+                if self.state.digest()? != accepted.acknowledged.digest()? {
+                    self.send(id, Message::ConfigState(self.state.wire().clone()))?;
+                }
             }
             Message::ConfigDone(done) => {
                 admission::receive_done(
@@ -1114,6 +1230,11 @@ impl Owner {
                         return Ok(());
                     }
                     return Err(v1::ErrorCode::NotReady.into());
+                }
+                #[cfg(test)]
+                if let Some(held) = &mut self.held_config_states {
+                    held.push((id, state));
+                    return Ok(());
                 }
                 let candidate = self.state.receive_update(&state, peer.device_id, self.identity.id())?;
                 let local_removed = !candidate.roster().contains(self.identity.id());
@@ -1275,6 +1396,17 @@ impl Owner {
             | Message::ConfigMergeReceipt(_)
             | Message::ConfigPairDecisionQuery(_)
             | Message::ConfigPairDecisionReply(_) => self.recovery_message(id, peer, message)?,
+            Message::ControlPowerState(value) => {
+                if !self.sessions[&id].ready || !self.state.roster().contains(peer.device_id) {
+                    return Err(v1::ErrorCode::NotReady.into());
+                }
+                self.shared.emit(ConfigChange::PowerState {
+                    group: self.shared.applied.load().group,
+                    boot: peer,
+                    received: Instant::now(),
+                    value,
+                });
+            }
             Message::ConfigSetLocalOption(_)
             | Message::ConfigLocalEditResult(_)
             | Message::ConfigSetExitVolume(_)
@@ -1340,7 +1472,20 @@ impl Owner {
             && self.state.roster().contains(session.peer_boot.device_id))
         .then_some(old)
     }
+    fn require_known_member(&self, id: LinkId) -> v1::Result<()> {
+        let peer = self
+            .sessions
+            .get(&id)
+            .ok_or(v1::ErrorCode::NotReady)?
+            .peer_boot
+            .device_id;
+        if !self.state.roster().contains(peer) {
+            return Err(v1::ErrorCode::AuthenticationFailed.into());
+        }
+        Ok(())
+    }
     fn begin_admission(&mut self, id: LinkId) -> v1::Result<()> {
+        self.require_known_member(id)?;
         let hash = self.sessions[&id]
             .peer
             .as_ref()
@@ -1358,13 +1503,16 @@ impl Owner {
         self.send(id, request)
     }
     fn ready(&mut self, id: LinkId) -> v1::Result<()> {
+        self.require_known_member(id)?;
         let session = self.sessions.get_mut(&id).ok_or(v1::ErrorCode::NotReady)?;
         session.ready = true;
         session.admitted_anchor = Some(self.state.roster().anchor());
         session.deadline = None;
         let peer = session.peer_boot;
         self.links.set_ready(id);
-        self.dials.entry(peer.device_id).or_default().failures = 0;
+        let dial = self.dials.entry(peer.device_id).or_default();
+        dial.failures = 0;
+        dial.ready_link = Some(id);
         self.presence
             .observe(self.state.roster().anchor().group, peer.device_id, now_ms())
             .map_err(|_| v1::ErrorCode::StateConflict)?;
@@ -1394,6 +1542,9 @@ impl Owner {
         Ok(())
     }
     fn tick(&mut self) {
+        if let Err(error) = self.reconcile_pointer_shortcuts() {
+            tracing::debug!(?error, "pointer shortcut allocation deferred");
+        }
         let now = Instant::now();
         if now >= self.network_checked + Duration::from_secs(2) {
             self.network_checked = now;

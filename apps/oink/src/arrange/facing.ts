@@ -61,7 +61,7 @@ export function sameProjections(a: Projection[], b: Projection[], eps: number): 
     });
 }
 
-/** Mirrors oink-display/layout/facing.rs; cross-language tests execute both.
+/** Mirrors oink-display/layout/facing.rs; both language suites check the shared conformance corpus.
  * Positive along-edge length, nonnegative gap up to scale-relative roundoff.
  * No raster rounding, corner-only contacts or UI pixel tolerance here. */
 export function facing(a: Rect, b: Rect, side: number, eps = tolerance([a, b])) {

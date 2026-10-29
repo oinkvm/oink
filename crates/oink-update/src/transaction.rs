@@ -59,7 +59,7 @@ impl Journal {
             || !hex(&self.transaction, 32)
             || !hex(&self.package_sha256, 64)
             || self.old_build == 0
-            || self.new_build <= self.old_build
+            || self.new_build < self.old_build
         {
             return Err(Error::RepairRequired);
         }
@@ -321,6 +321,11 @@ mod tests {
     }
     fn journal() -> Journal {
         Journal::new("01".repeat(16), 1, 2, "ab".repeat(32)).unwrap()
+    }
+    #[test]
+    fn equal_build_repair_is_a_valid_journal_but_downgrade_is_not() {
+        assert!(Journal::new("a".repeat(32), 30, 30, "b".repeat(64)).is_ok());
+        assert!(Journal::new("a".repeat(32), 30, 29, "b".repeat(64)).is_err());
     }
     #[test]
     fn commit_only_after_health_and_all_boundaries_are_flushed() {

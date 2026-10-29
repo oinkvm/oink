@@ -16,6 +16,10 @@ impl Router {
         if boot.device_id == self.me() || self.admitted_boots.get(&boot.device_id) != Some(&boot) {
             return;
         }
+        self.application.outgoing.retire_source(boot);
+        for code in self.application.incoming.forget_boot(boot) {
+            self.release_key_ref(code);
+        }
         if self.peers.get(&boot.device_id).is_some_and(|peer| peer.connected) {
             self.detach_input(boot.device_id);
         } else {
@@ -63,6 +67,8 @@ impl Router {
         self.dnd_member_attached(peer);
         self.send_focus_state(peer);
         self.send_game_state(peer);
+        self.send_entry_protection(peer);
+        self.sync_lock_escape();
         let interval = self.interval_us();
         self.next_sync = Some(self.next_sync.map_or(now + interval, |t| t.min(now + interval)));
         true

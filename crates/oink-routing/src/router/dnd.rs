@@ -79,6 +79,8 @@ pub enum DndCmd {
     ResumeSource {
         id: ClipId,
         epoch: u64,
+        /// Logical return location, never the platform's hidden hold point.
+        at: Option<Point>,
     },
     ReleaseSourceButton {
         id: ClipId,
@@ -193,7 +195,12 @@ pub enum DndEvent {
         epoch: u64,
         ok: bool,
     },
-    /// `Begin` 发起的拖拽结束了（`dropped`：放到了某个目标上）；`Begin` 失败时也报告（`dropped = false`）。
+    /// No native target session was started. The held source can still return.
+    BeginFailed {
+        id: ClipId,
+        epoch: u64,
+    },
+    /// `Begin` 发起的原生拖拽结束了（`dropped`：放到了某个目标上）。
     Ended {
         id: ClipId,
         epoch: u64,
@@ -202,6 +209,12 @@ pub enum DndEvent {
     /// Retired after explicit cancel/release and catcher exit; no native end.
     SourceCancelRetired {
         id: ClipId,
+    },
+    /// The source is back at its native return point; no held movement can
+    /// overtake the original UP after this acknowledgement.
+    SourceResumed {
+        id: ClipId,
+        epoch: u64,
     },
 }
 
@@ -233,6 +246,8 @@ pub(super) enum State {
         input: DeviceId,
         items: Vec<ClipData>,
         push: Option<EdgeGesture>,
+        /// Metadata/preparation failed; crossing back needs no native LeaveHost.
+        begin_failed: bool,
     },
 }
 
@@ -250,6 +265,8 @@ pub(super) struct PendingEnter {
     retained_inventory: Option<Vec<u8>>,
     incomplete: bool,
     focus_entered: bool,
+    entered_at: Option<u64>,
+    entered_instant: Option<std::time::Instant>,
     grant: Option<(DragKey, u64, u64)>,
 }
 
@@ -285,6 +302,7 @@ pub(super) struct Dnd {
     pub(super) state: State,
     pending: Option<PendingEnter>,
     last_enter_epoch: Option<u64>,
+    focus_arrival: Option<(DeviceId, u64, std::time::Instant)>,
     image: Option<(ClipId, DragImage)>,
     pub(super) press_origin: Option<ScreenPos>,
     preview_requested: Option<(DeviceId, ClipId, u64, PreviewBinding)>,
@@ -293,6 +311,86 @@ pub(super) struct Dnd {
 }
 
 impl Router {
+    /// Failure-only inspection for integration watchdogs; never includes offer payloads.
+    #[cfg(debug_assertions)]
+    pub fn dnd_watchdog_snapshot_for_test(&self) -> String {
+        let host = match &self.dnd.state {
+            State::Idle => None,
+            State::Probing { input, content, .. } => Some((content.as_ref().map(|(id, _)| *id), *input, None)),
+            State::Leaving {
+                id,
+                input,
+                native,
+                released,
+                epoch,
+                ..
+            } => Some((Some(*id), *input, Some((*epoch, *native, *released)))),
+            State::Hosting { id, input, .. } => Some((Some(*id), *input, None)),
+        };
+        let pending = self.dnd.pending.as_ref().map(|p| {
+            (
+                p.id,
+                p.from,
+                p.input,
+                p.epoch,
+                p.focus_entered,
+                p.incomplete,
+                p.preview_ready,
+                p.grant,
+            )
+        });
+        let sources: Vec<_> = self
+            .dnd
+            .sources
+            .iter()
+            .map(|(id, s)| {
+                (
+                    id,
+                    s.input,
+                    s.holder,
+                    s.phase,
+                    s.exported,
+                    s.exporting,
+                    s.confirmed,
+                    s.native,
+                    s.revision,
+                )
+            })
+            .collect();
+        let notices: Vec<_> = self
+            .dnd
+            .notices
+            .iter()
+            .map(|(peer, n)| {
+                (
+                    peer,
+                    n.notice.key,
+                    n.notice.revision,
+                    n.notice.state,
+                    n.incomplete,
+                    n.source_session,
+                )
+            })
+            .collect();
+        format!(
+            "router_dnd state={} host={host:?} pending_enter={pending:?}\nrouting holder={:?} epoch={} paused={} fully_paused={} capture_available={}\nsources={sources:?}\nnotices={notices:?}\nsource_sessions={:?} native_source={:?} pending_source_actions={:?}\ntarget_grant={:?} delivery_grants={:?} preparations={:?}\noriginal_presses={:?} outgoing={:?}",
+            self.dnd_state_name(),
+            self.holder,
+            self.epoch,
+            self.paused,
+            self.fully_paused,
+            self.capture_available,
+            self.dnd.source_sessions,
+            self.dnd.native_source,
+            self.dnd.pending_source,
+            self.dnd.target,
+            self.dnd.deliveries,
+            self.dnd.preparations,
+            self.dnd.presses,
+            self.dnd.outgoing,
+        )
+    }
+
     fn dnd_offer(id: ClipId) -> OfferId {
         OfferId {
             clip: id,
@@ -668,12 +766,31 @@ impl Router {
             self.dnd_cancel_hosting();
         }
     }
-    // Pairing is bounded by one focus expectation and one declaration per
-    // admitted source. Only explicit refusal/revocation ends an expectation.
+    // User decision (2026-10-27): target preparation has a 3s budget after
+    // pointer entry. This bounds missing metadata, not source holds or bytes
+    // transferred after Drop. Complete metadata hands the remaining budget to
+    // the background native preparer through DndTarget.
     pub(super) fn dnd_deadline(&self) -> Option<u64> {
-        None
+        self.dnd
+            .pending
+            .as_ref()?
+            .entered_at
+            .map(|at| at.saturating_add(3_000_000))
     }
-    pub(super) fn dnd_expire(&mut self) {}
+    pub(super) fn dnd_expire(&mut self) {
+        if self.dnd_deadline().is_some_and(|deadline| self.dnd.now >= deadline) {
+            tracing::warn!(
+                dnd_phase = 55_u64,
+                reason = 1_u64,
+                dnd_preparation_stage = 0_u64,
+                dnd_preparation_timeout = true,
+                elapsed_us = 3_000_000_u64,
+                preparation_stage = "file_list",
+                "cross-device drag preparation timeout"
+            );
+            self.dnd_cancel_pending();
+        }
+    }
 
     // ================= 公共接口 =================
 
@@ -757,6 +874,26 @@ impl Router {
                 self.dnd.sources.remove(&offer);
                 self.dnd.pending_source.retain(|(id, _), _| *id != offer);
                 self.out.push(Output::Dnd(DndCmd::ReleaseData { id }));
+            }
+            return;
+        }
+        if let DndEvent::SourceResumed { id, epoch } = ev {
+            let offer = Self::dnd_offer(id);
+            if let Some(source) = self.dnd.sources.get_mut(&offer).filter(|s| {
+                s.holder
+                    == (Holder {
+                        device: self.cfg.device,
+                        epoch,
+                    })
+                    && s.phase == source::Phase::Local
+                    && !s.exported
+            }) {
+                source.native = NativeObservation::Resumed;
+                let up_seen = self.dnd.presses.get(&offer).is_some_and(press::OriginalPress::up_seen);
+                self.dnd_return_source_press(offer);
+                if up_seen {
+                    self.dnd_original_route_released(offer);
+                }
             }
             return;
         }
@@ -845,6 +982,7 @@ impl Router {
         tracing::debug!(?ev, state = ?self.dnd_state_name(), "dnd event");
         match ev {
             DndEvent::SourceEnded { .. }
+            | DndEvent::SourceResumed { .. }
             | DndEvent::SourceHeld { .. }
             | DndEvent::SourceEffectFailed { .. }
             | DndEvent::SourceExported { .. }
@@ -880,8 +1018,38 @@ impl Router {
                     self.dnd_released(ok);
                 }
             }
+            DndEvent::BeginFailed { id, epoch } => {
+                if matches!(self.dnd.state, State::Hosting { id: active, .. } if active == id)
+                    && self
+                        .dnd
+                        .target
+                        .as_ref()
+                        .map_or(self.epoch == epoch, |grant| grant.holder.epoch == epoch)
+                {
+                    // Failure to create a receiver session is not the user's
+                    // cancellation of the original native drag. Keep the held
+                    // route until return, actual UP, Esc or source revocation.
+                    let released = self.dnd.target.as_ref().is_some_and(DndTarget::released);
+                    self.dnd_retire_preparation(id.origin);
+                    if let State::Hosting { begin_failed, .. } = &mut self.dnd.state {
+                        *begin_failed = true;
+                    }
+                    if released {
+                        // A released drag may outlive focus return. Keep its
+                        // grant until cancellation consumes the original holder epoch.
+                        self.dnd_cancel_hosting();
+                    } else if let Some(grant) = self.dnd.target.take() {
+                        grant.revoke();
+                    }
+                }
+            }
             DndEvent::Ended { id, epoch, dropped } => {
-                if let State::Hosting { id: active, input, .. } = &self.dnd.state
+                if let State::Hosting {
+                    id: active,
+                    input,
+                    begin_failed: false,
+                    ..
+                } = &self.dnd.state
                     && *active == id
                     && self
                         .dnd
@@ -939,6 +1107,12 @@ impl Router {
             State::Leaving { .. } => "leaving",
             State::Hosting { .. } => "hosting",
         }
+    }
+
+    /// Native drag cursors may be hidden or replaced by artwork. Their motion
+    /// is not evidence that the foreground application captured game input.
+    pub fn dnd_pointer_active(&self) -> bool {
+        !matches!(self.dnd.state, State::Idle) || self.dnd.native_source.is_some() || self.dnd.pending.is_some()
     }
 
     /// A target may prepare native file URLs only while this exact host still
@@ -1099,6 +1273,8 @@ impl Router {
                     items: Vec::new(),
                     incomplete: true,
                     focus_entered: false,
+                    entered_at: None,
+                    entered_instant: None,
                     image: None,
                     preview_ready: false,
                     preview_binding: None,
@@ -1135,7 +1311,7 @@ impl Router {
         at: Point,
     ) {
         if !self.dnd_enabled()
-            || self.focus_pinned()
+            || (self.focus_pinned() && !self.pointer_lock_escape_held())
             || self.system_clip_active()
             || self.paused
             || self.dnd.pending.is_some()
@@ -1277,6 +1453,11 @@ impl Router {
     /// 输入源（`input`）的左键抬起了（本机物理抬起，或远端源的 `Button{Left, up}` 到达）。
     pub(super) fn dnd_left_released(&mut self, input: DeviceId) {
         match &mut self.dnd.state {
+            State::Hosting {
+                input: i,
+                begin_failed: true,
+                ..
+            } if *i == input => self.dnd_cancel_hosting(),
             State::Probing { input: i, .. } if *i == input => self.dnd_unprobe(),
             State::Leaving { input: i, released, .. } if *i == input => {
                 tracing::info!(
@@ -1340,6 +1521,12 @@ impl Router {
         }
     }
 
+    /// Copy the existing local transport arrival clock before FocusEnter dispatch.
+    /// This bounded observation has no routing authority and is never serialized.
+    pub fn observe_dnd_focus_entry(&mut self, from: DeviceId, epoch: u64, at: std::time::Instant) {
+        self.dnd.focus_arrival = Some((from, epoch, at));
+    }
+
     /// `HeldSync` 里没有左键时是否仍保留为 `origin` 按着的左键（宿主还没得到输入源的确认）。
     pub(super) fn dnd_keep_left(&mut self, origin: DeviceId, _buttons: &[MouseButton]) -> bool {
         matches!(self.dnd.state, State::Hosting { input, .. } if input == origin)
@@ -1372,6 +1559,17 @@ impl Router {
             return;
         }
         p.focus_entered = true;
+        let entered_at = *p.entered_at.get_or_insert(self.dnd.now);
+        let arrival = self
+            .dnd
+            .focus_arrival
+            .filter(|(peer, generation, _)| *peer == from && *generation == epoch)
+            .map(|(_, _, at)| at);
+        let entered_instant = *p.entered_instant.get_or_insert_with(|| {
+            let at = arrival.unwrap_or_else(std::time::Instant::now);
+            tracing::debug!(dnd_phase = 0_u64, "target drag focus entered");
+            at
+        });
         if p.grant.is_none() {
             self.dnd.pending = Some(p);
             return;
@@ -1393,11 +1591,15 @@ impl Router {
                 return;
             }
             if !exported {
-                self.dnd_return_source_press(offer);
-                if let Some(source) = self.dnd.sources.get_mut(&offer) {
-                    source.native = NativeObservation::Resumed;
-                }
-                self.out.push(Output::Dnd(DndCmd::ResumeSource { id: p.id, epoch }));
+                // Native return runs on a separate worker from ordinary input.
+                // Keep the original UP withheld until its final dragged event
+                // and catcher teardown are acknowledged. Otherwise UP can reach
+                // the source first and a late forced dragged event latches it.
+                self.out.push(Output::Dnd(DndCmd::ResumeSource {
+                    id: p.id,
+                    epoch,
+                    at: Some(pos),
+                }));
                 self.dnd.preview_requested = None;
                 return;
             }
@@ -1452,6 +1654,7 @@ impl Router {
             id: p.id,
             input: p.input,
             items: p.items.clone(),
+            begin_failed: false,
             push: None,
         };
         self.dnd.preview_requested = (p.id.origin != self.me())
@@ -1472,7 +1675,10 @@ impl Router {
                 session,
             )
         });
-        let grant = DndTarget::new(preparation, Holder { device: me, epoch }, revision, p.input);
+        let remaining = 3_000_000_u64.saturating_sub(self.dnd.now.saturating_sub(entered_at));
+        let grant = DndTarget::new(preparation, Holder { device: me, epoch }, revision, p.input)
+            .with_preparation_remaining(std::time::Duration::from_micros(remaining))
+            .with_entered_at(entered_instant);
         self.dnd.target = Some(grant.clone());
         self.out.push(Output::Dnd(DndCmd::Begin {
             grant,
@@ -1719,10 +1925,9 @@ impl Router {
             let others = self.held.iter().any(|(o, h)| *o != me && !h.buttons.is_empty());
             ok && !others
         } else {
-            let ok = self
-                .held
-                .get(&input)
-                .is_some_and(|h| h.buttons.len() == 1 && h.buttons.contains(&left));
+            let held = self.held.get(&input);
+            let ok = held.is_some_and(|h| h.buttons.len() == 1 && h.buttons.contains(&left))
+                || (held.is_none_or(|h| h.buttons.is_empty()) && self.dnd_returning_left(Some(input)));
             let others = self.held.iter().any(|(o, h)| *o != input && !h.buttons.is_empty());
             ok && !others && self.buttons.is_empty()
         }
@@ -1775,6 +1980,7 @@ impl Router {
             .entry(offer)
             .or_insert_with(|| source::Source::new(offer, input, holder));
         source.metadata(items);
+        crate::dnd::source_learned_timing(id);
         self.dnd.native_source = Some(offer);
         self.dnd_announce_members(offer);
     }
@@ -1782,20 +1988,20 @@ impl Router {
     /// 准备离开：让平台结束本机的拖拽（`native`：源程序的拖拽 → `Release`；否则 `Cancel`）。
     fn dnd_leave(&mut self, native: bool) {
         let state = std::mem::take(&mut self.dnd.state);
-        let (input, gesture, id, items) = match state {
+        let (input, gesture, id, items, begin_failed) = match state {
             State::Probing {
                 input,
                 gesture,
                 content: Some((id, items)),
                 ..
-            } => (input, gesture, id, items),
+            } => (input, gesture, id, items, false),
             State::Hosting {
                 id,
                 input,
                 items,
                 push: Some(gesture),
-                ..
-            } => (input, gesture, id, items),
+                begin_failed,
+            } => (input, gesture, id, items, begin_failed),
             other => {
                 self.dnd.state = other;
                 return;
@@ -1865,6 +2071,10 @@ impl Router {
             }));
             return;
         }
+        if begin_failed {
+            self.dnd_released(true);
+            return;
+        }
         self.out.push(Output::Dnd(DndCmd::LeaveHost {
             id,
             epoch: self.epoch,
@@ -1901,6 +2111,8 @@ impl Router {
             Some("the left button was released meanwhile")
         } else if self.holder != me || self.epoch != epoch {
             Some("focus already left this device")
+        } else if self.focus_pinned() && !self.pointer_lock_escape_held() {
+            Some("focus lock prevents crossing")
         } else if self.system_clip_active() {
             Some("system cursor clip prevents crossing")
         } else if self.layout.reference_per_native_unit(&dst.screen).is_none()
@@ -1925,6 +2137,28 @@ impl Router {
             }
             if native && ok {
                 let offer = Self::dnd_offer(id);
+                if !released
+                    && !self.fully_paused
+                    && self.holder == me
+                    && self.epoch == epoch
+                    && self.dnd.sources.get(&offer).is_some_and(|s| !s.exported)
+                    && ((input == me && self.buttons.contains_key(&MouseButton::Left))
+                        || (input != me && self.reachable(input)))
+                {
+                    // Admission can change while the native worker holds the
+                    // source. The cursor never left: resume the same session,
+                    // keeping its UP withheld until the return is acknowledged.
+                    if let Some(source) = self.dnd.sources.get_mut(&offer) {
+                        source.confirmed = true;
+                        source.native = NativeObservation::Held;
+                    }
+                    self.out.push(Output::Dnd(DndCmd::ResumeSource {
+                        id,
+                        epoch,
+                        at: self.pointer.as_ref().map(|p| p.local),
+                    }));
+                    return;
+                }
                 if self.dnd.sources.get(&offer).is_some_and(|s| s.exported) {
                     self.dnd_integrity_end(offer, IntegrityOutcome::Cancelled);
                     self.dnd.sources.remove(&offer);
@@ -2013,7 +2247,13 @@ impl Router {
     }
 
     fn dnd_cancel_hosting(&mut self) {
-        let State::Hosting { id, input, .. } = std::mem::take(&mut self.dnd.state) else {
+        let State::Hosting {
+            id,
+            input,
+            begin_failed,
+            ..
+        } = std::mem::take(&mut self.dnd.state)
+        else {
             return;
         };
         let holder = self.dnd.target.take().map_or(
@@ -2029,11 +2269,13 @@ impl Router {
         let physical = input == self.me() && self.buttons.contains_key(&MouseButton::Left);
         self.release_button_silently(input, MouseButton::Left);
         self.dnd_retire_preparation(id.origin);
-        self.out.push(Output::Dnd(DndCmd::Cancel {
-            id,
-            epoch: holder.epoch,
-            physical,
-        }));
+        if !begin_failed {
+            self.out.push(Output::Dnd(DndCmd::Cancel {
+                id,
+                epoch: holder.epoch,
+                physical,
+            }));
+        }
         self.dnd_notify_source_at(id, holder, SourceAction::Cancel);
     }
 
@@ -2345,6 +2587,7 @@ mod connection_tests {
                 }
             };
             let hosted = || State::Hosting {
+                begin_failed: false,
                 id: ClipId {
                     origin: peer,
                     seq: DND_SEQ_BIT | 1,
@@ -2382,7 +2625,14 @@ mod connection_tests {
             motion(&mut r, 0., 10., Point::new(420., 600.), 6);
             assert!(matches!(r.dnd.state, State::Hosting { push: Some(_), .. }));
             motion(&mut r, 0., -1., Point::new(420., 599.), 7);
-            assert!(matches!(r.dnd.state, State::Hosting { push: None, .. }));
+            assert!(matches!(
+                r.dnd.state,
+                State::Hosting {
+                    begin_failed: false,
+                    push: None,
+                    ..
+                }
+            ));
         }
     }
 
@@ -2584,6 +2834,7 @@ mod connection_tests {
                         id,
                         input,
                         items: vec![ClipData::Text("drag".into())],
+                        begin_failed: false,
                         push: None,
                     };
                 }
@@ -2686,6 +2937,8 @@ mod connection_tests {
                 r.on_dnd_notice(peer, offered(&r, id, 2, peer, items.clone()), false, 3);
             }
             assert!(!r.out.iter().any(|o| matches!(o, Output::Dnd(DndCmd::Begin { .. }))));
+            let arrived = std::time::Instant::now() - std::time::Duration::from_millis(25);
+            r.observe_dnd_focus_entry(peer, 2, arrived);
             r.test_message(
                 peer,
                 Message::Control(crate::control::ControlMsg::FocusEnter {
@@ -2725,7 +2978,7 @@ mod connection_tests {
             assert!(
                 r.out
                     .iter()
-                    .any(|o| matches!(o, Output::Dnd(DndCmd::Begin { at, .. }) if *at == expected))
+                    .any(|o| matches!(o, Output::Dnd(DndCmd::Begin { at, grant, .. }) if *at == expected && grant.entered_at() == Some(arrived)))
             );
         }
     }
@@ -2819,6 +3072,466 @@ mod connection_tests {
     fn preview_wait() -> (Router, DeviceId, ClipId) {
         target_setup(false)
     }
+
+    fn lock_drag_pair() -> (Router, Router) {
+        use oink_foundation::{Rect, display::DisplayInfo};
+        let a = DeviceId([1; 32]);
+        let b = DeviceId([2; 32]);
+        let bounds = Rect::new(0., 0., 1000., 600.);
+        let mut layout = crate::SimpleLayout::new();
+        for (i, device) in [a, b].into_iter().enumerate() {
+            layout.add_screen(
+                crate::ScreenId::new(device, "screen"),
+                bounds,
+                Rect::new(i as f64, 0., 1., 0.6),
+            );
+        }
+        let layout = Arc::new(layout);
+        let mut routers = [a, b].map(|device| {
+            let mut r = Router::new(
+                RouterConfig::new(
+                    oink_foundation::session::Boot {
+                        device_id: device,
+                        nonce: [device.0[0]; 16],
+                    },
+                    "device",
+                    if device == a { Os::MacOS } else { Os::Windows },
+                ),
+                layout.clone(),
+            );
+            r.set_local_displays(vec![DisplayInfo {
+                key: "screen".into(),
+                name: String::new(),
+                bounds,
+                pixel_width: 1000,
+                pixel_height: 600,
+                reference_extent: None,
+                rotation_deg: 0,
+                is_primary: true,
+                is_builtin: false,
+                is_virtual: false,
+            }]);
+            r.set_dnd_available(true);
+            r.set_hotkeys(vec![crate::hotkey::HotkeyBinding {
+                action: "lock_escape".into(),
+                chord: crate::hotkey::Chord {
+                    mods: crate::hotkey::Mods::NONE,
+                    key: oink_foundation::input::KeyCode::LEFT_ALT,
+                },
+            }]);
+            r
+        });
+        for i in 0..2 {
+            let peer = [b, a][i];
+            routers[i].test_message(peer, Message::Dnd(DndMsg::Caps { enabled: true }), 1);
+            routers[i].peers.get_mut(&peer).unwrap().focus_ready = true;
+        }
+        let [mut a, mut b] = routers;
+        a.reclaim_focus(None);
+        exchange_drag_messages(&mut a, &mut b);
+        (a, b)
+    }
+
+    fn exchange_drag_messages(a: &mut Router, b: &mut Router) -> Vec<DndCmd> {
+        let mut commands = Vec::new();
+        for _ in 0..8 {
+            for reverse in [false, true] {
+                let (from, to) = if reverse {
+                    (&mut *b, &mut *a)
+                } else {
+                    (&mut *a, &mut *b)
+                };
+                for output in from.drain_outputs() {
+                    match output {
+                        Output::Send { to: target, msg, .. } if target == to.me() => {
+                            to.input_message(from.me(), msg, 10);
+                        }
+                        Output::Dnd(cmd) => commands.push(cmd),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        commands
+    }
+
+    fn native_drag_at_edge(r: &mut Router, dx: f64) -> ClipId {
+        let at = Point::new(if dx > 0. { 999. } else { 0. }, 300.);
+        r.set_cursor(at);
+        assert_eq!(r.local_button(MouseButton::Left, true), super::super::Disposition::Pass);
+        r.local_motion(dx, 0., Some(at), 20);
+        let id = ClipId {
+            origin: r.me(),
+            seq: DND_SEQ_BIT | 42,
+        };
+        r.on_dnd_event(DndEvent::Detected {
+            id,
+            items: vec![ClipData::Text("drag".into())],
+        });
+        id
+    }
+
+    #[test]
+    fn drag_entry_restores_target_lock_without_cancelling_source_or_host() {
+        for gossip_first in [false, true] {
+            let (mut a, mut b) = lock_drag_pair();
+            a.move_pointer_to(b.me()).unwrap();
+            exchange_drag_messages(&mut a, &mut b);
+            b.set_locked(true);
+            exchange_drag_messages(&mut a, &mut b);
+            b.move_pointer_to(a.me()).unwrap();
+            exchange_drag_messages(&mut a, &mut b);
+            assert!(b.owner_pointer_locked && !a.locked());
+            let id = native_drag_at_edge(&mut a, 100.);
+            assert!(matches!(a.dnd.state, State::Leaving { native: true, .. }));
+            a.on_dnd_event(DndEvent::SourceHeld {
+                id,
+                epoch: a.epoch,
+                ok: true,
+            });
+            if gossip_first {
+                b.input_message(
+                    a.me(),
+                    Message::Control(crate::control::ControlMsg::FocusState {
+                        lock_state: None,
+                        epoch: a.epoch,
+                        holder: b.me(),
+                        scope: a.focus_scope.clone(),
+                        session: Some(a.session),
+                    }),
+                    10,
+                );
+            }
+            let commands = exchange_drag_messages(&mut a, &mut b);
+            assert!(
+                commands
+                    .iter()
+                    .any(|c| matches!(c, DndCmd::Begin { id: active, .. } if *active == id)),
+                "restoring the target lock must start the incoming native host"
+            );
+            assert!(matches!(b.dnd.state, State::Hosting { id: active, .. } if active == id));
+            assert_eq!(a.dnd.sources[&Router::dnd_offer(id)].phase, source::Phase::Held);
+            assert!(
+                !commands
+                    .iter()
+                    .any(|c| matches!(c, DndCmd::FinishSource { accept: false, .. } | DndCmd::Cancel { .. }))
+            );
+            assert_eq!(a.locked_device(), Some(b.me()));
+            assert!(b.leave_blocked());
+        }
+    }
+
+    #[test]
+    fn locked_windows_native_drag_exits_only_while_escape_is_held() {
+        for (escape, remote_keyboard) in [(false, false), (true, false), (true, true)] {
+            let (mut a, mut b) = lock_drag_pair();
+            a.move_pointer_to(b.me()).unwrap();
+            exchange_drag_messages(&mut a, &mut b);
+            b.set_locked(true);
+            exchange_drag_messages(&mut a, &mut b);
+            if escape {
+                let keyboard = if remote_keyboard { &mut a } else { &mut b };
+                keyboard.on_local_event(
+                    &oink_foundation::input::CapturedEvent {
+                        event: oink_foundation::input::InputEvent::Key {
+                            code: oink_foundation::input::KeyCode::RIGHT_ALT,
+                            pressed: true,
+                        },
+                        cursor: None,
+                        physical: true,
+                        source: oink_foundation::input::SourceKind::Keyboard,
+                        time_us: 15,
+                    },
+                    15,
+                );
+                exchange_drag_messages(&mut a, &mut b);
+                assert!(b.pointer_lock_escape_held());
+            }
+            let id = native_drag_at_edge(&mut b, -100.);
+            if escape {
+                assert!(
+                    matches!(b.dnd.state, State::Leaving { native: true, .. }),
+                    "escape must open the drag gate as well as the ordinary pointer gate"
+                );
+                b.on_dnd_event(DndEvent::SourceHeld {
+                    id,
+                    epoch: b.epoch,
+                    ok: true,
+                });
+                let commands = exchange_drag_messages(&mut a, &mut b);
+                assert!(
+                    commands
+                        .iter()
+                        .any(|c| matches!(c, DndCmd::Begin { id: active, .. } if *active == id))
+                );
+                assert_eq!(a.holder, a.me());
+                assert!(b.owner_pointer_locked && !a.locked());
+                assert_eq!(b.dnd.sources[&Router::dnd_offer(id)].phase, source::Phase::Held);
+                assert!(
+                    !commands
+                        .iter()
+                        .any(|c| matches!(c, DndCmd::FinishSource { accept: false, .. }))
+                );
+            } else {
+                assert!(matches!(b.dnd.state, State::Idle));
+                assert!(!b.out.iter().any(|o| matches!(o, Output::Dnd(_))));
+                assert_eq!(
+                    b.local_button(MouseButton::Left, false),
+                    super::super::Disposition::Pass
+                );
+                assert_eq!(b.holder, b.me());
+            }
+        }
+    }
+
+    #[test]
+    fn refused_native_handoff_resumes_source_and_keeps_local_drop() {
+        for refusal in [0, 1, 2] {
+            let (mut a, mut b) = lock_drag_pair();
+            if refusal == 2 {
+                a.move_pointer_to(b.me()).unwrap();
+                exchange_drag_messages(&mut a, &mut b);
+                b.set_locked(true);
+                exchange_drag_messages(&mut a, &mut b);
+                b.lock_escape_keys.insert(oink_foundation::input::KeyCode::LEFT_ALT);
+                std::mem::swap(&mut a, &mut b);
+            }
+            let id = native_drag_at_edge(&mut a, if refusal == 2 { -100. } else { 100. });
+            assert!(matches!(a.dnd.state, State::Leaving { native: true, .. }));
+            let epoch = a.epoch;
+            match refusal {
+                0 => a.set_locked(true),
+                1 => a.peers.get_mut(&b.me()).unwrap().focus_ready = false,
+                _ => a.lock_escape_keys.clear(),
+            }
+            a.out.clear();
+            a.on_dnd_event(DndEvent::SourceHeld { id, epoch, ok: true });
+            assert_eq!(a.holder, a.me());
+            assert!(
+                a.out
+                    .iter()
+                    .any(|o| matches!(o, Output::Dnd(DndCmd::ResumeSource { id: active, .. }) if *active == id)),
+                "a refused crossing must resume the same native session"
+            );
+            assert!(
+                !a.out
+                    .iter()
+                    .any(|o| matches!(o, Output::Dnd(DndCmd::FinishSource { .. })))
+            );
+            a.on_dnd_event(DndEvent::SourceResumed { id, epoch });
+            assert_eq!(
+                a.local_button(MouseButton::Left, false),
+                super::super::Disposition::Pass,
+                "the original UP must reach the local application"
+            );
+        }
+    }
+
+    fn native_return_setup(local_input: bool) -> (Router, DeviceId, ClipId) {
+        let (mut r, peer, _) = target_setup(false);
+        let me = r.me();
+        let input = if local_input { me } else { peer };
+        let id = ClipId {
+            origin: me,
+            seq: DND_SEQ_BIT | 9,
+        };
+        let offer = Router::dnd_offer(id);
+        let source = source::Source::new(
+            offer,
+            input,
+            Holder {
+                device: me,
+                epoch: r.epoch,
+            },
+        );
+        let key = source.key();
+        r.dnd.sources.insert(offer, source);
+        r.dnd.native_source = Some(offer);
+        r.dnd.pending = Some(PendingEnter {
+            from: peer,
+            id,
+            epoch: r.epoch,
+            input,
+            items: Vec::new(),
+            image: None,
+            preview_ready: true,
+            preview_binding: None,
+            retained_inventory: None,
+            incomplete: false,
+            focus_entered: false,
+            entered_at: None,
+            entered_instant: None,
+            grant: Some((key, 1, 1)),
+        });
+        r.dnd_take_source_press(offer, input);
+        (r, input, id)
+    }
+
+    #[test]
+    fn recross_during_native_return_starts_a_probe_without_releasing_the_original_press() {
+        let (mut r, input, id) = native_return_setup(false);
+        let me = r.me();
+        let epoch = r.epoch;
+        let offer = Router::dnd_offer(id);
+        r.dnd.state = State::Idle;
+        r.peers.get_mut(&input).unwrap().focus_ready = true;
+        r.dnd.peers.insert(input);
+        let bounds = oink_foundation::Rect::new(0., 0., 1000., 600.);
+        let mut layout = crate::SimpleLayout::new();
+        layout.add_screen(crate::layout::ScreenId::new(me, "screen"), bounds, bounds);
+        layout.add_screen(
+            crate::layout::ScreenId::new(input, "screen"),
+            bounds,
+            oink_foundation::Rect::new(1000., 0., 1000., 600.),
+        );
+        r.layout = Arc::new(layout);
+        r.displays = vec![oink_foundation::display::DisplayInfo {
+            key: "screen".into(),
+            name: "screen".into(),
+            bounds: oink_foundation::Rect::new(0., 0., 1000., 600.),
+            pixel_width: 1000,
+            pixel_height: 600,
+            reference_extent: None,
+            rotation_deg: 0,
+            is_primary: true,
+            is_builtin: false,
+            is_virtual: false,
+        }];
+        r.dnd_focus_entered(input, epoch, Point::new(999., 300.));
+        r.pointer = Some(crate::layout::ScreenPos::new(
+            crate::layout::ScreenId::new(me, "screen"),
+            Point::new(999., 300.),
+        ));
+        r.out.clear();
+        // The source's Resume callback is still blocked. Deliver the next
+        // outward movement before its SourceResumed completion, deterministically.
+        r.remote_motion(input, 1000., 0., 10);
+        assert_eq!(
+            r.holder, me,
+            "the held native drag cannot become an ordinary focus handoff"
+        );
+        assert!(
+            r.out.iter().any(|o| matches!(o, Output::Dnd(DndCmd::Probe { .. }))),
+            "outputs={:?}; state={}; ready={}; holder={:?}",
+            r.out,
+            r.dnd_state_name(),
+            r.input_ready(input),
+            r.holder,
+        );
+        assert_eq!(
+            r.dnd.presses[&offer].disposition(),
+            SourceButtonDisposition::OriginalSourceOwns
+        );
+        assert!(
+            !r.held
+                .get(&input)
+                .is_some_and(|h| h.buttons.contains(&MouseButton::Left))
+        );
+        r.on_dnd_event(DndEvent::SourceResumed { id, epoch });
+        assert!(matches!(r.dnd.state, State::Probing { .. }));
+        assert!(
+            r.held
+                .get(&input)
+                .is_some_and(|h| h.buttons.contains(&MouseButton::Left))
+        );
+    }
+
+    #[test]
+    fn native_source_return_uses_the_logical_arrival_point() {
+        let (mut r, peer, id) = native_return_setup(false);
+        // Native placement is not a router origin; even a stale pointer sample
+        // cannot replace the topology's exact arrival supplied to this action.
+        if let Some(pointer) = &mut r.pointer {
+            pointer.local = Point::new(800., 500.);
+        }
+        let logical = Point::new(-400., 0.);
+        r.out.clear();
+        r.dnd_focus_entered(peer, r.epoch, logical);
+        assert!(r.out.iter().any(|output| matches!(
+            output,
+            Output::Dnd(DndCmd::ResumeSource { id: found, at: Some(at), .. })
+                if *found == id && *at == logical
+        )));
+    }
+    #[test]
+    fn native_return_keeps_up_withheld_until_the_last_dragged_event_is_done() {
+        for local_input in [false, true] {
+            for up_first in [false, true] {
+                for failed in [false, true] {
+                    let (mut r, input, id) = native_return_setup(local_input);
+                    let offer = Router::dnd_offer(id);
+                    let epoch = r.epoch;
+                    r.out.clear();
+                    let from = r.dnd.pending.as_ref().unwrap().from;
+                    r.dnd_focus_entered(from, epoch, Point::new(5., 6.));
+                    assert_eq!(
+                        r.dnd.presses[&offer].disposition(),
+                        SourceButtonDisposition::OriginalSourceOwns
+                    );
+                    assert!(
+                        !r.held
+                            .get(&input)
+                            .is_some_and(|held| held.buttons.contains(&MouseButton::Left))
+                    );
+                    if up_first {
+                        assert!(
+                            r.dnd_original_up(input),
+                            "UP must not enter the ordinary injection queue during return"
+                        );
+                    }
+                    r.out.clear();
+                    let result = if failed {
+                        DndEvent::SourceEffectFailed {
+                            id,
+                            epoch,
+                            effect: DndSourceEffect::Resume,
+                        }
+                    } else {
+                        DndEvent::SourceResumed { id, epoch }
+                    };
+                    r.on_dnd_event(result.clone());
+                    if up_first {
+                        assert_eq!(
+                            r.out
+                                .iter()
+                                .filter(|o| matches!(o,
+                        Output::Dnd(DndCmd::ReleaseSourceButton { id: found, .. }) if *found == id))
+                                .count(),
+                            1
+                        );
+                    } else {
+                        if local_input {
+                            assert_eq!(r.buttons.get(&MouseButton::Left), Some(&Target::Local));
+                        } else {
+                            assert!(
+                                r.held
+                                    .get(&input)
+                                    .is_some_and(|held| held.buttons.contains(&MouseButton::Left))
+                            );
+                        }
+                        assert!(
+                            !r.dnd_original_up(input),
+                            "normal route delivers the future original UP"
+                        );
+                    }
+                    if up_first {
+                        assert!(!r.dnd.sources.contains_key(&offer));
+                        assert_ne!(r.dnd.native_source, Some(offer));
+                        r.on_dnd_event(DndEvent::SourceButtonReleased { id, ok: true });
+                        assert!(!r.dnd.presses.contains_key(&offer));
+                    }
+                    r.out.clear();
+                    r.on_dnd_event(result);
+                    assert!(
+                        !r.out
+                            .iter()
+                            .any(|o| matches!(o, Output::Dnd(DndCmd::ReleaseSourceButton { .. })))
+                    );
+                }
+            }
+        }
+    }
+
     fn metadata_wait() -> (Router, DeviceId, ClipId) {
         target_setup(true)
     }
@@ -2845,6 +3558,41 @@ mod connection_tests {
         enter_target(&mut r, peer, id, 2, 2, incomplete);
         r.out.clear();
         (r, peer, id)
+    }
+
+    #[test]
+    fn automatic_pointer_capture_cannot_cancel_pending_or_hosted_drag() {
+        use crate::{GameMode, PointerCaptureObservation};
+        for incomplete in [false, true] {
+            for os in [Os::Windows, Os::MacOS] {
+                let (mut r, _, _) = target_setup(incomplete);
+                r.cfg.os = os;
+                let state = r.dnd_state_name();
+                assert!(r.dnd_pointer_active());
+                let hidden = PointerCaptureObservation {
+                    hidden: true,
+                    application_hidden: Some(true),
+                    foreground: 1,
+                };
+                // Repeated hidden/moving samples from native drag artwork
+                // must not acquire relative-input authority or cancel OLE.
+                for now in [0, 100_000, 1_000_000, 2_000_000] {
+                    r.observe_pointer_capture(Some(hidden), true, now);
+                    assert!(!r.game_mode().active);
+                    assert_eq!(r.dnd_state_name(), state);
+                    assert!(!r.out.iter().any(|o| matches!(o, Output::Dnd(DndCmd::Cancel { .. }))));
+                }
+                // Manual policy is still allowed to end a drag.
+                r.set_game_mode(GameMode::On);
+                assert!(r.game_mode().active);
+                assert!(!r.dnd_pointer_active());
+                r.set_game_mode(GameMode::Auto);
+                assert!(!r.game_mode().active);
+                // Fresh evidence after the drag must still detect a game.
+                r.observe_pointer_capture(Some(hidden), true, 3_000_000);
+                assert!(r.game_mode().active);
+            }
+        }
     }
 
     #[test]
@@ -3123,8 +3871,8 @@ mod connection_tests {
     }
 
     #[test]
-    fn file_url_preparation_ends_on_up_escape_leave_or_failure_and_cancels_the_source_once() {
-        for ending in 0..4 {
+    fn file_url_preparation_ends_on_up_escape_or_leave_and_cancels_the_source_once() {
+        for ending in 0..3 {
             let (mut r, peer, id) = preview_wait();
             r.test_message(
                 peer,
@@ -3143,15 +3891,11 @@ mod connection_tests {
                 1 => {
                     r.dnd_escape(peer);
                 }
-                2 => r.dnd_focus_left(),
-                _ => {} // manager failure/watchdog while still holding Left
+                _ => r.dnd_focus_left(),
             }
-            if ending != 3 {
-                assert_eq!(r.dnd_host_pending(), None);
-            }
-            // Failed Begin uses the existing host result, never the pre-Enter
-            // pending-entry cancellation path. This delivers Cancel to the held
-            // native source even if the target native session never existed.
+            assert_eq!(r.dnd_host_pending(), None);
+            // A terminal user action still cancels the held source once, even
+            // if its delayed backend completion arrives twice.
             r.on_dnd_event(DndEvent::Ended {
                 id,
                 epoch: 2,
@@ -3173,6 +3917,130 @@ mod connection_tests {
                 1
             );
             assert!(!r.out.iter().any(|o| matches!(o, Output::Dnd(DndCmd::Begin { .. }))));
+        }
+    }
+
+    #[test]
+    fn failed_begin_preserves_source_until_return_or_real_terminal_action() {
+        for ending in 0..5 {
+            let (mut r, peer, id) = preview_wait();
+            r.on_dnd_event(DndEvent::BeginFailed { id, epoch: 1 });
+            assert!(matches!(
+                r.dnd.state,
+                State::Hosting {
+                    begin_failed: false,
+                    ..
+                }
+            ));
+            r.on_dnd_event(DndEvent::BeginFailed { id, epoch: 2 });
+            r.on_dnd_event(DndEvent::BeginFailed { id, epoch: 2 });
+            r.on_dnd_event(DndEvent::Ended {
+                id,
+                epoch: 2,
+                dropped: false,
+            });
+            assert!(matches!(r.dnd.state, State::Hosting { begin_failed: true, .. }));
+            assert!(r.dnd.target.is_none());
+            assert!(!r.out.iter().any(|o| matches!(
+                o,
+                Output::Send {
+                    msg: Message::Dnd(DndMsg::Source {
+                        action: SourceAction::Cancel,
+                        ..
+                    }),
+                    ..
+                }
+            )));
+            r.out.clear();
+            match ending {
+                0 => {
+                    r.on_dnd_msg(peer, DndMsg::Caps { enabled: true });
+                    r.peers.get_mut(&peer).unwrap().focus_ready = true;
+                    let gesture = EdgeGesture::fixture(r.me(), peer, Point::new(1., 1.), (1., 0.), 0.);
+                    if let State::Hosting { push, .. } = &mut r.dnd.state {
+                        *push = Some(gesture);
+                    }
+                    r.dnd_leave(false);
+                    assert!(r.out.iter().any(|o| matches!(o, Output::Send { msg: Message::Dnd(DndMsg::Source { action: SourceAction::Handoff { next }, .. }), .. } if next.device == peer)));
+                    assert!(!r.out.iter().any(|o| matches!(
+                        o,
+                        Output::Send {
+                            msg: Message::Dnd(DndMsg::Source {
+                                action: SourceAction::Cancel,
+                                ..
+                            }),
+                            ..
+                        }
+                    )));
+                }
+                1 => r.dnd_left_released(peer),
+                2 => release_notice(&mut r, peer, id, 2, 5),
+                3 => {
+                    r.dnd_escape(peer);
+                }
+                _ => r.dnd_focus_left(),
+            }
+            if ending != 0 {
+                assert_eq!(
+                    r.out
+                        .iter()
+                        .filter(|o| matches!(
+                            o,
+                            Output::Send {
+                                msg: Message::Dnd(DndMsg::Source {
+                                    action: SourceAction::Cancel,
+                                    ..
+                                }),
+                                ..
+                            }
+                        ))
+                        .count(),
+                    1
+                );
+            }
+            assert!(
+                !r.out
+                    .iter()
+                    .any(|o| matches!(o, Output::Dnd(DndCmd::LeaveHost { .. } | DndCmd::Cancel { .. })))
+            );
+        }
+    }
+
+    #[test]
+    fn failed_begin_after_release_cancels_source_once() {
+        for focus_returned in [false, true] {
+            for down_submitted in [false, true] {
+                let (mut r, peer, id) = preview_wait();
+                if down_submitted {
+                    let grant = r.dnd.target.as_ref().unwrap();
+                    assert!(grant.claim_down());
+                    grant.down_submitted(true);
+                }
+                release_notice(&mut r, peer, id, 2, 5);
+                r.out.clear();
+                if focus_returned {
+                    r.become_source(3, peer);
+                }
+                r.on_dnd_event(DndEvent::BeginFailed { id, epoch: 2 });
+                r.on_dnd_event(DndEvent::BeginFailed { id, epoch: 2 });
+                assert_eq!(r.dnd_state_name(), "idle");
+                assert_eq!(
+                    r.out
+                        .iter()
+                        .filter(|o| matches!(
+                            o,
+                            Output::Send {
+                                msg: Message::Dnd(DndMsg::Source {
+                                    action: SourceAction::Cancel,
+                                    ..
+                                }),
+                                ..
+                            }
+                        ))
+                        .count(),
+                    1
+                );
+            }
         }
     }
 
@@ -3450,6 +4318,27 @@ mod connection_tests {
             r.out.iter().any(|o| matches!(o, Output::Dnd(DndCmd::Begin { .. }))),
             !incomplete
         );
+    }
+
+    #[test]
+    fn target_metadata_preparation_expires_three_seconds_after_focus_enter() {
+        let (mut r, peer, id) = metadata_wait();
+        let entered = r.dnd.now;
+        r.out.clear();
+        r.tick(entered + 2_999_999);
+        assert!(r.dnd.pending.is_some());
+        r.tick(entered + 3_000_000);
+        assert!(
+            r.dnd.pending.is_none(),
+            "target metadata exceeded the explicit 3s preparation budget"
+        );
+        r.on_dnd_notice(
+            peer,
+            offered(&r, id, 2, peer, vec![ClipData::Text("late".into())]),
+            false,
+            entered + 3_000_001,
+        );
+        assert!(!r.out.iter().any(|o| matches!(o, Output::Dnd(DndCmd::Begin { .. }))));
     }
 
     #[test]

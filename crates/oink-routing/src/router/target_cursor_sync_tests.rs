@@ -359,7 +359,7 @@ fn current_s2_bottom_diagonal_slide_preserves_normal_pressure_and_landing_x() {
 }
 
 #[test]
-fn current_s2_bottom_known_full_screen_and_desktop_clips_block_crossing() {
+fn current_s2_bottom_exact_windows_monitor_clip_is_not_confinement() {
     for os in [Os::MacOS, Os::Windows] {
         for clip in [
             Rect::new(1576., -1080., 1920., 1080.),
@@ -367,16 +367,20 @@ fn current_s2_bottom_known_full_screen_and_desktop_clips_block_crossing() {
         ] {
             let mut r = current_s2_bottom();
             r.cfg.os = os;
+            let no_inset = os == Os::Windows && clip == Rect::new(1576., -1080., 1920., 1080.);
             for i in 1..=200 {
                 r.reconcile_target_snapshot(Some(Point::new(2500., -1.)), Some(Some(clip)));
                 r.remote_motion(SOURCE, 0.0006, 0.003, i * 8_000);
+                if r.focus().holder == SOURCE {
+                    break;
+                }
             }
             assert_eq!(
                 r.focus().holder,
-                ME,
-                "known active {os:?} clip must block even when it covers the entire desktop"
+                if no_inset { SOURCE } else { ME },
+                "only an exact Windows monitor rectangle has no confinement inset"
             );
-            assert!(r.system_clip_active());
+            assert_eq!(r.system_clip_active(), !no_inset);
         }
     }
 }

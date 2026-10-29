@@ -2,7 +2,7 @@
 use super::*;
 #[derive(Default)]
 pub(super) struct CursorClip {
-    rect: Option<Rect>,
+    pub(super) rect: Option<Rect>,
     suppressed: u64,
     recheck_local: bool,
     checked: bool,
@@ -81,7 +81,7 @@ impl Router {
 
     /// A fresh target-side observation. Only Windows exposes this constraint;
     /// the backend has already excluded its explicitly owned source clip.
-    fn update_system_cursor_clip(&mut self, clip: Option<Rect>) {
+    pub(super) fn update_system_cursor_clip(&mut self, clip: Option<Rect>) {
         let clip = clip.filter(|r| {
             [r.x, r.y, r.w, r.h, r.right(), r.bottom()]
                 .into_iter()
@@ -102,6 +102,11 @@ impl Router {
     pub fn reconcile_target_snapshot(&mut self, position: Option<Point>, clip: Option<Option<Rect>>) {
         if let Some(clip) = clip {
             self.update_system_cursor_clip(clip);
+        }
+        if self.game_mode().active {
+            self.reconcile_game_escape_snapshot(self.last_pointer_source.unwrap_or(self.me()), position, None);
+            self.clamp_system_cursor_clip();
+            return;
         }
         if let Some(position) = position {
             self.reconcile_target_cursor(position);
@@ -128,7 +133,28 @@ impl Router {
         (self.cursor_clip.rect, self.cursor_clip.suppressed)
     }
     pub(super) fn system_clip_active(&self) -> bool {
-        self.holder == self.me() && !self.paused && self.cursor_clip.rect.is_some()
+        self.holder == self.me()
+            && !self.paused
+            && self.cursor_clip.rect.is_some_and(|clip| {
+                // An exact monitor rectangle has no inset. It must not disable that
+                // monitor's external Oink channels merely because Windows reports it.
+                self.cfg.os != Os::Windows
+                    || !self
+                        .pointer
+                        .as_ref()
+                        .and_then(|p| self.displays.iter().find(|d| d.key == p.screen.display))
+                        .is_some_and(|d| d.bounds == clip)
+            })
+    }
+    pub(super) fn system_clip_blocks_exit(&self) -> bool {
+        self.system_clip_active()
+            && !(self.cfg.os == Os::Windows
+                && self.pointer_lock_escape_held()
+                && self
+                    .pointer
+                    .as_ref()
+                    .and_then(|p| self.displays.iter().find(|d| d.key == p.screen.display))
+                    .is_some_and(|d| self.cursor_clip.rect.is_some_and(|clip| passive_clip(clip, d.bounds))))
     }
     pub(super) fn system_clip_position(&self, p: Point) -> Option<ScreenPos> {
         if !self.system_clip_active() {
@@ -161,9 +187,13 @@ impl Router {
         dx: f64,
         dy: f64,
         delta: (f64, f64),
+        now: Micros,
     ) -> bool {
         if !self.system_clip_active() {
             return false;
+        }
+        if self.escape_cursor_motion(origin, from, delta, now) {
+            return true;
         }
         if self.layout.step_from_source(from, (dx, dy), origin).to.screen.device != self.me() {
             self.cursor_clip.suppressed = self.cursor_clip.suppressed.saturating_add(1);
@@ -181,9 +211,14 @@ impl Router {
         self.dnd_off_edge();
         true
     }
-    pub(super) fn system_clip_local_motion(&mut self, dx: f64, dy: f64, cursor: Option<Point>) -> bool {
+    pub(super) fn system_clip_local_motion(&mut self, dx: f64, dy: f64, cursor: Option<Point>, now: Micros) -> bool {
         if !self.system_clip_active() {
             return false;
+        }
+        if let Some(actual) = cursor.and_then(|p| self.system_clip_position(p))
+            && self.escape_cursor_motion(self.me(), &actual, (dx, dy), now)
+        {
+            return true;
         }
         if let Some(from) = self.pointer.as_ref()
             && self
@@ -224,4 +259,23 @@ impl Router {
         }
         self.out = outputs;
     }
+}
+
+/// Windows games (including VALORANT / Unreal menus) can show the system
+/// cursor while ClipCursor uses a one-pixel inset, e.g. (1,1)-(3839,2159)
+/// on 3840x2160. Those pixels make Oink's real screen edge unreachable.
+/// Accept only 0..=2 physical pixels on EVERY side, with at least one inset:
+/// all-zero means no clip, while larger insets are intentional confinement.
+/// Compare raw half-open PMv2 rectangles against EACH monitor's DisplayInfo
+/// bounds, including negative origins, never against the group canvas or an
+/// intersection. A clip spanning monitors has a negative gap on each candidate
+/// and stays ordinary confinement; we must not manufacture passive internal seams.
+pub(super) fn passive_clip(clip: Rect, bounds: Rect) -> bool {
+    let gaps = [
+        clip.x - bounds.x,
+        clip.y - bounds.y,
+        bounds.right() - clip.right(),
+        bounds.bottom() - clip.bottom(),
+    ];
+    clip.w >= 1. && clip.h >= 1. && gaps.iter().all(|gap| (0. ..=2.).contains(gap)) && gaps.iter().any(|gap| *gap > 0.)
 }

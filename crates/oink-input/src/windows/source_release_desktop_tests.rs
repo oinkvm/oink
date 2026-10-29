@@ -59,11 +59,11 @@ fn pump_until(ready: impl Fn() -> bool) {
 }
 
 #[test]
-#[ignore = "requires device-test lock and an interactive Windows desktop"]
+#[ignore = "requires a reserved interactive Windows desktop"]
 fn source_up_returns_to_recorded_start_after_cursor_moves_to_another_window() {
     assert!(
         std::env::var_os("OINK_OWNED_WINDOW_TEST").is_some(),
-        "run through the device-test wrapper"
+        "set OINK_OWNED_WINDOW_TEST on a reserved desktop"
     );
     let _dpi = dpi::ThreadDpiGuard::per_monitor_v2();
     let input = WinInput::default();

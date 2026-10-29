@@ -9,8 +9,10 @@ use std::{
 };
 
 unsafe extern "C" {
+    fn oink_audio_endpoint_exists(uid: *const c_char, error: *mut c_char, capacity: usize) -> i32;
     fn oink_audio_endpoint_open(uid: *const c_char, error: *mut c_char, capacity: usize) -> *mut c_void;
     fn oink_audio_endpoint_close(observer: *mut c_void);
+    fn oink_audio_endpoint_on_change(observer: *mut c_void, wake: extern "C" fn(*mut c_void), context: *mut c_void);
     fn oink_audio_endpoint_read(
         observer: *mut c_void,
         volume: *mut f32,
@@ -52,6 +54,7 @@ impl Drop for SystemLock {
 struct Observer {
     raw: *mut c_void,
     uid: String,
+    _owner: Box<std::thread::Thread>,
 }
 impl Observer {
     fn new(uid: &str) -> Result<Self, String> {
@@ -63,7 +66,18 @@ impl Observer {
         if raw.is_null() {
             return Err(message(&error));
         }
-        Ok(Self { raw, uid: uid.into() })
+        let mut owner = Box::new(std::thread::current());
+        extern "C" fn wake(context: *mut c_void) {
+            // SAFETY: Observer retains the boxed thread until native close drains callbacks.
+            unsafe { &*context.cast::<std::thread::Thread>() }.unpark();
+        }
+        // SAFETY: stable boxed context outlives the native listener registration.
+        unsafe { oink_audio_endpoint_on_change(raw, wake, (&mut *owner as *mut std::thread::Thread).cast()) };
+        Ok(Self {
+            raw,
+            uid: uid.into(),
+            _owner: owner,
+        })
     }
     fn flags(&self) -> u32 {
         // SAFETY: live handle; only process-local atomics are read.
@@ -135,21 +149,50 @@ impl EndpointBackend for Unavailable {
         false
     }
 }
-fn recover_locked(journal: &mut Journal) -> Result<RecoveryReport, String> {
-    let Some(uid) = journal.endpoint().map(str::to_owned) else {
-        return journal.recover(&Unavailable, true);
-    };
-    if !journal.has_pending_restore() {
-        return journal.recover(&Unavailable, true);
-    }
-    match Observer::new(&uid) {
-        Ok(observer) => journal.recover(&observer, true),
-        Err(error) => {
-            tracing::warn!(%error, "saved source output unavailable; retaining mute recovery journal");
-            journal.recover(&Unavailable, true)
-        }
+fn endpoint_exists(uid: &str) -> Result<bool, String> {
+    let uid = CString::new(uid).map_err(|_| "source output UID contains NUL")?;
+    let mut error = [0 as c_char; 512];
+    // SAFETY: terminated UID and bounded error buffer; no OS mutations.
+    match unsafe { oink_audio_endpoint_exists(uid.as_ptr(), error.as_mut_ptr(), error.len()) } {
+        1 => Ok(true),
+        0 => Ok(false),
+        _ => Err(message(&error)),
     }
 }
+fn recover_locked(journal: &mut Journal) -> Result<RecoveryReport, String> {
+    let mut report = RecoveryReport {
+        outcome: RecoveryOutcome::NothingToRecover,
+        endpoint: None,
+        crash_intent_uncertain: false,
+    };
+    let mut deferred_report = None;
+    for uid in journal.endpoints() {
+        journal.select_endpoint(&uid)?;
+        report = if !journal.has_pending_restore_for(&uid) {
+            journal.recover(&Unavailable, true)?
+        } else {
+            match Observer::new(&uid) {
+                Ok(observer) => journal.recover(&observer, true)?,
+                Err(error) => {
+                    if endpoint_exists(&uid)? {
+                        return Err(error);
+                    }
+                    // CoreAudio does not distinguish unplugged hardware from an
+                    // uninstalled HAL device by UID. Retain its controls for replug,
+                    // independently of a lease on the replacement default output.
+                    tracing::warn!(%error, "saved source output unavailable; deferring mute recovery");
+                    journal.recover(&Unavailable, true)?
+                }
+            }
+        };
+        if report.outcome == RecoveryOutcome::EndpointUnavailable {
+            journal.defer_unavailable()?;
+            deferred_report.get_or_insert(report.clone());
+        }
+    }
+    Ok(deferred_report.unwrap_or(report))
+}
+
 pub fn recover(dir: &Path) -> Result<RecoveryReport, String> {
     let _lock = SystemLock::acquire()?;
     recover_locked(&mut Journal::open(dir)?)
@@ -164,9 +207,7 @@ impl MuteLease {
         let lock = SystemLock::acquire()?;
         let mut journal = Journal::open(dir)?;
         let report = recover_locked(&mut journal)?;
-        if report.outcome == RecoveryOutcome::EndpointUnavailable {
-            return Err("previous muted source output unavailable; recovery journal retained".into());
-        }
+
         if report.crash_intent_uncertain {
             tracing::warn!(
                 ?report,
@@ -177,7 +218,7 @@ impl MuteLease {
             // Failed acquisition already ran its RAII restore. Surface any
             // unresolved durable marker even though no Capture was returned.
             match Journal::open(dir) {
-                Ok(journal) if !journal.has_pending_restore() => error,
+                Ok(journal) if !journal.has_active_pending_restore() => error,
                 _ => format!("capture_mute_release_unconfirmed: {error}"),
             }
         })?;

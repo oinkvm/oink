@@ -1,8 +1,10 @@
 //! Update policy and verification shared by the backend, SYSTEM service and executor.
-//! No production trust-root override, installer commands or user-provided paths.
+//! No production trust-root override or installer commands. Local package paths
+//! require Apple authentication or independently verified Windows elevation.
 pub mod barrier;
 pub mod feed;
 pub mod ipc;
+pub mod local;
 pub mod package;
 pub mod policy;
 pub mod transaction;
@@ -20,6 +22,20 @@ pub const UPDATER_CAPABILITY: u32 = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error)]
 #[serde(rename_all = "snake_case")]
 pub enum Error {
+    #[error("this package is for another product")]
+    WrongProduct,
+    #[error("this package is for another architecture")]
+    WrongArchitecture,
+    #[error("an older version or build cannot be installed")]
+    Downgrade,
+    #[error("the package is damaged or incomplete")]
+    CorruptPackage,
+    #[error("the app is not notarized")]
+    NotNotarized,
+    #[error("the app location cannot be replaced without local authorization")]
+    NotWritable,
+    #[error("Windows elevation was canceled or failed; Oink is still running")]
+    Elevation,
     #[error("invalid update metadata")]
     Metadata,
     #[error("update signature rejected")]
@@ -50,6 +66,10 @@ pub enum Error {
     NotConfigured,
     #[error("network request failed")]
     Network,
+    #[error("package verification timed out; Oink is still running")]
+    VerificationTimeout,
+    #[error("the package could not be read or downloaded from its file provider")]
+    PackageUnavailable,
 }
 
 /// Official packages inject one display version for every executable and receipt.

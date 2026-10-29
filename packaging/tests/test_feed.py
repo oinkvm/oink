@@ -163,6 +163,16 @@ class FeedTests(unittest.TestCase):
 if __name__ == '__main__': unittest.main()
 
 class PublicationTests(FeedTests):
+    def test_windows_bridge_capability_gate_preserves_old_release_records(self):
+        import release
+        for version in ('0.1.0', '0.2.0', '0.2.1', '0.2.2'):
+            self.assertEqual(release.minimum_updater_schema(version), 1)
+        for version in ('0.2.3', '0.3.0', '1.0.0'):
+            self.assertEqual(release.minimum_updater_schema(version), 2)
+        for version in ('garbage', '0.2.2-inhouse.test', '0.3.0-inhouse.44', '0.3.0-inhouse.0f806215', '00.2.2'):
+            with self.assertRaises(ValueError):
+                release.minimum_updater_schema(version)
+
     def test_package_signer_rejects_unapproved_or_changed_artifacts(self):
         import release
         folder = self.state/'input'
@@ -198,6 +208,8 @@ class PublicationTests(FeedTests):
                 after = feed.registry(self.state)['feeds'][EPOCH['epoch']]['stable']
                 self.assertEqual(after['records'], before['records'])
                 self.assertEqual(after['last_allocated'], before['last_allocated'] + 1)
+            self.assertEqual(output['release']['minimumUpdaterSchema'], 2)
+            self.assertEqual(output['schema'], 1)
             self.assertFalse(output['published'])
             self.assertEqual(output['release']['notes'], {'zh-Hans': '测试更新', 'en': 'Test update'})
             feed.verify(raw, output['release']['package']['ed25519'], PUB)

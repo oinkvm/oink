@@ -7,24 +7,28 @@ STRINGS = {
         'CFBundleName': 'Oink',
         'CFBundleDisplayName': 'Oink',
         'NSAudioCaptureUsageDescription': 'Oink shares system audio with your selected devices.',
+        'NSMicrophoneUsageDescription': 'Oink shares your microphone only while another device uses it.',
         'NSLocalNetworkUsageDescription': 'Oink discovers and connects your devices on the local network.',
     },
     'zh-Hans': {
         'CFBundleName': 'Oink',
         'CFBundleDisplayName': 'Oink',
         'NSAudioCaptureUsageDescription': 'Oink 与你选择的设备共享系统音频。',
+        'NSMicrophoneUsageDescription': 'Oink 仅在其他设备使用时共享你的麦克风。',
         'NSLocalNetworkUsageDescription': 'Oink 在局域网中发现并连接你的设备。',
     },
     'ja': {
         'CFBundleName': 'Oink',
         'CFBundleDisplayName': 'Oink',
         'NSAudioCaptureUsageDescription': 'Oink は、選択したデバイスとシステムオーディオを共有します。',
+        'NSMicrophoneUsageDescription': 'Oink は、他のデバイスが使用している間だけマイクを共有します。',
         'NSLocalNetworkUsageDescription': 'Oink は、ローカルネットワーク上のデバイスを検出して接続します。',
     },
     'ko': {
         'CFBundleName': 'Oink',
         'CFBundleDisplayName': 'Oink',
         'NSAudioCaptureUsageDescription': 'Oink는 선택한 기기와 시스템 오디오를 공유합니다.',
+        'NSMicrophoneUsageDescription': 'Oink는 다른 기기가 사용하는 동안에만 마이크를 공유합니다.',
         'NSLocalNetworkUsageDescription': 'Oink는 로컬 네트워크에서 기기를 찾아 연결합니다.',
     },
 }

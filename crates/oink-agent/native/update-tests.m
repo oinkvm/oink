@@ -23,10 +23,20 @@ static void captureCandidate(uint32_t event,uint64_t build,uint64_t size,uint32_
         candidateNotes=[NSString stringWithUTF8String:notes];
     }
 }
+@interface ReplacedUpdateDriver : OinkUpdateDriver
+@end
+@implementation ReplacedUpdateDriver
+- (uint64_t)currentBuild {return 2;}
+@end
 @interface TestUpdateState : NSObject
 @end
 @implementation TestUpdateState
 - (SPUUserUpdateStage)stage {return SPUUserUpdateStageNotDownloaded;}
+@end
+@interface CachedUpdateState : TestUpdateState
+@end
+@implementation CachedUpdateState
+- (SPUUserUpdateStage)stage {return SPUUserUpdateStageInstalling;}
 @end
 @interface TestUpdater : NSObject
 @property BOOL sessionInProgress;
@@ -84,6 +94,21 @@ int main(void) {
         SUAppcastItem *item=[[SUAppcastItem alloc] initWithDictionary:properties];
 #pragma clang diagnostic pop
         assert(item);
+        // A local replacement can leave Sparkle's cached candidate at the
+        // running build. It must be dismissed before publishing availability.
+        ReplacedUpdateDriver *replaced=[ReplacedUpdateDriver new];
+        replaced.callback=captureCandidate;
+        __block int obsoleteReply=-1;
+        [replaced showUpdateFoundWithAppcastItem:item state:(SPUUserUpdateState *)[TestUpdateState new]
+            reply:^(SPUUserUpdateChoice choice) {obsoleteReply=(int)choice;}];
+        assert(obsoleteReply==SPUUserUpdateChoiceDismiss);
+        assert(candidateNotes==nil && replaced.found==nil && replaced.ready==nil && !replaced.armed);
+        obsoleteReply=-1;
+        [replaced showUpdateFoundWithAppcastItem:item state:(SPUUserUpdateState *)[CachedUpdateState new]
+            reply:^(SPUUserUpdateChoice choice) {obsoleteReply=(int)choice;}];
+        assert(obsoleteReply==SPUUserUpdateChoiceDismiss);
+        assert(candidateNotes==nil && replaced.ready==nil && !replaced.armed);
+
         // Fake Sparkle callbacks and a deterministic monotonic clock exercise
         // the production logger, without an updater, download or real install.
         TestUpdater *timingUpdater=[TestUpdater new];

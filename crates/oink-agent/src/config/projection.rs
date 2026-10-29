@@ -48,7 +48,6 @@ pub(super) fn values(settings: &Settings) -> Vec<(LocalOption, RawValue)> {
         ),
         (ClipboardEnabled, settings.clipboard_enabled.write()),
         (ForwardingEnabled, a.forwarding_enabled.write()),
-        (KeyboardDisabled, settings.keyboard_disabled.write()),
         (ScreenShared, settings.screen_shared.write()),
         (
             ScreenPreferences,
@@ -124,7 +123,28 @@ pub(super) fn values(settings: &Settings) -> Vec<(LocalOption, RawValue)> {
             .write(),
         ),
         (AcceptContacts, settings.accept_contacts.write()),
+        (TouchpadInjection, r.touchpad_injection.write()),
+        (NativeMultifinger, r.native_multifinger.write()),
+        (MacScrollFeel, r.mac_scroll_feel.write()),
         (AudioExitClaim, RawValue::Null),
+        (MicrophoneShareClaim, RawValue::Null),
+        (
+            MicrophoneControls,
+            map([
+                (1, settings.microphone.volume_percent.write()),
+                (2, settings.microphone.muted.write()),
+            ]),
+        ),
+        (MicrophoneReceiveMuted, settings.microphone.receive_muted.write()),
+        (
+            MicrophoneInput,
+            settings
+                .microphone
+                .input
+                .as_ref()
+                .map(|v| oink_protocol::v1::schema::Text::<512>(v.clone()))
+                .write(),
+        ),
         (SyncSystemArrangement, settings.sync_system_arrangement.write()),
     ]
 }
@@ -153,6 +173,26 @@ fn keyboard(value: &input::KeyboardMapping) -> RawValue {
     .into();
     if let Some(caps) = value.caps_tap_hold {
         raw.insert(3, map([(1, caps.tap.0.write()), (2, caps.hold.0.write())]));
+    }
+    if let Some(saved) = &value.saved_custom {
+        let mut snapshot: RawMap = [
+            (
+                1,
+                list(
+                    saved
+                        .table
+                        .iter()
+                        .map(|k| map([(1, k.from.0.write()), (2, k.to.0.write())])),
+                ),
+            ),
+            (3, saved.caps_split.write()),
+            (4, saved.allow_fn.write()),
+        ]
+        .into();
+        if let Some(hold) = saved.caps_hold {
+            snapshot.insert(2, hold.0.write());
+        }
+        raw.insert(4, RawValue::Map(snapshot));
     }
     RawValue::Map(raw)
 }
@@ -207,6 +247,27 @@ fn read_keyboard(value: dto::KeyboardMapping) -> Result<input::KeyboardMapping, 
                 })
             })
             .transpose()?,
+        saved_custom: value
+            .saved_custom()?
+            .map(|saved| {
+                Ok::<_, StoreError>(input::SavedCustomKeymap {
+                    table: saved
+                        .table()?
+                        .0
+                        .into_iter()
+                        .map(|k| {
+                            Ok(input::KeyMapping {
+                                from: KeyCode(k.from()?),
+                                to: KeyCode(k.to()?),
+                            })
+                        })
+                        .collect::<Result<_, StoreError>>()?,
+                    caps_hold: saved.caps_hold()?.map(KeyCode),
+                    caps_split: saved.caps_split()?,
+                    allow_fn: saved.allow_fn()?,
+                })
+            })
+            .transpose()?,
     })
 }
 fn read_target(value: dto::TargetTransform) -> Result<input::TargetTransform, StoreError> {
@@ -248,15 +309,14 @@ pub(super) fn apply(owner: &OwnerStore, settings: &mut Settings) -> Result<(), S
                 }
             }
             KeyboardMode => {
-                settings.routing.keyboard_mode = if value.as_u64()? == 0 {
-                    InputMode::Shared
-                } else {
-                    InputMode::Local
+                settings.routing.keyboard_mode = match value.as_u64()? {
+                    0 => InputMode::Shared,
+                    1 => InputMode::Local,
+                    _ => InputMode::Disabled,
                 }
             }
             ClipboardEnabled => settings.clipboard_enabled = bool::read(&value)?,
             ForwardingEnabled => settings.audio.forwarding_enabled = bool::read(&value)?,
-            KeyboardDisabled => settings.keyboard_disabled = bool::read(&value)?,
             ScreenShared => settings.screen_shared = bool::read(&value)?,
             ScreenPreferences => {
                 let value = dto::ScreenPreferencesValue::read(&value)?;
@@ -322,8 +382,20 @@ pub(super) fn apply(owner: &OwnerStore, settings: &mut Settings) -> Result<(), S
                 }
             }
             AcceptContacts => settings.accept_contacts = bool::read(&value)?,
+            TouchpadInjection => settings.routing.touchpad_injection = bool::read(&value)?,
+            NativeMultifinger => settings.routing.native_multifinger = bool::read(&value)?,
+            MacScrollFeel => settings.routing.mac_scroll_feel = bool::read(&value)?,
             SyncSystemArrangement => settings.sync_system_arrangement = bool::read(&value)?,
-            AudioExitClaim => {}
+            MicrophoneControls => {
+                let value = dto::ForwardingControlsValue::read(&value)?;
+                settings.microphone.volume_percent = value.volume_percent()?;
+                settings.microphone.muted = value.muted()?;
+            }
+            MicrophoneReceiveMuted => settings.microphone.receive_muted = bool::read(&value)?,
+            MicrophoneInput => {
+                settings.microphone.input = Option::<oink_protocol::v1::schema::Text<512>>::read(&value)?.map(|v| v.0)
+            }
+            AudioExitClaim | MicrophoneShareClaim => {}
             _ => return Err(StoreError::Invalid),
         }
     }
@@ -358,6 +430,9 @@ pub(super) fn local(settings: &Settings) -> serde_json::Value {
         "remote_scroll_speed",
         "cursor_trail",
         "accept_contacts",
+        "touchpad_injection",
+        "native_multifinger",
+        "mac_scroll_feel",
         "emergency_hold_ms",
     ] {
         routing.remove(field);

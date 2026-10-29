@@ -667,6 +667,7 @@ fn review_drag_corner_setup(os: Os, remote: bool, hosted: bool, left_portal: boo
     }
     if hosted {
         r.dnd.state = dnd::State::Hosting {
+            begin_failed: false,
             id: oink_foundation::content::ClipId {
                 origin: B,
                 seq: crate::dnd::DND_SEQ_BIT | 1,
@@ -1216,5 +1217,78 @@ fn multidisplay_small_native_gap_is_not_exempt_from_bottom_damping() {
         let dst = ScreenPos::new(ScreenId::new(B, "screen"), Point::new(-1000., -1079.));
         assert!(!r.push_resistance(A, &at, Some(&at), &dst, (0., 1.), 1), "gap={gap}");
         assert!(r.resistance.is_some());
+    }
+}
+
+#[test]
+fn passive_game_gap_continues_relative_packets_without_sampling_owned_park() {
+    let (mut r, _) = setup(false, true, SpeedMode::Physical);
+    r.cfg.os = Os::Windows;
+    r.reclaim_focus(None);
+    r.set_game_mode(GameMode::On);
+    r.set_system_cursor_clip(Some(Rect::new(1., 1., 998., 998.)));
+    r.input_message(SOURCE, Message::Control(ControlMsg::LockEscape { held: true }), 1);
+    let Message::Control(ControlMsg::GameMode { epoch, generation, .. }) = r.input_game_state() else {
+        panic!()
+    };
+    r.reconcile_game_escape_snapshot(
+        SOURCE,
+        Some(Point::new(998., 225.)),
+        Some(Some(Rect::new(1., 1., 998., 998.))),
+    );
+    r.input_message(
+        SOURCE,
+        Message::Input(InputMsg::RelativeMotion {
+            epoch,
+            generation,
+            seq: 1,
+            x: 1.,
+            y: 0.,
+        }),
+        2,
+    );
+    assert!(r.pointer_in_gap(), "escape retains configured physical gap travel");
+    assert!(
+        !r.game_escape_readback(SOURCE),
+        "the source park in virtual gap travel is Oink-owned"
+    );
+    r.input_message(
+        SOURCE,
+        Message::Input(InputMsg::RelativeMotion {
+            epoch,
+            generation,
+            seq: 2,
+            x: 201.,
+            y: 0.,
+        }),
+        3,
+    );
+    assert_eq!(r.holder, B);
+    assert!(!r.pointer_in_gap());
+}
+
+#[test]
+fn passive_entry_topology_damps_departure_channel_even_with_gap_travel() {
+    for gap in [false, true] {
+        let (mut r, _) = setup(false, gap, SpeedMode::Physical);
+        r.cfg.settings.damping.platform_profile = crate::damping::DampingProfile::DepthOnly { depth: 1000. };
+        r.input_message(
+            B,
+            Message::Control(ControlMsg::EntryProtection {
+                state: crate::control::EntryProtection {
+                    game: true,
+                    ..Default::default()
+                },
+            }),
+            1,
+        );
+        r.set_cursor(Point::new(999.9, 225.));
+        r.remote_motion(SOURCE, 1. / 686., 0., 2);
+        assert_eq!(r.holder, A);
+        assert!(
+            !r.pointer_in_gap(),
+            "damp the selected entry channel before leaving its source"
+        );
+        assert!(r.resistance.is_some(), "gap={gap}");
     }
 }

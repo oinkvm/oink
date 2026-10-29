@@ -4,12 +4,12 @@ use std::cell::RefCell;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
-type State = (Mutex<(bool, String)>, Condvar);
+type Probe = Arc<dyn Fn() -> String + Send + Sync>;
+type State = (Mutex<(bool, String)>, Condvar, Mutex<Vec<(String, Probe)>>);
 thread_local! {
     static CURRENT: RefCell<Weak<State>> = const { RefCell::new(Weak::new()) };
 }
 
-#[derive(Debug)]
 pub struct Scenario {
     state: Arc<State>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -20,15 +20,19 @@ impl Scenario {
         // allows the 60-second collection deadline plus setup and teardown.
         Self::with_limit(format!("{module}::{name}"), Duration::from_secs(180), "scenario entry")
     }
-    fn with_limit(name: String, limit: Duration, initial_phase: &str) -> Self {
-        let state = Arc::new((Mutex::new((false, String::new())), Condvar::new()));
+    pub(crate) fn with_limit(name: String, limit: Duration, initial_phase: &str) -> Self {
+        let state = Arc::new((
+            Mutex::new((false, String::new())),
+            Condvar::new(),
+            Mutex::new(Vec::new()),
+        ));
         CURRENT.with(|current| *current.borrow_mut() = Arc::downgrade(&state));
         phase(initial_phase);
         let waiting = state.clone();
         let worker = std::thread::Builder::new()
             .name("scenario-watchdog".into())
             .spawn(move || {
-                let (lock, wake) = &*waiting;
+                let (lock, wake, diagnostics) = &*waiting;
                 let (finished, _) = wake
                     .wait_timeout_while(lock.lock().unwrap(), limit, |state| !state.0)
                     .unwrap();
@@ -41,6 +45,23 @@ impl Scenario {
                         "SCENARIO WATCHDOG: {name}; pid={}; limit={limit:?}; last phase={}; synchronous call, blocked worker or teardown did not finish",
                         std::process::id(), finished.1
                     );
+                    drop(finished);
+                    // Probes run only on failure, outside the executor and the
+                    // phase lock. A blocked/poisoned diagnostic must not hide the
+                    // original watchdog or prevent later probes from being read.
+                    match diagnostics.try_lock() {
+                        Ok(probes) => {
+                            for (label, probe) in probes.iter() {
+                                let _ = writeln!(std::io::stderr().lock(), "WATCHDOG DIAGNOSTIC: {label}");
+                                let dump = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probe()))
+                                    .unwrap_or_else(|_| "diagnostic panicked".into());
+                                let _ = writeln!(std::io::stderr().lock(), "{dump}");
+                            }
+                        }
+                        Err(error) => {
+                            let _ = writeln!(std::io::stderr().lock(), "watchdog diagnostics unavailable: {error}");
+                        }
+                    }
                     // A panic here would only kill this watchdog thread. Exiting
                     // makes the test fail even when runtime Drop is waiting for
                     // an uninterruptible spawn_blocking task or native thread.
@@ -103,6 +124,16 @@ pub fn phase(phase: &str) {
     });
 }
 
+/// Register a failure-only, bounded probe. Capture weak handles so diagnostics
+/// cannot keep a node/provider alive through normal shutdown or runtime Drop.
+pub fn on_timeout(label: impl Into<String>, probe: impl Fn() -> String + Send + Sync + 'static) {
+    CURRENT.with(|current| {
+        if let Some(state) = current.borrow().upgrade() {
+            state.2.lock().unwrap().push((label.into(), Arc::new(probe)));
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +156,14 @@ mod tests {
                         Duration::from_millis(50),
                         "blocked synchronous call",
                     );
+                    let locked = Arc::new(Mutex::new(()));
+                    let read = locked.clone();
+                    on_timeout("fixture state", move || {
+                        format!("native_lock_unavailable={}", read.try_lock().is_err())
+                    });
+                    on_timeout("broken probe", || panic!("diagnostic fixture panic"));
+                    on_timeout("after broken probe", || "routing=blocked; grant=pending".into());
+                    let _held = locked.lock().unwrap();
                     loop {
                         std::thread::park();
                     }
@@ -145,13 +184,22 @@ mod tests {
                     Duration::from_millis(50),
                     "blocked runtime teardown",
                 );
+                on_timeout("fixture teardown", || "native publication=pending".into());
                 // Drop the runtime before its watchdog when unwinding.
                 let _runtime = runtime;
                 panic!("force unwind with an unfinished blocking task");
             }
             unreachable!();
         }
-        run(module_path!(), "normal completion", None, async {});
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_called = called.clone();
+        run(module_path!(), "normal completion", None, async {
+            on_timeout("must stay silent", move || {
+                probe_called.store(true, std::sync::atomic::Ordering::Relaxed);
+                "unexpected diagnostic".into()
+            });
+        });
+        assert!(!called.load(std::sync::atomic::Ordering::Relaxed));
         let test = format!("{}::process_watchdog_bounds_a_blocked_executor", module_path!());
         let test = test.split_once("::").unwrap().1;
         for case in ["executor", "teardown"] {
@@ -174,6 +222,13 @@ mod tests {
             assert_eq!(output.status.code(), Some(101));
             let message = String::from_utf8(output.stderr).unwrap();
             assert!(message.contains("SCENARIO WATCHDOG"), "{message}");
+            if case == "executor" {
+                assert!(message.contains("native_lock_unavailable=true"), "{message}");
+                assert!(message.contains("diagnostic panicked"), "{message}");
+                assert!(message.contains("routing=blocked; grant=pending"), "{message}");
+            } else {
+                assert!(message.contains("native publication=pending"), "{message}");
+            }
             assert!(
                 message.contains(if case == "executor" {
                     "blocked synchronous call"

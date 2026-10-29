@@ -40,13 +40,31 @@ impl Writer {
         for slot in 0..2 {
             let path = root.join(format!("{slot}.dmp"));
             let lease_path = root.join(format!("{slot}.lease"));
-            if let Some(old) = read_lease(&lease_path)
-                && now().saturating_sub(old.collected_at) >= 86400
-            {
-                let _ = std::fs::remove_file(&path);
-                let _ = std::fs::remove_file(&lease_path);
+            // Discard abandoned owned slots, never parse them in an application.
+            // A live collector's exclusive handle prevents this unlink.
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&lease_path);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let _ = std::fs::remove_file(&lease_path);
+                }
+                Err(_) => {}
             }
-            let file = match OpenOptions::new().create_new(true).write(true).read(true).open(&path) {
+            let mut options = OpenOptions::new();
+            options.create_new(true).write(true).read(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE};
+                // The kernel deletes raw memory even on abort/OOM/TerminateProcess.
+                // Exclusive sharing prevents another handle extending its lifetime.
+                // Verified by killing an isolated owning process on Windows 11.
+                options
+                    .share_mode(0)
+                    .custom_flags(FILE_FLAG_DELETE_ON_CLOSE | FILE_ATTRIBUTE_TEMPORARY);
+            }
+            let file = match options.open(&path) {
                 Ok(f) => f,
                 Err(_) => continue,
             };
@@ -78,6 +96,14 @@ impl Writer {
         Ok(())
     }
     pub fn project(self, manifest: &Manifest) -> Result<()> {
+        self.project_with_local(manifest, None, 0)
+    }
+    pub fn project_with_local(
+        self,
+        manifest: &Manifest,
+        local: Option<&crate::local::Target>,
+        thread: u32,
+    ) -> Result<()> {
         let Self {
             mut file,
             path,
@@ -100,14 +126,18 @@ impl Writer {
             let crash = crate::dump::extract(&bytes, manifest, lease.build, lease.component).ok_or(Error::Invalid)?;
             Ok(Projected { lease, crash })
         })();
-        // Delete raw material whether projection succeeds or fails. The only
-        // persistent output is a strict numeric typed record; no raw-upload API.
-        // Windows cannot delete a file held without delete sharing. Close the
-        // capture handle before deletion, including every projection error path.
+        // DELETE_ON_CLOSE keeps the raw file owned throughout parsing and removes
+        // it on success, errors, unwinder panic or collector process death.
         drop(file);
-        std::fs::remove_file(&path).map_err(|_| Error::Io)?;
-        std::fs::remove_file(&lease_path).map_err(|_| Error::Io)?;
-        let bytes = serde_json::to_vec(&projected?).map_err(|_| Error::Invalid)?;
+        let _ = std::fs::remove_file(&lease_path);
+        let projected = projected?;
+        if let Some(local) = local {
+            crate::local::write(local, projected.crash.clone(), projected.lease.collected_at, thread)?;
+        }
+        if projected.lease.generation == 0 {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec(&projected).map_err(|_| Error::Invalid)?;
         if bytes.len() > 32768 {
             return Err(Error::Limit);
         }
@@ -127,24 +157,16 @@ pub fn recover(root: &Path, consent: ReportConsent, manifest: &Manifest) -> Vec<
     for slot in 0..2 {
         let dump = root.join(format!("{slot}.dmp"));
         let lease_path = root.join(format!("{slot}.lease"));
-        if dump.exists() {
-            if let Some(lease) = read_lease(&lease_path).filter(|l| {
-                consent.granted() && l.generation == consent.generation && now().saturating_sub(l.collected_at) < 86400
-            }) {
-                if let Ok(file) = OpenOptions::new().read(true).write(true).open(&dump) {
-                    let _ = Writer {
-                        file,
-                        path: dump.clone(),
-                        lease_path: lease_path.clone(),
-                        high_water: 0,
-                        failed: false,
-                    }
-                    .project(manifest);
-                }
-                let _ = lease;
+        // Only typed .safe records survive a collector. An orphan raw dump is
+        // discarded, never retried or unwound synchronously during app startup.
+        match std::fs::remove_file(&dump) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&lease_path);
             }
-            let _ = std::fs::remove_file(&dump);
-            let _ = std::fs::remove_file(&lease_path);
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let _ = std::fs::remove_file(&lease_path);
+            }
+            Err(_) => {} // An exclusive live collector may still own this slot.
         }
         let safe = root.join(format!("{slot}.safe"));
         if let Ok(file) = File::open(&safe) {
@@ -167,6 +189,85 @@ pub fn recover(root: &Path, consent: ReportConsent, manifest: &Manifest) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_lease() -> Lease {
+        Lease {
+            generation: 1,
+            collected_at: now(),
+            component: Component::Agent,
+            build: BuildContext {
+                app_version: AppVersion {
+                    major: 1,
+                    minor: 0,
+                    patch: 0,
+                    build: 1,
+                },
+                os_version_class: OsVersionClass::Windows11,
+            },
+        }
+    }
+    #[test]
+    fn killed_collector_owner_leaves_no_raw_dump() {
+        const KEY: &str = "OINK_KILLED_DUMP_OWNER";
+        if let Some(root) = std::env::var_os(KEY) {
+            let root = PathBuf::from(root);
+            let mut writer = Writer::reserve(&root, test_lease()).unwrap();
+            writer.write_at(0, b"private stack bytes").unwrap();
+            std::fs::write(root.join("ready"), b"1").unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "staging::tests::killed_collector_owner_leaves_no_raw_dump"])
+            .env(KEY, root.path())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !root.path().join("ready").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let ready = root.path().join("ready").exists();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(ready);
+        assert!(
+            !root.path().join("0.dmp").exists(),
+            "OS must delete raw memory on process death"
+        );
+    }
+    #[test]
+    fn startup_discards_orphan_raw_dumps_without_running_the_parser() {
+        let root = tempfile::tempdir().unwrap();
+        let lease = test_lease();
+        let mut raw = vec![0u8; 232];
+        raw[..4].copy_from_slice(b"MDMP");
+        for (at, value) in [
+            (4, 0xa793u32),
+            (8, 1),
+            (12, 32),
+            (32, 6),
+            (36, 168),
+            (40, 64),
+            (72, 0xc0000005),
+        ] {
+            raw[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(root.path().join("0.dmp"), raw).unwrap();
+        std::fs::write(root.path().join("0.lease"), serde_json::to_vec(&lease).unwrap()).unwrap();
+        let manifest = Manifest {
+            version: lease.build.app_version,
+            images: vec![],
+        };
+        let grant = ReportConsent {
+            choice: Choice::Granted,
+            policy_version: POLICY_VERSION,
+            generation: 1,
+        };
+        assert!(recover(root.path(), grant, &manifest).is_empty());
+        assert!(!root.path().join("0.dmp").exists());
+        assert!(!root.path().join("0.lease").exists());
+    }
     #[test]
     fn failed_projection_deletes_raw_staging_but_never_other_storage_classes() {
         let dir = tempfile::tempdir().unwrap();

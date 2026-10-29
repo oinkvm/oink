@@ -183,6 +183,7 @@ struct Datagram {
     pending: oink_foundation::pending_age::Pending,
 }
 pub(super) struct DatagramQueue {
+    partitions: Option<super::realtime_datagram::Partitions>,
     items: ArrayQueue<Datagram>,
     pub(super) age: Arc<oink_foundation::pending_age::PendingAge>,
     spec: QueueSpec,
@@ -203,10 +204,21 @@ impl std::fmt::Debug for DatagramQueue {
 }
 impl DatagramQueue {
     pub(super) fn new(spec: QueueSpec) -> Arc<Self> {
+        Self::create(spec, None)
+    }
+    pub(super) fn new_partitioned(spec: QueueSpec, types: [[u16; 2]; 2]) -> Arc<Self> {
+        Self::create(spec, Some(types))
+    }
+    fn create(spec: QueueSpec, types: Option<[[u16; 2]; 2]>) -> Arc<Self> {
         assert!(spec.messages > 0 && spec.bytes > 0);
         Arc::new(Self {
-            items: ArrayQueue::new(spec.messages as usize),
-            age: oink_foundation::pending_age::PendingAge::new(spec.messages as usize + 2),
+            partitions: types.map(|types| super::realtime_datagram::Partitions::new(spec, types)),
+            items: ArrayQueue::new(if types.is_some() { 1 } else { spec.messages as usize }),
+            age: oink_foundation::pending_age::PendingAge::new(if types.is_some() {
+                1
+            } else {
+                spec.messages as usize + 2
+            }),
             spec,
             bytes: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -216,15 +228,39 @@ impl DatagramQueue {
             datagram_prefix: AtomicUsize::new(4),
         })
     }
+    pub(super) fn take_partition(
+        &self,
+        lane: usize,
+        output: &mut [u8],
+    ) -> Result<Option<(usize, std::time::Instant)>, super::DatagramError> {
+        if self.is_closed() {
+            return Err(super::DatagramError::Closed);
+        }
+        self.partitions
+            .as_ref()
+            .ok_or(super::DatagramError::Closed)?
+            .take(lane, output)
+    }
+    pub(super) fn partition_dropped(&self, lane: usize) -> u64 {
+        self.partitions.as_ref().map_or(0, |p| p.dropped(lane))
+    }
+    pub(super) fn oldest(&self) -> Option<std::time::Instant> {
+        if self.is_closed() {
+            return None;
+        }
+        self.partitions
+            .as_ref()
+            .map_or_else(|| self.age.oldest(), |p| p.oldest())
+    }
     pub(super) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
     pub(super) fn len(&self) -> usize {
-        self.items.len()
+        self.partitions.as_ref().map_or_else(|| self.items.len(), |p| p.len())
     }
     pub(super) fn set_wake(&self, wake: Wake) {
         self.wake.store(Some(Arc::new(WakeSlot(wake))));
-        if self.is_closed() || !self.items.is_empty() {
+        if self.is_closed() || self.len() != 0 {
             self.signal();
         }
     }
@@ -256,6 +292,13 @@ impl DatagramQueue {
         }
     }
     pub(super) fn post_lossy(&self, encoded: &[u8]) -> Result<(), super::DatagramError> {
+        self.post_lossy_at(encoded, std::time::Instant::now())
+    }
+    pub(super) fn post_lossy_at(
+        &self,
+        encoded: &[u8],
+        arrived: std::time::Instant,
+    ) -> Result<(), super::DatagramError> {
         if self.is_closed() {
             return Err(super::DatagramError::Closed);
         }
@@ -264,6 +307,13 @@ impl DatagramQueue {
         {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return Err(super::DatagramError::TooLarge);
+        }
+        if let Some(partitions) = &self.partitions {
+            if !partitions.post(encoded, arrived) {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            self.signal(); // network producer only; the RT consumer never wakes it
+            return Ok(());
         }
         while self.items.len() >= self.spec.messages as usize
             || self.bytes.load(Ordering::Acquire) + encoded.len() > self.spec.bytes as usize
@@ -359,6 +409,42 @@ fn crossing_token(bytes: &[u8], first_motion_epoch: &AtomicU64) -> Option<Token>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn realtime_datagram_read_never_notifies_producer() {
+        let queue = DatagramQueue::new_partitioned(
+            QueueSpec {
+                messages: 8,
+                bytes: 8800,
+            },
+            [[0x0604, 0x0606], [0x0618, 0x0619]],
+        );
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let observe = wakes.clone();
+        queue.set_producer_wake(Arc::new(move || {
+            observe.fetch_add(1, Ordering::Relaxed);
+        }));
+        let baseline = wakes.load(Ordering::Relaxed);
+        let mut bytes = [0; 1100];
+        let size = oink_protocol::v1::hot::encode_into(
+            0x0606,
+            &[
+                (1, oink_protocol::v1::hot::Value::Uint(1)),
+                (2, oink_protocol::v1::hot::Value::Uint(1)),
+                (3, oink_protocol::v1::hot::Value::Uint(1)),
+            ],
+            &mut bytes,
+            1100,
+        )
+        .unwrap();
+        queue.post_lossy(&bytes[..size]).unwrap();
+        assert!(queue.take_partition(0, &mut bytes).unwrap().is_some());
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            baseline,
+            "RT reader woke ordinary producer"
+        );
+    }
 
     #[test]
     fn reliable_and_datagram_ages_include_claimed_work_and_clear_on_discard() {

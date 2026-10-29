@@ -4,6 +4,8 @@
 //! state directories. Nothing here touches an installed Oink or injects native input.
 use oink_agent as test_agent;
 mod common;
+#[path = "link_scenarios/received.rs"]
+mod received;
 
 use oink_agent::api::{AgentApi, FileTransferPhase, Placement, ScreenKey};
 use oink_agent::node::{Node, NodeOptions};
@@ -112,6 +114,14 @@ async fn start_on(root: &Path, name: &str, port: u16) -> Dev {
     start_config(root, name, net).await
 }
 async fn start_config(root: &Path, name: &str, net: NetworkConfig) -> Dev {
+    start_config_with_received(root, name, net, None).await
+}
+async fn start_config_with_received(
+    root: &Path,
+    name: &str,
+    net: NetworkConfig,
+    received: Option<Arc<received::ReadGate>>,
+) -> Dev {
     let dir = root.join(name);
     let port = net.port;
     let input = FakeInput::new();
@@ -132,17 +142,17 @@ async fn start_config(root: &Path, name: &str, net: NetworkConfig) -> Dev {
         input: Arc::new(input.clone()),
         displays: vec![display(name)],
         display_backend: Some(displays.clone()),
-        clipboard: Some(clip.clone()),
+        clipboard: Some(if let Some(gate) = received {
+            Arc::new(received::Clipboard::new(clip.clone(), gate))
+        } else {
+            clip.clone()
+        }),
         mode_switch_in_callback: true,
         capture_reports_key_repeat: false,
         cursor_trail: false,
     })
     .await
     .unwrap_or_else(|e| panic!("start {name}: {e:#}"));
-    if let Ok(mut settings) = node.clipboard_settings() {
-        settings.files = true;
-        node.set_clipboard_settings(settings.into()).unwrap();
-    }
     Dev {
         node,
         input,
@@ -914,7 +924,17 @@ fn file_transfer_interrupted_by_link_drop_completes_after_reconnect() {
 async fn file_transfer_interrupted_by_link_drop_completes_after_reconnect_scenario() {
     let root = tempfile::tempdir().unwrap();
     let a = start(root.path(), "alpha").await;
-    let b = start(root.path(), "beta").await;
+    const VERIFIED: u64 = 1024 * 1024;
+    let (gate, entered, resume) = received::ReadGate::new(VERIFIED);
+    // This scenario tests real transport/resume with a private file-backed
+    // NativeFiles model. It makes no claim about OS provider hydration.
+    let b = start_config_with_received(
+        root.path(),
+        "beta",
+        oink_test_support::network_config(root.path().join("beta"), "beta", 0),
+        Some(gate.clone()),
+    )
+    .await;
     common::pair(&a.node, &b.node).await;
     let source = a.dir.join("source.bin");
     let bytes: Vec<u8> = (0..24_000_000u32)
@@ -928,8 +948,6 @@ async fn file_transfer_interrupted_by_link_drop_completes_after_reconnect_scenar
         modified_ms: None,
         local_path: Some(source.clone()),
     }];
-    const VERIFIED: u64 = 1024 * 1024;
-    let (gate, entered) = a.clip.gate_file_reads_after(VERIFIED);
     a.clip.copy(vec![ClipData::Files(files)], Sensitivity::Normal);
     wait_for("file demand available", 10.0, || {
         b.node
@@ -939,10 +957,14 @@ async fn file_transfer_interrupted_by_link_drop_completes_after_reconnect_scenar
     })
     .await;
     b.node.fetch_clipboard_files().unwrap();
-    let stopped_at = tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(10)).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(stopped_at, VERIFIED, "source pauses before its second payload block");
+    let (stopped_at, received_path) =
+        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(10)).unwrap())
+            .await
+            .unwrap();
+    assert_eq!(
+        stopped_at, VERIFIED,
+        "receiver pauses before requesting the next linked-file block"
+    );
     wait_for("receiver verified the first payload block", 10.0, || {
         b.node
             .clipboard_transfer()
@@ -950,6 +972,9 @@ async fn file_transfer_interrupted_by_link_drop_completes_after_reconnect_scenar
             .is_some_and(|progress| progress.done >= VERIFIED && progress.done < bytes.len() as u64)
     })
     .await;
+    // The read checkpoint identifies the actual consumer's destination. Current
+    // clipboard items can already belong to a later native publication, even
+    // for this same offer, and that new copy is not the active download.
     let links = b.node.links().unwrap();
     let source_device = a.node.id();
     let interrupted = links.links().by_peer(source_device).unwrap().link;
@@ -961,28 +986,37 @@ async fn file_transfer_interrupted_by_link_drop_completes_after_reconnect_scenar
             .is_none_or(|link| link.link != interrupted)
     })
     .await;
-    gate.release();
-    let clip = b.clip.clone();
+    // Force the later publication to win while the original reader is blocked.
+    // Looking up its destination in b.clip.items() would now wait for the wrong
+    // file even when the original download completes with all bytes intact.
+    common::watchdog::until("reconnect republishes a different native received copy", || {
+        b.clip.items().iter().any(|data| match data {
+            ClipData::Files(files) => files
+                .iter()
+                .any(|file| file.local_path.as_ref().is_some_and(|path| path != &received_path)),
+            _ => false,
+        })
+    })
+    .await;
+    resume.send(()).unwrap();
     let end = Instant::now() + Duration::from_secs(40);
     let received = loop {
-        let path = clip.items().into_iter().find_map(|d| match d {
-            ClipData::Files(f) => f[0].local_path.clone().filter(|p| p != &source && p.is_file()),
-            _ => None,
-        });
-        if let Some(path) = path {
-            break path;
+        if received_path.is_file() {
+            break received_path.clone();
         }
         assert!(
             Instant::now() < end,
-            "file never arrived after the reconnect: transfer={:?}, link={:?}",
+            "file never arrived after the reconnect: transfer={:?}, link={:?}, last read={:?}, partial={:?}",
             b.node.clipboard_transfer().unwrap(),
-            path_to(&b.node, &a.node)
+            path_to(&b.node, &a.node),
+            gate.offsets().last(),
+            std::fs::metadata(received_path.with_extension("partial")).map(|m| m.len())
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert!(
-        gate.opened_offsets().iter().any(|offset| *offset >= VERIFIED),
-        "reconnect resumes a verified nonzero payload offset"
+        gate.offsets().iter().any(|offset| *offset > VERIFIED),
+        "linked reader continues beyond its verified offset after reconnect"
     );
     assert_ne!(links.links().by_peer(source_device).unwrap().link, interrupted);
     assert!(
@@ -1013,6 +1047,14 @@ async fn pause_and_resume_from_either_side_restore_every_stream_scenario() {
     wait_for("initial wallpaper", 10.0, || wallpaper_seen(&b.node, &a.node).is_some()).await;
     // (who pauses, who resumes)
     for (round, (pauser, resumer)) in [(&a, &a), (&a, &b), (&b, &a), (&b, &b)].into_iter().enumerate() {
+        // Drain the previous wallpaper transfer before taking a negative pause
+        // snapshot. Input readiness alone does not acknowledge Low delivery.
+        let prior = blake3::hash(&a.displays.wallpapers().unwrap()[0].thumbnail.jpeg).to_hex()[..16].to_string();
+        wait_for("current wallpaper stored before pause", 10.0, || {
+            wallpaper_seen(&a.node, &a.node).as_ref() == Some(&prior)
+                && wallpaper_seen(&b.node, &a.node).as_ref() == Some(&prior)
+        })
+        .await;
         cross(&a, &b, 1.0).await;
         key(&a.input, 0x51, true);
         wait_for("held key on B", 5.0, || keys(&b.input).last() == Some(&(0x51, true))).await;
@@ -1057,14 +1099,20 @@ async fn pause_and_resume_from_either_side_restore_every_stream_scenario() {
         );
         let stale_wallpaper = wallpaper_seen(&b.node, &a.node);
         a.displays.set_wallpaper(0x60 + round as u8);
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        let current = blake3::hash(&a.displays.wallpapers().unwrap()[0].thumbnail.jpeg).to_hex()[..16].to_string();
+        // Wait for the source's actual image read, rather than assuming its
+        // 500ms settling timer and blocking read finished inside a 600ms sleep.
+        wait_for("paused wallpaper source captured current image", 10.0, || {
+            wallpaper_seen(&a.node, &a.node).as_ref() == Some(&current)
+        })
+        .await;
         assert_eq!(keys(&b.input).len(), before, "no keys while paused");
         assert_eq!(b.clip.items(), vec![ClipData::Text(format!("b keeps {round}"))]);
         if pauser.node.id() == a.node.id() {
             assert_eq!(wallpaper_seen(&b.node, &a.node), stale_wallpaper);
         } else {
             wait_for("paused receiver accepts wallpaper state", 10.0, || {
-                wallpaper_seen(&b.node, &a.node) != stale_wallpaper
+                wallpaper_seen(&b.node, &a.node).as_ref() == Some(&current)
             })
             .await;
         }
@@ -1123,7 +1171,7 @@ async fn pause_and_resume_from_either_side_restore_every_stream_scenario() {
             );
         }
         wait_for("wallpaper re-sent on resume", 10.0, || {
-            wallpaper_seen(&b.node, &a.node) != stale_wallpaper
+            wallpaper_seen(&b.node, &a.node).as_ref() == Some(&current)
         })
         .await;
         cross(&a, &b, 1.0).await;
@@ -2088,9 +2136,20 @@ async fn display_notifications_refresh_layout_topology_api_and_restore_detached_
     let root = tempfile::tempdir().unwrap();
     let a = start(root.path(), "display-owner").await;
     let b = start(root.path(), "display-peer").await;
+    let source_default =
+        oink_agent::layout_profiles::model::default_id(oink_agent::api::GroupKey(a.node.group_id().unwrap()));
     common::pair(&a.node, &b.node).await;
+    common::profile_handoff(&[&a.node, &b.node], &source_default).await;
     row(&[&a, &b]).await;
     let id = ScreenId::new(a.node.id(), &a.name);
+    let b_id = ScreenId::new(b.node.id(), &b.name);
+    let fixed_owner = a.node.layout().0.screen(&id).unwrap().clone();
+    let fixed_peer = a.node.layout().0.screen(&b_id).unwrap().clone();
+    let assert_peer = |expected: &oink_display::layout::ScreenPlacement| {
+        for dev in [&a, &b] {
+            assert_eq!(dev.node.layout().0.screen(&b_id), Some(expected));
+        }
+    };
     let check = |displays: &[DisplayInfo]| {
         [&a, &b].iter().all(|dev| {
             let config = dev.node.link_config().unwrap();
@@ -2142,29 +2201,27 @@ async fn display_notifications_refresh_layout_topology_api_and_restore_detached_
         check(&[primary.clone()])
     })
     .await;
-    assert_eq!(
-        a.node.layout().0.screen(&id).unwrap().rect,
-        Rect::new(0., 0., 320. / 686., 200. / 686.)
-    );
+    // A native shrink leaves the new gap: neither computer moves to reattach.
+    for dev in [&a, &b] {
+        assert_eq!(
+            dev.node.layout().0.screen(&id).unwrap().rect,
+            Rect::new(fixed_owner.rect.x, fixed_owner.rect.y, 320. / 686., 200. / 686.)
+        );
+        assert!(dev.node.layout().0.screen(&id).unwrap().rect.right() < fixed_peer.rect.x);
+    }
+    assert_peer(&fixed_peer);
     assert_eq!(
         a.node.link_config().unwrap().local_displays().displays,
         vec![primary.clone()]
     );
 
-    // Display mode changes preserve group scale and owner gain.
-    let edit_id = id.clone();
-    let config = a.node.link_config().unwrap();
-    tokio::task::spawn_blocking(move || {
-        config.edit_layout(
-            Box::new(move |layout| {
-                let screen = layout.screen_mut(&edit_id).unwrap();
-                screen.size_source = SizeSource::Manual;
-            }),
-            oink_protocol::v1::dto::LayoutSource::Manual,
-        )
+    // Exercise the product resize path, including its manual operation boundary.
+    let current_size = a.node.layout().0.screen(&id).unwrap().rect;
+    let size_key = ScreenKey::from(&id);
+    api(&a.node, move |node| {
+        node.set_screen_size(size_key, Size::new(current_size.w, current_size.h))
     })
     .await
-    .unwrap()
     .unwrap();
     let gain_key = ScreenKey {
         device: a.node.id().into(),
@@ -2173,11 +2230,23 @@ async fn display_notifications_refresh_layout_topology_api_and_restore_detached_
     api(&a.node, move |node| node.set_screen_gain(gain_key, 1.7))
         .await
         .unwrap();
+    wait_all(&[&a, &b], "manual size source synchronized", 10., || {
+        a.node.layout().0 == b.node.layout().0
+    })
+    .await;
+    let unchanged = a.node.layout().0;
     primary.pixel_width = 3840;
     primary.pixel_height = 2400;
     a.displays.set_displays(vec![primary.clone()]);
     wait_all(&[&a, &b], "pixel-only scale change", 10., || check(&[primary.clone()])).await;
-    let placement = a.node.layout().0.screen(&id).unwrap().clone();
+    for dev in [&a, &b] {
+        assert_eq!(
+            dev.node.layout().0,
+            unchanged,
+            "unchanged native bounds retain exact placements"
+        );
+    }
+    let placement = unchanged.screen(&id).unwrap().clone();
     primary.bounds = Rect::new(0., 0., 1920., 1200.);
     a.displays.set_displays(vec![primary.clone()]);
     wait_all(&[&a, &b], "manual-size resolution change", 10., || {
@@ -2187,7 +2256,10 @@ async fn display_notifications_refresh_layout_topology_api_and_restore_detached_
     for dev in [&a, &b] {
         let layout = dev.node.layout().0;
         let changed = layout.screen(&id).unwrap();
-        assert_eq!(changed.rect.x, placement.rect.x);
+        // Growth now overlaps the fixed peer. Moving left to retain their
+        // vertical edge is closer than escaping above or below it.
+        assert_eq!(changed.rect.x, fixed_peer.rect.x - changed.rect.w);
+        assert_eq!(changed.rect.y, placement.rect.y);
         assert!((changed.rect.w / changed.local.w - placement.rect.w / placement.local.w).abs() < 1e-12);
         assert_eq!(changed.size_source, SizeSource::Manual);
         assert_eq!(
@@ -2195,10 +2267,12 @@ async fn display_notifications_refresh_layout_topology_api_and_restore_detached_
             1.7
         );
     }
-    // Mac peer's reported sequence: a scaled mode and its revert, with the same
-    // peer attached throughout. Check facts, layout and compiled geometry after
+    assert_peer(&fixed_peer);
+    // Mac peer's reported sequence: a scaled mode and its revert. Keep both
+    // computers fixed while the gap changes. Check facts and compiled geometry after
     // every notification, then drive a real fake-backend handoff across its gap.
     let link = a.node.links().unwrap().links().by_peer(b.node.id()).unwrap().link;
+    let mode_transform = a.node.layout().0.device_transform(a.node.id()).unwrap();
     for (width, height) in [(1728., 1117.), (1496., 967.), (1728., 1117.)] {
         primary.bounds = Rect::new(0., 0., width, height);
         primary.pixel_width = (width * 2.) as u32;
@@ -2208,6 +2282,15 @@ async fn display_notifications_refresh_layout_topology_api_and_restore_detached_
             check(&[primary.clone()])
         })
         .await;
+        for dev in [&a, &b] {
+            let layout = dev.node.layout().0;
+            let changed = layout.screen(&id).unwrap();
+            assert!(changed.rect.right() < fixed_peer.rect.x);
+            let current = layout.device_transform(a.node.id()).unwrap();
+            assert_eq!(current.0, mode_transform.0);
+            assert!((current.1 - mode_transform.1).abs() < 1e-12);
+        }
+        assert_peer(&fixed_peer);
         assert_eq!(a.node.links().unwrap().links().by_peer(b.node.id()).unwrap().link, link);
     }
     let gain_key = ScreenKey {
@@ -2217,34 +2300,19 @@ async fn display_notifications_refresh_layout_topology_api_and_restore_detached_
     api(&a.node, move |node| node.set_screen_gain(gain_key, 1.))
         .await
         .unwrap();
-    let a_id = id.clone();
-    let b_id = ScreenId::new(b.node.id(), &b.name);
-    let config = a.node.link_config().unwrap();
-    tokio::task::spawn_blocking(move || {
-        config.edit_layout(
-            Box::new(move |layout| {
-                let left = layout.screen_mut(&a_id).unwrap();
-                left.rect = Rect::new(
-                    -526.2891611498471 / 686.,
-                    222.16467832122427 / 686.,
-                    337.83240576203025 / 686.,
-                    218.3789335857568 / 686.,
-                );
-                let right = layout.screen_mut(&b_id).unwrap();
-                right.rect = Rect::new(
-                    -123.71222202910451 / 686.,
-                    235.48722050101873 / 686.,
-                    447.39681080170357 / 686.,
-                    447.39681080170357 / 686. * 1000. / 1600.,
-                );
-                right.size_source = SizeSource::Manual;
-            }),
-            oink_protocol::v1::dto::LayoutSource::Manual,
-        )
-    })
-    .await
-    .unwrap()
-    .unwrap();
+    let placements = vec![
+        Placement {
+            device: a.node.id().into(),
+            origin: Point::new(-526.2891611498471 / 686., 222.16467832122427 / 686.),
+            scale: 337.83240576203025 / 686. / primary.bounds.w,
+        },
+        Placement {
+            device: b.node.id().into(),
+            origin: Point::new(-123.71222202910451 / 686., 235.48722050101873 / 686.),
+            scale: 447.39681080170357 / 686. / display(&b.name).bounds.w,
+        },
+    ];
+    api(&a.node, move |node| node.save_layout(placements)).await.unwrap();
     wait_all(&[&a, &b], "gap layout compiled on peer", 10., || {
         check(&[primary.clone()]) && b.node.layout().0 == a.node.layout().0
     })
@@ -2286,8 +2354,26 @@ async fn display_notifications_refresh_layout_topology_api_and_restore_detached_
     second.bounds.x = primary.bounds.right();
     second.is_primary = false;
     let two = vec![primary.clone(), second.clone()];
+    let before_add = a.node.layout().0;
+    let fixed_peer = before_add.screen(&b_id).unwrap().clone();
+    let (before_origin, scale) = before_add.device_transform(a.node.id()).unwrap();
     a.displays.set_displays(two.clone());
     wait_all(&[&a, &b], "display addition", 10., || check(&two)).await;
+    // Hotplug pins the attaching computer, including its existing screen. The
+    // new right-hand screen intersects the peer; the nearest free translation
+    // pushes that peer below the new screen, preserving its size and metadata.
+    let mut pushed_peer = fixed_peer.clone();
+    pushed_peer.rect.y = before_origin.y + second.bounds.bottom() * scale;
+    for dev in [&a, &b] {
+        let layout = dev.node.layout().0;
+        assert_eq!(layout.device_transform(a.node.id()).unwrap(), (before_origin, scale));
+        assert_eq!(layout.screen(&id), before_add.screen(&id));
+        assert!(layout.overlaps().is_empty());
+    }
+    assert_peer(&pushed_peer);
+    // Subsequent native rearrangements (no newly attached screens) still repair
+    // only their owner against this now-stationary peer.
+    let fixed_peer = pushed_peer;
     let second_id = ScreenId::new(a.node.id(), &second.key);
     let transform = a.node.layout().0.device_transform(a.node.id()).unwrap();
     let mut rearranged = second.clone();
@@ -2296,16 +2382,26 @@ async fn display_notifications_refresh_layout_topology_api_and_restore_detached_
     let native = vec![primary.clone(), rearranged.clone()];
     a.displays.set_displays(native.clone());
     wait_all(&[&a, &b], "native multi-screen rearrangement", 10.0, || check(&native)).await;
+    // Moving the added screen left removes the old contact without overlapping
+    // the peer. Preserve the owner's transform instead of closing that gap.
+    let rearranged_origin = transform.0;
     for dev in [&a, &b] {
         let layout = dev.node.layout().0;
         let current = layout.device_transform(a.node.id()).unwrap();
-        assert!((current.0.x - transform.0.x).abs() < 1e-12 && (current.0.y - transform.0.y).abs() < 1e-12);
-        assert!((current.1 - transform.1).abs() < 1e-12);
+        assert!((current.0.x - rearranged_origin.x).abs() < 1e-12 && (current.0.y - rearranged_origin.y).abs() < 1e-12);
+        assert_eq!(current.1, transform.1);
         let screen = layout.screen(&second_id).unwrap();
-        assert!((screen.rect.x - transform.0.x - rearranged.bounds.x * transform.1).abs() < 1e-12);
+        assert!((screen.rect.x - rearranged_origin.x - rearranged.bounds.x * scale).abs() < 1e-12);
     }
+    assert_peer(&fixed_peer);
+    let retained = a.node.layout().0.device_transform(a.node.id()).unwrap();
     a.displays.set_displays(two.clone());
     wait_all(&[&a, &b], "native group revert", 10.0, || check(&two)).await;
+    for dev in [&a, &b] {
+        // The reverted group fits; native changes never close a gap.
+        assert_eq!(dev.node.layout().0.device_transform(a.node.id()).unwrap(), retained);
+    }
+    assert_peer(&fixed_peer);
     let hidden = ScreenKey::from(&second_id);
     api(&a.node, move |node| node.set_screen_hidden(hidden, true))
         .await
@@ -2321,6 +2417,22 @@ async fn display_notifications_refresh_layout_topology_api_and_restore_detached_
         })
     })
     .await;
+    let group = oink_agent::api::GroupKey(a.node.link_config().unwrap().applied().group);
+    let hidden_profile = oink_agent::layout_profiles::store::load(&a.dir, group)
+        .unwrap()
+        .unwrap();
+    // The next edit originates on the peer. Wait for the profile stream as
+    // well as C0 so the two deliberate manual edits are causally ordered.
+    wait_all(&[&a, &b], "hidden screen saved on peer", 10.0, || {
+        oink_agent::layout_profiles::store::load(&b.dir, group)
+            .unwrap()
+            .is_some_and(|catalog| {
+                catalog.active().content_revision == hidden_profile.active().content_revision
+                    && catalog.active().content == hidden_profile.active().content
+                    && catalog.active().saved_topology == hidden_profile.active().saved_topology
+            })
+    })
+    .await;
     let device = a.node.id();
     api(&b.node, move |node| {
         node.save_layout(vec![Placement {
@@ -2331,8 +2443,23 @@ async fn display_notifications_refresh_layout_topology_api_and_restore_detached_
     })
     .await
     .unwrap();
+    let resized = oink_agent::layout_profiles::store::load(&b.dir, group)
+        .unwrap()
+        .unwrap();
     wait_all(&[&a, &b], "group scale includes hidden member", 10.0, || {
         a.node.layout().0 == b.node.layout().0
+    })
+    .await;
+    // C0 layout and profile catalog use separate streams. Finish the peer's
+    // saved edit before making the next manual edit on the owner.
+    wait_all(&[&a, &b], "peer scale edit saved on owner", 10.0, || {
+        oink_agent::layout_profiles::store::load(&a.dir, group)
+            .unwrap()
+            .is_some_and(|catalog| {
+                catalog.active().content_revision == resized.active().content_revision
+                    && catalog.active().content == resized.active().content
+                    && catalog.active().saved_topology == resized.active().saved_topology
+            })
     })
     .await;
     for screen in a.node.layout().0.screens.iter().filter(|s| s.id.device == device) {
@@ -2344,19 +2471,43 @@ async fn display_notifications_refresh_layout_topology_api_and_restore_detached_
         .unwrap();
     wait_all(&[&a, &b], "revealed native group", 10.0, || check(&two)).await;
 
-    let edit_id = second_id.clone();
-    let config = a.node.link_config().unwrap();
-    tokio::task::spawn_blocking(move || {
-        config.edit_layout(
-            Box::new(move |layout| {
-                layout.move_screen(&edit_id, Point::new(900.0 / 686.0, -300.0 / 686.0));
-            }),
-            oink_protocol::v1::dto::LayoutSource::Manual,
-        )
+    let saved_before = oink_agent::layout_profiles::store::load(&a.dir, group)
+        .unwrap()
+        .unwrap();
+    let moved_screen = ScreenKey::from(&second_id);
+    api(&a.node, move |node| {
+        node.move_screen(moved_screen, Point::new(900.0 / 686.0, -300.0 / 686.0))
     })
     .await
-    .unwrap()
     .unwrap();
+    let saved = oink_agent::layout_profiles::store::load(&a.dir, group)
+        .unwrap()
+        .unwrap();
+    assert_ne!(saved.active().content_revision, saved_before.active().content_revision);
+    let (origin, scale) = a.node.layout().0.device_transform(a.node.id()).unwrap();
+    let saved_placement = saved
+        .active()
+        .content
+        .placements
+        .iter()
+        .find(|p| p.device.0 == a.node.id())
+        .unwrap();
+    assert_eq!((saved_placement.origin, saved_placement.scale), (origin, scale));
+    assert!(saved.active().saved_topology.is_some());
+    assert_eq!(
+        saved.active().saved_topology,
+        oink_agent::layout_profiles::topology::from_facts(&a.node.link_config().unwrap().members())
+    );
+    wait_all(&[&a, &b], "manual profile revision saved on both replicas", 10., || {
+        oink_agent::layout_profiles::store::load(&b.dir, group)
+            .unwrap()
+            .is_some_and(|catalog| {
+                catalog.active().content_revision == saved.active().content_revision
+                    && catalog.active().content == saved.active().content
+                    && catalog.active().saved_topology == saved.active().saved_topology
+            })
+    })
+    .await;
     wait_all(&[&a, &b], "saved added display placement", 10., || {
         b.node.layout().0.screen(&second_id) == a.node.layout().0.screen(&second_id)
     })
@@ -2416,6 +2567,14 @@ async fn display_notifications_refresh_layout_topology_api_and_restore_detached_
             })
     })
     .await;
+    for dev in [&a, &b] {
+        let after = oink_agent::layout_profiles::store::load(&dev.dir, group)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.active().content_revision, saved.active().content_revision);
+        assert_eq!(after.active().content, saved.active().content);
+        assert_eq!(after.active().saved_topology, saved.active().saved_topology);
+    }
     shutdown(vec![a, b]).await;
 }
 

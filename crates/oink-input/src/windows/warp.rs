@@ -17,7 +17,7 @@ use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, POINT, RECT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, SendInput};
 use windows::Win32::UI::WindowsAndMessaging::{
     ClipCursor, GetClipCursor, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SetCursorPos,
 };
 
 use crate::stale_step::StaleSteps;
@@ -188,6 +188,25 @@ pub(super) fn place(p: POINT) -> windows::core::Result<()> {
     };
     if result.is_err() {
         BASE.with_borrow_mut(|base| base.cancel(sequence));
+    }
+    result
+}
+
+/// Only the bounded Local restore safety reset bypasses tagged input. Preserve
+/// displacement accounting before possible native reentry, then verify readback
+/// at the caller. Do not reuse this for ordinary parking or cursor refresh.
+pub(super) fn restore_synchronously(target: POINT) -> windows::core::Result<()> {
+    let before = super::hook::cursor_pos_checked()?;
+    let acceptance = accepted(before, target);
+    #[cfg(all(test, debug_assertions))]
+    if super::hook::test_place_cursor(target) {
+        return Ok(());
+    }
+    // SAFETY: physical point clamped to a real monitor; only the Local hook owner
+    // calls this once for its current restore generation, outside a LL callback.
+    let result = unsafe { SetCursorPos(target.x, target.y) };
+    if result.is_err() {
+        rejected(acceptance);
     }
     result
 }

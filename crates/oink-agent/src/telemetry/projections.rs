@@ -221,6 +221,14 @@ pub fn drag_native_begin(generation: u64, at: Instant, end: Instant) {
 
 pub fn drag_preparation(stage: oink_clipboard::dnd::PreparationStage, start: Instant, end: Instant) {
     use oink_clipboard::dnd::PreparationStage;
+    if let Some(elapsed) = end.checked_duration_since(start) {
+        tracing::debug!(
+            dnd_phase = 30_u64,
+            ?stage,
+            elapsed_us = elapsed.as_micros() as u64,
+            "drag preparation stage finished"
+        );
+    }
     if let Some(p) = super::producer()
         && let Some(stamp) = p.stamp_at(start)
     {
@@ -228,7 +236,34 @@ pub fn drag_preparation(stage: oink_clipboard::dnd::PreparationStage, start: Ins
             PreparationStage::SourceRead => PrepareStage::SourceRead,
             PreparationStage::Normalization => PrepareStage::Normalization,
             PreparationStage::NativePreparation => PrepareStage::NativePreparation,
+            PreparationStage::Metadata => PrepareStage::Metadata,
+            PreparationStage::PendingWindow => PrepareStage::PendingWindow,
+            PreparationStage::SourcePress => PrepareStage::SourcePress,
+            PreparationStage::NativeAcknowledgement => PrepareStage::NativeAcknowledgement,
+            PreparationStage::WritersPreview => PrepareStage::WritersPreview,
+            PreparationStage::NativeBegin => PrepareStage::NativeBegin,
+            PreparationStage::Preview => PrepareStage::Preview,
+            PreparationStage::Namespace => PrepareStage::Namespace,
+            PreparationStage::Registration => PrepareStage::Registration,
         };
+        p.interval(stamp, Metric::DragPrepareStage { stage }, end);
+    }
+}
+
+/// Fixed local stage log shares the exact boundaries used for report admission.
+pub fn drag_target_stage(stage: PrepareStage, start: Instant, end: Instant) {
+    let Some(elapsed) = end.checked_duration_since(start) else {
+        return;
+    };
+    tracing::debug!(
+        dnd_phase = 30_u64,
+        ?stage,
+        elapsed_us = elapsed.as_micros() as u64,
+        "target drag local stage finished"
+    );
+    if let Some(p) = super::producer()
+        && let Some(stamp) = p.stamp_at(start)
+    {
         p.interval(stamp, Metric::DragPrepareStage { stage }, end);
     }
 }

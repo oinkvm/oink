@@ -1,0 +1,183 @@
+{
+  "schema": 1,
+  "token": "fixture-capability",
+  "port": 1,
+  "records": [
+    {
+      "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root",
+      "parent": "root",
+      "name": "receive",
+      "directory": true,
+      "size": null,
+      "modified": null,
+      "node": null,
+      "version": 1,
+      "children": 1
+    },
+    {
+      "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-slot-folder-0",
+      "parent": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root",
+      "name": "tree",
+      "directory": true,
+      "size": null,
+      "modified": null,
+      "node": 1,
+      "version": 1,
+      "children": 2
+    },
+    {
+      "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-2",
+      "parent": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-slot-folder-0",
+      "name": "body",
+      "directory": false,
+      "size": 3,
+      "modified": null,
+      "node": 2,
+      "version": 5,
+      "children": null
+    },
+    {
+      "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-3",
+      "parent": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-slot-folder-0",
+      "name": "empty",
+      "directory": true,
+      "size": null,
+      "modified": null,
+      "node": 3,
+      "version": 2,
+      "children": 0
+    }
+  ],
+  "source": {
+    "offer": {
+      "clip": {
+        "origin": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "seq": 9223372036854775810
+      },
+      "generation": 9223372036854775810
+    },
+    "token": [
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8
+    ],
+    "provisional": false,
+    "roots": [
+      {
+        "id": 1,
+        "parent": null,
+        "name": "tree",
+        "kind": "Directory",
+        "size": {
+          "Known": 0
+        },
+        "version": 1,
+        "modified_ms": null
+      }
+    ],
+    "fulfilled": [
+      {
+        "node": 1,
+        "digest": [
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11
+        ]
+      }
+    ]
+  },
+  "pinning": [],
+  "urls": [],
+  "received_at": 1700000000000
+}

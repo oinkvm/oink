@@ -31,6 +31,7 @@ impl Files {
         let roots = namespace
             .roots()
             .iter()
+            .filter(|node| target != TargetOs::Windows || node.kind.symlink_target().is_none())
             .map(|node| names.entry(node))
             .collect::<io::Result<_>>()?;
         Ok(Arc::new(Self {
@@ -43,6 +44,71 @@ impl Files {
     pub fn roots(&self) -> &[FileEntry] {
         &self.roots
     }
+    /// Rebuild an already-published native index without enumerating the source.
+    #[cfg(any(windows, all(test, debug_assertions)))]
+    pub(crate) fn restore_table(
+        namespace: Arc<dyn Namespace>,
+        target: TargetOs,
+        nodes: Vec<FileNode>,
+        entries: Vec<FileEntry>,
+    ) -> io::Result<Arc<Self>> {
+        if nodes.len() != entries.len() || nodes.len() > MAX_DISCOVERED_NODES {
+            return Err(unavailable(Unavailable::InvalidData));
+        }
+        let mut ids = HashSet::new();
+        let mut directories = HashSet::new();
+        let mut paths = HashSet::new();
+        let mut roots = Vec::new();
+        for (node, entry) in nodes.iter().zip(&entries) {
+            if !node.valid()
+                || !ids.insert(node.id)
+                || node.parent.is_some_and(|parent| !directories.contains(&parent))
+                || entry.is_dir != (node.kind == NodeKind::Directory)
+                || entry.local_path.is_some()
+                || entry.path.is_empty()
+                || entry.path.len() > 32000
+                || entry.path.contains(['\\', '\0'])
+                || (target == TargetOs::Windows && (entry.path.contains(':') || node.kind.symlink_target().is_some()))
+                || node.kind.symlink_target().is_some_and(|target| {
+                    !oink_foundation::content::safe_symlink_target(
+                        target,
+                        entry.path.split('/').count().saturating_sub(1),
+                    )
+                })
+                || entry
+                    .path
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+                || !paths.insert(entry.path.to_lowercase())
+            {
+                return Err(unavailable(Unavailable::InvalidData));
+            }
+            if node.kind == NodeKind::Directory {
+                directories.insert(node.id);
+            }
+            if node.parent.is_none() {
+                roots.push(entry.clone());
+            }
+        }
+        let expected: HashSet<_> = namespace.roots().iter().map(|node| node.id).collect();
+        if expected
+            != nodes
+                .iter()
+                .filter(|node| node.parent.is_none())
+                .map(|node| node.id)
+                .collect()
+        {
+            return Err(unavailable(Unavailable::InvalidData));
+        }
+        let table = OnceLock::new();
+        let _ = table.set(Ok((nodes, entries)));
+        Ok(Arc::new(Self {
+            namespace,
+            target,
+            roots,
+            table,
+        }))
+    }
     fn table(&self) -> io::Result<&(Vec<FileNode>, Vec<FileEntry>)> {
         self.table
             .get_or_init(|| self.expand().map_err(|e| super::super::reason(&e)))
@@ -50,6 +116,7 @@ impl Files {
             .map_err(|reason| unavailable(*reason))
     }
     fn expand(&self) -> io::Result<(Vec<FileNode>, Vec<FileEntry>)> {
+        self.namespace.prepare()?;
         self.namespace.preparing();
         let mut names = Names::new(self.target);
         let mut nodes = Vec::new();
@@ -57,6 +124,9 @@ impl Files {
         let mut queue: VecDeque<_> = self.namespace.roots().into_iter().map(|n| (n, 0usize)).collect();
         let mut seen = HashSet::new();
         while let Some((node, depth)) = queue.pop_front() {
+            if self.target == TargetOs::Windows && node.kind.symlink_target().is_some() {
+                continue;
+            }
             if depth > 256 || nodes.len() >= MAX_DISCOVERED_NODES || !seen.insert(node.id) {
                 return Err(unavailable(Unavailable::LimitExceeded));
             }
@@ -64,7 +134,16 @@ impl Files {
             if node.kind == NodeKind::Directory {
                 let mut cursor = None;
                 loop {
-                    let page = self.namespace.list(node.id, cursor)?;
+                    // A retained descriptor may first expand after source release.
+                    // Prefer the received catalog once the drop has authority;
+                    // hover still enumerates metadata without hydrating a copy.
+                    let page = if self.namespace.source_link().is_some_and(|link| link.provisional) {
+                        self.namespace.list(node.id, cursor)
+                    } else {
+                        self.namespace
+                            .native_list(node.id, cursor)
+                            .unwrap_or_else(|| self.namespace.list(node.id, cursor))
+                    }?;
                     page.validate(cursor).map_err(unavailable)?;
                     queue.extend(page.entries.into_iter().map(|child| (child, depth + 1)));
                     cursor = page.next;
@@ -97,6 +176,9 @@ impl FileContents for Files {
     fn descriptor_entries(&self) -> io::Result<Option<Vec<FileEntry>>> {
         Ok(Some(self.table()?.1.clone()))
     }
+    fn descriptor_nodes(&self) -> io::Result<Option<Vec<FileNode>>> {
+        Ok(Some(self.table()?.0.clone()))
+    }
     fn descriptor_size_known(&self, index: usize) -> bool {
         self.table().is_ok_and(|table| {
             table
@@ -109,15 +191,32 @@ impl FileContents for Files {
         Some(self.namespace.clone())
     }
     fn open(&self, index: usize) -> io::Result<FileReader> {
+        let published = self
+            .table()?
+            .0
+            .get(index)
+            .ok_or_else(|| unavailable(Unavailable::NoSuchItem))?;
+        if let Some(reader) = self.namespace.native_open(published.id, 0) {
+            return reader;
+        }
         let selected = self.selected(index)?;
         self.namespace.open(selected.id, selected.version, 0)
     }
     fn metadata(&self, index: usize) -> io::Result<Option<FileMetadata>> {
+        let published = self
+            .table()?
+            .0
+            .get(index)
+            .ok_or_else(|| unavailable(Unavailable::NoSuchItem))?;
+        if let Some(metadata) = self.namespace.native_metadata(published.id) {
+            return metadata.map(Some);
+        }
         let entry = self.selected(index)?;
         let ContentSize::Known(size) = entry.size else {
             return Err(unavailable(Unavailable::InvalidData));
         };
         Ok(Some(FileMetadata {
+            exec_bits: entry.exec_bits,
             size,
             modified_ms: entry.modified_ms,
         }))
@@ -134,6 +233,7 @@ impl FileContents for Files {
         };
         Ok(Some((
             FileMetadata {
+                exec_bits: current.exec_bits,
                 size,
                 modified_ms: current.modified_ms,
             },
@@ -197,6 +297,11 @@ impl Names {
             self.paths.insert(node.id, path.clone());
             path
         };
+        if node.kind.symlink_target().is_some_and(|target| {
+            !oink_foundation::content::safe_symlink_target(target, path.split('/').count().saturating_sub(1))
+        }) {
+            return Err(unavailable(Unavailable::InvalidData));
+        }
         Ok(FileEntry {
             path,
             is_dir: node.kind == NodeKind::Directory,
@@ -237,6 +342,7 @@ impl Flat {
                     None => (None, entry.path.as_str()),
                 };
                 let node = FileNode {
+                    exec_bits: None,
                     id: NodeId(i as u64 + 1),
                     parent,
                     name: name.into(),
@@ -289,6 +395,7 @@ impl Namespace for Flat {
         if let Some(meta) = self.contents.metadata((id.0 - 1) as usize)? {
             node.size = ContentSize::Known(meta.size);
             node.modified_ms = meta.modified_ms;
+            node.exec_bits = meta.exec_bits;
         }
         Ok(node)
     }

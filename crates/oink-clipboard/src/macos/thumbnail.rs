@@ -252,7 +252,7 @@ mod native_tests {
     use objc2_app_kit::{NSPasteboardItem, NSPasteboardWriting};
     use objc2_foundation::{NSArray, NSData};
     fn board(items: Vec<Retained<NSPasteboardItem>>) -> Retained<NSPasteboard> {
-        let board = NSPasteboard::pasteboardWithUniqueName();
+        let board = crate::macos::test_pasteboard::new();
         let objects: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> =
             items.into_iter().map(ProtocolObject::from_retained).collect();
         assert!(board.writeObjects(&NSArray::from_retained_slice(&objects)));

@@ -11,6 +11,19 @@ from macos_imports import verify_imports
 from versioning import release_version, macos_version_fields
 
 
+def verify_microphone(app, source_tree_sha256, team_id):
+    plugin = app / 'Contents/Resources/AudioPlugin/OinkMicrophone.driver'
+    plugin_info = plistlib.loads((plugin / 'Contents/Info.plist').read_bytes())
+    if (plugin_info.get('CFBundleIdentifier') != 'com.hachiwii.oink.microphone.driver'
+            or plugin_info.get('CFBundleExecutable') != 'OinkMicrophone'
+            or plugin_info.get('OinkGitSHA') != source_tree_sha256
+            or not re.fullmatch(r'[a-f0-9]{64}', plugin_info.get('OinkPluginVersion', ''))):
+        raise RuntimeError('Virtual microphone identity/provenance mismatch')
+    verify_signature(plugin, team_id)
+    if not (app / 'Contents/Resources/AudioPlugin/install.sh').is_file():
+        raise RuntimeError('Virtual microphone installer missing')
+
+
 def verify_tcc_policy(info, entitlements):
     # AppKit's Apple Event registration and WebKit's media capability preflights
     # do not require permission to automate other apps or capture the camera.
@@ -104,8 +117,8 @@ def verify_app(app, identity):
             info.get('SUPublicEDKey') != trust['public_key'] or
             (trust['enabled'] and not trust['public_key'])):
         raise RuntimeError('Mac package provenance or update trust mismatch')
-    if metadata['version'] != release_version(identity['version'], metadata.get('source_commit')):
-        raise RuntimeError('Mac display version differs from the source commit')
+    if metadata['version'] != release_version(identity['version'], metadata.get('source_commit'), metadata['build']):
+        raise RuntimeError('Mac display version differs from the release build')
     for bundle_info in (info, ui, ext_info):
         if any(bundle_info.get(key) != value for key, value in macos_version_fields(metadata['version'], metadata['build']).items()):
             raise RuntimeError('Mac numeric/display bundle versions differ from the release receipt')
@@ -119,5 +132,6 @@ def verify_app(app, identity):
         raise RuntimeError('Mac crash report manifest differs from shipped images')
     if not (app / 'Contents/Frameworks/Sparkle.framework').is_dir():
         raise RuntimeError('Sparkle.framework missing')
+    verify_microphone(app, metadata['source_tree_sha256'], mac['team_id'])
     verify_signature(app, mac['team_id'])
     return components

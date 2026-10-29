@@ -88,6 +88,7 @@ async fn start() -> Vec<Running> {
         let snapshots = InputSnapshots {
             mode_switch_in_callback: true,
             capture_reports_key_repeat: false,
+            local_input_transform: oink_foundation::input_transform::InputTransform::initial(std::env::consts::OS),
             layout: config.router_layout(),
             settings: Arc::new(Snapshot::default()),
             environment: Arc::new(Snapshot::default()),

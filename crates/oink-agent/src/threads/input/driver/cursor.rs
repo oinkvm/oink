@@ -41,9 +41,7 @@ pub(super) struct Pending {
     time: Option<CaptureTime>,
     report: Option<crate::telemetry::Stamp>,
     pub(super) arrival: Option<(DeviceId, CaptureTime, Instant, bool)>,
-}
-pub(super) fn motion(message: &Message) -> bool {
-    pointer_motion(message, false)
+    game_escape: bool,
 }
 pub(super) fn pointer_motion(message: &Message, include_relative: bool) -> bool {
     fn input(msg: &InputMsg, include_relative: bool) -> bool {
@@ -105,17 +103,24 @@ impl Driver {
             // a new FIFO barrier AFTER that delta's native acceptance.
         }
         let router = self.adapter.router();
-        if motion(&message)
+        let game_escape = router.game_escape_readback(source.unwrap_or(peer));
+        if pointer_motion(&message, game_escape)
             && self.adapter.attached(peer)
             && router.has_pointer_focus()
             && !router.paused()
-            && !router.game_mode().active
+            && (!router.game_mode().active || game_escape)
             && !router.local_displays().is_empty()
         {
             // Network reads stop as soon as this slot is occupied. Reliable
             // buttons/keys and later datagrams remain in their bounded queues.
             debug_assert!(self.cursor.pending.is_none());
+            if game_escape {
+                self.adapter
+                    .router_mut()
+                    .reconcile_game_escape_snapshot(source.unwrap_or(peer), None, None);
+            }
             self.cursor.pending = Some(Pending {
+                game_escape,
                 peer,
                 source,
                 message,
@@ -151,6 +156,25 @@ impl Driver {
         // The press may have begun while this packet waited for its FIFO read.
         // Apply the same discard policy before either reconciliation or timeout.
         if self.inject.discard_source_motion() {
+            return;
+        }
+        if pending.game_escape
+            && !self
+                .adapter
+                .router()
+                .game_escape_readback(pending.source.unwrap_or(pending.peer))
+        {
+            // A local release can race the pending read. Route relative motion
+            // normally, without adopting the sample or scheduling another read.
+            self.input_time = pending.time;
+            self.input_report = pending.report;
+            self.adapter.inbound(pending.peer, pending.message);
+            self.outputs(pending.source);
+            if let Some((source, time, arrived, lossy)) = pending.arrival {
+                self.record_jitter(pending.peer, source, time, arrived, lossy);
+            }
+            self.input_time = None;
+            self.input_report = None;
             return;
         }
         if self.now.saturating_duration_since(pending.at) >= MAX_WAIT {
@@ -228,7 +252,17 @@ impl Driver {
         let clip = sample.and_then(|s| s.clip);
         self.clip_poll_at = self.now + Duration::from_millis(100);
         self.clip_available = clip.is_some();
-        self.adapter.router_mut().reconcile_target_snapshot(position, clip);
+        if pending.game_escape {
+            // Relative injection has no predicted absolute endpoint. Even an
+            // unchanged/Expected read is fresh boundary evidence for this packet.
+            self.adapter.router_mut().reconcile_game_escape_snapshot(
+                pending.source.unwrap_or(pending.peer),
+                sample.and_then(|s| s.observation.position),
+                clip,
+            );
+        } else {
+            self.adapter.router_mut().reconcile_target_snapshot(position, clip);
+        }
         // Consume exactly once, after resolving the base and constraint. Router
         // remains the sole authority for gain, gap, resistance, drag and crossing.
         self.input_time = pending.time;

@@ -92,8 +92,8 @@ pub enum NetError {
     Stopped,
 }
 
-/// Source of an already accepted physical-user activity notification. Audio is
-/// observed separately at media endpoints and never produces a group broadcast.
+/// Source of an already accepted activity notification. Group pulses may report
+/// physical input or real audio; this observation only updates local Low pacing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UserActivitySource {
     Local,
@@ -151,3 +151,5 @@ pub struct TcpBulkStatus {
 pub enum BulkTransport {
     TcpTls,
 }
+
+pub mod pointer_slots;

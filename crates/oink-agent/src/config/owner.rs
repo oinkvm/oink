@@ -67,7 +67,7 @@ impl OwnerStore {
             return Ok(false);
         }
         validate_value(option, &value).map_err(|_| StoreError::Invalid)?;
-        let mut items = self.preferences();
+        let mut items = self.stored_preferences();
         items.push(DevicePreference::from_raw(
             [(1, option.write()), (2, 1u64.write()), (3, value)].into(),
         )?);
@@ -80,7 +80,12 @@ impl OwnerStore {
         Self::from_raw(oink_protocol::v1::cbor::decode_map(bytes, MAX_OWNER_BYTES)?)
     }
     pub fn encode(&self) -> Result<Vec<u8>, StoreError> {
-        Ok(oink_protocol::v1::cbor::encode_map(&self.raw, MAX_OWNER_BYTES)?)
+        let mut raw = self.raw.clone();
+        raw.insert(
+            2,
+            RawValue::Array(self.stored_preferences().iter().map(WireValue::write).collect()),
+        );
+        Ok(oink_protocol::v1::cbor::encode_map(&raw, MAX_OWNER_BYTES)?)
     }
     fn from_raw(raw: RawMap) -> Result<Self, StoreError> {
         store::schema(&raw)?;
@@ -105,21 +110,63 @@ impl OwnerStore {
                 return Err(StoreError::Invalid);
             }
             parse_claims(map)?;
+            if let Some(microphone) = map.get(&5) {
+                parse_claims(microphone.as_map()?)?;
+            }
         }
         if let Some(group) = raw.get(&4) {
             store::group(group)?;
         }
         Ok(Self { raw })
     }
-    pub fn preferences(&self) -> Vec<DevicePreference> {
+    fn stored_preferences(&self) -> Vec<DevicePreference> {
         store::entries(&self.raw)
             .expect("validated items")
             .iter()
             .map(|item| DevicePreference::read(item).expect("validated preference"))
+            // Option 5 is retired locally. A stale saved guard is never authority.
+            .filter(|item| item.option() != Ok(LocalOption::KeyboardDisabled))
             .collect()
     }
+    /// Frozen v1 projection: Disabled is represented by the original bool option,
+    /// never by sending the local-only KeyboardMode value 2 to an old peer.
+    pub fn preferences(&self) -> Vec<DevicePreference> {
+        let mut items: Vec<_> = self
+            .stored_preferences()
+            .into_iter()
+            .map(|item| self.wire_item(item))
+            .collect();
+        if let Some(item) = self.item(LocalOption::KeyboardDisabled) {
+            items.push(item);
+        }
+        items.sort_by_key(|item| item.option().expect("validated option").number());
+        items
+    }
+    fn wire_item(&self, item: DevicePreference) -> DevicePreference {
+        if item.option() == Ok(LocalOption::KeyboardMode) && item.value() == Ok(2u32.write()) {
+            let mut raw = item.into_raw();
+            raw.insert(3, 0u32.write());
+            DevicePreference::from_raw(raw).expect("valid shared keyboard projection")
+        } else {
+            item
+        }
+    }
     pub fn item(&self, option: LocalOption) -> Option<DevicePreference> {
-        self.preferences().into_iter().find(|item| item.option() == Ok(option))
+        if option == LocalOption::KeyboardDisabled {
+            let mode = self.item(LocalOption::KeyboardMode)?;
+            return DevicePreference::from_raw(
+                [
+                    (1, option.write()),
+                    (2, mode.revision().ok()?.write()),
+                    (3, (mode.value().ok()? == 2u32.write()).write()),
+                ]
+                .into(),
+            )
+            .ok();
+        }
+        self.stored_preferences()
+            .into_iter()
+            .find(|item| item.option() == Ok(option))
     }
     pub fn revision(&self, option: LocalOption) -> Option<u64> {
         self.item(option).and_then(|item| item.revision().ok())
@@ -137,7 +184,21 @@ impl OwnerStore {
         expected: u64,
         patch: RawValue,
     ) -> Result<DevicePreference, ControlFailure> {
-        if option == LocalOption::AudioExitClaim {
+        // Compatibility command only: no separate local guard or guard revision.
+        if option == LocalOption::KeyboardDisabled {
+            let disabled = bool::read(&patch).map_err(invalid)?;
+            let value = if disabled {
+                2u32.write()
+            } else if self.value(LocalOption::KeyboardMode) == Some(2u32.write()) {
+                0u32.write()
+            } else {
+                self.value(LocalOption::KeyboardMode)
+                    .ok_or(ControlFailure::UnsupportedOption)?
+            };
+            self.edit(LocalOption::KeyboardMode, expected, value)?;
+            return self.item(option).ok_or(ControlFailure::UnsupportedOption);
+        }
+        if matches!(option, LocalOption::AudioExitClaim | LocalOption::MicrophoneShareClaim) {
             return Err(ControlFailure::UnsupportedOption);
         }
         let current = self.item(option).ok_or(ControlFailure::UnsupportedOption)?;
@@ -151,13 +212,26 @@ impl OwnerStore {
                 | LocalOption::InputTransform
                 | LocalOption::SourceInputPolicy
                 | LocalOption::ForwardingControls
+                | LocalOption::MicrophoneControls
         ) {
             apply_patch(option, &mut value, &patch)?;
         } else {
             value = patch;
         }
         validate_value(option, &value)?;
-        self.replace_value(option, expected, value)
+        let item = self.replace_value(option, expected, value)?;
+        if matches!(option, LocalOption::TouchpadInjection | LocalOption::NativeMultifinger)
+            && let Some(revision) = self.revision(LocalOption::AcceptContacts)
+        {
+            // New local and remote edits project to the same released fallback.
+            // An old Mac source still selects today's raw-or-mapped path, never
+            // the new plain-wheel or scroll-only classifiers.
+            let enabled = [LocalOption::TouchpadInjection, LocalOption::NativeMultifinger]
+                .into_iter()
+                .all(|option| self.value(option) == Some(RawValue::Bool(true)));
+            self.replace_value(LocalOption::AcceptContacts, revision, RawValue::Bool(enabled))?;
+        }
+        Ok(item)
     }
 
     /// Owner actor's already validated full value (used to commit a local typed
@@ -193,42 +267,16 @@ impl OwnerStore {
             .expect("known option");
         items[index] = item.write();
     }
-    /// Startup safety release is a new publication even when the persisted
-    /// keyboard was already enabled. Invoke once per backend Boot, inside the
-    /// same durable owner transaction used for ordinary preference changes.
-    pub fn clear_keyboard_on_start(&mut self) -> Result<DevicePreference, StoreError> {
-        let mut item = self
-            .item(LocalOption::KeyboardDisabled)
-            .ok_or(StoreError::Invalid)?
-            .into_raw();
-        let revision = item
-            .get(&2)
-            .ok_or(StoreError::Invalid)?
-            .as_u64()?
-            .checked_add(1)
-            .ok_or(StoreError::LimitExceeded)?;
-        item.insert(2, revision.write());
-        item.insert(3, false.write());
-        let item = DevicePreference::from_raw(item)?;
-        self.set_item(item.clone());
-        Ok(item)
-    }
-    /// Disabled is runtime intent, durably cleared before any owner/input task
-    /// starts. Preserve ordinary Local/Shared preferences and fence old Boots.
+    /// Both source modes use the same durable Disabled -> Shared release before
+    /// startup, on pause, and on the physical release chord. Local stays Local.
     pub fn clear_input_disables_on_start(&mut self) -> Result<(), StoreError> {
-        self.clear_keyboard_on_start()?;
         self.release_input_disables()
     }
-    /// One config candidate commits both release values atomically. Never turn a
-    /// normal mouse Local preference into Shared while clearing a keyboard guard.
     pub fn release_input_disables(&mut self) -> Result<(), StoreError> {
-        for (option, disabled, enabled) in [
-            (LocalOption::KeyboardDisabled, true.write(), false.write()),
-            (LocalOption::MouseMode, 2u32.write(), 0u32.write()),
-        ] {
+        for option in [LocalOption::KeyboardMode, LocalOption::MouseMode] {
             let item = self.item(option).ok_or(StoreError::Invalid)?;
-            if item.value()? == disabled {
-                self.edit(option, item.revision()?, enabled)
+            if item.value()? == 2u32.write() {
+                self.edit(option, item.revision()?, 0u32.write())
                     .map_err(|_| StoreError::Invalid)?;
             }
         }
@@ -238,7 +286,20 @@ impl OwnerStore {
         self.raw.get(&4).and_then(|value| store::group(value).ok())
     }
     pub fn claims(&self, group: GroupId) -> GroupClaims {
+        self.claims_for(group, LocalOption::AudioExitClaim)
+    }
+    pub fn microphone_claims(&self, group: GroupId) -> GroupClaims {
+        self.claims_for(group, LocalOption::MicrophoneShareClaim)
+    }
+    fn claims_for(&self, group: GroupId, option: LocalOption) -> GroupClaims {
         self.group_raw(group)
+            .and_then(|raw| {
+                if option == LocalOption::MicrophoneShareClaim {
+                    raw.get(&5).and_then(|v| v.as_map().ok())
+                } else {
+                    Some(raw)
+                }
+            })
             .map(|raw| parse_claims(raw).expect("validated group"))
             .unwrap_or_default()
     }
@@ -256,37 +317,118 @@ impl OwnerStore {
             return Ok(());
         }
         let mut candidate = self.clone();
-        let item = candidate.item(LocalOption::AudioExitClaim).ok_or(StoreError::Invalid)?;
-        let revision = item.revision()?.checked_add(1).ok_or(StoreError::LimitExceeded)?;
-        let mut claims = candidate.claims(group);
-        let claim = claims
-            .records
-            .iter()
-            .find(|r| r.owner == owner)
-            .and_then(|r| r.claim.clone());
-        let record = ClaimRecord {
-            owner,
-            revision,
-            claim: claim.clone(),
-        };
-        if let Some(existing) = claims.records.iter_mut().find(|r| r.owner == owner) {
-            *existing = record;
-        } else {
-            claims.records.push(record);
-        }
-        let mut raw = item.into_raw();
-        raw.insert(2, revision.write());
-        raw.insert(3, claim.write());
-        candidate.set_item(DevicePreference::from_raw(raw)?);
         candidate.raw.insert(4, RawValue::Bytes(group.0.to_vec()));
-        candidate.commit_claims(group, owner, claims)?;
+        for option in [LocalOption::AudioExitClaim, LocalOption::MicrophoneShareClaim] {
+            let Some(item) = candidate.item(option) else { continue };
+            let revision = item.revision()?.checked_add(1).ok_or(StoreError::LimitExceeded)?;
+            let mut claims = candidate.claims_for(group, option);
+            let claim = claims
+                .records
+                .iter()
+                .find(|r| r.owner == owner)
+                .and_then(|r| r.claim.clone());
+            let record = ClaimRecord {
+                owner,
+                revision,
+                claim: claim.clone(),
+            };
+            if let Some(existing) = claims.records.iter_mut().find(|r| r.owner == owner) {
+                *existing = record;
+            } else {
+                claims.records.push(record);
+            }
+            let mut raw = item.into_raw();
+            raw.insert(2, revision.write());
+            raw.insert(3, claim.write());
+            candidate.set_item(DevicePreference::from_raw(raw)?);
+            candidate.commit_claims_for(group, owner, claims, option)?;
+        }
+        *self = candidate;
+        Ok(())
+    }
+    /// A verified group merge carries active local roles into the new group.
+    /// Ordinary group switches still restore that group's independent history.
+    /// Each carried claim gets a fresh ordered stamp, so concurrent merge
+    /// participants converge and the losing local owner durably yields.
+    pub fn merge_group(&mut self, group: GroupId, owner: DeviceId) -> Result<(), StoreError> {
+        if self.active_group() == Some(group) {
+            return Ok(());
+        }
+        let mut candidate = self.clone();
+        candidate.switch_group(group, owner)?;
+        for option in [LocalOption::AudioExitClaim, LocalOption::MicrophoneShareClaim] {
+            let Some(item) = self.item(option) else { continue };
+            let claim = Option::<dto::AudioExitClaim>::read(&item.value()?)?;
+            if !claim.is_some_and(|c| c.claimed() == Ok(true)) {
+                continue;
+            }
+            let previous = self
+                .active_group()
+                .map(|g| self.claims_for(g, option))
+                .unwrap_or_default();
+            let mut claims = candidate.claims_for(group, option);
+            let counter = claims
+                .seen_counter
+                .max(previous.seen_counter)
+                .checked_add(1)
+                .ok_or(StoreError::LimitExceeded)?;
+            let stamp = oink_audio::claims::Stamp { counter, owner };
+            let claim = dto::AudioExitClaim::from_raw([(1, stamp.to_wire().write()), (2, true.write())].into())?;
+            let revision = candidate.revision(option).ok_or(StoreError::Invalid)?;
+            let local = claims
+                .records
+                .iter_mut()
+                .find(|r| r.owner == owner)
+                .ok_or(StoreError::Invalid)?;
+            local.claim = Some(claim.clone());
+            // switch_group already advances the local projection once; this is
+            // one atomic transition, never an intermediate published baseline.
+            local.revision = revision.checked_add(1).ok_or(StoreError::LimitExceeded)?;
+            claims.seen_counter = counter;
+            claims.watermark = Some(claim);
+            candidate.commit_claims_for(group, owner, claims, option)?;
+        }
         *self = candidate;
         Ok(())
     }
     /// Persist the pure audio owner's proposed authenticated records together
     /// with option20. Removed-member records and group history are never pruned.
     pub fn commit_claims(&mut self, group: GroupId, owner: DeviceId, claims: GroupClaims) -> Result<(), StoreError> {
-        let previous = self.claims(group);
+        self.commit_claims_for(group, owner, claims, LocalOption::AudioExitClaim)
+    }
+    pub fn commit_microphone_claims(
+        &mut self,
+        group: GroupId,
+        owner: DeviceId,
+        claims: GroupClaims,
+    ) -> Result<(), StoreError> {
+        self.commit_claims_for(group, owner, claims, LocalOption::MicrophoneShareClaim)
+    }
+    /// Release and receiver unmute share one retained-store transaction.
+    pub fn release_microphone_claim(
+        &mut self,
+        group: GroupId,
+        owner: DeviceId,
+        claims: GroupClaims,
+    ) -> Result<(), StoreError> {
+        let mut candidate = self.clone();
+        candidate.commit_microphone_claims(group, owner, claims)?;
+        let option = LocalOption::MicrophoneReceiveMuted;
+        let revision = candidate.revision(option).ok_or(StoreError::Invalid)?;
+        candidate
+            .edit(option, revision, false.write())
+            .map_err(|_| StoreError::Invalid)?;
+        *self = candidate;
+        Ok(())
+    }
+    fn commit_claims_for(
+        &mut self,
+        group: GroupId,
+        owner: DeviceId,
+        claims: GroupClaims,
+        option: LocalOption,
+    ) -> Result<(), StoreError> {
+        let previous = self.claims_for(group, option);
         if claims.seen_counter < previous.seen_counter {
             return Err(StoreError::Invalid);
         }
@@ -302,7 +444,16 @@ impl OwnerStore {
         {
             return Err(StoreError::Invalid);
         }
-        let mut map = self.group_raw(group).cloned().unwrap_or_default();
+        let mut outer = self.group_raw(group).cloned().unwrap_or_default();
+        let mut map = if option == LocalOption::MicrophoneShareClaim {
+            outer
+                .get(&5)
+                .map(|v| v.as_map().cloned())
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            outer.clone()
+        };
         let prior = map.get(&3).map(array).transpose()?.unwrap_or_default();
         let mut records = Vec::new();
         for record in &claims.records {
@@ -327,6 +478,14 @@ impl OwnerStore {
         map.insert(3, RawValue::Array(records));
         map.insert(4, claims.watermark.write());
         parse_claims(&map)?;
+        if option == LocalOption::MicrophoneShareClaim {
+            outer.entry(1).or_insert_with(|| RawValue::Bytes(group.0.to_vec()));
+            outer.entry(2).or_insert_with(|| 0u64.write());
+            outer.entry(3).or_insert_with(|| RawValue::Array(Vec::new()));
+            outer.entry(4).or_insert(RawValue::Null);
+            outer.insert(5, RawValue::Map(map));
+            map = outer;
+        }
         let mut candidate = self.clone();
         let RawValue::Array(groups) = candidate.raw.get_mut(&3).expect("groups") else {
             unreachable!()
@@ -342,10 +501,7 @@ impl OwnerStore {
         if candidate.active_group() == Some(group)
             && let Some(local) = claims.records.iter().find(|record| record.owner == owner)
         {
-            let mut item = candidate
-                .item(LocalOption::AudioExitClaim)
-                .ok_or(StoreError::Invalid)?
-                .into_raw();
+            let mut item = candidate.item(option).ok_or(StoreError::Invalid)?.into_raw();
             let current_revision = item.get(&2).ok_or(StoreError::Invalid)?.as_u64()?;
             if local.revision < current_revision {
                 return Err(StoreError::Invalid);
@@ -416,12 +572,12 @@ pub fn validate_value(option: LocalOption, value: &RawValue) -> Result<(), Contr
     use LocalOption::*;
     let bad = ControlFailure::InvalidValue;
     match option {
-        MouseMode => {
+        MouseMode | KeyboardMode => {
             if value.as_u64().map_err(invalid)? > 2 {
                 return Err(bad);
             }
         }
-        KeyboardMode | SpeedMode => {
+        SpeedMode => {
             if value.as_u64().map_err(invalid)? > 1 {
                 return Err(bad);
             }
@@ -437,7 +593,11 @@ pub fn validate_value(option: LocalOption, value: &RawValue) -> Result<(), Contr
         | ScreenShared
         | CursorTrail
         | AcceptContacts
-        | SyncSystemArrangement => {
+        | TouchpadInjection
+        | NativeMultifinger
+        | MacScrollFeel
+        | SyncSystemArrangement
+        | MicrophoneReceiveMuted => {
             bool::read(value).map_err(invalid)?;
         }
         CursorTrailDuration => {
@@ -492,10 +652,14 @@ pub fn validate_value(option: LocalOption, value: &RawValue) -> Result<(), Contr
                 return Err(bad);
             }
         }
-        ForwardingControls => {
+        ForwardingControls | MicrophoneControls => {
             dto::ForwardingControlsValue::read(value).map_err(invalid)?;
         }
-        AudioExitClaim => {
+        MicrophoneInput => {
+            let input = Option::<oink_protocol::v1::schema::Text<512>>::read(value).map_err(invalid)?;
+            oink_audio::validate_receive_output(input.as_ref().map(|v| v.0.as_str())).map_err(|_| bad)?;
+        }
+        AudioExitClaim | MicrophoneShareClaim => {
             Option::<dto::AudioExitClaim>::read(value).map_err(invalid)?;
         }
         _ => return Err(ControlFailure::UnsupportedOption),
@@ -514,15 +678,36 @@ fn validate_keyboard(keyboard: &dto::KeyboardMapping) -> Result<(), ControlFailu
     for key in keyboard.table().map_err(invalid)?.0 {
         let from = oink_foundation::input::KeyCode(key.from().map_err(invalid)?);
         let to = oink_foundation::input::KeyCode(key.to().map_err(invalid)?);
-        if !supported.contains(&from) || !supported.contains(&to) || !seen.insert(from) {
+        if !supported.contains(&from)
+            || (to != oink_foundation::input::KeyCode::NONE && !supported.contains(&to))
+            || !seen.insert(from)
+        {
             return Err(ControlFailure::InvalidValue);
         }
     }
     if let Some(caps) = keyboard.caps_tap_hold().map_err(invalid)?
-        && (!supported.contains(&oink_foundation::input::KeyCode(caps.tap().map_err(invalid)?))
-            || !supported.contains(&oink_foundation::input::KeyCode(caps.hold().map_err(invalid)?)))
+        && [caps.tap().map_err(invalid)?, caps.hold().map_err(invalid)?]
+            .iter()
+            .any(|code| *code != 0 && !supported.contains(&oink_foundation::input::KeyCode(*code)))
     {
         return Err(ControlFailure::InvalidValue);
+    }
+    if let Some(saved) = keyboard.saved_custom().map_err(invalid)? {
+        let mut sources = BTreeSet::new();
+        for key in saved.table().map_err(invalid)?.0 {
+            let from = oink_foundation::input::KeyCode(key.from().map_err(invalid)?);
+            let to = oink_foundation::input::KeyCode(key.to().map_err(invalid)?);
+            if !supported.contains(&from) || (to.0 != 0 && !supported.contains(&to)) || !sources.insert(from) {
+                return Err(ControlFailure::InvalidValue);
+            }
+        }
+        let hold = saved.caps_hold().map_err(invalid)?;
+        if hold.is_some_and(|code| code != 0 && !supported.contains(&oink_foundation::input::KeyCode(code)))
+            || (saved.caps_split().map_err(invalid)? && hold.is_none())
+            || (saved.allow_fn().map_err(invalid)? && !sources.contains(&oink_foundation::input::KeyCode::APPLE_FN))
+        {
+            return Err(ControlFailure::InvalidValue);
+        }
     }
     Ok(())
 }
@@ -535,6 +720,7 @@ enum Shape {
     Target,
     Override,
     Keyboard,
+    SavedCustom,
     Key,
     Caps,
     Policy,
@@ -545,7 +731,7 @@ fn apply_patch(option: LocalOption, current: &mut RawValue, patch: &RawValue) ->
         LocalOption::ScreenPreferences => Shape::ScreenPreferences,
         LocalOption::InputTransform => Shape::Transform,
         LocalOption::SourceInputPolicy => Shape::Policy,
-        LocalOption::ForwardingControls => Shape::Forwarding,
+        LocalOption::ForwardingControls | LocalOption::MicrophoneControls => Shape::Forwarding,
         _ => return Err(ControlFailure::UnsupportedOption),
     };
     patch_map(current, patch, shape)
@@ -564,18 +750,23 @@ fn patch_map(current: &mut RawValue, patch: &RawValue, shape: Shape) -> Result<(
             (Target, 2) | (Override, 3) => Some((Keyboard, false)),
             (Keyboard, 2) => Some((Key, true)),
             (Keyboard, 3) => Some((Caps, false)),
+            (Keyboard, 4) => Some((SavedCustom, false)),
+            (SavedCustom, 1) => Some((Key, true)),
             _ => None,
         };
         let valid = match shape {
             ScreenPreferences | Target | Key | Caps | Forwarding => key <= 2,
-            Screen => key <= 4,
-            Transform | Override | Keyboard => key <= 3,
+            Screen | Keyboard | SavedCustom => key <= 4,
+            Transform | Override => key <= 3,
             Policy => key <= 6,
         };
         if key == 0 || !valid {
             return Err(ControlFailure::UnsupportedOption);
         }
-        let optional = matches!((shape, key), (Policy, 1) | (Override, 2 | 3) | (Keyboard, 3));
+        let optional = matches!(
+            (shape, key),
+            (Policy, 1) | (Override, 2 | 3) | (Keyboard, 3 | 4) | (SavedCustom, 2)
+        );
         if optional && matches!(value, RawValue::Null) {
             if current.get(&key).is_some_and(|value| !matches!(value, RawValue::Null)) {
                 current.remove(&key);
@@ -682,7 +873,7 @@ pub(crate) fn typed_patch(option: LocalOption, before: &RawValue, after: &RawVal
         LocalOption::ScreenPreferences => Shape::ScreenPreferences,
         LocalOption::InputTransform => Shape::Transform,
         LocalOption::SourceInputPolicy => Shape::Policy,
-        LocalOption::ForwardingControls => Shape::Forwarding,
+        LocalOption::ForwardingControls | LocalOption::MicrophoneControls => Shape::Forwarding,
         _ => return after.clone(),
     };
     diff_map(before, after, shape)
@@ -704,6 +895,8 @@ fn diff_map(before: &RawValue, after: &RawValue, shape: Shape) -> RawValue {
             (Target, 2) | (Override, 3) => Some((Keyboard, false)),
             (Keyboard, 2) => Some((Key, true)),
             (Keyboard, 3) => Some((Caps, false)),
+            (Keyboard, 4) => Some((SavedCustom, false)),
+            (SavedCustom, 1) => Some((Key, true)),
             _ => None,
         };
         let value = if let Some((shape, list)) = child {
@@ -780,6 +973,102 @@ mod tests {
             .into(),
         )
         .unwrap()
+    }
+    #[test]
+    fn keyboard_and_mouse_modes_share_runtime_and_release_lifecycle() {
+        for option in [LocalOption::KeyboardMode, LocalOption::MouseMode] {
+            for initial in [0u32, 1u32] {
+                let mut owner = fresh();
+                owner.edit(option, 1, initial.write()).unwrap();
+                let revision = owner.revision(option).unwrap();
+                owner.edit(option, revision, 2u32.write()).unwrap();
+                assert_eq!(owner.value(option), Some(2u32.write()));
+                let saved = owner.encode().unwrap();
+                let mut restored = OwnerStore::decode(&saved).unwrap();
+                assert_eq!(restored.value(option), Some(2u32.write()));
+                assert!(
+                    restored
+                        .stored_preferences()
+                        .iter()
+                        .all(|item| item.option() != Ok(LocalOption::KeyboardDisabled))
+                );
+                restored.release_input_disables().unwrap();
+                assert_eq!(restored.value(option), Some(0u32.write()));
+                let revision = restored.revision(option).unwrap();
+                restored.edit(option, revision, 2u32.write()).unwrap();
+                restored.edit(option, revision + 1, 0u32.write()).unwrap();
+                assert_eq!(restored.value(option), Some(0u32.write()));
+            }
+        }
+    }
+    #[test]
+    fn frozen_keyboard_guard_commands_and_facts_are_boundary_projections() {
+        let mut owner = fresh();
+        owner.edit(LocalOption::KeyboardMode, 1, 1u32.write()).unwrap();
+        let revision = owner.revision(LocalOption::KeyboardMode).unwrap();
+        let disabled = owner
+            .edit(LocalOption::KeyboardDisabled, revision, true.write())
+            .unwrap();
+        assert_eq!(owner.value(LocalOption::KeyboardMode), Some(2u32.write()));
+        assert_eq!(disabled.value().unwrap(), true.write());
+        let preferences = owner.preferences();
+        assert_eq!(
+            preferences
+                .iter()
+                .find(|p| p.option() == Ok(LocalOption::KeyboardMode))
+                .unwrap()
+                .value()
+                .unwrap(),
+            0u32.write()
+        );
+        assert_eq!(
+            preferences
+                .iter()
+                .find(|p| p.option() == Ok(LocalOption::KeyboardDisabled))
+                .unwrap(),
+            &disabled
+        );
+        assert_eq!(
+            owner.edit(LocalOption::KeyboardDisabled, revision, false.write()),
+            Err(ControlFailure::StaleRevision)
+        );
+        owner
+            .edit(LocalOption::KeyboardDisabled, revision + 1, false.write())
+            .unwrap();
+        assert_eq!(owner.value(LocalOption::KeyboardMode), Some(0u32.write()));
+        assert_eq!(owner.value(LocalOption::KeyboardDisabled), Some(false.write()));
+    }
+    #[test]
+    fn stale_saved_keyboard_guard_is_ignored_and_is_not_saved_again() {
+        let mut owner = fresh();
+        owner.edit(LocalOption::KeyboardMode, 1, 1u32.write()).unwrap();
+        let RawValue::Array(items) = owner.raw.get_mut(&2).unwrap() else {
+            unreachable!()
+        };
+        items.push(
+            DevicePreference::from_raw(
+                [
+                    (1, LocalOption::KeyboardDisabled.write()),
+                    (2, 42u64.write()),
+                    (3, true.write()),
+                ]
+                .into(),
+            )
+            .unwrap()
+            .write(),
+        );
+        items.sort_by_key(|item| DevicePreference::read(item).unwrap().option().unwrap().number());
+        let bytes = oink_protocol::v1::cbor::encode_map(&owner.raw, MAX_OWNER_BYTES).unwrap();
+        let restored = OwnerStore::decode(&bytes).unwrap();
+        assert_eq!(restored.value(LocalOption::KeyboardMode), Some(1u32.write()));
+        assert_eq!(restored.value(LocalOption::KeyboardDisabled), Some(false.write()));
+        let raw = oink_protocol::v1::cbor::decode_map(&restored.encode().unwrap(), MAX_OWNER_BYTES).unwrap();
+        assert!(
+            store::entries(&raw)
+                .unwrap()
+                .iter()
+                .all(|item| DevicePreference::read(item).unwrap().option() != Ok(LocalOption::KeyboardDisabled))
+        );
     }
     #[test]
     fn composite_commands_preserve_unknown_paths_and_remove_only_explicit_keys() {
@@ -861,16 +1150,6 @@ mod tests {
         );
     }
     #[test]
-    fn keyboard_startup_release_advances_revision_even_if_already_enabled() {
-        let mut owner = fresh();
-        let released = owner.clear_keyboard_on_start().unwrap();
-        assert_eq!(released.revision().unwrap(), 2);
-        assert_eq!(released.value().unwrap(), false.write());
-        owner.edit(LocalOption::KeyboardDisabled, 2, true.write()).unwrap();
-        assert_eq!(owner.clear_keyboard_on_start().unwrap().revision().unwrap(), 4);
-        assert_eq!(owner.value(LocalOption::KeyboardDisabled), Some(false.write()));
-    }
-    #[test]
     fn keyed_identity_extensions_survive_and_conflicting_operations_fail() {
         let mut owner = fresh();
         let option = LocalOption::InputTransform;
@@ -949,6 +1228,77 @@ mod tests {
             Err(ControlFailure::StateConflict)
         );
         assert_eq!(loaded, before);
+    }
+    #[test]
+    fn microphone_release_unmutes_receiver_in_same_retained_projection() {
+        let mut owner = fresh();
+        let me = DeviceId([1; 32]);
+        let group = GroupId([3; 16]);
+        owner.switch_group(group, me).unwrap();
+        let option = LocalOption::MicrophoneReceiveMuted;
+        owner
+            .edit(option, owner.revision(option).unwrap(), true.write())
+            .unwrap();
+        let muted_revision = owner.revision(option).unwrap();
+        let mut claims = owner.microphone_claims(group);
+        claims.seen_counter = 1;
+        claims.records = vec![ClaimRecord {
+            owner: me,
+            revision: owner.revision(LocalOption::MicrophoneShareClaim).unwrap() + 1,
+            claim: Some(claim(me, 1, true)),
+        }];
+        owner.commit_microphone_claims(group, me, claims.clone()).unwrap();
+        claims.seen_counter = 2;
+        claims.records[0].revision += 1;
+        claims.records[0].claim = Some(claim(me, 2, false));
+        owner.release_microphone_claim(group, me, claims.clone()).unwrap();
+        let loaded = OwnerStore::decode(&owner.encode().unwrap()).unwrap();
+        assert_eq!(loaded.value(option), Some(false.write()));
+        assert_eq!(loaded.revision(option), Some(muted_revision + 1));
+        assert_eq!(loaded.microphone_claims(group), claims);
+        // Releasing an already unmuted receiver never adds an extra mute revision.
+        owner.release_microphone_claim(group, me, claims).unwrap();
+        assert_eq!(owner.revision(option), Some(muted_revision + 1));
+    }
+    #[test]
+    fn group_merge_carries_both_roles_without_crossing_their_claim_namespaces() {
+        let mut owner = fresh();
+        let me = DeviceId([1; 32]);
+        let a = GroupId([3; 16]);
+        let b = GroupId([4; 16]);
+        owner.switch_group(a, me).unwrap();
+        for option in [LocalOption::AudioExitClaim, LocalOption::MicrophoneShareClaim] {
+            let mut claims = owner.claims_for(a, option);
+            let revision = owner.revision(option).unwrap() + 1;
+            claims.seen_counter = 7;
+            claims.records = vec![ClaimRecord {
+                owner: me,
+                revision,
+                claim: Some(claim(me, 7, true)),
+            }];
+            owner.commit_claims_for(a, me, claims, option).unwrap();
+        }
+        let original = owner.clone();
+        owner.merge_group(b, me).unwrap();
+        for option in [LocalOption::AudioExitClaim, LocalOption::MicrophoneShareClaim] {
+            assert_eq!(owner.claims_for(a, option), original.claims_for(a, option));
+            let records = owner.claims_for(b, option);
+            assert_eq!(records.seen_counter, 8);
+            assert!(records.records[0].claim.as_ref().unwrap().claimed().unwrap());
+        }
+        let microphone = owner.microphone_claims(b);
+        let mut speaker = owner.claims(b);
+        speaker.seen_counter = 9;
+        speaker.records[0].revision += 1;
+        speaker.records[0].claim = Some(claim(me, 9, false));
+        owner.commit_claims(b, me, speaker).unwrap();
+        assert_eq!(owner.microphone_claims(b), microphone);
+        assert_eq!(
+            OwnerStore::decode(&owner.encode().unwrap())
+                .unwrap()
+                .microphone_claims(b),
+            microphone
+        );
     }
     #[test]
     fn group_switch_and_claim_records_commit_one_projection_without_losing_history() {
@@ -1142,5 +1492,24 @@ mod tests {
         assert!(patch.as_map().unwrap().get(&2).is_none());
         owner.edit(LocalOption::ScreenPreferences, 2, patch).unwrap();
         assert_eq!(owner.value(LocalOption::ScreenPreferences), Some(changed));
+    }
+    #[test]
+    fn owner_accepts_empty_destinations_but_never_empty_sources() {
+        let mapping = |from: u64, to: u64| {
+            dto::KeyboardMapping::from_raw(
+                [
+                    (1, RawValue::Uint(2)),
+                    (
+                        2,
+                        RawValue::Array(vec![map([(1, RawValue::Uint(from)), (2, RawValue::Uint(to))])]),
+                    ),
+                    (3, map([(1, RawValue::Uint(0)), (2, RawValue::Uint(0))])),
+                ]
+                .into(),
+            )
+            .unwrap()
+        };
+        assert!(validate_keyboard(&mapping(0xff0003, 0)).is_ok());
+        assert!(validate_keyboard(&mapping(0, 0x700e0)).is_err());
     }
 }

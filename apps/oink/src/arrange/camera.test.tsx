@@ -263,7 +263,27 @@ it.each([48, 24])('reconstructs the camera view and grows it at the reference ra
     const live = { x: view.x + view.w, y: view.y, w: 800, h: 500 };
     expect(growArrangementView(view, live, cam.zoom, padding, 0)).toBe(view);
     const next = growArrangementView(view, live, cam.zoom, padding, 1 / 60);
-    expect(next.w).toBeCloseTo(view.w + (live.w - padding / cam.zoom) * (1 - Math.exp(-6 / 60)), 10);
+    expect(next.w).toBeCloseTo(view.w + live.w * (1 - Math.exp(-6 / 60)), 10);
     expect(next.x).toBe(view.x);
     expect(next.y).toBe(view.y);
+});
+
+it.each([48, 24])('starts growing as soon as a screen crosses the visible canvas edge with %spx margins', padding => {
+    const cam = fitArrangement(bounds(initial), viewport, padding);
+    const view = visibleArrangement(cam, viewport, padding);
+    const k = 1 - Math.exp(-6 / 60), px = 2 / cam.zoom;
+    // Touching the card's right edge and its top edge (the 56px band) is still inside.
+    const right = { x: view.x + view.w + padding / cam.zoom - 800, y: view.y, w: 800, h: 500 };
+    const top = { x: view.x, y: view.y - 56 / cam.zoom, w: 800, h: 500 };
+    expect(growArrangementView(view, right, cam.zoom, padding, 1 / 60)).toBe(view);
+    // Two pixels past an edge, the whole screen becomes the target at once.
+    const outRight = growArrangementView(view, { ...right, x: right.x + px }, cam.zoom, padding, 1 / 60);
+    expect(outRight.w).toBeCloseTo(view.w + (padding / cam.zoom + px) * k, 10);
+    expect(outRight.x).toBe(view.x);
+    expect(outRight.h).toBe(view.h);
+    expect(growArrangementView(view, top, cam.zoom, padding, 1 / 60)).toBe(view);
+    const outTop = growArrangementView(view, { ...top, y: top.y - px }, cam.zoom, padding, 1 / 60);
+    expect(outTop.y).toBeCloseTo(view.y - (56 / cam.zoom + px) * k, 10);
+    expect(outTop.h).toBeCloseTo(view.h + (56 / cam.zoom + px) * k, 10);
+    expect(outTop.w).toBe(view.w);
 });

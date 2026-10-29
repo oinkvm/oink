@@ -762,27 +762,98 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn required_ipc_publication_failure_has_bounded_cleanup() {
-        let _scenario =
-            crate::test_watchdog::Scenario::new(module_path!(), "required_ipc_publication_failure_has_bounded_cleanup");
+    fn required_ipc_publication_recovers_without_restarting_host() {
+        let _scenario = crate::test_watchdog::Scenario::new(
+            module_path!(),
+            "required_ipc_publication_recovers_without_restarting_host",
+        );
         let dir = tempfile::tempdir().unwrap();
-        // Binding succeeds, but the endpoint cannot replace a directory.
-        std::fs::create_dir(dir.path().join(ipc::IPC_FILE)).unwrap();
-        let (input, entering, release, completing) = slow_stop(true);
-        let options = NodeOptions {
-            net: oink_test_support::network_config(dir.path().into(), "ipc-publication", 0),
-            input,
-            displays: vec![],
-            display_backend: None,
-            clipboard: None,
-            mode_switch_in_callback: true,
-            capture_reports_key_repeat: true,
-            cursor_trail: false,
+        let endpoint = dir.path().join(ipc::IPC_FILE);
+        // Deterministic failed publication, independent of scanner scheduling.
+        std::fs::create_dir(&endpoint).unwrap();
+        let (input, entering, release, completing) = slow_stop(false);
+        let host = AgentHost::start_with(
+            NodeOptions {
+                net: oink_test_support::network_config(dir.path().into(), "ipc-publication", 0),
+                input: input.clone(),
+                displays: vec![],
+                display_backend: None,
+                clipboard: None,
+                mode_switch_in_callback: true,
+                capture_reports_key_repeat: true,
+                cursor_trail: false,
+            },
+            IpcMode::Required,
+        )
+        .expect("failed publication must not tear down the backend");
+        let port = host.ipc.as_ref().unwrap().port();
+        assert!(std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_ok());
+        let remote = crate::remote::RemoteApi::new(dir.path());
+        assert!(remote.hello().is_err());
+        std::fs::remove_dir(&endpoint).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if remote.hello().is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "endpoint never became readable");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(ipc::Endpoint::read(dir.path()).unwrap().port, port);
+        input.armed.store(true, std::sync::atomic::Ordering::Release);
+        assert_returns_before_native_stop(entering, release, completing, move || host.shutdown());
+        assert!(!endpoint.exists());
+    }
+
+    fn embedded_network_config(directory: &std::path::Path) -> oink_network::NetworkConfig {
+        // Keep the shared process-lifetime lease through startup and the final
+        // rebind assertions. Probing/dropping a free pair alone can steal a
+        // leased port before another fixture's network thread binds it.
+        let mut config = oink_test_support::network_config(directory.into(), "embedded", 0);
+        // Bind a discovery socket on loopback without any beacon targets.
+        config.beacon = true;
+        config
+    }
+
+    #[tokio::test]
+    async fn embedded_fixtures_reserve_ports_before_either_network_starts() {
+        use oink_foundation::{realtime::Tier, session::Boot};
+        use oink_network::{
+            identity::Identity,
+            link::{LinkConfig, LinkLayer},
         };
-        let result = assert_returns_before_native_stop(entering, release, completing, move || {
-            AgentHost::start_with(options, IpcMode::Required)
-        });
-        assert!(result.unwrap_err().to_string().contains("IPC"));
+        let directories = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        // Hold both allocations before either bind, the window where another
+        // fixture may still be preparing its identity/credentials/network thread.
+        let configs = directories.each_ref().map(|dir| embedded_network_config(dir.path()));
+        let mut networks = Vec::new();
+        let mut errors = Vec::new();
+        for config in &configs {
+            let identity = Arc::new(Identity::generate());
+            match LinkLayer::start(LinkConfig {
+                profile: Default::default(),
+                boot: Boot {
+                    device_id: identity.id(),
+                    nonce: [1; 16],
+                },
+                identity,
+                bind: (config.bind_ip, config.port).into(),
+                tier: Tier::Elevated,
+            })
+            .await
+            {
+                Ok((network, _)) => networks.push(network),
+                Err(error) => errors.push(error),
+            }
+        }
+        for network in networks {
+            network.stop().await;
+        }
+        assert!(
+            errors.is_empty(),
+            "pending fixture ports {:?}: {errors:?}",
+            configs.each_ref().map(|c| c.port)
+        );
     }
 
     #[test]
@@ -792,21 +863,7 @@ mod lifecycle_tests {
             "embedded_shutdown_releases_ports_with_a_retained_node",
         );
         let dir = tempfile::tempdir().unwrap();
-        // Discovery uses QUIC's port + 1. On Windows two concurrent ephemeral
-        // allocations can be adjacent, so reserve a free pair outside the dynamic
-        // range for this fixture instead of letting the other host take its beacon port.
-        let (interactive, beacon) = (20000..40000)
-            .find_map(|port| {
-                let interactive = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)).ok()?;
-                let beacon = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port + 1)).ok()?;
-                Some((interactive, beacon))
-            })
-            .expect("free adjacent loopback ports");
-        let port = interactive.local_addr().unwrap().port();
-        let mut config = oink_test_support::network_config(dir.path().into(), "embedded", port);
-        // Bind a discovery socket on loopback without any beacon targets.
-        config.beacon = true;
-        drop((interactive, beacon));
+        let config = embedded_network_config(dir.path());
         let host = AgentHost::start(
             NodeOptions {
                 net: config,

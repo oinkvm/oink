@@ -14,9 +14,15 @@ use oink_network::link::{
 };
 use oink_protocol::{
     frame::{StreamCode, StreamKind},
-    v1::{self, Message},
+    v1::{
+        self, Message,
+        schema::{WireDto, WireValue},
+    },
 };
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 #[derive(Debug)]
 struct Peer {
@@ -30,6 +36,7 @@ struct Peer {
     wanted: bool,
     supported: bool,
     opening: Vec<Message>,
+    opening_at: Instant,
     received: Vec<Message>,
     operations: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -70,6 +77,7 @@ impl ProjectionStreams {
         if let Some(state) = self.peers.get_mut(&peer) {
             state.wanted |= !messages.is_empty();
             state.opening = messages;
+            state.opening_at = Instant::now();
         }
     }
 
@@ -129,7 +137,11 @@ impl ProjectionStreams {
         tracing::debug!(?peer, stream=?tx.id(), "opening Projection stream");
         state.tx = Some(tx);
         state.packets_tx = packets;
-        let opening = state.opening.clone();
+        let opening = state
+            .opening
+            .iter()
+            .filter_map(|message| remaining_opening(message, now.saturating_duration_since(state.opening_at)))
+            .collect::<Vec<_>>();
         for message in opening {
             if self.post(peer, &message, now).is_err() {
                 break;
@@ -236,6 +248,7 @@ impl StreamModule for ProjectionStreams {
             wanted: false,
             supported,
             opening: Vec::new(),
+            opening_at: Instant::now(),
             received: Vec::new(),
             operations: Vec::new(),
         });
@@ -345,5 +358,62 @@ impl Drop for ProjectionStreams {
                 self.links.close_stream(stream.id(), StreamCode::None);
             }
         }
+    }
+}
+
+// Reopening a stream must not reset the relative TTL of a cached seed. Preserve
+// explicit clears regardless of age: their sequence fences all earlier previews.
+fn remaining_opening(message: &Message, elapsed: Duration) -> Option<Message> {
+    let Message::ArrangementPreview(preview) = message else {
+        return Some(message.clone());
+    };
+    if preview.arrangement().ok()?.is_none() {
+        return Some(message.clone());
+    }
+    let remaining = Duration::from_millis(u64::from(preview.lease_ms().ok()?))
+        .saturating_sub(elapsed)
+        .as_millis() as u32;
+    if remaining == 0 {
+        return None;
+    }
+    let mut raw = preview.raw().clone();
+    raw.insert(3, remaining.write());
+    Some(Message::ArrangementPreview(
+        v1::dto::ArrangementPreview::from_raw(raw).ok()?,
+    ))
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+
+    #[test]
+    fn cached_reopen_seed_ages_monotonically_but_clear_keeps_its_fence() {
+        let snapshot =
+            crate::layout_profiles::render::capture(&oink_display::layout::Layout::default(), &Default::default());
+        let mut raw: v1::RawMap = [
+            (1, true.write()),
+            (2, 7u64.write()),
+            (3, 2000u32.write()),
+            (4, 1u64.write()),
+            (5, crate::layout_profiles::wire::snapshot(&snapshot).unwrap()),
+        ]
+        .into();
+        let frame = Message::ArrangementPreview(v1::dto::ArrangementPreview::from_raw(raw.clone()).unwrap());
+        let Some(Message::ArrangementPreview(remaining)) = remaining_opening(&frame, Duration::from_millis(1900))
+        else {
+            panic!("live seed missing");
+        };
+        assert_eq!(remaining.lease_ms().unwrap(), 100);
+        assert_eq!(remaining.sequence().unwrap(), 7);
+        assert_eq!(
+            remaining.expires_ms().unwrap(),
+            1,
+            "sender wall time does not gate a cached seed"
+        );
+        assert!(remaining_opening(&frame, Duration::from_millis(2000)).is_none());
+        raw.remove(&5);
+        let clear = Message::ArrangementPreview(v1::dto::ArrangementPreview::from_raw(raw).unwrap());
+        assert!(remaining_opening(&clear, Duration::from_secs(60)).is_some());
     }
 }

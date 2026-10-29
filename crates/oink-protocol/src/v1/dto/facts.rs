@@ -28,6 +28,7 @@ wire_map!(DeviceFacts, validate_facts, {
     22 => native_arrangement_token: Option<Text<128>> = optional;
     // oink.input.accessibility/1: absent means unknown or not applicable.
     23 => accessibility_granted: Option<bool> = optional;
+    24 => microphone_claim_watermark: Option<AudioExitClaim> = optional;
 });
 
 wire_map!(EndpointFact, validate_endpoint, {
@@ -103,6 +104,7 @@ wire_map!(ResourceFacts, validate_resources, {
     5 => speaker: Option<SpeakerObservation> = optional;
     6 => option_revisions: List<OptionRevision,32> = (List(Vec::new()));
     7 => game: Option<GameObservation> = optional;
+    8 => microphone: Option<MicrophoneObservation> = optional;
 });
 
 wire_map!(ResourceFaults, no_validation, {
@@ -190,7 +192,7 @@ open_enum!(FactPath { None=0,Direct=1,Relayed=2 });
 // Semantic Unknown=1 is distinct from an unrecognised numeric id.
 open_enum!(CapturePermission { NotRequested=0,Indeterminate=1,Authorized=2,Denied=3,NotRequired=4 });
 open_enum!(SharingMode { Shared=0,Local=1 });
-open_enum!(ResourceFaultCode { None=0,PermissionRequired=1,PermissionDenied=2,CaptureUnavailable=3,InjectionUnavailable=4,SecureInput=5,DeviceUnavailable=6,CleanupFailed=7,Unsupported=8,BackendFailed=9 });
+open_enum!(ResourceFaultCode { None=0,PermissionRequired=1,PermissionDenied=2,CaptureUnavailable=3,InjectionUnavailable=4,SecureInput=5,DeviceUnavailable=6,CleanupFailed=7,Unsupported=8,BackendFailed=9,MicrophoneLoopback=10 });
 open_enum!(SpeakerActivity { Unused=0,ExitReady=1,ExitPlaying=2,SourceForwarding=3,SourceSoundSleep=4,Preparing=5,WaitingForExit=6,LocalPaused=7,SystemSleeping=8,Failed=9 });
 fn validate_facts(raw: &RawMap) -> Result<()> {
     if required::<u64>(raw, 2)? == 0 {
@@ -285,7 +287,7 @@ wire_map!(VolumeRefused,no_validation,{
 });
 open_enum!(LocalOption {MouseMode=1,KeyboardMode=2,ClipboardEnabled=3,ForwardingEnabled=4,KeyboardDisabled=5,
     ScreenShared=6,ScreenPreferences=7,SpeedMode=8,CursorTrail=10,CursorTrailDuration=11,
-    RemoteScrollSpeed=12,InputTransform=13,SourceInputPolicy=14,ForwardingControls=15,DeviceName=16,GameModePreference=18,AcceptContacts=19,AudioExitClaim=20,SyncSystemArrangement=21});
+    RemoteScrollSpeed=12,InputTransform=13,SourceInputPolicy=14,ForwardingControls=15,DeviceName=16,GameModePreference=18,AcceptContacts=19,AudioExitClaim=20,SyncSystemArrangement=21,TouchpadInjection=26,NativeMultifinger=27,MacScrollFeel=28,MicrophoneShareClaim=22,MicrophoneControls=23,MicrophoneReceiveMuted=24,MicrophoneInput=25});
 open_enum!(ControlOutcome {Applied=0,NoChange=1,Refused=2,Failed=3});
 open_enum!(ControlFailure {None=0,Offline=1,Unsupported=2,StaleBoot=3,StaleRevision=4,NotMember=5,ResourceFault=6,InvalidValue=7,Busy=8,PersistenceFailed=9,ApplyFailed=10,LinkLost=11,OutcomeUnknown=12,NotExit=13,RouteChanged=14,OutputChanged=15,OutputUnavailable=16,VolumeUnsupported=17,PermissionDenied=18,Superseded=19,UnsupportedOption=20,StateConflict=21});
 open_enum!(ExitVolumeStatus {Ready=0,Unsupported=1,Unavailable=2,PermissionDenied=3,BackendFailed=4});

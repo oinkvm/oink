@@ -15,6 +15,9 @@ struct MenuLabels {
     copy: String,
     paste: String,
     select_all: String,
+    window: String,
+    minimize: String,
+    close_window: String,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -84,7 +87,25 @@ pub fn install(app: &AppHandle, language: UiLanguage) -> tauri::Result<()> {
             &PredefinedMenuItem::select_all(app, Some(&labels.select_all))?,
         ],
     )?;
-    app.set_menu(Menu::with_items(app, &[&product, &edit])?)?;
+    // The main window is borderless (custom title bar), so AppKit's predefined
+    // performClose:/performMiniaturize: items have no native buttons to act on.
+    // These items act on the focused Tauri window directly (see app.rs).
+    let window = Submenu::with_items(
+        app,
+        &labels.window,
+        true,
+        &[
+            &MenuItem::with_id(app, "shell-minimize", &labels.minimize, true, Some("CmdOrCtrl+M"))?,
+            &MenuItem::with_id(
+                app,
+                "shell-close-window",
+                &labels.close_window,
+                true,
+                Some("CmdOrCtrl+W"),
+            )?,
+        ],
+    )?;
+    app.set_menu(Menu::with_items(app, &[&product, &edit, &window])?)?;
     Ok(())
 }
 
@@ -119,6 +140,9 @@ mod tests {
                 &labels.redo,
                 &labels.cut,
                 &labels.copy,
+                &labels.window,
+                &labels.minimize,
+                &labels.close_window,
                 &labels.paste,
                 &labels.select_all,
             ] {

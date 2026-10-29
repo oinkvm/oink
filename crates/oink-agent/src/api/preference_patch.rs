@@ -102,6 +102,38 @@ mod tests {
         assert_eq!(applied.theme_accent.dark.as_str(), "#112233");
     }
     #[test]
+    fn clipboard_ipc_keeps_format_fields_true_and_never_stores_received_values() {
+        use crate::api::ClipboardSettings;
+        let patch: PreferencePatch<ClipboardSettings> = serde_json::from_value(json!({
+            "text":false,"rich_text":false,"images":false,"files":false,"custom":false,
+            "receive":false,"remove_ds_store":false
+        }))
+        .unwrap();
+        let applied = patch.apply(&ClipboardSettings::default()).unwrap();
+        assert_eq!(
+            serde_json::to_value(applied).unwrap(),
+            json!({
+                "receive":false,"send":true,"remove_ds_store":false,
+                "text":true,"rich_text":true,"images":true,"files":true,"custom":true
+            })
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::load_from(dir.path()).unwrap();
+        config
+            .update_local(&json!({"clipboard":patch.value()}), |settings| {
+                settings.clipboard = Some(applied.into());
+            })
+            .unwrap();
+        let raw: Value = serde_json::from_slice(&std::fs::read(config.settings_path()).unwrap()).unwrap();
+        assert_eq!(
+            raw["local"]["clipboard"],
+            json!({"receive":false,"remove_ds_store":false})
+        );
+        let local = AgentConfig::load_from(dir.path()).unwrap().settings.clipboard.unwrap();
+        assert_eq!(ClipboardSettings::from(local), applied);
+    }
+
+    #[test]
     fn invalid_and_unknown_supplied_fields_are_rejected() {
         let current = UiPreferences::from(&crate::config::Settings::default());
         for value in [

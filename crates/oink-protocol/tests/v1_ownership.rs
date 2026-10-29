@@ -250,6 +250,8 @@ fn reference_units_defaults_and_projection_bounds_match_the_design() {
         support::unhex("a10cfb0000000000000000")
     );
     assert_eq!(ScrollAmount::from_number(0), ScrollAmount::Reference);
+    assert_eq!(ScrollAmount::from_number(1), ScrollAmount::Lines);
+    assert_eq!(ScrollAmount::from_number(2), ScrollAmount::Pixels);
     assert_eq!(v1::CONTACT_REFERENCE_QUANTUM, 1.0 / 68600.0);
     for n in [-1.0, 8.0, 50.0 / 686.0 + f64::EPSILON] {
         assert!(TopologySettings::from_raw([(12, V::F64(n))].into()).is_err());

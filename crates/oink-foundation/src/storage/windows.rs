@@ -16,8 +16,9 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows_sys::Win32::Storage::FileSystem::{
-    CREATE_NEW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FileRenameInfoEx, OPEN_ALWAYS, SetFileInformationByHandle,
+    CREATE_NEW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_RENAME_INFO,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfoEx, OPEN_ALWAYS, OPEN_EXISTING,
+    SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_sys::Win32::System::WindowsProgramming::{
@@ -132,7 +133,7 @@ fn open_private(path: &Path, access: u32, sharing: u32, disposition: u32) -> io:
     }
 }
 
-pub(super) fn replace(file: &File, destination: &Path) -> io::Result<()> {
+pub(super) fn replace(file: &File, destination: &Path, log_retries: bool) -> io::Result<()> {
     // Keep the original private writer through publication. Closing and reopening the
     // staging path with DELETE lets a scanner or reader acquire a non-delete-
     // sharing handle in between, making an otherwise valid write fail. Obtain
@@ -176,8 +177,21 @@ pub(super) fn replace(file: &File, destination: &Path) -> io::Result<()> {
     // unchanged. Rationale, ACL-check limits and evidence: see
     // docs/design/windows-atomic-publication.md. Verified on Windows 11.
     let started = std::time::Instant::now();
-    let outcome = super::windows_retry::publish(
+    let outcome = super::windows_retry::publish_with_deadline(
+        super::windows_retry::native_deadline(),
         || {
+            // Windows 11 can leave a zero-handle destination unreplaceable after
+            // Defender's purge-failure-mode control, even after the scanned
+            // FILE_OBJECT closes. Keep a DELETE handle to the current target
+            // across the POSIX rename so Windows retains its old snapshot.
+            // Opening then closing did not help; holding it did in four live
+            // cases.
+            // Reacquire for each native attempt because another writer may
+            // have replaced the target. All sharing is allowed, the original
+            // staging writer stays open, and deadlines/retry counts are unchanged.
+            // The guard is best-effort: absent or inaccessible targets still
+            // receive the native rename's authoritative permission/share checks.
+            let _destination = retain_destination(&destination_name);
             // SAFETY: the aligned rename buffer and original file remain alive
             // and unchanged across all synchronous calls.
             let renamed = unsafe {
@@ -203,7 +217,7 @@ pub(super) fn replace(file: &File, destination: &Path) -> io::Result<()> {
         || started.elapsed(),
         std::thread::sleep,
     );
-    if outcome.attempts > 1 {
+    if log_retries && outcome.attempts > 1 {
         tracing::warn!(
             role = publication_role(destination),
             attempts = outcome.attempts,
@@ -214,6 +228,30 @@ pub(super) fn replace(file: &File, destination: &Path) -> io::Result<()> {
     }
     outcome.result?;
     file.sync_all()
+}
+
+fn retain_destination(path: &[u16]) -> Option<File> {
+    // Open the directory entry itself, including a reparse point, rather than
+    // following a link to a different object. No contents or attributes change.
+    // SAFETY: the caller supplies a terminated UTF-16 path. A successful handle
+    // transfers to File and is closed after the synchronous rename attempt.
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        None
+    } else {
+        // SAFETY: CreateFileW returned a newly owned, valid handle.
+        Some(unsafe { File::from_raw_handle(handle) })
+    }
 }
 
 #[link(name = "ntdll")]
@@ -290,7 +328,7 @@ mod tests {
         let mut writer = create_private_new(&temporary).unwrap();
         writer.write_all(b"private settings").unwrap();
         writer.sync_all().unwrap();
-        let published = replace(&writer, &destination);
+        let published = replace(&writer, &destination, true);
         let observed = std::fs::read(&destination);
         drop(writer);
         assert!(
@@ -298,6 +336,51 @@ mod tests {
             "publication must use the original private handle: {published:?}"
         );
         assert_eq!(observed.unwrap(), b"private settings");
+    }
+
+    #[test]
+    fn replacement_respects_a_reader_that_denies_delete_sharing() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.json");
+        super::super::atomic_write(&path, b"before").unwrap();
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .unwrap();
+        let error = super::super::atomic_write(&path, b"after").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(32));
+        assert_eq!(std::fs::read(&path).unwrap(), b"before");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        drop(reader);
+        super::super::atomic_write(&path, b"after").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"after");
+    }
+
+    #[test]
+    fn replacements_remain_visible_and_complete_to_concurrent_readers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.json");
+        let before = [b'a'; 4096];
+        let after = [b'b'; 4096];
+        super::super::atomic_write(&path, &before).unwrap();
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                start.wait();
+                for _ in 0..1024 {
+                    let observed = std::fs::read(&path).unwrap();
+                    assert!(observed == before || observed == after);
+                }
+            });
+            start.wait();
+            for sequence in 0..64 {
+                super::super::atomic_write(&path, if sequence % 2 == 0 { &after } else { &before }).unwrap();
+            }
+        });
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]

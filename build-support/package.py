@@ -14,6 +14,7 @@ import sys
 from provenance import ROOT, source_inventory, source_tree_sha256
 from identity import IDENTITY
 from versioning import local_source_commit, release_version
+import package_notes
 
 
 def main():
@@ -25,6 +26,8 @@ def main():
     versions = p.add_mutually_exclusive_group()
     versions.add_argument('--source-commit', help='Full source commit; required for local source archives')
     versions.add_argument('--public-version', action='store_true', help='Use the canonical manifest version for public releases')
+    p.add_argument('--update-notes-file', type=Path, help='Generated in-house notes sidecar for source archives')
+    p.add_argument('--previous-inhouse-release', type=Path, help='Previous completed in-house release.json (otherwise discover under output root)')
     p.add_argument('--source-inventory', type=Path,
                    help='Portable source modes for an archive without a Git index')
     p.add_argument('--tool-cache', type=Path, default=Path.home() / '.cache/oink-build')
@@ -53,8 +56,14 @@ def main():
         p.error('build must be in 1..2147483647')
     try:
         commit = None if a.public_version else local_source_commit(a.source_commit)
-        version = release_version(IDENTITY['version'], commit)
+        version = release_version(IDENTITY['version'], commit, a.build)
     except ValueError as error:
+        p.error(str(error))
+    if a.public_version and (a.update_notes_file or a.previous_inhouse_release):
+        p.error('public notes always come from the committed .github/update-notes.json')
+    try:
+        notes = package_notes.read(a.update_notes_file, a.build, commit) if a.update_notes_file else package_notes.generate(ROOT, a.build, commit, a.output_root, a.previous_inhouse_release)
+    except (ValueError, OSError) as error:
         p.error(str(error))
     tools = {'rust': subprocess.check_output(['rustc', '--version'], text=True).strip(),
              'node': subprocess.check_output(['node', '--version'], text=True).strip(),
@@ -67,6 +76,8 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     if (output / 'release.json').exists():
         p.error('this source tree already has a package; choose a fresh output root for a rebuild')
+    notes_file = output / 'embedded-update-notes.json'
+    package_notes.write(notes_file, notes)
     snapshot = output / 'source-inventory.json'
     (output / 'build-environment.json').write_text(json.dumps({**tools, 'version': version, 'source_commit': commit}, indent=2) + '\n')
     snapshot.write_text(json.dumps({'schema': 1, 'source_tree_sha256': tree, 'files': inventory}, indent=2) + '\n')
@@ -90,7 +101,7 @@ def main():
     subprocess.run(command, cwd=ROOT, check=True)
     binaries = Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target')) / target / 'release'
     command = [sys.executable, str(ROOT / 'packaging' / a.platform / 'build.py'),
-               '--binaries', str(binaries), '--output', str(output), *common]
+               '--binaries', str(binaries), '--output', str(output), '--update-notes-file', str(notes_file), *common]
     if macos:
         command += ['--sparkle-cache', str(a.tool_cache), '--notary-timeout', str(a.notary_timeout)]
         for flag, value in [('--signing-fingerprint', a.signing_fingerprint),
@@ -100,6 +111,11 @@ def main():
     else:
         command += ['--tool-cache', str(a.tool_cache)]
     subprocess.run(command, cwd=ROOT, check=True)
+    # Public CI uploads in its explicit workflow step; in-house packages use
+    # the same uploader and retain symbols even when no token is configured.
+    if not a.public_version:
+        from upload_symbols import upload
+        upload(output / 'symbols.noindex', a.tool_cache)
     print(f'Package complete: {output}')
 
 

@@ -23,9 +23,13 @@ macro_rules! enum_schemas {
     };
 }
 dto_schemas! {
+    ControlPowerState,
+    CloudLinkRequest,CloudLinkOffer,CloudLinkUnavailable,CloudLinkList,CloudLinkSelect,CloudLinkRead,NativeFileMetadata,WindowsFileDescriptor,MacPromiseGroup,MacPromiseControl,FulfilledRoot,
+    ApplicationFocusRecord, ApplicationFocusClaim, ApplicationFocusObservation, ApplicationFocusPrepare, ApplicationFocusApplied, ApplicationFocusSnapshot, ApplicationFocusRetire, ApplicationKeyRoute,
+    ControlMovePointer, PointerShortcutSlots, PointerShortcutSlot,
     LocalOutputVolume,
     LayoutProfilesStateV3,LayoutProfileCatalogV3,LayoutProfileJoinCompletion,LayoutProfilesJoin,
-    LayoutProfilesStateV2,LayoutProfileCatalogV2,LayoutProfileCatalog,LayoutProfile,LayoutProfileRecency,LayoutProfileDeviceState,
+    LayoutProfilesStateV2,LayoutProfileCatalogV2,LayoutProfileCatalog,LayoutProfile,LayoutProfileRecency,LayoutProfileDeviceState,LayoutPhysicalDevice,LayoutPhysicalScreen,
     ArrangementPreview,LayoutProfileScreens,LayoutProfileSnapshot,LayoutProfileSharing,LayoutProfilePlacement,LayoutProfileDisabled,
     LayoutProfileNative,LayoutProfileScreen,LayoutNativeOrigin,
     NotifyShow,NotifyAction,NotifyDismiss,
@@ -56,6 +60,7 @@ dto_schemas! {
     AttachmentHead,
     AttachmentItems,
     AttachmentResult,
+    MicrophoneInput,MicrophoneObservation,MicrophoneSession,MicrophoneDemand,MicrophonePrepared,MicrophoneReady,MicrophoneRenew,MicrophoneStop,MicrophonePacket,MicrophoneSleep,
     AudioDescriptor,
     AudioOutputFact,
     AudioPacket,
@@ -64,6 +69,7 @@ dto_schemas! {
     AudioRouteFault,
     AudioSleep,
     AudioState,
+    AudioMediaState,
     AudioSupport,
     Boot,
     BootPair,
@@ -113,6 +119,8 @@ dto_schemas! {
     ControlSetFocusLock,
     ControlSetGameMode,
     ControlUserActivity,
+    ControlLockEscape,
+    ControlEntryProtection,
     Coverage,
     Crossing,
     CryptoOffers,
@@ -154,6 +162,8 @@ dto_schemas! {
     FactCapabilities,
     FormatSupport,
     LayoutValue,
+    ApplicationFocusSettings,
+    DiagApplicationFocus,
     Grant,
     Greeting,
     GroupRef,
@@ -162,6 +172,7 @@ dto_schemas! {
     InputCapability,
     InputGesture,
     InputHeldSync,
+    ApplicationHeldKey,
     InputKey,
     InputKeyRepeat,
     InputLifecycle,
@@ -285,15 +296,17 @@ dto_schemas! {
     TargetOverride,
     TargetTransform,
     WallpaperSet,
+    SavedCustomKeymap,
 }
 enum_schemas! {
+    ApplicationFocusActionKind, ApplicationForeground, ApplicationParkResult, ApplicationFocusPhase, ApplicationFocusReason,
     MouseButtonKind,GestureKind,GesturePhase,SwipeAxis,
     DiagOrigin,DiagCaptureDisposition,DiagKeyClass,DiagRawKeyEvent,DiagStateKind,DiagPermissionState,DiagMouseButtonKind,DiagScrollUnit,DiagGesturePhase,DiagSwipeAxis,DiagGestureKind,DiagSafeInputKind,DiagSourceKind,DiagInputMode,DiagHandoffAction,DiagFlushReason,DiagDecisionKind,DiagDecisionReason,DiagTrailStage,DiagGestureStage,DiagObservedGestureKind,DiagGestureDecision,DiagContactsPath,DiagVolumeAction,DiagVolumeOriginKind,DiagVolumeDestination,DiagPlacementKind,DiagButtonLayer,DiagTimestampUnit,DiagCallClass,DiagFileProviderReason,DiagPreparationPath,DiagPlaceholderFallback,DiagProviderDragPath,DiagNativeHoldEnd,DiagImageNudgeReason,DiagOs,DiagSourceInput,DiagSourceDestination,DiagCaptureModeKind,DiagDndSourceEffect,DiagDndNativeKind,DiagRolePartition,DiagPhysicalObservation,DiagIntegrityOutcome,DiagSourceDisposition,DiagDndSourcePhase,DiagSegmentKind,DiagExceptionClass,DiagButtonHandoff,
     CacheCategory,
     MetadataReadiness,SourceMode,PreviewAvailabilityKind,RevokeReason,RevokeScopeKind,DragStateKind,SourceActionKind,
     PathReferenceKind,
     ContentSizeKind,RepresentationDataKind,NodeKind,DemandKind,
-    UserFacingCode,AudioPhase,LowFailureCode,TcpStage,PauseReason,EmergencyOutcome,ButtonHandoff,
+    AudioMediaKind,MicrophonePermission,UserFacingCode,AudioPhase,LowFailureCode,TcpStage,PauseReason,EmergencyOutcome,ButtonHandoff,
     LocalOption,ControlOutcome,ControlFailure,ExitVolumeStatus,
     AddressFamily,
     AimPhase,
@@ -343,7 +356,6 @@ enum_schemas! {
     VolumeKey,
 }
 
-
 #[cfg(test)]
 mod validation_dispatch_tests {
     use super::*;
@@ -351,15 +363,26 @@ mod validation_dispatch_tests {
     #[derive(Clone, Debug, PartialEq)]
     struct BorrowedOnly(RawMap);
     impl WireDto for BorrowedOnly {
-        const SCHEMA: Schema = Schema { name: "BorrowedOnly", fields: &[] };
+        const SCHEMA: Schema = Schema {
+            name: "BorrowedOnly",
+            fields: &[],
+        };
         fn from_raw(_: RawMap) -> Result<Self> {
             panic!("schema validation must not construct an owned DTO")
         }
         fn validate_raw(raw: &RawMap) -> Result<()> {
-            if raw.is_empty() { Ok(()) } else { Err(ErrorCode::MalformedFrame.into()) }
+            if raw.is_empty() {
+                Ok(())
+            } else {
+                Err(ErrorCode::MalformedFrame.into())
+            }
         }
-        fn raw(&self) -> &RawMap { &self.0 }
-        fn into_raw(self) -> RawMap { self.0 }
+        fn raw(&self) -> &RawMap {
+            &self.0
+        }
+        fn into_raw(self) -> RawMap {
+            self.0
+        }
     }
     dto_schemas!(BorrowedOnly);
 
@@ -369,9 +392,14 @@ mod validation_dispatch_tests {
         preflight_schema("BorrowedOnly", &mut minicbor::Decoder::new(&[0xa0]), 0).unwrap();
         validate_schema("BorrowedOnly", &RawMap::new()).unwrap();
         assert_eq!(
-            validate_schema("BorrowedOnly", &[(1, super::super::RawValue::Null)].into()).unwrap_err().code,
+            validate_schema("BorrowedOnly", &[(1, super::super::RawValue::Null)].into())
+                .unwrap_err()
+                .code,
             ErrorCode::MalformedFrame
         );
-        assert_eq!(validate_schema("unknown", &RawMap::new()).unwrap_err().code, ErrorCode::UnsupportedValue);
+        assert_eq!(
+            validate_schema("unknown", &RawMap::new()).unwrap_err().code,
+            ErrorCode::UnsupportedValue
+        );
     }
 }

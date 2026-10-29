@@ -80,6 +80,8 @@ pub fn verify(id: &DeviceId, msg: &[u8], sig: &[u8; 64]) -> bool {
 
 /// 严格验证（TLS 握手签名用）。
 pub(crate) fn verify_strict(id: &DeviceId, msg: &[u8], sig: &[u8]) -> bool {
+    #[cfg(test)]
+    STRICT_VERIFICATIONS.with(|count| count.set(count.get() + 1));
     let Ok(vk) = VerifyingKey::from_bytes(&id.0) else {
         return false;
     };
@@ -129,4 +131,9 @@ mod tests {
         assert!(verify(&a.id(), b"hello", &sig));
         assert!(!verify(&a.id(), b"hellO", &sig));
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static STRICT_VERIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

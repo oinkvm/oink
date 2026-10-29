@@ -757,6 +757,14 @@ fn enumerator() -> Result<IMMDeviceEnumerator, String> {
         .map_err(|e| format!("create audio device enumerator: {e}"))
 }
 
+fn endpoint_lookup<T>(result: windows::core::Result<T>) -> Result<Option<T>, String> {
+    match result {
+        Ok(device) => Ok(Some(device)),
+        Err(error) if error.code() == windows::core::HRESULT(0x80070490u32 as i32) => Ok(None),
+        Err(error) => Err(format!("look up exact audio endpoint: {error}")),
+    }
+}
+
 fn exact_device(enumerator: &IMMDeviceEnumerator, id: &str) -> Result<Option<IMMDevice>, String> {
     if id.is_empty() || id.contains('\0') || id.len() > 4096 {
         return Err("invalid audio endpoint ID".into());
@@ -765,7 +773,7 @@ fn exact_device(enumerator: &IMMDeviceEnumerator, id: &str) -> Result<Option<IMM
     // SAFETY: the ID is NUL-terminated and valid through this synchronous call.
     // Unavailable endpoints retain their journal; never substitute the default.
     unsafe {
-        let Ok(device) = enumerator.GetDevice(windows::core::PCWSTR(wide.as_ptr())) else {
+        let Some(device) = endpoint_lookup(enumerator.GetDevice(windows::core::PCWSTR(wide.as_ptr())))? else {
             return Ok(None);
         };
         if device.GetState().map_err(|e| e.to_string())? != DEVICE_STATE_ACTIVE {
@@ -832,7 +840,7 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeCallback_Impl {
 }
 
 struct VolumeSubscription {
-    device: IMMDevice,
+    _device: IMMDevice,
     id: String,
     volume: IAudioEndpointVolume,
     callback: IAudioEndpointVolumeCallback,
@@ -863,7 +871,7 @@ impl VolumeSubscription {
                 .RegisterControlChangeNotify(&callback)
                 .map_err(|e| format!("register endpoint volume observer: {e}"))?;
             Ok(Self {
-                device,
+                _device: device,
                 id,
                 volume,
                 callback,
@@ -881,10 +889,13 @@ impl EndpointBackend for VolumeSubscription {
             return Err("audio recovery endpoint mismatch".into());
         }
         // SAFETY: this device is owned by the current COM worker.
-        if unsafe { self.device.GetState() }.map_err(|e| e.to_string())? != DEVICE_STATE_ACTIVE {
+        if exact_device(&enumerator()?, endpoint)?.is_none() {
             return Ok(None);
         }
         read_volume(&self.volume, endpoint).map(Some)
+    }
+    fn permanently_removed(&self, endpoint: &str) -> Result<bool, String> {
+        endpoint_removed(endpoint)
     }
     fn set_mute(&self, endpoint: &str, muted: bool) -> Result<(), String> {
         if endpoint != self.id {
@@ -931,8 +942,20 @@ impl Drop for VolumeSubscription {
     }
 }
 
+// GetDevice still resolves disabled/unplugged/not-present endpoints. Only its
+// documented E_NOTFOUND means that endpoint identity (and persisted mute state)
+// is gone. Do not treat COM/permission/driver failures as proof of deletion.
+fn endpoint_removed(id: &str) -> Result<bool, String> {
+    let wide: Vec<u16> = id.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: COM initialized by caller; bounded, terminated ID lives through call.
+    endpoint_lookup(unsafe { enumerator()?.GetDevice(windows::core::PCWSTR(wide.as_ptr())) })
+        .map(|device| device.is_none())
+}
 struct UnavailableEndpoint;
 impl EndpointBackend for UnavailableEndpoint {
+    fn permanently_removed(&self, endpoint: &str) -> Result<bool, String> {
+        endpoint_removed(endpoint)
+    }
     fn read(&self, _: &str) -> Result<Option<EndpointState>, String> {
         Ok(None)
     }
@@ -945,17 +968,31 @@ impl EndpointBackend for UnavailableEndpoint {
 }
 
 fn recover_locked(journal: &mut Journal) -> Result<RecoveryReport, String> {
-    let Some(id) = journal.endpoint().map(str::to_owned) else {
-        return journal.recover(&UnavailableEndpoint, true);
+    let mut report = RecoveryReport {
+        outcome: RecoveryOutcome::NothingToRecover,
+        endpoint: None,
+        crash_intent_uncertain: false,
     };
-    if !journal.has_pending_restore() {
-        return journal.recover(&UnavailableEndpoint, true);
+    let mut deferred_report = None;
+    for id in journal.endpoints() {
+        journal.select_endpoint(&id)?;
+        report = if !journal.has_pending_restore_for(&id) {
+            journal.recover(&UnavailableEndpoint, true)?
+        } else {
+            match exact_device(&enumerator()?, &id)? {
+                Some(device) => {
+                    let observer = VolumeSubscription::new(device, Arc::new(AtomicBool::new(false)))?;
+                    journal.recover(&observer, true)?
+                }
+                None => journal.recover(&UnavailableEndpoint, true)?,
+            }
+        };
+        if report.outcome == RecoveryOutcome::EndpointUnavailable {
+            journal.defer_unavailable()?;
+            deferred_report.get_or_insert(report.clone());
+        }
     }
-    let Some(device) = exact_device(&enumerator()?, &id)? else {
-        return journal.recover(&UnavailableEndpoint, true);
-    };
-    let observer = VolumeSubscription::new(device, Arc::new(AtomicBool::new(false)))?;
-    journal.recover(&observer, true)
+    Ok(deferred_report.unwrap_or(report))
 }
 
 struct MuteLease {
@@ -971,9 +1008,7 @@ impl MuteLease {
         let system_lock = EndpointMuteLock::acquire()?;
         let mut journal = Journal::open(dir)?;
         let report = recover_locked(&mut journal)?;
-        if report.outcome == RecoveryOutcome::EndpointUnavailable {
-            return Err("previous muted endpoint is unavailable; its recovery journal was retained".into());
-        }
+
         if report.crash_intent_uncertain {
             tracing::warn!(
                 ?report,
@@ -998,9 +1033,13 @@ impl MuteLease {
         lease.observer.set_mute(&lease.observer.id, true)?;
         let mut expected = before;
         expected.muted = true;
-        if lease.observer.ownership_lost() || lease.observer.read(&lease.observer.id)? != Some(expected) {
+        let observed = lease.observer.read(&lease.observer.id)?;
+        if lease.observer.ownership_lost() || observed.as_ref().is_some_and(|state| state != &expected) {
             lease.journal.revoke()?;
             return Err("endpoint controls changed while starting capture; user state takes priority".into());
+        }
+        if observed.is_none() {
+            return Err("audio endpoint disappeared while muting".into());
         }
         lease.observer.muted_owned.store(true, Ordering::Release);
         // Close the atomic publication race with a concurrently delivered user
@@ -1029,13 +1068,8 @@ impl MuteLease {
         if self.observer.ownership_lost() {
             self.journal.release_after_volume_change(&self.observer)?;
         }
-        let report = self.journal.recover(&self.observer, false)?;
+        let report = self.journal.recover_or_defer(&self.observer, false)?;
         self.finished = true;
-        if report.outcome == RecoveryOutcome::EndpointUnavailable {
-            return Err(
-                "muted endpoint unavailable during stop; recovery journal retained for reconnect/startup".into(),
-            );
-        }
         tracing::info!(?report, "audio endpoint mute lease finished");
         Ok(())
     }
@@ -1143,5 +1177,32 @@ mod tests {
         unsafe { callback.OnNotify(&mut event) }.unwrap();
         assert!(revoked.load(Ordering::Acquire));
         assert!(!muted_owned.load(Ordering::Acquire));
+    }
+}
+
+#[cfg(test)]
+mod recovery_lookup_tests {
+    use super::*;
+    #[test]
+    fn only_not_found_means_deleted_and_other_states_remain_known() {
+        use windows::Win32::Media::Audio::{DEVICE_STATE_DISABLED, DEVICE_STATE_NOTPRESENT, DEVICE_STATE_UNPLUGGED};
+        // Fake GetDevice results: disabled/unplugged/not-present are identities
+        // the OS still knows, regardless of whether a stream can be opened.
+        for state in [
+            DEVICE_STATE_ACTIVE,
+            DEVICE_STATE_DISABLED,
+            DEVICE_STATE_NOTPRESENT,
+            DEVICE_STATE_UNPLUGGED,
+        ] {
+            assert_eq!(endpoint_lookup(Ok(state)).unwrap(), Some(state));
+        }
+        let missing: windows::core::Result<()> = Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+            0x80070490u32 as i32,
+        )));
+        assert!(endpoint_lookup(missing).unwrap().is_none());
+        let denied: windows::core::Result<()> = Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+            0x80070005u32 as i32,
+        )));
+        assert!(endpoint_lookup(denied).is_err());
     }
 }

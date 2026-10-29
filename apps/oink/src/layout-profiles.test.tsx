@@ -11,6 +11,7 @@ import type { ArrangementSnapshot, DeviceArrangementState, PreviewReply } from '
 import { layoutProfilesFixtureSnapshot } from './api/layoutProfiles.fixture';
 import type { Placement } from './api/types';
 import { cameraStore } from './arrange/cameraStore';
+import { overlaps } from './arrange/geometry';
 import { profileHarness } from './arrange/profileHarness';
 import { setLanguage } from './i18n';
 
@@ -264,16 +265,11 @@ describe('Settings › Layout profiles', () => {
     expect((within(row).getByRole('button', { name: 'Delete “Home”' }) as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it('creates from Settings through the same dialog', async () => {
-    const h = setup();
+  it('keeps saved layouts limited to rename and delete', async () => {
+    setup();
     const { container } = render(<App/>);
     const row = await openSettings(container);
-    fireEvent.click(within(row).getByRole('button', { name: 'New layout' }));
-    const dialog = await screen.findByRole('dialog', { name: 'New layout' });
-    fireEvent.change(within(dialog).getByRole('textbox', { name: 'Layout name' }), { target: { value: 'Studio' } });
-    await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Create' })); });
-    expect(h.of('create_layout_profile').map(r => r.params!.name)).toEqual(['Studio']);
-    await waitFor(() => expect(names(row)).toEqual(['Studio', 'Default layout']));
+    expect(within(row).queryByRole('button', { name: 'New layout' })).toBeNull();
   });
 
   it('opens from the toolbar menu', async () => {
@@ -367,6 +363,73 @@ describe('a system-arranged computer on the canvas', () => {
     await h.settle();
     expect(h.fixture.state().snapshot!.placements.find(p => p.device === A)).toEqual(final);
     expect(h.fixture.state().snapshot!.native.find(n => n.device === A)!.screens).toEqual(last.native.screens);
+  });
+
+  it.each([false, true])('repairs a native release collision before compaction (%s), keeping other computers fixed', async compact => {
+    agent.adopt('boot', { platform: 'windows', version: '0.3.0', build: null, backend: 'agent' });
+    const h = setup(true);
+    edit(h, s => { s.placements.find(p => p.device === B)!.origin = { x: 1.5, y: .8 }; });
+    const before = clone(h.fixture.state().snapshot!);
+    render(<App/>);
+    if (!compact) fireEvent.click(button('Auto-compact'));
+    const [, side] = alpha();
+    select(side);
+    const zoom = cameraStore.get()!.zoom;
+    fireEvent.pointerDown(side, { button: 0, clientX: 600, clientY: 300 });
+    fireEvent.pointerMove(side, { clientX: 600, clientY: 300 + .3 * 4096 * zoom });
+    await act(async () => { fireEvent.pointerUp(side); });
+    await h.settle();
+    const last = h.of('preview_system_arrangement').at(-1)!.reply as PreviewReply;
+    const after = clone(h.fixture.state().snapshot!);
+    expect(after.native.find(n => n.device === A)!.screens).toEqual(last.native.screens);
+    expect(after.placements.filter(p => p.device !== A)).toEqual(before.placements.filter(p => p.device !== A));
+    const rects = (device: string) => {
+      const p = after.placements.find(p => p.device === device)!;
+      return after.native.find(n => n.device === device)!.screens.map(s => ({
+        x: p.origin.x + s.origin.x * p.scale, y: p.origin.y + s.origin.y * p.scale,
+        w: s.size.w * p.scale, h: s.size.h * p.scale,
+      }));
+    };
+    expect(rects(A).some(a => [...rects(B), ...rects(C)].some(b => overlaps(a, b)))).toBe(false);
+    expect(h.of('commit_arrangement')).toHaveLength(1);
+    expect(h.of('commit_arrangement')[0].params!.native_plan_tokens).toEqual([last.plan_token]);
+    await act(async () => { fireEvent.click(button('Undo')); });
+    await h.settle();
+    expect(h.fixture.state().snapshot!.placements).toEqual(before.placements);
+    expect(h.fixture.state().snapshot!.native.map(n => n.screens)).toEqual(before.native.map(n => n.screens));
+    await act(async () => { fireEvent.click(button('Redo')); });
+    await h.settle();
+    expect(h.fixture.state().snapshot!.placements).toEqual(after.placements);
+  });
+
+  it.each(['ready', 'unsupported', 'unavailable', 'offline'] as const)('keeps a peer movable as a rigid computer when native editing is %s', async availability => {
+    agent.adopt('boot', { platform: 'windows', version: '0.3.0', build: null, backend: 'agent' });
+    const snapshot = layoutProfilesFixtureSnapshot();
+    snapshot.native.find(n => n.device === B)!.screens.splice(1);
+    snapshot.disabled = snapshot.disabled.filter(b => b.screen.device !== B || b.screen.display === 'main');
+    snapshot.placements.find(p => p.device === B)!.origin = { x: 1.5, y: .3 };
+    const owners = devices(false);
+    const peer = owners.find(d => d.device === B)!;
+    peer.availability = availability;
+    // Even an enabled but unavailable native editor must not gate rigid placement.
+    peer.sync_system_arrangement = availability !== 'ready';
+    peer.native_token = availability === 'ready' ? peer.native_token : null;
+    const h = backend.harness = profileHarness({ snapshot, devices: owners });
+    agent.adopt('layout', h.fixture.layout());
+    render(<App/>);
+    fireEvent.click(button('Auto-compact'));
+    const tile = Array.from(document.querySelectorAll<HTMLElement>('.scr')).find(s => s.getAttribute('aria-label')?.startsWith('Beta,'))!;
+    const zoom = cameraStore.get()!.zoom;
+    fireEvent.pointerDown(tile, { button: 0, clientX: 600, clientY: 300 });
+    fireEvent.pointerMove(tile, { clientX: 600 + 1.5 * 4096 * zoom, clientY: 300 });
+    await act(async () => { fireEvent.pointerUp(tile); });
+    await h.settle();
+    expect(h.of('preview_system_arrangement')).toHaveLength(0);
+    expect(h.of('commit_arrangement')).toHaveLength(1);
+    const commit = h.of('commit_arrangement')[0].params!;
+    expect(commit.native_plan_tokens).toEqual([]);
+    expect((commit.placements as Placement[]).find(p => p.device === B)!.origin.x).toBeGreaterThan(2.5);
+    expect(h.fixture.state().snapshot!.native.map(n => n.screens)).toEqual(snapshot.native.map(n => n.screens));
   });
 
   it('compacts the whole synced computer after resizing from a selected screen', async () => {

@@ -270,6 +270,9 @@ pub struct Stats {
     pub duplicates: u64,
     pub rejected: u64,
     pub decode_errors: u64,
+    /// Pull requests which exhausted their fixed codec-call budget.
+    #[serde(default)]
+    pub work_limited: u64,
     pub rebufferings: u64,
     pub queued_frames: usize,
     pub buffered_ms: f64,
@@ -329,6 +332,9 @@ pub struct RenderTrace {
     pub decoded_first_sequence: Option<u64>,
     pub decoded_last_sequence: Option<u64>,
     pub decode_ns: u64,
+    /// Concealment subset of decode_ns; zero when render tracing is disabled.
+    #[serde(default)]
+    pub plc_ns: u64,
     pub resample_ns: u64,
     pub packet_wait_ns: Option<u64>,
     pub kind: RenderKind,
@@ -339,24 +345,21 @@ struct QueuedPacket {
     len: usize,
     arrival: Instant,
 }
-// Sorted, preallocated storage. Insert/remove shift at most the existing codec
-// queue limit; unlike BTreeMap they never allocate or free in the work loop.
-struct PacketQueue(Vec<(u64, QueuedPacket)>);
+// Sorted, preallocated deque. The normal in-order insert/pop moves no queued
+// payloads; reordering shifts at most the fixed packet capacity.
+struct PacketQueue(VecDeque<(u64, QueuedPacket)>);
 impl PacketQueue {
     fn new(capacity: usize) -> Self {
-        let mut storage = vec![
+        let storage = prepared_deque(capacity, || {
             (
                 0,
                 QueuedPacket {
                     payload: [0; MAX_PACKET_BYTES],
                     len: 0,
                     arrival: Instant::now(),
-                }
-            );
-            capacity
-        ];
-        std::hint::black_box(&mut storage);
-        storage.clear();
+                },
+            )
+        });
         Self(storage)
     }
     fn len(&self) -> usize {
@@ -369,7 +372,7 @@ impl PacketQueue {
         self.0.binary_search_by_key(key, |(seq, _)| *seq).is_ok()
     }
     fn first_key_value(&self) -> Option<(&u64, &QueuedPacket)> {
-        self.0.first().map(|(seq, packet)| (seq, packet))
+        self.0.front().map(|(seq, packet)| (seq, packet))
     }
     fn values(&self) -> impl Iterator<Item = &QueuedPacket> {
         self.0.iter().map(|(_, packet)| packet)
@@ -385,7 +388,7 @@ impl PacketQueue {
         self.0
             .binary_search_by_key(seq, |(seq, _)| *seq)
             .ok()
-            .map(|at| self.0.remove(at).1)
+            .and_then(|at| self.0.remove(at).map(|(_, packet)| packet))
     }
 }
 fn packet_capacity(config: Config) -> usize {
@@ -429,10 +432,11 @@ pub struct LatePacket {
 }
 
 pub struct Receiver {
-    dropout_counters: Option<std::sync::Arc<crate::sink::DropoutCounters>>,
+    dropout_counters: Option<std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::sink::DropoutCounters>>>>,
     dropout_ledger: crate::sink::DropoutLedger,
     late_ledger: crate::sink::DropoutLedger,
     output_kinds: [OutputKind; FRAME_SIZE],
+    output_frames: usize,
     consumed: [Option<(u64, Instant)>; 512],
     late_packet: Option<LatePacket>,
     rejections: Rejections,
@@ -481,6 +485,7 @@ impl Receiver {
             dropout_ledger: Default::default(),
             late_ledger: Default::default(),
             output_kinds: [OutputKind::Intentional; FRAME_SIZE],
+            output_frames: config.frame_size(),
             config,
             decoder,
             packets: PacketQueue::new(packet_capacity(config)),
@@ -537,13 +542,20 @@ impl Receiver {
     ) -> bool {
         self.push_slice_at(seq, &payload, arrival, Some(source_emit_ns))
     }
+    /// Set on the ordinary owner before publishing this Receiver. The store is
+    /// pinned throughout retirement; RT only borrows its published counter.
+    pub(crate) fn set_dropout_store(
+        &mut self,
+        store: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::sink::DropoutCounters>>>,
+    ) {
+        self.dropout_counters = Some(store);
+    }
+    #[cfg(test)]
     pub(crate) fn set_dropout_counters(&mut self, counters: Option<&std::sync::Arc<crate::sink::DropoutCounters>>) {
-        if self.dropout_counters.is_none() {
-            self.dropout_counters = counters.cloned();
-        }
+        self.dropout_counters = counters.map(|counter| std::sync::Arc::new(std::sync::OnceLock::from(counter.clone())));
     }
     fn dropout(&mut self, first: u64, last: u64, at: Instant, late: bool) {
-        if let Some(counters) = &self.dropout_counters {
+        if let Some(counters) = self.dropout_counters.as_ref().and_then(|store| store.get()) {
             let count = self.dropout_ledger.insert(first, last);
             counters.record(
                 (crate::diagnostics::monotonic_us(at).max(0) / 1000) as u64,
@@ -595,7 +607,7 @@ impl Receiver {
                     .map(|(_, at)| at),
             });
             self.stats.late += 1;
-            if let Some(counters) = &self.dropout_counters {
+            if let Some(counters) = self.dropout_counters.as_ref().and_then(|store| store.get()) {
                 counters.record_quality(crate::sink::DropoutBucket {
                     at_ms: (crate::diagnostics::monotonic_us(arrival).max(0) / 1000) as u64,
                     late_packets: self.late_ledger.insert(seq, seq),
@@ -727,12 +739,34 @@ impl Receiver {
         self.render_into(now, demand_frames, &mut output, trace);
         output
     }
-    /// Render into caller-owned, exact codec-frame storage without heap work.
+    /// Fixed-codec-frame adapter for callers/tests. Production pull uses the
+    /// same core with the callback's shared, finite codec-call budget.
     pub fn render_into(
         &mut self,
         now: Instant,
         demand_frames: usize,
         output: &mut [f32],
+        trace: Option<&mut RenderTrace>,
+    ) {
+        if output.len() != self.config.frame_samples() {
+            output.fill(0.0);
+            return;
+        }
+        let mut budget = 6;
+        self.pull_into(now, demand_frames, output, &mut budget, trace);
+    }
+
+    /// Consume exactly the requested stereo frames, retaining only decoded
+    /// codec remainder and drift phase. The caller tiles requests above 480
+    /// frames and shares `codec_budget` across every tile of one callback.
+    /// Each actual decode/PLC call consumes one unit; invalid decode plus PLC
+    /// consumes two. Exhaustion yields finite missing samples, never a retry.
+    pub fn pull_into(
+        &mut self,
+        now: Instant,
+        demand_frames: usize,
+        output: &mut [f32],
+        codec_budget: &mut usize,
         mut trace: Option<&mut RenderTrace>,
     ) {
         output.fill(0.0);
@@ -741,10 +775,13 @@ impl Receiver {
         } else {
             OutputKind::Intentional
         });
-        if output.len() != self.config.frame_samples() {
+        self.output_frames = (output.len() / CHANNELS).min(FRAME_SIZE);
+        if output.is_empty() || !output.len().is_multiple_of(CHANNELS) || output.len() > FRAME_SAMPLES {
             return;
         }
         let frame_size = self.config.frame_size();
+        let requested = output.len() / CHANNELS;
+        let elapsed_ms = requested as f64 / 48.0;
         let fixed_profile = self.config.is_opus_10ms();
         // The jitter reserve is additional to all samples already demanded by
         // this native callback, not just the one codec frame returned here.
@@ -752,7 +789,7 @@ impl Receiver {
             self.adaptive.target * frame_size
         } else {
             (self.adaptive.target * frame_size)
-                .saturating_add(demand_frames.max(frame_size))
+                .saturating_add(demand_frames.max(requested))
                 .min(self.queue_capacity() * frame_size)
         };
         if self.next.is_none() {
@@ -772,8 +809,23 @@ impl Receiver {
                     .first_packet
                     .and_then(|first| now.checked_duration_since(first))
                     .unwrap_or_default();
-                self.occupancy() < target
-                    && waited < Duration::from_secs_f64((target - frame_size) as f64 / f64::from(SAMPLE_RATE))
+                // A freshly delivered capture batch is media for its whole
+                // interval, not pre-existing jitter reserve. Starting it at
+                // once can ask for the next packet before the next batch is
+                // available. Honor the existing jitter wait in that case;
+                // aged device-open backlog already satisfies it.
+                (self.adaptive.source_batch_ms > 0.0
+                    // Several batches already contain reserve. One codec frame
+                    // of rounding covers emission spread within a capture batch.
+                    && self.occupancy() <= (self.adaptive.source_batch_ms * 48.0).ceil() as usize + frame_size * 2
+                    && waited
+                        < Duration::from_secs_f64((self.adaptive.target * frame_size) as f64 / f64::from(SAMPLE_RATE)))
+                    || (self.occupancy() < target
+                        && waited
+                            < Duration::from_secs_f64(
+                                target.saturating_sub(frame_size).max(self.adaptive.target * frame_size) as f64
+                                    / f64::from(SAMPLE_RATE),
+                            ))
             };
             if waiting {
                 self.stats.startup_hold_frames += 1;
@@ -805,22 +857,25 @@ impl Receiver {
                 self.adjustment.change_target(0.0);
             }
         }
-        let error = self.occupancy() as f64 - target as f64;
+        // Sender timestamps exclude capture batching from network jitter, but
+        // the rate controller must still distinguish its normal queue swing
+        // from excess reserve. Otherwise it accelerates toward an empty trough.
+        let error = self.occupancy() as f64 - target as f64 - self.adaptive.source_queue_phase_ms(now) * 48.0;
         let adapting = (!fixed_profile || self.wake_backlog) && self.adjustment.active();
         let clock_ppm = if adapting {
             // A deliberate change of reserve is not oscillator drift. Keep
             // the learned clock rate while its extra samples are built/drained.
             self.drift.ppm
         } else if fixed_profile {
-            self.drift.update(error)
+            self.drift.update_duration(error, elapsed_ms)
         } else {
-            self.drift.update_low_latency(error, self.config.frame_duration_ms())
+            self.drift.update_low_latency(error, elapsed_ms)
         };
         let adaptation_ppm = if adapting {
             // Wake catch-up caps compression at +1%; it must still allow the
             // existing -2% reserve-building direction. Clamping negative rate
             // to zero left the adjustment engaged (and drift frozen) forever.
-            self.adjustment.update(error, frame_size)
+            self.adjustment.update_duration(error, frame_size, requested)
         } else {
             0.0
         };
@@ -833,9 +888,9 @@ impl Receiver {
             self.wake_backlog = false;
         }
         let required = if fixed_profile {
-            self.resampler.required_frames(frame_size, ppm)
+            self.resampler.required_frames(requested, ppm)
         } else {
-            self.resampler.required_frames_without_lookahead(frame_size, ppm)
+            self.resampler.required_frames_without_lookahead(requested, ppm)
         };
         while self.resampler.buffered_frames() < required {
             // At an idle handover the remaining received media is finite. Fill the
@@ -853,7 +908,7 @@ impl Receiver {
             // a real missing codec frame still follows the ordinary PLC path.
             if !fixed_profile
                 && self.packets.is_empty()
-                && self.resampler.buffered_frames() >= frame_size - 1
+                && self.resampler.buffered_frames() >= requested - 1
                 && required - self.resampler.buffered_frames() == 1
             {
                 break;
@@ -865,7 +920,11 @@ impl Receiver {
                 self.rebuffer_at(Some(now));
                 return;
             }
-            if !self.decode_next(now, trace.as_deref_mut()) {
+            if *codec_budget == 0 {
+                self.stats.work_limited += 1;
+                break;
+            }
+            if !self.decode_next(now, codec_budget, trace.as_deref_mut()) {
                 return;
             }
         }
@@ -892,7 +951,7 @@ impl Receiver {
                 if span_frames
                     >= self
                         .resampler
-                        .required_frames(frame_size, ppm)
+                        .required_frames(requested, ppm)
                         .min(self.resampler.buffered_frames())
                 {
                     break;
@@ -919,7 +978,7 @@ impl Receiver {
         // compression ceiling, rather than an unapplied controller request.
         let applied_adaptation_ppm = ppm - clock_ppm;
         self.stats.adaptation_ppm = applied_adaptation_ppm;
-        let adjusted_ms = applied_adaptation_ppm * self.config.frame_duration_ms() / 1_000_000.0;
+        let adjusted_ms = applied_adaptation_ppm * elapsed_ms / 1_000_000.0;
         self.stats.adaptation_stretched_ms += (-adjusted_ms).max(0.0);
         self.stats.adaptation_compressed_ms += adjusted_ms.max(0.0);
         self.consume_spans(before - self.resampler.buffered_frames());
@@ -928,7 +987,7 @@ impl Receiver {
         }
     }
     pub(crate) fn output_kinds(&self) -> &[OutputKind] {
-        &self.output_kinds[..self.config.frame_size()]
+        &self.output_kinds[..self.output_frames]
     }
     fn classify_output(&mut self, ppm: f64, hold_boundary: bool) {
         let buffered = self.resampler.buffered_frames();
@@ -942,7 +1001,7 @@ impl Receiver {
         } else {
             OutputKind::Missing
         };
-        for kind in &mut self.output_kinds[..self.config.frame_size()] {
+        for kind in &mut self.output_kinds[..self.output_frames] {
             let raw_index = phase.floor() as usize;
             let index = if hold_boundary && raw_index == buffered && buffered > 0 {
                 buffered - 1
@@ -967,17 +1026,23 @@ impl Receiver {
                 && index + 1 == end
                 && let Some(next) = spans.clone().next()
             {
-                *kind = (*kind).max(next.kind);
+                // A fractional boundary already contains the next span. Mark
+                // the transition on this sample, including PLC -> real audio,
+                // so splice repair does not start one sample after the jump.
+                *kind = next.kind;
             }
             phase += step;
         }
     }
-    fn decode_next(&mut self, now: Instant, trace: Option<&mut RenderTrace>) -> bool {
+    fn decode_next(&mut self, now: Instant, codec_budget: &mut usize, trace: Option<&mut RenderTrace>) -> bool {
         let Some(seq) = self.next else {
             return false;
         };
         let started = trace.as_ref().map(|_| Instant::now());
         let packet = self.packets.remove(&seq);
+        if packet.is_some() {
+            *codec_budget -= 1;
+        }
         let arrival = packet.as_ref().map(|packet| packet.arrival);
         let mut storage = [0.0; FRAME_SAMPLES];
         let pcm = &mut storage[..self.config.frame_samples()];
@@ -1003,6 +1068,7 @@ impl Receiver {
             (_, None) => false,
         };
         let mut kind = OutputKind::Audio;
+        let mut plc_ns = 0;
         if valid {
             self.consecutive_loss = 0;
             self.healthy_frames = (self.healthy_frames + self.config.frame_size()).min(SAMPLE_RATE as usize);
@@ -1028,15 +1094,24 @@ impl Receiver {
                 self.rebuffer_at(Some(now));
                 return false;
             }
+            let plc_started = trace.as_ref().map(|_| Instant::now());
             match &mut self.decoder {
                 DecoderCodec::Opus(decoder) => {
-                    if decoder.decode_float(&[], pcm, false).ok() != Some(self.config.frame_size()) {
+                    if *codec_budget == 0 {
+                        self.stats.work_limited += 1;
                         pcm.fill(0.0);
                     } else {
-                        kind = OutputKind::Concealed;
+                        *codec_budget -= 1;
+                        if decoder.decode_float(&[], pcm, false).ok() != Some(self.config.frame_size()) {
+                            pcm.fill(0.0);
+                        } else {
+                            kind = OutputKind::Concealed;
+                        }
                     }
                 }
                 DecoderCodec::Pcm16 => {
+                    // PCM fallback also consumes one bounded work unit.
+                    *codec_budget = codec_budget.saturating_sub(1);
                     // PCM has no codec PLC. Fade the last output sample to zero
                     // once, avoiding both invented signal and an indefinite tone.
                     for (i, frame) in pcm.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
@@ -1050,6 +1125,9 @@ impl Receiver {
                         }
                     }
                 }
+            }
+            if let Some(started) = plc_started {
+                plc_ns = duration_ns(started.elapsed());
             }
         }
         self.resampler.push(pcm);
@@ -1067,6 +1145,7 @@ impl Receiver {
             trace.decoded_first_sequence.get_or_insert(seq);
             trace.decoded_last_sequence = Some(seq);
             trace.decode_ns += duration_ns(started.unwrap().elapsed());
+            trace.plc_ns += plc_ns;
         }
         true
     }
@@ -1100,6 +1179,7 @@ impl Receiver {
         self.adaptive.anchor = None;
         self.adaptive.jitter_ms = 0.0;
         self.adaptive.spread_ms = 0.0;
+        self.adaptive.source_batch_ms = 0.0;
         self.adaptive.lower_candidate = None;
         self.adaptive.last_decay = None;
         self.stats = Stats::default();
@@ -1152,6 +1232,7 @@ struct Arrival {
     sequence: u64,
     at: Instant,
     transit_ms: f64,
+    source_phase_ms: f64,
 }
 struct AdaptiveJitter {
     config: Config,
@@ -1160,10 +1241,29 @@ struct AdaptiveJitter {
     anchor: Option<(u64, Instant, Option<u64>)>,
     jitter_ms: f64,
     spread_ms: f64,
+    source_batch_ms: f64,
     lower_candidate: Option<(Instant, usize)>,
     last_decay: Option<Instant>,
 }
 impl AdaptiveJitter {
+    fn source_queue_phase_ms(&self, now: Instant) -> f64 {
+        if !self.anchor.is_some_and(|(_, _, source)| source.is_some()) {
+            return 0.0;
+        }
+        let age_ms = self
+            .arrivals
+            .back()
+            .and_then(|last| now.checked_duration_since(last.at))
+            .unwrap_or_default()
+            .as_secs_f64()
+            * 1000.0;
+        // Four 5 ms packets emitted together make the queue fall through 20 ms
+        // before its next refill. Subtract that phase relative to the ordinary
+        // single-packet mean, rather than treating its upper half as surplus.
+        let frame_ms = self.config.frame_duration_ms();
+        (self.source_batch_ms + frame_ms - age_ms).max(0.0) - frame_ms * 0.5
+    }
+
     fn new(config: Config) -> Self {
         Self {
             config,
@@ -1172,10 +1272,12 @@ impl AdaptiveJitter {
                 sequence: 0,
                 at: Instant::now(),
                 transit_ms: 0.0,
+                source_phase_ms: 0.0,
             }),
             anchor: None,
             jitter_ms: 0.0,
             spread_ms: 0.0,
+            source_batch_ms: 0.0,
             lower_candidate: None,
             last_decay: None,
         }
@@ -1188,6 +1290,7 @@ impl AdaptiveJitter {
             self.arrivals.clear();
             self.anchor = None;
             self.jitter_ms = 0.0;
+            self.source_batch_ms = 0.0;
             self.lower_candidate = None;
             self.last_decay = None;
         }
@@ -1212,6 +1315,7 @@ impl AdaptiveJitter {
             sequence,
             at,
             transit_ms: transit,
+            source_phase_ms: source_elapsed - seq_delta * self.config.frame_duration_ms(),
         });
         while self.arrivals.len() > MAX_ARRIVALS
             || self
@@ -1222,8 +1326,12 @@ impl AdaptiveJitter {
             self.arrivals.pop_front();
         }
         let mut values = [0.0_f64; MAX_ARRIVALS];
+        let mut source_min = f64::INFINITY;
+        let mut source_max = f64::NEG_INFINITY;
         for (value, arrival) in values.iter_mut().zip(&self.arrivals) {
             *value = arrival.transit_ms;
+            source_min = source_min.min(arrival.source_phase_ms);
+            source_max = source_max.max(arrival.source_phase_ms);
         }
         let values = &mut values[..self.arrivals.len()];
         values.sort_unstable_by(f64::total_cmp);
@@ -1232,6 +1340,13 @@ impl AdaptiveJitter {
         // discards 10 ms of a 200 ms batch and under-protects its next arrival.
         let upper = values.len().saturating_sub(2);
         self.spread_ms = (values[upper] - values[0]).max(0.0);
+        // This is source availability, separate from transport variation. With
+        // no sender timestamp source_elapsed already follows media time, making
+        // this zero; arrival-based jitter then accounts for the batch itself.
+        self.source_batch_ms = (source_max - source_min).clamp(
+            0.0,
+            self.config.jitter.max_frames as f64 * self.config.frame_duration_ms(),
+        );
         // Half a frame of deadband avoids increasing delay for tiny scheduling
         // noise/clock drift. Capacity alone does not increase the target: a
         // steady link keeps the same 5 ms minimum, even with a 250 ms ceiling.
@@ -1290,13 +1405,13 @@ impl PlayoutAdjustment {
     fn active(&self) -> bool {
         self.engaged
     }
-    fn update(&mut self, occupancy_error: f64, frame_size: usize) -> f64 {
+    fn update_duration(&mut self, occupancy_error: f64, codec_frames: usize, consumed_frames: usize) -> f64 {
         // One full arrival batch does not imply a full playout reserve. Follow
         // a 250 ms smoothed occupancy error until it stays near the requested
         // reserve for a second; this also drains overshoot after re-prefill.
         // With no target change this controller is never engaged, so a healthy
         // stream still uses exactly the original oscillator drift path.
-        let dt = frame_size as f64 / f64::from(SAMPLE_RATE);
+        let dt = consumed_frames as f64 / f64::from(SAMPLE_RATE);
         self.filtered_error += (1.0 - (-dt / 0.250).exp()) * (occupancy_error - self.filtered_error);
         let mut requested = (self.filtered_error * 20.0).clamp(-20_000.0, 10_000.0);
         // Never deliberately drain a reserve which is currently below target.
@@ -1305,10 +1420,10 @@ impl PlayoutAdjustment {
             requested = 0.0;
         }
         // 0 -> 2% takes 200 ms; consecutive codec calls share the same phase.
-        let slew = frame_size as f64 / 48.0 * 100.0;
+        let slew = consumed_frames as f64 / 48.0 * 100.0;
         self.ppm += (requested - self.ppm).clamp(-slew, slew);
-        if self.filtered_error.abs() < frame_size as f64 * 0.5 && self.ppm.abs() < 1000.0 {
-            self.settled_frames += frame_size;
+        if self.filtered_error.abs() < codec_frames as f64 * 0.5 && self.ppm.abs() < 1000.0 {
+            self.settled_frames += consumed_frames;
             if self.settled_frames >= SAMPLE_RATE as usize {
                 self.engaged = false;
                 self.ppm = 0.0;
@@ -1336,11 +1451,16 @@ impl DriftController {
         self.ppm
     }
 
+    #[cfg(test)]
     fn update(&mut self, error_frames: f64) -> f64 {
-        self.filtered_error += 0.02 * (error_frames - self.filtered_error);
-        self.integral = (self.integral + self.filtered_error * 0.003).clamp(-1000.0, 1000.0);
+        self.update_duration(error_frames, 10.0)
+    }
+    fn update_duration(&mut self, error_frames: f64, elapsed_ms: f64) -> f64 {
+        let dt = elapsed_ms / 10.0;
+        self.filtered_error += (1.0 - 0.98_f64.powf(dt)) * (error_frames - self.filtered_error);
+        self.integral = (self.integral + self.filtered_error * 0.003 * dt).clamp(-1000.0, 1000.0);
         let target = (self.filtered_error * 0.5 + self.integral).clamp(-1000.0, 1000.0);
-        self.ppm += (target - self.ppm).clamp(-10.0, 10.0);
+        self.ppm += (target - self.ppm).clamp(-10.0 * dt, 10.0 * dt);
         self.ppm
     }
 }
@@ -1513,6 +1633,86 @@ mod tests {
     }
 
     #[test]
+    fn arbitrary_pull_consumes_requested_samples_and_keeps_only_codec_remainder() {
+        let mut config = Config {
+            codec: Codec::Pcm16,
+            bitrate: 1_536_000,
+            ..Config::low_latency_opus()
+        };
+        config.jitter.adaptive = false;
+        let mut encoder = Encoder::new_with_config(config).unwrap();
+        let packet = encoder.encode(&vec![0.25; config.frame_samples()]).unwrap();
+        for frames in [1, 64, 128, 139, 140, 256, 441, 480] {
+            let mut receiver = Receiver::new_with_config(config).unwrap();
+            let origin = Instant::now();
+            for seq in 0..4 {
+                assert!(receiver.push_slice_at(seq, &packet, origin, None));
+            }
+            let mut output = [0.0; FRAME_SAMPLES];
+            let mut budget = 4;
+            crate::allocation_audit::assert_no_heap(|| {
+                receiver.pull_into(
+                    origin + Duration::from_millis(20),
+                    frames,
+                    &mut output[..frames * CHANNELS],
+                    &mut budget,
+                    None,
+                );
+            });
+            let decoded = frames.div_ceil(config.frame_size());
+            assert_eq!(4 - budget, decoded, "request={frames}");
+            assert_eq!(
+                receiver.resampler.buffered_frames(),
+                decoded * config.frame_size() - frames
+            );
+            assert_eq!(receiver.output_kinds().len(), frames);
+            assert!(receiver.output_kinds().iter().all(|kind| *kind == OutputKind::Audio));
+            assert!(
+                output[..frames * CHANNELS]
+                    .iter()
+                    .all(|sample| (*sample - 0.25).abs() < 0.0001)
+            );
+        }
+        let origin = Instant::now();
+        let mut receiver = Receiver::new_with_config(config).unwrap();
+        for seq in 0..4 {
+            receiver.push_slice_at(seq, &packet, origin, None);
+        }
+        for remaining in [112, 224] {
+            receiver.pull_into(origin + Duration::from_millis(20), 128, &mut [0.0; 256], &mut 2, None);
+            assert_eq!(receiver.resampler.buffered_frames(), remaining);
+        }
+    }
+
+    #[test]
+    fn pull_codec_budget_is_shared_across_tiles_and_exhaustion_is_finite_missing() {
+        let mut config = Config::low_latency_opus();
+        config.jitter.adaptive = false;
+        let mut encoder = Encoder::new_with_config(config).unwrap();
+        let packet = encoder.encode(&vec![0.1; config.frame_samples()]).unwrap();
+        let mut receiver = Receiver::new_with_config(config).unwrap();
+        let origin = Instant::now();
+        for seq in 0..8 {
+            receiver.push_slice_at(seq, &packet, origin, None);
+        }
+        let mut budget = 1;
+        let mut output = [0.0; 240];
+        crate::allocation_audit::assert_no_heap(|| {
+            receiver.pull_into(origin, 480, &mut output, &mut budget, None);
+            receiver.pull_into(origin, 360, &mut output, &mut budget, None);
+            assert_eq!(budget, 0);
+            assert_eq!(receiver.stats().queued_frames, 7);
+            receiver.pull_into(origin, 240, &mut output, &mut budget, None);
+        });
+        assert_eq!(receiver.stats().queued_frames, 7, "no unbudgeted decode");
+        assert_eq!(receiver.stats().work_limited, 1);
+        assert!(output.iter().all(|sample| *sample == 0.0));
+        assert!(receiver.output_kinds().iter().all(|kind| *kind == OutputKind::Missing));
+        receiver.pull_into(origin, 120, &mut output, &mut 1, None);
+        assert_eq!(receiver.stats().queued_frames, 6);
+    }
+
+    #[test]
     fn fixed_storage_encode_receive_render_and_rebuffer_do_no_heap_work() {
         for config in [
             Config::opus_10ms(),
@@ -1632,7 +1832,7 @@ mod tests {
         let payload = pcm_packet(config, 0.2);
         assert!(r.push_at(99, payload.clone(), now));
         r.next = Some(99);
-        assert!(r.decode_next(now, None));
+        assert!(r.decode_next(now, &mut 2, None));
         assert!(r.resampler.buffered_frames() > 0);
         let at = (crate::diagnostics::monotonic_us(now).max(0) / 1000) as u64;
         assert!(c.snapshot(at).iter().all(Option::is_none));
@@ -1643,7 +1843,7 @@ mod tests {
         r.reset_burst();
         assert!(r.push_at(100, payload, now));
         r.next = Some(100);
-        assert!(r.decode_next(now, None));
+        assert!(r.decode_next(now, &mut 2, None));
         r.reset_burst();
         assert_eq!(c.snapshot(at).into_iter().flatten().map(|b| b.count()).sum::<u64>(), 1);
     }
@@ -2653,6 +2853,102 @@ mod tests {
 mod wake_backlog_tests {
     use super::*;
     #[test]
+    fn several_source_batches_already_supply_startup_reserve() {
+        let config = Config::low_latency_opus();
+        let mut encoder = Encoder::new_with_config(config).unwrap();
+        let mut receiver = Receiver::new_with_config(config).unwrap();
+        receiver.reset_burst();
+        let origin = Instant::now();
+        let mut payload = [0; MAX_PACKET_BYTES];
+        // A network burst delivers three complete capture batches together.
+        // Its media already covers the measured network reserve; another wait
+        // would needlessly retain fresh packets behind the filled queue.
+        for frame in 0..12 {
+            let len = encoder.encode_into(&[0.1; 480], &mut payload).unwrap();
+            assert!(receiver.push_slice_at(
+                frame + 1,
+                &payload[..len],
+                origin,
+                Some(frame / 4 * 20_000_000 + frame % 4 * 100),
+            ));
+        }
+        assert!(receiver.stats().current_target_ms > 5.0);
+        receiver.pull_into(origin, 128, &mut [0.0; 256], &mut 4, None);
+        assert_eq!(receiver.stats().startup_hold_frames, 0);
+        assert!(receiver.stats().queued_frames < 12);
+        assert_eq!(receiver.stats().lost, 0);
+    }
+
+    #[test]
+    fn healthy_twenty_ms_source_batches_do_not_repeatedly_conceal_with_native_pull() {
+        // Four 5 ms codec packets from one continuous capture buffer are emitted
+        // together. Every packet arrives immediately and in order. Exercise actual
+        // native pulls, including device-clock mismatch, not fixed-frame rendering.
+        for opened_us in [1000_u64, 33_000] {
+            for callback_frames in [128_usize, 480] {
+                for device_ppm in [-700.0, 0.0, 700.0] {
+                    let config = Config::low_latency_opus();
+                    let mut encoder = Encoder::new_with_config(config).unwrap();
+                    let mut receiver = Receiver::new_with_config(config).unwrap();
+                    receiver.reset_burst();
+                    let origin = Instant::now();
+                    let mut payload = [0; MAX_PACKET_BYTES];
+                    let mut output = [0.0; FRAME_SAMPLES];
+                    let mut batch = 0_u64;
+                    let mut callback = 0_u64;
+                    let mut learned_loss = 0;
+                    for now_us in (0..15_000_000).step_by(100) {
+                        while batch * 20_000 <= now_us {
+                            let emission_us = batch * 20_000;
+                            for packet in 0..4 {
+                                let len = encoder.encode_into(&[0.1; 480], &mut payload).unwrap();
+                                receiver.push_slice_at(
+                                    batch * 4 + packet + 1,
+                                    &payload[..len],
+                                    origin + Duration::from_micros(emission_us),
+                                    Some(emission_us * 1000 + packet * 100),
+                                );
+                            }
+                            batch += 1;
+                        }
+                        while opened_us as f64
+                            + callback as f64 * callback_frames as f64 / 0.048 / (1.0 + device_ppm / 1_000_000.0)
+                            <= now_us as f64
+                        {
+                            let mut budget = 2 * ((callback_frames * 1011).div_ceil(config.frame_size() * 1000) + 1);
+                            receiver.pull_into(
+                                origin + Duration::from_micros(now_us),
+                                callback_frames,
+                                &mut output[..callback_frames * CHANNELS],
+                                &mut budget,
+                                None,
+                            );
+                            callback += 1;
+                        }
+                        if now_us == 8_000_000 {
+                            learned_loss = receiver.stats().lost;
+                        }
+                    }
+                    let stats = receiver.stats();
+                    assert_eq!(stats.current_target_ms, 5.0);
+                    assert_eq!(stats.latency_trimmed_frames, 0);
+                    assert_eq!(stats.work_limited, 0);
+                    assert_eq!(stats.rejected, 0);
+                    assert_eq!(
+                        stats.lost, learned_loss,
+                        "healthy batches: open_us={opened_us}, callback={callback_frames}, ppm={device_ppm}: {stats:?}"
+                    );
+                    assert_eq!(
+                        stats.lost + stats.late,
+                        0,
+                        "a healthy start must not lose media: {stats:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn continued_burst_after_fallback_wake_rebuilds_reserve_on_a_steady_batched_source() {
         for continued in [true, false] {
             for callback_phase_us in [0, 1000, 2500] {
@@ -2757,10 +3053,12 @@ mod wake_backlog_tests {
         }
         // Every valid frame is followed by an empty queue. Consecutive-only
         // PLC counting sees one loss forever, although reserve never recovers.
+        // Start after the configured jitter wait so this exercises starvation,
+        // independently of the cold-start hold for the initial two-packet batch.
         for tick in 0..200 {
-            let at = origin + Duration::from_millis(tick * 5);
+            let at = origin + Duration::from_millis((tick + 1) * 5);
             if tick >= 3 && tick % 2 == 1 {
-                receiver.push_slice_at(tick + 1, &payload, at, Some(tick * 5_000_000));
+                receiver.push_slice_at(tick + 1, &payload, at, Some((tick + 1) * 5_000_000));
             }
             receiver.render_into(at, 240, &mut output, None);
         }

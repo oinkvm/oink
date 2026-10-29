@@ -9,6 +9,12 @@ pub const MAX_FRAME: usize = 65536;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    /// Only an elevated installed CLI may authorize this source. Never accepted
+    /// from a medium integrity backend, regardless of its package metadata.
+    ApproveLocal {
+        path: String,
+        sha256: String,
+    },
     Query,
     UserQuit,
     Startup,
@@ -75,6 +81,7 @@ mod tests {
         for bytes in [
             br#"{"type":"command","command":{"type":"install","expected_build":2,"url":"https://example.com/x"}}"#
                 .as_slice(),
+            br#"{"type":"approve_local","path":"C:\\evil.msi","sha256":"abc","elevated":true}"#,
             br#"{"type":"query","path":"C:\\x"}"#,
             br#"{"type":"command","command":{"type":"install","expected_build":2,"path":"C:\\Users\\Public\\evil.msi"}}"#,
             br#"{"type":"command","command":{"type":"check","arguments":"/i evil.msi"}}"#,

@@ -76,6 +76,21 @@ afterEach(()=>{cleanup();viewport={width:900,height:600};});
 const screens:Screen[]=[{id:'one',name:'Display',x:0,y:0,w:1000,h:600,wallpaper:0}];
 const settings={showHotZones:false,snapping:false,compact:false,padding:48,step:10};
 
+it.each(['win', 'mac'] as const)('keeps HTML dragstart from taking over screen pointer gestures on %s', platform => {
+  const tiles = ['local', 'peer', 'offline'].map((device, i) => ({
+    ...screens[0], id: device, device, x: i * 1200, image: `wallpaper-${device}.png`, offline: i === 2,
+  }));
+  const { container } = render(<Arrangement platform={platform} screens={tiles} onScreensChange={vi.fn()}
+    selectedId={null} onSelect={vi.fn()} settings={settings}/>);
+  // Every wallpaper follows the same CSS background path, with no draggable image/link.
+  expect(container.querySelectorAll('.scr img, .scr a')).toHaveLength(0);
+  for (const target of container.querySelectorAll('.scr, .scr__body, .scr__label')) {
+    const event = new Event('dragstart', { bubbles: true, cancelable: true });
+    fireEvent(target, event);
+    expect(event.defaultPrevented).toBe(true);
+  }
+});
+
 it('switches wallpaper to a static offline surface and restores it on reconnect',()=>{
   setLanguage('en');
   const online={...screens[0],image:'wallpaper.png'};

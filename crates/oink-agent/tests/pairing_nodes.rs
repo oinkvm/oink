@@ -71,10 +71,15 @@ fn fresh_install_and_pairing_keep_audio_local() {
                 assert!(!node.audio_status().unwrap().source_muted);
             }
             common::pair(&a, &b).await;
-            common::until("paired audio card baseline", || {
+            // Owner facts can make both cards known before the audio actor has
+            // consumed them. Wait for its published baseline independently.
+            common::until("paired audio resolution and card baseline", || {
                 [&a, &b].iter().all(|node| {
                     let cards = node.device_cards().unwrap();
-                    cards.cards.len() == 2
+                    !matches!(
+                        node.audio_status().unwrap().resolution,
+                        oink_audio::claims::Resolution::Unknown
+                    ) && cards.cards.len() == 2
                         && cards.cards.iter().all(|card| {
                             card.status.as_ref().is_some_and(|s| {
                                 s.speaker.forwarding_enabled.is_some() && s.speaker.resource.configured_mode.is_some()
@@ -89,7 +94,10 @@ fn fresh_install_and_pairing_keep_audio_local() {
                     !status.settings.forwarding_enabled,
                     "pairing must not opt in a fresh source"
                 );
-                assert!(matches!(status.resolution, oink_audio::claims::Resolution::None { .. }));
+                assert!(
+                    matches!(status.resolution, oink_audio::claims::Resolution::None { .. }),
+                    "{status:?}"
+                );
                 assert!(!status.source_muted);
                 assert_eq!(status.sent, 0);
                 for card in node.device_cards().unwrap().cards {

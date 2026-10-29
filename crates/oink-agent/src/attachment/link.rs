@@ -61,15 +61,6 @@ impl Header {
             }
         })
     }
-    fn refresh_digest(&mut self) -> v1::Result<()> {
-        if let Self::Offer(offer) = self {
-            let digest = blake3::hash(&offer.inventory()?.encode(limits::INVENTORY)?);
-            let mut raw = offer.raw().clone();
-            raw.insert(5, oink_clipboard::wire::digest(digest.into()).write());
-            *offer = dto::ClipboardOffer::from_raw(raw)?;
-        }
-        Ok(())
-    }
     fn wire(&self) -> v1::Result<dto::AttachmentHeader> {
         let kind = match self {
             Self::Offer(_) => 0,
@@ -201,7 +192,6 @@ pub(crate) fn split(id: u64, message: Message) -> v1::Result<(Message, Option<Me
     let mut inventory = oink_clipboard::wire::reliable_inventory(&original)?;
     if inventory != original {
         header = header.with_inventory(inventory.clone())?;
-        header.refresh_digest()?;
     }
     let message = header.message();
     if v1::frame::encode(&message, limits::RELIABLE_FRAME).is_ok() {
@@ -209,7 +199,6 @@ pub(crate) fn split(id: u64, message: Message) -> v1::Result<(Message, Option<Me
     }
     inventory = oink_clipboard::wire::descriptor_inventory(&inventory)?;
     header = header.with_inventory(inventory.clone())?;
-    header.refresh_digest()?;
     let low = prefix_count(id, &header, &inventory)?;
     let (prefix, tail) = inventory_parts(&inventory, low)?;
     let count = low + tail.items()?.0.len() + tail.roots()?.0.len();
@@ -506,6 +495,7 @@ mod tests {
             platform: ClipPlatform::Mac,
             roots: (0..roots)
                 .map(|n| FileNode {
+                    exec_bits: None,
                     id: NodeId(u64::from(n)),
                     parent: None,
                     name: format!("root-{n}"),
@@ -529,7 +519,6 @@ mod tests {
                         standard: None,
                         data: RepresentationData::Reader {
                             size: ContentSize::Unknown,
-                            hash: None,
                         },
                     }],
                 })

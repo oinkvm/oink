@@ -37,11 +37,13 @@ impl DeviceState {
     pub fn exact(&self, other: &Self) -> bool {
         self.connected_screens.values().all(Option::is_some)
             && other.connected_screens.values().all(Option::is_some)
-            && self == other
+            && self.connected_screens == other.connected_screens
     }
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_topology: Option<super::topology::PhysicalTopology>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extensions: Vec<u8>,
     pub id: String,
@@ -114,6 +116,7 @@ impl Catalog {
         let id = default_id(group);
         let version = Version { counter: 1, writer };
         let profile = Profile {
+            saved_topology: None,
             extensions: Vec::new(),
             id: id.clone(),
             default_group: Some(group),
@@ -125,7 +128,10 @@ impl Catalog {
                 sequence: 1,
             },
             content: snapshot,
-            match_state: state,
+            match_state: DeviceState {
+                online_devices: BTreeSet::new(),
+                ..state
+            },
         };
         Ok(Self {
             extensions: Vec::new(),
@@ -178,6 +184,9 @@ impl Catalog {
                 valid_name(value)?;
             }
             validate_snapshot(&profile.content)?;
+            if let Some(topology) = &profile.saved_topology {
+                super::topology::validate(topology)?;
+            }
         }
         if serde_json::to_vec(self)
             .map_err(|_| ProfileError::new(ErrorCode::InvalidGeometry, "Cannot encode catalog"))?
@@ -255,6 +264,7 @@ impl Catalog {
         if let Some(name) = custom_name {
             let id = new_id()?;
             next.profiles.push(Profile {
+                saved_topology: None,
                 default_group: None,
                 extensions: Vec::new(),
                 id: id.clone(),
@@ -262,7 +272,10 @@ impl Catalog {
                 content_revision: next.version.clone(),
                 last_used: used,
                 content,
-                match_state: state,
+                match_state: DeviceState {
+                    online_devices: BTreeSet::new(),
+                    ..state
+                },
             });
             next.active_profile_id = id;
         } else {
@@ -272,7 +285,11 @@ impl Catalog {
                 .find(|p| p.id == next.active_profile_id)
                 .expect("active");
             active.content = content;
-            active.match_state = state;
+            active.saved_topology = None;
+            active.match_state = DeviceState {
+                online_devices: BTreeSet::new(),
+                ..state
+            };
             active.content_revision = next.version.clone();
             active.last_used = used;
         }
@@ -468,7 +485,7 @@ pub fn validate_snapshot(snapshot: &ArrangementSnapshot) -> Result<()> {
     }
     Ok(())
 }
-fn close(a: f64, b: f64) -> bool {
+pub(super) fn close(a: f64, b: f64) -> bool {
     (a - b).abs() <= EPS * a.abs().max(b.abs()).max(1.0)
 }
 fn same_point(a: Point, b: Point) -> bool {

@@ -6,9 +6,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-// Retain the existing 60 one-second RTT samples.
-const WINDOW_MS: u64 = 60_000;
-const SLOTS: usize = 61;
+// Five minutes of source-clocked, one-second RTT samples.
+const WINDOW_MS: u64 = 300_000;
+const SLOTS: usize = 300;
 
 pub(crate) fn now_ms_at(now: Instant) -> u64 {
     static ORIGIN: OnceLock<Instant> = OnceLock::new();
@@ -53,22 +53,33 @@ impl History {
                     .filter(|s| at_ms.saturating_sub(s.at_ms) < WINDOW_MS)
                     .cloned()
                     .collect();
-                let mut values: Vec<_> = samples.iter().filter_map(|s| s.rtt_ms).collect();
-                values.sort_by(f64::total_cmp);
-                // Nearest rank on the same finite, nonnegative RTT points plotted
-                // in the trailing 60-second window (one point per sampling tick).
-                // P90 is sorted[ceil(0.90 * n) - 1]; gaps are excluded, with
-                // no interpolation, and an empty window returns None.
-                let percentile = |p: usize| values.get((values.len() * p).div_ceil(100).saturating_sub(1)).copied();
+                let stats = |window_ms| {
+                    let mut values: Vec<_> = samples
+                        .iter()
+                        .filter(|s| at_ms.saturating_sub(s.at_ms) < window_ms)
+                        .filter_map(|s| s.rtt_ms)
+                        .collect();
+                    values.sort_by(f64::total_cmp);
+                    // Nearest rank over raw finite points, never bucket maxima.
+                    let percentile = |p: usize| values.get((values.len() * p).div_ceil(100).saturating_sub(1)).copied();
+                    crate::api::LatencyWindowStats {
+                        p50_ms: percentile(50),
+                        p90_ms: percentile(90),
+                        p99_ms: percentile(99),
+                        max_ms: values.last().copied(),
+                    }
+                };
+                let minute = stats(60_000);
                 PeerQuality {
+                    stats_5m: stats(WINDOW_MS),
                     device: (*peer).into(),
                     name: self.metadata[peer].0.clone(),
                     path: self.metadata[peer].1.clone(),
                     current_ms: samples.last().and_then(|s| s.rtt_ms),
-                    p50_ms: percentile(50),
-                    p90_ms: percentile(90),
-                    p99_ms: percentile(99),
-                    max_ms: values.last().copied(),
+                    p50_ms: minute.p50_ms,
+                    p90_ms: minute.p90_ms,
+                    p99_ms: minute.p99_ms,
+                    max_ms: minute.max_ms,
                     samples,
                 }
             })
@@ -88,7 +99,7 @@ mod tests {
     use oink_foundation::DeviceId;
 
     #[test]
-    fn nearest_rank_percentiles_use_the_plotted_sixty_second_rtt_window() {
+    fn nearest_rank_percentiles_cover_both_raw_rtt_windows() {
         let peer = DeviceId([2; 32]);
         let mut history = History::default();
         for second in 1..=100 {
@@ -99,12 +110,16 @@ mod tests {
         }
         let view = history.view(100_000);
         let row = &view.peers[0];
-        assert_eq!(row.samples.len(), 60);
+        assert_eq!(row.samples.len(), 100);
+        assert_eq!(
+            (row.stats_5m.p50_ms, row.stats_5m.p90_ms, row.stats_5m.p99_ms),
+            (Some(50.), Some(90.), Some(99.))
+        );
         assert_eq!(
             (row.current_ms, row.p50_ms, row.p90_ms, row.p99_ms, row.max_ms),
             (Some(100.), Some(70.), Some(94.), Some(100.), Some(100.))
         );
-        assert!(history.view(160_000).peers[0].samples.is_empty());
+        assert!(history.view(400_000).peers[0].samples.is_empty());
     }
 
     #[test]
@@ -165,14 +180,14 @@ mod tests {
         history.record(1000, [(peer, "Peer".into(), crate::api::LinkKind::Direct, Some(1.))]);
         let opened = history.view(1000);
         drop(opened); // Closing a page only drops its snapshot.
-        for second in 2..=120 {
+        for second in 2..=600 {
             history.record(
                 second * 1000,
                 [(peer, "Peer".into(), crate::api::LinkKind::Direct, Some(2.))],
             );
         }
-        assert_eq!(history.view(120_000).peers[0].samples.len(), 60);
-        assert!(history.peers[&peer].len() <= 61);
+        assert_eq!(history.view(600_000).peers[0].samples.len(), 300);
+        assert!(history.peers[&peer].len() <= SLOTS);
     }
 
     #[test]

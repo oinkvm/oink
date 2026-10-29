@@ -203,10 +203,19 @@ impl Router {
                 {
                     self.dnd_cancel_pending();
                 }
-                if let State::Hosting { id: active, input, .. } = self.dnd.state
+                if let State::Hosting {
+                    id: active,
+                    input,
+                    begin_failed,
+                    ..
+                } = self.dnd.state
                     && active == id
                     && self.epoch == holder.epoch
                 {
+                    if begin_failed {
+                        self.dnd_cancel_hosting();
+                        return;
+                    }
                     if let Some(grant) = &self.dnd.target {
                         grant.release();
                     }

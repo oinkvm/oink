@@ -1,4 +1,5 @@
 //! Bounded, privacy-first diagnostic flight recorder. All disk/compression work is off input threads.
+mod application_focus;
 mod buttons;
 pub(crate) mod capture;
 mod clock;
@@ -74,6 +75,14 @@ impl ProviderAvailability {
             R::RegistrationFailed => 6.,
             R::BoundExpired => 7.,
             R::Cancelled => 8.,
+            R::ItemMissing => 9.,
+            R::ItemUnsupportedType => 10.,
+            R::ItemKindMismatch => 11.,
+            R::ItemTargetMismatch => 12.,
+            R::ItemIdentityMismatch => 13.,
+            R::ItemMetadataMismatch => 14.,
+            R::ItemAccessDenied => 15.,
+            R::ItemMetadataUnreadable => 16.,
         }
     }
     fn from_code(code: f64) -> Option<Self> {
@@ -88,6 +97,14 @@ impl ProviderAvailability {
             6. => R::RegistrationFailed,
             7. => R::BoundExpired,
             8. => R::Cancelled,
+            9. => R::ItemMissing,
+            10. => R::ItemUnsupportedType,
+            11. => R::ItemKindMismatch,
+            12. => R::ItemTargetMismatch,
+            13. => R::ItemIdentityMismatch,
+            14. => R::ItemMetadataMismatch,
+            15. => R::ItemAccessDenied,
+            16. => R::ItemMetadataUnreadable,
             _ => return None,
         };
         Some(reason.into())
@@ -465,6 +482,16 @@ impl Recorder {
         }
         let _reset = Reset(CAPTURE_STAMP.replace(Some(stamp)));
         action();
+    }
+    #[cfg(windows)]
+    pub(crate) fn crash_target(&self) -> Option<oink_crash::local::Target> {
+        self.inner
+            .enabled
+            .load(Ordering::Acquire)
+            .then(|| oink_crash::local::Target {
+                root: lock(&self.inner.store).dir.join("crash"),
+                instance: self.inner.instance.clone(),
+            })
     }
     pub fn enabled(&self) -> bool {
         self.inner.enabled.load(Ordering::Relaxed)
@@ -865,6 +892,18 @@ fn runtime_environment(node: &crate::node::Node, anon: &Anonymizer) -> Snapshot 
     let settings = node.settings();
     let os_version = system_version();
     let mut snapshot = Snapshot {
+        application_focus: node
+            .input_status()
+            .ok()
+            .and_then(|status| status.application_focus.clone())
+            .map(|state| store::ApplicationFocus {
+                pointer: anon.device(state.claim.pointer.device_id),
+                keyboard: state.keyboard.map(|boot| anon.device(boot.device_id)),
+                epoch: state.claim.epoch,
+                revision: state.revision,
+                phase: state.phase,
+                reason: state.reason,
+            }),
         #[cfg(target_os = "macos")]
         file_provider: lock(&node.inner.file_provider).snapshot().reason.map(Into::into),
         #[cfg(not(target_os = "macos"))]
@@ -896,6 +935,11 @@ fn runtime_environment(node: &crate::node::Node, anon: &Anonymizer) -> Snapshot 
                 settings.routing.return_pointer_on_display_sleep,
             ),
             ("cursor_trail".into(), settings.routing.cursor_trail),
+            (
+                "application_focus_enabled".into(),
+                node.link_config()
+                    .is_ok_and(|config| config.applied().application_focus_enabled),
+            ),
         ]
         .into(),
         routing_numbers: [
@@ -1045,7 +1089,9 @@ impl Recorder {
                 dx: *dx,
                 dy: *dy,
             },
-            InputMsg::Key { code, pressed } | InputMsg::CapsKey { code, pressed } => SafeInput::Key {
+            InputMsg::Key { code, pressed }
+            | InputMsg::CapsKey { code, pressed }
+            | InputMsg::ApplicationKey { code, pressed, .. } => SafeInput::Key {
                 class: privacy::KeyClass::from_code(*code),
                 pressed: *pressed,
                 repeat: Some(false),
@@ -1059,7 +1105,7 @@ impl Recorder {
                 repeat: Some(*repeat),
                 diagnostic: privacy::KeyDiagnostic::default(),
             },
-            InputMsg::KeyRepeat { code, .. } => SafeInput::Key {
+            InputMsg::KeyRepeat { code, .. } | InputMsg::ApplicationRepeat { code, .. } => SafeInput::Key {
                 class: privacy::KeyClass::from_code(*code),
                 pressed: true,
                 repeat: Some(true),
@@ -1083,14 +1129,18 @@ impl Recorder {
             InputMsg::Scroll {
                 dx,
                 dy,
-                unit: ScrollAmount::Lines,
+                unit: unit @ (ScrollAmount::Lines | ScrollAmount::Pixels),
                 phase,
                 ..
             } => SafeInput::Scroll {
                 dx: *dx,
                 dy: *dy,
                 phase: *phase,
-                unit: oink_foundation::input::ScrollUnit::Line,
+                unit: if *unit == ScrollAmount::Pixels {
+                    oink_foundation::input::ScrollUnit::Pixel
+                } else {
+                    oink_foundation::input::ScrollUnit::Line
+                },
             },
             InputMsg::Gesture { gesture, .. } => SafeInput::Gesture(*gesture),
             InputMsg::RelativeMotion {
@@ -1112,6 +1162,15 @@ impl Recorder {
                     active: !keys.is_empty() || !buttons.is_empty(),
                     count: keys.len() as u64,
                     value: buttons.len() as f64,
+                });
+                return;
+            }
+            InputMsg::ApplicationHeldSync { keys, .. } => {
+                self.record(Event::State {
+                    kind: StateKind::HeldSync,
+                    active: !keys.is_empty(),
+                    count: keys.len() as u64,
+                    value: 0.,
                 });
                 return;
             }
