@@ -949,13 +949,27 @@ async fn file_transfer_interrupted_by_link_drop_completes_after_reconnect_scenar
         local_path: Some(source.clone()),
     }];
     a.clip.copy(vec![ClipData::Files(files)], Sensitivity::Normal);
-    wait_for("file demand available", 10.0, || {
-        b.node
-            .clipboard_transfer()
-            .unwrap()
-            .is_some_and(|p| p.phase == FileTransferPhase::Pending)
-    })
+    // Observe demand after native descriptor publication, deliberately missing
+    // the transient Pending state. descriptor_nodes() calls Remote::preparing(),
+    // which reports Downloading before any file bytes are requested. Waiting
+    // for Pending races that metadata work and can never finish once it wins.
+    wait_for(
+        "native file demand published after descriptor preparation",
+        10.0,
+        || {
+            b.clip.contents().is_some()
+                && b.node
+                    .clipboard_transfer()
+                    .unwrap()
+                    .is_some_and(|progress| progress.phase == FileTransferPhase::Downloading)
+        },
+    )
     .await;
+    assert!(
+        gate.offsets().is_empty(),
+        "descriptor preparation must not read file payload"
+    );
+    assert_eq!(b.node.clipboard_transfer().unwrap().unwrap().done, 0);
     b.node.fetch_clipboard_files().unwrap();
     let (stopped_at, received_path) =
         tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(10)).unwrap())
