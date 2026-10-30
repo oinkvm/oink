@@ -617,15 +617,9 @@ async fn single_device_pairs_into_existing_group_in_both_directions_scenario() {
         all.iter().all(|dev| member_ids(&dev.node) == ids(&all))
     })
     .await;
-    // Loopback fixture: device facts advertise the machine's LAN addresses, which the
-    // 127.0.0.1-bound test endpoints do not answer, and discovery is off. Give
-    // each remaining pair its actual loopback address before checking the mesh.
-    for (source, target) in [(&b, &c), (&a, &d), (&c, &d)] {
-        assert_eq!(
-            common::query(&source.node, &target.node).await.peer.device.0,
-            target.node.id()
-        );
-    }
+    // Explicit loopback binds are advertised in endpoint facts. Let the merged
+    // group establish its mesh automatically; manual address queries add a
+    // separate 5 s lookup deadline while C0 admission is still converging.
     active(&all, 20.0, "four members").await;
     for dev in all {
         assert_eq!(group_anchor(dev).await, destination, "{} target group anchor", dev.name);
