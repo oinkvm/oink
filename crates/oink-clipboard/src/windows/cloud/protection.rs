@@ -1,8 +1,8 @@
-//! Short native mutation windows: existing readers may continue, writers cannot.
+//! Retirement handles and handle-free hydration edit checks.
 use super::*;
 use std::{
     fs::File,
-    os::windows::{ffi::OsStringExt, fs::OpenOptionsExt, io::AsRawHandle},
+    os::windows::{ffi::OsStringExt, io::AsRawHandle},
 };
 
 fn identity(handle: HANDLE) -> io::Result<(u32, u32, u32)> {
@@ -15,7 +15,7 @@ fn identity(handle: HANDLE) -> io::Result<(u32, u32, u32)> {
 }
 
 /// Referencing an exclusive RH handle is used only for retirement, after consumer
-/// drain. Hydration must coexist with the read which requested it (see Mutation).
+/// drain. Data hydration checks use callback identities without a data handle.
 pub(super) struct Protected {
     api: Arc<Api>,
     protected: HANDLE,
@@ -122,131 +122,15 @@ impl Drop for Protected {
     }
 }
 
-pub(super) struct Mutation {
-    protected: Protected,
-    // Retain the deny-write handle until AFTER releasing the R oplock.
-    sharing: File,
-}
-impl Mutation {
-    #[cfg(test)]
-    pub(super) fn open(api: Arc<Api>, path: &Path) -> io::Result<Self> {
-        Self::open_traced(api, path, HydrationTrace::default())
-    }
-    fn open_traced(api: Arc<Api>, path: &Path, trace: HydrationTrace) -> io::Result<Self> {
-        // READ_DATA is required for Win32 to enforce the sharing exclusion:
-        // an attributes/WRITE_DAC-only open did not deny writers in the private
-        // Windows 11 native regression. OPEN_REPARSE_POINT avoids open-triggered
-        // recall; this handle never reads body bytes. A pending native MOVE
-        // holds DELETE access while waiting for hydration. Share DELETE lets
-        // that consumer coexist; data writers remain excluded. The referenced
-        // R oplock and same-file check below protect the mutation itself.
-        // Verified with a separate-process MoveFileEx on Windows 11: denying
-        // DELETE returned sharing violation 32 during hydration; permitting it
-        // lets the platform finish hydration before moving the received copy.
-        let sharing = trace.io(
-            50,
-            std::fs::OpenOptions::new()
-                .access_mode(GENERIC_READ)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-                .open(path),
-        )?;
-        // The separate R oplock refuses a writable mapped section left after
-        // its creating handle closed. R alone is advisory for writes, hence it
-        // is NOT sufficient without the deny-write handle above. No network
-        // read/wait occurs while this pair is held.
-        let protected = Protected::open_traced(api, path, CF_OPEN_FILE_FLAG_NONE, trace)?;
-        // DELETE sharing permits pathname changes between the two opens. The
-        // data-write exclusion must belong to the protected file, not merely a
-        // file previously found at the same path.
-        if trace.io(82, identity(sharing.as_raw_handle()))? != trace.io(82, identity(protected.handle))? {
-            return trace.io(
-                82,
-                Err(crate::content::unavailable(crate::model::Unavailable::Superseded)),
-            );
-        }
-        Ok(Self { protected, sharing })
-    }
-    fn handle(&self) -> HANDLE {
-        self.protected.handle
-    }
-}
 impl Work {
-    pub(super) fn mutation(&self, expected_length: u64) -> io::Result<Mutation> {
+    // Hydration range checks must not open a data handle or issue a handle-based FSCTL:
+    // a minifilter scan can wait behind this very hydration. The hydration
+    // range API uses the callback's native file identity and filter message
+    // port instead. TRANSFER_DATA atomically preserves modified/unsynced ranges
+    // even if an edit races this preflight (CF_CALLBACK_PARAMETERS contract).
+    pub(super) fn check_hydration_target(&self) -> io::Result<()> {
         let trace = self.trace();
-        let protected = Mutation::open_traced(self.service.api.clone(), &self.delivery.file_path(self.index), trace)?;
-        let handle = protected.handle();
-        let (owner, index, _) = trace.io(54, self.service.handle_identity_traced(handle, 0, trace))?;
-        if owner != self.delivery.id || index != self.index {
-            return trace.io(
-                54,
-                Err(crate::content::unavailable(crate::model::Unavailable::Superseded)),
-            );
-        }
-        let mut buffer = [0u64; 1024];
-        let mut written = 0;
-        // SAFETY: aligned standard-info buffer and a referenced native handle.
-        trace.hr(55, unsafe {
-            (self.service.api.info)(
-                handle,
-                CF_PLACEHOLDER_INFO_STANDARD,
-                buffer.as_mut_ptr().cast(),
-                std::mem::size_of_val(&buffer) as u32,
-                &mut written,
-            )
-        })?;
-        // SAFETY: successful query initialized standard info.
-        let info = unsafe { &*buffer.as_ptr().cast::<CF_PLACEHOLDER_STANDARD_INFO>() };
-        let mut length = 0i64;
-        // SAFETY: fixed-size output and the same referenced native handle.
-        if unsafe { GetFileSizeEx(handle, &mut length) } == 0 {
-            return trace.io(56, Err(io::Error::last_os_error()));
-        }
-        if length < 0 {
-            return trace.io(56, Err(io::Error::from_raw_os_error(ERROR_INVALID_DATA as i32)));
-        }
         let file = self.delivery.file(self.index);
-        if info.ModifiedDataSize != 0
-            || info.InSyncState != CF_IN_SYNC_STATE_IN_SYNC
-            || length as u64 != expected_length
-        {
-            // Local edits own this identity from now on. Pin without hydrating;
-            // never synthesize Stored for locally changed/partly resident bytes.
-            // SAFETY: deny-write handle owns READ_DATA, sufficient for pinning.
-            let _ = trace.hr(57, unsafe {
-                (self.service.api.pin)(
-                    protected.sharing.as_raw_handle(),
-                    CF_PIN_STATE_PINNED,
-                    CF_SET_PIN_FLAG_NONE,
-                    std::ptr::null_mut(),
-                )
-            });
-            let resident = trace.io(
-                58,
-                self.service.handle_fully_resident_traced(handle, length as u64, trace),
-            )?;
-            let mut journal = self.service.received.lock().unwrap();
-            let previous = journal
-                .deliveries
-                .get(&owner)
-                .and_then(|nodes| nodes.get(index))
-                .cloned()
-                .ok_or(io::ErrorKind::NotFound)?;
-            let mut next = previous.clone();
-            next.local_final = true;
-            next.withdrawn = false;
-            next.length = length as u64;
-            next.handed_off = resident;
-            next.life.materialized = resident;
-            journal.deliveries.get_mut(&owner).unwrap()[index] = next;
-            if let Err(error) = trace.io(59, journal.save(&self.service.root)) {
-                journal.deliveries.get_mut(&owner).unwrap()[index] = previous;
-                return Err(error);
-            }
-            file.local_final.store(true, Ordering::Release);
-            file.withdrawn.store(false, Ordering::Release);
-            return Err(crate::content::unavailable(crate::model::Unavailable::Superseded));
-        }
         if self.request.cancelled.load(Ordering::Acquire)
             || file.deleted.load(Ordering::Acquire)
             || file.withdrawn.load(Ordering::Acquire)
@@ -254,47 +138,71 @@ impl Work {
         {
             return Err(unavailable());
         }
-        Ok(protected)
+        let key = (*self.service.connection.lock().unwrap()).ok_or(io::ErrorKind::NotConnected)?;
+        let mut range = CF_FILE_RANGE::default();
+        let mut written = 0;
+        // SAFETY: callback identity, bounded range output; no file is opened.
+        let code = unsafe {
+            (self.service.api.hydration_ranges)(
+                key,
+                self.request.transfer,
+                self.request.file_id,
+                CF_PLACEHOLDER_RANGE_INFO_MODIFIED,
+                0,
+                -1,
+                (&mut range as *mut CF_FILE_RANGE).cast(),
+                size_of::<CF_FILE_RANGE>() as u32,
+                &mut written,
+            )
+        };
+        let dirty = if (code & 0xffff) == ERROR_HANDLE_EOF as i32 && written == 0 {
+            self.request.total != 0
+        } else if (code & 0xffff) == ERROR_MORE_DATA as i32 || (code & 0xffff) == ERROR_CLOUD_FILE_NOT_IN_SYNC as i32 {
+            true
+        } else {
+            trace.hr(55, code)?;
+            if written != 0
+                && (written != size_of::<CF_FILE_RANGE>() as u32 || range.StartingOffset < 0 || range.Length <= 0)
+            {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            written != 0
+        };
+        if dirty {
+            let mut journal = self.service.received.lock().unwrap();
+            let previous = journal
+                .deliveries
+                .get(&self.delivery.id)
+                .and_then(|nodes| nodes.get(self.index))
+                .cloned()
+                .ok_or(io::ErrorKind::NotFound)?;
+            let mut next = previous.clone();
+            next.local_final = true;
+            next.withdrawn = false;
+            // Keep prior completion evidence. Partial local edits are never
+            // promoted to a successful source handoff or re-read for proof.
+            journal.deliveries.get_mut(&self.delivery.id).unwrap()[self.index] = next;
+            if let Err(error) = trace.io(59, journal.save(&self.service.root)) {
+                journal.deliveries.get_mut(&self.delivery.id).unwrap()[self.index] = previous;
+                return Err(error);
+            }
+            file.local_final.store(true, Ordering::Release);
+            file.withdrawn.store(false, Ordering::Release);
+            // NOT_IN_SYNC protects the OS copy immediately. Do not open a pin
+            // handle inside FETCH_DATA; restore/withdrawal publish local policy.
+            return Err(crate::content::unavailable(crate::model::Unavailable::Superseded));
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::windows::io::{FromRawHandle, OwnedHandle};
-
-    /// Real Win32 sharing/oplock behavior on private regular files only. This
-    /// does not register a Cloud Files root or establish hydration acceptance.
-    #[test]
-    fn native_mutation_guard_allows_readers_and_move_handles_but_excludes_writers() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("received");
-        std::fs::write(&path, b"original").unwrap();
-        let api = Api::load().unwrap();
-        let reader = File::open(&path).unwrap();
-        let guard = Mutation::open(api.clone(), &path).unwrap();
-        assert!(
-            File::open(&path).is_ok(),
-            "readers must coexist with the hydration mutation"
-        );
-        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
-        assert!(std::fs::write(&path, b"").is_err());
-        let move_handle = std::fs::OpenOptions::new()
-            .access_mode(DELETE | FILE_READ_ATTRIBUTES)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&path)
-            .unwrap();
-        drop(move_handle);
-        drop(guard);
-        drop(reader);
-        let writer = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
-        assert!(Mutation::open(api.clone(), &path).is_err());
-        drop(writer);
-        let guard = Mutation::open(api, &path).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"original");
-        drop(guard);
-    }
+    use std::os::windows::{
+        fs::OpenOptionsExt,
+        io::{FromRawHandle, OwnedHandle},
+    };
 
     #[test]
     fn native_hidden_and_large_file_sharing_errors_keep_the_original_win32_code() {
@@ -330,7 +238,6 @@ mod tests {
             .finish();
         tracing::subscriber::with_default(subscriber, || {
             let temp = tempfile::tempdir().unwrap();
-            let api = Api::load().unwrap();
             for (index, (name, bytes)) in [(".DS_Store", 6148), ("large.bin", 179_200)].into_iter().enumerate() {
                 let path = temp.path().join(name);
                 std::fs::write(&path, vec![0x5a; bytes]).unwrap();
@@ -346,11 +253,28 @@ mod tests {
                     index,
                 };
                 let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-                let error = Mutation::open_traced(api.clone(), &path, trace).err().unwrap();
+                let error = trace
+                    .io(
+                        50,
+                        std::fs::OpenOptions::new()
+                            .read(true)
+                            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+                            .open(&path),
+                    )
+                    .err()
+                    .unwrap();
                 assert_eq!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
                 drop(writer);
                 let reader = File::open(&path).unwrap();
-                let guard = Mutation::open_traced(api.clone(), &path, trace).unwrap();
+                let guard = trace
+                    .io(
+                        50,
+                        std::fs::OpenOptions::new()
+                            .read(true)
+                            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+                            .open(&path),
+                    )
+                    .unwrap();
                 assert_eq!(std::fs::read(&path).unwrap().len(), bytes);
                 drop((guard, reader));
                 // Full failing HRESULT survives conversion to io::Error.
@@ -368,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn native_mutation_and_delete_guards_refuse_lingering_writable_mapping() {
+    fn native_delete_guard_refuses_lingering_writable_mapping() {
         use windows::Win32::{
             Foundation::HANDLE as WinHandle,
             System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile},
@@ -387,7 +311,6 @@ mod tests {
         assert!(!view.Value.is_null());
         drop(file); // An ordinary share-none metadata open alone can now succeed.
         let api = Api::load().unwrap();
-        let mutation = Mutation::open(api.clone(), &path);
         let deletion = Protected::open(
             api.clone(),
             &path,
@@ -398,11 +321,14 @@ mod tests {
             UnmapViewOfFile(view).unwrap();
         }
         drop(mapping);
-        assert!(
-            mutation.is_err(),
-            "a lingering writable mmap must exclude hydration writes"
-        );
         assert!(deletion.is_err(), "a lingering writable mmap must exclude cleanup");
-        assert!(Mutation::open(api, &path).is_ok());
+        assert!(
+            Protected::open(
+                api,
+                &path,
+                CF_OPEN_FILE_FLAG_EXCLUSIVE | CF_OPEN_FILE_FLAG_DELETE_ACCESS | CF_OPEN_FILE_FLAG_WRITE_ACCESS
+            )
+            .is_ok()
+        );
     }
 }

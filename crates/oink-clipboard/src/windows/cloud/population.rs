@@ -531,6 +531,7 @@ pub(super) unsafe extern "system" fn fetch(info: *const CF_CALLBACK_INFO, _: *co
         return;
     };
     let request = Arc::new(Request {
+        file_id: info.FileId,
         transfer: info.TransferKey,
         key: info.RequestKey,
         start: 0,

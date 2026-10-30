@@ -37,6 +37,8 @@ pub(crate) use received::{open_received, received_usage};
 type Hydrate = unsafe extern "system" fn(HANDLE, i64, i64, i32, *mut windows_sys::Win32::System::IO::OVERLAPPED) -> i32;
 type Pin = unsafe extern "system" fn(HANDLE, i32, i32, *mut windows_sys::Win32::System::IO::OVERLAPPED) -> i32;
 type Ranges = unsafe extern "system" fn(HANDLE, i32, i64, i64, *mut c_void, u32, *mut u32) -> i32;
+type HydrationRanges =
+    unsafe extern "system" fn(CF_CONNECTION_KEY, i64, i64, i32, i64, i64, *mut c_void, u32, *mut u32) -> i32;
 type Info = unsafe extern "system" fn(HANDLE, i32, *mut c_void, u32, *mut u32) -> i32;
 type Register = unsafe extern "system" fn(*const u16, *const CF_SYNC_REGISTRATION, *const CF_SYNC_POLICIES, i32) -> i32;
 type Connect = unsafe extern "system" fn(
@@ -83,6 +85,7 @@ struct Api {
     pin: Pin,
     info: Info,
     ranges: Ranges,
+    hydration_ranges: HydrationRanges,
     create: Create,
     update: Update,
     execute: Execute,
@@ -165,9 +168,9 @@ impl Api {
             if code < 0 {
                 return Err(code & 0xffff);
             }
-            // Safe FULL-policy size changes require this platform opt-in.
+            // Handle-free hydration queries are required: callback-path CreateFile/FSCTL can deadlock behind AV.
             // Older Cloud Files integrations cannot implement our link contract.
-            if info.IntegrationNumber < 0x500 {
+            if info.IntegrationNumber < 0x600 {
                 return Err(ERROR_NOT_SUPPORTED as i32);
             }
             Ok(Arc::new(Api {
@@ -181,6 +184,7 @@ impl Api {
                 pin: function!("CfSetPinState", Pin),
                 info: function!("CfGetPlaceholderInfo", Info),
                 ranges: function!("CfGetPlaceholderRangeInfo", Ranges),
+                hydration_ranges: function!("CfGetPlaceholderRangeInfoForHydration", HydrationRanges),
                 register: function!("CfRegisterSyncRoot", Register),
                 connect: function!("CfConnectSyncRoot", Connect),
                 disconnect: function!("CfDisconnectSyncRoot", Disconnect),
@@ -457,6 +461,7 @@ impl Delivery {
     }
 }
 struct Request {
+    file_id: i64,
     transfer: i64,
     key: i64,
     start: i64,
@@ -551,8 +556,7 @@ impl Service {
             StructSize: size_of::<CF_SYNC_POLICIES>() as u32,
             Hydration: CF_HYDRATION_POLICY {
                 Primary: CF_HYDRATION_POLICY_FULL,
-                Modifier: CF_HYDRATION_POLICY_MODIFIER_ALLOW_FULL_RESTART_HYDRATION
-                    | CF_HYDRATION_POLICY_MODIFIER_AUTO_DEHYDRATION_ALLOWED,
+                Modifier: CF_HYDRATION_POLICY_MODIFIER_AUTO_DEHYDRATION_ALLOWED,
             },
             InSync: CF_INSYNC_POLICY_TRACK_FILE_LAST_WRITE_TIME
                 | CF_INSYNC_POLICY_TRACK_FILE_CREATION_TIME
@@ -1142,6 +1146,7 @@ unsafe extern "system" fn fetch(info: *const CF_CALLBACK_INFO, params: *const CF
         return;
     };
     let request = Arc::new(Request {
+        file_id: info.FileId,
         transfer: info.TransferKey,
         key: info.RequestKey,
         start: params.RequiredFileOffset,
@@ -1354,51 +1359,6 @@ impl Work {
         }
         self.service.requests.lock().unwrap().remove(&self.id);
     }
-    fn update_placeholder(&self, op: &CF_OPERATION_INFO, metadata: FileMetadata) -> io::Result<()> {
-        // Metadata changes arrive while a user read is pending. In Windows 11
-        // probes CfUpdatePlaceholder blocked when resizing from FETCH_DATA.
-        // RESTART_HYDRATION is the documented FULL-policy metadata update for
-        // this situation. Registration requires ALLOW_FULL_RESTART_HYDRATION
-        // so AV memory-mapped scans cannot deadlock a size change. It invalidates
-        // partial old bytes, changes size/mtime,
-        // and reissues pending reads. Never transfer under the old request after
-        // restart; the next callback opens the exact newly selected version.
-        let time = metadata
-            .modified_ms
-            .map_or(0, |ms| super::files::unix_ms_to_filetime(ms) as i64);
-        let metadata = CF_FS_METADATA {
-            BasicInfo: FILE_BASIC_INFO {
-                LastWriteTime: time,
-                ChangeTime: time,
-                ..Default::default()
-            },
-            FileSize: metadata.size as i64,
-        };
-        let mut op = *op;
-        op.Type = CF_OPERATION_TYPE_RESTART_HYDRATION;
-        let mut params = CF_OPERATION_PARAMETERS {
-            ParamSize: (offset_of!(CF_OPERATION_PARAMETERS, Anonymous) + size_of::<CF_OPERATION_PARAMETERS_0_3>())
-                as u32,
-            Anonymous: CF_OPERATION_PARAMETERS_0 {
-                RestartHydration: CF_OPERATION_PARAMETERS_0_3 {
-                    Flags: CF_OPERATION_RESTART_HYDRATION_FLAG_NONE,
-                    FsMetadata: &metadata,
-                    ..Default::default()
-                },
-            },
-        };
-        tracing::info!(target: "oink_file_diagnostics", file_stage = 7_u8,
-            file_request = self.id, file_index = self.index, size = metadata.FileSize,
-            "cloud file hydration restart entered");
-        // SAFETY: the operation keys, metadata and union arm remain live for
-        // this synchronous CfExecute; null identity retains delivery/index.
-        let code = unsafe { (self.service.api.execute)(&op, &mut params) };
-        tracing::info!(target: "oink_file_diagnostics", file_stage = 8_u8,
-            file_request = self.id, file_index = self.index, file_code = code as u32,
-            "cloud file hydration restart returned");
-        self.trace().hr(68, code)
-    }
-
     fn hydrate(&self, op: &CF_OPERATION_INFO, selected: &mut (FileMetadata, Option<u64>)) -> io::Result<()> {
         if self.request.cancelled.load(Ordering::Acquire) {
             return Err(unavailable());
@@ -1432,8 +1392,15 @@ impl Work {
         // rather than invalidate it with RESTART_HYDRATION. A known version,
         // including zero for flat providers, still detects later replacements.
         let changed = selected.0 != metadata || selected.1.is_some_and(|old| old != version);
+        if changed {
+            // No atomic metadata restart protects a concurrent local edit.
+            // Reject this stale source version before opening/mutating the
+            // native file. RESTART_HYDRATION can discard edited ranges, while
+            // CfUpdate alone does not complete a read waiting on the old EOF.
+            return Err(crate::content::unavailable(crate::model::Unavailable::Superseded));
+        }
         // Even an explicit fetch of an empty stream must pass exact-version
-        // EOF before updating native metadata. An EOF version error must not
+        // EOF before completing the native item. An EOF version error must not
         // expose an empty file as successful hydration.
         if metadata.size == 0 {
             let mut reader = self
@@ -1447,19 +1414,10 @@ impl Work {
             {
                 return Err(unavailable());
             }
-            let _mutation = self.mutation(selected.0.size)?;
-            if changed {
-                self.update_placeholder(op, metadata)?;
-            }
+            self.check_hydration_target()?;
             *selected = (metadata, Some(version));
             self.service.native_complete(self.delivery.id, self.index, 0);
             return Ok(());
-        }
-        if changed {
-            let _mutation = self.mutation(selected.0.size)?;
-            self.update_placeholder(op, metadata)?;
-            *selected = (metadata, Some(version));
-            return Ok(()); // cfapi reissues IO against the updated placeholder
         }
         *selected = (metadata, Some(version));
         tracing::info!(target: "oink_file_diagnostics", file_stage = 9_u8,
@@ -1493,11 +1451,11 @@ impl Work {
                     file_request = self.id, file_index = self.index, bytes = count,
                     "cloud file first source bytes verified");
             }
-            let mutation = self.mutation(metadata.size)?;
+            self.check_hydration_target()?;
             if offset == 0 {
                 tracing::info!(target: "oink_file_diagnostics", file_stage = 11_u8,
                     file_request = self.id, file_index = self.index,
-                    "cloud file mutation protection acquired");
+                    "cloud file hydration target validated");
             }
             self.trace().io(
                 69,
@@ -1511,7 +1469,6 @@ impl Work {
                     self.trace(),
                 ),
             )?;
-            drop(mutation);
             offset += count as u64;
             self.request.progress.store(offset, Ordering::Relaxed);
             self.delivery
@@ -1746,6 +1703,71 @@ mod tests {
     }
     use std::os::windows::fs::OpenOptionsExt;
     use std::sync::atomic::AtomicI32;
+    type HydrationTarget = (i64, PathBuf, [u8; 16], Info);
+    static HYDRATION_TARGETS: Mutex<Vec<HydrationTarget>> = Mutex::new(Vec::new());
+    unsafe extern "system" fn fake_hydration_ranges(
+        _: CF_CONNECTION_KEY,
+        _: i64,
+        file_id: i64,
+        _: i32,
+        _: i64,
+        _: i64,
+        buffer: *mut c_void,
+        _: u32,
+        written: *mut u32,
+    ) -> i32 {
+        let target = HYDRATION_TARGETS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(id, ..)| *id == file_id)
+            .cloned();
+        // SAFETY: the test owns the bounded range output and count.
+        unsafe {
+            *written = 0;
+        }
+        let Some((_, path, identity, info_fn)) = target else {
+            return 0;
+        };
+        let Ok(file) = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(path)
+        else {
+            return 0x80070178_u32 as i32;
+        };
+        use std::os::windows::io::AsRawHandle;
+        let mut info_buffer = [0u64; 1024];
+        let mut size = 0;
+        // SAFETY: private fake handle and aligned standard-info storage.
+        unsafe {
+            let code = info_fn(
+                file.as_raw_handle(),
+                CF_PLACEHOLDER_INFO_STANDARD,
+                info_buffer.as_mut_ptr().cast(),
+                std::mem::size_of_val(&info_buffer) as u32,
+                &mut size,
+            );
+            if code < 0 {
+                return code;
+            }
+            let info = &*info_buffer.as_ptr().cast::<CF_PLACEHOLDER_STANDARD_INFO>();
+            if info.FileIdentityLength != 16 || std::slice::from_raw_parts(info.FileIdentity.as_ptr(), 16) != identity {
+                return 0x80070178_u32 as i32;
+            }
+            if info.InSyncState != CF_IN_SYNC_STATE_IN_SYNC {
+                return 0x80070179_u32 as i32;
+            }
+            if info.ModifiedDataSize != 0 {
+                *buffer.cast::<CF_FILE_RANGE>() = CF_FILE_RANGE {
+                    StartingOffset: 0,
+                    Length: info.ModifiedDataSize,
+                };
+                *written = size_of::<CF_FILE_RANGE>() as u32;
+            }
+        }
+        0
+    }
     struct CleanupSetting;
     impl CleanupSetting {
         fn days7() -> Self {
@@ -1906,12 +1928,7 @@ mod tests {
                 return 0;
             }
             if (*op).Type == CF_OPERATION_TYPE_RESTART_HYDRATION {
-                let metadata = &*(*params).Anonymous.RestartHydration.FsMetadata;
-                UPDATES
-                    .lock()
-                    .unwrap()
-                    .push((metadata.FileSize as u64, metadata.BasicInfo.LastWriteTime));
-                return 0;
+                panic!("hydration must not invalidate local ranges with restart");
             }
             let p = (*params).Anonymous.TransferData;
             let bytes = if p.Buffer.is_null() {
@@ -1984,7 +2001,7 @@ mod tests {
     }
     unsafe extern "system" fn fake_update(
         _: HANDLE,
-        _: *const CF_FS_METADATA,
+        metadata: *const CF_FS_METADATA,
         _: *const c_void,
         _: u32,
         _: *const CF_FILE_RANGE,
@@ -1993,6 +2010,14 @@ mod tests {
         _: *mut i64,
         _: *mut windows_sys::Win32::System::IO::OVERLAPPED,
     ) -> i32 {
+        if !metadata.is_null() {
+            // SAFETY: caller retains this fixed-size input through the fake call.
+            let metadata = unsafe { &*metadata };
+            UPDATES
+                .lock()
+                .unwrap()
+                .push((metadata.FileSize as u64, metadata.BasicInfo.LastWriteTime));
+        }
         0
     }
     fn fake_with_info(root: PathBuf, info: Info) -> (Arc<Service>, mpsc::Receiver<Work>) {
@@ -2016,6 +2041,7 @@ mod tests {
         hydrate: Hydrate,
         pin: Pin,
     ) -> (Arc<Service>, mpsc::Receiver<Work>) {
+        HYDRATION_TARGETS.lock().unwrap().clear();
         DEHYDRATED.lock().unwrap().clear();
         DEHYDRATE_ACKS.lock().unwrap().clear();
         FAIL_DEHYDRATE.store(false, Ordering::Relaxed);
@@ -2098,6 +2124,7 @@ mod tests {
             release_protected,
             close_protected,
             ranges,
+            hydration_ranges: fake_hydration_ranges,
             hydrate,
             dehydrate: fake_dehydrate,
             pin,
@@ -2908,7 +2935,7 @@ mod tests {
                 crate::FileMetadata {
                     exec_bits: None,
                     size: self.size,
-                    modified_ms: Some(2000),
+                    modified_ms: Some(1000),
                 },
                 7,
             )))
@@ -2938,7 +2965,7 @@ mod tests {
         }
     }
     #[test]
-    fn placeholder_reads_select_latest_version_instead_of_immutable_ole_descriptor() {
+    fn matching_placeholder_metadata_selects_the_first_exact_source_version() {
         let _serial = SERIAL.lock().unwrap();
         for size in [131073, 10] {
             let temp = tempfile::tempdir().unwrap();
@@ -2950,14 +2977,11 @@ mod tests {
                 selected: AtomicU64::new(0),
             });
             let delivery = service
-                .publish(vec![entry("file", 10, false)], source.clone(), Instant::now())
+                .publish(vec![entry("file", size, false)], source.clone(), Instant::now())
                 .unwrap();
             request(&service, &delivery, &receiver, 0, false);
             assert_eq!(source.selected.load(Ordering::Relaxed), 7);
-            assert_eq!(
-                *UPDATES.lock().unwrap(),
-                [(size, super::super::files::unix_ms_to_filetime(2000) as i64)]
-            );
+            assert!(UPDATES.lock().unwrap().is_empty());
             let transfers = TRANSFERS.lock().unwrap();
             assert!(transfers.iter().all(|(_, _, status)| *status == STATUS_SUCCESS));
             assert_eq!(
@@ -3165,27 +3189,6 @@ mod tests {
                 }
             );
         }
-    }
-
-    #[test]
-    fn active_download_handle_allows_the_provider_mutation_guard() {
-        let _serial = SERIAL.lock().unwrap();
-        let temp = tempfile::tempdir().unwrap();
-        let (service, _) = fake_with_info(temp.path().join("CloudFiles"), owned_info);
-        let delivery = service
-            .publish(vec![entry("file", 3, false)], Bytes::new(3), Instant::now())
-            .unwrap();
-        let path = delivery.file_path(0);
-        // The active-download handle stays open until CfHydratePlaceholder
-        // completes, including the provider's FETCH_DATA mutation window.
-        let waiting = delivery.checked_file(&service, 0, &path, true).unwrap();
-        let mutation = protection::Mutation::open(service.api.clone(), &path);
-        assert!(
-            mutation.is_ok(),
-            "our active download must not count as a conflicting writer"
-        );
-        drop(mutation);
-        drop(waiting);
     }
 
     #[test]
@@ -4015,9 +4018,9 @@ mod tests {
         KEYS.lock().unwrap().clear();
     }
     #[test]
-    fn updated_placeholder_shrink_restarts_and_keeps_native_identity() {
+    fn changed_source_metadata_fails_without_touching_placeholder() {
         let _serial = SERIAL.lock().unwrap();
-        for size in [3, 0] {
+        for size in [3, 0, 10] {
             let temp = tempfile::tempdir().unwrap();
             let (service, receiver) = fake(temp.path().join("CloudFiles"));
             let source = Arc::new(Versioned {
@@ -4029,23 +4032,29 @@ mod tests {
             let delivery = service
                 .publish(vec![entry("file", 10, false)], source.clone(), Instant::now())
                 .unwrap();
-            let identity = delivery.id;
+            if size == 10 {
+                delivery.file(0).selected.lock().unwrap().1 = Some(0);
+            }
             let path = delivery.file_path(0);
+            let before = std::fs::read(&path).unwrap();
             request(&service, &delivery, &receiver, 0, false);
-            assert_eq!(source.selected.load(Ordering::Relaxed), 7);
-            assert_eq!(
-                *UPDATES.lock().unwrap(),
-                [(size, super::super::files::unix_ms_to_filetime(2000) as i64)]
+            assert!(
+                UPDATES.lock().unwrap().is_empty(),
+                "version failure must not mutate the placeholder"
             );
-            let transfers = TRANSFERS.lock().unwrap();
-            assert!(transfers.iter().all(|(_, _, status)| *status == STATUS_SUCCESS));
             assert_eq!(
-                transfers.iter().map(|(_, bytes, _)| bytes.len()).sum::<usize>(),
-                size as usize
+                source.selected.load(Ordering::Relaxed),
+                0,
+                "source bytes must not be read"
             );
-            assert_eq!(delivery.id, identity);
-            assert_eq!(delivery.file_path(0), path);
-            assert_eq!(delivery.file(0).selected.lock().unwrap().0.size, size);
+            assert_eq!(
+                *TRANSFERS.lock().unwrap(),
+                [(0, Vec::new(), STATUS_CLOUD_FILE_NOT_IN_SYNC)]
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 10);
+            assert_eq!(delivery.file(0).selected.lock().unwrap().0.size, 10);
+            assert!(!delivery.file(0).local_final.load(Ordering::Acquire));
         }
     }
     #[test]
@@ -4116,6 +4125,7 @@ mod tests {
     }
     fn pending_request() -> Arc<Request> {
         Arc::new(Request {
+            file_id: 0,
             transfer: 7,
             key: 0,
             start: 0,
@@ -4235,9 +4245,13 @@ mod tests {
             .unwrap();
         delivery.file(0).selected.lock().unwrap().1 = Some(0);
         request(&service, &delivery, &receiver, 0, false);
-        assert_eq!(UPDATES.lock().unwrap().len(), 1);
-        assert_eq!(source.selected.load(Ordering::Relaxed), 7);
-        assert_eq!(delivery.file(0).selected.lock().unwrap().1, Some(7));
+        assert!(UPDATES.lock().unwrap().is_empty());
+        assert_eq!(source.selected.load(Ordering::Relaxed), 0);
+        assert_eq!(delivery.file(0).selected.lock().unwrap().1, Some(0));
+        assert_eq!(
+            TRANSFERS.lock().unwrap().last().unwrap().2,
+            STATUS_CLOUD_FILE_NOT_IN_SYNC
+        );
     }
 
     fn entry(path: &str, size: u64, dir: bool) -> FileEntry {
@@ -4260,10 +4274,27 @@ mod tests {
         let mut identity = [0u8; 16];
         identity[..8].copy_from_slice(&id.to_le_bytes());
         identity[8..].copy_from_slice(&(index as u64).to_le_bytes());
+        use std::os::windows::io::AsRawHandle;
+        let native = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(delivery.file_path(index))
+            .unwrap();
+        let mut native_id = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: private metadata handle and fixed-size identity output.
+        let found = unsafe { GetFileInformationByHandle(native.as_raw_handle(), &mut native_id) };
+        assert_ne!(found, 0);
+        let file_id = ((u64::from(native_id.nFileIndexHigh) << 32) | u64::from(native_id.nFileIndexLow)) as i64;
+        HYDRATION_TARGETS.lock().unwrap().retain(|(key, ..)| *key != file_id);
+        HYDRATION_TARGETS
+            .lock()
+            .unwrap()
+            .push((file_id, delivery.file_path(index), identity, service.api.info));
         let info = CF_CALLBACK_INFO {
             CallbackContext: (&*service.context as *const Weak<Service>).cast_mut().cast(),
             FileIdentity: identity.as_ptr().cast(),
             FileIdentityLength: 16,
+            FileId: file_id,
             FileSize: delivery.file(index).selected.lock().unwrap().0.size as i64,
             TransferKey: 1,
             ..Default::default()
@@ -4285,20 +4316,7 @@ mod tests {
             }
         }
         if let Ok(work) = receiver.try_recv() {
-            let before = UPDATES.lock().unwrap().len();
             work.run();
-            if UPDATES.lock().unwrap().len() != before {
-                let size = delivery.file(index).selected.lock().unwrap().0.size;
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(delivery.file_path(index))
-                    .unwrap()
-                    .set_len(size)
-                    .unwrap();
-            }
-            if UPDATES.lock().unwrap().len() != before && delivery.file(index).selected.lock().unwrap().0.size != 0 {
-                assert!(request(service, delivery, receiver, index, false));
-            }
             true
         } else {
             false
@@ -4738,7 +4756,7 @@ mod tests {
     }
     #[test]
     #[ignore = "requires a standard interactive Windows desktop session"]
-    fn native_placeholder_updates_selected_version_before_read() {
+    fn native_placeholder_rejects_changed_version_before_read() {
         let temp = tempfile::tempdir().unwrap();
         let service = initialize(temp.path().to_owned()).unwrap();
         let root = service.root.clone();
@@ -4770,7 +4788,7 @@ mod tests {
                 .env("OINK_CLOUD_NATIVE_READ", &paths[0])
                 .env(
                     "OINK_CLOUD_NATIVE_VERSION_SIZE",
-                    if missing || fail_eof {
+                    if missing || fail_eof || size != 10 {
                         "fail".into()
                     } else {
                         size.to_string()
@@ -4790,7 +4808,7 @@ mod tests {
                 assert!(!paths[0].exists(), "NoSuchItem must withdraw the native path");
             } else {
                 let metadata = std::fs::metadata(&paths[0]).unwrap();
-                assert_eq!(metadata.len(), size);
+                assert_eq!(metadata.len(), 10);
                 assert_eq!(
                     metadata
                         .modified()
@@ -4798,9 +4816,9 @@ mod tests {
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_millis(),
-                    2000
+                    1000
                 );
-                assert_eq!(source.selected.load(Ordering::Relaxed), 7);
+                assert_eq!(source.selected.load(Ordering::Relaxed), if size == 10 { 7 } else { 0 });
             }
         }
         drop(service);
@@ -5191,6 +5209,7 @@ mod tests {
         use crate::content::namespace::NativeFiles;
         let _setting = CleanupSetting::days7();
         let temp = tempfile::tempdir().unwrap();
+        eprintln!("NATIVE_RETENTION own root {}", temp.path().display());
         let service = Service::new(temp.path().join("CloudFiles")).unwrap();
         struct Cleanup(Arc<Service>);
         impl Drop for Cleanup {
@@ -5217,6 +5236,33 @@ mod tests {
         };
         read();
         let path = linked.file_path(0);
+        let external_read = |path: &Path, size: usize| {
+            // ReadAllBytes keeps an external GENERIC_READ/FileShare.Read handle
+            // open while its read waits for FETCH_DATA. NativeFiles::open first
+            // calls CfHydratePlaceholder from the provider and misses this path.
+            let mut child = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile", "-NonInteractive", "-Command",
+                    "$ErrorActionPreference='Stop'; try {$b=[IO.File]::ReadAllBytes($env:OINK_RETENTION_READ_PATH)} catch {if($env:OINK_RETENTION_READ_SIZE -eq 'error' -and ($_.Exception.GetBaseException().HResult -band 65535) -eq 377){exit 0}; throw}; if($env:OINK_RETENTION_READ_SIZE -eq 'error'){throw 'expected version error'}; if($b.Length -ne [int]$env:OINK_RETENTION_READ_SIZE){throw 'length'}; for($i=0;$i -lt $b.Length;$i++){if($b[$i] -ne (97+$i%26)){throw 'content'}}",
+                ])
+                .env("OINK_RETENTION_READ_PATH", path)
+                .env("OINK_RETENTION_READ_SIZE", if size == usize::MAX { "error".into() } else { size.to_string() })
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "external ReadAllBytes failed");
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("external ReadAllBytes stalled waiting for FETCH_DATA");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
         let before = service.disk_identity(&path).unwrap();
         assert!(before.2);
         {
@@ -5244,7 +5290,7 @@ mod tests {
         service.received.lock().unwrap().deliveries.get_mut(&linked.id).unwrap()[0]
             .life
             .last_used = crate::received::now();
-        read();
+        external_read(&path, contents.bytes.len());
         assert!(
             service.disk_identity(&path).unwrap().2,
             "opening refetches the same linked identity"
@@ -5271,7 +5317,26 @@ mod tests {
         }
         external_dehydrate(&path, true);
         assert!(!service.disk_identity(&path).unwrap().2);
-        read();
+        external_read(&path, contents.bytes.len());
+        // A source change cannot safely restart the current read. Fail with
+        // the typed native version error and leave the placeholder untouched.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while linked.readers.load(Ordering::Acquire) != 0 || !service.requests.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "fixture workers did not drain");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        external_dehydrate(&path, true);
+        let original = service.disk_identity(&path).unwrap();
+        for size in [2048, 0] {
+            linked.replace_contents(Bytes::new(size)).unwrap();
+            external_read(&path, usize::MAX);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), contents.bytes.len() as u64);
+            assert_eq!(service.disk_identity(&path).unwrap(), original);
+            assert!(!linked.file(0).local_final.load(Ordering::Acquire));
+            eprintln!("NATIVE_RETENTION changed source size={size} returned typed error; placeholder unchanged");
+        }
+        linked.replace_contents(contents.clone()).unwrap();
+        external_read(&path, contents.bytes.len());
         // Storage Sense/Free up space must not discard a local edit simply
         // because ordinary linked content is no longer provider-pinned.
         let native_edit_state = |path: &Path| {
@@ -5299,6 +5364,27 @@ mod tests {
             let info = unsafe { &*buffer.as_ptr().cast::<CF_PLACEHOLDER_STANDARD_INFO>() };
             info.InSyncState
         };
+        use std::os::windows::io::AsRawHandle;
+        let target = std::fs::OpenOptions::new()
+            .access_mode(WRITE_DAC | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+            .unwrap();
+        let mut transfer_key = 0;
+        // SAFETY: private fixture handle retained through both native operations.
+        hr(unsafe { CfGetTransferKey(target.as_raw_handle(), &mut transfer_key) }).unwrap();
+        let stale = operation(service.connection.lock().unwrap().unwrap(), transfer_key, 0);
+        transfer(
+            &service.api,
+            &stale,
+            0,
+            contents.bytes.len() as i64,
+            contents.bytes.as_ptr().cast(),
+            STATUS_SUCCESS,
+            HydrationTrace::default(),
+        )
+        .unwrap();
         // Use an independent process: the sync engine's own writes preserve
         // in-sync by registration policy and cannot stand in for an app edit.
         let edited = std::process::Command::new(std::env::current_exe().unwrap())
@@ -5321,10 +5407,31 @@ mod tests {
         service.received_sweep();
         let mut expected_edit = contents.bytes.clone();
         expected_edit[0] = b'Z';
+        // An edit can occur after the provider's modified-range preflight. Use
+        // the still-live native transfer key to submit a late original packet;
+        // Cloud Filter must preserve dirty bytes atomically, without an oplock.
+        let late = transfer(
+            &service.api,
+            &stale,
+            0,
+            contents.bytes.len() as i64,
+            contents.bytes.as_ptr().cast(),
+            STATUS_SUCCESS,
+            HydrationTrace::default(),
+        );
+        eprintln!("NATIVE_RETENTION late original packet result={late:?}");
         assert_eq!(
             std::fs::read(&path).unwrap(),
             expected_edit,
-            "OS cleanup must not replace the edit with source bytes"
+            "late source packet clobbered edit"
+        );
+        // SAFETY: balance the key acquired above while its handle is still live.
+        unsafe { CfReleaseTransferKey(target.as_raw_handle(), &transfer_key) };
+        drop(target);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            expected_edit,
+            "OS cleanup must preserve the edit"
         );
         eprintln!(
             "NATIVE_RETENTION edited linked content NOT_IN_SYNC; external unpinned dehydration rejected; edited bytes retained"
