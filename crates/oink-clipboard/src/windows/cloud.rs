@@ -85,7 +85,7 @@ struct Api {
     pin: Pin,
     info: Info,
     ranges: Ranges,
-    hydration_ranges: HydrationRanges,
+    hydration_ranges: Option<HydrationRanges>,
     create: Create,
     update: Update,
     execute: Execute,
@@ -137,6 +137,19 @@ fn unavailable() -> io::Error {
     crate::content::unavailable(crate::model::Unavailable::Cancelled)
 }
 impl Api {
+    fn select_hydration_query(integration: u32, query: Option<HydrationRanges>) -> Option<HydrationRanges> {
+        query.filter(|_| integration >= 0x600)
+    }
+    fn can_evict_received(&self) -> bool {
+        self.hydration_ranges.is_some()
+    }
+    fn received_pin_state(&self, refetchable: bool) -> i32 {
+        if refetchable && self.can_evict_received() {
+            CF_PIN_STATE_UNSPECIFIED
+        } else {
+            CF_PIN_STATE_PINNED
+        }
+    }
     fn load() -> io::Result<Arc<Self>> {
         static API: OnceLock<Result<Arc<Api>, i32>> = OnceLock::new();
         // SAFETY: System32 exports below use the exact cfapi ABI; all buffers
@@ -168,11 +181,13 @@ impl Api {
             if code < 0 {
                 return Err(code & 0xffff);
             }
-            // Handle-free hydration queries are required: callback-path CreateFile/FSCTL can deadlock behind AV.
-            // Older Cloud Files integrations cannot implement our link contract.
-            if info.IntegrationNumber < 0x600 {
-                return Err(ERROR_NOT_SUPPORTED as i32);
-            }
+            // New range queries are optional. Older supported Windows releases
+            // still hydrate via TRANSFER_DATA, but retain received linked bytes
+            // locally and reject dehydration. Never fall back to a callback
+            // data open/handle-based range FSCTL: it can wait on this hydration.
+            let query = GetProcAddress(module, c"CfGetPlaceholderRangeInfoForHydration".as_ptr().cast())
+                .map(|pointer| std::mem::transmute::<unsafe extern "system" fn() -> isize, HydrationRanges>(pointer));
+            let hydration_ranges = Self::select_hydration_query(info.IntegrationNumber, query);
             Ok(Arc::new(Api {
                 open_protected: function!("CfOpenFileWithOplock", OpenProtected),
                 reference_protected: function!("CfReferenceProtectedHandle", ReferenceProtected),
@@ -184,7 +199,7 @@ impl Api {
                 pin: function!("CfSetPinState", Pin),
                 info: function!("CfGetPlaceholderInfo", Info),
                 ranges: function!("CfGetPlaceholderRangeInfo", Ranges),
-                hydration_ranges: function!("CfGetPlaceholderRangeInfoForHydration", HydrationRanges),
+                hydration_ranges,
                 register: function!("CfRegisterSyncRoot", Register),
                 connect: function!("CfConnectSyncRoot", Connect),
                 disconnect: function!("CfDisconnectSyncRoot", Disconnect),
@@ -556,7 +571,11 @@ impl Service {
             StructSize: size_of::<CF_SYNC_POLICIES>() as u32,
             Hydration: CF_HYDRATION_POLICY {
                 Primary: CF_HYDRATION_POLICY_FULL,
-                Modifier: CF_HYDRATION_POLICY_MODIFIER_AUTO_DEHYDRATION_ALLOWED,
+                Modifier: if api.can_evict_received() {
+                    CF_HYDRATION_POLICY_MODIFIER_AUTO_DEHYDRATION_ALLOWED
+                } else {
+                    0
+                },
             },
             InSync: CF_INSYNC_POLICY_TRACK_FILE_LAST_WRITE_TIME
                 | CF_INSYNC_POLICY_TRACK_FILE_CREATION_TIME
@@ -2041,6 +2060,15 @@ mod tests {
         hydrate: Hydrate,
         pin: Pin,
     ) -> (Arc<Service>, mpsc::Receiver<Work>) {
+        fake_with_capability(root, info, hydrate, pin, Some(fake_hydration_ranges))
+    }
+    fn fake_with_capability(
+        root: PathBuf,
+        info: Info,
+        hydrate: Hydrate,
+        pin: Pin,
+        hydration_ranges: Option<HydrationRanges>,
+    ) -> (Arc<Service>, mpsc::Receiver<Work>) {
         HYDRATION_TARGETS.lock().unwrap().clear();
         DEHYDRATED.lock().unwrap().clear();
         DEHYDRATE_ACKS.lock().unwrap().clear();
@@ -2124,7 +2152,7 @@ mod tests {
             release_protected,
             close_protected,
             ranges,
-            hydration_ranges: fake_hydration_ranges,
+            hydration_ranges,
             hydrate,
             dehydrate: fake_dehydrate,
             pin,
@@ -2328,6 +2356,112 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hydration_query_requires_both_platform_contract_and_optional_export() {
+        for integration in [0x320, 0x500, 0x600, 0x628] {
+            assert!(Api::select_hydration_query(integration, None).is_none());
+            assert_eq!(
+                Api::select_hydration_query(integration, Some(fake_hydration_ranges)).is_some(),
+                integration >= 0x600
+            );
+        }
+    }
+    static LEGACY_PINS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+    fn legacy_fixture(root: PathBuf) -> (Arc<Service>, mpsc::Receiver<Work>, Arc<Delivery>) {
+        unsafe extern "system" fn hydrate(
+            _: HANDLE,
+            _: i64,
+            _: i64,
+            _: i32,
+            _: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+        ) -> i32 {
+            0
+        }
+        unsafe extern "system" fn pin(
+            _: HANDLE,
+            state: i32,
+            _: i32,
+            _: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+        ) -> i32 {
+            LEGACY_PINS.lock().unwrap().push(state);
+            0
+        }
+        LEGACY_PINS.lock().unwrap().clear();
+        let (service, receiver) = fake_with_capability(root, owned_info, hydrate, pin, None);
+        let delivery = service
+            .publish(vec![entry("linked", 3, false)], Bytes::new(3), Instant::now())
+            .unwrap();
+        reader_catalog(&service, &delivery);
+        (service, receiver, delivery)
+    }
+    #[test]
+    fn legacy_platform_pins_linked_content_at_receive_and_restore() {
+        let _serial = SERIAL.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (service, _, delivery) = legacy_fixture(temp.path().join("CloudFiles"));
+        std::fs::write(delivery.file_path(0), b"abc").unwrap();
+        service.native_complete(delivery.id, 0, 3);
+        assert_eq!(*LEGACY_PINS.lock().unwrap(), [CF_PIN_STATE_PINNED]);
+        LEGACY_PINS.lock().unwrap().clear();
+        service.recover_received().unwrap();
+        assert!(!LEGACY_PINS.lock().unwrap().is_empty());
+        assert!(
+            LEGACY_PINS
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|state| *state == CF_PIN_STATE_PINNED)
+        );
+    }
+    #[test]
+    fn legacy_platform_expiry_preserves_linked_bytes() {
+        let _serial = SERIAL.lock().unwrap();
+        let _setting = CleanupSetting::days7();
+        let temp = tempfile::tempdir().unwrap();
+        let (service, _, delivery) = legacy_fixture(temp.path().join("CloudFiles"));
+        let path = delivery.file_path(0);
+        std::fs::write(&path, b"abc").unwrap();
+        {
+            let mut journal = service.received.lock().unwrap();
+            let node = &mut journal.deliveries.get_mut(&delivery.id).unwrap()[0];
+            node.life = crate::received::Item::new(1);
+            node.life.materialized = true;
+        }
+        service.received_sweep();
+        assert!(DEHYDRATED.lock().unwrap().is_empty(), "legacy platform must not evict");
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+        assert!(!service.received.lock().unwrap().deliveries[&delivery.id][0].deleted);
+    }
+    #[test]
+    fn legacy_platform_refuses_os_dehydration() {
+        let _serial = SERIAL.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (service, _, delivery) = legacy_fixture(temp.path().join("CloudFiles"));
+        let mut identity = [0u8; 16];
+        identity[..8].copy_from_slice(&delivery.id.to_le_bytes());
+        let info = CF_CALLBACK_INFO {
+            CallbackContext: (&*service.context as *const Weak<Service>).cast_mut().cast(),
+            FileIdentity: identity.as_ptr().cast(),
+            FileIdentityLength: 16,
+            ..Default::default()
+        };
+        // SAFETY: fixture-owned context and bounded identity live through callback.
+        unsafe {
+            received::dehydrating(&info, std::ptr::null());
+        }
+        assert_eq!(
+            *DEHYDRATE_ACKS.lock().unwrap().last().unwrap(),
+            STATUS_CLOUD_FILE_ACCESS_DENIED
+        );
+    }
+    #[test]
+    fn legacy_platform_same_size_fetch_needs_no_hydration_query() {
+        let _serial = SERIAL.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (service, receiver, delivery) = legacy_fixture(temp.path().join("CloudFiles"));
+        request(&service, &delivery, &receiver, 0, false);
+        assert_eq!(*TRANSFERS.lock().unwrap(), [(0, b"abc".to_vec(), STATUS_SUCCESS)]);
+    }
     #[test]
     fn linked_receipts_are_not_pinned_and_expiry_keeps_the_native_item() {
         use crate::content::{
@@ -5206,7 +5340,6 @@ mod tests {
             .with_ansi(false)
             .with_max_level(tracing::Level::DEBUG)
             .try_init();
-        use crate::content::namespace::NativeFiles;
         let _setting = CleanupSetting::days7();
         let temp = tempfile::tempdir().unwrap();
         eprintln!("NATIVE_RETENTION own root {}", temp.path().display());
@@ -5228,13 +5361,6 @@ mod tests {
             )
             .unwrap();
         reader_catalog(&service, &linked);
-        let read = || {
-            let mut reader = linked.open(crate::model::NodeId(1), 0).unwrap();
-            let mut bytes = Vec::new();
-            reader.read_to_end(&mut bytes).unwrap();
-            assert_eq!(bytes, contents.bytes);
-        };
-        read();
         let path = linked.file_path(0);
         let external_read = |path: &Path, size: usize| {
             // ReadAllBytes keeps an external GENERIC_READ/FileShare.Read handle
@@ -5263,6 +5389,10 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         };
+        // Exercise an app's first open too; no provider pre-hydration masks it.
+        external_read(&path, contents.bytes.len());
+        let can_evict = service.api.can_evict_received();
+        eprintln!("NATIVE_RETENTION optional range query available={can_evict}");
         let before = service.disk_identity(&path).unwrap();
         assert!(before.2);
         {
@@ -5282,11 +5412,14 @@ mod tests {
         let after = service.disk_identity(&path).unwrap();
         assert_eq!((before.0, before.1), (after.0, after.1));
         assert!(
-            !after.2 && path.exists(),
-            "expiry must dehydrate without deleting the item"
+            after.2 != can_evict && path.exists(),
+            "expiry must retain bytes on legacy platforms and dehydrate on capable platforms"
         );
         assert!(!service.received.lock().unwrap().deliveries[&linked.id][0].deleted);
-        eprintln!("NATIVE_RETENTION linked placeholder retained; open-file retry passed; resident=false");
+        eprintln!(
+            "NATIVE_RETENTION linked placeholder retained; age cleanup resident={}",
+            after.2
+        );
         service.received.lock().unwrap().deliveries.get_mut(&linked.id).unwrap()[0]
             .life
             .last_used = crate::received::now();
@@ -5315,28 +5448,48 @@ mod tests {
             assert!(Instant::now() < deadline, "fixture's hydration worker did not drain");
             std::thread::sleep(Duration::from_millis(5));
         }
-        external_dehydrate(&path, true);
-        assert!(!service.disk_identity(&path).unwrap().2);
+        external_dehydrate(&path, can_evict);
+        assert_eq!(service.disk_identity(&path).unwrap().2, !can_evict);
         external_read(&path, contents.bytes.len());
-        // A source change cannot safely restart the current read. Fail with
-        // the typed native version error and leave the placeholder untouched.
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while linked.readers.load(Ordering::Acquire) != 0 || !service.requests.lock().unwrap().is_empty() {
-            assert!(Instant::now() < deadline, "fixture workers did not drain");
-            std::thread::sleep(Duration::from_millis(5));
+        if can_evict {
+            // A source change cannot safely restart the current read. Fail with
+            // the typed native version error and leave the placeholder untouched.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while linked.readers.load(Ordering::Acquire) != 0 || !service.requests.lock().unwrap().is_empty() {
+                assert!(Instant::now() < deadline, "fixture workers did not drain");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            external_dehydrate(&path, true);
+            let original = service.disk_identity(&path).unwrap();
+            for size in [2048, 0] {
+                linked.replace_contents(Bytes::new(size)).unwrap();
+                external_read(&path, usize::MAX);
+                assert_eq!(std::fs::metadata(&path).unwrap().len(), contents.bytes.len() as u64);
+                assert_eq!(service.disk_identity(&path).unwrap(), original);
+                assert!(!linked.file(0).local_final.load(Ordering::Acquire));
+                eprintln!("NATIVE_RETENTION changed source size={size} returned typed error; placeholder unchanged");
+            }
+            linked.replace_contents(contents.clone()).unwrap();
+            external_read(&path, contents.bytes.len());
+        } else {
+            // Legacy roots intentionally cannot be dehydrated. Check source
+            // changes on new dataless items, without unpinning or forcing an
+            // OS policy. First-open failures must leave those items untouched.
+            for size in [2048, 0] {
+                let changed = service
+                    .publish(
+                        vec![entry("changed.bin", 131073, false)],
+                        Bytes::new(size),
+                        Instant::now(),
+                    )
+                    .unwrap();
+                reader_catalog(&service, &changed);
+                external_read(&changed.file_path(0), usize::MAX);
+                assert_eq!(std::fs::metadata(changed.file_path(0)).unwrap().len(), 131073);
+                assert!(!changed.file(0).local_final.load(Ordering::Acquire));
+                eprintln!("NATIVE_RETENTION legacy first-open changed source size={size} returned typed error");
+            }
         }
-        external_dehydrate(&path, true);
-        let original = service.disk_identity(&path).unwrap();
-        for size in [2048, 0] {
-            linked.replace_contents(Bytes::new(size)).unwrap();
-            external_read(&path, usize::MAX);
-            assert_eq!(std::fs::metadata(&path).unwrap().len(), contents.bytes.len() as u64);
-            assert_eq!(service.disk_identity(&path).unwrap(), original);
-            assert!(!linked.file(0).local_final.load(Ordering::Acquire));
-            eprintln!("NATIVE_RETENTION changed source size={size} returned typed error; placeholder unchanged");
-        }
-        linked.replace_contents(contents.clone()).unwrap();
-        external_read(&path, contents.bytes.len());
         // Storage Sense/Free up space must not discard a local edit simply
         // because ordinary linked content is no longer provider-pinned.
         let native_edit_state = |path: &Path| {

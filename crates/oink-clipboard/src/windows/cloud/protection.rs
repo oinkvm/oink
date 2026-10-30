@@ -138,12 +138,18 @@ impl Work {
         {
             return Err(unavailable());
         }
+        let Some(query) = self.service.api.hydration_ranges else {
+            // Legacy platforms cannot safely query this callback's ranges.
+            // TRANSFER_DATA itself atomically preserves modified/unsynced data;
+            // close/recovery still detects edits. No data handle/FSCTL fallback.
+            return Ok(());
+        };
         let key = (*self.service.connection.lock().unwrap()).ok_or(io::ErrorKind::NotConnected)?;
         let mut range = CF_FILE_RANGE::default();
         let mut written = 0;
         // SAFETY: callback identity, bounded range output; no file is opened.
         let code = unsafe {
-            (self.service.api.hydration_ranges)(
+            query(
                 key,
                 self.request.transfer,
                 self.request.file_id,

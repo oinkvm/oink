@@ -3,9 +3,9 @@ on:
   workflow_dispatch:
     inputs:
       build:
-        description: Reserved product build shared by public and in-house packages (0.3.0 uses 78)
+        description: Reserved product build shared by public and in-house packages (0.3.0 uses 79)
         required: true
-        default: '78'
+        default: '79'
         type: string
 permissions:
   contents: read

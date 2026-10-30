@@ -438,14 +438,7 @@ impl Service {
             tracing::warn!(%error, "cannot persist one-shot completion");
         }
         if let Some(path) = path {
-            self.request_policy(
-                &path,
-                if refetchable {
-                    CF_PIN_STATE_UNSPECIFIED
-                } else {
-                    CF_PIN_STATE_PINNED
-                },
-            );
+            self.request_policy(&path, self.api.received_pin_state(refetchable));
         }
     }
     fn request_policy(&self, path: &Path, policy: i32) {
@@ -529,9 +522,13 @@ impl Service {
                     .cleanup(received::now(), received::setting(), Basis::LastUsed, busy);
                 if !busy && complete && reason.is_some() && refetchable {
                     drop(journal);
-                    if let Err(error) = self.dehydrate_received(id, index, node, live.as_ref()) {
+                    if self.api.can_evict_received()
+                        && let Err(error) = self.dehydrate_received(id, index, node, live.as_ref())
+                    {
                         tracing::debug!(%error, "received dehydration deferred");
                     }
+                    // Legacy platforms keep linked content at expiry. Never
+                    // fall through to source-less deletion or attempt eviction.
                     continue;
                 }
                 if !busy && (stale || complete && reason.is_some()) {
@@ -634,7 +631,7 @@ impl Service {
     // state detects independent edits; it never reads pin state or checks that
     // the policy request was accepted. No pin confirmation/retry worker.
     fn restore_received_policy(&self, path: &Path, node: &Node, refetchable: bool) {
-        let policy = if refetchable {
+        let policy = if refetchable && self.api.can_evict_received() {
             let clean = std::fs::OpenOptions::new()
                 .access_mode(FILE_READ_ATTRIBUTES)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -652,6 +649,9 @@ impl Service {
         self.request_policy(path, policy);
     }
     fn dehydrate_received(&self, id: u64, index: usize, node: &Node, live: Option<&Arc<Delivery>>) -> io::Result<()> {
+        if !self.api.can_evict_received() {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
         let protected = protection::Protected::open(
             self.api.clone(),
             &self.root.join(&node.path),
@@ -1261,7 +1261,7 @@ pub(super) unsafe extern "system" fn dehydrating(info: *const CF_CALLBACK_INFO, 
             // actual file users; our native leases additionally cover streams
             // which have not opened a handle yet. Age cleanup still checks the
             // open balance before obtaining its own exclusive handle.
-            refetchable && readers == 0
+            service.api.can_evict_received() && refetchable && readers == 0
         } else {
             false
         };
