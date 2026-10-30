@@ -270,6 +270,31 @@ mod tests {
         assert_eq!(local.clock().unwrap(), 102);
     }
     #[test]
+    fn resume_publication_and_a_peer_copy_are_concurrent_until_they_converge() {
+        let at = Instant::now();
+        let mut a = Ordering::new(DeviceId([1; 32]), 100);
+        let mut b = Ordering::new(DeviceId([2; 32]), 100);
+        // Input is ready, but B's resume has only just observed its paused copy.
+        b.local_change(1, at);
+        let early = a.capture(inventory(), 1, Sensitivity::Normal, 0).unwrap().unwrap();
+        assert_eq!(early.clock().unwrap(), 101);
+        assert!(!b.receive(DeviceId([1; 32]), early.clone()).unwrap());
+        assert!(b.capture_due(at + Duration::from_millis(300)));
+        let resumed = b.capture(inventory(), 1, Sensitivity::Normal, 0).unwrap().unwrap();
+        assert_eq!(resumed.clock().unwrap(), 102);
+        assert!(a.receive(DeviceId([2; 32]), resumed).unwrap());
+        a.written(2);
+        // Waiting longer cannot make the losing offer win. Observe restoration
+        // first, then issue the sequential delivery check's new physical copy.
+        assert!(!b.capture_due(at + Duration::from_secs(60)));
+        assert!(!b.receive(DeviceId([1; 32]), early).unwrap());
+        assert!(a.local_change(3, at + Duration::from_secs(60)));
+        assert!(a.capture_due(at + Duration::from_secs(61)));
+        let after = a.capture(inventory(), 3, Sensitivity::Normal, 0).unwrap().unwrap();
+        assert_eq!(after.clock().unwrap(), 103);
+        assert!(b.receive(DeviceId([1; 32]), after).unwrap());
+    }
+    #[test]
     fn empty_copies_revoke_and_clock_exhaustion_never_wraps() {
         let mut state = Ordering::new(DeviceId([1; 32]), u64::MAX);
         assert!(state.capture(inventory(), 1, Sensitivity::Normal, 0).is_err());
