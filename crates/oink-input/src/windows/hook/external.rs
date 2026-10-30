@@ -20,7 +20,7 @@ static PHYSICAL_KEYS: [AtomicU32; 256] = [const { AtomicU32::new(0) }; 256];
 
 pub(super) fn mouse_origin(info: &MSLLHOOKSTRUCT) -> Origin {
     classify(
-        info.dwExtraInfo == INJECT_TAG,
+        inject::own_mouse_tag(info.dwExtraInfo),
         is_marker(info.dwExtraInfo),
         info.flags & LLMHF_INJECTED != 0,
         info.flags & LLMHF_LOWER_IL_INJECTED != 0,

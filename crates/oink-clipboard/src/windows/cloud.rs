@@ -74,6 +74,7 @@ struct Api {
     release_protected: CloseProtected,
     close_protected: CloseProtected,
     hydrate: Hydrate,
+    dehydrate: Hydrate,
     register: Register,
     connect: Connect,
     disconnect: Disconnect,
@@ -176,6 +177,7 @@ impl Api {
                 release_protected: function!("CfReleaseProtectedHandle", CloseProtected),
                 close_protected: function!("CfCloseHandle", CloseProtected),
                 hydrate: function!("CfHydratePlaceholder", Hydrate),
+                dehydrate: function!("CfDehydratePlaceholder", Hydrate),
                 pin: function!("CfSetPinState", Pin),
                 info: function!("CfGetPlaceholderInfo", Info),
                 ranges: function!("CfGetPlaceholderRangeInfo", Ranges),
@@ -543,12 +545,14 @@ impl Service {
         // FULL permits dehydrated placeholders and always completes the whole
         // file, including ranges beyond the platform's truncated >1GiB request.
         // PARTIAL population publishes roots first; FETCH_PLACEHOLDERS discovers
-        // direct children. No WinRT shell integration, streaming or auto-dehydration.
+        // direct children. OS dehydration is allowed for unpinned, in-sync files.
+        // One-shot and detached local content retain PINNED protection.
         let policies = CF_SYNC_POLICIES {
             StructSize: size_of::<CF_SYNC_POLICIES>() as u32,
             Hydration: CF_HYDRATION_POLICY {
                 Primary: CF_HYDRATION_POLICY_FULL,
-                Modifier: CF_HYDRATION_POLICY_MODIFIER_ALLOW_FULL_RESTART_HYDRATION,
+                Modifier: CF_HYDRATION_POLICY_MODIFIER_ALLOW_FULL_RESTART_HYDRATION
+                    | CF_HYDRATION_POLICY_MODIFIER_AUTO_DEHYDRATION_ALLOWED,
             },
             InSync: CF_INSYNC_POLICY_TRACK_FILE_LAST_WRITE_TIME
                 | CF_INSYNC_POLICY_TRACK_FILE_CREATION_TIME
@@ -622,6 +626,10 @@ impl Service {
             CF_CALLBACK_REGISTRATION {
                 Type: CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION,
                 Callback: Some(closed),
+            },
+            CF_CALLBACK_REGISTRATION {
+                Type: CF_CALLBACK_TYPE_NOTIFY_DEHYDRATE,
+                Callback: Some(received::dehydrating),
             },
             CF_CALLBACK_REGISTRATION {
                 Type: CF_CALLBACK_TYPE_NOTIFY_RENAME,
@@ -913,11 +921,6 @@ impl Service {
                     })
                     .collect(),
             );
-            if journal.pending_gaps.remove(&id) {
-                for node in journal.deliveries.get_mut(&id).unwrap() {
-                    node.life.gap(crate::received::now());
-                }
-            }
             let saved = journal.save(&self.root);
             drop(journal);
             if let Err(error) = saved {
@@ -1047,7 +1050,7 @@ impl Service {
         // Registration and fully hydrated pinned files outlive this backend.
         let mut journal = self.received.lock().unwrap();
         for node in journal.deliveries.values_mut().flatten() {
-            node.life.gap(crate::received::now());
+            node.life.resume_at(crate::received::now());
         }
         let _ = journal.save(&self.root);
     }
@@ -1641,14 +1644,17 @@ mod tests {
     fn one_shot_arrival_finishes_without_residency_pin_acceptance_or_source() {
         let _serial = SERIAL.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
+        static REQUESTS: AtomicUsize = AtomicUsize::new(0);
         unsafe extern "system" fn denied_pin(
             _: HANDLE,
             _: i32,
             _: i32,
             _: *mut windows_sys::Win32::System::IO::OVERLAPPED,
         ) -> i32 {
+            REQUESTS.fetch_add(1, Ordering::Relaxed);
             0x80070005u32 as i32
         }
+        REQUESTS.store(0, Ordering::Relaxed);
         let (service, _) = fake_with_pin(temp.path().join("CloudFiles"), owned_info, denied_pin);
         let delivery = one_shot_delivery(&service);
         // This fake domain has no receiver payload or connected sender: only
@@ -1659,6 +1665,14 @@ mod tests {
             service.received.lock().unwrap().sources[&delivery.id]
                 .settlement
                 .contains(crate::model::NodeId(1))
+        );
+        assert_eq!(REQUESTS.load(Ordering::Relaxed), 1);
+        service.received_sweep();
+        service.received_sweep();
+        assert_eq!(
+            REQUESTS.load(Ordering::Relaxed),
+            1,
+            "maintenance must not retry/confirm a failed pin request"
         );
         let journal = received::Journal::load(&service.root).unwrap();
         assert!(journal.sources[&delivery.id].descriptor.is_none());
@@ -1732,6 +1746,18 @@ mod tests {
     }
     use std::os::windows::fs::OpenOptionsExt;
     use std::sync::atomic::AtomicI32;
+    struct CleanupSetting;
+    impl CleanupSetting {
+        fn days7() -> Self {
+            crate::received::configure(crate::received::Cleanup::Days7);
+            Self
+        }
+    }
+    impl Drop for CleanupSetting {
+        fn drop(&mut self) {
+            crate::received::configure(crate::received::Cleanup::Never);
+        }
+    }
     static SERIAL: Mutex<()> = Mutex::new(());
     static FAIL_AFTER: AtomicI32 = AtomicI32::new(-1);
     static PROGRESS_SERVICE: Mutex<Weak<Service>> = Mutex::new(Weak::new());
@@ -1740,6 +1766,30 @@ mod tests {
     static TRANSFERS: Mutex<Vec<(i64, Vec<u8>, NTSTATUS)>> = Mutex::new(Vec::new());
     static KEYS: Mutex<Vec<(i64, PathBuf)>> = Mutex::new(Vec::new());
     static POPULATIONS: Mutex<Vec<NTSTATUS>> = Mutex::new(Vec::new());
+    static DEHYDRATED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    static FAIL_DEHYDRATE: AtomicBool = AtomicBool::new(false);
+    static DEHYDRATE_ACKS: Mutex<Vec<NTSTATUS>> = Mutex::new(Vec::new());
+    unsafe extern "system" fn fake_dehydrate(
+        handle: HANDLE,
+        offset: i64,
+        length: i64,
+        flags: i32,
+        _: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+    ) -> i32 {
+        assert_eq!((offset, length, flags), (0, -1, CF_DEHYDRATE_FLAG_NONE));
+        if FAIL_DEHYDRATE.load(Ordering::Relaxed) {
+            return 0x80070020u32 as i32;
+        }
+        let mut path = [0u16; 32768];
+        // SAFETY: the fake's live exclusive file handle and output buffer.
+        let count = unsafe { GetFinalPathNameByHandleW(handle, path.as_mut_ptr(), path.len() as u32, 0) };
+        assert!(count > 0);
+        DEHYDRATED
+            .lock()
+            .unwrap()
+            .push(PathBuf::from(String::from_utf16_lossy(&path[..count as usize])));
+        0
+    }
     static IDENTITIES: Mutex<Vec<(PathBuf, [u8; 16])>> = Mutex::new(Vec::new());
     unsafe fn string(p: *const u16) -> String {
         let mut length = 0;
@@ -1815,6 +1865,13 @@ mod tests {
         // SAFETY: production supplies the union arm selected by Type; all input
         // metadata and buffers remain live for these synchronous fake calls.
         unsafe {
+            if (*op).Type == CF_OPERATION_TYPE_ACK_DEHYDRATE {
+                DEHYDRATE_ACKS
+                    .lock()
+                    .unwrap()
+                    .push((*params).Anonymous.AckDehydrate.CompletionStatus);
+                return 0;
+            }
             if (*op).Type == CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS {
                 let params = &mut (*params).Anonymous.TransferPlaceholders;
                 assert_eq!(params.PlaceholderArray.is_null(), params.PlaceholderCount == 0);
@@ -1959,6 +2016,9 @@ mod tests {
         hydrate: Hydrate,
         pin: Pin,
     ) -> (Arc<Service>, mpsc::Receiver<Work>) {
+        DEHYDRATED.lock().unwrap().clear();
+        DEHYDRATE_ACKS.lock().unwrap().clear();
+        FAIL_DEHYDRATE.store(false, Ordering::Relaxed);
         FAIL_AFTER.store(-1, Ordering::Relaxed);
         TRANSFERS.lock().unwrap().clear();
         UPDATES.lock().unwrap().clear();
@@ -2039,6 +2099,7 @@ mod tests {
             close_protected,
             ranges,
             hydrate,
+            dehydrate: fake_dehydrate,
             pin,
             info,
             register,
@@ -2091,7 +2152,11 @@ mod tests {
             let info = &mut *buffer.cast::<CF_PLACEHOLDER_STANDARD_INFO>();
             info.FileIdentityLength = 16;
             info.InSyncState = CF_IN_SYNC_STATE_IN_SYNC;
-            info.OnDiskDataSize = std::fs::metadata(&path).map_or(0, |m| m.len() as i64);
+            info.OnDiskDataSize = if DEHYDRATED.lock().unwrap().contains(&path) {
+                0
+            } else {
+                std::fs::metadata(&path).map_or(0, |m| m.len() as i64)
+            };
             std::ptr::copy_nonoverlapping(identity.as_ptr(), info.FileIdentity.as_mut_ptr(), 16);
         }
         0
@@ -2099,6 +2164,305 @@ mod tests {
     #[test]
     fn failed_async_drop_removes_even_hydrated_payload_and_empty_parents() {
         drop_cleanup_fixture(1, false, false, 3);
+    }
+
+    #[test]
+    fn persistent_local_edits_are_not_unpinned_or_dehydrated_by_cleanup() {
+        static PINS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+        unsafe extern "system" fn info(
+            handle: HANDLE,
+            kind: i32,
+            buffer: *mut c_void,
+            size: u32,
+            written: *mut u32,
+        ) -> i32 {
+            // SAFETY: the fake owns the same output and handle through the call.
+            unsafe {
+                let result = owned_info(handle, kind, buffer, size, written);
+                if result >= 0 {
+                    let info = &mut *buffer.cast::<CF_PLACEHOLDER_STANDARD_INFO>();
+                    info.InSyncState = CF_IN_SYNC_STATE_NOT_IN_SYNC;
+                    info.ModifiedDataSize = 1;
+                }
+                result
+            }
+        }
+        unsafe extern "system" fn pin(
+            _: HANDLE,
+            state: i32,
+            _: i32,
+            _: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+        ) -> i32 {
+            PINS.lock().unwrap().push(state);
+            0
+        }
+        let _serial = SERIAL.lock().unwrap();
+        let _setting = CleanupSetting::days7();
+        let temp = tempfile::tempdir().unwrap();
+        let (service, _) = fake_with_pin(temp.path().join("CloudFiles"), info, pin);
+        let delivery = service
+            .publish(vec![entry("edited", 3, false)], Bytes::new(3), Instant::now())
+            .unwrap();
+        reader_catalog(&service, &delivery);
+        std::fs::write(delivery.file_path(0), b"new").unwrap();
+        {
+            let mut journal = service.received.lock().unwrap();
+            let node = &mut journal.deliveries.get_mut(&delivery.id).unwrap()[0];
+            node.life = crate::received::Item::new(1);
+            node.life.materialized = true;
+            node.handed_off = true;
+        }
+        PINS.lock().unwrap().clear();
+        service.received_sweep();
+        assert!(
+            PINS.lock().unwrap().is_empty(),
+            "maintenance must not confirm/retry pin policy"
+        );
+        assert!(DEHYDRATED.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read(delivery.file_path(0)).unwrap(), b"new");
+        assert!(!service.received.lock().unwrap().deliveries[&delivery.id][0].deleted);
+    }
+
+    #[test]
+    fn linked_empty_directories_survive_age_cleanup() {
+        let _serial = SERIAL.lock().unwrap();
+        let _setting = CleanupSetting::days7();
+        let temp = tempfile::tempdir().unwrap();
+        let (service, _) = fake_with_info(temp.path().join("CloudFiles"), owned_info);
+        let delivery = service
+            .publish(vec![entry("empty", 0, true)], Bytes::new(0), Instant::now())
+            .unwrap();
+        reader_catalog(&service, &delivery);
+        service
+            .received
+            .lock()
+            .unwrap()
+            .deliveries
+            .get_mut(&delivery.id)
+            .unwrap()[0]
+            .life = crate::received::Item::new(1);
+        service.received_sweep();
+        assert!(
+            delivery.file_path(0).is_dir(),
+            "expiry retains an independently selected linked empty directory"
+        );
+        assert!(!service.received.lock().unwrap().deliveries[&delivery.id][0].deleted);
+    }
+
+    #[test]
+    fn uncertain_residency_and_unbalanced_reads_defer_expiry() {
+        static FAIL: AtomicBool = AtomicBool::new(false);
+        unsafe extern "system" fn info(
+            handle: HANDLE,
+            kind: i32,
+            buffer: *mut c_void,
+            size: u32,
+            written: *mut u32,
+        ) -> i32 {
+            if FAIL.load(Ordering::Relaxed) {
+                return 0x80070005u32 as i32;
+            }
+            // SAFETY: forwarding the fake's bounded output and handle.
+            unsafe { owned_info(handle, kind, buffer, size, written) }
+        }
+        let _serial = SERIAL.lock().unwrap();
+        let _setting = CleanupSetting::days7();
+        let temp = tempfile::tempdir().unwrap();
+        let (service, _) = fake_with_info(temp.path().join("CloudFiles"), info);
+        let delivery = service
+            .publish(vec![entry("uncertain", 3, false)], Bytes::new(3), Instant::now())
+            .unwrap();
+        std::fs::write(delivery.file_path(0), b"abc").unwrap();
+        {
+            let mut journal = service.received.lock().unwrap();
+            let node = &mut journal.deliveries.get_mut(&delivery.id).unwrap()[0];
+            node.life = crate::received::Item::new(1);
+            node.life.materialized = true;
+            node.handed_off = true;
+        }
+        FAIL.store(true, Ordering::Relaxed);
+        service.received_sweep();
+        FAIL.store(false, Ordering::Relaxed);
+        assert!(
+            delivery.file_path(0).exists(),
+            "an OS query failure must not delete a previously received file"
+        );
+        service.received.lock().unwrap().opens.insert((delivery.id, 0), -1);
+        service.received_sweep();
+        assert!(
+            delivery.file_path(0).exists(),
+            "unbalanced notifications are uncertain, not idle"
+        );
+        service.received.lock().unwrap().opens.clear();
+        service.received_sweep();
+        assert!(
+            !delivery.file_path(0).exists(),
+            "one-shot expiry retries after confirmed idle"
+        );
+    }
+
+    #[test]
+    fn linked_receipts_are_not_pinned_and_expiry_keeps_the_native_item() {
+        use crate::content::{
+            Provider,
+            linked::{Connector, Descriptor},
+            namespace::Files,
+        };
+        use crate::model::{ContentSize, FileNode, NodeId, NodeKind};
+        static PINS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+        unsafe extern "system" fn pin(
+            _: HANDLE,
+            state: i32,
+            _: i32,
+            _: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+        ) -> i32 {
+            PINS.lock().unwrap().push(state);
+            0
+        }
+        let _serial = SERIAL.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (service, _) = fake_with_pin(temp.path().join("CloudFiles"), owned_info, pin);
+        let descriptor = Descriptor {
+            native: Default::default(),
+            provisional: false,
+            fulfilled: vec![],
+            offer: crate::content::tests::fixture().inventory().id,
+            token: crate::content::grants::LinkToken([9; 32]),
+            roots: vec![FileNode {
+                exec_bits: None,
+                id: NodeId(7),
+                parent: None,
+                name: "linked".into(),
+                kind: NodeKind::File,
+                size: ContentSize::Known(3),
+                version: 1,
+                modified_ms: None,
+            }],
+        };
+        let contents = Files::new(
+            Connector::default().restore(descriptor).unwrap(),
+            crate::sync::files::TargetOs::Windows,
+        )
+        .unwrap();
+        let delivery = service
+            .publish(
+                contents.descriptor_entries().unwrap().unwrap(),
+                contents,
+                Instant::now(),
+            )
+            .unwrap();
+        let path = delivery.file_path(0);
+        std::fs::write(&path, b"abc").unwrap();
+        PINS.lock().unwrap().clear();
+        service.native_complete(delivery.id, 0, 3);
+        service.received_sweep();
+        assert!(
+            !PINS.lock().unwrap().contains(&CF_PIN_STATE_PINNED),
+            "persistent content must be evictable by the OS"
+        );
+        {
+            let mut journal = service.received.lock().unwrap();
+            let node = &mut journal.deliveries.get_mut(&delivery.id).unwrap()[0];
+            node.life = crate::received::Item::new(1);
+            node.life.materialized = true;
+        }
+        let request_dehydrate = |native: &Delivery| {
+            let mut identity = [0u8; 16];
+            identity[..8].copy_from_slice(&native.id.to_le_bytes());
+            let info = CF_CALLBACK_INFO {
+                CallbackContext: (&*service.context as *const Weak<Service>).cast_mut().cast(),
+                FileIdentity: identity.as_ptr().cast(),
+                FileIdentityLength: 16,
+                ..Default::default()
+            };
+            // SAFETY: fixture-owned callback context and bounded native identity.
+            unsafe {
+                received::dehydrating(&info, std::ptr::null());
+            }
+            *DEHYDRATE_ACKS.lock().unwrap().last().unwrap()
+        };
+        service.received.lock().unwrap().opens.insert((delivery.id, 0), 1);
+        assert_eq!(
+            request_dehydrate(&delivery),
+            STATUS_SUCCESS,
+            "the dehydrator's own protected handle is not an active content read"
+        );
+        service.received.lock().unwrap().opens.clear();
+        let _setting = CleanupSetting::days7();
+        let lease = crate::content::namespace::NativeFiles::lease(delivery.as_ref()).unwrap();
+        assert_eq!(
+            request_dehydrate(&delivery),
+            STATUS_CLOUD_FILE_ACCESS_DENIED,
+            "pending native stream still protects its read"
+        );
+        service.received_sweep();
+        assert!(
+            DEHYDRATED.lock().unwrap().is_empty(),
+            "a retained native stream protects its pending read"
+        );
+        drop(lease);
+        let held = std::fs::File::open(&path).unwrap();
+        service.received_sweep();
+        assert!(DEHYDRATED.lock().unwrap().is_empty(), "open file is retried later");
+        drop(held);
+        FAIL_DEHYDRATE.store(true, Ordering::Relaxed);
+        service.received_sweep();
+        assert!(DEHYDRATED.lock().unwrap().is_empty());
+        assert!(
+            service.received.lock().unwrap().deliveries[&delivery.id][0]
+                .life
+                .materialized
+        );
+        FAIL_DEHYDRATE.store(false, Ordering::Relaxed);
+        service.received_sweep();
+        assert!(path.exists(), "persistent expiry must retain the native placeholder");
+        assert!(!service.received.lock().unwrap().deliveries[&delivery.id][0].deleted);
+        assert!(
+            !service.received.lock().unwrap().deliveries[&delivery.id][0]
+                .life
+                .materialized
+        );
+        assert_eq!(DEHYDRATED.lock().unwrap().len(), 1);
+        let old = std::mem::replace(&mut *CURRENT.lock().unwrap(), Arc::downgrade(&service));
+        let usage = received_usage().unwrap();
+        *CURRENT.lock().unwrap() = old;
+        assert_eq!(usage.materialized_bytes, 0, "evicted items have zero local bytes");
+        assert!(!usage.incomplete);
+        assert!(path.exists());
+        // F₁ continues to pin and delete at explicit expiry, without any
+        // completion proof or receiver ACK. A pin failure cannot authorize OS eviction.
+        let once = one_shot_delivery(&service);
+        std::fs::write(once.file_path(0), b"abc").unwrap();
+        PINS.lock().unwrap().clear();
+        service.native_complete(once.id, 0, 3);
+        assert!(PINS.lock().unwrap().contains(&CF_PIN_STATE_PINNED));
+        {
+            let mut journal = service.received.lock().unwrap();
+            journal.deliveries.get_mut(&once.id).unwrap()[0].life = crate::received::Item::new(1);
+            journal.deliveries.get_mut(&once.id).unwrap()[0].life.materialized = true;
+        }
+        let mut identity = [0u8; 16];
+        identity[..8].copy_from_slice(&once.id.to_le_bytes());
+        let info = CF_CALLBACK_INFO {
+            CallbackContext: (&*service.context as *const Weak<Service>).cast_mut().cast(),
+            FileIdentity: identity.as_ptr().cast(),
+            FileIdentityLength: 16,
+            ..Default::default()
+        };
+        // SAFETY: this fake callback owns the context and bounded identity.
+        unsafe {
+            received::dehydrating(&info, std::ptr::null());
+        }
+        assert_eq!(
+            DEHYDRATE_ACKS.lock().unwrap().last(),
+            Some(&STATUS_CLOUD_FILE_ACCESS_DENIED)
+        );
+        service.received_sweep();
+        assert!(
+            !once.file_path(0).exists(),
+            "one-shot expiry keeps its deletion behavior"
+        );
+        assert_eq!(DEHYDRATED.lock().unwrap().len(), 1, "one-shot never dehydrates");
     }
 
     #[test]
@@ -2659,6 +3023,7 @@ mod tests {
             result
         }
         let _serial = SERIAL.lock().unwrap();
+        let _setting = CleanupSetting::days7();
         let temp = tempfile::tempdir().unwrap();
         let (service, _) = fake_with_info(temp.path().join("CloudFiles"), racing_info);
         let delivery = service
@@ -2671,7 +3036,6 @@ mod tests {
             let node = &mut journal.deliveries.get_mut(&delivery.id).unwrap()[0];
             node.life = crate::received::Item::new(1);
             node.life.materialized = true;
-            node.life.shell = true;
         }
         *TARGET.lock().unwrap() = Arc::downgrade(&delivery);
         QUERIES.store(0, Ordering::SeqCst);
@@ -2917,10 +3281,10 @@ mod tests {
         let root = delivery.file_path(0);
         let child = delivery.file_path(1);
         std::fs::write(&child, b"abc").unwrap();
-        service.received_observe(delivery.id, 1, crate::received::Reader::Shell, true, false);
+        service.received_observe(delivery.id, 1, crate::received::Reader::App, true, false);
         let target = temp.path().join("received-file");
         std::fs::rename(&child, &target).unwrap();
-        service.received_observe(delivery.id, 1, crate::received::Reader::Shell, false, true);
+        service.received_observe(delivery.id, 1, crate::received::Reader::App, false, true);
         assert_eq!(service.received.lock().unwrap().opens[&(delivery.id, 1)], 0);
         service.received_sweep();
         assert!(!root.exists(), "a deleted close must not retain a phantom consumer");
@@ -2942,8 +3306,8 @@ mod tests {
         let root = delivery.file_path(0);
         let child = delivery.file_path(1);
         std::fs::write(&child, b"abc").unwrap();
-        service.received_observe(delivery.id, 0, crate::received::Reader::Shell, true, false);
-        service.received_observe(delivery.id, 1, crate::received::Reader::Shell, true, false);
+        service.received_observe(delivery.id, 0, crate::received::Reader::App, true, false);
+        service.received_observe(delivery.id, 1, crate::received::Reader::App, true, false);
         let target = temp.path().join("moved-file");
         std::fs::rename(&child, &target).unwrap();
         service
@@ -2957,7 +3321,7 @@ mod tests {
             root.is_dir(),
             "a live directory consumer still protects the empty parent"
         );
-        service.received_observe(delivery.id, 0, crate::received::Reader::Shell, false, false);
+        service.received_observe(delivery.id, 0, crate::received::Reader::App, false, false);
         service.received_sweep();
         assert!(
             !root.exists(),
@@ -3317,10 +3681,18 @@ mod tests {
             }
             result
         }
+        unsafe extern "system" fn denied_pin(
+            _: HANDLE,
+            _: i32,
+            _: i32,
+            _: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+        ) -> i32 {
+            0x80070005u32 as i32
+        }
         let _serial = SERIAL.lock().unwrap();
         for bytes in [b"user changed bytes".as_slice(), b""] {
             let temp = tempfile::tempdir().unwrap();
-            let (service, receiver) = fake_with_info(temp.path().join("CloudFiles"), edited_info);
+            let (service, receiver) = fake_with_pin(temp.path().join("CloudFiles"), edited_info, denied_pin);
             let source = Arc::new(Versioned {
                 size: 18,
                 missing: true,
@@ -3576,6 +3948,9 @@ mod tests {
         service.recover_received().unwrap();
         assert_eq!(lists.load(Ordering::Relaxed), 4);
         let recovered = service.deliveries.lock().unwrap()[&delivery.id].clone();
+        DEHYDRATED.lock().unwrap().clear();
+        DEHYDRATE_ACKS.lock().unwrap().clear();
+        FAIL_DEHYDRATE.store(false, Ordering::Relaxed);
         FAIL_AFTER.store(-1, Ordering::Relaxed);
         // A target-local replacement must never be overwritten on retry.
         let foreign = root_path.join("nested");
@@ -3954,7 +4329,7 @@ mod tests {
     fn materialized_received_policy_survives_expiry_stop_and_reload_without_backing() {
         let _serial = SERIAL.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let (service, _) = fake(temp.path().join("CloudFiles"));
+        let (service, _) = fake_with_info(temp.path().join("CloudFiles"), owned_info);
         let data = Bytes::new(3);
         let delivery = service
             .publish(vec![entry("media.bin", 3, false)], data, Instant::now())
@@ -3972,8 +4347,7 @@ mod tests {
         assert!(delivery.file_path(0).exists());
         let recovered = received::Journal::load(&service.root).unwrap();
         let node = &recovered.deliveries[&delivery.id][0];
-        assert!(node.life.materialized && node.life.observation_gap);
-        assert!(!node.life.shell_only());
+        assert!(node.life.materialized);
     }
     #[test]
     fn owner_publication_hydration_observation_and_cancellation_invalidate() {
@@ -3994,41 +4368,21 @@ mod tests {
         crate::cache::assert_mutation(&service.root, || service.cancel_received(delivery.id));
     }
     #[test]
-    fn unknown_reader_disqualifies_the_whole_batch_and_system_does_not_renew_usage() {
+    fn unknown_and_unpaired_notifications_update_usage_without_deletion_eligibility() {
         let _serial = SERIAL.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let (service, _) = fake(temp.path().join("CloudFiles"));
-        let data = Bytes::new(1);
-        let delivery = service
-            .publish(vec![entry("a", 1, false), entry("b", 1, false)], data, Instant::now())
-            .unwrap();
-        service.received_observe(delivery.id, 0, crate::received::Reader::Unknown, true, false);
-        assert!(
-            service.received.lock().unwrap().deliveries[&delivery.id]
-                .iter()
-                .all(|n| n.life.observation_gap)
-        );
-    }
-    #[test]
-    fn unpaired_close_and_prepublication_reads_create_batch_observation_gaps() {
-        let _serial = SERIAL.lock().unwrap();
-        let temp = tempfile::tempdir().unwrap();
-        let (service, _) = fake(temp.path().join("CloudFiles"));
-        service.received_observe(123, 0, crate::received::Reader::App, true, false);
-        assert!(service.received.lock().unwrap().pending_gaps.contains(&123));
         let delivery = service
             .publish(
-                vec![entry("one", 1, false), entry("two", 1, false)],
+                vec![entry("a", 1, false), entry("b", 1, false)],
                 Bytes::new(1),
                 Instant::now(),
             )
             .unwrap();
-        service.received_observe(delivery.id, 0, crate::received::Reader::Shell, false, false);
-        assert!(
-            service.received.lock().unwrap().deliveries[&delivery.id]
-                .iter()
-                .all(|n| n.life.observation_gap)
-        );
+        service.received_observe(delivery.id, 0, crate::received::Reader::Unknown, false, false);
+        let journal = service.received.lock().unwrap();
+        assert_eq!(journal.opens[&(delivery.id, 0)], -1);
+        assert!(journal.deliveries[&delivery.id][0].life.last_used > 0);
     }
     #[test]
     fn placeholders_are_lazy_hydration_uses_whole_verified_stream_and_consumed_cleanup() {
@@ -4121,6 +4475,9 @@ mod tests {
         );
         let sources: Vec<_> = std::fs::read_dir(&service.root).unwrap().collect();
         assert!(sources.is_empty(), "failed preparation left an empty source container");
+        DEHYDRATED.lock().unwrap().clear();
+        DEHYDRATE_ACKS.lock().unwrap().clear();
+        FAIL_DEHYDRATE.store(false, Ordering::Relaxed);
         FAIL_AFTER.store(-1, Ordering::Relaxed);
         let delivery = service
             .publish(vec![entry("one", 1, false)], bytes, Instant::now())
@@ -4777,6 +5134,242 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
         assert!(!root.exists());
     }
+    #[test]
+    #[ignore = "external dehydration child of the private received-retention fixture"]
+    fn native_received_external_dehydrate() {
+        assert!(std::env::var_os("ACROSS_DEVICE_TEST_HELD").is_some());
+        let path = PathBuf::from(std::env::var_os("OINK_RETENTION_EDIT_PATH").unwrap());
+        assert!(
+            path.starts_with(std::env::temp_dir())
+                && matches!(path.file_name().unwrap().to_str(), Some("linked.bin" | "one-shot.bin"))
+        );
+        let api = Api::load().unwrap();
+        let protected = protection::Protected::open(
+            api.clone(),
+            &path,
+            CF_OPEN_FILE_FLAG_EXCLUSIVE | CF_OPEN_FILE_FLAG_WRITE_ACCESS,
+        )
+        .unwrap();
+        // SAFETY: only this test's own file, protected by the required exclusive oplock.
+        let result = unsafe { (api.dehydrate)(protected.handle, 0, -1, CF_DEHYDRATE_FLAG_NONE, std::ptr::null_mut()) };
+        eprintln!("NATIVE_RETENTION external_dehydrate result={result:#x}");
+        assert_eq!(
+            result >= 0,
+            std::env::var("OINK_RETENTION_DEHYDRATE_ALLOWED").unwrap() == "true"
+        );
+    }
+
+    #[test]
+    #[ignore = "child of the private received-retention native fixture"]
+    fn native_received_local_edit_writer() {
+        assert!(std::env::var_os("ACROSS_DEVICE_TEST_HELD").is_some());
+        let path = PathBuf::from(std::env::var_os("OINK_RETENTION_EDIT_PATH").unwrap());
+        assert!(path.starts_with(std::env::temp_dir()) && path.file_name().unwrap() == "linked.bin");
+        use std::io::Write;
+        let mut edit = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+            .unwrap();
+        edit.write_all(b"Z").unwrap();
+        edit.sync_all().unwrap();
+    }
+
+    #[test]
+    #[ignore = "private Cloud Files root; run only under the device-test lock"]
+    #[cfg(debug_assertions)]
+    fn native_received_expiry_dehydrates_and_refetches_only_linked_content() {
+        assert!(
+            std::env::var_os("ACROSS_DEVICE_TEST_HELD").is_some(),
+            "device-test lock required"
+        );
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+        use crate::content::namespace::NativeFiles;
+        let _setting = CleanupSetting::days7();
+        let temp = tempfile::tempdir().unwrap();
+        let service = Service::new(temp.path().join("CloudFiles")).unwrap();
+        struct Cleanup(Arc<Service>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.0.stop();
+                cleanup_native_test_root(&self.0.root);
+            }
+        }
+        let _cleanup = Cleanup(service.clone());
+        let contents = Bytes::new(131073);
+        let linked = service
+            .publish(
+                vec![entry("linked.bin", 131073, false)],
+                contents.clone(),
+                Instant::now(),
+            )
+            .unwrap();
+        reader_catalog(&service, &linked);
+        let read = || {
+            let mut reader = linked.open(crate::model::NodeId(1), 0).unwrap();
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, contents.bytes);
+        };
+        read();
+        let path = linked.file_path(0);
+        let before = service.disk_identity(&path).unwrap();
+        assert!(before.2);
+        {
+            let mut journal = service.received.lock().unwrap();
+            let node = &mut journal.deliveries.get_mut(&linked.id).unwrap()[0];
+            node.life = crate::received::Item::new(1);
+            node.life.materialized = true;
+        }
+        let held = std::fs::File::open(&path).unwrap();
+        service.received_sweep();
+        assert!(
+            service.disk_identity(&path).unwrap().2,
+            "open linked file must retain data"
+        );
+        drop(held);
+        service.received_sweep();
+        let after = service.disk_identity(&path).unwrap();
+        assert_eq!((before.0, before.1), (after.0, after.1));
+        assert!(
+            !after.2 && path.exists(),
+            "expiry must dehydrate without deleting the item"
+        );
+        assert!(!service.received.lock().unwrap().deliveries[&linked.id][0].deleted);
+        eprintln!("NATIVE_RETENTION linked placeholder retained; open-file retry passed; resident=false");
+        service.received.lock().unwrap().deliveries.get_mut(&linked.id).unwrap()[0]
+            .life
+            .last_used = crate::received::now();
+        read();
+        assert!(
+            service.disk_identity(&path).unwrap().2,
+            "opening refetches the same linked identity"
+        );
+        let external_dehydrate = |candidate: &Path, allowed: bool| {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "windows::cloud::tests::native_received_external_dehydrate",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("OINK_RETENTION_EDIT_PATH", candidate)
+                .env("OINK_RETENTION_DEHYDRATE_ALLOWED", allowed.to_string())
+                .status()
+                .unwrap();
+            assert!(result.success(), "external dehydration child failed");
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while linked.readers.load(Ordering::Acquire) != 0 || !service.requests.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "fixture's hydration worker did not drain");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        external_dehydrate(&path, true);
+        assert!(!service.disk_identity(&path).unwrap().2);
+        read();
+        // Storage Sense/Free up space must not discard a local edit simply
+        // because ordinary linked content is no longer provider-pinned.
+        let native_edit_state = |path: &Path| {
+            use std::os::windows::io::AsRawHandle;
+            let file = std::fs::OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)
+                .unwrap();
+            let mut buffer = [0u64; 1024];
+            let mut written = 0;
+            // SAFETY: private file handle and aligned standard-info output.
+            hr(unsafe {
+                (service.api.info)(
+                    file.as_raw_handle(),
+                    CF_PLACEHOLDER_INFO_STANDARD,
+                    buffer.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&buffer) as u32,
+                    &mut written,
+                )
+            })
+            .unwrap();
+            // SAFETY: the successful query initialized standard info.
+            let info = unsafe { &*buffer.as_ptr().cast::<CF_PLACEHOLDER_STANDARD_INFO>() };
+            info.InSyncState
+        };
+        // Use an independent process: the sync engine's own writes preserve
+        // in-sync by registration policy and cannot stand in for an app edit.
+        let edited = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "windows::cloud::tests::native_received_local_edit_writer",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("OINK_RETENTION_EDIT_PATH", &path)
+            .status()
+            .unwrap();
+        assert!(edited.success());
+        assert_eq!(
+            native_edit_state(&path),
+            CF_IN_SYNC_STATE_NOT_IN_SYNC,
+            "Cloud Filter must detect the local write"
+        );
+        external_dehydrate(&path, false);
+        service.received_sweep();
+        let mut expected_edit = contents.bytes.clone();
+        expected_edit[0] = b'Z';
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            expected_edit,
+            "OS cleanup must not replace the edit with source bytes"
+        );
+        eprintln!(
+            "NATIVE_RETENTION edited linked content NOT_IN_SYNC; external unpinned dehydration rejected; edited bytes retained"
+        );
+        let once = service
+            .publish(
+                vec![entry("one-shot.bin", 131073, false)],
+                contents.clone(),
+                Instant::now(),
+            )
+            .unwrap();
+        reader_catalog(&service, &once);
+        {
+            let mut journal = service.received.lock().unwrap();
+            let source = journal.sources.get_mut(&once.id).unwrap();
+            source
+                .descriptor
+                .as_mut()
+                .unwrap()
+                .fulfilled
+                .push(crate::content::grants::FulfilledRoot {
+                    node: crate::model::NodeId(1),
+                    id: [2; 16],
+                });
+            journal.save(&service.root).unwrap();
+        }
+        let pin = native::ReaderPin::new(&once).unwrap();
+        let file = once.checked_file(&service, 0, &once.file_path(0), true).unwrap();
+        once.hydrate_native(&service, 0, &file, &|| Ok(())).unwrap();
+        drop((file, pin));
+        // Exercise the OS/user-side request, which must pass provider admission.
+        // Do not read pin state or use the sync engine's own privileged API
+        // invocation to confirm that the OS applied its requested policy.
+        external_dehydrate(&once.file_path(0), false);
+        {
+            let mut journal = service.received.lock().unwrap();
+            let node = &mut journal.deliveries.get_mut(&once.id).unwrap()[0];
+            node.life = crate::received::Item::new(1);
+            node.life.materialized = true;
+        }
+        service.received_sweep();
+        assert!(!once.file_path(0).exists(), "one-shot expiry still deletes");
+        eprintln!("NATIVE_RETENTION rehydration bytes match; one-shot OS eviction refused; one-shot expiry deleted");
+    }
+
     #[test]
     #[ignore = "requires native Cloud Files on NTFS; uses only a private non-GUI sync root"]
     #[cfg(debug_assertions)]

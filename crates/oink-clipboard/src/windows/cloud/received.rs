@@ -39,6 +39,27 @@ pub(super) struct Source {
     pub base: PathBuf,
 }
 impl Source {
+    fn refetchable(&self, index: usize) -> bool {
+        let Some(descriptor) = self.descriptor.as_ref().filter(|link| !link.provisional) else {
+            return false;
+        };
+        let Some(mut node) = self.nodes.get(index) else {
+            return false;
+        };
+        for _ in 0..256 {
+            if let Some(parent) = node.parent {
+                let Some(ancestor) = self.nodes.iter().find(|entry| entry.id == parent) else {
+                    return false;
+                };
+                node = ancestor;
+            } else {
+                return descriptor.roots.iter().any(|root| root.id == node.id)
+                    && !descriptor.fulfilled.iter().any(|root| root.node == node.id)
+                    && !self.failed.contains(&node.id);
+            }
+        }
+        false
+    }
     fn validate(&self) -> io::Result<()> {
         if !self.listed.is_subset(&self.pending)
             || self.pending.iter().any(|id| {
@@ -90,10 +111,17 @@ pub(super) struct Journal {
     /// Completed old paths leave the retry set without removing their journal.
     #[serde(skip)]
     pub cleanup_complete: HashSet<(u64, usize)>,
-    #[serde(skip)]
-    pub pending_gaps: HashSet<u64>,
 }
 impl Journal {
+    fn refetchable(&self, id: u64, index: usize) -> bool {
+        !self.cancelled.contains(&id)
+            && self
+                .deliveries
+                .get(&id)
+                .and_then(|nodes| nodes.get(index))
+                .is_some_and(|node| !node.local_final && !node.withdrawn && !node.deleted)
+            && self.sources.get(&id).is_some_and(|source| source.refetchable(index))
+    }
     pub(super) fn has_open_received_item(&self, id: u64) -> bool {
         // Windows 11 can deliver an open without a matching cloud close when
         // MOVE converts a child to an ordinary file outside the sync root.
@@ -102,7 +130,7 @@ impl Journal {
         // deletion still requires an exclusive, identity-checked native handle.
         self.opens.iter().any(|((owner, index), count)| {
             *owner == id
-                && *count > 0
+                && *count != 0
                 && self
                     .deliveries
                     .get(&id)
@@ -201,7 +229,7 @@ impl Journal {
                 {
                     return Err(io::ErrorKind::InvalidData.into());
                 }
-                node.life.gap(received::now());
+                node.life.resume_at(received::now());
             }
         }
         Ok(state)
@@ -238,7 +266,7 @@ impl Journal {
             old.length = node.length;
             old.life.materialized |= node.life.materialized;
             old.handed_off |= node.handed_off;
-            old.life.gap(received::now());
+            old.life.resume_at(received::now());
         }
     }
     pub fn save(&self, root: &Path) -> io::Result<()> {
@@ -391,9 +419,10 @@ impl Service {
         }
         if journal.save(&self.root).is_err() {
             for node in journal.deliveries.values_mut().flatten() {
-                node.life.gap(received::now());
+                node.life.resume_at(received::now());
             }
         }
+        let refetchable = journal.refetchable(id, index);
         let path = journal
             .deliveries
             .get(&id)
@@ -409,10 +438,17 @@ impl Service {
             tracing::warn!(%error, "cannot persist one-shot completion");
         }
         if let Some(path) = path {
-            self.request_keep_local(&path);
+            self.request_policy(
+                &path,
+                if refetchable {
+                    CF_PIN_STATE_UNSPECIFIED
+                } else {
+                    CF_PIN_STATE_PINNED
+                },
+            );
         }
     }
-    pub(super) fn request_keep_local(&self, path: &Path) {
+    fn request_policy(&self, path: &Path, policy: i32) {
         let result = (|| -> io::Result<()> {
             let file = std::fs::OpenOptions::new()
                 .access_mode(0x40000)
@@ -420,14 +456,7 @@ impl Service {
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
                 .open(path)?;
             // SAFETY: synchronous policy request, owned handle with WRITE_DAC.
-            hr(unsafe {
-                (self.api.pin)(
-                    file.as_raw_handle(),
-                    CF_PIN_STATE_PINNED,
-                    CF_SET_PIN_FLAG_NONE,
-                    std::ptr::null_mut(),
-                )
-            })
+            hr(unsafe { (self.api.pin)(file.as_raw_handle(), policy, CF_SET_PIN_FLAG_NONE, std::ptr::null_mut()) })
         })();
         if let Err(error) = result {
             tracing::debug!(%error, "received keep-local request failed");
@@ -452,10 +481,12 @@ impl Service {
                 let owned = identity
                     .as_ref()
                     .is_ok_and(|(owner, slot, _)| *owner == id && *slot == index);
-                let complete = owned && self.full_and_pin(&path, node.length).unwrap_or(false);
+                let refetchable = self.received.lock().unwrap().refetchable(id, index);
+                let residency = owned.then(|| self.received_residency(&path, node.length)).transpose();
+                let complete = matches!(residency, Ok(Some(true)));
                 let live = self.deliveries.lock().unwrap().get(&id).cloned();
                 let mut journal = self.received.lock().unwrap();
-                let busy = journal.opens.get(&(id, index)).copied().unwrap_or(0) > 0
+                let busy = journal.opens.get(&(id, index)).copied().unwrap_or(0) != 0
                     || live.as_ref().is_some_and(|d| d.readers.load(Ordering::Acquire) > 0);
                 let linked = journal.sources.contains_key(&id);
                 let awaiting_publication = journal.sources.get(&id).is_some_and(|source| {
@@ -475,9 +506,13 @@ impl Service {
                 if current.path != node.path {
                     continue;
                 }
-                if complete {
-                    current.life.materialized = true;
+                if let Ok(Some(full)) = residency {
+                    // Linked items can return to dataless. For source-less
+                    // items this remains evidence of a previous complete copy;
+                    // a later partial/uncertain observation cannot make it stale.
+                    current.life.materialized = full || !refetchable && current.life.materialized;
                 }
+
                 // Recovery only removes provably never-complete placeholders. A
                 // successful handoff or prior materialization is protected on errors.
                 let stale =
@@ -492,7 +527,14 @@ impl Service {
                 let reason = current
                     .life
                     .cleanup(received::now(), received::setting(), Basis::LastUsed, busy);
-                if !busy && (stale || reason.is_some()) {
+                if !busy && complete && reason.is_some() && refetchable {
+                    drop(journal);
+                    if let Err(error) = self.dehydrate_received(id, index, node, live.as_ref()) {
+                        tracing::debug!(%error, "received dehydration deferred");
+                    }
+                    continue;
+                }
+                if !busy && (stale || complete && reason.is_some()) {
                     // OS sharing denies deletion while an incompatible data handle
                     // exists; a failed deletion is retried, never counted as freed.
                     drop(journal);
@@ -516,7 +558,7 @@ impl Service {
                         let Some(current) = journal.deliveries.get(&id).and_then(|v| v.get(index)) else {
                             return false;
                         };
-                        let busy = journal.opens.get(&(id, index)).copied().unwrap_or(0) > 0
+                        let busy = journal.opens.get(&(id, index)).copied().unwrap_or(0) != 0
                             || live
                                 .as_ref()
                                 .is_some_and(|delivery| delivery.readers.load(Ordering::Acquire) != 0);
@@ -551,7 +593,6 @@ impl Service {
                                     "stale"
                                 } else {
                                     match reason.unwrap() {
-                                        received::Reason::Shell24h => "shell_24h",
                                         received::Reason::Age7 => "age_7d",
                                         received::Reason::Age30 => "age_30d",
                                     }
@@ -580,41 +621,85 @@ impl Service {
             tracing::warn!(reason = "journal_write", "received-file state not saved");
         }
     }
-    fn full_and_pin(&self, path: &Path, length: u64) -> io::Result<bool> {
+    fn received_residency(&self, path: &Path, length: u64) -> io::Result<bool> {
         let file = std::fs::OpenOptions::new()
-            .access_mode(FILE_READ_ATTRIBUTES | 0x40000)
+            .access_mode(FILE_READ_ATTRIBUTES)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
-        let mut buffer = vec![0u64; 1024];
-        let mut written = 0;
-        // SAFETY: cfapi fills an aligned buffer whose size covers standard info.
-        hr(unsafe {
-            (self.api.info)(
-                file.as_raw_handle(),
-                CF_PLACEHOLDER_INFO_STANDARD,
-                buffer.as_mut_ptr().cast(),
-                (buffer.len() * 8) as u32,
-                &mut written,
-            )
-        })?;
-        // SAFETY: the successful call initialized CF_PLACEHOLDER_STANDARD_INFO.
-        let info = unsafe { &*buffer.as_ptr().cast::<CF_PLACEHOLDER_STANDARD_INFO>() };
-        if info.OnDiskDataSize < length as i64 {
-            return Ok(false);
+        self.handle_identity(file.as_raw_handle(), length)
+            .map(|(_, _, full)| full)
+    }
+    // Restore applies the catalog's chosen policy once. Reading native dirty
+    // state detects independent edits; it never reads pin state or checks that
+    // the policy request was accepted. No pin confirmation/retry worker.
+    fn restore_received_policy(&self, path: &Path, node: &Node, refetchable: bool) {
+        let policy = if refetchable {
+            let clean = std::fs::OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)
+                .and_then(|file| self.clean_cancelled_file(file.as_raw_handle(), node.length));
+            if clean.unwrap_or(false) {
+                CF_PIN_STATE_UNSPECIFIED
+            } else {
+                CF_PIN_STATE_PINNED
+            }
+        } else {
+            CF_PIN_STATE_PINNED
+        };
+        self.request_policy(path, policy);
+    }
+    fn dehydrate_received(&self, id: u64, index: usize, node: &Node, live: Option<&Arc<Delivery>>) -> io::Result<()> {
+        let protected = protection::Protected::open(
+            self.api.clone(),
+            &self.root.join(&node.path),
+            CF_OPEN_FILE_FLAG_EXCLUSIVE | CF_OPEN_FILE_FLAG_WRITE_ACCESS,
+        )?;
+        if !self
+            .handle_identity(protected.handle, node.length)
+            .is_ok_and(|(owner, slot, full)| owner == id && slot == index && full)
+            || !self.clean_cancelled_file(protected.handle, node.length)?
+        {
+            return Err(io::ErrorKind::WouldBlock.into());
         }
-        if info.PinState != CF_PIN_STATE_PINNED {
-            // SAFETY: metadata-only handle has WRITE_DAC and stays live.
-            hr(unsafe {
-                (self.api.pin)(
-                    file.as_raw_handle(),
-                    CF_PIN_STATE_PINNED,
-                    CF_SET_PIN_FLAG_NONE,
-                    std::ptr::null_mut(),
-                )
-            })?;
+        {
+            let mut journal = self.received.lock().unwrap();
+            let eligible = journal.refetchable(id, index)
+                && journal.opens.get(&(id, index)).copied().unwrap_or(0) == 0
+                && live.is_none_or(|delivery| delivery.readers.load(Ordering::Acquire) == 0)
+                && journal
+                    .deliveries
+                    .get(&id)
+                    .and_then(|nodes| nodes.get(index))
+                    .is_some_and(|current| {
+                        current.path == node.path
+                            && current
+                                .life
+                                .cleanup(received::now(), received::setting(), Basis::LastUsed, false)
+                                .is_some()
+                    });
+            if !eligible || !journal.cleanup_inflight.insert((id, index)) {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
         }
-        Ok(true)
+        // Exclusive RH oplock and the reader admission barrier cover the same
+        // clean identity throughout. Never force dehydration of open/dirty files.
+        // Policy was published at receive/restore; do not read it back, unpin a
+        // newly user-pinned file, or retry a failed policy request here.
+        // SAFETY: synchronous dehydration on our referenced exclusive handle.
+        let result =
+            hr(unsafe { (self.api.dehydrate)(protected.handle, 0, -1, CF_DEHYDRATE_FLAG_NONE, std::ptr::null_mut()) });
+        let mut journal = self.received.lock().unwrap();
+        journal.cleanup_inflight.remove(&(id, index));
+        if result.is_ok() {
+            if let Some(current) = journal.deliveries.get_mut(&id).and_then(|nodes| nodes.get_mut(index)) {
+                current.life.materialized = false;
+            }
+            crate::cache::changed(&self.root);
+        }
+        result
     }
     pub(super) fn received_observe(&self, id: u64, index: usize, reader: Reader, open: bool, deleted: bool) {
         let mut journal = self.received.lock().unwrap();
@@ -622,44 +707,24 @@ impl Service {
         // separate DELETE_COMPLETION callback does not represent a close.
         let balance = journal.opens.entry((id, index)).or_default();
         *balance += if open { 1 } else { -1 };
-        let unbalanced = *balance < 0;
-        if !journal.deliveries.contains_key(&id) {
-            journal.pending_gaps.insert(id);
-        }
-        if let Some(nodes) = journal.deliveries.get_mut(&id) {
-            // HDROP can be requested during hover. Without a successful drop
-            // notification, start the shell-copy deadline no earlier than the
-            // first non-system content demand for this batch.
-            if reader != Reader::System && nodes.iter().all(|n| !n.life.shell && !n.life.app && !n.life.unknown) {
-                let delivered = received::now();
+        if let Some(nodes) = journal.deliveries.get_mut(&id)
+            && let Some(node) = nodes.get_mut(index)
+        {
+            node.life.observe(reader, received::now());
+            if deleted {
+                let path = node.path.clone();
                 for node in &mut *nodes {
-                    node.life.received_at = node.life.received_at.max(delivered);
-                    node.life.last_used = node.life.last_used.max(delivered);
-                }
-            }
-            if reader == Reader::Unknown || unbalanced {
-                for node in &mut *nodes {
-                    node.life.gap(received::now());
-                }
-            }
-            if let Some(node) = nodes.get_mut(index) {
-                node.life.observe(reader, received::now());
-                if deleted {
-                    let path = node.path.clone();
-                    for node in &mut *nodes {
-                        if node.path.starts_with(&path) {
-                            node.deleted = true;
-                        }
+                    if node.path.starts_with(&path) {
+                        node.deleted = true;
                     }
                 }
             }
         }
         // No disk, signature verification or native calls on cfapi threads.
-        // A crash before the next checkpoint disqualifies the whole batch on load.
+        // Reconnect advances last-used conservatively for every recovered item.
         tracing::debug!(
             reader = match reader {
                 Reader::System => 0_u8,
-                Reader::Shell => 1,
                 Reader::App => 2,
                 Reader::Unknown => 3,
             },
@@ -689,7 +754,7 @@ pub(crate) fn received_usage() -> io::Result<Usage> {
                 usage.incomplete = true;
                 continue;
             }
-            if !node.life.materialized {
+            if !node.life.materialized || !identity.as_ref().is_ok_and(|(_, _, full)| *full) {
                 usage.incomplete |= identity.is_ok_and(|(_, _, full)| full);
                 continue;
             }
@@ -720,7 +785,7 @@ pub(super) fn reader_classes() -> HashMap<String, Reader> {
     let windows = std::env::var_os("SystemRoot")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    let mut paths = vec![(windows.join("explorer.exe"), Reader::Shell)];
+    let mut paths = Vec::new();
     if let Some(programs) = std::env::var_os("ProgramFiles") {
         for exe in ["MsMpEng.exe", "MpDefenderCoreService.exe"] {
             paths.push((
@@ -1169,6 +1234,58 @@ impl Service {
         Ok(identity[..8] == id.to_le_bytes() && identity[8..] == u64::MAX.to_le_bytes())
     }
 }
+// Enabling OS auto-dehydration must not make a one-shot/local edit evictable
+// when its best-effort PINNED publication failed. The native in-sync/open-file
+// checks still apply after this admission decision; no pin proof gates F₁ EOF.
+pub(super) unsafe extern "system" fn dehydrating(info: *const CF_CALLBACK_INFO, _: *const CF_CALLBACK_PARAMETERS) {
+    // SAFETY: cfapi owns the context and bounded identity during this callback.
+    unsafe {
+        let info = &*info;
+        let Some(service) = (&*info.CallbackContext.cast::<Weak<Service>>()).upgrade() else {
+            return;
+        };
+        let allowed = if info.FileIdentityLength == 16 && !info.FileIdentity.is_null() {
+            let bytes = std::slice::from_raw_parts(info.FileIdentity.cast::<u8>(), 16);
+            let id = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            let index = u64::from_le_bytes(bytes[8..].try_into().unwrap()) as usize;
+            let live = service.deliveries.lock().unwrap().get(&id).cloned();
+            let journal = service.received.lock().unwrap();
+            let refetchable = journal.refetchable(id, index);
+            let balance = journal.opens.get(&(id, index)).copied().unwrap_or(0);
+            let readers = live.map_or(0, |delivery| delivery.readers.load(Ordering::Acquire));
+            tracing::debug!(refetchable, balance, readers, "received OS dehydration admission");
+            // Windows 11's external CfDehydratePlaceholder caller opens its
+            // own protected handle first (private probe 2026-10-29: balance=1,
+            // readers=0). Counting that handle here rejects every OS Free up
+            // space request. CfDehydrate's required exclusive oplock excludes
+            // actual file users; our native leases additionally cover streams
+            // which have not opened a handle yet. Age cleanup still checks the
+            // open balance before obtaining its own exclusive handle.
+            refetchable && readers == 0
+        } else {
+            false
+        };
+        let mut op = operation(info.ConnectionKey, info.TransferKey, info.RequestKey);
+        op.Type = CF_OPERATION_TYPE_ACK_DEHYDRATE;
+        let mut params = CF_OPERATION_PARAMETERS {
+            ParamSize: (offset_of!(CF_OPERATION_PARAMETERS, Anonymous) + size_of::<CF_OPERATION_PARAMETERS_0_5>())
+                as u32,
+            Anonymous: CF_OPERATION_PARAMETERS_0 {
+                AckDehydrate: CF_OPERATION_PARAMETERS_0_5 {
+                    Flags: CF_OPERATION_ACK_DEHYDRATE_FLAG_NONE,
+                    CompletionStatus: if allowed {
+                        STATUS_SUCCESS
+                    } else {
+                        STATUS_CLOUD_FILE_ACCESS_DENIED
+                    },
+                    FileIdentity: std::ptr::null(),
+                    FileIdentityLength: 0,
+                },
+            },
+        };
+        let _ = (service.api.execute)(&op, &mut params);
+    }
+}
 pub(super) unsafe fn deleted_path(info: *const CF_CALLBACK_INFO) {
     // SAFETY: all pointers refer to this cfapi notification.
     unsafe {
@@ -1319,7 +1436,7 @@ impl Service {
                             queue.push(path.clone());
                         }
                         let mut life = Item::new(received::now());
-                        life.gap(received::now());
+                        life.resume_at(received::now());
                         life.materialized = full && !directory;
                         found.insert(
                             index,
@@ -1401,11 +1518,11 @@ impl Service {
                 .collect::<io::Result<Vec<_>>>()?;
             let namespace = source
                 .settlement
-                .restore(source.descriptor, crate::content::linked::native_connector())?;
+                .restore(source.descriptor.clone(), crate::content::linked::native_connector())?;
             let contents = crate::content::namespace::Files::restore_table(
                 namespace,
                 crate::sync::files::TargetOs::Windows,
-                source.nodes,
+                source.nodes.clone(),
                 entries.clone(),
             )?;
             let native_paths: Vec<_> = nodes.iter().map(|node| self.root.join(&node.path)).collect();
@@ -1445,6 +1562,16 @@ impl Service {
             });
             self.deliveries.lock().unwrap().insert(id, delivery.clone());
             native::bind(&delivery)?;
+            for (index, node) in nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| !node.deleted && !node.directory)
+            {
+                let refetchable = !node.local_final && !node.withdrawn && source.refetchable(index);
+                if refetchable || node.local_final || node.handed_off {
+                    self.restore_received_policy(&self.root.join(&node.path), node, refetchable);
+                }
+            }
         }
         Ok(())
     }
@@ -1509,7 +1636,9 @@ impl Service {
                     node.directory
                         && !complete.contains(&(*id, *index))
                         && (cancelled
-                            || days != 0 && now.saturating_sub(node.life.last_used) >= days * received::DAY
+                            || days != 0
+                                && now.saturating_sub(node.life.last_used) >= days * received::DAY
+                                && !self.received.lock().unwrap().refetchable(*id, *index)
                             || file_paths
                                 .range(node.path.clone()..)
                                 .next()
@@ -1636,12 +1765,12 @@ mod tests {
     // Uses the debug-only cache mutation helpers.
     #[cfg(debug_assertions)]
     #[test]
-    fn journal_restart_discards_open_balances_but_preserves_items_and_disqualifies_shell_cleanup() {
+    fn journal_restart_discards_open_balances_and_advances_last_used() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("CloudFiles");
         let mut life = Item::new(1);
         life.materialized = true;
-        life.observe(Reader::Shell, 2);
+        life.observe(Reader::App, 2);
         let node = Node {
             path: PathBuf::from(r"device\batch\file"),
             life,
@@ -1661,21 +1790,17 @@ mod tests {
         let recovered = Journal::load(&root).unwrap();
         assert!(recovered.opens.is_empty());
         let item = &recovered.deliveries[&7][0].life;
-        assert!(item.materialized && item.observation_gap);
-        assert!(!item.shell_only());
+        assert!(item.materialized);
         assert!(item.last_used >= 2);
         journal.deliveries.get_mut(&7).unwrap()[0].path = PathBuf::from(r"..\foreign");
         journal.save(&root).unwrap();
         assert_eq!(Journal::load(&root).err().unwrap().kind(), io::ErrorKind::InvalidData);
     }
     #[test]
-    fn explorer_identity_is_verified_without_a_desktop_or_shell_registration() {
+    fn explorer_has_no_special_cleanup_identity() {
         let classes = reader_classes();
         let explorer = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("explorer.exe");
-        assert_eq!(
-            classes.get(&explorer.to_string_lossy().to_lowercase()),
-            Some(&Reader::Shell)
-        );
+        assert_eq!(classes.get(&explorer.to_string_lossy().to_lowercase()), None);
         let temp = tempfile::tempdir().unwrap();
         let imposter = temp.path().join("explorer.exe");
         std::fs::write(&imposter, b"not a signed executable").unwrap();

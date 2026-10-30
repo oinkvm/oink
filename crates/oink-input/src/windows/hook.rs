@@ -1753,7 +1753,7 @@ impl State {
             return;
         }
         let cur = cursor_pos();
-        let ours = info.dwExtraInfo == INJECT_TAG;
+        let ours = inject::own_mouse_tag(info.dwExtraInfo);
         let Some(anomaly) = w.check(cur, info.pt, !ours) else {
             return;
         };
@@ -1779,7 +1779,7 @@ impl State {
     }
 
     fn prepare_mouse(&mut self, msg: u32, info: &MSLLHOOKSTRUCT, now: Instant) -> Prepared {
-        if info.dwExtraInfo == INJECT_TAG {
+        if inject::own_mouse_tag(info.dwExtraInfo) {
             return self.prepare_own_mouse(msg, info);
         }
         // One snapshot must feed both stale-step classification and subtraction.
@@ -2475,7 +2475,7 @@ fn mouse_proc_with_next(code: i32, wparam: WPARAM, lparam: LPARAM, next: impl Fn
                 return prepared;
             }
             let msg = wparam.0 as u32;
-            let ours = info.dwExtraInfo == INJECT_TAG;
+            let ours = inject::own_mouse_tag(info.dwExtraInfo);
             if ours {
                 return st.prepare_own_mouse(msg, info);
             }
@@ -2533,7 +2533,7 @@ fn mouse_proc_with_next(code: i32, wparam: WPARAM, lparam: LPARAM, next: impl Fn
         if swallowed
             && wparam.0 as u32 == WM_MOUSEMOVE
             && !is_marker(info.dwExtraInfo)
-            && info.dwExtraInfo != INJECT_TAG
+            && !inject::own_mouse_tag(info.dwExtraInfo)
         {
             with_state(State::finish_ready_park);
         }
@@ -2586,8 +2586,12 @@ fn account_own_mouse(msg: u32, info: &MSLLHOOKSTRUCT) {
     // Register outside the State borrow: a tagged placement can reenter while
     // State is busy, and is still passed to Windows. MOVE|DOWN has a movement
     // callback as well as a button callback; only the movement changes the base.
-    if msg == WM_MOUSEMOVE && info.dwExtraInfo == INJECT_TAG {
-        super::warp::accepted(cursor_pos(), info.pt);
+    if msg == WM_MOUSEMOVE && inject::own_mouse_tag(info.dwExtraInfo) {
+        if info.dwExtraInfo == inject::SHAPE_REFRESH_TAG {
+            super::warp::accepted_refresh(cursor_pos(), info.pt);
+        } else {
+            super::warp::accepted(cursor_pos(), info.pt);
+        }
     }
 }
 
@@ -2621,7 +2625,7 @@ fn observe_button(msg: u32, info: &MSLLHOOKSTRUCT) {
         timestamp_unit: TimestampUnit::Milliseconds,
         source_state: None,
         physical: external::mouse_origin(info) == crate::windows_external_input::Origin::Physical,
-        own: info.dwExtraInfo == INJECT_TAG || is_marker(info.dwExtraInfo),
+        own: inject::own_mouse_tag(info.dwExtraInfo) || is_marker(info.dwExtraInfo),
         system: evidence::system_state(button),
     });
 }
@@ -3565,6 +3569,111 @@ mod tests {
             assert!(matches!(st.prepare_own_mouse(WM_LBUTTONDOWN, &own), Prepared::Pass));
             assert_step(&mut st);
         }
+    }
+
+    #[test]
+    fn tagged_refresh_echoes_are_own_input_and_keep_real_motion_origins() {
+        let entry = p(1200, 2100);
+        let park = p(1920, 1080);
+        let _cursor = TestCursor::at(park);
+        super::super::warp::accepted(entry, park);
+        for target in [p(park.x + 1, park.y), park] {
+            let echo = MSLLHOOKSTRUCT {
+                pt: target,
+                dwExtraInfo: inject::SHAPE_REFRESH_TAG,
+                ..Default::default()
+            };
+            assert!(inject::own_mouse_tag(echo.dwExtraInfo));
+            assert!(!is_marker(echo.dwExtraInfo));
+            assert_eq!(
+                external::mouse_origin(&echo),
+                crate::windows_external_input::Origin::Own
+            );
+            // Account before borrowing State, including a reentrant own echo.
+            STATE.with(|state| {
+                let _borrow = state.borrow_mut();
+                account_own_mouse(WM_MOUSEMOVE, &echo);
+            });
+            TEST_CURSOR.with(|c| c.set(Some(target)));
+        }
+        let mut st = remote_state();
+        let next = MSLLHOOKSTRUCT {
+            pt: p(park.x + 4, park.y - 2),
+            ..Default::default()
+        };
+        let Prepared::Event { event, .. } = st.prepare_mouse(WM_MOUSEMOVE, &next, Instant::now()) else {
+            panic!("physical motion must reach routing");
+        };
+        assert_eq!(event.event, InputEvent::PointerDelta { dx: 4., dy: -2. });
+        assert_eq!(super::super::warp::sample(entry), park);
+        assert_eq!(st.stale_base_for(p(entry.x + 4, entry.y - 2), park), Some(entry));
+    }
+
+    #[test]
+    fn remote_shape_refresh_preserves_the_forwarded_motion_sum() {
+        let park = p(1920, 1080);
+        let _cursor = TestCursor::at(park);
+        let mut st = remote_state();
+        // Same accounting as cursor::nudge, with no native input or placement.
+        let nudge = p(park.x + 1, park.y);
+        super::super::warp::accepted_refresh(park, nudge);
+        super::super::warp::accepted_refresh(nudge, park);
+        let mut forwarded = Point::new(0., 0.);
+        for _ in 0..100 {
+            let info = MSLLHOOKSTRUCT {
+                pt: p(park.x + 4, park.y - 2),
+                ..Default::default()
+            };
+            let Prepared::Event {
+                event, force_swallow, ..
+            } = st.prepare_mouse(WM_MOUSEMOVE, &info, Instant::now())
+            else {
+                panic!("physical movement must be forwarded");
+            };
+            let InputEvent::PointerDelta { dx, dy } = event.event else {
+                panic!("expected ordinary movement");
+            };
+            assert_eq!(event.cursor, None);
+            assert!(force_swallow);
+            forwarded.x += dx;
+            forwarded.y += dy;
+        }
+        assert_eq!(forwarded, Point::new(400., -200.));
+    }
+
+    #[test]
+    fn local_shape_refresh_does_not_swallow_the_rightward_arc() {
+        let entry = p(1200, 2100);
+        let _cursor = TestCursor::at(entry);
+        let mut st = remote_state();
+        st.mode = CaptureMode::Local;
+        // Same accounting as cursor::nudge, without native placement or input.
+        let nudge = p(entry.x + 1, entry.y);
+        super::super::warp::accepted_refresh(entry, nudge);
+        super::super::warp::accepted_refresh(nudge, entry);
+        let mut native = entry;
+        for _ in 0..100 {
+            let info = MSLLHOOKSTRUCT {
+                pt: p(native.x + 4, native.y - 2),
+                ..Default::default()
+            };
+            let Prepared::Event {
+                event, force_swallow, ..
+            } = st.prepare_mouse(WM_MOUSEMOVE, &info, Instant::now())
+            else {
+                panic!("physical movement must be routed");
+            };
+            assert_eq!(event.event, InputEvent::PointerDelta { dx: 4., dy: -2. });
+            assert_eq!(event.cursor, Some(to_point(info.pt)));
+            assert!(
+                !force_swallow,
+                "a Local shape-refresh alias cannot reject physical motion"
+            );
+            native = info.pt;
+            super::super::warp::passed(native);
+            TEST_CURSOR.with(|c| c.set(Some(native)));
+        }
+        assert_eq!(native, p(1600, 1900));
     }
 
     #[test]

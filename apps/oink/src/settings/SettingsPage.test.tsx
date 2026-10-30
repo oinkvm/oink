@@ -231,3 +231,8 @@ it('does not render the DS_Store switch on Windows',()=>{
   const {container}=render(view('win'));
   expect(container.querySelector('[data-item="removeDsStore"]')).toBeNull();
 });
+
+it.each([['zh-Hans','释放磁盘空间。仍在原设备上的文件可以再次下载，其他文件会被删除'],['en','Frees disk space. Files still on the original device can be downloaded again; others are deleted'],['ja','ディスク容量を空けます。元のデバイスにあるファイルは再ダウンロードでき、それ以外は削除されます'],['ko','디스크 공간을 확보합니다. 원래 기기에 있는 파일은 다시 내려받을 수 있고, 나머지는 삭제됩니다']] as const)('describes received cleanup accurately in %s', (language,copy)=>{
+ setLanguage(language);const {container}=render(view());
+ expect(container.querySelector('[data-item="receivedCleanup"]')?.textContent).toContain(copy);
+});

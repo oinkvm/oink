@@ -184,7 +184,7 @@ export const SECTIONS: SectionMeta[] = [
             { id: 'clipReceive', get label() { return tr('接收其它设备复制的内容'); }, get desc() { return tr('在其它设备上复制的内容，可以在本机粘贴'); } },
             { id: 'clipSend', get label() { return tr('同步复制的内容给其它设备'); }, get desc() { return tr('本机复制的内容，可以在其它设备上粘贴'); } },
             {id:'receivedFiles',get label(){return tr('收到的文件');},get desc(){return tr('从其它设备粘贴或拖拽到本机的文件');},get keywords(){return tr('收到 接收 文件 文件夹 粘贴 拖拽 管理 删除 空间 Finder Explorer');}},
-            {id:'receivedCleanup',get label(){return tr('自动清理收到的文件');},get desc(){return tr('节省磁盘空间，但未另存的文件可能丢失');},get keywords(){return tr('自动 清理 收到 文件 7天 30天 从不');}},
+            {id:'receivedCleanup',get label(){return tr('自动清理收到的文件');},get desc(){return tr('释放磁盘空间。仍在原设备上的文件可以再次下载，其他文件会被删除');},get keywords(){return tr('自动 清理 收到 文件 7天 30天 从不');}},
             { id: 'cache', get label() {
                     return tr('缓存文件');
                 }, get desc() { return tr('Oink 为传输临时保存的数据'); }, get keywords() { return tr('缓存 清理 空间 磁盘 cache 目录'); } },

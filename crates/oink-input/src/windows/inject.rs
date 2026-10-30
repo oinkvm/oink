@@ -1,4 +1,5 @@
-//! 注入：SendInput。所有注入的事件都带 [`INJECT_TAG`]（`dwExtraInfo`），钩子据此跳过自己注入的事件。
+//! 注入：SendInput。普通事件带 [`INJECT_TAG`]；光标形状刷新用 [`SHAPE_REFRESH_TAG`]。
+//! 钩子根据 `dwExtraInfo` 跳过自身事件，并区分定位来源。
 //!
 //! - 移动：`MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`，坐标归一化到虚拟桌面的
 //!   0..=65535（见 [`normalize`]）；绝对定位不经过「提高指针精确度」加速，按钮按住时产生拖动。
@@ -22,6 +23,12 @@ use super::keymap;
 
 /// Oink-originated input marker ("OINK"), shared with the service and volume exit.
 pub(crate) const INJECT_TAG: usize = 0x4F49_4E4B;
+/// Shape-refresh placement ("OINS"). Both cursor::nudge legs carry this tag so
+/// their hook echoes remain readback aliases, not physical motion origins.
+pub(crate) const SHAPE_REFRESH_TAG: usize = 0x4F49_4E53;
+pub(crate) fn own_mouse_tag(extra: usize) -> bool {
+    matches!(extra, INJECT_TAG | SHAPE_REFRESH_TAG)
+}
 /// 一格滚轮。
 pub(crate) const WHEEL_DELTA: f64 = 120.0;
 /// `Pixel` 单位滚动的换算：一行 = 100/3 个 DIP（Chromium 在 Windows 上的滚轮行高：一格 3 行 = 100 DIP）。

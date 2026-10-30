@@ -55,26 +55,21 @@ pub enum Basis {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reader {
     System,
-    Shell,
     App,
     Unknown,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
-    Shell24h,
     Age7,
     Age30,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+// Old reader-classification fields are intentionally discarded on journal load.
+// They cannot authorize cleanup and must not invalidate already received F₁ data.
 pub struct Item {
     pub received_at: u64,
     pub last_used: u64,
     pub materialized: bool,
-    pub shell: bool,
-    pub app: bool,
-    pub unknown: bool,
-    pub observation_gap: bool,
 }
 impl Item {
     pub fn new(received_at: u64) -> Self {
@@ -82,34 +77,20 @@ impl Item {
             received_at,
             last_used: received_at,
             materialized: false,
-            shell: false,
-            app: false,
-            unknown: false,
-            observation_gap: false,
         }
     }
     pub fn observe(&mut self, reader: Reader, now: u64) {
-        match reader {
-            Reader::System => return,
-            Reader::Shell => self.shell = true,
-            Reader::App => self.app = true,
-            Reader::Unknown => self.unknown = true,
+        if reader == Reader::System {
+            return;
         }
         self.last_used = self.last_used.max(now);
     }
-    pub fn gap(&mut self, now: u64) {
-        self.observation_gap = true;
+    pub fn resume_at(&mut self, now: u64) {
         self.last_used = self.last_used.max(now);
-    }
-    pub fn shell_only(&self) -> bool {
-        self.shell && !self.app && !self.unknown && !self.observation_gap
     }
     pub fn cleanup(&self, now: u64, setting: Cleanup, basis: Basis, busy: bool) -> Option<Reason> {
         if busy || !self.materialized {
             return None;
-        }
-        if basis == Basis::LastUsed && self.shell_only() && now.saturating_sub(self.received_at) >= DAY {
-            return Some(Reason::Shell24h);
         }
         let age = now.saturating_sub(match basis {
             Basis::Received => self.received_at,
@@ -384,43 +365,47 @@ mod tests {
             item.cleanup(100 + 7 * DAY, Cleanup::Days7, Basis::LastUsed, false),
             None
         );
-        item.gap(300);
-        assert!(!item.shell_only());
+        item.resume_at(300);
         assert_eq!(
             item.cleanup(100 + 30 * DAY, Cleanup::Days30, Basis::Received, true),
             None
         );
     }
     #[test]
-    fn shell_rule_requires_continuous_observation_and_materialization() {
+    fn explorer_reads_never_enable_automatic_24h_deletion() {
         let mut item = Item::new(10);
         item.observe(Reader::System, 20);
-        assert!(!item.shell_only());
-        item.observe(Reader::Shell, 30);
+        item.observe(Reader::App, 30);
         item.materialized = true;
-        assert_eq!(
-            item.cleanup(10 + DAY, Cleanup::Never, Basis::LastUsed, false),
-            Some(Reason::Shell24h)
-        );
+        assert_eq!(item.cleanup(10 + DAY, Cleanup::Never, Basis::LastUsed, false), None);
         assert_eq!(
             item.cleanup(10 + DAY, Cleanup::Never, Basis::Received, false),
             None,
             "macOS never applies shell-only cleanup"
         );
-        item.gap(40);
+        item.resume_at(40);
         assert_eq!(item.cleanup(10 + DAY, Cleanup::Never, Basis::LastUsed, false), None);
         assert_eq!(item.last_used, 40);
     }
     #[test]
-    fn system_activity_never_renews_user_usage_and_classification_is_monotonic() {
+    fn system_activity_never_renews_user_usage() {
         let mut item = Item::new(10);
         item.observe(Reader::App, 20);
-        item.observe(Reader::Shell, 30);
+        item.observe(Reader::App, 30);
         item.observe(Reader::System, 999);
         assert_eq!(item.last_used, 30);
-        assert!(!item.shell_only());
         let restored: Item = serde_json::from_slice(&serde_json::to_vec(&item).unwrap()).unwrap();
         assert_eq!(restored, item);
+    }
+    #[test]
+    fn old_reader_eligibility_is_discarded_without_losing_completed_receipts() {
+        let item:Item=serde_json::from_value(serde_json::json!({"received_at":1,"last_used":2,"materialized":true,"shell":true,"app":false,"unknown":false,"observation_gap":false})).unwrap();
+        let saved = serde_json::to_value(&item).unwrap();
+        assert_eq!(
+            saved,
+            serde_json::json!({"received_at":1,"last_used":2,"materialized":true})
+        );
+        assert_eq!(item.cleanup(2 + 30 * DAY, Cleanup::Never, Basis::LastUsed, false), None);
     }
     #[test]
     fn normalized_names_and_persisted_mapping_reject_traversal() {

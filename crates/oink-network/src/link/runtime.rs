@@ -1275,6 +1275,10 @@ impl Network {
             Err(reason) => {
                 writer.abort(match reason {
                     StreamClosed::Peer(code) => code,
+                    StreamClosed::Local => match &writer.source {
+                        Source::User(queue) => queue.close_code(),
+                        _ => StreamCode::None,
+                    },
                     _ => StreamCode::None,
                 });
                 if let Some(id) = writer.id {
@@ -1390,6 +1394,7 @@ impl Network {
             Err(reason) => {
                 reader.stop(match reason {
                     StreamClosed::Peer(code) => code,
+                    StreamClosed::Local => reader.queue.as_ref().map_or(StreamCode::None, |q| q.close_code()),
                     _ => StreamCode::None,
                 });
                 if let Some(id) = reader.id {

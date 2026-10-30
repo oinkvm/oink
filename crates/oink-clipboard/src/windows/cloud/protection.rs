@@ -213,14 +213,14 @@ impl Work {
             // Local edits own this identity from now on. Pin without hydrating;
             // never synthesize Stored for locally changed/partly resident bytes.
             // SAFETY: deny-write handle owns READ_DATA, sufficient for pinning.
-            trace.hr(57, unsafe {
+            let _ = trace.hr(57, unsafe {
                 (self.service.api.pin)(
                     protected.sharing.as_raw_handle(),
                     CF_PIN_STATE_PINNED,
                     CF_SET_PIN_FLAG_NONE,
                     std::ptr::null_mut(),
                 )
-            })?;
+            });
             let resident = trace.io(
                 58,
                 self.service.handle_fully_resident_traced(handle, length as u64, trace),

@@ -250,7 +250,7 @@ impl RawTracker {
 fn raw_motion_capture_eligible(flags: u16, has_device: bool, extra: u32) -> bool {
     flags & 1 == 0
         && has_device
-        && extra as usize != super::inject::INJECT_TAG
+        && !super::inject::own_mouse_tag(extra as usize)
         && !super::hook::is_marker(extra as usize)
 }
 
@@ -267,6 +267,9 @@ mod tests {
         let own = super::super::inject::INJECT_TAG as u32;
         assert!(!raw_motion_capture_eligible(0, true, own));
         assert!(!raw_motion_capture_eligible(0, false, own));
+        let refresh = super::super::inject::SHAPE_REFRESH_TAG as u32;
+        assert!(!raw_motion_capture_eligible(0, true, refresh));
+        assert!(!raw_motion_capture_eligible(0, false, refresh));
         assert!(!raw_motion_capture_eligible(0, true, 0x0001_4e57));
         assert!(raw_motion_capture_eligible(0, true, 0));
         assert!(raw_motion_capture_eligible(0, true, 0x1234));

@@ -26,6 +26,17 @@ pub struct SendStream {
 }
 
 impl SendStream {
+    /// Retire this session intentionally. The network owner sends `Cancelled`
+    /// even if it observes handle closure before the module's ordinary task.
+    /// Like dropping the handle, discards queued and in-flight messages.
+    pub fn cancel(&self) {
+        self.queue.cancel();
+    }
+    /// Whether closure intentionally retired the session. A realtime producer
+    /// can observe `PostError::Closed` before the module receives StreamClosed.
+    pub fn is_cancelled(&self) -> bool {
+        self.queue.close_code() == StreamCode::Cancelled
+    }
     /// Includes a reliable writer's pending frame until QUIC accepts it.
     pub fn oldest_pending(&self) -> Option<std::time::Instant> {
         self.queue.age.oldest()
@@ -55,6 +66,11 @@ pub struct RecvStream {
 }
 
 impl RecvStream {
+    /// Retire this session intentionally and stop the peer with `Cancelled`.
+    /// Publishes the cause before closing the queue; safe on the input thread.
+    pub fn cancel(&self) {
+        self.queue.cancel();
+    }
     /// Includes a reliable writer's pending frame until QUIC accepts it.
     pub fn oldest_pending(&self) -> Option<std::time::Instant> {
         self.queue.age.oldest()

@@ -1059,8 +1059,15 @@ async fn pause_and_resume_from_either_side_restore_every_stream_scenario() {
     common::pair(&a.node, &b.node).await;
     row(&[&a, &b]).await;
     wait_for("initial wallpaper", 10.0, || wallpaper_seen(&b.node, &a.node).is_some()).await;
-    // (who pauses, who resumes)
-    for (round, (pauser, resumer)) in [(&a, &a), (&a, &b), (&b, &a), (&b, &b)].into_iter().enumerate() {
+    // (who pauses, who resumes). Two cycles exceed the failure-backoff ladder
+    // that normal native safety-fence closes used to accumulate. Every round
+    // must retain its authenticated link, even without a ten-second idle gap.
+    for (round, (pauser, resumer)) in [(&a, &a), (&a, &b), (&b, &a), (&b, &b)]
+        .into_iter()
+        .cycle()
+        .take(8)
+        .enumerate()
+    {
         // Drain the previous wallpaper transfer before taking a negative pause
         // snapshot. Input readiness alone does not acknowledge Low delivery.
         let prior = blake3::hash(&a.displays.wallpapers().unwrap()[0].thumbnail.jpeg).to_hex()[..16].to_string();

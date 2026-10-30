@@ -966,7 +966,7 @@ mod tests {
                 .records
                 .iter()
                 .filter(|record| record.node == Some(1))
-                .all(|record| record.keep_local == Some(true))
+                .all(|record| record.keep_local == Some(true) && record.refetchable != Some(true))
         );
     }
     #[test]

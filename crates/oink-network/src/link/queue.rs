@@ -29,6 +29,7 @@ pub(super) struct Queue {
     spec: QueueSpec,
     bytes: AtomicUsize,
     closed: AtomicBool,
+    cancelled: AtomicBool,
     wake: ArcSwapOption<WakeSlot>,
     producer_wake: ArcSwapOption<WakeSlot>,
     pub(super) notify: Notify,
@@ -55,6 +56,7 @@ impl Queue {
             spec,
             bytes: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
             wake: ArcSwapOption::empty(),
             producer_wake: ArcSwapOption::empty(),
             notify: Notify::new(),
@@ -96,6 +98,19 @@ impl Queue {
             if let Some(wake) = self.producer_wake.load().as_ref() {
                 (wake.0)();
             }
+        }
+    }
+    pub(super) fn cancel(&self) {
+        // Publish the cause before closing/waking: the network owner can consume
+        // this queue before an ordinary module processes its close notification.
+        self.cancelled.store(true, Ordering::Release);
+        self.close();
+    }
+    pub(super) fn close_code(&self) -> oink_protocol::frame::StreamCode {
+        if self.cancelled.load(Ordering::Acquire) {
+            oink_protocol::frame::StreamCode::Cancelled
+        } else {
+            oink_protocol::frame::StreamCode::None
         }
     }
     pub(super) fn post(&self, encoded: Vec<u8>, limit: usize) -> Result<(), PostError> {

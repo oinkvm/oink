@@ -230,6 +230,7 @@ fn fill_catalog(key: &str, catalog: &mut Catalog) {
                 children: None,
                 hidden: Some(true),
                 keep_local: None,
+                refetchable: None,
             });
         }
     }

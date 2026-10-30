@@ -105,6 +105,53 @@ fn pause_and_resume_before_poll_discards_old_inbound_bytes() {
             .any(|event| matches!(event, InjectEvent::Key { pressed: true, .. }))
     );
 }
+
+#[test]
+fn safety_fence_reports_intentional_stream_cancellation() {
+    let fake = Arc::new(oink_test_support::input::FakeInput::new());
+    let mut h = Harness::with_backend(fake.clone());
+    let (_read, _motion) = h.outbound(1);
+    let (write, _incoming_motion) = h.inbound(1);
+    opening(&write, &remote(), true);
+    h.attach();
+    // Both native transitions precede the next owner poll and C0 publication.
+    fake.set_input_paused(true);
+    fake.set_input_paused(false);
+    h.poll();
+    let faults: Vec<_> = std::iter::from_fn(|| h.driver.notices.take())
+        .filter_map(|notice| match notice {
+            InputNotice::Fault { which, code, .. } => Some((which, code)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(faults.len(), 2);
+    assert!(
+        faults.iter().all(|(_, code)| *code == StreamCode::Cancelled),
+        "{faults:?}"
+    );
+}
+
+#[test]
+fn cancelled_writer_post_before_close_event_preserves_cause() {
+    let mut h = Harness::new();
+    let (read, _motion) = h.outbound(1);
+    let (write, _incoming_motion) = h.inbound(1);
+    opening(&write, &remote(), true);
+    h.attach();
+    let encoded = encode(&h.driver.adapter.opening_state(true)[0]).unwrap();
+    // Model the network processing the peer's STOP_SENDING while the ordinary
+    // input task has not yet delivered StreamClosed. A native post sees Closed
+    // first; its fault notice must not turn that same cancellation into failure.
+    read.cancel();
+    assert!(!h.driver.post_bytes(peer(), &encoded, false));
+    let faults: Vec<_> = std::iter::from_fn(|| h.driver.notices.take())
+        .filter_map(|notice| match notice {
+            InputNotice::Fault { which, code, .. } => Some((which, code)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(faults, vec![(Which::Outbound, StreamCode::Cancelled)]);
+}
 fn wait(mut predicate: impl FnMut() -> bool) {
     let end = Instant::now() + Duration::from_secs(3);
     while !predicate() {

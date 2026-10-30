@@ -6,6 +6,7 @@
 //! ```text
 //! Closed  --allowed and wanted: ordinal+1, open, post the opening state-->  Open
 //! Open    --post full / closed or rejected by the reader (not Unsupported)-->  Backoff
+//! Open    --intentional Cancelled-->  Backoff (due now, failure count cleared)
 //! Open    --module reopens (input capability changed): close, ordinal+1, open at once-->  Open
 //! Backoff --due and still allowed: ordinal+1, open, post the opening state-->  Open
 //! Open    --link lost / paused / rejected as Unsupported-->  Closed
@@ -44,6 +45,7 @@ pub enum Failure {
     /// `PostError::Full`.
     Full,
     /// `StreamClosed::Peer(code)`. `Unsupported` goes to `Closed` and is remembered;
+    /// `Cancelled` is an intentional session retirement, with no failure backoff.
     /// `NotReady` and `Resend` reopen like any other failure (the first one at once).
     Peer(StreamCode),
 }
@@ -136,6 +138,10 @@ impl StreamMachine {
             self.unsupported = true;
             self.state = State::Closed;
             self.retry_at = None;
+        } else if failure == Failure::Peer(StreamCode::Cancelled) {
+            self.failures = 0;
+            self.retry_at = Some(now);
+            self.state = State::Backoff;
         } else {
             if self.opened_at.is_some_and(|at| now.duration_since(at) >= STABLE_AFTER) {
                 self.failures = 0;
@@ -257,6 +263,40 @@ mod tests {
                 assert_eq!(m.poll(false, true, now), Step::Close(tag(kind, 4)));
             }
         }
+    }
+
+    #[test]
+    fn safety_cancellations_never_accumulate_failure_backoff() {
+        let mut machine = StreamMachine::new(StreamKind::Input);
+        let mut now = Instant::now();
+        machine.poll(true, true, now);
+        // Native pause and resume each retire the reader. Deliver those closes
+        // before any C0 Facts, with no stable ten-second interval between them.
+        for ordinal in 1..=16 {
+            now += Duration::from_millis(1);
+            assert_eq!(
+                machine.failed(Failure::Peer(StreamCode::Cancelled), now),
+                Step::Close(tag(StreamKind::Input, ordinal))
+            );
+            assert_eq!(machine.deadline(), Some(now), "a safety close is not a failed stream");
+            assert_eq!(
+                machine.poll(true, true, now),
+                Step::Open(tag(StreamKind::Input, ordinal + 1))
+            );
+        }
+        // Genuine queue/transport failures still back off. A later intentional
+        // retirement starts a new session, rather than inheriting those failures.
+        for delay in [BACKOFF[0], BACKOFF[1]] {
+            machine.failed(Failure::Full, now);
+            assert_eq!(machine.deadline(), Some(now + delay));
+            now += delay;
+            machine.poll(true, true, now);
+        }
+        machine.failed(Failure::Peer(StreamCode::Cancelled), now);
+        assert_eq!(machine.deadline(), Some(now));
+        machine.poll(true, true, now);
+        machine.failed(Failure::Full, now);
+        assert_eq!(machine.deadline(), Some(now));
     }
 
     #[test]

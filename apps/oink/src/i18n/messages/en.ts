@@ -104,7 +104,7 @@ export const en = {
   "收到的文件": "Received files",
   "从其它设备粘贴或拖拽到本机的文件": "Files pasted or dragged here from other devices",
   "自动清理收到的文件": "Automatically remove received files",
-  "节省磁盘空间，但未另存的文件可能丢失": "Save disk space; files you have not saved elsewhere may be lost",
+  "释放磁盘空间。仍在原设备上的文件可以再次下载，其他文件会被删除": "Frees disk space. Files still on the original device can be downloaded again; others are deleted",
   "7 天未使用": "Unused for 7 days",
   "30 天未使用": "Unused for 30 days",
   "收到 7 天后": "7 days after receipt",

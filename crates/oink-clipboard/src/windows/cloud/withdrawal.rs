@@ -97,9 +97,9 @@ impl Delivery {
                         // Preserve edited bytes without sending a source receipt.
                         // Dirty state and zero truncation both detach this slot.
                         // SAFETY: the protected handle owns READ_DATA, sufficient for pinning.
-                        hr(unsafe {
+                        let _ = hr(unsafe {
                             (service.api.pin)(handle, CF_PIN_STATE_PINNED, CF_SET_PIN_FLAG_NONE, std::ptr::null_mut())
-                        })?;
+                        });
                         let mut length = 0i64;
                         // SAFETY: live exclusive handle and fixed-size output.
                         if unsafe { GetFileSizeEx(handle, &mut length) } == 0 || length < 0 {

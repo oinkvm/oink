@@ -100,29 +100,36 @@ struct Record: Codable, Equatable {
     // Present on private placeholder pool items.
     let hidden: Bool?
     let keep_local: Bool?
-    init(id: String, parent: String, name: String, directory: Bool, size: UInt64?, modified: Int64?, node: UInt64?, version: UInt64 = 0, children: UInt64? = nil, hidden: Bool? = nil, created: Int64? = nil, keep_local: Bool? = nil, symlink_target: String? = nil, exec_bits: UInt16? = nil) {
+    let refetchable: Bool?
+    init(id: String, parent: String, name: String, directory: Bool, size: UInt64?, modified: Int64?, node: UInt64?, version: UInt64 = 0, children: UInt64? = nil, hidden: Bool? = nil, created: Int64? = nil, keep_local: Bool? = nil, refetchable: Bool? = nil, symlink_target: String? = nil, exec_bits: UInt16? = nil) {
         self.id = id; self.parent = parent; self.name = name; self.directory = directory
         self.size = size; self.modified = modified; self.node = node; self.version = version; self.children = children; self.hidden = hidden
-        self.created = created; self.keep_local = keep_local; self.symlink_target = symlink_target; self.exec_bits = exec_bits
+        self.created = created; self.keep_local = keep_local; self.refetchable = refetchable; self.symlink_target = symlink_target; self.exec_bits = exec_bits
     }
     // Keep the item identity stable while replacing the content/metadata version.
     // The backend has persisted the same metadata before sending this header.
     func updating(_ metadata: CurrentMetadata) -> Record {
         Record(id: id, parent: parent, name: name, directory: directory, size: metadata.size,
-               modified: metadata.modified, node: node, version: metadata.version, children: children, hidden: hidden, created: created, keep_local: keep_local, symlink_target: symlink_target, exec_bits: metadata.exec_bits)
+               modified: metadata.modified, node: node, version: metadata.version, children: children, hidden: hidden, created: created, keep_local: keep_local, refetchable: refetchable, symlink_target: symlink_target, exec_bits: metadata.exec_bits)
     }
     func withCreationDate(_ fallback: Int64?) -> Record {
         Record(id: id, parent: parent, name: name, directory: directory, size: size, modified: modified,
-               node: node, version: version, children: children, hidden: hidden, created: created ?? fallback, keep_local: keep_local, symlink_target: symlink_target, exec_bits: exec_bits)
+               node: node, version: version, children: children, hidden: hidden, created: created ?? fallback, keep_local: keep_local, refetchable: refetchable, symlink_target: symlink_target, exec_bits: exec_bits)
     }
     func retainingLocal(_ retain: Bool) -> Record {
         Record(id: id, parent: parent, name: name, directory: directory, size: size, modified: modified,
                node: node, version: version, children: children, hidden: hidden, created: created,
-               keep_local: retain || keep_local == true ? true : nil, symlink_target: symlink_target, exec_bits: exec_bits)
+               keep_local: retain || keep_local == true ? true : nil, refetchable: refetchable, symlink_target: symlink_target, exec_bits: exec_bits)
     }
-    enum CodingKeys: String, CodingKey { case id, parent, name, directory, size, modified, created, node, version, children, hidden, keep_local, symlink_target, exec_bits }
+    func receiptPolicy(_ source: Record, local: Bool = false) -> Record {
+        Record(id:id,parent:parent,name:name,directory:directory,size:size,modified:modified,node:node,
+               version:version,children:children,hidden:hidden,created:created,
+               keep_local:source.refetchable == true && !local ? nil : keep_local == true || source.keep_local == true ? true : nil,
+               refetchable:local ? nil : source.refetchable,symlink_target:symlink_target,exec_bits:exec_bits)
+    }
+    enum CodingKeys: String, CodingKey { case id, parent, name, directory, size, modified, created, node, version, children, hidden, keep_local, refetchable, symlink_target, exec_bits }
     init(from decoder: Decoder) throws {
-        try validateLocalKeys(decoder, allowed: ["id", "parent", "name", "directory", "size", "modified", "created", "node", "version", "children", "hidden", "keep_local", "symlink_target", "exec_bits"])
+        try validateLocalKeys(decoder, allowed: ["id", "parent", "name", "directory", "size", "modified", "created", "node", "version", "children", "hidden", "keep_local", "refetchable", "symlink_target", "exec_bits"])
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(String.self, forKey: .id)
         parent = try values.decode(String.self, forKey: .parent)
@@ -136,6 +143,7 @@ struct Record: Codable, Equatable {
         children = try values.decodeIfPresent(UInt64.self, forKey: .children)
         hidden = try values.decodeIfPresent(Bool.self, forKey: .hidden)
         keep_local = try values.decodeIfPresent(Bool.self, forKey: .keep_local)
+        refetchable = try values.decodeIfPresent(Bool.self, forKey: .refetchable)
         symlink_target = try values.decodeIfPresent(String.self, forKey: .symlink_target)
         exec_bits = try values.decodeIfPresent(UInt16.self, forKey: .exec_bits)
         if let bits = exec_bits { guard !directory, symlink_target == nil, bits & ~0o111 == 0 else { throw CocoaError(.fileReadCorruptFile) } }
@@ -402,7 +410,7 @@ private func receivedCatalogs(in root: URL) throws -> [Catalog] {
                        urls: catalog.urls, received_at: catalog.received_at, move_state: catalog.move_state)
     }
     let records = expanded.flatMap { $0.records }.map {
-        (entries[$0.id]?.record ?? $0).retainingLocal($0.keep_local == true)
+        (entries[$0.id]?.record ?? $0).receiptPolicy($0,local:entries[$0.id]?.modified_locally == true)
     }
     var deleted = Set(entries.filter { $0.value.deleted }.map { $0.key })
     var previous = -1
@@ -420,7 +428,7 @@ private func receivedCatalogs(in root: URL) throws -> [Catalog] {
     return expanded.map { catalog in
         Catalog(token: catalog.token, port: catalog.port, records: catalog.records.compactMap { record in
             needed.contains(record.id) ? (entries[record.id]?.record ?? record)
-                .retainingLocal(record.keep_local == true).withCreationDate(catalog.receivedMilliseconds ?? record.created) : nil
+                .receiptPolicy(record,local:entries[record.id]?.modified_locally == true).withCreationDate(catalog.receivedMilliseconds ?? record.created) : nil
         }, urls: catalog.urls, received_at: catalog.received_at, move_state: catalog.move_state)
     }
 }
@@ -471,6 +479,7 @@ final class Item: NSObject, NSFileProviderItem {
             metadata += "-\(record.name)-\(record.hidden == true)"
         }
         if record.keep_local == true { metadata += "-keep-local" }
+        if record.refetchable == true { metadata += "-refetchable" }
         return .init(contentVersion: Data(content.utf8), metadataVersion: Data(metadata.utf8))
     }
 }
@@ -1083,7 +1092,8 @@ private func receivedDeleted(_ record:Record,in root:URL) throws -> Bool {
 func receivedOverlay(_ record:Record,in root:URL) throws -> Record? {
     try withReceived(in:root) {
         if try receivedDeleted(record,in:root) {return nil}
-        return (try readReceived(receivedKey(record.id),in:root)[record.id]?.record ?? record).retainingLocal(record.keep_local == true)
+        let entry=try readReceived(receivedKey(record.id),in:root)[record.id]
+        return (entry?.record ?? record).receiptPolicy(record,local:entry?.modified_locally == true)
     }
 }
 private func receivedTime(_ id:String,in root:URL,fallback:Date=Date()) -> Double {
@@ -1228,7 +1238,7 @@ func receivedDirectoryListing(_ listing: DirectoryListing, directory: Record, in
         let entries = try receivedEntries(raw + listing.records, in: root)
         var records: [Record] = []
         for source in listing.records {
-            let record = (entries[source.id]?.record ?? source).retainingLocal(source.keep_local == true)
+            let record = (entries[source.id]?.record ?? source).receiptPolicy(source,local:entries[source.id]?.modified_locally == true)
             if record.parent == directory.id, try !receivedDeleted(record, in: root) { records.append(record) }
         }
         if listing.next == nil {
@@ -1274,7 +1284,7 @@ func receivedModify(_ item:NSFileProviderItem,fields:NSFileProviderItemFields,co
         let record = Record(id:id,parent:parent,name:name,directory:old.directory,size:size,
                             modified:changedContents ? Int64(Date().timeIntervalSince1970 * 1000) : old.modified,
                             node:old.node,version:old.version &+ (changedContents ? 1:0),children:old.children,
-                            hidden:old.hidden,created:old.created,keep_local:changedContents ? true : old.keep_local, symlink_target:old.symlink_target, exec_bits:old.exec_bits)
+                            hidden:old.hidden,created:old.created,keep_local:changedContents ? true : old.keep_local,refetchable:changedContents ? nil : old.refetchable, symlink_target:old.symlink_target, exec_bits:old.exec_bits)
         let updatedRecords = records.map { $0.id == record.id ? record : $0 }
         for candidate in updatedRecords where candidate.symlink_target != nil {
             try validateReceivedSymlink(candidate, records: updatedRecords)
@@ -1347,6 +1357,50 @@ func removeReceivedNative(_ url: URL, record: Record, identity: stat, in root: U
     return true
 }
 
+// Cleanup policy seam: native eviction is asynchronous and injected for pure tests.
+func cleanupReceivedNative(_ url: URL, record: Record, identity: stat, in root: URL,
+                           evict: () async throws -> Void) async throws -> Bool {
+    guard record.refetchable == true && record.keep_local != true else {
+        return try removeReceivedNative(url, record: record, identity: identity, in: root)
+    }
+    // Do not recursively evict directories: a mixed subtree can contain a
+    // one-shot or independent edit. Each ordinary linked file owns its policy;
+    // an empty directory/symlink occupies no received content bytes.
+    if record.directory || record.symlink_target != nil { return false }
+    guard let exclusion = try ReceivedConsumerExclusion(key:receivedKey(record.id),root:root) else { return false }
+    defer { withExtendedLifetime(exclusion) {} }
+    let eligible = try withReceived(in:root) { () throws -> Bool in
+        guard let current = try receivedCatalogs(in:root).flatMap({$0.records}).first(where:{$0.id == record.id}),
+              current.refetchable == true, current.keep_local != true,
+              Item(current).itemVersion.contentVersion == Item(record).itemVersion.contentVersion else { return false }
+        let entry = try readReceived(receivedKey(record.id),in:root)[record.id]
+        var actual=stat()
+        return entry?.deleted != true && entry?.modified_locally != true && (entry?.fetching ?? 0)==0
+            && lstat(url.path,&actual)==0 && actual.st_dev==identity.st_dev && actual.st_ino==identity.st_ino
+            && actual.st_flags & UInt32(SF_DATALESS)==0 && actual.st_size==identity.st_size
+            && actual.st_mtimespec.tv_sec==identity.st_mtimespec.tv_sec
+            && actual.st_mtimespec.tv_nsec==identity.st_mtimespec.tv_nsec
+            && actual.st_ctimespec.tv_sec==identity.st_ctimespec.tv_sec
+            && actual.st_ctimespec.tv_nsec==identity.st_ctimespec.tv_nsec
+    }
+    guard eligible else { return false }
+    // evictItem rejects open descriptors, unsynced edits and keep-local policy.
+    // Propagate failure to the next maintenance pass; never unlink or force it.
+    try await evict()
+    cacheStorageChanged()
+    try withReceived(in:root) {
+        let key=receivedKey(record.id);var entries=try readReceived(key,in:root)
+        if var entry=entries[record.id] {
+            entry.materialized=false;entries[record.id]=entry;try writeReceived(key,entries,in:root)
+        }
+    }
+    return true
+}
+
+func receivedLocalBytes(_ metadata: stat, record: Record) -> UInt64 {
+    metadata.st_flags & UInt32(SF_DATALESS) != 0 || record.directory || record.symlink_target != nil
+        ? 0 : UInt64(max(0,metadata.st_blocks))*512
+}
 // Enumerating/statting metadata must never read a dataless file's contents.
 func receivedUsage(manager:NSFileProviderManager,root:URL,days:UInt64,clear:Bool) async throws -> [String:Any] {
     let observer=MaterializedObserver(manager.enumeratorForMaterializedItems())
@@ -1357,7 +1411,8 @@ func receivedUsage(manager:NSFileProviderManager,root:URL,days:UInt64,clear:Bool
     for item in items {
         let id=item.itemIdentifier.rawValue
         guard let record=records.first(where:{$0.id==id}), receivedRecordEligible(record),!isReceivedContainer(record) else {continue}
-        let entry=try readReceived(receivedKey(id),in:root)[id] ?? ReceivedEntry(record:record,received_at:receivedTime(id,in:root),handed_off:false,materialized:false,deleted:false)
+        var entry=try readReceived(receivedKey(id),in:root)[id] ?? ReceivedEntry(record:record,received_at:receivedTime(id,in:root),handed_off:false,materialized:false,deleted:false)
+        entry.record=record
         guard !entry.deleted else {continue}
         do {
             let url=try await manager.getUserVisibleURL(for:item.itemIdentifier)
@@ -1369,12 +1424,19 @@ func receivedUsage(manager:NSFileProviderManager,root:URL,days:UInt64,clear:Bool
                 var current=values[id] ?? entry
                 if !current.deleted && !current.materialized {current.materialized=true;values[id]=current;try writeReceived(key,values,in:root)}
             }
-            let size=entry.record.directory || entry.record.symlink_target != nil ? 0 : UInt64(max(0,meta.st_blocks))*512
+            let size=receivedLocalBytes(meta,record:entry.record)
+            bytes += size
             let due=days>0 && Date().timeIntervalSince1970*1000-entry.received_at >= Double(days)*86_400_000
             if clear && due && (entry.fetching ?? 0)==0 {
-                if try removeReceivedNative(url, record: entry.record, identity: meta, in: root) { removed += 1 }
-                else { bytes += size }
-            } else {bytes+=size}
+                if try await cleanupReceivedNative(url, record: entry.record, identity: meta, in: root,
+                    evict: { try await manager.evictItem(identifier:item.itemIdentifier) }) {
+                    if entry.record.refetchable == true && entry.record.keep_local != true {
+                        var after=stat()
+                        if lstat(url.path,&after)==0 { bytes -= size;bytes += receivedLocalBytes(after,record:entry.record) }
+                        else { incomplete=true }
+                    } else { bytes -= size;removed += 1 }
+                }
+            }
         } catch {incomplete=true}
     }
     if removed>0 {try await manager.signalEnumerator(for:.workingSet)}

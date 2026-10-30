@@ -21,50 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::stale_step::StaleSteps;
-use crate::warp_base::{Registration, WarpBase};
-
-#[derive(Default)]
-struct Accounting {
-    base: WarpBase,
-    // Preserve the pre-existing old-coordinate-flight correction. This is
-    // separate from the exact readback repair above; all placements now update
-    // both, rather than only mode transitions knowing their displaced base.
-    stale: StaleSteps,
-}
-
-impl Accounting {
-    fn stale_base_for(&mut self, pt: Point, current: Point, now_us: u64) -> Option<Point> {
-        // Windows 11 can resume targets computed from an old native position
-        // after an idle interval, with tiny WM_INPUT deltas, even though the park
-        // marker committed and newer-based hooks already arrived. The short
-        // in-flight heuristic has expired by then. Keep using the same placement
-        // ledger for target classification and readback correction; otherwise
-        // pt - current forwards the entire park displacement as physical motion.
-        // This changes the subtraction base, never clips or discards movement.
-        self.base
-            .displaced_base_for(pt, current)
-            .or_else(|| self.stale.classify(pt, current, now_us))
-    }
-
-    fn register(&mut self, before: POINT, target: POINT) -> (Registration, StaleSteps) {
-        let previous = self.stale;
-        let current = self.base.sample(point(before));
-        let registration = self.base.register(point(before), point(target));
-        if current != point(target) {
-            self.stale
-                .switched(current, super::hook::time_us(std::time::Instant::now()));
-        }
-        (registration, previous)
-    }
-
-    fn cancel(&mut self, (registration, previous): (Registration, StaleSteps)) -> bool {
-        if self.base.cancel(registration) {
-            self.stale = previous;
-            return true;
-        }
-        false
-    }
-}
+use crate::warp_base::{Accounting, Registration};
 
 thread_local! {
     // Cursor/clip APIs run on the hook owner. Injection workers do not touch
@@ -81,7 +38,17 @@ fn point(p: POINT) -> Point {
 pub(super) struct Acceptance((Registration, StaleSteps));
 
 pub(super) fn accepted(before: POINT, target: POINT) -> Acceptance {
-    Acceptance(BASE.with_borrow_mut(|base| base.register(before, target)))
+    Acceptance(BASE.with_borrow_mut(|base| {
+        base.register(
+            point(before),
+            point(target),
+            super::hook::time_us(std::time::Instant::now()),
+        )
+    }))
+}
+
+pub(super) fn accepted_refresh(before: POINT, target: POINT) -> Acceptance {
+    Acceptance(BASE.with_borrow_mut(|base| base.register_refresh(point(before), point(target))))
 }
 
 pub(super) fn accepted_external(before: Option<POINT>, target: POINT) -> Acceptance {
@@ -144,10 +111,23 @@ fn clamped(p: POINT, rect: RECT) -> POINT {
 /// Ordinary cover parking uses an allowed native INPUT instead. Accounting is
 /// not hide permission for either path.
 pub(super) fn place(p: POINT) -> windows::core::Result<()> {
+    place_tagged(p, super::inject::INJECT_TAG)
+}
+
+/// Only cursor::nudge uses this provenance; ordinary park/restore stays a real placement.
+pub(super) fn refresh(p: POINT) -> windows::core::Result<()> {
+    place_tagged(p, super::inject::SHAPE_REFRESH_TAG)
+}
+
+fn place_tagged(p: POINT, tag: usize) -> windows::core::Result<()> {
     let before = super::hook::cursor_pos_checked()?;
     #[cfg(all(test, debug_assertions))]
     if super::hook::test_place_cursor(p) {
-        accepted(before, p);
+        if tag == super::inject::SHAPE_REFRESH_TAG {
+            accepted_refresh(before, p);
+        } else {
+            accepted(before, p);
+        }
         return Ok(());
     }
     let mut clip = RECT::default();
@@ -157,7 +137,11 @@ pub(super) fn place(p: POINT) -> windows::core::Result<()> {
     } else {
         p
     };
-    let sequence = BASE.with_borrow_mut(|base| base.register(before, target));
+    let acceptance = if tag == super::inject::SHAPE_REFRESH_TAG {
+        accepted_refresh(before, target)
+    } else {
+        accepted(before, target)
+    };
     // SetCursorPos cannot carry a per-event marker. Use the same tagged,
     // acceleration-free absolute INPUT as ordinary remote placement instead.
     // Windows resolves clipping; accounting is registered before possible hook
@@ -165,7 +149,7 @@ pub(super) fn place(p: POINT) -> windows::core::Result<()> {
     // Windows 11. No hook ACK is awaited from the hook thread.
     // SAFETY: system-metric queries have no borrowed handles or pointer arguments.
     let input = unsafe {
-        super::inject::move_abs(
+        let mut input = super::inject::move_abs(
             super::inject::normalize(
                 p.x,
                 GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -176,7 +160,9 @@ pub(super) fn place(p: POINT) -> windows::core::Result<()> {
                 GetSystemMetrics(SM_YVIRTUALSCREEN),
                 GetSystemMetrics(SM_CYVIRTUALSCREEN),
             ),
-        )
+        );
+        input.Anonymous.mi.dwExtraInfo = tag;
+        input
     };
     let result = if send(&[input]) == 1 {
         Ok(())
@@ -187,7 +173,7 @@ pub(super) fn place(p: POINT) -> windows::core::Result<()> {
         ))
     };
     if result.is_err() {
-        BASE.with_borrow_mut(|base| base.cancel(sequence));
+        rejected(acceptance);
     }
     result
 }
@@ -301,7 +287,7 @@ mod tests {
         let departure = Point::new(501., 400.);
         let park = Point::new(1920., 1080.);
         let mut accounting = Accounting::default();
-        accounting.register(POINT { x: 501, y: 400 }, POINT { x: 1920, y: 1080 });
+        accounting.register(departure, park, 0);
         // A correctly based callback retires the short in-flight heuristic.
         let fresh = Point::new(1921., 1080.);
         assert_eq!(accounting.stale_base_for(fresh, park, 0), None);
@@ -315,6 +301,37 @@ mod tests {
             let base = accounting.stale_base_for(target, current, late).unwrap_or(current);
             assert_eq!(Point::new(target.x - base.x, target.y - base.y), expected);
         }
+    }
+
+    #[test]
+    fn refresh_placement_source_preserves_park_motion_and_real_departure() {
+        let departure = POINT { x: 500, y: 2100 };
+        let park = POINT { x: 1920, y: 1080 };
+        let _native = native::Guard::at(park);
+        accepted(departure, park);
+        refresh(POINT {
+            x: park.x + 1,
+            y: park.y,
+        })
+        .unwrap();
+        refresh(park).unwrap();
+        let current = sample(park);
+        let next = POINT {
+            x: park.x + 4,
+            y: park.y - 2,
+        };
+        assert_eq!(stale_base_for(next, current), None);
+        assert_eq!(sample(departure), park);
+        assert_eq!(
+            stale_base_for(
+                POINT {
+                    x: departure.x + 4,
+                    y: departure.y - 2
+                },
+                current
+            ),
+            Some(departure)
+        );
     }
 
     #[test]

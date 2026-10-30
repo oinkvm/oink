@@ -175,8 +175,8 @@ impl Driver {
         self.inject.discard_pending();
         self.command(InputCommand::Paused(true));
         for peer in self.pairs.keys().copied().collect::<Vec<_>>() {
-            self.fault(peer, Which::Inbound, false, StreamCode::None);
-            self.fault(peer, Which::Outbound, false, StreamCode::None);
+            self.fault(peer, Which::Inbound, false, StreamCode::Cancelled);
+            self.fault(peer, Which::Outbound, false, StreamCode::Cancelled);
         }
         self.publish();
     }
@@ -658,6 +658,26 @@ impl Driver {
     }
     fn fault(&mut self, peer: DeviceId, which: Which, full: bool, code: StreamCode) {
         self.status_dirty = true;
+        if code == StreamCode::Cancelled
+            && let Some(pair) = self.pairs.get(&peer)
+        {
+            // The safety fence deliberately ends a native session. Mark the
+            // handle before dropping it: the network owner may see the closed
+            // queue before InputStreams receives our notice. Both event orders
+            // must tell the peer this was cancellation, not a failed opening.
+            match which {
+                Which::Outbound => {
+                    if let Some((stream, _)) = &pair.outbound {
+                        stream.cancel();
+                    }
+                }
+                Which::Inbound => {
+                    if let Some((stream, _)) = &pair.inbound {
+                        stream.cancel();
+                    }
+                }
+            }
+        }
         let stream = match which {
             Which::Outbound => self
                 .pairs
@@ -2316,6 +2336,8 @@ impl Driver {
                 error == PostError::Full,
                 if error == PostError::TooLarge {
                     StreamCode::Invalid
+                } else if error == PostError::Closed && stream.is_cancelled() {
+                    StreamCode::Cancelled
                 } else {
                     StreamCode::None
                 },
@@ -2568,8 +2590,8 @@ impl CaptureLoop for Driver {
             // Even a pause/resume completed between polls ends the old session.
             self.adapter.router_mut().set_input_suspended(true);
             for peer in self.pairs.keys().copied().collect::<Vec<_>>() {
-                self.fault(peer, Which::Inbound, false, StreamCode::None);
-                self.fault(peer, Which::Outbound, false, StreamCode::None);
+                self.fault(peer, Which::Inbound, false, StreamCode::Cancelled);
+                self.fault(peer, Which::Outbound, false, StreamCode::Cancelled);
             }
             self.input_safety = safety;
             self.adapter

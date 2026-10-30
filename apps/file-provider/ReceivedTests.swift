@@ -2,10 +2,12 @@ import Foundation
 import FileProvider
 import Darwin
 @main struct ReceivedTests {
-    static func main() throws {
+    static func main() async throws {
+        try await linkedExpiry(in: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
         let root=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
         defer { try? FileManager.default.removeItem(at:root) }
+
         try maintenancePreservesReplacement(in: root.appendingPathComponent("replacement"))
         try consumerPreventsMaintenance(in: root.appendingPathComponent("consumer"))
         try emptyContainers(in: root.appendingPathComponent("empty"))
@@ -40,6 +42,47 @@ import Darwin
         do {try receivedHandoff(late,in:root);preconditionFailure("late child handoff revived a deleted parent")} catch {}
         try privatePreparationCannotOverridePublication(in: root)
         print("received deletion, handoff, restart and private preparation tests passed")
+    }
+    static func linkedExpiry(in root: URL) async throws {
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let record = Record(id:"expiry-1",parent:"expiry-root",name:"file",directory:false,size:4,modified:nil,node:1,version:1,refetchable:true)
+        let url = root.appendingPathComponent("file")
+        try Data("data".utf8).write(to:url)
+        try JSONEncoder().encode(Catalog(token:"",port:0,records:[record],received_at:1)).write(to:root.appendingPathComponent("expiry.json"))
+        let oldPinned=record.retainingLocal(true)
+        let oldEntry=ReceivedEntry(record:oldPinned,received_at:1,handed_off:true,materialized:true,deleted:false)
+        try JSONEncoder().encode([record.id:oldEntry]).write(to:root.appendingPathComponent("expiry.received"))
+        let projected=try receivedOverlay(record,in:root)!
+        precondition(projected.keep_local != true,"stale provider pin must not protect a linked receipt")
+        precondition(projected.refetchable == true)
+        var identity=stat();precondition(lstat(url.path,&identity)==0)
+        precondition(Item(record).contentPolicy == .downloadLazily)
+        precondition(Item(record.retainingLocal(true)).contentPolicy == .downloadEagerlyAndKeepDownloaded)
+        let fd=Darwin.open(root.appendingPathComponent("expiry.consumers").path,O_CREAT|O_RDWR,0o600)
+        precondition(fd>=0 && flock(fd,LOCK_SH|LOCK_NB)==0)
+        let skipped=try await cleanupReceivedNative(url,record:record,identity:identity,in:root) { preconditionFailure("active native consumer evicted") }
+        precondition(!skipped);flock(fd,LOCK_UN);close(fd)
+        try receivedBegin(record,in:root)
+        let fetching=try await cleanupReceivedNative(url,record:record,identity:identity,in:root) {preconditionFailure("active fetch evicted")}
+        precondition(!fetching);try receivedFetchFailed(record.id,in:root)
+        do {
+            _ = try await cleanupReceivedNative(url,record:record,identity:identity,in:root) {throw POSIXError(.EBUSY)}
+            preconditionFailure("busy eviction should be retried")
+        } catch let error as POSIXError {precondition(error.code == .EBUSY)}
+        precondition(FileManager.default.fileExists(atPath:url.path))
+        var dataless=identity;dataless.st_flags |= UInt32(SF_DATALESS)
+        precondition(receivedLocalBytes(dataless,record:record)==0,"evicted content must count zero bytes")
+        let directory=Record(id:"expiry-2",parent:"expiry-root",name:"empty",directory:true,size:nil,modified:nil,node:2,refetchable:true)
+        let empty=root.appendingPathComponent("empty");try FileManager.default.createDirectory(at:empty,withIntermediateDirectories:false)
+        var dirIdentity=stat();precondition(lstat(empty.path,&dirIdentity)==0)
+        let emptyResult=try await cleanupReceivedNative(empty,record:directory,identity:dirIdentity,in:root) {preconditionFailure("must not recursively evict a directory")}
+        precondition(!emptyResult && FileManager.default.fileExists(atPath:empty.path))
+        var evicted=false
+        _ = try await cleanupReceivedNative(url,record:record,identity:identity,in:root) { evicted=true }
+        precondition(evicted && FileManager.default.fileExists(atPath:url.path), "persistent expiry must evict and retain its name and identity")
+        let entry = try readReceived("expiry",in:root)[record.id]
+        precondition(entry?.deleted != true)
     }
     static func consumerPreventsMaintenance(in root: URL) throws {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -117,7 +160,7 @@ import Darwin
     static func localEditRejectsLateSourceHandoff(in root: URL) throws {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let file = Record(id: "edited-1", parent: "edited-root", name: "file", directory: false,
-                          size: 4, modified: nil, node: 1, version: 5)
+                          size: 4, modified: nil, node: 1, version: 5, refetchable: true)
         let parent = Record(id: "edited-root", parent: NSFileProviderItemIdentifier.rootContainer.rawValue,
                             name: "batch", directory: true, size: nil, modified: nil, node: nil, children: 1)
         try JSONEncoder().encode(Catalog(token: "", port: 0, records: [parent, file], received_at: 1))
@@ -143,6 +186,9 @@ import Darwin
         } catch {}
         let recovered = try receivedOverlay(file, in: root)
         precondition(recovered == edited, "restart lost the local version or keep-downloaded policy")
+        precondition(recovered?.keep_local == true && recovered?.refetchable != true)
+        precondition(Item(recovered!).contentPolicy == .downloadEagerlyAndKeepDownloaded,
+                     "an accepted local edit must remain non-evictable after persistent source catalog replay")
         let entry = try readReceived("edited", in: root)[file.id]!
         precondition(entry.modified_locally == true && entry.materialized && entry.handed_off)
         precondition(entry.fetching == 0)

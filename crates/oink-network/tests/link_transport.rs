@@ -349,6 +349,66 @@ async fn negotiated_config_and_reliable_frames_preserve_unknown_fields() {
 }
 
 #[tokio::test]
+async fn handle_cancellation_preserves_its_cause_before_any_module_close_command() {
+    let mut a = Node::start().await;
+    let mut b = Node::start().await;
+    let (ac, bc) = connect(&mut a, &mut b).await;
+    a.ready(ac.link).await;
+    b.ready(bc.link).await;
+    for (ordinal, cancel_writer) in [(1, true), (2, false)] {
+        let (tx, _) = a
+            .network
+            .open_stream(ac.link, Priority::Normal, tag(ordinal), queues().0, None)
+            .unwrap();
+        tx.post(reliable(1)).unwrap();
+        let (mut rx, _) = b
+            .inbound()
+            .await
+            .accept(queues().1, QueueSpec::datagram(StreamKind::Diagnostics));
+        assert_eq!(rx.next().await.unwrap(), reliable(1));
+        let (port, expected) = if cancel_writer {
+            let expected = rx.id();
+            tx.cancel();
+            drop(tx);
+            (&mut b.module, expected)
+        } else {
+            let expected = tx.id();
+            rx.cancel();
+            drop(rx);
+            timeout(Duration::from_secs(2), async {
+                while tx.post(reliable(1)) != Err(PostError::Closed) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(tx.is_cancelled(), "post-before-event must preserve the peer's cause");
+            (&mut a.module, expected)
+        };
+        // The native owner closes its handle before the ordinary stream task
+        // handles a notice. Intentionally never send LinkLayer::close_stream:
+        // the queue alone must preserve Cancelled through RESET/STOP_SENDING.
+        timeout(Duration::from_secs(2), async {
+            loop {
+                match port.next().await.unwrap() {
+                    ModuleEvent::StreamClosed { stream, reason } if stream == expected => {
+                        assert_eq!(reason, StreamClosed::Peer(StreamCode::Cancelled));
+                        break;
+                    }
+                    ModuleEvent::LinkLost { reason, .. } => panic!("cancellation lost the link: {reason:?}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(a.network.links().by_peer(b.network.id()).unwrap().link, ac.link);
+        assert_eq!(b.network.links().by_peer(a.network.id()).unwrap().link, bc.link);
+    }
+    tokio::join!(a.network.stop(), b.network.stop());
+}
+
+#[tokio::test]
 async fn invalid_business_channel_isolated_without_losing_control() {
     let mut a = Node::start().await;
     let mut b = Node::start().await;

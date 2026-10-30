@@ -234,6 +234,8 @@ struct Record {
     hidden: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     keep_local: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refetchable: Option<bool>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Catalog {
@@ -289,8 +291,33 @@ impl Catalog {
                 break;
             }
         }
+        let mut linked: HashSet<String> = self
+            .source
+            .as_ref()
+            .into_iter()
+            .flat_map(|source| {
+                source
+                    .roots
+                    .iter()
+                    .filter(|root| !source.fulfilled.iter().any(|once| once.node == root.id))
+            })
+            .filter_map(|node| self.records.iter().find(|record| record.node == Some(node.id.0)))
+            .map(|record| record.id.clone())
+            .collect();
+        for _ in 0..256 {
+            let before = linked.len();
+            for record in &self.records {
+                if linked.contains(&record.parent) {
+                    linked.insert(record.id.clone());
+                }
+            }
+            if before == linked.len() {
+                break;
+            }
+        }
         for record in &mut self.records {
             record.keep_local = pinned.contains(&record.id).then_some(true);
+            record.refetchable = linked.contains(&record.id).then_some(true);
         }
     }
 }
@@ -1051,6 +1078,7 @@ fn node_record_with_aliases(
         children: None,
         hidden: None,
         keep_local: None,
+        refetchable: None,
     })
 }
 /// A native URL can be read long after its metadata was enumerated. Persist
@@ -1412,6 +1440,7 @@ fn received_source_catalog(
         children: None,
         hidden: None,
         keep_local: None,
+        refetchable: None,
     });
     save_catalog(&path, &catalog)?;
     Ok(id)
@@ -1480,6 +1509,7 @@ fn prepare_batch_with_root(
         children: Some(roots.len() as u64),
         hidden: None,
         keep_local: None,
+        refetchable: None,
     }];
     let mut entries = Vec::new();
     for node in roots {
@@ -2918,6 +2948,7 @@ mod tests {
             children: None,
             hidden: None,
             keep_local: None,
+            refetchable: None,
         };
         catalog.records.push(file.clone());
         save_catalog(&path, &catalog).unwrap();
@@ -3047,6 +3078,13 @@ mod tests {
         assert_eq!(parent.modified, first_catalog.received_at.map(|at| at as i64));
         assert!(parent.modified.unwrap() > 1_700_000_000_000);
         assert_eq!(parent.hidden, None);
+        let linked_record = first_catalog
+            .records
+            .iter()
+            .find(|record| record.node == Some(1))
+            .unwrap();
+        assert_eq!(linked_record.refetchable, Some(true));
+        assert_eq!(linked_record.keep_local, None);
         let source_path = root.path().join(format!("{}.json", parent.parent));
         let source: Catalog = serde_json::from_slice(&std::fs::read(&source_path).unwrap()).unwrap();
         assert_eq!(source.records.len(), 1);
@@ -3357,6 +3395,7 @@ mod tests {
                 children: None,
                 hidden: None,
                 keep_local: None,
+                refetchable: None,
             }],
             source: None,
             settlement: Default::default(),

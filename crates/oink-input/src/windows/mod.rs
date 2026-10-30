@@ -1,6 +1,7 @@
 //! Windows 实现：WH_KEYBOARD_LL / WH_MOUSE_LL 截获、Raw Input 区分设备、SendInput 注入。
 //!
-//! - 截获：专用线程 + 消息循环（[`hook`]）。自己注入的事件用 `dwExtraInfo` = [`inject::INJECT_TAG`] 识别并跳过；
+//! - 截获：专用线程 + 消息循环（[`hook`]）。自身事件用 `dwExtraInfo` 的 [`inject::INJECT_TAG`]
+//!   或光标形状刷新专用 [`inject::SHAPE_REFRESH_TAG`] 识别并跳过；
 //!   其他程序注入的事件（`LLMHF_INJECTED` / `LLKHF_INJECTED`）照常上报，来源为 `Unknown`。
 //! - `Remote` 模式：鼠标移动一律吞掉，位移 = 钩子里的 `pt` − 移动前的光标位置（即停靠点，
 //!   系统已按指针速度与「提高指针精确度」处理），事件不带光标位置；光标隐藏方案见 [`cursor`]。

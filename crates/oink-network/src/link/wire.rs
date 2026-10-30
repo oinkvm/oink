@@ -165,6 +165,11 @@ impl Writer {
         }
     }
     pub fn abort(&mut self, why: StreamCode) {
+        if why == StreamCode::Cancelled
+            && let Source::User(queue) = &self.source
+        {
+            queue.cancel();
+        }
         if let Some(stream) = &mut self.stream {
             let _ = stream.reset(code(why));
         }
@@ -357,6 +362,11 @@ impl Reader {
         }
     }
     pub fn stop(&mut self, why: StreamCode) {
+        if why == StreamCode::Cancelled
+            && let Some(queue) = &self.queue
+        {
+            queue.cancel();
+        }
         let _ = self.stream.stop(code(why));
         if let Some(q) = &self.queue {
             q.close();

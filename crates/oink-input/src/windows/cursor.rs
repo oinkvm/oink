@@ -716,8 +716,10 @@ fn nudge(p: POINT) {
     if test_native::refresh(p) {
         return;
     }
-    let _ = super::warp::place(POINT { x: p.x + 1, y: p.y });
-    let _ = super::warp::place(p);
+    // Tag the source of both moves. Their intermediate coordinate may be read
+    // back later, but must not bias every physical step in a frozen session.
+    let _ = super::warp::refresh(POINT { x: p.x + 1, y: p.y });
+    let _ = super::warp::refresh(p);
 }
 
 /// 启动遮罩线程：创建（隐藏的）遮罩窗口，一直取消息，收到 `WM_CLOSE` 时销毁窗口并退出。

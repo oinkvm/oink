@@ -9,6 +9,7 @@ import unittest
 from macos_launch_smoke import launch_smoke
 
 
+@unittest.skipUnless(sys.platform == 'darwin', 'macOS packaging launch gate uses a shebang stub')
 class LaunchSmokeTests(unittest.TestCase):
     def run_stub(self, body):
         with tempfile.TemporaryDirectory() as directory:
