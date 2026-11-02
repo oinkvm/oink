@@ -11,14 +11,6 @@
 
 Oink, short for "Oink Is Not only a KVM", is modern software that builds a peer-to-peer sharing network across multiple Windows and Mac computers. Use the keyboard, mouse and trackpad of any device to control any nearby device, with the same native feel everywhere; play the audio of several devices through the speakers or headphones connected to one of them; share the clipboard and drag and drop between devices; discover devices on the local network automatically; all traffic is encrypted by default.
 
-> Oink is a personal project. All of its code was written by AI (thanks to Claude Code and Codex); the human manages the project, sets the technical direction and encourages the AI. The project has not been thoroughly tested in diverse environments, especially:
->
-> 1. Windows computers with multiple displays
-> 2. Windows laptops with touchpads
-> 3. Windows 10, and Macs that are not on an up-to-date macOS
->
-> Some features may not work in your environment. Many thanks to everyone who sends feedback.
-
 ## Install
 
 Get installers and matching source from [GitHub Releases](https://github.com/oinkvm/oink/releases).
@@ -53,9 +45,6 @@ Yes, but trackpads on Windows have not been tested.
 
 **Does it support clipboard sharing and drag and drop across operating systems?**\
 Yes. The clipboard is synced across devices automatically, and you can drag text, images and files directly from one device to another — even straight into apps such as Chrome.
-
-**Does Oink support Linux?**\
-Not yet. It may be added in the future.
 
 **Do I need to buy a license for personal or commercial use?**\
 No. Oink is free software released under GPL-3.0-only with additional terms, so you can use it for any personal or commercial purpose without asking for any further license. If you distribute Oink or a modified version of it, you must provide the complete source code under the same license, keep the original author attribution and license notices, and mark your changes; under the additional terms you also may not use the Oink name to promote derived products. Modifying Oink only for your own use, without distributing it, carries none of these obligations.
