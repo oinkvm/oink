@@ -3,17 +3,22 @@ import { useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { VisuallyHidden, animate } from 'oink-ui';
 import type { Platform } from '../window/DesktopWindow';
-export type ShortcutId = 'microphoneMute' | 'recall' | 'lock' | 'lockEscape' | 'pauseSelf' | 'pauseAll' | 'game' | `move:${string}`;
+export type ShortcutId = 'remoteWindowsLock' | 'microphoneMute' | 'recall' | 'lock' | 'lockEscape' | 'pauseSelf' | 'pauseAll' | 'game' | `move:${string}`;
 export interface ShortcutPref {
     on: boolean;
     keys: string;
 }
 export const SHORTCUTS: Array<{
     id: ShortcutId;
+    only?: Platform;
     label: string;
     desc: string;
     keywords: string;
 }> = [
+    { id: 'remoteWindowsLock', only: 'win',
+      get label() { return tr('锁定远程 Windows 计算机'); },
+      get desc() { return tr('按下此快捷键，锁定指针所在 Windows 计算机，Win+L 保持锁定自身'); },
+      get keywords() { return tr('光标 鼠标 锁定 解锁'); } },
     { id: 'recall', get label() {
             return tr('召回指针到本机');
         }, get desc() {
@@ -47,6 +52,7 @@ export const SHORTCUTS: Array<{
         }, get keywords() { return tr('游戏 手柄 3D'); } },
 ];
 export const DEFAULT_SHORTCUTS: Record<ShortcutId, ShortcutPref> = {
+    remoteWindowsLock: { on: true, keys: 'Meta+Shift+L' },
     microphoneMute: { on: false, keys: 'Control+Alt+M' },
     recall: { on: true, keys: 'Control+Alt+H' },
     lock: { on: true, keys: 'Control+Alt+L' },
@@ -55,7 +61,7 @@ export const DEFAULT_SHORTCUTS: Record<ShortcutId, ShortcutPref> = {
     pauseAll: { on: true, keys: 'Control+Alt+Shift+P' },
     game: { on: true, keys: 'Control+Alt+G' },
 };
-const actions = {toggle_microphone_mute:'microphoneMute',return_pointer_home:'recall',lock_focus:'lock',lock_escape:'lockEscape',toggle_sharing:'pauseSelf',pause_all:'pauseAll',toggle_game_mode:'game'} as const;
+const actions = {lock_remote_windows:'remoteWindowsLock',toggle_microphone_mute:'microphoneMute',return_pointer_home:'recall',lock_focus:'lock',lock_escape:'lockEscape',toggle_sharing:'pauseSelf',pause_all:'pauseAll',toggle_game_mode:'game'} as const;
 export function shortcutId(h: import('../api/types').Hotkey): ShortcutId | undefined {
     return h.action === 'move_pointer_to' && h.device ? `move:${h.device}` : actions[h.action as keyof typeof actions];
 }

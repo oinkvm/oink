@@ -193,4 +193,5 @@ message_registry! {
     0x0338 => CloudLinkSelect(CloudLinkSelect), [Route {kind:4, transport:Transport::Low, extra_capabilities:&[]}, Route {kind:10, transport:Transport::Low, extra_capabilities:&["oink.drag/1"]}], ["oink.clipboard/1", "oink.low/1", "oink.cloud-file-links/1"], Suspend;
     0x0339 => CloudLinkRead(CloudLinkRead), [Route {kind:4, transport:Transport::Low, extra_capabilities:&[]}, Route {kind:10, transport:Transport::Low, extra_capabilities:&["oink.drag/1"]}], ["oink.clipboard/1", "oink.low/1", "oink.cloud-file-links/1"], Suspend;
     0x061a => AudioMediaState(AudioMediaState), [Route {kind:5, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.audio/1", "oink.audio.media-health/1"], Suspend;
+    0x0111 => ControlLockRemoteWindows(ControlLockRemoteWindows), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1", "oink.input.lock-remote-windows/1"], Suspend;
 }

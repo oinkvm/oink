@@ -14,7 +14,7 @@ beforeEach(()=>{
   vi.clearAllMocks();localStorage.clear();
   mocks.group.mockResolvedValue({members:[]});
   mocks.state={localPreferences:{notification_level:'default',ui_language:'system',theme_mode:'system',theme_accent:{light:'#2E7BFF',dark:'#5599FF'},show_status_icon:true,confirm_quit:true,log_level:'info',log_max_mb:1024},
-    input:{event_frequency:'unlimited',wake_displays_on_input:true,cursor_trail:false,accept_contacts:true,mac_scroll_feel:true,device_gain:1,emergency_hold_ms:5000,hotkeys:[]},
+    input:{event_frequency:'unlimited',wake_displays_on_input:true,cursor_trail:false,accept_contacts:true,touchpad_injection_enabled:true,mac_scroll_feel:true,device_gain:1,emergency_hold_ms:5000,hotkeys:[]},
     clipboard:{text:true,rich_text:true,images:true,files:true,custom:true},audio:{settings:{keep_local_playback:true,receive_output:null,forwarding_enabled:true}}};
   mocks.call.mockResolvedValue(mocks.state.localPreferences);
 });
@@ -47,6 +47,14 @@ it.each(['macos','windows'])('persists a separate custom map through preset chan
   expect(stored[target].keyboard.caps_tap_hold).toEqual({tap:0,hold:0});
   if(mac)expect(stored[target].keyboard.table).toContainEqual({from:0xff0003,to:0});
   expect(localStorage.getItem('oink:prefs')).toBeNull();
+});
+it('keeps the stored touchpad preference while injection is temporarily unavailable', async()=>{
+  mocks.state.input={...(mocks.state.input as object),accept_contacts:false,touchpad_injection_enabled:true,contacts_injection_available:false};
+  const {result}=renderHook(usePreferences);
+  expect(result.current.prefs.touchpadInject).toBe(true);
+  await act(async()=>result.current.set('keepAwake',false));
+  expect(mocks.input).toHaveBeenCalledExactlyOnceWith({wake_displays_on_input:false});
+  expect(result.current.prefs.touchpadInject).toBe(true);
 });
 it('defaults external input forwarding off and persists only its local input patch', async()=>{
   const {result}=renderHook(usePreferences);
@@ -215,4 +223,38 @@ it('reloads the DS_Store preference from the device clipboard settings without a
   mocks.state={...mocks.state,clipboard:null};
   const unavailable=renderHook(usePreferences);
   expect(unavailable.result.current.canEdit('removeDsStore')).toBe(false);
+});
+
+it('defaults foreground capture on for old settings and saves only the local edited field',async()=>{
+  mocks.input.mockImplementation(async patch=>{
+    mocks.state={...mocks.state,input:{...(mocks.state.input as object),...patch}};
+    mocks.listeners.forEach(listener=>listener());
+  });
+  const mounted=renderHook(usePreferences);
+  expect(mounted.result.current.prefs.takeForegroundOnLeave).toBe(true);
+  expect(mounted.result.current.canEdit('takeForegroundOnLeave')).toBe(true);
+  await act(async()=>mounted.result.current.set('takeForegroundOnLeave',false));
+  expect(mocks.input).toHaveBeenCalledExactlyOnceWith({take_foreground_on_leave:false});
+  mounted.unmount();
+  const reloaded=renderHook(usePreferences);
+  expect(reloaded.result.current.prefs.takeForegroundOnLeave).toBe(false);
+  expect(reloaded.result.current.prefs.forwardInjectedInput).toBe(false);
+  expect(mocks.transform).not.toHaveBeenCalled();
+  expect(mocks.call).not.toHaveBeenCalled();
+  expect(localStorage.getItem('oink:prefs')).toBeNull();
+});
+
+it.each(['macos','windows'])('defaults source wheel lines on and persists only its local patch on %s', async platform => {
+  mocks.state={...mocks.state,boot:{platform}};
+  const {result,unmount}=renderHook(usePreferences);
+  expect(result.current.prefs.forwardWheelByLines).toBe(true);
+  expect(result.current.canEdit('forwardWheelByLines')).toBe(true);
+  await act(async()=>result.current.set('forwardWheelByLines',false));
+  expect(mocks.input).toHaveBeenCalledExactlyOnceWith({forward_wheel_by_lines:false});
+  expect(mocks.transform).not.toHaveBeenCalled();
+  expect(localStorage.getItem('oink:prefs')).toBeNull();
+  unmount();
+  mocks.state={...mocks.state,input:{...(mocks.state.input as object),forward_wheel_by_lines:false}};
+  const reloaded=renderHook(usePreferences);
+  expect(reloaded.result.current.prefs.forwardWheelByLines).toBe(false);
 });

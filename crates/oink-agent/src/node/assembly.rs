@@ -324,6 +324,7 @@ fn application_profile() -> oink_network::negotiation::OfferProfile {
                 "oink.input.accessibility/1",
                 "oink.input.touchpad-options/1",
                 "oink.input.keymap-none/1",
+                oink_routing::control::WINDOWS_LOCK_CAPABILITY,
                 "oink.input.scroll-pixels/1",
                 "oink.aim/1",
                 "oink.notify/1",

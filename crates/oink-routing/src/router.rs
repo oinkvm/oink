@@ -56,7 +56,12 @@ mod hidden;
 mod input_pair;
 pub(crate) mod keyboard;
 mod local_modes;
+mod windows_lock;
+pub use windows_lock::WindowsLockPermit;
 mod screen;
+mod source_foreground;
+#[cfg(test)]
+mod windows_lock_tests;
 use game::GameState;
 pub use game::{GameMode, GameModeStatus};
 pub use game_capture::PointerCaptureObservation;
@@ -229,6 +234,8 @@ pub enum Output {
     },
     /// 注入到本机。
     Inject(InjectEvent),
+    /// Validated explicit Windows lock, ordered with key releases.
+    LockWindows(WindowsLockPermit),
     /// 切换本机截获模式（焦点离开本机时 `Remote`，回到本机且不知道光标落点时 `Local`）。
     SetMode(CaptureMode),
     /// Ordered native confinement; None releases only our own lease.
@@ -489,6 +496,7 @@ pub struct Router {
     projection_gesture: bool,
     capture_available: bool,
     keyboard: keyboard::Keyboard,
+    windows_lock: windows_lock::State,
     screen_local: bool,
     native_constraint: Option<Rect>,
     last_enabled_focus: Option<DeviceId>,
@@ -695,6 +703,7 @@ impl Router {
             volume_targets: HashMap::new(),
             trail_probe: None,
             hotkeys: Hotkeys::default(),
+            windows_lock: Default::default(),
             keys: HashMap::new(),
             buttons: HashMap::new(),
             button_diagnostics: Default::default(),
@@ -1119,6 +1128,7 @@ impl Router {
             self.cancel_caps();
         }
         self.paused = paused;
+        self.refresh_windows_locks();
         self.publish_lock_escape();
         self.last_user_activity = None;
         self.reset_game_focus();
@@ -1250,6 +1260,7 @@ impl Router {
             self.cancel_caps();
         }
         self.capture_available = available;
+        self.refresh_windows_locks();
         if !available {
             if self.locked_device() == Some(self.me()) {
                 self.end_focus_lock();
@@ -1572,6 +1583,7 @@ impl Router {
 
     /// 取走待执行的输出（按产生顺序）。
     pub fn drain_outputs(&mut self) -> Vec<Output> {
+        self.refresh_windows_locks();
         self.sync_entry_protection();
         self.application_sync(self.dnd.now);
         // 任何入口都可能改变焦点、按钮、游戏模式或设置：交出输出前统一同步拖尾状态。
@@ -1678,11 +1690,9 @@ impl Router {
             }
         }
         self.cancel_fn_for_function_row();
-        if self.cfg.os == Os::MacOS && matches!(ev.event, InputEvent::Key { code, .. } if code.is_brightness()) {
-            // Brightness NX events are observed only to retire a mapped Fn chord.
-            // Their native local down/repeat/up path remains untouched.
-            self.source_decision(&ev.event, Disposition::Pass, decision_start);
-            return Disposition::Pass;
+        if let Some(disposition) = self.brightness_event(&ev.event) {
+            self.source_decision(&ev.event, disposition, decision_start);
+            return disposition;
         }
         // A real event still counts as user activity when gap travel drops it.
         // Reconciled modifiers and other synthetic input never enter that path.
@@ -1778,7 +1788,13 @@ impl Router {
                 }
                 disposition
             }
-            InputEvent::Scroll { dx, dy, unit, phase } => self.local_scroll(ev.source, dx, dy, unit, phase),
+            InputEvent::Scroll {
+                dx,
+                dy,
+                unit,
+                phase,
+                wheel_steps,
+            } => self.local_scroll(ev.source, dx, dy, unit, phase, wheel_steps),
             InputEvent::Gesture(g) => self.local_gesture(ev.source, g),
         };
         let disposition = if local_mouse_woke && disposition == Disposition::Pass {
@@ -2174,6 +2190,12 @@ impl Router {
                 .hotkeys
                 .matching(code, Mods::held(self.keys.keys().copied()))
                 .filter(|action| *action != "pause_all")
+                .filter(|action| {
+                    *action != "lock_remote_windows"
+                        || code != KeyCode::keyboard(0x0f)
+                        || Mods::held(self.keys.keys().copied()) != Mods::META
+                })
+                .filter(|action| *action != "lock_remote_windows" || self.windows_lock_target().is_some())
             {
                 // 全局快捷键：这个键不交给任何设备，它的重复与抬起也吞掉（`Dropped`）；已经交出去的
                 // 修饰键照常在原目标抬起，不会卡键。
@@ -2184,6 +2206,9 @@ impl Router {
                 self.mask_menu_keys();
                 // Capture the focus/epoch at the physical key press, before later
                 // input or an ordinary-thread hotkey dispatcher can change it.
+                if action == "lock_remote_windows" {
+                    self.request_windows_lock(self.windows_lock_target().expect("matched supported Windows target"));
+                }
                 if action == "lock_focus" {
                     self.toggle_locked();
                 }
@@ -2283,10 +2308,8 @@ impl Router {
             } else if let Some(mapped) = self.held.get(&self.me()).and_then(|h| h.keys.get(&code)).copied()
                 && repeatable(mapped)
             {
-                self.out.push(Output::Inject(InjectEvent::Key {
-                    code: mapped,
-                    pressed: true,
-                }));
+                self.out
+                    .push(Output::Inject(self.native_key_event(self.me(), mapped, true)));
             }
         }
         let remote: Vec<DeviceId> = targets
@@ -2312,6 +2335,7 @@ impl Router {
         dy: f64,
         unit: ScrollUnit,
         phase: ScrollPhase,
+        wheel_steps: Option<Point>,
     ) -> Disposition {
         // A focus change poisons the whole remaining finger/momentum sequence.
         // Unphased wheel steps are independent and do not reset a trackpad pan.
@@ -2365,6 +2389,11 @@ impl Router {
             ScrollUnit::Pixel => (LEGACY_SCROLL_REFERENCE_PER_PIXEL, ScrollAmount::Reference),
             ScrollUnit::Line => (self.feel.wheel_lines_per_notch.unwrap_or(1.0), ScrollAmount::Lines),
         };
+        let wheel_steps = (!self.cfg.settings.forward_wheel_by_lines
+            && source == SourceKind::Mouse
+            && phase == ScrollPhase::None
+            && unit == ScrollUnit::Line)
+            .then(|| wheel_steps.unwrap_or(Point::new(dx, dy)));
         self.send(
             d,
             Message::Input(InputMsg::Scroll {
@@ -2373,6 +2402,7 @@ impl Router {
                 dy: dy * k,
                 unit: amount,
                 phase,
+                wheel_steps,
             }),
         );
         Disposition::Swallow
@@ -2590,6 +2620,7 @@ impl Router {
                     cursor_hiding_cause_available,
                 );
             }
+            ControlMsg::LockRemoteWindows(request) => self.receive_windows_lock(from, request),
             ControlMsg::MovePointer { epoch, target } => {
                 if self.holder == self.me() && self.epoch == epoch && self.group_focus_status().participating {
                     let _ = self.move_pointer_to(target);
@@ -2933,6 +2964,7 @@ impl Router {
                 dy,
                 unit,
                 phase,
+                wheel_steps,
             } => {
                 // Retain a forwarding route only while its actual holder has
                 // not changed. Focus changes clear it, so late finger/momentum
@@ -2962,7 +2994,7 @@ impl Router {
                 {
                     return;
                 }
-                self.inject_scroll(origin, source, dx, dy, unit, phase);
+                self.inject_scroll(origin, source, dx, dy, unit, phase, wheel_steps);
             }
             InputMsg::HeldSync { keys, buttons } => self.held_sync(from, origin, &keys, &buttons),
             InputMsg::KeyRepeat { code, n } => self.remote_repeat(origin, hops, code, n, msg),
@@ -3113,10 +3145,8 @@ impl Router {
         if self.send_volume(origin, code, true, true) {
             return;
         }
-        self.out.push(Output::Inject(InjectEvent::Key {
-            code: mapped,
-            pressed: true,
-        }));
+        self.out
+            .push(Output::Inject(self.native_key_event(origin, mapped, true)));
     }
 
     /// 源机的触摸板 Gesture 到达目标端：开始时转发出去的，后续阶段仍跟着转发；
@@ -3278,6 +3308,7 @@ impl Router {
         self.hand_off(r.to, Some(trail_head));
     }
 
+    #[allow(clippy::too_many_arguments)] // Scroll fields plus the original source identity.
     fn inject_scroll(
         &mut self,
         origin: DeviceId,
@@ -3286,6 +3317,7 @@ impl Router {
         dy: f64,
         unit: ScrollAmount,
         phase: ScrollPhase,
+        wheel_steps: Option<Point>,
     ) {
         let s = &self.cfg.settings;
         let invert =
@@ -3297,6 +3329,20 @@ impl Router {
         });
         let mpu = LEGACY_SCROLL_REFERENCE_PER_PIXEL;
         let lpn = self.feel.wheel_lines_per_notch.filter(|v| *v > 0.0).unwrap_or(1.0);
+        // OFF events carry their own native steps. The base Lines remain intact
+        // for old receivers; absence deliberately keeps the original target-line
+        // mapping. Never reconstruct the mode or steps from mutable peer state.
+        if let Some(steps) = wheel_steps
+            .filter(|_| source == SourceKind::Mouse && phase == ScrollPhase::None && unit == ScrollAmount::Lines)
+        {
+            self.out.push(Output::Inject(InjectEvent::Scroll {
+                dx: steps.x * sign * s.remote_scroll_speed,
+                dy: steps.y * sign * s.remote_scroll_speed,
+                unit: ScrollUnit::Line,
+                phase,
+            }));
+            return;
+        }
         // A fixed 32 source pixels per line retains the default wheel fallback
         // without feeding calibrated screen size back into pixel scrolling.
         let k = match (unit, out_unit) {
@@ -3497,6 +3543,12 @@ impl Router {
     }
 
     fn target_key(&mut self, origin: DeviceId, code: KeyCode, pressed: bool) {
+        // Source-device brightness gestures are meaningful only to a Mac target.
+        // Ignore them before transforms/held state, so Windows never injects an
+        // unsupported key or reports a platform mapping error.
+        if self.cfg.os == Os::Windows && code.is_brightness() {
+            return;
+        }
         if !pressed {
             self.application_key(origin, 0, code, None, false);
             self.press_routes.remove(&(origin, HeldItem::Key(code)));
@@ -3554,10 +3606,8 @@ impl Router {
             let rc = self.key_refs.entry(mapped).or_insert(0);
             *rc += 1;
             if *rc == 1 {
-                self.out.push(Output::Inject(InjectEvent::Key {
-                    code: mapped,
-                    pressed: true,
-                }));
+                self.out
+                    .push(Output::Inject(self.native_key_event(origin, mapped, true)));
             }
         } else {
             let Some(mapped) = h.keys.remove(&code) else {
@@ -3835,6 +3885,7 @@ impl Router {
                         dy: 0.,
                         unit: ScrollAmount::Reference,
                         phase,
+                        wheel_steps: None,
                     }),
                 ),
                 Target::Local => self.out.push(Output::Inject(InjectEvent::Scroll {
@@ -4434,6 +4485,7 @@ impl Router {
     }
 
     fn push_focus_status(&mut self) {
+        self.refresh_windows_locks();
         self.reset_game_focus();
         let info = self.focus();
         self.out.push(Output::Status(StatusEvent::Focus(info)));
@@ -4576,6 +4628,9 @@ mod scroll_tests;
 
 #[cfg(test)]
 mod transform_tests;
+
+#[cfg(test)]
+mod brightness_tests;
 
 #[cfg(test)]
 mod trigger_tests;

@@ -49,6 +49,9 @@ impl Owner {
         let target = peer.anchor()?;
         self.lookups
             .insert(link, (source, Instant::now() + Duration::from_secs(10)));
+        if !self.sessions[&link].ready {
+            self.sessions.get_mut(&link).unwrap().deadline = Some(Instant::now() + ADMISSION_TIMEOUT);
+        }
         self.links.set_old_member_lane(link, true);
         self.migration(source, Some(target), api::MigrationPhase::ProofWaiting, None);
         self.send(
@@ -273,6 +276,11 @@ impl Owner {
             Message::ConfigPairObjectChunk(chunk) => {
                 let digest = chunk.digest()?.0;
                 self.proof_objects.chunk(id.0, chunk, Instant::now())?;
+                // Staging accepts only a new, nonempty, contiguous chunk. A
+                // replay cannot extend an otherwise stalled admission lifetime.
+                if !self.sessions[&id].ready {
+                    self.sessions.get_mut(&id).unwrap().deadline = Some(Instant::now() + ADMISSION_TIMEOUT);
+                }
                 if let Some(expected) = self.proof_expected.get_mut(&(id, digest)) {
                     expected.deadline = Instant::now() + Duration::from_secs(10);
                 }
@@ -438,6 +446,9 @@ impl Owner {
         }
         if self.proof_expected.keys().filter(|(id, _)| *id == link).count() >= 2 {
             return Err(v1::ErrorCode::LimitExceeded.into());
+        }
+        if !self.sessions[&link].ready {
+            self.sessions.get_mut(&link).unwrap().deadline = Some(Instant::now() + ADMISSION_TIMEOUT);
         }
         self.proof_expected.insert(
             key,

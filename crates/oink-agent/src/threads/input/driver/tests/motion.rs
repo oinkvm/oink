@@ -79,6 +79,7 @@ fn pending_motion_precedes_buttons_keys_scroll_and_focus_handoff_without_waiting
             dy: 1.,
             unit: oink_routing::input::ScrollAmount::Lines,
             phase: ScrollPhase::None,
+            wheel_steps: None,
         }),
         Message::Control(ControlMsg::FocusEnter {
             epoch: 2,

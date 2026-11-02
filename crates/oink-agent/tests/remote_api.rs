@@ -360,6 +360,7 @@ fn partial_preference_commands_persist_only_explicit_local_choices() {
     let read =
         || -> Value { serde_json::from_slice(&std::fs::read(dir.path().join("settings.json")).unwrap()).unwrap() };
     let before = read();
+    assert!(remote.input_settings().unwrap().forward_wheel_by_lines);
     assert_eq!(before["local"], json!({}));
     remote
         .set_ui_preferences(serde_json::from_value(json!({"show_status_icon":true})).unwrap())
@@ -386,7 +387,7 @@ fn partial_preference_commands_persist_only_explicit_local_choices() {
         .unwrap();
     remote
         .set_input_settings(
-            serde_json::from_value(json!({"event_frequency":"hz125","emergency_hold_ms":5000})).unwrap(),
+            serde_json::from_value(json!({"event_frequency":"hz125","emergency_hold_ms":5000,"forward_wheel_by_lines":false,"forward_injected_input":true})).unwrap(),
         )
         .unwrap();
     let applied = read();
@@ -395,10 +396,13 @@ fn partial_preference_commands_persist_only_explicit_local_choices() {
         json!({
             "show_status_icon":true,"confirm_quit":false,"theme_accent":{"dark":"#112233"},
             "clipboard":{"send":false},"audio":{"keep_local_playback":false,"receive_output":null},
-            "event_frequency":"hz125","emergency_hold_ms":5000
+            "event_frequency":"hz125","emergency_hold_ms":5000,
+            "routing":{"forward_wheel_by_lines":false,"forward_injected_input":true}
         })
     );
     assert_eq!(applied["device_options_cbor"], before["device_options_cbor"]);
+    assert!(!remote.input_settings().unwrap().forward_wheel_by_lines);
+    assert!(remote.input_settings().unwrap().forward_injected_input);
     assert_eq!(remote.ui_preferences().unwrap().theme_accent.light.as_str(), "#FF6B8E");
     assert!(!remote.clipboard_settings().unwrap().send);
     let wire = serde_json::to_value(remote.clipboard_settings().unwrap()).unwrap();
@@ -443,6 +447,53 @@ fn partial_preference_commands_persist_only_explicit_local_choices() {
     assert!(!config.settings.confirm_quit);
     assert!(config.settings.show_status_icon);
     assert!(!config.settings.clipboard.unwrap().send);
+    rt.shutdown_timeout(Duration::from_millis(200));
+}
+
+#[test]
+fn unrelated_input_preferences_preserve_saved_hotkeys_without_projected_defaults() {
+    let _scenario = test_watchdog::Scenario::new(
+        module_path!(),
+        "unrelated_input_preferences_preserve_saved_hotkeys_without_projected_defaults",
+    );
+    use serde_json::{Value, json};
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let node = rt.block_on(start(dir.path()));
+    let server = rt.block_on(Server::start_on(node.clone(), 0)).unwrap();
+    let remote = RemoteApi::new(dir.path());
+    let read =
+        || -> Value { serde_json::from_slice(&std::fs::read(dir.path().join("settings.json")).unwrap()).unwrap() };
+    let hotkeys = json!([
+        {"action":"toggle_sharing","keys":["Ctrl","Alt","S"],"enabled":true},
+        {"action":"lock_remote_windows","keys":["Meta","Shift","L"],"enabled":false},
+        {"action":"lock_escape","keys":["Alt"],"enabled":true}
+    ]);
+    remote
+        .set_input_settings(serde_json::from_value(json!({"hotkeys":hotkeys})).unwrap())
+        .unwrap();
+    assert_eq!(read()["local"]["hotkeys"], hotkeys);
+    // The API projects a missing new action's default and, on Mac, hides the
+    // Windows-only action. Neither projection is a user edit to the saved list.
+    assert!(
+        remote
+            .input_settings()
+            .unwrap()
+            .hotkeys
+            .iter()
+            .any(|h| h.action == oink_agent::api::HotkeyAction::ToggleMicrophoneMute)
+    );
+    for value in [false, true] {
+        remote
+            .set_input_settings(serde_json::from_value(json!({"forward_wheel_by_lines":value})).unwrap())
+            .unwrap();
+        assert_eq!(read()["local"]["hotkeys"], hotkeys);
+        assert_eq!(read()["local"]["routing"]["forward_wheel_by_lines"], value);
+    }
+    rt.block_on(server.close());
+    rt.block_on(node.shutdown());
+    let loaded = oink_agent::config::AgentConfig::load_from(dir.path()).unwrap();
+    assert_eq!(serde_json::to_value(loaded.settings.hotkeys.unwrap()).unwrap(), hotkeys);
     rt.shutdown_timeout(Duration::from_millis(200));
 }
 

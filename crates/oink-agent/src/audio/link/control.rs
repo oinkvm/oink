@@ -1145,7 +1145,12 @@ impl Owner {
         let _ = self.streams.send(peer, &Message::AudioPreparedAck(ack), Instant::now());
     }
     pub(super) fn message(&mut self, peer: DeviceId, message: Message) {
-        if self.driver_change_active() {
+        let driver_change = self.driver_change_active();
+        // M0 stays connected while the installer owns native audio. Keep the
+        // latest authenticated source intent: dropping its one reliable offer
+        // leaves both peers waiting forever after maintenance. prepare_peer
+        // still fences device/session admission until the guard is released.
+        if driver_change && !matches!(&message, Message::AudioSourceRouteOffer(_)) {
             return;
         }
         if self.update_suspended {
@@ -1162,18 +1167,19 @@ impl Owner {
         self.microphone_message(peer, &message);
         match message {
             Message::AudioSourceRouteOffer(offer) => {
-                let reason =
-                    if offer.source() != Ok(current_boot.clone()) || offer.receiver() != Ok(boot(self.links.boot())) {
-                        Some(Failure::StaleBoot)
-                    } else if self.resolution.owner() != Some(self.links.id()) {
-                        Some(Failure::NotExit)
-                    } else if self.resolution.stamp().map(Stamp::to_wire) != offer.exit_claim().ok() {
-                        Some(Failure::RouteChanged)
-                    } else if self.paused || self.power_state.sleeping || self.bound_output.is_none() {
-                        Some(Failure::OutputUnavailable)
-                    } else {
-                        None
-                    };
+                let reason = if offer.source() != Ok(current_boot.clone())
+                    || offer.receiver() != Ok(boot(self.links.boot()))
+                {
+                    Some(Failure::StaleBoot)
+                } else if self.resolution.owner() != Some(self.links.id()) {
+                    Some(Failure::NotExit)
+                } else if self.resolution.stamp().map(Stamp::to_wire) != offer.exit_claim().ok() {
+                    Some(Failure::RouteChanged)
+                } else if self.paused || self.power_state.sleeping || (!driver_change && self.bound_output.is_none()) {
+                    Some(Failure::OutputUnavailable)
+                } else {
+                    None
+                };
                 if let Some(reason) = reason {
                     self.refuse_offer(peer, offer, reason);
                     return;

@@ -712,6 +712,7 @@ impl Visit for Scalars {
                         | "udp_send"
                         | "candidate_dial"
                         | "connection_step"
+                        | "admission_timeout"
                         | "migration_step"
                         | "low_step"
                         | "low_control"
@@ -1743,6 +1744,8 @@ mod tests {
             tracing::info!(target: "oink_link_diagnostics", kind = "input_wait", peer_id = peer.to_hex().as_str(),
                 stage = "input_opening", result = "failed", reason = "input_opening_timeout",
                 opening_received = 0u64, wait_inbound = true, elapsed_ms = 3000.);
+            tracing::warn!(target: "oink_link_diagnostics", kind = "admission_timeout", peer_id = peer.to_hex().as_str(),
+                stage = "config_ready", result = "failed", reason = "handshake_timeout", duration_ms = 10000u64);
             tracing::warn!(target: "oink_link_diagnostics", kind = "udp_send", stage = "kernel",
                 result = "dropped", reason = "host_unreachable", os_error = 65i32, os_error_known = true,
                 destination = "203.0.113.7:47470", src_ip = "203.0.113.8", error = "PRIVATE ERROR /PRIVATE/PATH");
@@ -1782,6 +1785,14 @@ mod tests {
                 && labels.contains(&("result".into(), "failed".into()))
                 && labels.contains(&("reason".into(), "input_opening_timeout".into())))),
             "opening recovery detection survives diagnostic projection"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| matches!(&row.event, Event::Log { fields, labels, .. }
+            if labels.contains(&("kind".into(), "admission_timeout".into()))
+                && labels.contains(&("reason".into(), "handshake_timeout".into()))
+                && fields.contains(&("duration_ms".into(), 10000.)))),
+            "admission timeout detection survives diagnostic projection"
         );
         recorder.shutdown();
         let mut store = store::Store::open(temp.path().join("store"), "a".repeat(24), true).unwrap();

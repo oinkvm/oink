@@ -923,6 +923,8 @@ pub enum HotkeyAction {
     MovePointerTo,
     /// Hold one key to bypass a pointer lock at normal screen edges.
     LockEscape,
+    /// Windows source: lock only the remote Windows pointer focus.
+    LockRemoteWindows,
 }
 
 impl HotkeyAction {
@@ -937,6 +939,7 @@ impl HotkeyAction {
         HotkeyAction::ToggleMicrophoneMute,
         HotkeyAction::MovePointerTo,
         HotkeyAction::LockEscape,
+        HotkeyAction::LockRemoteWindows,
     ];
 
     /// 序列化时的名字（`"lock_focus"` 等），也是路由 `StatusEvent::Hotkey::action` 的写法。
@@ -951,6 +954,7 @@ impl HotkeyAction {
             HotkeyAction::ToggleMicrophoneMute => "toggle_microphone_mute",
             HotkeyAction::MovePointerTo => "move_pointer_to",
             HotkeyAction::LockEscape => "lock_escape",
+            HotkeyAction::LockRemoteWindows => "lock_remote_windows",
         }
     }
 
@@ -1004,6 +1008,10 @@ pub struct InputSettings {
     #[serde(default)]
     pub event_frequency: EventFrequency,
     pub accept_contacts: bool,
+    /// Read-only stored parent preference; unlike accept_contacts this is not
+    /// masked by a transient desktop/injector outage. Edit via accept_contacts.
+    #[serde(default)]
+    pub touchpad_injection_enabled: bool,
     /// Owner's native non-scroll gesture preference; retained while the parent is off.
     #[serde(default = "default_true")]
     pub native_multifinger: bool,
@@ -1013,6 +1021,12 @@ pub struct InputSettings {
     /// Windows source-local preference. Never replicated to peers.
     #[serde(default)]
     pub forward_injected_input: bool,
+    /// Windows source-local preference, default on for existing settings too.
+    #[serde(default = "default_true")]
+    pub take_foreground_on_leave: bool,
+    /// Physical source preference, persisted only by this device.
+    #[serde(default = "default_true")]
+    pub forward_wheel_by_lines: bool,
     /// Read-only live native injector availability; absent means unavailable.
     #[serde(default)]
     pub contacts_injection_available: bool,
@@ -3179,10 +3193,13 @@ fn test_input_settings() -> InputSettings {
         key_support: Default::default(),
         event_frequency: Default::default(),
         accept_contacts: true,
+        touchpad_injection_enabled: true,
         contacts_injection_available: true,
         native_multifinger: true,
         mac_scroll_feel: true,
         forward_injected_input: false,
+        take_foreground_on_leave: true,
+        forward_wheel_by_lines: true,
         emergency_hold_ms: 5000,
         device_gain: 1.,
         scroll: ScrollSettings { speed: 1. },
@@ -3204,6 +3221,16 @@ fn test_input_settings() -> InputSettings {
 #[cfg(test)]
 mod input_validation_tests {
     use super::*;
+    #[test]
+    fn old_input_settings_default_foreground_capture_on() {
+        let mut value = serde_json::to_value(test_input_settings()).unwrap();
+        value.as_object_mut().unwrap().remove("take_foreground_on_leave");
+        assert!(
+            serde_json::from_value::<InputSettings>(value)
+                .unwrap()
+                .take_foreground_on_leave
+        );
+    }
     #[test]
     fn trail_duration_bounds_are_checked_without_an_api_mock() {
         let mut value = serde_json::to_value(test_input_settings()).unwrap();

@@ -121,8 +121,9 @@ pub(crate) fn hide() {
 }
 
 /// Re-establish the single hide request after our window has taken cursor ownership.
-/// The old background hide may have been ignored by Dock. The transparent glyph covers the
-/// balanced show/hide transition; this is an ownership handshake, never a timer/retry loop.
+/// WindowServer can ignore the old background hide even over an ordinary app window.
+/// The transparent glyph covers the balanced show/hide transition; this is an
+/// ownership handshake, never a timer/retry loop.
 pub(crate) fn hide_owned() {
     if HIDDEN.load(Ordering::Acquire) {
         handoff_timing::native(TimingStage::HideStarted, 1); // renew after blank-glyph ownership

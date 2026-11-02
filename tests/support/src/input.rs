@@ -35,12 +35,14 @@ struct State {
     loop_capturing: bool,
     mode: Option<CaptureMode>,
     keyboard_remote: bool,
+    source_foreground: Vec<bool>,
     drag_anchor: Option<oink_foundation::dnd::DragAnchor>,
     cursor: Point,
     system_clip: Option<oink_foundation::Rect>,
     system_clip_failed: bool,
     system_clip_reads: u64,
     injected: Vec<InjectEvent>,
+    workstation_locks: Vec<usize>,
     timed_injections: Option<Vec<(std::time::Instant, InjectEvent)>>,
     injection_sources: Option<Vec<Option<oink_input::source_time::InjectionSource>>>,
     feel: FeelProfile,
@@ -61,6 +63,15 @@ pub enum PendingMode {
 
 impl State {
     fn inject(&mut self, event: &InjectEvent) {
+        // The native stream is identical for lock-bypassed keys. The policy is
+        // exercised separately by LockChord; loopback clients observe OS keys.
+        let event = match event {
+            InjectEvent::KeyWithoutLock { code, pressed } => InjectEvent::Key {
+                code: *code,
+                pressed: *pressed,
+            },
+            event => event.clone(),
+        };
         if let Some(pos) = event.move_target() {
             self.cursor = pos;
         }
@@ -70,7 +81,7 @@ impl State {
         if let Some(sources) = &mut self.injection_sources {
             sources.push(oink_input::source_time::injection_source());
         }
-        self.injected.push(event.clone());
+        self.injected.push(event);
     }
 
     fn apply(&mut self, m: PendingMode) {
@@ -117,6 +128,10 @@ impl std::fmt::Debug for FakeInput {
 }
 
 impl FakeInput {
+    pub fn source_foreground_requests(&self) -> Vec<bool> {
+        self.state.lock().unwrap().source_foreground.clone()
+    }
+
     /// Weak, nonblocking native-state inspection for a failing test watchdog.
     #[cfg(debug_assertions)]
     pub fn watchdog_probe_for_test(&self) -> impl Fn() -> String + Send + Sync + 'static {
@@ -282,6 +297,11 @@ impl FakeInput {
     /// Read the currently retained injection evidence without consuming it.
     pub fn injected(&self) -> Vec<InjectEvent> {
         self.state.lock().unwrap().injected.clone()
+    }
+
+    /// Fake lock requests record the preceding injection count; never call an OS.
+    pub fn workstation_locks(&self) -> Vec<usize> {
+        self.state.lock().unwrap().workstation_locks.clone()
     }
 
     /// 取出并清空已注入的事件。
@@ -477,6 +497,10 @@ impl oink_input::display_power::Observation for DisplayPower {
 }
 
 impl InputBackend for FakeInput {
+    fn set_source_foreground(&self, enabled: bool) {
+        self.state.lock().unwrap().source_foreground.push(enabled);
+    }
+
     #[cfg(debug_assertions)]
     fn application_focus_test_clock(&self) -> Option<oink_foundation::application_focus::TestClock> {
         self.state.lock().unwrap().application_clock.clone()
@@ -636,6 +660,13 @@ impl InputBackend for FakeInput {
         self.state.lock().unwrap().switch(PendingMode::RestoreLocal(at))
     }
 
+    fn lock_workstation(&self) -> Result<(), InputError> {
+        let mut state = self.state.lock().unwrap();
+        let before = state.injected.len();
+        state.workstation_locks.push(before);
+        Ok(())
+    }
+
     fn inject(&self, event: &InjectEvent) -> Result<(), InputError> {
         self.state.lock().unwrap().inject(event);
         Ok(())
@@ -680,6 +711,20 @@ impl InputBackend for FakeInput {
 
 #[cfg(all(test, debug_assertions))]
 mod tests {
+    #[test]
+    fn lock_bypass_metadata_still_delivers_a_normal_native_key() {
+        let fake = super::FakeInput::new();
+        let code = oink_foundation::input::KeyCode::keyboard(0x0f);
+        for pressed in [true, false] {
+            oink_input::InputBackend::inject(&fake, &super::InjectEvent::KeyWithoutLock { code, pressed }).unwrap();
+        }
+        assert_eq!(
+            fake.injected(),
+            [true, false].map(|pressed| super::InjectEvent::Key { code, pressed })
+        );
+        assert!(fake.workstation_locks().is_empty());
+    }
+
     use super::*;
     use oink_foundation::input::{InputEvent, MouseButton, SourceKind};
     use std::sync::Arc;

@@ -724,6 +724,7 @@ pub(crate) fn default_hotkeys() -> Vec<Hotkey> {
     };
     vec![
         k(HotkeyAction::LockFocus, &["Ctrl", "Alt", "L"]),
+        k(HotkeyAction::LockRemoteWindows, &["Meta", "Shift", "L"]),
         k(HotkeyAction::LockEscape, &["Alt"]),
         k(HotkeyAction::ReturnPointerHome, &["Ctrl", "Alt", "H"]),
         k(HotkeyAction::ToggleSharing, &["Ctrl", "Alt", "P"]),
@@ -749,10 +750,13 @@ pub(crate) fn input_settings(node: &Node) -> InputSettings {
         key_support: KeySupport::default(),
         event_frequency: s.event_frequency,
         accept_contacts: s.routing.touchpad_injection && contacts_injection_available,
+        touchpad_injection_enabled: s.routing.touchpad_injection,
         native_multifinger: s.routing.native_multifinger,
         contacts_injection_available,
         mac_scroll_feel: s.routing.mac_scroll_feel,
         forward_injected_input: s.routing.forward_injected_input,
+        take_foreground_on_leave: s.routing.take_foreground_on_leave,
+        forward_wheel_by_lines: s.routing.forward_wheel_by_lines,
         emergency_hold_ms: s.emergency_hold_ms.get(),
         device_gain: s.screen_preferences.device_gain,
         scroll: ScrollSettings {
@@ -769,7 +773,11 @@ pub(crate) fn input_settings(node: &Node) -> InputSettings {
             },
             drag_across_devices: r.button_handoff == ButtonHandoff::Allow,
         },
-        hotkeys: node.effective_hotkeys(),
+        hotkeys: node
+            .effective_hotkeys()
+            .into_iter()
+            .filter(|h| cfg!(windows) || h.action != HotkeyAction::LockRemoteWindows)
+            .collect(),
         gestures_enabled: r.forward_gestures,
         return_pointer_on_display_sleep: r.return_pointer_on_display_sleep,
         wake_displays_on_input: r.wake_displays_on_input,
@@ -1384,18 +1392,32 @@ impl AgentApi for Node {
         let mut local_patch = patch.value();
         if let Some(object) = local_patch.as_object_mut() {
             object.remove("application_focus_enabled");
+            object.remove("touchpad_injection_enabled");
         }
-        if let Some(value) = local_patch
-            .as_object_mut()
-            .and_then(|p| p.remove("forward_injected_input"))
-        {
-            local_patch["routing"] = serde_json::json!({"forward_injected_input":value});
+        for key in [
+            "forward_injected_input",
+            "forward_wheel_by_lines",
+            "take_foreground_on_leave",
+        ] {
+            if let Some(value) = local_patch.as_object_mut().and_then(|p| p.remove(key)) {
+                let routing = local_patch
+                    .as_object_mut()
+                    .unwrap()
+                    .entry("routing")
+                    .or_insert_with(|| serde_json::json!({}));
+                routing[key] = value;
+            }
         }
-        let slots = self.link_config()?.applied().pointer_slots.clone();
-        let saved_hotkeys = crate::hotkeys::save_overrides(&s.hotkeys, self.settings().hotkeys, &slots);
-        if local_patch.get("hotkeys").is_some() {
-            local_patch["hotkeys"] = serde_json::to_value(&saved_hotkeys).map_err(|e| invalid(e.to_string()))?;
-        }
+        // Getter-only defaults and platform filtering are not edits to the saved
+        // list. Materialize overrides only when this patch explicitly edits it.
+        let saved_hotkeys = if local_patch.get("hotkeys").is_some() {
+            let slots = self.link_config()?.applied().pointer_slots.clone();
+            let saved = crate::hotkeys::save_overrides(&s.hotkeys, self.settings().hotkeys, &slots);
+            local_patch["hotkeys"] = serde_json::to_value(&saved).map_err(|e| invalid(e.to_string()))?;
+            Some(saved)
+        } else {
+            None
+        };
         self.edit_local_input_settings(&local_patch, |candidate| {
             let routing = &mut candidate.routing;
             routing.mac_scroll_feel = s.mac_scroll_feel;
@@ -1404,6 +1426,8 @@ impl AgentApi for Node {
                 routing.touchpad_injection = s.accept_contacts;
             }
             routing.forward_injected_input = s.forward_injected_input;
+            routing.take_foreground_on_leave = s.take_foreground_on_leave;
+            routing.forward_wheel_by_lines = s.forward_wheel_by_lines;
             routing.remote_scroll_speed = s.scroll.speed;
             routing.fixed_reference_display = match s.pointer.reference {
                 PointerReference::Fixed { display } => Some(display),
@@ -1426,7 +1450,9 @@ impl AgentApi for Node {
                 PointerScaling::Physical => SpeedMode::Physical,
                 PointerScaling::Proportional => SpeedMode::ScreenProportional,
             };
-            candidate.hotkeys = Some(saved_hotkeys);
+            if let Some(hotkeys) = saved_hotkeys {
+                candidate.hotkeys = Some(hotkeys);
+            }
         })?;
         drop(_gate);
         if patch.value().get("application_focus_enabled").is_some() {

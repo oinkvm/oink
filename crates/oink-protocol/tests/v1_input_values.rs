@@ -114,3 +114,41 @@ fn trail_order_and_notification_age_are_bounded() {
         ErrorCode::UnsupportedValue
     );
 }
+
+#[test]
+fn optional_wheel_steps_preserve_legacy_lines_and_absence_defaults_to_lines() {
+    use oink_protocol::v1::schema::{WireValue, required};
+    let old: RawMap = [
+        (1, V::Uint(0)),
+        (2, V::F64(3.)),
+        (3, V::F64(-6.)),
+        (4, V::Uint(1)),
+        (5, V::Uint(0)),
+    ]
+    .into();
+    for steps in [
+        None,
+        Some(Point::from_raw([(1, V::F64(1.)), (2, V::F64(-2.))].into()).unwrap()),
+    ] {
+        let mut raw = old.clone();
+        if let Some(p) = &steps {
+            raw.insert(103, p.write());
+        }
+        let encoded = bytes(&raw);
+        let decoded = InputScroll::decode(&encoded, 8192).unwrap();
+        assert_eq!(decoded.wheel_steps().unwrap(), steps);
+        assert_eq!(decoded.encode(8192).unwrap(), encoded);
+        let hot = hot::View::<InputScroll>::parse(&encoded, 8192).unwrap();
+        assert_eq!(
+            hot.wheel_steps().unwrap().map(|p| (p.x().unwrap(), p.y().unwrap())),
+            steps.as_ref().map(|_| (1., -2.))
+        );
+        // Frozen pre-extension receiver projection: only keys 1..5 are known.
+        // All remain unchanged when the optional native representation is sent.
+        let legacy = v1::cbor::decode_map(&encoded, 8192).unwrap();
+        assert_eq!(required::<f64>(&legacy, 2).unwrap(), 3.);
+        assert_eq!(required::<f64>(&legacy, 3).unwrap(), -6.);
+        assert_eq!(required::<ScrollAmount>(&legacy, 4).unwrap(), ScrollAmount::Lines);
+        assert_eq!(required::<ScrollPhase>(&legacy, 5).unwrap(), ScrollPhase::None);
+    }
+}

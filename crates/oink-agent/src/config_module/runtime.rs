@@ -35,7 +35,12 @@ mod pairing_api;
 mod recovery;
 #[path = "runtime_state.rs"]
 mod state_owner;
-/// Signed state exchange after a same-group C0 greeting succeeds.
+/// Maximum idle interval on a greeted, unadmitted C0, including one opened
+/// before either peer learned membership. Real configuration admission normally
+/// takes about 150 ms; ten seconds leaves ample scheduling/network margin.
+/// New admission/proof milestones and strictly advancing proof chunks rearm it.
+/// Human pairing has its own lease and phase deadlines, rather than this idle
+/// member-admission budget. Heartbeats, repeated lookups and beacons do not rearm it.
 const ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(super) fn now_ms() -> u64 {
@@ -592,7 +597,9 @@ impl Owner {
             deadline = deadline.min((*at).max(Instant::now() + Duration::from_millis(100)));
         }
         for link in self.sessions.values() {
-            if let Some(at) = link.deadline {
+            if let Some(at) = link.deadline
+                && (link.peer.is_none() || link.departing || !self.pairs.has_lease(link.peer_boot))
+            {
                 deadline = deadline.min(at);
             }
         }
@@ -1009,7 +1016,7 @@ impl Owner {
             let same = result.anchor()? == self.state.roster().anchor();
             let session = self.sessions.get_mut(&id).expect("link");
             session.peer = Some(result);
-            session.deadline = None;
+            session.deadline = Some(Instant::now() + ADMISSION_TIMEOUT);
             if let Some(address) = session.remote {
                 // An incoming manual lookup now uses a dedicated ephemeral
                 // source port. Reconnect to its advertised listener, while an
@@ -1133,9 +1140,15 @@ impl Owner {
                     admission::receive_request(&self.state, &request, self.identity.id(), peer.device_id, hash)?;
                 self.commit(candidate.clone())
                     .map_err(|_| v1::ErrorCode::StateConflict)?;
+                let advanced = self.sessions[&id]
+                    .accepted
+                    .as_ref()
+                    .is_none_or(|previous| previous.digest().ok() != candidate.digest().ok());
                 self.sessions.get_mut(&id).expect("link").accepted = Some(candidate.clone());
                 self.links.set_half_open(id);
-                self.sessions.get_mut(&id).expect("link").deadline = Some(Instant::now() + Duration::from_secs(10));
+                if advanced {
+                    self.sessions.get_mut(&id).expect("link").deadline = Some(Instant::now() + ADMISSION_TIMEOUT);
+                }
                 self.send(
                     id,
                     admission::reply(
@@ -1498,9 +1511,48 @@ impl Owner {
             self.links.links().ready_count() as u8,
         )?;
         let session = self.sessions.get_mut(&id).expect("link");
+        let advanced = match &session.sent {
+            Some(previous) => previous.digest()? != self.state.digest()?,
+            None => true,
+        };
         session.sent = Some(self.state.clone());
-        session.deadline = Some(Instant::now() + ADMISSION_TIMEOUT);
+        // A repeated current-root lookup can ask for the same Request again.
+        // Reply to it, but do not turn that replay into admission progress.
+        if advanced || session.deadline.is_none() {
+            session.deadline = Some(Instant::now() + ADMISSION_TIMEOUT);
+        }
         self.send(id, request)
+    }
+    /// A lookup can finish before the peer joins through another member. Its
+    /// retained greeting will not fire again, and its C0 suppresses fresh dials.
+    /// Reconcile newly trusted peers against idle C0s, using local membership as
+    /// authority even when the immutable greeting predates that membership.
+    fn reconcile_member_admission(&mut self, peers: impl IntoIterator<Item = DeviceId>) {
+        if self.needs_apply || self.sleeping {
+            return;
+        }
+        let peers = peers.into_iter().collect::<BTreeSet<_>>();
+        let waiting = self
+            .sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                (peers.contains(&session.peer_boot.device_id)
+                    && self.state.roster().contains(session.peer_boot.device_id)
+                    && session.peer.is_some()
+                    && !session.ready
+                    && !session.departing
+                    && session.sent.is_none()
+                    && session.accepted.is_none()
+                    && !self.lookups.contains_key(id)
+                    && !self.pairs.has_lease(session.peer_boot))
+                .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in waiting {
+            if self.begin_admission(id).is_err() {
+                self.close(id, Disconnect::HandshakeFailed);
+            }
+        }
     }
     fn ready(&mut self, id: LinkId) -> v1::Result<()> {
         self.require_known_member(id)?;
@@ -1611,10 +1663,26 @@ impl Owner {
         for id in self
             .sessions
             .iter()
-            .filter_map(|(id, l)| l.deadline.filter(|at| now >= *at).map(|_| *id))
+            .filter_map(|(id, l)| {
+                l.deadline
+                    .filter(|at| now >= *at)
+                    .filter(|_| l.peer.is_none() || l.departing || !self.pairs.has_lease(l.peer_boot))
+                    .map(|_| *id)
+            })
             .collect::<Vec<_>>()
         {
-            self.close(id, Disconnect::HandshakeFailed);
+            let session = &self.sessions[&id];
+            if session.departing {
+                self.close(id, Disconnect::HandshakeFailed);
+                continue;
+            }
+            tracing::warn!(target: "oink_link_diagnostics", kind = "admission_timeout",
+                peer_id = session.peer_boot.device_id.to_hex().as_str(), link = id.0,
+                stage = if session.peer.is_none() { "instance" } else { "config_ready" },
+                result = "failed", reason = "handshake_timeout",
+                duration_ms = ADMISSION_TIMEOUT.as_millis() as u64,
+                "Configuration admission stalled; closing link for normal redial");
+            self.close(id, Disconnect::HandshakeTimeout);
         }
         for peer in self
             .connecting
@@ -1647,6 +1715,9 @@ impl Owner {
                 .filter(|m| m.device != self.identity.id())
                 .map(|m| m.device)
                 .collect::<Vec<_>>();
+            // Also covers a durable membership update whose native application
+            // was deferred when commit first attempted the reconciliation.
+            self.reconcile_member_admission(peers.iter().copied());
             for peer in peers {
                 if self.sessions.values().any(|l| l.peer_boot.device_id == peer) {
                     continue;

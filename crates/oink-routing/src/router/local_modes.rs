@@ -92,6 +92,7 @@ impl Router {
                 mut dy,
                 unit,
                 phase,
+                ..
             } => {
                 if self.local_rewrite.take() == Some(oink_foundation::input::LocalRewrite::ReverseWheel) {
                     dx = -dx;

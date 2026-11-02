@@ -131,8 +131,10 @@ export function createAgentStore() {
       case 'nearby_changed': {
         if (!state.nearby) { initialNearbyEvents.push(event); return; }
         if (BigInt(event.data.revision) < BigInt(state.nearby.revision)) return;
+        // Snapshots list rows in device-id order; keep that order across deltas so an
+        // updated address or discovery source never moves a row to the end.
         const rows=state.nearby.rows.filter(row=>!event.data.removed.includes(row.device) && !event.data.upserts.some(next=>next.device===row.device));
-        return adopt('nearby',{revision:event.data.revision,rows:[...rows,...event.data.upserts]});
+        return adopt('nearby',{revision:event.data.revision,rows:[...rows,...event.data.upserts].sort((a,b)=>a.device<b.device?-1:a.device>b.device?1:0)});
       }
       case 'pairing_changed': {
         if (!state.pairings) { initialPairEvents.push(event); return; }

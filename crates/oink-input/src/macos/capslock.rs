@@ -13,6 +13,8 @@
 //! 设置缓存和守卫通过主队列异步执行，每个 TIS 入口拒绝后台调用。主队列未运行时按普通锁定处理。
 //! Read settings through dynamically resolved `TISIsRomanSwitchEnabled` / `TISIsRomanSwitchAllowed`,
 //! then global `TISRomanSwitchState`; an unknown setting uses ordinary Caps Lock.
+//! The user session's IME preference applies only while that session is unlocked.
+//! Locked/unknown targets use the HID lock path, including the keyboard LED.
 //!
 //! [`LocalGuard`] 防止源 Mac 的 HID 层在 event tap 吞键之前意外改变本机状态。进入 Remote 记录本机
 //! Caps 与输入源；吞掉 Caps 后 1.5 秒内核对并恢复。回到 Local 时仅在窗口内最后核对，不无条件恢复。
@@ -121,6 +123,20 @@ pub(crate) fn decide(s: SwitchSetting) -> Behavior {
     let on = s.enabled_fn.or(s.pref).unwrap_or(false);
     if on {
         Behavior::SwitchInputSource
+    } else {
+        Behavior::Lock
+    }
+}
+
+fn behavior_for_session(behavior: Behavior, locked: Option<bool>) -> Behavior {
+    // The cached TIS preference describes the logged-in user's IME, not loginwindow.
+    // On macOS 14.7.8, remote Caps DOWN/UP (including >500 ms holds) reached
+    // injection while locked with Secure Input; HID polling still reported ON.
+    // Use the existing ordinary HID lock/LED path for the password screen; another
+    // posted FlagsChanged cannot toggle that lock. Do not change unlocked IME
+    // gestures or use Secure Input alone: ordinary apps can enable it too.
+    if locked == Some(false) {
+        behavior
     } else {
         Behavior::Lock
     }
@@ -609,7 +625,8 @@ pub(crate) fn set_behavior_override(b: Option<Behavior>) {
 /// 注入的 Caps Lock 采用的行为（任意线程，读缓存）。缓存还没有填好（主线程不服务主队列）时按普通大写
 /// 锁定处理。
 pub(crate) fn current_behavior() -> Behavior {
-    match BEHAVIOR_OVERRIDE.load(Ordering::Acquire) {
+    super::session::init();
+    let behavior = match BEHAVIOR_OVERRIDE.load(Ordering::Acquire) {
         1 => Behavior::Lock,
         2 => Behavior::SwitchInputSource,
         _ => {
@@ -624,7 +641,8 @@ pub(crate) fn current_behavior() -> Behavior {
             }
             decide(c.setting)
         }
-    }
+    };
+    behavior_for_session(behavior, super::session::locked())
 }
 
 /// 目标端的 Caps Lock（注入器持有）。
@@ -863,6 +881,52 @@ pub mod diag {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locked_target_caps_toggles_hid_instead_of_the_user_sessions_ime() {
+        for lock_on in [false, true] {
+            let mut m = Machine::default();
+            let behavior = behavior_for_session(Behavior::SwitchInputSource, Some(true));
+            assert_eq!(m.press(behavior, lock_on), Action::SetLock(!lock_on));
+            assert_eq!(m.press(behavior, !lock_on), Action::None);
+            assert_eq!(m.release(), Action::None);
+            assert_eq!(m.release(), Action::None);
+        }
+    }
+
+    #[test]
+    fn caps_behavior_requires_a_known_unlocked_user_session_for_native_ime() {
+        for behavior in [Behavior::Lock, Behavior::SwitchInputSource] {
+            assert_eq!(behavior_for_session(behavior, None), Behavior::Lock);
+            assert_eq!(behavior_for_session(behavior, Some(true)), Behavior::Lock);
+            assert_eq!(behavior_for_session(behavior, Some(false)), behavior);
+        }
+    }
+
+    #[test]
+    fn session_changes_preserve_the_in_flight_caps_release_and_next_press_policy() {
+        let configured = Behavior::SwitchInputSource;
+        let mut m = Machine::default();
+        assert_eq!(
+            m.press(behavior_for_session(configured, Some(false)), false),
+            Action::NativeCaps(true)
+        );
+        assert_eq!(
+            m.press(behavior_for_session(configured, Some(true)), false),
+            Action::None
+        );
+        assert_eq!(m.release(), Action::NativeCaps(false));
+        assert_eq!(
+            m.press(behavior_for_session(configured, Some(true)), false),
+            Action::SetLock(true)
+        );
+        assert_eq!(m.release(), Action::None);
+        assert_eq!(
+            m.press(behavior_for_session(configured, Some(false)), true),
+            Action::NativeCaps(true)
+        );
+        assert_eq!(m.release(), Action::NativeCaps(false));
+    }
 
     #[test]
     fn lock_mode_toggles_once_per_press_without_native_gesture() {

@@ -54,6 +54,10 @@ impl Router {
         }
         if let Some(old) = state.session.filter(|old| *old != instance) {
             state.retired_sessions.insert(old);
+            // A rebuilt input owner restarts its request counter even if the
+            // enclosing process Boot survived. Exact I0 identity fences old input;
+            // do not reject every fresh press as a duplicate of the retired owner.
+            self.windows_lock.seen.remove(&boot);
         }
         state.session = Some(instance);
         state.sharing = controllable;
@@ -81,6 +85,7 @@ impl Router {
             return;
         }
         state.connected = false;
+        self.windows_lock.capable.remove(&peer);
         state.touchpad_contacts = None;
         state.focus_ready = false;
         state.held_sync_nonempty = false;
@@ -93,6 +98,7 @@ impl Router {
         }
         self.dnd_hello(peer);
         self.restart_game_stream();
+        self.refresh_windows_locks();
     }
     pub fn input_message(&mut self, peer: DeviceId, message: Message, now: Micros) -> bool {
         if self.peers.get(&peer).is_none_or(|p| !p.connected) {
@@ -131,6 +137,7 @@ impl Router {
     /// replacing either input stream or changing the router's held-key ledger.
     pub fn set_peer_os(&mut self, peer: DeviceId, os: Os, now: Micros) {
         self.peers.entry(peer).or_insert_with(|| Peer::new(now)).os = os;
+        self.refresh_windows_locks();
     }
     /// Display facts are metadata only; topology arrives already compiled by config.
     pub fn set_peer_displays(&mut self, peer: DeviceId, displays: Vec<DisplayInfo>) {

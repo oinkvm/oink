@@ -169,6 +169,12 @@ impl RouterAdapter for Adapter {
         ) {
             return;
         }
+        self.router.set_peer_windows_lock(
+            peer,
+            admission
+                .agreement
+                .contains(oink_routing::control::WINDOWS_LOCK_CAPABILITY),
+        );
         self.router.set_peer_touchpad_contacts(peer, state.touchpad_contacts);
         self.router
             .set_peer_scroll_pixels(peer, admission.agreement.contains("oink.input.scroll-pixels/1"));
@@ -1073,6 +1079,7 @@ mod os_tests {
                     dy: 2.,
                     unit: oink_routing::input::ScrollAmount::Reference,
                     phase: oink_foundation::input::ScrollPhase::Began,
+                    wheel_steps: None,
                 }),
             );
             let outputs = input.drain_outputs();

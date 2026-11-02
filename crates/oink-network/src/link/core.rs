@@ -269,14 +269,15 @@ impl Core {
         mode: DialMode,
         now: Instant,
     ) -> Result<(), DialRefused> {
-        if self.peer_link(peer).is_some() {
+        let installing = self.peer_link(peer);
+        if installing.is_some_and(|id| self.links[&id].installed) {
             return Err(DialRefused::AlreadyLinked);
         }
         if self.dials.contains_key(&peer) || self.dials.len() >= MAX_DIALS {
             return Err(DialRefused::Busy);
         }
         path_trace(peer, "establishing", None, "local", "dial");
-        let direct = !addresses.is_empty();
+        let direct = installing.is_none() && !addresses.is_empty();
         self.dials.insert(
             peer,
             Dial {
@@ -287,6 +288,18 @@ impl Core {
                 request: None,
             },
         );
+        if let Some(id) = installing {
+            // An inbound path is not in the public snapshot until installed.
+            // A caller can already have reserved this dial; join that path's
+            // pending result instead of silently rejecting the queued command.
+            let link = self.links.get_mut(&id).expect("installing path");
+            for address in addresses {
+                if !link.addresses.contains(&address) {
+                    link.addresses.push(address);
+                }
+            }
+            return Ok(());
+        }
         if direct {
             self.effects.push_back(Effect::Dial { peer, addresses });
         }
@@ -299,9 +312,16 @@ impl Core {
         Ok(())
     }
     fn fail_dial(&mut self, peer: DeviceId, reason: DialFailure) {
-        if let Some(dial) = self.dials.remove(&peer)
-            && self.peer_link(peer).is_none()
-        {
+        // Creating a path is not a dial result: only connected() publishes C0.
+        // Keep an installing path's dial until its own acknowledgement/deadline,
+        // so lose() can report failure even if the earlier relay search expires.
+        if let Some(id) = self.peer_link(peer) {
+            if self.links[&id].installed && self.dials.remove(&peer).is_some() {
+                self.effects.push_back(Effect::DialFinished(peer));
+            }
+            return;
+        }
+        if let Some(dial) = self.dials.remove(&peer) {
             super::timing::record(
                 super::timing::Measurement::Setup(super::timing::Result::Failed),
                 dial.deadline - DIAL_BUDGET,
@@ -324,6 +344,14 @@ impl Core {
     }
     pub fn dial_done(&mut self, peer: DeviceId, now: Instant) {
         if let Some(id) = self.peer_link(peer) {
+            if !self.links[&id].installed {
+                // TLS candidates ended while a reverse connection or relay was
+                // still installing. The path now owns the outstanding result.
+                if let Some(dial) = self.dials.get_mut(&peer) {
+                    dial.direct = false;
+                }
+                return;
+            }
             if self.dials.remove(&peer).is_none() {
                 return;
             }
@@ -1483,10 +1511,10 @@ impl Core {
                 include(l.next_direct);
             }
         }
-        for d in self.dials.values() {
+        for (peer, d) in &self.dials {
             // The executor owns candidate/round deadlines, including time spent
             // waiting for a global handshake slot. Only relay deadlines live here.
-            if !d.direct && d.request.is_none() {
+            if !d.direct && d.request.is_none() && self.peer_link(*peer).is_none() {
                 include(d.deadline);
             }
             if let Some(r) = d.request {
@@ -1557,7 +1585,9 @@ impl Core {
         let failed: Vec<_> = self
             .dials
             .iter()
-            .filter(|(_, d)| !d.direct && d.request.is_none() && now >= d.deadline)
+            .filter(|(peer, d)| {
+                !d.direct && d.request.is_none() && now >= d.deadline && self.peer_link(**peer).is_none()
+            })
             .map(|(peer, _)| *peer)
             .collect();
         for peer in failed {

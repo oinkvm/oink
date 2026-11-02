@@ -211,6 +211,26 @@ fn remote_source_delivers_once_to_p_and_k_then_retires_only_k_refs() {
 }
 
 #[test]
+fn brightness_controls_are_dropped_by_windows_without_application_focus_forwarding() {
+    let mut g = Group::new();
+    g.enter_hidden();
+    // The pointer focus is Windows; the extra application destination is a Mac.
+    // A source's brightness gesture must not escape the Windows target's drop.
+    for usage in [0x6f, 0x70, 0x79, 0x7a, 0x7c] {
+        let code = KeyCode::new(KeyCode::PAGE_CONSUMER, usage);
+        g.source_key(code, true);
+        g.routers[1].input_message(
+            boot(3).device_id,
+            Message::Input(InputMsg::KeyRepeat { code, n: 1 }),
+            30,
+        );
+        g.pump();
+        g.source_key(code, false);
+        assert!(g.injected.is_empty());
+    }
+}
+
+#[test]
 fn local_p_passes_native_key_and_terminal_k_never_forwards_back() {
     let mut g = Group::new();
     g.enter_hidden();

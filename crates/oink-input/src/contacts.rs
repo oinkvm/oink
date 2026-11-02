@@ -96,10 +96,16 @@ impl Receiver {
             self.active = true;
             self.frames = 0;
         }
-        let tick = self
+        let mut tick = self
             .begin_tick
             .wrapping_add(((frame.time_us - self.first_us) / 1_000) as u32)
             .max(1);
+        // Millisecond rounding or a split report can put the source-derived
+        // tick at/before the last native call. Advance only that call; the next
+        // source interval still uses first_us/begin_tick and catches up normally.
+        if self.tick != 0 && (tick.wrapping_sub(self.tick) as i32) <= 0 {
+            tick = self.tick.wrapping_add(1).max(1);
+        }
         let old = self.slots;
         let mut next = old;
         let mut departing = [false; MAX_CONTACTS];
@@ -119,13 +125,25 @@ impl Receiver {
             next = [None; MAX_CONTACTS];
         }
         // A hardware report may replace all five IDs. Release the old set before
-        // reusing slots; each native call remains at most five pointers. Both
-        // submissions use the same source tick (no invented movement interval).
+        // reusing slots; each native call remains at most five pointers. Windows
+        // 11 build 26200 rejected a same-tick reuse in a 5 -> 2 replacement.
+        // Separate those native reports by one tick, retaining the source clock
+        // for subsequent frames. No sleep, resampling or scroll gain is applied.
         let additions = frame.changes().iter().filter(|c| c.phase == Phase::Begin).count();
         let split = old.iter().flatten().count() + additions > MAX_CONTACTS;
-        if split && !self.submit(sink, &old, &next, &departing, frame.time_us, tick) {
-            self.cancel(sink);
-            return false;
+        if split {
+            if !self.submit(sink, &old, &next, &departing, frame.time_us, tick) {
+                self.tick = tick;
+                self.cancel(sink);
+                return false;
+            }
+            // Commit each accepted native report, not only the complete source
+            // frame. If the addition fails, cancel only the surviving contacts
+            // at a time after the accepted release, then destroy the device.
+            self.slots = next;
+            self.last_us = frame.time_us;
+            self.tick = tick;
+            tick = tick.wrapping_add(1).max(1);
         }
         for change in frame.changes().iter().filter(|c| c.phase == Phase::Begin) {
             let slot = next
@@ -148,6 +166,7 @@ impl Receiver {
             self.submit(sink, &old, &next, &departing, frame.time_us, tick)
         };
         if !submitted {
+            self.tick = tick;
             self.cancel(sink);
             return false;
         }
@@ -288,6 +307,7 @@ mod tests {
         frames: Vec<(Vec<Pointer>, u32)>,
         closed: usize,
         fail: bool,
+        reject_at: Option<usize>,
     }
     impl Sink for Fake {
         fn create(&mut self, s: Surface) -> bool {
@@ -296,7 +316,7 @@ mod tests {
         }
         fn frame(&mut self, points: &[Pointer], tick: u32) -> bool {
             self.frames.push((points.to_vec(), tick));
-            !self.fail
+            !self.fail && self.reject_at != Some(self.frames.len())
         }
         fn close(&mut self) {
             self.closed += 1;
@@ -361,7 +381,65 @@ mod tests {
         assert!(sink.frames[1].0.iter().all(|c| c.flags == 0x4000));
         assert!(sink.frames[2].0.iter().all(|c| c.flags == 0x4006));
         assert!(sink.frames.iter().all(|f| f.0.len() == 5));
-        assert_eq!(sink.frames[1].1, sink.frames[2].1);
+        assert!(sink.frames[2].1 > sink.frames[1].1);
+    }
+    #[test]
+    fn five_to_two_replacement_separates_native_ticks_and_keeps_source_clock() {
+        let mut receiver = Receiver::default();
+        let mut sink = Fake::default();
+        let a = sample(0, &[5, 10, 11, 7, 9]);
+        let b = sample(8000, &[11, 6]);
+        assert!(receiver.apply(&Frame::between(None, &a), &mut sink));
+        assert!(receiver.apply(&Frame::between(Some(&a), &b), &mut sink));
+        assert_eq!(sink.frames[1].1, 9);
+        assert_eq!(
+            sink.frames[2].1, 10,
+            "released IDs cannot be reused at the release tick"
+        );
+        assert_eq!(sink.frames[1].0.iter().filter(|p| p.flags == 0x4000).count(), 4);
+        assert_eq!(sink.frames[2].0.iter().map(|p| p.id).collect::<Vec<_>>(), [1, 3]);
+        let c = sample(16000, &[11, 6]);
+        assert!(receiver.apply(&Frame::between(Some(&b), &c), &mut sink));
+        assert_eq!(sink.frames[3].1, 17, "split must not shift the source clock");
+    }
+    #[test]
+    fn a_following_source_frame_cannot_rewind_the_split_native_clock() {
+        let mut receiver = Receiver::default();
+        let mut sink = Fake::default();
+        let a = sample(0, &[1, 2, 3, 4, 5]);
+        let b = sample(8000, &[3, 6]);
+        let c = sample(8500, &[3, 6]);
+        for frame in [
+            Frame::between(None, &a),
+            Frame::between(Some(&a), &b),
+            Frame::between(Some(&b), &c),
+        ] {
+            assert!(receiver.apply(&frame, &mut sink));
+        }
+        let ticks: Vec<_> = sink.frames.iter().map(|f| f.1).collect();
+        assert_eq!(ticks, [1, 9, 10, 11]);
+    }
+    #[test]
+    fn rejected_split_cancels_only_last_accepted_contacts_after_release_tick() {
+        let mut receiver = Receiver::default();
+        let mut sink = Fake {
+            reject_at: Some(3),
+            ..Default::default()
+        };
+        let a = sample(0, &[5, 10, 11, 7, 9]);
+        let b = sample(8000, &[11, 6]);
+        assert!(receiver.apply(&Frame::between(None, &a), &mut sink));
+        assert!(!receiver.apply(&Frame::between(Some(&a), &b), &mut sink));
+        let (cancel, tick) = sink.frames.last().unwrap();
+        assert_eq!(cancel.iter().map(|p| p.id).collect::<Vec<_>>(), [3]);
+        assert!(cancel.iter().all(|p| p.flags == 0xc000));
+        assert!(
+            *tick > sink.frames[2].1,
+            "cancel cannot move the native clock backwards"
+        );
+        assert!(!receiver.active());
+        assert_eq!(sink.closed, 1);
+        assert!(receiver.apply(&Frame::between(None, &sample(24000, &[1, 2])), &mut sink));
     }
     #[test]
     fn partial_replacement_does_not_duplicate_native_id_in_one_call() {

@@ -1992,6 +1992,7 @@ fn scroll(dx: f64, dy: f64) -> InputEvent {
         dy,
         unit: ScrollUnit::Line,
         phase: ScrollPhase::None,
+        wheel_steps: None,
     }
 }
 

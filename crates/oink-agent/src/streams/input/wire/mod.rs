@@ -119,7 +119,7 @@ pub(crate) fn decode(bytes: &[u8], peer: &PeerAdmission, datagram: bool) -> v1::
             }
             Ok(Decoded::Deferred(message))
         }
-        _ if (0x0100..=0x010f).contains(&frame.header.type_id) || frame.header.type_id == 0x1300 => {
+        _ if (0x0100..=0x010f).contains(&frame.header.type_id) || matches!(frame.header.type_id, 0x1300 | 0x0111) => {
             control::decode(message).map(|value| Decoded::Packet(Packet::Control(value)))
         }
         _ => crate::dnd::wire::decode(message).map(|value| Decoded::Packet(Packet::Dnd(value))),
@@ -147,6 +147,7 @@ pub(crate) fn supported(message: &Packet, peer: &PeerAdmission) -> bool {
         Packet::Dnd(_) => "oink.drag/1",
         Packet::Control(ControlMsg::MovePointer { .. }) => "oink.pointer.move/1",
         Packet::Control(ControlMsg::EntryProtection { .. }) => "oink.pointer.entry-protection/1",
+        Packet::Control(ControlMsg::LockRemoteWindows(_)) => oink_routing::control::WINDOWS_LOCK_CAPABILITY,
         Packet::Control(ControlMsg::LockEscape { .. }) => "oink.pointer.lock-escape/1",
         _ => "oink.input/1",
     };
@@ -201,6 +202,7 @@ mod scroll_pixel_tests {
                     dy: -37.,
                     unit,
                     phase: oink_foundation::input::ScrollPhase::Began,
+                    wheel_steps: None,
                 };
                 let allowed = capable || unit == oink_routing::input::ScrollAmount::Reference;
                 assert_eq!(supported(&Packet::Input(input.clone()), &peer), allowed);
@@ -289,6 +291,57 @@ mod entry_protection_tests {
             } else {
                 assert!(decoded.is_err());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod windows_lock_tests {
+    use super::*;
+    #[test]
+    fn lock_request_roundtrips_and_old_agreements_never_send_the_new_type() {
+        let source = Boot {
+            device_id: oink_foundation::DeviceId([1; 32]),
+            nonce: [2; 16],
+        };
+        let target = Boot {
+            device_id: oink_foundation::DeviceId([3; 32]),
+            nonce: [4; 16],
+        };
+        let packet = Packet::Control(ControlMsg::LockRemoteWindows(
+            oink_routing::control::WindowsLockRequest {
+                source,
+                target,
+                epoch: 27,
+                id: 5,
+            },
+        ));
+        for capable in [false, true] {
+            let mut caps = vec!["oink.core/1".to_owned(), "oink.input/1".to_owned()];
+            if capable {
+                caps.push(oink_routing::control::WINDOWS_LOCK_CAPABILITY.into());
+            }
+            let peer = PeerAdmission {
+                boot: source,
+                link: oink_network::link::LinkId(1),
+                agreement: Arc::new(Agreement::new(caps).unwrap()),
+            };
+            assert_eq!(supported(&packet, &peer), capable);
+            let mut bytes = [0; 512];
+            let n = encode(&packet, &mut bytes).unwrap();
+            if capable {
+                assert!(matches!(decode(&bytes[..n],&peer,false).unwrap(), Decoded::Packet(p) if p==packet));
+            } else {
+                assert!(decode(&bytes[..n], &peer, false).is_err());
+            }
+            // Existing input is still admitted; capability absence is not a link failure.
+            let key = Packet::Input(InputMsg::Key {
+                code: oink_foundation::input::KeyCode::keyboard(4),
+                pressed: true,
+            });
+            assert!(supported(&key, &peer));
+            let n = encode(&key, &mut bytes).unwrap();
+            assert!(matches!(decode(&bytes[..n],&peer,false).unwrap(),Decoded::Packet(p) if p==key));
         }
     }
 }

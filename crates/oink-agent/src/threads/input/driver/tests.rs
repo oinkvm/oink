@@ -3304,3 +3304,72 @@ fn application_focus_remote_commit_publishes_without_unrelated_native_work() {
 }
 
 mod reconnect;
+
+#[test]
+fn source_foreground_driver_follows_departure_return_and_live_policy() {
+    use oink_foundation::input::InputMode;
+    let backend = Arc::new(oink_test_support::input::FakeInput::new());
+    let mut h = Harness::with_backend(backend.clone());
+    let (_reader, _) = h.outbound(1);
+    let (writer, _) = h.inbound(1);
+    opening(&writer, &remote(), true);
+    h.attach();
+    h.driver.adapter.router_mut().move_pointer_to(peer()).unwrap();
+    h.driver.outputs(None);
+    let wait = |expected: &[bool], driver: &mut Driver| {
+        // An ordered fence proves the fake backend processed the transition too.
+        let done = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        driver.inject.push(InjectItem::UpdateFence(done.clone()));
+        let until = Instant::now() + Duration::from_secs(2);
+        while done.load(Ordering::Acquire) == 0 && Instant::now() < until {
+            std::thread::yield_now();
+        }
+        assert_eq!(done.load(Ordering::Acquire), 1);
+        assert_eq!(backend.source_foreground_requests(), expected);
+    };
+    wait(&[true], &mut h.driver);
+    h.driver.outputs(None);
+    wait(&[true], &mut h.driver);
+    let defaults = h.driver.adapter.router().config().settings.clone();
+    let mut settings = defaults.clone();
+    settings.keyboard_mode = InputMode::Local;
+    h.driver.adapter.router_mut().set_settings(settings);
+    h.driver.outputs(None);
+    wait(&[true, false], &mut h.driver);
+    h.driver.adapter.router_mut().set_settings(defaults.clone());
+    h.driver.outputs(None);
+    wait(&[true, false, true], &mut h.driver);
+    let mut settings = defaults;
+    settings.take_foreground_on_leave = false;
+    h.driver.adapter.router_mut().set_settings(settings);
+    h.driver.outputs(None);
+    wait(&[true, false, true, false], &mut h.driver);
+    h.driver.adapter.router_mut().return_pointer_home();
+    h.driver.outputs(None);
+    wait(&[true, false, true, false], &mut h.driver);
+}
+
+#[test]
+fn source_foreground_driver_restores_on_normal_return_and_delegates_application_focus() {
+    let backend = Arc::new(oink_test_support::input::FakeInput::new());
+    let mut h = Harness::with_backend(backend.clone());
+    let (_reader, _) = h.outbound(1);
+    let (writer, _) = h.inbound(1);
+    opening(&writer, &remote(), true);
+    h.attach();
+    h.driver.adapter.router_mut().move_pointer_to(peer()).unwrap();
+    h.driver.outputs(None);
+    h.driver.adapter.router_mut().return_pointer_home();
+    h.driver.outputs(None);
+    h.driver.adapter.router_mut().set_application_focus_enabled(true, 0);
+    h.driver.adapter.router_mut().move_pointer_to(peer()).unwrap();
+    h.driver.outputs(None);
+    let done = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    h.driver.inject.push(InjectItem::UpdateFence(done.clone()));
+    let until = Instant::now() + Duration::from_secs(2);
+    while done.load(Ordering::Acquire) == 0 && Instant::now() < until {
+        std::thread::yield_now();
+    }
+    assert_eq!(done.load(Ordering::Acquire), 1);
+    assert_eq!(backend.source_foreground_requests(), [true, false]);
+}

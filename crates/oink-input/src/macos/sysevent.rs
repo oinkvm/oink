@@ -329,12 +329,19 @@ mod tests {
     #[test]
     fn aux_fields_roundtrip_on_background_thread() {
         assert!(!super::super::main_queue::is_main_thread());
-        for key in [0, 1, 2, 3, 7, 16, 17, 18, 19, 20, 4, 0xffff] {
+        for key in [0, 1, 2, 3, 7, 16, 17, 18, 19, 20, 21, 22, 23, 4, 0xffff] {
             for pressed in [false, true] {
                 for repeat in [false, true] {
                     let key = AuxKey { key, pressed, repeat };
                     let ev = create_aux_key(key).unwrap();
                     assert_eq!(read_aux_key(&ev), Some(key));
+                    // Even when Command is held in the injector/system state,
+                    // brightness must carry only the native NX direction flags.
+                    assert_eq!(CGEvent::flags(Some(&ev)).0, if pressed { 0xa00 } else { 0xb00 });
+                    assert_eq!(
+                        CGEvent::integer_value_field(Some(&ev), CGEventField::EventSourceUserData),
+                        MAGIC
+                    );
                     assert_eq!(CGEvent::integer_value_field(Some(&ev), CGEventField(field::DATA2)), -1);
                     CGEvent::set_integer_value_field(Some(&ev), CGEventField(field::SUBTYPE), 7);
                     assert_eq!(read_aux_key(&ev), None);

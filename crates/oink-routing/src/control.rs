@@ -6,6 +6,16 @@ use oink_foundation::Point;
 use oink_foundation::input::FeelProfile;
 use serde::{Deserialize, Serialize};
 
+pub const WINDOWS_LOCK_CAPABILITY: &str = "oink.input.lock-remote-windows/1";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsLockRequest {
+    pub source: oink_foundation::session::Boot,
+    pub target: oink_foundation::session::Boot,
+    pub epoch: u64,
+    pub id: u64,
+}
+
 /// Routing process incarnations participating when a focus handoff was created.
 /// Gossip preserves this snapshot; reconnecting must never add a new incarnation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -115,6 +125,8 @@ pub enum ControlMsg {
         /// Gesture-only physical contacts supported by the live injector.
         touchpad_contacts: Option<u8>,
     },
+    /// Explicit action; never forwarded to a new focus or converted to keys.
+    LockRemoteWindows(WindowsLockRequest),
 }
 
 /// Bounded continuation. On the wire positions/direction are reference-plane offsets from

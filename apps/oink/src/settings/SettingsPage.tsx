@@ -85,8 +85,9 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
     // This device's own system-arrangement preference; hidden where the owner cannot write it at all.
     const arrangement = agentState.layoutProfiles?.devices.find(d => d.device === agentState.overview?.this_device.id);
     const [syncPending, setSyncPending] = useState(false);
-    const applicable = (item: ItemMeta) => (item.id !== 'perm-network' || perms.network !== 'not_required') && (!['touchpadInject','nativeMultifinger','macScrollFeel'].includes(item.id) || agentState.input?.contacts_injection_available === true)
+    const applicable = (item: ItemMeta) => (item.id !== 'perm-network' || perms.network !== 'not_required')
         && (item.id !== 'syncSystemArrangement' || arrangement?.availability !== 'unsupported');
+    const contactsAvailable = agentState.input?.contacts_injection_available === true;
     const setSync = async (enabled: boolean, label: string) => {
         if (!arrangement) return;
         setSyncPending(true);
@@ -97,7 +98,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
             toast.danger({ title: tr('无法更改「{0}」', label), description: e instanceof LayoutProfileFailure ? profileErrorText(e.problem) : tr('不可用') });
         } finally { setSyncPending(false); }
     };
-    const shortcuts = [...SHORTCUTS, ...deviceShortcuts(agentState.input?.hotkeys ?? [], agentState.cards?.cards ?? [])];
+    const shortcuts = [...SHORTCUTS.filter(s => !s.only || s.only === platform), ...deviceShortcuts(agentState.input?.hotkeys ?? [], agentState.cards?.cards ?? [])];
     const sections = sectionsFor(platform, shortcuts).map(s => ({ ...s, items: s.items.filter(applicable) }));
     const found = searchSections(platform, query, shortcuts);
     const shown = sections.filter((s) => {
@@ -246,9 +247,10 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
             case 'confirmQuit':
             case 'escStop':
             case 'scrollInvert':
+            case 'forwardWheelByLines':
             case 'forwardInjectedInput':
+            case 'takeForegroundOnLeave':
             case 'keepAwake':
-            case 'touchpadInject':
             case 'pointerTrail':
             case 'keepLocalPlayback':
             case 'diagnostics':
@@ -256,8 +258,12 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
             case 'clipReceive':
             case 'clipSend':
                 return sw(item.id);
-            case 'nativeMultifinger': return { node: <Switch aria-label={label} checked={prefs.nativeMultifinger} onChange={toggle('nativeMultifinger',label)} disabled={!prefs.touchpadInject}/> };
-            case 'macScrollFeel': return { node: <Switch aria-label={label} checked={prefs.macScrollFeel} onChange={toggle('macScrollFeel',label)} disabled={!prefs.touchpadInject}/> };
+            case 'touchpadInject': return {
+                desc: !contactsAvailable ? <>{text(item.desc, platform)} · {tr('原生触摸板注入暂不可用')}</> : undefined,
+                node: <Switch aria-label={label} checked={prefs.touchpadInject} onChange={toggle('touchpadInject',label)} disabled={!contactsAvailable}/>,
+            };
+            case 'nativeMultifinger': return { node: <Switch aria-label={label} checked={prefs.nativeMultifinger} onChange={toggle('nativeMultifinger',label)} disabled={!contactsAvailable || !prefs.touchpadInject}/> };
+            case 'macScrollFeel': return { node: <Switch aria-label={label} checked={prefs.macScrollFeel} onChange={toggle('macScrollFeel',label)} disabled={!contactsAvailable || !prefs.touchpadInject}/> };
             case 'hideSponsor': return { node: <Switch aria-label={label} checked={api.presentation?.hide_sponsor ?? false} onChange={v => api.savePresentation({ hide_sponsor: v })}/> };
             case 'onboarding': return { node: <Button size="sm" onClick={onOnboarding}>{tr('显示')}</Button> };
             case 'uninstall': return { node: <UninstallControl/> };
@@ -446,7 +452,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                     const label = text(i.label, platform);
                     const c = control(i, label);
                     const desc = c.desc ?? (i.desc ? hl(text(i.desc, platform), query) : undefined);
-                    const node = api.canEdit(i.id) ? c.node : <span className="setp__note">{tr('不可用')}</span>;
+                    const node = api.canEdit(i.id) || ['touchpadInject','nativeMultifinger','macScrollFeel'].includes(i.id) ? c.node : <span className="setp__note">{tr('不可用')}</span>;
                     const marks = { id: i.id === 'virtualMicrophone' ? 'settings-virtual-microphone' : undefined, 'data-item': i.id, 'data-parent': i.parent, 'data-flash': flash?.id === i.id ? flash.n : undefined, onAnimationEnd: () => setFlash(null) };
                     if (c.panel)
                         return (<Accordion key={i.id} {...marks} variant="plain" headingLevel={3} className="setp__row setp__acc" items={[{ value: i.id, content: node,

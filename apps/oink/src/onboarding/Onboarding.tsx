@@ -187,7 +187,7 @@ function Telemetry({ leaving, preferences, onNext }: {
                 </>
               }
             >
-              <Switch size="lg" aria-label={tr('上报崩溃记录和性能数据')} checked={on} onChange={setOn} />
+              <Switch aria-label={tr('上报崩溃记录和性能数据')} checked={on} onChange={setOn} />
             </Row>
           </Group>
         </div>

@@ -45,6 +45,8 @@ mod park_commit;
 pub mod pointer_capture;
 pub mod pointer_transition;
 pub mod session_gate;
+#[cfg(any(windows, test))]
+mod source_foreground;
 pub mod source_time;
 pub mod stale_step;
 pub mod timing;
@@ -120,6 +122,10 @@ pub type EventHandler = Arc<dyn Fn(&CapturedEvent) -> Disposition + Send + Sync>
 /// - 切到 `Remote` 时先隐藏再停靠 / 冻结：光标不能在别处露出来。
 /// - 所有方法可以从任意线程调用。
 pub trait InputBackend: Send + Sync {
+    /// Ordered outside capture callbacks. Windows owns a dedicated foreground
+    /// window until false; other platforms retain their native focus behavior.
+    fn set_source_foreground(&self, _enabled: bool) {}
+
     /// A fake platform may drive application-focus deadlines explicitly. This
     /// hook is absent from releases and defaults to the production wall clock.
     #[cfg(debug_assertions)]
@@ -304,6 +310,11 @@ pub trait InputBackend: Send + Sync {
     /// Injected events wake displays and reset idle time. Windows SendInput already
     /// counts as activity; macOS separately declares activity, at most once per second.
     fn inject(&self, event: &InjectEvent) -> Result<(), InputError>;
+    /// Explicit Windows session lock, called on the ordered injection worker.
+    /// Other platforms refuse; this must never fall back to synthetic keys.
+    fn lock_workstation(&self) -> Result<(), InputError> {
+        Err(InputError::Unsupported)
+    }
     /// One-shot display wake / idle timer reset; does not change routing focus.
     /// Returns true when declared, false when coalesced with a recent declaration.
     fn declare_user_activity(&self) -> Result<bool, InputError> {

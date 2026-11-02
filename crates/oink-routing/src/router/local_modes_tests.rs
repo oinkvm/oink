@@ -95,6 +95,7 @@ fn mouse_local_restores_last_local_cursor_and_never_claims_focus() {
             dy: 1.,
             unit: ScrollUnit::Line,
             phase: ScrollPhase::None,
+            wheel_steps: None,
         },
         InputEvent::Gesture(Gesture::SmartMagnify),
     ] {
@@ -399,6 +400,7 @@ fn local_mode_transforms_stay_local_and_shared_input_can_still_arrive() {
                 dy: 1.,
                 unit: ScrollUnit::Line,
                 phase: ScrollPhase::None,
+                wheel_steps: None,
             },
         );
         assert!(inputs(&r).is_empty());
@@ -423,7 +425,14 @@ fn local_contacts_and_gestures_never_forward_and_switch_cancels_old_sequences() 
     use oink_foundation::contacts::{Sample, Surface};
     let mut r = router(true);
     r.set_peer_touchpad_contacts(PEER, Some(5));
-    r.local_scroll(SourceKind::Touchpad, 0., 1., ScrollUnit::Pixel, ScrollPhase::Began);
+    r.local_scroll(
+        SourceKind::Touchpad,
+        0.,
+        1.,
+        ScrollUnit::Pixel,
+        ScrollPhase::Began,
+        None,
+    );
     r.local_gesture(
         SourceKind::Touchpad,
         Gesture::Magnify {
@@ -701,7 +710,8 @@ fn first_local_wheel_after_departure_keeps_local_transform_and_never_forwards() 
                         dx: 1.,
                         dy: 2.,
                         unit: ScrollUnit::Line,
-                        phase: ScrollPhase::None
+                        phase: ScrollPhase::None,
+                        wheel_steps: None,
                     },
                     cursor: None,
                     time_us: 100
@@ -831,6 +841,7 @@ fn mouse_disabled_consumes_source_input_without_revealing_or_forwarding() {
                 dy: 1.,
                 unit: ScrollUnit::Line,
                 phase: ScrollPhase::None,
+                wheel_steps: None,
             },
             InputEvent::Gesture(Gesture::SmartMagnify),
         ] {

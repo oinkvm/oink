@@ -43,7 +43,11 @@ fn action_name(h: &Hotkey) -> String {
 pub(crate) fn effective(saved: Option<Vec<Hotkey>>, slots: &BTreeMap<DeviceId, Option<u8>>) -> Vec<Hotkey> {
     let mut saved = configured(saved);
     // New actions are visible at runtime without changing the saved override list.
-    for action in [HotkeyAction::LockEscape, HotkeyAction::ToggleMicrophoneMute] {
+    for action in [
+        HotkeyAction::LockEscape,
+        HotkeyAction::ToggleMicrophoneMute,
+        HotkeyAction::LockRemoteWindows,
+    ] {
         if !saved.iter().any(|h| h.action == action) {
             saved.push(
                 crate::agent_api::default_hotkeys()
@@ -121,6 +125,12 @@ pub(crate) fn validate(list: &[Hotkey]) -> Result<(), String> {
         .filter(|h| h.enabled && !h.keys.is_empty() && h.action != HotkeyAction::LockEscape)
     {
         let chord = Chord::parse(&h.keys).map_err(|e| format!("快捷键 {}：{e}", h.keys.join("+")))?;
+        if h.action == HotkeyAction::LockRemoteWindows
+            && chord.key == oink_foundation::input::KeyCode::keyboard(0x0f)
+            && chord.mods == oink_routing::Mods::META
+        {
+            return Err("Win+L 保持锁定自身，请为远程锁屏选择其他快捷键".into());
+        }
         if seen.contains(&chord) {
             return Err("两个快捷键不能相同".into());
         }
@@ -147,6 +157,10 @@ pub(crate) fn bindings(list: &[Hotkey]) -> Vec<HotkeyBinding> {
             continue;
         }
         match Chord::parse(&h.keys) {
+            Ok(chord)
+                if h.action == HotkeyAction::LockRemoteWindows
+                    && chord.key == oink_foundation::input::KeyCode::keyboard(0x0f)
+                    && chord.mods == oink_routing::Mods::META => {}
             Ok(chord) if out.iter().any(|b| b.chord == chord) => {
                 tracing::warn!(action = h.action.as_str(), keys = ?h.keys, "hotkey duplicates another one: ignored");
             }
@@ -247,6 +261,7 @@ impl Node {
         };
         let r = match action {
             HotkeyAction::MovePointerTo | HotkeyAction::LockEscape => Ok(()),
+            HotkeyAction::LockRemoteWindows => Ok(()), // Router captured and dispatched the exact target.
             HotkeyAction::LockFocus => {
                 // The router already requested the toggle at physical key-down,
                 // using that exact focus epoch. This event is notification only.
@@ -299,6 +314,43 @@ impl Node {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+    #[test]
+    fn remote_windows_lock_validation_preserves_saved_choices_and_rejects_bare_win_l() {
+        let valid = hk(HotkeyAction::LockRemoteWindows, &["Meta", "Shift", "L"], true);
+        assert!(validate(std::slice::from_ref(&valid)).is_ok());
+        let mut disabled = valid.clone();
+        disabled.enabled = false;
+        let list = effective(Some(vec![disabled.clone()]), &BTreeMap::new());
+        assert_eq!(
+            list.iter().find(|h| h.action == HotkeyAction::LockRemoteWindows),
+            Some(&disabled)
+        );
+        assert!(
+            validate(&[
+                valid.clone(),
+                hk(HotkeyAction::OpenWindow, &["Shift", "Meta", "L"], true)
+            ])
+            .is_err()
+        );
+        let invalid = hk(HotkeyAction::LockRemoteWindows, &["Meta", "L"], true);
+        assert!(validate(std::slice::from_ref(&invalid)).is_err());
+        assert!(bindings(&[invalid]).is_empty());
+    }
+
+    #[test]
+    fn remote_windows_lock_default_is_enabled_and_merged_into_saved_lists() {
+        let defaults = crate::agent_api::default_hotkeys();
+        let item = defaults.iter().find(|h| h.action.as_str() == "lock_remote_windows");
+        assert!(item.is_some(), "Windows remote lock action must have a default");
+        let item = item.unwrap();
+        assert!(item.enabled);
+        assert_eq!(item.keys, ["Meta", "Shift", "L"]);
+        assert!(
+            effective(Some(Vec::new()), &BTreeMap::new())
+                .iter()
+                .any(|h| h.action.as_str() == "lock_remote_windows" && h.enabled)
+        );
+    }
 
     #[test]
     fn microphone_hotkey_defaults_off_and_preserves_saved_choices() {

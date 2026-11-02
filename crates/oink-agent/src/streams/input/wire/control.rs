@@ -9,7 +9,7 @@ use oink_routing::control::{ControlMsg, FocusLock, FocusScope, GameMode, TrailCo
 fn map<const N: usize>(fields: [(u32, RawValue); N]) -> RawMap {
     fields.into()
 }
-use oink_network::wire_identity::device;
+use oink_network::wire_identity::{boot, device, read_boot};
 fn read_device(value: w::DeviceId) -> v1::Result<DeviceId> {
     oink_network::wire_identity::read_device(&value)
 }
@@ -131,6 +131,14 @@ fn read_trail(value: w::TrailContinuation) -> v1::Result<TrailContinuation> {
 
 pub(super) fn encode(value: &ControlMsg) -> v1::Result<Message> {
     Ok(match value {
+        ControlMsg::LockRemoteWindows(request) => {
+            Message::ControlLockRemoteWindows(w::ControlLockRemoteWindows::from_raw(map([
+                (1, boot(request.source).write()),
+                (2, boot(request.target).write()),
+                (3, request.epoch.write()),
+                (4, request.id.write()),
+            ]))?)
+        }
         ControlMsg::ApplicationFocus(value) => super::application_focus::encode(value)?,
         ControlMsg::MovePointer { epoch, target } => {
             Message::ControlMovePointer(w::ControlMovePointer::from_raw(map([
@@ -248,6 +256,14 @@ pub(super) fn encode(value: &ControlMsg) -> v1::Result<Message> {
 }
 pub(super) fn decode(value: Message) -> v1::Result<ControlMsg> {
     Ok(match value {
+        Message::ControlLockRemoteWindows(v) => {
+            ControlMsg::LockRemoteWindows(oink_routing::control::WindowsLockRequest {
+                source: read_boot(&v.source()?)?,
+                target: read_boot(&v.target()?)?,
+                epoch: v.epoch()?,
+                id: v.request_id()?,
+            })
+        }
         Message::ApplicationFocus(value) => ControlMsg::ApplicationFocus(super::application_focus::decode(value)?),
         Message::ControlMovePointer(v) => ControlMsg::MovePointer {
             epoch: v.epoch()?,

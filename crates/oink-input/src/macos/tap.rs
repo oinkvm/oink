@@ -783,6 +783,18 @@ fn apply_mode_locked(s: &'static Shared, hidden: &mut HiddenCursor) {
     }
 }
 
+/// Testable policy boundary: owning the frozen cursor is independent of
+/// relocation. The caller supplies only a destination permitted by edge policy.
+fn prepare_freeze_owner(from: Point, to: Point, prepare: impl FnOnce(Point, Point)) {
+    // A background Hide can succeed while the cursor over an ordinary app
+    // stays visible. Current hit ownership is not hide admission. Always
+    // establish the blank owner, retaining the source point when no departure
+    // is allowed. The owner handshake posts only its same-position marker then.
+    // Stationary acquisition was exercised on macOS 26.6.2; the preexisting
+    // relocating handshake was exercised on macOS 14 and 26.
+    prepare(from, if warp_moves_cursor(from, to) { to } else { from });
+}
+
 /// Freeze immediately. Relocate only after AppKit owns a transparent cursor at the source point.
 fn freeze_clear_of_zones(s: &'static Shared) -> Point {
     cursor::freeze();
@@ -790,15 +802,16 @@ fn freeze_clear_of_zones(s: &'static Shared) -> Point {
     let cur = Point::new(cur.x, cur.y);
     if s.drag_anchor.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
         // Clipboard owns the same catcher through hold/return and commits its
-        // return through the serialized input transition. Ordinary Dock/edge
-        // relocation must not move an active native source behind its back.
+        // return through the serialized input transition. That native owner
+        // must not be covered by the ordinary Remote owner or relocated.
         return cur;
     }
     let displays = cursor::display_bounds();
     let settings = system::edge_settings();
     let generation = s.owner_generation.load(Ordering::Acquire);
     let to = clear_of_active_edge_zones(cur, &displays, None, &settings.corners);
-    // Only the configured Dock side can need AX. Ordinary edges never create an owner.
+    // Only the configured Dock side needs AX for its optional departure target.
+    // Ordinary edges acquire ownership at the unchanged source point.
     let near_dock = settings.dock.is_some_and(|side| {
         displays.iter().any(|d| {
             let distance = match side {
@@ -810,9 +823,7 @@ fn freeze_clear_of_zones(s: &'static Shared) -> Point {
         })
     });
     if !near_dock {
-        if warp_moves_cursor(cur, to) {
-            cursor::owner::prepare(s, generation, cur, to);
-        }
+        prepare_freeze_owner(cur, to, |from, to| cursor::owner::prepare(s, generation, from, to));
         return cur;
     }
     // Cache per generation, including an in-flight marker. Repeated Remote requests can resume
@@ -821,7 +832,7 @@ fn freeze_clear_of_zones(s: &'static Shared) -> Point {
     let mut query = QUERY.lock().unwrap_or_else(|e| e.into_inner());
     if query.0 == generation {
         if let Some((from, to)) = query.1 {
-            cursor::owner::prepare(s, generation, from, to);
+            prepare_freeze_owner(from, to, |from, to| cursor::owner::prepare(s, generation, from, to));
         }
     } else {
         *query = (generation, None);
@@ -843,10 +854,10 @@ fn freeze_clear_of_zones(s: &'static Shared) -> Point {
                 let target = clear_of_active_edge_zones(cur, &displays, dock, &settings.corners);
                 tracing::debug!(target: "oink_cursor_timing", ?dock, ?cur, ?target, generation, "freeze active zones");
                 let mut query = QUERY.lock().unwrap_or_else(|e| e.into_inner());
-                if query.0 == generation && warp_moves_cursor(cur, target) {
+                if query.0 == generation {
                     query.1 = Some((cur, target));
                     drop(query);
-                    cursor::owner::prepare(s, generation, cur, target);
+                    prepare_freeze_owner(cur, target, |from, to| cursor::owner::prepare(s, generation, from, to));
                 }
             });
         if result.is_err() {
@@ -2243,6 +2254,7 @@ unsafe extern "C-unwind" fn callback(
                         } else {
                             ScrollPhase::Cancelled
                         },
+                        wheel_steps: None,
                     },
                 },
             );
@@ -2703,6 +2715,27 @@ fn key_capture_metadata(
     }
 }
 
+// Public CGEventTypes.h fields 177/178 contain floating raw wheel deltas;
+// the integer accessor returns zero on real macOS 26.6.2 scroll samples. Raw
+// deltas precede natural-direction inversion, so restore that source preference
+// through AppKit's public event accessor, never a private CG field. Synthetic
+// events/older producers may omit raw data; their coarse line steps are an
+// explicit fallback, not a claim of physical HID equivalence. See routing.md.
+fn native_wheel_steps(event: &CGEvent, coarse: Point) -> Point {
+    let raw = Point::new(
+        CGEvent::double_value_field(Some(event), CGEventField(177)),
+        CGEvent::double_value_field(Some(event), CGEventField(178)),
+    );
+    if raw.x == 0. && raw.y == 0. {
+        return coarse;
+    }
+    let inverted = objc2::rc::autoreleasepool(|_| {
+        objc2_app_kit::NSEvent::eventWithCGEvent(event).is_some_and(|e| e.isDirectionInvertedFromDevice())
+    });
+    let sign = if inverted { -1. } else { 1. };
+    Point::new(raw.x * sign, raw.y * sign)
+}
+
 fn translate(ty: CGEventType, ev: &CGEvent) -> Translated {
     let int = |f: CGEventField| CGEvent::integer_value_field(Some(ev), f);
     let dbl = |f: CGEventField| CGEvent::double_value_field(Some(ev), f);
@@ -2777,13 +2810,32 @@ fn translate(ty: CGEventType, ev: &CGEvent) -> Translated {
         let continuous = int(CGEventField::ScrollWheelEventIsContinuous) != 0;
         let phase = int(CGEventField::ScrollWheelEventScrollPhase);
         let momentum = int(CGEventField::ScrollWheelEventMomentumPhase);
-        // 像素增量（已含系统滚动加速）。CGEvent 的滚动增量本身就表示「视图移动方向」：
-        // 正值 = 视图向文档顶部移动，本机的「自然滚动」设置已由系统体现在符号里，与线上约定一致。
-        let dy = dbl(CGEventField::ScrollWheelEventPointDeltaAxis1);
-        let dx = dbl(CGEventField::ScrollWheelEventPointDeltaAxis2);
+        // Both legacy coarse and FixedPt line deltas are accelerated by macOS.
+        // ON keeps the fractional line amount; OFF carries the separate raw
+        // steps. Continuous trackpads/Magic Mouse retain the pixel path.
+        let (dx, dy, unit, wheel_steps) = if continuous {
+            (
+                dbl(CGEventField::ScrollWheelEventPointDeltaAxis2),
+                dbl(CGEventField::ScrollWheelEventPointDeltaAxis1),
+                ScrollUnit::Pixel,
+                None,
+            )
+        } else {
+            let coarse = Point::new(
+                int(CGEventField::ScrollWheelEventDeltaAxis2) as f64,
+                int(CGEventField::ScrollWheelEventDeltaAxis1) as f64,
+            );
+            (
+                dbl(CGEventField::ScrollWheelEventFixedPtDeltaAxis2),
+                dbl(CGEventField::ScrollWheelEventFixedPtDeltaAxis1),
+                ScrollUnit::Line,
+                Some(native_wheel_steps(ev, coarse)),
+            )
+        };
         tracing::trace!(
             dx,
             dy,
+            ?unit,
             line_dy = dbl(CGEventField::ScrollWheelEventFixedPtDeltaAxis1),
             continuous,
             phase,
@@ -2804,8 +2856,9 @@ fn translate(ty: CGEventType, ev: &CGEvent) -> Translated {
                 InputEvent::Scroll {
                     dx,
                     dy,
-                    unit: ScrollUnit::Pixel,
+                    unit,
                     phase,
+                    wheel_steps,
                 },
                 source,
                 cursor,
@@ -2923,8 +2976,8 @@ fn translate(ty: CGEventType, ev: &CGEvent) -> Translated {
 }
 
 /// 系统定义事件：发往正在操作的那台电脑的媒体键（`keymap::nx_to_hid`）翻译成 Consumer 页的按键，
-/// 按下 / 抬起 / 重复与普通键一样处理（重复只在源机产生、逐个转发）。亮度 / 键盘背光仅上报供
-/// 路由取消同一手势的 Fn 映射，仍原样放行；其余（电源、弹出等、其他 subtype）不上报。
+/// 按下 / 抬起 / 重复与普通键一样处理（重复只在源机产生、逐个转发）。亮度 / 键盘背光上报供
+/// 路由取消 Fn 映射、判断 Cmd + 远端焦点手势；其余（电源、弹出等、其他 subtype）不上报。
 /// Caps 的明确方向也在这里采集，
 /// 但原生事件仍放行给本机，保持 LocalGuard 的既有行为。
 fn translate_aux(ev: &CGEvent) -> Translated {
@@ -2941,9 +2994,8 @@ fn translate_aux(ev: &CGEvent) -> Translated {
     let Some(code) = (if aux.key == 4 {
         Some(KeyCode::keyboard(0x39))
     } else {
-        // These controls still act natively on the source. Observation lets the
-        // router release Fn's mapped modifier before a translated F-row action;
-        // it does not add a HID->NX injection path or intercept the local action.
+        // Brightness observation also retires Fn's mapped modifier before the
+        // router chooses native local delivery or Command + remote focus delivery.
         keymap::nx_to_hid(aux.key).or_else(|| keymap::local_brightness_key(aux.key))
     }) else {
         tracing::trace!("system-defined key stays local");
@@ -3029,6 +3081,53 @@ fn map_phase(phase: i64, momentum: i64) -> Option<ScrollPhase> {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_freeze_ownership_does_not_depend_on_relocation_or_hit_window() {
+        use crate::warp_delta::{DockSide, DockZone};
+        use oink_foundation::Rect;
+
+        let displays = [Rect::new(0.0, 0.0, 1728.0, 1117.0)];
+        let dock = DockZone {
+            side: DockSide::Bottom,
+            frame: Rect::new(178.0, 1000.0, 1372.0, 107.0),
+            tile_pt: 87.0,
+        };
+        // Ordinary side edges, the Dock-side gutter, and an interior source
+        // (e.g. another device requested focus) all stay at their original point.
+        // None requires a Dock hit or a native visibility read to acquire ownership.
+        for cur in [
+            Point::new(0.0, 1054.875),
+            Point::new(80.0, 1048.25),
+            Point::new(0.0, 500.0),
+            Point::new(1727.0, 558.5),
+            Point::new(400.0, 500.0),
+        ] {
+            let target = clear_of_active_edge_zones(cur, &displays, Some(dock), &[]);
+            assert_eq!(target, cur);
+            let mut preparations = Vec::new();
+            prepare_freeze_owner(cur, target, |from, to| preparations.push((from, to)));
+            assert_eq!(preparations, [(cur, cur)]);
+        }
+        // The existing permitted departure still uses exactly its old target.
+        let cur = Point::new(864.0, 1054.875);
+        let target = clear_of_active_edge_zones(cur, &displays, Some(dock), &[]);
+        assert!(warp_moves_cursor(cur, target));
+        let mut preparations = Vec::new();
+        prepare_freeze_owner(cur, target, |from, to| preparations.push((from, to)));
+        assert_eq!(preparations, [(cur, target)]);
+
+        let cur = Point::new(400.0, 500.0);
+        let mut preparations = Vec::new();
+        prepare_freeze_owner(cur, Point::new(400.25, 500.0), |from, to| {
+            preparations.push((from, to));
+        });
+        assert_eq!(
+            preparations,
+            [(cur, cur)],
+            "subpixel clearance must not add a departure"
+        );
+    }
 
     #[test]
     fn remote_control_source_end_owner_move_and_release_do_not_create_a_local_modifier() {
@@ -3467,6 +3566,82 @@ mod tests {
             transformed_modifier_flags(CGEventFlags(0), &[(KeyCode::keyboard(4), KeyCode::RIGHT_SHIFT)], &[]);
         assert_eq!(modifier_pressed(0x3c, from_letter), Some(true));
         assert_eq!(modifier_pressed(0x38, from_letter), Some(false));
+    }
+
+    #[test]
+    fn notched_mouse_scroll_keeps_native_lines_while_continuous_scroll_keeps_pixels() {
+        for continuous in [false, true] {
+            let event =
+                CGEvent::new_scroll_wheel_event2(None, objc2_core_graphics::CGScrollEventUnit::Line, 2, 1, -2, 0)
+                    .unwrap();
+            CGEvent::set_integer_value_field(
+                Some(&event),
+                CGEventField::ScrollWheelEventIsContinuous,
+                i64::from(continuous),
+            );
+            // Distinguish the native wheel report from the pixel displacement
+            // that macOS supplies alongside it. No events are posted.
+            CGEvent::set_integer_value_field(Some(&event), CGEventField::ScrollWheelEventPointDeltaAxis1, 10);
+            CGEvent::set_integer_value_field(Some(&event), CGEventField::ScrollWheelEventPointDeltaAxis2, -20);
+            let captured = translate(CGEventType::ScrollWheel, &event).event.unwrap();
+            assert_eq!(
+                captured.source,
+                if continuous {
+                    SourceKind::Touchpad
+                } else {
+                    SourceKind::Mouse
+                }
+            );
+            assert_eq!(
+                captured.event,
+                if continuous {
+                    InputEvent::Scroll {
+                        dx: -20.,
+                        dy: 10.,
+                        unit: ScrollUnit::Pixel,
+                        phase: ScrollPhase::None,
+                        wheel_steps: None,
+                    }
+                } else {
+                    InputEvent::Scroll {
+                        dx: -2.,
+                        dy: 1.,
+                        unit: ScrollUnit::Line,
+                        phase: ScrollPhase::None,
+                        wheel_steps: Some(Point::new(-2., 1.)),
+                    }
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn noncontinuous_wheel_separates_accelerated_lines_from_raw_double_steps() {
+        let event =
+            CGEvent::new_scroll_wheel_event2(None, objc2_core_graphics::CGScrollEventUnit::Line, 2, 4, -8, 0).unwrap();
+        CGEvent::set_double_value_field(Some(&event), CGEventField::ScrollWheelEventFixedPtDeltaAxis1, 4.5);
+        CGEvent::set_double_value_field(Some(&event), CGEventField::ScrollWheelEventFixedPtDeltaAxis2, -9.);
+        CGEvent::set_double_value_field(Some(&event), CGEventField(178), 1.);
+        CGEvent::set_double_value_field(Some(&event), CGEventField(177), -2.);
+        let captured = translate(CGEventType::ScrollWheel, &event).event.unwrap();
+        assert_eq!(
+            captured.event,
+            InputEvent::Scroll {
+                dx: -9.,
+                dy: 4.5,
+                unit: ScrollUnit::Line,
+                phase: ScrollPhase::None,
+                wheel_steps: Some(Point::new(-2., 1.))
+            }
+        );
+        // Public AppKit accessor supplies the direction applied to the raw data.
+        CGEvent::set_integer_value_field(Some(&event), CGEventField(137), 1);
+        assert!(
+            objc2_app_kit::NSEvent::eventWithCGEvent(&event)
+                .unwrap()
+                .isDirectionInvertedFromDevice()
+        );
+        assert_eq!(native_wheel_steps(&event, Point::default()), Point::new(2., -1.));
     }
 
     #[test]
@@ -3941,7 +4116,7 @@ mod brightness_tests {
                         if Some(*code) == keymap::local_brightness_key(key) && *direction == pressed));
                 assert!(translated.repeat_of.is_none());
                 assert!(translated.release_first.is_none());
-                assert!(keymap::hid_to_nx(keymap::local_brightness_key(key).unwrap()).is_none());
+                assert_eq!(keymap::hid_to_nx(keymap::local_brightness_key(key).unwrap()), Some(key));
                 track_keys(translated.event.as_ref().unwrap(), translated.disp_key);
             }
         }

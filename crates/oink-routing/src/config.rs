@@ -81,6 +81,8 @@ pub struct RoutingSettings {
     pub max_forward_hops: u8,
     /// 本机作为目标时注入远端滚动的倍率（界面「滚动速度」，默认 1）。
     pub remote_scroll_speed: f64,
+    /// Source-local: preserve source line counts (on), or forward native wheel steps (off).
+    pub forward_wheel_by_lines: bool,
     /// 紧急暂停：在本机键盘上按住 Esc 多久（毫秒）暂停整个设备组的
     /// 共享；0 表示关闭长按触发。
     pub emergency_hold_ms: u32,
@@ -102,6 +104,8 @@ pub struct RoutingSettings {
     pub native_multifinger: bool,
     /// Windows capture-local opt-in to legacy forwarding of other apps' injected input.
     pub forward_injected_input: bool,
+    /// Windows source-local foreground capture; never published to peers.
+    pub take_foreground_on_leave: bool,
     /// Runtime projection of this device owner's persistent game preference.
     #[serde(skip)]
     pub game_mode_preference: crate::GameMode,
@@ -141,6 +145,7 @@ impl Default for RoutingSettings {
             fallback_reference_per_native_unit: 0.25 / 686.0,
             max_forward_hops: 2,
             remote_scroll_speed: 1.0,
+            forward_wheel_by_lines: true,
             emergency_hold_ms: DEFAULT_EMERGENCY_HOLD_MS,
             emergency_combo: true,
             forward_gestures: true,
@@ -149,6 +154,7 @@ impl Default for RoutingSettings {
             touchpad_injection: true,
             native_multifinger: true,
             forward_injected_input: false,
+            take_foreground_on_leave: true,
             game_mode_preference: crate::GameMode::Auto,
             return_pointer_on_display_sleep: true,
             wake_displays_on_input: true,

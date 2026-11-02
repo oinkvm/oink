@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
 import { OinkProvider } from 'oink-ui';
 import { agent } from '../api/store';
 import type { InputSettings } from '../api/types';
@@ -43,22 +43,82 @@ it.each(['en','ja','ko','zh-Hans'])('shows default-off external forwarding only 
   expect(mac.container.querySelector('[data-item="forwardInjectedInput"]')).toBeNull();
   expect(sectionsFor('mac').flatMap(section=>section.items).some(item=>item.id==='forwardInjectedInput')).toBe(false);
 });
+it.each(['en','ja','ko','zh-Hans'])('shows default-on foreground capture only on Windows in %s', language => {
+  setLanguage(language);
+  const set=vi.fn();
+  const {container,unmount}=render(view(initial,'',vi.fn(),undefined,'win',{...prefs,set}));
+  const row=container.querySelector<HTMLElement>('[data-item="takeForegroundOnLeave"]')!;
+  expect(row).not.toBeNull();
+  expect(row.classList.contains('ok-row--stack')).toBe(false);
+  expect(row.nextElementSibling?.getAttribute('data-item')).toBe('forwardInjectedInput');
+  const control=within(row).getByRole('switch') as HTMLInputElement;
+  expect(control.checked).toBe(true);
+  fireEvent.click(control);
+  expect(set).toHaveBeenCalledExactlyOnceWith('takeForegroundOnLeave',false);
+  const item=sectionsFor('win').flatMap(section=>section.items).find(item=>item.id==='takeForegroundOnLeave')!;
+  if(language==='zh-Hans') {
+    expect(item.label).toBe('指针离开时接管前台');
+    expect(item.desc).toBe('指针离开本机时，接管前台应用，避免本机运行读取物理按键的应用时，按键同时在两边生效。若部分应用在指针离开后行为异常，可关闭此开关。');
+  } else {
+    expect(item.label).not.toBe('指针离开时接管前台');
+    expect(item.desc).not.toContain('指针离开本机时');
+  }
+  expect(sectionsFor('win').find(section=>section.id==='input')?.items.some(item=>item.id==='takeForegroundOnLeave')).toBe(true);
+  const found=searchSections('win',String(item.label)).get('input');
+  expect(found==='all'||found?.has('takeForegroundOnLeave')).toBe(true);
+  unmount();
+  const mac=render(view());
+  expect(mac.container.querySelector('[data-item="takeForegroundOnLeave"]')).toBeNull();
+  expect(sectionsFor('mac').flatMap(section=>section.items).some(item=>item.id==='takeForegroundOnLeave')).toBe(false);
+});
 const prefs = { prefs: DEFAULT_PREFS, set() {}, canEdit: () => true } as unknown as PrefsApi;
 const initial: Record<PermissionId, PermState> = { accessibility: 'not_granted', input: 'not_granted', network: 'not_required', files: 'unknown', audio: 'not_determined' };
 function view(perms = initial, query = '', onGrant = vi.fn(), onOpenPermissionSettings?: (id: PermissionId) => void, platform: Platform = 'mac', settings = prefs) {
   return <OinkProvider defaultMotion="reduced"><SettingsPage open platform={platform} api={settings} capsIme={false} query={query} jump={null} onActive={() => {}} version="test" upgrade={{available:false,next:''}} perms={perms} onGrant={onGrant} onOpenPermissionSettings={onOpenPermissionSettings} onLog={() => {}} onAbout={() => {}} onBlocklist={() => {}}/></OinkProvider>;
 }
-it.each(['en','ja','ko','zh-Hans'])('hides contacts settings without an injector in %s', language => {
+it.each(['en','ja','ko','zh-Hans'])('keeps touchpad preferences visible and disables unavailable injection in %s', language => {
   setLanguage(language);
   for (const available of [undefined,false,true]) {
     agent.adopt('input', {contacts_injection_available:available} as unknown as InputSettings);
     const {container,unmount}=render(view(initial,'',vi.fn(),undefined,'win'));
-    expect(!!container.querySelector('[data-item="touchpadInject"]')).toBe(available===true);
-    expect(!!container.querySelector('[data-item="nativeMultifinger"]')).toBe(available===true);
-    expect(!!container.querySelector('[data-item="macScrollFeel"]')).toBe(available===true);
+    for (const id of ['touchpadInject','nativeMultifinger','macScrollFeel']) {
+      const row=container.querySelector<HTMLElement>(`[data-item="${id}"]`)!;
+      expect(row).not.toBeNull();
+      const control=within(row).getByRole('switch') as HTMLInputElement;
+      expect(control.checked).toBe(true);
+      expect(control.disabled).toBe(available!==true);
+      if (id==='touchpadInject' && available!==true) {
+        expect(row.textContent).toContain(language==='en' ? 'Native touchpad injection is currently unavailable' : language==='zh-Hans' ? '原生触摸板注入暂不可用' : '');
+      }
+    }
     unmount();
   }
   agent.adopt('input', null);
+});
+it('keeps disabled touchpad switches visible before input settings load',()=>{
+  setLanguage('en');
+  agent.adopt('input',null);
+  const {container}=render(view(initial,'',vi.fn(),undefined,'win',{...prefs,canEdit:()=>false}));
+  for(const id of ['touchpadInject','nativeMultifinger','macScrollFeel']) {
+    const row=container.querySelector<HTMLElement>(`[data-item="${id}"]`)!;
+    expect((within(row).getByRole('switch') as HTMLInputElement).disabled).toBe(true);
+  }
+});
+it('updates disabled touchpad rows in place when injector availability changes', async()=>{
+  setLanguage('en');
+  agent.adopt('input', {contacts_injection_available:true} as InputSettings);
+  const {container}=render(view(initial,'',vi.fn(),undefined,'win'));
+  const row=container.querySelector<HTMLElement>('[data-item="touchpadInject"]')!;
+  for (const available of [false,true]) {
+    await act(async()=>agent.adopt('input',{contacts_injection_available:available} as InputSettings));
+    expect(container.querySelector('[data-item="touchpadInject"]')).toBe(row);
+    for(const id of ['touchpadInject','nativeMultifinger','macScrollFeel']) {
+      const control=within(container.querySelector<HTMLElement>(`[data-item="${id}"]`)!).getByRole('switch') as HTMLInputElement;
+      expect(control.disabled).toBe(!available);
+      expect(control.checked).toBe(true);
+    }
+  }
+  agent.adopt('input',null);
 });
 it.each(['en','ja','ko','zh-Hans'])('places the default-on Mac scroll switch below contacts and disables it with its parent in %s', language => {
   setLanguage(language);

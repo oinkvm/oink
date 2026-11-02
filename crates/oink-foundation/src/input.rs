@@ -126,7 +126,7 @@ pub enum ScrollUnit {
     /// 源机本地坐标单位（mac point / Win px），已含源系统的滚动加速；触摸板和 mac 鼠标通常是这种。
     Pixel,
     /// 滚轮格数（notch）。Windows：`mouseData / WHEEL_DELTA`（高精度滚轮为小数），注入时 1.0 = `WHEEL_DELTA`；
-    /// macOS：按行计（macOS 没有「每格行数」设置，一格即一行）。
+    /// macOS：系统行量，可能包含滚轮加速；原始轮步另存于 `InputEvent::Scroll::wheel_steps`。
     /// 与「行」的换算（× `FeelProfile::wheel_lines_per_notch`）由输入路由负责，平台实现不做。
     Line,
 }
@@ -168,6 +168,10 @@ pub enum InputEvent {
         dy: f64,
         unit: ScrollUnit,
         phase: ScrollPhase,
+        /// Best available native wheel steps; Mac producers without raw fields fall back to coarse lines.
+        /// Never used for continuous input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wheel_steps: Option<crate::Point>,
     },
     Key {
         code: KeyCode,
@@ -342,6 +346,13 @@ pub enum InjectEvent {
         dy: f64,
         pixels_per_reference: f64,
         wheel: ScrollInjection,
+    },
+    /// A mapped key whose remote origin must not request Win+L compensation.
+    /// Deliver normally; Windows origins already own their native lock chord.
+    /// This is local injection metadata, never a wire key identity.
+    KeyWithoutLock {
+        code: KeyCode,
+        pressed: bool,
     },
 }
 

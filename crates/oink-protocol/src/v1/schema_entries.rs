@@ -121,6 +121,7 @@ dto_schemas! {
     ControlUserActivity,
     ControlLockEscape,
     ControlEntryProtection,
+    ControlLockRemoteWindows,
     Coverage,
     Crossing,
     CryptoOffers,

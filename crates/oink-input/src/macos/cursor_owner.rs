@@ -1,10 +1,11 @@
 //! Hold a transparent cursor in a nonactivating window while the source is frozen.
 //!
-//! A Dock-owned cursor ignores our background hide request. Moving that visible cursor out of
-//! the Dock exposes the freeze point. A tiny alpha-backed panel takes pointer ownership at the
+//! A background hide can be ignored even over an ordinary application window. Moving that
+//! visible cursor exposes the freeze point. A tiny alpha-backed panel takes pointer ownership at the
 //! original position first; its cursor rectangle supplies an all-transparent bitmap. Only after
 //! its marked same-position event is consumed and the main thread verifies ownership may the
-//! tap move to the freeze point.
+//! tap make an optional permitted departure. With no departure the owner stays at the source
+//! point and only the acknowledged same-position marker is posted.
 //! The panel stays until Local. No polling/repeated hide and no global cursor preference changes.
 
 use std::cell::{Cell, RefCell};
@@ -399,7 +400,12 @@ fn finish_marked_move(shared: &'static Shared, generation: u64) {
             handoff_timing::native(TimingStage::OwnerReady, 0);
             super::hide_owned();
             tracing::debug!(generation, from = ?ui.from, to = ?ivars.to, "cursor owner: blank glyph ready");
-            shared.owner_ready(generation, ivars.to);
+            // An ordinary Remote freeze needs ownership without a departure.
+            // The acknowledged same-position event already acquired
+            // it; keep the ordinary-edge freeze point and post nothing else.
+            if crate::warp_delta::warp_moves_cursor(ui.from, ivars.to) {
+                shared.owner_ready(generation, ivars.to);
+            }
         });
     });
 }
@@ -466,7 +472,8 @@ pub(crate) fn prepare(shared: &'static Shared, generation: u64, from: Point, to:
             UI.with(|ui| {
                 let ui = ui.borrow();
                 if let Some(ui) = ui.as_ref().filter(|u| u.generation == generation && active(generation)) {
-                    if ui.view.ivars().ready.get() {
+                    if ui.view.ivars().ready.get() && crate::warp_delta::warp_moves_cursor(ui.from, ui.view.ivars().to)
+                    {
                         shared.owner_ready(generation, ui.view.ivars().to);
                     }
                     true

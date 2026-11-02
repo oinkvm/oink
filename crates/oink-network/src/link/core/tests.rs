@@ -1071,3 +1071,190 @@ fn fresh_addresses_join_a_pending_relay_search_once() {
     assert_eq!(r.nodes[0].dials[&target].deadline, deadline);
     assert!(r.nodes[0].dials[&target].direct);
 }
+
+#[test]
+fn relay_search_expiry_during_path_install_still_reports_dial_failure() {
+    let mut r = Rig::new(3);
+    r.connect(0, 1);
+    r.connect(1, 2);
+    r.pump();
+    r.ready(0, 1);
+    r.ready(1, 2);
+    r.observed.clear();
+    let peer = r.peer(2);
+    r.nodes[0].dial(peer, vec![], DialMode::PreferDirect, r.now).unwrap();
+    let search_deadline = r.now + RELAY_TIMEOUT;
+    // Installation starts after the relay search, so its acknowledgement can
+    // remain in flight when the earlier search budget expires.
+    r.now += Duration::from_millis(100);
+    let mut held = Vec::new();
+    r.pump_holding(&mut held, |n, e| {
+        n == 0 && matches!(e, Effect::Control { message, .. } if matches!(message.as_ref(), LinkMsg::PathInstall(_)))
+    });
+    let link = r.link(0, 2);
+    assert!(!r.nodes[0].links[&link].installed);
+    let install_deadline = r.nodes[0].links[&link].installation_deadline;
+    assert!(search_deadline < install_deadline);
+    // Other admitted neighbors keep answering heartbeats throughout this queue.
+    for l in r.nodes[0].links.values_mut().filter(|l| l.installed) {
+        l.heartbeat.progress = install_deadline;
+    }
+    r.nodes[0].tick(search_deadline);
+    r.nodes[0].tick(install_deadline);
+    assert!(r.nodes[0].peer_link(peer).is_none());
+    assert_eq!(
+        r.nodes[0]
+            .effects
+            .iter()
+            .filter(|e| matches!(e, Effect::DialFailed(p, _) if *p == peer))
+            .count(),
+        1,
+        "an uninstalled path must not swallow the dial result and strand its caller active"
+    );
+    assert!(
+        !r.observed
+            .iter()
+            .any(|(n, e)| *n == 0 && matches!(e, Effect::Connected(_)))
+    );
+    // The caller can now consume DialFailed and use its normal retry schedule.
+    // No stale dial/candidate reservation may prevent that next real attempt.
+    r.now = install_deadline;
+    r.nodes[0].dial(peer, vec![], DialMode::PreferDirect, r.now).unwrap();
+    r.pump();
+    assert!(r.nodes[0].links[&r.link(0, 2)].installed);
+    assert!(r.nodes[2].links[&r.link(2, 0)].installed);
+}
+
+#[test]
+fn exhausted_candidates_during_path_install_still_report_dial_failure() {
+    let mut r = Rig::new(2);
+    let peer = r.peer(1);
+    r.nodes[0]
+        .dial(peer, vec!["127.0.0.1:9".parse().unwrap()], DialMode::DirectOnly, r.now)
+        .unwrap();
+    // A reverse incoming candidate wins selection while the outgoing
+    // candidates finish. Path installation has not acknowledged success yet.
+    r.connect(1, 0);
+    let mut held = Vec::new();
+    r.pump_holding(&mut held, |n, e| {
+        n == 0 && matches!(e, Effect::Control { message, .. } if matches!(message.as_ref(), LinkMsg::PathInstall(_)))
+    });
+    let link = r.link(0, 1);
+    assert!(!r.nodes[0].links[&link].installed);
+    r.nodes[0].dial_done(peer, r.now);
+    r.nodes[0].tick(r.now + DIAL_BUDGET);
+    assert!(r.nodes[0].peer_link(peer).is_none());
+    assert_eq!(
+        r.nodes[0]
+            .effects
+            .iter()
+            .filter(|e| matches!(e, Effect::DialFailed(p, _) if *p == peer))
+            .count(),
+        1,
+        "finishing TLS candidates cannot finish a dial before the path exists"
+    );
+    assert!(
+        !r.observed
+            .iter()
+            .any(|(n, e)| *n == 0 && matches!(e, Effect::Connected(_)))
+    );
+}
+
+#[test]
+fn exhausted_candidates_during_path_install_can_still_connect() {
+    let mut r = Rig::new(2);
+    let peer = r.peer(1);
+    r.nodes[0]
+        .dial(peer, vec!["127.0.0.1:9".parse().unwrap()], DialMode::DirectOnly, r.now)
+        .unwrap();
+    r.now += Duration::from_millis(100);
+    r.connect(1, 0);
+    let mut held = Vec::new();
+    r.pump_holding(&mut held, |n, e| {
+        n == 0 && matches!(e, Effect::Control { message, .. } if matches!(message.as_ref(), LinkMsg::PathInstall(_)))
+    });
+    let link = r.link(0, 1);
+    r.nodes[0].dial_done(peer, r.now);
+    // The old dial budget can finish before the path's existing installation
+    // budget. Neither fail it early nor spin on that obsolete dial deadline.
+    r.now += DIAL_BUDGET - Duration::from_millis(50);
+    r.nodes[0].links.get_mut(&link).unwrap().heartbeat.progress = r.now;
+    r.nodes[0].tick(r.now);
+    assert!(r.nodes[0].links.contains_key(&link));
+    assert!(r.nodes[0].next_deadline().unwrap() > r.now);
+    assert!(r.nodes[0].dials.contains_key(&peer));
+    for (_, effect) in held {
+        let Effect::Control {
+            connection,
+            tag,
+            message,
+        } = effect
+        else {
+            unreachable!()
+        };
+        r.nodes[1].receive(connection, tag, *message, r.now);
+    }
+    r.pump();
+    assert!(r.nodes[0].links[&link].installed);
+    assert!(!r.nodes[0].dials.contains_key(&peer));
+    assert_eq!(
+        r.observed
+            .iter()
+            .filter(|(n, e)| *n == 0 && matches!(e, Effect::Connected(id) if *id == link))
+            .count(),
+        1
+    );
+    assert!(
+        !r.observed
+            .iter()
+            .any(|(n, e)| *n == 0 && matches!(e, Effect::DialFailed(p, _) if *p == peer))
+    );
+}
+
+#[test]
+fn dial_queued_during_inbound_path_install_receives_a_result() {
+    for completes in [false, true] {
+        let mut r = Rig::new(2);
+        let peer = r.peer(1);
+        // Installing paths are absent from LinkLayer's public snapshot, so an
+        // ordinary owner can reserve and queue its dial before Connected exists.
+        r.connect(1, 0);
+        let mut held = Vec::new();
+        r.pump_holding(&mut held, |n, e| {
+            n == 0
+                && matches!(e, Effect::Control { message, .. } if matches!(message.as_ref(), LinkMsg::PathInstall(_)))
+        });
+        let link = r.link(0, 1);
+        assert!(!r.nodes[0].links[&link].installed);
+        assert!(!r.nodes[0].dials.contains_key(&peer));
+        r.nodes[0].dial(peer, vec![], DialMode::PreferDirect, r.now).unwrap();
+        if completes {
+            for (_, effect) in held {
+                let Effect::Control {
+                    connection,
+                    tag,
+                    message,
+                } = effect
+                else {
+                    unreachable!()
+                };
+                r.nodes[1].receive(connection, tag, *message, r.now);
+            }
+            r.pump();
+            assert!(
+                r.observed
+                    .iter()
+                    .any(|(n, e)| *n == 0 && matches!(e, Effect::Connected(id) if *id == link))
+            );
+        } else {
+            r.nodes[0].tick(r.now + DIAL_BUDGET);
+            assert!(
+                r.nodes[0]
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::DialFailed(p, _) if *p == peer))
+            );
+        }
+        assert!(!r.nodes[0].dials.contains_key(&peer));
+    }
+}

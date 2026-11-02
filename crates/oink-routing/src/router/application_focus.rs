@@ -88,9 +88,9 @@ impl Router {
         if !self.application.enabled {
             return;
         }
-        // Volume keeps the existing audio-exit transaction; K never chooses a
-        // second audio exit. This is the pre-existing hardware-key policy.
-        if physical.is_none() && code.is_volume() {
+        // Hardware controls belong to the pointer focus (or volume's audio exit),
+        // never to the optional application-focus destination.
+        if physical.is_none() && (code.is_volume() || code.is_brightness()) {
             return;
         }
         let Some(source) = self.admitted_boots.get(&origin).copied() else {
@@ -139,7 +139,7 @@ impl Router {
         if !self.application.enabled {
             return;
         }
-        if code.is_volume() {
+        if code.is_volume() || code.is_brightness() {
             return;
         }
         let Some(source) = self.admitted_boots.get(&origin).copied() else {
@@ -266,10 +266,8 @@ impl Router {
                     *count += 1;
                     if *count == 1 {
                         self.application_diagnostic(evidence(a::KeyStage::Injected));
-                        self.out.push(Output::Inject(InjectEvent::Key {
-                            code: mapped,
-                            pressed: true,
-                        }));
+                        self.out
+                            .push(Output::Inject(self.native_key_event(origin, mapped, true)));
                     }
                 }
             }
@@ -285,10 +283,8 @@ impl Router {
                     .repeat(source, identity, &token, repeat.unwrap_or(0))
                     && repeatable(mapped)
                 {
-                    self.out.push(Output::Inject(InjectEvent::Key {
-                        code: mapped,
-                        pressed: true,
-                    }));
+                    self.out
+                        .push(Output::Inject(self.native_key_event(origin, mapped, true)));
                 }
             }
         }

@@ -13,10 +13,24 @@ pub(crate) struct LockChord {
 }
 
 impl LockChord {
+    #[cfg(all(test, debug_assertions))]
     pub(crate) fn key<E>(
         &mut self,
         code: KeyCode,
         pressed: bool,
+        send: impl FnMut(KeyCode, bool) -> Result<(), E>,
+        lock: impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.key_with_lock(code, pressed, true, send, lock)
+    }
+
+    /// `allow_lock` is decided per mapped event from its admitted original OS.
+    /// False still sends L and updates the ordinary held ledger; it adds no mask.
+    pub(crate) fn key_with_lock<E>(
+        &mut self,
+        code: KeyCode,
+        pressed: bool,
+        allow_lock: bool,
         mut send: impl FnMut(KeyCode, bool) -> Result<(), E>,
         mut lock: impl FnMut() -> Result<(), E>,
     ) -> Result<(), E> {
@@ -28,7 +42,7 @@ impl LockChord {
         }
         let win_down = self.held.contains(&KeyCode::LEFT_GUI) || self.held.contains(&KeyCode::RIGHT_GUI);
         let other_modifier = self.held.iter().any(|key| key.is_modifier() && !is_win(*key));
-        if code == L && pressed && !self.held.contains(&L) && win_down && !other_modifier {
+        if allow_lock && code == L && pressed && !self.held.contains(&L) && win_down && !other_modifier {
             self.consumed.insert(L);
             // L is never submitted. Mask the otherwise bare Win up so it does not open Start.
             // Release before the asynchronous lock can switch desktops: the helper's held
@@ -135,6 +149,42 @@ mod tests {
             f.key(wins[0], true);
             f.key(L, true);
             assert_eq!(f.locks, 2);
+        }
+    }
+
+    #[test]
+    fn windows_origin_passes_complete_win_l_without_lock_mask_or_start_menu() {
+        for win in [KeyCode::LEFT_GUI, KeyCode::RIGHT_GUI] {
+            let mut chord = LockChord::default();
+            let expected = [(win, true), (L, true), (L, true), (L, false), (win, false)];
+            let mut sent = Vec::new();
+            let mut win_used = false;
+            let mut start_menu = false;
+            for (code, pressed) in expected {
+                chord
+                    .key_with_lock(
+                        code,
+                        pressed,
+                        false,
+                        |key, down| {
+                            // Fake shell only: a non-modifier between Win DOWN/UP marks
+                            // the Win press as used. No SendInput or native lock is called.
+                            if key == L && down {
+                                win_used = true;
+                            }
+                            if key == win && !down {
+                                start_menu = !win_used;
+                            }
+                            sent.push((key, down));
+                            Ok::<_, ()>(())
+                        },
+                        || panic!("Windows-origin Win+L must not request another lock"),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(sent, expected);
+            assert!(!start_menu);
+            assert!(chord.held.is_empty() && chord.consumed.is_empty());
         }
     }
 

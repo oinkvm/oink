@@ -87,6 +87,17 @@ describe('authenticated presentation ordering', () => {
     store.receive({type:'nearby_snapshot',data:{revision:'1',rows:[]}});
     expect(store.get().nearby?.revision).toBe('3');
   });
+  it('keeps nearby rows in snapshot order when a row is updated or added',async()=>{
+    const store=createAgentStore();
+    const address={family:0,address:[192,0,2,1],port:47470,interface_scope:0};
+    const row=(device:string,source=0):NearbySnapshot['rows'][number]=>({device,name:device.slice(0,1),os:'macos',group:{group:'g',root:null},count:1,addresses:[address],selected:address,source,identity:'advertised',reachable:true,compatible:true,problem:null});
+    const [a,b,c]=['a','b','c'].map(x=>x.repeat(64));
+    await store.query('nearby',async()=>({revision:'1',rows:[row(a),row(c)]}));
+    store.receive({type:'nearby_changed',data:{revision:'2',upserts:[row(a,1)],removed:[]}});
+    expect(store.get().nearby?.rows.map(r=>r.device)).toEqual([a,c]);
+    store.receive({type:'nearby_changed',data:{revision:'3',upserts:[row(b)],removed:[]}});
+    expect(store.get().nearby?.rows.map(r=>r.device)).toEqual([a,b,c]);
+  });
   it('keeps applied preference events newer than a pending command reply',async()=>{
     const store=createAgentStore();
     const before:import('./cards').UiPreferences={notification_level:'default',show_status_icon:true,confirm_quit:true,ui_language:'auto',theme_mode:'light',theme_accent:{light:'#2E7BFF',dark:'#2E7BFF'},log_level:'info',log_max_mb:1024};

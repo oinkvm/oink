@@ -420,7 +420,10 @@ impl crate::contacts::Sink for NativeContacts {
                 None
             }
         };
-        self.device.is_some()
+        let available = self.device.is_some();
+        CONTACT_CAPACITY.store(if available { 5 } else { 0 }, Ordering::Release);
+        CONTACT_INIT.store(self.init_error_kind.map_or(1, |error| error as u8), Ordering::Release);
+        available
     }
     fn frame(&mut self, contacts: &[crate::contacts::Pointer], tick: u32) -> bool {
         let Some(device) = &mut self.device else {
@@ -438,7 +441,38 @@ impl crate::contacts::Sink for NativeContacts {
         // SAFETY: one owned gesture-only device, at most five initialized pointers.
         let ok = unsafe { (device.inject)(device.handle, pointers.as_ptr(), contacts.len() as u32) != 0 };
         if !ok {
-            tracing::warn!(error = ?windows::core::Error::from_thread(), "raw touchpad injection rejected");
+            // Read GetLastError before any other native call can overwrite it.
+            // Formatted tracing is suppressed on the capture thread; the bounded
+            // lifecycle queue preserves the failure and rejected geometry instead.
+            // SAFETY: GetLastError reads only this thread's error slot.
+            let error = unsafe { windows::Win32::Foundation::GetLastError() }.0;
+            use crate::native_lifecycle::{Data, Kind, emit_lifecycle};
+            emit_lifecycle(
+                Kind::ContactInjection,
+                Data {
+                    reason: 4,
+                    flags: error,
+                    message: contacts.len() as u32,
+                    extra: u64::from(tick),
+                    point: Some([self.surface.width as i32, self.surface.height as i32]),
+                    success: Some(false),
+                    ..Default::default()
+                },
+            );
+            for contact in contacts {
+                emit_lifecycle(
+                    Kind::ContactInjection,
+                    Data {
+                        reason: 5,
+                        message: contact.id,
+                        flags: contact.flags,
+                        extra: u64::from(tick),
+                        point: Some([contact.x, contact.y]),
+                        success: Some(false),
+                        ..Default::default()
+                    },
+                );
+            }
         }
         super::mouse_keys::edge(crate::mouse_keys::Reason::DeviceInject);
         ok
@@ -503,9 +537,10 @@ impl<S: crate::contacts::Sink> Raw<S> {
         let ok = self.receiver.apply(frame, &mut self.sink);
         self.frames += 1;
         if !ok {
+            // A rejected frame retires this gesture/device, not the platform
+            // capability. Receiver already cancels and destroys it; a later
+            // complete Begin creates a fresh device through the normal path.
             self.cancel();
-            self.available = false;
-            CONTACT_CAPACITY.store(0, Ordering::Release);
         }
         if frame.phase == oink_foundation::contacts::Phase::Begin || frame.phase.ends() || !ok {
             use crate::native_lifecycle::{Data, Kind, emit_lifecycle};
@@ -546,10 +581,9 @@ impl<S: crate::contacts::Sink> Raw<S> {
             );
             self.ended = Some(Instant::now());
         }
-        if !self.receiver.cancel(&mut self.sink) {
-            self.available = false;
-            CONTACT_CAPACITY.store(0, Ordering::Release);
-        }
+        // Device destruction guarantees cleanup even if the native cancellation
+        // is rejected. That per-frame failure cannot invalidate the API probe.
+        self.receiver.cancel(&mut self.sink);
     }
     fn owns_wheel(&self, now: Instant) -> bool {
         self.receiver.active()
@@ -701,18 +735,21 @@ mod tests {
         }
     }
     #[test]
-    fn failed_native_contact_release_keeps_tail_and_withdraws_device() {
+    fn failed_native_contact_release_keeps_tail_without_withdrawing_capability() {
         let mut raw = raw();
         let sample = begin(&mut raw);
         raw.sink.fail = true;
         assert!(!raw.apply(&Frame::cancel(sample.device)));
-        assert!(!raw.available);
+        assert!(raw.available);
         assert!(!raw.receiver.active());
         let ended = raw
             .ended
             .expect("a failed native release may already have promoted wheels");
         assert_wheel_capture(&raw, ended, true);
         assert_wheel_capture(&raw, ended + AMBIGUOUS_TAIL, false);
+        raw.sink.fail = false;
+        begin(&mut raw);
+        assert!(raw.receiver.active(), "next complete gesture must be accepted");
     }
 
     #[test]

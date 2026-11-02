@@ -6,6 +6,9 @@ import type { Message } from '../catalog';
  * uses each message.
  */
 export const en = {
+  "锁定远程 Windows 计算机": "Lock remote Windows computer",
+  "按下此快捷键，锁定指针所在 Windows 计算机，Win+L 保持锁定自身": "Press this shortcut to lock the Windows computer under the pointer. Win+L keeps locking this computer.",
+  "原生触摸板注入暂不可用": "Native touchpad injection is currently unavailable",
   "共享的麦克风": "Microphone to share",
   "跟随系统默认": "Follow system default",
   "选择本机共享到其他设备的麦克风": "Choose this device’s microphone to share with other devices",
@@ -130,6 +133,9 @@ export const en = {
   "设为音频出口": "Set as audio output",
   "转发音频到 {0}": "Forward audio to {0}",
   "点击选中这台设备，展开音量条": "Click to select this device and show volume",
+  "指针离开时接管前台": "Take the foreground when the pointer leaves",
+  "指针离开本机时，接管前台应用，避免本机运行读取物理按键的应用时，按键同时在两边生效。若部分应用在指针离开后行为异常，可关闭此开关。": "When the pointer leaves this computer, take the foreground to prevent apps that read physical input from responding on both devices at once. Turn this off if an app behaves unexpectedly after the pointer leaves.",
+  "前台 窗口 游戏 捕获 点击 按键 全屏": "foreground window game capture clicks keys fullscreen",
   "转发程序注入的输入": "Forward injected input",
   "关闭时，用本机控制其它设备时，本机其它程序注入的输入不转发至被控设备": "When off, input that other apps on this computer inject stays here while you control another device",
   "程序 注入 输入 转发 模拟 自动化 宏 辅助功能 SendInput computer use": "injected input forwarding synthetic automation macro accessibility SendInput computer use",
@@ -629,6 +635,8 @@ export const en = {
   "限制发给其他设备的指针移动事件频率，降低网络和 CPU 占用": "Limit pointer motion events sent to other devices to reduce network and CPU usage",
   "鼠标 回报率 hz 频率": "mouse polling rate hz frequency",
   "鼠标滚轮反转": "Reverse mouse wheel",
+  "按行转发滚轮事件": "Forward mouse wheel events by lines",
+  "开启时，被控机一次滚动的行数与本机一致；关闭时，受被控机自身滚动设置影响。如部分应用滚动出现异常，请关闭此开关。": "When enabled, each scroll moves the same number of lines on the controlled computer as on this computer. When disabled, the controlled computer’s own scroll settings apply. Turn this off if scrolling behaves unexpectedly in some apps.",
   "在使用本机鼠标时，反转滚轮滚动方向": "Reverse wheel scrolling when using this device’s mouse",
   "滚动 方向 自然滚动": "scroll direction natural scrolling wheel",
   "被控时指针速度增益": "Pointer gain when controlled",

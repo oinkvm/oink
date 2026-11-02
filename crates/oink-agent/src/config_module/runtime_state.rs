@@ -82,6 +82,12 @@ impl Owner {
             config.update_owner(switch).map_err(internal)?;
             self.local = next_facts;
         }
+        let introduced = candidate
+            .roster()
+            .members()
+            .filter(|member| !self.state.roster().contains(member.device))
+            .map(|member| member.device)
+            .collect::<Vec<_>>();
         self.state = candidate;
         // Revoke synchronously before publishing the new membership. A failed
         // journal write also revokes live readers; the store fails closed.
@@ -92,7 +98,9 @@ impl Owner {
         self.needs_apply = true;
         let _ = self.refresh_diagnostics();
         self.finish_apply()?;
-        self.reconcile_pointer_shortcuts()
+        self.reconcile_pointer_shortcuts()?;
+        self.reconcile_member_admission(introduced);
+        Ok(())
     }
     /// Membership allocation is a separate durable edit, after the exact signed
     /// merge projection. It completes before accepting the next serial join.
@@ -261,6 +269,7 @@ impl Owner {
             for (id, session) in &mut self.sessions {
                 if session.ready {
                     session.ready = false;
+                    session.deadline = Some(Instant::now() + ADMISSION_TIMEOUT);
                     self.links.retire(*id);
                     // The transition proof was queued on every old ready C0
                     // before retiring business authority. Resume signed member

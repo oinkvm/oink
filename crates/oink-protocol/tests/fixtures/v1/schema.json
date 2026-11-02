@@ -55,7 +55,8 @@
     "oink.input.keymap-none/1",
     "oink.pointer.entry-protection/1",
     "oink.power/1",
-    "oink.cloud-file-links/1"
+    "oink.cloud-file-links/1",
+    "oink.input.lock-remote-windows/1"
   ],
   "diagnostic_events": [
     "protocol-violation/1",
@@ -5414,6 +5415,12 @@
             "key": 102,
             "name": "capture_time_us",
             "shape": "Option<u32>"
+          },
+          {
+            "absence": "optional",
+            "key": 103,
+            "name": "wheel_steps",
+            "shape": "Option<Point>"
           }
         ],
         "name": "InputScroll"
@@ -13082,6 +13089,51 @@
           }
         ],
         "name": "AudioMediaState"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.input/1",
+        "oink.input.lock-remote-windows/1"
+      ],
+      "id": 273,
+      "name": "ControlLockRemoteWindows",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 3,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "source",
+            "shape": "Boot"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "target",
+            "shape": "Boot"
+          },
+          {
+            "absence": "required",
+            "key": 3,
+            "name": "epoch",
+            "shape": "u64"
+          },
+          {
+            "absence": "required",
+            "key": 4,
+            "name": "request_id",
+            "shape": "u64"
+          }
+        ],
+        "name": "ControlLockRemoteWindows"
       }
     }
   ],
@@ -22961,6 +23013,35 @@
         {
           "absence": "required",
           "key": 1,
+          "name": "source",
+          "shape": "Boot"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "target",
+          "shape": "Boot"
+        },
+        {
+          "absence": "required",
+          "key": 3,
+          "name": "epoch",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 4,
+          "name": "request_id",
+          "shape": "u64"
+        }
+      ],
+      "name": "ControlLockRemoteWindows"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
           "name": "start_us",
           "shape": "i64"
         },
@@ -24844,6 +24925,12 @@
           "key": 102,
           "name": "capture_time_us",
           "shape": "Option<u32>"
+        },
+        {
+          "absence": "optional",
+          "key": 103,
+          "name": "wheel_steps",
+          "shape": "Option<Point>"
         }
       ],
       "name": "InputScroll"

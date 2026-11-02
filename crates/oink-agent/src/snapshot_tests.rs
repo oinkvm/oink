@@ -888,18 +888,25 @@ fn unavailable_contacts_are_effectively_disabled_without_rewriting_preference() 
         assert!(node.settings().accept_contacts);
         let settings = serde_json::to_value(node.input_settings().unwrap()).unwrap();
         assert_eq!(settings["accept_contacts"], false);
+        assert_eq!(settings["touchpad_injection_enabled"], true);
         assert_eq!(settings["contacts_injection_available"], false);
         assert!(!node.status().unwrap().accept_contacts);
         assert!(
             node.set_input_settings(serde_json::from_value(serde_json::json!({"accept_contacts":true})).unwrap())
                 .is_err()
         );
-        node.set_input_settings(serde_json::from_value(serde_json::json!({"event_frequency":"hz125"})).unwrap())
-            .unwrap();
+        node.set_input_settings(
+            serde_json::from_value(serde_json::json!({
+                "event_frequency":"hz125", "touchpad_injection_enabled":false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         assert!(
             node.settings().accept_contacts,
-            "unrelated patch must preserve stored true"
+            "unrelated/read-only patch must preserve stored true"
         );
+        assert!(node.input_settings().unwrap().touchpad_injection_enabled);
         node.shutdown().await;
     });
 }
@@ -943,6 +950,7 @@ fn local_contacts_capability_and_effective_preference_recover() {
             })
             .await;
             assert_eq!(a.input_settings().unwrap().accept_contacts, available);
+            assert!(a.input_settings().unwrap().touchpad_injection_enabled);
             assert!(a.settings().accept_contacts);
             if !available {
                 let requester = b.clone();
@@ -980,6 +988,31 @@ fn local_contacts_capability_and_effective_preference_recover() {
         assert!(b.input_settings().unwrap().mac_scroll_feel);
         assert!(!a.input_settings().unwrap().forward_injected_input);
         assert!(!b.input_settings().unwrap().forward_injected_input);
+        assert!(a.input_settings().unwrap().take_foreground_on_leave);
+        assert!(b.input_settings().unwrap().take_foreground_on_leave);
+        for enabled in [false, true] {
+            let node = a.clone();
+            tokio::task::spawn_blocking(move || {
+                node.set_input_settings(
+                    serde_json::from_value(serde_json::json!({
+                        "take_foreground_on_leave":enabled, "forward_injected_input":true
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(a.input_settings().unwrap().take_foreground_on_leave, enabled);
+            let reloaded = crate::config::AgentConfig::load_from(&configs[0].data_dir).unwrap();
+            assert_eq!(reloaded.settings.routing.take_foreground_on_leave, enabled);
+            assert!(reloaded.settings.routing.forward_injected_input);
+            assert!(
+                b.input_settings().unwrap().take_foreground_on_leave,
+                "must not propagate to peer"
+            );
+            assert!(!b.input_settings().unwrap().forward_injected_input);
+        }
         for enabled in [true, false] {
             let node = a.clone();
             tokio::task::spawn_blocking(move || {

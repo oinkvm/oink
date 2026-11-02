@@ -148,7 +148,9 @@ impl SafeInput {
             InputEvent::PointerDelta { dx, dy } => Self::Motion { dx, dy, raw: false },
             InputEvent::RawPointerDelta { dx, dy } => Self::Motion { dx, dy, raw: true },
             InputEvent::Button { button, pressed } => Self::Button { button, pressed },
-            InputEvent::Scroll { dx, dy, unit, phase } => Self::Scroll { dx, dy, unit, phase },
+            InputEvent::Scroll {
+                dx, dy, unit, phase, ..
+            } => Self::Scroll { dx, dy, unit, phase },
             InputEvent::Key { code, pressed } => Self::Key {
                 class: KeyClass::from_code(code),
                 pressed,
@@ -181,7 +183,7 @@ impl SafeInput {
                 unit: ScrollUnit::Pixel,
                 phase: wheel.phase,
             },
-            InjectEvent::Key { code, pressed } => Self::Key {
+            InjectEvent::Key { code, pressed } | InjectEvent::KeyWithoutLock { code, pressed } => Self::Key {
                 class: KeyClass::from_code(code),
                 pressed,
                 repeat: None,

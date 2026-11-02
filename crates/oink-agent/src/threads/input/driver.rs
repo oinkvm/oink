@@ -84,6 +84,7 @@ pub(super) struct Driver {
     relative_capture: bool,
     queued_cursor_constraints: bool,
     keyboard_remote: bool,
+    source_foreground: bool,
     source_modes_revision: u64,
     inject: InjectHandle,
     main: crate::threads::MainSender,
@@ -267,6 +268,7 @@ impl Driver {
             relative_capture: false,
             queued_cursor_constraints: false,
             keyboard_remote: false,
+            source_foreground: false,
             source_modes_revision: 1,
             inject,
             main,
@@ -1759,6 +1761,12 @@ impl Driver {
             trace.dnd_state(router.dnd_state_name(), router.focus().epoch, router.local_pointer());
         }
         let router = self.adapter.router();
+        let source_foreground = router.source_foreground_capture();
+        if self.source_foreground != source_foreground {
+            self.source_foreground = source_foreground;
+            self.inject
+                .push_in_epoch(self.input_safety, InjectItem::SetSourceForeground(source_foreground));
+        }
         let keyboard_remote = router.focus().holder != self.local && !router.keyboard_local() && !router.paused();
         if self.keyboard_remote != keyboard_remote && self.inject.backend().set_keyboard_remote(keyboard_remote).is_ok()
         {
@@ -1909,6 +1917,9 @@ impl Driver {
                         modifiers,
                     });
                 }
+                Output::LockWindows(permit) => self
+                    .inject
+                    .push_in_epoch(self.input_safety, InjectItem::LockWindows(permit)),
                 Output::Send { to, msg, delivery: _ } => self.send_from(to, msg, from),
                 Output::ApplicationFocus(command) => self.application_focus_command(command),
                 Output::Inject(event @ InjectEvent::Volume { .. }) => {
@@ -2594,6 +2605,7 @@ impl CaptureLoop for Driver {
                 self.fault(peer, Which::Outbound, false, StreamCode::Cancelled);
             }
             self.input_safety = safety;
+            self.source_foreground = false;
             self.adapter
                 .router_mut()
                 .set_input_suspended(self.paused || self.environment.system_sleeping || self.update_hold.is_some());

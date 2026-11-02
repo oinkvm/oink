@@ -25,7 +25,7 @@ impl CallClass {
         match event {
             MoveTo { .. } | MoveToWithDelta { .. } | MoveRelative { .. } => Self::Motion,
             Button { .. } => Self::Button,
-            Key { .. } | Volume { .. } => Self::Key,
+            Key { .. } | KeyWithoutLock { .. } | Volume { .. } => Self::Key,
             Scroll { .. } | TouchpadScroll { .. } => Self::Scroll,
             Gesture(_) | TouchpadContacts(_) => Self::Gesture,
         }

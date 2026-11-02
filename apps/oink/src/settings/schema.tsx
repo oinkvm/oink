@@ -149,6 +149,7 @@ export const SECTIONS: SectionMeta[] = [
                 desc: (p) => (p === 'mac' ? tr('用这台 Mac 的键盘控制 Windows 设备时，修饰键怎么对应') : tr('用这台电脑的键盘控制 Mac 时，修饰键怎么对应')),
                 get keywords() { return tr('键盘 修饰键 快捷键 command option control ctrl alt win caps lock 大写 中英 输入法 映射'); },
             },
+            { id: 'takeForegroundOnLeave', only: 'win', get label() { return tr('指针离开时接管前台'); }, get desc() { return tr('指针离开本机时，接管前台应用，避免本机运行读取物理按键的应用时，按键同时在两边生效。若部分应用在指针离开后行为异常，可关闭此开关。'); }, get keywords() { return tr('前台 窗口 游戏 捕获 点击 按键 全屏'); } },
             { id: 'forwardInjectedInput', only: 'win', get label() { return tr('转发程序注入的输入'); }, get desc() { return tr('关闭时，用本机控制其它设备时，本机其它程序注入的输入不转发至被控设备'); }, get keywords() { return tr('程序 注入 输入 转发 模拟 自动化 宏 辅助功能 SendInput computer use'); } },
             { id: 'pollLimit', get label() {
                     return tr('指针事件频率上限');
@@ -160,6 +161,7 @@ export const SECTIONS: SectionMeta[] = [
                 }, get desc() {
                     return tr('在使用本机鼠标时，反转滚轮滚动方向');
                 }, get keywords() { return tr('滚动 方向 自然滚动'); } },
+            { id: 'forwardWheelByLines', get label() { return tr('按行转发滚轮事件'); }, get desc() { return tr('开启时，被控机一次滚动的行数与本机一致；关闭时，受被控机自身滚动设置影响。如部分应用滚动出现异常，请关闭此开关。'); }, get keywords() { return tr('滚动 方向 自然滚动'); } },
             { id: 'touchpadInject', get label() {
                     return tr('注入原生触摸板事件');
                 }, get desc() {
@@ -299,7 +301,7 @@ export const SECTIONS: SectionMeta[] = [
     },
 ];
 export const sectionsFor = (p: Platform, shortcuts = SHORTCUTS): SectionMeta[] => SECTIONS.filter((s) => !s.only || s.only === p)
-    .map((s) => ({ ...s, items: (s.id === 'shortcuts' ? shortcuts.map(row=>({id:`sc-${row.id}`,label:row.label,desc:row.desc,keywords:`${tr('快捷键 热键')} ${row.keywords}`})) : s.items).filter((i: ItemMeta) => !i.only || i.only === p) }));
+    .map((s) => ({ ...s, items: (s.id === 'shortcuts' ? shortcuts.filter(row=>!row.only || row.only===p).map(row=>({id:`sc-${row.id}`,label:row.label,desc:row.desc,keywords:`${tr('快捷键 热键')} ${row.keywords}`})) : s.items).filter((i: ItemMeta) => !i.only || i.only === p) }));
 const norm = (s: string) => s.toLowerCase().replace(/\s+/g, '');
 export function searchSections(p: Platform, query: string, shortcuts = SHORTCUTS): Map<SectionId, Set<string> | 'all'> {
     const q = norm(query);

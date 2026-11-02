@@ -81,7 +81,7 @@ fn frame(
         fields[count] = (103, V::Map(&application_fields));
         count += 1;
     }
-    for field in body.iter().filter(|(key, _)| *key >= 104) {
+    for field in body.iter().filter(|(key, _)| *key >= 103) {
         fields[count] = *field;
         count += 1;
     }
@@ -301,17 +301,20 @@ pub(super) fn encode(input: &InputMsg, time: Option<n::CaptureTime>, out: &mut [
             dy,
             unit,
             phase: scroll_phase,
-        } => emit(
-            "InputScroll",
-            &[
+            wheel_steps,
+        } => {
+            let steps = wheel_steps.unwrap_or_default();
+            let native = [(1, V::F64(steps.x)), (2, V::F64(steps.y))];
+            let body = [
                 (1, V::Uint(source(*kind))),
                 (2, V::F64(*dx)),
                 (3, V::F64(*dy)),
                 (4, V::Uint(amount(*unit))),
                 (5, V::Uint(phase(*scroll_phase))),
-            ],
-            out,
-        ),
+                (103, V::Map(&native)),
+            ];
+            emit("InputScroll", &body[..if wheel_steps.is_some() { 6 } else { 5 }], out)
+        }
         InputMsg::HeldSync { keys, buttons } => {
             if keys.len() > 256 || buttons.len() > 32 {
                 return Err(v1::ErrorCode::LimitExceeded.into());
@@ -607,7 +610,11 @@ pub(super) fn decode(frame: OpaqueFrame<'_>) -> v1::Result<Packet> {
                 dx: v.dx()?,
                 dy: v.dy()?,
                 unit: read_amount(v.unit()?)?,
-                phase: read_phase(v.phase()?)?
+                phase: read_phase(v.phase()?)?,
+                wheel_steps: v
+                    .wheel_steps()?
+                    .map(|p| -> v1::Result<_> { Ok(oink_foundation::Point::new(p.x()?, p.y()?)) })
+                    .transpose()?,
             }
         ),
         hot::Message::InputHeldSync(v) => decoded!(v, {
@@ -809,6 +816,41 @@ mod tests {
         found
     }
     #[test]
+    fn optional_native_wheel_steps_survive_wire_forwarding_and_capture_time() {
+        for steps in [None, Some(oink_foundation::Point::new(1., -2.))] {
+            let input = InputMsg::Scroll {
+                source: n::SourceKind::Mouse,
+                dx: 3.,
+                dy: -6.,
+                unit: ScrollAmount::Lines,
+                phase: n::ScrollPhase::None,
+                wheel_steps: steps,
+            };
+            roundtrip(input.clone());
+            let forwarded = InputMsg::Forwarded {
+                origin: Boot {
+                    device_id: DeviceId([4; 32]),
+                    nonce: [5; 16],
+                },
+                hops: 1,
+                msg: Box::new(input),
+            };
+            let mut bytes = [0; 1024];
+            let len = encode(&forwarded, Some(n::CaptureTime(77)), &mut bytes).unwrap();
+            let frame = OpaqueFrame::parse_exact(&bytes[..len], 1024).unwrap();
+            let raw = frame.decode().unwrap();
+            assert_eq!(raw.raw().contains_key(&103), steps.is_some());
+            assert_eq!(
+                decode(frame).unwrap(),
+                Packet::TimedInput {
+                    time: n::CaptureTime(77),
+                    input: forwarded
+                }
+            );
+        }
+    }
+
+    #[test]
     fn source_pixel_scroll_preserves_delta_and_phase_on_wire() {
         for phase in [
             n::ScrollPhase::Began,
@@ -822,6 +864,7 @@ mod tests {
                 dy: -37.0,
                 unit: ScrollAmount::Pixels,
                 phase,
+                wheel_steps: None,
             });
         }
     }

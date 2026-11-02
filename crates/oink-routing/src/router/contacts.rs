@@ -1093,6 +1093,7 @@ mod tests {
                     dy: 1.,
                     unit: ScrollAmount::Reference,
                     phase,
+                    wheel_steps: None,
                 };
                 r.on_input(origin, origin, 0, scroll(ScrollPhase::Began), 0);
                 assert!(r.multifinger.contains_key(&origin));
@@ -1171,15 +1172,30 @@ mod tests {
                     }
                 }
             };
-            source.local_scroll(SourceKind::Touchpad, 0., 1., ScrollUnit::Pixel, ScrollPhase::Began);
+            source.local_scroll(
+                SourceKind::Touchpad,
+                0.,
+                1.,
+                ScrollUnit::Pixel,
+                ScrollPhase::Began,
+                None,
+            );
             if momentum {
-                source.local_scroll(SourceKind::Touchpad, 0., 0., ScrollUnit::Pixel, ScrollPhase::Ended);
+                source.local_scroll(
+                    SourceKind::Touchpad,
+                    0.,
+                    0.,
+                    ScrollUnit::Pixel,
+                    ScrollPhase::Ended,
+                    None,
+                );
                 source.local_scroll(
                     SourceKind::Touchpad,
                     0.,
                     1.,
                     ScrollUnit::Pixel,
                     ScrollPhase::MomentumBegan,
+                    None,
                 );
             }
             deliver(&mut source, &mut target);
@@ -1292,6 +1308,7 @@ mod tests {
                 dy: 1.,
                 unit: ScrollAmount::Reference,
                 phase,
+                wheel_steps: None,
             };
             let old = sample(0, 2, 1000);
             r.receive_contacts(origin, Frame::between(None, &old));
@@ -1342,6 +1359,7 @@ mod tests {
             2.,
             ScrollAmount::Reference,
             ScrollPhase::Began,
+            None,
         );
         assert!(matches!(r.out.last(), Some(Output::Inject(InjectEvent::Scroll { .. }))));
     }
@@ -1365,7 +1383,15 @@ mod tests {
                     r.receive_contacts(origin, Frame::between(None, &first));
                     for phase in [ScrollPhase::Began, ScrollPhase::Changed, ScrollPhase::Ended] {
                         if r.filter_multifinger(origin, MultiEvent::Scroll(phase)) {
-                            r.inject_scroll(origin, SourceKind::Touchpad, 1., 2., ScrollAmount::Reference, phase);
+                            r.inject_scroll(
+                                origin,
+                                SourceKind::Touchpad,
+                                1.,
+                                2.,
+                                ScrollAmount::Reference,
+                                phase,
+                                None,
+                            );
                         }
                     }
                     r.receive_contacts(origin, Frame::between(Some(&first), &sample(8000, 0, 0)));
@@ -1507,6 +1533,7 @@ mod tests {
                     2.,
                     ScrollAmount::Reference,
                     ScrollPhase::Began,
+                    None,
                 );
                 assert_eq!(
                     r.out
@@ -1539,6 +1566,7 @@ mod tests {
                         2.,
                         ScrollAmount::Reference,
                         ScrollPhase::Began,
+                        None,
                     );
                 }
                 assert!(
@@ -1766,6 +1794,7 @@ mod tests {
             dy: 1.,
             unit: ScrollAmount::Reference,
             phase,
+            wheel_steps: None,
         };
         let old = sample(0, 2, 1000);
         r.receive_contacts(origin, Frame::between(None, &old));
@@ -1810,6 +1839,7 @@ mod tests {
             dy: 1.,
             unit: ScrollAmount::Reference,
             phase,
+            wheel_steps: None,
         };
         let old = sample(0, 2, 1000);
         r.receive_contacts(origin, Frame::between(None, &old));
@@ -2047,7 +2077,14 @@ mod tests {
         r.claim = peer;
         r.on_local_event(&captured(sample(0, 0, 0)), 0);
         r.on_local_event(&captured(sample(8000, 2, 1000)), 8000);
-        r.local_scroll(SourceKind::Touchpad, 1., 2., ScrollUnit::Pixel, ScrollPhase::Began);
+        r.local_scroll(
+            SourceKind::Touchpad,
+            1.,
+            2.,
+            ScrollUnit::Pixel,
+            ScrollPhase::Began,
+            None,
+        );
         r.out.clear();
         let mut settings = r.config().settings.clone();
         settings.forward_gestures = false;
@@ -2066,10 +2103,17 @@ mod tests {
             }
         )));
         r.out.clear();
-        r.local_scroll(SourceKind::Touchpad, 1., 2., ScrollUnit::Pixel, ScrollPhase::Changed);
+        r.local_scroll(
+            SourceKind::Touchpad,
+            1.,
+            2.,
+            ScrollUnit::Pixel,
+            ScrollPhase::Changed,
+            None,
+        );
         r.on_local_event(&captured(sample(16000, 2, 2000)), 16000);
         assert!(r.out.is_empty());
-        r.local_scroll(SourceKind::Mouse, 0., 1., ScrollUnit::Line, ScrollPhase::None);
+        r.local_scroll(SourceKind::Mouse, 0., 1., ScrollUnit::Line, ScrollPhase::None, None);
         assert!(r.out.iter().any(|o| matches!(
             o,
             Output::Send {

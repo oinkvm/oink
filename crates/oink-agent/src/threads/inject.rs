@@ -29,6 +29,7 @@ pub enum InjectItem {
         failures: std::sync::Arc<std::sync::atomic::AtomicU64>,
         expect_released: bool,
     },
+    LockWindows(oink_routing::router::WindowsLockPermit),
     /// Inject one event; `from` is the peer whose key state it belongs to.
     Inject {
         event: InjectEvent,
@@ -38,6 +39,8 @@ pub enum InjectItem {
     SetMode(CaptureMode),
     ConstrainCursor(Option<oink_foundation::Rect>),
     SetRelativeCapture(bool),
+    /// Ordinary UI work; never activate a window inside a native input callback.
+    SetSourceForeground(bool),
     RestoreLocal {
         at: Point,
     },
@@ -158,11 +161,13 @@ fn session_sensitive(item: &InjectItem) -> bool {
     matches!(
         item,
         InjectItem::Inject { .. }
+            | InjectItem::LockWindows(_)
             | InjectItem::CursorRead { .. }
             | InjectItem::ConstrainCursor(Some(_))
             | InjectItem::SetMode(_)
             | InjectItem::RestoreLocal { .. }
             | InjectItem::SetRelativeCapture(true)
+            | InjectItem::SetSourceForeground(true)
             | InjectItem::Dnd {
                 command: oink_routing::DndCmd::Begin { .. }
                     | oink_routing::DndCmd::HoldSource { .. }
@@ -800,6 +805,7 @@ pub(crate) fn start_with_trace(
                     for owner in held.0.keys().copied().collect::<Vec<_>>() {
                         cleanup_ok &= held.release(owner, native.as_ref());
                     }
+                    native.set_source_foreground(false);
                     cleanup_ok &= native.set_relative_capture(false).is_ok();
                     cleanup_ok &= native.set_mode(CaptureMode::Local).is_ok();
                     if !cleanup_ok {
@@ -971,6 +977,11 @@ pub(crate) fn start_with_trace(
                             wake();
                         }
                     }
+                    InjectItem::LockWindows(permit) => {
+                        if permit.take() && native.lock_workstation().is_err() {
+                            failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                     InjectItem::Inject { mut event, from } => {
                         if queued.first_motion {
                             handoff_timing::native(Stage::FirstMotionStarted, 0);
@@ -1085,6 +1096,7 @@ pub(crate) fn start_with_trace(
                             wake();
                         }
                     }
+                    InjectItem::SetSourceForeground(active) => native.set_source_foreground(active),
                     InjectItem::SetRelativeCapture(active) => {
                         cursor.clear();
                         let called = std::time::Instant::now();
@@ -1193,6 +1205,7 @@ pub(crate) fn start_with_trace(
                         fence.store(if released { 1 } else { 2 }, std::sync::atomic::Ordering::Release);
                     }
                     InjectItem::Stop => {
+                        native.set_source_foreground(false);
                         for owner in held.0.keys().copied().collect::<Vec<_>>() {
                             held.release(owner, native.as_ref());
                         }
@@ -1256,7 +1269,7 @@ struct Held(std::collections::HashMap<Option<DeviceId>, Vec<InjectEvent>>);
 impl Held {
     fn record(&mut self, owner: Option<DeviceId>, event: &InjectEvent) {
         let (release, down) = match event {
-            InjectEvent::Key { code, pressed } => (
+            InjectEvent::Key { code, pressed } | InjectEvent::KeyWithoutLock { code, pressed } => (
                 InjectEvent::Key {
                     code: *code,
                     pressed: false,
@@ -1299,6 +1312,105 @@ impl Held {
 
 #[cfg(all(test, debug_assertions))]
 mod tests {
+    #[test]
+    fn windows_lock_native_queue_orders_releases_and_rejects_revoked_or_duplicate_authority() {
+        use super::*;
+        use oink_foundation::{input::KeyCode, session::Boot};
+        use oink_routing::{
+            Os, Output, Packet, Router, RouterConfig,
+            control::{ControlMsg, FocusScope, WindowsLockRequest},
+        };
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        for revoked in [false, true] {
+            let target = Boot {
+                device_id: DeviceId([1; 32]),
+                nonce: [1; 16],
+            };
+            let source = Boot {
+                device_id: DeviceId([2; 32]),
+                nonce: [2; 16],
+            };
+            let mut router = Router::new(
+                RouterConfig::new(target, "target", Os::Windows),
+                Arc::new(oink_routing::SimpleLayout::new()),
+            );
+            let session = match &router.input_opening(true)[2] {
+                Packet::Control(ControlMsg::FocusState { session: Some(s), .. }) => *s,
+                _ => unreachable!(),
+            };
+            router.set_peer_os(source.device_id, Os::Windows, 0);
+            router.attach_input(source, [2; 16], true, false, Default::default(), 0);
+            router.set_peer_windows_lock(source.device_id, true);
+            router.input_message(
+                source.device_id,
+                Packet::Control(ControlMsg::FocusState {
+                    epoch: 7,
+                    holder: target.device_id,
+                    scope: Some(FocusScope {
+                        members: vec![(target.device_id, session), (source.device_id, [2; 16])],
+                    }),
+                    session: Some([2; 16]),
+                    lock_state: None,
+                }),
+                0,
+            );
+            router.drain_outputs();
+            router.input_message(
+                source.device_id,
+                Packet::Control(ControlMsg::LockRemoteWindows(WindowsLockRequest {
+                    source,
+                    target,
+                    epoch: 7,
+                    id: 1,
+                })),
+                1,
+            );
+            let permit = router
+                .drain_outputs()
+                .into_iter()
+                .find_map(|o| match o {
+                    Output::LockWindows(p) => Some(p),
+                    _ => None,
+                })
+                .unwrap();
+            if revoked {
+                router.set_paused(true);
+            }
+            let backend = Arc::new(oink_test_support::input::FakeInput::new());
+            let handle = start_with_backend(backend.clone(), Box::new(|_| {})).unwrap();
+            let events = [
+                (KeyCode::LEFT_GUI, true),
+                (KeyCode::LEFT_SHIFT, true),
+                (KeyCode::MENU_MASK, true),
+                (KeyCode::MENU_MASK, false),
+                (KeyCode::LEFT_GUI, false),
+                (KeyCode::LEFT_SHIFT, false),
+            ];
+            for (code, pressed) in events {
+                handle.push(InjectItem::Inject {
+                    event: InjectEvent::Key { code, pressed },
+                    from: Some(source.device_id),
+                });
+            }
+            handle.push(InjectItem::LockWindows(permit.clone()));
+            handle.push(InjectItem::LockWindows(permit));
+            handle.push(InjectItem::Inject {
+                event: InjectEvent::Key {
+                    code: KeyCode::keyboard(4),
+                    pressed: false,
+                },
+                from: None,
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while backend.injected().len() < 7 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(backend.injected().len(), 7);
+            assert_eq!(backend.workstation_locks(), if revoked { vec![] } else { vec![6] });
+            drop(handle);
+        }
+    }
     #[test]
     fn pause_discards_queued_input_releases_held_once_and_joins_before_fresh_session() {
         use super::*;

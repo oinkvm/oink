@@ -53,6 +53,45 @@ impl Keyboard {
     }
 }
 impl Router {
+    pub(super) fn brightness_event(&mut self, event: &InputEvent) -> Option<Disposition> {
+        let InputEvent::Key { code, pressed } = *event else {
+            return None;
+        };
+        if self.cfg.os != Os::MacOS || !code.is_brightness() {
+            return None;
+        }
+        // These source-device controls bypass ordinary key transforms/hotkeys.
+        // Command opts into controlling the remote focus; keep the first DOWN's route
+        // for repeats and UP, including a local DOWN followed by Command/focus changes.
+        if pressed {
+            if let Some(targets) = self.keys.get(&code).cloned() {
+                if !targets.contains(&Target::Local) {
+                    self.forward_key_repeat(code, &targets);
+                }
+                return Some(disposition_for(targets.contains(&Target::Local)));
+            }
+            let target = if !self.keyboard_local()
+                && [KeyCode::LEFT_GUI, KeyCode::RIGHT_GUI]
+                    .iter()
+                    .any(|k| self.keys.contains_key(k))
+                && let Target::Remote(peer) = self.current_target()
+            {
+                Target::Remote(peer)
+            } else {
+                Target::Local
+            };
+            self.keys.insert(code, vec![target]);
+            self.key_repeats.remove(&code);
+            if let Target::Remote(peer) = target {
+                self.send(peer, Message::Input(InputMsg::Key { code, pressed }));
+            }
+            Some(disposition_for(target == Target::Local))
+        } else {
+            let targets = self.keys.remove(&code).unwrap_or_else(|| vec![Target::Local]);
+            Some(disposition_for(self.release_local_key(code, targets)))
+        }
+    }
+
     pub(super) fn cancel_fn_for_function_row(&mut self) {
         if self.cfg.os != Os::MacOS || !self.fn_sync_held || !self.keyboard.down.iter().copied().any(fn_row_key) {
             return;

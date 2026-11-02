@@ -1,5 +1,5 @@
-//! Session notifications are observation only: never change focus or replay keys.
-//! Unknown until the first notification (in particular when starting already locked).
+//! Session observations never change focus or replay keys. Seed from the current
+//! session dictionary at startup, then follow lock/unlock notifications.
 use std::ffi::c_void;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -53,6 +53,45 @@ fn next_state(old: u64, locked: bool) -> u64 {
     ((old & !1).wrapping_add(2)) | u64::from(locked)
 }
 
+fn initial_lock_state(screen_locked: Option<bool>, on_console: Option<bool>, login_done: Option<bool>) -> Option<bool> {
+    if screen_locked == Some(true) {
+        Some(true)
+    } else if on_console == Some(true) && login_done == Some(true) {
+        // The unlocked dictionary can omit CGSSessionScreenIsLocked (observed
+        // on macOS 26.6.2); absence alone says nothing about an off-console session.
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn initial_sample(state: &AtomicU64, locked: Option<bool>) {
+    if let Some(locked) = locked {
+        // A notification is newer evidence. Never replace it with a startup read.
+        let _ = state.compare_exchange(0, next_state(0, locked), Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+fn sample_initial_lock_state() {
+    let Some(dict) = CGSessionCopyCurrentDictionary() else {
+        return;
+    };
+    // SAFETY: CG's session dictionary has string keys and CF object values.
+    let dict: &CFDictionary<CFString, CFType> = unsafe { dict.cast_unchecked() };
+    let flag = |key| {
+        dict.get(&CFString::from_static_str(key))
+            .and_then(|v| v.downcast_ref::<CFBoolean>().map(CFBoolean::as_bool))
+    };
+    initial_sample(
+        &STATE,
+        initial_lock_state(
+            flag("CGSSessionScreenIsLocked"),
+            flag("kCGSSessionOnConsoleKey"),
+            flag("kCGSessionLoginDoneKey"),
+        ),
+    );
+}
+
 fn changed(locked: bool) {
     let mut old = STATE.load(Ordering::Acquire);
     loop {
@@ -103,6 +142,7 @@ pub(crate) fn init() {
             unsafe {
                 let center = CFNotificationCenterGetDistributedCenter();
                 if center.is_null() {
+                    sample_initial_lock_state();
                     tracing::warn!("session notification center unavailable");
                     return;
                 }
@@ -125,7 +165,10 @@ pub(crate) fn init() {
                     );
                 }
             }
-            tracing::info!("session lock observer installed; initial lock state unknown");
+            // Query on main after registering, including when the backend starts
+            // behind loginwindow. No synchronous session query runs on injection.
+            sample_initial_lock_state();
+            tracing::info!(locked = ?locked(), "session lock observer installed");
         });
     });
 }
@@ -133,6 +176,26 @@ pub(crate) fn init() {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_session_sample_handles_already_locked_and_unlocked_without_a_lock_key() {
+        assert_eq!(initial_lock_state(Some(true), Some(true), Some(true)), Some(true));
+        assert_eq!(initial_lock_state(Some(false), Some(true), Some(true)), Some(false));
+        assert_eq!(initial_lock_state(None, Some(true), Some(true)), Some(false));
+        assert_eq!(initial_lock_state(None, Some(false), Some(true)), None);
+        assert_eq!(initial_lock_state(None, Some(true), Some(false)), None);
+        assert_eq!(initial_lock_state(None, None, None), None);
+        for locked in [false, true] {
+            let state = AtomicU64::new(0);
+            initial_sample(&state, None);
+            assert_eq!(state.load(Ordering::Acquire), 0);
+            initial_sample(&state, Some(locked));
+            assert_eq!(state.load(Ordering::Acquire), next_state(0, locked));
+            let notified = next_state(state.load(Ordering::Acquire), !locked);
+            state.store(notified, Ordering::Release);
+            initial_sample(&state, Some(locked));
+            assert_eq!(state.load(Ordering::Acquire), notified);
+        }
+    }
     #[test]
     fn screensaver_grace_and_lock_block_idle_pulses() {
         assert!(idle_session_permitted(false, Some(false)));

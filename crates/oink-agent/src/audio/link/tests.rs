@@ -2232,6 +2232,73 @@ async fn permission_revocation_retires_active_capture_without_changing_playback_
 }
 
 #[tokio::test]
+async fn exit_driver_operation_retains_source_offer_received_during_maintenance() {
+    let mut running = Running::start(false).await;
+    let source = running.owners[0].links.id();
+    let old = running.owners[0].source_session.prepared().unwrap().clone();
+    let settings = running.owners[0].settings.clone();
+    let claim = running.owners[0].resolution;
+    running.owners[1].service_generation = Some(1);
+    lock(&running.platforms[1].0).service_generation = Some(1);
+    let active = Arc::new(AtomicBool::new(true));
+    running.owners[1].prepare_driver_change(active.clone()).unwrap();
+    let native_events = lock(&running.platforms[1].0).events.clone();
+    let native_opens = lock(&running.platforms[1].0).opened_outputs.len();
+    // An idle WASAPI source can reopen while the exit's driver installer owns
+    // its audio guard. M0 stays live and delivers the replacement offer once.
+    let deadline = Instant::now() + Duration::from_secs(11);
+    running.owners[0].tick_source_at(deadline);
+    assert!(running.owners[0].capture.is_none());
+    running
+        .until(|r| {
+            r.owners[0].source_session.offer().is_some_and(|offer| {
+                offer.source_route_generation().ok() != old.session().source_route_generation().ok()
+            }) && r.owners[0].source_session.prepared().is_none()
+        })
+        .await;
+    let pending = running.owners[0].source_session.offer().unwrap().clone();
+    // Observe reliable delivery at the maintenance owner before releasing it.
+    running
+        .until(|r| r.owners[1].offers.get(&source) == Some(&pending))
+        .await;
+    let mut stale = pending.clone();
+    stale
+        .edit(|raw| {
+            raw.insert(2, old.session().source_route_generation().unwrap().write());
+        })
+        .unwrap();
+    running.owners[1].message(source, Message::AudioSourceRouteOffer(stale));
+    let mut wrong_boot = pending.clone();
+    wrong_boot
+        .edit(|raw| {
+            let RawValue::Map(source) = raw.get_mut(&1).unwrap() else {
+                unreachable!()
+            };
+            source.insert(2, FixedBytes([99; 16]).write());
+        })
+        .unwrap();
+    running.owners[1].message(source, Message::AudioSourceRouteOffer(wrong_boot));
+    assert_eq!(running.owners[1].offers.get(&source), Some(&pending));
+    assert!(running.owners[1].playback.is_none());
+    assert!(running.owners[1].capture.is_none());
+    assert!(running.owners[1].receive_sessions.is_empty());
+    assert_eq!(lock(&running.platforms[1].0).events, native_events);
+    assert_eq!(lock(&running.platforms[1].0).opened_outputs.len(), native_opens);
+    // The installer also restarts the OS audio service before releasing IO.
+    lock(&running.platforms[1].0).service_generation = Some(2);
+    active.store(false, Ordering::Release);
+    running.until(Running::prepared_route_ready).await;
+    assert_ne!(running.owners[0].source_session.prepared().unwrap(), &old);
+    assert_eq!(running.owners[0].settings, settings);
+    assert_eq!(running.owners[0].resolution, claim);
+    let sent = running.owners[0].sent.load(Ordering::Relaxed);
+    running.supply(0, 0.2);
+    assert!(running.owners[0].sent.load(Ordering::Relaxed) > sent);
+    assert_eq!(pauses(&running.platforms[0]), 0);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn driver_operation_retires_mute_before_installer_and_holds_until_worker_exits() {
     let mut running = Running::start(false).await;
     let before = running.owners[0].settings.clone();

@@ -113,6 +113,7 @@ hot_map!(InputScroll, no_validation, {
     100 => origin: Option<Boot> = optional;
     101 => forwarded_hops: u8 = 0;
     102 => capture_time_us: Option<u32> = optional;
+    103 => wheel_steps: Option<Point> = optional;
 });
 
 hot_map!(InputHeldSync, no_validation, {
@@ -938,3 +939,11 @@ fn validate_power_state(raw: &RawMap) -> Result<()> {
     }
     Ok(())
 }
+
+// Appended optional I0 action. Boots fence process reincarnations; epoch fences focus.
+wire_map!(ControlLockRemoteWindows, no_validation, {
+    1 => source: Boot = required;
+    2 => target: Boot = required;
+    3 => epoch: u64 = required;
+    4 => request_id: u64 = required;
+});

@@ -47,12 +47,14 @@ export interface Prefs {
     allowFnMapping: boolean;
     pollLimit: '125' | 'none';
     scrollInvert: boolean;
+    forwardWheelByLines: boolean;
     pointerGain: number;
     keepAwake: boolean;
     touchpadInject: boolean;
     nativeMultifinger: boolean;
     macScrollFeel: boolean;
     forwardInjectedInput: boolean;
+    takeForegroundOnLeave: boolean;
     pointerTrail: boolean;
     clipReceive: boolean;
     clipSend: boolean;
@@ -80,12 +82,14 @@ export const DEFAULT_PREFS: Prefs = {
     allowFnMapping: false,
     pollLimit: '125',
     scrollInvert: false,
+    forwardWheelByLines: true,
     pointerGain: 1,
     keepAwake: true,
     touchpadInject: true,
     nativeMultifinger: true,
     macScrollFeel: true,
     forwardInjectedInput: false,
+    takeForegroundOnLeave: true,
     pointerTrail: true,
     clipReceive: true,
     clipSend: true,

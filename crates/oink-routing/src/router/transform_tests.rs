@@ -200,7 +200,7 @@ fn wheel_both_axes_reverse_but_continuous_input_never_does() {
             (SourceKind::Touchpad, ScrollPhase::None, 1.),
             (SourceKind::Mouse, ScrollPhase::Changed, 1.),
         ] {
-            r.inject_scroll(SOURCE, source, 2., 3., ScrollAmount::Lines, phase);
+            r.inject_scroll(SOURCE, source, 2., 3., ScrollAmount::Lines, phase, None);
             assert!(r.drain_outputs().iter().any(|o| matches!(o, Output::Inject(InjectEvent::Scroll { dx, dy, .. }) if dx.signum() == sign && dy.signum() == sign)));
         }
         for source in [SourceKind::Mouse, SourceKind::Touchpad] {
@@ -214,6 +214,7 @@ fn wheel_both_axes_reverse_but_continuous_input_never_does() {
                     dy: 3.,
                     unit: ScrollUnit::Line,
                     phase: ScrollPhase::None,
+                    wheel_steps: None,
                 },
             };
             let inverted = source == SourceKind::Mouse;
@@ -739,7 +740,7 @@ fn fn_row_brightness_observation_keeps_every_transition_native() {
         for pressed in [true, true, false] {
             assert_eq!(physical(&mut source, code, pressed), Disposition::Pass);
             assert!(relay_keys(&mut source, &mut target).is_empty());
-            assert!(!source.keys.contains_key(&code));
+            assert_eq!(source.keys.get(&code), pressed.then_some(&vec![Target::Local]));
         }
     }
 }

@@ -182,7 +182,7 @@ export interface ScrollSettings { speed: number }
 export type PointerReference = { type: "last_screen" } | { type: "fixed"; display: string };
 export type PointerScaling = "physical" | "proportional";
 export interface PointerSettings { reference: PointerReference; scaling: PointerScaling; drag_across_devices: boolean }
-export type HotkeyAction = "toggle_microphone_mute" | "lock_escape" | "lock_focus" | "return_pointer_home" | "toggle_sharing" | "open_window" | "toggle_game_mode" | "pause_all" | "move_pointer_to";
+export type HotkeyAction = "lock_remote_windows" | "toggle_microphone_mute" | "lock_escape" | "lock_focus" | "return_pointer_home" | "toggle_sharing" | "open_window" | "toggle_game_mode" | "pause_all" | "move_pointer_to";
 export interface Hotkey { action: HotkeyAction; device?: DeviceKey; keys: string[]; enabled: boolean }
 export type EventFrequency = "hz125" | "unlimited";
 export interface KeySupport { macos: number[]; windows: number[] }
@@ -192,11 +192,15 @@ export interface InputSettings {
   /** Local normal pointer-motion rate; persisted by the settings owner. */
   event_frequency: EventFrequency;
   accept_contacts: boolean;
+  /** Stored parent preference; accept_contacts is the currently effective value. */
+  touchpad_injection_enabled: boolean;
   native_multifinger: boolean;
   contacts_injection_available: boolean;
   mac_scroll_feel: boolean;
+  forward_wheel_by_lines?: boolean;
   /** Windows capture-local opt-in; false keeps other apps' injected input local. */
   forward_injected_input: boolean;
+  take_foreground_on_leave: boolean;
   emergency_hold_ms: number;
   device_gain: number;
   scroll: ScrollSettings;

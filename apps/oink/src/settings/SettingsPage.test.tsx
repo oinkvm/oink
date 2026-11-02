@@ -236,3 +236,27 @@ it.each([['zh-Hans','释放磁盘空间。仍在原设备上的文件可以再�
  setLanguage(language);const {container}=render(view());
  expect(container.querySelector('[data-item="receivedCleanup"]')?.textContent).toContain(copy);
 });
+
+it.each(['mac','win'] as const)('places the enabled wheel-lines switch directly below reverse-wheel on %s', platform => {
+  setLanguage('zh-Hans');
+  const {container}=render(view(platform));
+  const input=container.querySelector<HTMLElement>('[data-section="input"]')!;
+  const ids=Array.from(input.querySelectorAll<HTMLElement>('[data-item]'),n=>n.dataset.item);
+  expect(ids[ids.indexOf('scrollInvert')+1]).toBe('forwardWheelByLines');
+  const row=input.querySelector<HTMLElement>('[data-item="forwardWheelByLines"]')!;
+  expect(row.querySelector('.ok-row__desc')?.textContent).toBe('开启时，被控机一次滚动的行数与本机一致；关闭时，受被控机自身滚动设置影响。如部分应用滚动出现异常，请关闭此开关。');
+  const toggle=within(row).getByRole('switch',{name:'按行转发滚轮事件'}) as HTMLInputElement;
+  expect(toggle.checked).toBe(true);
+});
+
+it.each([
+  ['en','Forward mouse wheel events by lines'],
+  ['ja','マウスホイールイベントを行単位で転送'],
+  ['ko','마우스 휠 이벤트를 줄 단위로 전달'],
+] as const)('translates the wheel-lines row in %s', (language,label) => {
+  setLanguage(language);
+  const {container}=render(view());
+  const row=container.querySelector<HTMLElement>('[data-item="forwardWheelByLines"]')!;
+  expect(within(row).getByRole('switch',{name:label})).toBeTruthy();
+  expect(row.querySelector('.ok-row__desc')?.textContent).not.toContain('开启时');
+});

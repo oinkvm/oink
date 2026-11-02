@@ -28,6 +28,7 @@ mod rawinput;
 mod resume_hotkey;
 pub mod service;
 mod settings;
+mod source_foreground;
 #[cfg(all(test, debug_assertions))]
 mod source_release_desktop_tests;
 mod task_view;
@@ -66,6 +67,7 @@ pub(crate) fn backend() -> Result<Box<dyn InputBackend>, InputError> {
 #[derive(Debug, Default)]
 struct WinInput {
     application_focus: application_focus::Controller,
+    source_foreground: source_foreground::Controller,
     safety: crate::session_gate::SessionGate,
     hook: Mutex<Option<hook::HookHandle>>,
     /// 滚轮小数部分的累积（水平、垂直），单位 1/120 格。
@@ -149,6 +151,10 @@ fn cursor_dpi() -> u32 {
 }
 
 impl InputBackend for WinInput {
+    fn set_source_foreground(&self, enabled: bool) {
+        self.source_foreground.set(enabled);
+    }
+
     fn application_focus_supported(&self) -> bool {
         true
     }
@@ -176,6 +182,7 @@ impl InputBackend for WinInput {
         service::initialize()
     }
     fn stop_injection_session(&self) {
+        self.source_foreground.set(false);
         let _ = self.set_cursor_constraint(None);
         oink_winsvc::client::suspend();
         *self.scroll_acc.lock().unwrap_or_else(|e| e.into_inner()) = (0., 0.);
@@ -261,6 +268,7 @@ impl InputBackend for WinInput {
     }
 
     fn stop(&self) {
+        self.source_foreground.stop();
         let _ = self.set_cursor_constraint(None);
         oink_winsvc::client::release_if_connected();
         // 先取出句柄再等待线程退出：回调里若调用 set_mode，不会因为这把锁死锁
@@ -430,10 +438,24 @@ impl InputBackend for WinInput {
             .map_err(|_| InputError::Platform("relative accumulator poisoned".into()))? = (0., 0.);
         self.cursor_position()
     }
+    fn lock_workstation(&self) -> Result<(), InputError> {
+        if !self.input_safety().active() {
+            return Err(InputError::NotStarted);
+        }
+        // Public session operation, on the interactive user's ordered worker.
+        // Never request this from the session-0 broker or synthesize a SAS.
+        // A successful return only starts the asynchronous lock request.
+        // SAFETY: no pointers/handles; production callers run in the logged-in
+        // interactive user backend, not the session-0 service.
+        unsafe { LockWorkStation() }.map_err(|e| InputError::Platform(format!("LockWorkStation: {e}")))
+    }
+
     fn inject(&self, event: &InjectEvent) -> Result<(), InputError> {
         let cleanup = matches!(
             event,
-            InjectEvent::Key { pressed: false, .. } | InjectEvent::Button { pressed: false, .. }
+            InjectEvent::Key { pressed: false, .. }
+                | InjectEvent::KeyWithoutLock { pressed: false, .. }
+                | InjectEvent::Button { pressed: false, .. }
         );
         if !cleanup && !self.input_safety().active() {
             return Err(InputError::NotStarted);
@@ -585,7 +607,7 @@ impl InputBackend for WinInput {
                 }
                 if inputs.is_empty() { Ok(()) } else { send(&inputs) }
             }
-            InjectEvent::Key { code, pressed } => {
+            InjectEvent::Key { code, pressed } | InjectEvent::KeyWithoutLock { code, pressed } => {
                 if win_actions::key_dropped(*code) {
                     tracing::debug!("mac-only key: dropped");
                     return Ok(());
@@ -608,9 +630,10 @@ impl InputBackend for WinInput {
                 self.lock_chord
                     .lock()
                     .map_err(|_| InputError::Platform("lock chord mutex poisoned".into()))?
-                    .key(
+                    .key_with_lock(
                         *code,
                         *pressed,
+                        !matches!(event, InjectEvent::KeyWithoutLock { .. }),
                         |code, pressed| send(&[inject::key(code, pressed).ok_or(InputError::Unsupported)?]),
                         || {
                             // OS workaround: Windows reserves Win+L below the injected-key
@@ -626,8 +649,7 @@ impl InputBackend for WinInput {
                             // https://learn.microsoft.com/windows/apps/dev-tools/winapp-cli/ui-automation
                             // SAFETY: production injection thread on the interactive desktop;
                             // tests exercise LockChord with fake send/lock functions only.
-                            unsafe { LockWorkStation() }
-                                .map_err(|e| InputError::Platform(format!("LockWorkStation: {e}")))
+                            self.lock_workstation()
                         },
                     )
             }

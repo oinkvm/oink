@@ -766,6 +766,31 @@ mod tests {
     }
 
     #[test]
+    fn wheel_lines_default_on_and_persist_only_in_owner_local_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::load_from(dir.path()).unwrap();
+        config.save().unwrap();
+        assert!(config.settings.routing.forward_wheel_by_lines);
+        assert!(
+            stored(dir.path())["local"]
+                .get("routing")
+                .is_none_or(|r| r.get("forward_wheel_by_lines").is_none())
+        );
+        let original_owners = stored(dir.path())["device_options_cbor"].clone();
+        for value in [false, true] {
+            config
+                .update_local(&serde_json::json!({"routing":{"forward_wheel_by_lines":value}}), |s| {
+                    s.routing.forward_wheel_by_lines = value;
+                })
+                .unwrap();
+            let reloaded = AgentConfig::load_from(dir.path()).unwrap();
+            assert_eq!(reloaded.settings.routing.forward_wheel_by_lines, value);
+            assert_eq!(stored(dir.path())["local"]["routing"]["forward_wheel_by_lines"], value);
+            assert_eq!(stored(dir.path())["device_options_cbor"], original_owners);
+        }
+    }
+
+    #[test]
     fn injected_input_forwarding_defaults_off_and_persists_only_locally() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = AgentConfig::load_from(dir.path()).unwrap();
@@ -788,6 +813,36 @@ mod tests {
             let mut raw = stored(dir.path());
             raw.as_object_mut().unwrap().remove("local");
             assert!(!raw.to_string().contains("forward_injected_input"));
+        }
+    }
+
+    #[test]
+    fn foreground_capture_defaults_on_for_old_files_and_stays_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::load_from(dir.path()).unwrap();
+        config.save().unwrap();
+        let mut old = stored(dir.path());
+        old["local"]["routing"] = serde_json::json!({"forward_injected_input":true});
+        std::fs::write(config.settings_path(), serde_json::to_vec(&old).unwrap()).unwrap();
+        config = AgentConfig::load_from(dir.path()).unwrap();
+        assert!(config.settings.routing.take_foreground_on_leave);
+        for enabled in [false, true] {
+            config
+                .update_local(
+                    &serde_json::json!({"routing":{"take_foreground_on_leave":enabled}}),
+                    |s| s.routing.take_foreground_on_leave = enabled,
+                )
+                .unwrap();
+            let reloaded = AgentConfig::load_from(dir.path()).unwrap();
+            assert_eq!(reloaded.settings.routing.take_foreground_on_leave, enabled);
+            assert!(
+                reloaded.settings.routing.forward_injected_input,
+                "do not pin sibling defaults"
+            );
+            let mut raw = stored(dir.path());
+            assert_eq!(raw["local"]["routing"]["take_foreground_on_leave"], enabled);
+            raw.as_object_mut().unwrap().remove("local");
+            assert!(!raw.to_string().contains("take_foreground_on_leave"));
         }
     }
 

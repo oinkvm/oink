@@ -205,7 +205,7 @@ wire_map!(ReplySnapshot, no_validation, {
     1 => state: GroupState = required;
 });
 
-wire_map!(Point, no_validation, {
+crate::v1::hot::hot_map!(Point, no_validation, {
     1 => x: f64 = required;
     2 => y: f64 = required;
 });

@@ -2,6 +2,234 @@
 use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn joining_group_admits_an_existing_unpaired_member_link() {
+    let nodes = start(fresh(3)).await;
+    let first = request(&nodes[0], &nodes[1], [21; 16]).await;
+    let code = accept(&nodes[0], &nodes[1], &first).await;
+    submit(&nodes[1], &first, 1, code);
+    complete(&nodes[0], &nodes[1], &first).await;
+    assert!(until(|| ready(&nodes[..2])).await);
+
+    // A manual lookup can leave a greeted C0 between different groups. It has
+    // no membership authority and must not become ready before the actual join.
+    let _ = query(&nodes[2], &nodes[1], [22; 16]).await;
+    let peer = nodes[1].identity.id();
+    let waiting = nodes[2].links.links().by_peer(peer).unwrap().link;
+    assert!(!nodes[2].links.links().ready(peer));
+    assert!(!nodes[2].group.members().members.iter().any(|m| m.device == peer));
+    assert!(
+        nodes[2]
+            .group
+            .call(move |owner| Ok(owner.sessions[&waiting].peer.is_some()))
+            .unwrap()
+    );
+    // Keep this candidate alive beyond the mesh assertion on both owners. The
+    // independent inactivity fallback must not conceal missing reconciliation.
+    for (local, remote) in [(2, 1), (1, 2)] {
+        let peer = nodes[remote].identity.id();
+        nodes[local]
+            .group
+            .call(move |owner| {
+                let id = owner.selected_session(peer).unwrap().0;
+                owner.sessions.get_mut(&id).unwrap().deadline = Some(Instant::now() + Duration::from_secs(60));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    // Join through the other member. The already greeted C0 now belongs to a
+    // known member, but neither a new greeting nor a new dial will arrive on it.
+    let join = request(&nodes[2], &nodes[0], [23; 16]).await;
+    let code = accept(&nodes[2], &nodes[0], &join).await;
+    submit(&nodes[0], &join, 1, code);
+    complete(&nodes[2], &nodes[0], &join).await;
+    let mesh = until(|| ready(&nodes)).await;
+    stop(&nodes).await;
+    assert!(
+        mesh,
+        "a greeted nonmember C0 must resume admission when the peer becomes a member"
+    );
+    // The other owner can learn membership after the first Request arrives.
+    // Its normal unknown-member rejection and redial are valid; pinning the
+    // physical LinkId would require relaxing that authorization boundary.
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unadmitted_link_times_out_and_member_redial_recovers() {
+    use oink_network::link::{LinkLost, ModuleEvent};
+    use oink_protocol::frame::StreamKind;
+    let nodes = start(fresh(2)).await;
+    let _ = query(&nodes[0], &nodes[1], [24; 16]).await;
+    let peer = nodes[1].identity.id();
+    let stalled = nodes[0].links.links().by_peer(peer).unwrap().link;
+    let deadline = nodes[0]
+        .group
+        .call(move |owner| Ok(owner.sessions[&stalled].deadline))
+        .unwrap();
+    assert!(
+        deadline.is_some(),
+        "a greeted but unadmitted C0 must retain a bounded deadline"
+    );
+    let mut events = nodes[0].links.register(&[StreamKind::Input]);
+    let remote = nodes[1].group.clone();
+    let (entered, entering) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let blocked = std::thread::spawn(move || {
+        remote.call(move |_| {
+            // Keep the actual C0 reader and QUIC/heartbeat alive while its
+            // configuration owner stops answering admission.
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+            Ok(())
+        })
+    });
+    entering.recv().unwrap();
+    let stored = same_group(2).remove(0);
+    let anchor = Anchor {
+        group: GroupId(stored.state.group().unwrap().0),
+        root: stored.state.roster().unwrap().root_id().unwrap().0,
+    };
+    let target_state = State::verify(stored.state, anchor).unwrap();
+    let local_state = target_state.clone();
+    nodes[0].group.call(move |owner| owner.commit(local_state)).unwrap();
+    nodes[0]
+        .group
+        .call(move |owner| {
+            assert!(!owner.sessions[&stalled].ready);
+            let pending = owner.sessions[&stalled].deadline;
+            owner.begin_admission(stalled).map_err(internal)?;
+            assert_eq!(
+                owner.sessions[&stalled].deadline, pending,
+                "repeating the same admission request is not progress"
+            );
+            // Advance just this real C0's inactivity boundary; avoid a ten-second
+            // wall-clock wait or changing the network owner's heartbeat clock.
+            owner.sessions.get_mut(&stalled).unwrap().deadline = Some(Instant::now() - Duration::from_millis(1));
+            owner.tick();
+            assert!(!owner.sessions.contains_key(&stalled));
+            Ok(())
+        })
+        .unwrap();
+    let reason = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(ModuleEvent::LinkLost { link, reason, .. }) = events.next().await
+                && link == stalled
+            {
+                break reason;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(reason, LinkLost::Local(Disconnect::HandshakeTimeout));
+    release.send(()).unwrap();
+    blocked.join().unwrap().unwrap();
+    nodes[1].group.call(move |owner| owner.commit(target_state)).unwrap();
+    let recovered = until(|| ready(&nodes)).await;
+    let replaced = nodes[0]
+        .links
+        .links()
+        .by_peer(peer)
+        .is_some_and(|link| link.link != stalled);
+    stop(&nodes).await;
+    assert!(
+        recovered,
+        "the normal member dialer must recover after an unadmitted C0 expires"
+    );
+    assert!(replaced);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_human_pairing_keeps_its_own_lifetime_before_admission() {
+    let nodes = start(fresh(2)).await;
+    let pair = request(&nodes[0], &nodes[1], [25; 16]).await;
+    let peer = nodes[1].identity.id();
+    let link = nodes[0].links.links().by_peer(peer).unwrap().link;
+    nodes[0]
+        .group
+        .call(move |owner| {
+            owner.sessions.get_mut(&link).unwrap().deadline = Some(Instant::now() - Duration::from_millis(1));
+            owner.tick();
+            assert!(
+                owner.sessions.contains_key(&link),
+                "waiting for a human is not stalled member admission"
+            );
+            assert!(
+                owner.next_deadline() > Instant::now(),
+                "a suspended idle deadline must not spin the owner"
+            );
+            Ok(())
+        })
+        .unwrap();
+    let code = accept(&nodes[0], &nodes[1], &pair).await;
+    submit(&nodes[1], &pair, 1, code);
+    complete(&nodes[0], &nodes[1], &pair).await;
+    assert!(until(|| ready(&nodes)).await);
+    stop(&nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advancing_proof_chunks_extend_admission_but_replays_do_not() {
+    let nodes = start(fresh(2)).await;
+    let _ = query(&nodes[0], &nodes[1], [26; 16]).await;
+    let peer = nodes[1].identity.id();
+    let link = nodes[0].links.links().by_peer(peer).unwrap().link;
+    nodes[0]
+        .group
+        .call(move |owner| {
+            let anchor = owner.state.roster().anchor();
+            let context = dto::ObjectContext::from_raw(
+                [
+                    (1, dto::ObjectContextKind::GroupRef.write()),
+                    (
+                        2,
+                        RawValue::Map([(1, oink_network::group_merge::group_ref(anchor).write())].into()),
+                    ),
+                ]
+                .into(),
+            )
+            .unwrap();
+            let (reference, frames) = oink_network::pair_objects::transfer(
+                context.clone(),
+                dto::ObjectKind::Transfer,
+                &[(1, RawValue::Bytes(vec![7; 32768]))].into(),
+            )
+            .unwrap();
+            owner.lookups.insert(link, (anchor, Instant::now() + ADMISSION_TIMEOUT));
+            let header = v1::frame::encode(
+                &Message::ConfigMergeTransfer(dto::MergeTransfer::from_raw([(1, reference.write())].into()).unwrap()),
+                v1::limits::CONFIG_FRAME,
+            )
+            .unwrap();
+            owner.control(link, &header).map_err(internal)?;
+            let begin = v1::frame::encode(&frames[0], v1::limits::CONFIG_FRAME).unwrap();
+            owner.control(link, &begin).map_err(internal)?;
+            let before = Instant::now();
+            owner.sessions.get_mut(&link).unwrap().deadline = Some(before - Duration::from_millis(1));
+            let chunk = v1::frame::encode(&frames[1], v1::limits::CONFIG_FRAME).unwrap();
+            owner.control(link, &chunk).map_err(internal)?;
+            let renewed = owner.sessions[&link].deadline.unwrap();
+            assert!(renewed >= before + ADMISSION_TIMEOUT);
+            owner.tick();
+            assert!(
+                owner.sessions.contains_key(&link),
+                "real proof progress must keep admission alive"
+            );
+            assert!(owner.control(link, &chunk).is_err(), "an old chunk is not progress");
+            assert_eq!(owner.sessions[&link].deadline, Some(renewed));
+            owner.control(link, &header).map_err(internal)?;
+            assert_eq!(
+                owner.sessions[&link].deadline,
+                Some(renewed),
+                "a repeated proof header is not progress"
+            );
+            Ok(())
+        })
+        .unwrap();
+    stop(&nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unreceipted_commit_after_peer_reset_keeps_the_link_available_for_pairing() {
     let mut nodes = start(fresh(2)).await;
     let first = request(&nodes[0], &nodes[1], [6; 16]).await;

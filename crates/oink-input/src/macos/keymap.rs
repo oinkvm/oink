@@ -193,8 +193,9 @@ pub const NX_KEYTYPE_PREVIOUS: NxKey = 18;
 pub const NX_KEYTYPE_FAST: NxKey = 19;
 pub const NX_KEYTYPE_REWIND: NxKey = 20;
 
-/// 系统定义事件里**发往正在操作的那台电脑**的键（用户规则）。表里没有的（键盘背光
-/// `NX_KEYTYPE_ILLUMINATION_*`、电源、弹出、Caps Lock 等）留在本机、原样放行。一一对应，双向使用。
+/// Ordinary media keys that follow focus, mapped in both directions. Brightness /
+/// backlight use the separate observation path below and require Command to leave
+/// the source. Power, eject and native Caps keep their existing local policies.
 const NX_KEYS: &[(NxKey, KeyCode)] = &[
     (NX_KEYTYPE_SOUND_UP, c(0xE9)),   // Volume Increment
     (NX_KEYTYPE_SOUND_DOWN, c(0xEA)), // Volume Decrement
@@ -206,14 +207,22 @@ const NX_KEYS: &[(NxKey, KeyCode)] = &[
     (NX_KEYTYPE_REWIND, c(0xB4)),     // Rewind
 ];
 
-/// 只用于 HID → NX：键盘页的音量键（`kVK_VolumeUp` 等普通按键系统不认，注入时改发系统定义事件）。
+/// HID → NX aliases and brightness controls. Source brightness is observed by
+/// local_brightness_key; the router alone decides whether Command sends it remotely.
+/// Keyboard-page volume keys also need NX (`kVK_VolumeUp` is ineffective).
 const NX_HID_ONLY: &[(KeyCode, NxKey)] = &[
+    (c(0x6F), 2),  // NX_KEYTYPE_BRIGHTNESS_UP
+    (c(0x70), 3),  // NX_KEYTYPE_BRIGHTNESS_DOWN
+    (c(0x79), 21), // NX_KEYTYPE_ILLUMINATION_UP
+    (c(0x7A), 22), // NX_KEYTYPE_ILLUMINATION_DOWN
+    (c(0x7C), 23), // NX_KEYTYPE_ILLUMINATION_TOGGLE
     (k(0x7F), NX_KEYTYPE_MUTE),
     (k(0x80), NX_KEYTYPE_SOUND_UP),
     (k(0x81), NX_KEYTYPE_SOUND_DOWN),
 ];
 
-/// Local-only brightness controls; deliberately absent from the forwarding table.
+/// Source brightness controls, local unless the router selects Command + remote focus.
+/// Kept separate from ordinary media capture; all transitions still reach routing.
 /// NX constants come from IOKit/hidsystem/ev_keymap.h.
 pub fn local_brightness_key(nx: NxKey) -> Option<KeyCode> {
     Some(c(match nx {
@@ -226,12 +235,12 @@ pub fn local_brightness_key(nx: NxKey) -> Option<KeyCode> {
     }))
 }
 
-/// 系统定义事件的键类型 → HID。不在转发之列的键为 `None`。
+/// Ordinary media NX → HID. Brightness capture uses local_brightness_key instead.
 pub fn nx_to_hid(nx: NxKey) -> Option<KeyCode> {
     NX_KEYS.iter().find(|(n, _)| *n == nx).map(|(_, h)| *h)
 }
 
-/// HID → 注入用的系统定义事件键类型（音量、播放控制）。
+/// HID → 注入用的系统定义事件键类型（音量、播放控制、亮度与背光）。
 pub fn hid_to_nx(code: KeyCode) -> Option<NxKey> {
     NX_KEYS
         .iter()
@@ -388,7 +397,7 @@ mod tests {
             // 系统定义事件的键不是普通 kVK：注入不能走 keyDown（系统不认）。
             assert_eq!(hid_to_mac(*h), None, "Consumer {:#x}", h.usage());
         }
-        // 留在本机的：键盘背光（21–23）、Caps Lock（4）、电源（6）、弹出（14）。
+        // Brightness has a separate observer; Caps, power and eject are not media.
         for n in [2, 3, 4, 6, 14, 21, 22, 23] {
             assert_eq!(nx_to_hid(n), None);
         }
@@ -456,7 +465,7 @@ mod tests {
 mod brightness_tests {
     use super::*;
     #[test]
-    fn guard_brightness_aux_keys_are_local_for_down_repeat_and_up() {
+    fn brightness_aux_keys_have_native_injection_codes_for_down_repeat_and_up() {
         for nx in [2, 3, 21, 22, 23] {
             for (pressed, repeat) in [(true, false), (true, true), (false, false)] {
                 let key = AuxKey::parse(
@@ -469,7 +478,8 @@ mod brightness_tests {
                 )
                 .unwrap();
                 assert!(local_brightness_key(key.key).unwrap().is_brightness());
-                assert_eq!(nx_to_hid(key.key), None, "must never enter forwarding map");
+                assert_eq!(nx_to_hid(key.key), None, "uses brightness observation path");
+                assert_eq!(hid_to_nx(local_brightness_key(key.key).unwrap()), Some(nx));
             }
         }
         for nx in [0, 1, 4, 7, 14, 16, 17, 18, 19, 20, 24, 255] {

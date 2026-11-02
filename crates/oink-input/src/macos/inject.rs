@@ -427,7 +427,9 @@ impl Injector {
         let hold_epoch = self.hold_epoch.load(Ordering::Acquire);
         self.check_session(matches!(
             event,
-            InjectEvent::Key { pressed: false, .. } | InjectEvent::Button { pressed: false, .. }
+            InjectEvent::Key { pressed: false, .. }
+                | InjectEvent::KeyWithoutLock { pressed: false, .. }
+                | InjectEvent::Button { pressed: false, .. }
         ))?;
         // Record activity before delivery; only the ordinary worker may wake
         // displays through powerd. Native input never waits for that declaration.
@@ -483,7 +485,9 @@ impl Injector {
         // blocked across a pause while holding this mutex.
         self.check_session(matches!(
             event,
-            InjectEvent::Key { pressed: false, .. } | InjectEvent::Button { pressed: false, .. }
+            InjectEvent::Key { pressed: false, .. }
+                | InjectEvent::KeyWithoutLock { pressed: false, .. }
+                | InjectEvent::Button { pressed: false, .. }
         ))?;
         let position_context = self.motion.position_context();
         let result = match event {
@@ -503,7 +507,7 @@ impl Injector {
             InjectEvent::TouchpadScroll { wheel, .. } => {
                 self.scroll(&mut st, wheel.dx, wheel.dy, wheel.unit, wheel.phase)
             }
-            InjectEvent::Key { code, pressed } => {
+            InjectEvent::Key { code, pressed } | InjectEvent::KeyWithoutLock { code, pressed } => {
                 let result = self.key(&mut st, *code, *pressed);
                 st.pending_position = None;
                 let mods = st
@@ -1036,6 +1040,11 @@ impl Injector {
                 st.down_aux.remove(&key);
                 false
             };
+            // Command is the source's brightness/backlight routing gesture, not
+            // an NX modifier. post_aux_key constructs fresh direction-only flags;
+            // never merge self.flags(st), which includes the forwarded Command.
+            // macOS 26.6.2: brightness/backlight +/- still step with Command held
+            // in CombinedSessionState; no auxiliary modifier release is needed.
             return if sysevent::post_aux_key(AuxKey { key, pressed, repeat }) {
                 Ok(())
             } else {

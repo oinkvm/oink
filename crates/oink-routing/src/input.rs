@@ -77,6 +77,8 @@ pub enum InputMsg {
         dy: f64,
         unit: ScrollAmount,
         phase: ScrollPhase,
+        /// OFF-mode native wheel steps; dx/dy remain legacy Lines for older receivers.
+        wheel_steps: Option<oink_foundation::Point>,
     },
     /// 按键状态同步：源机认为在接收方仍按着的键和按钮（随心跳发送，仅在非空或刚变空时）。
     /// 接收方释放为该源按下、但不在列表中的键和按钮；从不据此按下。
@@ -147,7 +149,7 @@ pub enum ScrollAmount {
     /// Legacy reference-plane distance; encode/decode at the fixed canonical
     /// .25/686 per pixel, never a physical display calibration.
     Reference,
-    /// 行：源机的行滚动 × 源机每格行数（macOS 源为 1）。
+    /// 源行量：Windows 原生格数 × 源每格行数；macOS 已加速行量（每格行数按 1）。
     Lines,
 }
 

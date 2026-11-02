@@ -94,6 +94,10 @@ pub enum Kind {
     /// message: contact phase (0=Begin, 1=Move, 2=End, 3=Cancel),
     /// extra: submitted frame count; success: native receiver result.
     /// reason: 0=submission, 1=remote capture, 2=mode transition, 3=desktop unavailable.
+    /// 4=native rejection: flags=GetLastError, message=pointer count,
+    /// extra=dwTime, point=surface dimensions (HIMETRIC).
+    /// 5=rejected pointer: message=ID, flags=pointer flags, extra=dwTime,
+    /// point=contact coordinates (HIMETRIC). Emitted only on failure, at most five.
     ContactInjection,
     /// Windows marker boundary stages. Data.marker is the native input tag;
     /// extra is its full transition sequence (0 when an obsolete tag is unknown).
