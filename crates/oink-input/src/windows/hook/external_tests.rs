@@ -30,10 +30,15 @@ struct Fixture {
     _physical_snapshot: MutexGuard<'static, ()>,
 }
 static PHYSICAL_SNAPSHOT: Mutex<()> = Mutex::new(());
+
+// These tests drive the real LL callback and source router together; no native
+// hook is installed and no SendInput, desktop switch or real lock is performed.
+mod key_tail_tests;
 impl Fixture {
     fn new() -> Self {
         let physical_snapshot = PHYSICAL_SNAPSHOT.lock().unwrap();
         external::gap();
+        key_releases::clear();
         let cursor = tests::TestCursor::at(POINT { x: 1920, y: 1080 });
         let events = Arc::new(Mutex::new(Vec::<CapturedEvent>::new()));
         let output = events.clone();
@@ -119,10 +124,58 @@ fn held_snapshot_excludes_external_and_own_keys_and_gap_cannot_rebuild_them() {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        key_releases::clear();
         STATE.with(|slot| slot.borrow_mut().take());
         crate::capture_loop::clear();
         external::gap();
     }
+}
+
+#[test]
+fn right_shift_snapshot_and_routing_ignore_fake_shift_edges() {
+    let f = Fixture::new();
+    let mut info = KBDLLHOOKSTRUCT {
+        vkCode: 0xa1,
+        scanCode: 0x36,
+        flags: LLKHF_EXTENDED,
+        ..Default::default()
+    };
+    let deliver = |msg, info: &KBDLLHOOKSTRUCT| {
+        keyboard_proc_with_next(
+            0,
+            WPARAM(msg as usize),
+            LPARAM((info as *const KBDLLHOOKSTRUCT) as isize),
+            || LRESULT(0),
+        )
+    };
+    assert_eq!(deliver(WM_KEYDOWN, &info), LRESULT(1));
+    assert_eq!(physical_keys(), [KeyCode::RIGHT_SHIFT]);
+    assert_eq!(f.events.lock().unwrap().len(), 1);
+    for (vk, scan) in [(0xa0, 0x22a), (0xa1, 0x236), (0xff, 0x2a), (0xff, 0x36)] {
+        let fake = KBDLLHOOKSTRUCT {
+            vkCode: vk,
+            scanCode: scan,
+            ..info
+        };
+        for msg in [WM_KEYDOWN, WM_KEYUP] {
+            assert_eq!(deliver(msg, &fake), LRESULT(1));
+            assert_eq!(physical_keys(), [KeyCode::RIGHT_SHIFT]);
+            assert_eq!(f.events.lock().unwrap().len(), 1);
+        }
+    }
+    // An unmarked restoration DOWN is a repeat of the still-held real Shift.
+    deliver(WM_KEYDOWN, &info);
+    info.flags.0 |= 0x80;
+    deliver(WM_KEYUP, &info);
+    assert!(physical_keys().is_empty());
+    assert_eq!(f.events.lock().unwrap().len(), 3);
+    assert_eq!(
+        f.events.lock().unwrap().last().unwrap().event,
+        InputEvent::Key {
+            code: KeyCode::RIGHT_SHIFT,
+            pressed: false
+        }
+    );
 }
 
 #[test]

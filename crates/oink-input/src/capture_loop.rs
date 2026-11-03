@@ -149,6 +149,13 @@ pub(crate) fn keyboard_remote() -> Option<bool> {
     OWNER.with(|slot| slot.try_borrow().ok()?.as_ref()?.keyboard_remote())
 }
 
+#[cfg(windows)]
+pub(crate) fn callback_available() -> bool {
+    // A nested native message may arrive while event()/poll() owns the router.
+    // It must defer its release instead of borrowing that owner a second time.
+    OWNER.with(|slot| slot.try_borrow_mut().is_ok())
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn constrained_cursor() -> Option<oink_foundation::Point> {
     OWNER.with(|slot| slot.borrow().as_ref().and_then(|owner| owner.constrained_cursor()))

@@ -96,6 +96,7 @@ windows = { version = "0.62", features = [
 ] }
 
 [target.'cfg(windows)'.dev-dependencies]
+oink-routing = { path = "../oink-routing" }
 serde_json.workspace = true
 # 验证程序：测试窗口取消输入法关联（避免注入的 Shift 切换用户的输入法中英文状态）
 # windows_inject_diag：进程 token、桌面、会话

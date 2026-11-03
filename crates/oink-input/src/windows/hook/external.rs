@@ -119,21 +119,16 @@ pub(super) fn pass_key(next: impl FnOnce() -> LRESULT) -> LRESULT {
 }
 
 pub(super) fn observe_physical_key(msg: u32, info: &KBDLLHOOKSTRUCT) {
+    let Some(scan) = keyboard_scancode(info) else {
+        // Fake Shift UP must not erase a genuinely held Shift observation.
+        return;
+    };
     let Some(slot) = PHYSICAL_KEYS.get(info.vkCode as usize) else {
         return;
     };
     match msg {
         WM_KEYUP | WM_SYSKEYUP => slot.store(0, Ordering::Relaxed),
         WM_KEYDOWN | WM_SYSKEYDOWN => {
-            let mut scan = (info.scanCode & 0xff) as u16;
-            if info.flags.0 & LLKHF_EXTENDED.0 != 0 {
-                scan |= 0xe000;
-            }
-            if info.scanCode == 0 {
-                // Match ordinary hook translation without reading merged key state.
-                // SAFETY: a read-only virtual-key to scan-code lookup.
-                scan = unsafe { MapVirtualKeyW(info.vkCode, MAPVK_VK_TO_VSC_EX) } as u16;
-            }
             if let Some(code) = keymap::scancode_to_hid(scan) {
                 slot.store(code.0, Ordering::Relaxed);
             }

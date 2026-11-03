@@ -91,95 +91,198 @@ fn ready(r: &mut Router) {
     r.drain_outputs();
 }
 
+fn sent_keys(r: &mut Router) -> Vec<(KeyCode, bool)> {
+    r.drain_outputs()
+        .into_iter()
+        .filter_map(|o| match o {
+            Output::Send {
+                to: PEER,
+                msg: Message::Input(InputMsg::Key { code, pressed }),
+                ..
+            } => Some((code, pressed)),
+            Output::Inject(_) => panic!("lock chord must not inject source keys or menu masks"),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
-fn remote_windows_lock_is_once_per_press_and_releases_only_its_own_chord_first() {
+fn remote_windows_lock_only_consumes_l_and_is_once_per_press() {
     for win in [KeyCode::LEFT_GUI, KeyCode::RIGHT_GUI] {
         for shift in [KeyCode::LEFT_SHIFT, KeyCode::RIGHT_SHIFT] {
             let mut r = router(Os::Windows, Os::Windows, true);
             ready(&mut r);
-            key(&mut r, win, true);
-            key(&mut r, shift, true);
-            r.drain_outputs();
-            key(&mut r, L, true);
+            for code in [win, shift] {
+                key(&mut r, code, true);
+            }
+            assert_eq!(sent_keys(&mut r), [(win, true), (shift, true)]);
+            assert_eq!(key(&mut r, L, true), Disposition::Swallow);
             let requests: Vec<_> = r
                 .out
                 .iter()
-                .enumerate()
-                .filter_map(|(i, o)| match o {
+                .filter_map(|o| match o {
                     Output::Send {
-                        to,
-                        msg: Message::Control(ControlMsg::LockRemoteWindows(request)),
+                        to: PEER,
+                        msg: Message::Control(ControlMsg::LockRemoteWindows(q)),
                         ..
-                    } => {
-                        assert_eq!(*to, PEER);
-                        assert_eq!(request.source, r.cfg.boot);
-                        assert_eq!(request.target, r.admitted_boots[&PEER]);
-                        assert_eq!(request.epoch, 7);
-                        Some(i)
-                    }
+                    } => Some(q.clone()),
                     _ => None,
                 })
                 .collect();
             assert_eq!(requests.len(), 1);
-            for modifier in [win, shift] {
-                assert!(r.out[..requests[0]].iter().any(|o| matches!(o,
-                    Output::Send {msg: Message::Input(InputMsg::Key {code, pressed:false}),..} if *code==modifier)));
+            assert_eq!(requests[0].source, r.cfg.boot);
+            assert_eq!(requests[0].target, r.admitted_boots[&PEER]);
+            assert_eq!(requests[0].epoch, 7);
+            assert!(
+                sent_keys(&mut r).is_empty(),
+                "only a lock request, no early UPs or mask"
+            );
+            for code in [win, shift] {
+                assert!(!r.keyboard_key_blocked(Some(code)));
             }
-            r.drain_outputs();
-            key(&mut r, L, true);
-            // A focus change cannot rebuild retired Win/Shift before physical UP.
-            r.holder = ME;
-            r.retarget_modifiers();
+            // Keep L held across capability/modifier changes: it cannot become a new chord.
+            for _ in 0..20 {
+                key(&mut r, L, true);
+            }
+            r.set_peer_windows_lock(PEER, false);
             key(&mut r, shift, false);
             key(&mut r, L, true);
             key(&mut r, L, false);
             key(&mut r, win, false);
-            assert!(!r.out.iter().any(|o| matches!(
-                o,
-                Output::Send {
-                    msg: Message::Input(_) | Message::Control(ControlMsg::LockRemoteWindows(_)),
-                    ..
-                } | Output::Inject(InjectEvent::Key { pressed: true, .. })
-            )));
+            assert!(
+                !r.out.iter().any(|o| matches!(
+                    o,
+                    Output::Send {
+                        msg: Message::Control(ControlMsg::LockRemoteWindows(_)),
+                        ..
+                    }
+                )),
+                "held L cannot issue another request"
+            );
+            assert_eq!(sent_keys(&mut r), [(shift, false), (win, false)]);
             assert!(r.keys.is_empty());
+            r.set_peer_windows_lock(PEER, true);
+            for code in [win, shift, L] {
+                key(&mut r, code, true);
+            }
+            assert!(r.out.iter().any(|o| matches!(o, Output::Send {
+                msg: Message::Control(ControlMsg::LockRemoteWindows(q)), ..
+            } if q.id == requests[0].id + 1)));
         }
     }
 }
 
 #[test]
-fn remote_lock_retires_modifiers_pressed_locally_before_crossing() {
+fn remote_lock_keeps_modifiers_pressed_locally_before_crossing_until_real_up() {
     let mut r = router(Os::Windows, Os::Windows, false);
     ready(&mut r);
     for code in [KeyCode::LEFT_GUI, KeyCode::LEFT_SHIFT] {
         assert_eq!(key(&mut r, code, true), Disposition::Pass);
     }
-    r.holder = PEER;
     r.claim = PEER;
-    r.retarget_modifiers();
+    r.become_source(8, PEER);
     r.drain_outputs();
     assert_eq!(key(&mut r, L, true), Disposition::Swallow);
-    let out = r.drain_outputs();
-    let lock = out
-        .iter()
-        .position(|o| {
-            matches!(
-                o,
-                Output::Send {
-                    msg: Message::Control(ControlMsg::LockRemoteWindows(_)),
-                    ..
-                }
-            )
-        })
-        .unwrap();
-    for code in [KeyCode::LEFT_GUI, KeyCode::LEFT_SHIFT] {
-        assert!(
-            out[..lock].contains(&Output::Inject(InjectEvent::Key { code, pressed: false })),
-            "the source OS must receive an UP for its previously passed DOWN"
-        );
-        assert_eq!(key(&mut r, code, false), Disposition::Swallow);
+    assert!(sent_keys(&mut r).is_empty());
+    for code in [KeyCode::LEFT_SHIFT, KeyCode::LEFT_GUI] {
+        assert_eq!(key(&mut r, code, false), Disposition::Pass);
+        assert_eq!(sent_keys(&mut r), [(code, false)]);
     }
     key(&mut r, L, false);
     assert!(r.keys.is_empty());
+}
+
+#[test]
+fn lock_chord_immediate_recall_and_return_does_not_consume_next_press() {
+    for physical in [true, false] {
+        for lock in [false, true] {
+            for release_after_return in [true, false] {
+                let mut r = router(Os::Windows, Os::Windows, true);
+                ready(&mut r);
+                let send = |r: &mut Router, code, pressed| {
+                    r.on_local_event(
+                        &CapturedEvent {
+                            event: InputEvent::Key { code, pressed },
+                            physical,
+                            source: SourceKind::Keyboard,
+                            time_us: 1,
+                            cursor: None,
+                        },
+                        1,
+                    )
+                };
+                r.set_peer_windows_lock(PEER, lock);
+                for code in [KeyCode::LEFT_GUI, KeyCode::LEFT_SHIFT, L] {
+                    send(&mut r, code, true);
+                }
+                r.drain_outputs();
+                r.return_pointer_home();
+                assert_eq!(r.holder, ME);
+                if lock {
+                    assert_eq!(send(&mut r, L, true), Disposition::Swallow);
+                    assert!(!r.out.iter().any(|o| matches!(
+                        o,
+                        Output::Send {
+                            msg: Message::Control(ControlMsg::LockRemoteWindows(_)),
+                            ..
+                        }
+                    )));
+                }
+                // The recall must not add suppression for a key whose real UP is still coming.
+                for code in [KeyCode::LEFT_GUI, KeyCode::LEFT_SHIFT, L] {
+                    assert!(
+                        !r.keyboard_key_blocked(Some(code)),
+                        "physical={physical}, lock={lock}, key={code:?}"
+                    );
+                }
+                if release_after_return {
+                    r.claim = PEER;
+                    r.become_source(9, PEER);
+                }
+                for code in [L, KeyCode::LEFT_SHIFT, KeyCode::LEFT_GUI] {
+                    send(&mut r, code, false);
+                }
+                if !release_after_return {
+                    r.claim = PEER;
+                    r.become_source(9, PEER);
+                }
+                r.drain_outputs();
+                for code in [L, KeyCode::LEFT_SHIFT, KeyCode::LEFT_GUI] {
+                    send(&mut r, code, true);
+                    send(&mut r, code, false);
+                    assert_eq!(
+                        sent_keys(&mut r),
+                        [(code, true), (code, false)],
+                        "physical={physical}, lock={lock}"
+                    );
+                }
+                assert!(r.keys.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn lock_request_leaves_no_suppression_debt_when_capture_misses_chord_ups() {
+    let mut r = router(Os::Windows, Os::Windows, true);
+    ready(&mut r);
+    for code in [KeyCode::LEFT_GUI, KeyCode::LEFT_SHIFT, L] {
+        key(&mut r, code, true);
+    }
+    r.return_pointer_home();
+    // Model a genuine capture gap, during which the source cannot see the UPs.
+    // The old eager modifier release left suppressed entries through this gap,
+    // consuming the next complete Win/Shift press even though it was fresh.
+    r.set_capture_available(false);
+    r.set_capture_available(true);
+    r.claim = PEER;
+    r.become_source(9, PEER);
+    r.drain_outputs();
+    for code in [L, KeyCode::LEFT_SHIFT, KeyCode::LEFT_GUI] {
+        key(&mut r, code, true);
+        key(&mut r, code, false);
+        assert_eq!(sent_keys(&mut r), [(code, true), (code, false)]);
+    }
 }
 
 fn request(r: &Router) -> crate::control::WindowsLockRequest {

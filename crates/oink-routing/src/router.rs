@@ -2203,11 +2203,12 @@ impl Router {
                 tracing::info!(%action, "hotkey pressed");
                 self.keys.insert(code, vec![Target::Dropped]);
                 self.key_repeats.remove(&code);
-                self.mask_menu_keys();
                 // Capture the focus/epoch at the physical key press, before later
                 // input or an ordinary-thread hotkey dispatcher can change it.
                 if action == "lock_remote_windows" {
                     self.request_windows_lock(self.windows_lock_target().expect("matched supported Windows target"));
+                } else {
+                    self.mask_menu_keys();
                 }
                 if action == "lock_focus" {
                     self.toggle_locked();

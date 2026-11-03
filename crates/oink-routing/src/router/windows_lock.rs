@@ -68,20 +68,10 @@ impl Router {
         self.admitted_boots.get(&self.holder).copied()
     }
     pub(super) fn request_windows_lock(&mut self, target: Boot) {
-        // Only this source's chord contribution is retired. Other sources retain
-        // their mapped modifier references; the lock API does not inspect them.
-        let modifiers: Vec<_> = self.keys.keys().copied().filter(|k| k.is_modifier()).collect();
-        for code in modifiers {
-            if let Some(targets) = self.keys.remove(&code) {
-                if self.release_local_key(code, targets) {
-                    // A modifier pressed before leaving this source may have a
-                    // native DOWN as well as remote contributions. Retire it now:
-                    // suppression will swallow the eventual physical UP too.
-                    self.out.push(Output::Inject(InjectEvent::Key { code, pressed: false }));
-                }
-                self.keyboard.suppress(code);
-            }
-        }
+        // Only the hotkey's L is dropped. Win/Shift keep their ordinary press
+        // routes and real UPs, including after the destination locks; its input
+        // service can release them on the lock desktop. No early release or
+        // suppression debt is needed, and Win+Shift does not need a menu mask.
         self.windows_lock.next_id += 1;
         self.send(
             target.device_id,

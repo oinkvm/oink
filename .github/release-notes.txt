@@ -10,6 +10,7 @@ Oink 0.3.1 adds a shortcut to lock a remote Windows computer, a choice of how mo
 ## Fixes
 
 - Fixed Win+L locking both computers when a Windows computer controls another Windows computer.
+- Fixed Right Shift not reaching other computers from some Windows keyboards.
 - Fixed Caps Lock not switching case on a locked Mac.
 - Fixed a pointer staying visible on both Macs after moving the pointer between them.
 - Fixed native multi-finger gestures on Windows sometimes turning into mapped shortcuts.

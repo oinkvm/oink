@@ -44,6 +44,7 @@ mod desktop_trace;
 mod external;
 #[cfg(all(test, debug_assertions))]
 mod external_tests;
+mod key_releases;
 mod observations;
 mod restore;
 
@@ -836,6 +837,9 @@ fn run(
                 if stopped {
                     break;
                 }
+                // Native work during poll may have pumped a nested key UP.
+                // The routing owner is no longer borrowed at this boundary.
+                key_releases::drain();
                 resume_hotkey.update(crate::capture_loop::paused_hotkey());
                 let requested = crate::capture_loop::capture_requested();
                 mouse_keys.sharing(requested);
@@ -876,6 +880,7 @@ fn run(
                             st.uninstall_hooks();
                             rawinput::unregister();
                             st.keys.clear();
+                            key_releases::clear();
                             external::gap();
                         }
                     }
@@ -914,11 +919,15 @@ fn run(
                 crate::capture_loop::resume_hotkey();
             } else if msg.hwnd.is_invalid() && msg.message == WM_APP_CMD {
                 process_commands();
+            } else if msg.hwnd.is_invalid() && msg.message == key_releases::MESSAGE {
+                key_releases::drain();
             } else {
                 DispatchMessageW(&msg);
             }
+            key_releases::drain();
             report_busy("message", msg.message, t0.elapsed());
         }
+        key_releases::clear();
 
         if let Some(observations) = &observations {
             observations.set_window(None);
@@ -1915,15 +1924,11 @@ impl State {
         }
         let remote = matches!(self.mode, CaptureMode::Remote { .. });
         let pressed = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
-        let mut sc = (info.scanCode & 0xFF) as u16;
-        if info.flags.0 & LLKHF_EXTENDED.0 != 0 {
-            sc |= 0xE000;
-        }
-        if info.scanCode == 0 {
-            // 某些软件合成的按键没有扫描码：按虚拟键反查
-            // SAFETY: 纯查表函数。
-            sc = unsafe { MapVirtualKeyW(info.vkCode, MAPVK_VK_TO_VSC_EX) } as u16;
-        }
+        let Some(sc) = keyboard_scancode(info) else {
+            // Fake Shift must not change routing/held state, even under the
+            // disabled-key fallback for otherwise unmapped hardware keys.
+            return if remote { Prepared::Swallow } else { Prepared::Pass };
+        };
         let Some(code) = keymap::scancode_to_hid(sc).or_else(|| {
             (physical_keyboard(info) && crate::capture_loop::keyboard_disabled()).then_some(KeyCode::new(0xFFAB, sc))
         }) else {
@@ -2283,6 +2288,7 @@ fn capture_availability_changed(desktop_changed: bool) {
         }
         st.touchpad.cancel_all();
         st.keys.clear();
+        key_releases::clear();
         external::gap();
         let now = time_us(Instant::now());
         let events = if desktop_changed {
@@ -2640,6 +2646,38 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     r
 }
 
+/// Translate LL-hook metadata, not Raw Input's MakeCode/RI_KEY_E0 pair.
+fn keyboard_scancode(info: &KBDLLHOOKSTRUCT) -> Option<u16> {
+    // Windows' layout table marks real RShift (T36) KBDEXT, although its Set-1
+    // scan is 0x36 without E0. Thus LLKHF_EXTENDED does not prove a wire E0 prefix.
+    // Windows 11 physical + SendInput evidence both show VK_RSHIFT/0x36/EXTENDED.
+    // Normalize only that exact VK/full-scan pair, never every apparent E0 36.
+    // https://github.com/microsoft/Windows-driver-samples/blob/main/input/layout/kbdus/kbdus.c
+    //
+    // NumLock/navigation fake Shift can instead reach WH_KEYBOARD_LL with
+    // SCANCODE_SIMULATED (0x200) in scanCode, even without LLKHF_INJECTED.
+    // Check BEFORE truncating: 0x22a/0x236 must not become real Shift DOWN/UP.
+    // kbd.h defines this flag; the hook encoding is undocumented (also observed
+    // by AutoHotkey's keyboard_mouse.h). Invalid-VK E0 fake shifts stay excluded.
+    // Raw Input's documented sample ignores VKey=255; it arrives after the hook and
+    // cannot be required to authorize a swallowed remote key.
+    // https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/RecompiledIdlHeaders/um/kbd.h
+    let shift_scan = matches!(info.scanCode & 0xff, 0x2a | 0x36);
+    if shift_scan && (info.scanCode & 0x200 != 0 || info.vkCode == 0xff) {
+        return None;
+    }
+    if info.scanCode == 0 {
+        // Some software-synthesized keys omit the scan code.
+        // SAFETY: read-only virtual-key to scan-code lookup.
+        return Some(unsafe { MapVirtualKeyW(info.vkCode, MAPVK_VK_TO_VSC_EX) } as u16);
+    }
+    let extended = info.flags.0 & LLKHF_EXTENDED.0 != 0;
+    if extended && shift_scan {
+        return (info.vkCode == 0xa1 && info.scanCode == 0x36).then_some(0x36);
+    }
+    Some((info.scanCode & 0xff) as u16 | if extended { 0xe000 } else { 0 })
+}
+
 fn physical_keyboard(info: &KBDLLHOOKSTRUCT) -> bool {
     external::key_origin(info) == crate::windows_external_input::Origin::Physical
 }
@@ -2657,6 +2695,9 @@ fn keyboard_proc_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
 
 fn keyboard_proc_with_next(code: i32, wparam: WPARAM, lparam: LPARAM, next: impl FnOnce() -> LRESULT) -> LRESULT {
     if code >= 0 {
+        // Complete an earlier reentrant UP before classifying a later DOWN as
+        // a repeat. No focus change or elapsed time proves a physical release.
+        key_releases::drain();
         // SAFETY: HC_ACTION 时 lparam 指向系统提供的 KBDLLHOOKSTRUCT，回调期间有效。
         let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
         use crate::windows_external_input::Origin;
@@ -2665,6 +2706,17 @@ fn keyboard_proc_with_next(code: i32, wparam: WPARAM, lparam: LPARAM, next: impl
             Origin::External if external::key_local(wparam.0 as u32, info) => return external::pass_key(next),
             Origin::Physical => external::observe_physical_key(wparam.0 as u32, info),
             _ => {}
+        }
+        if !crate::capture_loop::callback_available() || STATE.with(|slot| slot.try_borrow_mut().is_err()) {
+            key_releases::defer(wparam.0 as u32, info);
+            let n = REENTERED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(
+                    n,
+                    "keyboard hook reentered while its owner was busy; observed UPs are deferred"
+                );
+            }
+            return next();
         }
         if physical_keyboard(info) {
             // SAFETY: read-only system millisecond counter, no handles or pointers.
@@ -2755,6 +2807,66 @@ static REMOTE_KEY_PASSED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn right_shift_hook_translation_preserves_down_repeat_up_with_extended_flag() {
+        use windows::Win32::UI::WindowsAndMessaging::{KBDLLHOOKSTRUCT_FLAGS, WM_KEYUP};
+        for flags in [0, LLKHF_EXTENDED.0, LLKHF_EXTENDED.0 | LLKHF_INJECTED.0] {
+            let mut state = remote_state();
+            for (msg, pressed) in [(WM_KEYDOWN, true), (WM_KEYDOWN, true), (WM_KEYUP, false)] {
+                let info = KBDLLHOOKSTRUCT {
+                    vkCode: 0xa1,
+                    scanCode: 0x36,
+                    flags: KBDLLHOOKSTRUCT_FLAGS(flags | if pressed { 0 } else { 0x80 }),
+                    ..Default::default()
+                };
+                let Prepared::Event { event, track_key, .. } = state.prepare_key(msg, &info, Instant::now()) else {
+                    panic!("VK_RSHIFT/scan 0x36 must reach routing, flags={flags:#x}");
+                };
+                assert_eq!(
+                    event.event,
+                    InputEvent::Key {
+                        code: KeyCode::RIGHT_SHIFT,
+                        pressed
+                    }
+                );
+                assert_eq!(event.physical, flags & LLKHF_INJECTED.0 == 0);
+                if let Some(code) = track_key {
+                    state.keys.insert(code, true);
+                }
+            }
+            assert!(state.keys.is_empty());
+        }
+    }
+
+    #[test]
+    fn fake_shift_hook_events_never_reach_routing_or_retire_real_shift() {
+        use windows::Win32::UI::WindowsAndMessaging::{KBDLLHOOKSTRUCT_FLAGS, WM_KEYUP};
+        for (scan, vk) in [(0x22a, 0xa0), (0x236, 0xa1), (0x2a, 0xff), (0x36, 0xff), (0x36, 0x10)] {
+            for flags in [0, LLKHF_EXTENDED.0] {
+                // A bare non-extended generic Shift is outside the E0 fake-shift case.
+                if scan < 0x200 && flags == 0 {
+                    continue;
+                }
+                let mut state = remote_state();
+                state.keys.insert(KeyCode::LEFT_SHIFT.0, true);
+                state.keys.insert(KeyCode::RIGHT_SHIFT.0, true);
+                let info = KBDLLHOOKSTRUCT {
+                    vkCode: vk,
+                    scanCode: scan,
+                    flags: KBDLLHOOKSTRUCT_FLAGS(flags),
+                    ..Default::default()
+                };
+                for msg in [WM_KEYDOWN, WM_KEYUP] {
+                    assert!(
+                        matches!(state.prepare_key(msg, &info, Instant::now()), Prepared::Swallow),
+                        "fake shift scan={scan:#x}, vk={vk:#x}, flags={flags:#x}"
+                    );
+                }
+                assert_eq!(state.keys.len(), 2);
+            }
+        }
+    }
 
     #[test]
     fn initial_hook_install_and_retry_publish_keyboard_capture_health() {

@@ -3327,6 +3327,7 @@ dependencies = [
  "objc2-core-graphics",
  "objc2-foundation",
  "oink-foundation",
+ "oink-routing",
  "oink-winsvc",
  "serde",
  "serde_json",
