@@ -8,6 +8,8 @@ mod notifications;
 mod observers;
 mod power;
 #[cfg(all(test, debug_assertions))]
+mod profile_tests;
+#[cfg(all(test, debug_assertions))]
 mod startup_store_tests;
 use crate::api::{self, ApiEvent, EventSink, SubscriptionId};
 use crate::clip::ClipHandle;
@@ -26,6 +28,58 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
+/// Which components a backend process assembles. The process entry chooses it
+/// explicitly; owners never test for a pre-login mode themselves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Profile {
+    /// The signed-in user's backend: every component.
+    #[default]
+    User,
+    /// Windows before anyone signs in (SYSTEM on the logon desktop, started by
+    /// OinkInput): network, routing, displays, input capture and injection only.
+    /// No clipboard, drag and drop, Cloud Files, audio, local IPC, tray, reports,
+    /// native surfaces or pairing; it uses only an identity exported by its owner.
+    Prelogin,
+}
+
+/// The components a [`Profile`] installs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Components {
+    /// Clipboard, drag and drop, file cache and Cloud Files.
+    pub content: bool,
+    pub audio: bool,
+    /// Aim game, layout projection/preview, wallpaper, layout profiles, notifications.
+    pub companions: bool,
+    /// Pairing with devices outside the roster.
+    pub pairing: bool,
+    /// Telemetry/crash report store and uploads.
+    pub reports: bool,
+    /// A missing identity may be created (never for the pre-login backend).
+    pub create_identity: bool,
+}
+impl Profile {
+    pub(crate) fn components(self) -> Components {
+        match self {
+            Self::User => Components {
+                content: true,
+                audio: true,
+                companions: true,
+                pairing: true,
+                reports: true,
+                create_identity: true,
+            },
+            Self::Prelogin => Components {
+                content: false,
+                audio: false,
+                companions: false,
+                pairing: false,
+                reports: false,
+                create_identity: false,
+            },
+        }
+    }
+}
+
 /// 启动一个服务进程需要的部件。
 pub struct NodeOptions {
     pub net: NetworkConfig,
@@ -105,6 +159,7 @@ pub(crate) struct Inner {
     native_surfaces: bool,
     system_dark: AtomicBool,
     pub(crate) native_services: bool,
+    pub(crate) profile: Profile,
     mode_switch_in_callback: bool,
     capture_reports_key_repeat: bool,
     ordinary_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
@@ -113,6 +168,8 @@ pub(crate) struct Inner {
     pub(crate) dnd: OnceLock<crate::dnd::LinkHandle>,
     pub(crate) input_trace: OnceLock<Arc<crate::diagnostics::input_trace::InputTrace>>,
     pub(crate) diagnostics: OnceLock<crate::diagnostics::collection::Collector>,
+    /// Wakes the pre-login snapshot export (Windows user backend only).
+    pub(crate) prelogin_export: OnceLock<Arc<tokio::sync::Notify>>,
     pub clip: std::sync::OnceLock<ClipHandle>,
     pub(crate) cache: crate::cache::State,
     #[cfg(target_os = "macos")]
@@ -223,6 +280,31 @@ impl Node {
         Self::start_with_services(opts, !cfg!(test)).await
     }
 
+    /// The Windows pre-login backend. Native services (audio recovery, File
+    /// Provider, update gate, microphone plug-in) never start in this profile.
+    pub async fn start_prelogin(opts: NodeOptions) -> anyhow::Result<Self> {
+        let node = Self::prepare_profile(opts, false, Profile::Prelogin).context("prepare pre-login backend")?;
+        if let Some(error) = lock(&node.inner.group_unreadable).clone() {
+            // No IPC exists to reset it, and nothing is ever written back.
+            anyhow::bail!("pre-login group state unreadable: {error}");
+        }
+        node.start_sharing().await.context("start pre-login sharing")?;
+        Ok(node)
+    }
+
+    /// The same pre-login assembly against fake platform backends (tests).
+    #[cfg(debug_assertions)]
+    pub async fn start_prelogin_with_fake_platform(mut opts: NodeOptions) -> anyhow::Result<Self> {
+        opts.cursor_trail = false;
+        let node = Self::prepare_profile(opts, false, Profile::Prelogin)?;
+        node.start_sharing().await?;
+        Ok(node)
+    }
+
+    pub fn profile(&self) -> Profile {
+        self.inner.profile
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) async fn start_launch_smoke(opts: NodeOptions) -> anyhow::Result<Self> {
         // Keep native trail/appearance startup, but never request native audio
@@ -258,15 +340,26 @@ impl Node {
         Self::prepare_with_services(opts, false)
     }
 
-    fn prepare_with_services(mut opts: NodeOptions, native_services: bool) -> anyhow::Result<Self> {
+    fn prepare_with_services(opts: NodeOptions, native_services: bool) -> anyhow::Result<Self> {
+        Self::prepare_profile(opts, native_services, Profile::User)
+    }
+
+    fn prepare_profile(mut opts: NodeOptions, native_services: bool, profile: Profile) -> anyhow::Result<Self> {
+        let components = profile.components();
         let data_dir = opts.net.data_dir.clone();
         let mut config = AgentConfig::load_from_with_device_name(&data_dir, opts.net.device_name.clone())
             .context("load backend settings")?;
         if let Some(name) = &config.settings.device_name {
             opts.net.device_name = name.clone();
         }
-        let identity =
-            Arc::new(oink_network::identity::Identity::load_or_create(&data_dir).context("load backend identity")?);
+        let identity = Arc::new(
+            if components.create_identity {
+                oink_network::identity::Identity::load_or_create(&data_dir)
+            } else {
+                oink_network::identity::Identity::load_existing(&data_dir)
+            }
+            .context("load backend identity")?,
+        );
         tracing::info!("backend identity and settings ready");
         let me = identity.id();
         let boot = oink_foundation::session::Boot {
@@ -294,7 +387,11 @@ impl Node {
         let native = opts.cursor_trail;
         let node = Self {
             inner: Arc::new(Inner {
-                reports: crate::telemetry::Owner::new(&data_dir, config.settings.reports),
+                reports: if components.reports {
+                    crate::telemetry::Owner::new(&data_dir, config.settings.reports)
+                } else {
+                    crate::telemetry::Owner::offline(&data_dir)
+                },
                 links: OnceLock::new(),
                 group: OnceLock::new(),
                 input: OnceLock::new(),
@@ -302,6 +399,7 @@ impl Node {
                 dnd: OnceLock::new(),
                 input_trace: OnceLock::new(),
                 diagnostics: OnceLock::new(),
+                prelogin_export: OnceLock::new(),
                 clip: OnceLock::new(),
                 cache: crate::cache::State::new(native),
                 input_backend: opts.input,
@@ -321,6 +419,7 @@ impl Node {
                 system_dark: AtomicBool::new(false),
                 native_surfaces: native,
                 native_services,
+                profile,
                 mode_switch_in_callback: opts.mode_switch_in_callback,
                 capture_reports_key_repeat: opts.capture_reports_key_repeat,
                 ordinary_threads: Mutex::new(Vec::new()),
@@ -546,6 +645,7 @@ impl Node {
         if let Err(error) = lock(&self.inner.config).flush_deferred() {
             tracing::error!(%error, "pending settings could not be flushed before process exit");
         }
+        self.prelogin_export_on_exit().await;
         if let Some(d) = self.inner.diagnostics.get() {
             let recorder = d.recorder.clone();
             let _ = tokio::task::spawn_blocking(move || recorder.shutdown()).await;
@@ -763,6 +863,8 @@ impl Node {
         {
             tracing::warn!(kind = ?error.kind(), "ordinary log cleanup failed");
         }
+        drop(c);
+        self.prelogin_changed();
         Ok(())
     }
 

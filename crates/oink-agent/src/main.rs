@@ -70,6 +70,11 @@ enum Cmd {
     /// Set machine update policy from this already-elevated installed CLI.
     #[cfg(windows)]
     UpdatePolicy(update_admin::Args),
+    /// Internal continuation; UAC authorizes only claiming the pre-login identity
+    /// for this session's user.
+    #[cfg(windows)]
+    #[command(hide = true)]
+    PreloginClaim,
     /// 按方法名和 JSON 参数调用任意后台接口。
     Call { method: String, params: Option<String> },
     /// 订阅后台事件，每行输出一条 JSON，后台退出后结束。
@@ -352,6 +357,13 @@ fn execute() -> anyhow::Result<ExitCode> {
         oink_agent::microphone_plugin::complete_windows_installation(action, token).map_err(anyhow::Error::msg)?;
         return Ok(ExitCode::SUCCESS);
     }
+    // Same: the elevated claim sends one request over the launch pipe and never
+    // reads the user's Oink state.
+    #[cfg(windows)]
+    if let Cmd::PreloginClaim = &cli.cmd {
+        oink_winsvc::prelogin::claim()?;
+        return Ok(ExitCode::SUCCESS);
+    }
     if let Some(home) = &cli.home {
         // SAFETY: 单线程启动阶段，尚未创建其他线程。
         unsafe { std::env::set_var("OINK_HOME", home) };
@@ -409,6 +421,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.cmd {
         #[cfg(windows)]
         Cmd::CompleteMicrophoneInstallation { .. } => unreachable!("handled before CLI state initialization"),
+        #[cfg(windows)]
+        Cmd::PreloginClaim => unreachable!("handled before CLI state initialization"),
         #[cfg(windows)]
         Cmd::ApproveLocalUpdate { path, sha256 } => {
             match oink_winsvc::update::request(oink_update::ipc::Request::ApproveLocal { path, sha256 })? {

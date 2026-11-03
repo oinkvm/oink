@@ -1507,6 +1507,7 @@ impl Work {
 // Uses the debug-only content and drag-preview fixtures and cache mutation helpers.
 #[cfg(all(test, debug_assertions))]
 mod tests {
+    mod move_observed;
     mod shell_ops;
     mod zip_drop;
     use super::*;
@@ -3468,7 +3469,7 @@ mod tests {
         service.received_sweep();
         assert!(matches!(
             service.received.lock().unwrap().moves[&delivery.id],
-            moved::State::Removed
+            moved::State::Retained
         ));
     }
 

@@ -53,13 +53,24 @@ quiet upgrades. The welcome checkbox can change the remembered choice on a
 full-UI major upgrade; transitive MSI component ownership handles repair and
 uninstall. Upgrading a build without a saved choice preserves its absence.
 
-After a successful full-UI install or major upgrade, Finish offers `Launch Oink`
-and `Start Oink when I sign in`, both checked. Repair and uninstall do not offer
-them. Quiet/passive and update-worker installs never invoke the finish action.
+The welcome page also offers `Start Oink when I sign in` (public property
+`OINK_START_AT_LOGIN`): checked for a fresh full-UI install, and on a major
+upgrade checked only if the installing user already has the Oink Run entry. It is
+chosen before the elevated transaction because it also enables the machine-level
+pre-login backend: the deferred SYSTEM action `EnablePrelogin` records the
+installing user as its owner under `HKLM\SOFTWARE\Oink\Prelogin`. A quiet
+install sets nothing unless the property is passed explicitly.
+
+After a successful full-UI install or major upgrade, Finish offers `Launch Oink`,
+checked; Finish also registers the user's login entry when the welcome choice was
+checked. Repair and uninstall do not offer them. Quiet/passive and update-worker
+installs never invoke the finish action.
 It runs only from the client Finish button, checks the actual child token
 before resuming it, and refuses elevation, UIAccess and session zero. Start
 Setup normally: an explicitly elevated client cannot launch Oink and receives
 a warning to open it from Start instead. The short-lived app entry uses the
-same OS-backed login API as Settings; unchecked means no preference edit.
+same OS-backed login API as Settings for the user entry only (the installer has
+already written the machine part, so Finish never asks for a second approval);
+unchecked means no preference edit.
 The resident UI is argument-free and its existing instance lock hands off to
 an already-running UI if another launch races with Finish.

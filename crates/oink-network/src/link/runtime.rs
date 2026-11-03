@@ -1,6 +1,8 @@
 //! The single network thread. Quinn drivers run on this same current-thread runtime;
 //! stream work is polled here, in the three measured time-budget classes.
 mod low;
+#[cfg(any(target_os = "macos", test))]
+mod udp;
 use super::control::LinkMsg;
 use super::{
     core::{Core, Effect},
@@ -91,6 +93,8 @@ struct Network {
     started: Instant,
     core: Core,
     endpoint: quinn::Endpoint,
+    #[cfg(any(target_os = "macos", test))]
+    socket: Arc<udp::Socket>,
     probe_client: quinn::ClientConfig,
     accepting: wire::Waiter<Option<quinn::Incoming>>,
     shared: Arc<Shared>,
@@ -163,27 +167,34 @@ pub(super) async fn run(
             None
         }
     };
-    let setup = || -> Result<(quinn::Endpoint, quinn::ClientConfig), crate::NetError> {
+    let setup = || -> Result<_, crate::NetError> {
         let (server, client) = transport(&credentials)?;
-        let socket = std::net::UdpSocket::bind(config.bind)?;
-        crate::qos::set_service_type(&socket, crate::qos::ServiceType::Voice);
-        let socket = crate::qos::wrap_udp_socket(socket)?;
+        #[cfg(any(target_os = "macos", test))]
+        let socket = udp::Socket::bind(config.bind, shared.wake.clone())?;
+        #[cfg(not(any(target_os = "macos", test)))]
+        let socket = {
+            let socket = std::net::UdpSocket::bind(config.bind)?;
+            crate::qos::set_service_type(&socket, crate::qos::ServiceType::Voice);
+            crate::qos::wrap_udp_socket(socket)?
+        };
         let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
             Default::default(),
             Some(server),
-            socket,
+            socket.clone(),
             Arc::new(quinn::TokioRuntime),
         )?;
         endpoint.set_default_client_config(client.clone());
-        Ok((endpoint, client))
+        Ok((endpoint, socket, client))
     };
-    let (endpoint, probe_client) = match setup() {
+    let (endpoint, socket, probe_client) = match setup() {
         Ok(endpoint) => endpoint,
         Err(e) => {
             let _ = start.send(Err(e));
             return;
         }
     };
+    #[cfg(not(any(target_os = "macos", test)))]
+    drop(socket);
     match endpoint.local_addr() {
         Ok(address) => {
             let _ = shared.address.set(address);
@@ -207,6 +218,8 @@ pub(super) async fn run(
         started: now,
         core: Core::new(config.boot),
         endpoint,
+        #[cfg(any(target_os = "macos", test))]
+        socket,
         probe_client,
         accepting: Default::default(),
         shared: shared.clone(),
@@ -251,6 +264,12 @@ pub(super) async fn run(
     while !network.stop {
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
+        // Rebind outside Quinn's socket callbacks, which hold its endpoint lock.
+        // Failure is logged by the socket and resumes Quinn's native I/O errors.
+        #[cfg(any(target_os = "macos", test))]
+        if let Ok(Some(socket)) = network.socket.rebind(&network.endpoint) {
+            network.socket = socket;
+        }
         let began = Instant::now();
         if let Some(expected) = expected {
             let late = began.saturating_duration_since(expected);

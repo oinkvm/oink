@@ -1850,21 +1850,25 @@ impl AgentApi for Node {
     // Login registration is queried from the OS instead of persisted settings.
     // 平台模块登记相应应用入口；界面只显示后台返回/推送的实际系统状态。
     fn launch_at_login_status(&self) -> ApiResult<LaunchAtLoginStatus> {
-        let mut status = oink_autostart::status();
+        let mut status = oink_autostart::status(&*crate::prelogin::machine_layer(self));
         status.configured = self.settings().launch_at_login_configured;
         Ok(status)
     }
 
     fn set_launch_at_login(&self, enabled: bool) -> ApiResult<LaunchAtLoginStatus> {
-        let _gate = self.owner_gate();
-        match oink_autostart::set_enabled(enabled) {
+        // The machine layer may wait for administrator approval: hold the owner
+        // gate only for the durable settings edit, never across that prompt.
+        match oink_autostart::set_enabled(enabled, &*crate::prelogin::machine_layer(self)) {
             Ok(mut status) => {
                 // Leaving onboarding confirms the displayed choice, including an
                 // untouched default. Store only that confirmation, not OS state.
-                self.update_settings(|s| s.launch_at_login_configured = true)
-                    .map_err(|error| unavailable(error.to_string()))?;
+                {
+                    let _gate = self.owner_gate();
+                    self.update_settings(|s| s.launch_at_login_configured = true)
+                        .map_err(|error| unavailable(error.to_string()))?;
+                }
                 status.configured = true;
-                tracing::info!(enabled, state = ?status.state, "launch at login changed by user");
+                tracing::info!(enabled, state = ?status.state, prelogin = ?status.prelogin, "launch at login changed by user");
                 self.emit(ApiEvent::LaunchAtLogin(status.clone()));
                 Ok(status)
             }

@@ -398,6 +398,11 @@ export type LaunchAtLoginState =
 export interface LaunchAtLoginStatus {
   state: LaunchAtLoginState;
   configured: boolean;
+  /** Machine-level part (Windows pre-login backend). Older backends omit it. */
+  prelogin?: {
+    state: "unsupported" | "off" | "enabled" | "other_user";
+    problem: null | "elevation_declined" | "service_unavailable" | "rejected";
+  };
 
   problem: null | "main_app_required" | "installed_app_required" | "approval_required" | "different_installation" | "invalid_run_entry" | "system_unavailable" | "unsupported_platform";
 }

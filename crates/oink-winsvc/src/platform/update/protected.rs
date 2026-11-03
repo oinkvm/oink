@@ -115,7 +115,7 @@ fn inspect(file: &File, directory: bool) -> io::Result<()> {
     }
     acl(file.as_raw_handle())
 }
-fn open_one(path: &Path, directory: bool) -> io::Result<File> {
+pub(in crate::platform) fn open_one(path: &Path, directory: bool) -> io::Result<File> {
     let file = open_raw(path, directory)?;
     inspect(&file, directory)?;
     Ok(file)

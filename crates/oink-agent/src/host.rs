@@ -177,6 +177,20 @@ impl AgentHost {
         Ok(host)
     }
 
+    /// The Windows pre-login backend: no local IPC (nothing in the logon session
+    /// may call it), no tray or UI, no native DnD.
+    #[cfg(windows)]
+    pub(crate) fn start_prelogin(opts: NodeOptions, lock: InstanceLock) -> anyhow::Result<Self> {
+        let rt = runtime()?;
+        let termination = {
+            let _enter = rt.enter();
+            Termination::listen()?
+        };
+        let mut host = Self::start_on_runtime(opts, IpcMode::Off, rt, termination, Node::start_prelogin, None)?;
+        host._instance = Some(lock);
+        Ok(host)
+    }
+
     pub fn start(opts: NodeOptions, with_ipc: bool) -> anyhow::Result<Self> {
         Self::start_with(opts, if with_ipc { IpcMode::Optional } else { IpcMode::Off })
     }

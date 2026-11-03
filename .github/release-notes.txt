@@ -1,27 +1,18 @@
-Oink 0.3.1 adds a shortcut to lock a remote Windows computer, a choice of how mouse wheel scrolling is forwarded and a foreground option for games and other apps that read physical input, and fixes Win+L, Caps Lock, pointer, gesture, audio and connection issues.
+Oink 0.3.2 lets you use Oink at the Windows sign-in screen, and fixes images dragged into web pages on Windows and a Mac staying offline.
 
 ## New
 
-- Lock a remote Windows computer: on Windows, press Win+Shift+L to lock the Windows computer the pointer is on. Win+L still locks the computer you are using. Turn it on or off in Settings → Shortcuts.
-- Forward mouse wheel events by lines (Settings → Input, on by default): the remote computer scrolls the same number of lines as this one. Turn it off to send wheel notches so the remote computer applies its own scroll settings. If scrolling misbehaves in some apps or games, turn it off.
-- Take the foreground when the pointer leaves (Windows, Settings → Input, on by default): stops games and other apps that read physical input from also responding on this computer while you control another one.
-- Hold Command and press the brightness or keyboard backlight keys to adjust the Mac you are controlling.
+- Use Oink at the Windows sign-in screen: when Launch at login is on, Oink also runs on Windows before anyone signs in, so you can control the sign-in screen from your other computers. Turning it on asks once for administrator approval; if it still needs approval, Settings → General shows a Grant access button next to Launch at login.
+- The Windows installer now asks on its first page whether to start Oink when you sign in.
 
 ## Fixes
 
-- Fixed Win+L locking both computers when a Windows computer controls another Windows computer.
-- Fixed Right Shift not reaching other computers from some Windows keyboards.
-- Fixed Caps Lock not switching case on a locked Mac.
-- Fixed a pointer staying visible on both Macs after moving the pointer between them.
-- Fixed native multi-finger gestures on Windows sometimes turning into mapped shortcuts.
-- Fixed mouse wheel scrolling on Windows being split into partial notches, which some games ignored.
-- Fixed a Windows speaker showing as unavailable after the audio driver was reinstalled or updated.
-- Fixed two computers in the same group sometimes never connecting to each other.
-- Nearby devices no longer change order while the list updates.
+- Fixed images dragged from another computer into Chrome and other browsers on Windows failing to load (for example, "image failed to load" on upload pages).
+- Fixed a Mac sometimes staying offline until Oink was restarted, after macOS stopped Oink's network connection (for example, when VPN or security software changed network settings).
 
 ## Compatibility
 
-- 0.3.1 works with 0.3.0. The remote lock shortcut and the Win+L fix need 0.3.1 on the Windows computers involved. Remote computers still on 0.3.0 keep scrolling by lines even when line forwarding is off.
+- 0.3.2 works with 0.3.1 and 0.3.0. Using the Windows sign-in screen needs 0.3.2 on that Windows computer; the computers controlling it can be on 0.3.0 or later.
 
 ## Downloads
 
@@ -32,6 +23,9 @@ Verify downloads against `SHA256SUMS`.
 
 ## Known limitations
 
+- At the Windows sign-in screen, only keyboard and mouse sharing works; clipboard, files and audio start after you sign in. While you type a password with that computer's own keyboard, the keyboard cannot control other computers.
+- If several Windows users turn on Launch at login, the sign-in screen uses the device identity of the user who turned it on most recently.
+- Turning Oink off in Windows Settings → Apps → Startup does not stop it at the sign-in screen; turn off Launch at login in Oink instead.
 - The Windows MSI is not code-signed in this release. SmartScreen may say "Windows protected your PC": choose **More info → Run anyway**. UAC shows an unknown publisher.
 - Receiving files on a Mac requires the Oink File Provider location to be enabled; if prompted, enable it in Settings → Permissions.
-- Windows users on 0.2.1 need to install the 0.2.2 bridge update before the in-app update can install 0.3.1.
+- Windows users on 0.2.1 need to install the 0.2.2 bridge update before the in-app update can install 0.3.2.

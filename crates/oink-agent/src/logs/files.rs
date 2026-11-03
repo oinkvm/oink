@@ -16,6 +16,7 @@ const ROLES: &[&str] = &[
     "oink-service",
     "oink-crash-collector",
     "oink-update-worker",
+    "oink-prelogin",
 ];
 
 /// Update ordinary-log retention, including already closed files. Diagnostics
@@ -202,6 +203,21 @@ mod tests {
         writer.append(day, b"discarded", Some(0)).unwrap();
         assert!(!path.exists());
         assert_eq!(1024 * MB, 1_024_000_000);
+    }
+
+    #[test]
+    fn every_process_role_initialized_by_logs_has_its_own_file() {
+        // logs::init_* silently runs without a file when Writer::new refuses
+        // its role; the Windows pre-login backend did exactly that.
+        let dir = tempfile::tempdir().unwrap();
+        let day = time::Date::from_calendar_date(2026, time::Month::January, 1).unwrap();
+        for role in ["oink", "oink-ui", "oink-update-worker", "oink-prelogin"] {
+            let writer = Writer::new(dir.path().into(), role, || 1024).unwrap();
+            writer.append(day, role.as_bytes(), Some(1 << 20)).unwrap();
+            let name = format!("{role}.2026-01-01.log");
+            assert_eq!(ordinary_log(&name), Some("2026-01-01"), "{role}");
+            assert_eq!(fs::read(dir.path().join(name)).unwrap(), role.as_bytes());
+        }
     }
 
     #[test]

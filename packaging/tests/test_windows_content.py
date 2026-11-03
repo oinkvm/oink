@@ -84,8 +84,9 @@ class MsiContent(unittest.TestCase):
         })
         acl['InstallExecuteSequence'].append(['CleanupMaintenance', 'REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE', '6599'])
         acl['InstallExecuteSequence'].append(['CleanupUserData', 'REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE', '6598'])
-        acl['Property'] += [['ARPPRODUCTICON', 'OinkIcon.ico'], ['OinkLaunch', '1'], ['OinkLogin', '1'],
-                            ['SecureCustomProperties', 'OINK_DESKTOP_SHORTCUT'], ['ALLUSERS', '1'], ['MSIRESTARTMANAGERCONTROL', 'Disable']]
+        acl['Property'] += [['ARPPRODUCTICON', 'OinkIcon.ico'], ['OinkLaunch', '1'],
+                            ['SecureCustomProperties', 'OINK_DESKTOP_SHORTCUT;OINK_START_AT_LOGIN'],
+                            ['ALLUSERS', '1'], ['MSIRESTARTMANAGERCONTROL', 'Disable']]
         acl['Icon'] = [['OinkIcon.ico', hashlib.sha256((ROOT / 'apps/oink/src-tauri/icons/icon.ico').read_bytes()).hexdigest()]]
         acl['Binary'] = [[name, hashlib.sha256((ROOT / 'packaging/windows' / asset).read_bytes()).hexdigest()]
                          for name, asset in [('WixUI_Bmp_Dialog', 'installer-background.bmp'), ('WixUI_Bmp_Banner', 'installer-banner.bmp')]]
@@ -102,10 +103,12 @@ class MsiContent(unittest.TestCase):
         acl['Registry'] += [['DesktopChoice', '2', 'Software\\Oink', 'DesktopShortcut', '[OINK_DESKTOP_SHORTCUT]', 'InstallRoot']]
         acl['RegLocator'] = [['SavedDesktopChoice', '2', 'Software\\Oink', 'DesktopShortcut', '18']]
         acl['AppSearch'] = [['OINK_SAVED_DESKTOP', 'SavedDesktopChoice']]
+        acl['RegLocator'].append(['SavedLoginChoice', '1', r'Software\Microsoft\Windows\CurrentVersion\Run', 'Oink', '2'])
+        acl['AppSearch'].append(['OINK_SAVED_LOGIN', 'SavedLoginChoice'])
         acl['Control'] = [[dialog, control, 'CheckBox', '0', '0', '200', '18', '3', prop, label]
                           for dialog, control, prop, label in [
                               ('OinkExitDlg', 'LaunchChoice', 'OinkLaunch', 'Launch Oink'),
-                              ('OinkExitDlg', 'LoginChoice', 'OinkLogin', 'Start Oink when I sign in'),
+                              ('OinkWelcomeDlg', 'LoginChoice', 'OinkLogin', 'Start Oink when I sign in'),
                               ('OinkWelcomeDlg', 'DesktopChoice', 'OinkDesktop', 'Create a desktop shortcut')]]
         license_rtf = root / 'license.rtf'
         B.write_license_rtf(license_rtf)
@@ -113,29 +116,63 @@ class MsiContent(unittest.TestCase):
                            ['OinkWelcomeDlg', 'Artwork', 'Bitmap', '0', '0', '370', '234', '1', '', 'WixUI_Bmp_Dialog', 'LicenseText'],
                            ['OinkExitDlg', 'Artwork', 'Bitmap', '0', '0', '370', '234', '1', '', 'WixUI_Bmp_Dialog', 'LaunchChoice']]
         acl['ControlCondition'] = [['OinkExitDlg', control, 'Show', 'UILevel = 5 AND NOT Installed AND NOT REMOVE']
-                                   for control in ['LaunchChoice', 'LoginChoice']]
+                                   for control in ['LaunchChoice']]
         acl['ControlEvent'] = [['OinkExitDlg', 'Finish', 'DoAction', 'FinishInstall',
-                               'UILevel = 5 AND NOT Installed AND NOT REMOVE AND (OinkLaunch = "1" OR OinkLogin = "1")', '1']]
+                               'UILevel = 5 AND NOT Installed AND NOT REMOVE AND (OinkLaunch = "1" OR OINK_START_AT_LOGIN = "1")', '1']]
         acl['Control'] += [['OinkFinishWarningDlg', 'Description', 'Text', '20', '49', '330', '58', '3', '',
                             'Open Oink from the Start menu and check Start at login in Settings.']]
         acl['ControlEvent'] += [['OinkExitDlg', 'Finish', '[OinkFinishFailed]', '[OinkFinishFailed]', '1', '2'],
                                 ['OinkExitDlg', 'Finish', 'SpawnDialog', 'OinkFinishWarningDlg', 'OinkFinishFailed = "1"', '3'],
                                 ['OinkExitDlg', 'Finish', 'EndDialog', 'Return', '1', '999'],
                                 ['OinkFinishWarningDlg', 'Done', 'EndDialog', 'Return', '1', '1']]
+        acl['ControlEvent'] += [['OinkWelcomeDlg', 'Install', '[OINK_DESKTOP_SHORTCUT]', '0', 'OinkDesktop <> "1"', '1'],
+                                ['OinkWelcomeDlg', 'Install', '[OINK_DESKTOP_SHORTCUT]', '1', 'OinkDesktop = "1"', '2'],
+                                ['OinkWelcomeDlg', 'Install', '[OINK_START_AT_LOGIN]', '0', 'OinkLogin <> "1"', '3'],
+                                ['OinkWelcomeDlg', 'Install', '[OINK_START_AT_LOGIN]', '1', 'OinkLogin = "1"', '4'],
+                                ['OinkWelcomeDlg', 'Install', 'EndDialog', 'Return', '1', '5']]
         acl['CheckBox'] = [[name, '1'] for name in ('OinkDesktop', 'OinkLaunch', 'OinkLogin')]
         acl['CustomAction'] += [['FinishInstall', '1', 'InstallerCA', 'FinishInstall'],
-                                ['DefaultDesktopChoice', '51', 'OINK_DESKTOP_SHORTCUT', '1']]
+                                ['DefaultDesktopChoice', '51', 'OINK_DESKTOP_SHORTCUT', '1'],
+                                ['DefaultLoginChoice', '51', 'OinkLogin', '1'],
+                                ['SetEnablePrelogin', '51', 'EnablePrelogin', '[UserSID]'],
+                                ['EnablePrelogin', '3137', 'InstallerCA', 'EnablePrelogin']]
+        acl['InstallExecuteSequence'] += [['SetEnablePrelogin', 'OINK_START_AT_LOGIN = "1" AND NOT REMOVE', '6503'],
+                                          ['EnablePrelogin', 'OINK_START_AT_LOGIN = "1" AND NOT REMOVE', '6504']]
         acl['InstallUISequence'] = [['DefaultDesktopChoice',
                                     'UILevel = 5 AND NOT Installed AND NOT WIX_UPGRADE_DETECTED AND NOT OINK_DESKTOP_SHORTCUT', '997'],
                                    ['AppSearch', '', '400'], ['ShowDesktopChoice', '', '998'],
                                    ['OinkWelcomeDlg', 'NOT Installed', '999'], ['CostFinalize', '', '1000'],
                                    ['MaintenanceWelcomeDlg', 'Installed AND NOT RESUME AND NOT Preselected AND NOT PATCH', '1298'],
                                    ['ProgressDlg', '', '1299'], ['ExecuteAction', '', '1300']]
+        acl['InstallUISequence'].append(['DefaultLoginChoice',
+                                        'UILevel = 5 AND NOT Installed AND (NOT WIX_UPGRADE_DETECTED OR OINK_SAVED_LOGIN)', '998'])
         acl['CustomAction'].append(['PrepareUserSessions', '1', 'InstallerCA', 'PrepareUserSessions'])
         acl['InstallExecuteSequence'] += [['PrepareUserSessions', 'NOT UPGRADINGPRODUCTCODE', '1399'],
                                           ['CheckInstallPath', '', '1499']]
         ET.SubElement(xml, 'Launch', Condition='Installed OR WEBVIEW2RUNTIME')
         return xml, extracted, acl
+
+    def test_login_choice_precedes_elevation_without_a_quiet_default(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, _, tables = self.fixture(Path(temp))
+            C.verify_install_ui(tables)
+            for mutation in ('finish_page', 'quiet_default', 'missing_secure_property',
+                             'impersonated_action', 'broad_action_condition', 'late_ui_default'):
+                changed = copy.deepcopy(tables)
+                if mutation == 'finish_page':
+                    next(row for row in changed['Control'] if row[1] == 'LoginChoice')[0] = 'OinkExitDlg'
+                elif mutation == 'quiet_default':
+                    changed['Property'].append(['OINK_START_AT_LOGIN', '1'])
+                elif mutation == 'missing_secure_property':
+                    next(row for row in changed['Property'] if row[0] == 'SecureCustomProperties')[1] = 'OINK_DESKTOP_SHORTCUT'
+                elif mutation == 'impersonated_action':
+                    next(row for row in changed['CustomAction'] if row[0] == 'EnablePrelogin')[1] = '1089'
+                elif mutation == 'broad_action_condition':
+                    next(row for row in changed['InstallExecuteSequence'] if row[0] == 'EnablePrelogin')[1] = 'NOT REMOVE'
+                else:
+                    next(row for row in changed['InstallUISequence'] if row[0] == 'DefaultLoginChoice')[2] = '1001'
+                with self.subTest(mutation=mutation), self.assertRaises(RuntimeError):
+                    C.verify_install_ui(changed)
 
     def test_start_menu_maps_to_removable_machine_product(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -269,7 +306,7 @@ class MsiContent(unittest.TestCase):
             for table, row, field, value in [
                     ('Icon', 0, 1, '0' * 64), ('Shortcut', 0, 8, ''), ('Shortcut', 1, 8, ''),
                     ('Shortcut', 1, 1, 'ProgramMenuFolder'), ('Control', 0, 9, 'Wrong'),
-                    ('ControlCondition', 1, 3, '1'), ('ControlEvent', 0, 4, '1'),
+                    ('ControlCondition', 0, 3, '1'), ('ControlEvent', 0, 4, '1'),
                     ('CheckBox', 0, 1, '0'), ('InstallUISequence', 3, 2, '1299')]:
                 changed = copy.deepcopy(tables)
                 changed[table][row][field] = value

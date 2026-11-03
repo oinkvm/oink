@@ -423,6 +423,36 @@ pub(super) fn run(parent_pid: u32) -> io::Result<()> {
     workers.stop_native();
     Ok(())
 }
+/// The helper's injection lanes inside the calling SYSTEM process, with no pipe.
+/// The pre-login backend uses this: before anyone signs in there is no session
+/// user to bind the helper pipe's DACL to, and widening that DACL is not an
+/// option. The same [`Injector`] follows the input desktop, keeps held keys per
+/// desktop and releases them across desktop switches.
+pub(super) fn in_process(notify: crate::owner::Wake) -> io::Result<crate::helper::Server> {
+    let id = session()?;
+    let priority = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1));
+    let native_priority = priority.clone();
+    crate::helper::Server::new(
+        move || {
+            let applied = oink_foundation::realtime::apply(
+                oink_foundation::realtime::ThreadRole::Inject,
+                oink_foundation::realtime::Tier::Realtime,
+            )?;
+            native_priority.store(applied.native, std::sync::atomic::Ordering::Release);
+            Ok(Native {
+                id,
+                injector: Injector::default(),
+                priority: native_priority,
+            })
+        },
+        move || Ordinary {
+            id,
+            desktop: None,
+            priority,
+        },
+        notify,
+    )
+}
 struct ConnectionContext<'a> {
     id: u32,
     stop: &'a Handle,

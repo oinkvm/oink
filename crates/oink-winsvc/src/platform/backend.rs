@@ -35,6 +35,10 @@ pub fn require_interactive_ui() -> io::Result<()> {
     }
 }
 
+pub(super) fn token_uiaccess(token: HANDLE) -> io::Result<u32> {
+    number(token, TokenUIAccess)
+}
+
 fn number(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<u32> {
     let (mut value, mut len) = (0u32, 0);
     // SAFETY: all callers request DWORD token fields into a correctly sized buffer.
@@ -73,6 +77,26 @@ fn request(data_dir: &Path, directory: &Path, reopen: bool) -> io::Result<u32> {
     }
     environment.push(0);
     crate::launch_recipe::validate_environment(&environment)?;
+    let message = if reopen {
+        BackendLaunch::Reopen { environment, directory }
+    } else {
+        BackendLaunch::Start { environment, directory }
+    };
+    match exchange(message)? {
+        BackendLaunch::Started { pid } => {
+            tracing::info!(pid, reopen, "OinkInput backend entry created");
+            Ok(pid)
+        }
+        BackendLaunch::Failed { error } => Err(io::Error::other(error)),
+        _ => Err(denied()),
+    }
+}
+/// One request/reply on this session's launch pipe, after verifying the
+/// installed OinkInput service as its server. Never replayed.
+pub(super) fn exchange(message: BackendLaunch) -> io::Result<BackendLaunch> {
+    if !security::client_installation()? {
+        return Err(denied());
+    }
     let id = session()?;
     // At logon the interactive token can appear before SCM has exposed the launch
     // pipe. Bound only this startup/pipe-busy wait; never replay a sent launch request.
@@ -102,23 +126,9 @@ fn request(data_dir: &Path, directory: &Path, reopen: bool) -> io::Result<u32> {
     // SAFETY: owned connected pipe and valid mode.
     check(unsafe { SetNamedPipeHandleState(pipe.0, &mode, ptr::null(), ptr::null()) })?;
     super::service_peer::verify(pipe.0)?;
-    tracing::info!(session = id, reopen, "OinkInput launch server verified");
-    send(
-        &pipe,
-        if reopen {
-            BackendLaunch::Reopen { environment, directory }
-        } else {
-            BackendLaunch::Start { environment, directory }
-        },
-    )?;
-    match receive(&pipe)? {
-        BackendLaunch::Started { pid } => {
-            tracing::info!(pid, reopen, "OinkInput backend entry created");
-            Ok(pid)
-        }
-        BackendLaunch::Failed { error } => Err(io::Error::other(error)),
-        _ => Err(denied()),
-    }
+    tracing::info!(session = id, "OinkInput launch server verified");
+    send(&pipe, message)?;
+    receive(&pipe)
 }
 fn send(pipe: &Handle, message: BackendLaunch) -> io::Result<()> {
     let frame = message.encode()?;
@@ -215,13 +225,28 @@ fn serve_session(id: u32) -> io::Result<()> {
             if !security::interactive_token(client_token.0)? {
                 return Err(denied());
             }
+            if matches!(
+                request,
+                BackendLaunch::PreloginStatus
+                    | BackendLaunch::PreloginClaim
+                    | BackendLaunch::PreloginRelease
+                    | BackendLaunch::PreloginSnapshot { .. }
+            ) {
+                return super::prelogin::handle(&request, id, &_client);
+            }
             let user = security::sid_bytes(client_token.0)?;
             crate::launch_recipe::dispatch(request, |environment, directory, target| {
+                if target == crate::launch_recipe::Target::Backend {
+                    // One DeviceId, one process: the pre-login backend releases its
+                    // keys and leaves the group before the user's backend exists.
+                    super::prelogin::stop();
+                }
                 spawn(id, &user, environment, directory, target)
             })
+            .map(|pid| BackendLaunch::Started { pid })
         })();
         let reply = match result {
-            Ok(pid) => BackendLaunch::Started { pid },
+            Ok(reply) => reply,
             Err(error) => {
                 eprintln!("Oink UIAccess backend start failed: {error}");
                 BackendLaunch::Failed {

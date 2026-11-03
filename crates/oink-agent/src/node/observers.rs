@@ -386,7 +386,7 @@ impl Node {
                         Some(crate::config_module::ConfigChange::BlockedDevices)=>{
                             if let Ok(snapshot)=node.link_config().and_then(|group|group.blocked_devices()){node.emit(ApiEvent::BlockedDevices{snapshot});}
                         },
-                        Some(_) => { node.apply_hotkeys(&node.effective_hotkeys()); node.emit(ApiEvent::InputSettings(crate::agent_api::input_settings(&node))); node.emit_layout(); node.emit_group(); },
+                        Some(_) => { node.apply_hotkeys(&node.effective_hotkeys()); node.emit(ApiEvent::InputSettings(crate::agent_api::input_settings(&node))); node.emit_layout(); node.emit_group(); node.prelogin_changed(); },
                         None => break,
                     },
                     deadline = sample.tick() => {

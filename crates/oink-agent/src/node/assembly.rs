@@ -11,14 +11,21 @@ impl Node {
         application_profile()
     }
 
+    #[cfg(test)]
+    pub(crate) fn offer_profile_for(profile: super::Profile) -> oink_network::negotiation::OfferProfile {
+        offer_profile(profile.components())
+    }
+
     pub(super) async fn start_sharing(&self) -> anyhow::Result<()> {
-        self.start_sharing_with_profile(application_profile()).await
+        self.start_sharing_with_profile(offer_profile(self.inner.profile.components()))
+            .await
     }
 
     pub(super) async fn start_sharing_with_profile(
         &self,
         profile: oink_network::negotiation::OfferProfile,
     ) -> anyhow::Result<()> {
+        let components = self.inner.profile.components();
         // The caller serializes first start/reset. Check before LinkLayer::start: even
         // a bound socket would violate the IPC-only unreadable-state contract.
         crate::config_module::group_store::load(
@@ -60,16 +67,26 @@ impl Node {
             self.watch_trail_appearance();
         }
         // Registration precedes discovery and every possible ready notification.
+        // A profile without a component leaves its stream kinds unregistered:
+        // the link layer then refuses those streams as Unsupported (protocol v1).
         let input_port = links.register(crate::streams::input::KINDS);
-        let clip_port = links.register(crate::streams::clipboard::KINDS);
-        let audio_port = links.register(crate::streams::audio::KINDS);
-        let aim_port = links.register(crate::streams::aim::KINDS);
-        let projection_port = links.register(crate::streams::projection::KINDS);
-        let wallpaper_port = links.register(crate::streams::wallpaper::KINDS);
-        let profiles_port = links.register(&[oink_protocol::frame::StreamKind::LayoutProfilesV3]);
-        let cache_port = links.register(&[oink_protocol::frame::StreamKind::Cache]);
+        let content = components.content.then(|| {
+            (
+                links.register(crate::streams::clipboard::KINDS),
+                links.register(&[oink_protocol::frame::StreamKind::Cache]),
+                links.register(crate::streams::dnd::KINDS),
+            )
+        });
+        let audio_port = components.audio.then(|| links.register(crate::streams::audio::KINDS));
+        let companions = components.companions.then(|| {
+            (
+                links.register(crate::streams::aim::KINDS),
+                links.register(crate::streams::projection::KINDS),
+                links.register(crate::streams::wallpaper::KINDS),
+                links.register(&[oink_protocol::frame::StreamKind::LayoutProfilesV3]),
+            )
+        });
         let diagnostics_port = links.register(crate::streams::diagnostics::KINDS);
-        let dnd_port = links.register(crate::streams::dnd::KINDS);
         self.inner
             .links
             .set(links.clone())
@@ -192,29 +209,40 @@ impl Node {
             !inject_blocked(&self.inner.input_backend.permissions()),
             input_port,
         )];
-        if let Some(backend) = &self.inner.clipboard_backend {
+        let (clip_port, cache_port, dnd_port) = match content {
+            Some((clip, cache, dnd)) => (Some(clip), Some(cache), Some(dnd)),
+            None => (None, None, None),
+        };
+        if let (Some(backend), Some(clip_port)) = (&self.inner.clipboard_backend, clip_port) {
             tasks.push(
                 crate::clip::start_link_runtime(self.clone(), clip_port, backend.clone())
                     .context("start clipboard owner")?,
             );
         }
-        let (audio, audio_task) =
-            crate::audio::start_link_runtime(self.clone(), audio_port).context("start audio owner")?;
-        self.inner
-            .audio
-            .set(audio)
-            .map_err(|_| anyhow::anyhow!("audio already started"))?;
-        tasks.push(audio_task);
-        tasks.push(crate::cache::start(self.clone(), cache_port));
-        tasks.push(crate::display_overlay::start(self.clone()).context("start display overlay")?);
-        tasks.push(crate::aim::start_link_runtime(self.clone(), aim_port).context("start aim owner")?);
-        tasks.push(
-            crate::projection::start(self.clone(), projection_port, self.inner.native_surfaces)
-                .context("start projection owner")?,
-        );
-        tasks
-            .push(crate::wallpaper::start_link_runtime(self.clone(), wallpaper_port).context("start wallpaper owner")?);
-        tasks.push(crate::layout_profiles::sync::start(self.clone(), profiles_port));
+        if let Some(audio_port) = audio_port {
+            let (audio, audio_task) =
+                crate::audio::start_link_runtime(self.clone(), audio_port).context("start audio owner")?;
+            self.inner
+                .audio
+                .set(audio)
+                .map_err(|_| anyhow::anyhow!("audio already started"))?;
+            tasks.push(audio_task);
+        }
+        if let Some(cache_port) = cache_port {
+            tasks.push(crate::cache::start(self.clone(), cache_port));
+        }
+        if let Some((aim_port, projection_port, wallpaper_port, profiles_port)) = companions {
+            tasks.push(crate::display_overlay::start(self.clone()).context("start display overlay")?);
+            tasks.push(crate::aim::start_link_runtime(self.clone(), aim_port).context("start aim owner")?);
+            tasks.push(
+                crate::projection::start(self.clone(), projection_port, self.inner.native_surfaces)
+                    .context("start projection owner")?,
+            );
+            tasks.push(
+                crate::wallpaper::start_link_runtime(self.clone(), wallpaper_port).context("start wallpaper owner")?,
+            );
+            tasks.push(crate::layout_profiles::sync::start(self.clone(), profiles_port));
+        }
         let (diagnostics, diagnostics_task) =
             crate::diagnostics::collection::start_link_runtime(self.clone(), diagnostics_port, recorder)?;
         self.inner
@@ -222,12 +250,15 @@ impl Node {
             .set(diagnostics)
             .map_err(|_| anyhow::anyhow!("diagnostics already started"))?;
         tasks.push(diagnostics_task);
-        let (dnd, dnd_task) = crate::dnd::start_link_runtime(self.clone(), dnd_port)?;
-        self.inner
-            .dnd
-            .set(dnd)
-            .map_err(|_| anyhow::anyhow!("drag task already started"))?;
-        tasks.push(dnd_task);
+        if let Some(dnd_port) = dnd_port {
+            let (dnd, dnd_task) = crate::dnd::start_link_runtime(self.clone(), dnd_port)?;
+            self.inner
+                .dnd
+                .set(dnd)
+                .map_err(|_| anyhow::anyhow!("drag task already started"))?;
+            tasks.push(dnd_task);
+        }
+        tasks.extend(self.start_prelogin_export());
         lock(&self.inner.tasks).extend(tasks);
         self.start_main_commands(receive)?;
         self.start_observers()?;
@@ -297,6 +328,50 @@ impl crate::config_module::ConfigApplication for Application {
         }
         Ok(())
     }
+}
+
+/// Offer only the capabilities of installed components. Without content, audio,
+/// companions or pairing, peers never open those streams or pairing with this
+/// backend; the v1 baseline (including the clipboard decoder) stays offered.
+fn offer_profile(components: super::Components) -> oink_network::negotiation::OfferProfile {
+    let mut profile = application_profile();
+    if components.content && components.audio && components.companions && components.pairing {
+        return profile;
+    }
+    let mut removed: Vec<&str> = Vec::new();
+    if !components.content {
+        removed.extend(
+            oink_clipboard::negotiation::CAPABILITIES
+                .iter()
+                .filter(|c| !oink_protocol::v1::registry::BASELINE.contains(c)),
+        );
+        profile.formats = oink_network::negotiation::OfferProfile::default().formats;
+    }
+    if !components.audio {
+        removed.extend(oink_audio::negotiation::CAPABILITIES);
+        profile.audio = Vec::new();
+    }
+    if !components.companions {
+        removed.extend([
+            "oink.aim/1",
+            "oink.wallpaper/1",
+            "oink.layout.projection/1",
+            "oink.layout.preview/1",
+            "oink.layout.profiles/3",
+            "oink.layout.topology/1",
+            "oink.notify/1",
+            "oink.notify.microphone/1",
+            "oink.power/1",
+            // No visible windows on the logon desktop: no trail, no app focus.
+            "oink.input.trail/1",
+            "oink.input.application-focus/1",
+        ]);
+    }
+    if !components.pairing {
+        removed.push("oink.pairing/1");
+    }
+    profile.capabilities.retain(|c| !removed.contains(&c.as_str()));
+    profile
 }
 
 /// Capabilities describe implemented modules. Local projection permission is

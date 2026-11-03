@@ -57,21 +57,43 @@ def verify_install_ui(tables):
             not license_text[9].startswith('{\\rtf1') or 'GNU GENERAL PUBLIC LICENSE' not in license_text[9] or
             'Additional terms under GNU GPL' not in license_text[9]):
         raise RuntimeError('MSI license must be complete visible RTF in a readable scrollable viewport')
-    for control, property_name, label in [('LaunchChoice', 'OinkLaunch', 'Launch Oink'),
-                                           ('LoginChoice', 'OinkLogin', 'Start Oink when I sign in')]:
-        row = controls.get(('OinkExitDlg', control))
-        if not row or row[2] != 'CheckBox' or row[8:10] != [property_name, label] or properties.get(property_name) != '1':
-            raise RuntimeError('MSI finish choices must both default checked')
-        if ['OinkExitDlg', control, 'Show', 'UILevel = 5 AND NOT Installed AND NOT REMOVE'] not in tables.get('ControlCondition', []):
-            raise RuntimeError('MSI finish choices must only appear after successful full-UI install/upgrade')
+    row = controls.get(('OinkExitDlg', 'LaunchChoice'))
+    if not row or row[2] != 'CheckBox' or row[8:10] != ['OinkLaunch', 'Launch Oink'] or properties.get('OinkLaunch') != '1':
+        raise RuntimeError('MSI launch choice must default checked')
+    if ['OinkExitDlg', 'LaunchChoice', 'Show', 'UILevel = 5 AND NOT Installed AND NOT REMOVE'] not in tables.get('ControlCondition', []):
+        raise RuntimeError('MSI launch choice must only appear after successful full-UI install/upgrade')
+    if ('OinkExitDlg', 'LoginChoice') in controls:
+        raise RuntimeError('MSI login choice must precede the elevated transaction')
     desktop_control = controls.get(('OinkWelcomeDlg', 'DesktopChoice'))
     if not desktop_control or desktop_control[8:10] != ['OinkDesktop', 'Create a desktop shortcut']:
         raise RuntimeError('MSI desktop choice belongs on the welcome/license page')
+    # Launch at login also enables the machine-level pre-login backend, written
+    # by the elevated transaction: the choice is made before it, not at Finish.
+    login_control = controls.get(('OinkWelcomeDlg', 'LoginChoice'))
+    if not login_control or login_control[2] != 'CheckBox' or login_control[8:10] != ['OinkLogin', 'Start Oink when I sign in']:
+        raise RuntimeError('MSI login choice belongs on the welcome/license page')
+    if ('OINK_START_AT_LOGIN' not in properties.get('SecureCustomProperties', '').split(';') or
+            'OINK_START_AT_LOGIN' in properties or 'OinkLogin' in properties):
+        raise RuntimeError('MSI login choice must transfer securely without a quiet-install default')
+    login_events = [row for row in tables.get('ControlEvent', []) if row[:2] == ['OinkWelcomeDlg', 'Install']]
+    for expected in [['OinkWelcomeDlg', 'Install', '[OINK_START_AT_LOGIN]', '0', 'OinkLogin <> "1"', '3'],
+                     ['OinkWelcomeDlg', 'Install', '[OINK_START_AT_LOGIN]', '1', 'OinkLogin = "1"', '4'],
+                     ['OinkWelcomeDlg', 'Install', 'EndDialog', 'Return', '1', '5']]:
+        if expected not in login_events:
+            raise RuntimeError('MSI welcome Install must publish the login choice before returning')
+    custom = {row[0]: row for row in tables.get('CustomAction', [])}
+    if custom.get('EnablePrelogin', [])[1:4] != ['3137', 'InstallerCA', 'EnablePrelogin']:
+        raise RuntimeError('MSI pre-login marker must be a deferred, non-impersonating, non-fatal DLL action')
+    execute_rows = {row[0]: row for row in tables.get('InstallExecuteSequence', [])}
+    if execute_rows.get('EnablePrelogin', ['', ''])[1] != 'OINK_START_AT_LOGIN = "1" AND NOT REMOVE':
+        raise RuntimeError('MSI pre-login marker must follow only the explicit login choice')
     checks = dict(tables.get('CheckBox', []))
     if any(checks.get(name) != '1' for name in ('OinkDesktop', 'OinkLaunch', 'OinkLogin')):
         raise RuntimeError('MSI checkbox checked values must be the explicit value one')
     ui_sequence = {row[0]: int(row[2]) for row in tables.get('InstallUISequence', [])}
     order = ['AppSearch', 'DefaultDesktopChoice', 'ShowDesktopChoice', 'OinkWelcomeDlg', 'CostFinalize', 'ExecuteAction']
+    if not ui_sequence.get('DefaultLoginChoice', 10**9) < ui_sequence.get('OinkWelcomeDlg', 0):
+        raise RuntimeError('MSI login default must be set before the welcome page')
     if any(name not in ui_sequence for name in order) or any(
             ui_sequence[a] >= ui_sequence[b] for a, b in zip(order, order[1:])):
         raise RuntimeError('MSI desktop choice must be finalized before conditional component costing')
@@ -82,7 +104,7 @@ def verify_install_ui(tables):
         if any(row[0] == 'FinishInstall' for row in tables.get(table, [])):
             raise RuntimeError('MSI finish action must never be scheduled by an install sequence')
     event = ['OinkExitDlg', 'Finish', 'DoAction', 'FinishInstall',
-             'UILevel = 5 AND NOT Installed AND NOT REMOVE AND (OinkLaunch = "1" OR OinkLogin = "1")', '1']
+             'UILevel = 5 AND NOT Installed AND NOT REMOVE AND (OinkLaunch = "1" OR OINK_START_AT_LOGIN = "1")', '1']
     if event not in tables.get('ControlEvent', []):
         raise RuntimeError('MSI finish action must be gated by the full-UI Finish button')
     events = tables.get('ControlEvent', [])

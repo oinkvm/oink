@@ -5,6 +5,7 @@ mod broker;
 pub mod client;
 mod pipe_io;
 mod power;
+pub mod prelogin;
 mod security;
 mod server;
 mod service_peer;

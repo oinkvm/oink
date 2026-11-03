@@ -203,7 +203,7 @@ def main():
               'SourceTreeSha256': a.source_tree_sha256, 'ProductCode': product_code, 'UpgradeCode': w['upgrade_code'],
               'MinimumWindowsBuild': str(I['minimumWindowsBuild']),
               'InstallDirectory': w['install_directory'], 'ServiceName': w['service_name'],
-              'ServiceDisplayName': w['service_display_name'], 'RegistryKey': w['registry_key'],
+              'ServiceDisplayName': w['service_display_name'], 'RegistryKey': w['registry_key'], 'RunValue': w['run_value'],
               'MaintenanceDirectory': w['maintenance_directory'], 'UiExe': b['ui'] + '.exe',
               'AgentExe': b['agent'] + '.exe', 'ServiceExe': b['service'] + '.exe',
               'WorkerExe': b['update_worker'] + '.exe', 'HasUpdateWorker': '1' if has_worker else '0',

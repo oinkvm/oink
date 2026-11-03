@@ -32,6 +32,7 @@ pub mod layout_sync;
 pub mod logs;
 
 pub mod node;
+pub mod prelogin;
 mod projection;
 pub mod remote;
 pub mod telemetry;

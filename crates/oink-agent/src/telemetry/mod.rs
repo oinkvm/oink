@@ -196,7 +196,18 @@ pub use ui::UiCapture;
 
 impl Owner {
     pub fn new(data_dir: &Path, consent: ReportConsent) -> Self {
+        Self::build(data_dir, consent, true)
+    }
+
+    /// No report store, upload endpoint or native crash collector. The Windows
+    /// pre-login backend (SYSTEM, before anyone signs in) never reports.
+    pub fn offline(data_dir: &Path) -> Self {
+        Self::build(data_dir, ReportConsent::default(), false)
+    }
+
+    fn build(data_dir: &Path, consent: ReportConsent, online: bool) -> Self {
         let (expected, manifest) = packaged_manifest();
+        let manifest = manifest.filter(|_| online);
         let endpoint = manifest.as_ref().and_then(|_| Endpoint::compiled());
         #[cfg(windows)]
         let endpoint = endpoint.filter(|_| oink_crash::collector::allowed_process(std::process::id()));
@@ -219,7 +230,7 @@ impl Owner {
             ),
         });
         let dir = data_dir.join("reports");
-        let store = if endpoint.is_some() || dir.exists() {
+        let store = if online && (endpoint.is_some() || dir.exists()) {
             Store::open(&dir, consent, now()).ok()
         } else {
             None

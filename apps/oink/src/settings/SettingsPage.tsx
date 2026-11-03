@@ -242,7 +242,13 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                     node: <Switch aria-label={label} checked={prefs.crashReports} onChange={toggle('crashReports', label)}/>,
                 };
             }
-            case 'launchAtLogin': return { desc: api.launchStatus?.state === 'requires_approval' ? tr('需要在系统设置中批准登录项') : undefined, node:<span className="setp__btns">{api.launchStatus?.state === 'requires_approval' && <Button size="sm" onClick={()=>{void backend.openLaunchAtLoginSettings().catch(()=>agent.fail('unavailable'));}}>{tr('打开设置')}</Button>}<Switch aria-label={label} checked={prefs.launchAtLogin} onChange={toggle('launchAtLogin',label)} disabled={api.launchStatus?.state === 'unavailable'}/></span> };
+            case 'launchAtLogin': {
+                // Windows: launch at login also runs Oink at the sign-in screen with this
+                // user's device identity; that machine-level part may still need approval.
+                const machine = api.launchStatus?.state === 'enabled' ? api.launchStatus.prelogin?.state : undefined;
+                const machineDesc = machine === 'off' ? tr('登录前可用需要管理员授权') : machine === 'other_user' ? tr('登录前可用正在使用另一位用户的身份') : undefined;
+                return { desc: api.launchStatus?.state === 'requires_approval' ? tr('需要在系统设置中批准登录项') : machineDesc, node:<span className="setp__btns">{api.launchStatus?.state === 'requires_approval' && <Button size="sm" onClick={()=>{void backend.openLaunchAtLoginSettings().catch(()=>agent.fail('unavailable'));}}>{tr('打开设置')}</Button>}{machineDesc && <Button size="sm" onClick={()=>{void api.confirmLaunchAtLogin(true).catch(()=>toast.danger({ title: tr('无法更改「{0}」', label), description: tr('不可用') }));}}>{tr('授权')}</Button>}<Switch aria-label={label} checked={prefs.launchAtLogin} onChange={toggle('launchAtLogin',label)} disabled={api.launchStatus?.state === 'unavailable'}/></span> };
+            }
             case 'showInMenuBar':
             case 'confirmQuit':
             case 'escStop':

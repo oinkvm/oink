@@ -13,8 +13,18 @@
     <Property Id="ARPPRODUCTICON" Value="OinkIcon.ico" />
     <!-- Private UI properties never cross to the elevated execute sequence. -->
     <Property Id="OinkLaunch" Value="1" />
-    <Property Id="OinkLogin" Value="1" />
     <Property Id="OINK_DESKTOP_SHORTCUT" Secure="yes" />
+    <!-- Launch at login: chosen on the welcome page, before the elevated
+         transaction, because it also enables the machine-level pre-login
+         backend for this user. Fresh installs default on; an upgrade defaults
+         to the user's current Run entry. No quiet-install default. -->
+    <Property Id="OINK_START_AT_LOGIN" Secure="yes" />
+    <Property Id="OINK_SAVED_LOGIN">
+      <RegistrySearch Id="SavedLoginChoice" Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                      Name="$(var.RunValue)" Type="raw" />
+    </Property>
+    <SetProperty Id="OinkLogin" Action="DefaultLoginChoice" Value="1" Before="OinkWelcomeDlg" Sequence="ui"
+                 Condition="UILevel = 5 AND NOT Installed AND (NOT WIX_UPGRADE_DETECTED OR OINK_SAVED_LOGIN)" />
     <Property Id="OINK_SAVED_DESKTOP">
       <RegistrySearch Id="SavedDesktopChoice" Root="HKLM" Key="$(var.RegistryKey)"
                       Name="DesktopShortcut" Type="raw" Bitness="always64" />
@@ -162,6 +172,13 @@
     <CustomAction Id="CleanupMaintenance" BinaryRef="InstallerCA" DllEntry="CleanupMaintenance" Execute="commit" Impersonate="no" Return="ignore" />
     <!-- Commit-only: a failed uninstall must not silently disable autostart. -->
     <CustomAction Id="RemoveLoginEntry" BinaryRef="InstallerCA" DllEntry="RemoveLoginEntry" Execute="commit" Impersonate="no" Return="check" />
+    <!-- The elevated installer records the machine-level pre-login owner for
+         the installing user when launch at login was chosen. Return=ignore:
+         the product still installs; the backend reports the missing machine
+         part and the user can turn launch at login on again to approve. -->
+    <CustomAction Id="EnablePrelogin" BinaryRef="InstallerCA" DllEntry="EnablePrelogin" Execute="deferred" Impersonate="no" Return="ignore" />
+    <SetProperty Id="EnablePrelogin" Value="[UserSID]" Before="EnablePrelogin" Sequence="execute"
+                 Condition="OINK_START_AT_LOGIN = &quot;1&quot; AND NOT REMOVE" />
     <!-- Called only by the successful full-UI Finish button, in the client. -->
     <CustomAction Id="FinishInstall" BinaryRef="InstallerCA" DllEntry="FinishInstall" Execute="immediate" Return="check" />
     <!-- Execute sequence only: full UI must return from its final Install/
@@ -195,6 +212,7 @@
       <Custom Action="CleanupUserData" Before="CleanupMaintenance" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="CleanupMaintenance" Before="InstallFinalize" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="RemoveLoginEntry" Before="RemoveRegistryValues" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="EnablePrelogin" After="StartServices" Condition="OINK_START_AT_LOGIN = &quot;1&quot; AND NOT REMOVE" />
     </InstallExecuteSequence>
     <Feature Id="Product" Title="$(var.ProductName)" Level="1">
       <ComponentRef Id="InstallRoot" />

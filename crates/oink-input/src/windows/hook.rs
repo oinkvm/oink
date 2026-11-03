@@ -97,6 +97,8 @@ pub(super) const WM_APP_COVER_READY: u32 = WM_APP + 3;
 pub(super) const WM_APP_COVER_HIDDEN: u32 = WM_APP + 4;
 pub(super) const WM_APP_COVER_PLACED: u32 = WM_APP + 5;
 const WM_APP_PARK_COMPLETE: u32 = WM_APP + 6;
+/// The logon password-field focus changed (pre-login profile; see credential_focus).
+const WM_CAPTURE_CREDENTIAL: u32 = WM_APP + 21;
 /// 鼠标钩子回调重入、事件没经过截获就放行的次数（检测日志）。
 static REENTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const WATCHDOG_TIMER: usize = 1;
@@ -809,6 +811,7 @@ fn run(
             })
         });
         let _desktop_trace = desktop_trace::Observer::new(hwnd);
+        let _credential_focus = super::credential_focus::start(hwnd, WM_CAPTURE_CREDENTIAL);
         capture_availability_changed(false);
         if pacing.is_none()
             && let Some(Err(e)) = with_state(|st| st.install_hooks())
@@ -935,6 +938,7 @@ fn run(
         if pacing.is_some() {
             crate::capture_loop::clear();
         }
+        drop(_credential_focus);
         drop(_desktop_trace);
         // 清理：卸载钩子、恢复光标、注销 Raw Input
         let _ = KillTimer(Some(hwnd), WATCHDOG_TIMER);
@@ -1049,6 +1053,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         desktop_trace::WM_CAPTURE_DESKTOP => {
             capture_availability_changed(true);
+            LRESULT(0)
+        }
+        WM_CAPTURE_CREDENTIAL => {
+            capture_availability_changed(false);
             LRESULT(0)
         }
         windows::Win32::UI::WindowsAndMessaging::WM_WTSSESSION_CHANGE => {
@@ -2279,7 +2287,9 @@ fn call_handler(handler: &EventHandler, event: &CapturedEvent) -> Disposition {
 /// The Default lock curtain remains capturable with UIAccess. Only inaccessible
 /// desktops gate the source; WTS lock is a notification to re-query, not a gate.
 fn capture_availability_changed(desktop_changed: bool) {
-    let desktop_available = desktop_trace::default_desktop_active();
+    // A focused logon password field withdraws the source like a desktop switch
+    // (pre-login profile only; see credential_focus for why).
+    let desktop_available = desktop_trace::capture_desktop_active() && !super::credential_focus::password_focused();
     super::touchpad::contact_desktop(desktop_available);
     let Some((handler, events, available)) = with_state(|st| {
         let available = desktop_available;

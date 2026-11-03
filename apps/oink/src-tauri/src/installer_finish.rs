@@ -64,7 +64,9 @@ pub fn dispatch_args() -> Option<std::process::ExitCode> {
         || {
             // Same OS-backed preference used by AgentApi::set_launch_at_login and
             // Settings. An unchecked box never disables or rewrites a prior choice.
-            let status = oink_autostart::set_enabled(true)?;
+            // The elevated installer already enabled the machine level; Finish
+            // runs as the user and must not ask for a second approval.
+            let status = oink_autostart::set_user_enabled_only(true)?;
             if status.state == oink_autostart::LaunchAtLoginState::Enabled {
                 Ok(())
             } else {

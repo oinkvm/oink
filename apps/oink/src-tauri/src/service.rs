@@ -9,6 +9,8 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 pub const SERVICE_ARG: &str = "--service";
+/// SYSTEM pre-login backend, created only by OinkInput on the logon desktop.
+pub const PRELOGIN_ARG: &str = "--prelogin";
 pub const STOP_SERVICE_ARG: &str = "--stop-service";
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(windows)]
@@ -45,6 +47,9 @@ pub fn dispatch_args() -> Option<ExitCode> {
             oink_agent::logs::init_service();
             Some(ExitCode::from(oink_agent::host::run_service()))
         }
+        // Logging starts inside: its roots are fixed only after the entry checks.
+        #[cfg(windows)]
+        PRELOGIN_ARG => Some(ExitCode::from(oink_agent::prelogin::run())),
         #[cfg(windows)]
         STOP_SERVICE_ARG => {
             oink_agent::logs::init();

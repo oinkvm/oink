@@ -388,7 +388,7 @@ pub(super) fn system_security() -> io::Result<Descriptor> {
 pub(super) fn staging_security() -> io::Result<Descriptor> {
     descriptor("O:SYG:SYD:P(A;OICI;FA;;;SY)")
 }
-fn descriptor(sddl: &str) -> io::Result<Descriptor> {
+pub(super) fn descriptor(sddl: &str) -> io::Result<Descriptor> {
     let mut sd = ptr::null_mut();
     // SAFETY: parser owns allocation; Descriptor frees it.
     check(unsafe {

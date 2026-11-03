@@ -53,6 +53,61 @@ struct Endpoint {
 }
 static OWNER: Mutex<Option<Arc<Client>>> = Mutex::new(None);
 static PAUSED: AtomicBool = AtomicBool::new(false);
+static IN_PROCESS: AtomicBool = AtomicBool::new(false);
+/// Inject through the helper's lanes inside this process instead of the session
+/// helper's pipe. Only the SYSTEM pre-login backend calls this, at entry, before
+/// any input request; the protected-install selection and every caller are unchanged.
+pub fn use_in_process_helper() {
+    IN_PROCESS.store(true, Ordering::Release);
+}
+/// In-process transport: requests go straight to the helper's lanes.
+struct InProcess {
+    server: crate::helper::Server,
+    generation: u64,
+    wake: pipe_io::Signal,
+}
+impl Transport for InProcess {
+    fn send(&mut self, request: Request) -> io::Result<bool> {
+        if request.command == Command::Heartbeat {
+            // The lease heartbeat guards a remote pipe peer; there is none here.
+            return Ok(true);
+        }
+        if self.generation == 0 {
+            self.generation = self.server.begin();
+        }
+        self.server.submit(crate::helper::Work {
+            generation: self.generation,
+            request,
+        })?;
+        Ok(true)
+    }
+    fn receive(&mut self) -> io::Result<Option<Reply>> {
+        while let Some(result) = self.server.receive() {
+            if result.generation == self.generation {
+                return Ok(Some(result.reply));
+            }
+        }
+        Ok(None)
+    }
+    fn wait(&mut self, timeout: Duration) -> io::Result<()> {
+        let milliseconds = timeout.as_millis() + u128::from(!timeout.subsec_nanos().is_multiple_of(1_000_000));
+        // SAFETY: owned auto-reset event, bounded wait.
+        if unsafe { WaitForSingleObject(self.wake.handle(), milliseconds.min(u128::from(u32::MAX)) as u32) }
+            == WAIT_FAILED
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    fn connected(&self) -> bool {
+        self.generation != 0
+    }
+    fn disconnect(&mut self) {
+        // A generation change is the native owner's release barrier.
+        self.server.disconnect();
+        self.generation = 0;
+    }
+}
 pub fn initialize() -> io::Result<()> {
     PAUSED.store(false, Ordering::Release);
     owner().map(|_| ())
@@ -82,6 +137,25 @@ pub fn suspend() {
 fn create_owner() -> io::Result<Client> {
     let wake = pipe_io::Signal::new()?;
     let signal = wake.clone();
+    if IN_PROCESS.load(Ordering::Acquire) {
+        let notify: crate::owner::Wake = std::sync::Arc::new(move || signal.notify());
+        let server = super::server::in_process(notify.clone())?;
+        return Client::new(
+            InProcess {
+                server,
+                generation: 0,
+                wake,
+            },
+            notify,
+            || {
+                oink_foundation::realtime::apply(
+                    oink_foundation::realtime::ThreadRole::Inject,
+                    oink_foundation::realtime::Tier::Realtime,
+                )
+                .map(|_| ())
+            },
+        );
+    }
     Client::new(
         Endpoint {
             connection: None,

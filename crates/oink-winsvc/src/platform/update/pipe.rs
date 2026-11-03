@@ -211,7 +211,7 @@ fn peer(pipe: HANDLE, id: u32) -> io::Result<Handle> {
 // This authorizes machine-wide preferences, not launching Oink. Keep the real
 // elevation requirement: both Full and Default+elevated (UAC off) qualify, while
 // Limited and Default non-admin must never gain machine policy write access.
-pub(super) fn elevated(process: &Handle) -> bool {
+pub(in crate::platform) fn elevated(process: &Handle) -> bool {
     let Ok(token) = token(process.0) else {
         return false;
     };

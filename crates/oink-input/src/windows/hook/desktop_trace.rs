@@ -95,8 +95,36 @@ unsafe extern "system" fn changed(
         let _ = PostMessageW(Some(WINDOW.get()), WM_CAPTURE_DESKTOP, WPARAM(0), LPARAM(0));
     }
 }
+/// Whether the input desktop is this backend's capture desktop (`Default` for the
+/// user backend, `Winlogon` for the pre-login backend). An inaccessible desktop
+/// is unavailable, not evidence that every key is physically UP.
+pub(super) fn capture_desktop_active() -> bool {
+    let expected = super::super::profile::current().capture_desktop;
+    if expected == "Default" {
+        return default_desktop_active();
+    }
+    // SAFETY: read-only handle/query, bounded UTF-16 buffer, handle always closed.
+    unsafe {
+        let Ok(desktop) = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) else {
+            return false;
+        };
+        let mut name = [0u16; 64];
+        let result = GetUserObjectInformationW(
+            HANDLE(desktop.0),
+            UOI_NAME,
+            Some(name.as_mut_ptr().cast()),
+            std::mem::size_of_val(&name) as u32,
+            None,
+        )
+        .is_ok();
+        let _ = CloseDesktop(desktop);
+        let length = name.iter().position(|c| *c == 0).unwrap_or(name.len());
+        result && name[..length].iter().copied().eq(expected.encode_utf16())
+    }
+}
+
 /// An inaccessible desktop is unavailable, not evidence that every key is physically UP.
-pub(super) fn default_desktop_active() -> bool {
+fn default_desktop_active() -> bool {
     // SAFETY: read-only handle/query, bounded UTF-16 buffer, handle always closed.
     unsafe {
         let Ok(desktop) = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) else {

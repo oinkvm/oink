@@ -148,6 +148,6 @@ pub(super) fn verify_update(pipe: HANDLE) -> io::Result<()> {
     verify_pipe(pipe, installed_pid_for("OinkInput", true)?)
 }
 
-fn installed_pid() -> io::Result<u32> {
+pub(super) fn installed_pid() -> io::Result<u32> {
     installed_pid_for("OinkInput", false)
 }

@@ -4,6 +4,7 @@ mod local;
 mod msi;
 pub use local::{elevate as elevate_local, inspect as inspect_local, spool as spool_local};
 mod pipe;
+pub(in crate::platform) use pipe::elevated;
 pub(super) mod protected;
 mod service;
 mod signature;

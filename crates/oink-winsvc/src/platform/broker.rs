@@ -79,9 +79,13 @@ unsafe extern "system" fn main(_argc: u32, _argv: *mut *mut u16) {
                 Err(e) => eprintln!("Oink input helper start failed: {e}"),
             }
         }
+        // The pre-login backend runs only while the console has no user; the
+        // launch server stops it again before creating any user backend.
+        super::prelogin::tick();
         thread::sleep(Duration::from_millis(250));
     }
     status(handle, SERVICE_STOP_PENDING, 0);
+    super::prelogin::stop();
     drop(child);
     let _ = launcher.join();
     let _ = updater.join();
@@ -146,9 +150,9 @@ pub(super) fn privilege(t: HANDLE, name: &str) -> io::Result<()> {
     }
     Ok(())
 }
-fn spawn(id: u32) -> io::Result<Child> {
-    let path = security::install_dir()?.join("oink-service.exe");
-    security::protected_file(&path)?;
+/// A primary SYSTEM token assigned to session `id`: the input helper and the
+/// pre-login backend run as SYSTEM inside the console session.
+pub(super) fn session_system_token(id: u32) -> io::Result<Handle> {
     let mut raw = ptr::null_mut();
     // SAFETY: broker's own SYSTEM token, requesting rights needed for duplicated session token only.
     check(unsafe {
@@ -188,6 +192,12 @@ fn spawn(id: u32) -> io::Result<Child> {
             size_of::<u32>() as u32,
         )
     })?;
+    Ok(primary)
+}
+fn spawn(id: u32) -> io::Result<Child> {
+    let path = security::install_dir()?.join("oink-service.exe");
+    security::protected_file(&path)?;
+    let primary = session_system_token(id)?;
     // Client may query the helper token and process for reverse authentication, but cannot
     // duplicate/adjust its token, write its memory, suspend it or create threads in it.
     let process_sd = security::identity_security(id, PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE)?;

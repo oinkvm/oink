@@ -84,6 +84,13 @@ pub fn init_service() {
     install(configured_level(), file_writer("oink"));
 }
 
+/// The Windows pre-login backend's own file in the machine-level log directory
+/// (`%ProgramData%\Oink\Prelogin\Logs`, fixed by its entry before this call).
+/// Group diagnostic collection reads the same log root.
+pub fn init_prelogin() {
+    install(configured_level(), file_writer("oink-prelogin"));
+}
+
 /// Initialize the UI role's separate ordinary log file.
 pub fn init_ui() {
     install(configured_level(), file_writer("oink-ui"));

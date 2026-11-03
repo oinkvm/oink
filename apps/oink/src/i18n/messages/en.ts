@@ -516,6 +516,8 @@ export const en = {
   "报告发送当前不可用": "Report delivery is currently unavailable",
   "隐私": "Privacy",
   "需要在系统设置中批准登录项": "Approve the login item in system settings",
+  "登录前可用需要管理员授权": "Sign-in screen access needs administrator approval",
+  "登录前可用正在使用另一位用户的身份": "Sign-in screen access uses another user's identity",
   "显示": "Show",
   "管理": "Manage",
   "没有缓存": "No cached files",

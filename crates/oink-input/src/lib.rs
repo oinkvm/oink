@@ -428,6 +428,12 @@ pub fn run_with_main_run_loop<T: Send + 'static>(f: impl FnOnce() -> T + Send + 
     f()
 }
 
+/// Windows pre-login backend (SYSTEM on the logon desktop): see `windows::profile`.
+#[cfg(windows)]
+pub fn prelogin_backend() -> Result<Box<dyn InputBackend>, InputError> {
+    windows::prelogin_backend()
+}
+
 /// 创建本机平台的实现。
 pub fn platform_backend() -> Result<Box<dyn InputBackend>, InputError> {
     #[cfg(target_os = "macos")]

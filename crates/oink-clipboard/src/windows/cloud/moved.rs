@@ -10,6 +10,8 @@ pub(super) enum State {
     /// Optimized MOVE: converge absent/moved identities without deleting a surviving copy.
     Observed,
     Removed,
+    /// Identity convergence finished with at least one surviving received copy.
+    Retained,
 }
 impl Offer {
     pub(in crate::windows) fn target_consumed(&self, entry: usize) -> io::Result<()> {
@@ -81,7 +83,10 @@ impl Service {
             return Err(unavailable());
         }
         let previous = journal.moves.get(&id).copied();
-        if matches!(previous, Some(State::Removed | State::Pending)) || previous == Some(next) {
+        if matches!(previous, Some(State::Removed | State::Pending))
+            || previous == Some(next)
+            || (previous == Some(State::Retained) && next == State::Observed)
+        {
             return Ok(());
         }
         journal.moves.insert(id, next);
@@ -106,7 +111,7 @@ impl Service {
             .unwrap()
             .moves
             .iter()
-            .filter(|(_, state)| **state != State::Removed)
+            .filter(|(_, state)| matches!(state, State::Observed | State::Pending))
             .map(|(id, state)| (*id, *state))
             .collect();
         for (id, state) in pending {
@@ -119,15 +124,23 @@ impl Service {
         let delivery = self.deliveries.lock().unwrap().get(&id).cloned();
         let (mut nodes, _admission) = {
             let mut journal = self.received.lock().unwrap();
-            if journal.cancelled.contains(&id) || journal.cleanup_inflight.iter().any(|(owner, _)| *owner == id) {
+            if !matches!(intent, State::Observed | State::Pending)
+                || journal.moves.get(&id) != Some(&intent)
+                || journal.cancelled.contains(&id)
+                || journal.cleanup_inflight.iter().any(|(owner, _)| *owner == id)
+            {
                 return Ok(());
             }
             let nodes = journal.deliveries.get(&id).ok_or(io::ErrorKind::NotFound)?.clone();
-            journal.cleanup_inflight.insert((id, usize::MAX));
-            (
-                nodes.into_iter().enumerate().collect::<Vec<_>>(),
-                Admission { service: self, id },
-            )
+            // Observed only converges identity. A deletion admission barrier
+            // rejects concurrent ReaderPin/FETCH_DATA and cancels the target's
+            // first hydration (Chrome on Windows 11, 2026-11-03). It must neither
+            // close reader admission nor acquire exclusive/write/delete access.
+            let admission = (intent == State::Pending).then(|| {
+                journal.cleanup_inflight.insert((id, usize::MAX));
+                Admission { service: self, id }
+            });
+            (nodes.into_iter().enumerate().collect::<Vec<_>>(), admission)
         };
         nodes.sort_by_key(|(_, node)| std::cmp::Reverse(node.path.components().count()));
         for (index, node) in nodes {
@@ -144,8 +157,16 @@ impl Service {
                     .or_else(|| delivery.as_ref().map(|delivery| delivery.path.clone()))
             };
             let relocated = base.as_ref().is_some_and(|base| !path.starts_with(base));
-            let result = if relocated {
-                Ok(())
+            let gone = if relocated {
+                true
+            } else if intent == State::Observed {
+                // Shared FILE_READ_ATTRIBUTES + OPEN_REPARSE_POINT, without
+                // recalling data or excluding hydration/consumer handles.
+                match self.disk_identity(&path) {
+                    Ok((owner, slot, _)) => owner != id || slot != index,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                    Err(error) => return Err(error),
+                }
             } else {
                 match protection::Protected::open(
                     self.api.clone(),
@@ -154,30 +175,31 @@ impl Service {
                 ) {
                     Ok(file) => {
                         let (owner, slot, _) = self.handle_identity(file.handle, 0)?;
-                        if owner != id || slot != index {
-                            // A replacement has independent ownership. Forget this
-                            // old identity; never unlink the object at its old path.
-                            Ok(())
-                        } else if intent == State::Observed {
-                            Err(io::ErrorKind::WouldBlock.into())
-                        } else {
+                        // A replacement has independent ownership. Forget this
+                        // old identity; never unlink the object at its old path.
+                        if owner == id && slot == index {
                             // User decision 2026-10-29: MOVE is the deletion
                             // authority. No content, in-sync, residency or consumer
                             // proof is required after that native report.
                             file.delete()?;
                             crate::cache::changed(&self.root);
-                            Ok(())
                         }
+                        true
                     }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                    Err(error) => Err(error),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                    Err(error) => return Err(error),
                 }
             };
-            result?;
             let mut journal = self.received.lock().unwrap();
+            if journal.moves.get(&id) != Some(&intent) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
             if let Some(current) = journal.deliveries.get_mut(&id).and_then(|nodes| nodes.get_mut(index)) {
                 if current.path != node.path {
                     return Err(io::ErrorKind::Interrupted.into());
+                }
+                if !gone {
+                    continue;
                 }
                 current.deleted = true;
             }
@@ -187,12 +209,23 @@ impl Service {
             journal.save(&self.root)?;
         }
         let mut journal = self.received.lock().unwrap();
-        if journal
+        let removed = journal
             .deliveries
             .get(&id)
-            .is_some_and(|nodes| nodes.iter().all(|node| node.deleted))
+            .is_some_and(|nodes| nodes.iter().all(|node| node.deleted));
+        // Retained ends only this MOVE observation, not the file's receive or
+        // one-shot lifecycle. Later Pending evidence can still authorize unlink.
+        let next = if removed {
+            Some(State::Removed)
+        } else if intent == State::Observed {
+            Some(State::Retained)
+        } else {
+            None
+        };
+        if journal.moves.get(&id) == Some(&intent)
+            && let Some(next) = next
         {
-            let previous = journal.moves.insert(id, State::Removed);
+            let previous = journal.moves.insert(id, next);
             if let Err(error) = journal.save(&self.root) {
                 if let Some(previous) = previous {
                     journal.moves.insert(id, previous);

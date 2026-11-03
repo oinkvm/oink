@@ -60,6 +60,9 @@ thread_local! {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Strategy {
     Window,
+    /// Park without hiding: the pre-login backend may not show a cover window on
+    /// the logon desktop, so the parked cursor stays visible.
+    ParkVisible,
     #[cfg(debug_assertions)]
     SystemCursors,
     #[cfg(debug_assertions)]
@@ -68,6 +71,9 @@ pub(crate) enum Strategy {
 
 impl Strategy {
     pub(crate) fn from_env() -> Self {
+        if !super::profile::current().visible_windows {
+            return Self::ParkVisible;
+        }
         #[cfg(not(debug_assertions))]
         {
             Self::Window
@@ -513,6 +519,11 @@ impl Hider {
                 self.hidden = true;
                 true
             }
+            Strategy::ParkVisible => {
+                warp(park);
+                self.hidden = true;
+                true
+            }
             #[cfg(debug_assertions)]
             Strategy::None => {
                 warp(park);
@@ -630,6 +641,7 @@ impl Hider {
                 restore_system_cursors();
                 let _ = std::fs::remove_file(marker_path());
             }
+            Strategy::ParkVisible => {}
             #[cfg(debug_assertions)]
             Strategy::None => {}
         }
@@ -702,7 +714,6 @@ impl Drop for Hider {
     }
 }
 
-#[cfg(debug_assertions)]
 fn warp(p: POINT) -> bool {
     super::trace::action(crate::native_lifecycle::Kind::Park, Some(p), 0, None);
     let result = super::warp::place(p).is_ok();

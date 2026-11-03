@@ -14,6 +14,7 @@
 //!   安全桌面立即收回本机来源并释放已转发按压；现有 SYSTEM helper 的注入职责不变。
 
 mod application_focus;
+mod credential_focus;
 mod cursor;
 mod dpi;
 mod hook;
@@ -23,6 +24,7 @@ mod cursor_clip;
 mod loop_timer;
 mod mouse_keys;
 mod pointer_capture;
+pub(crate) mod profile;
 pub mod raw_capture;
 mod rawinput;
 mod resume_hotkey;
@@ -55,6 +57,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::win_actions::{self, GestureMapper, WinAction};
 use crate::{EventHandler, InputBackend, InputError};
+
+/// The SYSTEM pre-login backend's input: capture on the logon desktop, in-process
+/// injection (see `oink_winsvc::client::use_in_process_helper`), no visible windows.
+pub(crate) fn prelogin_backend() -> Result<Box<dyn InputBackend>, InputError> {
+    profile::select(profile::PRELOGIN)?;
+    backend()
+}
 
 pub(crate) fn backend() -> Result<Box<dyn InputBackend>, InputError> {
     if let Err(msg) = dpi::ensure_process_per_monitor_v2() {
@@ -152,13 +161,19 @@ fn cursor_dpi() -> u32 {
 
 impl InputBackend for WinInput {
     fn set_source_foreground(&self, enabled: bool) {
-        self.source_foreground.set(enabled);
+        // The foreground-capture window would be shown on the logon desktop.
+        if profile::current().visible_windows {
+            self.source_foreground.set(enabled);
+        }
     }
 
     fn application_focus_supported(&self) -> bool {
-        true
+        profile::current().visible_windows
     }
     fn application_focus_watch(&self, observer: Option<crate::application_focus::Observer>) {
+        if !profile::current().visible_windows {
+            return;
+        }
         self.application_focus.watch(observer);
     }
     fn application_focus_sample(&self) -> oink_foundation::application_focus::Observation {

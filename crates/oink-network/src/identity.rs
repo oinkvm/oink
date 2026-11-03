@@ -32,16 +32,8 @@ impl Identity {
     /// 从 `dir/device.key` 读取；不存在时生成并保存（权限 0600）。
     pub fn load_or_create(dir: &Path) -> std::io::Result<Self> {
         let path = dir.join("device.key");
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("{} 长度不是 32 字节", path.display()),
-                    )
-                })?;
-                Ok(Self::from_seed(seed))
-            }
+        match Self::load_existing(dir) {
+            Ok(identity) => Ok(identity),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 std::fs::create_dir_all(dir)?;
                 let id = Self::generate();
@@ -50,6 +42,21 @@ impl Identity {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Load `dir/device.key` only. A missing key is `NotFound`; it is never
+    /// generated. The Windows pre-login backend (SYSTEM) uses this: it may
+    /// only act as the identity its owner exported, never mint a new device.
+    pub fn load_existing(dir: &Path) -> std::io::Result<Self> {
+        let path = dir.join("device.key");
+        let bytes = std::fs::read(&path)?;
+        let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} 长度不是 32 字节", path.display()),
+            )
+        })?;
+        Ok(Self::from_seed(seed))
     }
 
     pub fn id(&self) -> DeviceId {
@@ -99,6 +106,23 @@ pub(crate) fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_existing_never_creates_an_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            Identity::load_existing(dir.path()).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let created = Identity::load_or_create(dir.path()).unwrap();
+        assert_eq!(Identity::load_existing(dir.path()).unwrap().id(), created.id());
+        std::fs::write(dir.path().join("device.key"), b"short").unwrap();
+        assert_eq!(
+            Identity::load_existing(dir.path()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
 
     #[test]
     fn invalid_key_is_preserved_and_never_regenerated() {

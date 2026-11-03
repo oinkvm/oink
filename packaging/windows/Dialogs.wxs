@@ -32,14 +32,20 @@
              Artwork stays in the left gutter; native controls use the plain
              button-face area on the right rather than overlaying the drawing. -->
         <Control Id="Artwork" Type="Bitmap" X="0" Y="0" Width="370" Height="234" TabSkip="no" Text="WixUI_Bmp_Dialog" />
-        <Control Id="Heading" Type="Text" X="130" Y="8" Width="226" Height="25" Transparent="yes"
+        <Control Id="Heading" Type="Text" X="130" Y="8" Width="226" Height="20" Transparent="yes"
                  Text="{\WixUI_Font_Title}Welcome to Oink Setup" />
-        <Control Id="LicenseText" Type="ScrollableText" X="130" Y="36" Width="226" Height="142" Sunken="yes" TabSkip="no">
+        <Control Id="LicenseText" Type="ScrollableText" X="130" Y="30" Width="226" Height="130" Sunken="yes" TabSkip="no">
           <Text SourceFile="$(var.LicenseRtf)" />
         </Control>
-        <Control Id="DesktopChoice" Type="CheckBox" X="130" Y="183" Width="226" Height="18"
+        <Control Id="DesktopChoice" Type="CheckBox" X="130" Y="163" Width="226" Height="18"
                  Property="OinkDesktop" CheckBoxValue="1" Text="Create a desktop shortcut" />
-        <Control Id="LicenseAcceptedCheckBox" Type="CheckBox" X="130" Y="207" Width="226" Height="18"
+        <!-- Before the elevated transaction: launch at login also enables the
+             machine-level pre-login backend, which the installer (already an
+             administrator) records directly. A Finish-page choice would run in
+             the unelevated client and need a second approval. -->
+        <Control Id="LoginChoice" Type="CheckBox" X="130" Y="181" Width="226" Height="18"
+                 Property="OinkLogin" CheckBoxValue="1" Text="Start Oink when I sign in" />
+        <Control Id="LicenseAcceptedCheckBox" Type="CheckBox" X="130" Y="199" Width="226" Height="18"
                  Property="LicenseAccepted" CheckBoxValue="1" Text="I accept the license agreement" />
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
         <Control Id="Install" Type="PushButton" X="212" Y="243" Width="80" Height="17" Default="yes"
@@ -52,7 +58,9 @@
                wait for CostingComplete here; costing resumes after Return. -->
           <Publish Property="OINK_DESKTOP_SHORTCUT" Value="0" Order="1" Condition="OinkDesktop &lt;&gt; &quot;1&quot;" />
           <Publish Property="OINK_DESKTOP_SHORTCUT" Value="1" Order="2" Condition="OinkDesktop = &quot;1&quot;" />
-          <Publish Event="EndDialog" Value="Return" Order="3" />
+          <Publish Property="OINK_START_AT_LOGIN" Value="0" Order="3" Condition="OinkLogin &lt;&gt; &quot;1&quot;" />
+          <Publish Property="OINK_START_AT_LOGIN" Value="1" Order="4" Condition="OinkLogin = &quot;1&quot;" />
+          <Publish Event="EndDialog" Value="Return" Order="5" />
         </Control>
         <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancel">
           <Publish Event="SpawnDialog" Value="CancelDlg" />
@@ -67,14 +75,11 @@
         <Control Id="LaunchChoice" Type="CheckBox" X="135" Y="135" Width="220" Height="18" Hidden="yes"
                  Property="OinkLaunch" CheckBoxValue="1" Text="Launch Oink"
                  ShowCondition="UILevel = 5 AND NOT Installed AND NOT REMOVE" />
-        <Control Id="LoginChoice" Type="CheckBox" X="135" Y="160" Width="220" Height="18" Hidden="yes"
-                 Property="OinkLogin" CheckBoxValue="1" Text="Start Oink when I sign in"
-                 ShowCondition="UILevel = 5 AND NOT Installed AND NOT REMOVE" />
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
         <Control Id="Finish" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Cancel="yes" Text="Finish">
           <Publish Event="EndDialog" Value="Return" Order="999" />
           <Publish Event="DoAction" Value="FinishInstall" Order="1"
-                   Condition="UILevel = 5 AND NOT Installed AND NOT REMOVE AND (OinkLaunch = &quot;1&quot; OR OinkLogin = &quot;1&quot;)" />
+                   Condition="UILevel = 5 AND NOT Installed AND NOT REMOVE AND (OinkLaunch = &quot;1&quot; OR OINK_START_AT_LOGIN = &quot;1&quot;)" />
           <!-- Refresh the CA result for later ControlEvent conditions. Native
                DoAction CAs cannot display warnings with MsiProcessMessage. -->
           <Publish Property="OinkFinishFailed" Value="[OinkFinishFailed]" Order="2" />

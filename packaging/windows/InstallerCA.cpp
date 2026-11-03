@@ -108,7 +108,7 @@ extern "C" __declspec(dllexport) UINT __stdcall FinishInstall(MSIHANDLE install)
         !property(install, L"REMOVE").empty(), MsiGetMode(install, MSIRUNMODE_SCHEDULED) != FALSE,
         MsiGetMode(install, MSIRUNMODE_COMMIT) != FALSE, MsiGetMode(install, MSIRUNMODE_ROLLBACK) != FALSE)) return ERROR_SUCCESS;
     const bool launch = property(install, L"OinkLaunch") == L"1";
-    const bool login = property(install, L"OinkLogin") == L"1";
+    const bool login = property(install, L"OINK_START_AT_LOGIN") == L"1";
     if (!launch && !login) return ERROR_SUCCESS;
     const auto directory = root();
     std::wstring arguments = L"--installer-finish";
@@ -441,6 +441,42 @@ extern "C" __declspec(dllexport) UINT __stdcall RemoveLoginEntry(MSIHANDLE) {
             _wcsicmp(command, expected.c_str()) == 0) RegDeleteValueW(run, ID_RUN_VALUE);
         RegCloseKey(run);
     }
+    return ERROR_SUCCESS;
+}
+
+// Deferred, as SYSTEM, only when launch at login was chosen on the welcome page.
+// CustomActionData is the installing user's SID. Same marker and descriptor as
+// OinkInput's own writer (crates/oink-winsvc/src/platform/prelogin.rs): Enabled
+// and Owner under HKLM\SOFTWARE\Oink\Prelogin, readable by users, writable by
+// SYSTEM and Administrators only. The owner's backend exports its snapshot later.
+extern "C" __declspec(dllexport) UINT __stdcall EnablePrelogin(MSIHANDLE install) {
+    const auto owner = property(install, L"CustomActionData");
+    PSID sid = nullptr;
+    if (owner.empty() || !ConvertStringSidToSidW(owner.c_str(), &sid)) {
+        cleanup_log(install, L"HKLM\\SOFTWARE\\Oink\\Prelogin", L"owner SID", GetLastError());
+        return ERROR_SUCCESS;
+    }
+    LocalFree(sid);
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"O:SYG:SYD:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;CI;KR;;;BU)", SDDL_REVISION_1, &descriptor, nullptr)) {
+        cleanup_log(install, L"HKLM\\SOFTWARE\\Oink\\Prelogin", L"descriptor", GetLastError());
+        return ERROR_SUCCESS;
+    }
+    SECURITY_ATTRIBUTES attributes{sizeof(attributes), descriptor, FALSE};
+    HKEY key = nullptr;
+    LONG result = RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Oink\\Prelogin", 0, nullptr, 0,
+        KEY_SET_VALUE | KEY_WOW64_64KEY, &attributes, &key, nullptr);
+    LocalFree(descriptor);
+    if (result == ERROR_SUCCESS) {
+        const DWORD enabled = 1;
+        result = RegSetValueExW(key, L"Enabled", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&enabled), sizeof(enabled));
+        if (result == ERROR_SUCCESS)
+            result = RegSetValueExW(key, L"Owner", 0, REG_SZ, reinterpret_cast<const BYTE*>(owner.c_str()),
+                static_cast<DWORD>((owner.size() + 1) * sizeof(wchar_t)));
+        RegCloseKey(key);
+    }
+    if (result != ERROR_SUCCESS) cleanup_log(install, L"HKLM\\SOFTWARE\\Oink\\Prelogin", L"marker", static_cast<DWORD>(result));
     return ERROR_SUCCESS;
 }
 

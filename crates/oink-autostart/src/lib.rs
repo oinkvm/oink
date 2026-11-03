@@ -6,6 +6,10 @@
 //!   Merely starting Oink or reading preferences never registers a login item.
 //! - [`launched_at_login`] / [`handle_autostart_arg`]：本次是否由登录项启动（是的话界面不弹主窗口）。
 //! - 没有含 C 代码的依赖，Windows 部分可以在 Mac 上交叉检查。
+//! - **两层**：用户级登记（上面两种系统登录项）之外，[`set_enabled`] 还负责机器级的
+//!   「登录前可用」（Windows 的登录前后台，见 `docs/design/winsvc.md`）。机器级只有一份身份，
+//!   属于最近一次打开开机自启的用户；具体操作由调用方通过 [`MachineLayer`] 提供（Windows 上经
+//!   `OinkInput` 服务），本 crate 只决定两层的先后与状态合成。macOS 目前没有机器级（[`NoMachineLayer`]）。
 
 use std::process::ExitCode;
 
@@ -58,12 +62,85 @@ impl LaunchAtLoginProblem {
     }
 }
 
+/// Machine-level part of launch at login: whether this machine's pre-login
+/// backend runs with this user's identity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreloginState {
+    /// This platform or installation has no machine-level part.
+    #[default]
+    Unsupported,
+    /// The pre-login backend is disabled on this machine.
+    Off,
+    /// Enabled, and the machine identity is this user's.
+    Enabled,
+    /// Enabled with another user's identity. This user's choice does not change it
+    /// until this user turns launch at login on again.
+    OtherUser,
+}
+
+/// Why the machine-level part did not reach the requested state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreloginProblem {
+    /// Administrator approval was declined or failed.
+    ElevationDeclined,
+    /// The machine service could not be reached or failed.
+    ServiceUnavailable,
+    /// The machine service refused the request.
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreloginStatus {
+    pub state: PreloginState,
+    pub problem: Option<PreloginProblem>,
+}
+
+/// Machine-level operations supplied by the platform host.
+pub trait MachineLayer {
+    /// Read-only current state for this user.
+    fn status(&self) -> Result<PreloginState, PreloginProblem>;
+    /// Enable with this user's identity. May ask for administrator approval.
+    fn claim(&self) -> Result<PreloginState, PreloginProblem>;
+    /// Disable when this user owns it; another user's identity is left alone.
+    fn release(&self) -> Result<PreloginState, PreloginProblem>;
+}
+
+/// No machine-level part (macOS, tests, development builds).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoMachineLayer;
+impl MachineLayer for NoMachineLayer {
+    fn status(&self) -> Result<PreloginState, PreloginProblem> {
+        Ok(PreloginState::Unsupported)
+    }
+    fn claim(&self) -> Result<PreloginState, PreloginProblem> {
+        Ok(PreloginState::Unsupported)
+    }
+    fn release(&self) -> Result<PreloginState, PreloginProblem> {
+        Ok(PreloginState::Unsupported)
+    }
+}
+
+fn prelogin_status(result: Result<PreloginState, PreloginProblem>, fallback: PreloginState) -> PreloginStatus {
+    match result {
+        Ok(state) => PreloginStatus { state, problem: None },
+        Err(problem) => PreloginStatus {
+            state: fallback,
+            problem: Some(problem),
+        },
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchAtLoginStatus {
     pub state: LaunchAtLoginState,
     pub problem: Option<LaunchAtLoginProblem>,
     /// The backend fills this from its local confirmation marker, never OS state.
     pub configured: bool,
+    /// Machine-level part (pre-login backend). Older payloads omit it.
+    #[serde(default)]
+    pub prelogin: PreloginStatus,
 }
 
 impl LaunchAtLoginStatus {
@@ -72,6 +149,7 @@ impl LaunchAtLoginStatus {
             state,
             problem,
             configured: false,
+            prelogin: PreloginStatus::default(),
         }
     }
     pub fn unavailable(problem: LaunchAtLoginProblem) -> Self {
@@ -100,8 +178,7 @@ fn registration_result(
     }
 }
 
-/// 向系统查询登录项的当前状态。只读，可以在打开设置页、窗口重新获得焦点时调用。
-pub fn status() -> LaunchAtLoginStatus {
+fn user_status() -> LaunchAtLoginStatus {
     #[cfg(target_os = "macos")]
     return macos::status();
     #[cfg(windows)]
@@ -110,22 +187,68 @@ pub fn status() -> LaunchAtLoginStatus {
     LaunchAtLoginStatus::unavailable(LaunchAtLoginProblem::UnsupportedPlatform)
 }
 
+fn set_user_enabled(enabled: bool) -> Result<LaunchAtLoginStatus, String> {
+    #[cfg(target_os = "macos")]
+    return macos::set_enabled(enabled);
+    #[cfg(windows)]
+    return windows::set_enabled(enabled);
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let _ = enabled;
+        Err("unsupported_platform".into())
+    }
+}
+
+/// 向系统查询登录项的当前状态（两层）。只读，可以在打开设置页、窗口重新获得焦点时调用。
+pub fn status(machine: &dyn MachineLayer) -> LaunchAtLoginStatus {
+    let mut status = user_status();
+    status.prelogin = prelogin_status(machine.status(), PreloginState::Off);
+    status
+}
+
 /// Register/unregister after an explicit edit or confirmation, returning OS state.
 ///
 /// 打开之后系统仍可能要求用户批准：这时返回 `Ok`，状态是 [`LaunchAtLoginState::RequiresApproval`]。
 /// Failure returns a fixed problem code; native error details stay in local logs.
-pub fn set_enabled(enabled: bool) -> Result<LaunchAtLoginStatus, String> {
-    apply_enabled(enabled, status(), |enabled| {
-        #[cfg(target_os = "macos")]
-        return macos::set_enabled(enabled);
-        #[cfg(windows)]
-        return windows::set_enabled(enabled);
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            let _ = enabled;
-            Err("unsupported_platform".into())
-        }
-    })
+///
+/// Both layers follow the one switch. Turning on registers the user entry first, then
+/// claims the machine-level identity (which may ask for administrator approval). A
+/// machine-level failure keeps the user entry and is reported in
+/// [`LaunchAtLoginStatus::prelogin`]. Turning off releases the machine level first
+/// (only if this user owns it), then removes the user entry.
+pub fn set_enabled(enabled: bool, machine: &dyn MachineLayer) -> Result<LaunchAtLoginStatus, String> {
+    apply_layers(enabled, user_status(), set_user_enabled, machine)
+}
+
+/// Only the user-level entry. The MSI Finish step uses this: the elevated installer
+/// has already enabled the machine level, and Finish must never ask for a second approval.
+pub fn set_user_enabled_only(enabled: bool) -> Result<LaunchAtLoginStatus, String> {
+    apply_enabled(enabled, user_status(), set_user_enabled)
+}
+
+fn apply_layers(
+    enabled: bool,
+    current: LaunchAtLoginStatus,
+    mutate: impl FnOnce(bool) -> Result<LaunchAtLoginStatus, String>,
+    machine: &dyn MachineLayer,
+) -> Result<LaunchAtLoginStatus, String> {
+    if enabled {
+        let mut status = apply_enabled(true, current, mutate)?;
+        status.prelogin = match machine.status() {
+            Ok(state @ (PreloginState::Enabled | PreloginState::Unsupported)) => prelogin_status(Ok(state), state),
+            Ok(state) => prelogin_status(machine.claim(), state),
+            Err(_) => prelogin_status(machine.claim(), PreloginState::Off),
+        };
+        Ok(status)
+    } else {
+        let machine_after = match machine.status() {
+            Ok(PreloginState::Enabled) => prelogin_status(machine.release(), PreloginState::Enabled),
+            other => prelogin_status(other, PreloginState::Off),
+        };
+        let mut status = apply_enabled(false, current, mutate)?;
+        status.prelogin = machine_after;
+        Ok(status)
+    }
 }
 
 /// Confirming the shown value does not rewrite an existing MSI registration or
@@ -267,6 +390,136 @@ mod tests {
         assert!(removed);
     }
 
+    use std::cell::RefCell;
+
+    struct FakeMachine {
+        state: RefCell<PreloginState>,
+        claim: Result<PreloginState, PreloginProblem>,
+        calls: RefCell<Vec<&'static str>>,
+    }
+    impl FakeMachine {
+        fn new(state: PreloginState, claim: Result<PreloginState, PreloginProblem>) -> Self {
+            Self {
+                state: RefCell::new(state),
+                claim,
+                calls: RefCell::default(),
+            }
+        }
+    }
+    impl MachineLayer for FakeMachine {
+        fn status(&self) -> Result<PreloginState, PreloginProblem> {
+            self.calls.borrow_mut().push("status");
+            Ok(*self.state.borrow())
+        }
+        fn claim(&self) -> Result<PreloginState, PreloginProblem> {
+            self.calls.borrow_mut().push("claim");
+            if let Ok(state) = self.claim {
+                *self.state.borrow_mut() = state;
+            }
+            self.claim
+        }
+        fn release(&self) -> Result<PreloginState, PreloginProblem> {
+            self.calls.borrow_mut().push("release");
+            *self.state.borrow_mut() = PreloginState::Off;
+            Ok(PreloginState::Off)
+        }
+    }
+    fn user(state: LaunchAtLoginState) -> LaunchAtLoginStatus {
+        LaunchAtLoginStatus::new(state, None)
+    }
+    fn mutate(enabled: bool) -> Result<LaunchAtLoginStatus, String> {
+        Ok(user(if enabled {
+            LaunchAtLoginState::Enabled
+        } else {
+            LaunchAtLoginState::Disabled
+        }))
+    }
+
+    #[test]
+    fn turning_on_claims_the_machine_identity_unless_already_owned() {
+        for (before, expected_calls) in [
+            (PreloginState::Off, vec!["status", "claim"]),
+            (PreloginState::OtherUser, vec!["status", "claim"]),
+            (PreloginState::Enabled, vec!["status"]),
+            (PreloginState::Unsupported, vec!["status"]),
+        ] {
+            let machine = FakeMachine::new(before, Ok(PreloginState::Enabled));
+            let status = apply_layers(true, user(LaunchAtLoginState::Disabled), mutate, &machine).unwrap();
+            assert_eq!(status.state, LaunchAtLoginState::Enabled);
+            assert_eq!(*machine.calls.borrow(), expected_calls, "{before:?}");
+            let expected = if before == PreloginState::Unsupported {
+                PreloginState::Unsupported
+            } else {
+                PreloginState::Enabled
+            };
+            assert_eq!(
+                status.prelogin,
+                PreloginStatus {
+                    state: expected,
+                    problem: None
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_declined_machine_claim_keeps_the_user_entry_and_reports_the_partial_state() {
+        for before in [PreloginState::Off, PreloginState::OtherUser] {
+            let machine = FakeMachine::new(before, Err(PreloginProblem::ElevationDeclined));
+            let status = apply_layers(true, user(LaunchAtLoginState::Disabled), mutate, &machine).unwrap();
+            assert_eq!(status.state, LaunchAtLoginState::Enabled);
+            assert_eq!(
+                status.prelogin,
+                PreloginStatus {
+                    state: before,
+                    problem: Some(PreloginProblem::ElevationDeclined)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn turning_off_releases_only_an_owned_machine_identity_before_the_user_entry() {
+        for (before, released, after) in [
+            (PreloginState::Enabled, true, PreloginState::Off),
+            (PreloginState::OtherUser, false, PreloginState::OtherUser),
+            (PreloginState::Off, false, PreloginState::Off),
+        ] {
+            let machine = FakeMachine::new(before, Ok(PreloginState::Enabled));
+            let order = RefCell::new(Vec::new());
+            let status = apply_layers(
+                false,
+                user(LaunchAtLoginState::Enabled),
+                |enabled| {
+                    order.borrow_mut().extend(machine.calls.borrow().iter().copied());
+                    mutate(enabled)
+                },
+                &machine,
+            )
+            .unwrap();
+            assert_eq!(status.state, LaunchAtLoginState::Disabled);
+            assert_eq!(machine.calls.borrow().contains(&"release"), released);
+            // The machine level is settled before the user entry is removed.
+            assert_eq!(*order.borrow(), *machine.calls.borrow());
+            assert_eq!(status.prelogin.state, after);
+        }
+    }
+
+    #[test]
+    fn a_failed_user_entry_never_touches_the_machine_level_when_turning_on() {
+        let machine = FakeMachine::new(PreloginState::Off, Ok(PreloginState::Enabled));
+        assert!(
+            apply_layers(
+                true,
+                user(LaunchAtLoginState::Disabled),
+                |_| Err("denied".into()),
+                &machine
+            )
+            .is_err()
+        );
+        assert!(machine.calls.borrow().is_empty());
+    }
+
     #[test]
     fn status_json_shape() {
         let s = LaunchAtLoginStatus::new(
@@ -275,8 +528,24 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(&s).unwrap(),
-            serde_json::json!({"state": "requires_approval", "problem": "approval_required", "configured": false})
+            serde_json::json!({
+                "state": "requires_approval",
+                "problem": "approval_required",
+                "configured": false,
+                "prelogin": {"state": "unsupported", "problem": null}
+            })
         );
+        let older: LaunchAtLoginStatus =
+            serde_json::from_value(serde_json::json!({"state": "enabled", "problem": null, "configured": true}))
+                .unwrap();
+        assert_eq!(older.prelogin, PreloginStatus::default());
+        for (state, name) in [
+            (PreloginState::Off, "off"),
+            (PreloginState::Enabled, "enabled"),
+            (PreloginState::OtherUser, "other_user"),
+        ] {
+            assert_eq!(serde_json::to_value(state).unwrap(), serde_json::json!(name));
+        }
         for (state, name) in [
             (LaunchAtLoginState::Enabled, "enabled"),
             (LaunchAtLoginState::Disabled, "disabled"),
