@@ -28,7 +28,7 @@ dto_schemas! {
     ApplicationFocusRecord, ApplicationFocusClaim, ApplicationFocusObservation, ApplicationFocusPrepare, ApplicationFocusApplied, ApplicationFocusSnapshot, ApplicationFocusRetire, ApplicationKeyRoute,
     ControlMovePointer, PointerShortcutSlots, PointerShortcutSlot,
     LocalOutputVolume,
-    LayoutProfilesStateV3,LayoutProfileCatalogV3,LayoutProfileJoinCompletion,LayoutProfilesJoin,
+    LayoutProfilesStateV3,LayoutProfileCatalogV3,LayoutProfileJoinCompletion,LayoutProfileJoinAppends,LayoutProfilesJoin,
     LayoutProfilesStateV2,LayoutProfileCatalogV2,LayoutProfileCatalog,LayoutProfile,LayoutProfileRecency,LayoutProfileDeviceState,LayoutPhysicalDevice,LayoutPhysicalScreen,
     ArrangementPreview,LayoutProfileScreens,LayoutProfileSnapshot,LayoutProfileSharing,LayoutProfilePlacement,LayoutProfileDisabled,
     LayoutProfileNative,LayoutProfileScreen,LayoutNativeOrigin,

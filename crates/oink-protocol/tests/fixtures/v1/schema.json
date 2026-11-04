@@ -14602,6 +14602,12 @@
           "key": 9,
           "name": "completed_joins",
           "shape": "List<LayoutProfileJoinCompletion,256>"
+        },
+        {
+          "absence": "optional",
+          "key": 10,
+          "name": "join_appends",
+          "shape": "Option<List<LayoutProfileJoinAppends,256>>"
         }
       ],
       "name": "LayoutProfileCatalogV3"
@@ -14634,6 +14640,23 @@
         }
       ],
       "name": "LayoutProfileJoinCompletion"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "merge_id",
+          "shape": "Hash32"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "templates",
+          "shape": "List<LayoutProfile,2>"
+        }
+      ],
+      "name": "LayoutProfileJoinAppends"
     },
     {
       "fields": [

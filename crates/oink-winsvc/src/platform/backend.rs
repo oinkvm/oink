@@ -239,7 +239,7 @@ fn serve_session(id: u32) -> io::Result<()> {
                 if target == crate::launch_recipe::Target::Backend {
                     // One DeviceId, one process: the pre-login backend releases its
                     // keys and leaves the group before the user's backend exists.
-                    super::prelogin::stop();
+                    return super::prelogin::handoff(|| spawn(id, &user, environment, directory, target));
                 }
                 spawn(id, &user, environment, directory, target)
             })
@@ -378,6 +378,7 @@ fn spawn_at(
         ..Default::default()
     };
     let mut process = PROCESS_INFORMATION::default();
+    let register_route = !update && target == crate::launch_recipe::Target::Backend;
     // CreateProcessAsUser otherwise opens the cwd/image as the calling SYSTEM
     // service, not hToken's user. CLI/reopen may have a user-only directory or
     // per-logon drive mapping. Use the documented target-user file-access context
@@ -401,7 +402,11 @@ fn spawn_at(
             ptr::null(),
             ptr::null(),
             0,
-            CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS,
+            CREATE_UNICODE_ENVIRONMENT
+                | DETACHED_PROCESS
+                | CREATE_NEW_PROCESS_GROUP
+                | NORMAL_PRIORITY_CLASS
+                | if register_route { CREATE_SUSPENDED } else { 0 },
             environment.as_ptr().cast(),
             directory.as_ptr(),
             &startup,
@@ -414,8 +419,38 @@ fn spawn_at(
         std::process::abort();
     }
     created.map_err(|e| context("CreateProcessAsUserW(backend entry)", e))?;
-    drop(Handle::new(process.hThread)?);
-    drop(Handle::new(process.hProcess)?);
+    let thread = Handle::new(process.hThread)?;
+    let child = Handle::new(process.hProcess)?;
+    if register_route {
+        // Pin the exact service-created --service process before any user code
+        // executes. UIAccess/path/parent scans alone cannot mint a route grant.
+        crate::launch_recipe::registered_backend(
+            || console::register(&child, id, user),
+            || {
+                // A console transition during creation invalidates this launch.
+                // SAFETY: read-only query and owned suspended primary thread.
+                if unsafe { WTSGetActiveConsoleSessionId() } != id {
+                    return Err(denied());
+                }
+                // SAFETY: owned primary thread of our still-suspended child.
+                if unsafe { ResumeThread(thread.0) } == u32::MAX {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            },
+            || {
+                // SAFETY: our suspended child has not run; termination failure
+                // is returned explicitly rather than claiming cleanup succeeded.
+                unsafe {
+                    check(TerminateProcess(child.0, 1))?;
+                    if WaitForSingleObject(child.0, 2500) != WAIT_OBJECT_0 {
+                        return Err(io::Error::other("suspended backend termination unconfirmed"));
+                    }
+                }
+                Ok(())
+            },
+        )?;
+    }
     Ok(process.dwProcessId)
 }
 fn integrity(token: HANDLE) -> io::Result<u32> {

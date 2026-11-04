@@ -331,13 +331,14 @@ impl AgentConfig {
         displays: impl IntoIterator<Item = (&'a str, bool)>,
     ) -> anyhow::Result<bool> {
         let mut preferences = self.settings.screen_preferences.screens.clone();
-        for (display, is_virtual) in displays {
+        for (display, _is_virtual) in displays {
             if !preferences.iter().any(|screen| screen.display == display) {
                 preferences.push(ScreenPreference {
                     remote_gain: 1.0,
                     display: display.to_owned(),
                     gain: 1.0,
-                    enabled: !is_virtual,
+                    // Display classification is not a user visibility choice.
+                    enabled: true,
                 });
             }
         }
@@ -1215,16 +1216,16 @@ mod tests {
                 .unwrap()
         );
         assert!(config.settings.screen_preferences.screens[0].enabled);
-        assert!(!config.settings.screen_preferences.screens[1].enabled);
+        assert!(config.settings.screen_preferences.screens[1].enabled);
         config
-            .update(|s| s.screen_preferences.screens[1].enabled = true)
+            .update(|s| s.screen_preferences.screens[1].enabled = false)
             .unwrap();
         let revision = config.owner().revision(LocalOption::ScreenPreferences).unwrap();
         assert!(!config.seed_screen_preferences([("virtual", true)]).unwrap());
         assert_eq!(config.owner().revision(LocalOption::ScreenPreferences), Some(revision));
         let reloaded = AgentConfig::load_from(dir.path()).unwrap();
         assert_eq!(reloaded.settings.screen_preferences.screens.len(), 2);
-        assert!(reloaded.settings.screen_preferences.screens[1].enabled);
+        assert!(!reloaded.settings.screen_preferences.screens[1].enabled);
     }
     #[test]
     fn typed_edit_bumps_only_changed_owner_options_and_keeps_other_values() {

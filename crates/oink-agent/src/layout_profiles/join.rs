@@ -23,6 +23,10 @@ pub(super) struct Join {
     pub acceptor: DeviceKey,
     pub joining_member: bool,
     pub catalog: Option<Catalog>,
+    #[serde(default)]
+    pub source_members: std::collections::BTreeSet<DeviceKey>,
+    #[serde(default)]
+    pub target_members: std::collections::BTreeSet<DeviceKey>,
 }
 fn failure(e: impl std::fmt::Display) -> ProfileError {
     ProfileError::new(ErrorCode::PersistenceFailed, format!("Profile join: {e}"))
@@ -112,7 +116,7 @@ pub(super) fn awaiting_catalog(root: &Path, group: GroupKey) -> Result<Option<Ca
     Err(failure("cyclic retained catalog handoff"))
 }
 impl Node {
-    pub(crate) fn prepare_profile_join(&self, intent: &dto::MergeIntent) -> Result<()> {
+    pub(crate) fn prepare_profile_join(&self, intent: &dto::MergeIntent, target_base: &dto::GroupState) -> Result<()> {
         let id = intent
             .merge_id()
             .map_err(wire::invalid)?
@@ -172,6 +176,28 @@ impl Node {
                 acceptor,
                 joining_member,
                 catalog,
+                source_members: intent
+                    .members()
+                    .map_err(wire::invalid)?
+                    .0
+                    .iter()
+                    .map(|m| {
+                        oink_network::wire_identity::read_device(&m.device().map_err(wire::invalid)?)
+                            .map(DeviceKey)
+                            .map_err(wire::invalid)
+                    })
+                    .collect::<Result<_>>()?,
+                target_members: oink_network::roster::Roster::verify(
+                    target_base.roster().map_err(wire::invalid)?,
+                    oink_network::roster::Anchor {
+                        group: target.0,
+                        root: target_base.roster().and_then(|r| r.root_id()).map_err(wire::invalid)?.0,
+                    },
+                )
+                .map_err(wire::invalid)?
+                .members()
+                .map(|m| DeviceKey(m.device))
+                .collect(),
             },
         )
     }
@@ -195,5 +221,37 @@ impl Node {
             }
         }
         Ok(pending)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn completed_older_join_bindings_do_not_block_listing_new_pending_joins() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "cd".repeat(32);
+        let target = GroupKey(oink_foundation::GroupId([2; 16]));
+        let old = Join {
+            id: id.clone(),
+            source: GroupKey(oink_foundation::GroupId([1; 16])),
+            target,
+            initiator: DeviceKey(oink_foundation::DeviceId([1; 32])),
+            acceptor: DeviceKey(oink_foundation::DeviceId([2; 32])),
+            joining_member: false,
+            catalog: None,
+            source_members: Default::default(),
+            target_members: Default::default(),
+        };
+        let mut raw = serde_json::to_value(&old).unwrap();
+        raw.as_object_mut().unwrap().remove("source_members");
+        raw.as_object_mut().unwrap().remove("target_members");
+        std::fs::create_dir_all(dir.path().join("layout-profile-joins")).unwrap();
+        std::fs::write(path(dir.path(), &id), serde_json::to_vec(&raw).unwrap()).unwrap();
+        let joins = list(dir.path(), target).unwrap();
+        assert_eq!(joins.len(), 1);
+        assert!(joins[0].catalog.is_none());
+        assert!(joins[0].source_members.is_empty());
+        assert!(joins[0].target_members.is_empty());
     }
 }

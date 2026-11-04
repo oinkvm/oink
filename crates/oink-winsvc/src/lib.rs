@@ -21,3 +21,8 @@ mod isolation_tests;
 
 #[cfg(any(windows, test))]
 mod token_policy;
+
+#[cfg(any(windows, test))]
+mod console_policy;
+#[cfg(any(windows, test))]
+mod prelogin_route;

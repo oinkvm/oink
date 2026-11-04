@@ -84361,6 +84361,45 @@
       "file": "dto-ControlLockRemoteWindows.hex",
       "kind": "dto",
       "schema": "ControlLockRemoteWindows"
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          "2": {
+            "list": []
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-LayoutProfileJoinAppends.hex",
+      "kind": "dto",
+      "schema": "LayoutProfileJoinAppends"
     }
   ],
   "frozen": false,
@@ -84373,5 +84412,5 @@
     "reliable_frame": 16384
   },
   "revision": "2026-10-15-ui-freeze",
-  "schema_sha256": "439fad0fb474b0d401593a18cce2fb528f1c045aff7b2687e6a964b77e1df785"
+  "schema_sha256": "7c377029c3179a7f2105bda5af0497c8e4330dcf5a8f8e8eb27def71d49a01b6"
 }

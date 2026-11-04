@@ -1279,7 +1279,7 @@ mod integration_tests {
                     .set(Mutex::new(Instant::now()))
                     .unwrap();
             }
-            let source_default = crate::layout_profiles::model::default_id(a.group_id().unwrap().into());
+            let target_default = crate::layout_profiles::model::default_id(b.group_id().unwrap().into());
             a.inner
                 .profiles
                 .defer_catalogs
@@ -1290,7 +1290,7 @@ mod integration_tests {
             })
             .await;
             let nodes = [&a, &b];
-            let mut handoff = std::pin::pin!(common::profile_handoff(&nodes, &source_default));
+            let mut handoff = std::pin::pin!(common::profile_handoff(&nodes, &target_default));
             if delay_catalog {
                 let observed =
                     std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(handoff.as_mut(), cx)))

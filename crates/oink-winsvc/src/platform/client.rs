@@ -43,6 +43,7 @@ struct Connection {
     sending: Option<(u32, std::time::Instant)>,
     _pipe: pipe_io::SharedPipe,
     _peer: Handle,
+    target_session: Option<u32>,
 }
 // SAFETY: the single owner transfers these pinned I/O buffers, never shares them.
 unsafe impl Send for Connection {}
@@ -53,62 +54,21 @@ struct Endpoint {
 }
 static OWNER: Mutex<Option<Arc<Client>>> = Mutex::new(None);
 static PAUSED: AtomicBool = AtomicBool::new(false);
-static IN_PROCESS: AtomicBool = AtomicBool::new(false);
-/// Inject through the helper's lanes inside this process instead of the session
-/// helper's pipe. Only the SYSTEM pre-login backend calls this, at entry, before
-/// any input request; the protected-install selection and every caller are unchanged.
+static PRELOGIN_ROUTE: AtomicBool = AtomicBool::new(false);
+static PRELOGIN_RELEASED: AtomicBool = AtomicBool::new(false);
+/// Select the service-authorized route to the active console helper. The helper
+/// independently authenticates this process against the broker's pinned child.
+pub fn use_prelogin_route() {
+    PRELOGIN_ROUTE.store(true, Ordering::Release);
+}
+/// Kept for source compatibility; pre-login injection now always crosses the
+/// separate SYSTEM-only pipe and never uses the network process's session.
 pub fn use_in_process_helper() {
-    IN_PROCESS.store(true, Ordering::Release);
+    use_prelogin_route();
 }
-/// In-process transport: requests go straight to the helper's lanes.
-struct InProcess {
-    server: crate::helper::Server,
-    generation: u64,
-    wake: pipe_io::Signal,
-}
-impl Transport for InProcess {
-    fn send(&mut self, request: Request) -> io::Result<bool> {
-        if request.command == Command::Heartbeat {
-            // The lease heartbeat guards a remote pipe peer; there is none here.
-            return Ok(true);
-        }
-        if self.generation == 0 {
-            self.generation = self.server.begin();
-        }
-        self.server.submit(crate::helper::Work {
-            generation: self.generation,
-            request,
-        })?;
-        Ok(true)
-    }
-    fn receive(&mut self) -> io::Result<Option<Reply>> {
-        while let Some(result) = self.server.receive() {
-            if result.generation == self.generation {
-                return Ok(Some(result.reply));
-            }
-        }
-        Ok(None)
-    }
-    fn wait(&mut self, timeout: Duration) -> io::Result<()> {
-        let milliseconds = timeout.as_millis() + u128::from(!timeout.subsec_nanos().is_multiple_of(1_000_000));
-        // SAFETY: owned auto-reset event, bounded wait.
-        if unsafe { WaitForSingleObject(self.wake.handle(), milliseconds.min(u128::from(u32::MAX)) as u32) }
-            == WAIT_FAILED
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-    fn connected(&self) -> bool {
-        self.generation != 0
-    }
-    fn disconnect(&mut self) {
-        // A generation change is the native owner's release barrier.
-        self.server.disconnect();
-        self.generation = 0;
-    }
-}
+
 pub fn initialize() -> io::Result<()> {
+    PRELOGIN_RELEASED.store(false, Ordering::Release);
     PAUSED.store(false, Ordering::Release);
     owner().map(|_| ())
 }
@@ -131,31 +91,29 @@ pub fn suspend() {
         owner.take()
     };
     if let Some(owner) = owner {
+        if PRELOGIN_ROUTE.load(Ordering::Acquire) {
+            // stop_injection_session runs after the injection FIFO drains. This
+            // final native ACK, not an earlier release racing queued Downs, is
+            // the handoff proof consumed after the host has fully shut down.
+            let result = owner
+                .request(Command::Release, false, false)
+                .and_then(|reply| reply.ok_or_else(|| io::Error::other("missing release ACK")))
+                .and_then(status);
+            PRELOGIN_RELEASED.store(result.is_ok(), Ordering::Release);
+            if let Err(error) = result {
+                tracing::error!(%error, "pre-login final release failed");
+            }
+        }
         owner.shutdown();
     }
+}
+/// Read after the input owner has stopped, never while it can enqueue new input.
+pub fn prelogin_shutdown_confirmed() -> bool {
+    PRELOGIN_RELEASED.load(Ordering::Acquire)
 }
 fn create_owner() -> io::Result<Client> {
     let wake = pipe_io::Signal::new()?;
     let signal = wake.clone();
-    if IN_PROCESS.load(Ordering::Acquire) {
-        let notify: crate::owner::Wake = std::sync::Arc::new(move || signal.notify());
-        let server = super::server::in_process(notify.clone())?;
-        return Client::new(
-            InProcess {
-                server,
-                generation: 0,
-                wake,
-            },
-            notify,
-            || {
-                oink_foundation::realtime::apply(
-                    oink_foundation::realtime::ThreadRole::Inject,
-                    oink_foundation::realtime::Tier::Realtime,
-                )
-                .map(|_| ())
-            },
-        );
-    }
     Client::new(
         Endpoint {
             connection: None,
@@ -173,11 +131,21 @@ fn create_owner() -> io::Result<Client> {
     )
 }
 impl Connection {
+    fn check_target(&self) -> io::Result<()> {
+        // SAFETY: read-only console observation; an old ACK is not new-target success.
+        if self.target_session.is_some_and(|id| unsafe {
+            windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId() != id
+        }) {
+            return Err(io::Error::other("active input target changed; not replayed"));
+        }
+        Ok(())
+    }
     fn arm(&mut self) -> io::Result<()> {
         // SAFETY: pinned Box response lives until reader cancellation/completion.
         unsafe { self.reader.read(&mut *self.response) }
     }
     fn start_write(&mut self) -> io::Result<()> {
+        self.check_target()?;
         if self.sending.is_none()
             && let Some(request) = self.outgoing.pop()
         {
@@ -211,6 +179,7 @@ impl Transport for Endpoint {
             }
         }
         let c = self.connection.as_mut().expect("connected");
+        c.check_target()?;
         // Only two request flights plus one heartbeat can exist. Keep message
         // writes ordered, but NEVER wait for an ordinary write on this owner:
         // an input ACK/read may be ready while that kernel write is pending.
@@ -253,6 +222,7 @@ impl Transport for Endpoint {
         let Some(c) = self.connection.as_mut() else {
             return Ok(None);
         };
+        c.check_target()?;
         // SAFETY: read-only, nonblocking test of the owned completion event.
         if unsafe { WaitForSingleObject(c.reader.event(), 0) } != WAIT_OBJECT_0 {
             return Ok(None);
@@ -296,13 +266,23 @@ impl Transport for Endpoint {
     }
 }
 fn connect() -> io::Result<Connection> {
-    let id = session()?;
+    let own = session()?;
+    // A foreign console uses the separate broker-authorized endpoint. The
+    // unchanged user pipe never accepts another session's SID or PID. Choosing
+    // this name grants nothing: the helper requires the registered source.
+    // SAFETY: read-only physical console query.
+    let active = unsafe { windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId() };
+    let routed = PRELOGIN_ROUTE.load(Ordering::Acquire) || active != own;
+    let id = if routed { active } else { own };
+    if id == 0 || id == u32::MAX {
+        return Err(denied());
+    }
     // Exact rights exclude FILE_CREATE_PIPE_INSTANCE; identification impersonation allows
     // token identity inspection, never impersonation capable of acting as the user.
     // SAFETY: local fixed pipe name, non-inherited handle, existing object only.
     let pipe = Handle::new(unsafe {
         CreateFileW(
-            pipe_name(id).as_ptr(),
+            if routed { prelogin_pipe_name(id) } else { pipe_name(id) }.as_ptr(),
             FILE_READ_DATA
                 | FILE_WRITE_DATA
                 | FILE_READ_ATTRIBUTES
@@ -316,11 +296,17 @@ fn connect() -> io::Result<Connection> {
             ptr::null_mut(),
         )
     })
-    .map_err(|e| context("CreateFileW(input pipe)", e))?;
+    .map_err(|e| {
+        let error = context(&format!("CreateFileW(input pipe target={id})"), e);
+        if routed { non_absence(error) } else { error }
+    })?;
     let mode = PIPE_READMODE_MESSAGE | PIPE_WAIT;
     // SAFETY: valid connected pipe; mode pointer exists for call duration.
     check(unsafe { SetNamedPipeHandleState(pipe.0, &mode, ptr::null(), ptr::null()) })
         .map_err(|e| non_absence(context("SetNamedPipeHandleState", e)))?;
+    if routed {
+        security::service_pipe_security(pipe.0).map_err(non_absence)?;
+    }
     let peer = security::peer(pipe.0, id, true).map_err(non_absence)?;
     let pipe = pipe_io::SharedPipe::new(pipe);
     let reader = pipe_io::OwnedOperation::new(pipe.clone())?;
@@ -333,6 +319,7 @@ fn connect() -> io::Result<Connection> {
         sending: None,
         _pipe: pipe,
         _peer: peer,
+        target_session: Some(id),
     };
     connection.arm()?;
     Ok(connection)
@@ -354,13 +341,19 @@ fn status(reply: Reply) -> io::Result<ServiceStatus> {
         n(crate::wire::REPLY_PRIORITY_OFFSET) as i32,
         std::sync::atomic::Ordering::Release,
     );
+    let end = reply[20..84].iter().position(|b| *b == 0).unwrap_or(64);
     if n(0) != 0 {
         return Err(context(
-            crate::wire::error_stage_name(n(84)),
+            &format!(
+                "{} helper={} target={} desktop={}",
+                crate::wire::error_stage_name(n(84)),
+                n(4),
+                n(8),
+                String::from_utf8_lossy(&reply[20..20 + end])
+            ),
             io::Error::from_raw_os_error(n(0) as i32),
         ));
     }
-    let end = reply[20..84].iter().position(|b| *b == 0).unwrap_or(64);
     Ok(ServiceStatus {
         pid: n(4),
         session: n(8),
@@ -404,6 +397,7 @@ pub(super) fn private_pipe_client(pipe: Handle) -> io::Result<Client> {
         _pipe: pipe,
         // SAFETY: our own process, SYNCHRONIZE only, non-inherited test pin.
         _peer: Handle::new(unsafe { OpenProcess(SYNCHRONIZE, 0, GetCurrentProcessId()) })?,
+        target_session: None,
     };
     connection.arm()?;
     let wake = pipe_io::Signal::new()?;

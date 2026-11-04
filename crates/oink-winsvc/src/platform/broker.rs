@@ -58,35 +58,46 @@ unsafe extern "system" fn main(_argc: u32, _argv: *mut *mut u16) {
     status(handle, SERVICE_RUNNING, 0);
     let launcher = thread::spawn(super::backend::serve);
     let updater = thread::spawn(super::update::serve);
-    let mut child: Option<Child> = None;
+    let mut helpers = crate::prelogin_route::Route::<Child>::new();
     while !STOP.load(Ordering::Acquire) {
         // SAFETY: querying active physical session, no state mutation.
         let id = unsafe { WTSGetActiveConsoleSessionId() };
-        let replace = child
-            .as_ref()
-            .is_some_and(|c| c.id != id || !c.alive() || security::user_sid(id).ok().as_ref() != Some(&c.user_sid));
-        if replace {
-            child.take();
-        }
-        if super::update::input_allowed()
-            && child.is_none()
-            && id != 0
-            && id != u32::MAX
-            && security::user_sid(id).is_ok()
-        {
-            match spawn(id) {
-                Ok(c) => child = Some(c),
-                Err(e) => eprintln!("Oink input helper start failed: {e}"),
-            }
-        }
-        // The pre-login backend runs only while the console has no user; the
-        // launch server stops it again before creating any user backend.
+        // Network ownership and input-target ownership are independent. The
+        // original pre-login process survives console changes; only this helper
+        // moves. Holding the old helper until its stop/cleanup result prevents
+        // two sessions accepting input concurrently.
         super::prelogin::tick();
+        let route = match super::prelogin::route_identity() {
+            Ok(route) => route,
+            Err(error) => {
+                eprintln!("Oink pre-login route identity failed: {error}");
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+        };
+        let account = console::account(id);
+        let route = console::select(id, &account, route);
+        // User sources keep the existing session-bound pipe while on their own
+        // console. Only the temporary-session exception uses the routed endpoint.
+        let route = route.filter(|s| s.user_sid.is_none() || s.identity.session != id);
+        let desired = super::update::input_allowed().then_some(crate::prelogin_route::Target {
+            session: id,
+            source: route,
+            user_sid: match account {
+                crate::console_policy::Account::User(sid) => Some(sid),
+                _ => None,
+            },
+        });
+        if let Err(error) = helpers.update(desired, spawn) {
+            eprintln!("Oink input helper transition failed: {error}");
+        }
         thread::sleep(Duration::from_millis(250));
     }
     status(handle, SERVICE_STOP_PENDING, 0);
-    super::prelogin::stop();
-    drop(child);
+    if let Err(error) = super::prelogin::stop() {
+        eprintln!("Oink pre-login stop failed: {error}");
+    }
+    drop(helpers);
     let _ = launcher.join();
     let _ = updater.join();
     status(handle, SERVICE_STOPPED, 0);
@@ -107,27 +118,59 @@ pub(super) fn run() -> io::Result<()> {
     check(unsafe { StartServiceCtrlDispatcherW(table.as_ptr()) })
 }
 struct Child {
-    id: u32,
-    user_sid: Vec<u8>,
+    target: crate::prelogin_route::Target,
+    stopped: bool,
     process: Handle,
     stop: Handle,
 }
-impl Child {
+impl crate::prelogin_route::Helper for Child {
+    fn target(&self) -> &crate::prelogin_route::Target {
+        &self.target
+    }
     fn alive(&self) -> bool {
         // SAFETY: owned process handle, nonblocking query.
         unsafe { WaitForSingleObject(self.process.0, 0) == WAIT_TIMEOUT }
     }
+    fn session_ended(&self) -> bool {
+        // Windows 10 22H2 logoff terminates this SYSTEM child with 0x40010004
+        // before native cleanup can ACK. Keeping Route.failed forever then
+        // disables every later login screen. Retire only after the pinned
+        // process is signalled AND WTS successfully reports its session gone;
+        // FUS/disconnection, missing user tokens and query errors do not qualify.
+        // No old input is replayed, and same-session release failures stay closed.
+        // SAFETY: retained process handle; a failed wait is not an exit proof.
+        let exited = unsafe { WaitForSingleObject(self.process.0, 0) == WAIT_OBJECT_0 };
+        exited && matches!(console::session_exists(self.target.session), Ok(false))
+    }
+    fn stop(&mut self) -> io::Result<()> {
+        if self.stopped {
+            return Ok(());
+        }
+        // SAFETY: owned event/process; do not create a replacement unless old
+        // native cleanup returned and the old process exited normally.
+        unsafe {
+            check(SetEvent(self.stop.0))?;
+            if WaitForSingleObject(self.process.0, 2500) != WAIT_OBJECT_0 {
+                check(TerminateProcess(self.process.0, 1))?;
+                WaitForSingleObject(self.process.0, 500);
+                return Err(io::Error::other("helper stop/release timed out"));
+            }
+            let mut exit = 1;
+            check(GetExitCodeProcess(self.process.0, &mut exit))?;
+            if exit != 0 {
+                return Err(io::Error::other(format!(
+                    "helper release failed: session={} exit={exit:#010x}",
+                    self.target.session
+                )));
+            }
+        }
+        self.stopped = true;
+        Ok(())
+    }
 }
 impl Drop for Child {
     fn drop(&mut self) {
-        // SAFETY: owned event/process; give helper time to release keys before final bounded cleanup.
-        unsafe {
-            SetEvent(self.stop.0);
-            if WaitForSingleObject(self.process.0, 2500) == WAIT_TIMEOUT {
-                TerminateProcess(self.process.0, 1);
-                WaitForSingleObject(self.process.0, 500);
-            }
-        }
+        let _ = crate::prelogin_route::Helper::stop(self);
     }
 }
 pub(super) fn privilege(t: HANDLE, name: &str) -> io::Result<()> {
@@ -194,13 +237,22 @@ pub(super) fn session_system_token(id: u32) -> io::Result<Handle> {
     })?;
     Ok(primary)
 }
-fn spawn(id: u32) -> io::Result<Child> {
+fn spawn(target: crate::prelogin_route::Target) -> io::Result<Child> {
+    let id = target.session;
+    let route = target.source.as_ref();
     let path = security::install_dir()?.join("oink-service.exe");
     security::protected_file(&path)?;
     let primary = session_system_token(id)?;
     // Client may query the helper token and process for reverse authentication, but cannot
     // duplicate/adjust its token, write its memory, suspend it or create threads in it.
-    let process_sd = security::identity_security(id, PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE)?;
+    let process_sd = if let Some(source) = route {
+        match &source.user_sid {
+            Some(sid) => security::sid_security(sid, PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE)?,
+            None => security::system_security()?,
+        }
+    } else {
+        security::identity_security(id, PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE)?
+    };
     // The helper grants TOKEN_QUERY on its actual process token before exposing the pipe.
     // Windows does not preserve the source primary token object's DACL when assigning
     // the newly-created process token (verified on Windows with a medium-integrity client).
@@ -216,8 +268,22 @@ fn spawn(id: u32) -> io::Result<Child> {
     let app = wide(path.to_str().ok_or_else(denied)?);
     // SAFETY: read-only own process ID.
     let pid = unsafe { GetCurrentProcessId() };
-    let mut cmd = wide(&format!("\"{}\" --helper {pid}", path.display()));
-    let mut desktop = wide(r"winsta0\default");
+    let mut cmd = wide(&match route {
+        Some(source) => {
+            use base64::Engine;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(source)?);
+            format!("\"{}\" --routed-helper {encoded}", path.display())
+        }
+        None => format!("\"{}\" --helper {pid}", path.display()),
+    });
+    // Before sign-in, Winlogon is the established desktop (as for the source
+    // process). This helper creates no windows/hooks; its native owner then
+    // follows OpenInputDesktop. The user helper keeps its existing Default entry.
+    let mut desktop = wide(if route.is_some() {
+        r"winsta0\Winlogon"
+    } else {
+        r"winsta0\default"
+    });
     let si = STARTUPINFOW {
         cb: size_of::<STARTUPINFOW>() as u32,
         lpDesktop: desktop.as_mut_ptr(),
@@ -245,9 +311,9 @@ fn spawn(id: u32) -> io::Result<Child> {
     let process = Handle::new(pi.hProcess)?;
     drop(Handle::new(pi.hThread)?);
     Ok(Child {
-        id,
+        target,
         process,
         stop,
-        user_sid: security::user_sid(id)?,
+        stopped: false,
     })
 }

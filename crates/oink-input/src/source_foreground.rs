@@ -6,7 +6,8 @@ pub(crate) trait Native {
     fn show_capture(&mut self);
     fn hide_capture(&mut self);
     fn minimized(&self, window: Self::Window) -> bool;
-    fn restore(&mut self, window: Self::Window);
+    /// Queue a restore without activating when the target UI thread handles it.
+    fn restore_without_activation(&mut self, window: Self::Window);
     /// Native implementations log a refused attempt, without retrying it.
     fn activate(&mut self, window: Self::Window);
 }
@@ -31,7 +32,10 @@ impl<W: Copy + Eq> Lease<W> {
                 && native.valid(previous)
             {
                 if native.minimized(previous) {
-                    native.restore(previous);
+                    // The other UI thread may process this after a new application
+                    // takes foreground. Only the immediate request below may activate;
+                    // the deferred show must preserve whichever window is then foreground.
+                    native.restore_without_activation(previous);
                 }
                 native.activate(previous);
             }
@@ -50,6 +54,7 @@ mod tests {
         closed: bool,
         refuse: bool,
         actions: Vec<(&'static str, u64)>,
+        pending_restores: Vec<(u64, bool)>,
     }
     impl Native for Desktop {
         type Window = u64;
@@ -68,9 +73,10 @@ mod tests {
         fn minimized(&self, _: u64) -> bool {
             self.minimized
         }
-        fn restore(&mut self, window: u64) {
+        fn restore_without_activation(&mut self, window: u64) {
             self.actions.push(("restore", window));
-            self.minimized = false;
+            // Model both native show modes, including their delayed activation.
+            self.pending_restores.push((window, false));
         }
         fn activate(&mut self, window: u64) {
             self.actions.push(("activate", window));
@@ -79,9 +85,74 @@ mod tests {
             }
         }
     }
+    impl Desktop {
+        fn complete_restores(&mut self) {
+            for (window, activate) in self.pending_restores.drain(..) {
+                self.minimized = false;
+                if activate {
+                    self.foreground = Some(window);
+                }
+            }
+        }
+    }
+    fn departing() -> (Lease<u64>, Desktop) {
+        let mut lease = Lease::default();
+        let mut native = Desktop {
+            foreground: Some(1),
+            ..Default::default()
+        };
+        lease.update(true, 2, &mut native);
+        (lease, native)
+    }
+    #[test]
+    fn third_party_foreground_before_return_is_preserved_without_restoring_the_previous_window() {
+        let (mut lease, mut native) = departing();
+        native.foreground = Some(3);
+        native.minimized = true;
+        lease.update(false, 2, &mut native);
+        assert_eq!(&native.actions[2..], [("hide", 2)]);
+        assert!(native.pending_restores.is_empty());
+        assert_eq!(native.foreground, Some(3));
+        assert!(lease.previous.is_none());
+    }
+    #[test]
+    fn capture_still_foreground_restores_the_previous_window() {
+        let (mut lease, mut native) = departing();
+        lease.update(false, 2, &mut native);
+        assert_eq!(&native.actions[2..], [("activate", 1), ("hide", 2)]);
+        assert_eq!(native.foreground, Some(1));
+    }
+    #[test]
+    fn destroyed_previous_window_is_neither_restored_nor_activated() {
+        let (mut lease, mut native) = departing();
+        native.closed = true;
+        native.minimized = true;
+        lease.update(false, 2, &mut native);
+        assert_eq!(&native.actions[2..], [("hide", 2)]);
+        assert!(native.pending_restores.is_empty());
+    }
+    #[test]
+    fn delayed_restore_cannot_steal_foreground_from_a_new_application() {
+        let (mut lease, mut native) = departing();
+        native.minimized = true;
+        lease.update(false, 2, &mut native);
+        assert_eq!(native.pending_restores, [(1, false)]);
+        // The old UI thread has not consumed its restore request yet. A new
+        // application finishes starting and obtains foreground in the meantime.
+        native.foreground = Some(3);
+        native.complete_restores();
+        assert!(!native.minimized);
+        assert_eq!(native.foreground, Some(3));
+    }
     #[test]
     fn takes_once_and_restores_a_minimized_application_only_while_still_foreground() {
-        for (current, closed) in [(Some(2), false), (Some(3), false), (Some(2), true)] {
+        for (current, closed) in [
+            (Some(2), false),
+            (Some(3), false),
+            (Some(1), false),
+            (None, false),
+            (Some(2), true),
+        ] {
             let mut lease = Lease::default();
             let mut native = Desktop {
                 foreground: Some(1),

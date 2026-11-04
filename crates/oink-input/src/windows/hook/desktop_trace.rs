@@ -119,7 +119,14 @@ pub(super) fn capture_desktop_active() -> bool {
         .is_ok();
         let _ = CloseDesktop(desktop);
         let length = name.iter().position(|c| *c == 0).unwrap_or(name.len());
-        result && name[..length].iter().copied().eq(expected.encode_utf16())
+        use windows::Win32::System::{
+            RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId},
+            Threading::GetCurrentProcessId,
+        };
+        let mut own_session = 0;
+        let active = ProcessIdToSessionId(GetCurrentProcessId(), &mut own_session).is_ok()
+            && WTSGetActiveConsoleSessionId() == own_session;
+        result && super::super::profile::current().source_allowed(&String::from_utf16_lossy(&name[..length]), active)
     }
 }
 

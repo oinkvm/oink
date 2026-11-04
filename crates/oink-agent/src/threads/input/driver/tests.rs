@@ -3373,3 +3373,28 @@ fn source_foreground_driver_restores_on_normal_return_and_delegates_application_
     assert_eq!(done.load(Ordering::Acquire), 1);
     assert_eq!(backend.source_foreground_requests(), [true, false]);
 }
+
+#[test]
+fn unavailable_injection_target_withdraws_capability_and_faults_both_resources() {
+    use oink_protocol::v1::dto::ResourceFaultCode as Fault;
+    let mut h = Harness::new();
+    h.driver.command(InputCommand::InjectionAvailable(Some(false)));
+    assert_eq!(h.driver.notices.take(), Some(InputNotice::Controllable(false)));
+    assert_eq!(h.driver.resource_faults().mouse, Some(Fault::BackendFailed));
+    assert_eq!(h.driver.resource_faults().keyboard, Some(Fault::BackendFailed));
+    let (mut read, _) = h.outbound(1);
+    assert!(matches!(
+        drain(&mut read)[0],
+        Message::Control(ControlMsg::InputCapability {
+            controllable: false,
+            ..
+        })
+    ));
+    // Target recovery cannot manufacture capture permission.
+    h.driver.command(InputCommand::Controllable(false));
+    h.driver.command(InputCommand::InjectionAvailable(Some(true)));
+    assert!(!h.driver.controllable);
+    h.driver.command(InputCommand::Controllable(true));
+    assert!(h.driver.controllable);
+    assert_eq!(h.driver.resource_faults().keyboard, Some(Fault::None));
+}

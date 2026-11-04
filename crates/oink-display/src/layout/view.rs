@@ -19,7 +19,7 @@ pub struct ScreenView {
     pub primary: bool,
     /// 内建屏（笔记本屏幕）。
     pub builtin: bool,
-    /// 用户是否启用（虚拟显示器默认不启用）。
+    /// 用户是否启用。新屏幕的初始可见性由 owner 设置层提供。
     pub enabled: bool,
     /// 所属设备是否在线：`false` 时画成「熄屏」样式（位置不变，但不参与穿越）。
     pub online: bool,

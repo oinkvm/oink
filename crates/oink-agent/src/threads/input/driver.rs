@@ -100,6 +100,8 @@ pub(super) struct Driver {
     projection_until: Option<Instant>,
     overlay_escape: Option<(u64, Instant)>,
     controllable: bool,
+    permission_controllable: bool,
+    injection_available: Option<bool>,
     stopping: bool,
     start: Instant,
     now: Instant,
@@ -284,6 +286,8 @@ impl Driver {
             projection_until: None,
             overlay_escape: None,
             controllable: true,
+            permission_controllable: true,
+            injection_available: None,
             stopping: false,
             start: now,
             now,
@@ -453,15 +457,35 @@ impl Driver {
     fn resource_faults(&self) -> super::ResourceFaults {
         use oink_protocol::v1::dto::ResourceFaultCode;
         let native = self.inject.resource_faults();
+        let target = self.injection_available.map(|available| {
+            if available {
+                ResourceFaultCode::None
+            } else {
+                ResourceFaultCode::BackendFailed
+            }
+        });
         super::ResourceFaults {
             screen: super::faults::combine(native.screen, self.display_fault),
-            mouse: super::faults::combine(native.mouse, self.capture_fault),
+            mouse: super::faults::combine(target, super::faults::combine(native.mouse, self.capture_fault)),
             keyboard: if self.environment.secure_input {
                 Some(ResourceFaultCode::SecureInput)
             } else {
-                self.capture_fault
+                super::faults::combine(target, self.capture_fault)
             },
         }
+    }
+    fn update_controllable(&mut self) {
+        let controllable = self.permission_controllable && self.injection_available != Some(false);
+        if !controllable {
+            self.capture_fault = None;
+        }
+        if self.controllable != controllable {
+            self.notices.post(InputNotice::Controllable(controllable));
+        }
+        self.controllable = controllable;
+        self.adapter
+            .router_mut()
+            .set_paused(self.paused || self.environment.system_sleeping || !controllable);
     }
     fn owner_fence(
         &mut self,
@@ -927,16 +951,12 @@ impl Driver {
                     .set_paused(paused || self.environment.system_sleeping || !self.controllable);
             }
             InputCommand::Controllable(controllable) => {
-                if !controllable {
-                    self.capture_fault = None;
-                }
-                if self.controllable != controllable {
-                    self.notices.post(InputNotice::Controllable(controllable));
-                }
-                self.controllable = controllable;
-                self.adapter
-                    .router_mut()
-                    .set_paused(self.paused || self.environment.system_sleeping || !controllable);
+                self.permission_controllable = controllable;
+                self.update_controllable();
+            }
+            InputCommand::InjectionAvailable(available) => {
+                self.injection_available = available;
+                self.update_controllable();
             }
             InputCommand::FocusLock(locked) => self.adapter.router_mut().set_locked(locked),
             InputCommand::ReleaseOwnedFocusLock { reply } => {

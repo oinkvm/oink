@@ -86,6 +86,7 @@ impl Node {
                 drop(inner);
                 let mut last_preferences = None;
                 let mut last_permissions = None;
+                let mut last_injection = None;
                 let mut last_input_capabilities = None;
                 let mut last_feel = None;
                 let mut last_edges = None;
@@ -239,6 +240,14 @@ impl Node {
                         if last_input_capabilities != Some(capabilities) {
                             last_input_capabilities = Some(capabilities);
                             node.emit(ApiEvent::InputSettings(crate::agent_api::input_settings(&node)));
+                        }
+                        let injection = backend.injection_available();
+                        if last_injection != Some(injection) {
+                            if let Some(available) = injection {
+                                tracing::info!(available, "input target availability changed");
+                            }
+                            input.send(InputCommand::InjectionAvailable(injection));
+                            last_injection = Some(injection);
                         }
                         let permissions = backend.permissions();
                         environment.secure_input = permissions.secure_input_active;

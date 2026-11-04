@@ -14,6 +14,20 @@ pub(crate) fn uiaccess_token<T>(
     Ok(primary)
 }
 
+/// The suspended process becomes a routing authority before it runs. Any failed
+/// registration/resume consumes the unstarted process, not a partially live role.
+pub(crate) fn registered_backend(
+    register: impl FnOnce() -> io::Result<()>,
+    resume: impl FnOnce() -> io::Result<()>,
+    abort: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let result = register().and_then(|()| resume());
+    if result.is_err() {
+        abort()?;
+    }
+    result
+}
+
 pub(crate) fn validate_environment(environment: &[u16]) -> io::Result<()> {
     if environment.len() > crate::backend_launch::MAX_ENVIRONMENT
         || !environment.ends_with(&[0, 0])
@@ -79,6 +93,34 @@ pub(crate) fn dispatch(
 mod tests {
     use super::*;
     use std::cell::Cell;
+    #[test]
+    fn failed_registration_cannot_run_a_user_backend_or_leave_a_suspended_child() {
+        use std::cell::RefCell;
+        for fail in [None, Some("register"), Some("resume"), Some("abort")] {
+            let log = RefCell::new(Vec::new());
+            let step = |name| {
+                log.borrow_mut().push(name);
+                if fail == Some(name) || (fail == Some("abort") && name == "register") {
+                    Err(io::Error::other(name))
+                } else {
+                    Ok(())
+                }
+            };
+            let result = registered_backend(|| step("register"), || step("resume"), || step("abort"));
+            assert_eq!(result.is_ok(), fail.is_none());
+            assert_eq!(
+                *log.borrow(),
+                match fail {
+                    None => vec!["register", "resume"],
+                    Some("resume") => vec!["register", "resume", "abort"],
+                    _ => vec!["register", "abort"],
+                }
+            );
+            if fail == Some("abort") {
+                assert_eq!(result.unwrap_err().to_string(), "abort");
+            }
+        }
+    }
     #[test]
     fn update_relaunch_is_fixed_ordinary_ui_entry() {
         assert_eq!(Target::UpdateUi.argument(), "");

@@ -3,9 +3,11 @@ pub mod backend;
 mod backend_stop;
 mod broker;
 pub mod client;
+mod console;
 mod pipe_io;
 mod power;
 pub mod prelogin;
+mod prelogin_peer;
 mod security;
 mod server;
 mod service_peer;
@@ -70,12 +72,23 @@ fn session() -> io::Result<u32> {
 fn pipe_name(id: u32) -> Vec<u16> {
     wide(&format!(r"\\.\pipe\Oink.Input.v1.{id}"))
 }
+fn prelogin_pipe_name(id: u32) -> Vec<u16> {
+    wide(&format!(r"\\.\pipe\Oink.Prelogin.Input.v1.{id}"))
+}
 pub fn run() -> io::Result<()> {
     security::verify_self()?;
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [] => broker::run(),
-        [arg, pid] if arg == "--helper" => server::run(pid.parse().map_err(|_| denied())?),
+        [arg, pid] if arg == "--helper" => server::run(pid.parse().map_err(|_| denied())?, None),
+        [arg, encoded] if arg == "--routed-helper" => {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| denied())?;
+            let source: crate::prelogin_route::Source = serde_json::from_slice(&bytes).map_err(|_| denied())?;
+            server::run(source.identity.parent, Some(source))
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "no public command-line options",

@@ -200,8 +200,8 @@ fn run_checked() -> anyhow::Result<()> {
     oink_winsvc::prelogin::prepare_work().context("prepare pre-login working copy")?;
     crate::logs::init_prelogin();
     tracing::info!(session = entry.session, "pre-login backend starting");
-    // No helper exists before anyone signs in; inject through its lanes in-process.
-    oink_winsvc::client::use_in_process_helper();
+    // The broker selects the active console helper independently of this network session.
+    oink_winsvc::client::use_prelogin_route();
     let input = oink_input::prelogin_backend().map_err(|e| anyhow::anyhow!("input backend: {e}"))?;
     let display = oink_display::platform_backend().map_err(|e| anyhow::anyhow!("display backend: {e}"))?;
     let displays = display.displays().map_err(|e| anyhow::anyhow!("displays: {e}"))?;
@@ -233,8 +233,15 @@ fn run_checked() -> anyhow::Result<()> {
         })?;
     host.block_on(host.node().wait_for_stop());
     tracing::info!("pre-login backend stopping");
-    host.shutdown();
+    // Drain routing/injection and leave the group before confirming the final
+    // native release ACK. The service's 2.5 s deadline still bounds this exit;
+    // it never treats forced termination or an unconfirmed release as handoff.
+    host.shutdown_and_wait();
     drop(waiter);
+    anyhow::ensure!(
+        oink_winsvc::client::prelogin_shutdown_confirmed(),
+        "pre-login release barrier unconfirmed"
+    );
     Ok(())
 }
 

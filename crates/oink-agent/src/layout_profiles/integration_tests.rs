@@ -21,6 +21,7 @@ struct Displays {
     read_fail: std::sync::atomic::AtomicBool,
     watchers: Mutex<Vec<ChangeHandler>>,
     fail: std::sync::atomic::AtomicBool,
+    virtual_display: std::sync::atomic::AtomicBool,
 }
 impl Displays {
     fn new() -> Arc<Self> {
@@ -48,6 +49,7 @@ impl Displays {
             read_fail: std::sync::atomic::AtomicBool::new(false),
             watchers: Mutex::new(Vec::new()),
             fail: std::sync::atomic::AtomicBool::new(false),
+            virtual_display: std::sync::atomic::AtomicBool::new(false),
         })
     }
     fn changed(&self) {
@@ -71,7 +73,7 @@ impl DisplayBackend for Displays {
                 rotation_deg: 0,
                 is_primary: s.primary,
                 is_builtin: false,
-                is_virtual: false,
+                is_virtual: self.virtual_display.load(Ordering::SeqCst),
             })
             .collect())
     }
@@ -286,9 +288,9 @@ fn native_screen_preview_leaves_other_computers_fixed_for_frontend_release() {
         let db = Displays::new();
         let a = start(dirs[0].path(), da.clone()).await;
         let b = start(dirs[1].path(), db.clone()).await;
-        let source_default = query(&a).await.active_profile_id.unwrap();
+        let expected_default = query(&b).await.active_profile_id.unwrap();
         common::pair(&a, &b).await;
-        common::profile_handoff(&[&a, &b], &source_default).await;
+        common::profile_handoff(&[&a, &b], &expected_default).await;
         enable(&a, a.id().into(), "enable-native-edit").await;
         let state = query(&a).await;
         let mut placements = state.snapshot.as_ref().unwrap().placements.clone();
@@ -488,7 +490,7 @@ fn profiles_merge_and_sync_over_low_without_applying_native() {
         common::until("profile catalogs union and converge", || {
             let ca = lock(&a.inner.profiles.data).catalog.clone();
             let cb = lock(&b.inner.profiles.data).catalog.clone();
-            ca.as_ref().is_some_and(|c| c.profiles.len() == 3) && ca == cb
+            ca.as_ref().is_some_and(|c| c.profiles.len() == 2) && ca == cb
         })
         .await;
         assert_eq!(da.calls.load(Ordering::SeqCst) + db.calls.load(Ordering::SeqCst), 0);
@@ -511,7 +513,7 @@ fn profiles_merge_and_sync_over_low_without_applying_native() {
         })
         .await;
         // Exercise the larger catalog over the real Low transport, then deletion.
-        for i in 3..16 {
+        for i in 2..16 {
             let state = query(&a).await;
             let _: LayoutProfilesState = call(
                 &a,
@@ -654,9 +656,9 @@ fn multi_owner_load_returns_actual_partial_state_without_compensation() {
         let db = Displays::new();
         let a = start(dirs[0].path(), da.clone()).await;
         let b = start(dirs[1].path(), db.clone()).await;
-        let source_default = query(&a).await.active_profile_id.unwrap();
+        let expected_default = query(&b).await.active_profile_id.unwrap();
         common::pair(&a, &b).await;
-        common::profile_handoff(&[&a, &b], &source_default).await;
+        common::profile_handoff(&[&a, &b], &expected_default).await;
         enable(&a, a.id().into(), "enable-a").await;
         enable(&a, b.id().into(), "enable-b").await;
         let state = query(&a).await;
@@ -1212,6 +1214,443 @@ fn legacy_manual_commit_preserves_intervening_automatic_layout_fields() {
     });
 }
 
+#[test]
+fn multi_group_profile_overflow_completes_handoff_without_pending_joins() {
+    crate::test_watchdog::run(module_path!(), "profile overflow handoff", Some(10), async {
+        let dirs = (0..4).map(|_| tempfile::tempdir().unwrap()).collect::<Vec<_>>();
+        let displays = (0..4).map(|_| Displays::new()).collect::<Vec<_>>();
+        let mut nodes = Vec::new();
+        for i in 0..4 {
+            nodes.push(start(dirs[i].path(), displays[i].clone()).await);
+            query(&nodes[i]).await;
+        }
+        for first in [0, 2] {
+            common::pair(&nodes[first + 1], &nodes[first]).await;
+            common::until("original group profile handoff completes", || {
+                let a = lock(&nodes[first].inner.profiles.data).catalog.clone();
+                let b = lock(&nodes[first + 1].inner.profiles.data).catalog.clone();
+                a.as_ref().is_some_and(|c| c.completed_joins.len() == 1)
+                    && a == b
+                    && [&nodes[first], &nodes[first + 1]]
+                        .iter()
+                        .all(|n| common::profile_layout_ready(n))
+            })
+            .await;
+            let profiles = query(&nodes[first]).await.profiles.len();
+            for i in profiles..16 {
+                let state = query(&nodes[first]).await;
+                let _: LayoutProfilesState = call(
+                    &nodes[first],
+                    Request::CreateLayoutProfile(Create {
+                        request_id: format!("overflow-{first}-{i}"),
+                        expected_token: state.token,
+                        name: format!("Desk {first}-{i}"),
+                    }),
+                )
+                .await;
+            }
+            common::until("full original catalog converges", || {
+                let a = lock(&nodes[first].inner.profiles.data).catalog.clone();
+                let b = lock(&nodes[first + 1].inner.profiles.data).catalog.clone();
+                a.as_ref().is_some_and(|c| c.profiles.len() == 16) && a == b
+            })
+            .await;
+        }
+        let source_default = lock(&nodes[0].inner.profiles.data)
+            .catalog
+            .as_ref()
+            .unwrap()
+            .default_profile()
+            .unwrap()
+            .id
+            .clone();
+        let target_active = query(&nodes[2]).await.active_profile_id.unwrap();
+        common::pair(&nodes[0], &nodes[2]).await;
+        common::until("overflow completes instead of remaining pending", || {
+            let catalogs = nodes
+                .iter()
+                .map(|n| lock(&n.inner.profiles.data).catalog.clone())
+                .collect::<Vec<_>>();
+            catalogs[0].as_ref().is_some_and(|c| {
+                c.profiles.len() == 16
+                    && c.active_profile_id == target_active
+                    && c.default_profile().is_some_and(|p| p.id == source_default)
+                    && c.completed_joins.len() == 2
+            }) && catalogs.iter().all(|c| c == &catalogs[0])
+                && nodes[0].pending_profile_joins(nodes[2].id()).unwrap().is_empty()
+                && nodes.iter().all(common::profile_layout_ready)
+        })
+        .await;
+        for node in &nodes {
+            let state = query(node).await;
+            assert_ne!(state.readiness, Readiness::Syncing);
+            let catalog = lock(&node.inner.profiles.data).catalog.clone().unwrap();
+            assert!(catalog.profiles.iter().all(|p| p.content.placements.len() == 4));
+            assert_eq!(
+                super::store::load(&node.inner.data_dir, catalog.group)
+                    .unwrap()
+                    .as_ref(),
+                Some(&catalog)
+            );
+        }
+        assert!(displays.iter().all(|d| d.calls.load(Ordering::SeqCst) == 0));
+        for node in nodes {
+            node.shutdown().await;
+        }
+    });
+}
+
+#[test]
+fn empty_singleton_joins_three_device_group_without_losing_saved_default_over_low() {
+    crate::test_watchdog::run(module_path!(), "empty singleton profile import", Some(8), async {
+        let dirs = (0..4).map(|_| tempfile::tempdir().unwrap()).collect::<Vec<_>>();
+        let displays = (0..4).map(|_| Displays::new()).collect::<Vec<_>>();
+        let mut nodes = Vec::new();
+        for i in 0..4 {
+            nodes.push(start(dirs[i].path(), displays[i].clone()).await);
+            query(&nodes[i]).await;
+        }
+        // Model a singleton whose saved default was created without screen facts,
+        // even though its live desktop has since become available.
+        let node = nodes[3].clone();
+        tokio::task::spawn_blocking(move || {
+            let _gate = node.inner.profiles.gate.lock().unwrap();
+            let empty = ArrangementSnapshot {
+                placements: vec![],
+                disabled: vec![],
+                native: vec![],
+                screen_shared: vec![],
+                topology: Default::default(),
+                active_profile_id: String::new(),
+            };
+            let catalog = model::Catalog::initial(
+                node.group_id().unwrap().into(),
+                node.id().into(),
+                &empty,
+                model::DeviceState {
+                    online_devices: Default::default(),
+                    connected_screens: Default::default(),
+                },
+                1,
+            )
+            .unwrap();
+            node.persist_catalog(catalog).unwrap();
+        })
+        .await
+        .unwrap();
+        let initial_default = query(&nodes[1]).await.active_profile_id.unwrap();
+        common::pair(&nodes[0], &nodes[1]).await;
+        common::profile_handoff(&[&nodes[0], &nodes[1]], &initial_default).await;
+        common::pair(&nodes[0], &nodes[2]).await;
+        common::profile_handoff(&[&nodes[0], &nodes[1], &nodes[2]], &initial_default).await;
+        common::editable_layouts(&[&nodes[0], &nodes[1], &nodes[2]], 6).await;
+        let target_group = nodes[2].group_id().unwrap();
+        let live = query(&nodes[2]).await.snapshot.unwrap();
+        let node = nodes[2].clone();
+        let saved = tokio::task::spawn_blocking(move || {
+            let _gate = node.inner.profiles.gate.lock().unwrap();
+            let catalog = lock(&node.inner.profiles.data).catalog.clone().unwrap();
+            let next = catalog
+                .save(node.id().into(), &live, catalog.active().match_state.clone(), None, 497)
+                .unwrap();
+            let saved = next.active().clone();
+            node.persist_catalog(next).unwrap();
+            saved
+        })
+        .await
+        .unwrap();
+        common::until("saved three-device default converges", || {
+            nodes[..3].iter().all(|n| {
+                lock(&n.inner.profiles.data)
+                    .catalog
+                    .as_ref()
+                    .is_some_and(|c| c.profile(&saved.id) == Ok(&saved))
+            })
+        })
+        .await;
+        let singleton_default = query(&nodes[3]).await.active_profile_id.unwrap();
+        let before = query(&nodes[2]).await.snapshot.unwrap();
+        assert!(
+            lock(&nodes[3].inner.profiles.data)
+                .catalog
+                .as_ref()
+                .unwrap()
+                .active()
+                .content
+                .placements
+                .is_empty()
+        );
+        common::pair(&nodes[3], &nodes[2]).await;
+        common::profile_handoff(&nodes.iter().collect::<Vec<_>>(), &saved.id).await;
+        let result = lock(&nodes[2].inner.profiles.data).catalog.clone().unwrap();
+        assert_eq!(result.version.writer.0, nodes[2].id());
+        assert!(result.profile(&singleton_default).is_err());
+        let preserved = result.profile(&saved.id).unwrap();
+        for old in &saved.content.placements {
+            assert!(preserved.content.placements.contains(old));
+        }
+        for old in &saved.content.disabled {
+            assert!(preserved.content.disabled.contains(old));
+        }
+        assert!(preserved.content.placements.iter().any(|p| p.device.0 == nodes[3].id()));
+        assert!(
+            preserved
+                .content
+                .disabled
+                .iter()
+                .filter(|d| d.screen.device.0 == nodes[3].id())
+                .all(|d| !d.disabled)
+        );
+        assert!(preserved.content_revision > saved.content_revision);
+        assert_eq!(preserved.last_used, saved.last_used);
+        assert_eq!(preserved.default_group, Some(result.group));
+        for node in &nodes {
+            assert_eq!(node.group_id(), Some(target_group));
+            assert_eq!(lock(&node.inner.profiles.data).catalog.as_ref(), Some(&result));
+        }
+        let after = query(&nodes[2]).await.snapshot.unwrap();
+        for placement in before.placements {
+            assert!(after.placements.contains(&placement));
+        }
+        assert!(displays.iter().all(|d| d.calls.load(Ordering::SeqCst) == 0));
+        for node in nodes {
+            node.shutdown().await;
+        }
+    });
+}
+
+#[test]
+fn fresh_virtual_screen_is_visible_after_singleton_pairing_in_both_directions() {
+    crate::test_watchdog::run(module_path!(), "fresh virtual screen pairing", Some(4), async {
+        for reverse in [false, true] {
+            let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+            let displays = [Displays::new(), Displays::new()];
+            displays[0].virtual_display.store(true, Ordering::SeqCst);
+            let a = start(dirs[0].path(), displays[0].clone()).await;
+            let b = start(dirs[1].path(), displays[1].clone()).await;
+            let (source, target) = if reverse { (&b, &a) } else { (&a, &b) };
+            let default = query(target).await.active_profile_id.unwrap();
+            common::pair(source, target).await;
+            common::profile_handoff(&[&a, &b], &default).await;
+            for node in [&a, &b] {
+                let layout: crate::api::Layout = call(node, Request::Layout).await;
+                assert!(layout.geometry.screens.iter().any(|s| s.key.device.0 == a.id()));
+                assert!(
+                    layout.geometry.screens.iter().all(|s| !s.hidden && !s.device_disabled),
+                    "a freshly enumerated screen must not require manual Show after pairing"
+                );
+            }
+            a.shutdown().await;
+            b.shutdown().await;
+        }
+    });
+}
+
+#[test]
+fn new_virtual_screen_hotplug_is_visible_and_explicit_hidden_choice_survives_refresh() {
+    crate::test_watchdog::run(module_path!(), "virtual screen hotplug visibility", Some(2), async {
+        let dir = tempfile::tempdir().unwrap();
+        let displays = Displays::new();
+        let node = start(dir.path(), displays.clone()).await;
+        query(&node).await;
+        displays.virtual_display.store(true, Ordering::SeqCst);
+        lock(&displays.state).displays.push(NativeDisplay {
+            key: "third".into(),
+            bounds: Rect::new(200.0, 0.0, 100.0, 100.0),
+            primary: false,
+            mirror_of: None,
+            mode: "mode-c".into(),
+        });
+        displays.changed();
+        common::until("hotplugged virtual screen", || node.layout().0.screens.len() == 3).await;
+        let current: crate::api::Layout = call(&node, Request::Layout).await;
+        assert!(
+            !current
+                .geometry
+                .screens
+                .iter()
+                .find(|s| s.key.display == "third")
+                .unwrap()
+                .hidden,
+            "a new virtual screen must not be auto-hidden"
+        );
+        let _: serde_json::Value = call(
+            &node,
+            Request::SetScreenHidden {
+                screen: crate::api::ScreenKey {
+                    device: node.id().into(),
+                    display: "third".into(),
+                },
+                hidden: true,
+            },
+        )
+        .await;
+        displays.virtual_display.store(false, Ordering::SeqCst);
+        displays.changed();
+        let current: crate::api::Layout = call(&node, Request::Layout).await;
+        assert!(
+            current
+                .geometry
+                .screens
+                .iter()
+                .find(|s| s.key.display == "third")
+                .unwrap()
+                .hidden
+        );
+        node.shutdown().await;
+    });
+}
+
+async fn pairing_visibility_matrix(source_count: usize, target_count: usize) {
+    for selection in 0..4 {
+        let count = source_count + target_count;
+        let dirs = (0..count).map(|_| tempfile::tempdir().unwrap()).collect::<Vec<_>>();
+        let displays = (0..count).map(|_| Displays::new()).collect::<Vec<_>>();
+        let mut nodes = Vec::new();
+        for i in 0..count {
+            nodes.push(start(dirs[i].path(), displays[i].clone()).await);
+            query(&nodes[i]).await;
+        }
+        for range in [0..source_count, source_count..count] {
+            let first = &nodes[range.start];
+            let default = query(&nodes[range.start + usize::from(range.len() > 1)])
+                .await
+                .active_profile_id
+                .unwrap();
+            for i in range.clone().skip(1) {
+                common::pair(first, &nodes[i]).await;
+                common::profile_handoff(&nodes[range.start..=i].iter().collect::<Vec<_>>(), &default).await;
+            }
+            common::until(
+                &format!(
+                    "visibility {source_count}+{target_count} selection {selection} original group {}",
+                    range.start
+                ),
+                || {
+                    nodes[range.clone()]
+                        .iter()
+                        .all(|n| n.layout().0.screens.len() == range.len() * 2 && common::profile_layout_ready(n))
+                },
+            )
+            .await;
+            let source = range.start == 0;
+            let custom = selection & if source { 1 } else { 2 } != 0;
+            if custom {
+                let state = query(first).await;
+                let _: LayoutProfilesState = call(
+                    first,
+                    Request::CreateLayoutProfile(Create {
+                        request_id: format!("custom-{selection}-{source}"),
+                        expected_token: state.token,
+                        name: if source { "Source desk" } else { "Target desk" }.into(),
+                    }),
+                )
+                .await;
+                // Only this explicitly hidden screen may stay hidden after pairing.
+                let _: serde_json::Value = call(
+                    first,
+                    Request::SetScreenHidden {
+                        screen: crate::api::ScreenKey {
+                            device: first.id().into(),
+                            display: "second".into(),
+                        },
+                        hidden: true,
+                    },
+                )
+                .await;
+            }
+        }
+        let before_source: crate::api::Layout = call(&nodes[0], Request::Layout).await;
+        let before_target: crate::api::Layout = call(&nodes[source_count], Request::Layout).await;
+        let completed_joins = lock(&nodes[source_count].inner.profiles.data)
+            .catalog
+            .as_ref()
+            .unwrap()
+            .completed_joins
+            .len();
+        let target_group = nodes[source_count].group_id().unwrap();
+        common::pair(&nodes[0], &nodes[source_count]).await;
+        common::until("visibility matrix catalog handoff", || {
+            let catalogs = nodes
+                .iter()
+                .map(|n| lock(&n.inner.profiles.data).catalog.clone())
+                .collect::<Vec<_>>();
+            catalogs.iter().all(|c| c == &catalogs[0])
+                && catalogs[0]
+                    .as_ref()
+                    .is_some_and(|c| c.group.0 == target_group && c.completed_joins.len() == completed_joins + 1)
+        })
+        .await;
+        common::until(
+            &format!("visibility {source_count}+{target_count} selection {selection} merged layout"),
+            || {
+                nodes
+                    .iter()
+                    .all(|n| n.layout().0.screens.len() == count * 2 && common::profile_layout_ready(n))
+            },
+        )
+        .await;
+        for node in &nodes {
+            let after: crate::api::Layout = call(node, Request::Layout).await;
+            for before in before_source
+                .geometry
+                .screens
+                .iter()
+                .chain(&before_target.geometry.screens)
+            {
+                let screen = after.geometry.screens.iter().find(|s| s.key == before.key).unwrap();
+                assert_eq!(screen.hidden, before.hidden, "pairing changed per-screen visibility");
+                assert_eq!(screen.device_disabled, before.device_disabled);
+                assert!(screen.online);
+            }
+            let visible = after.geometry.screens.iter().filter(|s| !s.hidden).collect::<Vec<_>>();
+            for (i, a) in visible.iter().enumerate() {
+                for b in visible.iter().skip(i + 1).filter(|b| a.key.device != b.key.device) {
+                    let (a, b) = (a.rect(), b.rect());
+                    assert!(
+                        a.right() <= b.x || b.right() <= a.x || a.bottom() <= b.y || b.bottom() <= a.y,
+                        "pairing failed to arrange both groups"
+                    );
+                }
+            }
+        }
+        assert!(displays.iter().all(|d| d.calls.load(Ordering::SeqCst) == 0));
+        for node in nodes {
+            node.shutdown().await;
+        }
+    }
+}
+
+#[test]
+fn pairing_visibility_singleton_singleton_defaults_and_custom_profiles() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "singleton visibility matrix",
+        Some(4),
+        pairing_visibility_matrix(1, 1),
+    );
+}
+
+#[test]
+fn pairing_visibility_group_singleton_defaults_and_custom_profiles() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "group singleton visibility matrix",
+        Some(8),
+        pairing_visibility_matrix(1, 3),
+    );
+}
+
+#[test]
+fn pairing_visibility_group_group_defaults_and_custom_profiles() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "group group visibility matrix",
+        Some(8),
+        pairing_visibility_matrix(2, 2),
+    );
+}
+
 async fn directional_default_join(source_members: usize) {
     let count = source_members + 2;
     let dirs = (0..count).map(|_| tempfile::tempdir().unwrap()).collect::<Vec<_>>();
@@ -1223,7 +1662,7 @@ async fn directional_default_join(source_members: usize) {
     for node in &nodes {
         query(node).await;
     }
-    let source_default = lock(&nodes[0].inner.profiles.data)
+    let source_default = lock(&nodes[usize::from(source_members == 2)].inner.profiles.data)
         .catalog
         .as_ref()
         .unwrap()
@@ -1240,7 +1679,7 @@ async fn directional_default_join(source_members: usize) {
         })
         .await;
     }
-    let target_default = lock(&nodes[source_members].inner.profiles.data)
+    let target_default = lock(&nodes[source_members + 1].inner.profiles.data)
         .catalog
         .as_ref()
         .unwrap()
@@ -1256,6 +1695,12 @@ async fn directional_default_join(source_members: usize) {
     })
     .await;
     let target_group = nodes[source_members + 1].group_id().unwrap();
+    let expected_default = if source_members == 1 {
+        target_default.clone()
+    } else {
+        source_default.clone()
+    };
+    let expected_profiles = if source_members == 1 { 1 } else { 2 };
     // The responder accepts; the initiating source joins its existing group.
     common::pair(&nodes[0], &nodes[source_members + 1]).await;
     common::until("directional default rule converges on all members", || {
@@ -1266,12 +1711,13 @@ async fn directional_default_join(source_members: usize) {
         catalogs.iter().all(|c| c == &catalogs[0])
             && catalogs[0].as_ref().is_some_and(|c| {
                 c.group.0 == target_group
-                    && c.profiles.len() == 1
-                    && c.active_profile_id == source_default
-                    && c.default_profile().is_some_and(|p| p.id == source_default)
-                    && c.completed_joins
-                        .values()
-                        .any(|j| j.dropped_defaults.contains(&target_default))
+                    && c.profiles.len() == expected_profiles
+                    && c.active_profile_id == expected_default
+                    && c.default_profile().is_some_and(|p| p.id == expected_default)
+                    && (source_members == 1
+                        || c.completed_joins
+                            .values()
+                            .any(|j| j.dropped_defaults.contains(&target_default)))
             })
     })
     .await;
@@ -1282,7 +1728,7 @@ async fn directional_default_join(source_members: usize) {
 }
 
 #[test]
-fn group_group_pairing_drops_acceptors_inherited_default_over_low() {
+fn group_group_pairing_preserves_acceptors_inherited_default_over_low() {
     crate::test_watchdog::run(
         module_path!(),
         "two groups default import",
@@ -1292,7 +1738,7 @@ fn group_group_pairing_drops_acceptors_inherited_default_over_low() {
 }
 
 #[test]
-fn single_device_pairing_drops_acceptor_group_default_over_low() {
+fn single_device_pairing_preserves_acceptor_group_default_over_low() {
     crate::test_watchdog::run(
         module_path!(),
         "device joins group default import",
@@ -1384,12 +1830,13 @@ async fn offline_acceptor_scenario(recover_projection: bool) {
         let ca = lock(&a.inner.profiles.data).catalog.clone();
         let cb = lock(&b.inner.profiles.data).catalog.clone();
         ca.as_ref().is_some_and(|c| {
-            c.completed_joins.contains_key(&id) && c.default_profile().is_some_and(|p| p.id == source_default)
+            c.completed_joins.contains_key(&id) && c.default_profile().is_some_and(|p| p.id == target_default)
         }) && ca == cb
     })
     .await;
     let result = super::store::load(dirs[1].path(), group).unwrap().unwrap();
-    assert!(!result.profiles.iter().any(|p| p.id == target_default));
+    assert!(!result.profiles.iter().any(|p| p.id == source_default));
+    assert_eq!(result.active_profile_id, target_default);
     assert!(a.pending_profile_joins(b.id()).unwrap().is_empty());
     assert!(
         super::join::read(dirs[0].path(), &id)
@@ -1434,8 +1881,8 @@ fn rapid_second_pairing_converges_three_real_nodes_without_import_proofs() {
         let a = start(dirs[0].path(), displays[0].clone()).await;
         let b = start(dirs[1].path(), displays[1].clone()).await;
         let c = start(dirs[2].path(), displays[2].clone()).await;
-        let source_default = query(&a).await.active_profile_id.unwrap();
-        query(&b).await;
+        let expected_default = query(&b).await.active_profile_id.unwrap();
+        query(&a).await;
         query(&c).await;
         common::pair(&a, &b).await;
         // The new join contract assumes the initiator has its converged source
@@ -1445,7 +1892,7 @@ fn rapid_second_pairing_converges_three_real_nodes_without_import_proofs() {
             lock(&a.inner.profiles.data).catalog.as_ref().is_some_and(|c| {
                 c.group.0 == b.group_id().unwrap()
                     && !c.completed_joins.is_empty()
-                    && c.default_profile().is_some_and(|p| p.id == source_default)
+                    && c.default_profile().is_some_and(|p| p.id == expected_default)
             })
         })
         .await;
@@ -1455,7 +1902,7 @@ fn rapid_second_pairing_converges_three_real_nodes_without_import_proofs() {
             let catalogs = [&a, &b, &c].map(|n| lock(&n.inner.profiles.data).catalog.clone());
             catalogs[0].as_ref().is_some_and(|catalog| {
                 catalog.group.0 == c.group_id().unwrap()
-                    && catalog.default_profile().is_some_and(|p| p.id == source_default)
+                    && catalog.default_profile().is_some_and(|p| p.id == expected_default)
             }) && catalogs.iter().all(|catalog| catalog == &catalogs[0])
                 && [&a, &b, &c]
                     .iter()
@@ -1630,7 +2077,7 @@ async fn pairing_without_live_facts(source_permits: bool) {
     };
     // Both saved catalogs already exist. Facts/UI readiness is independent
     // of the saved list and must not block the membership commit protocol.
-    let original = lock(&a.inner.profiles.data).catalog.clone().unwrap();
+    let original = lock(&b.inner.profiles.data).catalog.clone().unwrap();
     for node in [&a, &b] {
         assert!(
             super::store::load(&node.inner.data_dir, node.group_id().unwrap().into())
@@ -1704,7 +2151,7 @@ fn hotplug_fixture_waits_for_handoff_even_when_provisional_catalogs_match() {
         let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
         let a = start(dirs[0].path(), Displays::new()).await;
         let b = start(dirs[1].path(), Displays::new()).await;
-        let source_default = query(&a).await.active_profile_id.unwrap();
+        let expected_default = query(&b).await.active_profile_id.unwrap();
         b.inner.profiles.defer_joins.store(true, Ordering::SeqCst);
         common::pair(&a, &b).await;
         common::until("provisional catalogs match before handoff", || {
@@ -1717,7 +2164,7 @@ fn hotplug_fixture_waits_for_handoff_even_when_provisional_catalogs_match() {
         })
         .await;
         let nodes = [&a, &b];
-        let mut handoff = std::pin::pin!(common::profile_handoff(&nodes, &source_default));
+        let mut handoff = std::pin::pin!(common::profile_handoff(&nodes, &expected_default));
         let observed =
             std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(handoff.as_mut(), cx))).await;
         assert!(
@@ -1729,7 +2176,7 @@ fn hotplug_fixture_waits_for_handoff_even_when_provisional_catalogs_match() {
         for node in [&a, &b] {
             let catalog = lock(&node.inner.profiles.data).catalog.clone().unwrap();
             assert!(!catalog.completed_joins.is_empty());
-            assert_eq!(catalog.active_profile_id, source_default);
+            assert_eq!(catalog.active_profile_id, expected_default);
         }
         a.shutdown().await;
         b.shutdown().await;
@@ -1744,9 +2191,9 @@ fn physical_topology_ignores_online_state_and_profile_restores_plug_unplug_once(
         let db = Displays::new();
         let a = start(dirs[0].path(), da.clone()).await;
         let b = start(dirs[1].path(), db.clone()).await;
-        let source_default = query(&a).await.active_profile_id.unwrap();
+        let expected_default = query(&b).await.active_profile_id.unwrap();
         common::pair(&a, &b).await;
-        common::profile_handoff(&[&a, &b], &source_default).await;
+        common::profile_handoff(&[&a, &b], &expected_default).await;
         let n = a.clone();
         let peer = b.id();
         tokio::task::spawn_blocking(move || {
@@ -2006,13 +2453,13 @@ fn remote_hotplug_profile_return(delay_manual_layout: bool) {
         } else {
             (a, b, da, db)
         };
-        let source_default = query(&a).await.active_profile_id.unwrap();
+        let expected_default = query(&b).await.active_profile_id.unwrap();
         common::pair(&a, &b).await;
-        common::profile_handoff(&[&a, &b], &source_default).await;
+        common::profile_handoff(&[&a, &b], &expected_default).await;
         let c = start(dirs[2].path(), Displays::new()).await;
         common::pair(&a, &c).await;
         common::active(&[&a, &b, &c]).await;
-        common::profile_handoff(&[&a, &b, &c], &source_default).await;
+        common::profile_handoff(&[&a, &b, &c], &expected_default).await;
         let leaving = c.clone();
         tokio::task::spawn_blocking(move || leaving.leave_group())
             .await
@@ -2024,7 +2471,7 @@ fn remote_hotplug_profile_return(delay_manual_layout: bool) {
                 .all(|n| n.link_config().unwrap().members().members.len() == 2)
         })
         .await;
-        common::profile_handoff(&[&a, &b], &source_default).await;
+        common::profile_handoff(&[&a, &b], &expected_default).await;
         let peer_observation_settled = || {
             let token = model::hash(&*lock(&db.state));
             let version = a.link_config().unwrap().applied().version.clone();

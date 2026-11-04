@@ -10,7 +10,7 @@ use std::sync::{
 };
 
 const ACTION_CAPACITY: usize = 1024;
-const LOCAL_STATE_CAPACITY: usize = 23;
+const LOCAL_STATE_CAPACITY: usize = 24;
 const STATE_CAPACITY: usize = LOCAL_STATE_CAPACITY + 2 * oink_protocol::v1::limits::MEMBERS;
 
 type StateKey = (u8, Option<oink_foundation::DeviceId>);
@@ -26,6 +26,7 @@ fn state_key(command: &InputCommand) -> Option<StateKey> {
         Paused(_) => 0,
         Overlay(_) => 1,
         Controllable(_) => 2,
+        InjectionAvailable(_) => 23,
         FocusLock(_) => 3,
         GameMode(_) => 4,
         KeyboardDisabled(_) => 18,
@@ -87,6 +88,7 @@ impl Clone for StateCommand {
             Paused(v) => Paused(*v),
             Overlay(v) => Overlay(*v),
             Controllable(v) => Controllable(*v),
+            InjectionAvailable(v) => InjectionAvailable(*v),
             FocusLock(v) => FocusLock(*v),
             GameMode(v) => GameMode(*v),
             KeyboardDisabled(v) => KeyboardDisabled(*v),

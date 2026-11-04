@@ -179,6 +179,12 @@ pub trait InputBackend: Send + Sync {
     }
     /// Runs after finite held-input cleanup, before that worker exits.
     fn stop_injection_session(&self) {}
+    /// Ordinary-thread observation of the current injection target. None keeps
+    /// the existing permission-only policy; false withdraws controllability
+    /// without claiming the network connection is offline.
+    fn injection_available(&self) -> Option<bool> {
+        None
+    }
     /// Cached source preference only: safe on the capture owner, no TIS/OS calls.
     /// None means the preference has not been observed or is not applicable.
     fn caps_lock_switches_input_source(&self) -> Option<bool> {

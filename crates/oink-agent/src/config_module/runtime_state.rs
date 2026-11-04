@@ -243,7 +243,10 @@ impl Owner {
         };
         if let Some(bundle) = self.journal.pending_bundle().map_err(internal)? {
             let intent = bundle.certificate().and_then(|c| c.intent()).map_err(internal)?;
-            if let Err(error) = self.application.prepare_profile_join(&intent) {
+            if let Err(error) = self.application.prepare_profile_join_with_target(
+                &intent,
+                &bundle.plan().and_then(|p| p.target_base()).map_err(internal)?,
+            ) {
                 tracing::warn!(%error, "profile handoff deferred before group projection");
                 self.projection_retry = Some(Instant::now() + Duration::from_millis(50));
                 return Ok(false);

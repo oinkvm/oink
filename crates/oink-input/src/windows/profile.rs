@@ -43,3 +43,23 @@ pub(crate) fn select(profile: Profile) -> Result<(), crate::InputError> {
         ))
     }
 }
+
+impl Profile {
+    /// A disconnected session's OpenInputDesktop can describe its old desktop.
+    /// It must never make the SYSTEM source active on a different console.
+    pub(crate) fn source_allowed(self, desktop: &str, active_console: bool) -> bool {
+        desktop == self.capture_desktop && (self != PRELOGIN || active_console)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn prelogin_never_captures_default_or_a_disconnected_console() {
+        assert!(PRELOGIN.source_allowed("Winlogon", true));
+        assert!(!PRELOGIN.source_allowed("Default", true));
+        assert!(!PRELOGIN.source_allowed("Winlogon", false));
+        assert!(USER.source_allowed("Default", true));
+    }
+}

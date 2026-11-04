@@ -601,7 +601,7 @@ pub struct Screen {
     pub gain: f64,
     /// Extra pointer speed multiplier used only for foreign pointer sources.
     pub remote_gain: f64,
-    /// 不参与布局与传送门（虚拟显示器默认隐藏）。
+    /// 不参与布局与传送门（仅由用户隐藏）。
     pub hidden: bool,
     /// Visible/editable placement whose device cannot be a focus target.
     pub device_disabled: bool,

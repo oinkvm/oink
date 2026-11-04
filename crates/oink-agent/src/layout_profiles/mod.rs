@@ -5,10 +5,13 @@ pub mod types;
 
 mod autosave;
 mod commands;
+mod composition;
 #[cfg(all(test, debug_assertions))]
 mod integration_tests;
 mod join;
 mod merge;
+#[cfg(test)]
+mod merge_policy_tests;
 pub mod native;
 pub mod state;
 pub mod store;

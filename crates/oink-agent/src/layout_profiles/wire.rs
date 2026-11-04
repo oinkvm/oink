@@ -290,6 +290,34 @@ pub fn catalog(v: &Catalog) -> v1::Result<d::LayoutProfileCatalogV3> {
             (4, bytes(&v.active_profile_id, 16)?),
             (5, V::Array(profiles)),
             (
+                10,
+                V::Array(
+                    v.completed_joins
+                        .iter()
+                        .filter(|(_, j)| !j.appends.is_empty())
+                        .map(|(id, j)| {
+                            Ok(V::Map(
+                                [
+                                    (1, bytes(id, 32)?),
+                                    (
+                                        2,
+                                        V::Array(
+                                            j.appends
+                                                .iter()
+                                                .map(|a| {
+                                                    Ok(catalog(&template_catalog(a, v.group))?.profiles()?.0[0].write())
+                                                })
+                                                .collect::<v1::Result<_>>()?,
+                                        ),
+                                    ),
+                                ]
+                                .into(),
+                            ))
+                        })
+                        .collect::<v1::Result<_>>()?,
+                ),
+            ),
+            (
                 9,
                 V::Array(
                     v.completed_joins
@@ -441,6 +469,35 @@ pub fn read_catalog(v: d::LayoutProfileCatalogV3) -> Result<Catalog> {
                             version: version(j.version()?)?,
                             default_profile: j.default_profile()?.map(|id| hex(&id.0)),
                             dropped_defaults: j.dropped_defaults()?.0.into_iter().map(|id| hex(&id.0)).collect(),
+                            appends: v
+                                .join_appends()?
+                                .map(|a| a.0)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .find(|a| a.merge_id() == j.merge_id())
+                                .map(|a| a.templates())
+                                .transpose()?
+                                .map(|a| a.0)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|p| {
+                                    let wrapper = d::LayoutProfileCatalogV3::from_raw(
+                                        [
+                                            (1, 1u32.write()),
+                                            (2, v.group()?.write()),
+                                            (3, p.content_revision()?.write()),
+                                            (4, p.id()?.write()),
+                                            (5, V::Array(vec![p.write()])),
+                                        ]
+                                        .into(),
+                                    )?;
+                                    let template = read_catalog(wrapper)
+                                        .map_err(|_| v1::ErrorCode::UnsupportedValue)?
+                                        .profiles
+                                        .remove(0);
+                                    Ok(template)
+                                })
+                                .collect::<v1::Result<_>>()?,
                         },
                     ))
                 })
@@ -542,4 +599,16 @@ fn restore_extensions(raw: v1::RawMap, bytes: &[u8]) -> v1::Result<v1::RawMap> {
     let mut value = V::Map(raw);
     overlay(&mut value, V::Map(v1::cbor::decode_map(bytes, MAX_BYTES)?));
     Ok(value.as_map()?.clone())
+}
+
+fn template_catalog(p: &Profile, group: GroupKey) -> Catalog {
+    Catalog {
+        schema: 1,
+        extensions: Vec::new(),
+        group,
+        version: p.content_revision.clone(),
+        active_profile_id: p.id.clone(),
+        profiles: vec![p.clone()],
+        completed_joins: Default::default(),
+    }
 }

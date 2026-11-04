@@ -12,10 +12,9 @@ use windows::{
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW,
-            IsIconic, IsWindow, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_RESTORE,
-            SW_SHOWNOACTIVATE, SetForegroundWindow, ShowWindow, ShowWindowAsync, TranslateMessage, WM_APP, WM_CHAR,
-            WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_EX_TOOLWINDOW,
-            WS_POPUP,
+            IsIconic, IsWindow, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
+            SetForegroundWindow, ShowWindow, ShowWindowAsync, TranslateMessage, WM_APP, WM_CHAR, WM_DESTROY,
+            WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
         },
     },
     core::w,
@@ -102,11 +101,19 @@ impl Native for Desktop {
         // SAFETY: read-only query of the remembered, validated top-level window.
         unsafe { IsIconic(HWND(window as *mut _)).as_bool() }
     }
-    fn restore(&mut self, window: isize) {
+    fn restore_without_activation(&mut self, window: isize) {
         // SAFETY: the remembered HWND was validated; no pointers are passed.
         // Queue restoration to the other UI thread rather than blocking ours on an unresponsive game.
+        // SW_RESTORE also activates when that thread finally handles the request,
+        // potentially stealing foreground from an application started in the meantime.
+        // SW_SHOWNOACTIVATE restores without that deferred activation; the lease's
+        // separate SetForegroundWindow remains a single immediate request. No input
+        // queues, synthetic keys or foreground-lock settings are changed. Verified
+        // with a stalled UI thread and a newly foreground fullscreen window on
+        // Windows 11 build 26200; merely checking GetForegroundWindow before queueing
+        // SW_RESTORE does not protect against its later activation.
         unsafe {
-            let _ = ShowWindowAsync(HWND(window as *mut _), SW_RESTORE);
+            let _ = ShowWindowAsync(HWND(window as *mut _), SW_SHOWNOACTIVATE);
         }
     }
     fn activate(&mut self, window: isize) {

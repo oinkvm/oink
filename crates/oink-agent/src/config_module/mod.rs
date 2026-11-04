@@ -152,6 +152,14 @@ pub trait ConfigApplication: Send + Sync {
         Ok(())
     }
 
+    fn prepare_profile_join_with_target(
+        &self,
+        intent: &dto::MergeIntent,
+        _target: &dto::GroupState,
+    ) -> Result<(), String> {
+        self.prepare_profile_join(intent)
+    }
+
     fn apply_state(&self, state: &group_store::StoredGroupState) -> Result<(), String>;
 }
 pub struct ConfigDeps {

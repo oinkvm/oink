@@ -19,7 +19,7 @@ pub fn cursor_position() -> Result<Point, String> {
         .map(|s| Point::new(f64::from(s.x), f64::from(s.y)))
         .map_err(|e| e.to_string())
 }
-fn installed() -> io::Result<bool> {
+pub(super) fn installed() -> io::Result<bool> {
     static INSTALLATION: OnceLock<Result<bool, String>> = OnceLock::new();
     INSTALLATION
         .get_or_init(|| client::service_installation().map_err(|e| e.to_string()))

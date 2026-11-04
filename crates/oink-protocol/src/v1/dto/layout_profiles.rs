@@ -149,6 +149,11 @@ wire_map!(LayoutProfileCatalogV3, no_validation, {
     4 => active: Id16 = required;
     5 => profiles: List<LayoutProfile,16> = required;
     9 => completed_joins: List<LayoutProfileJoinCompletion,256> = (List(Vec::new()));
+    10 => join_appends: Option<List<LayoutProfileJoinAppends,256>> = optional;
+});
+wire_map!(LayoutProfileJoinAppends, no_validation, {
+    1 => merge_id: Hash32 = required;
+    2 => templates: List<LayoutProfile,2> = required;
 });
 wire_map!(LayoutProfileJoinCompletion, no_validation, {
     1 => merge_id: Hash32 = required;

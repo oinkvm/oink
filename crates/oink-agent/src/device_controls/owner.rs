@@ -127,7 +127,8 @@ impl Node {
                         [
                             (1, oink_protocol::v1::RawValue::Text(display.key.clone())),
                             (2, 1f64.write()),
-                            (3, (!display.is_virtual).write()),
+                            // A virtual screen is still visible until the user hides it.
+                            (3, true.write()),
                         ]
                         .into(),
                     )

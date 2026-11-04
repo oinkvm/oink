@@ -1060,15 +1060,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(0)
         }
         windows::Win32::UI::WindowsAndMessaging::WM_WTSSESSION_CHANGE => {
-            use windows::Win32::UI::WindowsAndMessaging::{WTS_SESSION_LOCK, WTS_SESSION_UNLOCK};
+            use windows::Win32::UI::WindowsAndMessaging::{
+                WTS_CONSOLE_CONNECT, WTS_CONSOLE_DISCONNECT, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+            };
             if wparam.0 as u32 == WTS_SESSION_LOCK {
                 desktop_trace::session_changed(WTS_SESSION_LOCK, true);
-                capture_availability_changed(false);
             }
             if wparam.0 as u32 == WTS_SESSION_UNLOCK {
                 desktop_trace::session_changed(WTS_SESSION_UNLOCK, false);
-                capture_availability_changed(false);
             }
+            // Console disconnect/connect also changes source eligibility even
+            // when the old session still reports a Winlogon input desktop.
+            capture_availability_changed(matches!(wparam.0 as u32, WTS_CONSOLE_CONNECT | WTS_CONSOLE_DISCONNECT));
             LRESULT(0)
         }
         WM_INPUT => {

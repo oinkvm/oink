@@ -397,7 +397,9 @@ pub(super) fn descriptor(sddl: &str) -> io::Result<Descriptor> {
     Ok(Descriptor(sd))
 }
 pub(super) fn identity_security(id: u32, rights: u32) -> io::Result<Descriptor> {
-    let sid = user_sid(id)?;
+    sid_security(&user_sid(id)?, rights)
+}
+pub(super) fn sid_security(sid: &[u8], rights: u32) -> io::Result<Descriptor> {
     let mut raw = ptr::null_mut();
     // SAFETY: SID from token, converted string freed after use.
     let text = unsafe {
@@ -417,7 +419,10 @@ pub(super) fn identity_security(id: u32, rights: u32) -> io::Result<Descriptor> 
 /// CreateProcessAsUser does not preserve the duplicated source token object's DACL.
 /// Called as SYSTEM, before creating the public pipe; never grants TOKEN_DUPLICATE or ADJUST.
 pub(super) fn grant_own_token_query(id: u32) -> io::Result<()> {
-    let sd = identity_security(id, TOKEN_QUERY)?;
+    grant_token_query(&user_sid(id)?)
+}
+pub(super) fn grant_token_query(sid: &[u8]) -> io::Result<()> {
+    let sd = sid_security(sid, TOKEN_QUERY)?;
     let mut raw = ptr::null_mut();
     // SAFETY: own SYSTEM token only; WRITE_DAC is needed solely to set its object DACL.
     check(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | WRITE_DAC, &mut raw) })

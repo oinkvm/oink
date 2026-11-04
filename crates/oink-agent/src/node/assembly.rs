@@ -201,12 +201,14 @@ impl Node {
         )));
         input.send(InputCommand::LocalFeel(self.inner.input_backend.feel_profile()));
         input.send(InputCommand::EventFrequency(settings.event_frequency));
+        let injection = self.inner.input_backend.injection_available();
+        input.send(InputCommand::InjectionAvailable(injection));
         let mut tasks = vec![crate::streams::input::InputStreams::spawn_with_port(
             links,
             group.clone(),
             input,
             notices,
-            !inject_blocked(&self.inner.input_backend.permissions()),
+            !inject_blocked(&self.inner.input_backend.permissions()) && injection != Some(false),
             input_port,
         )];
         let (clip_port, cache_port, dnd_port) = match content {
@@ -296,9 +298,15 @@ impl Node {
 
 struct Application(std::sync::Weak<Inner>);
 impl crate::config_module::ConfigApplication for Application {
-    fn prepare_profile_join(&self, intent: &oink_protocol::v1::dto::MergeIntent) -> Result<(), String> {
+    fn prepare_profile_join_with_target(
+        &self,
+        intent: &oink_protocol::v1::dto::MergeIntent,
+        target: &oink_protocol::v1::dto::GroupState,
+    ) -> Result<(), String> {
         let inner = self.0.upgrade().ok_or("backend stopped")?;
-        Node { inner }.prepare_profile_join(intent).map_err(|e| e.message)
+        Node { inner }
+            .prepare_profile_join(intent, target)
+            .map_err(|e| e.message)
     }
 
     fn apply_state(&self, state: &crate::config_module::group_store::StoredGroupState) -> Result<(), String> {

@@ -58,8 +58,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::win_actions::{self, GestureMapper, WinAction};
 use crate::{EventHandler, InputBackend, InputError};
 
-/// The SYSTEM pre-login backend's input: capture on the logon desktop, in-process
-/// injection (see `oink_winsvc::client::use_in_process_helper`), no visible windows.
+/// The SYSTEM pre-login backend captures only on Winlogon; injection uses the
+/// broker-authorized active-console helper. No visible windows.
 pub(crate) fn prelogin_backend() -> Result<Box<dyn InputBackend>, InputError> {
     profile::select(profile::PRELOGIN)?;
     backend()
@@ -205,6 +205,25 @@ impl InputBackend for WinInput {
         self.shortcut_keys.lock().unwrap_or_else(|e| e.into_inner()).clear();
         *self.gestures.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         *self.lock_chord.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+    }
+    fn injection_available(&self) -> Option<bool> {
+        if profile::current() != profile::PRELOGIN && matches!(service::installed(), Ok(false)) {
+            return None;
+        }
+        // This is an ordinary observer query, never a per-input log. Report
+        // changed failures with the helper's existing stage/Win32/target metadata,
+        // without key values, credentials, or claiming the network is offline.
+        static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+        let result = oink_winsvc::client::probe();
+        let error = result.as_ref().err().map(ToString::to_string);
+        let mut last = LAST_ERROR.lock().unwrap_or_else(|e| e.into_inner());
+        if *last != error {
+            if let Some(error) = &error {
+                tracing::warn!(%error, "input target unavailable");
+            }
+            *last = error;
+        }
+        Some(result.is_ok())
     }
     fn input_safety(&self) -> crate::session_gate::InputSafety {
         self.safety.snapshot()

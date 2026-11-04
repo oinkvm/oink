@@ -229,7 +229,7 @@ impl Injector {
             self.pending
                 .entry(old.name.clone())
                 .or_default()
-                .extend(old_held.clone());
+                .extend(self.held.clone());
         }
         // SAFETY: this dedicated thread never owns a window or a hook.
         check(unsafe { SetThreadDesktop(next.handle) })?;
@@ -293,7 +293,7 @@ impl Injector {
         Ok(())
     }
 }
-pub(super) fn run(parent_pid: u32) -> io::Result<()> {
+pub(super) fn run(parent_pid: u32, route: Option<crate::prelogin_route::Source>) -> io::Result<()> {
     // SAFETY: dedicated helper process sets DPI awareness before any desktop/input access.
     unsafe {
         windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
@@ -306,15 +306,53 @@ pub(super) fn run(parent_pid: u32) -> io::Result<()> {
     let id = session()?;
     // SAFETY: read-only active console session query.
     if id == 0 || unsafe { WTSGetActiveConsoleSessionId() } != id {
-        return Err(denied());
+        // Retired before an injector exists: no ledger requires cleanup.
+        return Ok(());
     }
-    security::grant_own_token_query(id)?;
-    let sd = security::pipe_security(id)?;
+    // The service selects this one source at helper creation. An arbitrary
+    // SYSTEM process or a source-provided session is never authorization.
+    let _source = route.as_ref().map(super::prelogin_peer::pin).transpose()?;
+    let account = console::account(id);
+    if let Some(source) = &route {
+        if !crate::console_policy::allows(source.identity.session, id, &account, &source.owner_sid) {
+            return Err(denied());
+        }
+        if let Some(sid) = &source.user_sid {
+            security::grant_token_query(sid)?;
+        }
+    }
+    let current = || console::matches_account(id, &account) && route.as_ref().is_none_or(console::source_current);
+    if !current() {
+        // Token creation can race helper startup at logon. No input has been
+        // admitted, so retirement is clean and must not latch a release failure.
+        return Ok(());
+    }
+    if route.is_some() {
+        // SAFETY: own kernel PID; command-line arguments alone do not prove parentage.
+        if prelogin::parent_pid(unsafe { GetCurrentProcessId() })? != parent_pid {
+            return Err(denied());
+        }
+    } else {
+        security::grant_own_token_query(id)?;
+    }
+    let sd = if let Some(source) = &route {
+        match &source.user_sid {
+            Some(sid) => security::sid_security(sid, 0x12019b)?,
+            None => security::system_security()?,
+        }
+    } else {
+        security::pipe_security(id)?
+    };
     let sa = sd.attrs();
     // SAFETY: fixed local name, protected DACL, one instance, overlapped message mode.
     let pipe = Handle::new(unsafe {
         CreateNamedPipeW(
-            pipe_name(id).as_ptr(),
+            if route.is_some() {
+                prelogin_pipe_name(id)
+            } else {
+                pipe_name(id)
+            }
+            .as_ptr(),
             PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1,
@@ -332,6 +370,10 @@ pub(super) fn run(parent_pid: u32) -> io::Result<()> {
     let notify = signal.clone();
     let priority = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1));
     let native_priority = priority.clone();
+    let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let native_released = released.clone();
+    let native_account = account.clone();
+    let native_source = route.clone();
     let mut workers = crate::helper::Server::new(
         move || {
             let applied = oink_foundation::realtime::apply(
@@ -343,6 +385,9 @@ pub(super) fn run(parent_pid: u32) -> io::Result<()> {
                 id,
                 injector: Injector::default(),
                 priority: native_priority,
+                released: native_released,
+                account: native_account,
+                source: native_source,
             })
         },
         move || Ordinary {
@@ -378,7 +423,7 @@ pub(super) fn run(parent_pid: u32) -> io::Result<()> {
                 n if n == WAIT_OBJECT_0 + 1 || n == WAIT_OBJECT_0 + 2 => break 'serve,
                 n if n == WAIT_OBJECT_0 + 3 => {
                     // SAFETY: read-only active console session query.
-                    if unsafe { WTSGetActiveConsoleSessionId() } != id {
+                    if !current() {
                         break 'serve;
                     }
                 }
@@ -397,11 +442,11 @@ pub(super) fn run(parent_pid: u32) -> io::Result<()> {
                 signal: &signal,
             },
             &mut workers,
-            |pipe, id| security::peer(pipe, id, false),
-            || {
-                // SAFETY: read-only console observation, no synthetic input.
-                (unsafe { WTSGetActiveConsoleSessionId() }) == id
+            |pipe, id| match &route {
+                Some(expected) => super::prelogin_peer::peer(pipe, expected),
+                None => security::peer(pipe, id, false),
             },
+            current,
         )?;
         workers.disconnect();
         // SAFETY: connection operations have cancelled/drained before disconnect.
@@ -413,7 +458,7 @@ pub(super) fn run(parent_pid: u32) -> io::Result<()> {
         let stopped = unsafe {
             WaitForSingleObject(stop.0, 0) == WAIT_OBJECT_0
                 || WaitForSingleObject(parent.0, 0) == WAIT_OBJECT_0
-                || WTSGetActiveConsoleSessionId() != id
+                || !current()
         };
         if stopped {
             break;
@@ -421,37 +466,10 @@ pub(super) fn run(parent_pid: u32) -> io::Result<()> {
     }
     workers.disconnect();
     workers.stop_native();
+    if !released.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(io::Error::other("helper release unconfirmed"));
+    }
     Ok(())
-}
-/// The helper's injection lanes inside the calling SYSTEM process, with no pipe.
-/// The pre-login backend uses this: before anyone signs in there is no session
-/// user to bind the helper pipe's DACL to, and widening that DACL is not an
-/// option. The same [`Injector`] follows the input desktop, keeps held keys per
-/// desktop and releases them across desktop switches.
-pub(super) fn in_process(notify: crate::owner::Wake) -> io::Result<crate::helper::Server> {
-    let id = session()?;
-    let priority = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1));
-    let native_priority = priority.clone();
-    crate::helper::Server::new(
-        move || {
-            let applied = oink_foundation::realtime::apply(
-                oink_foundation::realtime::ThreadRole::Inject,
-                oink_foundation::realtime::Tier::Realtime,
-            )?;
-            native_priority.store(applied.native, std::sync::atomic::Ordering::Release);
-            Ok(Native {
-                id,
-                injector: Injector::default(),
-                priority: native_priority,
-            })
-        },
-        move || Ordinary {
-            id,
-            desktop: None,
-            priority,
-        },
-        notify,
-    )
 }
 struct ConnectionContext<'a> {
     id: u32,
@@ -549,6 +567,9 @@ fn serve_connection(
                         if unsafe { WaitForSingleObject(peer.as_ref().expect("authenticated").0, 0) } != WAIT_TIMEOUT {
                             return Err(denied());
                         }
+                        if !active_session() {
+                            return Err(denied());
+                        }
                         stage = ErrorStage::Decode;
                         let request =
                             request.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid input frame"))?;
@@ -605,17 +626,50 @@ struct Native {
     id: u32,
     injector: Injector,
     priority: std::sync::Arc<std::sync::atomic::AtomicI32>,
+    released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    account: crate::console_policy::Account,
+    source: Option<crate::prelogin_route::Source>,
 }
 impl crate::helper::Native for Native {
     fn apply(&mut self, command: Command) -> Reply {
         let mut stage = ErrorStage::Desktop;
-        let result = self.injector.apply(command, &mut stage);
+        // OpenInputDesktop only follows desktops within this process's session.
+        // Check the physical console at execution (not just the pipe timer), so
+        // queued input cannot enter a retired session after PIN/account switching.
+        // Release still acts on the old attached desktop before the helper exits.
+        // SAFETY: read-only console query.
+        let result = if command != Command::Release
+            && (!console::matches_account(self.id, &self.account)
+                || self.source.as_ref().is_some_and(|s| !console::source_current(s)))
+        {
+            stage = ErrorStage::Liveness;
+            Err(denied())
+        } else {
+            self.injector.apply(command, &mut stage).and_then(|()| {
+                if command == Command::Release && self.injector.pending.values().any(|held| !held.is_empty()) {
+                    Err(io::Error::other("old desktop release remains pending"))
+                } else {
+                    Ok(())
+                }
+            })
+        };
         let priority = oink_foundation::realtime::read_back().map_or(-1, |p| p.native);
         self.priority.store(priority, std::sync::atomic::Ordering::Release);
-        response(result, stage, self.injector.desktop.as_ref(), priority, self.id)
+        response(
+            result,
+            stage,
+            self.injector.desktop.as_ref(),
+            priority,
+            self.id,
+            command,
+        )
     }
     fn release(&mut self) {
-        let _ = self.injector.release();
+        let result = self.injector.release();
+        self.released.store(
+            result.is_ok() && self.injector.pending.values().all(BTreeMap::is_empty),
+            std::sync::atomic::Ordering::Release,
+        );
     }
     fn maintain(&mut self) {
         if !self.injector.held.is_empty() || !self.injector.pending.is_empty() {
@@ -658,26 +712,58 @@ impl crate::helper::Query for Ordinary {
             self.desktop.as_ref(),
             self.priority.load(std::sync::atomic::Ordering::Acquire),
             self.id,
+            command,
         )
     }
 }
 fn response(
+    result: io::Result<()>,
+    stage: ErrorStage,
+    desktop: Option<&Desktop>,
+    priority: i32,
+    id: u32,
+    command: Command,
+) -> Reply {
+    // SAFETY: read-only query on THIS owner's attached desktop.
+    let cursor = unsafe {
+        let mut p = POINT::default();
+        if GetCursorPos(&mut p) == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(p)
+        }
+    };
+    response_with_cursor(result, stage, desktop, priority, id, command, cursor)
+}
+fn response_with_cursor(
     mut result: io::Result<()>,
     mut stage: ErrorStage,
     desktop: Option<&Desktop>,
     priority: i32,
     id: u32,
+    command: Command,
+    cursor: io::Result<POINT>,
 ) -> Reply {
     let mut bytes = [0u8; REPLY_SIZE];
-    // SAFETY: read-only queries on THIS owner's attached desktop.
-    let (pid, pos) = unsafe {
-        let mut p = POINT::default();
-        if GetCursorPos(&mut p) == 0 && result.is_ok() {
-            stage = ErrorStage::Cursor;
-            result = Err(io::Error::last_os_error());
+    let pos = match cursor {
+        Ok(p) => p,
+        Err(error) => {
+            // Release acknowledges the old desktop's ledger, not cursor facts.
+            // A never-used native lane can still be attached to Winlogon after
+            // login; GetCursorPos requires the input desktop and may fail even
+            // though there are no holds (or every Up already succeeded). Do not
+            // switch that thread merely for metadata, or turn cleanup into a
+            // false handoff failure. Real release errors remain authoritative;
+            // probes and other input replies retain their cursor requirement.
+            if command != Command::Release && result.is_ok() {
+                stage = ErrorStage::Cursor;
+                result = Err(error);
+            }
+            POINT::default()
         }
-        (GetCurrentProcessId(), p)
     };
+    // SAFETY: read-only own process identity.
+    let pid = unsafe { GetCurrentProcessId() };
     let error = result.err().map_or(0, |e| {
         e.raw_os_error()
             .filter(|n| *n != 0)
@@ -730,6 +816,138 @@ impl Drop for Ordinary {
 mod isolated_pipe_tests {
     use super::*;
     use std::sync::{Arc, Mutex, mpsc};
+    #[test]
+    fn final_release_ack_survives_unavailable_cursor_on_retired_desktop() {
+        let reply = response_with_cursor(
+            Ok(()),
+            ErrorStage::Release,
+            None,
+            -1,
+            2,
+            Command::Release,
+            Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)),
+        );
+        assert_eq!(
+            &reply.0[..4],
+            &0u32.to_le_bytes(),
+            "empty/cleared ledger is a successful final ACK"
+        );
+    }
+    #[test]
+    fn cursor_unavailability_does_not_hide_real_cleanup_or_query_failures() {
+        let release = response_with_cursor(
+            Err(io::Error::from_raw_os_error(ERROR_GEN_FAILURE as i32)),
+            ErrorStage::Release,
+            None,
+            -1,
+            2,
+            Command::Release,
+            Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)),
+        );
+        assert_eq!(&release.0[..4], &ERROR_GEN_FAILURE.to_le_bytes());
+        assert_eq!(&release.0[84..88], &(ErrorStage::Release as u32).to_le_bytes());
+        for command in [Command::Ping, Command::Position, Command::Move { x: 1, y: 2 }] {
+            let reply = response_with_cursor(
+                Ok(()),
+                ErrorStage::Desktop,
+                None,
+                -1,
+                2,
+                command,
+                Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)),
+            );
+            assert_eq!(&reply.0[..4], &ERROR_ACCESS_DENIED.to_le_bytes());
+            assert_eq!(&reply.0[84..88], &(ErrorStage::Cursor as u32).to_le_bytes());
+        }
+    }
+    #[test]
+    fn retired_console_rejects_new_input_then_releases_the_old_ledger() {
+        use crate::isolation_tests::{Native as FakeNative, Os};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Query;
+        impl crate::helper::Query for Query {
+            fn query(&mut self, _: Command) -> Reply {
+                Reply([0; REPLY_SIZE])
+            }
+        }
+        let (server_pipe, client_pipe) = pipe_io::tests::pair();
+        let server_pipe = pipe_io::SharedPipe::new(server_pipe);
+        let os = Arc::new(Mutex::new(Os::default()));
+        let native_os = os.clone();
+        let active = Arc::new(AtomicBool::new(true));
+        let current = active.clone();
+        let stop = pipe_io::Signal::new().unwrap();
+        let stop_server = stop.clone();
+        let helper = std::thread::spawn(move || {
+            let signal = pipe_io::Signal::new().unwrap();
+            let notify = signal.clone();
+            let mut workers = crate::helper::Server::new(
+                move || Ok(FakeNative { os: native_os }),
+                || Query,
+                Arc::new(move || notify.notify()),
+            )
+            .unwrap();
+            // SAFETY: private test process/event, not the installed service.
+            let parent = Handle::new(unsafe { OpenProcess(SYNCHRONIZE, 0, GetCurrentProcessId()) }).unwrap();
+            // The unarmed timer keeps this interleaving deterministic: the next
+            // frame, not maintenance polling, must reject the retired target.
+            // SAFETY: unnamed, private timer, never performs a desktop operation.
+            let timer = Handle::new(unsafe { CreateWaitableTimerW(ptr::null(), 0, ptr::null()) }).unwrap();
+            // SAFETY: duplicate owned private event for ConnectionContext.
+            let stop_handle = Handle::new(unsafe {
+                let mut duplicate = ptr::null_mut();
+                check(DuplicateHandle(
+                    GetCurrentProcess(),
+                    stop_server.handle(),
+                    GetCurrentProcess(),
+                    &mut duplicate,
+                    SYNCHRONIZE,
+                    0,
+                    0,
+                ))
+                .unwrap();
+                duplicate
+            })
+            .unwrap();
+            serve_connection(
+                server_pipe.handle(),
+                ConnectionContext {
+                    id: 1,
+                    stop: &stop_handle,
+                    parent: &parent,
+                    timer: &timer,
+                    signal: &signal,
+                },
+                &mut workers,
+                |_, _| {
+                    // SAFETY: fake authenticated peer is the current test process.
+                    Handle::new(unsafe { OpenProcess(SYNCHRONIZE, 0, GetCurrentProcessId()) })
+                },
+                || current.load(Ordering::Acquire),
+            )
+            .unwrap();
+            workers.disconnect();
+            workers.stop_native();
+        });
+        let client = super::super::client::private_pipe_client(client_pipe).unwrap();
+        let down = client
+            .request(Command::Button { button: 0, down: true }, false, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&down.0[..4], &[0; 4]);
+        active.store(false, Ordering::Release);
+        let rejected = client.request(Command::Move { x: 12, y: 34 }, false, false);
+        stop.notify();
+        helper.join().unwrap();
+        let rejected = rejected.unwrap().unwrap();
+        assert_ne!(&rejected.0[..4], &[0; 4]);
+        assert_eq!(
+            u32::from_le_bytes(rejected.0[84..88].try_into().unwrap()),
+            ErrorStage::Liveness as u32
+        );
+        assert!(os.lock().unwrap().held.is_empty());
+    }
+
     #[test]
     fn private_overlapped_pipe_delivers_input_ack_while_query_is_blocked() {
         use crate::isolation_tests::{Native as FakeNative, Os, Query as FakeQuery};

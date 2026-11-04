@@ -2164,10 +2164,10 @@ async fn display_notifications_refresh_layout_topology_api_and_restore_detached_
     let root = tempfile::tempdir().unwrap();
     let a = start(root.path(), "display-owner").await;
     let b = start(root.path(), "display-peer").await;
-    let source_default =
-        oink_agent::layout_profiles::model::default_id(oink_agent::api::GroupKey(a.node.group_id().unwrap()));
+    let target_default =
+        oink_agent::layout_profiles::model::default_id(oink_agent::api::GroupKey(b.node.group_id().unwrap()));
     common::pair(&a.node, &b.node).await;
-    common::profile_handoff(&[&a.node, &b.node], &source_default).await;
+    common::profile_handoff(&[&a.node, &b.node], &target_default).await;
     row(&[&a, &b]).await;
     let id = ScreenId::new(a.node.id(), &a.name);
     let b_id = ScreenId::new(b.node.id(), &b.name);

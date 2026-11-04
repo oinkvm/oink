@@ -270,7 +270,7 @@ fn mru_profiles_precede_older_matches_and_unknown_is_never_exact() {
     assert!(c.summaries(&unknown).iter().all(|p| !p.exact_match));
 }
 #[test]
-fn sixteenth_profile_blocks_create_and_group_merge_drops_least_recent() {
+fn sixteenth_profile_blocks_create_but_join_overflow_evicts_lru_and_completes() {
     let s = snapshot();
     let mut c = catalog(&s);
     let old = c.active_profile_id.clone();
@@ -287,17 +287,164 @@ fn sixteenth_profile_blocks_create_and_group_merge_drops_least_recent() {
     );
     let mut source = Catalog::initial(GroupKey(GroupId([5; 16])), device(2), &s, state(&s), 90).unwrap();
     source = source.save(device(2), &s, state(&s), Some("Imported"), 100).unwrap();
+    let before = c.clone();
     let merged = c.merge_group(&source, &"ab".repeat(32), device(1)).unwrap();
     assert_eq!(merged.profiles.len(), 16);
-    assert!(!merged.profiles.iter().any(|p| p.id == old));
-    assert!(merged.profiles.iter().any(|p| p.id == source.active_profile_id));
+    assert_eq!(merged.active_profile_id, c.active_profile_id);
     assert_eq!(
-        merged.merge_group(&source, &"ab".repeat(32), device(1)).unwrap(),
-        merged
+        merged.default_profile().unwrap().id,
+        source.default_profile().unwrap().id
     );
+    assert!(merged.completed_joins.contains_key(&"ab".repeat(32)));
+    assert_eq!(c, before);
+    assert_ne!(c.active_profile_id, old);
 }
 
-fn accepting_default_is_dropped(source_devices: usize) {
+#[test]
+fn merge_and_load_preserve_visibility_for_all_group_sizes_and_profile_selections() {
+    fn group(first: u8, count: u8) -> ArrangementSnapshot {
+        let mut s = snapshot();
+        s.placements.clear();
+        s.native.clear();
+        s.disabled.clear();
+        for n in first..first + count {
+            s.placements.push(Placement {
+                device: device(n),
+                origin: Point::new(f64::from(n) * 300.0, 0.0),
+                scale: 1.0,
+            });
+            let screens = ["main", "second"].map(|name| screen(n, name));
+            s.native.push(NativeState {
+                device: device(n),
+                token: String::new(),
+                primary: screens[0].clone(),
+                screens: screens
+                    .iter()
+                    .enumerate()
+                    .map(|(i, key)| NativeScreen {
+                        screen: key.clone(),
+                        origin: Point::new(i as f64 * 100.0, 0.0),
+                        size: Size::new(100.0, 100.0),
+                    })
+                    .collect(),
+            });
+            s.disabled.extend(screens.into_iter().map(|screen| Disabled {
+                screen,
+                disabled: false,
+            }));
+        }
+        s
+    }
+    // Both directions of group + singleton, plus singleton + singleton and group + group.
+    for (target_count, source_count) in [(1, 1), (3, 1), (1, 3), (3, 2)] {
+        for selections in 0..4 {
+            // Independent per-screen and whole-device visibility on both sides.
+            for hidden in 0..16 {
+                let mut target_live = group(1, target_count);
+                let mut source_live = group(10, source_count);
+                target_live.disabled[1].disabled = hidden & 1 != 0;
+                source_live.disabled[1].disabled = hidden & 2 != 0;
+                target_live.screen_shared.push(DeviceSharing {
+                    device: device(1),
+                    shared: hidden & 4 == 0,
+                });
+                source_live.screen_shared.push(DeviceSharing {
+                    device: device(10),
+                    shared: hidden & 8 == 0,
+                });
+                let mut target = catalog(&target_live);
+                let mut source = Catalog::initial(
+                    GroupKey(GroupId([5; 16])),
+                    device(10),
+                    &source_live,
+                    state(&source_live),
+                    20,
+                )
+                .unwrap();
+                if selections & 1 != 0 {
+                    target = target
+                        .save(device(1), &target_live, state(&target_live), Some("Target desk"), 30)
+                        .unwrap();
+                }
+                if selections & 2 != 0 {
+                    source = source
+                        .save(device(10), &source_live, state(&source_live), Some("Source desk"), 30)
+                        .unwrap();
+                }
+                let mut live = target_live.clone();
+                live.placements.extend(source_live.placements);
+                live.native.extend(source_live.native);
+                live.disabled.extend(source_live.disabled);
+                live.screen_shared.extend(source_live.screen_shared);
+                // A screen unknown to either saved catalog must retain its current
+                // visible state when a profile missing it is explicitly loaded.
+                let new_screen = screen(1, "new");
+                live.native[0].screens.push(NativeScreen {
+                    screen: new_screen.clone(),
+                    origin: Point::new(200.0, 0.0),
+                    size: Size::new(100.0, 100.0),
+                });
+                live.disabled.push(Disabled {
+                    screen: new_screen.clone(),
+                    disabled: false,
+                });
+                let merged = target.merge_group(&source, &"ad".repeat(32), device(1)).unwrap();
+                for profile in &merged.profiles {
+                    let loaded = restore(&profile.content, &live, &devices(&live)).unwrap().snapshot;
+                    for before in &live.disabled {
+                        let expected = profile
+                            .content
+                            .disabled
+                            .iter()
+                            .find(|d| d.screen == before.screen)
+                            .unwrap_or(before);
+                        assert!(
+                            loaded.disabled.contains(expected),
+                            "visibility changed for {target_count}+{source_count}, selection={selections}, hidden={hidden}"
+                        );
+                    }
+                    for p in &live.placements {
+                        let expected = if profile.content.placements.iter().any(|s| s.device == p.device) {
+                            screen_shared(&profile.content, p.device)
+                        } else {
+                            screen_shared(&live, p.device)
+                        };
+                        assert_eq!(screen_shared(&loaded, p.device), expected);
+                    }
+                    assert!(loaded.disabled.iter().any(|d| d.screen == new_screen && !d.disabled));
+                    assert_eq!(loaded.placements.len(), live.placements.len());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn preserved_default_is_a_normal_profile_with_unique_name_and_durable_deletion() {
+    let s = snapshot();
+    let target = catalog(&s);
+    let source = Catalog::initial(GroupKey(GroupId([5; 16])), device(2), &s, state(&s), 20).unwrap();
+    let id = "ac".repeat(32);
+    let merged = target.merge_group(&source, &id, device(1)).unwrap();
+    let preserved = merged.profiles.iter().find(|p| p.default_group.is_none()).unwrap();
+    let ProfileName::Custom { value } = &preserved.name else {
+        panic!("ordinary name required")
+    };
+    let target = target.save(device(1), &s, state(&s), Some(value), 30).unwrap();
+    let merged = target.merge_group(&source, &id, device(1)).unwrap();
+    assert_eq!(merged.profiles.len(), 3);
+    merged.validate().unwrap();
+    let preserved = merged.profile(&preserved.id).unwrap();
+    assert_eq!(preserved.content_revision, target.profiles[0].content_revision);
+    let deleted = merged.delete(device(1), &preserved.id, &s, state(&s), 40).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    store::save(root.path(), &deleted).unwrap();
+    let recovered = store::load(root.path(), target.group).unwrap().unwrap();
+    assert_eq!(recovered.merge_group(&source, &id, device(1)).unwrap(), deleted);
+    assert!(recovered.profile(&preserved.id).is_err());
+}
+
+fn accepting_default_is_preserved(source_devices: usize) {
     let target_snapshot = snapshot();
     let mut source_snapshot = snapshot();
     source_snapshot.placements.truncate(source_devices);
@@ -337,8 +484,14 @@ fn accepting_default_is_dropped(source_devices: usize) {
         )
         .unwrap();
     let merged = target.merge_group(&source, &"ef".repeat(32), device(1)).unwrap();
+    if source_devices == 1 {
+        assert_eq!(merged.profiles.len(), target.profiles.len());
+        assert_eq!(merged.default_profile().unwrap().id, target_default);
+        assert_eq!(merged.active_profile_id, target.active_profile_id);
+        return;
+    }
     assert!(!merged.profiles.iter().any(|p| p.id == target_default));
-    assert_eq!(merged.profiles.len(), 3);
+    assert_eq!(merged.profiles.len(), 4);
     assert_eq!(merged.active_profile_id, source_default);
     assert_eq!(
         merged
@@ -354,22 +507,27 @@ fn accepting_default_is_dropped(source_devices: usize) {
             .iter()
             .chain(&source.profiles)
             .find(|p| p.id == profile.id)
-            .unwrap();
+            .unwrap_or_else(|| target.profile(&target_default).unwrap());
         assert_eq!(profile.content, original.content);
-        assert_eq!(profile.name, original.name);
+        if profile.id == original.id {
+            assert_eq!(profile.name, original.name);
+        } else {
+            assert_eq!(profile.default_group, None);
+            assert!(matches!(profile.name, ProfileName::Custom { .. }));
+        }
         assert_eq!(profile.content_revision, original.content_revision);
         assert_eq!(profile.last_used, original.last_used);
     }
 }
 
 #[test]
-fn group_join_discards_accepting_group_default() {
-    accepting_default_is_dropped(2);
+fn group_join_replaces_default_identity_and_preserves_acceptors_content() {
+    accepting_default_is_preserved(2);
 }
 
 #[test]
-fn single_device_join_discards_accepting_group_default() {
-    accepting_default_is_dropped(1);
+fn single_device_join_keeps_acceptors_multi_device_default() {
+    accepting_default_is_preserved(1);
 }
 
 #[test]
@@ -627,7 +785,7 @@ fn offline_sync_is_effectively_rigid_and_reconnect_retains_placement() {
 // It preserves unknown profile fields but only the target catalog's extensions.
 
 #[test]
-fn second_join_discards_inherited_default_even_after_rename() {
+fn second_join_preserves_inherited_default_content_even_after_rename() {
     let s = snapshot();
     let target = catalog(&s);
     let first = Catalog::initial(GroupKey(GroupId([5; 16])), device(2), &s, state(&s), 10).unwrap();
@@ -644,6 +802,20 @@ fn second_join_discards_inherited_default_even_after_rename() {
         .merge_group(&second, &"cd".repeat(32), device(1))
         .unwrap();
     assert!(!result.profiles.iter().any(|p| p.id == first.active_profile_id));
+    let preserved = result
+        .profiles
+        .iter()
+        .find(|p| {
+            p.name
+                == ProfileName::Custom {
+                    value: "Renamed inherited default".into(),
+                }
+        })
+        .expect("renaming the inherited default must not make its content disposable");
+    assert_eq!(preserved.content, active_default.active().content);
+    assert_eq!(preserved.content_revision, active_default.active().content_revision);
+    assert_eq!(preserved.last_used, active_default.active().last_used);
+    assert_eq!(preserved.default_group, None);
     assert_eq!(result.default_profile().unwrap().id, second.active_profile_id);
     assert_eq!(result.active_profile_id, second.active_profile_id);
     assert!(result.profiles.iter().any(|p| p.id == active_custom));
@@ -652,7 +824,7 @@ fn second_join_discards_inherited_default_even_after_rename() {
 }
 
 #[test]
-fn deleted_defaults_are_not_recreated_and_surviving_default_is_not_pinned_over_mru() {
+fn deleted_defaults_are_not_recreated_and_overflow_keeps_imported_default_and_active() {
     let s = snapshot();
     let target = catalog(&s);
     let source = Catalog::initial(GroupKey(GroupId([5; 16])), device(2), &s, state(&s), 1).unwrap();
@@ -681,7 +853,12 @@ fn deleted_defaults_are_not_recreated_and_surviving_default_is_not_pinned_over_m
         .unwrap();
     let merged = full.merge_group(&source, &"cd".repeat(32), device(1)).unwrap();
     assert_eq!(merged.profiles.len(), 16);
-    assert!(merged.default_profile().is_none());
+    assert_eq!(merged.active_profile_id, full.active_profile_id);
+    assert_eq!(
+        merged.default_profile().unwrap().id,
+        source.default_profile().unwrap().id
+    );
+    assert!(merged.profiles.iter().any(|p| p.id == source.active_profile_id));
 }
 
 #[test]
@@ -746,7 +923,15 @@ fn simultaneous_acceptors_union_once_and_use_later_completed_default() {
     let b = target.merge_group(&source_b, &"bb".repeat(32), device(4)).unwrap();
     assert!(b.version > a.version);
     let joined = a.receive(&b, device(1)).unwrap();
-    assert_eq!(joined.profiles.len(), 2);
+    assert_eq!(joined.profiles.len(), 3);
+    let preserved = joined
+        .profiles
+        .iter()
+        .filter(|p| p.id != source_a.active_profile_id && p.id != source_b.active_profile_id)
+        .collect::<Vec<_>>();
+    assert_eq!(preserved.len(), 1, "concurrent acceptors preserve only one copy");
+    assert_eq!(preserved[0].content, target.active().content);
+    assert_eq!(preserved[0].default_group, None);
     assert_eq!(joined.default_profile().unwrap().id, source_b.active_profile_id);
     assert_eq!(joined.completed_joins.len(), 2);
     assert!(joined.profiles.iter().any(|p| p.id == source_a.active_profile_id));

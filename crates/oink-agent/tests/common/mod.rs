@@ -39,16 +39,16 @@ pub async fn editable_layouts(nodes: &[&Node], screen_count: usize) {
     .await;
 }
 
-/// A fresh-default fixture needs the completed directional catalog handoff before
-/// editing, pairing onward, or removing the acceptor. Matching target catalogs
-/// can precede its import of the source default; that later import replaces the
-/// target default even if the fixture has already edited it.
+/// A fresh-default fixture needs the completed catalog handoff before editing,
+/// pairing onward, or removing the acceptor. Matching provisional catalogs can
+/// precede completion even when the retained default ID does not change. Check
+/// durable completion and every profile's member coverage as well as API state.
 #[allow(
     dead_code,
     reason = "shared fixture also compiled into tests without profile handoffs"
 )]
-pub async fn profile_handoff(nodes: &[&Node], source_default: &str) {
-    until("source default catalog converged after pairing", || {
+pub async fn profile_handoff(nodes: &[&Node], expected_default: &str) {
+    until("complete profile catalog converged after pairing", || {
         let states = nodes
             .iter()
             .map(|node| {
@@ -56,10 +56,24 @@ pub async fn profile_handoff(nodes: &[&Node], source_default: &str) {
             })
             .collect::<Result<Vec<_>, _>>();
         states.is_ok_and(|states| {
-            states.iter().all(|state| {
+            states.iter().zip(nodes).all(|(state, node)| {
                 state["readiness"] == "ready"
-                    && state["active_profile_id"] == source_default
+                    && state["active_profile_id"] == expected_default
                     && state["catalog_token"] == states[0]["catalog_token"]
+                    && node.group_id().is_some_and(|group| {
+                        super::test_agent::layout_profiles::store::load(node.data_dir(), group.into()).is_ok_and(
+                            |catalog| {
+                                catalog.is_some_and(|c| {
+                                    !c.completed_joins.is_empty()
+                                        && c.profiles.iter().all(|p| {
+                                            nodes
+                                                .iter()
+                                                .all(|n| p.content.placements.iter().any(|p| p.device.0 == n.id()))
+                                        })
+                                })
+                            },
+                        )
+                    })
             })
         })
     })

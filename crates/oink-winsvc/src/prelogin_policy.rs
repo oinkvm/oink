@@ -209,6 +209,8 @@ pub(crate) struct Observation {
     pub console: Option<u32>,
     /// The console session has a logged-on user token.
     pub user_present: bool,
+    /// Logged-on user owns the snapshot and has an enabled installed Run entry.
+    pub owner_autostart: bool,
     /// [`ready`]: enabled, owned and the owner's snapshot exists.
     pub ready: bool,
     /// A service-created user backend (UIAccess) is still alive in any session,
@@ -229,11 +231,13 @@ pub(crate) trait Child {
     fn session(&self) -> u32;
     fn alive(&self) -> bool;
     /// Signal stop, give it the bounded release window, then terminate.
-    fn stop(self);
+    fn stop(&mut self) -> io::Result<()>;
 }
 
 /// Minimum interval between two starts, so an immediately failing backend
 /// cannot become a SYSTEM process spawn loop at the service's poll rate.
+pub(crate) const HANDOFF_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub(crate) const RESTART_DELAY: Duration = Duration::from_secs(5);
 
 /// Owns the single pre-login child. At most one exists, and it is stopped
@@ -241,14 +245,26 @@ pub(crate) const RESTART_DELAY: Duration = Duration::from_secs(5);
 pub(crate) struct Supervisor<C: Child> {
     child: Option<C>,
     last_start: Option<Instant>,
+    phase: Handoff,
+    console_lost: Option<Instant>,
 }
 impl<C: Child> Default for Supervisor<C> {
     fn default() -> Self {
         Self {
             child: None,
             last_start: None,
+            phase: Handoff::LoginScreen,
+            console_lost: None,
         }
     }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Handoff {
+    LoginScreen,
+    AwaitingStart(Instant),
+    Stopping,
+    UserBackend,
+    Failed,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Tick {
@@ -259,7 +275,10 @@ pub(crate) enum Tick {
     Exited,
 }
 impl<C: Child> Supervisor<C> {
-    #[cfg(test)]
+    pub(crate) fn child(&self) -> Option<&C> {
+        self.child.as_ref()
+    }
+
     pub(crate) fn running(&self) -> Option<u32> {
         self.child.as_ref().filter(|c| c.alive()).map(Child::session)
     }
@@ -275,11 +294,34 @@ impl<C: Child> Supervisor<C> {
                 self.child = None;
                 return Ok(Tick::Exited);
             }
-            if wanted == Some(child.session()) {
+            // WTS returns no console while one is being attached/detached. Keep
+            // the network owner through that transition, but not indefinitely.
+            let console_available = if observed.console.is_some() {
+                self.console_lost = None;
+                true
+            } else {
+                let since = *self.console_lost.get_or_insert(now);
+                now.saturating_duration_since(since) < HANDOFF_TIMEOUT
+            };
+            let eligible = console_available && observed.ready && !observed.user_backend_alive && !observed.maintenance;
+            if eligible && !observed.user_present && self.phase == Handoff::LoginScreen {
                 return Ok(Tick::Running(child.session()));
             }
-            self.stop();
+            if eligible && observed.user_present && observed.owner_autostart {
+                if self.phase == Handoff::LoginScreen {
+                    self.phase = Handoff::AwaitingStart(now);
+                }
+                if let Handoff::AwaitingStart(since) = self.phase
+                    && now.saturating_duration_since(since) < HANDOFF_TIMEOUT
+                {
+                    return Ok(Tick::Running(child.session()));
+                }
+            }
+            self.stop()?;
             return Ok(Tick::Stopped);
+        }
+        if matches!(self.phase, Handoff::Failed | Handoff::Stopping) {
+            return Ok(Tick::Idle);
         }
         let Some(session) = wanted else {
             return Ok(Tick::Idle);
@@ -292,16 +334,33 @@ impl<C: Child> Supervisor<C> {
         }
         self.last_start = Some(now);
         self.child = Some(start(session)?);
+        self.phase = Handoff::LoginScreen;
+        self.console_lost = None;
         Ok(Tick::Started(session))
     }
-    /// Stop before a user backend may start. Returns whether a child was running.
-    pub(crate) fn stop(&mut self) -> bool {
-        match self.child.take() {
-            Some(child) => {
-                child.stop();
-                true
+    /// The caller holds the supervisor mutex through creation: the poller cannot
+    /// restart the old identity between the release/exit barrier and CreateProcess.
+    pub(crate) fn handoff<T>(&mut self, create: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        if self.phase == Handoff::Failed {
+            return Err(io::Error::other("pre-login cleanup was not confirmed"));
+        }
+        self.phase = Handoff::Stopping;
+        self.stop()?;
+        self.phase = Handoff::UserBackend;
+        create()
+    }
+    /// Retain ownership on failure: never mistake an unconfirmed termination for
+    /// permission to create another process with the same device identity.
+    pub(crate) fn stop(&mut self) -> io::Result<bool> {
+        if let Some(child) = &mut self.child {
+            if let Err(error) = child.stop() {
+                self.phase = Handoff::Failed;
+                return Err(error);
             }
-            None => false,
+            self.child = None;
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 }
@@ -504,15 +563,17 @@ mod tests {
         fn alive(&self) -> bool {
             *self.alive.borrow()
         }
-        fn stop(self) {
+        fn stop(&mut self) -> io::Result<()> {
             self.log.borrow_mut().push(format!("stop {}", self.session));
             *self.alive.borrow_mut() = false;
+            Ok(())
         }
     }
     fn login_screen(session: u32) -> Observation {
         Observation {
             console: Some(session),
             user_present: false,
+            owner_autostart: true,
             ready: true,
             user_backend_alive: false,
             maintenance: false,
@@ -520,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_runs_only_at_a_ready_login_screen_and_stops_when_a_user_appears() {
+    fn supervisor_runs_only_at_a_ready_login_screen_and_stops_for_a_non_owner() {
         let log = Rc::new(RefCell::new(Vec::new()));
         let alive = Rc::new(RefCell::new(true));
         let start = |session| {
@@ -554,14 +615,167 @@ mod tests {
         }
         assert_eq!(supervisor.tick(&login_screen(1), t0, start).unwrap(), Tick::Started(1));
         assert_eq!(supervisor.tick(&login_screen(1), t0, start).unwrap(), Tick::Running(1));
-        // The user signs in: stop before the user backend can start.
+        // A different user signs in: stop immediately.
         let signed_in = Observation {
             user_present: true,
+            owner_autostart: false,
             ..login_screen(1)
         };
         assert_eq!(supervisor.tick(&signed_in, t0, start).unwrap(), Tick::Stopped);
         assert_eq!(supervisor.running(), None);
         assert_eq!(*log.borrow(), ["start 1", "stop 1"]);
+    }
+
+    #[test]
+    fn token_before_start_keeps_network_owner_alive() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut supervisor = Supervisor::default();
+        let start = |session| {
+            Ok(Fake {
+                session,
+                alive: Rc::new(RefCell::new(true)),
+                log: log.clone(),
+            })
+        };
+        let now = Instant::now();
+        supervisor.tick(&login_screen(1), now, start).unwrap();
+        let logged_in = Observation {
+            user_present: true,
+            ..login_screen(1)
+        };
+        assert_eq!(supervisor.tick(&logged_in, now, start).unwrap(), Tick::Running(1));
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn owner_wait_is_bounded_and_start_requires_cleanup_before_creation() {
+        for autostart in [false, true] {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut supervisor = Supervisor::default();
+            let start = |session| {
+                Ok(Fake {
+                    session,
+                    alive: Rc::new(RefCell::new(true)),
+                    log: log.clone(),
+                })
+            };
+            let now = Instant::now();
+            supervisor.tick(&login_screen(1), now, start).unwrap();
+            let logged_in = Observation {
+                user_present: true,
+                owner_autostart: autostart,
+                ..login_screen(1)
+            };
+            let expected = if autostart { Tick::Running(1) } else { Tick::Stopped };
+            assert_eq!(supervisor.tick(&logged_in, now, start).unwrap(), expected);
+            if autostart {
+                assert_eq!(
+                    supervisor.tick(&logged_in, now + HANDOFF_TIMEOUT, start).unwrap(),
+                    Tick::Stopped
+                );
+                assert_eq!(
+                    supervisor.tick(&logged_in, now + HANDOFF_TIMEOUT, start).unwrap(),
+                    Tick::Idle
+                );
+            }
+            assert_eq!(*log.borrow(), ["stop 1"]);
+        }
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut supervisor = Supervisor::default();
+        supervisor
+            .tick(&login_screen(1), Instant::now(), |session| {
+                Ok(Fake {
+                    session,
+                    alive: Rc::new(RefCell::new(true)),
+                    log: log.clone(),
+                })
+            })
+            .unwrap();
+        supervisor
+            .handoff(|| {
+                log.borrow_mut().push("create user".into());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(*log.borrow(), ["stop 1", "create user"]);
+    }
+
+    #[test]
+    fn transient_console_detach_does_not_destroy_network_identity() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut supervisor = Supervisor::default();
+        let start = |session| {
+            Ok(Fake {
+                session,
+                alive: Rc::new(RefCell::new(true)),
+                log: log.clone(),
+            })
+        };
+        let now = Instant::now();
+        supervisor.tick(&login_screen(1), now, start).unwrap();
+        let detached = Observation {
+            console: None,
+            ..login_screen(1)
+        };
+        assert_eq!(supervisor.tick(&detached, now, start).unwrap(), Tick::Running(1));
+        assert_eq!(supervisor.tick(&login_screen(2), now, start).unwrap(), Tick::Running(1));
+        assert_eq!(supervisor.tick(&detached, now, start).unwrap(), Tick::Running(1));
+        assert_eq!(
+            supervisor.tick(&detached, now + HANDOFF_TIMEOUT, start).unwrap(),
+            Tick::Stopped
+        );
+        assert_eq!(*log.borrow(), ["stop 1"]);
+    }
+
+    #[test]
+    fn active_console_switch_preserves_the_original_network_process() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut supervisor = Supervisor::default();
+        let start = |session| {
+            Ok(Fake {
+                session,
+                alive: Rc::new(RefCell::new(true)),
+                log: log.clone(),
+            })
+        };
+        let now = Instant::now();
+        supervisor.tick(&login_screen(1), now, start).unwrap();
+        assert_eq!(supervisor.tick(&login_screen(2), now, start).unwrap(), Tick::Running(1));
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn failed_stop_never_creates_or_restarts_an_identity() {
+        struct Stuck;
+        impl Child for Stuck {
+            fn session(&self) -> u32 {
+                1
+            }
+            fn alive(&self) -> bool {
+                true
+            }
+            fn stop(&mut self) -> io::Result<()> {
+                Err(io::Error::other("release unconfirmed"))
+            }
+        }
+        let mut supervisor = Supervisor::default();
+        let now = Instant::now();
+        supervisor.tick(&login_screen(1), now, |_| Ok(Stuck)).unwrap();
+        assert!(
+            supervisor
+                .handoff(|| -> io::Result<()> { panic!("must not create") })
+                .is_err()
+        );
+        assert_eq!(supervisor.running(), Some(1));
+        assert!(
+            supervisor.child().is_some(),
+            "failed cleanup retains the original process owner"
+        );
+        assert!(
+            supervisor
+                .handoff(|| -> io::Result<()> { panic!("must not retry creation") })
+                .is_err()
+        );
     }
 
     #[test]
@@ -595,12 +809,11 @@ mod tests {
             Tick::Started(3)
         );
         let next = later + RESTART_DELAY;
-        assert_eq!(supervisor.tick(&login_screen(4), next, start).unwrap(), Tick::Stopped);
         assert_eq!(
             supervisor.tick(&login_screen(4), next, start).unwrap(),
-            Tick::Started(4)
+            Tick::Running(3)
         );
-        assert_eq!(*log.borrow(), ["start 2", "stop 2", "start 3", "stop 3", "start 4"]);
+        assert_eq!(*log.borrow(), ["start 2", "stop 2", "start 3"]);
     }
 
     #[test]
@@ -629,7 +842,7 @@ mod tests {
         );
         assert_eq!(*starts.borrow(), 2);
         // The user backend launch path stops it unconditionally first.
-        assert!(supervisor.stop());
-        assert!(!supervisor.stop());
+        assert!(supervisor.stop().unwrap());
+        assert!(!supervisor.stop().unwrap());
     }
 }

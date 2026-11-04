@@ -304,7 +304,10 @@ impl Owner {
             if let Some(bundle) = journal.pending_bundle().map_err(|e| fail(&e))? {
                 let intent = bundle.certificate().and_then(|c| c.intent()).map_err(|e| fail(&e))?;
                 deps.application
-                    .prepare_profile_join(&intent)
+                    .prepare_profile_join_with_target(
+                        &intent,
+                        &bundle.plan().and_then(|p| p.target_base()).map_err(|e| fail(&e))?,
+                    )
                     .map_err(StartError::Unreadable)?;
             }
             stored.state = projected;

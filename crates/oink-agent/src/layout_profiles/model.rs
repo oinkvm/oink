@@ -54,11 +54,13 @@ pub struct Profile {
     pub content: ArrangementSnapshot,
     pub match_state: DeviceState,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompletedJoin {
     pub version: Version,
     pub default_profile: Option<String>,
     pub dropped_defaults: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub appends: Vec<Profile>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Catalog {
@@ -154,6 +156,7 @@ impl Catalog {
                     || !id.bytes().all(|b| b.is_ascii_hexdigit())
                     || j.version.counter == 0
                     || j.dropped_defaults.len() > 16
+                    || j.appends.len() > 2
                     || j.dropped_defaults
                         .iter()
                         .chain(j.default_profile.iter())
@@ -162,6 +165,20 @@ impl Catalog {
             || !self.profiles.iter().any(|p| p.id == self.active_profile_id)
         {
             return Err(ProfileError::new(ErrorCode::InvalidGeometry, "Invalid profile catalog"));
+        }
+        for profile in self.completed_joins.values().flat_map(|j| &j.appends) {
+            // Reuse ordinary profile validation; the wrapper has no completions,
+            // so validation cannot recurse through further append records.
+            Catalog {
+                schema: 1,
+                extensions: Vec::new(),
+                group: self.group,
+                version: profile.content_revision.clone(),
+                active_profile_id: profile.id.clone(),
+                profiles: vec![profile.clone()],
+                completed_joins: BTreeMap::new(),
+            }
+            .validate()?;
         }
         let mut ids = BTreeSet::new();
         let mut names = BTreeSet::new();

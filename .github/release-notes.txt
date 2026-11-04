@@ -1,4 +1,4 @@
-Oink 0.3.2 lets you use Oink at the Windows sign-in screen, and fixes images dragged into web pages on Windows and a Mac staying offline.
+Oink 0.3.2 lets you use Oink at the Windows sign-in screen, and fixes images dragged into web pages on Windows, a Mac staying offline, apps losing focus when the pointer returns to Windows, and newly paired computers appearing hidden in the layout.
 
 ## New
 
@@ -9,6 +9,8 @@ Oink 0.3.2 lets you use Oink at the Windows sign-in screen, and fixes images dra
 
 - Fixed images dragged from another computer into Chrome and other browsers on Windows failing to load (for example, "image failed to load" on upload pages).
 - Fixed a Mac sometimes staying offline until Oink was restarted, after macOS stopped Oink's network connection (for example, when VPN or security software changed network settings).
+- Fixed apps opened on Windows while the pointer was on another computer losing focus or minimizing (for example, fullscreen games) when the pointer came back.
+- Fixed a newly paired computer or newly connected screen sometimes being hidden in the layout until you showed it manually.
 
 ## Compatibility
 

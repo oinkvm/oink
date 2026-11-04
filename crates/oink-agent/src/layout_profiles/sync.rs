@@ -113,7 +113,28 @@ impl Node {
                 }
                 let current = store::load(&self.inner.data_dir, group.into())?
                     .ok_or_else(|| super::state::unavailable("Accepting catalog unavailable"))?;
-                let next = current.merge_group(&source, &id, self.id().into())?;
+                // Admission must not depend on a live-facts query. Complete
+                // saved snapshots are sufficient; a genuinely missing member
+                // remains pending until an authoritative observation is available.
+                let live =
+                    self.observe_profiles()
+                        .map(|o| o.snapshot)
+                        .unwrap_or_else(|_| super::types::ArrangementSnapshot {
+                            placements: Vec::new(),
+                            native: Vec::new(),
+                            disabled: Vec::new(),
+                            screen_shared: Vec::new(),
+                            topology: Default::default(),
+                            active_profile_id: String::new(),
+                        });
+                let current_members = self.group_members().into_iter().map(crate::api::DeviceKey).collect();
+                let context = super::composition::MergeContext {
+                    source_members: &join.source_members,
+                    target_members: &join.target_members,
+                    current_members: &current_members,
+                    live: &live,
+                };
+                let next = current.merge_group_with_context(&source, &id, self.id().into(), &context)?;
                 if next != current {
                     self.persist_catalog(next)?;
                 }

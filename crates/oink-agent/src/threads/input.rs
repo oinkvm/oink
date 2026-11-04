@@ -69,6 +69,8 @@ pub enum InputCommand {
     IdentifyScreens(u64),
     /// This device can or cannot be controlled (`set_paused(paused || !controllable)`).
     Controllable(bool),
+    /// Observed helper-target availability; separate from capture permissions.
+    InjectionAvailable(Option<bool>),
     FocusLock(bool),
     ReleaseOwnedFocusLock {
         reply: OwnerApplyReply,
