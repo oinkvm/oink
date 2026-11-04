@@ -237,6 +237,8 @@ export type BlockedDeviceRequest =
 export type UpdateError = 'package_unavailable'|'verification_timeout'|'wrong_product'|'wrong_architecture'|'downgrade'|'corrupt_package'|'not_notarized'|'not_writable'|'elevation'| 'metadata'|'signature'|'expired_feed'|'replay'|'clock'|'url'|'limit'|'policy'|'os_unsupported'|'busy'|'transaction'|'repair_required'|'storage'|'not_configured'|'network';
 
 export interface ApiError {
+  /** Local backend startup/connection detail, when available. */
+  message?: string;
   code: "update_failed" | "unavailable" | "not_found" | "invalid_argument" | "invalid_state"
     | "network" | "unsupported" | "internal" | "invalid_address" | "not_member" | "persistence_failed" | "network_stopped";
   problem: UserFacingProblem;

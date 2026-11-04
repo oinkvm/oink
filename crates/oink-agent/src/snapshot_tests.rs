@@ -988,8 +988,8 @@ fn local_contacts_capability_and_effective_preference_recover() {
         assert!(b.input_settings().unwrap().mac_scroll_feel);
         assert!(!a.input_settings().unwrap().forward_injected_input);
         assert!(!b.input_settings().unwrap().forward_injected_input);
-        assert!(a.input_settings().unwrap().take_foreground_on_leave);
-        assert!(b.input_settings().unwrap().take_foreground_on_leave);
+        assert!(!a.input_settings().unwrap().take_foreground_on_leave);
+        assert!(!b.input_settings().unwrap().take_foreground_on_leave);
         for enabled in [false, true] {
             let node = a.clone();
             tokio::task::spawn_blocking(move || {
@@ -1008,7 +1008,7 @@ fn local_contacts_capability_and_effective_preference_recover() {
             assert_eq!(reloaded.settings.routing.take_foreground_on_leave, enabled);
             assert!(reloaded.settings.routing.forward_injected_input);
             assert!(
-                b.input_settings().unwrap().take_foreground_on_leave,
+                !b.input_settings().unwrap().take_foreground_on_leave,
                 "must not propagate to peer"
             );
             assert!(!b.input_settings().unwrap().forward_injected_input);

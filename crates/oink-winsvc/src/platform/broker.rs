@@ -131,37 +131,44 @@ impl crate::prelogin_route::Helper for Child {
         // SAFETY: owned process handle, nonblocking query.
         unsafe { WaitForSingleObject(self.process.0, 0) == WAIT_TIMEOUT }
     }
-    fn session_ended(&self) -> bool {
-        // Windows 10 22H2 logoff terminates this SYSTEM child with 0x40010004
-        // before native cleanup can ACK. Keeping Route.failed forever then
-        // disables every later login screen. Retire only after the pinned
-        // process is signalled AND WTS successfully reports its session gone;
-        // FUS/disconnection, missing user tokens and query errors do not qualify.
-        // No old input is replayed, and same-session release failures stay closed.
-        // SAFETY: retained process handle; a failed wait is not an exit proof.
-        let exited = unsafe { WaitForSingleObject(self.process.0, 0) == WAIT_OBJECT_0 };
-        exited && matches!(console::session_exists(self.target.session), Ok(false))
-    }
     fn stop(&mut self) -> io::Result<()> {
         if self.stopped {
             return Ok(());
         }
-        // SAFETY: owned event/process; do not create a replacement unless old
-        // native cleanup returned and the old process exited normally.
+        // The old process must exit before replacement. Release remains best
+        // effort; a nonzero exit or a surviving disconnected session is not a
+        // barrier (the same handoff rule as the network backend).
+        // SAFETY: owned event/process; waits and forced termination are bounded.
         unsafe {
-            check(SetEvent(self.stop.0))?;
-            if WaitForSingleObject(self.process.0, 2500) != WAIT_OBJECT_0 {
-                check(TerminateProcess(self.process.0, 1))?;
-                WaitForSingleObject(self.process.0, 500);
-                return Err(io::Error::other("helper stop/release timed out"));
+            if WaitForSingleObject(self.process.0, 0) != WAIT_OBJECT_0 {
+                check(SetEvent(self.stop.0))?;
+                match WaitForSingleObject(self.process.0, 2500) {
+                    WAIT_OBJECT_0 => {}
+                    WAIT_TIMEOUT => {
+                        check(TerminateProcess(self.process.0, 1))?;
+                        let exited = WaitForSingleObject(self.process.0, 500) == WAIT_OBJECT_0;
+                        eprintln!(
+                            "Oink helper stop timed out: session={} process_exit_confirmed={exited}",
+                            self.target.session
+                        );
+                        if !exited {
+                            return Err(io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                "helper_process_still_running",
+                            ));
+                        }
+                    }
+                    _ => return Err(io::Error::last_os_error()),
+                }
             }
             let mut exit = 1;
-            check(GetExitCodeProcess(self.process.0, &mut exit))?;
-            if exit != 0 {
-                return Err(io::Error::other(format!(
-                    "helper release failed: session={} exit={exit:#010x}",
+            if GetExitCodeProcess(self.process.0, &mut exit) == 0 {
+                eprintln!("Oink helper exit code unavailable: {}", io::Error::last_os_error());
+            } else if exit != 0 {
+                eprintln!(
+                    "Oink helper exited during handoff: session={} code={exit:#010x}",
                     self.target.session
-                )));
+                );
             }
         }
         self.stopped = true;
@@ -316,4 +323,39 @@ fn spawn(target: crate::prelogin_route::Target) -> io::Result<Child> {
         stop,
         stopped: false,
     })
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::*;
+    use crate::prelogin_route::{Helper as _, Target};
+    use std::os::windows::io::IntoRawHandle;
+
+    #[test]
+    fn helper_exit_allows_replacement_even_when_release_failed_and_session_still_exists() {
+        for exit in [0, 1, 7] {
+            let process = std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", &format!("exit {exit}")])
+                .spawn()
+                .unwrap();
+            let process = Handle::new(process.into_raw_handle()).unwrap();
+            // SAFETY: private child and unnamed event; no installed service or desktop action.
+            let stop = Handle::new(unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) }).unwrap();
+            // SAFETY: owned private process, bounded wait for actual exit.
+            assert_eq!(unsafe { WaitForSingleObject(process.0, 5000) }, WAIT_OBJECT_0);
+            let mut child = Child {
+                target: Target {
+                    session: session().unwrap(),
+                    source: None,
+                    user_sid: None,
+                },
+                stopped: false,
+                process,
+                stop,
+            };
+            child.stop().unwrap();
+            assert!(!child.alive());
+            child.stop().unwrap();
+        }
+    }
 }

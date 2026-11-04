@@ -818,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_capture_defaults_on_for_old_files_and_stays_local() {
+    fn foreground_capture_defaults_off_for_old_files_and_stays_local() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = AgentConfig::load_from(dir.path()).unwrap();
         config.save().unwrap();
@@ -826,8 +826,23 @@ mod tests {
         old["local"]["routing"] = serde_json::json!({"forward_injected_input":true});
         std::fs::write(config.settings_path(), serde_json::to_vec(&old).unwrap()).unwrap();
         config = AgentConfig::load_from(dir.path()).unwrap();
-        assert!(config.settings.routing.take_foreground_on_leave);
-        for enabled in [false, true] {
+        assert!(!config.settings.routing.take_foreground_on_leave);
+        config
+            .update_local(&serde_json::json!({"routing":{"forward_injected_input":false}}), |s| {
+                s.routing.forward_injected_input = false;
+            })
+            .unwrap();
+        assert!(
+            stored(dir.path())["local"]["routing"]
+                .get("take_foreground_on_leave")
+                .is_none()
+        );
+        config
+            .update_local(&serde_json::json!({"routing":{"forward_injected_input":true}}), |s| {
+                s.routing.forward_injected_input = true;
+            })
+            .unwrap();
+        for enabled in [true, false] {
             config
                 .update_local(
                     &serde_json::json!({"routing":{"take_foreground_on_leave":enabled}}),

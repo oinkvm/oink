@@ -10,7 +10,7 @@ repository.workspace = true
 
 [features]
 # Enabled only by the unpublished shared test-support package.
-test-support = []
+test-support = ["dep:fs2"]
 
 [dependencies]
 oink-foundation.workspace = true
@@ -27,6 +27,7 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
 socket2 = "0.6"
+fs2 = { version = "0.4", optional = true }
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8", "serde"] }
@@ -50,6 +51,7 @@ mdns-sd = "0.21"
 libc = "0.2"
 
 [dev-dependencies]
+oink-network = { path = ".", features = ["test-support"] }
 oink-foundation = { workspace = true, features = ["test-storage-retries"] }
 tokio = { workspace = true, features = ["test-util"] }
 oink-audio.workspace = true
@@ -57,7 +59,7 @@ oink-clipboard.workspace = true
 blake3 = "1"
 tracing-subscriber.workspace = true
 tempfile = "3"
-# tests/support/src/ports.rs is included by path and uses fs2 file locks.
+# Socket reservations retain file leases after their owners shut down.
 fs2 = "0.4"
 
 [lints]

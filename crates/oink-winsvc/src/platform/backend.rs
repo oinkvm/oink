@@ -48,16 +48,47 @@ fn number(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<u32> {
 
 /// A request starts exactly the installed backend. No direct-process fallback.
 pub fn start(data_dir: &Path) -> io::Result<u32> {
+    start_tracked(data_dir).map(|process| process.id())
+}
+/// The broker duplicates the original creation handle into this UI. Opening a
+/// PID here would race early exit/PID reuse and UIAccess integrity restrictions.
+pub fn start_tracked(data_dir: &Path) -> io::Result<StartedProcess> {
     let exe = std::env::current_exe()?;
-    start_in(data_dir, exe.parent().ok_or_else(denied)?)
+    request(data_dir, exe.parent().ok_or_else(denied)?, false)
 }
 pub fn reopen(data_dir: &Path) -> io::Result<u32> {
-    request(data_dir, &std::env::current_dir()?, true)
+    request(data_dir, &std::env::current_dir()?, true).map(|process| process.id())
 }
 pub fn start_in(data_dir: &Path, directory: &Path) -> io::Result<u32> {
-    request(data_dir, directory, false)
+    request(data_dir, directory, false).map(|process| process.id())
 }
-fn request(data_dir: &Path, directory: &Path, reopen: bool) -> io::Result<u32> {
+/// Owns only SYNCHRONIZE and PROCESS_QUERY_LIMITED_INFORMATION, never input,
+/// mutation, token or duplication rights to the UIAccess process.
+#[derive(Debug)]
+pub struct StartedProcess {
+    process: Handle,
+    pid: u32,
+}
+impl StartedProcess {
+    pub fn id(&self) -> u32 {
+        self.pid
+    }
+    pub fn exit_code(&self) -> io::Result<Option<u32>> {
+        // Check the signaled state first: 259 is also a legal process exit code.
+        // SAFETY: this object owns the query/synchronize handle until Drop.
+        match unsafe { WaitForSingleObject(self.process.0, 0) } {
+            WAIT_TIMEOUT => Ok(None),
+            WAIT_OBJECT_0 => {
+                let mut code = 0;
+                // SAFETY: owned process handle and valid DWORD output.
+                check(unsafe { GetExitCodeProcess(self.process.0, &mut code) })?;
+                Ok(Some(code))
+            }
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+}
+fn request(data_dir: &Path, directory: &Path, reopen: bool) -> io::Result<StartedProcess> {
     if !security::client_installation()? {
         return Err(denied());
     }
@@ -82,10 +113,27 @@ fn request(data_dir: &Path, directory: &Path, reopen: bool) -> io::Result<u32> {
     } else {
         BackendLaunch::Start { environment, directory }
     };
-    match exchange(message)? {
-        BackendLaunch::Started { pid } => {
+    let reply = crate::launch_recipe::wait_for_prelogin_exit(
+        || exchange(message.clone()),
+        |process_handle| {
+            // SAFETY: only a verified service reply supplies this synchronize-only handle.
+            let previous = Handle::new(process_handle as usize as HANDLE)?;
+            tracing::info!("pre-login process still running; waiting for confirmed exit");
+            // A signaled pinned process authorizes another Start request.
+            // SAFETY: owned synchronize-only old-process handle from the broker.
+            match unsafe { WaitForSingleObject(previous.0, INFINITE) } {
+                WAIT_OBJECT_0 => Ok(()),
+                _ => Err(io::Error::last_os_error()),
+            }
+        },
+    )?;
+    match reply {
+        BackendLaunch::Started { pid, process_handle } => {
+            // SAFETY: the verified SYSTEM broker duplicated this owned handle
+            // into the requesting process before replying on this exact pipe.
+            let process = Handle::new(process_handle as usize as HANDLE)?;
             tracing::info!(pid, reopen, "OinkInput backend entry created");
-            Ok(pid)
+            Ok(StartedProcess { process, pid })
         }
         BackendLaunch::Failed { error } => Err(io::Error::other(error)),
         _ => Err(denied()),
@@ -212,7 +260,7 @@ fn serve_session(id: u32) -> io::Result<()> {
         drop(op);
         let result = (|| {
             let request = receive(&pipe)?;
-            let _client = security::peer(pipe.0, id, false).map_err(|e| context("authenticate launch client", e))?;
+            let _client = security::launch_peer(pipe.0, id).map_err(|e| context("authenticate launch client", e))?;
             // A session may have switched while authentication was running.
             // SAFETY: no mutation; launch must still belong to the active interactive user.
             if unsafe { WTSGetActiveConsoleSessionId() } != id {
@@ -236,14 +284,19 @@ fn serve_session(id: u32) -> io::Result<()> {
             }
             let user = security::sid_bytes(client_token.0)?;
             crate::launch_recipe::dispatch(request, |environment, directory, target| {
+                let create = || {
+                    let process = spawn(id, &user, environment, directory, target)?;
+                    let handle = duplicate_for_client(&process, &_client)?;
+                    Ok(BackendLaunch::Started {
+                        pid: process.pid,
+                        process_handle: handle,
+                    })
+                };
                 if target == crate::launch_recipe::Target::Backend {
-                    // One DeviceId, one process: the pre-login backend releases its
-                    // keys and leaves the group before the user's backend exists.
-                    return super::prelogin::handoff(|| spawn(id, &user, environment, directory, target));
+                    return super::prelogin::handoff(&_client, create);
                 }
-                spawn(id, &user, environment, directory, target)
+                create()
             })
-            .map(|pid| BackendLaunch::Started { pid })
         })();
         let reply = match result {
             Ok(reply) => reply,
@@ -280,7 +333,7 @@ fn spawn(
     environment: &[u16],
     directory: &[u16],
     target: crate::launch_recipe::Target,
-) -> io::Result<u32> {
+) -> io::Result<StartedProcess> {
     spawn_at(id, user, environment, directory, target, false)
 }
 fn spawn_at(
@@ -290,7 +343,7 @@ fn spawn_at(
     directory: &[u16],
     target: crate::launch_recipe::Target,
     update: bool,
-) -> io::Result<u32> {
+) -> io::Result<StartedProcess> {
     crate::launch_recipe::validate_environment(environment)?;
     let path = if update {
         super::update::protected::root()?.join("oink.exe")
@@ -451,7 +504,29 @@ fn spawn_at(
             },
         )?;
     }
-    Ok(process.dwProcessId)
+    Ok(StartedProcess {
+        process: child,
+        pid: process.dwProcessId,
+    })
+}
+fn duplicate_for_client(process: &StartedProcess, client: &Handle) -> io::Result<u64> {
+    let mut duplicate = ptr::null_mut();
+    // SAFETY: both original handles are owned and pinned. SYSTEM duplicates
+    // only wait/query rights into the authenticated pipe client. The UI needs
+    // no OpenProcess access to a higher-integrity process and gains no UIAccess authority.
+    check(unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            process.process.0,
+            client.0,
+            &mut duplicate,
+            SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            0,
+        )
+    })
+    .map_err(|e| context("duplicate backend wait handle", e))?;
+    Ok(duplicate as usize as u64)
 }
 fn integrity(token: HANDLE) -> io::Result<u32> {
     let mut storage = [0usize; 64];
@@ -498,5 +573,77 @@ fn spawn_update_target(id: u32, user: &[u8], target: crate::launch_recipe::Targe
         block
     };
     let directory = wide(super::update::protected::root()?.to_str().ok_or_else(denied)?);
-    spawn_at(id, user, &block, &directory, target, true)
+    spawn_at(id, user, &block, &directory, target, true).map(|process| process.id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::io::AsRawHandle;
+
+    fn track(child: &std::process::Child) -> StartedProcess {
+        // SAFETY: current-process pseudo handle and live owned Child handle.
+        let client = Handle::new(unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, GetCurrentProcessId()) }).unwrap();
+        let mut raw = ptr::null_mut();
+        // SAFETY: retain the original creation handle, including after exit.
+        check(unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                child.as_raw_handle(),
+                GetCurrentProcess(),
+                &mut raw,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        })
+        .unwrap();
+        let original = StartedProcess {
+            process: Handle::new(raw).unwrap(),
+            pid: child.id(),
+        };
+        let duplicate = duplicate_for_client(&original, &client).unwrap();
+        StartedProcess {
+            process: Handle::new(duplicate as usize as HANDLE).unwrap(),
+            pid: child.id(),
+        }
+    }
+
+    #[test]
+    fn original_creation_handle_reports_exit_before_first_poll_including_still_active_code() {
+        for code in [1, 259, 3221225477_u32] {
+            let mut child = std::process::Command::new("cmd.exe")
+                .args(["/c", &format!("exit {code}")])
+                .spawn()
+                .unwrap();
+            child.wait().unwrap();
+            let tracked = track(&child);
+            drop(child); // No PID lookup and no dependency on the creator staying alive.
+            assert_eq!(tracked.exit_code().unwrap(), Some(code));
+        }
+    }
+
+    #[test]
+    fn held_process_fixture() {
+        if std::env::var_os("OINK_HELD_PROCESS_FIXTURE").is_some() {
+            std::thread::sleep(Duration::from_secs(15));
+        }
+    }
+
+    #[test]
+    fn wait_handle_detects_a_later_exit_without_granting_process_mutation() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "platform::backend::tests::held_process_fixture"])
+            .env("OINK_HELD_PROCESS_FIXTURE", "1")
+            .spawn()
+            .unwrap();
+        let tracked = track(&child);
+        assert_eq!(tracked.exit_code().unwrap(), None);
+        // SAFETY: query/wait handle intentionally lacks PROCESS_TERMINATE.
+        assert_eq!(unsafe { TerminateProcess(tracked.process.0, 42) }, 0);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(5));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(tracked.exit_code().unwrap().is_some());
+    }
 }

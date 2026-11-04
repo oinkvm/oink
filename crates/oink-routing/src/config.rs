@@ -154,7 +154,7 @@ impl Default for RoutingSettings {
             touchpad_injection: true,
             native_multifinger: true,
             forward_injected_input: false,
-            take_foreground_on_leave: true,
+            take_foreground_on_leave: false,
             game_mode_preference: crate::GameMode::Auto,
             return_pointer_on_display_sleep: true,
             wake_displays_on_input: true,

@@ -84,6 +84,15 @@ impl Drop for Scenario {
     }
 }
 
+/// Most fixtures run inside `run`; legacy async callers still need a process
+/// bound when using a shared wait directly. Reuse an enclosing scenario rather
+/// than starting another budget for each convergence phase.
+#[allow(dead_code)] // Standalone watchdog binaries do not use node fixtures.
+pub fn ensure(what: &str) -> Option<Scenario> {
+    let active = CURRENT.with(|current| current.borrow().upgrade().is_some());
+    (!active).then(|| Scenario::new(module_path!(), what))
+}
+
 /// Observe an asynchronous boundary without asserting machine scheduling time.
 /// The enclosing Scenario bounds the whole executor and teardown independently.
 #[allow(dead_code)] // Shared with binaries that only use synchronous guards.
@@ -191,9 +200,17 @@ mod tests {
             }
             unreachable!();
         }
+        let fallback = ensure("standalone shared wait").expect("a direct async caller needs a watchdog");
+        assert!(
+            ensure("nested shared wait").is_none(),
+            "reuse the existing total budget"
+        );
+        drop(fallback);
+        assert!(CURRENT.with(|current| current.borrow().upgrade().is_none()));
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let probe_called = called.clone();
         run(module_path!(), "normal completion", None, async {
+            assert!(ensure("nested wait").is_none());
             on_timeout("must stay silent", move || {
                 probe_called.store(true, std::sync::atomic::Ordering::Relaxed);
                 "unexpected diagnostic".into()

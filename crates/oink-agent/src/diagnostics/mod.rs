@@ -927,6 +927,10 @@ fn runtime_environment(node: &crate::node::Node, anon: &Anonymizer) -> Snapshot 
             ),
             ("diagnostics_enabled".into(), settings.diagnostics_enabled),
             ("forward_gestures".into(), settings.routing.forward_gestures),
+            ("accept_contacts".into(), settings.accept_contacts),
+            ("touchpad_injection".into(), settings.routing.touchpad_injection),
+            ("native_multifinger".into(), settings.routing.native_multifinger),
+            ("mac_scroll_feel".into(), settings.routing.mac_scroll_feel),
             ("dnd".into(), settings.routing.dnd),
             ("emergency_combo".into(), settings.routing.emergency_combo),
             ("wake_displays_on_input".into(), settings.routing.wake_displays_on_input),
@@ -989,6 +993,62 @@ fn runtime_environment(node: &crate::node::Node, anon: &Anonymizer) -> Snapshot 
             REPORT.get_or_init(crash_report::latest).clone()
         },
     };
+    snapshot
+        .routing_numbers
+        .extend(oink_input::contact_diagnostics::snapshot().map(|(key, value)| (key.into(), value as f64)));
+    let injection = node.input_backend().contact_injection_status();
+    for (key, value) in [
+        ("contact_injection_supported", u64::from(injection.supported)),
+        ("contact_injection_initialized", u64::from(injection.initialized)),
+        (
+            "contact_injection_max_contacts",
+            injection.max_contacts.unwrap_or(0).into(),
+        ),
+        (
+            "contact_injection_init_error_kind",
+            injection.init_error_kind.map_or(0, |e| e as u64),
+        ),
+        (
+            "local_i0_touchpad_contacts",
+            node.input_backend().touchpad_contacts().unwrap_or(0).into(),
+        ),
+    ] {
+        snapshot.routing_numbers.insert(key.into(), value as f64);
+    }
+    if let Ok(input) = node.input_status() {
+        if let Some(state) = input.contact_diagnostics {
+            for (key, value) in [
+                "contacts_observed",
+                "contacts_healthy",
+                "contacts_mode",
+                "contacts_path",
+            ]
+            .into_iter()
+            .zip(state)
+            {
+                snapshot.routing_numbers.insert(key.into(), value as f64);
+            }
+        }
+        for peer in &input.peers {
+            let alias = anon.device(peer.peer);
+            for (key, value) in [
+                ("attached", u8::from(peer.attached)),
+                ("i0_touchpad_contacts", peer.touchpad_contacts.unwrap_or(0)),
+                ("touchpad_options", peer.touchpad_options.map_or(0, |v| 1 + u8::from(v))),
+                (
+                    "contacts_path",
+                    crate::api::PeerContactsPath::derive(
+                        true,
+                        peer.attached.then_some(peer.touchpad_contacts).flatten(),
+                    ) as u8,
+                ),
+            ] {
+                snapshot
+                    .routing_numbers
+                    .insert(format!("peer.{alias}.{key}"), value.into());
+            }
+        }
+    }
     // The typed field is in memory only; first/rekey segments must carry the
     // same persisted reason as snapshots refreshed just before collection.
     if let Some(provider) = snapshot.file_provider {

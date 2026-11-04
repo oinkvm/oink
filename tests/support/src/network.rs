@@ -5,9 +5,16 @@ use std::{
     path::PathBuf,
 };
 
+/// Reserve real loopback sockets when `port` is zero; explicit ports are caller-owned.
 pub fn network_config(data_dir: PathBuf, name: &str, port: u16) -> NetworkConfig {
+    network_config_with_bind(data_dir, name, port, Ipv4Addr::LOCALHOST.into())
+}
+
+/// Choose the bind address before reserving sockets, including wildcard fixtures.
+/// Do not change `bind_ip` on an automatically allocated configuration afterwards.
+pub fn network_config_with_bind(data_dir: PathBuf, name: &str, port: u16, bind_ip: IpAddr) -> NetworkConfig {
     let port = if port == 0 {
-        super::ports::test_port_pair()
+        oink_network::test_ports::reserve(bind_ip)
     } else {
         port
     };
@@ -15,7 +22,7 @@ pub fn network_config(data_dir: PathBuf, name: &str, port: u16) -> NetworkConfig
         data_dir,
         device_name: name.to_string(),
         os: std::env::consts::OS.to_string(),
-        bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        bind_ip,
         port,
         bulk_port: 0,
         bulk_pacing: true,

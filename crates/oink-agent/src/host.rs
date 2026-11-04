@@ -438,6 +438,10 @@ pub fn run_service() -> u8 {
         host.shutdown();
         Ok(())
     });
+    service_exit_code(result)
+}
+
+pub(crate) fn service_exit_code(result: anyhow::Result<()>) -> u8 {
     match result {
         Ok(()) => 0,
         Err(e) if e.downcast_ref::<StartupTerminated>().is_some() => {

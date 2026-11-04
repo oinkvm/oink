@@ -6,6 +6,8 @@ import type { Message } from '../catalog';
  * uses each message.
  */
 export const en = {
+  '后台启动后退出（退出码 {0}）': 'The backend exited after launch (exit code {0})',
+  '复制错误详情': 'Copy error details',
   "锁定远程 Windows 计算机": "Lock remote Windows computer",
   "按下此快捷键，锁定指针所在 Windows 计算机，Win+L 保持锁定自身": "Press this shortcut to lock the Windows computer under the pointer. Win+L keeps locking this computer.",
   "原生触摸板注入暂不可用": "Native touchpad injection is currently unavailable",

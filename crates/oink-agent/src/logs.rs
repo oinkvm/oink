@@ -15,7 +15,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
-use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::{FilterExt, LevelFilter};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
@@ -23,8 +22,30 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::api::{LogLevel, LogLine};
 
+#[cfg(all(test, debug_assertions))]
+mod exit_tests;
 mod files;
+mod worker;
 pub use files::set_max_mb;
+use worker::FileWriter;
+
+static FILE_WRITER: OnceLock<FileWriter> = OnceLock::new();
+
+/// Owned by the application entry boundary, outside every role's error handler.
+/// Static subscribers are never dropped at process exit, so explicitly wait for
+/// all records queued before the boundary returns or unwinds.
+pub(crate) struct FlushOnExit;
+impl Drop for FlushOnExit {
+    fn drop(&mut self) {
+        flush();
+    }
+}
+/// Drain every record already produced. Also called before Tauri's direct exit.
+pub fn flush() {
+    if let Some(writer) = FILE_WRITER.get() {
+        let _ = writer.drain();
+    }
+}
 
 type LevelReloader = Box<dyn Fn(&str) -> std::io::Result<()> + Send + Sync>;
 static LEVEL_RELOADERS: OnceLock<Vec<LevelReloader>> = OnceLock::new();
@@ -97,12 +118,9 @@ pub fn init_ui() {
 }
 
 /// The local replacement continuation outlives the backend that launched it.
-/// Keep this guard in main until the command returns so its final outcome is
-/// flushed too; its inherited stderr may be /dev/null after a Finder launch.
-pub fn init_update() -> Option<WorkerGuard> {
-    let (writer, guard) = file_writer_parts("oink-update-worker").unzip();
-    install(configured_level(), writer);
-    guard
+/// Its entry boundary drains its own log even when stderr is /dev/null.
+pub fn init_update() {
+    install(configured_level(), file_writer("oink-update-worker"));
 }
 
 /// Ordinary logs and diagnostics share the platform log root and separate budgets.
@@ -110,15 +128,7 @@ pub fn log_dir() -> PathBuf {
     oink_foundation::paths::log_dir()
 }
 
-fn file_writer(prefix: &str) -> Option<NonBlocking> {
-    static GUARD: OnceLock<WorkerGuard> = OnceLock::new();
-    let (writer, guard) = file_writer_parts(prefix)?;
-    // The long-lived service owns this writer until process exit.
-    GUARD.set(guard).ok()?;
-    Some(writer)
-}
-
-fn file_writer_parts(prefix: &str) -> Option<(NonBlocking, WorkerGuard)> {
+fn file_writer(prefix: &str) -> Option<FileWriter> {
     let dir = log_dir();
     std::fs::create_dir_all(&dir).ok()?;
     let appender = files::Writer::new(dir, prefix, || {
@@ -128,7 +138,9 @@ fn file_writer_parts(prefix: &str) -> Option<(NonBlocking, WorkerGuard)> {
         )
     })
     .ok()?;
-    Some(tracing_appender::non_blocking(appender))
+    let writer = FileWriter::new(appender).ok()?;
+    FILE_WRITER.set(writer.clone()).ok()?;
+    Some(writer)
 }
 
 fn local_log_metadata(metadata: &tracing::Metadata<'_>) -> bool {
@@ -175,7 +187,7 @@ impl<S: Subscriber> tracing_subscriber::layer::Filter<S> for LocalLogFilter {
     }
 }
 
-fn install(directive: &str, file: Option<NonBlocking>) {
+fn install(directive: &str, file: Option<FileWriter>) {
     let directive = if directive.trim().is_empty() { "info" } else { directive };
     let env = || EnvFilter::try_new(directive).unwrap_or_else(|_| EnvFilter::new("info"));
     let (stderr_filter, stderr_handle) = tracing_subscriber::reload::Layer::new(env());
@@ -206,6 +218,14 @@ fn install(directive: &str, file: Option<NonBlocking>) {
         .try_init();
     if result.is_ok() {
         let _ = LEVEL_RELOADERS.set(reloaders);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Keep local panic details in the ordinary log, never in telemetry.
+            if let Some(writer) = FILE_WRITER.get() {
+                writer.record_panic(format!("ERROR oink_panic: {info}\n"));
+            }
+            previous(info);
+        }));
     }
 }
 
@@ -421,6 +441,7 @@ mod tests {
             tracing::info!(target: "oink_local_transfer", "file transfer started");
             tracing::info!(target: "oink_transfer_diagnostics", kind="transfer_start", "file transfer boundary");
             tracing::info!(target: "oink_pacing_diagnostics", kind="pacing_sample", "Low pacing observation");
+            tracing::info!(target: "oink_touchpad_diagnostics", stage=1_u8, "contact availability");
             tracing::info!(target: "oink_unrelated", bytes=123_u64, "ordinary log");
         });
         let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
@@ -429,5 +450,6 @@ mod tests {
         assert!(text.contains("ordinary log"));
         assert!(!text.contains("file transfer boundary"));
         assert!(!text.contains("Low pacing observation"));
+        assert!(!text.contains("contact availability"));
     }
 }

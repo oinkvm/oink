@@ -1,5 +1,18 @@
 //! The small UIAccess recipe has no alternate-token or ordinary launch branch.
 use std::io;
+/// Pending is explicit proof that no process was created. Lost replies and
+/// ordinary failures are never retried, so two network identities cannot start.
+pub(crate) fn wait_for_prelogin_exit(
+    mut request: impl FnMut() -> io::Result<crate::backend_launch::BackendLaunch>,
+    mut wait: impl FnMut(u64) -> io::Result<()>,
+) -> io::Result<crate::backend_launch::BackendLaunch> {
+    loop {
+        match request()? {
+            crate::backend_launch::BackendLaunch::PreloginStopping { process_handle } => wait(process_handle)?,
+            reply => return Ok(reply),
+        }
+    }
+}
 
 pub(crate) fn uiaccess_token<T>(
     source: impl FnOnce() -> io::Result<T>,
@@ -60,10 +73,10 @@ impl Target {
     }
 }
 
-pub(crate) fn dispatch(
+pub(crate) fn dispatch<T>(
     message: crate::backend_launch::BackendLaunch,
-    spawn: impl FnOnce(&[u16], &[u16], Target) -> io::Result<u32>,
-) -> io::Result<u32> {
+    spawn: impl FnOnce(&[u16], &[u16], Target) -> io::Result<T>,
+) -> io::Result<T> {
     use crate::backend_launch::BackendLaunch;
     let (environment, directory, target) = match message {
         BackendLaunch::Start { environment, directory } => (environment, directory, Target::Backend),
@@ -181,7 +194,7 @@ mod tests {
                 }
             };
             let request = BackendLaunch::decode(&request.encode().unwrap()).unwrap();
-            let result = dispatch(request, |actual_env, actual_dir, actual_target| {
+            let result: io::Result<u32> = dispatch(request, |actual_env, actual_dir, actual_target| {
                 assert_eq!(actual_env, environment);
                 assert_eq!(actual_dir, directory);
                 assert_eq!(actual_target, target);
@@ -199,7 +212,10 @@ mod tests {
             assert_eq!(result.unwrap_err().to_string(), "token/create failure");
         }
         for invalid in [
-            BackendLaunch::Started { pid: 42 },
+            BackendLaunch::Started {
+                pid: 42,
+                process_handle: 1,
+            },
             BackendLaunch::Failed {
                 error: "no service".into(),
             },
@@ -212,7 +228,64 @@ mod tests {
                 directory: vec![65, 0, 66, 0],
             },
         ] {
-            assert!(dispatch(invalid, |_, _, _| panic!("invalid request must not launch")).is_err());
+            assert!(dispatch::<u32>(invalid, |_, _, _| panic!("invalid request must not launch")).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod prelogin_wait_tests {
+    use super::*;
+    use crate::backend_launch::BackendLaunch;
+    use std::{cell::RefCell, collections::VecDeque};
+    #[test]
+    fn ui_waits_for_process_exit_before_resubmitting_the_uncreated_launch() {
+        let log = RefCell::new(Vec::new());
+        let replies = RefCell::new(VecDeque::from([
+            BackendLaunch::PreloginStopping { process_handle: 17 },
+            BackendLaunch::Started {
+                pid: 42,
+                process_handle: 99,
+            },
+        ]));
+        let result = wait_for_prelogin_exit(
+            || {
+                log.borrow_mut().push("request");
+                Ok(replies.borrow_mut().pop_front().unwrap())
+            },
+            |event| {
+                assert_eq!(event, 17);
+                log.borrow_mut().push("confirmed exit");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(result, BackendLaunch::Started { pid: 42, .. }));
+        assert_eq!(*log.borrow(), ["request", "confirmed exit", "request"]);
+    }
+    #[test]
+    fn broker_death_lost_reply_and_permanent_failure_never_replay_a_launch() {
+        let calls = std::cell::Cell::new(0);
+        let result = wait_for_prelogin_exit(
+            || {
+                calls.set(calls.get() + 1);
+                Ok(BackendLaunch::PreloginStopping { process_handle: 17 })
+            },
+            |_| Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(calls.get(), 1);
+        assert!(
+            wait_for_prelogin_exit(
+                || Err(io::Error::from(io::ErrorKind::TimedOut)),
+                |_| panic!("not pending")
+            )
+            .is_err()
+        );
+        let failure = BackendLaunch::Failed { error: "denied".into() };
+        assert_eq!(
+            wait_for_prelogin_exit(|| Ok(failure.clone()), |_| panic!("permanent failure")).unwrap(),
+            failure
+        );
     }
 }

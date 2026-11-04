@@ -2,11 +2,11 @@
 //!
 //! 钩子回调由系统在本线程取消息时同步调用，必须在 `LowLevelHooksTimeout`（默认约 300 ms，上限 1 s）内返回，
 //! 否则系统会跳过、多次超时后**静默卸载**钩子。所以回调里只做：读结构体、查表、`GetCursorPos`、调用
-//! `EventHandler`（契约要求 < 0.5 ms）；线程优先级设为 HIGHEST；看门狗每秒检查一次，鼠标、键盘分开：
-//! 可产生 LL 回调的设备 Raw Input 在动而对应的钩子超过 1 s 没被调用 → 重装那个钩子（[`hook_lost`]）。系统卸载钩子
-//! 是一个一个卸的：键盘钩子丢了、鼠标钩子还在时，共用一个「最近调用」时间就发现不了（评审 W02；2026-09-30
-//! Windows 上 Windows 控制 Mac 时按键全部留在本机，鼠标照常移交）。看门狗先核对 Raw Input 注册没被本进程的界面
-//! 改走（见 [`super::rawinput`]，评审 W01）。
+//! `EventHandler`（契约要求 < 0.5 ms）；线程优先级设为 HIGHEST；鼠标看门狗每秒检查一次：
+//! 可产生 LL 回调的鼠标 Raw Input 在动而鼠标钩子超过 1 s 没被调用 → 重装鼠标钩子（[`hook_lost`]）。
+//! 看门狗先核对鼠标/触摸板 Raw Input 注册没被本进程的其他代码改走（见 [`super::rawinput`]）。
+//! 后台不注册键盘 Raw Input，以免触发 Windows 的未公开 LL 链绕过行为，因此没有键盘看门狗，
+//! 键盘钩子被系统静默摘除后不自动重装（原因与系统实现证据见 [`super::rawinput::register`]）。
 //!
 //! 状态都在本线程的 thread_local 里，钩子回调不加锁。其他线程通过 `PostThreadMessage` + 通道发命令；
 //! 在回调里（本线程）调用 `set_mode` 时直接生效，不经过消息。
@@ -292,9 +292,11 @@ pub(crate) struct HookHandle {
 /// 线程内状态的对外快照（诊断）。
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Stats {
+    /// Mouse watchdog reinstalls only; keep the diagnostic field layout stable.
     pub hook_reinstalls: u64,
     pub slow_handler_calls: u64,
     pub touch_reports: u64,
+    /// Historical field name retained for diagnostics; now counts mouse reports only.
     pub mouse_kbd_raw_reports: u64,
     pub cursor_hidden: bool,
 }
@@ -329,15 +331,14 @@ struct State {
     /// 按下中的键 → 按下事件是否被吞掉（识别自动重复、保证本机不卡键）。
     keys: HashMap<u32, bool>,
     continuity: crate::capture_continuity::CaptureContinuity,
-    /// 鼠标、键盘钩子最近一次被调用（看门狗分别核对）。
+    /// 鼠标钩子最近一次被调用，供鼠标看门狗核对。
     last_mouse_hook: Instant,
-    last_kbd_hook: Instant,
     /// 上一次核对 Raw Input 注册的结果（只在变化时记日志）。
     raw_registration_ok: bool,
     ordinary_observer: bool,
     capture_enabled: bool,
-    /// 已经记过「看门狗收到了鼠标 / 键盘的 Raw Input」（各记一次，证明看门狗有数据可用）。
-    raw_seen_logged: (bool, bool),
+    /// 已经记过「看门狗收到了鼠标 Raw Input」，证明看门狗有数据可用。
+    raw_seen_logged: bool,
     cmd_rx: mpsc::Receiver<Command>,
     stats: Stats,
     pipeline: PipelineCounts,
@@ -360,14 +361,14 @@ thread_local! {
     static IN_HOOK: Cell<bool> = const { Cell::new(false) };
 }
 
-/// 看门狗分别核对的钩子。
+/// 安装/卸载的钩子种类；只有鼠标参与看门狗重装。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HookKind {
     Mouse,
     Keyboard,
 }
 
-/// 这类设备的钩子是否已被系统卸载：Raw Input 最近（[`WATCHDOG_MS`] 的两倍以内）收到了输入，而钩子在那之前
+/// 鼠标钩子是否已被系统卸载：Raw Input 最近（[`WATCHDOG_MS`] 的两倍以内）收到了输入，而钩子在那之前
 /// 已经超过 [`HOOK_SILENT`] 没被调用。钩子吞掉的事件 Raw Input 收不到、放行的事件钩子先于 Raw Input 看到，
 /// 调用方先排除无设备、无动作以及 clip 下纯移动等不证明 LL 回调应当发生的报告。
 /// 这仍是恢复启发式，Windows 不提供“钩子已被摘除”的查询。
@@ -799,11 +800,10 @@ fn run(
                 keys: HashMap::new(),
                 continuity: Default::default(),
                 last_mouse_hook: Instant::now(),
-                last_kbd_hook: Instant::now(),
                 raw_registration_ok: true,
                 ordinary_observer: observations.is_some(),
                 capture_enabled: pacing.is_none(),
-                raw_seen_logged: (false, false),
+                raw_seen_logged: false,
                 cmd_rx,
                 stats: Stats::default(),
                 pipeline: PipelineCounts::default(),
@@ -1240,7 +1240,6 @@ impl State {
                         .map_err(|e| format!("SetWindowsHookExW(WH_KEYBOARD_LL): {e}"))?;
                     self.kbd_hook = Some(h);
                     CAPTURE_HOOKS.fetch_add(1, Ordering::AcqRel);
-                    self.last_kbd_hook = Instant::now();
                 }
             }
         }
@@ -1285,7 +1284,7 @@ impl State {
             return;
         }
         let now = Instant::now();
-        // Raw Input 注册被本进程的其他代码（界面的 tao 事件循环）改走时，看门狗收不到任何设备输入（W01）。
+        // 鼠标/触摸板 Raw Input 注册被本进程的其他代码改走时，看门狗收不到任何设备输入（W01）。
         if !self.ordinary_observer {
             let reg = rawinput::registration_ok(self.hwnd);
             if reg.is_ok() != self.raw_registration_ok {
@@ -1295,7 +1294,7 @@ impl State {
                     tracing::warn!(
                         ours = self.hwnd.0 as isize,
                         ?found,
-                        "Raw Input registration for mouse/keyboard was taken over by other code in this process; re-registering"
+                        "Raw Input registration for mouse/touchpad was taken over by other code in this process; re-registering"
                     );
                 }
             }
@@ -1307,31 +1306,23 @@ impl State {
                 }
             }
         }
-        if !self.raw_seen_logged.0 && self.raw.last_mouse.is_some() {
-            self.raw_seen_logged.0 = true;
+        if !self.raw_seen_logged && self.raw.last_mouse.is_some() {
+            self.raw_seen_logged = true;
             tracing::info!("watchdog: receiving mouse Raw Input");
         }
-        if !self.raw_seen_logged.1 && self.raw.last_kbd.is_some() {
-            self.raw_seen_logged.1 = true;
-            tracing::info!("watchdog: receiving keyboard Raw Input");
-        }
-        for (kind, raw, last) in [
-            (HookKind::Mouse, self.raw.last_mouse_hook_evidence, self.last_mouse_hook),
-            (HookKind::Keyboard, self.raw.last_kbd, self.last_kbd_hook),
-        ] {
-            if hook_lost(now, raw, last) {
-                tracing::warn!(
-                    ?kind,
-                    hook_silent_ms = now.saturating_duration_since(last).as_millis() as u64,
-                    "low-level hook silent despite eligible device input; reinstalling suspected lost hook"
-                );
-                super::trace::action(crate::native_lifecycle::Kind::HookReinstall, None, kind as u32, None);
-                self.uninstall_hook(kind);
-                if let Err(e) = self.install_hook(kind) {
-                    tracing::error!("重新安装钩子失败：{e}");
-                }
-                self.stats.hook_reinstalls += 1;
+        if hook_lost(now, self.raw.last_mouse_hook_evidence, self.last_mouse_hook) {
+            let kind = HookKind::Mouse;
+            tracing::warn!(
+                ?kind,
+                hook_silent_ms = now.saturating_duration_since(self.last_mouse_hook).as_millis() as u64,
+                "low-level hook silent despite eligible device input; reinstalling suspected lost hook"
+            );
+            super::trace::action(crate::native_lifecycle::Kind::HookReinstall, None, kind as u32, None);
+            self.uninstall_hook(kind);
+            if let Err(e) = self.install_hook(kind) {
+                tracing::error!("重新安装钩子失败：{e}");
             }
+            self.stats.hook_reinstalls += 1;
         }
         self.diagnostic_ticks += 1;
         let counts = std::mem::take(&mut self.pipeline);
@@ -1347,7 +1338,6 @@ impl State {
                 captured_held = self.keys.len(),
                 raw_mouse_reports = self.raw.mouse_reports,
                 raw_without_device = self.raw.mouse_without_device,
-                raw_keyboard_reports = self.raw.keyboard_reports,
                 hook_reinstalls = self.stats.hook_reinstalls,
                 "Windows input pipeline (callbacks per interval; raw reports cumulative)"
             );
@@ -2764,7 +2754,6 @@ fn keyboard_proc_with_next(code: i32, wparam: WPARAM, lparam: LPARAM, next: impl
         let _in_hook = InHook::enter();
         let mut remote = false;
         let prepared = with_state(|st| {
-            st.last_kbd_hook = now;
             st.pipeline.keyboard_callbacks += 1;
             remote = matches!(st.mode, CaptureMode::Remote { .. });
             st.prepare_key(wparam.0 as u32, info, now)
@@ -3126,11 +3115,10 @@ mod tests {
             keys: HashMap::new(),
             continuity: Default::default(),
             last_mouse_hook: now,
-            last_kbd_hook: now,
             raw_registration_ok: true,
             ordinary_observer: false,
             capture_enabled: true,
-            raw_seen_logged: (false, false),
+            raw_seen_logged: false,
             cmd_rx: mpsc::channel().1,
             stats: Stats::default(),
             pipeline: PipelineCounts::default(),

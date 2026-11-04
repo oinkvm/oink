@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from 'react';
 import { toast } from 'oink-ui';
 import { api, call, onAgentEvent, shell } from './client';
-import { toFailure } from './transport';
+import { ApiFailure, toFailure } from './transport';
 import { problemText, tr } from '../i18n';
 import type * as T from './types';
 import type { DeviceCardsView, DeviceControlCompleted, DeviceControlReply } from './cards';
@@ -67,15 +67,33 @@ export function newerProfiles(current: LayoutProfilesState | null, incoming: Lay
   return /^\d+$/.test(incoming.sequence) && BigInt(incoming.sequence) > BigInt(current.sequence);
 }
 
-function requestProblem(code: string) {
+export function backendFailureDetail(detail: string): string {
+  const exited = /^backend_exited:(\d+)$/.exec(detail);
+  return exited ? tr('后台启动后退出（退出码 {0}）', `${exited[1]} / 0x${Number(exited[1]).toString(16).toUpperCase().padStart(8,'0')}`) : detail;
+}
+function requestProblem(code: string, detail?: string) {
   if(code==='volume_unsupported')return;
   // A failed request is a receipt, not a retained statement about backend health.
   // The native shell owns the authenticated subscription and exits on its loss.
-  toast.danger({ id: `request:${code}`, title: problemText(code), duration: 4200 });
+  const description = detail ? backendFailureDetail(detail) : undefined;
+  toast.danger({ id: `request:${code}`, title: problemText(code), duration: description ? 0 : 4200,
+    ...(description ? { description, action: {label:tr('复制错误详情'), onClick:()=>{void navigator.clipboard.writeText(description);} } } : {}) });
 }
-function requestFailure(error: unknown) { requestProblem(toFailure(error).problem.code); }
+function requestFailure(error: unknown) { const failure=toFailure(error); requestProblem(failure.problem.code, failure.detail); }
 /** Legacy bottom-centred notices are no longer shown; their codes go to the UI log. */
 function logNotice(code: string) { void shell.logNotice(code).catch(() => {}); }
+
+/** App catches show backend unavailability with its typed detail; other legacy
+ * action failures keep their existing log-only (or suppressed) behavior. */
+export function reportBackendFailure(error: unknown) {
+  const failure = error instanceof ApiFailure ? error : undefined;
+  const code: string = failure?.problem.code ?? 'unavailable';
+  if (code === 'unavailable' || code === 'local_service_unavailable') {
+    requestProblem(code === 'unavailable' ? 'backend_failed' : code, failure?.detail);
+    return;
+  }
+  if (code && code !== 'volume_unsupported' && code !== 'outcome_unknown') logNotice(code);
+}
 
 export function createAgentStore() {
   const cardSignals = createCardSignalsStore();
@@ -198,12 +216,12 @@ export function createAgentStore() {
     consumePairingEvent: (id:string) => set({pairingEvents:state.pairingEvents.filter(event=>event.data.event_id!==id)}),
     reset: () => { generation++; revisions.clear(); cardSignals.reset(); initialPairEvents=[]; initialNearbyEvents=[]; set(initial()); },
     /** @deprecated Logs the legacy bottom-centred notice; nothing is shown. New code must use the in-app oink-ui toast instead. */
-    fail: (reason: string) => {
+    fail: (reason: string, detail?: unknown) => {
       if(reason==='volume_unsupported'||reason==='outcome_unknown')return;
       if (reason === 'unavailable' || reason === 'local_service_unavailable') {
         // Legacy catch-all callers have no evidence of IPC loss. Only the typed
         // transport problem may say that the local service could not be reached.
-        requestProblem(reason === 'unavailable' ? 'backend_failed' : reason);
+        requestProblem(reason === 'unavailable' ? 'backend_failed' : reason, typeof detail === 'string' ? detail : undefined);
         return;
       }
       if(reason)logNotice(reason);

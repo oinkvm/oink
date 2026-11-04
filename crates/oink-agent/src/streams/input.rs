@@ -1068,6 +1068,7 @@ mod os_tests {
                 );
             }
             input.attach(&admission, &state, Os::MacOS);
+            assert_eq!(input.router.peer_touchpad_options(peer), Some(capable));
             input.inbound(peer, enter(&input));
             input.drain_outputs();
             input.router_mut().set_accept_contacts(false);
@@ -1197,6 +1198,7 @@ mod wait_tests {
             attached: true,
             online: true,
             touchpad_contacts: None,
+            touchpad_options: None,
             feel: None,
         };
         InputStreams::observe_wait(
@@ -1252,6 +1254,7 @@ mod wait_tests {
             attached: true,
             online: false,
             touchpad_contacts: None,
+            touchpad_options: None,
             feel: None,
         };
         InputStreams::observe_wait(

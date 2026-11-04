@@ -121,6 +121,7 @@ async fn start(dir: &std::path::Path, displays: Arc<Displays>) -> Node {
     })
     .await
     .unwrap();
+    diagnose(&node);
     let n = node.clone();
     tokio::task::spawn_blocking(move || n.refresh_native_arrangement())
         .await
@@ -128,8 +129,58 @@ async fn start(dir: &std::path::Path, displays: Arc<Displays>) -> Node {
         .unwrap();
     node
 }
+fn diagnose(node: &Node) {
+    let weak = Arc::downgrade(&node.inner);
+    common::watchdog::on_timeout(format!("layout fixture: {:?}", node.id()), move || {
+        let Some(inner) = weak.upgrade() else {
+            return "node stopped".into();
+        };
+        let node = Node { inner };
+        let config = node.link_config().unwrap();
+        let applied = config.applied();
+        let profiles = match node.inner.profiles.data.try_lock() {
+            Ok(data) => format!(
+                "pending={:?}; catalog={:?}; last_readiness={:?}; operation={:?}",
+                data.pending_layout,
+                data.catalog.as_ref().map(|c| (
+                    c.group,
+                    &c.version,
+                    &c.active_profile_id,
+                    c.profiles.len(),
+                    c.completed_joins.keys().collect::<Vec<_>>()
+                )),
+                data.last.as_ref().map(|s| s.readiness),
+                data.operations.back().map(|op| (&op.id, op.status))
+            ),
+            Err(error) => format!("profile data unavailable: {error}"),
+        };
+        format!(
+            "device={:?}; group={:?}; layout_version={:?}; screens={}; owners={:?}; members={:?}; {profiles}",
+            node.id(),
+            applied.group,
+            applied.version,
+            applied.layout.screens.len(),
+            applied.owners.keys(),
+            config
+                .members()
+                .members
+                .iter()
+                .map(|m| (m.device, m.online, m.facts.is_some()))
+                .collect::<Vec<_>>()
+        )
+    });
+}
+
 async fn call<T: serde::de::DeserializeOwned>(node: &Node, request: Request) -> T {
     let diagnostic = format!("{request:?}");
+    let changes = matches!(
+        &request,
+        Request::LoadLayoutProfile(_)
+            | Request::CommitArrangement(_)
+            | Request::ResetArrangement(_)
+            | Request::ReplayArrangement(_)
+    )
+    .then(|| common::StateChanges::new(&[node], &diagnostic));
     let n = node.clone();
     let reply = tokio::task::spawn_blocking(move || dispatch(&n, request))
         .await
@@ -139,7 +190,6 @@ async fn call<T: serde::de::DeserializeOwned>(node: &Node, request: Request) -> 
     // Mutation acceptance is asynchronous; test the final authoritative event
     // state rather than assuming the IPC reply completed the operation.
     if let Some(id) = value["operation_id"].as_str().map(str::to_owned) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let n = node.clone();
             let state = tokio::task::spawn_blocking(move || n.profile_snapshot())
@@ -154,8 +204,7 @@ async fn call<T: serde::de::DeserializeOwned>(node: &Node, request: Request) -> 
                 value["state"] = serde_json::to_value(state).unwrap();
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "operation did not settle: {id}");
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            changes.as_ref().expect("mutation subscription").notified().await;
         }
     }
     serde_json::from_value(value.clone())
@@ -487,7 +536,7 @@ fn profiles_merge_and_sync_over_low_without_applying_native() {
         )
         .await;
         common::pair(&a, &b).await;
-        common::until("profile catalogs union and converge", || {
+        common::converge(&[&a, &b], "profile catalogs union and converge", || {
             let ca = lock(&a.inner.profiles.data).catalog.clone();
             let cb = lock(&b.inner.profiles.data).catalog.clone();
             ca.as_ref().is_some_and(|c| c.profiles.len() == 2) && ca == cb
@@ -506,7 +555,7 @@ fn profiles_merge_and_sync_over_low_without_applying_native() {
             }),
         )
         .await;
-        common::until("renamed catalog reaches peer", || {
+        common::converge(&[&a, &b], "renamed catalog reaches peer", || {
             let ca = lock(&a.inner.profiles.data).catalog.clone();
             let cb = lock(&b.inner.profiles.data).catalog.clone();
             ca == cb
@@ -525,7 +574,7 @@ fn profiles_merge_and_sync_over_low_without_applying_native() {
             )
             .await;
         }
-        common::until("sixteen profiles reach peer", || {
+        common::converge(&[&a, &b], "sixteen profiles reach peer", || {
             let ca = lock(&a.inner.profiles.data).catalog.clone();
             let cb = lock(&b.inner.profiles.data).catalog.clone();
             ca.as_ref().is_some_and(|c| c.profiles.len() == 16) && ca == cb
@@ -542,7 +591,7 @@ fn profiles_merge_and_sync_over_low_without_applying_native() {
             }),
         )
         .await;
-        common::until("deleted profile reaches peer", || {
+        common::converge(&[&a, &b], "deleted profile reaches peer", || {
             let ca = lock(&a.inner.profiles.data).catalog.clone();
             let cb = lock(&b.inner.profiles.data).catalog.clone();
             ca.as_ref().is_some_and(|c| c.profiles.len() == 15) && ca == cb
@@ -682,7 +731,7 @@ fn multi_owner_load_returns_actual_partial_state_without_compensation() {
             .await
             .unwrap();
         }
-        common::until("observed native changes converge", || {
+        common::converge(&[&a, &b], "observed native changes converge", || {
             a.layout().0 == b.layout().0
                 && a.device_facts(b.id()).and_then(|f| f.native_arrangement_token().ok())
                     == b.device_facts(b.id()).and_then(|f| f.native_arrangement_token().ok())
@@ -857,7 +906,7 @@ fn requester_restart_resolves_durable_pending_without_a_second_write() {
         if recovered.operation.unwrap().status == OperationStatus::OutcomeUnknown {
             assert!(!recovered.create_enabled);
         }
-        common::until("pending result resolves through status polling", || {
+        common::converge(&[&restarted], "pending result resolves through status polling", || {
             lock(&restarted.inner.profiles.data)
                 .operations
                 .back()
@@ -1226,15 +1275,19 @@ fn multi_group_profile_overflow_completes_handoff_without_pending_joins() {
         }
         for first in [0, 2] {
             common::pair(&nodes[first + 1], &nodes[first]).await;
-            common::until("original group profile handoff completes", || {
-                let a = lock(&nodes[first].inner.profiles.data).catalog.clone();
-                let b = lock(&nodes[first + 1].inner.profiles.data).catalog.clone();
-                a.as_ref().is_some_and(|c| c.completed_joins.len() == 1)
-                    && a == b
-                    && [&nodes[first], &nodes[first + 1]]
-                        .iter()
-                        .all(|n| common::profile_layout_ready(n))
-            })
+            common::converge(
+                &[&nodes[first], &nodes[first + 1]],
+                "original group profile handoff completes",
+                || {
+                    let a = lock(&nodes[first].inner.profiles.data).catalog.clone();
+                    let b = lock(&nodes[first + 1].inner.profiles.data).catalog.clone();
+                    a.as_ref().is_some_and(|c| c.completed_joins.len() == 1)
+                        && a == b
+                        && [&nodes[first], &nodes[first + 1]]
+                            .iter()
+                            .all(|n| common::profile_layout_ready(n))
+                },
+            )
             .await;
             let profiles = query(&nodes[first]).await.profiles.len();
             for i in profiles..16 {
@@ -1249,11 +1302,15 @@ fn multi_group_profile_overflow_completes_handoff_without_pending_joins() {
                 )
                 .await;
             }
-            common::until("full original catalog converges", || {
-                let a = lock(&nodes[first].inner.profiles.data).catalog.clone();
-                let b = lock(&nodes[first + 1].inner.profiles.data).catalog.clone();
-                a.as_ref().is_some_and(|c| c.profiles.len() == 16) && a == b
-            })
+            common::converge(
+                &[&nodes[first], &nodes[first + 1]],
+                "full original catalog converges",
+                || {
+                    let a = lock(&nodes[first].inner.profiles.data).catalog.clone();
+                    let b = lock(&nodes[first + 1].inner.profiles.data).catalog.clone();
+                    a.as_ref().is_some_and(|c| c.profiles.len() == 16) && a == b
+                },
+            )
             .await;
         }
         let source_default = lock(&nodes[0].inner.profiles.data)
@@ -1266,20 +1323,24 @@ fn multi_group_profile_overflow_completes_handoff_without_pending_joins() {
             .clone();
         let target_active = query(&nodes[2]).await.active_profile_id.unwrap();
         common::pair(&nodes[0], &nodes[2]).await;
-        common::until("overflow completes instead of remaining pending", || {
-            let catalogs = nodes
-                .iter()
-                .map(|n| lock(&n.inner.profiles.data).catalog.clone())
-                .collect::<Vec<_>>();
-            catalogs[0].as_ref().is_some_and(|c| {
-                c.profiles.len() == 16
-                    && c.active_profile_id == target_active
-                    && c.default_profile().is_some_and(|p| p.id == source_default)
-                    && c.completed_joins.len() == 2
-            }) && catalogs.iter().all(|c| c == &catalogs[0])
-                && nodes[0].pending_profile_joins(nodes[2].id()).unwrap().is_empty()
-                && nodes.iter().all(common::profile_layout_ready)
-        })
+        common::converge(
+            &nodes.iter().collect::<Vec<_>>(),
+            "overflow completes instead of remaining pending",
+            || {
+                let catalogs = nodes
+                    .iter()
+                    .map(|n| lock(&n.inner.profiles.data).catalog.clone())
+                    .collect::<Vec<_>>();
+                catalogs[0].as_ref().is_some_and(|c| {
+                    c.profiles.len() == 16
+                        && c.active_profile_id == target_active
+                        && c.default_profile().is_some_and(|p| p.id == source_default)
+                        && c.completed_joins.len() == 2
+                }) && catalogs.iter().all(|c| c == &catalogs[0])
+                    && nodes[0].pending_profile_joins(nodes[2].id()).unwrap().is_empty()
+                    && nodes.iter().all(common::profile_layout_ready)
+            },
+        )
         .await;
         for node in &nodes {
             let state = query(node).await;
@@ -1359,14 +1420,18 @@ fn empty_singleton_joins_three_device_group_without_losing_saved_default_over_lo
         })
         .await
         .unwrap();
-        common::until("saved three-device default converges", || {
-            nodes[..3].iter().all(|n| {
-                lock(&n.inner.profiles.data)
-                    .catalog
-                    .as_ref()
-                    .is_some_and(|c| c.profile(&saved.id) == Ok(&saved))
-            })
-        })
+        common::converge(
+            &nodes[..3].iter().collect::<Vec<_>>(),
+            "saved three-device default converges",
+            || {
+                nodes[..3].iter().all(|n| {
+                    lock(&n.inner.profiles.data)
+                        .catalog
+                        .as_ref()
+                        .is_some_and(|c| c.profile(&saved.id) == Ok(&saved))
+                })
+            },
+        )
         .await;
         let singleton_default = query(&nodes[3]).await.active_profile_id.unwrap();
         let before = query(&nodes[2]).await.snapshot.unwrap();
@@ -1462,7 +1527,10 @@ fn new_virtual_screen_hotplug_is_visible_and_explicit_hidden_choice_survives_ref
             mode: "mode-c".into(),
         });
         displays.changed();
-        common::until("hotplugged virtual screen", || node.layout().0.screens.len() == 3).await;
+        common::converge(&[&node], "hotplugged virtual screen", || {
+            node.layout().0.screens.len() == 3
+        })
+        .await;
         let current: crate::api::Layout = call(&node, Request::Layout).await;
         assert!(
             !current
@@ -1501,6 +1569,39 @@ fn new_virtual_screen_hotplug_is_visible_and_explicit_hidden_choice_survives_ref
     });
 }
 
+/// Membership and the saved catalog can converge before every owner has been
+/// admitted and published its visibility. Ready also permits cached offline
+/// owners, so it alone cannot fence the online assertions below. Subscribe
+/// before observing, coalesce real state changes, and keep the exact snapshots
+/// that met all conditions. The scenario watchdog bounds a missing event or
+/// permanent non-convergence independently of machine scheduling speed.
+async fn visibility_layouts(nodes: &[Node], screen_count: usize, what: &str) -> Vec<crate::api::Layout> {
+    let refs = nodes.iter().collect::<Vec<_>>();
+    let changes = common::StateChanges::new(&refs, what);
+    loop {
+        let nodes = nodes.to_vec();
+        let observed = tokio::task::spawn_blocking(move || {
+            nodes
+                .iter()
+                .map(|node| (node.profile_snapshot(), crate::agent_api::layout_api(node).unwrap()))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap();
+        if observed.iter().all(|(profile, layout)| {
+            profile
+                .as_ref()
+                .is_ok_and(|state| state.readiness == Readiness::Ready && state.snapshot.is_some())
+                && layout.geometry.screens.len() == screen_count
+                && layout.geometry.screens.iter().all(|screen| screen.online)
+        }) {
+            break observed.into_iter().map(|(_, layout)| layout).collect();
+        }
+        // notify_one retains a permit when publication races the observation.
+        changes.notified().await;
+    }
+}
+
 async fn pairing_visibility_matrix(source_count: usize, target_count: usize) {
     for selection in 0..4 {
         let count = source_count + target_count;
@@ -1521,7 +1622,8 @@ async fn pairing_visibility_matrix(source_count: usize, target_count: usize) {
                 common::pair(first, &nodes[i]).await;
                 common::profile_handoff(&nodes[range.start..=i].iter().collect::<Vec<_>>(), &default).await;
             }
-            common::until(
+            common::converge(
+                &nodes[range.clone()].iter().collect::<Vec<_>>(),
                 &format!(
                     "visibility {source_count}+{target_count} selection {selection} original group {}",
                     range.start
@@ -1570,28 +1672,28 @@ async fn pairing_visibility_matrix(source_count: usize, target_count: usize) {
             .len();
         let target_group = nodes[source_count].group_id().unwrap();
         common::pair(&nodes[0], &nodes[source_count]).await;
-        common::until("visibility matrix catalog handoff", || {
-            let catalogs = nodes
-                .iter()
-                .map(|n| lock(&n.inner.profiles.data).catalog.clone())
-                .collect::<Vec<_>>();
-            catalogs.iter().all(|c| c == &catalogs[0])
-                && catalogs[0]
-                    .as_ref()
-                    .is_some_and(|c| c.group.0 == target_group && c.completed_joins.len() == completed_joins + 1)
-        })
-        .await;
-        common::until(
-            &format!("visibility {source_count}+{target_count} selection {selection} merged layout"),
+        common::converge(
+            &nodes.iter().collect::<Vec<_>>(),
+            "visibility matrix catalog handoff",
             || {
-                nodes
+                let catalogs = nodes
                     .iter()
-                    .all(|n| n.layout().0.screens.len() == count * 2 && common::profile_layout_ready(n))
+                    .map(|n| lock(&n.inner.profiles.data).catalog.clone())
+                    .collect::<Vec<_>>();
+                catalogs.iter().all(|c| c == &catalogs[0])
+                    && catalogs[0]
+                        .as_ref()
+                        .is_some_and(|c| c.group.0 == target_group && c.completed_joins.len() == completed_joins + 1)
             },
         )
         .await;
-        for node in &nodes {
-            let after: crate::api::Layout = call(node, Request::Layout).await;
+        let after_layouts = visibility_layouts(
+            &nodes,
+            count * 2,
+            &format!("visibility {source_count}+{target_count} selection {selection} merged layout"),
+        )
+        .await;
+        for after in after_layouts {
             for before in before_source
                 .geometry
                 .screens
@@ -1670,7 +1772,7 @@ async fn directional_default_join(source_members: usize) {
         .clone();
     if source_members == 2 {
         common::pair(&nodes[0], &nodes[1]).await;
-        common::until("source group default converges", || {
+        common::converge(&[&nodes[0], &nodes[1]], "source group default converges", || {
             let a = lock(&nodes[0].inner.profiles.data).catalog.clone();
             let b = lock(&nodes[1].inner.profiles.data).catalog.clone();
             a.as_ref()
@@ -1686,13 +1788,17 @@ async fn directional_default_join(source_members: usize) {
         .active_profile_id
         .clone();
     common::pair(&nodes[source_members], &nodes[source_members + 1]).await;
-    common::until("target group inherited default converges", || {
-        let a = lock(&nodes[source_members].inner.profiles.data).catalog.clone();
-        let b = lock(&nodes[source_members + 1].inner.profiles.data).catalog.clone();
-        a.as_ref()
-            .is_some_and(|c| c.profiles.len() == 1 && c.active_profile_id == target_default)
-            && a == b
-    })
+    common::converge(
+        &[&nodes[source_members], &nodes[source_members + 1]],
+        "target group inherited default converges",
+        || {
+            let a = lock(&nodes[source_members].inner.profiles.data).catalog.clone();
+            let b = lock(&nodes[source_members + 1].inner.profiles.data).catalog.clone();
+            a.as_ref()
+                .is_some_and(|c| c.profiles.len() == 1 && c.active_profile_id == target_default)
+                && a == b
+        },
+    )
     .await;
     let target_group = nodes[source_members + 1].group_id().unwrap();
     let expected_default = if source_members == 1 {
@@ -1703,23 +1809,27 @@ async fn directional_default_join(source_members: usize) {
     let expected_profiles = if source_members == 1 { 1 } else { 2 };
     // The responder accepts; the initiating source joins its existing group.
     common::pair(&nodes[0], &nodes[source_members + 1]).await;
-    common::until("directional default rule converges on all members", || {
-        let catalogs = nodes
-            .iter()
-            .map(|n| lock(&n.inner.profiles.data).catalog.clone())
-            .collect::<Vec<_>>();
-        catalogs.iter().all(|c| c == &catalogs[0])
-            && catalogs[0].as_ref().is_some_and(|c| {
-                c.group.0 == target_group
-                    && c.profiles.len() == expected_profiles
-                    && c.active_profile_id == expected_default
-                    && c.default_profile().is_some_and(|p| p.id == expected_default)
-                    && (source_members == 1
-                        || c.completed_joins
-                            .values()
-                            .any(|j| j.dropped_defaults.contains(&target_default)))
-            })
-    })
+    common::converge(
+        &nodes.iter().collect::<Vec<_>>(),
+        "directional default rule converges on all members",
+        || {
+            let catalogs = nodes
+                .iter()
+                .map(|n| lock(&n.inner.profiles.data).catalog.clone())
+                .collect::<Vec<_>>();
+            catalogs.iter().all(|c| c == &catalogs[0])
+                && catalogs[0].as_ref().is_some_and(|c| {
+                    c.group.0 == target_group
+                        && c.profiles.len() == expected_profiles
+                        && c.active_profile_id == expected_default
+                        && c.default_profile().is_some_and(|p| p.id == expected_default)
+                        && (source_members == 1
+                            || c.completed_joins
+                                .values()
+                                .any(|j| j.dropped_defaults.contains(&target_default)))
+                })
+        },
+    )
     .await;
     assert!(displays.iter().all(|d| d.calls.load(Ordering::SeqCst) == 0));
     for node in nodes {
@@ -1826,13 +1936,17 @@ async fn offline_acceptor_scenario(recover_projection: bool) {
     let a = start(dirs[0].path(), displays[0].clone()).await;
     common::query(&a, &b).await;
     common::active(&[&a, &b]).await;
-    common::until("retained source list completes after acceptor restart", || {
-        let ca = lock(&a.inner.profiles.data).catalog.clone();
-        let cb = lock(&b.inner.profiles.data).catalog.clone();
-        ca.as_ref().is_some_and(|c| {
-            c.completed_joins.contains_key(&id) && c.default_profile().is_some_and(|p| p.id == target_default)
-        }) && ca == cb
-    })
+    common::converge(
+        &[&a, &b],
+        "retained source list completes after acceptor restart",
+        || {
+            let ca = lock(&a.inner.profiles.data).catalog.clone();
+            let cb = lock(&b.inner.profiles.data).catalog.clone();
+            ca.as_ref().is_some_and(|c| {
+                c.completed_joins.contains_key(&id) && c.default_profile().is_some_and(|p| p.id == target_default)
+            }) && ca == cb
+        },
+    )
     .await;
     let result = super::store::load(dirs[1].path(), group).unwrap().unwrap();
     assert!(!result.profiles.iter().any(|p| p.id == source_default));
@@ -1888,7 +2002,7 @@ fn rapid_second_pairing_converges_three_real_nodes_without_import_proofs() {
         // The new join contract assumes the initiator has its converged source
         // list. Pair again immediately when it has the acceptor's first result;
         // do not wait for every member's catalog/facts/UI readiness.
-        common::until("initiator has the first acceptor result", || {
+        common::converge(&[&a], "initiator has the first acceptor result", || {
             lock(&a.inner.profiles.data).catalog.as_ref().is_some_and(|c| {
                 c.group.0 == b.group_id().unwrap()
                     && !c.completed_joins.is_empty()
@@ -1898,7 +2012,7 @@ fn rapid_second_pairing_converges_three_real_nodes_without_import_proofs() {
         .await;
         common::pair(&a, &c).await;
         common::active(&[&a, &b, &c]).await;
-        common::until("rapid second result relays to every member", || {
+        common::converge(&[&a, &b, &c], "rapid second result relays to every member", || {
             let catalogs = [&a, &b, &c].map(|n| lock(&n.inner.profiles.data).catalog.clone());
             catalogs[0].as_ref().is_some_and(|catalog| {
                 catalog.group.0 == c.group_id().unwrap()
@@ -1933,7 +2047,7 @@ fn manual_layout_fixture_waits_for_target_catalog_after_screen_facts() {
         b.inner.profiles.defer_joins.store(true, Ordering::SeqCst);
         common::pair(&a, &b).await;
         let nodes = [&a, &b];
-        common::until("screen facts before target catalog", || {
+        common::converge(&nodes, "screen facts before target catalog", || {
             nodes.iter().all(|n| n.layout().0.screens.len() == 4)
                 && a.profile_snapshot().is_ok_and(|s| s.readiness == Readiness::Syncing)
         })
@@ -1968,7 +2082,7 @@ fn manual_layout_fixture_waits_for_target_catalog_after_screen_facts() {
             .await
             .unwrap()
             .unwrap();
-        common::until("visibility edit after catalog publication", || {
+        common::converge(&nodes, "visibility edit after catalog publication", || {
             nodes.iter().all(|n| {
                 n.link_config()
                     .unwrap()
@@ -1995,7 +2109,7 @@ fn awaiting_target_catalog_never_mutates_retained_source_profiles() {
         a.inner.profiles.defer_catalogs.store(true, Ordering::SeqCst);
         b.inner.profiles.defer_joins.store(true, Ordering::SeqCst);
         common::pair(&a, &b).await;
-        common::until("owner facts visible during pending catalog", || {
+        common::converge(&[&a, &b], "owner facts visible during pending catalog", || {
             a.profile_snapshot().is_ok()
         })
         .await;
@@ -2091,7 +2205,7 @@ async fn pairing_without_live_facts(source_permits: bool) {
         assert_eq!(node.profile_snapshot().unwrap_err().code, ErrorCode::FactsUnavailable);
     }
     common::pair(&a, &b).await;
-    common::until("saved catalog transferred without live observation", || {
+    common::converge(&[&a, &b], "saved catalog transferred without live observation", || {
         lock(&b.inner.profiles.data).catalog.as_ref().is_some_and(|c| {
             !c.completed_joins.is_empty()
                 && c.default_profile().map(|p| &p.id) == original.default_profile().map(|p| &p.id)
@@ -2154,7 +2268,7 @@ fn hotplug_fixture_waits_for_handoff_even_when_provisional_catalogs_match() {
         let expected_default = query(&b).await.active_profile_id.unwrap();
         b.inner.profiles.defer_joins.store(true, Ordering::SeqCst);
         common::pair(&a, &b).await;
-        common::until("provisional catalogs match before handoff", || {
+        common::converge(&[&a, &b], "provisional catalogs match before handoff", || {
             let ca = lock(&a.inner.profiles.data).catalog.clone();
             let cb = lock(&b.inner.profiles.data).catalog.clone();
             ca.as_ref().is_some_and(|c| {
@@ -2218,7 +2332,7 @@ fn physical_topology_ignores_online_state_and_profile_restores_plug_unplug_once(
         .await;
         let saved = lock(&a.inner.profiles.data).catalog.clone().unwrap();
         assert!(saved.active().saved_topology.is_some());
-        common::until("saved topology propagated", || {
+        common::converge(&[&a, &b], "saved topology propagated", || {
             lock(&b.inner.profiles.data).catalog.as_ref() == Some(&saved)
         })
         .await;
@@ -2242,7 +2356,7 @@ fn physical_topology_ignores_online_state_and_profile_restores_plug_unplug_once(
         };
         lock(&da.state).displays.push(extra);
         da.changed();
-        common::until("hotplug moves peer but not profile", || {
+        common::converge(&[&a, &b], "hotplug moves peer but not profile", || {
             let observed = a.observe_profiles().unwrap();
             observed
                 .snapshot
@@ -2259,7 +2373,7 @@ fn physical_topology_ignores_online_state_and_profile_restores_plug_unplug_once(
         assert_eq!(lock(&a.inner.profiles.data).catalog.as_ref(), Some(&saved));
         lock(&da.state).displays.pop();
         da.changed();
-        common::until("saved placements restored on both replicas", || {
+        common::converge(&[&a, &b], "saved placements restored on both replicas", || {
             [&a, &b].iter().all(|n| {
                 n.observe_profiles()
                     .is_ok_and(|o| model::same_content(&o.snapshot, &saved.active().content))
@@ -2272,7 +2386,7 @@ fn physical_topology_ignores_online_state_and_profile_restores_plug_unplug_once(
             "matching saved geometry can precede the restore register"
         );
         b.link_config().unwrap().hold_incoming_config_states(false);
-        common::until("restored content and register converged", || {
+        common::converge(&[&a, &b], "restored content and register converged", || {
             let version = a.link_config().unwrap().applied().version.clone();
             [&a, &b].iter().all(|node| {
                 node.link_config().unwrap().applied().version == version
@@ -2392,13 +2506,10 @@ fn native_tokens_refresh_on_display_events_without_idle_polling_and_retry_failur
         // Mode identity can change while DisplayInfo bounds/pixels stay equal.
         lock(&displays.state).displays[0].mode.push_str("-changed");
         displays.changed();
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while token() == initial {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
+        common::converge(&[&node], "display callback refreshes native token", || {
+            token() != initial
         })
-        .await
-        .expect("display callback must refresh the native token promptly");
+        .await;
         let next = token();
         let reads = displays.reads.load(Ordering::SeqCst);
         displays.read_fail.store(true, Ordering::SeqCst);
@@ -2410,13 +2521,10 @@ fn native_tokens_refresh_on_display_events_without_idle_polling_and_retry_failur
         .await;
         displays.read_fail.store(false, Ordering::SeqCst);
         // Some platforms send no second notification after a transient error.
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while token() == next {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
+        common::converge(&[&node], "failed event read retries without another callback", || {
+            token() != next
         })
-        .await
-        .expect("failed event read must retry without another callback");
+        .await;
         node.shutdown().await;
     });
 }
@@ -2465,7 +2573,7 @@ fn remote_hotplug_profile_return(delay_manual_layout: bool) {
             .await
             .unwrap()
             .unwrap();
-        common::until("departed computer leaves the active roster", || {
+        common::converge(&[&a, &b, &c], "departed computer leaves the active roster", || {
             [&a, &b]
                 .iter()
                 .all(|n| n.link_config().unwrap().members().members.len() == 2)
@@ -2487,7 +2595,12 @@ fn remote_hotplug_profile_return(delay_manual_layout: bool) {
                     })
             })
         };
-        common::until("initial native observations published", peer_observation_settled).await;
+        common::converge(
+            &[&a, &b],
+            "initial native observations published",
+            peer_observation_settled,
+        )
+        .await;
         let state = query(&a).await;
         let mut placements = state.snapshot.as_ref().unwrap().placements.clone();
         for p in &mut placements {
@@ -2530,7 +2643,7 @@ fn remote_hotplug_profile_return(delay_manual_layout: bool) {
         let retained = crate::config_module::layout_wire::from_wire(&value).unwrap();
         assert!(retained.screens.iter().any(|s| s.id.device == c.id()));
         assert!(!a.layout().0.screens.iter().any(|s| s.id.device == c.id()));
-        common::until("manual save propagated", || {
+        common::converge(&[&a, &b], "manual save propagated", || {
             lock(&b.inner.profiles.data).catalog.as_ref() == Some(&saved)
         })
         .await;
@@ -2543,7 +2656,7 @@ fn remote_hotplug_profile_return(delay_manual_layout: bool) {
         };
         lock(&db.state).displays.push(extra.clone());
         db.changed();
-        common::until("remote hotplug pushes the overlapping computer", || {
+        common::converge(&[&a, &b], "remote hotplug pushes the overlapping computer", || {
             a.observe_profiles().is_ok_and(|o| {
                 o.snapshot
                     .native
@@ -2556,7 +2669,8 @@ fn remote_hotplug_profile_return(delay_manual_layout: bool) {
         // The kind-2 layout can arrive before its physical Facts. The logical
         // restore clock must observe a coherent departure before we unplug;
         // sleeping for the installed incident's duration cannot establish that.
-        common::until(
+        common::converge(
+            &[&a, &b],
             "remote hotplug native facts and layout converged",
             peer_observation_settled,
         )
@@ -2583,15 +2697,19 @@ fn remote_hotplug_profile_return(delay_manual_layout: bool) {
         }
         lock(&db.state).displays.pop();
         db.changed();
-        common::until("remote unplug restores saved geometry on both replicas", || {
-            // Matching content is insufficient when a replica still has an
-            // earlier register. Finish this excursion before another manual edit.
-            peer_observation_settled()
-                && [&a, &b].iter().all(|n| {
-                    n.observe_profiles()
-                        .is_ok_and(|o| model::same_content(&o.snapshot, &expected))
-                })
-        })
+        common::converge(
+            &[&a, &b],
+            "remote unplug restores saved geometry on both replicas",
+            || {
+                // Matching content is insufficient when a replica still has an
+                // earlier register. Finish this excursion before another manual edit.
+                peer_observation_settled()
+                    && [&a, &b].iter().all(|n| {
+                        n.observe_profiles()
+                            .is_ok_and(|o| model::same_content(&o.snapshot, &expected))
+                    })
+            },
+        )
         .await;
         for node in [&a, &b] {
             assert_eq!(lock(&node.inner.profiles.data).catalog.as_ref(), Some(&saved));
@@ -2602,10 +2720,15 @@ fn remote_hotplug_profile_return(delay_manual_layout: bool) {
         // not attach the floating computer to a corner or compact either unit.
         // Layout publication and native-token/facts publication are separate;
         // finish the first excursion before starting another manual command.
-        common::until("unplugged native observations published", peer_observation_settled).await;
+        common::converge(
+            &[&a, &b],
+            "unplugged native observations published",
+            peer_observation_settled,
+        )
+        .await;
         lock(&db.state).displays.push(extra);
         db.changed();
-        common::until("second remote plug repaired", || {
+        common::converge(&[&a, &b], "second remote plug repaired", || {
             peer_observation_settled()
                 && a.observe_profiles().is_ok_and(|o| {
                     o.snapshot
@@ -2638,7 +2761,7 @@ fn remote_hotplug_profile_return(delay_manual_layout: bool) {
         let unmatched = manual.state.snapshot.unwrap();
         let saved_plugged = lock(&a.inner.profiles.data).catalog.clone().unwrap();
         assert_ne!(saved_plugged.active().content_revision, saved.active().content_revision);
-        common::until("plugged manual save propagated", || {
+        common::converge(&[&a, &b], "plugged manual save propagated", || {
             lock(&b.inner.profiles.data).catalog.as_ref() == Some(&saved_plugged)
         })
         .await;
@@ -2652,7 +2775,8 @@ fn remote_hotplug_profile_return(delay_manual_layout: bool) {
         lock(&db.state).displays.pop();
         db.changed();
         if delay_manual_layout {
-            common::until(
+            common::converge(
+                &[&a, &b],
                 "unplug native observation reaches the owner before C0 is released",
                 || {
                     b.link_config()
@@ -2668,7 +2792,7 @@ fn remote_hotplug_profile_return(delay_manual_layout: bool) {
             .await;
             b.link_config().unwrap().hold_incoming_config_states(false);
         }
-        common::until("unmatched unplug observed on both replicas", || {
+        common::converge(&[&a, &b], "unmatched unplug observed on both replicas", || {
             [&a, &b].iter().all(|n| {
                 n.observe_profiles().is_ok_and(|o| {
                     o.snapshot
@@ -2679,7 +2803,8 @@ fn remote_hotplug_profile_return(delay_manual_layout: bool) {
             })
         })
         .await;
-        common::until(
+        common::converge(
+            &[&a, &b],
             "unmatched unplug native facts and layout converged",
             peer_observation_settled,
         )

@@ -43,7 +43,7 @@ it.each(['en','ja','ko','zh-Hans'])('shows default-off external forwarding only 
   expect(mac.container.querySelector('[data-item="forwardInjectedInput"]')).toBeNull();
   expect(sectionsFor('mac').flatMap(section=>section.items).some(item=>item.id==='forwardInjectedInput')).toBe(false);
 });
-it.each(['en','ja','ko','zh-Hans'])('shows default-on foreground capture only on Windows in %s', language => {
+it.each(['en','ja','ko','zh-Hans'])('shows default-off foreground capture only on Windows in %s', language => {
   setLanguage(language);
   const set=vi.fn();
   const {container,unmount}=render(view(initial,'',vi.fn(),undefined,'win',{...prefs,set}));
@@ -52,9 +52,9 @@ it.each(['en','ja','ko','zh-Hans'])('shows default-on foreground capture only on
   expect(row.classList.contains('ok-row--stack')).toBe(false);
   expect(row.nextElementSibling?.getAttribute('data-item')).toBe('forwardInjectedInput');
   const control=within(row).getByRole('switch') as HTMLInputElement;
-  expect(control.checked).toBe(true);
+  expect(control.checked).toBe(false);
   fireEvent.click(control);
-  expect(set).toHaveBeenCalledExactlyOnceWith('takeForegroundOnLeave',false);
+  expect(set).toHaveBeenCalledExactlyOnceWith('takeForegroundOnLeave',true);
   const item=sectionsFor('win').flatMap(section=>section.items).find(item=>item.id==='takeForegroundOnLeave')!;
   if(language==='zh-Hans') {
     expect(item.label).toBe('指针离开时接管前台');

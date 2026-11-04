@@ -12,6 +12,24 @@ pub enum ContactsPath {
     Local,
 }
 
+/// Transient diagnostic observation. The consumer anonymizes source; never wire input.
+#[derive(Clone, Copy, Debug)]
+pub struct TouchpadRoute {
+    pub source: DeviceId,
+    /// input, kind, phase, path, reason, allowed, epoch, options, capacity,
+    /// accept_contacts, touchpad_injection, native_multifinger, mac_scroll_feel.
+    pub fields: [u64; 13],
+}
+
+/// Source routing transitions, retained independently of realtime tracing suppression.
+#[derive(Clone, Copy, Debug)]
+pub struct TouchpadSource {
+    pub source: DeviceId,
+    /// mode, previous_mode, observed, healthy, destination, forward_gestures,
+    /// frames, cancelled, epoch.
+    pub fields: [u64; 9],
+}
+
 impl Router {
     /// Owner preference on the receiving Windows device. It never gates capture
     /// or the advertised native injector capability.
@@ -20,6 +38,41 @@ impl Router {
             self.retire_received_multifinger();
             self.accept_contacts = enabled;
         }
+    }
+    /// Observation only; never used for admission or capability advertisement.
+    pub fn contact_diagnostic_state(&self) -> [u64; 4] {
+        [
+            u64::from(self.contacts_observed),
+            u64::from(self.contacts_healthy),
+            self.contacts.mode() as u64,
+            self.contacts_path() as u64,
+        ]
+    }
+    pub fn peer_touchpad_options(&self, peer: DeviceId) -> Option<bool> {
+        self.peers.get(&peer).map(|p| p.touchpad_options)
+    }
+    pub(super) fn diagnostic_contact_gate(&self, origin: DeviceId, msg: &InputMsg, reason: u8) {
+        let Some(sink) = self.diagnostics.as_deref().filter(|d| d.enabled()) else {
+            return;
+        };
+        let event = match msg {
+            InputMsg::Gesture { gesture, .. } => MultiEvent::Gesture(*gesture),
+            InputMsg::TouchpadContacts(frame) => MultiEvent::Contacts(frame.phase),
+            _ => return,
+        };
+        trace_route(
+            sink,
+            origin,
+            event,
+            255,
+            reason,
+            false,
+            self.epoch,
+            self.touchpad_options_enabled(origin),
+            self.touchpad_contacts,
+            self.accept_contacts,
+            &self.cfg.settings,
+        );
     }
     pub fn contacts_path(&self) -> ContactsPath {
         if !matches!(self.mouse_target(), Target::Remote(_)) {
@@ -140,6 +193,22 @@ impl Router {
     fn contacts_diagnostic(&mut self, old: crate::contacts::Mode, before: u64) {
         let mode = self.contacts.mode();
         if mode != old {
+            if let Some(sink) = self.diagnostics.as_deref().filter(|d| d.enabled()) {
+                sink.touchpad_source(TouchpadSource {
+                    source: self.me(),
+                    fields: [
+                        mode as u64,
+                        old as u64,
+                        u64::from(self.contacts_observed),
+                        u64::from(self.contacts_healthy),
+                        u64::from(self.contacts_destination().is_some()),
+                        u64::from(self.cfg.settings.forward_gestures),
+                        self.contacts.raw_frames,
+                        self.contacts.cancelled,
+                        self.epoch,
+                    ],
+                });
+            }
             self.out.push(Output::Status(StatusEvent::TouchpadContacts {
                 mode,
                 frames: self.contacts.raw_frames,
@@ -182,6 +251,7 @@ impl Router {
     pub(super) fn receive_contacts(&mut self, origin: DeviceId, frame: Frame) {
         // No forwarding: focus handoff cancels the old target locally and at source.
         if self.holder != self.me() || self.claim != self.me() {
+            self.diagnostic_contact_gate(origin, &InputMsg::TouchpadContacts(frame), 8);
             // Focus retirement already cancelled native injection. Still consume
             // the source's End/Cancel: it is addressed to this old receiver and
             // may arrive after the focus announcement. Leaving its contact bit
@@ -255,6 +325,21 @@ impl Router {
                     MultiPath::Native
                 };
                 self.multifinger.get_mut(&origin).expect("pending sequence").path = path;
+                if let Some(sink) = self.diagnostics.as_deref().filter(|d| d.enabled()) {
+                    trace_route(
+                        sink,
+                        origin,
+                        MultiEvent::Contacts(frame.phase),
+                        path as u8,
+                        9,
+                        matches!(path, MultiPath::Native | MultiPath::NativeScroll),
+                        self.epoch,
+                        self.touchpad_options_enabled(origin),
+                        self.touchpad_contacts,
+                        self.accept_contacts,
+                        &self.cfg.settings,
+                    );
+                }
                 self.resolve_pending_contacts(origin, path);
             }
             return;
@@ -429,6 +514,53 @@ pub(super) enum MultiEvent {
     Gesture(Gesture),
     Scroll(ScrollPhase),
 }
+// Boundary-only routing evidence, independent of admission and injector execution.
+#[allow(clippy::too_many_arguments)]
+fn trace_route(
+    sink: &dyn RoutingDiagnostics,
+    source: DeviceId,
+    event: MultiEvent,
+    path: u8,
+    reason: u8,
+    allowed: bool,
+    epoch: u64,
+    options: bool,
+    capacity: Option<u8>,
+    accept: bool,
+    settings: &crate::RoutingSettings,
+) {
+    let (input, kind, phase) = match event {
+        MultiEvent::Contacts(p) if p != Phase::Move || reason == 9 => (1_u8, 0_u8, p as u8),
+        MultiEvent::Gesture(g) if g.starts() || g.ends() => {
+            let (kind, phase) = match g {
+                Gesture::DockSwipe { axis, phase, .. } => (axis as u8, phase),
+                Gesture::Magnify { phase, .. } => (3, phase),
+                Gesture::Rotate { phase, .. } => (4, phase),
+                Gesture::SmartMagnify => (5, oink_foundation::input::GesturePhase::Ended),
+            };
+            (2, kind, phase as u8)
+        }
+        _ => return,
+    };
+    sink.touchpad_route(TouchpadRoute {
+        source,
+        fields: [
+            input.into(),
+            kind.into(),
+            phase.into(),
+            path.into(),
+            reason.into(),
+            u64::from(allowed),
+            epoch,
+            u64::from(options),
+            capacity.unwrap_or(0).into(),
+            u64::from(accept),
+            u64::from(settings.touchpad_injection),
+            u64::from(settings.native_multifinger),
+            u64::from(settings.mac_scroll_feel),
+        ],
+    });
+}
 impl Router {
     fn resolve_pending_contacts(&mut self, origin: DeviceId, path: MultiPath) {
         if self.pending_contacts.origin != Some(origin) {
@@ -524,6 +656,23 @@ impl Router {
             }
         }
         let Some(state) = self.multifinger.get_mut(&origin) else {
+            if let Some(sink) = self.diagnostics.as_deref().filter(|d| d.enabled())
+                && !matches!(event, MultiEvent::Scroll(_))
+            {
+                trace_route(
+                    sink,
+                    origin,
+                    event,
+                    255,
+                    1,
+                    false,
+                    self.epoch,
+                    options,
+                    self.touchpad_contacts,
+                    self.accept_contacts,
+                    &self.cfg.settings,
+                );
+            }
             return false;
         };
         if state.path == MultiPath::Pending && !state.retired && starts {
@@ -590,6 +739,30 @@ impl Router {
             MultiPath::Pending | MultiPath::Suppressed => false,
         };
         let allow = live && !state.retired && selected;
+        if let Some(sink) = self.diagnostics.as_deref().filter(|d| d.enabled()) {
+            let reason = if !live {
+                2
+            } else if state.retired {
+                3
+            } else if !selected {
+                4
+            } else {
+                0
+            };
+            trace_route(
+                sink,
+                origin,
+                event,
+                path as u8,
+                reason,
+                allow,
+                self.epoch,
+                options,
+                self.touchpad_contacts,
+                self.accept_contacts,
+                &self.cfg.settings,
+            );
+        }
         if !state.contacts && !state.gesture && state.scroll.is_none() {
             self.multifinger.remove(&origin);
         }
@@ -1372,6 +1545,55 @@ mod tests {
         r.set_settings(settings);
         r.out.clear();
         (r, origin)
+    }
+    #[test]
+    fn route_evidence_records_boundaries_and_does_not_change_selection() {
+        struct Sink {
+            enabled: bool,
+            records: std::sync::Mutex<Vec<TouchpadRoute>>,
+        }
+        impl RoutingDiagnostics for Sink {
+            fn enabled(&self) -> bool {
+                self.enabled
+            }
+            fn decision(&self, _: DecisionKind, _: DecisionReason, _: u64, _: DeviceId, _: Option<&ScreenPos>) {}
+            fn touchpad_route(&self, record: TouchpadRoute) {
+                self.records.lock().unwrap().push(record);
+            }
+        }
+        for parent in [false, true] {
+            for native in [false, true] {
+                for enabled in [false, true] {
+                    let (mut r, origin) = options_router(parent, native, true);
+                    let sink = Arc::new(Sink {
+                        enabled,
+                        records: Default::default(),
+                    });
+                    r.set_diagnostics(sink.clone());
+                    for phase in [GesturePhase::Began, GesturePhase::Changed, GesturePhase::Ended] {
+                        let event = MultiEvent::Gesture(Gesture::DockSwipe {
+                            axis: oink_foundation::input::SwipeAxis::Horizontal,
+                            phase,
+                            progress: 0.5,
+                            velocity: 0.,
+                        });
+                        assert_eq!(r.filter_multifinger(origin, event), !(parent && native));
+                    }
+                    let records = sink.records.lock().unwrap();
+                    assert_eq!(records.len(), if enabled { 2 } else { 0 });
+                    for record in records.iter() {
+                        assert_eq!(record.source, origin);
+                        assert_eq!(record.fields[0], 2);
+                        assert_eq!(record.fields[3], if parent && native { 0 } else { 3 });
+                        assert_eq!(record.fields[4], if parent && native { 4 } else { 0 });
+                        assert_eq!(record.fields[5], u64::from(!(parent && native)));
+                        assert_eq!(record.fields[7], 1);
+                        assert_eq!(record.fields[8], 5);
+                    }
+                    assert!(r.out.is_empty(), "observing route cannot inject anything");
+                }
+            }
+        }
     }
     #[test]
     fn touchpad_options_matrix_selects_one_scroll_injection_path() {

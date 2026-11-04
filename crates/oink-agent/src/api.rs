@@ -138,7 +138,8 @@ impl From<&ScreenKey> for dl::ScreenId {
 
 // ───────────────────────────── 错误 ─────────────────────────────
 
-/// Typed local failures. Diagnostic text stays inside the backend; clients translate codes.
+/// Typed local failures. Clients translate codes; Unavailable also preserves
+/// the local startup/connection reason so users can display and copy it.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum ApiError {
@@ -148,7 +149,7 @@ pub enum ApiError {
     },
     /// 服务未运行或尚未就绪。
     Unavailable {
-        #[serde(skip)]
+        #[serde(default)]
         message: String,
     },
     /// 引用的设备、屏幕、请求等不存在（可能已被移除或过期）。
@@ -247,7 +248,7 @@ impl ApiError {
 impl Serialize for ApiError {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let fields = if matches!(self, Self::UpdateFailed { .. }) {
+        let fields = if matches!(self, Self::UpdateFailed { .. } | Self::Unavailable { .. }) {
             3
         } else {
             2
@@ -255,6 +256,9 @@ impl Serialize for ApiError {
         let mut value = serializer.serialize_struct("ApiError", fields)?;
         value.serialize_field("code", self.code())?;
         value.serialize_field("problem", &self.problem())?;
+        if let Self::Unavailable { message } = self {
+            value.serialize_field("message", message)?;
+        }
         if let Self::UpdateFailed { update_error } = self {
             value.serialize_field("update_error", update_error)?;
         }
@@ -1021,8 +1025,8 @@ pub struct InputSettings {
     /// Windows source-local preference. Never replicated to peers.
     #[serde(default)]
     pub forward_injected_input: bool,
-    /// Windows source-local preference, default on for existing settings too.
-    #[serde(default = "default_true")]
+    /// Windows source-local preference, default off for settings without this key.
+    #[serde(default)]
     pub take_foreground_on_leave: bool,
     /// Physical source preference, persisted only by this device.
     #[serde(default = "default_true")]
@@ -2847,6 +2851,19 @@ pub fn parse_address(input: &str, default_port: u16) -> ApiResult<std::net::Sock
 mod tests {
     use super::*;
     #[test]
+    fn backend_startup_detail_survives_both_ipc_hops() {
+        let error = ApiError::Unavailable {
+            message: "backend_exited:3221225477".into(),
+        };
+        let first = serde_json::to_value(&error).unwrap();
+        let forwarded: ApiError = serde_json::from_value(first).unwrap();
+        assert_eq!(forwarded, error);
+        assert_eq!(
+            serde_json::to_value(forwarded).unwrap()["message"],
+            "backend_exited:3221225477"
+        );
+    }
+    #[test]
     fn errors_expose_codes_without_backend_diagnostic_text() {
         let error = ApiError::Internal {
             message: "private native detail".into(),
@@ -3198,7 +3215,7 @@ fn test_input_settings() -> InputSettings {
         native_multifinger: true,
         mac_scroll_feel: true,
         forward_injected_input: false,
-        take_foreground_on_leave: true,
+        take_foreground_on_leave: false,
         forward_wheel_by_lines: true,
         emergency_hold_ms: 5000,
         device_gain: 1.,
@@ -3222,14 +3239,23 @@ fn test_input_settings() -> InputSettings {
 mod input_validation_tests {
     use super::*;
     #[test]
-    fn old_input_settings_default_foreground_capture_on() {
+    fn old_input_settings_default_foreground_capture_off() {
         let mut value = serde_json::to_value(test_input_settings()).unwrap();
         value.as_object_mut().unwrap().remove("take_foreground_on_leave");
         assert!(
-            serde_json::from_value::<InputSettings>(value)
+            !serde_json::from_value::<InputSettings>(value.clone())
                 .unwrap()
                 .take_foreground_on_leave
         );
+        for enabled in [true, false] {
+            value["take_foreground_on_leave"] = serde_json::json!(enabled);
+            let settings: InputSettings = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(settings.take_foreground_on_leave, enabled);
+            assert_eq!(
+                serde_json::to_value(settings).unwrap()["take_foreground_on_leave"],
+                enabled
+            );
+        }
     }
     #[test]
     fn trail_duration_bounds_are_checked_without_an_api_mock() {

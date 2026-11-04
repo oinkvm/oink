@@ -100,8 +100,8 @@ impl<O: Owner> Fixture<O> {
             let directory = tempfile::tempdir().unwrap();
             let stored = group_store::StoredGroupState::new(identity.id(), state.wire().clone()).unwrap();
             group_store::save(&directory.path().join(group_store::STATE_FILE), &stored).unwrap();
-            // QUIC and Low TCP share a port. UDP :0 can pick a Windows TCP
-            // ephemeral/TIME_WAIT port, leaving this fixture without Low.
+            // QUIC and Low TCP share a port. Reserve both actual sockets;
+            // probing and closing them leaves a gap before network startup.
             let network = oink_test_support::network_config(directory.path().into(), "synthetic", 0);
             let profile = OfferProfile {
                 capabilities: v1::registry::CAPABILITIES

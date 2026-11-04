@@ -173,7 +173,14 @@ pub(super) async fn run(
         let socket = udp::Socket::bind(config.bind, shared.wake.clone())?;
         #[cfg(not(any(target_os = "macos", test)))]
         let socket = {
-            let socket = std::net::UdpSocket::bind(config.bind)?;
+            #[cfg(feature = "test-support")]
+            let reserved = crate::test_ports::take_udp(config.bind);
+            #[cfg(not(feature = "test-support"))]
+            let reserved: Option<std::net::UdpSocket> = None;
+            let socket = match reserved {
+                Some(socket) => socket,
+                None => std::net::UdpSocket::bind(config.bind)?,
+            };
             crate::qos::set_service_type(&socket, crate::qos::ServiceType::Voice);
             crate::qos::wrap_udp_socket(socket)?
         };

@@ -189,6 +189,13 @@ fn preview(items: &[ClipData], scale: f64) -> Result<Option<Bitmap>, String> {
     {
         let mut bitmap = Bitmap::new((160. * scale).round() as i32, (32. * scale).round() as i32)?;
         bitmap.pixels().fill(255);
+        // Windows 11 DrawTextW dereferences lpchText even with cchText == 0.
+        // An empty UTF-16 Vec supplies the dangling address 0x2, causing an AV
+        // inside USER32. Skip drawing the empty string; retain the same opaque
+        // white preview. Verified with the original preview and a guard-page probe.
+        if text.is_empty() {
+            return Ok(Some(bitmap));
+        }
         let mut text: Vec<u16> = text_preview(text).encode_utf16().collect();
         bitmap.draw(|dc| {
             // SAFETY: bounded text in the selected DIB; font is deselected before deletion.
@@ -894,6 +901,12 @@ mod tests {
             assert!(bitmap.pixels().as_chunks::<4>().0.iter().all(|p| p[3] == 255));
             assert!(bitmap.pixels().as_chunks::<4>().0.iter().any(|p| p[..3] != [255; 3]));
         }
+    }
+    #[test]
+    fn empty_text_preview_does_not_pass_a_dangling_buffer_to_draw_text() {
+        let mut bitmap = preview(&[ClipData::Text(String::new())], 1.).unwrap().unwrap();
+        assert_eq!((bitmap.width, bitmap.height), (160, 32));
+        assert!(bitmap.pixels().iter().all(|byte| *byte == 255));
     }
     #[test]
     fn image_preview_is_top_down_straight_alpha_bgra() {

@@ -16,6 +16,7 @@ enum Record {
     Remote(DeviceId, InputMsg),
     Held(HeldRecord),
     Contacts(oink_input::contact_trace::Observation),
+    TouchpadInjection(Option<DeviceId>, [u64; 5]),
 }
 #[derive(Clone, Copy)]
 struct HeldRecord {
@@ -52,6 +53,8 @@ pub(super) enum Evidence {
     CursorReconciliation(super::cursor_reconciliation::Record),
     Volume(oink_routing::router::VolumeDecision),
     SourceRouting(oink_routing::router::SourceDecision),
+    TouchpadRoute(oink_routing::router::TouchpadRoute),
+    TouchpadSource(oink_routing::router::TouchpadSource),
     Dnd(super::dnd::Raw),
     Log {
         line: u32,
@@ -192,6 +195,18 @@ impl InputTrace {
             None,
             None,
         ));
+    }
+    pub fn touchpad_injected(
+        &self,
+        event: &InjectEvent,
+        peer: Option<DeviceId>,
+        result: &Result<(), oink_input::InputError>,
+    ) {
+        if self.enabled()
+            && let Some(values) = super::contacts::injection_result(event, result)
+        {
+            self.push(Record::TouchpadInjection(peer, values));
+        }
     }
     pub fn injected(&self, event: &InjectEvent, peer: Option<DeviceId>, success: bool) {
         if matches!(event, InjectEvent::TouchpadContacts(_)) {
@@ -336,6 +351,13 @@ impl InputTrace {
                     recorder.captured_outcome(&event, None, metadata, outcome, path)
                 }
                 Record::Contacts(observation) => recorder.record(super::contacts::event(observation)),
+                Record::TouchpadInjection(source, values) => recorder.record(super::contacts::numeric_event(
+                    4,
+                    source,
+                    &["input", "kind", "phase", "success", "error_kind"],
+                    &values,
+                    recorder,
+                )),
                 Record::Injection(event, peer, success) => recorder.injected(&event, peer, success),
                 Record::Remote(peer, message) => recorder.remote_message(peer, &Message::Input(message)),
                 Record::Held(held) => recorder.record(Event::HeldSync {
@@ -366,6 +388,24 @@ impl InputTrace {
                     Evidence::CursorClip(record) => record.export(recorder),
                     Evidence::CursorReconciliation(record) => record.export(recorder),
                     Evidence::SourceRouting(record) => Event::SourceRouting(record),
+                    Evidence::TouchpadRoute(record) => super::contacts::route_event(record, recorder),
+                    Evidence::TouchpadSource(record) => super::contacts::numeric_event(
+                        2,
+                        Some(record.source),
+                        &[
+                            "mode",
+                            "previous_mode",
+                            "observed",
+                            "healthy",
+                            "destination",
+                            "forward_gestures",
+                            "frames",
+                            "cancelled",
+                            "epoch",
+                        ],
+                        &record.fields,
+                        recorder,
+                    ),
                     Evidence::Volume(record) => Event::VolumeRouting(super::volume::export(recorder, record)),
                     Evidence::Dnd(raw) => raw.export(recorder),
                     Evidence::Log { line, message, epoch } => Event::Log {

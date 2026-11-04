@@ -427,28 +427,36 @@ impl prelogin_policy::Child for Child {
         unsafe { WaitForSingleObject(self.process.0, 0) == WAIT_TIMEOUT }
     }
     fn stop(&mut self) -> io::Result<()> {
-        // The 2.5 s budget is unchanged. Exit zero acknowledges the explicit
-        // release barrier and normal group shutdown in the pre-login entry.
-        // Forced termination is never reported as a successful handoff.
+        // Handoff depends on the pinned network process exiting. Final input
+        // release remains best effort; its ACK and exit code are diagnostic.
         // SAFETY: owned event/process handles; every wait and termination is bounded.
         unsafe {
+            if WaitForSingleObject(self.process.0, 0) == WAIT_OBJECT_0 {
+                return Ok(());
+            }
             check(SetEvent(self.stop.0))?;
             match WaitForSingleObject(self.process.0, 2500) {
                 WAIT_OBJECT_0 => {
                     let mut code = 1;
-                    check(GetExitCodeProcess(self.process.0, &mut code))?;
-                    if code == 0 {
-                        Ok(())
-                    } else {
-                        Err(io::Error::other("pre-login release/shutdown failed"))
+                    if GetExitCodeProcess(self.process.0, &mut code) == 0 {
+                        eprintln!("Oink pre-login exit code unavailable: {}", io::Error::last_os_error());
+                    } else if code != 0 {
+                        eprintln!("Oink pre-login backend exited during handoff: code={code:#010x}");
                     }
+                    Ok(())
                 }
                 WAIT_TIMEOUT => {
                     check(TerminateProcess(self.process.0, 1))?;
                     let exited = WaitForSingleObject(self.process.0, 500) == WAIT_OBJECT_0;
-                    Err(io::Error::other(format!(
-                        "pre-login stop timed out; terminated={exited}; release unconfirmed"
-                    )))
+                    eprintln!("Oink pre-login stop timed out; process_exit_confirmed={exited}");
+                    if exited {
+                        Ok(())
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "prelogin_process_still_running",
+                        ))
+                    }
                 }
                 _ => Err(io::Error::last_os_error()),
             }
@@ -648,13 +656,40 @@ pub(super) fn stop() -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn handoff<T>(create: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
-    supervisor().lock().unwrap_or_else(|e| e.into_inner()).handoff(|| {
+pub(super) fn handoff(
+    client: &Handle,
+    create: impl FnOnce() -> io::Result<BackendLaunch>,
+) -> io::Result<BackendLaunch> {
+    let mut supervisor = supervisor().lock().unwrap_or_else(|e| e.into_inner());
+    let result = supervisor.handoff(|| {
         if other_backend_alive(None, false) {
             return Err(io::Error::other("an earlier SYSTEM backend has not exited"));
         }
         create()
-    })
+    });
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            let child = supervisor.child().ok_or_else(denied)?;
+            let mut raw = ptr::null_mut();
+            // SAFETY: duplicate the exact old generation while its supervisor is
+            // still held. Only synchronize rights enter the authenticated UI.
+            check(unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    child.process.0,
+                    client.0,
+                    &mut raw,
+                    SYNCHRONIZE,
+                    0,
+                    0,
+                )
+            })?;
+            Ok(BackendLaunch::PreloginStopping {
+                process_handle: raw as usize as u64,
+            })
+        }
+        result => result,
+    }
 }
 
 /// The service's retained process handle is the authority, never a PID supplied
@@ -977,4 +1012,29 @@ pub fn elevate_claim() -> Elevation {
         }
     }
     Elevation::Approved
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::*;
+    use crate::prelogin_policy::Child as _;
+    use std::os::windows::io::IntoRawHandle;
+    #[test]
+    fn nonzero_exit_including_unconfirmed_release_is_diagnostic_not_a_handoff_barrier() {
+        for exit in [0, 1, 7] {
+            let process = std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", &format!("exit {exit}")])
+                .spawn()
+                .unwrap();
+            let process = Handle::new(process.into_raw_handle()).unwrap();
+            // SAFETY: private test child and unnamed event; no installed process or desktop.
+            let stop = Handle::new(unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) }).unwrap();
+            // SAFETY: owned private child process handle, bounded wait.
+            let exited = unsafe { WaitForSingleObject(process.0, 5000) };
+            assert_eq!(exited, WAIT_OBJECT_0);
+            let mut child = Child { id: 1, process, stop };
+            child.stop().unwrap();
+            assert!(!child.alive());
+        }
+    }
 }

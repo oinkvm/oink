@@ -1802,12 +1802,6 @@ Copyright 2023 The swift-rs developers
 Full terms: licenses/texts/908a661cf763bddfa04f2739bea561be62a246f03ad53fcb2272d3ddbd1d943f.txt
 Full terms: licenses/texts/f3c3e9f4febe81ff14ccc233c344e6e60051290d1c1e5a2c670d63cc3608a5bb.txt
 
-symlink 0.1.0 (MIT)
-Copyright (c) 2014 Chris Morgan and the Teepee project developers
-Full terms: licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt
-Full terms: licenses/texts/b85cb7b51c3f8d600bbac3fb8dbbfe64cde697e460a55fc80978eb0804ca1427.txt
-Full terms: licenses/texts/edb9885b41e4851740dcdcde4d2419c60104e1f3473f7bea6293a82729a32068.txt
-
 syn 2.0.119 (MIT)
 Full terms: licenses/texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt
 Full terms: licenses/texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt
@@ -1986,10 +1980,6 @@ Full terms: licenses/texts/4249c8e6c5ebb85f97c77e6457c6fafc1066406eb8f1ef61e796f
 tower 0.5.3 (MIT)
 Copyright (c) 2019 Tower Contributors
 Full terms: licenses/texts/4249c8e6c5ebb85f97c77e6457c6fafc1066406eb8f1ef61e796fbdc5ff18482.txt
-
-tracing-appender 0.2.5 (MIT)
-Copyright (c) 2019 Tokio Contributors
-Full terms: licenses/texts/898b1ae9821e98daf8964c8d6c7f61641f5f5aa78ad500020771c0939ee0dea1.txt
 
 tracing-attributes 0.1.31 (MIT)
 Copyright (c) 2019 Tokio Contributors

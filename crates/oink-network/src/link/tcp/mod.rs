@@ -155,6 +155,8 @@ struct Core {
     inbound: Mutex<HashSet<ConnectionId>>,
     pacers: Mutex<HashMap<ConnectionId, Arc<crate::pace::Pacer>>>,
     listener: Mutex<Option<SocketAddr>>,
+    #[cfg(any(test, feature = "test-support"))]
+    reserved_listener: Mutex<Option<std::net::TcpListener>>,
     listener_failure: Mutex<Option<String>>,
     runtime: tokio::runtime::Handle,
     stopped: watch::Sender<bool>,
@@ -254,6 +256,8 @@ impl LowPool {
             inbound: Mutex::new(HashSet::new()),
             pacers: Mutex::new(HashMap::new()),
             listener: Mutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            reserved_listener: Mutex::new(crate::test_ports::take_tcp(address)),
             listener_failure: Mutex::new(None),
             runtime: tokio::runtime::Handle::current(),
             stopped: watch::channel(false).0,
@@ -599,6 +603,8 @@ impl Core {
     }
     async fn stop(&self) {
         self.stopped.send_replace(true);
+        #[cfg(any(test, feature = "test-support"))]
+        drop(lock(&self.reserved_listener).take());
         let pools: Vec<_> = lock(&self.pools).drain().map(|(_, p)| p).collect();
         let auths: Vec<_> = pools
             .iter()

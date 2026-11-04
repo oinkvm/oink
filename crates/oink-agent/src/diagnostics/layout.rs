@@ -554,7 +554,7 @@ fn owner_preference(
         (8 | 18, RawValue::Uint(mode)) if mode <= if option == 8 { 1 } else { 2 } => {
             effective.scalars.insert("mode".into(), Scalar::Integer(mode));
         }
-        (3 | 4 | 5 | 6 | 10 | 19, RawValue::Bool(flag)) => {
+        (3 | 4 | 5 | 6 | 10 | 19 | 26 | 27 | 28, RawValue::Bool(flag)) => {
             effective.scalars.insert("enabled".into(), Scalar::Flag(flag));
         }
         (11, RawValue::Uint(duration)) => {

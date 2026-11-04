@@ -85,7 +85,12 @@ async fn changes() {
             .is_some_and(|p| p.device_gain == 1.25))
         .await
     );
-    owner_settings(&nodes[1], |s| s.screen_shared = false);
+    owner_settings(&nodes[1], |s| {
+        s.screen_shared = false;
+        s.routing.touchpad_injection = false;
+        s.routing.native_multifinger = true;
+        s.routing.mac_scroll_feel = false;
+    });
     assert!(
         until(|| nodes[0]
             .group
@@ -139,6 +144,18 @@ async fn changes() {
                 && p.option == 6
                 && p.effective.scalars.get("enabled") == Some(&layout::Scalar::Flag(false)))
     );
+    for (option, enabled) in [(26, false), (27, true), (28, false)] {
+        let preference = current
+            .owner_preferences
+            .iter()
+            .find(|p| p.device_alias == anon.device(peer) && p.option == option)
+            .unwrap();
+        assert!(!preference.effective.omitted);
+        assert_eq!(
+            preference.effective.scalars.get("enabled"),
+            Some(&layout::Scalar::Flag(enabled))
+        );
+    }
     let saved_peer = current.saved.iter().find(|s| s.device == anon.device(peer)).unwrap();
     assert!(!saved_peer.enabled);
     assert!(

@@ -32,31 +32,6 @@ pub(super) fn user_token(id: u32) -> io::Result<Handle> {
     Handle::new(raw)
 }
 
-/// Enumerate all sessions, including disconnected and tokenless ones. Token
-/// absence is not session destruction, and a failed query is not proof either.
-pub(super) fn session_exists(id: u32) -> io::Result<bool> {
-    let (mut raw, mut count) = (ptr::null_mut(), 0);
-    // SAFETY: WTS owns the returned array until WTSFreeMemory. No client IDs or
-    // user-only filter can hide a disconnected session with outstanding holds.
-    unsafe {
-        check(WTSEnumerateSessionsW(
-            WTS_CURRENT_SERVER_HANDLE,
-            0,
-            1,
-            &mut raw,
-            &mut count,
-        ))?;
-        if raw.is_null() {
-            return Err(io::Error::other("empty WTS session enumeration"));
-        }
-        let exists = std::slice::from_raw_parts(raw, count as usize)
-            .iter()
-            .any(|s| s.SessionId == id);
-        WTSFreeMemory(raw.cast());
-        Ok(exists)
-    }
-}
-
 fn no_user(id: u32, error: &io::Error) -> bool {
     if error.raw_os_error() != Some(ERROR_NO_TOKEN as i32) {
         return false;
@@ -115,8 +90,68 @@ fn is_wsi(sid: &[u8]) -> bool {
         let domain = &domain[..domain.iter().position(|c| *c == 0).unwrap_or(domain.len())];
         let local_user =
             kind == SidTypeUser && String::from_utf16(domain).is_ok_and(|d| d.eq_ignore_ascii_case(&computer));
-        let bytes = std::slice::from_raw_parts(local_sid.as_ptr().cast::<u8>(), sid_len as usize);
+        let bytes = lookup_sid_bytes(&local_sid);
         crate::console_policy::wsi_sid(sid, bytes, local_user)
+    }
+}
+
+// SAFETY: storage contains a valid SID returned by a successful Windows lookup.
+unsafe fn lookup_sid_bytes(storage: &[u32; 17]) -> &[u8] {
+    // LookupAccountNameW only promises a required cbSid on insufficient space.
+    // Windows 11 25H2 leaves our successful 68-byte capacity unchanged for the
+    // 28-byte WsiAccount SID. Comparing the padded buffer misclassifies it as a
+    // real user, revoking the original source and spawning an ordinary helper.
+    // Read the SID's own length; exact SID/domain/type authorization is unchanged.
+    // SAFETY: caller guarantees a valid SID in this aligned maximum-size buffer.
+    unsafe {
+        let length = GetLengthSid(storage.as_ptr().cast_mut().cast()) as usize;
+        std::slice::from_raw_parts(storage.as_ptr().cast(), length)
+    }
+}
+
+#[cfg(test)]
+mod sid_tests {
+    use super::*;
+
+    #[test]
+    fn lookup_buffer_capacity_is_not_the_local_account_sid_length() {
+        let mut storage = [0u32; 17];
+        let mut expected = vec![1, 5, 0, 0, 0, 0, 0, 5];
+        for n in [21u32, 11, 22, 33, 1022] {
+            expected.extend(n.to_le_bytes());
+        }
+        // SAFETY: the complete valid SID fits in the aligned initialized storage.
+        unsafe { ptr::copy_nonoverlapping(expected.as_ptr(), storage.as_mut_ptr().cast(), expected.len()) };
+        // SAFETY: constructed a complete valid local-account SID above.
+        let actual = unsafe { lookup_sid_bytes(&storage) };
+        assert_eq!(actual, expected);
+        assert!(crate::console_policy::wsi_sid(&expected, actual, true));
+    }
+
+    #[test]
+    fn successful_native_lookup_uses_the_sid_not_the_supplied_capacity() {
+        let mut storage = [0u32; 17];
+        let mut size = std::mem::size_of_val(&storage) as u32;
+        let mut domain = [0u16; 256];
+        let mut domain_size = domain.len() as u32;
+        let mut kind = SidTypeUnknown;
+        // A fixed OS account avoids depending on a PIN or WsiAccount existing.
+        // SAFETY: initialized aligned buffers and output lengths; query only.
+        check(unsafe {
+            LookupAccountNameW(
+                ptr::null(),
+                wide("NT AUTHORITY\\SYSTEM").as_ptr(),
+                storage.as_mut_ptr().cast(),
+                &mut size,
+                domain.as_mut_ptr(),
+                &mut domain_size,
+                &mut kind,
+            )
+        })
+        .unwrap();
+        // SAFETY: successful OS lookup returned a valid SID.
+        let actual = unsafe { lookup_sid_bytes(&storage) };
+        assert_eq!(actual, [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]);
     }
 }
 

@@ -1,5 +1,80 @@
-//! Per-frame contact topology in the existing generic numeric log, without
-//! geometry or any new release-wire event/field identifiers.
+pub(crate) fn route_event(record: oink_routing::router::TouchpadRoute, recorder: &super::Recorder) -> Event {
+    let keys = [
+        "input",
+        "kind",
+        "phase",
+        "path",
+        "reason",
+        "allowed",
+        "epoch",
+        "touchpad_options",
+        "max_contacts",
+        "accept_contacts",
+        "touchpad_injection",
+        "native_multifinger",
+        "mac_scroll_feel",
+    ];
+    numeric_event(3, Some(record.source), &keys, &record.fields, recorder)
+}
+pub(crate) fn numeric_event(
+    stage: u8,
+    source: Option<oink_foundation::DeviceId>,
+    keys: &[&str],
+    values: &[u64],
+    recorder: &super::Recorder,
+) -> Event {
+    Event::Log {
+        module: "oink_touchpad_diagnostics".into(),
+        line: 0,
+        level: 2,
+        fields: std::iter::once(("stage".into(), f64::from(stage)))
+            .chain(keys.iter().zip(values).map(|(k, v)| ((*k).into(), *v as f64)))
+            .collect(),
+        labels: source
+            .into_iter()
+            .map(|source| ("source".into(), recorder.anonymizer().device(source)))
+            .collect(),
+    }
+}
+
+/// Injection completion is an API result, not proof that an application acted.
+pub(crate) fn injection_result(
+    event: &oink_input::InjectEvent,
+    result: &Result<(), oink_input::InputError>,
+) -> Option<[u64; 5]> {
+    use oink_foundation::input::{Gesture, InjectEvent};
+    let (input, kind, phase, boundary) = match event {
+        InjectEvent::Gesture(g) => {
+            let (kind, phase) = match *g {
+                Gesture::DockSwipe { axis, phase, .. } => (axis as u8, phase),
+                Gesture::Magnify { phase, .. } => (3, phase),
+                Gesture::Rotate { phase, .. } => (4, phase),
+                Gesture::SmartMagnify => (5, oink_foundation::input::GesturePhase::Ended),
+            };
+            (2_u8, kind, phase as u8, g.starts() || g.ends())
+        }
+        InjectEvent::TouchpadContacts(f) => (1, 0, f.phase as u8, f.phase != oink_foundation::contacts::Phase::Move),
+        _ => return None,
+    };
+    if !boundary && result.is_ok() {
+        return None;
+    }
+    let error_kind = match result {
+        Ok(()) => 0_u8,
+        Err(oink_input::InputError::PermissionDenied(_)) => 1,
+        Err(oink_input::InputError::Unsupported) => 2,
+        Err(oink_input::InputError::NotStarted) => 3,
+        Err(oink_input::InputError::Platform(_)) => 4,
+    };
+    Some([
+        input.into(),
+        kind.into(),
+        phase.into(),
+        u64::from(result.is_ok()),
+        error_kind.into(),
+    ])
+}
+
 use super::Event;
 use oink_input::contact_trace::Observation;
 

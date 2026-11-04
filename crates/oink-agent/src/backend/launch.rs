@@ -17,6 +17,10 @@ pub struct Lifetime {
 pub fn start_backend(data_dir: &Path) -> std::io::Result<u32> {
     oink_winsvc::backend::start(data_dir)
 }
+#[cfg(windows)]
+pub fn start_backend_tracked(data_dir: &Path) -> std::io::Result<oink_winsvc::backend::StartedProcess> {
+    oink_winsvc::backend::start_tracked(data_dir)
+}
 
 pub const TIED_TO_JOB: &str = "backend lifetime tied to the launching job";
 

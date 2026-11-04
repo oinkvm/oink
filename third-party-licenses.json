@@ -12426,44 +12426,6 @@
       ]
     },
     {
-      "id": "cargo:symlink@0.1.0",
-      "name": "symlink",
-      "version": "0.1.0",
-      "ecosystem": "cargo",
-      "repository": "https://gitlab.com/chris-morgan/symlink",
-      "source": {
-        "url": "https://crates.io/api/v1/crates/symlink/0.1.0/download",
-        "integrity": "sha256:a7973cce6668464ea31f176d85b13c7ab3bba2cb3b77a2ed26abd7801688010a"
-      },
-      "licenseExpression": "MIT OR Apache-2.0",
-      "selectedLicense": "MIT",
-      "modified": false,
-      "scope": [
-        "runtime"
-      ],
-      "platforms": [
-        "macos-arm64",
-        "windows-x64"
-      ],
-      "copyright": [
-        "Copyright (c) 2014 Chris Morgan and the Teepee project developers"
-      ],
-      "licenseFiles": [
-        {
-          "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
-          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
-        },
-        {
-          "path": "licenses/texts/b85cb7b51c3f8d600bbac3fb8dbbfe64cde697e460a55fc80978eb0804ca1427.txt",
-          "sha256": "b85cb7b51c3f8d600bbac3fb8dbbfe64cde697e460a55fc80978eb0804ca1427"
-        },
-        {
-          "path": "licenses/texts/edb9885b41e4851740dcdcde4d2419c60104e1f3473f7bea6293a82729a32068.txt",
-          "sha256": "edb9885b41e4851740dcdcde4d2419c60104e1f3473f7bea6293a82729a32068"
-        }
-      ]
-    },
-    {
       "id": "cargo:syn@2.0.119",
       "name": "syn",
       "version": "2.0.119",
@@ -13786,36 +13748,6 @@
         {
           "path": "licenses/texts/4249c8e6c5ebb85f97c77e6457c6fafc1066406eb8f1ef61e796fbdc5ff18482.txt",
           "sha256": "4249c8e6c5ebb85f97c77e6457c6fafc1066406eb8f1ef61e796fbdc5ff18482"
-        }
-      ]
-    },
-    {
-      "id": "cargo:tracing-appender@0.2.5",
-      "name": "tracing-appender",
-      "version": "0.2.5",
-      "ecosystem": "cargo",
-      "repository": "https://github.com/tokio-rs/tracing",
-      "source": {
-        "url": "https://crates.io/api/v1/crates/tracing-appender/0.2.5/download",
-        "integrity": "sha256:050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
-      },
-      "licenseExpression": "MIT",
-      "selectedLicense": "MIT",
-      "modified": false,
-      "scope": [
-        "runtime"
-      ],
-      "platforms": [
-        "macos-arm64",
-        "windows-x64"
-      ],
-      "copyright": [
-        "Copyright (c) 2019 Tokio Contributors"
-      ],
-      "licenseFiles": [
-        {
-          "path": "licenses/texts/898b1ae9821e98daf8964c8d6c7f61641f5f5aa78ad500020771c0939ee0dea1.txt",
-          "sha256": "898b1ae9821e98daf8964c8d6c7f61641f5f5aa78ad500020771c0939ee0dea1"
         }
       ]
     },

@@ -260,6 +260,8 @@ pub struct PeerInput {
     pub online: bool,
     /// Capability from the currently received InputCapability record.
     pub touchpad_contacts: Option<u8>,
+    /// Actual authenticated touchpad-options agreement, absent before admission.
+    pub touchpad_options: Option<bool>,
     /// The peer's feel settings from its input stream, for the input settings view.
     pub feel: Option<oink_foundation::input::FeelProfile>,
 }
@@ -268,6 +270,8 @@ pub struct PeerInput {
 /// (`SharingState::derive`), the tray and diagnostics.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InputStatus {
+    /// Source contact observed/healthy/mode/path; unknown until first owner publication.
+    pub contact_diagnostics: Option<[u64; 4]>,
     pub application_focus: Option<oink_routing::application_focus::Snapshot>,
     pub update_held_input: bool,
     pub update_remote_control: bool,

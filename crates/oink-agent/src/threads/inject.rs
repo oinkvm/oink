@@ -1026,6 +1026,9 @@ pub(crate) fn start_with_trace(
                                 native.inject(&event)
                             }
                         });
+                        if let Some(trace) = &input_trace {
+                            trace.touchpad_injected(&event, from, &result);
+                        }
                         let success = result.is_ok();
                         cursor.posted(native.as_ref(), queued.pointer_scope, &event, cursor_before, success);
                         if queued.first_motion {

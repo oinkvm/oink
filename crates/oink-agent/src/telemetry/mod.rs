@@ -46,7 +46,12 @@ pub struct ReportStatus {
     #[serde(default)]
     pub local_diagnostics_generation: u64,
 }
-pub use oink_crash::capsule::fatal_boundary;
+pub fn fatal_boundary<T>(run: impl FnOnce() -> T) -> T {
+    oink_crash::capsule::fatal_boundary(|| {
+        let _logs = crate::logs::FlushOnExit;
+        run()
+    })
+}
 pub use oink_telemetry::realtime::Stamp;
 #[derive(Debug)]
 struct Observation {

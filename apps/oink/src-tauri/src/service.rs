@@ -13,6 +13,34 @@ pub const SERVICE_ARG: &str = "--service";
 pub const PRELOGIN_ARG: &str = "--prelogin";
 pub const STOP_SERVICE_ARG: &str = "--stop-service";
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Frontend API calls wait asynchronously while the broker retires the old
+/// process. Shell menus and Quit remain independent of backend readiness.
+#[derive(Debug)]
+pub(crate) struct Startup(tokio::sync::watch::Sender<Option<Result<(), String>>>);
+impl Startup {
+    pub(crate) fn new(pending: bool) -> Self {
+        Self(tokio::sync::watch::channel(if pending { None } else { Some(Ok(())) }).0)
+    }
+    pub(crate) fn ready(&self) -> bool {
+        matches!(*self.0.borrow(), Some(Ok(())))
+    }
+    #[cfg(any(windows, test))]
+    pub(crate) fn finish(&self, result: Result<(), String>) {
+        self.0.send_replace(Some(result));
+    }
+    pub(crate) async fn wait(&self) -> Result<(), String> {
+        let mut state = self.0.subscribe();
+        loop {
+            if let Some(result) = state.borrow().clone() {
+                return result;
+            }
+            state
+                .changed()
+                .await
+                .map_err(|_| "backend_startup_cancelled".to_owned())?;
+        }
+    }
+}
 #[cfg(windows)]
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -74,17 +102,27 @@ pub fn dispatch_args() -> Option<ExitCode> {
 #[cfg(windows)]
 pub fn start_once(api: &RemoteApi, exe: &Path) -> Result<(), String> {
     let mut seen_owner = false;
-    match oink_agent::instance::is_running(api.data_dir()) {
-        Some(true) => seen_owner = true,
-        Some(false) => {
-            oink_agent::backend::launch::start_backend(api.data_dir())
-                .map_err(|e| format!("UIAccess backend launch failed: {e}"))?;
+    let launched = match oink_agent::instance::is_running(api.data_dir()) {
+        Some(true) => {
+            seen_owner = true;
+            None
         }
+        Some(false) => Some(
+            oink_agent::backend::launch::start_backend_tracked(api.data_dir())
+                .map_err(|e| format!("UIAccess backend launch failed: {e}"))?,
+        ),
         None => return Err("backend_ownership_unavailable".into()),
-    }
+    };
     let _ = exe;
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
+        if let Some(process) = &launched
+            && let Some(code) = process
+                .exit_code()
+                .map_err(|e| format!("backend exit query failed: {e}"))?
+        {
+            return Err(format!("backend_exited:{code}"));
+        }
         // A live backend may still be retrying its endpoint publication after
         // Windows scanner denial. Keep reading the file while that owner lives;
         // the launch deadline only bounds acquiring ownership, not publication.
@@ -93,14 +131,18 @@ pub fn start_once(api: &RemoteApi, exe: &Path) -> Result<(), String> {
                 seen_owner = true;
                 true
             }
-            Some(false) if seen_owner => return Err("backend_unavailable".into()),
+            Some(false) if seen_owner && launched.is_none() => return Err("backend_unavailable".into()),
             Some(false) if Instant::now() >= deadline => return Err("backend_start_timeout".into()),
             Some(false) => false,
             None => return Err("backend_ownership_unavailable".into()),
         };
+        if !owned {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
         api.reset_connections();
-        match api.hello() {
-            Ok(_) if owned => {
+        match api.hello_with_timeout(Duration::from_millis(100)) {
+            Ok(info) if launched.as_ref().is_none_or(|process| process.id() == info.pid) => {
                 return validate_running_backend(api);
             }
             Ok(_) => {}
@@ -159,4 +201,34 @@ pub fn wait_previous_pair(data_dir: &Path) -> Result<(), String> {
 #[cfg(windows)]
 pub fn require_normal_user_ui() -> std::io::Result<()> {
     oink_winsvc::backend::require_interactive_ui()
+}
+
+#[cfg(test)]
+mod startup_wait_tests {
+    use super::*;
+    #[tokio::test]
+    async fn pending_handoff_waits_without_reporting_backend_failure_and_wakes_all_requests() {
+        let startup = std::sync::Arc::new(Startup::new(true));
+        let mut waiting = Vec::new();
+        for _ in 0..3 {
+            let startup = startup.clone();
+            waiting.push(tokio::spawn(async move { startup.wait().await }));
+        }
+        tokio::task::yield_now().await;
+        assert!(!startup.ready());
+        assert!(waiting.iter().all(|request| !request.is_finished()));
+        startup.finish(Ok(()));
+        for request in waiting {
+            request.await.unwrap().unwrap();
+        }
+        assert!(startup.ready());
+        startup.wait().await.unwrap();
+    }
+    #[tokio::test]
+    async fn permanent_startup_failure_is_reported_without_losing_an_early_notification() {
+        let startup = Startup::new(true);
+        startup.finish(Err("launch denied".into()));
+        assert_eq!(startup.wait().await, Err("launch denied".into()));
+        assert!(!startup.ready());
+    }
 }

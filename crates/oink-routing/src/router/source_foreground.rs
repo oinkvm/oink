@@ -41,6 +41,7 @@ mod tests {
     #[test]
     fn setting_modes_native_drag_and_application_focus_keep_the_source_application() {
         let mut r = router();
+        r.cfg.settings.take_foreground_on_leave = true;
         r.become_source(1, PEER);
         for (mouse, keyboard) in [
             (InputMode::Local, InputMode::Shared),
@@ -72,6 +73,7 @@ mod tests {
     #[test]
     fn game_and_focus_lock_do_not_take_foreground_without_departure() {
         let mut r = router();
+        r.cfg.settings.take_foreground_on_leave = true;
         for game in [true, false] {
             r.set_game_mode(if game { GameMode::On } else { GameMode::Off });
             r.set_locked(!game);
@@ -83,6 +85,7 @@ mod tests {
     #[test]
     fn unavailable_capture_or_suspended_session_releases_source_foreground() {
         let mut r = router();
+        r.cfg.settings.take_foreground_on_leave = true;
         r.become_source(1, PEER);
         assert!(r.source_foreground_capture());
         r.set_capture_available(false);
@@ -94,8 +97,16 @@ mod tests {
         assert!(!r.source_foreground_capture());
     }
     #[test]
+    fn windows_departure_keeps_foreground_by_default() {
+        let mut r = router();
+        assert!(!r.cfg.settings.take_foreground_on_leave);
+        r.become_source(1, PEER);
+        assert!(!r.source_foreground_capture());
+    }
+    #[test]
     fn windows_departure_takes_foreground_and_return_releases_it() {
         let mut r = router();
+        r.cfg.settings.take_foreground_on_leave = true;
         assert!(!r.source_foreground_capture());
         r.become_source(1, PEER);
         assert!(r.source_foreground_capture());

@@ -37,7 +37,9 @@ impl Settings {
 
 pub(crate) fn initialize(app: &AppHandle) {
     // Read once before exposing the tray; subscriptions supply subsequent changes.
-    if let Some(api) = &app.state::<crate::app::Backend>().api {
+    if app.state::<crate::app::Backend>().startup.ready()
+        && let Some(api) = &app.state::<crate::app::Backend>().api
+    {
         match api.ui_preferences() {
             Ok(value) => preferences(app, &value),
             Err(error) => tracing::warn!(%error, "initial application appearance unavailable"),

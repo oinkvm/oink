@@ -15,6 +15,7 @@ pub mod application_focus;
 pub mod capture_continuity;
 #[cfg(any(target_os = "macos", all(test, debug_assertions)))]
 mod contact_capture;
+pub mod contact_diagnostics;
 mod contact_status;
 pub mod contact_trace;
 #[cfg(any(target_os = "macos", all(test, debug_assertions)))]

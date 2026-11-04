@@ -186,7 +186,15 @@ impl Discovery {
                 "IPv4 address required",
             ));
         }
-        let std_sock = std::net::UdpSocket::bind(SocketAddr::new(cfg.bind_ip, cfg.port))?;
+        let address = SocketAddr::new(cfg.bind_ip, cfg.port);
+        #[cfg(any(test, feature = "test-support"))]
+        let reserved = crate::test_ports::take_udp(address);
+        #[cfg(not(any(test, feature = "test-support")))]
+        let reserved: Option<std::net::UdpSocket> = None;
+        let std_sock = match reserved {
+            Some(socket) => socket,
+            None => std::net::UdpSocket::bind(address)?,
+        };
         std_sock.set_broadcast(true)?;
         std_sock.set_nonblocking(true)?;
         let socket = Arc::new(UdpSocket::from_std(std_sock)?);

@@ -45,6 +45,11 @@ use oink_foundation::input::{CaptureMode, FeelProfile, InjectEvent, InputPermiss
 
 use crate::{EventHandler, InputBackend, InputError};
 
+/// Same host clock as contact callback receipt; observation only, no native input.
+pub(crate) fn contact_snapshot_us() -> u64 {
+    tap::now_event_ns() / 1_000
+}
+
 /// `crate::run_with_main_run_loop` 的 macOS 实现：主线程以 0.1 s 为一段运行 run loop，直到工作线程结束。
 pub(crate) fn run_with_main_run_loop<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     let worker = std::thread::Builder::new()

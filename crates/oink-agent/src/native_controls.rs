@@ -287,11 +287,8 @@ pub enum ShellAction {
 
 pub fn dispatch(api: &dyn crate::api::AgentApi, id: &str) -> crate::api::ApiResult<Option<ShellAction>> {
     use crate::api::ApiError;
-    match id {
-        "show" => return Ok(Some(ShellAction::Show)),
-        "about" => return Ok(Some(ShellAction::About)),
-        "quit" => return Ok(Some(ShellAction::Quit)),
-        _ => {}
+    if let Some(action) = shell_command(id) {
+        return Ok(Some(action));
     }
     let unavailable = || ApiError::Unavailable {
         message: "native control is unavailable".into(),
@@ -382,6 +379,30 @@ pub fn dispatch(api: &dyn crate::api::AgentApi, id: &str) -> crate::api::ApiResu
         }
     }
     Ok(None)
+}
+
+pub fn shell_command(id: &str) -> Option<ShellAction> {
+    match id {
+        "show" => Some(ShellAction::Show),
+        "about" => Some(ShellAction::About),
+        "quit" => Some(ShellAction::Quit),
+        _ => None,
+    }
+}
+/// A usable shell remains available before connection and after launch failure.
+pub fn disconnected_model(language: UiLanguage) -> Model {
+    Model {
+        groups: Vec::new(),
+        tasks: ["show", "about", "quit"]
+            .into_iter()
+            .map(|id| Item {
+                id,
+                label: label(language, id).into(),
+                checked: None,
+                enabled: true,
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -692,5 +713,32 @@ mod dispatch_tests {
         }
         node.unsubscribe(subscription);
         node.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod startup_menu_tests {
+    use super::*;
+    #[test]
+    fn backend_startup_failure_keeps_show_about_and_quit_available() {
+        for language in [
+            UiLanguage::English,
+            UiLanguage::SimplifiedChinese,
+            UiLanguage::Japanese,
+            UiLanguage::Korean,
+        ] {
+            let menu = disconnected_model(language);
+            assert!(menu.groups.is_empty());
+            assert_eq!(
+                menu.tasks.iter().map(|i| i.id).collect::<Vec<_>>(),
+                ["show", "about", "quit"]
+            );
+            assert!(
+                menu.tasks
+                    .iter()
+                    .all(|i| i.enabled && !i.label.is_empty() && shell_command(i.id).is_some())
+            );
+        }
+        assert!(shell_command("mouse-shared").is_none());
     }
 }

@@ -8,6 +8,8 @@ import type { Catalog } from '../catalog';
  * inserted word). Korean has a single plural category.
  */
 export const ko: Catalog = {
+  '后台启动后退出（退出码 {0}）': '백엔드가 시작 후 종료되었습니다(종료 코드 {0})',
+  '复制错误详情': '오류 세부 정보 복사',
   "锁定远程 Windows 计算机": "원격 Windows 컴퓨터 잠금",
   "按下此快捷键，锁定指针所在 Windows 计算机，Win+L 保持锁定自身": "이 단축키로 포인터가 있는 Windows 컴퓨터를 잠급니다. Win+L은 계속 이 컴퓨터를 잠급니다.",
   "原生触摸板注入暂不可用": "현재 기본 터치패드 입력을 사용할 수 없습니다",

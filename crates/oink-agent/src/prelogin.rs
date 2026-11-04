@@ -234,14 +234,13 @@ fn run_checked() -> anyhow::Result<()> {
     host.block_on(host.node().wait_for_stop());
     tracing::info!("pre-login backend stopping");
     // Drain routing/injection and leave the group before confirming the final
-    // native release ACK. The service's 2.5 s deadline still bounds this exit;
-    // it never treats forced termination or an unconfirmed release as handoff.
+    // native release ACK. Release failure is diagnostic; the service waits for
+    // this pinned process to exit before creating the user network identity.
     host.shutdown_and_wait();
     drop(waiter);
-    anyhow::ensure!(
-        oink_winsvc::client::prelogin_shutdown_confirmed(),
-        "pre-login release barrier unconfirmed"
-    );
+    if let Some(reason) = oink_winsvc::client::prelogin_shutdown_failure() {
+        tracing::warn!(?reason, "pre-login final release unconfirmed; shutdown complete");
+    }
     Ok(())
 }
 

@@ -23,9 +23,12 @@ pub fn language(app: &AppHandle, language: UiLanguage) {
     refresh(app);
 }
 pub fn initialize(app: &AppHandle) {
+    refresh(app);
     let handle = app.clone();
     let api = app.state::<crate::app::Backend>().api.clone();
-    if let Some(api) = api {
+    if app.state::<crate::app::Backend>().startup.ready()
+        && let Some(api) = api
+    {
         std::thread::spawn(move || {
             if let Ok(p) = api.ui_preferences() {
                 language(&handle, p.ui_language);
@@ -40,6 +43,10 @@ pub fn invoke(app: &AppHandle, id: &str) {
     let app = app.clone();
     let id = id.to_owned();
     tauri::async_runtime::spawn(async move {
+        if let Some(action) = oink_agent::native_controls::shell_command(&id) {
+            shell_action(&app, action).await;
+            return;
+        }
         let api = app.state::<crate::app::Backend>().api.clone();
         let Some(api) = api else {
             return;
@@ -91,9 +98,6 @@ async fn route_shell_action<O, Q>(
 
 fn refresh(app: &AppHandle) {
     let mut snapshot = SNAPSHOT.lock().unwrap();
-    let Some(view) = &snapshot.view else {
-        return;
-    };
     let language = if snapshot.language == UiLanguage::Auto {
         UiLanguage::Auto.resolve(
             crate::system_locale::preferred_languages()
@@ -104,7 +108,10 @@ fn refresh(app: &AppHandle) {
     } else {
         snapshot.language
     };
-    let model = oink_agent::native_controls::model(view, language);
+    let model = snapshot.view.as_ref().map_or_else(
+        || oink_agent::native_controls::disconnected_model(language),
+        |view| oink_agent::native_controls::model(view, language),
+    );
     if snapshot.rendered.as_ref() == Some(&model) {
         return;
     }

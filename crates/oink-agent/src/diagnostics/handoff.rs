@@ -455,6 +455,12 @@ impl input_trace::InputTrace {
     }
 }
 impl RoutingDiagnostics for input_trace::InputTrace {
+    fn touchpad_source(&self, record: oink_routing::router::TouchpadSource) {
+        self.evidence(input_trace::Evidence::TouchpadSource(record));
+    }
+    fn touchpad_route(&self, record: oink_routing::router::TouchpadRoute) {
+        self.evidence(input_trace::Evidence::TouchpadRoute(record));
+    }
     fn application_focus(&self, record: oink_routing::application_focus::Diagnostic) {
         self.evidence(input_trace::Evidence::ApplicationFocus(record));
     }

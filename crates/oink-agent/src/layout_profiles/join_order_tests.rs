@@ -24,7 +24,7 @@ fn second_merge_adopts_membership_before_a_noninitiating_members_catalog_arrives
             a.inner.profiles.defer_catalogs.store(true, Ordering::SeqCst);
             common::pair(&a, &b).await;
             let intermediate = b.group_id().unwrap();
-            common::until("first acceptor has merged the saved list", || {
+            common::converge(&[&b], "first acceptor has merged the saved list", || {
                 lock(&b.inner.profiles.data)
                     .catalog
                     .as_ref()
@@ -36,7 +36,7 @@ fn second_merge_adopts_membership_before_a_noninitiating_members_catalog_arrives
                     .unwrap()
                     .is_none()
             );
-            common::until("first membership owner facts are visible", || {
+            common::converge(&[&a], "first membership owner facts are visible", || {
                 a.profile_snapshot().is_ok()
             })
             .await;
@@ -45,12 +45,13 @@ fn second_merge_adopts_membership_before_a_noninitiating_members_catalog_arrives
             // Holding catalog delivery makes this ordering independent of CPU speed.
             common::pair(&b, &c).await;
             let target = c.group_id().unwrap();
-            common::until(
+            common::converge(
+                &[&a],
                 "observer adopts the second committed membership without its intermediate catalog",
                 || a.group_id() == Some(target),
             )
             .await;
-            common::until("second membership owner facts are visible", || {
+            common::converge(&[&a], "second membership owner facts are visible", || {
                 a.profile_snapshot().is_ok()
             })
             .await;
@@ -64,7 +65,7 @@ fn second_merge_adopts_membership_before_a_noninitiating_members_catalog_arrives
                     .is_none()
             );
             a.inner.profiles.defer_catalogs.store(false, Ordering::SeqCst);
-            common::until("final target catalog reaches the observer", || {
+            common::converge(&[&a, &b, &c], "final target catalog reaches the observer", || {
                 let catalogs = [&a, &b, &c].map(|n| lock(&n.inner.profiles.data).catalog.clone());
                 catalogs[0].as_ref().is_some_and(|catalog| catalog.group.0 == target)
                     && catalogs.iter().all(|catalog| catalog == &catalogs[0])

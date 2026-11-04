@@ -13,8 +13,6 @@ use std::{sync::Arc, time::Duration};
 use tokio::time::{sleep, timeout};
 #[path = "support/frames.rs"]
 mod frames;
-#[path = "../../../tests/support/src/ports.rs"]
-mod ports;
 
 struct Node {
     network: LinkLayer,
@@ -29,6 +27,21 @@ impl Node {
         Self::start_identity(Arc::new(Identity::generate()), tier).await
     }
     async fn start_identity(identity: Arc<Identity>, tier: Tier) -> Self {
+        Self::start_reserved(identity, tier, false).await.0
+    }
+    async fn start_reserved(
+        identity: Arc<Identity>,
+        tier: Tier,
+        blocked: bool,
+    ) -> (Self, Option<std::net::TcpListener>) {
+        let address = (
+            std::net::Ipv4Addr::LOCALHOST,
+            oink_network::test_ports::reserve(std::net::Ipv4Addr::LOCALHOST.into()),
+        )
+            .into();
+        // Intentionally keep Low's listener outside the pool to exercise the
+        // unavailable-listener path; ordinary fixtures hand it to the pool.
+        let blocker = blocked.then(|| oink_network::test_ports::take_tcp(address).unwrap());
         let boot = Boot {
             device_id: identity.id(),
             nonce: rand::random(),
@@ -37,17 +50,20 @@ impl Node {
             profile: frames::profile(),
             identity,
             boot,
-            bind: (std::net::Ipv4Addr::LOCALHOST, ports::test_port_pair()).into(),
+            bind: address,
             tier,
         })
         .await
         .unwrap();
         let module = network.register(&[StreamKind::Diagnostics, StreamKind::Input, StreamKind::Clipboard]);
-        Self {
-            network,
-            config,
-            module,
-        }
+        (
+            Self {
+                network,
+                config,
+                module,
+            },
+            blocker,
+        )
     }
     async fn connected(&mut self) -> Box<LinkConnected> {
         match timeout(Duration::from_secs(4), self.config.next())
@@ -260,16 +276,10 @@ impl Relayed {
     }
     async fn start_with_blocked_second_hop(blocked: bool) -> Self {
         let mut a = Node::start().await;
-        let mut relay = Node::start().await;
-        let mut b = Node::start().await;
-        let blocked_tcp = if blocked {
-            vec![
-                std::net::TcpListener::bind(relay.network.local_addr()).unwrap(),
-                std::net::TcpListener::bind(b.network.local_addr()).unwrap(),
-            ]
-        } else {
-            vec![]
-        };
+        let (mut relay, relay_blocker) =
+            Node::start_reserved(Arc::new(Identity::generate()), Tier::Elevated, blocked).await;
+        let (mut b, b_blocker) = Node::start_reserved(Arc::new(Identity::generate()), Tier::Elevated, blocked).await;
+        let blocked_tcp = [relay_blocker, b_blocker].into_iter().flatten().collect();
         let (ar, ra) = connect(&mut a, &mut relay).await;
         let (br, rb) = connect(&mut b, &mut relay).await;
         a.ready(ar.link).await;

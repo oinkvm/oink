@@ -9,6 +9,4 @@ pub mod protocol;
 #[cfg(feature = "network")]
 pub mod network;
 #[cfg(feature = "network")]
-mod ports;
-#[cfg(feature = "network")]
 pub use network::network_config;

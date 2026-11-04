@@ -150,9 +150,17 @@ impl RemoteApi {
     }
 
     fn open(&self, timeout: Option<Duration>) -> Result<Conn, ApiError> {
+        self.open_with_connect_timeout(timeout, CONNECT_TIMEOUT)
+    }
+
+    fn open_with_connect_timeout(
+        &self,
+        timeout: Option<Duration>,
+        connect_timeout: Duration,
+    ) -> Result<Conn, ApiError> {
         let endpoint = Endpoint::read(&self.inner.data_dir).map_err(|e| unavailable(format!("{e:#}")))?;
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], endpoint.port));
-        let s = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+        let s = TcpStream::connect_timeout(&addr, connect_timeout)
             .map_err(|e| unavailable(format!("连不上服务进程（端口 {}）：{e}", endpoint.port)))?;
         let _ = s.set_nodelay(true);
         s.set_read_timeout(timeout)
@@ -187,6 +195,15 @@ impl RemoteApi {
 
     /// 发一个请求信封，返回 `ok` 的内容。
     fn request(&self, make: impl FnOnce(String) -> Envelope) -> Result<serde_json::Value, ApiError> {
+        self.request_with_timeout(make, CALL_TIMEOUT, CONNECT_TIMEOUT)
+    }
+
+    fn request_with_timeout(
+        &self,
+        make: impl FnOnce(String) -> Envelope,
+        call_timeout: Duration,
+        connect_timeout: Duration,
+    ) -> Result<serde_json::Value, ApiError> {
         if self.build_mismatch() {
             return Err(unavailable(
                 "local IPC build mismatch; reopen Oink from the current bundle",
@@ -195,14 +212,15 @@ impl RemoteApi {
         let pooled = lock(&self.inner.pool).pop();
         let mut conn = match pooled {
             Some(c) => c,
-            None => self.open(Some(CALL_TIMEOUT))?,
+            None => self.open_with_connect_timeout(Some(call_timeout), connect_timeout)?,
         };
         let mut env = make(conn.endpoint.token.clone());
         env.build = Some(BuildIdentity::current());
-        let timeout = crate::ipc::response_timeout(env.call.as_ref(), CALL_TIMEOUT);
+        let timeout = crate::ipc::response_timeout(env.call.as_ref(), call_timeout);
         conn.reader
             .get_mut()
             .set_read_timeout(timeout)
+            .and_then(|()| conn.reader.get_mut().set_write_timeout(Some(call_timeout)))
             .map_err(|e| unavailable(e.to_string()))?;
         let mut v = Self::roundtrip(&mut conn, &env)?;
         if v.get("closing").and_then(|value| value.as_str()) == Some(CLOSING_BUILD_MISMATCH) {
@@ -247,6 +265,21 @@ impl RemoteApi {
             hello: true,
             ..Envelope::default()
         })?;
+        self.service_info(v)
+    }
+
+    /// A startup probe must yield to the original process-handle exit check,
+    /// even when a stale endpoint has been acquired by an unresponsive listener.
+    pub fn hello_with_timeout(&self, timeout: Duration) -> ApiResult<ServiceInfo> {
+        let v = self.request_with_timeout(
+            |token| Envelope {
+                token,
+                hello: true,
+                ..Envelope::default()
+            },
+            timeout,
+            timeout,
+        )?;
         self.service_info(v)
     }
 
@@ -893,5 +926,41 @@ impl AgentApi for RemoteApi {
     }
     fn unsubscribe(&self, id: SubscriptionId) {
         lock(&self.inner.sinks).retain(|(i, _)| *i != id.0);
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    #[test]
+    fn stale_silent_endpoint_does_not_block_startup_exit_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        std::fs::write(
+            dir.path().join(crate::ipc::IPC_FILE),
+            serde_json::to_vec(&Endpoint {
+                port: listener.local_addr().unwrap().port(),
+                token: "stale".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (_connection, _) = listener.accept().unwrap();
+            // Bound the fixture too, so reverting to the 120-second ordinary
+            // call timeout fails this assertion without hanging the test suite.
+            let _ = wait.recv_timeout(Duration::from_secs(2));
+        });
+        let began = std::time::Instant::now();
+        let result = RemoteApi::new(dir.path()).hello_with_timeout(Duration::from_millis(50));
+        let elapsed = began.elapsed();
+        let _ = done.send(());
+        server.join().unwrap();
+        assert!(result.is_err());
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "startup handshake blocked for {elapsed:?}"
+        );
     }
 }

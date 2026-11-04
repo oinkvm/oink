@@ -3,8 +3,6 @@ use crate::negotiation as oink_network_profile;
 use crate::{LowOptions, identity::Identity};
 #[path = "../../../tests/support/frames.rs"]
 mod frames;
-#[path = "../../../../../tests/support/src/ports.rs"]
-mod ports;
 use tokio::time::{sleep, timeout};
 
 #[tokio::test]
@@ -123,7 +121,11 @@ async fn node() -> (LinkLayer, ConfigPort, ModulePort) {
         profile: frames::profile(),
         identity,
         boot,
-        bind: (std::net::Ipv4Addr::LOCALHOST, ports::test_port_pair()).into(),
+        bind: (
+            std::net::Ipv4Addr::LOCALHOST,
+            crate::test_ports::reserve(std::net::Ipv4Addr::LOCALHOST.into()),
+        )
+            .into(),
         tier: Tier::Elevated,
     })
     .await
@@ -132,21 +134,29 @@ async fn node() -> (LinkLayer, ConfigPort, ModulePort) {
     (network, config, module)
 }
 #[tokio::test]
-async fn loopback_fixture_uses_ports_available_to_both_udp_and_tcp() {
+async fn loopback_fixture_keeps_tcp_and_discovery_reserved_until_their_owners_start() {
     let (network, _, _) = node().await;
     let address = network.local_addr();
     let tcp = std::net::TcpListener::bind(address);
     let discovery = std::net::UdpSocket::bind((address.ip(), address.port() + 1));
     network.stop().await;
+    // Shutdown releases even a Low reservation whose lazy listener never ran.
+    let _low_after_stop = std::net::TcpListener::bind(address).unwrap();
     // The fixtures share a QUIC/TCP port and the next UDP port is discovery.
     // OS-assigned UDP ports can be excluded for TCP on Windows. Use the
-    // explicitly probed fixture range, below all supported OS ephemeral ranges.
+    // reserved fixture range, below the default OS ephemeral ranges.
     assert!(
         address.port() < 32768,
         "fixture selected an OS ephemeral UDP port: {address}"
     );
-    assert!(tcp.is_ok(), "fixture TCP port unavailable: {tcp:?}");
-    assert!(discovery.is_ok(), "fixture discovery port unavailable: {discovery:?}");
+    assert!(
+        tcp.is_err(),
+        "Low socket must stay reserved until its lazy listener starts"
+    );
+    assert!(
+        discovery.is_err(),
+        "discovery socket must stay reserved until discovery starts"
+    );
 }
 
 async fn connected(config: &mut ConfigPort) -> Box<LinkConnected> {

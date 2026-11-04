@@ -225,20 +225,26 @@ it('reloads the DS_Store preference from the device clipboard settings without a
   expect(unavailable.result.current.canEdit('removeDsStore')).toBe(false);
 });
 
-it('defaults foreground capture on for old settings and saves only the local edited field',async()=>{
+it('defaults foreground capture off for old settings and saves only the local edited field',async()=>{
   mocks.input.mockImplementation(async patch=>{
     mocks.state={...mocks.state,input:{...(mocks.state.input as object),...patch}};
     mocks.listeners.forEach(listener=>listener());
   });
   const mounted=renderHook(usePreferences);
-  expect(mounted.result.current.prefs.takeForegroundOnLeave).toBe(true);
+  expect(mounted.result.current.prefs.takeForegroundOnLeave).toBe(false);
   expect(mounted.result.current.canEdit('takeForegroundOnLeave')).toBe(true);
-  await act(async()=>mounted.result.current.set('takeForegroundOnLeave',false));
-  expect(mocks.input).toHaveBeenCalledExactlyOnceWith({take_foreground_on_leave:false});
   mounted.unmount();
-  const reloaded=renderHook(usePreferences);
-  expect(reloaded.result.current.prefs.takeForegroundOnLeave).toBe(false);
-  expect(reloaded.result.current.prefs.forwardInjectedInput).toBe(false);
+  for(const enabled of [true,false]) {
+    const editing=renderHook(usePreferences);
+    mocks.input.mockClear();
+    await act(async()=>editing.result.current.set('takeForegroundOnLeave',enabled));
+    expect(mocks.input).toHaveBeenCalledExactlyOnceWith({take_foreground_on_leave:enabled});
+    editing.unmount();
+    const reloaded=renderHook(usePreferences);
+    expect(reloaded.result.current.prefs.takeForegroundOnLeave).toBe(enabled);
+    expect(reloaded.result.current.prefs.forwardInjectedInput).toBe(false);
+    reloaded.unmount();
+  }
   expect(mocks.transform).not.toHaveBeenCalled();
   expect(mocks.call).not.toHaveBeenCalled();
   expect(localStorage.getItem('oink:prefs')).toBeNull();

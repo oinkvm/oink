@@ -45,7 +45,7 @@ mod cursor_clip_tests;
 mod entry_policy_tests;
 mod entry_protection;
 mod escape_cursor;
-pub use contacts::ContactsPath;
+pub use contacts::{ContactsPath, TouchpadRoute, TouchpadSource};
 mod emergency_input;
 mod focus_lock;
 pub use focus_lock::FocusLockError;
@@ -144,6 +144,8 @@ pub struct DepartureEvidence<'a> {
     pub point: Option<&'a ScreenPos>,
 }
 pub trait RoutingDiagnostics: Send + Sync {
+    fn touchpad_route(&self, _record: TouchpadRoute) {}
+    fn touchpad_source(&self, _record: TouchpadSource) {}
     fn application_focus(&self, _record: crate::application_focus::Diagnostic) {}
     fn held_buttons(&self, _record: ButtonRefusal) {}
     fn volume(&self, _record: VolumeDecision) {}
@@ -2876,6 +2878,17 @@ impl Router {
                 _ => false,
             };
             if drop {
+                self.diagnostic_contact_gate(
+                    origin,
+                    &msg,
+                    if self.paused {
+                        5
+                    } else if self.epoch == 0 {
+                        6
+                    } else {
+                        7
+                    },
+                );
                 return;
             }
         }

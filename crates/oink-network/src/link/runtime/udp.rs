@@ -35,7 +35,14 @@ pub(super) struct Socket {
 }
 impl Socket {
     pub(super) fn bind(address: SocketAddr, wake: Arc<tokio::sync::Notify>) -> io::Result<Arc<Self>> {
-        let socket = std::net::UdpSocket::bind(address)?;
+        #[cfg(any(test, feature = "test-support"))]
+        let reserved = crate::test_ports::take_udp(address);
+        #[cfg(not(any(test, feature = "test-support")))]
+        let reserved: Option<std::net::UdpSocket> = None;
+        let socket = match reserved {
+            Some(socket) => socket,
+            None => std::net::UdpSocket::bind(address)?,
+        };
         crate::qos::set_service_type(&socket, crate::qos::ServiceType::Voice);
         Self::wrap(crate::qos::wrap_udp_socket(socket)?, wake)
     }

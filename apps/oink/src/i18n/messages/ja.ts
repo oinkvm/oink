@@ -6,6 +6,8 @@ import type { Catalog } from '../catalog';
  * Japanese has a single plural category, so no message needs plural forms.
  */
 export const ja: Catalog = {
+  '后台启动后退出（退出码 {0}）': 'バックエンドが起動後に終了しました（終了コード {0}）',
+  '复制错误详情': 'エラーの詳細をコピー',
   "锁定远程 Windows 计算机": "リモートの Windows コンピューターをロック",
   "按下此快捷键，锁定指针所在 Windows 计算机，Win+L 保持锁定自身": "このショートカットでポインターがある Windows コンピューターをロックします。Win+L は引き続きこのコンピューターをロックします。",
   "原生触摸板注入暂不可用": "ネイティブタッチパッド入力は現在利用できません",

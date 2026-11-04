@@ -383,6 +383,34 @@ impl Scalars {
             )
         } else if self.4 == "oink_microphone_routing" {
             f.name() == "to_device_key" && (0.0..281_474_976_710_656.0).contains(&v)
+        } else if self.2 == "oink_touchpad_diagnostics" {
+            matches!(
+                f.name(),
+                "stage"
+                    | "reason"
+                    | "mode"
+                    | "previous_mode"
+                    | "observed"
+                    | "healthy"
+                    | "destination"
+                    | "forward_gestures"
+                    | "frames"
+                    | "cancelled"
+                    | "epoch"
+                    | "input"
+                    | "kind"
+                    | "phase"
+                    | "path"
+                    | "allowed"
+                    | "touchpad_options"
+                    | "max_contacts"
+                    | "accept_contacts"
+                    | "touchpad_injection"
+                    | "native_multifinger"
+                    | "mac_scroll_feel"
+                    | "success"
+                    | "error_kind"
+            )
         } else if self.2 == "oink_windows_external_input" {
             matches!(
                 f.name(),
@@ -567,7 +595,7 @@ impl Scalars {
 }
 impl Visit for Scalars {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        if self.2 == "oink_windows_external_input" {
+        if matches!(self.2, "oink_windows_external_input" | "oink_touchpad_diagnostics") {
             return;
         }
         // Only these audited Option<bool>/Option<u32>/CGError callsite fields use Debug.
@@ -631,7 +659,10 @@ impl Visit for Scalars {
             }
             return;
         }
-        if matches!(self.2, "oink_overlay_diagnostics" | "oink_windows_external_input") {
+        if matches!(
+            self.2,
+            "oink_overlay_diagnostics" | "oink_windows_external_input" | "oink_touchpad_diagnostics"
+        ) {
             return;
         }
         if clipboard_numeric_field(field.name())
@@ -1007,6 +1038,7 @@ pub(crate) fn bundle_only_target(target: &str) -> bool {
             | "oink_audio_diagnostics"
             | "oink_overlay_diagnostics"
             | "oink_windows_external_input"
+            | "oink_touchpad_diagnostics"
     )
 }
 fn safe_os_version(module: &str, value: &str) -> bool {

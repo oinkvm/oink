@@ -4,14 +4,12 @@
 //! - 精确式触摸板的数字化仪集合（HID Usage Page 0x0D / Usage 0x05）：用 `HidP_GetUsageValue` 读报告里的
 //!   Contact Count（0x0D/0x54）。最近 [`TOUCH_WINDOW`] 内有 ≥ 1 个触点的报告，就把同期的指针/滚轮事件标为
 //!   `SourceKind::Touchpad`。
-//! - 鼠标（0x01/0x02）与键盘（0x01/0x06）：分别记录时间，供看门狗分别判断鼠标、键盘低级钩子是否被系统静默卸载。
+//! - 鼠标（0x01/0x02）：记录时间，供鼠标钩子看门狗使用。不注册键盘，也没有键盘钩子看门狗（原因见 [`register`]）。
 //!
 //! **注册会被同一进程里的其他代码覆盖**：Raw Input 按进程、按用途（Usage Page/Usage）只有一个目标窗口，后注册
-//! 的生效。界面程序（Tauri）的事件循环 tao 在 `EventLoop::new` 与 `set_device_event_filter` 里为鼠标、键盘注册
-//! 它自己的窗口（`RIDEV_DEVNOTIFY`，默认过滤 `Unfocused`），而服务进程（含截获）在界面构建之前启动，于是截获线程
-//! 的注册被覆盖、再也收不到鼠标和键盘的 `WM_INPUT`，看门狗从来没有生效（评审 W01）。所以看门狗每次先核对
-//! 注册（[`registration_ok`]），被改走了就记一条警告并重新注册。tao 只把这些 Raw Input 用于 `DeviceEvent`，
-//! 界面没有使用。
+//! 的生效。所以鼠标看门狗先核对鼠标/触摸板注册（[`registration_ok`]），被改走就记警告并重新注册。
+//! 这只检查 Oink 自己订阅的两种用途，不检查或清除其他代码的键盘注册。UI 的 tao 注册在独立进程，
+//! 不装 LL 钩子，不会触发后台的前台/键盘 Raw 冲突。
 //!
 //! 局限：
 //! - 吞掉低级钩子的 MOVE 会影响 Raw Input，所以游戏模式保留 MOVE；不能推断所有 wheel 的顺序也一样。
@@ -31,8 +29,8 @@ use windows::Win32::Devices::HumanInterfaceDevice::{
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM};
 use windows::Win32::UI::Input::{
     GetRawInputData, GetRawInputDeviceInfoW, GetRegisteredRawInputDevices, HRAWINPUT, RAWHID, RAWINPUT, RAWINPUTDEVICE,
-    RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK, RIDEV_REMOVE, RIDI_PREPARSEDDATA, RIM_TYPEHID, RIM_TYPEKEYBOARD,
-    RIM_TYPEMOUSE, RegisterRawInputDevices,
+    RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK, RIDEV_REMOVE, RIDI_PREPARSEDDATA, RIM_TYPEHID, RIM_TYPEMOUSE,
+    RegisterRawInputDevices,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetMessageTime;
 
@@ -43,23 +41,34 @@ const PAGE_DIGITIZER: u16 = 0x0D;
 const USAGE_TOUCHPAD: u16 = 0x05;
 const USAGE_CONTACT_COUNT: u16 = 0x54;
 
-fn devices(hwnd: HWND, flags: windows::Win32::UI::Input::RAWINPUTDEVICE_FLAGS) -> [RAWINPUTDEVICE; 3] {
+fn devices(hwnd: HWND, flags: windows::Win32::UI::Input::RAWINPUTDEVICE_FLAGS) -> [RAWINPUTDEVICE; 2] {
     let d = |page: u16, usage: u16| RAWINPUTDEVICE {
         usUsagePage: page,
         usUsage: usage,
         dwFlags: flags,
         hwndTarget: hwnd,
     };
-    [d(0x01, 0x02), d(0x01, 0x06), d(PAGE_DIGITIZER, USAGE_TOUCHPAD)]
+    [d(0x01, 0x02), d(PAGE_DIGITIZER, USAGE_TOUCHPAD)]
 }
 
 pub(crate) fn register(hwnd: HWND) -> Result<(), String> {
+    // Never register keyboard Raw Input in the backend process. On Windows 11
+    // (win32kfull 10.0.26100.9711), on the ordinary interactive desktop,
+    // EditionKeyEventLLHook skips the entire LL
+    // keyboard chain when the foreground queue's keyboard thread and the first
+    // valid WH_KEYBOARD_LL hook belong to a process with an effective keyboard
+    // Raw Input registration. SendInput is affected too; flags, HWND and thread
+    // changes do not avoid it, and a newer hook in another process can mask it.
+    // This undocumented OS behavior was verified using Microsoft symbols.
+    // Register only mouse/PTP;
+    // without keyboard Raw evidence we deliberately have no keyboard watchdog
+    // or automatic recovery after Windows silently removes the keyboard hook.
     let devs = devices(hwnd, RIDEV_INPUTSINK | windows::Win32::UI::Input::RIDEV_DEVNOTIFY);
     // SAFETY: 设备数组在调用期间有效，cbSize 为单个结构大小。
     unsafe { RegisterRawInputDevices(&devs, size_of::<RAWINPUTDEVICE>() as u32) }.map_err(|e| e.to_string())
 }
 
-/// 本进程当前的 Raw Input 注册里，鼠标、键盘、触摸板三项是否都以 `hwnd` 为目标。不是时返回找到的
+/// 鼠标、触摸板是否以 `hwnd` 为目标。不是时返回找到的
 /// `(usage page, usage, 目标窗口)`（没有注册的项目标为 0），供日志说明是谁改走了。
 pub(crate) fn registration_ok(hwnd: HWND) -> Result<(), Vec<(u16, u16, isize)>> {
     let mut buf = [RAWINPUTDEVICE::default(); 32];
@@ -107,16 +116,14 @@ pub(crate) struct RawTracker {
     /// 最近一次「有触点」的触摸板报告。
     pub last_touch: Option<Instant>,
     pub last_contacts: u32,
-    /// 最近一次鼠标、键盘的 Raw Input（看门狗分别用）。
+    /// 最近一次鼠标 Raw Input。
     pub last_mouse: Option<Instant>,
-    pub last_kbd: Option<Instant>,
     /// A device report for which a legacy LL mouse callback is expected. Raw
     /// motion at a one-pixel clip and device-less SendInput reports are not proof
     /// that Windows removed the hook.
     pub last_mouse_hook_evidence: Option<Instant>,
     pub mouse_reports: u64,
     pub mouse_without_device: u64,
-    pub keyboard_reports: u64,
     pub touch_reports: u64,
     pub mouse_kbd_reports: u64,
 }
@@ -171,14 +178,6 @@ impl RawTracker {
                     self.motion = Some((f64::from(mouse.lLastX), f64::from(mouse.lLastY)));
                 }
                 self.last_mouse = Some(now);
-                self.mouse_kbd_reports += 1;
-                return;
-            }
-            if raw.header.dwType == RIM_TYPEKEYBOARD.0 {
-                self.keyboard_reports += 1;
-                if !raw.header.hDevice.is_invalid() {
-                    self.last_kbd = Some(now);
-                }
                 self.mouse_kbd_reports += 1;
                 return;
             }
@@ -288,5 +287,24 @@ mod tests {
         // represent a mouse action at all. Neither authorizes reinstallation.
         assert!(!mouse_hook_expected(false, true, true, false));
         assert!(!mouse_hook_expected(true, false, false, false));
+    }
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    #[test]
+    fn backend_raw_registrations_never_include_keyboard() {
+        // Test Oink's descriptors only; no runtime scan for other libraries'
+        // registrations and no changes to process-wide native registration.
+        for flags in [
+            RIDEV_INPUTSINK | windows::Win32::UI::Input::RIDEV_DEVNOTIFY,
+            RIDEV_REMOVE,
+        ] {
+            let registrations = devices(HWND::default(), flags);
+            assert!(!registrations.iter().any(|r| r.usUsagePage == 1 && r.usUsage == 6));
+            assert_eq!(registrations.map(|r| (r.usUsagePage, r.usUsage)), [(1, 2), (0x0D, 5)]);
+        }
     }
 }

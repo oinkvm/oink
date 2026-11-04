@@ -323,6 +323,13 @@ pub(super) fn peer(pipe: HANDLE, id: u32, server: bool) -> io::Result<Handle> {
     peer_at(pipe, id, id, server)
 }
 pub(super) fn peer_at(pipe: HANDLE, process_session: u32, id: u32, server: bool) -> io::Result<Handle> {
+    peer_with_access(pipe, process_session, id, server, 0)
+}
+/// Only the SYSTEM launch broker needs to deliver a restricted child handle.
+pub(super) fn launch_peer(pipe: HANDLE, id: u32) -> io::Result<Handle> {
+    peer_with_access(pipe, id, id, false, PROCESS_DUP_HANDLE)
+}
+fn peer_with_access(pipe: HANDLE, process_session: u32, id: u32, server: bool, access: u32) -> io::Result<Handle> {
     let (mut pid, mut sid) = (0, 0);
     // SAFETY: connected pipe and valid output variables; PID and session come from kernel.
     unsafe {
@@ -341,10 +348,10 @@ pub(super) fn peer_at(pipe: HANDLE, process_session: u32, id: u32, server: bool)
     if sid != process_session {
         return Err(denied());
     }
-    // SAFETY: query-only handle pins identity across PID reuse.
+    // SAFETY: the handle pins the kernel-supplied peer identity across PID reuse.
     let process = Handle::new(unsafe {
         OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | if process_session == 0 { 0 } else { SYNCHRONIZE },
+            access | PROCESS_QUERY_LIMITED_INFORMATION | if process_session == 0 { 0 } else { SYNCHRONIZE },
             0,
             pid,
         )

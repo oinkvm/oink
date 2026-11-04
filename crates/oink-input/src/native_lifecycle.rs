@@ -86,7 +86,9 @@ pub enum Kind {
     ParkInputReadbackMismatch,
     ParkInputCompletionUnavailable,
     /// message: 0=subscription started, 1=fault, 2=known-idle entry attestation,
-    /// 3=local capture generation barrier (never a native fault).
+    /// 3=local capture generation barrier (never a native fault),
+    /// 4=runtime fault recovered by a new validated hardware full lift,
+    /// 5=startup failure: reason is contact_diagnostics::CaptureFailure.
     /// Fault reason: 1=frame shape,
     /// 2=state, 3=contact geometry/count, 4=duplicate ID, 5=queue overflow.
     /// No coordinates or contact IDs are recorded.

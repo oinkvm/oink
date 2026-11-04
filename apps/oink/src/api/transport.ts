@@ -5,11 +5,13 @@ export class ApiFailure extends Error {
   code: ApiError['code'];
   problem: UserFacingProblem;
   updateError?: UpdateError;
+  detail?: string;
   constructor(err: ApiError) {
     super(err.problem.code);
     this.code = err.code;
     this.problem = err.problem;
     this.updateError = err.update_error;
+    this.detail = err.message;
   }
 }
 

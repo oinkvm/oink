@@ -56,6 +56,27 @@ static OWNER: Mutex<Option<Arc<Client>>> = Mutex::new(None);
 static PAUSED: AtomicBool = AtomicBool::new(false);
 static PRELOGIN_ROUTE: AtomicBool = AtomicBool::new(false);
 static PRELOGIN_RELEASED: AtomicBool = AtomicBool::new(false);
+static PRELOGIN_RELEASE_ERROR: Mutex<Option<ReleaseFailure>> = Mutex::new(None);
+#[derive(Clone, Debug)]
+pub enum ReleaseFailure {
+    OwnerAbsent,
+    Transport(String),
+    MissingAck,
+    NativeRejected(String),
+}
+/// Read on the ordinary shutdown thread: injection intentionally has no tracing subscriber.
+pub fn prelogin_shutdown_failure() -> Option<ReleaseFailure> {
+    if prelogin_shutdown_confirmed() {
+        return None;
+    }
+    Some(
+        PRELOGIN_RELEASE_ERROR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or(ReleaseFailure::OwnerAbsent),
+    )
+}
 /// Select the service-authorized route to the active console helper. The helper
 /// independently authenticates this process against the broker's pinned child.
 pub fn use_prelogin_route() {
@@ -69,6 +90,7 @@ pub fn use_in_process_helper() {
 
 pub fn initialize() -> io::Result<()> {
     PRELOGIN_RELEASED.store(false, Ordering::Release);
+    *PRELOGIN_RELEASE_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
     PAUSED.store(false, Ordering::Release);
     owner().map(|_| ())
 }
@@ -94,15 +116,14 @@ pub fn suspend() {
         if PRELOGIN_ROUTE.load(Ordering::Acquire) {
             // stop_injection_session runs after the injection FIFO drains. This
             // final native ACK, not an earlier release racing queued Downs, is
-            // the handoff proof consumed after the host has fully shut down.
+            // the best-effort cleanup result diagnosed after host shutdown.
             let result = owner
                 .request(Command::Release, false, false)
-                .and_then(|reply| reply.ok_or_else(|| io::Error::other("missing release ACK")))
-                .and_then(status);
+                .map_err(|e| ReleaseFailure::Transport(e.to_string()))
+                .and_then(|reply| reply.ok_or(ReleaseFailure::MissingAck))
+                .and_then(|reply| status(reply).map_err(|e| ReleaseFailure::NativeRejected(e.to_string())));
             PRELOGIN_RELEASED.store(result.is_ok(), Ordering::Release);
-            if let Err(error) = result {
-                tracing::error!(%error, "pre-login final release failed");
-            }
+            *PRELOGIN_RELEASE_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = result.err();
         }
         owner.shutdown();
     }

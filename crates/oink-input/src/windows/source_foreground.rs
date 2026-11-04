@@ -1,7 +1,8 @@
 //! Dedicated foreground capture window, separate from the nonactivating cursor cover.
 //! All activation is on this ordinary UI thread; the capture callback only queues intent.
-use crate::source_foreground::{Lease, Native};
+use crate::source_foreground::{Lease, Native, ReleaseDecision};
 use std::{
+    collections::HashSet,
     sync::{Mutex, mpsc},
     thread::JoinHandle,
     time::Duration,
@@ -9,15 +10,18 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-        System::LibraryLoader::GetModuleHandleW,
+        Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
+        System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentProcessId},
         UI::WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW,
-            IsIconic, IsWindow, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
-            SetForegroundWindow, ShowWindow, ShowWindowAsync, TranslateMessage, WM_APP, WM_CHAR, WM_DESTROY,
-            WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
+            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GUITHREADINFO, GW_HWNDNEXT,
+            GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow, GetGUIThreadInfo, GetMessageW, GetTopWindow, GetWindow,
+            GetWindowLongPtrW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, MSG, PostMessageW,
+            PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SetForegroundWindow, ShowWindow,
+            ShowWindowAsync, TranslateMessage, WM_APP, WM_CHAR, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR,
+            WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
         },
     },
-    core::w,
+    core::{BOOL, w},
 };
 const UPDATE: u32 = WM_APP + 1;
 const STOP: u32 = WM_APP + 2;
@@ -73,6 +77,60 @@ impl Controller {
 }
 struct Desktop {
     capture: HWND,
+    visible_at_departure: Option<HashSet<isize>>,
+    new_target: Option<isize>,
+}
+
+fn windows() -> Option<Vec<HWND>> {
+    unsafe extern "system" fn collect(window: HWND, context: LPARAM) -> BOOL {
+        // SAFETY: EnumWindows invokes this synchronously with our live Vec.
+        unsafe { (&mut *(context.0 as *mut Vec<HWND>)).push(window) };
+        BOOL(1)
+    }
+    let mut windows = Vec::new();
+    // SAFETY: synchronous enumeration; no HWND ownership or pointers escape it.
+    unsafe { EnumWindows(Some(collect), LPARAM((&mut windows as *mut Vec<HWND>) as isize)) }.ok()?;
+    Some(windows)
+}
+
+fn application_window(window: HWND) -> bool {
+    // SAFETY: read-only queries tolerate windows being destroyed during enumeration.
+    unsafe {
+        let mut pid = 0;
+        GetWindowThreadProcessId(window, Some(&mut pid));
+        if pid == 0
+            || pid == GetCurrentProcessId()
+            || !IsWindowVisible(window).as_bool()
+            || GetWindowLongPtrW(window, GWL_STYLE) as u32 & WS_DISABLED.0 != 0
+            || IsIconic(window).as_bool()
+            || GetWindowLongPtrW(window, GWL_EXSTYLE) as u32 & (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW).0 != 0
+        {
+            return false;
+        }
+        let mut cloaked = 0u32;
+        DwmGetWindowAttribute(
+            window,
+            DWMWA_CLOAKED,
+            (&mut cloaked as *mut u32).cast(),
+            size_of::<u32>() as u32,
+        )
+        .is_ok()
+            && cloaked == 0
+    }
+}
+
+fn active_in_own_queue(window: HWND) -> bool {
+    // A denied SetForegroundWindow can still activate the application's own
+    // input queue. Query that queue, not thread 0 (the system foreground queue).
+    // SAFETY: initialized output structure; a vanished thread returns an error.
+    unsafe {
+        let thread = GetWindowThreadProcessId(window, None);
+        let mut info = GUITHREADINFO {
+            cbSize: size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        thread != 0 && GetGUIThreadInfo(thread, &mut info).is_ok() && info.hwndActive == window
+    }
 }
 impl Native for Desktop {
     type Window = isize;
@@ -86,20 +144,70 @@ impl Native for Desktop {
         unsafe { IsWindow(Some(HWND(window as *mut _))).as_bool() }
     }
     fn show_capture(&mut self) {
+        self.new_target = None;
+        self.visible_at_departure = windows().map(|windows| {
+            windows
+                .into_iter()
+                // Remember every already-visible window, including disabled or
+                // tool windows. A later style change must not make an existing
+                // window look like an application that appeared during departure.
+                // SAFETY: read-only visibility query; destroyed windows return false.
+                .filter(|window| unsafe { IsWindowVisible(*window) }.as_bool())
+                .map(|window| window.0 as isize)
+                .collect()
+        });
+        tracing::info!(target: "oink_source_foreground", transition = 1u64,
+            known = self.visible_at_departure.is_some(),
+            "source foreground capture beginning");
         // SAFETY: this thread owns the capture window.
         unsafe {
             let _ = ShowWindow(self.capture, SW_SHOWNOACTIVATE);
         }
     }
     fn hide_capture(&mut self) {
+        let before = self.foreground() == Some(self.capture.0 as isize);
         // SAFETY: this thread owns the capture window.
         unsafe {
             let _ = ShowWindow(self.capture, SW_HIDE);
         }
+        tracing::info!(target: "oink_source_foreground", transition = 8u64, before,
+            active = self.foreground() == Some(self.capture.0 as isize), "source foreground capture hidden");
     }
     fn minimized(&self, window: isize) -> bool {
         // SAFETY: read-only query of the remembered, validated top-level window.
         unsafe { IsIconic(HWND(window as *mut _)).as_bool() }
+    }
+    fn new_activation_target(&mut self) -> Option<isize> {
+        self.new_target = None;
+        let before = self.visible_at_departure.as_ref()?;
+        let windows = windows()?;
+        let candidates: HashSet<_> = windows
+            .iter()
+            .copied()
+            .filter(|window| !before.contains(&(window.0 as isize)))
+            .filter(|window| application_window(*window) && active_in_own_queue(*window))
+            .map(|window| window.0 as isize)
+            .collect();
+        // Windows can show a new fullscreen application and activate its local
+        // queue while denying system foreground because our capture owns it.
+        // Hand foreground to the highest new visible, active application on
+        // return; don't override it with the saved application. Existing windows,
+        // nonactivating tools, minimized notifications and cloaked desktops are
+        // excluded. No global ASFW grant, attached queues or synthetic input.
+        // Use documented Z order, not an assumed EnumWindows ordering. Bound the
+        // walk by the snapshot size: destruction/reordering must not cause a loop.
+        // Verified with a denied fullscreen window on Windows 11 build 26200.
+        // SAFETY: read-only top-level Z-order query on this UI thread's desktop.
+        let mut window = unsafe { GetTopWindow(None) }.ok()?;
+        for _ in 0..windows.len() {
+            if candidates.contains(&(window.0 as isize)) {
+                self.new_target = Some(window.0 as isize);
+                break;
+            }
+            // SAFETY: read-only Z-order query; destruction ends the bounded walk.
+            window = unsafe { GetWindow(window, GW_HWNDNEXT) }.ok()?;
+        }
+        self.new_target
     }
     fn restore_without_activation(&mut self, window: isize) {
         // SAFETY: the remembered HWND was validated; no pointers are passed.
@@ -112,21 +220,42 @@ impl Native for Desktop {
         // with a stalled UI thread and a newly foreground fullscreen window on
         // Windows 11 build 26200; merely checking GetForegroundWindow before queueing
         // SW_RESTORE does not protect against its later activation.
-        unsafe {
-            let _ = ShowWindowAsync(HWND(window as *mut _), SW_SHOWNOACTIVATE);
-        }
+        let success = unsafe { ShowWindowAsync(HWND(window as *mut _), SW_SHOWNOACTIVATE) }.as_bool();
+        tracing::info!(target: "oink_source_foreground", transition = 7u64, success,
+            "source foreground previous window restore queued");
     }
     fn activate(&mut self, window: isize) {
         // SetForegroundWindow is a single documented request and may be refused.
         // Do not attach input queues, synthesize Alt, alter foreground-lock settings,
         // or retry: those change local input ownership beyond this preference.
-        // SAFETY: either our live capture window or the validated remembered HWND.
-        if !unsafe { SetForegroundWindow(HWND(window as *mut _)) }.as_bool() {
-            tracing::warn!(
-                taking = window == self.capture.0 as isize,
-                "source foreground request refused"
-            );
+        let taking = window == self.capture.0 as isize;
+        let transition = if taking {
+            3u64
+        } else if self.new_target == Some(window) {
+            5
+        } else {
+            4
+        };
+        // SAFETY: our live capture window or a validated saved/new application HWND.
+        let success = unsafe { SetForegroundWindow(HWND(window as *mut _)) }.as_bool();
+        tracing::info!(target: "oink_source_foreground", transition, success,
+            active = self.foreground() == Some(window), "source foreground activation completed");
+        if !success {
+            tracing::warn!(taking, "source foreground request refused");
         }
+    }
+    fn released(&mut self, decision: ReleaseDecision) {
+        // Existing reviewed diagnostic scalar names keep window/process identity
+        // out of both ordinary logs and group diagnostic bundles. transition=2:
+        // before=saved HWND, active=capture owned foreground, known=saved valid,
+        // detected=new app, hidden=saved minimized, wanted=activation requested.
+        tracing::info!(target: "oink_source_foreground", transition = 2u64,
+            before = decision.previous_available, active = decision.capture_foreground,
+            known = decision.previous_valid, detected = decision.new_application,
+            hidden = decision.previous_minimized, wanted = decision.activation_requested,
+            "source foreground release decision");
+        self.visible_at_departure = None;
+        self.new_target = None;
     }
 }
 unsafe extern "system" fn procedure(window: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -183,7 +312,11 @@ fn start() -> Option<Worker> {
                     return;
                 }
                 let mut lease = Lease::default();
-                let mut native = Desktop { capture: window };
+                let mut native = Desktop {
+                    capture: window,
+                    visible_at_departure: None,
+                    new_target: None,
+                };
                 let mut message = MSG::default();
                 while GetMessageW(&mut message, None, 0, 0).0 > 0 {
                     match message.message {

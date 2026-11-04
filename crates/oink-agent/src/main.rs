@@ -319,7 +319,7 @@ enum ConfigCmd {
 }
 
 fn main() -> ExitCode {
-    oink_crash::capsule::fatal_boundary(main_inner)
+    oink_agent::telemetry::fatal_boundary(main_inner)
 }
 
 fn main_inner() -> ExitCode {
@@ -374,14 +374,12 @@ fn execute() -> anyhow::Result<ExitCode> {
     let replacing = false;
     // The replacement helper survives the backend and flushes its own file on
     // return. Finder-launched backends do not retain a useful inherited stderr.
-    let _update_log_guard = if replacing {
-        oink_agent::logs::init_update()
+    if replacing {
+        oink_agent::logs::init_update();
     } else if matches!(cli.cmd, Cmd::Run) {
         oink_agent::logs::init_service();
-        None
     } else {
         oink_agent::logs::init();
-        None
     };
     run(cli)
 }

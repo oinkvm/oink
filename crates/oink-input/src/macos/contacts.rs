@@ -15,6 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::contact_diagnostics::{self as diag, CaptureFailure as Failure};
+
 type Device = *const c_void;
 type Callback = unsafe extern "C" fn(Device, *const NativeContact, usize, f64, usize);
 type Register = unsafe extern "C" fn(Device, Callback);
@@ -50,6 +52,7 @@ impl Shared {
         }
     }
     fn fail(&self, reason: u8) {
+        diag::fault(reason);
         if reason != 5 {
             // A malformed report cannot establish a full lift, even if its
             // partially decoded prefix happened to contain no touching contacts.
@@ -157,6 +160,7 @@ unsafe extern "C" fn observe(
             ..Default::default()
         };
         if !valid {
+            diag::sample(received_us, false, false);
             shared.trace(trace);
             shared.gate.finish(true);
             shared.fail(1);
@@ -181,6 +185,7 @@ unsafe extern "C" fn observe(
             }
             let result = decode(native, &mut sample);
             let valid_frame = result.is_ok();
+            diag::sample(received_us, valid_frame, valid_frame && sample.len == 0);
             trace.valid = valid_frame;
             trace.accepted = sample.len;
             shared.trace(trace);
@@ -234,8 +239,10 @@ pub(super) struct Capture {
 impl Capture {
     pub fn start(remote: &'static AtomicBool, wake: crate::capture_loop::Wake) -> Option<Self> {
         if !CURRENT.load(Ordering::SeqCst).is_null() {
+            diag::failure(Failure::AlreadyActive);
             return None;
         }
+        diag::begin(super::tap::now_event_ns() / 1_000);
         // SAFETY: all runtime symbols have the P0-checked C signatures. The library
         // remains loaded for process lifetime; it may retain its own worker threads.
         unsafe {
@@ -244,22 +251,34 @@ impl Capture {
                 libc::RTLD_NOW | libc::RTLD_LOCAL,
             );
             if library.is_null() {
+                diag::failure(Failure::Framework);
                 return None;
             }
-            let symbol = |name: &CStr| {
+            let symbol = |name: &CStr, failure: Failure| {
                 let p = libc::dlsym(library, name.as_ptr());
+                if p.is_null() {
+                    diag::failure(failure);
+                }
                 (!p.is_null()).then_some(p)
             };
-            let list_fn: unsafe extern "C" fn() -> *const c_void = std::mem::transmute(symbol(c"MTDeviceCreateList")?);
-            let built_in: unsafe extern "C" fn(Device) -> bool = std::mem::transmute(symbol(c"MTDeviceIsBuiltIn")?);
-            let dimensions: unsafe extern "C" fn(Device, *mut i32, *mut i32) -> i32 =
-                std::mem::transmute(symbol(c"MTDeviceGetSensorSurfaceDimensions")?);
-            let register: Register = std::mem::transmute(symbol(c"MTRegisterContactFrameCallback")?);
-            let unregister: Register = std::mem::transmute(symbol(c"MTUnregisterContactFrameCallback")?);
-            let start: unsafe extern "C" fn(Device, i32) -> i32 = std::mem::transmute(symbol(c"MTDeviceStart")?);
-            let stop: Stop = std::mem::transmute(symbol(c"MTDeviceStop")?);
+            let list_fn: unsafe extern "C" fn() -> *const c_void =
+                std::mem::transmute(symbol(c"MTDeviceCreateList", Failure::ListSymbol)?);
+            let built_in: unsafe extern "C" fn(Device) -> bool =
+                std::mem::transmute(symbol(c"MTDeviceIsBuiltIn", Failure::BuiltInSymbol)?);
+            let dimensions: unsafe extern "C" fn(Device, *mut i32, *mut i32) -> i32 = std::mem::transmute(symbol(
+                c"MTDeviceGetSensorSurfaceDimensions",
+                Failure::DimensionsSymbol,
+            )?);
+            let register: Register =
+                std::mem::transmute(symbol(c"MTRegisterContactFrameCallback", Failure::RegisterSymbol)?);
+            let unregister: Register =
+                std::mem::transmute(symbol(c"MTUnregisterContactFrameCallback", Failure::UnregisterSymbol)?);
+            let start: unsafe extern "C" fn(Device, i32) -> i32 =
+                std::mem::transmute(symbol(c"MTDeviceStart", Failure::StartSymbol)?);
+            let stop: Stop = std::mem::transmute(symbol(c"MTDeviceStop", Failure::StopSymbol)?);
             let list = list_fn();
             if list.is_null() {
+                diag::failure(Failure::DeviceList);
                 return None;
             }
             let mut device: Device = std::ptr::null();
@@ -277,6 +296,12 @@ impl Capture {
                     ambiguous = true;
                 }
             }
+            diag::set(10, device_count.into());
+            diag::set(11, built_in_count.into());
+            // IsBuiltIn cannot distinguish an external trackpad from a touch mouse.
+            // Preserve that uncertainty rather than claiming all are trackpads.
+            diag::set(12, (device_count - built_in_count).into());
+            diag::set(13, 1);
             // CG reports a device class, not an MT device ID. Until multi-board
             // correlation is validated, keep the existing fallback if more than
             // the one P0-verified built-in touch surface is present.
@@ -289,11 +314,17 @@ impl Capture {
                 ..Default::default()
             });
             if device.is_null() || ambiguous {
+                diag::failure(if device.is_null() {
+                    Failure::NoBuiltIn
+                } else {
+                    Failure::AmbiguousDevices
+                });
                 CFRelease(list);
                 return None;
             }
             let (mut width, mut height) = (0, 0);
-            dimensions(device, &mut width, &mut height);
+            let dimensions_result = dimensions(device, &mut width, &mut height);
+            diag::set(16, dimensions_result as u32 as u64);
             // Native sensor units are 1e-5 metres. The fixed reference quantum
             // is exactly that length, so the integer boundary conversion is exact.
             let surface = Surface {
@@ -301,6 +332,7 @@ impl Capture {
                 height: height as u32,
             };
             if !surface.valid() {
+                diag::failure(Failure::InvalidDimensions);
                 CFRelease(list);
                 return None;
             }
@@ -333,9 +365,15 @@ impl Capture {
             // The product owns one capture thread; startup/stop are serialized.
             CURRENT.store(&mut *capture.shared, Ordering::SeqCst);
             register(device, observe);
-            if start(device, 0) != 0 {
+            // Register returns void: this proves the call, not callback delivery.
+            diag::set(14, 1);
+            let start_result = start(device, 0);
+            diag::set(15, start_result as u32 as u64);
+            if start_result != 0 {
+                diag::failure(Failure::StartRejected);
                 return None;
             }
+            diag::set(0, 2);
             crate::native_lifecycle::emit_lifecycle(
                 crate::native_lifecycle::Kind::ContactCapture,
                 crate::native_lifecycle::Data {
@@ -407,6 +445,9 @@ fn event(sample: Sample) -> CapturedEvent {
 }
 impl Drop for Capture {
     fn drop(&mut self) {
+        if diag::snapshot().next().is_some_and(|(_, state)| state == 2) {
+            diag::set(0, 4);
+        }
         CURRENT.store(std::ptr::null_mut(), Ordering::SeqCst);
         // SAFETY: same retained device and registered callback, capture owner only.
         unsafe {
@@ -425,6 +466,23 @@ impl Drop for Capture {
 mod tests {
     use super::*;
     static REMOTE: AtomicBool = AtomicBool::new(true);
+    /// Device-test lock required. Only opens/closes the contact subscription;
+    /// never installs a tap, changes capture mode, or touches cursor/focus/settings.
+    #[test]
+    #[ignore = "native contact subscription; run under scripts/device-test.sh"]
+    fn capture_availability_on_device() {
+        static LOCAL: AtomicBool = AtomicBool::new(false);
+        let capture = Capture::start(&LOCAL, std::sync::Arc::new(|| {}));
+        std::thread::sleep(Duration::from_millis(250));
+        let values: std::collections::BTreeMap<_, _> = diag::snapshot().collect();
+        for (key, value) in &values {
+            println!("{key}={value}");
+        }
+        assert_eq!(values["capture_state"], if capture.is_some() { 2 } else { 3 });
+        assert_eq!(values["capture_failure"] == 0, capture.is_some());
+        assert!(values["capture_started_us"] > 0);
+        drop(capture);
+    }
     #[test]
     fn hardware_contact_activity_excludes_delivery_lifts_and_faults() {
         let mut sample = Sample {

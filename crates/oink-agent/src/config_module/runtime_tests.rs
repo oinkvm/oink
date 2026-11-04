@@ -242,8 +242,8 @@ async fn start_with_bind(
         assert_eq!(state.device, identity.id());
         let directory = tempfile::tempdir().unwrap();
         group_store::save(&directory.path().join(group_store::STATE_FILE), &state).unwrap();
-        let mut network = oink_test_support::network_config(directory.path().into(), "synthetic", 0);
-        network.bind_ip = bind_ip;
+        let network =
+            oink_test_support::network::network_config_with_bind(directory.path().into(), "synthetic", 0, bind_ip);
         let (links, port) = LinkLayer::start(LinkConfig {
             profile: crate::node::Node::offer_profile(),
             identity: identity.clone(),

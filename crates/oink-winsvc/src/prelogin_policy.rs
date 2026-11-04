@@ -230,7 +230,7 @@ impl Observation {
 pub(crate) trait Child {
     fn session(&self) -> u32;
     fn alive(&self) -> bool;
-    /// Signal stop, give it the bounded release window, then terminate.
+    /// Signal stop, wait a bounded window, then terminate. Success requires exit.
     fn stop(&mut self) -> io::Result<()>;
 }
 
@@ -264,7 +264,6 @@ enum Handoff {
     AwaitingStart(Instant),
     Stopping,
     UserBackend,
-    Failed,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Tick {
@@ -292,6 +291,7 @@ impl<C: Child> Supervisor<C> {
         if let Some(child) = &self.child {
             if !child.alive() {
                 self.child = None;
+                self.phase = Handoff::LoginScreen;
                 return Ok(Tick::Exited);
             }
             // WTS returns no console while one is being attached/detached. Keep
@@ -320,7 +320,7 @@ impl<C: Child> Supervisor<C> {
             self.stop()?;
             return Ok(Tick::Stopped);
         }
-        if matches!(self.phase, Handoff::Failed | Handoff::Stopping) {
+        if self.phase == Handoff::Stopping {
             return Ok(Tick::Idle);
         }
         let Some(session) = wanted else {
@@ -341,21 +341,18 @@ impl<C: Child> Supervisor<C> {
     /// The caller holds the supervisor mutex through creation: the poller cannot
     /// restart the old identity between the release/exit barrier and CreateProcess.
     pub(crate) fn handoff<T>(&mut self, create: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
-        if self.phase == Handoff::Failed {
-            return Err(io::Error::other("pre-login cleanup was not confirmed"));
-        }
         self.phase = Handoff::Stopping;
         self.stop()?;
         self.phase = Handoff::UserBackend;
         create()
     }
-    /// Retain ownership on failure: never mistake an unconfirmed termination for
-    /// permission to create another process with the same device identity.
+    /// Retain the pinned generation until actual exit, and recheck on the next
+    /// observation/Start. A stop failure must not become a permanent rejection.
     pub(crate) fn stop(&mut self) -> io::Result<bool> {
         if let Some(child) = &mut self.child {
             if let Err(error) = child.stop() {
-                self.phase = Handoff::Failed;
-                return Err(error);
+                self.phase = Handoff::Stopping;
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, error));
             }
             self.child = None;
             Ok(true)
@@ -844,5 +841,75 @@ mod tests {
         // The user backend launch path stops it unconditionally first.
         assert!(supervisor.stop().unwrap());
         assert!(!supervisor.stop().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod process_exit_tests {
+    use super::*;
+    use std::{cell::Cell, rc::Rc};
+    struct DelayedExit(Rc<Cell<bool>>);
+    impl Child for DelayedExit {
+        fn session(&self) -> u32 {
+            1
+        }
+        fn alive(&self) -> bool {
+            !self.0.get()
+        }
+        fn stop(&mut self) -> io::Result<()> {
+            if self.alive() {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "still running"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[test]
+    fn failed_stop_waits_for_exit_and_next_start_recovers_without_service_restart() {
+        let exited = Rc::new(Cell::new(false));
+        let mut supervisor = Supervisor::default();
+        let screen = Observation {
+            console: Some(1),
+            ready: true,
+            ..Default::default()
+        };
+        supervisor
+            .tick(&screen, Instant::now(), |_| Ok(DelayedExit(exited.clone())))
+            .unwrap();
+        assert!(
+            supervisor
+                .handoff(|| -> io::Result<()> { panic!("two network identities") })
+                .is_err()
+        );
+        // Native cleanup may be unknown throughout: only the pinned network
+        // process's exit matters. No repeated Start is needed to observe it.
+        exited.set(true);
+        let signed_in = Observation {
+            user_present: true,
+            ..screen
+        };
+        assert_eq!(
+            supervisor
+                .tick(&signed_in, Instant::now(), |_| panic!("new prelogin while signed in"))
+                .unwrap(),
+            Tick::Exited
+        );
+        assert_eq!(supervisor.handoff(|| Ok(42)).unwrap(), 42);
+    }
+    #[test]
+    fn next_start_can_observe_exit_before_the_poller_without_a_failed_latch() {
+        let exited = Rc::new(Cell::new(false));
+        let mut supervisor = Supervisor::default();
+        let screen = Observation {
+            console: Some(1),
+            ready: true,
+            ..Default::default()
+        };
+        supervisor
+            .tick(&screen, Instant::now(), |_| Ok(DelayedExit(exited.clone())))
+            .unwrap();
+        assert!(supervisor.handoff(|| Ok(0)).is_err());
+        exited.set(true);
+        assert_eq!(supervisor.handoff(|| Ok(42)).unwrap(), 42);
     }
 }

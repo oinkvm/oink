@@ -3,20 +3,93 @@ use super::test_agent::api::{AgentApi, ApiEvent, SharingState, pairing};
 use super::test_agent::device_cards::DecimalU64;
 use super::test_agent::node::{Node, NodeOptions};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::Duration;
 
-pub async fn until(what: &str, mut ready: impl FnMut() -> bool) {
-    phase(what);
-    tokio::time::timeout(Duration::from_secs(15), async {
-        while !ready() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+/// Poll conditions that have no published event (for example fixture counters).
+/// The enclosing process watchdog bounds missing progress and synchronous calls.
+#[allow(dead_code, reason = "shared fixture also compiled into event-only tests")]
+pub async fn until(what: &str, ready: impl FnMut() -> bool) {
+    let _watchdog = watchdog::ensure(what);
+    watchdog::until(what, ready).await;
+}
+
+type EventDiagnostics = Arc<Mutex<std::collections::BTreeMap<&'static str, String>>>;
+
+/// Subscribe before observing so publication cannot race the first query.
+/// Notify keeps one permit when an event arrives during an observation; Drop
+/// removes subscriptions even when a fixture cancels its pending wait.
+pub struct StateChanges<'a> {
+    subscriptions: Vec<(&'a Node, super::test_agent::api::SubscriptionId)>,
+    changed: Arc<tokio::sync::Notify>,
+    _diagnostics: Vec<EventDiagnostics>,
+    _watchdog: Option<watchdog::Scenario>,
+}
+impl<'a> StateChanges<'a> {
+    pub fn new(nodes: &[&'a Node], what: &str) -> Self {
+        let watchdog = watchdog::ensure(what);
+        phase(what);
+        let mut changes = Self {
+            subscriptions: Vec::new(),
+            changed: Arc::new(tokio::sync::Notify::new()),
+            _diagnostics: Vec::new(),
+            _watchdog: watchdog,
+        };
+        for node in nodes {
+            let diagnostic = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+            let weak = Arc::downgrade(&diagnostic);
+            watchdog::on_timeout(format!("{what}: {:?}", node.id()), move || {
+                weak.upgrade().map_or_else(
+                    || "wait finished".into(),
+                    |state| match state.try_lock() {
+                        Ok(state) => format!("last published state: {state:#?}"),
+                        Err(error) => format!("event diagnostic unavailable: {error}"),
+                    },
+                )
+            });
+            let changed = changes.changed.clone();
+            let cache = diagnostic.clone();
+            let subscription = node.subscribe(Arc::new(move |event| {
+                let (kind, state) = match event {
+                    ApiEvent::Layout(layout) => ("layout", format!("{layout:?}")),
+                    ApiEvent::LayoutProfiles(state) => ("profiles", format!("{state:?}")),
+                    ApiEvent::LayoutProfileOperation(state) => ("operation", format!("{state:?}")),
+                    ApiEvent::Group(group) => ("group", format!("{group:?}")),
+                    ApiEvent::PairingChanged { view, .. } => ("pairing", format!("{view:?}")),
+                    ApiEvent::PairingRequestsChanged { requests, .. } => ("requests", format!("{requests:?}")),
+                    ApiEvent::GroupMigrationChanged(state) => ("migration", format!("{state:?}")),
+                    _ => return,
+                };
+                cache.lock().unwrap().insert(kind, state);
+                changed.notify_one();
+            }));
+            changes.subscriptions.push((node, subscription));
+            changes._diagnostics.push(diagnostic);
         }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("timed out: {what}"));
+        changes
+    }
+
+    pub async fn notified(&self) {
+        self.changed.notified().await;
+    }
+}
+impl Drop for StateChanges<'_> {
+    fn drop(&mut self) {
+        for (node, subscription) in self.subscriptions.drain(..) {
+            node.unsubscribe(subscription);
+        }
+    }
+}
+
+/// Await the actual multi-node predicate after each relevant state publication.
+/// There is no per-phase scheduling budget; the scenario watchdog remains armed.
+#[allow(dead_code)]
+pub async fn converge(nodes: &[&Node], what: &str, mut ready: impl FnMut() -> bool) {
+    let changes = StateChanges::new(nodes, what);
+    while !ready() {
+        changes.notified().await;
+    }
 }
 
 /// A manual layout fixture needs a writable target catalog as well as owner facts.
@@ -31,7 +104,7 @@ pub fn profile_layout_ready(node: &Node) -> bool {
 /// also need the target catalog and its owner visibility snapshot to be ready.
 #[allow(dead_code, reason = "shared fixture also compiled into tests without layout edits")]
 pub async fn editable_layouts(nodes: &[&Node], screen_count: usize) {
-    until("editable shared layouts", || {
+    converge(nodes, "editable shared layouts", || {
         nodes
             .iter()
             .all(|node| node.layout().0.screens.len() == screen_count && profile_layout_ready(node))
@@ -48,7 +121,7 @@ pub async fn editable_layouts(nodes: &[&Node], screen_count: usize) {
     reason = "shared fixture also compiled into tests without profile handoffs"
 )]
 pub async fn profile_handoff(nodes: &[&Node], expected_default: &str) {
-    until("complete profile catalog converged after pairing", || {
+    converge(nodes, "complete profile catalog converged after pairing", || {
         let states = nodes
             .iter()
             .map(|node| {
@@ -97,6 +170,7 @@ pub async fn query_at(
     expected_device: oink_foundation::DeviceId,
     address: std::net::SocketAddr,
 ) -> pairing::FoundPeer {
+    let _watchdog = watchdog::ensure("pairing address query");
     let generation = DecimalU64(OPERATIONS.fetch_add(1, Ordering::Relaxed));
     let operation = format!("00000000-0000-4000-8000-{:012x}", generation.0);
     phase("pair: prepared address query");
@@ -135,6 +209,7 @@ pub async fn query_at(
 
 /// Start and explicitly accept a request, stopping before code submission.
 pub async fn request(initiator: &Node, responder: &Node) -> (pairing::PairId, String) {
+    let _watchdog = watchdog::ensure("pairing request");
     let peer = query(initiator, responder).await;
     assert!(peer.prepared, "a new pairing request needs a prepared peer");
     let client = initiator.clone();
@@ -158,35 +233,17 @@ pub async fn request(initiator: &Node, responder: &Node) -> (pairing::PairId, St
         panic!("pairing start refused: {started:?}")
     };
     phase("explicit incoming pairing request");
-    let incoming = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let outgoing = initiator.pairings().unwrap();
-            let incoming = responder.pairings().unwrap();
-            // Started can already have a typed terminal outcome before a
-            // request is published. Preserve that cause instead of hiding it
-            // behind the request-arrival timeout.
-            assert!(
-                !outgoing.sessions.iter().any(|s| s.id == pair_id && s.phase == 8),
-                "pairing ended before incoming request: pair={pair_id}; outgoing={outgoing:?}; incoming={incoming:?}; initiator_group={:?}; responder_group={:?}",
-                initiator.group(), responder.group(),
-            );
-            if incoming.requests.iter().any(|r| r.id == pair_id) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    converge(&[initiator, responder], "explicit incoming pairing request", || {
+        let outgoing = initiator.pairings().unwrap();
+        let incoming = responder.pairings().unwrap();
+        assert!(
+            !outgoing.sessions.iter().any(|s| s.id == pair_id && s.phase == 8),
+            "pairing ended before incoming request: pair={pair_id}; outgoing={outgoing:?}; incoming={incoming:?}; initiator_group={:?}; responder_group={:?}",
+            initiator.group(), responder.group(),
+        );
+        incoming.requests.iter().any(|r| r.id == pair_id)
     })
     .await;
-    assert!(
-        incoming.is_ok(),
-        "timed out: explicit incoming pairing request; pair={pair_id}; initiator={:?}; responder={:?}; outgoing={:?}; incoming={:?}; initiator_links={:?}; responder_links={:?}",
-        initiator.id(),
-        responder.id(),
-        initiator.pairings(),
-        responder.pairings(),
-        initiator.links().map(|l| l.links()),
-        responder.links().map(|l| l.links()),
-    );
     let request = responder
         .pairings()
         .unwrap()
@@ -214,7 +271,7 @@ pub async fn request(initiator: &Node, responder: &Node) -> (pairing::PairId, St
     // The initiator already shows its code before acceptance. The accept
     // acknowledgement advances its revision without changing that UI phase;
     // returning earlier races the next command's expected revision.
-    until("initiator received pairing acceptance", || {
+    converge(&[initiator], "initiator received pairing acceptance", || {
         initiator
             .pairings()
             .unwrap()
@@ -224,7 +281,7 @@ pub async fn request(initiator: &Node, responder: &Node) -> (pairing::PairId, St
     })
     .await;
     let code = initiator.pairing_code(pair_id.clone()).unwrap().six_digits;
-    until("responder ready for code", || {
+    converge(&[responder], "responder ready for code", || {
         responder
             .pairings()
             .unwrap()
@@ -258,6 +315,7 @@ pub async fn submit(
 }
 
 pub async fn pair(initiator: &Node, responder: &Node) {
+    let _watchdog = watchdog::ensure("pairing fixture");
     let (pair_id, code) = request(initiator, responder).await;
     let submitted = submit(responder, pair_id.clone(), 1, code).await;
     assert!(
@@ -268,7 +326,7 @@ pub async fn pair(initiator: &Node, responder: &Node) {
     // Completion includes the owner's bounded prepare/admission/recovery stages,
     // not just the earlier roster projection. Observe its typed terminal state;
     // the enclosing process watchdog still bounds a missing completion.
-    loop {
+    converge(&[initiator, responder], "durable paired membership", || {
         let a = initiator.group().unwrap();
         let b = responder.group().unwrap();
         let pairings = [initiator.pairings().unwrap(), responder.pairings().unwrap()];
@@ -280,7 +338,7 @@ pub async fn pair(initiator: &Node, responder: &Node) {
             initiator.group_migration(),
             responder.group_migration(),
         );
-        if a.id.is_some()
+        a.id.is_some()
                 && a.id == b.id
                 && a.members.iter().any(|m| m.device.id.0 == responder.id())
                 && b.members.iter().any(|m| m.device.id.0 == initiator.id())
@@ -291,52 +349,30 @@ pub async fn pair(initiator: &Node, responder: &Node) {
                 && pairings.iter().all(|p| {
                     p.sessions.iter().any(|s| s.id == pair_id && s.phase == 7)
                 })
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    })
+    .await;
     active(&[initiator, responder]).await;
 }
 
 pub async fn active(nodes: &[&Node]) {
-    phase("all input sharing active");
-    let ready = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            if nodes.iter().all(|a| {
-                let group = a.group().unwrap();
-                nodes.iter().all(|b| {
-                    a.id() == b.id()
-                        || group
-                            .members
-                            .iter()
-                            .any(|m| m.device.id.0 == b.id() && m.sharing == SharingState::Active)
-                })
-            }) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    converge(nodes, "all input sharing active", || {
+        nodes.iter().all(|a| {
+            let group = a.group().unwrap();
+            nodes.iter().all(|b| {
+                a.id() == b.id()
+                    || group
+                        .members
+                        .iter()
+                        .any(|m| m.device.id.0 == b.id() && m.sharing == SharingState::Active)
+            })
+        })
     })
     .await;
-    assert!(
-        ready.is_ok(),
-        "timed out: all input sharing active; {:#?}",
-        nodes
-            .iter()
-            .map(|n| (
-                n.id(),
-                n.group(),
-                n.pause_status(),
-                n.input_status(),
-                n.links().map(|l| l.links())
-            ))
-            .collect::<Vec<_>>()
-    );
 }
 
 #[allow(dead_code)]
 pub async fn start(options: impl IntoIterator<Item = NodeOptions>) -> Vec<Node> {
+    let _watchdog = watchdog::ensure("start paired nodes");
     let mut nodes = Vec::new();
     for option in options {
         nodes.push(Node::start_with_fake_platform(option).await.unwrap());

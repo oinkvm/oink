@@ -543,6 +543,7 @@ impl Driver {
         if !self.status_dirty
             // Remote commits and timer transitions can change application focus
             // without a native command or an ordinary routing Status event.
+            && status.contact_diagnostics == Some(router.contact_diagnostic_state())
             && status.application_focus.as_ref() == router.application_focus()
             && status.update_held_input == router.update_input_held()
             && status.update_remote_control == router.update_remote_control(self.micros())
@@ -586,11 +587,13 @@ impl Driver {
                         .receive_state(*peer)
                         .is_some_and(|s| s.controllable == Some(true)),
                 touchpad_contacts: self.adapter.receive_state(*peer).and_then(|s| s.touchpad_contacts),
+                touchpad_options: pair.attached.then(|| router.peer_touchpad_options(*peer)).flatten(),
                 feel: self.adapter.receive_state(*peer).and_then(|s| s.feel.clone()),
             })
             .collect();
         peers.sort_by_key(|peer| peer.peer);
         let status = InputStatus {
+            contact_diagnostics: Some(router.contact_diagnostic_state()),
             application_focus: router.application_focus().cloned(),
             update_held_input: router.update_input_held(),
             update_remote_control: router.update_remote_control(self.micros()),

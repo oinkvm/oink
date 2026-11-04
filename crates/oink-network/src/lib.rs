@@ -34,6 +34,9 @@ mod qos;
 
 mod tls;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_ports;
+
 pub use config::{DEFAULT_PORT, MdnsMode, NetworkConfig};
 pub use discovery::Advert as DiscoveryAdvert;
 pub use discovery::{Sighting as DiscoverySighting, Source as DiscoverySource};

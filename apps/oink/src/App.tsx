@@ -2,7 +2,7 @@ import { LayoutProjectionPreview } from './arrange/projection';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Button, Confirmer, Icon, OinkProvider, Toaster, Tooltip, VisuallyHidden, mergeRefs, speed, toast } from 'oink-ui';
 import { ApiFailure, api, shell } from './api/client';
-import { agent, start, useAgent } from './api/store';
+import { agent, reportBackendFailure, start, useAgent } from './api/store';
 import { inTauri } from './api/transport';
 import { presentControls, resourceAction } from './devices/project';
 import { useGrant } from './settings/useGrant';
@@ -154,7 +154,7 @@ export function App() {
             onboardTimer.current = window.setTimeout(() => setOnboard('off'), 700 * Math.max(speed(), 0));
             await agent.query('overview', api.overview);
             return true;
-        } catch { agent.fail('unavailable'); return false; }
+        } catch (error) { reportBackendFailure(error); return false; }
         finally { onboardingBusy.current = false; }
     };
     const replayOnboarding = () => {
@@ -250,8 +250,7 @@ export function App() {
         const quality = view==='main'&&navMode==='settings'&&(section==='diagnostics'||query.trim().length>0);
         void shell.liveViews({stats:false,card_signals:view==='main'||view==='panel',group_quality:quality,audio_quality:quality,diagnostics:false}).catch(()=>agent.fail('unavailable'));
     },[view,navMode,section,query]);
-    /** @deprecated Legacy bottom-centred notice. New code must use the in-app oink-ui toast instead. */
-    const fail = (e: unknown) => agent.fail(e instanceof ApiFailure ? e.problem.code : 'unavailable');
+    const fail = reportBackendFailure;
     const permissionPage = () => { setNavMode('settings'); setNavOpen(true); setJump({ section: 'permissions', n: Date.now() }); };
     const invoke = async (id: string, resource: string, desired: string | boolean | number) => {
         const card = agent.get().cards?.cards.find(c => c.device === id);

@@ -89,7 +89,7 @@ export const DEFAULT_PREFS: Prefs = {
     nativeMultifinger: true,
     macScrollFeel: true,
     forwardInjectedInput: false,
-    takeForegroundOnLeave: true,
+    takeForegroundOnLeave: false,
     pointerTrail: true,
     clipReceive: true,
     clipSend: true,

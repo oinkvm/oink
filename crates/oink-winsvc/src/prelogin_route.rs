@@ -80,22 +80,20 @@ impl Target {
 pub(crate) trait Helper {
     fn target(&self) -> &Target;
     fn alive(&self) -> bool;
+    /// Success requires positive exit proof for the retained process handle.
+    /// Release ACK and exit code do not determine whether replacement is allowed.
     fn stop(&mut self) -> std::io::Result<()>;
-    /// Positive OS proof that both the process and its entire session are gone.
-    fn session_ended(&self) -> bool {
-        false
-    }
 }
 #[derive(Default)]
 pub(crate) struct Route<C> {
     child: Option<C>,
-    failed: bool,
+    stopping: bool,
 }
 impl<C: Helper> Route<C> {
     pub(crate) fn new() -> Self {
         Self {
             child: None,
-            failed: false,
+            stopping: false,
         }
     }
     pub(crate) fn update(
@@ -103,31 +101,23 @@ impl<C: Helper> Route<C> {
         desired: Option<Target>,
         start: impl FnOnce(Target) -> std::io::Result<C>,
     ) -> std::io::Result<()> {
-        if self.failed {
-            // Logoff may terminate a SYSTEM helper with the whole session,
-            // before it can ACK cleanup. The failure belongs to that session,
-            // not every future login. A console switch or process exit alone
-            // is insufficient: disconnected sessions still own desktops/holds.
-            if !self.child.as_ref().is_some_and(Helper::session_ended) {
-                return Ok(());
-            }
-            self.child = None;
-            self.failed = false;
-        }
         let desired = desired.filter(Target::valid);
-        if self
-            .child
-            .as_ref()
-            .is_some_and(|c| c.alive() && Some(c.target()) == desired.as_ref())
+        if !self.stopping
+            && self
+                .child
+                .as_ref()
+                .is_some_and(|c| c.alive() && Some(c.target()) == desired.as_ref())
         {
             return Ok(());
         }
-        if let Some(old) = &mut self.child
-            && let Err(error) = old.stop()
-        {
-            self.failed = true;
-            return Err(error);
+        if let Some(old) = &mut self.child {
+            // A failed wait retains the exact child and retries stopping it on
+            // the next tick. An exited helper cannot own another input lane,
+            // even if its disconnected session or held-key state still exists.
+            self.stopping = true;
+            old.stop()?;
         }
+        self.stopping = false;
         self.child = None;
         if let Some(target) = desired {
             self.child = Some(start(target)?);
@@ -180,7 +170,7 @@ mod route_tests {
         }
     }
     #[test]
-    fn new_console_helper_is_created_only_after_old_release_confirmation() {
+    fn new_console_helper_is_created_only_after_old_process_exit() {
         for fail in [false, true] {
             let log = Rc::new(RefCell::new(Vec::new()));
             let create = |target: Target| {
@@ -195,8 +185,8 @@ mod route_tests {
             route.update(Some(target(1)), create).unwrap();
             assert_eq!(route.update(Some(target(2)), create).is_err(), fail);
             if fail {
-                route.update(Some(target(2)), create).unwrap();
-                assert_eq!(*log.borrow(), ["start 1", "release 1"]);
+                assert!(route.update(Some(target(2)), create).is_err());
+                assert_eq!(*log.borrow(), ["start 1", "release 1", "release 1"]);
             } else {
                 assert_eq!(*log.borrow(), ["start 1", "release 1", "start 2"]);
                 route.update(None, create).unwrap();
@@ -245,12 +235,11 @@ mod route_tests {
         );
     }
 
-    struct LoggedOff {
+    struct Exiting {
         target: Target,
         process_exited: Rc<std::cell::Cell<bool>>,
-        session_absent: Rc<std::cell::Cell<Option<bool>>>,
     }
-    impl Helper for LoggedOff {
+    impl Helper for Exiting {
         fn target(&self) -> &Target {
             &self.target
         }
@@ -258,73 +247,45 @@ mod route_tests {
             !self.process_exited.get()
         }
         fn stop(&mut self) -> std::io::Result<()> {
-            if self.target.session == 1 {
-                Err(std::io::Error::other("session teardown terminated helper without ACK"))
-            } else {
+            if self.process_exited.get() {
                 Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "helper still running",
+                ))
             }
-        }
-        fn session_ended(&self) -> bool {
-            self.process_exited.get() && self.session_absent.get() == Some(true)
         }
     }
 
     #[test]
-    fn logout_into_new_tokenless_console_does_not_latch_the_previous_session_failure() {
-        let exited = Rc::new(std::cell::Cell::new(false));
-        let absent = Rc::new(std::cell::Cell::new(Some(false)));
-        let started = Rc::new(RefCell::new(Vec::new()));
-        let create = |target: Target| {
-            started.borrow_mut().push(target.session);
-            Ok(LoggedOff {
-                target,
-                process_exited: exited.clone(),
-                session_absent: absent.clone(),
-            })
-        };
-        let mut route = Route::new();
-        let user = Target {
-            session: 1,
-            source: None,
-            user_sid: Some(vec![1]),
-        };
-        route.update(Some(user), create).unwrap();
-        let mut login = target(2);
-        login.source.as_mut().unwrap().identity.session = 2;
-        assert!(login.user_sid.is_none());
-        assert!(route.update(Some(login.clone()), create).is_err());
-
-        // A disconnected/FUS session, a failed WTS query, or a live helper is
-        // never evidence of cleanup. Even a different target must stay blocked.
-        for (process_exited, session_absent) in [(false, Some(true)), (true, None), (true, Some(false))] {
-            exited.set(process_exited);
-            absent.set(session_absent);
-            route.update(Some(login.clone()), create).unwrap();
+    fn failed_stop_is_retried_and_exit_allows_replacement_without_session_destruction() {
+        // Covers PIN/FUS (old user session still exists), same-target helper
+        // recovery, and an absent target. An unconfirmed exit never starts one.
+        for desired in [Some(target(2)), Some(target(1)), None] {
+            let exited = Rc::new(std::cell::Cell::new(false));
+            let started = Rc::new(RefCell::new(Vec::new()));
+            let create = |target: Target| {
+                started.borrow_mut().push(target.session);
+                Ok(Exiting {
+                    target,
+                    process_exited: exited.clone(),
+                })
+            };
+            let mut route = Route::new();
+            route.update(Some(target(1)), create).unwrap();
+            // Begin stopping before even a switch back to the same target.
+            assert!(route.update(None, create).is_err());
+            assert!(route.update(desired.clone(), create).is_err());
             assert_eq!(*started.borrow(), [1]);
+            exited.set(true);
+            route.update(desired.clone(), create).unwrap();
+            let expected = match desired {
+                Some(t) => vec![1, t.session],
+                None => vec![1],
+            };
+            assert_eq!(*started.borrow(), expected);
+            assert!(!route.stopping);
         }
-        exited.set(true);
-        absent.set(Some(true));
-        route.update(Some(login), create).unwrap();
-        assert_eq!(
-            *started.borrow(),
-            [1, 2],
-            "the destroyed session must not disable the new login screen"
-        );
-
-        // The next login still uses normal release-before-replace. Neither the
-        // new prelogin final ACK nor the user's own-session helper is latched
-        // behind the dead session's failed cleanup.
-        let mut waiting_start = target(2);
-        waiting_start.source.as_mut().unwrap().identity.session = 2;
-        waiting_start.user_sid = Some(vec![1]);
-        route.update(Some(waiting_start), create).unwrap();
-        route.update(None, create).unwrap();
-        let user = Target {
-            session: 2,
-            source: None,
-            user_sid: Some(vec![1]),
-        };
-        route.update(Some(user), create).unwrap();
-        assert_eq!(*started.borrow(), [1, 2, 2, 2]);
     }
 }

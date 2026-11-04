@@ -3313,6 +3313,9 @@ fn source_foreground_driver_follows_departure_return_and_live_policy() {
     let (_reader, _) = h.outbound(1);
     let (writer, _) = h.inbound(1);
     opening(&writer, &remote(), true);
+    let mut settings = h.driver.adapter.router().config().settings.clone();
+    settings.take_foreground_on_leave = true;
+    h.driver.adapter.router_mut().set_settings(settings);
     h.attach();
     h.driver.adapter.router_mut().move_pointer_to(peer()).unwrap();
     h.driver.outputs(None);
@@ -3356,6 +3359,9 @@ fn source_foreground_driver_restores_on_normal_return_and_delegates_application_
     let (_reader, _) = h.outbound(1);
     let (writer, _) = h.inbound(1);
     opening(&writer, &remote(), true);
+    let mut settings = h.driver.adapter.router().config().settings.clone();
+    settings.take_foreground_on_leave = true;
+    h.driver.adapter.router_mut().set_settings(settings);
     h.attach();
     h.driver.adapter.router_mut().move_pointer_to(peer()).unwrap();
     h.driver.outputs(None);

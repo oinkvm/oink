@@ -32,7 +32,7 @@ pub(crate) struct Backend {
     pub(crate) api: Option<Arc<dyn AgentApi>>,
     boot: BootInfo,
     update_window: Arc<crate::update_window::Owner>,
-    startup_error: Option<String>,
+    pub(crate) startup: crate::service::Startup,
     pub(crate) remote: Option<RemoteApi>,
     capture: Mutex<Option<oink_agent::telemetry::UiCapture>>,
     pub(crate) control: Mutex<Option<oink_agent::ipc::UiControl>>,
@@ -136,11 +136,13 @@ async fn execute_api_call(
             message: "unknown product window".into(),
         });
     }
+    state
+        .startup
+        .wait()
+        .await
+        .map_err(|message| ApiError::Unavailable { message })?;
     let api = state.api.clone().ok_or_else(|| ApiError::Unavailable {
-        message: state
-            .startup_error
-            .clone()
-            .unwrap_or_else(|| "服务尚未启动，请退出 Oink 后重新打开。".into()),
+        message: "服务尚未启动，请退出 Oink 后重新打开。".into(),
     })?;
     let installing = matches!(
         &request,
@@ -247,9 +249,8 @@ async fn open_diagnostics_folder(window: tauri::WebviewWindow, state: State<'_, 
 pub fn run() {
     oink_agent::logs::init_ui();
     tracing::info!(pid = std::process::id(), "UI process starting");
-    let mut startup_error = None;
     let ui_lock;
-    let mut remote_api = None;
+    let remote_api;
     let api: Option<Arc<dyn AgentApi>> = {
         let data_dir = oink_foundation::paths::data_dir();
         let remote = RemoteApi::new(data_dir.clone());
@@ -280,41 +281,19 @@ pub fn run() {
                 return;
             }
         }
-        #[cfg(windows)]
-        if let Err(error) = std::env::current_exe()
-            .map_err(|e| e.to_string())
-            .and_then(|exe| crate::service::start_once(&remote, &exe))
+        #[cfg(not(windows))]
         {
-            tracing::error!(%error);
-            startup_error = Some(error);
-        }
-        if remote.build_mismatch() {
-            return;
-        }
-        #[cfg(target_os = "macos")]
-        if let Err(error) = crate::service::check_backend_ownership(&data_dir) {
-            tracing::error!(%error, "backend process ownership unavailable");
-            return;
-        }
-        if startup_error.is_none()
-            && let Err(error) = remote.hello()
-        {
-            tracing::error!(%error, "backend unavailable");
-            if remote.build_mismatch() {
+            if let Err(error) = crate::service::check_backend_ownership(&data_dir) {
+                tracing::error!(%error, "backend process ownership unavailable");
                 return;
             }
-            if cfg!(windows) {
-                startup_error = Some(error.to_string());
-            } else {
+            if let Err(error) = remote.hello() {
+                tracing::error!(%error, "backend unavailable");
                 return;
             }
         }
-        if startup_error.is_some() {
-            None
-        } else {
-            remote_api = Some(remote.clone());
-            Some(Arc::new(remote))
-        }
+        remote_api = Some(remote.clone());
+        Some(Arc::new(remote))
     };
     let boot = BootInfo::new(remote_api.is_some());
     let app = tauri::Builder::default()
@@ -331,7 +310,7 @@ pub fn run() {
             api,
             boot,
             update_window: Arc::new(crate::update_window::Owner::default()),
-            startup_error,
+            startup: crate::service::Startup::new(cfg!(windows)),
             remote: remote_api,
             capture: Mutex::new(Some(oink_agent::telemetry::UiCapture::new(
                 oink_foundation::paths::data_dir(),
@@ -431,6 +410,27 @@ pub fn run() {
             if let Some(remote) = handle.state::<Backend>().remote.clone() {
                 let connected = handle.clone();
                 std::thread::spawn(move || {
+                    #[cfg(windows)]
+                    {
+                        let result = std::env::current_exe().map_err(|e| e.to_string())
+                            .and_then(|exe| crate::service::start_once(&remote, &exe));
+                        match result {
+                            Ok(()) => {
+                                connected.state::<Backend>().startup.finish(Ok(()));
+                                crate::native_controls::initialize(&connected);
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, "backend startup failed");
+                                connected.state::<Backend>().startup.finish(Err(error));
+                                if remote.build_mismatch() {
+                                    connected.exit(0);
+                                    return;
+                                }
+                                show_main(&connected);
+                                return;
+                            }
+                        }
+                    }
                     crate::service::follow(
                         &remote,
                         |_| {
@@ -554,6 +554,8 @@ pub fn run() {
         }
         if matches!(event, tauri::RunEvent::Exit) {
             crate::shell::shutdown(handle);
+            // Tauri's event loop exits the process directly, skipping main's guard.
+            oink_agent::logs::flush();
         }
         #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Reopen { .. } = event {

@@ -47,6 +47,13 @@ impl Core {
             return;
         }
         let create = || -> std::io::Result<TcpListener> {
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(socket) = lock(&self.reserved_listener).take() {
+                #[cfg(not(windows))]
+                socket2::SockRef::from(&socket).set_reuse_address(true)?;
+                socket.set_nonblocking(true)?;
+                return TcpListener::from_std(socket);
+            }
             let addr = SocketAddr::new(self.cfg.bind_ip, self.cfg.port);
             let socket = socket2::Socket::new(
                 socket2::Domain::for_address(addr),

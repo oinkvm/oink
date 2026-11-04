@@ -134,6 +134,28 @@ async fn runtime_environment_is_in_startup_and_rekey_segments_before_any_save() 
         assert!(snapshot.button_handoff.is_some());
         assert!(snapshot.settings.contains_key("forward_gestures"));
         assert!(snapshot.routing_numbers.contains_key("remote_scroll_speed"));
+        for key in [
+            "accept_contacts",
+            "touchpad_injection",
+            "native_multifinger",
+            "mac_scroll_feel",
+        ] {
+            assert!(snapshot.settings.contains_key(key), "{key}");
+        }
+        for key in [
+            "capture_state",
+            "capture_failure",
+            "capture_callbacks",
+            "capture_last_valid_us",
+            "capture_last_lift_us",
+            "contact_injection_supported",
+            "contact_injection_initialized",
+            "contact_injection_max_contacts",
+            "contact_injection_init_error_kind",
+            "local_i0_touchpad_contacts",
+        ] {
+            assert!(snapshot.routing_numbers.contains_key(key), "{key}");
+        }
         let encoded = serde_json::to_string(&snapshot).unwrap();
         assert!(!encoded.contains("PRIVATE"));
         assert!(!encoded.contains(&node.id().to_hex()));
@@ -3308,4 +3330,74 @@ fn rejected_provider_item_causes_roundtrip_the_existing_diagnostic_scalar_and_st
         let encoded = serde_json::to_value(availability).unwrap();
         assert_eq!(encoded["reason"], reason.to_string());
     }
+}
+
+#[test]
+fn touchpad_route_and_injection_diagnostics_export_only_reviewed_metadata() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let temp = tempfile::tempdir().unwrap();
+    let source = DeviceId([89; 32]);
+    let r = isolated(temp.path().into(), DeviceId([81; 32]), Some(GroupId([82; 16])), true).unwrap();
+    r.wait_recovery();
+    let subscriber = tracing_subscriber::registry().with(trace::scoped(&r));
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::info!(target: "oink_touchpad_diagnostics", stage=1_u8, reason=13_u8,
+            phase="PRIVATE-TOUCHPAD", path=?"PRIVATE-TOUCHPAD", name="PRIVATE-TOUCHPAD", x=987654321_u64,
+            serial=987654321_u64, "PRIVATE-TOUCHPAD");
+    });
+    use oink_routing::router::RoutingDiagnostics;
+    let input = input_trace::InputTrace::for_recorder(&r);
+    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+        input.touchpad_injected(
+            &oink_input::InjectEvent::Gesture(oink_input::Gesture::SmartMagnify),
+            Some(source),
+            &Err(oink_input::InputError::Platform("PRIVATE-TOUCHPAD".into())),
+        );
+        input.touchpad_source(oink_routing::router::TouchpadSource {
+            source,
+            fields: [3, 0, 0, 0, 1, 1, 0, 0, 11],
+        });
+        input.touchpad_route(oink_routing::router::TouchpadRoute {
+            source,
+            fields: [2, 0, 0, 0, 4, 0, 11, 1, 5, 1, 1, 1, 1],
+        });
+    });
+    input.drain(&r);
+    let bundle = r.save(Reason::Manual).unwrap();
+    if let Some(output) = std::env::var_os("OINK_TOUCHPAD_DIAGNOSTICS_EVIDENCE") {
+        std::fs::copy(
+            &bundle.path,
+            std::path::Path::new(&output).join("touchpad-metadata-fixture.zip"),
+        )
+        .unwrap();
+    }
+    let rows = timeline(&bundle.path, "merged.ndjson");
+    let logs: Vec<_> = rows
+        .iter()
+        .filter_map(|row| row["event"].get("Log"))
+        .filter(|log| log["module"] == "oink_touchpad_diagnostics")
+        .collect();
+    assert_eq!(logs.len(), 4);
+    let fields = |index: usize| -> std::collections::BTreeMap<String, f64> {
+        serde_json::from_value::<Vec<(String, f64)>>(logs[index]["fields"].clone())
+            .unwrap()
+            .into_iter()
+            .collect()
+    };
+    assert_eq!(fields(0).len(), 2);
+    assert!(logs[0]["labels"].as_array().unwrap().is_empty());
+    assert_eq!(fields(1)["error_kind"], 4.);
+    assert_eq!(fields(1)["success"], 0.);
+    assert_eq!(fields(2)["mode"], 3.);
+    assert_eq!(fields(3)["path"], 0.);
+    assert_eq!(fields(3)["allowed"], 0.);
+    assert_eq!(
+        logs[3]["labels"],
+        serde_json::json!([["source", r.anonymizer().device(source)]])
+    );
+    let text = serde_json::to_string(&logs).unwrap();
+    assert!(!text.contains("PRIVATE-TOUCHPAD"));
+    assert!(!text.contains("987654321"));
+    assert!(!text.contains(&source.to_hex()));
+    r.shutdown();
 }

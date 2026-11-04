@@ -31,9 +31,16 @@ pub(crate) enum BackendLaunch {
     },
     Started {
         pid: u32,
+        /// Query/synchronize-only handle duplicated into the authenticated caller.
+        process_handle: u64,
     },
     Failed {
         error: String,
+    },
+    /// No backend was created. Retry only after the pinned old network process
+    /// exits; this handle grants synchronization only.
+    PreloginStopping {
+        process_handle: u64,
     },
     /// Read the machine-level pre-login state for the calling user.
     PreloginStatus,
@@ -72,9 +79,10 @@ impl BackendLaunch {
                     out.extend_from_slice(&unit.to_le_bytes());
                 }
             }
-            Self::Started { pid } => {
+            Self::Started { pid, process_handle } => {
                 out.push(2);
                 out.extend_from_slice(&pid.to_le_bytes());
+                out.extend_from_slice(&process_handle.to_le_bytes());
             }
             Self::Failed { error } => {
                 if error.len() > MAX_ERROR {
@@ -83,6 +91,13 @@ impl BackendLaunch {
                 out.push(3);
                 out.extend_from_slice(&(error.len() as u32).to_le_bytes());
                 out.extend_from_slice(error.as_bytes());
+            }
+            Self::PreloginStopping { process_handle } => {
+                if *process_handle == 0 {
+                    return Err(invalid());
+                }
+                out.push(9);
+                out.extend_from_slice(&process_handle.to_le_bytes());
             }
             Self::PreloginStatus => out.push(4),
             Self::PreloginClaim => out.push(5),
@@ -151,7 +166,10 @@ impl BackendLaunch {
                     Self::Reopen { environment, directory }
                 })
             }
-            2 if bytes.len() == 9 => Ok(Self::Started { pid: number(5)? }),
+            2 if bytes.len() == 17 => Ok(Self::Started {
+                pid: number(5)?,
+                process_handle: u64::from_le_bytes(bytes[9..17].try_into().map_err(|_| invalid())?),
+            }),
             3 => {
                 let len = number(5)? as usize;
                 if len > MAX_ERROR || bytes.len() != 9 + len {
@@ -162,6 +180,13 @@ impl BackendLaunch {
                 })
             }
             4 if bytes.len() == 5 => Ok(Self::PreloginStatus),
+            9 if bytes.len() == 13 => {
+                let process_handle = u64::from_le_bytes(bytes[5..13].try_into().map_err(|_| invalid())?);
+                if process_handle == 0 {
+                    return Err(invalid());
+                }
+                Ok(Self::PreloginStopping { process_handle })
+            }
             5 if bytes.len() == 5 => Ok(Self::PreloginClaim),
             6 if bytes.len() == 5 => Ok(Self::PreloginRelease),
             7 if bytes.len() >= 6 => {
@@ -216,8 +241,12 @@ mod tests {
                 environment: vec![1, 0, 0],
                 directory: vec![2, 0],
             },
-            BackendLaunch::Started { pid: 17 },
+            BackendLaunch::Started {
+                pid: 17,
+                process_handle: 0x12345678,
+            },
             BackendLaunch::Failed { error: "denied".into() },
+            BackendLaunch::PreloginStopping { process_handle: 123 },
             BackendLaunch::PreloginStatus,
             BackendLaunch::PreloginClaim,
             BackendLaunch::PreloginRelease,
@@ -244,7 +273,7 @@ mod tests {
             extra.push(0);
             assert!(BackendLaunch::decode(&extra).is_err());
             let mut unknown = frame;
-            unknown[4] = 9;
+            unknown[4] = u8::MAX;
             assert!(BackendLaunch::decode(&unknown).is_err());
         }
         assert!(BackendLaunch::decode(&[0; 20]).is_err());
