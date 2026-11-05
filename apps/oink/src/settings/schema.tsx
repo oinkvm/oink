@@ -201,6 +201,7 @@ export const SECTIONS: SectionMeta[] = [
         },
         icon: <SpeakerIcon />,
         items: [
+            { id: 'audioEncodingQuality', get label() { return tr('音频质量'); }, get desc() { return tr('决定转发音频到其它设备时使用的编码参数，更高质量可能引入更大延迟或带宽需求'); } },
             { id: 'audioDevice', get label() {
                     return tr('音频输出设备');
                 }, get desc() {

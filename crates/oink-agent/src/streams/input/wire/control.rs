@@ -139,7 +139,17 @@ pub(super) fn encode(value: &ControlMsg) -> v1::Result<Message> {
                 (4, request.id.write()),
             ]))?)
         }
-        ControlMsg::ApplicationFocus(value) => super::application_focus::encode(value)?,
+        ControlMsg::LocalClick {
+            epoch,
+            holder,
+            scope: members,
+            phase,
+        } => Message::ControlLocalClick(w::ControlLocalClick::from_raw(map([
+            (1, epoch.write()),
+            (2, device(*holder).write()),
+            (3, scope(Some(members))?.write()),
+            (4, phase.write()),
+        ]))?),
         ControlMsg::MovePointer { epoch, target } => {
             Message::ControlMovePointer(w::ControlMovePointer::from_raw(map([
                 (1, epoch.write()),
@@ -149,7 +159,14 @@ pub(super) fn encode(value: &ControlMsg) -> v1::Result<Message> {
         ControlMsg::Feel { profile } => {
             Message::ControlFeel(w::ControlFeel::from_raw(map([(1, feel(profile)?.write())]))?)
         }
-        ControlMsg::FocusEnter {
+        ControlMsg::MovePointerEnter {
+            epoch,
+            display,
+            pos,
+            scope: members,
+            pointer_source,
+        }
+        | ControlMsg::FocusEnter {
             epoch,
             display,
             pos,
@@ -157,13 +174,18 @@ pub(super) fn encode(value: &ControlMsg) -> v1::Result<Message> {
             pointer_source,
         } => {
             let members = members.as_ref().ok_or(v1::ErrorCode::StateConflict)?;
-            Message::ControlFocusEnter(w::ControlFocusEnter::from_raw(map([
+            let enter = w::ControlFocusEnter::from_raw(map([
                 (1, epoch.write()),
                 (2, Text::<512>(display.clone()).write()),
                 (3, point(*pos)?.write()),
                 (4, scope(Some(members))?.write()),
                 (5, pointer_source.map(device).write()),
-            ]))?)
+            ]))?;
+            if matches!(value, ControlMsg::MovePointerEnter { .. }) {
+                Message::ControlMovePointerEnter(enter)
+            } else {
+                Message::ControlFocusEnter(enter)
+            }
         }
         ControlMsg::FocusState {
             epoch,
@@ -200,9 +222,6 @@ pub(super) fn encode(value: &ControlMsg) -> v1::Result<Message> {
         }
         ControlMsg::FocusLock { state } => {
             Message::ControlFocusLock(w::ControlFocusLock::from_raw(map([(1, lock(state)?.write())]))?)
-        }
-        ControlMsg::IdentifyScreens { id } => {
-            Message::ControlIdentifyScreens(w::ControlIdentifyScreens::from_raw(map([(1, id.write())]))?)
         }
         ControlMsg::GameMode {
             epoch,
@@ -264,7 +283,12 @@ pub(super) fn decode(value: Message) -> v1::Result<ControlMsg> {
                 id: v.request_id()?,
             })
         }
-        Message::ApplicationFocus(value) => ControlMsg::ApplicationFocus(super::application_focus::decode(value)?),
+        Message::ControlLocalClick(v) => ControlMsg::LocalClick {
+            epoch: v.epoch()?,
+            holder: read_device(v.holder()?)?,
+            scope: read_scope(v.scope()?)?,
+            phase: v.phase()?,
+        },
         Message::ControlMovePointer(v) => ControlMsg::MovePointer {
             epoch: v.epoch()?,
             target: read_device(v.target()?)?,
@@ -273,6 +297,13 @@ pub(super) fn decode(value: Message) -> v1::Result<ControlMsg> {
             profile: read_feel(v.profile()?)?,
         },
         Message::ControlFocusEnter(v) => ControlMsg::FocusEnter {
+            epoch: v.epoch()?,
+            display: v.display()?.0,
+            pos: read_point(v.pos()?)?,
+            scope: Some(read_scope(v.scope()?)?),
+            pointer_source: v.pointer_source()?.map(read_device).transpose()?,
+        },
+        Message::ControlMovePointerEnter(v) => ControlMsg::MovePointerEnter {
             epoch: v.epoch()?,
             display: v.display()?.0,
             pos: read_point(v.pos()?)?,
@@ -305,7 +336,6 @@ pub(super) fn decode(value: Message) -> v1::Result<ControlMsg> {
         Message::ControlFocusLock(v) => ControlMsg::FocusLock {
             state: read_lock(v.state()?)?,
         },
-        Message::ControlIdentifyScreens(v) => ControlMsg::IdentifyScreens { id: v.id()? },
         Message::ControlGameMode(v) => ControlMsg::GameMode {
             epoch: v.epoch()?,
             generation: v.generation()?,
@@ -395,5 +425,36 @@ mod tests {
             pointer_source: Some(DeviceId([2; 32])),
         };
         assert_eq!(decode(encode(&enter).unwrap()).unwrap(), enter);
+    }
+    #[test]
+    fn pointer_shortcut_entry_roundtrips_without_becoming_an_edge_entry() {
+        let entry = ControlMsg::MovePointerEnter {
+            epoch: 19,
+            display: "hidden".into(),
+            pos: Point::new(-200., 350.),
+            scope: Some(FocusScope {
+                members: vec![(DeviceId([1; 32]), [3; 16]), (DeviceId([2; 32]), [4; 16])],
+            }),
+            pointer_source: Some(DeviceId([1; 32])),
+        };
+        let encoded = encode(&entry).unwrap();
+        assert_eq!(encoded.type_id(), 0x1301);
+        assert_eq!(decode(encoded).unwrap(), entry);
+    }
+    #[test]
+    fn local_click_phases_roundtrip() {
+        for phase in 0..=5 {
+            let value = ControlMsg::LocalClick {
+                epoch: 42,
+                holder: DeviceId([1; 32]),
+                scope: FocusScope {
+                    members: vec![(DeviceId([1; 32]), [2; 16])],
+                },
+                phase,
+            };
+            let wire = encode(&value).unwrap();
+            assert_eq!(wire.type_id(), 0x1302);
+            assert_eq!(decode(wire).unwrap(), value);
+        }
     }
 }

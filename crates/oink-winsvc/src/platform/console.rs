@@ -247,7 +247,19 @@ pub(super) fn register(process: &Handle, id: u32, sid: &[u8]) -> io::Result<()> 
     });
     // The launch path verified this was the active console, never an RDP source.
     registry.owner.0 = Some(id);
+    super::broker::changed();
     Ok(())
+}
+
+pub(super) fn processes() -> io::Result<Vec<Handle>> {
+    let registry = registry().lock().unwrap_or_else(|e| e.into_inner());
+    // Duplicate under the registry lock; never return a borrowed handle that a
+    // concurrent handoff or session cleanup could close before registration.
+    registry
+        .children
+        .iter()
+        .map(|child| child.process.duplicate())
+        .collect()
 }
 
 pub(super) fn select(id: u32, account: &Account, prelogin: Option<Source>) -> Option<Source> {

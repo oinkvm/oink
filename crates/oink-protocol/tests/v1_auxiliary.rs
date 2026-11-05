@@ -1,15 +1,6 @@
-use oink_protocol::v1::{self, ErrorCode, RawValue as V, dto::*, schema::WireDto};
+use oink_protocol::v1::{self, ErrorCode, RawValue as V};
 use oink_test_support::protocol as support;
 
-#[test]
-fn game_state_uses_reference_lengths_and_keeps_future_phase() {
-    let mut raw = support::sample_named("AimState");
-    raw.insert(3, V::Uint(99));
-    let state = AimState::from_raw(raw.clone()).unwrap();
-    assert_eq!(state.phase().unwrap(), AimPhase::Unknown(99));
-    raw.insert(7, V::F32(7.0));
-    assert_eq!(AimState::from_raw(raw).unwrap_err().code, ErrorCode::UnsupportedValue);
-}
 #[test]
 fn wallpaper_payload_is_bounded_before_materialization() {
     let mut screen = support::sample_named("ScreenWallpaper");

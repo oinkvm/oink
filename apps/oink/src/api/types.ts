@@ -126,7 +126,7 @@ export interface GroupView { id: GroupKey | null; members: Member[] }
 
 export type InterfaceKind = "ethernet" | "wifi" | "vpn" | "other";
 export interface LocalAddress { ip: string; interface: string; kind: InterfaceKind }
-export interface NetworkInfo { addresses: LocalAddress[]; port: number }
+export interface NetworkInfo { addresses: LocalAddress[]; port: number; low_port?: number | null }
 
 export interface DisplayInfo {
   key: string;
@@ -187,6 +187,8 @@ export interface Hotkey { action: HotkeyAction; device?: DeviceKey; keys: string
 export type EventFrequency = "hz125" | "unlimited";
 export interface KeySupport { macos: number[]; windows: number[] }
 export interface InputSettings {
+  /** Read-only recovery chord provided by the router. */
+  keyboard_release_keys: string[];
   mac_caps_switches_input_source: boolean | null;
   key_support: KeySupport;
   /** Local normal pointer-motion rate; persisted by the settings owner. */
@@ -211,7 +213,6 @@ export interface InputSettings {
   return_pointer_on_display_sleep: boolean;
   wake_displays_on_input: boolean;
 
-  application_focus_enabled: boolean;
   cursor_trail: boolean;
   cursor_trail_duration_ms: number;
   /** Group setting, stored and shared with the layout. */
@@ -304,39 +305,6 @@ export interface GameModeStatus {
   cursor_hiding_cause_available: boolean | null;
 }
 
-export type AimPhase = "idle" | "countdown" | "running" | "finished";
-export interface AimResult {
-
-  native_input: boolean;
-
-  mode_changed: boolean;
-  score: number;
-  clicks: number;
-
-  accuracy: number | null;
-  hits_per_sec: number;
-  avg_hit_interval_ms: number | null;
-  played_ms: number;
-  completed: boolean;
-  devices: number;
-  ended_at_ms: number;
-}
-export interface AimStatus {
-  available: boolean;
-  phase: AimPhase;
-
-  host: boolean;
-
-  native_input: boolean;
-  remaining_ms: number;
-  score: number;
-  clicks: number;
-  devices: number;
-  target_diameter: number;
-  duration_ms: number;
-  results: AimResult[];
-}
-
 export type ApiEvent =
   | { type: "no_shared_microphone" }
   | import('./layoutProfiles').LayoutProfilesEvent
@@ -371,7 +339,6 @@ export type ApiEvent =
   | { type: "emergency_stop"; data: EmergencyStop }
 
   | { type: "show_window" }
-  | { type: "aim"; data: AimStatus }
 
   | { type: "wallpapers" };
 
@@ -440,14 +407,13 @@ export interface DiagnosticRecorderStatus {
 }
 
 export type AudioDeviceId = number[];
-export type AudioFormat = "pcm16_2p5ms" | "opus5ms";
 export type AudioCapturePermission = "not_requested" | "unknown" | "authorized" | "denied" | "not_required";
 export interface AudioSettings {
   receive_output: string | null;
   forwarding_off_reason: "local_volume_changed" | "default_output_changed" | null;
   keep_local_playback: boolean;
   capture_scope: "default_output" | "global";
-  preferred_format: AudioFormat;
+  quality: 'smooth' | 'quality' | 'lossless';
   /** Local speaker source only; has no effect while this device is the exit. */
   forwarding_enabled: boolean;
   /** Local speaker forwarding gain, integer 0–200; 100 is unchanged. */
@@ -548,6 +514,8 @@ export interface AudioReceiverStats {
   startup_wait_ms: number;
   adaptation_hold_frames: number;
   adaptation_hold_ms: number;
+  quiet_discarded_ms: number;
+  quiet_inserted_ms: number;
   target_increases: number;
   target_decreases: number;
   gap_plc_frames: number;

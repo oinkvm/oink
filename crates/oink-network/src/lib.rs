@@ -150,9 +150,7 @@ pub struct TcpBulkStatus {
     pub first_dial_failure: Option<String>,
     pub pacing: Option<LowPacingStatus>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BulkTransport {
-    TcpTls,
-}
 
 pub mod pointer_slots;
+
+mod listeners;

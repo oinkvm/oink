@@ -110,32 +110,9 @@ impl Context<'_> {
         self.failure(code, Some(type_id), None)
     }
 
-    /// Optional execution-bearing key fields require their own negotiated
-    /// capability even though the containing key message is baseline input.
-    /// Inspect the borrowed map before allocating any retained payload tree.
+    /// Header admission before allocating any retained payload tree.
     pub fn admit_frame(&self, frame: OpaqueFrame<'_>) -> std::result::Result<(), Violation> {
-        self.admit(frame.header)?;
-        if matches!(frame.header.type_id, 0x0202 | 0x0205 | 0x0207) {
-            let present = super::hot::Map::parse(frame.payload(), limits::RELIABLE_FRAME)
-                .and_then(|map| {
-                    let route = map.field(103)?;
-                    if frame.header.type_id == 0x0205 && route.is_none() {
-                        map.field(104)
-                    } else {
-                        Ok(route)
-                    }
-                })
-                .map_err(|error| self.failure(error.code, Some(frame.header.type_id), None))?
-                .is_some();
-            if present && !self.agreement.contains("oink.input.application-focus/1") {
-                return Err(self.failure(
-                    ErrorCode::UnnegotiatedCapability,
-                    Some(frame.header.type_id),
-                    Some("oink.input.application-focus/1"),
-                ));
-            }
-        }
-        Ok(())
+        self.admit(frame.header)
     }
 
     fn failure(&self, code: ErrorCode, type_id: Option<u16>, capability: Option<&'static str>) -> Violation {

@@ -210,6 +210,7 @@ fn target_started(generation: u64, start: Instant, end: Instant) {
                 generation,
                 at: start,
                 transport: None,
+                codec: None,
             },
             Metric::DragTargetStart { boundary },
             end,

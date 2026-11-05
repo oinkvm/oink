@@ -147,7 +147,7 @@ impl AgentHost {
         let provider_startup = crate::file_provider::startup::prepare(&net.data_dir)?;
         let opts = NodeOptions::platform(net)?;
         tracing::info!("platform backends prepared");
-        let mut host = Self::start_on_runtime(opts, ipc, rt, termination, Node::start, None)?;
+        let mut host = Self::start_on_runtime(opts, ipc, rt, termination, Node::start)?;
         host._instance = Some(lock);
         #[cfg(target_os = "macos")]
         {
@@ -165,14 +165,7 @@ impl AgentHost {
             let _enter = rt.enter();
             Termination::listen()?
         };
-        let mut host = Self::start_on_runtime(
-            opts,
-            IpcMode::Required,
-            rt,
-            termination,
-            Node::start_launch_smoke,
-            Some(0),
-        )?;
+        let mut host = Self::start_on_runtime(opts, IpcMode::Required, rt, termination, Node::start_launch_smoke)?;
         host._instance = Some(lock);
         Ok(host)
     }
@@ -186,7 +179,7 @@ impl AgentHost {
             let _enter = rt.enter();
             Termination::listen()?
         };
-        let mut host = Self::start_on_runtime(opts, IpcMode::Off, rt, termination, Node::start_prelogin, None)?;
+        let mut host = Self::start_on_runtime(opts, IpcMode::Off, rt, termination, Node::start_prelogin)?;
         host._instance = Some(lock);
         Ok(host)
     }
@@ -223,7 +216,7 @@ impl AgentHost {
             let _enter = rt.enter();
             Termination::listen()?
         };
-        Self::start_on_runtime(opts, mode, rt, termination, start, None)
+        Self::start_on_runtime(opts, mode, rt, termination, start)
     }
 
     fn start_on_runtime<F>(
@@ -232,7 +225,6 @@ impl AgentHost {
         rt: tokio::runtime::Runtime,
         termination: Termination,
         start: impl FnOnce(NodeOptions) -> F,
-        ipc_port: Option<u16>,
     ) -> anyhow::Result<Self>
     where
         F: std::future::Future<Output = anyhow::Result<Node>>,
@@ -242,8 +234,11 @@ impl AgentHost {
         let listener = match mode {
             IpcMode::Off => None,
             IpcMode::Optional | IpcMode::Required => {
-                let port = ipc_port.unwrap_or_else(|| ipc::Server::configured_port(opts.net.port));
-                match rt.block_on(tokio::net::TcpListener::bind(("127.0.0.1", port))) {
+                let result = {
+                    let _enter = rt.enter();
+                    ipc::Listener::bind(&opts.net.data_dir, "agent")
+                };
+                match result {
                     Ok(listener) => Some(listener),
                     Err(error) if mode == IpcMode::Optional => {
                         tracing::warn!(%error, "local IPC unavailable");
@@ -753,13 +748,15 @@ mod lifecycle_tests {
     fn required_ipc_bind_failure_precedes_node_startup() {
         let _scenario =
             crate::test_watchdog::Scenario::new(module_path!(), "required_ipc_bind_failure_precedes_node_startup");
-        let occupied = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = occupied.local_addr().unwrap().port();
         let dir = tempfile::tempdir().unwrap();
+        let rt = runtime().unwrap();
+        let _enter = rt.enter();
+        let occupied = ipc::Listener::bind(dir.path(), "agent").unwrap();
+        drop(_enter);
         let input = Arc::new(oink_test_support::input::FakeInput::new());
         let result = AgentHost::start_with(
             NodeOptions {
-                net: oink_test_support::network_config(dir.path().into(), "ipc-required", port - 2),
+                net: oink_test_support::network_config(dir.path().into(), "ipc-required", 0),
                 input: input.clone(),
                 displays: vec![],
                 display_backend: None,
@@ -772,11 +769,8 @@ mod lifecycle_tests {
         );
         assert!(result.unwrap_err().to_string().contains("IPC"));
         assert!(input.mode().is_none());
-        assert_eq!(
-            std::fs::read_dir(dir.path()).unwrap().count(),
-            0,
-            "Node wrote startup state"
-        );
+        assert!(!dir.path().join("identity.json").exists(), "Node wrote startup state");
+        drop(occupied);
     }
 
     #[test]
@@ -804,8 +798,8 @@ mod lifecycle_tests {
             IpcMode::Required,
         )
         .expect("failed publication must not tear down the backend");
-        let port = host.ipc.as_ref().unwrap().port();
-        assert!(std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_ok());
+        let address = host.ipc.as_ref().unwrap().address();
+        assert!(address.connect(Duration::from_secs(1)).is_ok());
         let remote = crate::remote::RemoteApi::new(dir.path());
         assert!(remote.hello().is_err());
         std::fs::remove_dir(&endpoint).unwrap();
@@ -817,7 +811,7 @@ mod lifecycle_tests {
             assert!(Instant::now() < deadline, "endpoint never became readable");
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(ipc::Endpoint::read(dir.path()).unwrap().port, port);
+        assert_eq!(ipc::Endpoint::read(dir.path()).unwrap().address, address);
         input.armed.store(true, std::sync::atomic::Ordering::Release);
         assert_returns_before_native_stop(entering, release, completing, move || host.shutdown());
         assert!(!endpoint.exists());

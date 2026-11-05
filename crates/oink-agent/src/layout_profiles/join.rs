@@ -94,6 +94,25 @@ pub(super) fn list(root: &Path, group: GroupKey) -> Result<Vec<Join>> {
     }
     Ok(out)
 }
+/// The node is the sole writer of join bindings. Reload on its durable writes
+/// and on group changes, not on each peer's two-second delivery retry.
+#[derive(Debug, Default)]
+pub(super) struct JoinCache {
+    current: Option<(GroupKey, Vec<Join>)>,
+}
+impl JoinCache {
+    fn load(&mut self, root: &Path, group: GroupKey) -> Result<&mut Vec<Join>> {
+        if self.current.as_ref().is_none_or(|(cached, _)| *cached != group) {
+            self.current = None;
+            self.current = Some((group, list(root, group)?));
+        }
+        Ok(&mut self.current.as_mut().expect("loaded joins").1)
+    }
+    fn invalidate(&mut self) {
+        self.current = None;
+    }
+}
+
 pub(super) fn awaiting_catalog(root: &Path, group: GroupKey) -> Result<Option<Catalog>> {
     let mut group = group;
     let mut visited = std::collections::HashSet::new();
@@ -166,6 +185,10 @@ impl Node {
         } else {
             None
         };
+        let mut cached = lock(&self.inner.profiles.joins);
+        // A durable replace can fail after rename. Even that outcome must
+        // retire an earlier empty scan before admission retries the binding.
+        cached.invalidate();
         save(
             &self.inner.data_dir,
             &Join {
@@ -199,14 +222,17 @@ impl Node {
                 .map(|m| DeviceKey(m.device))
                 .collect(),
             },
-        )
+        )?;
+        self.inner.profiles.wake.notify_waiters();
+        Ok(())
     }
 
     pub(super) fn pending_profile_joins(&self, peer: oink_foundation::DeviceId) -> Result<Vec<Join>> {
         let group = self.group_id().ok_or_else(|| failure("group unavailable"))?.into();
         let current = lock(&self.inner.profiles.data).catalog.clone();
         let mut pending = Vec::new();
-        for mut join in list(&self.inner.data_dir, group)? {
+        let mut cached = lock(&self.inner.profiles.joins);
+        for join in cached.load(&self.inner.data_dir, group)? {
             if join.initiator.0 != self.id() || join.acceptor.0 != peer || join.catalog.is_none() {
                 continue;
             }
@@ -214,10 +240,12 @@ impl Node {
                 .as_ref()
                 .is_some_and(|c| c.group == group && c.completed_joins.contains_key(&join.id))
             {
-                join.catalog = None;
-                save(&self.inner.data_dir, &join)?;
+                let mut completed = join.clone();
+                completed.catalog = None;
+                save(&self.inner.data_dir, &completed)?;
+                *join = completed;
             } else {
-                pending.push(join);
+                pending.push(join.clone());
             }
         }
         Ok(pending)
@@ -227,6 +255,22 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn idle_join_retries_use_retained_bindings_until_invalidated() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = GroupKey(oink_foundation::GroupId([2; 16]));
+        let mut cache = JoinCache::default();
+        assert!(cache.load(dir.path(), group).unwrap().is_empty());
+        // Make a scan fail: stable retry must not reopen storage at all.
+        std::fs::write(dir.path().join("layout-profile-joins"), b"not a directory").unwrap();
+        for _ in 0..30 {
+            assert!(cache.load(dir.path(), group).unwrap().is_empty());
+        }
+        cache.invalidate();
+        assert!(cache.load(dir.path(), group).is_err());
+        assert!(cache.current.is_none());
+    }
+
     #[test]
     fn completed_older_join_bindings_do_not_block_listing_new_pending_joins() {
         let dir = tempfile::tempdir().unwrap();

@@ -13,6 +13,7 @@ pub struct Publication {
     serial: tokio::sync::Mutex<()>,
     state: Mutex<State>,
     changed: tokio::sync::Notify,
+    stopped: tokio::sync::Notify,
 }
 #[derive(Default)]
 struct State {
@@ -67,6 +68,7 @@ impl Publication {
             serial: tokio::sync::Mutex::new(()),
             state: Mutex::default(),
             changed: tokio::sync::Notify::new(),
+            stopped: tokio::sync::Notify::new(),
         }
     }
     pub fn set_demand(&self, demand: Demand) {
@@ -74,6 +76,9 @@ impl Publication {
     }
     pub async fn prepare(&self) -> io::Result<Linked> {
         let _serial = self.serial.lock().await;
+        let stopped = self.stopped.notified();
+        tokio::pin!(stopped);
+        stopped.as_mut().enable();
         let demand = *self.demand.lock().unwrap();
         {
             let state = self.state.lock().unwrap();
@@ -86,13 +91,16 @@ impl Publication {
                 return Err(unavailable(Unavailable::Cancelled));
             }
         }
-        let linked = Linked::acquire(
+        let acquire = Linked::acquire(
             self.offer,
             self.roots.iter().map(|root| root.id).collect(),
             demand,
             self.link.clone(),
-        )
-        .await?;
+        );
+        let linked = tokio::select! {
+            _ = stopped => return Err(unavailable(Unavailable::Cancelled)),
+            linked = acquire => linked?,
+        };
         let mut state = self.state.lock().unwrap();
         if state.cancelled {
             return Err(unavailable(Unavailable::Cancelled));
@@ -129,14 +137,27 @@ impl Publication {
     pub fn ready(&self) -> io::Result<Linked> {
         self.runtime.block_on(self.prepare())
     }
+    pub(crate) fn ready_while(&self, current: &dyn Fn() -> bool) -> io::Result<Linked> {
+        if !current() {
+            return Err(unavailable(Unavailable::Cancelled));
+        }
+        self.runtime.block_on(async {
+            tokio::select! {
+                result = self.prepare() => result,
+                _ = async { while current() { tokio::time::sleep(Duration::from_millis(10)).await; } } =>
+                    Err(unavailable(Unavailable::Cancelled)),
+            }
+        })
+    }
     pub fn bind_native(&self, native: Weak<dyn NativeFiles>) -> io::Result<()> {
         let mut state = self.state.lock().unwrap();
         let owner = native.upgrade().ok_or_else(|| unavailable(Unavailable::Cancelled))?;
-        let linked = state
-            .linked
-            .as_ref()
-            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
-        owner.persist_link(linked.descriptor())?;
+        // A clipboard cache receiver can be registered from Offer metadata,
+        // before acquiring source authority. prepare() persists the descriptor
+        // into every registered native owner before allowing a body read.
+        if let Some(linked) = state.linked.as_ref() {
+            owner.persist_link(linked.descriptor())?;
+        }
         state.native.retain(|native| native.strong_count() != 0);
         if !state.native.iter().any(|existing| existing.ptr_eq(&native)) {
             state.native.push(native);
@@ -178,5 +199,14 @@ impl Publication {
             linked.cancel();
         }
         self.changed.notify_waiters();
+        self.stopped.notify_waiters();
+    }
+    /// A failed five-second cache read owns no persistent linked received item.
+    /// Unlike ordinary clipboard replacement, stop its live network readers.
+    pub fn cancel_receiving(&self) {
+        if let Some(linked) = self.state.lock().unwrap().linked.as_ref() {
+            linked.cancel();
+        }
+        self.cancel();
     }
 }

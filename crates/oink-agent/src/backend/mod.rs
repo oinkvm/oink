@@ -9,7 +9,8 @@
 pub mod cli;
 pub mod foreground;
 pub mod launch;
-pub mod overlay;
+#[cfg(windows)]
+mod main_windows;
 
 use crate::api::{ApiError, ApiEvent, ApiResult};
 use crate::node::Node;
@@ -356,7 +357,7 @@ pub(crate) fn on_main(work: impl FnOnce() + Send + 'static) {
     #[cfg(target_os = "macos")]
     macos::on_main(work);
     #[cfg(windows)]
-    overlay::on_main(work);
+    main_windows::on_main(work);
     #[cfg(not(any(target_os = "macos", windows)))]
     work();
 }
@@ -366,7 +367,7 @@ pub(crate) fn on_main(work: impl FnOnce() + Send + 'static) {
 pub(crate) fn run_main<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
     #[cfg(windows)]
     {
-        overlay::run_main(work)
+        main_windows::run_main(work)
     }
     #[cfg(not(windows))]
     {
@@ -516,7 +517,7 @@ mod startup_tests {
                 sent.send(()).unwrap();
             }
         }));
-        let server = crate::ipc::Server::start_on(node.clone(), 0).await.unwrap();
+        let server = crate::ipc::Server::start(node.clone()).await.unwrap();
         assert!(claim_instance(dir.path()).unwrap().is_none());
         received.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         assert!(received.try_recv().is_err(), "only one open request is sent");

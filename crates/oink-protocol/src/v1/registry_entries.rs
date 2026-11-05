@@ -2,13 +2,11 @@
 message_registry! {
     0x0001 => ProtocolError(ProtocolError), [Route {kind:0, transport:Transport::Reliable, extra_capabilities:&[]}, Route {kind:2, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.core/1"], Allow;
     0x0002 => Negotiated(Negotiated), [Route {kind:0, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.core/1"], Allow;
-    0x0003 => StreamOpened(StreamOpened), [Route {kind:0, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.core/1"], Allow;
     0x0100 => ControlFeel(ControlFeel), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1"], Suspend;
     0x0101 => ControlFocusEnter(ControlFocusEnter), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1"], Suspend;
     0x0102 => ControlFocusState(ControlFocusState), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1"], Suspend;
     0x0103 => ControlSetFocusLock(ControlSetFocusLock), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1"], Suspend;
     0x0104 => ControlFocusLock(ControlFocusLock), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1"], Suspend;
-    0x0105 => ControlIdentifyScreens(ControlIdentifyScreens), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1"], Suspend;
     0x0106 => ControlGameMode(ControlGameMode), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1", "oink.input.relative/1"], Suspend;
     0x0107 => ControlSetGameMode(ControlSetGameMode), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1", "oink.input.relative/1"], Suspend;
     0x0108 => ControlFocusResume(ControlFocusResume), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1"], Suspend;
@@ -71,18 +69,11 @@ message_registry! {
     0x0617 => MicrophoneStop(MicrophoneStop), [Route {kind:5, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.audio/1", "oink.audio.microphone/1"], Suspend;
     0x0618 => MicrophonePacket(MicrophonePacket), [Route {kind:5, transport:Transport::Datagram, extra_capabilities:&[]}], ["oink.audio/1", "oink.audio.microphone/1"], Suspend;
     0x0619 => MicrophoneSleep(MicrophoneSleep), [Route {kind:5, transport:Transport::Datagram, extra_capabilities:&[]}], ["oink.audio/1", "oink.audio.microphone/1"], Suspend;
-    0x0700 => AimOpen(AimOpen), [Route {kind:7, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.aim/1"], Allow;
-    0x0701 => AimJoined(AimJoined), [Route {kind:7, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.aim/1"], Allow;
-    0x0702 => AimDeclined(AimDeclined), [Route {kind:7, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.aim/1"], Allow;
-    0x0703 => AimState(AimState), [Route {kind:7, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.aim/1"], Allow;
-    0x0704 => AimClick(AimClick), [Route {kind:7, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.aim/1"], Allow;
-    0x0705 => AimClose(AimClose), [Route {kind:7, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.aim/1"], Allow;
     0x0800 => WallpaperSet(WallpaperSet), [Route {kind:9, transport:Transport::Low, extra_capabilities:&[]}], ["oink.wallpaper/1", "oink.low/1"], Suspend;
     0x0901 => DiscoveryBeacon(Advert), [Route {kind:65535, transport:Transport::Discovery, extra_capabilities:&[]}], [], Allow;
     0x0902 => DiscoveryQuery(DiscoveryQuery), [Route {kind:65535, transport:Transport::Discovery, extra_capabilities:&[]}], [], Allow;
     0x0903 => DiscoveryReply(DiscoveryReply), [Route {kind:65535, transport:Transport::Discovery, extra_capabilities:&[]}], [], Allow;
     0x0a00 => DiagnosticsHello(DiagnosticsHello), [Route {kind:8, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.diagnostics.collect/1"], Allow;
-    0x0a01 => DiagnosticsGoodbye(DiagnosticsGoodbye), [Route {kind:8, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.diagnostics.collect/1"], Allow;
     0x0a02 => DiagnosticsRequest(DiagnosticsRequest), [Route {kind:8, transport:Transport::Low, extra_capabilities:&[]}], ["oink.diagnostics.collect/1", "oink.low/1"], Allow;
     0x0a03 => DiagnosticsResponse(DiagnosticsResponse), [Route {kind:8, transport:Transport::Low, extra_capabilities:&[]}], ["oink.diagnostics.collect/1", "oink.low/1"], Allow;
     0x0a04 => DiagnosticsChunk(DiagnosticsChunk), [Route {kind:8, transport:Transport::Low, extra_capabilities:&[]}], ["oink.diagnostics.collect/1", "oink.low/1"], Allow;
@@ -156,8 +147,6 @@ message_registry! {
     0x0f01 => CacheRequest(CacheRequest), [Route {kind:11, transport:Transport::Low, extra_capabilities:&[]}], ["oink.cache/1", "oink.low/1"], Allow;
     0x0f02 => CacheResult(CacheResult), [Route {kind:11, transport:Transport::Low, extra_capabilities:&[]}], ["oink.cache/1", "oink.low/1"], Allow;
     0x1100 => ProjectionPreview(ProjectionPreview), [Route {kind:12, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.layout.projection/1"], Allow;
-    0x1101 => ProjectionMode(ProjectionMode), [Route {kind:12, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.layout.projection/1"], Allow;
-    0x1102 => ProjectionGesture(ProjectionGesture), [Route {kind:12, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.layout.projection/1"], Allow;
     0x0d23 => ConfigSetLocalOption(SetLocalOption), [Route {kind:2, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.group/1", "oink.device-options/1"], Allow;
     0x0d24 => ConfigLocalEditResult(LocalEditResult), [Route {kind:2, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.group/1", "oink.device-options/1"], Allow;
     0x0d25 => ConfigSetExitVolume(SetExitVolume), [Route {kind:2, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.group/1", "oink.audio.exit-volume/1"], Allow;
@@ -181,7 +170,6 @@ message_registry! {
     0x1222 => LayoutProfilesJoin(LayoutProfilesJoin), [Route {kind:15, transport:Transport::Low, extra_capabilities:&[]}], ["oink.group/1", "oink.layout.profiles/3", "oink.low/1"], Allow;
     0x1210 => LayoutProfilesStateV2(LayoutProfilesStateV2), [Route {kind:14, transport:Transport::Low, extra_capabilities:&[]}], ["oink.group/1", "oink.layout.profiles/2", "oink.low/1"], Allow;
     0x1211 => LayoutProfilesReceiptV2(LayoutProfilesReceipt), [Route {kind:14, transport:Transport::Low, extra_capabilities:&[]}], ["oink.group/1", "oink.layout.profiles/2", "oink.low/1"], Allow;
-    0x010d => ApplicationFocus(ApplicationFocusRecord), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1", "oink.input.application-focus/1"], Suspend;
     0x1300 => ControlMovePointer(ControlMovePointer), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1", "oink.pointer.move/1"], Suspend;
     0x010e => ControlLockEscape(ControlLockEscape), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1", "oink.pointer.lock-escape/1"], Suspend;
     0x010f => ControlEntryProtection(ControlEntryProtection), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1", "oink.pointer.entry-protection/1"], Suspend;
@@ -194,4 +182,7 @@ message_registry! {
     0x0339 => CloudLinkRead(CloudLinkRead), [Route {kind:4, transport:Transport::Low, extra_capabilities:&[]}, Route {kind:10, transport:Transport::Low, extra_capabilities:&["oink.drag/1"]}], ["oink.clipboard/1", "oink.low/1", "oink.cloud-file-links/1"], Suspend;
     0x061a => AudioMediaState(AudioMediaState), [Route {kind:5, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.audio/1", "oink.audio.media-health/1"], Suspend;
     0x0111 => ControlLockRemoteWindows(ControlLockRemoteWindows), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1", "oink.input.lock-remote-windows/1"], Suspend;
+    0x1301 => ControlMovePointerEnter(ControlFocusEnter), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1", "oink.pointer.move-hidden/1"], Suspend;
+    0x061b => AudioQualitySourceOffer(SourceRouteOffer), [Route {kind:5, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.audio/1", "oink.audio.quality/1"], Suspend;
+    0x1302 => ControlLocalClick(ControlLocalClick), [Route {kind:3, transport:Transport::Reliable, extra_capabilities:&[]}], ["oink.input/1", "oink.focus.local-click/1"], Suspend;
 }

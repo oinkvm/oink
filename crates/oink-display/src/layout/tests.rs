@@ -773,7 +773,7 @@ fn portals_clip_only_the_intervals_occluded_by_a_nearer_screen() {
         )
         .unwrap();
     assert_eq!(r.to.screen, sid(B, "r"));
-    // 隐藏的在线屏幕仍挡住其覆盖区间，不能跳过它进入远处屏幕
+    // 隐藏的在线屏幕和离线屏幕一样不存在：不挡路，整条边照常通到右屏
     let dis = l.clone();
     let mut owners = BTreeMap::new();
     let mut owner = OwnerLayoutPreferences::default();
@@ -788,10 +788,7 @@ fn portals_clip_only_the_intervals_occluded_by_a_nearer_screen() {
     owners.insert(X, owner);
     assert_eq!(
         portals(&dis.topology(&owners), &sid(A, "l"), Side::Right),
-        vec![
-            (0.0, 15.0 / 686.0, Some("r".into())),
-            (15.0 / 686.0, 315.0 / 686.0, None)
-        ]
+        vec![(0.0, (315.0 / 686.0), Some("r".into()))]
     );
 }
 
@@ -1969,7 +1966,7 @@ fn hidden_missing_and_offline_geometry_do_not_redirect_sources() {
 }
 
 #[test]
-fn hidden_screen_blocks_a_farther_target_even_across_unbounded_gaps() {
+fn hidden_screen_is_absent_like_an_offline_one_across_unbounded_gaps() {
     let mut owners: BTreeMap<DeviceId, OwnerLayoutPreferences> = BTreeMap::new();
     let mut saved = layout(vec![
         screen(A, "a", Rect::new(0., 0., 200. / 686.0, 160. / 686.0), 1. * 686.0),
@@ -1987,17 +1984,20 @@ fn hidden_screen_blocks_a_farther_target_even_across_unbounded_gaps() {
         ),
     ]);
     owners.entry(X).or_default().screen_shared = false;
-    assert!(
-        portals(&saved.topology(&owners), &sid(A, "a"), Side::Right)
-            .iter()
-            .all(|p| p.2.is_none())
+    let reaches_b = |saved: &Layout, owners: &BTreeMap<DeviceId, OwnerLayoutPreferences>| {
+        portals(&saved.topology(owners), &sid(A, "a"), Side::Right)
+    };
+    assert_eq!(
+        reaches_b(&saved, &owners),
+        portals(
+            &saved.topology_online(&Default::default(), |d| *d != X),
+            &sid(A, "a"),
+            Side::Right
+        )
     );
+    assert_eq!(reaches_b(&saved, &owners), vec![(0.0, 160. / 686.0, Some("b".into()))]);
     saved.screens[2].rect.y = 170. / 686.0; // No along-edge overlap; only a corner/diagonal.
-    assert!(
-        portals(&saved.topology(&owners), &sid(A, "a"), Side::Right)
-            .iter()
-            .all(|p| p.2.is_none())
-    );
+    assert!(reaches_b(&saved, &owners).iter().all(|p| p.2.is_none()));
 }
 
 #[test]
@@ -2134,7 +2134,7 @@ fn native_seams_ignore_cross_computer_wall_extension_and_minimum_portal() {
 }
 
 #[test]
-fn hidden_screens_keep_geometry_and_wall_both_directions_including_farther_targets() {
+fn hidden_screens_are_absent_for_others_and_wall_their_own_edges() {
     for same_device in [false, true] {
         for hide_all in [false, true] {
             let hidden_device = if same_device { A } else { X };
@@ -2158,21 +2158,124 @@ fn hidden_screens_keep_geometry_and_wall_both_directions_including_farther_targe
             let topology = saved.topology(&owners);
             let hidden_id = sid(hidden_device, "hidden");
             assert!(topology.screen(&hidden_id).is_some(), "hidden geometry is retained");
+            // Other screens route exactly as if the hidden ones were not in the layout.
+            let absent = layout(
+                saved
+                    .screens
+                    .iter()
+                    .filter(|s| topology.is_active(&s.id))
+                    .cloned()
+                    .collect(),
+            )
+            .topology(&Default::default());
             for (id, point, delta) in [
                 (sid(A, "left"), Point::new(900., 500.), (2., 0.)),
-                (hidden_id.clone(), Point::new(1500., 500.), (-2., 0.)),
-                (hidden_id.clone(), Point::new(1500., 500.), (2., 0.)),
                 (sid(B, "far"), Point::new(2100., 500.), (-2., 0.)),
             ] {
+                if !topology.is_active(&id) {
+                    continue;
+                }
                 let from = ScreenPos {
                     screen: id.clone(),
                     local: point,
                 };
-                let step = topology.step(&from, delta).unwrap();
-                assert_eq!(step.to.screen, id);
-                assert!(step.crossed.is_empty());
-                assert!(step.blocked_x);
+                assert_eq!(topology.step(&from, delta), absent.step(&from, delta));
+                assert_eq!(portals(&topology, &id, Side::Right), portals(&absent, &id, Side::Right));
+                assert_eq!(portals(&topology, &id, Side::Left), portals(&absent, &id, Side::Left));
             }
+            if !(same_device && hide_all) {
+                let from = ScreenPos {
+                    screen: sid(A, "left"),
+                    local: Point::new(900., 500.),
+                };
+                assert_eq!(topology.step(&from, (2., 0.)).unwrap().to.screen, sid(B, "far"));
+            }
+            // A pointer on the hidden screen never crosses out by itself.
+            for delta in [(-2., 0.), (2., 0.), (0., -2.), (0., 2.)] {
+                let from = ScreenPos {
+                    screen: hidden_id.clone(),
+                    local: Point::new(1500., 500.),
+                };
+                let step = topology.step(&from, delta).unwrap();
+                assert_eq!(step.to.screen, hidden_id);
+                assert!(step.crossed.is_empty());
+                assert!(step.blocked_x || step.blocked_y);
+            }
+        }
+    }
+}
+
+/// oinkvm/oink#10: two computers share a middle monitor through different inputs.
+/// Each keeps both screens in its native extended desktop; one copy is hidden.
+#[test]
+fn shared_monitor_hidden_native_neighbour_does_not_wall_the_visible_screen() {
+    let native = |dev, key, x: f64, plane_x: f64| ScreenPlacement {
+        local: Rect::new(x, 0., 1000., 600.),
+        ..screen(dev, key, Rect::new(plane_x, 0., 1., 0.6), 1000.)
+    };
+    for hide_b1 in [true, false] {
+        // A1 | A2 | B2 (B1 hidden, rigidly under A2) or A1 | B1 | B2 (A2 hidden under B1).
+        let saved = layout(vec![
+            native(A, "a1", 0., 0.),
+            native(A, "a2", 1000., 1.),
+            native(B, "b1", 0., 1.),
+            native(B, "b2", 1000., 2.),
+        ]);
+        let (hidden_dev, hidden, middle_dev, middle) = if hide_b1 {
+            (B, "b1", A, "a2")
+        } else {
+            (A, "a2", B, "b1")
+        };
+        let owners = BTreeMap::from([(
+            hidden_dev,
+            OwnerLayoutPreferences {
+                screens: [(
+                    hidden.into(),
+                    ScreenPreference {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            },
+        )]);
+        let t = saved.topology(&owners);
+        let (outer_dev, outer, outer_x, inward) = if hide_b1 {
+            (B, "b2", 1100., -0.2)
+        } else {
+            (A, "a1", 900., 0.2)
+        };
+        // The visible screen next to the hidden native sibling routes to the middle one.
+        let step = t
+            .step(
+                &ScreenPos {
+                    screen: sid(outer_dev, outer),
+                    local: Point::new(outer_x, 300.),
+                },
+                (inward, 0.),
+            )
+            .unwrap();
+        assert_eq!(step.to.screen, sid(middle_dev, middle), "hide_b1={hide_b1}");
+        // And back again.
+        let middle_x = if hide_b1 { 1900. } else { 100. };
+        let step = t
+            .step(
+                &ScreenPos {
+                    screen: sid(middle_dev, middle),
+                    local: Point::new(middle_x, 300.),
+                },
+                (-inward, 0.),
+            )
+            .unwrap();
+        assert_eq!(step.to.screen, sid(outer_dev, outer), "hide_b1={hide_b1}");
+        // The hidden copy itself is walled on every side.
+        for delta in [(-0.2, 0.), (0.2, 0.)] {
+            let from = ScreenPos {
+                screen: sid(hidden_dev, hidden),
+                local: Point::new(if hide_b1 { 500. } else { 1500. }, 300.),
+            };
+            assert_eq!(t.step(&from, delta).unwrap().to.screen, from.screen);
         }
     }
 }

@@ -383,15 +383,18 @@ impl Owner {
         let output_changed = self.settings.receive_output != settings.receive_output;
         let capture_changed = self.settings.capture_scope != settings.capture_scope
             || self.settings.keep_local_playback != settings.keep_local_playback;
-        let format_changed = self.settings.preferred_format != settings.preferred_format;
+        let format_changed = self.settings.quality != settings.quality;
         self.settings = settings;
         self.forwarding_off_reason = self.settings.forwarding_off_reason;
         if !self.settings.forwarding_enabled {
             self.stop_source();
-        } else if capture_changed {
+        } else if capture_changed || format_changed {
             let _ = self.release_capture();
         }
-        if output_changed || format_changed {
+        if format_changed {
+            self.stop_source();
+        }
+        if output_changed {
             self.retire_sessions();
             self.playback_failed = false;
             self.reset_playback_retry();
@@ -1009,10 +1012,11 @@ impl Owner {
         let Some(agreement) = self.group.peer_agreement(peer) else {
             return false;
         };
+        // supported_by already rejects PCM16 and anything but Opus5 without quality/1.
         agreement.contains("oink.audio/1")
             && profile.supported_by(
                 &self.peer_audio(peer),
-                agreement.contains("oink.audio.pcm/1"),
+                agreement.contains("oink.audio.quality/1"),
                 v1::limits::DATAGRAM,
             )
     }
@@ -1044,8 +1048,42 @@ impl Owner {
             if !same {
                 self.selected = None;
                 self.streams.forget_preparation(peer);
+                // Choose the profile before beginning the offer: a begun offer
+                // counts as sent above, so an early return must not leave one.
+                let profile = if self.group.peer_supports(peer, "oink.audio.quality/1") {
+                    let rate = if self.settings.quality == oink_audio::negotiation::Quality::Lossless {
+                        match self.platform.capture_sample_rate() {
+                            Ok(rate) => rate,
+                            Err(error) => {
+                                self.fail_source(error);
+                                return;
+                            }
+                        }
+                    } else {
+                        48_000
+                    };
+                    let Ok(profile) = oink_audio::negotiation::select(
+                        self.settings.quality.profile(rate),
+                        &self.peer_audio(peer),
+                        true,
+                        v1::limits::DATAGRAM,
+                    ) else {
+                        return;
+                    };
+                    Some(profile)
+                } else {
+                    None
+                };
                 if let Ok(offer) = self.source_session.begin(current_boot, stamp.to_wire()).cloned() {
-                    let message = Message::AudioSourceRouteOffer(offer);
+                    let message = match profile {
+                        Some(profile) => {
+                            let Ok(offer) = self.source_session.set_profile(profile).cloned() else {
+                                return;
+                            };
+                            Message::AudioQualitySourceOffer(offer)
+                        }
+                        None => Message::AudioSourceRouteOffer(offer),
+                    };
                     self.streams.set_opening(peer, vec![message.clone()]);
                     let _ = self.streams.send(peer, &message, Instant::now());
                 }
@@ -1072,9 +1110,18 @@ impl Owner {
             return;
         };
         let profile = match oink_audio::negotiation::select(
-            self.settings.preferred_format,
+            if agreement.contains("oink.audio.quality/1") {
+                offer
+                    .preferred_descriptor()
+                    .ok()
+                    .flatten()
+                    .and_then(|descriptor| StreamFormat::from_descriptor(&descriptor).ok())
+                    .unwrap_or(StreamFormat::Opus5ms)
+            } else {
+                StreamFormat::Opus5ms
+            },
             &self.peer_audio(peer),
-            agreement.contains("oink.audio.pcm/1"),
+            agreement.contains("oink.audio.quality/1"),
             v1::limits::DATAGRAM,
         ) {
             Ok(profile) => profile,
@@ -1150,7 +1197,12 @@ impl Owner {
         // latest authenticated source intent: dropping its one reliable offer
         // leaves both peers waiting forever after maintenance. prepare_peer
         // still fences device/session admission until the guard is released.
-        if driver_change && !matches!(&message, Message::AudioSourceRouteOffer(_)) {
+        if driver_change
+            && !matches!(
+                &message,
+                Message::AudioSourceRouteOffer(_) | Message::AudioQualitySourceOffer(_)
+            )
+        {
             return;
         }
         if self.update_suspended {
@@ -1166,7 +1218,7 @@ impl Owner {
         };
         self.microphone_message(peer, &message);
         match message {
-            Message::AudioSourceRouteOffer(offer) => {
+            Message::AudioSourceRouteOffer(offer) | Message::AudioQualitySourceOffer(offer) => {
                 let reason = if offer.source() != Ok(current_boot.clone())
                     || offer.receiver() != Ok(boot(self.links.boot()))
                 {
@@ -1229,11 +1281,22 @@ impl Owner {
                 self.streams.set_opening(
                     peer,
                     vec![
-                        Message::AudioSourceRouteOffer(self.source_session.offer().unwrap().clone()),
+                        if self.group.peer_supports(peer, "oink.audio.quality/1") {
+                            Message::AudioQualitySourceOffer(self.source_session.offer().unwrap().clone())
+                        } else {
+                            Message::AudioSourceRouteOffer(self.source_session.offer().unwrap().clone())
+                        },
                         ack_message,
                     ],
                 );
                 if previous.as_ref() != Some(&prepared) {
+                    if self
+                        .encoded
+                        .as_ref()
+                        .is_some_and(|capture| capture.sample_rate() != profile.config().sample_rate)
+                    {
+                        let _ = self.release_capture();
+                    }
                     if self.exit_switch_deadline.is_some() {
                         if let Some(encoded) = &mut self.encoded
                             && let Err(error) = encoded.reconfigure(profile.config())

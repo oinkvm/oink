@@ -84,8 +84,6 @@ impl Owner {
             problem: problem.as_ref().and_then(|p| api::PairProblem::try_from(p).ok()),
         };
         self.shared.migration.publish(Some(status.clone()));
-        self.shared
-            .emit_pairing(api::PairingEvent::GroupMigrationChanged(status));
     }
     pub(crate) fn recovery_message(&mut self, id: LinkId, peer: Boot, message: Message) -> v1::Result<()> {
         match message {
@@ -655,8 +653,6 @@ impl Owner {
             let mut status = status.clone();
             status.phase = api::MigrationPhase::Adopted;
             self.shared.migration.publish(Some(status.clone()));
-            self.shared
-                .emit_pairing(api::PairingEvent::GroupMigrationChanged(status));
         }
         Ok(())
     }

@@ -23,7 +23,7 @@ use std::{
     os::windows::{ffi::OsStringExt, fs::OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Security::Authorization::*,
@@ -309,6 +309,17 @@ fn set_machine(machine: &Machine) -> io::Result<()> {
 
 /// The SYSTEM-side store. Only the service and the pre-login entry (both SYSTEM) use it.
 pub(crate) struct Protected;
+
+fn store_access() -> &'static prelogin_policy::StoreAccess {
+    // A final startup check can overlap an already-authenticated request at
+    // logout. Serialize that check and the launch worker's complete request so
+    // readiness's deny-delete pins
+    // cannot collide with snapshot rename/delete. Do not relax protected file
+    // sharing flags: pinned ancestors still prevent path replacement attacks.
+    static ACCESS: OnceLock<prelogin_policy::StoreAccess> = OnceLock::new();
+    ACCESS.get_or_init(prelogin_policy::StoreAccess::default)
+}
+
 impl Store for Protected {
     fn machine(&self) -> io::Result<Machine> {
         machine()
@@ -388,11 +399,14 @@ fn sid_string(sid: &[u8]) -> io::Result<String> {
 pub(super) fn handle(request: &BackendLaunch, id: u32, process: &Handle) -> io::Result<BackendLaunch> {
     let sid = sid_string(&security::user_sid(id)?)?;
     let elevated = super::update::elevated(process);
-    let reply = prelogin_policy::handle(
+    let reply = store_access().handle(
         &mut Protected,
         request,
         &prelogin_policy::Caller { sid: &sid, elevated },
     );
+    if reply.is_ok() && !matches!(request, BackendLaunch::PreloginStatus) {
+        super::broker::changed();
+    }
     if let Ok(BackendLaunch::PreloginState {
         enabled,
         owner,
@@ -413,6 +427,7 @@ pub(super) fn handle(request: &BackendLaunch, id: u32, process: &Handle) -> io::
 /// A running `oink.exe --prelogin` created by this service.
 pub(super) struct Child {
     id: u32,
+    owner: String,
     process: Handle,
     stop: Handle,
 }
@@ -473,14 +488,14 @@ fn supervisor() -> &'static Mutex<prelogin_policy::Supervisor<Child>> {
 /// restart must not create the same identity while its previous child is still
 /// draining after parent death. Exclude only our retained, live child handle.
 fn other_backend_alive(owned_pid: Option<u32>, include_user: bool) -> bool {
-    let Ok(expected) = security::install_dir().map(|d| d.join("oink.exe")) else {
-        return true;
-    };
+    backend_processes(owned_pid, include_user).map_or(true, |processes| !processes.is_empty())
+}
+
+pub(super) fn backend_processes(owned_pid: Option<u32>, include_user: bool) -> io::Result<Vec<Handle>> {
+    let expected = security::install_dir()?.join("oink.exe");
+    let mut processes = Vec::new();
     // SAFETY: process snapshot handle owned below; entries copied by value.
-    let Ok(snapshot) = Handle::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
-        // Fail closed: an unknown process list must not start a second identity.
-        return true;
-    };
+    let snapshot = Handle::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })?;
     let mut entry = PROCESSENTRY32W {
         dwSize: size_of::<PROCESSENTRY32W>() as u32,
         ..Default::default()
@@ -511,23 +526,22 @@ fn other_backend_alive(owned_pid: Option<u32>, include_user: bool) -> bool {
                     system || (include_user && super::backend::token_uiaccess(t.0).unwrap_or(0) != 0)
                 })
             {
-                return true;
+                processes.push(process);
             }
         }
         // SAFETY: same live snapshot and entry.
         more = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
     }
-    false
+    Ok(processes)
 }
 
 /// Only read the loaded user's registry; never load a hive or touch a user path
 /// as SYSTEM. A missing/disabled Run entry means no replacement is expected.
-fn owner_autostart(id: u32) -> bool {
+fn owner_autostart(id: u32, owner: &str) -> bool {
     let Ok(sid) = security::user_sid(id).and_then(|s| sid_string(&s)) else {
         return false;
     };
-    let Ok(machine) = machine() else { return false };
-    if !machine.enabled || !machine.owner.as_ref().is_some_and(|o| o.eq_ignore_ascii_case(&sid)) {
+    if !owner.eq_ignore_ascii_case(&sid) {
         return false;
     }
     let Ok(exe) = security::install_dir().map(|d| d.join("oink.exe")) else {
@@ -597,52 +611,88 @@ fn owner_autostart(id: u32) -> bool {
     code == ERROR_FILE_NOT_FOUND || (code == 0 && (size == 0 || data[0] & 1 == 0))
 }
 
-fn observe(origin: Option<u32>, owned_pid: Option<u32>) -> prelogin_policy::Observation {
+fn observe(origin: Option<&Child>, owned_pid: Option<u32>) -> prelogin_policy::Observation {
     // SAFETY: read-only active console session query.
     let id = unsafe { WTSGetActiveConsoleSessionId() };
     let console = (id != 0 && id != u32::MAX).then_some(id);
-    let user_session = origin.or(console);
+    let user_session = origin.map(|child| child.id).or(console);
     let user_present = user_session.is_some_and(|id| security::user_sid(id).is_ok());
-    let ready = if console.is_some() || origin.is_some() {
-        match prelogin_policy::ready(&Protected) {
-            Ok(ready) => ready,
-            Err(error) => {
-                static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    eprintln!("Oink pre-login store unavailable: {error}");
-                }
-                false
-            }
-        }
-    } else {
-        false
-    };
     prelogin_policy::Observation {
         console,
         user_present,
-        owner_autostart: user_session.is_some_and(owner_autostart),
-        ready,
-        // Only consulted when everything else would start a pre-login backend.
-        user_backend_alive: ready && other_backend_alive(owned_pid, true),
+        owner_autostart: user_present && origin.is_some_and(|child| owner_autostart(child.id, &child.owner)),
+        // A live child must still yield to an existing user backend. Without a
+        // child, no process scan is needed while a user token prevents a start.
+        user_backend_alive: (origin.is_some() || (console.is_some() && !user_present))
+            && other_backend_alive(owned_pid, true),
         maintenance: super::update::pending(),
     }
 }
 
-/// Broker poll: start, keep or stop the pre-login backend.
-pub(super) fn tick() {
+/// Broker observation: start, keep or stop the pre-login backend.
+pub(super) struct Watch {
+    pub deadline: Option<Instant>,
+    pub owner: Option<String>,
+    pub running: bool,
+}
+
+pub(super) fn processes() -> io::Result<Vec<Handle>> {
+    let supervisor = supervisor().lock().unwrap_or_else(|e| e.into_inner());
+    supervisor
+        .child()
+        .map(|child| child.process.duplicate())
+        .transpose()
+        .map(|child| child.into_iter().collect())
+}
+
+pub(super) fn tick() -> Watch {
     let mut supervisor = supervisor().lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: retained process handle is the identity exclusion, not a PID file.
     let owned_pid = supervisor
         .child()
         .filter(|c| prelogin_policy::Child::alive(*c))
         .map(|c| unsafe { GetProcessId(c.process.0) });
-    let observed = observe(supervisor.running(), owned_pid);
-    match supervisor.tick(&observed, Instant::now(), spawn) {
+    let origin = supervisor.child().filter(|c| prelogin_policy::Child::alive(*c));
+    let observed = observe(origin, owned_pid);
+    let result = supervisor.tick(
+        &observed,
+        Instant::now(),
+        || match store_access().ready(&Protected) {
+            Ok(owner) => Ok(owner),
+            Err(error) => {
+                static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("Oink pre-login store unavailable: {error}");
+                }
+                Ok(None)
+            }
+        },
+        spawn,
+    );
+    let retry = result.is_err().then(|| Instant::now() + Duration::from_millis(250));
+    match result {
         Ok(prelogin_policy::Tick::Started(id)) => eprintln!("Oink pre-login backend started in session {id}"),
         Ok(prelogin_policy::Tick::Stopped) => eprintln!("Oink pre-login backend stopped: {observed:?}"),
-        Ok(prelogin_policy::Tick::Exited) => eprintln!("Oink pre-login backend exited"),
+        Ok(prelogin_policy::Tick::Exited) => {
+            eprintln!("Oink pre-login backend exited");
+            // Reaping returns before startup decisions. Continue once without
+            // relying on a future poll; existing restart backoff still applies.
+            super::broker::changed();
+        }
         Ok(_) => {}
         Err(error) => eprintln!("Oink pre-login backend start failed: {error}"),
+    }
+    Watch {
+        deadline: supervisor
+            .deadline(&observed, Instant::now())
+            .into_iter()
+            .chain(retry)
+            .min(),
+        owner: observed
+            .user_present
+            .then(|| supervisor.child().map(|child| child.owner.clone()))
+            .flatten(),
+        running: supervisor.child().is_some(),
     }
 }
 
@@ -701,10 +751,9 @@ pub(super) fn route_identity() -> io::Result<Option<crate::prelogin_route::Sourc
     };
     // SAFETY: owned child handle and current service pseudo handle.
     unsafe {
-        let owner = Protected.machine()?.owner.ok_or_else(denied)?;
         let mut raw = ptr::null_mut();
         check(windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW(
-            wide(&owner).as_ptr(),
+            wide(&child.owner).as_ptr(),
             &mut raw,
         ))?;
         let owner_sid = std::slice::from_raw_parts(raw.cast::<u8>(), GetLengthSid(raw) as usize).to_vec();
@@ -724,7 +773,7 @@ pub(super) fn route_identity() -> io::Result<Option<crate::prelogin_route::Sourc
     }
 }
 
-fn spawn(id: u32) -> io::Result<Child> {
+fn spawn(id: u32, owner: String) -> io::Result<Child> {
     let path = security::install_dir()?.join("oink.exe");
     security::protected_file(&path).map_err(|e| context("protected pre-login image", e))?;
     let primary = super::broker::session_system_token(id)?;
@@ -771,7 +820,12 @@ fn spawn(id: u32) -> io::Result<Child> {
     .map_err(|e| context("CreateProcessAsUserW(prelogin)", e))?;
     let process = Handle::new(info.hProcess)?;
     drop(Handle::new(info.hThread)?);
-    Ok(Child { id, process, stop })
+    Ok(Child {
+        id,
+        owner,
+        process,
+        stop,
+    })
 }
 
 /// Entry guard of `oink.exe --prelogin`: SYSTEM, a non-zero active console
@@ -1032,7 +1086,12 @@ mod exit_tests {
             // SAFETY: owned private child process handle, bounded wait.
             let exited = unsafe { WaitForSingleObject(process.0, 5000) };
             assert_eq!(exited, WAIT_OBJECT_0);
-            let mut child = Child { id: 1, process, stop };
+            let mut child = Child {
+                id: 1,
+                owner: String::new(),
+                process,
+                stop,
+            };
             child.stop().unwrap();
             assert!(!child.alive());
         }

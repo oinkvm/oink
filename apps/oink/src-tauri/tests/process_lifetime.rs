@@ -47,7 +47,7 @@ fn start(dir: &Path, port: u16) -> Svc {
             cursor_trail: false,
         }))
         .unwrap();
-    let server = rt.block_on(Server::start_on(node.clone(), 0)).unwrap();
+    let server = rt.block_on(Server::start(node.clone())).unwrap();
     Svc {
         rt,
         node,
@@ -125,8 +125,7 @@ fn ipc_rejects_missing_or_different_build_before_serving_ui_calls() {
             } else {
                 true.into()
             };
-            let mut stream =
-                std::net::TcpStream::connect(("127.0.0.1", endpoint["port"].as_u64().unwrap() as u16)).unwrap();
+            let mut stream = oink_agent::ipc::open_stream(dir.path(), Duration::from_secs(2)).unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             writeln!(stream, "{request}").unwrap();
             let mut line = String::new();

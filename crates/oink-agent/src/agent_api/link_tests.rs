@@ -173,13 +173,6 @@ async fn simultaneous_dial_keeps_pairing_metadata_link_view_and_diagnostics_scen
         .dial(a.id(), vec![a.links().unwrap().local_addr()], DialMode::DirectOnly)
         .unwrap();
     pair(&a, &b).await;
-    a.device_rename("a-after-selection".into()).await.unwrap();
-    b.device_rename("b-after-selection".into()).await.unwrap();
-    until(
-        "bilateral metadata after selected connection and losing dial cleanup",
-        || a.device_name(b.id()) == "b-after-selection" && b.device_name(a.id()) == "a-after-selection",
-    )
-    .await;
     inspect_link(&a, &b, None).await;
     inspect_link(&b, &a, None).await;
     a.shutdown().await;

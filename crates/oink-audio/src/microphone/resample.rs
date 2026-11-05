@@ -1,60 +1,43 @@
-//! Streaming windowed-sinc conversion with anti-aliasing on downsampling.
-//! Fixed history and coefficient tables; independent of native callback boundaries.
+//! Mono capture uses the same band-limited kernel as speaker audio.
 #[cfg(any(target_os = "macos", windows, test))]
 pub(super) struct Resampler {
-    history: [f32; 64],
-    coefficients: Vec<[f32; 64]>,
+    history: Vec<f32>,
+    kernel: crate::resample::Kernel,
     input_position: u64,
-    next_output: f64,
+    output_position: u64,
     step: f64,
 }
 #[cfg(any(target_os = "macos", windows, test))]
 impl Resampler {
     pub fn new(rate: u32) -> Self {
-        let cutoff = (48_000.0 / f64::from(rate)).min(1.0) * 0.90;
-        let mut coefficients = vec![[0.0; 64]; 256];
-        for (phase, table) in coefficients.iter_mut().enumerate() {
-            let fraction = phase as f64 / 256.0;
-            let mut sum = 0.0;
-            for (tap, coefficient) in table.iter_mut().enumerate() {
-                let x = tap as f64 - 31.0 - fraction;
-                let sinc = if x.abs() < 1e-12 {
-                    cutoff
-                } else {
-                    (std::f64::consts::PI * cutoff * x).sin() / (std::f64::consts::PI * x)
-                };
-                let window = 0.5 + 0.5 * (std::f64::consts::PI * x / 32.0).cos();
-                *coefficient = (sinc * window) as f32;
-                sum += *coefficient;
-            }
-            for coefficient in table {
-                *coefficient /= sum;
-            }
-        }
+        let step = f64::from(rate) / 48_000.0;
+        let kernel = crate::resample::Kernel::new(step);
         Self {
-            history: [0.0; 64],
-            coefficients,
+            history: vec![0.0; kernel.taps()],
+            kernel,
             input_position: 0,
-            next_output: 0.0,
-            step: f64::from(rate) / 48_000.0,
+            output_position: 0,
+            step,
         }
     }
     pub fn push(&mut self, value: f32, mut emit: impl FnMut(f32)) {
+        let value = if value.is_finite() { value } else { 0.0 };
+        if self.step == 1.0 {
+            emit(value);
+            return;
+        }
         let current = self.input_position;
-        self.history[current as usize % 64] = if value.is_finite() { value } else { 0.0 };
-        // 32 input frames of lookahead: always retain all 64 filter samples.
-        while self.next_output.floor() + 32.0 <= current as f64 {
-            let center = self.next_output.floor() as i64;
-            let phase = ((self.next_output.fract() * 256.0) as usize).min(255);
-            let mut sample = 0.0;
-            for (tap, coefficient) in self.coefficients[phase].iter().enumerate() {
-                let index = center - 31 + tap as i64;
-                if index >= 0 {
-                    sample += self.history[index as usize % 64] * coefficient;
+        let len = self.history.len();
+        self.history[current as usize % len] = value;
+        while (self.output_position as f64 * self.step).floor() <= current as f64 {
+            emit(self.kernel.sample(self.output_position as f64 * self.step, |index| {
+                if index < 0 {
+                    0.0
+                } else {
+                    self.history[index as usize % len]
                 }
-            }
-            emit(sample);
-            self.next_output += self.step;
+            }));
+            self.output_position += 1;
         }
         self.input_position += 1;
     }
@@ -70,6 +53,29 @@ mod tests {
             converter.push(input, |sample| output.push(sample));
         }
         output
+    }
+    #[test]
+    fn microphone_impulse_has_shared_filter_delay_and_unity_bypass() {
+        for rate in [44_100, 48_000, 96_000] {
+            let mut converter = Resampler::new(rate);
+            let mut output = Vec::new();
+            for i in 0..256 {
+                converter.push(if i == 0 { 1.0 } else { 0.0 }, |v| output.push(v));
+            }
+            let peak = (0..output.len())
+                .max_by(|a, b| output[*a].abs().total_cmp(&output[*b].abs()))
+                .unwrap();
+            let expected = if rate == 48_000 {
+                0.0
+            } else {
+                converter.kernel.delay() as f64 * 48_000.0 / f64::from(rate)
+            };
+            assert!((peak as f64 - expected).abs() <= 0.5);
+            eprintln!(
+                "microphone {rate}->48000: peak {peak} frames, {} ms",
+                peak as f64 / 48.0
+            );
+        }
     }
     #[test]
     fn sample_count_and_passband() {

@@ -98,7 +98,7 @@ export function usePreferences(): PrefsApi {
         ...(state.input?{pollLimit:state.input.event_frequency==='hz125'?'125':'none',keepAwake:state.input.wake_displays_on_input,pointerTrail:state.input.cursor_trail,touchpadInject:state.input.touchpad_injection_enabled,nativeMultifinger:state.input.native_multifinger??true,macScrollFeel:state.input.mac_scroll_feel,forwardWheelByLines:state.input.forward_wheel_by_lines??true,forwardInjectedInput:state.input.forward_injected_input??false,takeForegroundOnLeave:state.input.take_foreground_on_leave??false,pointerGain:state.input.device_gain,escStop:state.input.emergency_hold_ms!==0,
           shortcuts:{...Object.fromEntries(Object.entries(p.shortcuts).filter(([id])=>!id.startsWith('move:'))),...Object.fromEntries(state.input.hotkeys.filter(h=>shortcutId(h)).map(h=>[shortcutId(h),{on:h.enabled,keys:h.keys.map(k=>k==='Ctrl'?'Control':k).join('+')}]))}} as const:{}),
         ...(state.clipboard?{clipReceive:state.clipboard.receive ?? true,clipSend:state.clipboard.send ?? true,removeDsStore:state.clipboard.remove_ds_store ?? true}:{}),
-        ...(state.audio?{keepLocalPlayback:state.audio.settings.keep_local_playback,audioDevice:state.audio.settings.receive_output??'default'}:{}),
+        ...(state.audio?{audioEncodingQuality:state.audio.settings.quality??'quality',keepLocalPlayback:state.audio.settings.keep_local_playback,audioDevice:state.audio.settings.receive_output??'default'}:{}),
         ...(state.launch?{launchAtLogin:state.launch.state==='enabled'||state.launch.state==='requires_approval'}:{}),
         ...(state.diagnostics?{diagnostics:state.diagnostics.configured_enabled}:{}),
         ...(report?{crashReports:report.consent.choice==='granted'}:{}),
@@ -144,9 +144,9 @@ export function usePreferences(): PrefsApi {
         if(!current.clipboard)throw new Error('unavailable');
         await api.setClipboardSettings({...(changed('clipReceive')?{receive:next.clipReceive}:{}),...(changed('clipSend')?{send:next.clipSend}:{}),...(changed('removeDsStore')?{remove_ds_store:next.removeDsStore}:{})});
       }
-      if(changed('keepLocalPlayback')||changed('audioDevice')){
+      if(changed('audioEncodingQuality')||changed('keepLocalPlayback')||changed('audioDevice')){
         if(!current.audio)throw new Error('unavailable');
-        await api.setAudioSettings({...(changed('keepLocalPlayback')?{keep_local_playback:next.keepLocalPlayback}:{}),...(changed('audioDevice')?{receive_output:next.audioDevice==='default'?null:next.audioDevice}:{})});
+        await api.setAudioSettings({...(changed('audioEncodingQuality')?{quality:next.audioEncodingQuality}:{}),...(changed('keepLocalPlayback')?{keep_local_playback:next.keepLocalPlayback}:{}),...(changed('audioDevice')?{receive_output:next.audioDevice==='default'?null:next.audioDevice}:{})});
       }
       if((['showInMenuBar','confirmQuit','notificationLevel','language','logLevel','logMaxMb'] as const).some(changed)){
         if(!appliedLocal)throw new Error('unavailable');
@@ -170,7 +170,7 @@ export function usePreferences(): PrefsApi {
       if(['keymap','scrollInvert'].includes(key))return transform!==null;
       if(['pollLimit','pointerGain','keepAwake','pointerTrail','touchpadInject','nativeMultifinger','macScrollFeel','forwardWheelByLines','forwardInjectedInput','takeForegroundOnLeave','escStop'].includes(key)||key.startsWith('sc-'))return state.input!==null;
       if(key.startsWith('clip')||key==='removeDsStore')return state.clipboard!==null;
-      if(['audioDevice','keepLocalPlayback'].includes(key))return state.audio!==null;
+      if(['audioEncodingQuality','audioDevice','keepLocalPlayback'].includes(key))return state.audio!==null;
       if(key==='launchAtLogin')return state.launch!==null;
       if(key==='diagnostics')return state.diagnostics!==null;
       if(key==='crashReports')return report!==null;

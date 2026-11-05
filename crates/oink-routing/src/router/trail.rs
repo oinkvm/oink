@@ -23,7 +23,7 @@ pub(super) struct TrailState {
     /// 焦点机：已输出的绘制状态。
     drawing: bool,
     pending: Option<PendingTrail>,
-    /// 焦点机：常驻显示（瞄准小游戏进行中，[`Router::set_trail_pinned`]）。
+    /// Simulator seam: request a persistent trail without circle detection.
     pinned: bool,
 }
 
@@ -37,21 +37,9 @@ struct PendingTrail {
 }
 
 impl Router {
-    /// 本机此刻是否在画拖尾（最近一次 `Output::CursorTrail` 的值）。
-    pub fn cursor_trail_drawing(&self) -> bool {
-        self.trail.drawing
-    }
-
-    /// Keep the trail visible while the local pointer participates in an aim session; no circle required.
-    /// 触发，不受本机拖尾开关、「按钮按着时不画」的限制（游戏里每次点击都按着按钮）；指针不在本机、
-    /// 指针锁定的游戏模式下仍然不画。跨设备的连续交接照常（两端都常驻时不需要源的触发）。
-    /// 关掉后回到原来的规则与设置。
+    /// Test seam for persistent trails, preserving focus and game-mode gates.
     pub fn set_trail_pinned(&mut self, pinned: bool) {
         self.trail.pinned = pinned;
-    }
-
-    pub fn trail_pinned(&self) -> bool {
-        self.trail.pinned
     }
 
     /// 源端画圈识别的当前圈数（诊断、测试用）。

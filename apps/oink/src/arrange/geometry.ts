@@ -196,27 +196,6 @@ export function growAvoiding(r: Rect, w: number, others: Rect[], minimumWidth = 
     }
     return null;
 }
-export function nearestFree(r: Rect, others: Rect[]): Rect {
-    if (!overlapsAny(r, others))
-        return r;
-    const xs = [r.x, ...others.flatMap((o) => [o.x - r.w, o.x + o.w])];
-    const ys = [r.y, ...others.flatMap((o) => [o.y - r.h, o.y + o.h])];
-    let best: Rect | null = null;
-    let bestD = Infinity;
-    for (const x of xs) {
-        for (const y of ys) {
-            const d = (x - r.x) ** 2 + (y - r.y) ** 2;
-            if (d >= bestD)
-                continue;
-            const cand = { ...r, x, y };
-            if (!overlapsAny(cand, others)) {
-                best = cand;
-                bestD = d;
-            }
-        }
-    }
-    return best ?? r;
-}
 type Axis = 'x' | 'y';
 export function facingGap(r: Rect, others: Rect[], axis: Axis, dir: 1 | -1): number | null {
     const side = (axis === 'y' ? 2 : 0) + (dir > 0 ? 1 : 0);

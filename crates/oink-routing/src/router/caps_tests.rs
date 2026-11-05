@@ -286,12 +286,16 @@ fn caps_held_sync_preserves_committed_output_and_heals_a_lost_release() {
     key(&mut s, KeyCode::CAPS_LOCK, true, 10);
     key(&mut s, LETTER, true, 20);
     deliver(&mut s, &mut t);
-    s.send_state_sync();
+    for message in s.heartbeat_messages(PC) {
+        t.input_message(ME, message, 2_000_000);
+    }
     assert!(deliver(&mut s, &mut t).is_empty());
     assert!(t.key_refs.contains_key(&KeyCode::LEFT_SHIFT));
     key(&mut s, KeyCode::CAPS_LOCK, false, 30);
     s.drain_outputs(); // Drop the ordered release to exercise source-state healing.
-    s.send_state_sync();
+    for message in s.heartbeat_messages(PC) {
+        t.input_message(ME, message, 4_000_000);
+    }
     assert_eq!(deliver(&mut s, &mut t), [(KeyCode::LEFT_SHIFT, false)]);
 }
 

@@ -66,14 +66,14 @@ export function ManualSearch({ pairing, autoFocus = true }: {
         if (busy.state === 'loading')
             return;
         window.clearTimeout(leaveTimer.current);setFoundState(null);setLeaving(false);
-        const ipv = ip.trim();
-        const pv = port.trim();
+        const [ipv, inlinePort, ...extra] = ip.trim().split(':');
+        const pv = inlinePort ?? port.trim();
         if (!ipv)
             return fail(tr('请输入 IP 地址'), 'ip');
-        if (!isIPv4(ipv))
+        if (extra.length || !isIPv4(ipv))
             return fail(tr('请输入有效的 IPv4 地址，例如 192.168.1.20'), 'ip');
         const p = pv ? Number(pv) : defaultPort;
-        if (!/^\d+$/.test(pv || '0') || p < 1 || p > 65535)
+        if ((inlinePort !== undefined && !inlinePort) || !/^\d+$/.test(pv || '0') || p < 1 || p > 65535)
             return fail(tr('端口应在 1–65535 之间'), 'port');
         setError(null);
         busy.run(actions.search(ipv, p)).then(setFound, (error:unknown) => fail(error instanceof PairFailure ? pairProblemText(error.problem) : tr('连接失败，请检查地址或稍后重试')));
@@ -83,14 +83,10 @@ export function ManualSearch({ pairing, autoFocus = true }: {
         <label className="manual__field manual__field--ip">
           <span className="manual__label">{tr('IP 地址')}<span className="manual__req" aria-hidden>*</span></span>
           <Input value={ip} onChange={(v) => {
-            if (v.includes(':')) {
-                fail(tr('请输入有效的 IPv4 地址'), 'ip');
-                return;
-            }
-            setIp(v.replace(/[^\d.]/g, '').slice(0, 15));
+            setIp(v.replace(/[^\d.:]/g, '').slice(0, 21));
             if (error?.field === 'ip')
                 setError(null);
-        }} inputMode="decimal" autoComplete="off" spellCheck={false} required autoFocus={autoFocus} invalid={error?.field === 'ip'} aria-describedby="manual-msg"/>
+        }} inputMode="text" autoComplete="off" spellCheck={false} required autoFocus={autoFocus} invalid={error?.field === 'ip'} aria-describedby="manual-msg"/>
         </label>
         <label className="manual__field manual__field--port">
           <span className="manual__label">{tr('端口')}</span>

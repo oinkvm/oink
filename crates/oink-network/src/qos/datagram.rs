@@ -22,6 +22,12 @@ pub(super) fn send_result(result: io::Result<()>, transmit: &Transmit<'_>) -> io
                 "UDP host unreachable; QUIC loss recovery remains active");
             Ok(())
         }
+        // Quinn's path-MTU discovery probes beyond the interface MTU (1280 on a
+        // Tailscale utun), and Darwin rejects those sends with EMSGSIZE. Quinn's
+        // default socket treats that as a lost probe; returning it here would
+        // exit the connection driver. Drop it so the probe is simply lost.
+        #[cfg(target_os = "macos")]
+        Err(error) if error.raw_os_error() == Some(libc::EMSGSIZE) => Ok(()),
         result => result,
     }
 }

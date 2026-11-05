@@ -53,9 +53,6 @@ impl State {
         let mut layout = false;
         for register in state.registers()?.0 {
             retained::verify_register(&register)?;
-            if register.kind()? == 8 && !register.deleted()? {
-                dto::ApplicationFocusSettings::from_raw(register.value()?)?;
-            }
             if register.kind()? == 2 {
                 validate_layout(&dto::LayoutValue::from_raw(register.value()?)?)?;
                 layout = true;
@@ -162,7 +159,7 @@ pub fn validate_rect(rect: &dto::Rect) -> v1::Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn group_application_setting_merges_from_any_member_and_survives_opaque_relay() {
+    fn retired_register_merges_opaquely_without_affecting_layout() {
         fn edit(state: &State, writer: DeviceId, enabled: bool) -> State {
             let mut registers = state.wire().registers().unwrap().0;
             let current = registers.iter().find(|r| r.kind() == Ok(8));
@@ -223,12 +220,7 @@ mod tests {
             .into_iter()
             .find(|r| r.kind() == Ok(8))
             .unwrap();
-        assert!(
-            !dto::ApplicationFocusSettings::from_raw(setting.value().unwrap())
-                .unwrap()
-                .enabled()
-                .unwrap()
-        );
+        assert_eq!(setting.value().unwrap().get(&1), Some(&false.write()));
         assert!(setting.value().unwrap().contains_key(&90));
         assert_eq!(merged.layout().unwrap(), base.layout().unwrap());
         // Concurrent equal-counter edits converge regardless of delivery order.

@@ -196,13 +196,7 @@ impl Queue {
                 .is_none_or(|at| !reduced && now.saturating_duration_since(at).as_secs_f64() < 0.17)
         });
     }
-    pub fn frames(
-        &self,
-        now: Instant,
-        style: Style,
-        reduced: bool,
-        text: &dyn crate::aim::text::TextRaster,
-    ) -> Vec<Frame> {
+    pub fn frames(&self, now: Instant, style: Style, reduced: bool, text: &dyn crate::text::TextRaster) -> Vec<Frame> {
         let mut offsets = std::collections::HashMap::<String, f64>::new();
         self.entries
             .iter()
@@ -370,7 +364,7 @@ impl NotificationOverlay {
             .name("oink-notifications".into())
             .spawn(move || {
                 let Some(mut surface) = factory() else { return };
-                let text = crate::aim::text::system_toast();
+                let text = crate::text::system_toast();
                 let mut last_revision = u64::MAX;
                 let mut last_reduced = None;
                 let mut was_animated = false;
@@ -574,7 +568,7 @@ mod tests {
                     now + Duration::from_millis(ms),
                     Style::default(),
                     false,
-                    &crate::aim::text::StrokeText,
+                    &crate::text::StrokeText,
                 )
             };
             let m = frames(&mac).remove(0);
@@ -597,7 +591,7 @@ mod tests {
             t.scale = scale;
             ids.push(q.push(t, now));
         }
-        let frames = |q: &Queue| q.frames(now, Style::default(), true, &crate::aim::text::StrokeText);
+        let frames = |q: &Queue| q.frames(now, Style::default(), true, &crate::text::StrokeText);
         let before = frames(&q);
         for (f, scale) in before.iter().zip([1., 1.25, 1.5, 2.]) {
             assert_eq!(f.width, (360_f64 * scale).ceil() as usize);
@@ -621,10 +615,10 @@ mod tests {
     fn animated_text_is_rasterized_at_final_physical_scale() {
         #[derive(Debug, Default)]
         struct Recording(std::sync::Mutex<Vec<f64>>);
-        impl crate::aim::text::TextRaster for Recording {
-            fn line(&self, text: &str, cap: f64, bold: bool) -> crate::aim::text::Mask {
+        impl crate::text::TextRaster for Recording {
+            fn line(&self, text: &str, cap: f64, bold: bool) -> crate::text::Mask {
                 self.0.lock().unwrap().push(cap);
-                crate::aim::text::TextRaster::line(&crate::aim::text::StrokeText, text, cap, bold)
+                crate::text::TextRaster::line(&crate::text::StrokeText, text, cap, bold)
             }
         }
         for scale in [1., 1.25, 1.5, 2.] {
@@ -690,7 +684,7 @@ mod tests {
             assert_eq!(queue.entries.iter().map(|e| e.id).collect::<Vec<_>>(), [current, other]);
             assert!(queue.entries.iter().all(|e| e.leaving.is_none()));
             for reduced in [false, true] {
-                let frames = queue.frames(now, Style::default(), reduced, &crate::aim::text::StrokeText);
+                let frames = queue.frames(now, Style::default(), reduced, &crate::text::StrokeText);
                 assert_eq!(frames.iter().map(|f| f.id).collect::<Vec<_>>(), [current, other]);
             }
             assert!(queue.click(Click { id: old, undo: true }, now).is_none());
@@ -744,7 +738,7 @@ mod tests {
         use interaction::{HitState, Input};
         let now = Instant::now();
         let settled = now + Duration::from_secs(1);
-        let font = crate::aim::text::StrokeText;
+        let font = crate::text::StrokeText;
         for dark in [false, true] {
             for ppu in [1, 2] {
                 for scale in [0.5, 1., 1.25, 2.] {
@@ -805,7 +799,7 @@ mod tests {
         let now = Instant::now();
         let mut q = Queue::default();
         let id = q.push(toast(true), now);
-        let font = crate::aim::text::StrokeText;
+        let font = crate::text::StrokeText;
         for dark in [false, true] {
             let style = Style {
                 dark,
@@ -910,7 +904,7 @@ mod tests {
         let mut q = Queue::default();
         let a = q.push(toast(false), now);
         let b = q.push(toast(true), now);
-        let frames = q.frames(now, Style::default(), true, &crate::aim::text::StrokeText);
+        let frames = q.frames(now, Style::default(), true, &crate::text::StrokeText);
         assert_eq!(frames[0].bounds.x, -380.);
         assert!(frames[1].bounds.y + frames[1].card.y > frames[0].bounds.y + frames[0].card.bottom());
         q.tick(now + LIFETIME, true);
@@ -933,7 +927,7 @@ mod tests {
         t.description = "Extra description below the title".into();
         queue.push(t, now);
         let frame = queue
-            .frames(now, Style::default(), true, &crate::aim::text::StrokeText)
+            .frames(now, Style::default(), true, &crate::text::StrokeText)
             .remove(0);
         let hit = frame.undo.unwrap();
         assert_eq!(hit.h, 32.0);
@@ -946,7 +940,7 @@ mod tests {
         let mut q = Queue::default();
         let id = q.push(toast(true), now);
         let frame = q
-            .frames(now, Style::default(), true, &crate::aim::text::StrokeText)
+            .frames(now, Style::default(), true, &crate::text::StrokeText)
             .remove(0);
         assert_eq!(frame.bounds.x, -380.);
         assert!(frame.pixels.iter().any(|p| p >> 24 == 255));
@@ -1187,7 +1181,7 @@ mod geometry_tests {
                 now + Duration::from_secs(1),
                 Style::default(),
                 false,
-                &crate::aim::text::StrokeText,
+                &crate::text::StrokeText,
             )
             .remove(0);
         assert_eq!(frame.bounds.x, 620.);
@@ -1201,7 +1195,7 @@ mod geometry_tests {
                 now + Duration::from_secs(2),
                 Style::default(),
                 true,
-                &crate::aim::text::StrokeText,
+                &crate::text::StrokeText,
             )
             .remove(0);
         assert_eq!(frame.bounds.x, -380.);

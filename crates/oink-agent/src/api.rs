@@ -566,6 +566,8 @@ pub struct NetworkInfo {
     pub addresses: Vec<LocalAddress>,
     /// QUIC 端口，默认 47470。
     pub port: u16,
+    /// Actual Low TCP port, announced independently by the frozen Low::Info.
+    pub low_port: Option<u16>,
 }
 
 // Shared layout geometry.
@@ -635,11 +637,6 @@ impl std::fmt::Debug for ScreenWallpaper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "ScreenWallpaper({} B)", self.image.len())
     }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct ProjectionStatus {
-    pub editing: bool,
 }
 
 /// One rigid computer's native-origin canvas placement. Scale is uniform
@@ -997,9 +994,9 @@ impl Default for KeySupport {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InputSettings {
-    /// One default-off group setting, stored in GroupState register 8.
-    #[serde(default)]
-    pub application_focus_enabled: bool,
+    /// Read-only recovery chord from the router. Never persisted or applied on edits.
+    #[serde(default = "keyboard_release_keys")]
+    pub keyboard_release_keys: Vec<String>,
     /// Observed native Caps Lock input-source preference; never writable by clients.
     // Replies and subscription events are deserialized by the desktop bridge too.
     // The settings owner ignores this field on edits; skipping it here loses native observations.
@@ -1058,6 +1055,13 @@ pub struct InputSettings {
     pub cursor_trail_duration_ms: u32,
     /// Group setting stored and shared with the layout.
     pub gap_travel: bool,
+}
+
+pub(crate) fn keyboard_release_keys() -> Vec<String> {
+    oink_routing::KEYBOARD_RELEASE_KEYS
+        .iter()
+        .map(|key| (*key).to_owned())
+        .collect()
 }
 
 fn default_return_pointer_on_display_sleep() -> bool {
@@ -1577,7 +1581,7 @@ pub enum PermissionKind {
     AudioCapture,
     /// Optional microphone capture, requested only by an explicit Grant action.
     Microphone,
-    /// Windows 防火墙入站规则（默认 UDP 47470/47471：交互连接/发现；TCP 47472：Low 数据流）。
+    /// Windows 防火墙入站规则（按应用放行 QUIC/发现 UDP 与 Low TCP，包含系统分配的端口）。
     Firewall,
     /// Windows 系统服务：锁屏、管理员授权弹窗也能被远端键鼠操作（可选）。
     SystemService,
@@ -1622,50 +1626,6 @@ pub struct PermissionItem {
     pub required: bool,
 }
 
-/// 一块屏幕上显示的内容。
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum OverlayContent {
-    /// 识别屏幕：大字显示「设备名 · 屏幕名」。
-    Identify,
-}
-
-/// 一块本机屏幕上的窗口。
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct OverlayScreen {
-    /// 本机 `DisplayInfo::key`。
-    pub display: String,
-    pub device_name: String,
-    pub display_name: String,
-    pub content: OverlayContent,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OverlayKind {
-    Identify,
-}
-
-/// Short-lived identification windows on this device.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Overlay {
-    pub id: u64,
-    pub kind: OverlayKind,
-    pub screens: Vec<OverlayScreen>,
-    /// Wall-clock expiry; the backend dismisses the windows after three seconds.
-    pub expires_at_ms: Option<i64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct OverlayShown {
-    pub display: String,
-    /// Actual pixel dimensions of the rendered window.
-    pub pixel_width: u32,
-    pub pixel_height: u32,
-    /// 显示失败的原因（找不到这块屏幕、窗口创建失败）；成功为 `None`。
-    pub error: Option<String>,
-}
-
 // ───────────────────────────── 事件 ─────────────────────────────
 
 /// Game mode of the currently focused device. Commands to a remote holder are asynchronous.
@@ -1691,71 +1651,6 @@ impl From<oink_routing::GameModeStatus> for GameModeStatus {
             cursor_hiding_cause_available: s.cursor_hiding_cause_available,
         }
     }
-}
-
-// ───────────────────────────── 瞄准小游戏 ─────────────────────────────
-
-/// Current phase of the aiming exercise.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AimPhase {
-    /// 没有进行中的游戏。
-    #[default]
-    Idle,
-    /// 开局倒计时。
-    Countdown,
-    Running,
-    /// 时间到，叠加层上显示着结果（几秒后或点击 / Esc 后收起）。
-    Finished,
-}
-
-/// 瞄准小游戏的状态。
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct AimStatus {
-    /// 本机能否显示全屏叠加层（平台实现）。`false` 时不能开始。
-    pub available: bool,
-    pub phase: AimPhase,
-    /// 这一局是本机发起的（本机计分、计时）；其它设备发起的一局里本机只显示叠加层。
-    pub host: bool,
-    /// 进行中：这一局是在暂停共享时开的（各设备用自己的原生输入）。空闲时：现在开始会是这种局
-    /// （即本机此刻处于暂停共享）。
-    pub native_input: bool,
-    /// 当前阶段剩余的毫秒数（发出事件的时刻；界面按本机时钟倒数）。
-    pub remaining_ms: u32,
-    pub score: u32,
-    /// 计入命中率的点击次数。
-    pub clicks: u32,
-    /// 参与的设备数（含本机）；本机不是发起方时为 0。
-    pub devices: u32,
-    /// 标靶直径（视平面毫米），所有屏幕上相同。
-    pub target_diameter: f64,
-    /// 一局的时长。
-    pub duration_ms: u32,
-    /// 本机发起的最近几局的结果（新的在前，最多 10 局；不保存，服务重启后清空）。
-    pub results: Vec<AimResult>,
-}
-
-/// 一局的结果。
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct AimResult {
-    /// 这一局是在暂停共享时开的：每台设备用自己的原生输入（基线）。否则输入经 Oink 转发。
-    pub native_input: bool,
-    /// 进行中共享的暂停状态变过（这一局不适合用来对比）。
-    pub mode_changed: bool,
-    pub score: u32,
-    pub clicks: u32,
-    /// 命中率（0–1）；没有点击时为 `None`。
-    pub accuracy: Option<f64>,
-    pub hits_per_sec: f64,
-    /// 平均命中间隔；没有命中时为 `None`。
-    pub avg_hit_interval_ms: Option<f64>,
-    /// 实际进行的时长（提前结束时小于一局的时长）。
-    pub played_ms: u32,
-    /// 是否打满了时间。
-    pub completed: bool,
-    /// 参与的设备数（含本机）。
-    pub devices: u32,
-    pub ended_at_ms: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1789,7 +1684,6 @@ pub enum ApiEvent {
         revision: crate::device_cards::DecimalU64,
         requests: Vec<pairing::PendingRequest>,
     },
-    GroupMigrationChanged(pairing::GroupMigrationStatus),
     PairingFailed {
         event_id: crate::device_cards::DecimalU64,
         pair_id: pairing::PairId,
@@ -1847,7 +1741,6 @@ pub enum ApiEvent {
         error: Option<String>,
     },
     Layout(Layout),
-    LayoutProjection(ProjectionStatus),
     /// core
     InputSettings(InputSettings),
     /// core
@@ -1876,8 +1769,6 @@ pub enum ApiEvent {
     TogglePanel(crate::backend::PanelAnchor),
     /// Windows backend asks the tray/UI process to explicitly reopen both processes.
     ReopenOink,
-    /// core：瞄准小游戏的状态（阶段、得分变化时；进行中每 250 ms 一次）。
-    Aim(AimStatus),
     /// core：某块屏幕的壁纸缩略图变了（本机的或其他设备的）；界面重新调用 `wallpapers`。
     /// 事件本身不带图片。
     Wallpapers,
@@ -1969,7 +1860,6 @@ pub trait AgentApi: Send + Sync {
     fn pairings(&self) -> ApiResult<pairing::PairingSnapshot>;
     /// Ephemeral local admission policy while the welcome flow connects a peer.
     fn set_onboarding_connect(&self, active: bool) -> ApiResult<()>;
-    fn group_migration(&self) -> ApiResult<Option<pairing::GroupMigrationStatus>>;
     fn accept_pairing(
         &self,
         pair_id: String,
@@ -2040,17 +1930,8 @@ pub trait AgentApi: Send + Sync {
         })
     }
 
-    // Aiming exercise.
-    fn aim_status(&self) -> ApiResult<AimStatus>;
-    /// 开始一局：组内每台在线设备的每块屏幕盖上全屏叠加层，本机计分、计时。已有一局在进行时报错。
-    fn aim_start(&self) -> ApiResult<AimStatus>;
-    /// 结束当前这一局（本机发起的：整局结束；其它设备发起的：请它结束）。没有进行中的游戏时什么也不做。
-    fn aim_stop(&self) -> ApiResult<()>;
-
     // 设备与配对（net）
     fn group(&self) -> ApiResult<GroupView>;
-    /// 改名：本机或本组其他设备（改名在组内同步）。
-    fn rename_device(&self, device: DeviceKey, name: String) -> ApiResult<()>;
 
     /// 从本组移除一台设备（被移除的设备无法再连回来）。
     fn remove_member(&self, device: DeviceKey) -> ApiResult<()>;
@@ -2067,13 +1948,10 @@ pub trait AgentApi: Send + Sync {
     fn set_screen_remote_gain(&self, screen: ScreenKey, gain: f64) -> ApiResult<()>;
     fn set_screen_hidden(&self, screen: ScreenKey, hidden: bool) -> ApiResult<()>;
     /// Briefly identify screens on this device and attached peers.
-    fn identify_screens(&self) -> ApiResult<()>;
     /// 各屏幕（本机的与其他设备的）当前桌面壁纸的缩略图。`refresh` 为真时另外让服务重新读一次本机的
     /// 壁纸（界面打开布局页时；不等它读完，有变化时发 [`ApiEvent::Wallpapers`]）。
     fn wallpapers(&self, _refresh: bool) -> ApiResult<Vec<ScreenWallpaper>>;
 
-    fn layout_projection(&self) -> ApiResult<ProjectionStatus>;
-    fn set_layout_projection(&self, enabled: bool) -> ApiResult<ProjectionStatus>;
     fn preview_layout_projection(
         &self,
         gesture: u64,
@@ -2311,7 +2189,6 @@ pub enum Request {
     SetOnboardingConnect {
         active: bool,
     },
-    GroupMigration,
     AcceptPairing {
         pair_id: String,
         expected_revision: crate::device_cards::DecimalU64,
@@ -2414,10 +2291,6 @@ pub enum Request {
     },
     ToggleGameMode,
     Group,
-    RenameDevice {
-        device: DeviceKey,
-        name: String,
-    },
     RemoveMember {
         device: DeviceKey,
     },
@@ -2439,11 +2312,6 @@ pub enum Request {
     SetScreenHidden {
         screen: ScreenKey,
         hidden: bool,
-    },
-    IdentifyScreens,
-    LayoutProjection,
-    SetLayoutProjection {
-        enabled: bool,
     },
     PreviewLayoutProjection {
         gesture: u64,
@@ -2526,9 +2394,6 @@ pub enum Request {
     },
     OpenLaunchAtLoginSettings,
     ShowWindow,
-    AimStatus,
-    AimStart,
-    AimStop,
     Wallpapers {
         #[serde(default)]
         refresh: bool,
@@ -2558,7 +2423,6 @@ pub enum Reply {
     RefreshNearby(pairing::PairReply<pairing::Accepted>),
     StartPairing(pairing::PairReply<pairing::Started>),
     Pairings(pairing::PairingSnapshot),
-    GroupMigration(Option<pairing::GroupMigrationStatus>),
     CancelPairing(pairing::PairReply<pairing::CancelResult>),
     PairingCode(pairing::CodeView),
     SubscribePairingEvents(Vec<pairing::PairingEvent>),
@@ -2568,11 +2432,9 @@ pub enum Reply {
     UiPreferences(UiPreferences),
     ReportStatus(crate::telemetry::ReportStatus),
     UpdateStatus(UpdateStatus),
-    LayoutProjection(ProjectionStatus),
     Audio(oink_audio::Status),
     MicrophonePlugin(crate::microphone_plugin::MicrophonePluginStatus),
     GameMode(GameModeStatus),
-    Aim(AimStatus),
     Unit,
     Overview(Overview),
     Pause(PauseStatus),
@@ -2698,7 +2560,6 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
         R::StartPairing { operation_id, target } => api.start_pairing(operation_id, target).map(Reply::StartPairing),
         R::Pairings => api.pairings().map(Reply::Pairings),
         R::SetOnboardingConnect { active } => unit(api.set_onboarding_connect(active)),
-        R::GroupMigration => api.group_migration().map(Reply::GroupMigration),
         R::AcceptPairing {
             pair_id,
             expected_revision,
@@ -2752,7 +2613,6 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
         R::SetGameMode { mode } => unit(api.set_game_mode(mode)),
         R::ToggleGameMode => unit(api.toggle_game_mode()),
         R::Group => api.group().map(Reply::Group),
-        R::RenameDevice { device, name } => unit(api.rename_device(device, name)),
         R::RemoveMember { device } => unit(api.remove_member(device)),
         R::LeaveGroup => unit(api.leave_group()),
         R::NetworkInfo => api.network_info().map(Reply::NetworkInfo),
@@ -2762,13 +2622,7 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
         R::SetScreenGain { screen, gain } => unit(api.set_screen_gain(screen, gain)),
         R::SetScreenRemoteGain { screen, gain } => unit(api.set_screen_remote_gain(screen, gain)),
         R::SetScreenHidden { screen, hidden } => unit(api.set_screen_hidden(screen, hidden)),
-        R::IdentifyScreens => unit(api.identify_screens()),
-        R::AimStatus => api.aim_status().map(Reply::Aim),
-        R::AimStart => api.aim_start().map(Reply::Aim),
-        R::AimStop => unit(api.aim_stop()),
         R::Wallpapers { refresh } => api.wallpapers(refresh).map(Reply::Wallpapers),
-        R::LayoutProjection => api.layout_projection().map(Reply::LayoutProjection),
-        R::SetLayoutProjection { enabled } => api.set_layout_projection(enabled).map(Reply::LayoutProjection),
         R::PreviewLayoutProjection {
             gesture,
             placements,
@@ -3083,6 +2937,21 @@ mod input_transform_contract_tests {
     };
 
     #[test]
+    fn keyboard_release_keys_survive_replies_and_events() {
+        let settings = test_input_settings();
+        assert_eq!(settings.keyboard_release_keys, oink_routing::KEYBOARD_RELEASE_KEYS);
+        let reply = Reply::InputSettings(settings.clone());
+        let decoded: InputSettings = serde_json::from_value(serde_json::to_value(reply).unwrap()).unwrap();
+        assert_eq!(decoded.keyboard_release_keys, settings.keyboard_release_keys);
+        let event = ApiEvent::InputSettings(settings.clone());
+        let decoded: ApiEvent = serde_json::from_value(serde_json::to_value(event).unwrap()).unwrap();
+        let ApiEvent::InputSettings(decoded) = decoded else {
+            panic!("expected input settings event")
+        };
+        assert_eq!(decoded.keyboard_release_keys, settings.keyboard_release_keys);
+    }
+
+    #[test]
     fn native_caps_observation_survives_replies_and_events() {
         for observed in [Some(true), Some(false), None] {
             let mut settings = test_input_settings();
@@ -3206,6 +3075,7 @@ mod product_boundary {
 #[cfg(test)]
 fn test_input_settings() -> InputSettings {
     InputSettings {
+        keyboard_release_keys: keyboard_release_keys(),
         mac_caps_switches_input_source: None,
         key_support: Default::default(),
         event_frequency: Default::default(),
@@ -3231,7 +3101,6 @@ fn test_input_settings() -> InputSettings {
         wake_displays_on_input: true,
         cursor_trail: true,
         cursor_trail_duration_ms: 270,
-        application_focus_enabled: false,
         gap_travel: false,
     }
 }
@@ -3273,31 +3142,5 @@ mod input_validation_tests {
             value["cursor_trail_duration_ms"] = serde_json::json!(ms);
             assert!(serde_json::from_value::<InputSettings>(value.clone()).is_err());
         }
-    }
-}
-
-#[cfg(test)]
-mod removed_api_tests {
-    use super::*;
-
-    #[test]
-    fn removed_methods_and_events_use_generic_unknown_rejection() {
-        for method in [
-            "calibration",
-            "show_calibration_pattern",
-            "hide_calibration_pattern",
-            "upload_calibration_photo",
-            "upload_calibration_photo_from_clipboard",
-            "confirm_calibration",
-            "cancel_calibration",
-            "apply_calibration",
-        ] {
-            let error = serde_json::from_value::<Request>(serde_json::json!({"method": method})).unwrap_err();
-            assert!(error.to_string().contains("unknown variant"), "{method}: {error}");
-        }
-        assert!(serde_json::from_value::<ApiEvent>(serde_json::json!({"type":"calibration", "data":{}})).is_err());
-        assert!(serde_json::from_value::<LayoutSource>(serde_json::json!("calibrated")).is_err());
-        assert!(serde_json::from_value::<SizeSource>(serde_json::json!("calibrated")).is_err());
-        assert!(serde_json::from_value::<Request>(serde_json::json!({"method":"identify_screens"})).is_ok());
     }
 }

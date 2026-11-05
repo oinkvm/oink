@@ -180,6 +180,10 @@ impl RouterAdapter for Adapter {
             .set_peer_scroll_pixels(peer, admission.agreement.contains("oink.input.scroll-pixels/1"));
         self.router
             .set_peer_touchpad_options(peer, admission.agreement.contains("oink.input.touchpad-options/1"));
+        self.router
+            .set_peer_pointer_move_hidden(peer, admission.agreement.contains("oink.pointer.move-hidden/1"));
+        self.router
+            .set_peer_local_click(peer, admission.agreement.contains("oink.focus.local-click/1"));
         self.active.insert(peer);
         self.received.insert(peer, state.clone());
         for message in [
@@ -743,20 +747,7 @@ impl StreamModule for InputStreams {
                 });
             }
             let mut transform = None;
-            use oink_foundation::input::InputMode;
-            let mode = |raw| match raw {
-                0 => InputMode::Shared,
-                1 => InputMode::Local,
-                _ => InputMode::Disabled,
-            };
-            let mut mouse_mode = InputMode::Disabled;
-            let mut keyboard_mode = InputMode::Disabled;
             for option in facts.preferences()?.map_or(Vec::new(), |values| values.0) {
-                match option.option()? {
-                    dto::LocalOption::MouseMode => mouse_mode = mode(option.value()?.as_u64()?),
-                    dto::LocalOption::KeyboardMode => keyboard_mode = mode(option.value()?.as_u64()?),
-                    _ => {}
-                }
                 if option.option()? == dto::LocalOption::InputTransform {
                     let value = dto::InputTransformValue::read(&option.value()?)?;
                     transform = Some(
@@ -765,16 +756,10 @@ impl StreamModule for InputStreams {
                     );
                 }
             }
-            Ok((
-                displays,
-                transform,
-                oink_routing::Os::parse(&facts.os()?.0),
-                (mouse_mode, keyboard_mode),
-            ))
+            Ok((displays, transform, oink_routing::Os::parse(&facts.os()?.0)))
         };
-        if let Ok((displays, transform, os, modes)) = project() {
+        if let Ok((displays, transform, os)) = project() {
             self.input.send(InputCommand::PeerFacts {
-                application_modes: modes,
                 boot,
                 os,
                 displays,

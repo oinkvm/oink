@@ -445,18 +445,6 @@ async fn pair_route_clipboard_layout_disconnect_scenario() {
     assert_layout_files_equal(&an, &bn);
     sessions_unchanged("checkpoint 2");
 
-    an.identify_screens().unwrap();
-    wait_for("identify reaches peer", 5.0, || {
-        bn.overlay()
-            .unwrap()
-            .is_some_and(|o| o.kind == crate::api::OverlayKind::Identify)
-    })
-    .await;
-    wait_for("identify expires on both peers", 5.0, || {
-        an.overlay().unwrap().is_none() && bn.overlay().unwrap().is_none()
-    })
-    .await;
-
     let la = an.layout().0;
     let ax = la.screens.iter().find(|s| s.id.device == an.id()).unwrap().rect.x;
     let bx = la.screens.iter().find(|s| s.id.device == bn.id()).unwrap().rect.x;
@@ -588,7 +576,9 @@ async fn pair_route_clipboard_layout_disconnect_scenario() {
     // ---- Native file admission and authority across real node connections.
     // This backend has no OS received store and must refuse file publication.
     let source = an.data_dir().join("source.bin");
-    let bytes: Vec<u8> = (0..2_000_000u32).map(|i| (i * 11 % 251) as u8).collect();
+    // Keep this manual/provider-admission scenario outside the automatic cache
+    // budget. Small known file offers now begin fetching as soon as received.
+    let bytes = vec![0x5a; oink_clipboard::model::AUTO_PULL_BYTES as usize + 1];
     std::fs::write(&source, &bytes).unwrap();
     let files = vec![oink_clipboard::FileEntry {
         path: "传输.bin".into(),
@@ -775,12 +765,11 @@ async fn pair_route_clipboard_layout_disconnect_scenario() {
     }
 
     // ---- 断线：A 按着 A 键时退出 → B 释放它。
-    let server = crate::ipc::Server::start_on(an.clone(), 0).await.unwrap();
-    let ep: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(an.data_dir().join("ipc.json")).unwrap()).unwrap();
+    let server = crate::ipc::Server::start(an.clone()).await.unwrap();
+    let dir = an.data_dir().to_owned();
     tokio::task::spawn_blocking(move || {
         use std::io::{BufRead, Write};
-        let mut socket = std::net::TcpStream::connect(("127.0.0.1", ep["port"].as_u64().unwrap() as u16)).unwrap();
+        let mut socket = crate::ipc::open_stream(&dir, Duration::from_secs(2)).unwrap();
         socket.write_all(b"{\"token\":\"wrong\",\"stop\":true}\n").unwrap();
         let mut reply = String::new();
         std::io::BufReader::new(socket).read_line(&mut reply).unwrap();
@@ -825,14 +814,6 @@ async fn pair_route_clipboard_layout_disconnect_scenario() {
 }
 
 // In-process renderer probe; the renderer is not exposed through AgentApi or IPC.
-trait RendererProbe {
-    fn overlay(&self) -> crate::api::ApiResult<Option<crate::api::Overlay>>;
-}
-impl RendererProbe for Node {
-    fn overlay(&self) -> crate::api::ApiResult<Option<crate::api::Overlay>> {
-        Ok(crate::display_overlay::overlay(self))
-    }
-}
 struct Injected {
     moves: usize,
     key_events: usize,
@@ -857,6 +838,101 @@ fn injected(input: &oink_test_support::input::FakeInput) -> Injected {
         }
     }
     stats
+}
+
+#[test]
+fn pointer_shortcut_enters_and_leaves_hidden_screen_over_quic() {
+    use oink_routing::LayoutQuery;
+    crate::test_watchdog::run(
+        module_path!(),
+        "pointer_shortcut_enters_and_leaves_hidden_screen_over_quic",
+        Some(4),
+        async {
+            for per_screen in [false, true] {
+                let a = start("shortcut-a", 0).await;
+                let b = start("shortcut-b", 0).await;
+                common::pair(&a.node, &b.node).await;
+                common::active(&[&a.node, &b.node]).await;
+                key(&a.input, KeyCode::keyboard(4), true);
+                key(&a.input, KeyCode::keyboard(4), false);
+                wait_for("shared source focus", 5., || {
+                    [&a.node, &b.node]
+                        .into_iter()
+                        .all(|node| node.focus().is_some_and(|focus| focus.device.0 == a.node.id()))
+                })
+                .await;
+                let target = b.node.id();
+                api(&b.node, move |node| {
+                    if per_screen {
+                        node.set_screen_hidden(
+                            ScreenKey {
+                                device: target.into(),
+                                display: "shortcut-b".into(),
+                            },
+                            true,
+                        )
+                    } else {
+                        node.set_screen_disabled(target.into(), true)
+                    }
+                })
+                .await
+                .unwrap();
+                wait_for("hidden layout on both nodes", 5., || {
+                    [&a.node, &b.node].into_iter().all(|node| {
+                        !node
+                            .inner
+                            .group
+                            .get()
+                            .unwrap()
+                            .router_layout()
+                            .load()
+                            .topology
+                            .contains_device(target)
+                    })
+                })
+                .await;
+                b.input.set_cursor(Point::new(130., 170.));
+                api(&a.node, move |node| {
+                    node.on_hotkey(&format!("move_pointer_to:{}", target.to_hex()))
+                })
+                .await;
+                wait_for("shortcut focus on hidden target", 5., || {
+                    [&a.node, &b.node]
+                        .into_iter()
+                        .all(|node| node.focus().is_some_and(|focus| focus.device.0 == target))
+                })
+                .await;
+                wait_for("hidden target landing", 2., || {
+                    b.input.cursor_position().unwrap() == Point::new(800., 500.)
+                })
+                .await;
+                let source = a.node.id();
+                api(&a.node, move |node| {
+                    node.on_hotkey(&format!("move_pointer_to:{}", source.to_hex()))
+                })
+                .await;
+                wait_for("shortcut leaves hidden target", 5., || {
+                    [&a.node, &b.node]
+                        .into_iter()
+                        .all(|node| node.focus().is_some_and(|focus| focus.device.0 == source))
+                })
+                .await;
+                assert!(
+                    !a.node
+                        .inner
+                        .group
+                        .get()
+                        .unwrap()
+                        .router_layout()
+                        .load()
+                        .topology
+                        .contains_device(target)
+                );
+                a.node.shutdown().await;
+                b.node.shutdown().await;
+            }
+        },
+    );
 }
 
 #[test]
@@ -904,7 +980,7 @@ fn game_badges_follow_only_the_shortcut_target_and_each_owner_preference() {
             })
             .await;
             for node in [&a.node, &b.node] {
-                assert_eq!(node.settings().game_mode, GameModePreference::Auto);
+                assert_eq!(node.settings().game_mode, crate::config::Settings::default().game_mode);
                 let runtime = node.game_mode().unwrap();
                 assert_eq!(runtime.holder.0, a.node.id());
                 assert!(runtime.active);
@@ -1620,13 +1696,11 @@ fn remote_card_modes_apply_persist_and_publish_without_editing_requester() {
             let editor = b.node.clone();
             let owner = a.node.id();
             tokio::task::spawn_blocking(move || {
-                editor.rename_device(owner.into(), "remote-owner".into()).unwrap();
                 editor.set_input_transform(owner.into(), transform.into()).unwrap();
             })
             .await
             .unwrap();
             let saved = crate::config::AgentConfig::load_from(a._dir.path()).unwrap();
-            assert_eq!(saved.settings.device_name.as_deref(), Some("remote-owner"));
             assert_eq!(saved.settings.input_transform, expected_transform);
             let raw = saved
                 .owner()
@@ -1643,10 +1717,6 @@ fn remote_card_modes_apply_persist_and_publish_without_editing_requester() {
             assert_eq!(a.node.settings().input_transform, expected_transform);
             assert_eq!(b.node.settings().input_transform, requester_transform);
             assert_eq!(b.node.device_name(b.node.id()), requester_name);
-            wait_for("remote owner name publication", 5., || {
-                b.node.device_name(owner) == "remote-owner"
-            })
-            .await;
             let mut removed = expected_transform;
             removed.windows.keyboard.table.clear();
             removed.overrides.clear();

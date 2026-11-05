@@ -584,7 +584,7 @@ fn restored_native_index_never_enumerates_offline_and_rejects_path_escape() {
 
 // Real registry and source identity store, with bounded transport in both
 // directions. No collector can quietly download the file behind a slow reader.
-struct RegistryLink(Arc<super::super::Registry>);
+pub(crate) struct RegistryLink(pub(crate) Arc<super::super::Registry>);
 struct Pipe {
     send: Option<tokio::sync::mpsc::Sender<ContentMsg>>,
     receive: tokio::sync::mpsc::Receiver<ContentMsg>,
@@ -643,6 +643,55 @@ impl BulkLink for RegistryLink {
             }) as Box<dyn BulkChannel>)
         })
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deferred_native_registration_does_not_acquire_and_cancel_interrupts_pending_authority() {
+    struct Stalled(tokio::sync::Notify);
+    impl BulkLink for Stalled {
+        fn bind(self: Arc<Self>, _: DeviceId, _: ClipId) -> Arc<dyn BulkLink> {
+            self
+        }
+        fn supports_cloud_links(&self) -> bool {
+            true
+        }
+        fn open(&self, _: DeviceId) -> BoxFuture<'_, io::Result<Box<dyn BulkChannel>>> {
+            Box::pin(async {
+                self.0.notify_one();
+                std::future::pending().await
+            })
+        }
+    }
+    let descriptor = descriptor(3);
+    let link = Arc::new(Stalled(tokio::sync::Notify::new()));
+    let publication = Arc::new(Publication::new(
+        descriptor.offer,
+        descriptor.roots,
+        link.clone(),
+        Demand::Clipboard,
+        tokio::runtime::Handle::current(),
+    ));
+    let directory = tempfile::tempdir().unwrap();
+    let native = Arc::new(NativeCatalog {
+        path: directory.path().join("catalog.json"),
+        fail: AtomicBool::new(false),
+    });
+    let owner: Arc<dyn crate::content::namespace::NativeFiles> = native.clone();
+    publication.bind_native(Arc::downgrade(&owner)).unwrap();
+    assert!(publication.descriptor().is_none());
+    assert!(!native.path.exists());
+    let pending = publication.clone();
+    let request = tokio::spawn(async move { pending.prepare().await });
+    tokio::time::timeout(Duration::from_secs(1), link.0.notified())
+        .await
+        .unwrap();
+    publication.cancel_receiving();
+    let error = tokio::time::timeout(Duration::from_secs(1), request)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(reason(&error), Unavailable::Cancelled);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1229,4 +1278,43 @@ async fn windows_target_projects_a_filtered_link_root_out_of_native_inventory() 
             .unwrap();
     assert_eq!(files.roots().len(), 1);
     assert_eq!(files.roots()[0].path, "file");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn obsolete_metadata_preparation_cancels_while_waiting_for_the_remote_grant() {
+    struct Pending(std::sync::mpsc::Sender<()>);
+    impl BulkLink for Pending {
+        fn bind(self: Arc<Self>, _: DeviceId, _: ClipId) -> Arc<dyn BulkLink> {
+            self
+        }
+        fn supports_cloud_links(&self) -> bool {
+            true
+        }
+        fn open(&self, _: DeviceId) -> BoxFuture<'_, io::Result<Box<dyn BulkChannel>>> {
+            Box::pin(async {
+                self.0.send(()).unwrap();
+                std::future::pending().await
+            })
+        }
+    }
+    let descriptor = descriptor(4);
+    let (started, entered) = std::sync::mpsc::channel();
+    let publication = Arc::new(Publication::new(
+        descriptor.offer,
+        descriptor.roots,
+        Arc::new(Pending(started)),
+        Demand::Clipboard,
+        tokio::runtime::Handle::current(),
+    ));
+    let current = Arc::new(AtomicBool::new(true));
+    let worker_current = current.clone();
+    let worker =
+        tokio::task::spawn_blocking(move || publication.ready_while(&|| worker_current.load(Ordering::Acquire)));
+    entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    current.store(false, Ordering::Release);
+    let result = tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(crate::content::reason(&result.unwrap_err()), Unavailable::Cancelled);
 }

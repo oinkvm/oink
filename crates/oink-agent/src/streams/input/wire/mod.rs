@@ -1,5 +1,4 @@
 //! The input owner's v1 boundary. Transport admission precedes every DTO projection.
-mod application_focus;
 mod control;
 mod input;
 use oink_foundation::session::Boot;
@@ -19,9 +18,6 @@ pub struct PeerAdmission {
     pub agreement: Arc<Agreement>,
 }
 impl PeerAdmission {
-    pub fn application_focus(&self) -> bool {
-        self.agreement.contains("oink.input.application-focus/1")
-    }
     pub fn relative(&self) -> bool {
         self.agreement.contains("oink.input.relative/1")
     }
@@ -86,6 +82,7 @@ impl PeerAdmission {
 // Keep ordinary input decoding allocation-free; deferred records are the rare path.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Decoded {
+    Retired,
     Packet(Packet),
     /// Drag inventories and attachment declarations stay retained until their ordinary owner consumes them.
     Deferred(v1::Message),
@@ -98,6 +95,9 @@ pub(crate) fn decode(bytes: &[u8], peer: &PeerAdmission, datagram: bool) -> v1::
         v1::limits::RELIABLE_FRAME
     };
     let frame = OpaqueFrame::parse_exact(bytes, maximum)?;
+    if v1::registry::retired_input_frame(frame)? {
+        return Ok(Decoded::Retired);
+    }
     peer.context(datagram)
         .admit_frame(frame)
         .map_err(|violation| v1::Error::from(violation.code))?;
@@ -119,7 +119,9 @@ pub(crate) fn decode(bytes: &[u8], peer: &PeerAdmission, datagram: bool) -> v1::
             }
             Ok(Decoded::Deferred(message))
         }
-        _ if (0x0100..=0x010f).contains(&frame.header.type_id) || matches!(frame.header.type_id, 0x1300 | 0x0111) => {
+        _ if (0x0100..=0x010f).contains(&frame.header.type_id)
+            || matches!(frame.header.type_id, 0x1300 | 0x1301 | 0x1302 | 0x0111) =>
+        {
             control::decode(message).map(|value| Decoded::Packet(Packet::Control(value)))
         }
         _ => crate::dnd::wire::decode(message).map(|value| Decoded::Packet(Packet::Dnd(value))),
@@ -140,12 +142,13 @@ pub(crate) fn encode_wire(message: &v1::Message, out: &mut [u8]) -> v1::Result<u
 }
 pub(crate) fn supported(message: &Packet, peer: &PeerAdmission) -> bool {
     let capability = match message {
-        Packet::Control(ControlMsg::ApplicationFocus(_)) => "oink.input.application-focus/1",
         Packet::Input(input) | Packet::TimedInput { input, .. } => return input_supported(input, peer),
         Packet::Control(ControlMsg::GameMode { .. } | ControlMsg::SetGameMode { .. }) => "oink.input.relative/1",
         Packet::Control(ControlMsg::CursorTrail { .. } | ControlMsg::CursorTrailHandoff { .. }) => "oink.input.trail/1",
         Packet::Dnd(_) => "oink.drag/1",
+        Packet::Control(ControlMsg::LocalClick { .. }) => "oink.focus.local-click/1",
         Packet::Control(ControlMsg::MovePointer { .. }) => "oink.pointer.move/1",
+        Packet::Control(ControlMsg::MovePointerEnter { .. }) => "oink.pointer.move-hidden/1",
         Packet::Control(ControlMsg::EntryProtection { .. }) => "oink.pointer.entry-protection/1",
         Packet::Control(ControlMsg::LockRemoteWindows(_)) => oink_routing::control::WINDOWS_LOCK_CAPABILITY,
         Packet::Control(ControlMsg::LockEscape { .. }) => "oink.pointer.lock-escape/1",
@@ -155,9 +158,6 @@ pub(crate) fn supported(message: &Packet, peer: &PeerAdmission) -> bool {
 }
 fn input_supported(input: &InputMsg, peer: &PeerAdmission) -> bool {
     let capability = match input {
-        InputMsg::ApplicationKey { .. } | InputMsg::ApplicationRepeat { .. } | InputMsg::ApplicationHeldSync { .. } => {
-            "oink.input.application-focus/1"
-        }
         InputMsg::Forwarded { msg, .. } => return input_supported(msg, peer),
         InputMsg::RelativeMotion { .. } => "oink.input.relative/1",
         InputMsg::Gesture { .. } => "oink.input.gestures/1",
@@ -343,5 +343,207 @@ mod windows_lock_tests {
             let n = encode(&key, &mut bytes).unwrap();
             assert!(matches!(decode(&bytes[..n],&peer,false).unwrap(),Decoded::Packet(p) if p==key));
         }
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+    #[test]
+    fn retired_input_is_discarded_and_next_ordinary_key_decodes() {
+        let peer = PeerAdmission {
+            boot: Boot {
+                device_id: oink_foundation::DeviceId([1; 32]),
+                nonce: [1; 16],
+            },
+            link: oink_network::link::LinkId(1),
+            agreement: Arc::new(Agreement::new(v1::registry::BASELINE.iter().map(|s| s.to_string())).unwrap()),
+        };
+        assert!(Agreement::new(["oink.input.application-focus/1".into()]).is_err());
+        for (id, fields) in [
+            (0x010d, vec![]),
+            (0x0202, vec![103]),
+            (0x0207, vec![103]),
+            (0x0205, vec![103]),
+            (0x0205, vec![104]),
+        ] {
+            let fields: v1::RawMap = fields.into_iter().map(|key| (key, v1::RawValue::Bool(true))).collect();
+            let payload = v1::cbor::encode_map(&fields, 1024).unwrap();
+            let mut bytes = v1::frame::FrameHeader {
+                type_id: id,
+                payload_length: payload.len() as u32,
+            }
+            .bytes()
+            .to_vec();
+            bytes.extend_from_slice(&payload);
+            assert!(matches!(decode(&bytes, &peer, false).unwrap(), Decoded::Retired));
+        }
+        let key = Packet::Input(InputMsg::Key {
+            code: oink_foundation::input::KeyCode::CAPS_LOCK,
+            pressed: true,
+        });
+        let mut bytes = [0; 1024];
+        let n = encode(&key, &mut bytes).unwrap();
+        assert!(matches!(decode(&bytes[..n], &peer, false).unwrap(), Decoded::Packet(found) if found == key));
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use oink_foundation::{DeviceId, Point};
+    use oink_routing::control::{EntryProtection, FocusLock, FocusScope, GameMode, TrailContinuation};
+    use std::collections::BTreeSet;
+
+    fn samples() -> Vec<ControlMsg> {
+        let device = DeviceId([1; 32]);
+        let boot = Boot {
+            device_id: device,
+            nonce: [2; 16],
+        };
+        let scope = FocusScope {
+            members: vec![(device, [3; 16])],
+        };
+        let lock = FocusLock {
+            revision: 1,
+            author: device,
+            epoch: 1,
+            holder: device,
+            session: [3; 16],
+            scope: scope.clone(),
+            locked: true,
+        };
+        vec![
+            ControlMsg::LocalClick {
+                epoch: 1,
+                holder: device,
+                scope: scope.clone(),
+                phase: 0,
+            },
+            ControlMsg::EntryProtection {
+                state: EntryProtection::default(),
+            },
+            ControlMsg::LockEscape { held: true },
+            ControlMsg::MovePointer {
+                epoch: 1,
+                target: device,
+            },
+            ControlMsg::Feel {
+                profile: Default::default(),
+            },
+            ControlMsg::FocusEnter {
+                epoch: 1,
+                display: "screen".into(),
+                pos: Point::new(0.5, 0.5),
+                scope: Some(scope.clone()),
+                pointer_source: None,
+            },
+            ControlMsg::FocusState {
+                epoch: 1,
+                holder: device,
+                scope: Some(scope.clone()),
+                session: Some([3; 16]),
+                lock_state: Some(lock.clone()),
+            },
+            ControlMsg::SetFocusLock {
+                epoch: 1,
+                locked: Some(true),
+                target: Some(device),
+            },
+            ControlMsg::FocusLock { state: lock },
+            ControlMsg::GameMode {
+                epoch: 1,
+                generation: 1,
+                mode: GameMode::Auto,
+                detected: false,
+                active: false,
+                cursor_hiding_cause_available: None,
+            },
+            ControlMsg::SetGameMode {
+                epoch: 1,
+                mode: GameMode::On,
+            },
+            ControlMsg::FocusResume {
+                epoch: 1,
+                holder: device,
+                scope: scope.clone(),
+            },
+            ControlMsg::CursorTrail { active: true },
+            ControlMsg::UserActivity,
+            ControlMsg::CursorTrailHandoff {
+                epoch: 1,
+                sources: vec![device],
+                state: TrailContinuation {
+                    shown_secs: 0.,
+                    size_scale: 1.,
+                    native_units_per_reference: 1.,
+                    emit_carry: 0.,
+                    heading: Point::new(1., 0.),
+                    points: vec![],
+                },
+            },
+            ControlMsg::InputCapability {
+                controllable: true,
+                touchpad_contacts: None,
+            },
+            ControlMsg::LockRemoteWindows(oink_routing::control::WindowsLockRequest {
+                source: boot,
+                target: boot,
+                epoch: 1,
+                id: 1,
+            }),
+            ControlMsg::MovePointerEnter {
+                epoch: 1,
+                display: "hidden".into(),
+                pos: Point::new(-200., 350.),
+                scope: Some(scope),
+                pointer_source: Some(device),
+            },
+        ]
+    }
+
+    /// The top-level input decoder chooses the control decoder from a type-id
+    /// list. A control message missing from it falls into the drag decoder and
+    /// faults the stream (0x1302 once did), so every I0 control type must decode
+    /// as control through the same entry point the stream uses.
+    #[test]
+    fn every_input_stream_control_type_dispatches_to_the_control_decoder() {
+        let peer = PeerAdmission {
+            boot: Boot {
+                device_id: DeviceId([1; 32]),
+                nonce: [1; 16],
+            },
+            link: oink_network::link::LinkId(1),
+            agreement: Arc::new(Agreement::new(v1::registry::CAPABILITIES.iter().map(|s| s.to_string())).unwrap()),
+        };
+        let mut covered = BTreeSet::new();
+        for sample in samples() {
+            let packet = Packet::Control(sample);
+            let mut out = [0u8; 4096];
+            let n = encode(&packet, &mut out).unwrap();
+            let type_id = OpaqueFrame::parse_exact(&out[..n], v1::limits::RELIABLE_FRAME)
+                .unwrap()
+                .header
+                .type_id;
+            covered.insert(type_id);
+            let decoded = decode(&out[..n], &peer, false);
+            assert!(
+                matches!(
+                    (&decoded, &packet),
+                    (Ok(Decoded::Packet(Packet::Control(found))), Packet::Control(sent))
+                        if std::mem::discriminant(found) == std::mem::discriminant(sent)
+                ),
+                "type {type_id:#06x} did not decode as its control message"
+            );
+        }
+        // Every control type the registry routes on the input stream has a sample.
+        let registered: BTreeSet<u16> = v1::registry::MESSAGES
+            .iter()
+            .filter(|m| m.routes.iter().any(|r| r.kind == 3))
+            .filter(|m| !(0x0201..=0x02ff).contains(&m.id))
+            .filter(|m| !m.name.starts_with("Dnd") && !m.name.starts_with("Attachment"))
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(covered, registered);
     }
 }

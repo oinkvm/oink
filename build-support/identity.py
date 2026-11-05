@@ -8,6 +8,11 @@ ROOT = Path(__file__).resolve().parents[1]
 IDENTITY = json.loads((ROOT / 'packaging/identity.json').read_text())
 
 
+def artifact_stem(version, platform, arch):
+    """Public URLs use display versions; numeric builds stay in package metadata."""
+    return f"{IDENTITY['name']}-{version}-{platform}-{arch}"
+
+
 def windows_product_version(build):
     """MSI's 8/8/16 fields preserve global build ordering across human versions."""
     if type(build) is not int or not 1 <= build < 2**31:

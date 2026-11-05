@@ -64,7 +64,7 @@ impl Router {
         if region.edges.contains(&edge) {
             return true;
         }
-        // Use the tangent's physical scale: calibrated axes need not have equal plane/point.
+        // Use the tangent's physical scale: layout axes need not have equal plane/point.
         let Some((b, k)) = self.resistance_geometry(p, (n.1, n.0)) else {
             return false;
         };
@@ -97,7 +97,7 @@ impl Router {
         })
     }
 
-    /// Geometry uses the calibrated physical rectangle, not the motion gain or the destination screen.
+    /// Geometry uses the layout rectangle, not the motion gain or the destination screen.
     fn resistance_geometry(&self, p: &ScreenPos, normal: (f64, f64)) -> Option<(Rect, f64)> {
         let b = self.displays.iter().find(|d| d.key == p.screen.display)?.bounds;
         let a = self

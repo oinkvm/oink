@@ -99,13 +99,33 @@ pub fn input_window(ingress: &Ingress, sample: &oink_input::timing::Sample) {
     }
 }
 pub fn distribution_value(ingress: &Ingress, generation: u64, metric: Metric, value_us: u64, window_us: Option<u64>) {
+    distribution_context(ingress, generation, ingress.context(metric), value_us, window_us);
+}
+pub fn audio_distribution_value(
+    ingress: &Ingress,
+    generation: u64,
+    metric: Metric,
+    profile: oink_audio::negotiation::Profile,
+    value_us: u64,
+) {
+    let mut context = ingress.context(metric);
+    context.codec = Some(audio_codec(profile));
+    distribution_context(ingress, generation, context, value_us, None);
+}
+fn distribution_context(
+    ingress: &Ingress,
+    generation: u64,
+    context: MeasurementContext,
+    value_us: u64,
+    window_us: Option<u64>,
+) {
     let started = Instant::now();
     let bins = sampling::singleton(value_us);
     ingress.submit(
         generation,
         now(),
         Report::PerformanceDistribution(PerformanceDistribution {
-            context: ingress.context(metric),
+            context,
             histogram: HistogramSchema::Duration14,
             bins,
             sample_count: 1,
@@ -116,9 +136,18 @@ pub fn distribution_value(ingress: &Ingress, generation: u64, metric: Metric, va
         }),
     );
 }
-pub fn audio_histogram(metric: Metric, buckets: [u64; 8], window_us: u64) {
+pub fn audio_histogram(metric: Metric, profile: oink_audio::negotiation::Profile, buckets: [u64; 8], window_us: u64) {
     let source = super::producer();
     let Some(ingress) = source.as_ref() else { return };
+    audio_histogram_for(ingress, metric, profile, buckets, window_us);
+}
+pub(super) fn audio_histogram_for(
+    ingress: &Ingress,
+    metric: Metric,
+    profile: oink_audio::negotiation::Profile,
+    buckets: [u64; 8],
+    window_us: u64,
+) {
     let Some(generation) = ingress.generation() else { return };
     if !ingress.window_eligible(window_us) {
         return;
@@ -135,7 +164,8 @@ pub fn audio_histogram(metric: Metric, buckets: [u64; 8], window_us: u64) {
         return;
     }
     ingress.mark_busy();
-    let context = ingress.context(metric);
+    let mut context = ingress.context(metric);
+    context.codec = Some(audio_codec(profile));
     ingress.submit(
         generation,
         now(),
@@ -152,10 +182,11 @@ pub fn audio_histogram(metric: Metric, buckets: [u64; 8], window_us: u64) {
     );
 }
 
-pub fn audio_presentation(pushed_at: Instant, playback_at: Instant) {
+pub fn audio_presentation(pushed_at: Instant, playback_at: Instant, codec: oink_audio::playback::PresentationCodec) {
     if let Some(ingress) = super::producer().as_ref()
-        && let Some(stamp) = ingress.stamp_at(pushed_at)
+        && let Some(mut stamp) = ingress.stamp_at(pushed_at)
     {
+        stamp.codec = Some(presentation_codec(codec));
         ingress.interval(stamp, Metric::AudioPushToPresentationEstimate, playback_at);
     }
 }
@@ -212,6 +243,7 @@ pub fn drag_native_begin(generation: u64, at: Instant, end: Instant) {
                 generation,
                 at,
                 transport: None,
+                codec: None,
             },
             Metric::DragStart { boundary },
             end,
@@ -265,5 +297,44 @@ pub fn drag_target_stage(stage: PrepareStage, start: Instant, end: Instant) {
         && let Some(stamp) = p.stamp_at(start)
     {
         p.interval(stamp, Metric::DragPrepareStage { stage }, end);
+    }
+}
+
+/// Drop all profile parameters before entering the reporting model.
+pub fn audio_codec(profile: oink_audio::negotiation::Profile) -> Codec {
+    use oink_audio::negotiation::Profile;
+    match profile {
+        Profile::Opus5ms => Codec::Opus5ms,
+        Profile::Opus20ms => Codec::Opus20ms,
+        Profile::Pcm24 { .. } => Codec::Pcm,
+        Profile::Pcm16_2p5ms => Codec::Pcm16_2p5ms,
+    }
+}
+fn presentation_codec(codec: oink_audio::playback::PresentationCodec) -> Codec {
+    use oink_audio::playback::PresentationCodec as C;
+    match codec {
+        C::Opus5ms => Codec::Opus5ms,
+        C::Opus20ms => Codec::Opus20ms,
+        C::Pcm24 => Codec::Pcm,
+        C::Pcm16_2p5ms => Codec::Pcm16_2p5ms,
+        C::Unknown => Codec::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn presentation_classes_map_without_profile_parameters() {
+        use oink_audio::playback::PresentationCodec as C;
+        for (input, output) in [
+            (C::Opus5ms, Codec::Opus5ms),
+            (C::Opus20ms, Codec::Opus20ms),
+            (C::Pcm24, Codec::Pcm),
+            (C::Pcm16_2p5ms, Codec::Pcm16_2p5ms),
+            (C::Unknown, Codec::Unknown),
+        ] {
+            assert_eq!(presentation_codec(input), output);
+        }
     }
 }

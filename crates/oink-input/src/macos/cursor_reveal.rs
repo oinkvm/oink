@@ -228,9 +228,7 @@ impl Motion {
     }
     pub fn submit_cg(&self, event: &CGEvent, tap: CGEventTapLocation) -> Result<Receipt<'_>, InputError> {
         let started = self.begin_cg(CGEvent::r#type(Some(event)))?;
-        if let Some(started) = started {
-            CGEvent::set_timestamp(Some(event), started);
-        }
+        stamp_cg_event(event, started, super::tap::now_event_ns());
         CGEvent::set_integer_value_field(Some(event), CGEventField::EventSourceUserData, super::inject::MAGIC);
         CGEvent::post(tap, Some(event));
         Ok(Receipt {
@@ -540,9 +538,75 @@ fn own_button(ty: u32, source: i64, pid: i64, own_pid: u32) -> bool {
         && source == i64::from(CGEventSourceStateID::HIDSystemState.0)
         && pid == i64::from(own_pid)
 }
+/// Modifiers use the submission clock for their ACK identity. Ordinary keys
+/// must use the same clock: leaving zero lets WindowServer stamp them later,
+/// after a following modifier release was already timestamped. IMEs can then
+/// see a Shift chord whose timestamps put the character outside the hold.
+/// This does not add an ACK wait to ordinary keys (Secure Input hides them).
+fn stamp_cg_event(event: &CGEvent, acknowledgement: Option<u64>, now: u64) {
+    let keyboard = matches!(
+        CGEvent::r#type(Some(event)),
+        CGEventType::KeyDown | CGEventType::KeyUp | CGEventType::FlagsChanged
+    );
+    if let Some(timestamp) = acknowledgement.or_else(|| keyboard.then_some(now)) {
+        CGEvent::set_timestamp(Some(event), timestamp);
+    }
+}
+
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+    #[test]
+    fn keyboard_timestamps_share_submission_clock_without_ordinary_key_ack() {
+        let source = objc2_core_graphics::CGEventSource::new(CGEventSourceStateID::Private).unwrap();
+        for shift in [56, 60] {
+            let side = if shift == 56 { 2 } else { 4 };
+            let mut timestamps = Vec::new();
+            for (key, down, ty, held, ack, now) in [
+                (shift, true, CGEventType::FlagsChanged, true, Some(100), 101),
+                (44, true, CGEventType::KeyDown, true, None, 102),
+                (44, false, CGEventType::KeyUp, true, None, 103),
+                (shift, false, CGEventType::FlagsChanged, false, Some(104), 105),
+            ] {
+                let event = CGEvent::new_keyboard_event(Some(&source), key, down).unwrap();
+                CGEvent::set_type(Some(&event), ty);
+                let flags = CGEventFlags(if held { 0x20100 | side } else { 0x100 });
+                CGEvent::set_flags(Some(&event), flags);
+                CGEvent::set_integer_value_field(
+                    Some(&event),
+                    CGEventField::EventSourceUserData,
+                    super::super::inject::MAGIC,
+                );
+                stamp_cg_event(&event, ack, now);
+                timestamps.push(CGEvent::timestamp(Some(&event)));
+                assert_eq!(CGEvent::r#type(Some(&event)), ty);
+                assert_eq!(
+                    CGEvent::integer_value_field(Some(&event), CGEventField::KeyboardEventKeycode),
+                    i64::from(key)
+                );
+                assert_eq!(CGEvent::flags(Some(&event)), flags);
+                assert_eq!(
+                    CGEvent::integer_value_field(Some(&event), CGEventField::KeyboardEventAutorepeat),
+                    0
+                );
+                assert_eq!(
+                    CGEvent::integer_value_field(Some(&event), CGEventField::EventSourceUserData),
+                    super::super::inject::MAGIC
+                );
+            }
+            assert_eq!(timestamps, [100, 102, 103, 104]);
+        }
+        let event = CGEvent::new(None).unwrap();
+        CGEvent::set_type(Some(&event), CGEventType::FlagsChanged);
+        stamp_cg_event(&event, None, 200); // no active capture tap
+        assert_eq!(CGEvent::timestamp(Some(&event)), 200);
+        CGEvent::set_type(Some(&event), CGEventType::MouseMoved);
+        stamp_cg_event(&event, None, 300);
+        assert_eq!(CGEvent::timestamp(Some(&event)), 200); // pointer path unchanged
+        stamp_cg_event(&event, Some(400), 401);
+        assert_eq!(CGEvent::timestamp(Some(&event)), 400); // preserve exact ACK token
+    }
+
     #[test]
     fn held_source_requires_observed_delivery_not_just_an_accepted_post() {
         let motion = Motion::default();

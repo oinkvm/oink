@@ -155,8 +155,6 @@ struct Core {
     inbound: Mutex<HashSet<ConnectionId>>,
     pacers: Mutex<HashMap<ConnectionId, Arc<crate::pace::Pacer>>>,
     listener: Mutex<Option<SocketAddr>>,
-    #[cfg(any(test, feature = "test-support"))]
-    reserved_listener: Mutex<Option<std::net::TcpListener>>,
     listener_failure: Mutex<Option<String>>,
     runtime: tokio::runtime::Handle,
     stopped: watch::Sender<bool>,
@@ -224,17 +222,22 @@ impl LowPool {
                 .then(|| pool.pacer.snapshot()),
         })
     }
+    pub(super) fn local_addr(&self) -> Option<SocketAddr> {
+        *lock(&self.core.listener)
+    }
     pub(super) fn tcp_inbound_verified(&self) -> bool {
         !*self.core.stopped.borrow() && lock(&self.core.listener).is_some() && !lock(&self.core.inbound).is_empty()
     }
     pub fn new(
         config: &super::LinkConfig,
-        address: SocketAddr,
+        listener: std::net::TcpListener,
         creds: Arc<tls::Credentials>,
         hub: Arc<Hub>,
         commands: mpsc::UnboundedSender<super::handle::Command>,
         activity: Arc<crate::activity::Activity>,
     ) -> Arc<Self> {
+        let address = listener.local_addr().expect("bound Low listener");
+        let listener = tokio::net::TcpListener::from_std(listener).expect("nonblocking Low listener");
         let network = Arc::new(Port {
             boot: config.boot,
             hub,
@@ -256,8 +259,6 @@ impl LowPool {
             inbound: Mutex::new(HashSet::new()),
             pacers: Mutex::new(HashMap::new()),
             listener: Mutex::new(None),
-            #[cfg(any(test, feature = "test-support"))]
-            reserved_listener: Mutex::new(crate::test_ports::take_tcp(address)),
             listener_failure: Mutex::new(None),
             runtime: tokio::runtime::Handle::current(),
             stopped: watch::channel(false).0,
@@ -265,6 +266,7 @@ impl LowPool {
             background: Arc::new(watch::channel(0).0),
             me: me.clone(),
         });
+        core.start_listener(listener);
         let worker = core.clone();
         core.runtime.spawn(async move {
             loop {
@@ -603,8 +605,6 @@ impl Core {
     }
     async fn stop(&self) {
         self.stopped.send_replace(true);
-        #[cfg(any(test, feature = "test-support"))]
-        drop(lock(&self.reserved_listener).take());
         let pools: Vec<_> = lock(&self.pools).drain().map(|(_, p)| p).collect();
         let auths: Vec<_> = pools
             .iter()

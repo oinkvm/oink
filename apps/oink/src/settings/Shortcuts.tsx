@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { VisuallyHidden, animate } from 'oink-ui';
 import type { Platform } from '../window/DesktopWindow';
-export type ShortcutId = 'remoteWindowsLock' | 'microphoneMute' | 'recall' | 'lock' | 'lockEscape' | 'pauseSelf' | 'pauseAll' | 'game' | `move:${string}`;
+export type ShortcutId = 'openWindow' | 'keyboardRelease' | 'remoteWindowsLock' | 'microphoneMute' | 'recall' | 'lock' | 'lockEscape' | 'pauseSelf' | 'pauseAll' | 'game' | `move:${string}`;
 export interface ShortcutPref {
     on: boolean;
     keys: string;
@@ -15,6 +15,14 @@ export const SHORTCUTS: Array<{
     desc: string;
     keywords: string;
 }> = [
+    { id: 'openWindow',
+      get label() { return tr('打开 Oink 窗口'); },
+      get desc() { return tr('打开或切换到本机的 Oink 窗口'); },
+      get keywords() { return tr('窗口 打开 主界面 显示'); } },
+    { id: 'keyboardRelease',
+      get label() { return tr('解除本机键盘和鼠标禁用'); },
+      get desc() { return tr('键盘或鼠标被禁用时，按住此组合键 1 秒即可恢复'); },
+      get keywords() { return tr('禁用 恢复 解除 键盘 鼠标'); } },
     { id: 'remoteWindowsLock', only: 'win',
       get label() { return tr('锁定远程 Windows 计算机'); },
       get desc() { return tr('按下此快捷键，锁定指针所在 Windows 计算机，Win+L 保持锁定自身'); },
@@ -52,6 +60,8 @@ export const SHORTCUTS: Array<{
         }, get keywords() { return tr('游戏 手柄 3D'); } },
 ];
 export const DEFAULT_SHORTCUTS: Record<ShortcutId, ShortcutPref> = {
+    openWindow: { on: false, keys: 'Control+Alt+A' },
+    keyboardRelease: { on: true, keys: '' },
     remoteWindowsLock: { on: true, keys: 'Meta+Shift+L' },
     microphoneMute: { on: false, keys: 'Control+Alt+M' },
     recall: { on: true, keys: 'Control+Alt+H' },
@@ -61,7 +71,7 @@ export const DEFAULT_SHORTCUTS: Record<ShortcutId, ShortcutPref> = {
     pauseAll: { on: true, keys: 'Control+Alt+Shift+P' },
     game: { on: true, keys: 'Control+Alt+G' },
 };
-const actions = {lock_remote_windows:'remoteWindowsLock',toggle_microphone_mute:'microphoneMute',return_pointer_home:'recall',lock_focus:'lock',lock_escape:'lockEscape',toggle_sharing:'pauseSelf',pause_all:'pauseAll',toggle_game_mode:'game'} as const;
+const actions = {open_window:'openWindow',lock_remote_windows:'remoteWindowsLock',toggle_microphone_mute:'microphoneMute',return_pointer_home:'recall',lock_focus:'lock',lock_escape:'lockEscape',toggle_sharing:'pauseSelf',pause_all:'pauseAll',toggle_game_mode:'game'} as const;
 export function shortcutId(h: import('../api/types').Hotkey): ShortcutId | undefined {
     return h.action === 'move_pointer_to' && h.device ? `move:${h.device}` : actions[h.action as keyof typeof actions];
 }

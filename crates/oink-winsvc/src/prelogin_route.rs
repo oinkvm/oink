@@ -90,6 +90,10 @@ pub(crate) struct Route<C> {
     stopping: bool,
 }
 impl<C: Helper> Route<C> {
+    #[cfg(windows)]
+    pub(crate) fn child(&self) -> Option<&C> {
+        self.child.as_ref()
+    }
     pub(crate) fn new() -> Self {
         Self {
             child: None,

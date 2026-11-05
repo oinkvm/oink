@@ -1,13 +1,6 @@
 //! Ephemeral layout editing only. Final geometry uses the normal C0 LayoutItem.
 use oink_foundation::{DeviceId, Rect};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ModeId {
-    pub owner: DeviceId,
-    pub serial: u64,
-    pub boot_nonce: [u8; 16],
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScreenRect {
     pub device: DeviceId,
@@ -29,11 +22,6 @@ pub enum Action {
         screens: Option<Vec<ScreenRect>>,
         affected: Vec<(DeviceId, String)>,
     },
-    /// Owner renews its edit lease every 500 ms. Any member may end this exact mode.
-    Mode { id: ModeId, enabled: bool },
-    /// Prevent edge handoff for the duration of a genuine native handle gesture.
-    /// This never changes persisted focus lock, cursor ownership or pause.
-    Gesture { id: ModeId, active: bool },
 }
 
 impl Action {
@@ -68,7 +56,6 @@ impl Action {
                             })
                     })
             }
-            Self::Mode { .. } | Self::Gesture { .. } => true,
         }
     }
 }

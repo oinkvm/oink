@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'build-support'))
-from identity import IDENTITY, windows_product_version
+from identity import IDENTITY, artifact_stem, signpath_configuration, windows_product_version
 from provenance import verify, digest
 import versioning
 from versioning import release_version, local_source_commit, macos_version_fields
@@ -26,6 +26,22 @@ DISPLAY = f"{IDENTITY['inhouse_version']}-inhouse.17"
 
 
 class LocalVersions(unittest.TestCase):
+    def test_artifact_names_use_only_display_version_and_match_signpath(self):
+        import fnmatch
+        import xml.etree.ElementTree as ET
+        pattern = ET.fromstring(signpath_configuration()).find('.//{*}msi-file').get('path')
+        self.assertEqual(signpath_configuration(), (ROOT / '.signpath/artifact-configurations/windows-msi-v1.xml').read_bytes())
+        for version in ('0.3.3', '0.3.3-beta.1', '0.3.3-inhouse.97'):
+            for platform, arch, extensions in [('windows', 'x64', ['msi']), ('macos', 'arm64', ['dmg', 'zip'])]:
+                for ext in extensions:
+                    name = f'{artifact_stem(version, platform, arch)}.{ext}'
+                    self.assertEqual(name, f'Oink-{version}-{platform}-{arch}.{ext}')
+                    if platform == 'windows':
+                        self.assertTrue(fnmatch.fnmatchcase(name, pattern))
+        self.assertTrue(fnmatch.fnmatchcase('Oink-0.3.2-93-windows-x64.msi', pattern))
+        self.assertNotEqual(artifact_stem(release_version('0.3.3', COMMIT, 97), 'windows', 'x64'),
+                            artifact_stem(release_version('0.3.3', COMMIT, 98), 'windows', 'x64'))
+
     def test_build_label_is_independent_of_source_commit(self):
         self.assertEqual(release_version('0.1.0-beta.1', COMMIT, 17), DISPLAY)
         self.assertEqual(release_version('0.1.0-beta.1', '01234567' * 5, 17),

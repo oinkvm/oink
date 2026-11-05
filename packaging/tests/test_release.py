@@ -36,7 +36,7 @@ class PublicRelease(unittest.TestCase):
     def package(self, root, platform):
         path = root / TREE / ('macos-arm64' if platform == 'macos' else 'windows-x64')
         path.mkdir(parents=True)
-        name = 'Oink-0.1.0-28-' + ('macos-arm64.dmg' if platform == 'macos' else 'windows-x64.msi')
+        name = 'Oink-0.1.0-' + ('macos-arm64.dmg' if platform == 'macos' else 'windows-x64.msi')
         f = path / name; f.write_bytes(platform.encode())
         record = dict(version='0.1.0', build=28, source_commit=None, source_tree_sha256=TREE,
             notarized=True, notarization={k:dict(status='Accepted',stapled=True) for k in ['app','dmg']},

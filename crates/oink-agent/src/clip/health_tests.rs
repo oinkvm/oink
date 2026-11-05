@@ -251,3 +251,45 @@ fn directional_masters_revoke_native_publications_independently() {
         },
     );
 }
+
+#[test]
+fn remote_write_then_repeated_local_images_each_publish_and_reach_peer() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "remote_write_then_repeated_local_images_each_publish_and_reach_peer",
+        Some(4),
+        async {
+            let root = tempfile::tempdir().unwrap();
+            let source = Arc::new(FakeClipboard::new());
+            let target = Arc::new(FakeClipboard::new());
+            let a = start_with_clip(
+                &oink_test_support::network_config(root.path().join("a"), "a", 0),
+                &Displays::new("a"),
+                Some(source.clone()),
+            )
+            .await;
+            let b = start_with_clip(
+                &oink_test_support::network_config(root.path().join("b"), "b", 0),
+                &Displays::new("b"),
+                Some(target.clone()),
+            )
+            .await;
+            common::pair(&a, &b).await;
+            target.copy(vec![ClipData::Text("remote copy".into())], Sensitivity::Normal);
+            common::until("remote write received", || source.items() == target.items()).await;
+            let mut publications = a.clipboard_activity().unwrap().len();
+            for version in 1..=4 {
+                let image = vec![ClipData::Png(vec![version; 256])];
+                source.copy(image.clone(), Sensitivity::Normal);
+                common::until("new image published", || {
+                    a.clipboard_activity().unwrap().len() > publications
+                })
+                .await;
+                publications = a.clipboard_activity().unwrap().len();
+                common::until("new image received", || target.items() == image).await;
+            }
+            a.shutdown().await;
+            b.shutdown().await;
+        },
+    );
+}

@@ -154,6 +154,7 @@ fn transport(
 }
 pub(super) async fn run(
     config: LinkConfig,
+    udp_socket: std::net::UdpSocket,
     credentials: Arc<crate::tls::Credentials>,
     shared: Arc<Shared>,
     commands: mpsc::UnboundedReceiver<Command>,
@@ -170,17 +171,10 @@ pub(super) async fn run(
     let setup = || -> Result<_, crate::NetError> {
         let (server, client) = transport(&credentials)?;
         #[cfg(any(target_os = "macos", test))]
-        let socket = udp::Socket::bind(config.bind, shared.wake.clone())?;
+        let socket = udp::Socket::from_std(udp_socket, shared.wake.clone())?;
         #[cfg(not(any(target_os = "macos", test)))]
         let socket = {
-            #[cfg(feature = "test-support")]
-            let reserved = crate::test_ports::take_udp(config.bind);
-            #[cfg(not(feature = "test-support"))]
-            let reserved: Option<std::net::UdpSocket> = None;
-            let socket = match reserved {
-                Some(socket) => socket,
-                None => std::net::UdpSocket::bind(config.bind)?,
-            };
+            let socket = udp_socket;
             crate::qos::set_service_type(&socket, crate::qos::ServiceType::Voice);
             crate::qos::wrap_udp_socket(socket)?
         };
@@ -598,7 +592,19 @@ impl Network {
                     message,
                 } => {
                     if let Some(&uid) = self.connections.get(&connection) {
+                        let heartbeat = match message.as_ref() {
+                            LinkMsg::Pulse(pulse) => self
+                                .core
+                                .links
+                                .values()
+                                .find(|l| l.wire.path_id == pulse.path_id)
+                                .map(|l| (l.id, pulse.nonce)),
+                            _ => None,
+                        };
                         self.send_control(uid, tag, *message);
+                        if let Some((link, nonce)) = heartbeat {
+                            self.write_heartbeat(link, uid, tag, nonce);
+                        }
                     }
                 }
                 Effect::CloseConnection(connection) => {
@@ -1279,6 +1285,9 @@ impl Network {
         let Some(index) = self.writers.iter().position(|w| stream_class(w.header) == class) else {
             return false;
         };
+        self.write_at(index, cx)
+    }
+    fn write_at(&mut self, index: usize, cx: &mut Context<'_>) -> bool {
         let mut writer = self.writers.remove(index).expect("writer");
         let frozen = writer
             .id
@@ -1315,6 +1324,41 @@ impl Network {
                 true
             }
         }
+    }
+    fn write_heartbeat(&mut self, link: LinkId, uid: usize, tag: u64, nonce: u64) {
+        // No runtime yield between these Quinn writes: N0 and the registered I0/M0
+        // records reach the same driver turn. MTU/congestion can still split packets.
+        let periodic = nonce.is_multiple_of(4);
+        let frozen = self.core.links.get(&link).is_none_or(|l| l.frozen());
+        let mut indices = Vec::new();
+        for (index, writer) in self.writers.iter_mut().enumerate() {
+            let internal =
+                writer.uid == uid && writer.header.route_tag == tag && writer.header.tag.kind == StreamKind::Internal;
+            if internal || periodic && !frozen && writer.id.is_some_and(|id| id.link == link) && writer.heartbeat() {
+                indices.push(index);
+            }
+        }
+        let waker = Waker::from(Arc::new(Signal(self.shared.wake.clone())));
+        let mut cx = Context::from_waker(&waker);
+        #[cfg(test)]
+        let mut accepted = Vec::new();
+        for index in indices.into_iter().rev() {
+            #[cfg(test)]
+            let kind = self.writers[index].header.tag.kind;
+            let progress = self.write_at(index, &mut cx);
+            #[cfg(not(test))]
+            let _ = progress;
+            #[cfg(test)]
+            if progress {
+                accepted.push(kind);
+            }
+        }
+        #[cfg(test)]
+        self.shared
+            .heartbeat_batches
+            .lock()
+            .unwrap()
+            .push((nonce, Instant::now(), accepted));
     }
     fn read_one(&mut self, class: u8, cx: &mut Context<'_>) -> bool {
         let Some(index) = self

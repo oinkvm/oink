@@ -149,8 +149,28 @@ impl Store {
                     return Err(Error::Invalid);
                 }
                 // Corrupt budgets cannot be treated as a fresh allowance.
-                let s: State = serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?;
-                if s.schema != 3
+                let mut value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?;
+                let s: State = if value["schema"] == 3 {
+                    // The old broad codec values have ambiguous meaning. Discard
+                    // all old samples before typed decoding, but retain consent,
+                    // spent budgets and crash deduplication across the upgrade.
+                    value["schema"] = SCHEMA_VERSION.into();
+                    value["queue"] = serde_json::json!([]);
+                    value["reservoirs"] =
+                        serde_json::to_value(std::array::from_fn::<_, 8, _>(|_| Reservoir::default()))
+                            .map_err(|_| Error::Invalid)?;
+                    value["clipboard_reservoirs"] =
+                        serde_json::to_value(std::array::from_fn::<_, 2, _>(|_| Reservoir::default()))
+                            .map_err(|_| Error::Invalid)?;
+                    value["audio_minute"] = serde_json::Value::Null;
+                    value["audio_seen"] = 0.into();
+                    serde_json::from_value(value).map_err(|_| Error::Invalid)?
+                } else {
+                    // Keep strict typed decoding (including duplicate-field
+                    // rejection) for current checkpoints.
+                    serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?
+                };
+                if s.schema != SCHEMA_VERSION
                     || s.queue.len() > 266
                     || s.admissions.len() > 5
                     || s.reservoirs
@@ -163,7 +183,7 @@ impl Store {
                 s
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State {
-                schema: 3,
+                schema: SCHEMA_VERSION,
                 consent,
                 budget: Budget {
                     day: now / DAY,
@@ -552,6 +572,80 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn codec_upgrade_discards_old_samples_without_resetting_consent_or_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path(), consent(), DAY).unwrap();
+        s.state.budget.perf_roots = 12;
+        s.observe(1, crash(1), DAY, DAY).unwrap();
+        s.checkpoint().unwrap();
+        drop(s);
+        let path = dir.path().join("checkpoint.json");
+        let mut old: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        old["schema"] = 3.into();
+        // Even legacy codec values in old queues/reservoirs must never be
+        // decoded as the new PCM24 class or emitted with a new schema label.
+        old["queue"][0]["report"]["schema_version"] = 3.into();
+        let Report::MeasuredInterval(mut sample) = interval() else {
+            unreachable!()
+        };
+        sample.context.metric = Metric::AudioPushToPresentationEstimate;
+        sample.context.codec = Some(Codec::Pcm);
+        let mut candidate = serde_json::to_value(Candidate {
+            report: Report::MeasuredInterval(sample),
+            at: DAY,
+        })
+        .unwrap();
+        old["reservoirs"][6]["candidates"] = serde_json::json!([candidate.clone()]);
+        candidate["report"]["data"]["context"]["codec"] = "opus".into();
+        old["audio_minute"] = candidate;
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let s = Store::open(dir.path(), consent(), DAY + 1).unwrap();
+        assert_eq!(s.state.schema, SCHEMA_VERSION);
+        assert_eq!(s.consent(), consent());
+        assert_eq!(s.state.budget.perf_roots, 12);
+        assert_eq!(s.state.admissions.len(), 1);
+        assert!(!s.has_work());
+        assert!(s.state.audio_minute.is_none());
+    }
+
+    #[test]
+    fn audio_codec_survives_store_restart_and_unknown_values_fail_closed() {
+        for codec in [
+            Codec::Opus5ms,
+            Codec::Opus20ms,
+            Codec::Pcm,
+            Codec::Pcm16_2p5ms,
+            Codec::Unknown,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut s = Store::open(dir.path(), consent(), DAY).unwrap();
+            let Report::MeasuredInterval(mut sample) = interval() else {
+                unreachable!()
+            };
+            sample.context.metric = Metric::AudioPushToPresentationEstimate;
+            sample.context.codec = Some(codec);
+            s.enqueue(Report::MeasuredInterval(sample), DAY, DAY).unwrap();
+            s.checkpoint().unwrap();
+            drop(s);
+            let s = Store::open(dir.path(), consent(), DAY + 1).unwrap();
+            assert_eq!(s.state.queue[0].report.report.context().unwrap().codec, Some(codec));
+            drop(s);
+            let path = dir.path().join("checkpoint.json");
+            let data = std::fs::read_to_string(&path).unwrap();
+            let encoded = serde_json::to_string(&codec).unwrap();
+            std::fs::write(
+                &path,
+                data.replace(&format!("\"codec\":{encoded}"), "\"codec\":\"future_codec\""),
+            )
+            .unwrap();
+            assert!(matches!(
+                Store::open(dir.path(), consent(), DAY + 1),
+                Err(Error::Invalid)
+            ));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn dropped_writer_releases_its_lease_while_an_inherited_descriptor_remains_open() {

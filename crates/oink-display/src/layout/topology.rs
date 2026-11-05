@@ -53,8 +53,9 @@ pub struct PortalExit {
 
 /// 从 [`Layout`] 编译出的只读查询结构。
 ///
-/// **在线设备**：离线设备的屏幕在逻辑上视为不存在——不是任何传送门的目标，也不挡路（隔着它的两块
-/// 屏幕直接相连，穿越时跳过它所占的位置）；它自己的边全是墙。它仍在 [`Topology::screens`] 里
+/// **在线设备与隐藏屏**：离线设备的屏幕和隐藏屏（整机 `screen_shared=false` 或单屏
+/// `enabled=false`）在逻辑上视为不存在——不是任何传送门的目标，也不挡路（隔着它的两块
+/// 屏幕直接相连，穿越时跳过它所占的位置），也不构成本机屏幕之间的原生接缝；它自己的边全是墙。它仍在 [`Topology::screens`] 里
 /// （界面照常画在原位置），[`Topology::is_active`] 为 `false`。用 [`Topology::with_online`] 传入
 /// 在线设备（包括本机）；[`Topology::new`] 把所有设备都当作在线。
 #[derive(Clone, Debug)]
@@ -92,22 +93,15 @@ impl Topology {
     pub fn from_effective(layout: &EffectiveLayout, online: impl Fn(&DeviceId) -> bool) -> Self {
         let screens: Vec<_> = layout.screens().iter().filter(|s| s.is_valid()).cloned().collect();
         let rects: Vec<Rect> = screens.iter().map(|s| s.rect).collect();
-        let occupied: Vec<bool> = screens.iter().map(|s| online(&s.id.device)).collect();
-        let active: Vec<bool> = screens
-            .iter()
-            .zip(&occupied)
-            .map(|(s, online)| s.enabled && *online)
-            .collect();
+        // Hidden screens, like offline ones, are absent for every other screen:
+        // they neither receive portals nor occlude or wall anything behind them.
+        let active: Vec<bool> = screens.iter().map(|s| s.enabled && online(&s.id.device)).collect();
         let st = layout.settings();
         let edges: Vec<[Vec<Seg>; 4]> = (0..screens.len())
             .map(|i| {
                 Side::ALL.map(|side| {
                     if active[i] {
-                        let segments = compute_side(&rects, &occupied, i, side, st, |b| {
-                            // Hidden online geometry is an opaque wall, including native seams.
-                            if !active[b] {
-                                return None;
-                            }
+                        let segments = compute_side(&rects, &active, i, side, st, |b| {
                             if screens[i].id.device != screens[b].id.device {
                                 return Some(st.minimum_portal);
                             }

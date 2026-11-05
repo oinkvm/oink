@@ -344,57 +344,72 @@ impl Namespace for Linked {
         self.0.runtime.block_on(self.selected(node))
     }
     fn open(&self, node: NodeId, version: u64, offset: u64) -> io::Result<FileReader> {
-        let report_start = (offset == 0).then(crate::timing::start).flatten();
-        if self.descriptor().provisional {
-            return Err(unavailable(Unavailable::Permission));
-        }
-        let entry = self.select(node)?;
-        if version != entry.version {
-            return Err(unavailable(Unavailable::Superseded));
-        }
-        let ContentSize::Known(size) = entry.size else {
-            unreachable!()
-        };
-        if offset > size {
-            return Err(unavailable(Unavailable::InvalidData));
-        }
-        // Native readers may seek arbitrarily. Fetch the containing block and
-        // discard its prefix in memory, without reading the preceding file.
-        let start = offset / BLOCK * BLOCK;
-        let left = size - start;
-        let budget = left
-            .checked_add(left.div_ceil(BLOCK).saturating_add(2).saturating_mul(512))
-            .ok_or_else(|| unavailable(Unavailable::LimitExceeded))?;
-        let Descriptor { offer, token, .. } = self.descriptor();
-        let request = ContentMsg::CloudLinkRead {
-            offer: *offer,
-            token: *token,
-            node,
-            version,
-            offset: start,
-        };
-        let mut report = crate::timing::FileRead::new(report_start, size);
-        let channel = match self.0.runtime.block_on(self.channel(&request, budget)) {
-            Ok(channel) => channel,
-            Err(error) => {
-                report.finish(crate::timing::Outcome::Failed(reason(&error)));
-                return Err(error);
+        let mut diagnostic =
+            crate::copy_diagnostics::Read::file(self.descriptor().offer, node, crate::copy_diagnostics::Channel::Low);
+        let result: io::Result<FileReader> = (|| {
+            let report_start = (offset == 0).then(crate::timing::start).flatten();
+            if self.descriptor().provisional {
+                return Err(unavailable(Unavailable::Permission));
             }
-        };
-        Ok(terminal_reader(Box::new(Reader {
-            files: self.clone(),
-            report,
-            channel,
-            node,
-            version,
-            size,
-            at: start,
-            skip: (offset - start) as usize,
-            buffer: io::Cursor::new(Vec::new()),
-            complete: false,
-            failed: false,
-        })))
+            let entry = self.select(node)?;
+            if version != entry.version {
+                return Err(unavailable(Unavailable::Superseded));
+            }
+            let ContentSize::Known(size) = entry.size else {
+                unreachable!()
+            };
+            if offset > size {
+                return Err(unavailable(Unavailable::InvalidData));
+            }
+            // Native readers may seek arbitrarily. Fetch the containing block and
+            // discard its prefix in memory, without reading the preceding file.
+            let start = offset / BLOCK * BLOCK;
+            let left = size - start;
+            let budget = left
+                .checked_add(left.div_ceil(BLOCK).saturating_add(2).saturating_mul(512))
+                .ok_or_else(|| unavailable(Unavailable::LimitExceeded))?;
+            let Descriptor { offer, token, .. } = self.descriptor();
+            let request = ContentMsg::CloudLinkRead {
+                offer: *offer,
+                token: *token,
+                node,
+                version,
+                offset: start,
+            };
+            let mut report = crate::timing::FileRead::new(report_start, size);
+            let channel = match self.0.runtime.block_on(self.channel(&request, budget)) {
+                Ok(channel) => channel,
+                Err(error) => {
+                    report.finish(crate::timing::Outcome::Failed(reason(&error)));
+                    return Err(error);
+                }
+            };
+            Ok(terminal_reader(Box::new(Reader {
+                files: self.clone(),
+                report,
+                channel,
+                node,
+                version,
+                size,
+                at: start,
+                skip: (offset - start) as usize,
+                buffer: io::Cursor::new(Vec::new()),
+                complete: false,
+                failed: false,
+            })))
+        })();
+        if let Err(error) = &result {
+            diagnostic.failure(error);
+        }
+        result.map(|reader| {
+            Box::new(super::DiagnosticReader {
+                reader,
+                trace: diagnostic,
+                bytes: 0,
+            }) as FileReader
+        })
     }
+
     fn cancel(&self) {
         self.0.cancelled.store(true, Ordering::Release);
         self.0.changed.notify_waiters();
@@ -604,3 +619,5 @@ impl Read for Reader {
 
 #[cfg(all(test, debug_assertions))]
 mod tests;
+#[cfg(all(test, debug_assertions, target_os = "macos"))]
+pub(crate) use tests::RegistryLink;

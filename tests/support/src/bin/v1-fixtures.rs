@@ -4,6 +4,9 @@ use oink_protocol::v1::{self, RawValue, frame, registry, schema::WireDto};
 use oink_test_support::protocol as support;
 use serde_json::json;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().nth(1).as_deref() == Some("--retire-removed") {
+        return retire_removed();
+    }
     if std::env::args().nth(1).as_deref() == Some("--append-compatible") {
         return append_compatible();
     }
@@ -608,6 +611,59 @@ fn append_value(
         .as_array_mut()
         .unwrap()
         .push(json!({"file":file,"kind":kind,"schema":schema,"expected":support::describe(&value)}));
+    Ok(())
+}
+
+/// Remove retired allocations while preserving all surviving frozen bytes,
+/// including the optional compatibility witnesses appended after the freeze.
+fn retire_removed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/oink-protocol/tests/fixtures/v1");
+    let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("manifest.json"))?)?;
+    let schema = support::schema_json();
+    let mut removed = Vec::new();
+    manifest["fixtures"]
+        .as_array_mut()
+        .ok_or("missing fixtures")?
+        .retain(|fixture| {
+            let name = fixture["schema"].as_str().unwrap_or("");
+            let keep = match fixture["kind"].as_str().unwrap() {
+                "frame" => registry::MESSAGES
+                    .iter()
+                    .any(|entry| Some(u64::from(entry.id)) == fixture["type_id"].as_u64()),
+                "dto" => registry::SCHEMAS.iter().any(|entry| entry.name == name),
+                "enum" => registry::ENUMS.iter().any(|entry| entry.0 == name),
+                "open" => registry::OPEN_ENUMS.iter().any(|entry| entry.0 == name),
+                _ => true,
+            };
+            if !keep {
+                removed.push(fixture["file"].as_str().unwrap().to_owned());
+            }
+            keep
+        });
+    // Every removed message must have a permanent allocation tombstone.
+    let previous: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("schema.json"))?)?;
+    for message in previous["messages"].as_array().ok_or("missing messages")? {
+        let id = message["id"].as_u64().ok_or("missing message id")? as u16;
+        if !registry::MESSAGES.iter().any(|entry| entry.id == id)
+            && !registry::RESERVED_MESSAGES.iter().any(|entry| entry.0 == id)
+        {
+            return Err(format!("removed message {id:#06x} lacks a permanent tombstone").into());
+        }
+    }
+    for file in &removed {
+        std::fs::remove_file(directory.join(file))?;
+    }
+    manifest["schema_sha256"] = support::schema_hash().into();
+    std::fs::write(
+        directory.join("manifest.json"),
+        format!("{}\n", serde_json::to_string_pretty(&manifest)?),
+    )?;
+    std::fs::write(
+        directory.join("schema.json"),
+        format!("{}\n", serde_json::to_string_pretty(&schema)?),
+    )?;
+    println!("retired {} vectors; surviving bytes preserved", removed.len());
     Ok(())
 }
 

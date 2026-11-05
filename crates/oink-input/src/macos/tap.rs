@@ -3345,7 +3345,7 @@ mod tests {
             });
             for flags in [0, CGEventFlags::MaskShift.0 | 2] {
                 let event = CGEvent::new(None).unwrap();
-                CGEvent::set_type(Some(&event), CGEventType::FlagsChanged);
+                CGEvent::set_type(Some(&event), CGEventType::ScrollWheel);
                 CGEvent::set_integer_value_field(
                     Some(&event),
                     CGEventField::EventSourceUserData,
@@ -3357,7 +3357,7 @@ mod tests {
                 let result = unsafe {
                     callback(
                         std::ptr::null_mut(),
-                        CGEventType::FlagsChanged,
+                        CGEventType::ScrollWheel,
                         NonNull::from(&*event),
                         &shared as *const Shared as *mut c_void,
                     )

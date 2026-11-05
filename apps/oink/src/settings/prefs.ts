@@ -59,6 +59,7 @@ export interface Prefs {
     clipReceive: boolean;
     clipSend: boolean;
     removeDsStore: boolean;
+    audioEncodingQuality: 'smooth' | 'quality' | 'lossless';
     audioDevice: string;
     keepLocalPlayback: boolean;
     shortcuts: Record<ShortcutId, ShortcutPref>;
@@ -94,6 +95,7 @@ export const DEFAULT_PREFS: Prefs = {
     clipReceive: true,
     clipSend: true,
     removeDsStore: true,
+    audioEncodingQuality: 'quality',
     audioDevice: 'default',
     keepLocalPlayback: false,
     shortcuts: DEFAULT_SHORTCUTS,

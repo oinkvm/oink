@@ -59,6 +59,8 @@ pub(super) struct Shared {
     pub stopped: AtomicBool,
     #[cfg(test)]
     pub expired_service_budget: AtomicBool,
+    #[cfg(test)]
+    pub heartbeat_batches: std::sync::Mutex<Vec<(u64, std::time::Instant, Vec<StreamKind>)>>,
     #[cfg(any(test, feature = "test-support"))]
     pub low_open_attempts: std::sync::Mutex<std::collections::BTreeMap<u8, u64>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -116,6 +118,8 @@ impl LinkLayer {
         let credentials = Arc::new(
             crate::tls::Credentials::new(&config.identity).map_err(|e| crate::NetError::Endpoint(e.to_string()))?,
         );
+        let udp = crate::listeners::udp(config.bind)?;
+        let tcp = crate::listeners::tcp(std::net::SocketAddr::new(config.bind.ip(), udp.local_addr()?.port()))?;
         let ordinary_config = config.clone();
         let ordinary_credentials = credentials.clone();
         let (commands, rx) = mpsc::unbounded_channel();
@@ -134,6 +138,8 @@ impl LinkLayer {
             stopped: AtomicBool::new(false),
             #[cfg(test)]
             expired_service_budget: AtomicBool::new(false),
+            #[cfg(test)]
+            heartbeat_batches: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
             low_open_attempts: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
@@ -157,6 +163,7 @@ impl LinkLayer {
                 match runtime {
                     Ok(runtime) => runtime.block_on(super::runtime::run(
                         config,
+                        udp,
                         credentials,
                         owner.clone(),
                         rx,
@@ -176,7 +183,7 @@ impl LinkLayer {
             .map_err(|_| crate::NetError::Endpoint("network thread stopped during startup".into()))??;
         let pool = super::tcp::LowPool::new(
             &ordinary_config,
-            *shared.address.get().expect("bound endpoint"),
+            tcp,
             ordinary_credentials,
             shared.hub.clone(),
             shared.commands.clone(),
@@ -294,6 +301,7 @@ mod config_order_tests {
             stopped: AtomicBool::new(false),
             #[cfg(test)]
             expired_service_budget: AtomicBool::new(false),
+            heartbeat_batches: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
             low_open_attempts: Default::default(),
             #[cfg(any(test, feature = "test-support"))]

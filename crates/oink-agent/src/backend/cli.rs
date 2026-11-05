@@ -20,28 +20,11 @@ pub fn call(data_dir: &Path, method: &str, params: Option<&str>) -> anyhow::Resu
     Client::connect(data_dir)?.call(request)
 }
 
-/// CLI-only access to the existing durable group setting. A narrow patch keeps
-/// concurrent edits to unrelated input settings intact.
-pub fn application_focus(data_dir: &Path, enabled: Option<bool>) -> anyhow::Result<bool> {
-    let client = Client::connect(data_dir)?;
-    if let Some(enabled) = enabled {
-        client.call(Request::SetInputSettings {
-            settings: serde_json::from_value(serde_json::json!({"application_focus_enabled": enabled}))?,
-        })?;
-    }
-    let settings = client.call(Request::InputSettings)?;
-    settings
-        .get("application_focus_enabled")
-        .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| anyhow::anyhow!("backend did not return application_focus_enabled"))
-}
-
 /// `oink-agent events`: subscribe and print every `ApiEvent` as one JSON line until the
 /// backend goes away or the process is interrupted.
 pub fn events(data_dir: &Path, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
     let endpoint = Endpoint::read(data_dir)?;
-    let mut stream =
-        std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], endpoint.port).into(), Duration::from_secs(2))?;
+    let mut stream = endpoint.address.connect(Duration::from_secs(2))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     serde_json::to_writer(
@@ -118,7 +101,9 @@ mod tests {
         std::fs::write(
             dir.path().join(crate::ipc::IPC_FILE),
             serde_json::to_vec(&Endpoint {
-                port: listener.local_addr().unwrap().port(),
+                address: crate::ipc::transport::Address::Legacy {
+                    port: listener.local_addr().unwrap().port(),
+                },
                 token: "cli-test-token".into(),
             })
             .unwrap(),
@@ -137,38 +122,6 @@ mod tests {
             }
         });
         (dir, task)
-    }
-
-    #[test]
-    fn application_focus_query_is_read_only_and_set_uses_only_the_group_field() {
-        for requested in [None, Some(true), Some(false)] {
-            let mut step = 0;
-            let (dir, task) = server_many(if requested.is_some() { 2 } else { 1 }, move |request, stream| {
-                if step == 0
-                    && let Some(value) = requested
-                {
-                    let Some(Request::SetInputSettings { settings }) = request.call else {
-                        panic!("expected patch")
-                    };
-                    assert_eq!(settings.value(), serde_json::json!({"application_focus_enabled":value}));
-                    stream.write_all(b"{\"ok\":null}\n").unwrap();
-                } else {
-                    assert!(matches!(request.call, Some(Request::InputSettings)));
-                    serde_json::to_writer(
-                        &mut *stream,
-                        &serde_json::json!({"ok":{"application_focus_enabled":requested.unwrap_or(true)}}),
-                    )
-                    .unwrap();
-                    stream.write_all(b"\n").unwrap();
-                }
-                step += 1;
-            });
-            assert_eq!(
-                application_focus(dir.path(), requested).unwrap(),
-                requested.unwrap_or(true)
-            );
-            task.join().unwrap();
-        }
     }
 
     #[test]

@@ -1708,19 +1708,6 @@ pub fn register(
     tracing::debug!(?id, "registering File Provider drag snapshot");
     publish(entries, contents, timeout)
 }
-/// Wait for actual system URLs while the exact target host still holds Left.
-/// macOS 26 needs two namespace materialization steps (~1.0–1.4 s in acceptance),
-/// even with a warm extension. The former 750 ms UI budget killed publication
-/// between those steps. There is no OS readiness latency guarantee: retain only
-/// the manager's existing 12 s operation watchdog, plus owner cancellation. A
-/// failed publication must not silently change file URLs into file promises.
-pub fn register_drag(
-    entries: &[FileEntry],
-    contents: Arc<dyn FileContents>,
-    current: &dyn Fn() -> bool,
-) -> Result<Registration, ClipboardError> {
-    publish_while(entries, contents, MANAGER_TIMEOUT, current)
-}
 /// Target drag owner opts into the one-shot spare and typed phase observations.
 pub fn register_drag_measured(
     id: ClipId,
@@ -1753,6 +1740,28 @@ pub(crate) fn publish(
 ) -> Result<Registration, ClipboardError> {
     publish_while(entries, contents, timeout, &|| true)
 }
+/// Clipboard preparation shares the one-shot ready-parent pool, but never the
+/// experimental drag placeholder rename pool. An obsolete offer kills/reaps its
+/// helper through the same checks as cancelled drag preparation.
+pub(super) fn publish_clipboard(
+    id: ClipId,
+    entries: &[FileEntry],
+    contents: Arc<dyn FileContents>,
+    current: &dyn Fn() -> bool,
+) -> Result<Registration, ClipboardError> {
+    let result = publish_inner(
+        entries,
+        contents,
+        Instant::now() + MANAGER_TIMEOUT,
+        current,
+        &mut PublicationTrace::new(Some(PublicationOwner::Clipboard(id))),
+        None,
+        &mut PreparationTiming::default(),
+        monotonic_ns(),
+    );
+    record_result(&result);
+    result
+}
 fn publish_while(
     entries: &[FileEntry],
     contents: Arc<dyn FileContents>,
@@ -1774,13 +1783,14 @@ fn publish_while(
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PublicationOwner {
+    Clipboard(ClipId),
     Drag(ClipId, u64),
     Announced(PreparationKey),
     Entered(PreparationKey, u64),
 }
 impl PublicationOwner {
     fn permits_placeholder(self) -> bool {
-        !matches!(self, Self::Announced(_))
+        !matches!(self, Self::Announced(_) | Self::Clipboard(_))
     }
 }
 #[derive(Clone, Copy, Debug)]
@@ -1934,7 +1944,10 @@ fn publish_attempt(
         Some(namespace) => namespace,
         None => Flat::new(entries, contents).map_err(|e| error_at("source_namespace", e))?,
     };
-    contents.prepare().map_err(|error| {
+    check_publication(deadline, current)?;
+    let prepared = contents.prepare_while(&|| current() && Instant::now() < deadline);
+    check_publication(deadline, current)?;
+    prepared.map_err(|error| {
         let reason = crate::content::reason(&error);
         tracing::warn!(operation = "source_prepare", ?reason, cause = %diagnostics::Failure::from(error).0,
             "File Provider source preparation failed");
@@ -1966,7 +1979,7 @@ fn publish_attempt(
             pool.snapshot(),
             match owner {
                 PublicationOwner::Drag(_, epoch) | PublicationOwner::Entered(_, epoch) => Some(epoch),
-                PublicationOwner::Announced(_) => None,
+                PublicationOwner::Announced(_) | PublicationOwner::Clipboard(_) => None,
             },
         );
         if placeholder.is_some() {
@@ -2696,7 +2709,13 @@ mod tests {
                 Err(crate::content::unavailable(self.0))
             }
             fn roots(&self) -> Vec<FileNode> {
-                linked_fixture().roots()
+                // Keep this adapter assertion on the File Provider route.
+                // Small-cache failures are asynchronous prefetch/URL failures.
+                let mut roots = linked_fixture().roots();
+                for root in &mut roots {
+                    root.size = ContentSize::Known(crate::model::AUTO_PULL_BYTES + 1);
+                }
+                roots
             }
             fn list(&self, _: NodeId, _: Option<DirectoryCursor>) -> io::Result<crate::model::DirectoryPage> {
                 panic!("failed source was enumerated")
@@ -2746,13 +2765,14 @@ mod tests {
                 file_contents: Some(source),
                 sensitivity: crate::Sensitivity::Normal,
             };
-            let error = crate::ClipboardBackend::write_native_guarded(
-                &clipboard,
-                spec,
-                Arc::new(|| panic!("failed source reached clipboard publication")),
-            )
-            .unwrap_err();
-            assert!(matches!(error, ClipboardError::ContentUnavailable(reason) if reason == cause));
+            // Preparation failure belongs to the delayed file read, not declaration.
+            crate::ClipboardBackend::write_native_guarded(&clipboard, spec, Arc::new(|| Ok(()))).unwrap();
+            let held = clipboard.registration.lock().unwrap();
+            let Some((_, super::super::FilePublication::Lazy(urls))) = held.as_ref() else {
+                panic!("missing lazy URLs")
+            };
+            let _callback = crate::content::native_read::Callback::begin();
+            assert_eq!(crate::content::reason(&urls.read(NodeId(1)).unwrap_err()), cause);
         }
     }
 

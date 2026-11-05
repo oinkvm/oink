@@ -130,7 +130,6 @@ type Pending = Arc<Mutex<HashMap<[u8; 16], oneshot::Sender<(Advert, SocketAddr)>
 pub struct Discovery {
     socket: Mutex<Option<Arc<UdpSocket>>>,
     pending: Pending,
-    extra_targets: Arc<Mutex<Vec<SocketAddr>>>,
     refresh: mpsc::UnboundedSender<()>,
     mdns: Mutex<Option<MdnsHandle>>,
     task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -149,14 +148,6 @@ enum MdnsHandle {
 }
 
 impl MdnsHandle {
-    fn update(&self, a: &Advert) {
-        match self {
-            #[cfg(target_os = "macos")]
-            MdnsHandle::System(m) => m.update(a.clone()),
-            MdnsHandle::Builtin(m) => m.update(a),
-        }
-    }
-
     fn refresh(&self) {
         match self {
             #[cfg(target_os = "macos")]
@@ -186,18 +177,26 @@ impl Discovery {
                 "IPv4 address required",
             ));
         }
-        let address = SocketAddr::new(cfg.bind_ip, cfg.port);
-        #[cfg(any(test, feature = "test-support"))]
-        let reserved = crate::test_ports::take_udp(address);
-        #[cfg(not(any(test, feature = "test-support")))]
-        let reserved: Option<std::net::UdpSocket> = None;
-        let std_sock = match reserved {
-            Some(socket) => socket,
-            None => std::net::UdpSocket::bind(address)?,
+        let socket = match (|| -> std::io::Result<_> {
+            let address = SocketAddr::new(cfg.bind_ip, cfg.port);
+            #[cfg(any(test, feature = "test-support"))]
+            let reserved = crate::test_ports::take_udp(address);
+            #[cfg(not(any(test, feature = "test-support")))]
+            let reserved: Option<std::net::UdpSocket> = None;
+            let std_sock = match reserved {
+                Some(socket) => socket,
+                None => std::net::UdpSocket::bind(address)?,
+            };
+            std_sock.set_broadcast(true)?;
+            std_sock.set_nonblocking(true)?;
+            UdpSocket::from_std(std_sock).map(Arc::new)
+        })() {
+            Ok(socket) => Some(socket),
+            Err(error) => {
+                tracing::warn!(port = cfg.port, %error, os_error = ?error.raw_os_error(), "beacon unavailable; discovery continues using mDNS/DNS-SD and manual addresses");
+                None
+            }
         };
-        std_sock.set_broadcast(true)?;
-        std_sock.set_nonblocking(true)?;
-        let socket = Arc::new(UdpSocket::from_std(std_sock)?);
         let pending: Pending = Arc::default();
         let extra_targets: Arc<Mutex<Vec<SocketAddr>>> = Arc::default();
         let (refresh_tx, refresh_rx) = mpsc::unbounded_channel();
@@ -220,22 +219,23 @@ impl Discovery {
                 .map(MdnsHandle::Builtin),
         };
 
-        let task = tokio::spawn(run(
-            cfg,
-            socket.clone(),
-            advert,
-            out,
-            pending.clone(),
-            extra_targets.clone(),
-            refresh_rx,
-        ));
+        let task = socket.as_ref().map(|socket| {
+            tokio::spawn(run(
+                cfg,
+                socket.clone(),
+                advert,
+                out,
+                pending.clone(),
+                extra_targets.clone(),
+                refresh_rx,
+            ))
+        });
         Ok(Self {
-            socket: Mutex::new(Some(socket)),
+            socket: Mutex::new(socket),
             pending,
-            extra_targets,
             refresh: refresh_tx,
             mdns: Mutex::new(mdns),
-            task: tokio::sync::Mutex::new(Some(task)),
+            task: tokio::sync::Mutex::new(task),
         })
     }
 
@@ -248,30 +248,10 @@ impl Discovery {
             .ok()
     }
 
-    /// 通告内容变化（组、名字、人数）。
-    pub fn advert_changed(&self, a: &Advert) {
-        if let Some(m) = self.mdns.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            m.update(a);
-        }
-        let _ = self.refresh.send(());
-    }
-
     /// 网络变化：立即重新广播、重新浏览。
     pub fn refresh(&self) {
         if let Some(m) = self.mdns.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             m.refresh();
-        }
-        let _ = self.refresh.send(());
-    }
-
-    /// 额外的信标目标（单播；测试和同机多实例用）。
-    pub fn add_target(&self, addr: SocketAddr) {
-        if !addr.is_ipv4() {
-            return;
-        }
-        let mut t = self.extra_targets.lock().unwrap_or_else(|e| e.into_inner());
-        if !t.contains(&addr) {
-            t.push(addr);
         }
         let _ = self.refresh.send(());
     }
@@ -565,6 +545,30 @@ mod tests {
     }
 
     #[test]
+    fn frozen_v1_advert_and_dynamic_port_use_the_existing_field() {
+        let hex = include_str!("../../../oink-protocol/tests/fixtures/v1/0901.hex").trim();
+        let mut bytes = b"OINK\x01\x00".to_vec();
+        bytes.extend(
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()),
+        );
+        let Some(Packet::Beacon(mut old)) = decode(&bytes) else {
+            panic!("frozen advert rejected")
+        };
+        assert_eq!(old.port, 1);
+        old.port = 54321;
+        let encoded = encode_beacon(&old).unwrap();
+        // Same frozen parser and mandatory port field; no extension, new message
+        // or capability is required to carry an OS-assigned destination.
+        assert_eq!(decode(&encoded), Some(Packet::Beacon(old.clone())));
+        let pairs = txt_pairs(&old);
+        let txt = advert_from_txt(|key| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())).unwrap();
+        assert_eq!(txt.port, old.port);
+        assert_eq!(txt.id, old.id);
+    }
+
+    #[test]
     fn txt_roundtrip() {
         let a = advert();
         let pairs = txt_pairs(&a);
@@ -652,6 +656,41 @@ mod tests {
             endpoint,
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), advert_tx.borrow().port)
         );
+        discovery.stop().await;
+    }
+}
+
+#[cfg(test)]
+mod unavailable_beacon_tests {
+    use super::*;
+    #[tokio::test]
+    async fn occupied_beacon_port_keeps_discovery_alive() {
+        let occupied = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let (_, advert) = watch::channel(Advert::local(
+            oink_foundation::DeviceId([1; 32]),
+            "test".into(),
+            oink_foundation::GroupId([2; 16]),
+            1,
+            54321,
+            "test".into(),
+        ));
+        let (out, _) = mpsc::channel(2);
+        let discovery = Discovery::start(
+            DiscoveryConfig {
+                bind_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+                port,
+                beacon: true,
+                beacon_ports: vec![],
+                beacon_interval: Duration::from_secs(2),
+                mdns: MdnsMode::Off,
+            },
+            advert,
+            out,
+        )
+        .await
+        .unwrap();
+        assert!(discovery.local_addr().is_none());
         discovery.stop().await;
     }
 }

@@ -13,7 +13,7 @@ import urllib.request
 import uuid
 import zipfile
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'build-support'))
-from identity import signpath_configuration, windows_product_version
+from identity import artifact_stem, signpath_configuration, windows_product_version
 from provenance import verify, digest
 import package_notes
 from payload import copy_notices
@@ -269,7 +269,7 @@ def main():
     wix = wix_tool(a.tool_cache.resolve())
     firewall = extension(a.tool_cache.resolve(), 'Firewall', FIREWALL_SHA256)
     ui = extension(a.tool_cache.resolve(), 'UI', UI_SHA256)
-    msi = a.output / f"{I['name']}-{a.version}-{a.build}-windows-x64.msi"
+    msi = a.output / f"{artifact_stem(a.version, 'windows', 'x64')}.msi"
     defines = [part for key, value in values.items() for part in ['-d', f'{key}={value}']]
     defines += ['-d', 'AppIcon=' + str(ROOT / 'apps/oink/src-tauri/icons/icon.ico')]
     run(*wix, 'build', ROOT / 'packaging/windows/Package.wxs', ROOT / 'packaging/windows/Dialogs.wxs', notices, '-ext', firewall, '-ext', ui, '-arch', 'x64', '-culture', 'en-US', *defines,

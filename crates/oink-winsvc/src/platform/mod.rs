@@ -12,6 +12,7 @@ mod security;
 mod server;
 mod service_peer;
 pub mod update;
+mod wake;
 use std::{io, ptr};
 use windows_sys::Win32::{
     Foundation::*,
@@ -21,6 +22,23 @@ use windows_sys::Win32::{
 #[derive(Debug)]
 struct Handle(HANDLE);
 impl Handle {
+    fn duplicate(&self) -> io::Result<Self> {
+        let mut copy = ptr::null_mut();
+        // SAFETY: source remains owned by self throughout duplication; the
+        // result is a separate creation-object reference, never a PID reopen.
+        check(unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                self.0,
+                GetCurrentProcess(),
+                &mut copy,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        })?;
+        Self::new(copy)
+    }
     fn new(h: HANDLE) -> io::Result<Self> {
         if h.is_null() || h == INVALID_HANDLE_VALUE {
             Err(io::Error::last_os_error())

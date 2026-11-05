@@ -105,6 +105,35 @@ fn injected_key(device: DeviceId, code: KeyCode, pressed: bool) -> (DeviceId, In
     (device, InjectEvent::Key { code, pressed })
 }
 
+fn heartbeat(nodes: &mut [Router], now: Micros) -> Vec<(DeviceId, InjectEvent)> {
+    let mut sent = Vec::new();
+    for router in nodes.iter() {
+        for &to in &[SOURCE, TARGET, THIRD] {
+            for message in router.heartbeat_messages(to) {
+                if let Message::Input(input) = message {
+                    sent.push((router.me(), to, input));
+                }
+            }
+        }
+    }
+    for (from, to, input) in sent {
+        nodes
+            .iter_mut()
+            .find(|r| r.me() == to)
+            .unwrap()
+            .input_message(from, Message::Input(input), now);
+    }
+    flush(nodes, now)
+}
+
+fn periodic_flush(nodes: &mut [Router], now: Micros) -> Vec<(DeviceId, InjectEvent)> {
+    if now.is_multiple_of(2_000_000) {
+        heartbeat(nodes, now)
+    } else {
+        flush(nodes, now)
+    }
+}
+
 fn reflected_history() -> Vec<Router> {
     let mut nodes = nodes(&[SOURCE, TARGET]);
     focus(&mut nodes[0], TARGET);
@@ -134,7 +163,7 @@ fn reflected_history_does_not_release_direct_tab_on_periodic_sync() {
             router.tick(now);
         }
         assert!(
-            flush(&mut nodes, now).is_empty(),
+            periodic_flush(&mut nodes, now).is_empty(),
             "spurious release on sync turn {turn}"
         );
         if turn > 12 {
@@ -160,13 +189,13 @@ fn reflected_history_preserves_direct_button_and_still_repairs_a_lost_up() {
         for router in &mut nodes {
             router.tick(now);
         }
-        assert!(flush(&mut nodes, now).is_empty());
+        assert!(periodic_flush(&mut nodes, now).is_empty());
     }
     capture(&mut nodes[0], InputEvent::Button { button, pressed: false }, 3_100_000);
     nodes[0].drain_outputs(); // Lose the direct UP; state repair must still release it.
-    nodes[0].tick(3_250_000);
+    nodes[0].tick(4_000_000);
     assert_eq!(
-        flush(&mut nodes, 3_250_000),
+        heartbeat(&mut nodes, 4_000_000),
         [(TARGET, InjectEvent::Button { button, pressed: false })]
     );
 }
@@ -190,7 +219,7 @@ fn reflected_live_press_and_direct_press_share_one_source_snapshot() {
             router.tick(now);
         }
         assert!(
-            flush(&mut nodes, now).is_empty(),
+            periodic_flush(&mut nodes, now).is_empty(),
             "disjoint snapshots on sync turn {turn}"
         );
     }
@@ -219,16 +248,16 @@ fn reflected_button_survives_empty_direct_state_and_repairs_a_lost_forwarded_up(
         for router in &mut nodes {
             router.tick(now);
         }
-        assert!(flush(&mut nodes, now).is_empty());
+        assert!(periodic_flush(&mut nodes, now).is_empty());
     }
     capture(&mut nodes[0], InputEvent::Button { button, pressed: false }, 3_100_000);
     assert!(flush_filter(&mut nodes, 3_100_000, |to, _| to != THIRD).is_empty());
     assert!(nodes[0].forwarded.is_empty());
     // The same combined source snapshot owns reflected cleanup, including when
     // the physical source's original destination was a different peer.
-    nodes[0].tick(3_250_000);
+    nodes[0].tick(4_000_000);
     assert_eq!(
-        flush(&mut nodes, 3_250_000),
+        heartbeat(&mut nodes, 4_000_000),
         [(THIRD, InjectEvent::Button { button, pressed: false })]
     );
 }

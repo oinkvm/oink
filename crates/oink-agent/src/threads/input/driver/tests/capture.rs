@@ -152,9 +152,16 @@ fn windows_capture_loss_releases_mapped_control_and_held_sync_heals_a_lost_relea
             source.on_local_event(&resumed, 30);
         }
         let mut sent = Vec::new();
-        for now in [250_000, 500_000, 750_000, 1_000_000] {
+        for now in [500_000, 1_000_000, 1_500_000, 2_000_000] {
             source.tick(now);
             sent.extend(deliver(&mut source, &mut target, &fake, false));
+            if now == 2_000_000 {
+                for message in source.heartbeat_messages(target.device()) {
+                    target.input_message(source.device(), message.clone(), now);
+                    sent.push(message);
+                }
+                deliver(&mut source, &mut target, &fake, false);
+            }
         }
         assert!(sent.iter().any(
             |m| matches!(m, Message::Input(InputMsg::HeldSync {keys, buttons}) if keys.is_empty() && buttons.is_empty())

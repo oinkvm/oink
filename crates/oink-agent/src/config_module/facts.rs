@@ -6,6 +6,18 @@ use oink_protocol::v1::{
     self, RawValue, dto,
     schema::{WireDto, WireValue},
 };
+/// Telemetry and its sequence do not change configuration, historical metadata,
+/// addresses or layout diagnostics. Compare borrowed fields, including unknown
+/// keys, rather than hashing/encoding/cloning the retained CBOR tree.
+pub(super) fn same_configuration(before: &dto::DeviceFacts, after: &dto::DeviceFacts) -> bool {
+    let configuration = |key: &&u32| !matches!(**key, 2 | 15);
+    before
+        .raw()
+        .iter()
+        .filter(|(key, _)| configuration(key))
+        .eq(after.raw().iter().filter(|(key, _)| configuration(key)))
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Facts {
     value: dto::DeviceFacts,
@@ -887,5 +899,51 @@ mod keymap_compatibility_tests {
                 .iter()
                 .any(|c| c == "oink.input.keymap-none/1")
         );
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+
+    #[test]
+    fn telemetry_comparison_retains_unknown_and_configuration_fields() {
+        let boot = Boot {
+            device_id: oink_foundation::DeviceId([1; 32]),
+            nonce: [2; 16],
+        };
+        let original = Facts::new(boot, GroupId([3; 16]), "owner", "macos", &OfferProfile::default()).unwrap();
+        let mut telemetry = original.value().raw().clone();
+        telemetry.insert(2, 99u64.write());
+        telemetry.insert(
+            15,
+            RawValue::Array(vec![RawValue::Map(
+                [
+                    (1, wire::device(boot.device_id).write()),
+                    (2, dto::FactPath::Direct.write()),
+                    (4, 1000u64.write()),
+                    (5, 5000u32.write()),
+                    (6, 7u64.write()),
+                    (7, 0u64.write()),
+                    (8, true.write()),
+                    (9, 1u64.write()),
+                ]
+                .into(),
+            )]),
+        );
+        let telemetry = dto::DeviceFacts::from_raw(telemetry).unwrap();
+        assert!(same_configuration(original.value(), &telemetry));
+        for (key, value) in [
+            (6, RawValue::from("new name")),
+            (900, RawValue::from("unknown extension")),
+        ] {
+            let mut changed = telemetry.raw().clone();
+            changed.insert(key, value);
+            let changed = dto::DeviceFacts::from_raw(changed).unwrap();
+            assert!(
+                !same_configuration(original.value(), &changed),
+                "field {key} cannot take the telemetry shortcut"
+            );
+        }
     }
 }

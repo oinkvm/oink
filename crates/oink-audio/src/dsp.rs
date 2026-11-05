@@ -18,7 +18,12 @@ const MAX_PLC_FRAMES: usize = 6;
 const MAX_RESAMPLE_FRAMES: usize = FRAME_SIZE * 32;
 const ARRIVAL_WINDOW: Duration = Duration::from_secs(1);
 const MAX_ARRIVALS: usize = 512;
-const TARGET_STABLE_INTERVAL: Duration = Duration::from_secs(3);
+// Reserve adaptation only; oscillator correction remains independently bounded.
+const MAX_ADAPTATION_PPM: f64 = 2_000.0;
+const MAX_COMPRESSION_PPM: u32 = 5_000;
+// -60 dBFS peak on both channels for 20 ms. This admits quiet portions of
+// background noise while rejecting -50 dBFS sustained material; not an RMS gate.
+const QUIET_PEAK: f32 = 0.001;
 const TARGET_DECAY_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_JITTER_MS: f64 = 250.0;
 
@@ -26,10 +31,13 @@ const MAX_JITTER_MS: f64 = 250.0;
 pub enum Codec {
     Opus,
     Pcm16,
+    Pcm24,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FrameDuration {
+    Ms20,
+    Samples160,
     Ms10,
     Ms5,
     Ms2p5,
@@ -37,6 +45,8 @@ pub enum FrameDuration {
 impl FrameDuration {
     pub const fn samples(self) -> usize {
         match self {
+            Self::Ms20 => 960,
+            Self::Samples160 => 160,
             Self::Ms10 => 480,
             Self::Ms5 => 240,
             Self::Ms2p5 => 120,
@@ -55,11 +65,16 @@ pub struct JitterConfig {
     pub min_frames: usize,
     pub max_frames: usize,
     pub adaptive: bool,
+    /// Continuous lower demand required before decay; independent of codec.
+    pub target_stable_secs: u32,
+    /// Reserve recovery only, excluding oscillator correction.
+    pub max_compression_ppm: u32,
     pub max_plc_frames: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
+    pub sample_rate: u32,
     pub codec: Codec,
     pub frame_duration: FrameDuration,
     /// Opus CBR rate; PCM must specify its actual 1,536,000 bit/s stream rate.
@@ -70,6 +85,7 @@ pub struct Config {
 impl Config {
     pub const fn opus_10ms() -> Self {
         Self {
+            sample_rate: SAMPLE_RATE,
             codec: Codec::Opus,
             frame_duration: FrameDuration::Ms10,
             bitrate: 128_000,
@@ -78,12 +94,15 @@ impl Config {
                 min_frames: 3,
                 max_frames: 3,
                 adaptive: false,
+                target_stable_secs: 3,
+                max_compression_ppm: MAX_COMPRESSION_PPM,
                 max_plc_frames: MAX_PLC_FRAMES,
             },
         }
     }
     pub const fn low_latency_pcm() -> Self {
         Self {
+            sample_rate: SAMPLE_RATE,
             codec: Codec::Pcm16,
             frame_duration: FrameDuration::Ms2p5,
             bitrate: 1_536_000,
@@ -92,12 +111,15 @@ impl Config {
                 min_frames: 2,
                 max_frames: 100,
                 adaptive: true,
+                target_stable_secs: 3,
+                max_compression_ppm: MAX_COMPRESSION_PPM,
                 max_plc_frames: 8,
             },
         }
     }
     pub const fn low_latency_opus() -> Self {
         Self {
+            sample_rate: SAMPLE_RATE,
             codec: Codec::Opus,
             frame_duration: FrameDuration::Ms5,
             bitrate: 320_000,
@@ -106,7 +128,42 @@ impl Config {
                 min_frames: 1,
                 max_frames: 50,
                 adaptive: true,
+                target_stable_secs: 3,
+                max_compression_ppm: MAX_COMPRESSION_PPM,
                 max_plc_frames: 4,
+            },
+        }
+    }
+    pub const fn music_opus() -> Self {
+        Self {
+            frame_duration: FrameDuration::Ms20,
+            jitter: JitterConfig {
+                initial_frames: 1,
+                min_frames: 1,
+                max_frames: 12,
+                adaptive: true,
+                target_stable_secs: 30,
+                max_compression_ppm: 2_000,
+                max_plc_frames: 1,
+            },
+            ..Self::low_latency_opus()
+        }
+    }
+    pub const fn lossless(sample_rate: u32) -> Self {
+        let minimum = (sample_rate as usize * 5).div_ceil(160_000);
+        Self {
+            sample_rate,
+            codec: Codec::Pcm24,
+            frame_duration: FrameDuration::Samples160,
+            bitrate: sample_rate * 48,
+            jitter: JitterConfig {
+                initial_frames: minimum,
+                min_frames: minimum,
+                max_frames: sample_rate as usize / 640,
+                adaptive: true,
+                target_stable_secs: 30,
+                max_compression_ppm: 2_000,
+                max_plc_frames: sample_rate as usize / 8_000,
             },
         }
     }
@@ -117,20 +174,27 @@ impl Config {
         self.frame_size() * CHANNELS
     }
     pub fn frame_duration_ms(self) -> f64 {
-        self.frame_duration.milliseconds()
+        self.frame_size() as f64 * 1000.0 / f64::from(self.sample_rate)
     }
     pub fn payload_bytes(self) -> usize {
         match self.codec {
             Codec::Pcm16 => self.frame_samples() * 2,
+            Codec::Pcm24 => self.frame_samples() * 3,
             Codec::Opus => (u64::from(self.bitrate) * self.frame_size() as u64 / (u64::from(SAMPLE_RATE) * 8)) as usize,
         }
     }
     pub fn validate(self) -> Result<(), String> {
-        if self.jitter.min_frames == 0
+        if self.jitter.max_compression_ppm > MAX_COMPRESSION_PPM {
+            return Err("reserve compression must not exceed 5000 ppm".into());
+        }
+        if !(8_000..=192_000).contains(&self.sample_rate)
+            || (self.codec != Codec::Pcm24 && self.sample_rate != SAMPLE_RATE)
+            || (self.codec == Codec::Pcm24 && self.frame_duration != FrameDuration::Samples160)
+            || self.jitter.min_frames == 0
             || self.jitter.min_frames as f64 * self.frame_duration_ms() < 5.0
             || self.jitter.initial_frames < self.jitter.min_frames
             || self.jitter.initial_frames > self.jitter.max_frames
-            || self.jitter.max_frames > 100
+            || self.jitter.max_frames > 400
             || self.jitter.max_frames as f64 * self.frame_duration_ms() > MAX_JITTER_MS
             || self.jitter.max_plc_frames == 0
             || self.jitter.max_plc_frames > 24
@@ -138,7 +202,7 @@ impl Config {
         {
             return Err("jitter bounds must be nonzero, ordered, and at most 250 ms; PLC at most 60 ms".into());
         }
-        let opus_max_bitrate = if self.frame_duration == FrameDuration::Ms5 {
+        let opus_max_bitrate = if matches!(self.frame_duration, FrameDuration::Ms5 | FrameDuration::Ms20) {
             320_000
         } else {
             256_000
@@ -148,6 +212,9 @@ impl Config {
                 return Err(format!(
                     "Opus CBR must be 16,000..={opus_max_bitrate} bit/s for this frame duration"
                 ));
+            }
+            Codec::Pcm24 if self.bitrate != self.sample_rate * 48 => {
+                return Err("PCM24 bitrate must equal sample rate times 48".into());
             }
             Codec::Pcm16 if self.bitrate != 1_536_000 => {
                 return Err("PCM16 stereo at 48 kHz requires 1,536,000 bit/s".into());
@@ -168,7 +235,7 @@ pub fn valid_payload(config: Config, payload: &[u8]) -> bool {
     !payload.is_empty()
         && payload.len() <= MAX_PACKET_BYTES
         && match config.codec {
-            Codec::Pcm16 => payload.len() == config.payload_bytes(),
+            Codec::Pcm16 | Codec::Pcm24 => payload.len() == config.payload_bytes(),
             Codec::Opus => opus::packet::get_nb_samples(payload, SAMPLE_RATE).ok() == Some(config.frame_size()),
         }
 }
@@ -176,6 +243,7 @@ pub fn valid_payload(config: Config, payload: &[u8]) -> bool {
 enum EncoderCodec {
     Opus(opus::Encoder),
     Pcm16,
+    Pcm24,
 }
 pub struct Encoder {
     inner: EncoderCodec,
@@ -195,14 +263,20 @@ impl Encoder {
         config.validate()?;
         let (inner, lookahead) = match config.codec {
             Codec::Pcm16 => (EncoderCodec::Pcm16, 0),
+            Codec::Pcm24 => (EncoderCodec::Pcm24, 0),
             Codec::Opus => {
-                let mut encoder = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Stereo, opus::Application::LowDelay)
-                    .map_err(|e| e.to_string())?;
+                let application = if config.frame_duration == FrameDuration::Ms20 {
+                    opus::Application::Audio
+                } else {
+                    opus::Application::LowDelay
+                };
+                let mut encoder =
+                    opus::Encoder::new(SAMPLE_RATE, opus::Channels::Stereo, application).map_err(|e| e.to_string())?;
                 encoder
                     .set_bitrate(opus::Bitrate::Bits(config.bitrate as i32))
                     .map_err(|e| e.to_string())?;
                 encoder.set_vbr(false).map_err(|e| e.to_string())?;
-                if config.frame_duration == FrameDuration::Ms5 {
+                if matches!(config.frame_duration, FrameDuration::Ms5 | FrameDuration::Ms20) {
                     // The negotiated 5 ms profile uses 320 kbit/s CBR (200 bytes)
                     // and preserves stereo/fullband even for mono-like input.
                     // LowDelay above is OPUS_APPLICATION_RESTRICTED_LOWDELAY;
@@ -216,6 +290,9 @@ impl Encoder {
                     encoder.set_complexity(10).map_err(|e| e.to_string())?;
                     encoder.set_dtx(false).map_err(|e| e.to_string())?;
                     encoder.set_inband_fec(false).map_err(|e| e.to_string())?;
+                }
+                if config.frame_duration == FrameDuration::Ms20 {
+                    encoder.set_signal(opus::Signal::Music).map_err(|e| e.to_string())?;
                 }
                 let lookahead = encoder.get_lookahead().map_err(|e| e.to_string())? as usize;
                 (EncoderCodec::Opus(encoder), lookahead)
@@ -251,6 +328,15 @@ impl Encoder {
         }
         match &mut self.inner {
             EncoderCodec::Opus(encoder) => encoder.encode_float(samples, packet).map_err(|_| "Opus encode failed"),
+            EncoderCodec::Pcm24 => {
+                for (sample, bytes) in samples.iter().zip(packet.as_chunks_mut::<3>().0) {
+                    let value = (sample.clamp(-1.0, 1.0) * 8_388_608.0)
+                        .round()
+                        .clamp(-8_388_608.0, 8_388_607.0) as i32;
+                    bytes.copy_from_slice(&value.to_le_bytes()[..3]);
+                }
+                Ok(samples.len() * 3)
+            }
             EncoderCodec::Pcm16 => {
                 for (sample, bytes) in samples.iter().zip(packet.as_chunks_mut::<2>().0) {
                     bytes.copy_from_slice(&((sample.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes());
@@ -301,6 +387,10 @@ pub struct Stats {
     pub adaptation_ppm: f64,
     pub adaptation_stretched_ms: f64,
     pub adaptation_compressed_ms: f64,
+    /// Near-silent decoded media removed without changing its playback pitch.
+    pub quiet_discarded_ms: f64,
+    /// No quiet insertion is currently performed; reserve builds by rate or re-prefill.
+    pub quiet_inserted_ms: f64,
     pub target_increases: u64,
     pub target_decreases: u64,
     pub gap_plc_frames: u64,
@@ -409,6 +499,7 @@ struct DecodedSpan {
 enum DecoderCodec {
     Opus(opus::Decoder),
     Pcm16,
+    Pcm24,
 }
 
 /// Local rejection reasons for one diagnostic reporting window.
@@ -435,7 +526,7 @@ pub struct Receiver {
     dropout_counters: Option<std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::sink::DropoutCounters>>>>,
     dropout_ledger: crate::sink::DropoutLedger,
     late_ledger: crate::sink::DropoutLedger,
-    output_kinds: [OutputKind; FRAME_SIZE],
+    output_kinds: [OutputKind; FRAME_SIZE * 2],
     output_frames: usize,
     consumed: [Option<(u64, Instant)>; 512],
     late_packet: Option<LatePacket>,
@@ -453,11 +544,15 @@ pub struct Receiver {
     recovering: bool,
     resampler: DriftResampler,
     spans: VecDeque<DecodedSpan>,
+    kind_history: Vec<OutputKind>,
+    kind_cursor: usize,
     drift: DriftController,
     adaptive: AdaptiveJitter,
     adjustment: PlayoutAdjustment,
     wake_backlog: bool,
+    quiet_cooldown_frames: usize,
     draining: bool,
+    retiring: bool,
     last_output: [f32; CHANNELS],
     stats: Stats,
 }
@@ -479,12 +574,16 @@ impl Receiver {
                 DecoderCodec::Opus(opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo).map_err(|e| e.to_string())?)
             }
             Codec::Pcm16 => DecoderCodec::Pcm16,
+            Codec::Pcm24 => DecoderCodec::Pcm24,
         };
+        let mut resampler = DriftResampler::new(CHANNELS);
+        resampler.set_rates(config.sample_rate, SAMPLE_RATE);
+        let kind_history = vec![OutputKind::Intentional; resampler.kernel.delay()];
         Ok(Self {
             dropout_counters: None,
             dropout_ledger: Default::default(),
             late_ledger: Default::default(),
-            output_kinds: [OutputKind::Intentional; FRAME_SIZE],
+            output_kinds: [OutputKind::Intentional; FRAME_SIZE * 2],
             output_frames: config.frame_size(),
             config,
             decoder,
@@ -499,7 +598,9 @@ impl Receiver {
             empty_queue_loss: 0,
             healthy_frames: 0,
             recovering: false,
-            resampler: DriftResampler::new(CHANNELS),
+            resampler,
+            kind_history,
+            kind_cursor: 0,
             spans: prepared_deque(MAX_RESAMPLE_FRAMES / config.frame_size() + 2, || DecodedSpan {
                 sequence: 0,
                 frames: 0,
@@ -511,7 +612,9 @@ impl Receiver {
             adaptive: AdaptiveJitter::new(config),
             adjustment: PlayoutAdjustment::default(),
             wake_backlog: false,
+            quiet_cooldown_frames: 0,
             draining: false,
+            retiring: false,
             last_output: [0.0; CHANNELS],
             stats: Stats::default(),
             rejections: Rejections::default(),
@@ -594,8 +697,12 @@ impl Receiver {
                 self.stats.target_decreases += 1;
             }
             if self.adaptive.target != previous {
-                self.adjustment
-                    .change_target((self.adaptive.target as f64 - previous as f64) * self.config.frame_size() as f64);
+                self.adjustment.change_target(
+                    (self.adaptive.target as f64 - previous as f64)
+                        * self.config.frame_size() as f64
+                        * f64::from(SAMPLE_RATE)
+                        / f64::from(self.config.sample_rate),
+                );
                 self.drift.filtered_error = 0.0;
             }
         }
@@ -679,13 +786,16 @@ impl Receiver {
         self.packets.len() * self.config.frame_size() + self.resampler.buffered_frames()
     }
     fn update_peak(&mut self) {
-        self.stats.peak_buffered_ms = self.stats.peak_buffered_ms.max(self.occupancy() as f64 / 48.0);
+        self.stats.peak_buffered_ms = self
+            .stats
+            .peak_buffered_ms
+            .max(self.occupancy() as f64 / (f64::from(self.config.sample_rate) / 1000.0));
     }
     pub fn stats(&self) -> Stats {
         let ms = self.config.frame_duration_ms();
         Stats {
             queued_frames: self.packets.len(),
-            buffered_ms: self.occupancy() as f64 / 48.0,
+            buffered_ms: self.occupancy() as f64 / (f64::from(self.config.sample_rate) / 1000.0),
             drift_ppm: self.drift.ppm,
             frame_duration_ms: ms,
             initial_target_ms: self.config.jitter.initial_frames as f64 * ms,
@@ -693,7 +803,7 @@ impl Receiver {
             min_target_ms: self.config.jitter.min_frames as f64 * ms,
             max_target_ms: self.config.jitter.max_frames as f64 * ms,
             packet_queue_ms: self.packets.len() as f64 * ms,
-            decoded_queue_ms: self.resampler.buffered_frames() as f64 / 48.0,
+            decoded_queue_ms: self.resampler.buffered_frames() as f64 / (f64::from(self.config.sample_rate) / 1000.0),
             arrival_jitter_ms: self.adaptive.jitter_ms,
             arrival_spread_ms: self.adaptive.spread_ms,
             adaptation_hold_ms: self.stats.adaptation_hold_frames as f64 * ms,
@@ -713,18 +823,6 @@ impl Receiver {
     }
     pub fn render_at(&mut self, now: Instant) -> Vec<f32> {
         self.render_inner(now, self.config.frame_size(), None)
-    }
-    /// Render one codec frame while accounting for the caller's remaining
-    /// native callback demand (in 48 kHz stereo frames, including this frame).
-    /// A batched callback must retain the jitter reserve after the whole batch,
-    /// rather than letting drift correction consume it between codec frames.
-    pub fn render_for_demand(&mut self, frames: usize) -> Vec<f32> {
-        self.render_inner(Instant::now(), frames, None)
-    }
-    pub fn render_for_demand_with_trace(&mut self, now: Instant, frames: usize) -> (Vec<f32>, RenderTrace) {
-        let mut trace = RenderTrace::default();
-        let samples = self.render_inner(now, frames, Some(&mut trace));
-        (samples, trace)
     }
     pub fn render_with_trace(&mut self, now: Instant) -> (Vec<f32>, RenderTrace) {
         let mut trace = RenderTrace::default();
@@ -761,6 +859,16 @@ impl Receiver {
     /// frames and shares `codec_budget` across every tile of one callback.
     /// Each actual decode/PLC call consumes one unit; invalid decode plus PLC
     /// consumes two. Exhaustion yields finite missing samples, never a retry.
+    /// Configure on the ordinary owner before publishing this receiver.
+    pub fn set_output_rate(&mut self, rate: u32) {
+        self.resampler.set_rates(self.config.sample_rate, rate);
+        self.kind_history = vec![OutputKind::Intentional; self.resampler.kernel.delay()];
+        self.kind_cursor = 0;
+    }
+    pub fn output_rate(&self) -> u32 {
+        (f64::from(self.config.sample_rate) / self.resampler.rate_ratio).round() as u32
+    }
+
     pub fn pull_into(
         &mut self,
         now: Instant,
@@ -775,13 +883,15 @@ impl Receiver {
         } else {
             OutputKind::Intentional
         });
-        self.output_frames = (output.len() / CHANNELS).min(FRAME_SIZE);
-        if output.is_empty() || !output.len().is_multiple_of(CHANNELS) || output.len() > FRAME_SAMPLES {
+        self.output_frames = (output.len() / CHANNELS).min(FRAME_SIZE * 2);
+        if output.is_empty() || !output.len().is_multiple_of(CHANNELS) || output.len() > FRAME_SAMPLES * 2 {
             return;
         }
         let frame_size = self.config.frame_size();
         let requested = output.len() / CHANNELS;
-        let elapsed_ms = requested as f64 / 48.0;
+        let elapsed_ms = requested as f64 * 1000.0 / f64::from(self.output_rate());
+        let source_requested = (requested as f64 * self.resampler.rate_ratio).ceil() as usize;
+        let source_demand = (demand_frames as f64 * self.resampler.rate_ratio).ceil() as usize;
         let fixed_profile = self.config.is_opus_10ms();
         // The jitter reserve is additional to all samples already demanded by
         // this native callback, not just the one codec frame returned here.
@@ -789,7 +899,7 @@ impl Receiver {
             self.adaptive.target * frame_size
         } else {
             (self.adaptive.target * frame_size)
-                .saturating_add(demand_frames.max(requested))
+                .saturating_add(source_demand.max(source_requested))
                 .min(self.queue_capacity() * frame_size)
         };
         if self.next.is_none() {
@@ -817,14 +927,14 @@ impl Receiver {
                 (self.adaptive.source_batch_ms > 0.0
                     // Several batches already contain reserve. One codec frame
                     // of rounding covers emission spread within a capture batch.
-                    && self.occupancy() <= (self.adaptive.source_batch_ms * 48.0).ceil() as usize + frame_size * 2
+                    && self.occupancy() <= (self.adaptive.source_batch_ms * (f64::from(self.config.sample_rate) / 1000.0)).ceil() as usize + frame_size * 2
                     && waited
-                        < Duration::from_secs_f64((self.adaptive.target * frame_size) as f64 / f64::from(SAMPLE_RATE)))
+                        < Duration::from_secs_f64((self.adaptive.target * frame_size) as f64 / f64::from(self.config.sample_rate)))
                     || (self.occupancy() < target
                         && waited
                             < Duration::from_secs_f64(
                                 target.saturating_sub(frame_size).max(self.adaptive.target * frame_size) as f64
-                                    / f64::from(SAMPLE_RATE),
+                                    / f64::from(self.config.sample_rate),
                             ))
             };
             if waiting {
@@ -860,7 +970,12 @@ impl Receiver {
         // Sender timestamps exclude capture batching from network jitter, but
         // the rate controller must still distinguish its normal queue swing
         // from excess reserve. Otherwise it accelerates toward an empty trough.
-        let error = self.occupancy() as f64 - target as f64 - self.adaptive.source_queue_phase_ms(now) * 48.0;
+        // Controllers retain their calibrated 48k-frame units at every native rate.
+        let error = (self.occupancy() as f64
+            - target as f64
+            - self.adaptive.source_queue_phase_ms(now) * (f64::from(self.config.sample_rate) / 1000.0))
+            * f64::from(SAMPLE_RATE)
+            / f64::from(self.config.sample_rate);
         let adapting = (!fixed_profile || self.wake_backlog) && self.adjustment.active();
         let clock_ppm = if adapting {
             // A deliberate change of reserve is not oscillator drift. Keep
@@ -872,18 +987,24 @@ impl Receiver {
             self.drift.update_low_latency(error, elapsed_ms)
         };
         let adaptation_ppm = if adapting {
-            // Wake catch-up caps compression at +1%; it must still allow the
-            // existing -2% reserve-building direction. Clamping negative rate
-            // to zero left the adjustment engaged (and drift frozen) forever.
-            self.adjustment.update_duration(error, frame_size, requested)
+            // Wake catch-up and target adaptation share the same bidirectional
+            // pitch budget. Clock correction is independent and unchanged.
+            self.adjustment.update_duration(
+                error,
+                (frame_size as f64 * f64::from(SAMPLE_RATE) / f64::from(self.config.sample_rate)).round() as usize,
+                (elapsed_ms * 48.0).round() as usize,
+                self.config.jitter.max_compression_ppm,
+            )
         } else {
             0.0
         };
-        let ppm = if self.wake_backlog {
-            (clock_ppm + adaptation_ppm).min(10_000.0)
-        } else {
-            clock_ppm + adaptation_ppm
-        };
+        self.quiet_cooldown_frames = self.quiet_cooldown_frames.saturating_sub(requested);
+        let mut ppm = clock_ppm
+            + if self.quiet_cooldown_frames > 0 && adaptation_ppm > 0.0 {
+                0.0
+            } else {
+                adaptation_ppm
+            };
         if !self.adjustment.active() {
             self.wake_backlog = false;
         }
@@ -896,19 +1017,15 @@ impl Receiver {
             // At an idle handover the remaining received media is finite. Fill the
             // rest with zeros instead of manufacturing a PLC tail or dropping PCM.
             if self.draining && self.packets.is_empty() {
+                self.finish_draining_tail();
                 break;
             }
             let Some(seq) = self.next else {
                 break;
             };
-            // Clock correction can put the last output sample one input
-            // sample beyond the current codec frame. Do not advance the codec
-            // and conceal an entire not-yet-arrived packet just for that sample.
-            // This is bounded to one sample, with an otherwise complete frame;
-            // a real missing codec frame still follows the ordinary PLC path.
             if !fixed_profile
                 && self.packets.is_empty()
-                && self.resampler.buffered_frames() >= requested - 1
+                && self.resampler.buffered_frames() >= source_requested.saturating_sub(1)
                 && required - self.resampler.buffered_frames() == 1
             {
                 break;
@@ -928,12 +1045,68 @@ impl Receiver {
                 return;
             }
         }
+        // Opportunistic lookahead uses only the remaining shared decode budget
+        // and already received consecutive packets. It never conceals missing packets,
+        // holds the output, or changes normal healthy/startup/draining behavior.
+        if adapting
+            && !self.draining
+            && !self.recovering
+            && self.consecutive_loss == 0
+            && self
+                .spans
+                .iter()
+                .all(|span| span.kind == OutputKind::Audio && !span.concealed)
+            // Protect a whole codec arrival swing as well as the 5 ms cut:
+            // a packet arriving is not proof of excess reserve at its trough.
+            && error >= (self.config.frame_duration_ms() + 6.0) * 48.0
+            && self.quiet_cooldown_frames == 0
+        {
+            let quiet_frames = (self.config.sample_rate as usize * 20).div_ceil(1000);
+            let drop_frames = self.config.sample_rate as usize * 5 / 1000;
+            let fade_frames = (self.config.sample_rate as usize).div_ceil(1000);
+            let lookahead = quiet_frames.max(required + drop_frames);
+            while self.resampler.buffered_frames() < lookahead
+                && *codec_budget >= 2
+                && self
+                    .resampler
+                    .samples
+                    .iter()
+                    .take(quiet_frames * CHANNELS)
+                    .all(|sample| sample.abs() <= QUIET_PEAK)
+                && self.next.is_some_and(|seq| self.packets.contains_key(&seq))
+            {
+                if !self.decode_next(now, codec_budget, trace.as_deref_mut()) {
+                    return;
+                }
+                // A corrupt received packet uses its normal bounded PLC path,
+                // but optional lookahead must stop before another such decode.
+                if self.consecutive_loss > 0 {
+                    break;
+                }
+            }
+            if self.resampler.buffered_frames() >= lookahead
+                && self
+                    .spans
+                    .iter()
+                    .all(|span| span.kind == OutputKind::Audio && !span.concealed)
+                && self
+                    .resampler
+                    .discard_quiet_prefix(drop_frames, quiet_frames, fade_frames)
+            {
+                // FIR history still describes emitted media, not discarded media.
+                // Advance source attribution without advancing that output history.
+                self.discard_spans(drop_frames);
+                self.stats.quiet_discarded_ms += drop_frames as f64 * 1000.0 / f64::from(self.config.sample_rate);
+                self.quiet_cooldown_frames = (self.output_rate() as usize * 20).div_ceil(1000);
+                ppm = clock_ppm;
+            }
+        }
         if let Some(trace) = trace.as_deref_mut()
             && let Some(first) = self.spans.front()
         {
             trace.sequence = Some(first.sequence);
             trace.sequence_offset_ns = ((frame_size.saturating_sub(first.frames) as f64 + self.resampler.phase) * 1e9
-                / f64::from(SAMPLE_RATE))
+                / f64::from(self.config.sample_rate))
             .round() as u64;
             trace.packet_wait_ns = first
                 .arrival
@@ -974,14 +1147,15 @@ impl Receiver {
             trace.resample_ns += duration_ns(started.elapsed());
         }
         self.stats.boundary_hold_samples += boundary_holds as u64;
-        // Report the rate actually given to the resampler, including the wake
-        // compression ceiling, rather than an unapplied controller request.
+        // Report adaptation actually given to the resampler separately from
+        // the unchanged oscillator correction.
         let applied_adaptation_ppm = ppm - clock_ppm;
         self.stats.adaptation_ppm = applied_adaptation_ppm;
         let adjusted_ms = applied_adaptation_ppm * elapsed_ms / 1_000_000.0;
         self.stats.adaptation_stretched_ms += (-adjusted_ms).max(0.0);
         self.stats.adaptation_compressed_ms += adjusted_ms.max(0.0);
         self.consume_spans(before - self.resampler.buffered_frames());
+        self.finish_draining_tail();
         if let Some(last) = output.as_chunks::<CHANNELS>().0.last() {
             self.last_output.copy_from_slice(last);
         }
@@ -989,10 +1163,21 @@ impl Receiver {
     pub(crate) fn output_kinds(&self) -> &[OutputKind] {
         &self.output_kinds[..self.output_frames]
     }
+    fn finish_draining_tail(&mut self) {
+        if self.draining && self.packets.is_empty() && self.resampler.finish_tail(self.retiring) {
+            self.spans.push_back(DecodedSpan {
+                sequence: self.last_decoded.unwrap_or(0),
+                frames: self.resampler.kernel.taps() - 1,
+                arrival: None,
+                concealed: false,
+                kind: OutputKind::Intentional,
+            });
+        }
+    }
     fn classify_output(&mut self, ppm: f64, hold_boundary: bool) {
         let buffered = self.resampler.buffered_frames();
         let mut phase = self.resampler.phase;
-        let step = DriftResampler::step(ppm);
+        let step = self.resampler.ratio(ppm);
         let mut spans = self.spans.iter();
         let mut span = spans.next();
         let mut end = span.map_or(0, |s| s.frames);
@@ -1002,34 +1187,22 @@ impl Receiver {
             OutputKind::Missing
         };
         for kind in &mut self.output_kinds[..self.output_frames] {
-            let raw_index = phase.floor() as usize;
-            let index = if hold_boundary && raw_index == buffered && buffered > 0 {
-                buffered - 1
-            } else {
-                raw_index
-            };
-            if index >= buffered || (!hold_boundary && phase.fract() > 0.0 && index + 1 >= buffered) {
+            let raw = phase.ceil() as usize;
+            if raw >= buffered && !(hold_boundary && raw == buffered && buffered > 0) {
                 *kind = fallback;
-                continue;
-            }
-            while index >= end {
-                span = spans.next();
-                if let Some(s) = span {
-                    end += s.frames;
-                } else {
-                    break;
+            } else if raw < self.kind_history.len() {
+                *kind = self.kind_history[(self.kind_cursor + raw) % self.kind_history.len()];
+            } else {
+                let index = raw - self.kind_history.len();
+                while index >= end {
+                    span = spans.next();
+                    if let Some(s) = span {
+                        end += s.frames;
+                    } else {
+                        break;
+                    }
                 }
-            }
-            *kind = span.map_or(fallback, |s| s.kind);
-            if raw_index == index
-                && phase.fract() > 0.0
-                && index + 1 == end
-                && let Some(next) = spans.clone().next()
-            {
-                // A fractional boundary already contains the next span. Mark
-                // the transition on this sample, including PLC -> real audio,
-                // so splice repair does not start one sample after the jump.
-                *kind = next.kind;
+                *kind = span.map_or(fallback, |s| s.kind);
             }
             phase += step;
         }
@@ -1044,7 +1217,7 @@ impl Receiver {
             *codec_budget -= 1;
         }
         let arrival = packet.as_ref().map(|packet| packet.arrival);
-        let mut storage = [0.0; FRAME_SAMPLES];
+        let mut storage = [0.0; FRAME_SAMPLES * 2];
         let pcm = &mut storage[..self.config.frame_samples()];
         let valid = match (&mut self.decoder, packet) {
             (DecoderCodec::Opus(decoder), Some(packet)) => {
@@ -1055,6 +1228,14 @@ impl Receiver {
                         false
                     }
                 }
+            }
+            (DecoderCodec::Pcm24, Some(packet)) => {
+                for (sample, bytes) in pcm.iter_mut().zip(packet.payload[..packet.len].as_chunks::<3>().0) {
+                    let value =
+                        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], if bytes[2] & 0x80 != 0 { 255 } else { 0 }]);
+                    *sample = value as f32 / 8_388_608.0;
+                }
+                true
             }
             (DecoderCodec::Pcm16, Some(packet)) => {
                 for (sample, bytes) in pcm
@@ -1071,8 +1252,9 @@ impl Receiver {
         let mut plc_ns = 0;
         if valid {
             self.consecutive_loss = 0;
-            self.healthy_frames = (self.healthy_frames + self.config.frame_size()).min(SAMPLE_RATE as usize);
-            if self.healthy_frames == SAMPLE_RATE as usize {
+            self.healthy_frames =
+                (self.healthy_frames + self.config.frame_size()).min(self.config.sample_rate as usize);
+            if self.healthy_frames == self.config.sample_rate as usize {
                 self.empty_queue_loss = 0;
             }
         } else {
@@ -1109,7 +1291,7 @@ impl Receiver {
                         }
                     }
                 }
-                DecoderCodec::Pcm16 => {
+                DecoderCodec::Pcm16 | DecoderCodec::Pcm24 => {
                     // PCM fallback also consumes one bounded work unit.
                     *codec_budget = codec_budget.saturating_sub(1);
                     // PCM has no codec PLC. Fade the last output sample to zero
@@ -1155,12 +1337,30 @@ impl Receiver {
                 break;
             };
             let consumed = frames.min(span.frames);
+            for _ in 0..consumed {
+                self.kind_history[self.kind_cursor] = span.kind;
+                self.kind_cursor = (self.kind_cursor + 1) % self.kind_history.len();
+            }
             span.frames -= consumed;
             frames -= consumed;
             if span.frames == 0 {
                 self.spans.pop_front();
             }
         }
+    }
+    fn discard_spans(&mut self, mut frames: usize) {
+        while frames > 0 {
+            let Some(span) = self.spans.front_mut() else { break };
+            let discarded = frames.min(span.frames);
+            span.frames -= discarded;
+            frames -= discarded;
+            if span.frames == 0 {
+                self.spans.pop_front();
+            }
+        }
+    }
+    pub(crate) fn set_retiring(&mut self, retiring: bool) {
+        self.retiring = retiring;
     }
     pub(crate) fn set_draining(&mut self, draining: bool) {
         self.draining = draining;
@@ -1211,8 +1411,11 @@ impl Receiver {
         self.recovering = true;
         self.resampler.clear();
         self.spans.clear();
+        self.kind_history.fill(OutputKind::Intentional);
+        self.kind_cursor = 0;
         self.drift = DriftController::default();
         self.adjustment = PlayoutAdjustment::default();
+        self.quiet_cooldown_frames = 0;
         self.stats.adaptation_ppm = 0.0;
         self.last_output = [0.0; CHANNELS];
         if let DecoderCodec::Opus(decoder) = &mut self.decoder {
@@ -1361,12 +1564,12 @@ impl AdaptiveJitter {
             self.last_decay = None;
         } else if desired < self.target {
             // Retain protection through recurring wireless stalls. After the
-            // one-second measurement window clears, require three seconds of
-            // lower demand, then lower by at most 5 ms per 500 ms. Receiver
+            // one-second measurement window clears, require the profile's stable
+            // interval of lower demand, then decay in rounded codec frames. Receiver
             // drains the resulting reserve by rate correction, never a skip.
             let (since, candidate) = self.lower_candidate.get_or_insert((at, desired));
             *candidate = (*candidate).max(desired);
-            if at.duration_since(*since) >= TARGET_STABLE_INTERVAL
+            if at.duration_since(*since) >= Duration::from_secs(u64::from(self.config.jitter.target_stable_secs))
                 && self
                     .last_decay
                     .is_none_or(|last| at.duration_since(last) >= TARGET_DECAY_INTERVAL)
@@ -1383,12 +1586,11 @@ impl AdaptiveJitter {
     }
 }
 
-/// Deliberate reserve changes use a continuous resampling phase, not frame
-/// deletion or inserted silence. Building at <=2% takes at least 10 s for
-/// 200 ms; a buffer already emptied by the first burst still needs the normal
-/// bounded PLC/re-prefill path. Draining at <=1% takes at least 20 s. These
-/// small rate changes can shift pitch (about -35/+17 cents); no pitch-preserving
-/// time stretcher is claimed. With no target changes this is exactly inactive.
+/// Deliberate reserve changes use continuous resampling with at most -0.2%
+/// expansion and a per-profile compression ceiling, plus clock correction. This does
+/// not preserve pitch. Building 20 ms takes at least 10 s; rate-only draining
+/// takes at least 4/10 s by profile. Starvation still needs bounded PLC/re-prefill.
+/// This controller only changes rate; the receiver separately handles quiet cuts.
 #[derive(Default)]
 struct PlayoutAdjustment {
     engaged: bool,
@@ -1405,7 +1607,13 @@ impl PlayoutAdjustment {
     fn active(&self) -> bool {
         self.engaged
     }
-    fn update_duration(&mut self, occupancy_error: f64, codec_frames: usize, consumed_frames: usize) -> f64 {
+    fn update_duration(
+        &mut self,
+        occupancy_error: f64,
+        codec_frames: usize,
+        consumed_frames: usize,
+        max_compression_ppm: u32,
+    ) -> f64 {
         // One full arrival batch does not imply a full playout reserve. Follow
         // a 250 ms smoothed occupancy error until it stays near the requested
         // reserve for a second; this also drains overshoot after re-prefill.
@@ -1413,13 +1621,13 @@ impl PlayoutAdjustment {
         // stream still uses exactly the original oscillator drift path.
         let dt = consumed_frames as f64 / f64::from(SAMPLE_RATE);
         self.filtered_error += (1.0 - (-dt / 0.250).exp()) * (occupancy_error - self.filtered_error);
-        let mut requested = (self.filtered_error * 20.0).clamp(-20_000.0, 10_000.0);
+        let mut requested = (self.filtered_error * 20.0).clamp(-MAX_ADAPTATION_PPM, f64::from(max_compression_ppm));
         // Never deliberately drain a reserve which is currently below target.
         // The phase/rate still slews continuously; a packet gap is not a skip.
         if occupancy_error < 0.0 && requested > 0.0 {
             requested = 0.0;
         }
-        // 0 -> 2% takes 200 ms; consecutive codec calls share the same phase.
+        // Retain the existing slew and continuous phase within the smaller cap.
         let slew = consumed_frames as f64 / 48.0 * 100.0;
         self.ppm += (requested - self.ppm).clamp(-slew, slew);
         if self.filtered_error.abs() < codec_frames as f64 * 0.5 && self.ppm.abs() < 1000.0 {
@@ -1465,10 +1673,13 @@ impl DriftController {
     }
 }
 
-/// Streaming linear interpolator for small clock corrections (not a general
-/// band-limited sample-rate converter). Positive ppm consumes input faster.
+/// Band-limited asynchronous conversion. Positive ppm consumes input faster.
 #[derive(Debug)]
 pub struct DriftResampler {
+    tail_pending: bool,
+    rate_ratio: f64,
+    kernel: crate::resample::Kernel,
+    history: crate::resample::History,
     samples: VecDeque<f32>,
     channels: usize,
     phase: f64,
@@ -1476,14 +1687,31 @@ pub struct DriftResampler {
 
 impl DriftResampler {
     pub fn new(channels: usize) -> Self {
+        let kernel = crate::resample::Kernel::new(1.011);
         Self {
-            samples: prepared_deque(MAX_RESAMPLE_FRAMES * channels.clamp(1, 32), || 0.0),
+            tail_pending: false,
+            rate_ratio: 1.0,
+            history: crate::resample::History::new(channels.clamp(1, 32), kernel.taps()),
+            samples: prepared_deque((MAX_RESAMPLE_FRAMES + kernel.taps()) * channels.clamp(1, 32), || 0.0),
+            kernel,
             channels: channels.clamp(1, 32),
             phase: 0.0,
         }
     }
 
+    fn set_rates(&mut self, input: u32, output: u32) {
+        self.rate_ratio = f64::from(input) / f64::from(output);
+        self.kernel = crate::resample::Kernel::new(self.rate_ratio * 1.011);
+        self.history = crate::resample::History::new(self.channels, self.kernel.taps());
+        self.samples
+            .reserve((MAX_RESAMPLE_FRAMES + self.kernel.taps()) * self.channels - self.samples.len());
+    }
+    fn ratio(&self, ppm: f64) -> f64 {
+        self.rate_ratio * Self::step(ppm)
+    }
+
     pub fn push(&mut self, samples: &[f32]) {
+        self.tail_pending |= !samples.is_empty();
         for frame in samples.chunks_exact(self.channels) {
             if self.buffered_frames() == MAX_RESAMPLE_FRAMES {
                 self.samples.drain(..self.channels);
@@ -1494,18 +1722,76 @@ impl DriftResampler {
         }
     }
 
+    fn finish_tail(&mut self, hold: bool) -> bool {
+        if !self.tail_pending {
+            return false;
+        }
+        // Retirement already applies a downstream fade which holds the last
+        // frame after PCM ends. Extend that same endpoint through the FIR so
+        // zero padding cannot introduce a new edge before the fade completes.
+        let mut last = [0.0; 32];
+        if hold {
+            let frames = self.buffered_frames();
+            for (channel, value) in last[..self.channels].iter_mut().enumerate() {
+                *value = if frames == 0 {
+                    self.history.get(-1, channel)
+                } else {
+                    self.samples[(frames - 1) * self.channels + channel]
+                };
+            }
+        }
+        self.samples
+            .extend((0..(self.kernel.taps() - 1) * self.channels).map(|i| last[i % self.channels]));
+        self.tail_pending = false;
+        true
+    }
     pub fn buffered_frames(&self) -> usize {
         self.samples.len() / self.channels
     }
 
     pub fn clear(&mut self) {
         self.samples.clear();
+        self.history.clear();
+        self.tail_pending = false;
         self.phase = 0.0;
+    }
+
+    /// Remove only a verified near-silent prefix. The shared stereo offset and
+    /// 1 ms linear crossfade preserve the first sample and the original endpoint.
+    /// With fade <= drop, writes cannot overwrite a later read. No allocation.
+    fn discard_quiet_prefix(&mut self, drop: usize, guard: usize, fade: usize) -> bool {
+        if drop == 0
+            || fade < 2
+            || fade > drop
+            || guard < drop + fade
+            || self.buffered_frames() < guard
+            || self
+                .samples
+                .iter()
+                .take(guard * self.channels)
+                .any(|sample| sample.abs() > QUIET_PEAK)
+        {
+            return false;
+        }
+        for frame in 0..fade {
+            let weight = frame as f32 / (fade - 1) as f32;
+            for channel in 0..self.channels {
+                let first = self.samples[frame * self.channels + channel];
+                let second = self.samples[(drop + frame) * self.channels + channel];
+                self.samples[(drop + frame) * self.channels + channel] = if frame + 1 == fade {
+                    second
+                } else {
+                    first + (second - first) * weight
+                };
+            }
+        }
+        self.samples.drain(..drop * self.channels);
+        true
     }
 
     fn step(ppm: f64) -> f64 {
         1.0 + if ppm.is_finite() {
-            ppm.clamp(-21_000.0, 11_000.0)
+            ppm.clamp(-(MAX_ADAPTATION_PPM + 1000.0), f64::from(MAX_COMPRESSION_PPM) + 1000.0)
         } else {
             0.0
         } / 1_000_000.0
@@ -1515,14 +1801,15 @@ impl DriftResampler {
         if frames == 0 {
             return 0;
         }
-        (self.phase + (frames - 1) as f64 * Self::step(ppm)).ceil() as usize + 1
+        ((self.phase + (frames - 1) as f64 * self.ratio(ppm)).ceil() as usize + 1)
+            .max((self.phase + frames as f64 * self.ratio(ppm)).floor() as usize)
     }
-
     fn required_frames_without_lookahead(&self, frames: usize, ppm: f64) -> usize {
         if frames == 0 {
             return 0;
         }
-        (self.phase + (frames - 1) as f64 * Self::step(ppm)).floor() as usize + 1
+        ((self.phase + (frames - 1) as f64 * self.ratio(ppm)).floor() as usize + 1)
+            .max((self.phase + frames as f64 * self.ratio(ppm)).floor() as usize)
     }
 
     pub fn render(&mut self, frames: usize, ppm: f64) -> Vec<f32> {
@@ -1543,41 +1830,29 @@ impl DriftResampler {
             return 0;
         }
         let mut held_samples = 0;
-        let step = Self::step(ppm);
+        let step = self.ratio(ppm);
         for frame in out.chunks_exact_mut(self.channels) {
             let index = self.phase.floor() as usize;
-            let fraction = self.phase - index as f64;
-            if hold_boundary && index == self.buffered_frames() && index > 0 {
-                // Extend only the final sample for the bounded clock-correction
-                // shortage accepted by Receiver. Discard the unfulfilled phase
-                // advance below instead of charging it to the next codec frame.
-                held_samples += 1;
-                for (channel, sample) in frame.iter_mut().enumerate() {
-                    *sample = self.samples[(index - 1) * self.channels + channel];
+            if index >= self.buffered_frames() {
+                if !(hold_boundary && index == self.buffered_frames() && index > 0) {
+                    break;
                 }
-                self.phase += step;
-                continue;
-            }
-            if index >= self.buffered_frames()
-                || (!hold_boundary && fraction > 0.0 && index + 1 >= self.buffered_frames())
-            {
-                break;
-            }
-            if fraction > 0.0 && index + 1 >= self.buffered_frames() {
                 held_samples += 1;
             }
             for (channel, sample) in frame.iter_mut().enumerate() {
-                let a = self.samples[index * self.channels + channel];
-                let b = self
-                    .samples
-                    .get((index + 1) * self.channels + channel)
-                    .copied()
-                    .unwrap_or(a);
-                *sample = a + (b - a) * fraction as f32;
+                *sample = self.kernel.sample(self.phase, |index| {
+                    if index < 0 {
+                        self.history.get(index, channel)
+                    } else {
+                        self.samples[index.min(self.buffered_frames() as isize - 1) as usize * self.channels + channel]
+                    }
+                });
             }
             self.phase += step;
         }
         let consumed = (self.phase.floor() as usize).min(self.buffered_frames());
+        self.history
+            .retain(consumed, |frame, channel| self.samples[frame * self.channels + channel]);
         self.samples.drain(..consumed * self.channels);
         self.phase -= consumed as f64;
         if hold_boundary && self.samples.is_empty() {
@@ -1635,6 +1910,7 @@ mod tests {
     #[test]
     fn arbitrary_pull_consumes_requested_samples_and_keeps_only_codec_remainder() {
         let mut config = Config {
+            sample_rate: SAMPLE_RATE,
             codec: Codec::Pcm16,
             bitrate: 1_536_000,
             ..Config::low_latency_opus()
@@ -1666,9 +1942,18 @@ mod tests {
                 decoded * config.frame_size() - frames
             );
             assert_eq!(receiver.output_kinds().len(), frames);
-            assert!(receiver.output_kinds().iter().all(|kind| *kind == OutputKind::Audio));
             assert!(
-                output[..frames * CHANNELS]
+                receiver.output_kinds()[..frames.min(47)]
+                    .iter()
+                    .all(|kind| *kind == OutputKind::Intentional)
+            );
+            assert!(
+                receiver.output_kinds()[frames.min(48)..]
+                    .iter()
+                    .all(|kind| *kind == OutputKind::Audio)
+            );
+            assert!(
+                output[(96.min(frames)) * CHANNELS..frames * CHANNELS]
                     .iter()
                     .all(|sample| (*sample - 0.25).abs() < 0.0001)
             );
@@ -1773,9 +2058,9 @@ mod tests {
             kind: OutputKind::Concealed,
         });
         r.classify_output(0.0, true);
-        assert!(r.output_kinds()[..119].iter().all(|k| *k == OutputKind::Audio));
-        // Interpolation at 119.5 includes concealed input from the next span.
-        assert!(r.output_kinds()[119..].iter().all(|k| *k == OutputKind::Concealed));
+        assert!(r.output_kinds()[..47].iter().all(|k| *k == OutputKind::Intentional));
+        assert!(r.output_kinds()[47..167].iter().all(|k| *k == OutputKind::Audio));
+        assert!(r.output_kinds()[167..].iter().all(|k| *k == OutputKind::Concealed));
         r.rebuffer_at(Some(Instant::now()));
         assert!(r.output_kinds().iter().all(|k| *k == OutputKind::Missing));
         r.reset_burst();
@@ -2030,8 +2315,10 @@ mod tests {
                 pushed += 500;
                 let out = resampler.render(480, ppm);
                 for frame in out.as_chunks::<2>().0.iter() {
-                    let expected = rendered as f64 * DriftResampler::step(ppm);
-                    assert!((f64::from(frame[0]) - expected).abs() < 0.01);
+                    let expected = rendered as f64 * DriftResampler::step(ppm) - resampler.kernel.delay() as f64;
+                    if rendered > 96 {
+                        assert!((f64::from(frame[0]) - expected).abs() < 0.05);
+                    }
                     assert_eq!(frame[0], -frame[1]);
                     rendered += 1;
                 }
@@ -2280,13 +2567,12 @@ mod tests {
             .flat_map(|i| if i == 0 { [2.0, -2.0] } else { [0.25, -0.75] })
             .collect();
         let encoded = encoder.encode(&input).unwrap();
-        let origin = Instant::now();
         let mut receiver = Receiver::new_with_config(config).unwrap();
-        receiver.push_at(0, encoded, origin);
-        let (decoded, trace) = receiver.render_with_trace(origin + Duration::from_millis(5));
-        assert_eq!(trace.sequence, Some(0));
-        assert_eq!(trace.kind, RenderKind::Audio);
-        for (actual, expected) in decoded.iter().zip(&input) {
+        let now = Instant::now();
+        receiver.push_at(0, encoded, now);
+        receiver.next = Some(0);
+        assert!(receiver.decode_next(now, &mut 2, None));
+        for (actual, expected) in receiver.resampler.samples.iter().zip(&input) {
             assert!((actual - expected.clamp(-1.0, 1.0)).abs() <= 1.0 / 32767.0);
         }
         assert_eq!(receiver.stats().lost, 0);
@@ -2445,7 +2731,7 @@ mod tests {
         assert_eq!(trace.sequence, Some(40));
         assert_eq!(trace.decoded_last_sequence, Some(40));
         assert_eq!(receiver.stats().lost, 0);
-        assert_eq!(receiver.stats().boundary_hold_samples, 1);
+        assert_eq!(receiver.stats().boundary_hold_samples, 0);
         assert!(receiver.push_at(41, pcm_packet(config, 0.25), origin + Duration::from_millis(6)));
         assert_eq!(receiver.stats().late, 0);
     }
@@ -2486,11 +2772,11 @@ mod tests {
     }
 
     #[test]
-    fn arrival_adaptation_preserves_continuity_then_returns_to_real_low_latency() {
-        let adaptive = simulate_arrival_trace(Config::low_latency_pcm(), 12_000);
+    fn adaptive_and_fixed_playout_settle_near_minimum_without_extra_loss() {
+        let adaptive = simulate_arrival_trace(Config::low_latency_pcm(), 40_000);
         let mut fixed = Config::low_latency_pcm();
         fixed.jitter.adaptive = false;
-        let fixed = simulate_arrival_trace(fixed, 12_000);
+        let fixed = simulate_arrival_trace(fixed, 40_000);
         assert!(adaptive.target_increases > 0);
         assert!(adaptive.target_decreases > 0);
         assert!(
@@ -2507,7 +2793,10 @@ mod tests {
         // damaged just to make the adaptive comparison strictly better.
         assert!(adaptive.lost <= fixed.lost, "adaptive={adaptive:?}, fixed={fixed:?}");
         assert!(adaptive.late <= fixed.late, "adaptive={adaptive:?}, fixed={fixed:?}");
-        assert!(adaptive.buffered_ms < fixed.buffered_ms);
+        // Over the longer settling interval the fixed controller also drains
+        // toward its minimum. Compare within one packet of callback phase,
+        // rather than requiring adaptive to beat an equally settled stream.
+        assert!(adaptive.buffered_ms <= fixed.buffered_ms + Config::low_latency_pcm().frame_duration_ms());
     }
 
     #[test]
@@ -2621,7 +2910,7 @@ mod tests {
         let origin = Instant::now();
         let payload = pcm_packet(config, 0.05);
         let mut receiver = Receiver::new_with_config(config).unwrap();
-        let mut events: Vec<_> = (0..8000_u64)
+        let mut events: Vec<_> = (0..24000_u64)
             .map(|seq| {
                 let source_ns = seq * 2_500_000;
                 // A finite 100 ms interval of delayed network packets, followed by
@@ -2637,7 +2926,7 @@ mod tests {
         events.sort_unstable();
         let mut next = 0;
         let mut peak = 0.0_f64;
-        for tick in 0..8000_u64 {
+        for tick in 0..24000_u64 {
             let now_ns = tick * 2_500_000;
             while next < events.len() && events[next].0 <= now_ns {
                 let (arrival, seq, emitted) = events[next];
@@ -2657,7 +2946,7 @@ mod tests {
             // newly on-time packets. Preserve that bounded transient instead
             // of deleting valid future frames to force the target immediately.
             assert!(stats.buffered_ms <= 115.0, "at {now_ns}: {stats:?}");
-            if now_ns >= 16_000_000_000 {
+            if now_ns >= 56_000_000_000 {
                 assert_eq!(stats.current_target_ms, 5.0, "{stats:?}");
                 assert!(stats.buffered_ms <= 10.0, "{stats:?}");
             }
@@ -2783,7 +3072,7 @@ mod tests {
                     .unwrap();
                 let mut receiver = Receiver::new_with_config(config).unwrap();
                 let period_us = (config.frame_duration_ms() * 1000.0) as u64;
-                let mut events: Vec<_> = (0..45_000_000 / period_us)
+                let mut events: Vec<_> = (0..130_000_000 / period_us)
                     .map(|sequence| {
                         let source_us = sequence * period_us;
                         // Simulated 200 ms radio outages in seconds 1..8;
@@ -2803,7 +3092,7 @@ mod tests {
                 let mut peak_target = 0.0_f64;
                 let mut callback_tick = 0;
                 let mut output_frames = 0_usize;
-                for now_us in (0..45_000_000).step_by(1000) {
+                for now_us in (0..130_000_000).step_by(1000) {
                     let now = origin + Duration::from_micros(now_us);
                     while index < events.len() && events[index].0 <= now_us {
                         let (arrival, sequence, source) = events[index];
@@ -2955,10 +3244,13 @@ mod wake_backlog_tests {
                 let config = Config::low_latency_opus();
                 let mut encoder = Encoder::new_with_config(config).unwrap();
                 let mut payload = [0; MAX_PACKET_BYTES];
+                // Sustained tone stays audible after Opus DC rejection.
+                let tone: [f32; 480] =
+                    std::array::from_fn(|i| 0.1 * (std::f32::consts::TAU * 1200.0 * (i / 2) as f32 / 48_000.0).sin());
                 // Retain old encoder state, as in a fixed_profile same-burst wake. A new
                 // receiver must recover its timing even without a paired source reset.
                 for _ in 0..32 {
-                    encoder.encode_into(&[0.1; 480], &mut payload).unwrap();
+                    encoder.encode_into(&tone, &mut payload).unwrap();
                 }
                 if !continued {
                     encoder.reset().unwrap();
@@ -2978,16 +3270,18 @@ mod wake_backlog_tests {
                 let mut queued_output = 0_usize;
                 let mut minimum_ppm = 0.0_f64;
                 let mut losses_after_learning = 0;
-                for now_us in (0..15_000_000).step_by(100) {
+                for now_us in (0..22_000_000).step_by(100) {
                     // WASAPI emits two 5 ms packets per 10 ms capture buffer. Source
                     // timestamps preserve that cadence, not invented 5 ms spacing.
+                    // At +0.5% catch-up, perturb the source while adjustment is
+                    // still engaged; twelve seconds is already past settling.
                     let phase = if next_batch >= 400 { 3000 } else { 0 };
                     while next_batch * 10_000 + phase <= now_us {
                         let arrival_us = next_batch * 10_000 + phase;
                         let at = origin + Duration::from_micros(arrival_us);
                         for packet in 0..2 {
                             let sequence = first_sequence + next_batch * 2 + packet;
-                            let len = encoder.encode_into(&[0.1; 480], &mut payload).unwrap();
+                            let len = encoder.encode_into(&tone, &mut payload).unwrap();
                             assert!(admission.media(burst, sequence, at));
                             receiver.push_slice_at(
                                 sequence,
@@ -3015,6 +3309,15 @@ mod wake_backlog_tests {
                     minimum_ppm = minimum_ppm.min(receiver.stats().adaptation_ppm);
                     if now_us == 8_000_000 {
                         losses_after_learning = receiver.stats().lost;
+                    }
+                    // Observe fourteen full seconds after the post-change settling
+                    // interval, not just the final second or final sample.
+                    if now_us >= 8_000_000 {
+                        assert_eq!(
+                            receiver.stats().lost,
+                            losses_after_learning,
+                            "steady playout at {now_us}"
+                        );
                     }
                 }
                 let stats = receiver.stats();
@@ -3198,23 +3501,27 @@ mod wake_backlog_tests {
         let losses = receiver.stats().lost;
         receiver.set_draining(true);
         receiver.render_into(origin + Duration::from_secs(5), 120, &mut output, None);
-        assert!(output.iter().all(|sample| *sample > 0.19));
+        assert!(output[192..].iter().all(|sample| *sample > 0.19));
         assert_eq!(receiver.stats().lost, losses);
     }
     #[test]
-    fn wake_backlog_drains_at_up_to_one_percent_without_trimming_media() {
+    fn nonquiet_wake_backlog_drains_with_profile_rate_budget_without_trimming_media() {
         for config in [
             Config::low_latency_pcm(),
             Config::low_latency_opus(),
             Config::opus_10ms(),
+            Config::music_opus(),
+            Config::lossless(48_000),
         ] {
             let mut encoder = Encoder::new_with_config(config).unwrap();
             let mut receiver = Receiver::new_with_config(config).unwrap();
             receiver.reset_burst();
             let origin = Instant::now();
             let mut payload = [0; MAX_PACKET_BYTES];
+            let tone: [f32; FRAME_SAMPLES * 2] =
+                std::array::from_fn(|i| 0.1 * (std::f32::consts::TAU * 1200.0 * (i / 2) as f32 / 48_000.0).sin());
             let len = encoder
-                .encode_into(&[0.1; FRAME_SAMPLES][..config.frame_samples()], &mut payload)
+                .encode_into(&tone[..config.frame_samples()], &mut payload)
                 .unwrap();
             let step_ns = config.frame_size() as u64 * 1_000_000_000 / 48_000;
             let backlog_frames = (80.0 / config.frame_duration_ms()) as u64;
@@ -3228,20 +3535,21 @@ mod wake_backlog_tests {
             }
             let mut maximum_ppm = 0.0_f64;
             let initial = receiver.stats().buffered_ms;
-            let mut pcm = [0.0; FRAME_SAMPLES];
-            for tick in 1..=(20_000.0 / config.frame_duration_ms()) as u64 {
+            let mut pcm = [0.0; FRAME_SAMPLES * 2];
+            for tick in 1..=(60_000.0 / config.frame_duration_ms()) as u64 {
                 let sequence = backlog_frames + tick;
                 let at = origin + Duration::from_nanos(sequence * step_ns);
                 assert!(receiver.push_slice_at(sequence, &payload[..len], at, Some(sequence * step_ns)));
                 receiver.render_into(at, config.frame_size(), &mut pcm[..config.frame_samples()], None);
                 let stats = receiver.stats();
                 maximum_ppm = maximum_ppm.max(stats.adaptation_ppm);
-                assert!(stats.adaptation_ppm <= 10_000.0);
+                assert!(stats.adaptation_ppm >= -MAX_ADAPTATION_PPM - 1e-9);
+                assert!(stats.adaptation_ppm <= f64::from(config.jitter.max_compression_ppm) + 1e-9);
                 assert_eq!(stats.latency_trimmed_frames, 0);
                 assert_eq!(stats.lost, 0);
             }
             let stats = receiver.stats();
-            assert!(maximum_ppm > 9_000.0);
+            assert!(maximum_ppm >= f64::from(config.jitter.max_compression_ppm) - 1e-9);
             assert!(stats.buffered_ms < initial - 30.0, "backlog did not drain: {stats:?}");
             assert!(
                 stats.buffered_ms <= stats.current_target_ms + config.frame_duration_ms() + 2.0,
@@ -3249,6 +3557,633 @@ mod wake_backlog_tests {
             );
             assert!(stats.arrival_jitter_ms < 1e-6);
             assert_eq!(stats.current_target_ms, stats.initial_target_ms);
+        }
+    }
+}
+
+#[cfg(test)]
+mod quality_profile_tests {
+    use super::*;
+    #[test]
+    fn finite_stream_drain_emits_the_complete_fir_tail() {
+        let mut converter = DriftResampler::new(2);
+        let mut input = [0.0; 128];
+        input[126] = 1.0;
+        converter.push(&input);
+        assert!(converter.finish_tail(false));
+        assert!(!converter.finish_tail(false));
+        let actual = converter.render(256, 0.0);
+        for (i, frame) in actual.as_chunks::<2>().0.iter().enumerate() {
+            let expected = converter.kernel.sample(i as f64, |j| if j == 63 { 1.0 } else { 0.0 });
+            assert!((frame[0] - expected).abs() < 1e-6, "tail frame {i}");
+            assert_eq!(frame[1], 0.0);
+        }
+        assert_eq!(converter.buffered_frames(), 0);
+    }
+    #[test]
+    fn native_pcm_clocks_keep_bounded_reserve_in_both_drift_directions() {
+        for rate in [44_100, 96_000] {
+            for ppm in [-700.0, 700.0] {
+                let config = Config::lossless(rate);
+                let mut receiver = Receiver::new_with_config(config).unwrap();
+                let mut encoder = Encoder::new_with_config(config).unwrap();
+                let packet = encoder.encode(&vec![0.1; config.frame_samples()]).unwrap();
+                let origin = Instant::now();
+                let period = config.frame_duration_ms() / 1000.0 / (1.0 + ppm / 1e6);
+                let mut sequence = 0;
+                for tick in 0..2000 {
+                    let elapsed = tick as f64 * 120.0 / 48000.0;
+                    let now = origin + Duration::from_secs_f64(elapsed);
+                    while sequence as f64 * period <= elapsed {
+                        assert!(receiver.push_with_source_time_at(
+                            sequence,
+                            packet.clone(),
+                            origin + Duration::from_secs_f64(sequence as f64 * period),
+                            (sequence as f64 * period * 1e9) as u64
+                        ));
+                        sequence += 1;
+                    }
+                    receiver.pull_into(now, 120, &mut [0.0; 240], &mut 8, None);
+                    assert!(receiver.stats().buffered_ms < 20.0);
+                }
+                let stats = receiver.stats();
+                assert_eq!(
+                    stats.lost + stats.late + stats.rejected + stats.latency_trimmed_frames,
+                    0,
+                    "{rate} {ppm}: {stats:?}"
+                );
+                eprintln!(
+                    "native PCM clock {rate} {ppm}ppm, 5 seconds: buffer {} ms, correction {}ppm",
+                    stats.buffered_ms, stats.drift_ppm
+                );
+            }
+        }
+    }
+    #[test]
+    fn playback_conversion_and_drift_share_one_impulse_delay() {
+        for (input, output) in [(44_100, 48_000), (48_000, 44_100), (48_000, 48_000), (96_000, 48_000)] {
+            for ppm in [-700.0, 0.0, 700.0] {
+                let mut converter = DriftResampler::new(2);
+                converter.set_rates(input, output);
+                let mut impulse = [0.0; 1024];
+                impulse[0] = 1.0;
+                converter.push(&impulse);
+                let rendered = converter.render(256, ppm);
+                let peak = (0..256)
+                    .max_by(|a, b| rendered[*a * 2].abs().total_cmp(&rendered[*b * 2].abs()))
+                    .unwrap();
+                let expected =
+                    converter.kernel.delay() as f64 * f64::from(output) / f64::from(input) / DriftResampler::step(ppm);
+                assert!((peak as f64 - expected).abs() <= 0.5);
+                assert!(rendered.as_chunks::<2>().0.iter().all(|pair| pair[1] == 0.0));
+                eprintln!(
+                    "playback {input}->{output}, {ppm}ppm: impulse peak {peak} output frames, {} ms",
+                    peak as f64 * 1000.0 / f64::from(output)
+                );
+            }
+        }
+    }
+    #[test]
+    fn quality_profiles_encode_decode_and_report_real_parameters() {
+        for config in [
+            Config::low_latency_opus(),
+            Config::music_opus(),
+            Config::lossless(44_100),
+            Config::lossless(48_000),
+            Config::lossless(96_000),
+        ] {
+            let mut encoder = Encoder::new_with_config(config).unwrap();
+            if let EncoderCodec::Opus(inner) = &mut encoder.inner {
+                let application = if config.frame_duration == FrameDuration::Ms20 {
+                    opus::Application::Audio
+                } else {
+                    opus::Application::LowDelay
+                };
+                assert_eq!(inner.get_application().unwrap(), application);
+                assert_eq!(inner.get_bitrate().unwrap(), opus::Bitrate::Bits(320_000));
+                assert!(!inner.get_vbr().unwrap());
+                assert_eq!(inner.get_complexity().unwrap(), 10);
+            }
+            let mut receiver = Receiver::new_with_config(config).unwrap();
+            let origin = Instant::now();
+            let samples: Vec<_> = (0..config.frame_size())
+                .flat_map(|i| {
+                    let value = (std::f32::consts::TAU * 997.0 * i as f32 / config.sample_rate as f32).sin() * 0.1;
+                    [value, -value]
+                })
+                .collect();
+            for sequence in 0..8 {
+                let payload = encoder.encode(&samples).unwrap();
+                assert_eq!(payload.len(), config.payload_bytes());
+                assert!(valid_payload(config, &payload));
+                assert!(receiver.push_at(sequence, payload, origin));
+            }
+            let mut output = [0.0; 960];
+            receiver.pull_into(origin + Duration::from_millis(100), 480, &mut output, &mut 8, None);
+            assert!(output.iter().all(|value| value.is_finite()));
+            assert!(output.iter().any(|value| value.abs() > 0.01));
+            assert_eq!(receiver.stats().decode_errors, 0);
+            eprintln!(
+                "profile {:?}: rate {}, frame {:.6} ms, lookahead {} samples, payload {} bytes",
+                config.codec,
+                config.sample_rate,
+                config.frame_duration_ms(),
+                encoder.lookahead_samples(),
+                config.payload_bytes()
+            );
+        }
+    }
+    #[test]
+    fn pcm24_round_trip_preserves_all_twenty_four_bits() {
+        let config = Config::lossless(44_100);
+        let values = [-8_388_608_i32, -8_388_607, -1, 0, 1, 8_388_607];
+        let input: Vec<_> = (0..config.frame_samples())
+            .map(|i| values[i % values.len()] as f32 / 8_388_608.0)
+            .collect();
+        let payload = Encoder::new_with_config(config).unwrap().encode(&input).unwrap();
+        let mut receiver = Receiver::new_with_config(config).unwrap();
+        receiver.push_at(0, payload, Instant::now());
+        receiver.next = Some(0);
+        assert!(receiver.decode_next(Instant::now(), &mut 2, None));
+        assert_eq!(receiver.resampler.samples.iter().copied().collect::<Vec<_>>(), input);
+    }
+}
+
+#[cfg(test)]
+mod pitch_budget_tests {
+    use super::*;
+
+    #[test]
+    fn reserve_rate_is_bounded_and_profile_holds_are_explicit() {
+        for ppm in [-30_000.0, -3000.0, 0.0, 3000.0, 30_000.0] {
+            assert!((DriftResampler::step(ppm) - (1.0 + ppm.clamp(-3000.0, 6000.0) / 1e6)).abs() < 1e-12);
+        }
+        assert_eq!(DriftResampler::step(f64::NAN), 1.0);
+        for cap in [2000, 5000] {
+            for error in [-48_000.0, 48_000.0] {
+                let mut adjustment = PlayoutAdjustment::default();
+                adjustment.change_target(-error);
+                for _ in 0..1000 {
+                    let ppm = adjustment.update_duration(error, 160, 128, cap);
+                    assert!((-MAX_ADAPTATION_PPM..=f64::from(cap)).contains(&ppm));
+                }
+                assert_eq!(
+                    adjustment.ppm,
+                    if error < 0.0 {
+                        -MAX_ADAPTATION_PPM
+                    } else {
+                        f64::from(cap)
+                    }
+                );
+            }
+        }
+        assert_eq!(Config::low_latency_pcm().jitter.max_compression_ppm, 5000);
+        assert_eq!(Config::low_latency_opus().jitter.max_compression_ppm, 5000);
+        assert_eq!(Config::music_opus().jitter.max_compression_ppm, 2000);
+        assert_eq!(Config::low_latency_pcm().jitter.target_stable_secs, 3);
+        assert_eq!(Config::low_latency_opus().jitter.target_stable_secs, 3);
+        assert_eq!(Config::music_opus().jitter.target_stable_secs, 30);
+        for &rate in crate::negotiation::SAMPLE_RATES {
+            assert_eq!(Config::lossless(rate).jitter.target_stable_secs, 30);
+            assert_eq!(Config::lossless(rate).jitter.max_compression_ppm, 2000);
+        }
+    }
+
+    // Synthetic packet-level reconstruction of the *pattern* in the per-second
+    // receiver log (not an exact packet replay, which that log cannot supply).
+    // Recurring 100 ms episodes with 15/18/22 ms extra transit, separated by
+    // 5/7/10 seconds; then 40 s
+    // of clean traffic. Device callback is 128 frames, source clock is exact.
+    #[test]
+    fn recurring_wifi_excursions_keep_music_reserve_and_bound_pitch() {
+        for config in [
+            Config::low_latency_pcm(),
+            Config::low_latency_opus(),
+            Config::music_opus(),
+            Config::lossless(48_000),
+        ] {
+            let origin = Instant::now();
+            let packet = Encoder::new_with_config(config)
+                .unwrap()
+                .encode(&vec![0.05; config.frame_samples()])
+                .unwrap();
+            let stalls = [
+                (5_000_000, 15_000),
+                (12_000_000, 18_000),
+                (22_000_000, 22_000),
+                (27_000_000, 15_000),
+                (34_000_000, 18_000),
+                (44_000_000, 22_000),
+                (49_000_000, 15_000),
+                (56_000_000, 18_000),
+            ];
+            let mut events: Vec<_> = (0..100 * config.sample_rate as u64 / config.frame_size() as u64)
+                .map(|seq| {
+                    let source = seq * config.frame_size() as u64 * 1_000_000 / config.sample_rate as u64;
+                    let arrival = stalls
+                        .iter()
+                        .find(|&&(start, _)| source >= start && source < start + 100_000)
+                        .map_or(source, |&(_, length)| source + length)
+                        + 3000;
+                    (arrival, source, seq)
+                })
+                .collect();
+            events.sort_unstable();
+            let mut receiver = Receiver::new_with_config(config).unwrap();
+            let mut index = 0;
+            let mut output = [0.0; 256];
+            let mut peak_ppm = 0.0_f64;
+            let mut recurring_decreases = 0;
+            let mut learned_loss = 0;
+            let mut recurring_loss = 0;
+            let mut recurring_rebuffers = 0;
+            let mut peak_target = 0.0_f64;
+            let mut recovery_hold_ms = 0.0;
+            for tick in 0..37_500_u64 {
+                let now_us = tick * 128 * 1_000_000 / 48_000;
+                let now = origin + Duration::from_micros(now_us);
+                let mut budget = 6;
+                let was_recovering = receiver.recovering;
+                let previous_holds = receiver.stats.startup_hold_frames;
+                crate::allocation_audit::assert_no_heap(|| {
+                    while index < events.len() && events[index].0 <= now_us {
+                        let (arrival, source, sequence) = events[index];
+                        receiver.push_slice_at(
+                            sequence,
+                            &packet,
+                            origin + Duration::from_micros(arrival),
+                            Some(source * 1000),
+                        );
+                        index += 1;
+                    }
+                    receiver.pull_into(now, 128, &mut output, &mut budget, None);
+                });
+                let stats = receiver.stats();
+                if was_recovering && stats.startup_hold_frames > previous_holds {
+                    recovery_hold_ms += 128.0 / 48.0;
+                }
+                peak_ppm = peak_ppm.max(stats.adaptation_ppm.abs());
+                peak_target = peak_target.max(stats.current_target_ms);
+                assert!(stats.adaptation_ppm >= -MAX_ADAPTATION_PPM - 1e-9);
+                assert!(stats.adaptation_ppm <= f64::from(config.jitter.max_compression_ppm) + 1e-9);
+                if now_us < 30_000_000 {
+                    learned_loss = stats.lost;
+                }
+                if now_us < 60_000_000 {
+                    recurring_decreases = stats.target_decreases;
+                    recurring_loss = stats.lost;
+                    recurring_rebuffers = stats.rebufferings;
+                }
+            }
+            let stats = receiver.stats();
+            eprintln!(
+                "wifi profile={:?}/{} hold={} peak_target_ms={peak_target:.3} recurring_decreases={recurring_decreases} peak_ppm={peak_ppm:.3} learned_loss={learned_loss} recurring_loss={recurring_loss} recurring_rebuffers={recurring_rebuffers} recovery_hold_ms={recovery_hold_ms:.3} final_buffer_ms={:.3} stretched_ms={:.3} compressed_ms={:.3}",
+                config.codec,
+                config.frame_size(),
+                config.jitter.target_stable_secs,
+                stats.buffered_ms,
+                stats.adaptation_stretched_ms,
+                stats.adaptation_compressed_ms
+            );
+            if config.jitter.target_stable_secs == 30 {
+                assert_eq!(recurring_decreases, 0);
+                // This trace establishes reserve primarily by starvation and
+                // re-prefill, not continuous slowing. Do not claim that the
+                // small resampling contribution alone absorbs these stalls.
+                assert_eq!(recurring_rebuffers, 1);
+                assert!(recovery_hold_ms > 0.0);
+                assert!(stats.adaptation_stretched_ms < (peak_target - stats.initial_target_ms) * 0.5);
+                assert_eq!(recurring_loss, learned_loss, "no further PLC after reserve is learned");
+            } else {
+                assert!(recurring_decreases > 0, "Smooth still decays aggressively");
+            }
+            assert!(stats.target_decreases > 0, "music eventually releases the reserve too");
+            assert_eq!(stats.current_target_ms, stats.min_target_ms);
+            assert_eq!(stats.work_limited, 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod quiet_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn quiet_splices_are_stereo_coherent_bounded_and_allocation_free_at_all_rates() {
+        for &rate in crate::negotiation::SAMPLE_RATES {
+            let guard = (rate as usize * 20).div_ceil(1000);
+            let drop = rate as usize * 5 / 1000;
+            let fade = (rate as usize).div_ceil(1000);
+            for amplitude in [0.0, QUIET_PEAK * 0.9, 10.0_f32.powf(-50.0 / 20.0), 0.01, 0.05] {
+                let samples: Vec<_> = (0..guard + drop)
+                    .flat_map(|i| {
+                        let phase = std::f32::consts::TAU * i as f32 / rate as f32;
+                        let sample = amplitude
+                            * (0.5 * (phase * 440.0).cos()
+                                + 0.3 * (phase * 554.365).cos()
+                                + 0.2 * (phase * 659.255).cos());
+                        [sample, -sample]
+                    })
+                    .collect();
+                let mut resampler = DriftResampler::new(CHANNELS);
+                resampler.push(&samples);
+                let mut did_drop = false;
+                crate::allocation_audit::assert_no_heap(|| {
+                    did_drop = resampler.discard_quiet_prefix(drop, guard, fade);
+                });
+                if amplitude <= QUIET_PEAK {
+                    assert!(did_drop, "rate={rate}");
+                    assert_eq!(resampler.buffered_frames(), guard);
+                    assert_eq!(resampler.samples[0], samples[0]);
+                    assert_eq!(resampler.samples[(fade - 1) * 2], samples[(fade - 1 + drop) * 2]);
+                    assert!(
+                        resampler
+                            .samples
+                            .iter()
+                            .skip(fade * 2)
+                            .eq(samples.iter().skip((drop + fade) * 2))
+                    );
+                    for i in 0..resampler.buffered_frames() {
+                        assert_eq!(resampler.samples[i * 2], -resampler.samples[i * 2 + 1]);
+                        if i > 0 {
+                            assert!(
+                                (resampler.samples[i * 2] - resampler.samples[(i - 1) * 2]).abs() <= QUIET_PEAK * 2.0
+                            );
+                        }
+                    }
+                } else {
+                    assert!(!did_drop, "weak tails and music must survive at {rate}");
+                    assert!(resampler.samples.iter().copied().eq(samples));
+                }
+            }
+            // A transient in either channel disqualifies the whole window,
+            // including an anti-phase signal which a mid-only gate would miss.
+            let mut samples = vec![0.0; (guard + drop) * 2];
+            samples[(guard - 1) * 2 + 1] = 0.01;
+            let mut resampler = DriftResampler::new(CHANNELS);
+            resampler.push(&samples);
+            assert!(!resampler.discard_quiet_prefix(drop, guard, fade));
+            assert!(resampler.samples.iter().copied().eq(samples));
+        }
+    }
+
+    // Offline timing exercise: aged startup backlog and a deliberate target
+    // reduction. Both use real receiver decode, attribution and shared budgets.
+    fn recover(config: Config, extra_ms: usize, wake: bool, quiet: bool) -> (Stats, f64) {
+        recover_material(config, extra_ms, wake, quiet, None)
+    }
+    fn recover_material(
+        config: Config,
+        extra_ms: usize,
+        wake: bool,
+        quiet: bool,
+        material: Option<&[Vec<u8>]>,
+    ) -> (Stats, f64) {
+        let mut receiver = Receiver::new_with_config(config).unwrap();
+        if wake {
+            receiver.reset_burst();
+        }
+        let mut encoder = Encoder::new_with_config(config).unwrap();
+        let lookahead = encoder.lookahead_samples();
+        let packet = encoder
+            .encode(&vec![if quiet { 0.0 } else { 0.05 }; config.frame_samples()])
+            .unwrap();
+        let origin = Instant::now();
+        let backlog = ((extra_ms + config.frame_duration_ms().ceil() as usize * config.jitter.initial_frames) as f64
+            / config.frame_duration_ms())
+        .ceil() as u64;
+        let mut sequence = 0;
+        let source_origin = origin - Duration::from_secs_f64(backlog as f64 * config.frame_duration_ms() / 1000.0);
+        let mut pcm = [0.0; 256];
+        let mut recovery_ms = f64::INFINITY;
+        let mut started = false;
+        // A high target provides the finite prefill for the target-drop case.
+        if !wake {
+            receiver.adaptive.target += (extra_ms as f64 / config.frame_duration_ms()).ceil() as usize;
+            receiver.config.jitter.adaptive = false;
+        }
+        for tick in 0..if quiet { 4500_u64 } else { 22_500 } {
+            // At most 12/60 s, including one second of settled output.
+            let elapsed_us = tick * 128 * 1_000_000 / 48_000;
+            let at = origin + Duration::from_micros(elapsed_us);
+            let mut budget = 6;
+            let discarded_before = receiver.stats.quiet_discarded_ms;
+            let source_cursor = receiver
+                .spans
+                .front()
+                .map(|span| {
+                    span.sequence as usize * config.frame_size() + config.frame_size().saturating_sub(span.frames)
+                })
+                .or_else(|| receiver.next.map(|seq| seq as usize * config.frame_size()));
+            crate::allocation_audit::assert_no_heap(|| {
+                while sequence
+                    < backlog + elapsed_us * u64::from(config.sample_rate) / (config.frame_size() as u64 * 1_000_000)
+                {
+                    let source_ns =
+                        sequence * config.frame_size() as u64 * 1_000_000_000 / u64::from(config.sample_rate);
+                    receiver.push_slice_at(
+                        sequence,
+                        material.map_or(packet.as_slice(), |packets| {
+                            packets[sequence as usize % packets.len()].as_slice()
+                        }),
+                        source_origin + Duration::from_nanos(source_ns),
+                        Some(source_ns),
+                    );
+                    sequence += 1;
+                }
+                receiver.pull_into(at, 128, &mut pcm, &mut budget, None);
+            });
+            if material.is_some() && receiver.stats.quiet_discarded_ms > discarded_before {
+                let start = source_cursor.expect("active source cursor");
+                let removed = ((receiver.stats.quiet_discarded_ms - discarded_before) * 48.0).round() as usize;
+                assert!(
+                    (start..start + removed).all(|frame| frame.saturating_sub(lookahead) % 48_000 >= 28_800),
+                    "speech cut: {start} + {removed}"
+                );
+            }
+            if !started && receiver.next.is_some() {
+                started = true;
+                if !wake {
+                    let delta = (receiver.adaptive.target - config.jitter.initial_frames) * config.frame_size();
+                    receiver.adaptive.target = config.jitter.initial_frames;
+                    receiver
+                        .adjustment
+                        .change_target(-(delta as f64) * 48_000.0 / f64::from(config.sample_rate));
+                }
+            }
+            assert_eq!(
+                receiver.spans.iter().map(|span| span.frames).sum::<usize>(),
+                receiver.resampler.buffered_frames()
+            );
+            let stats = receiver.stats();
+            assert_eq!(stats.quiet_inserted_ms, 0.0);
+            if started
+                && stats.buffered_ms
+                    <= config.jitter.initial_frames as f64 * config.frame_duration_ms()
+                        + config.frame_duration_ms()
+                        + 3.0
+            {
+                recovery_ms = recovery_ms.min(elapsed_us as f64 / 1000.0);
+            } else {
+                // A trough-only crossing is not recovery: the whole following
+                // second, including packet-arrival peaks, must stay in bounds.
+                recovery_ms = f64::INFINITY;
+            }
+            if elapsed_us as f64 / 1000.0 > recovery_ms + 1000.0 {
+                break;
+            }
+        }
+        (receiver.stats(), recovery_ms)
+    }
+
+    #[test]
+    fn quiet_backlog_recovers_in_seconds_without_discarding_music() {
+        for config in [
+            Config::low_latency_pcm(),
+            Config::low_latency_opus(),
+            Config::music_opus(),
+            Config::lossless(48_000),
+            Config::lossless(192_000),
+        ] {
+            for (extra, wake) in [(100, false), (80, true)] {
+                let (quiet, recovery) = recover(config, extra, wake, true);
+                eprintln!(
+                    "quiet recovery {:?}/{} extra={extra} wake={wake} recovery_ms={recovery:.3} discarded_ms={:.3} resampled_ms={:.3} lost={} rebuffer={}",
+                    config.codec,
+                    config.sample_rate,
+                    quiet.quiet_discarded_ms,
+                    quiet.adaptation_compressed_ms,
+                    quiet.lost,
+                    quiet.rebufferings
+                );
+                assert!(recovery < 10_000.0, "{quiet:?}");
+                assert!(quiet.quiet_discarded_ms >= extra as f64 - 30.0, "{quiet:?}");
+                assert_eq!(quiet.lost, 0, "{quiet:?}");
+                assert_eq!(quiet.work_limited, 0);
+                assert_eq!(quiet.rebufferings, 0);
+            }
+        }
+        // Same Quality/Lossless +0.2% cap as the pre-quiet implementation.
+        // Non-quiet material is the pure-resampling timing reference.
+        for (extra, wake) in [(100, false), (80, true)] {
+            let (music, baseline_ms) = recover(Config::lossless(48_000), extra, wake, false);
+            eprintln!("rate-only reference extra={extra} wake={wake} recovery_ms={baseline_ms:.3}");
+            assert_eq!(music.quiet_discarded_ms, 0.0);
+            assert_eq!(music.lost, 0);
+            assert!(music.adaptation_compressed_ms > 0.0);
+            assert!(baseline_ms > if wake { 30_000.0 } else { 40_000.0 });
+            assert!(baseline_ms < 60_000.0);
+        }
+    }
+    fn pink_noise(frames: usize) -> Vec<f32> {
+        // Deterministic Voss octave-bank approximation, plus white high band.
+        let mut seed = 0x12345678_u32;
+        let mut rows = [0.0_f32; 16];
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32 * 2.0 - 1.0
+        };
+        for row in &mut rows {
+            *row = random();
+        }
+        let mut noise: Vec<_> = (1..=frames)
+            .map(|i| {
+                rows[i.trailing_zeros().min(15) as usize] = random();
+                rows.iter().sum::<f32>() + random()
+            })
+            .collect();
+        let mean = noise.iter().sum::<f32>() / frames as f32;
+        for sample in &mut noise {
+            *sample -= mean;
+        }
+        let peak = noise.iter().fold(0.0_f32, |a, b| a.max(b.abs()));
+        for sample in &mut noise {
+            *sample *= 10.0_f32.powf(-55.0 / 20.0) / peak;
+        }
+        noise
+    }
+
+    #[test]
+    fn speech_pauses_with_minus_55_dbfs_peak_pink_noise_recover_without_cutting_voice() {
+        let noise = pink_noise(48_000);
+        let rms = (noise.iter().map(|x| x * x).sum::<f32>() / noise.len() as f32).sqrt();
+        eprintln!("pink noise peak_dbfs=-55 rms_dbfs={:.3}", 20.0 * rms.log10());
+        for db in [-65.0_f32, -60.0, -55.0] {
+            let threshold = 10.0_f32.powf(db / 20.0);
+            let eligible = noise
+                .as_chunks::<960>()
+                .0
+                .iter()
+                .filter(|window| window.iter().all(|sample| sample.abs() <= threshold))
+                .count();
+            eprintln!("pink gate_dbfs={db} eligible_windows={eligible}/50");
+        }
+        let speech: Vec<_> = noise
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &n)| {
+                let phase = std::f32::consts::TAU * 120.0 * i as f32 / 48_000.0;
+                let voice = if i < 28_800 {
+                    0.08 * (phase.sin() + 0.4 * (phase * 3.0).sin() + 0.2 * (phase * 7.0).sin())
+                } else {
+                    0.0
+                };
+                [voice + n, voice - n]
+            })
+            .collect();
+        for config in [Config::low_latency_opus(), Config::lossless(48_000)] {
+            let mut encoder = Encoder::new_with_config(config).unwrap();
+            let packets: Vec<_> = speech
+                .chunks_exact(config.frame_samples())
+                .map(|frame| encoder.encode(frame).unwrap())
+                .collect();
+            for (extra, wake) in [(100, false), (80, true)] {
+                let (stats, recovery) = recover_material(config, extra, wake, true, Some(&packets));
+                eprintln!(
+                    "speech {:?} extra={extra} wake={wake} recovery_ms={recovery:.3} discarded_ms={:.3} lost={}",
+                    config.codec, stats.quiet_discarded_ms, stats.lost
+                );
+                assert!(stats.quiet_discarded_ms > 30.0, "{stats:?}");
+                assert!(recovery < 10_000.0);
+                assert_eq!(stats.lost, 0);
+                assert_eq!(stats.work_limited, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn low_level_sine_splice_has_no_abrupt_edge_at_any_rate() {
+        let amplitude = 10.0_f32.powf(-61.0 / 20.0);
+        for &rate in crate::negotiation::SAMPLE_RATES {
+            for frequency in [110.0_f32, 440.0, 997.0] {
+                let guard = (rate as usize * 20).div_ceil(1000);
+                let drop = rate as usize * 5 / 1000;
+                let fade = (rate as usize).div_ceil(1000);
+                let samples: Vec<_> = (0..guard + drop)
+                    .flat_map(|i| {
+                        let v = amplitude * (std::f32::consts::TAU * frequency * i as f32 / rate as f32).sin();
+                        [v, -v]
+                    })
+                    .collect();
+                let mut resampler = DriftResampler::new(2);
+                resampler.push(&samples);
+                assert!(resampler.discard_quiet_prefix(drop, guard, fade));
+                let max_delta = (1..resampler.buffered_frames())
+                    .map(|i| (resampler.samples[2 * i] - resampler.samples[2 * (i - 1)]).abs())
+                    .fold(0.0_f32, f32::max);
+                // Original sine slope plus the crossfade's bounded weight change.
+                let bound = 2.0 * amplitude * (std::f32::consts::PI * frequency / rate as f32).sin().abs()
+                    + 2.0 * amplitude / (fade - 1) as f32;
+                assert!(
+                    max_delta <= bound + 1e-8,
+                    "rate={rate} hz={frequency} delta={max_delta} bound={bound}"
+                );
+                if rate == 48_000 {
+                    eprintln!("sine rate={rate} hz={frequency} max_delta={max_delta:.9} bound={bound:.9}");
+                }
+            }
         }
     }
 }

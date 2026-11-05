@@ -2,7 +2,7 @@
 //! membership and live Boots from the authenticated configuration actor.
 use super::*;
 use crate::api::{DeviceKey, GroupKey};
-use oink_protocol::v1::{RawValue, dto};
+use oink_protocol::v1::{RawValue, dto, schema::WireDto};
 use std::{cell::OnceCell, collections::BTreeMap, sync::Arc};
 use unicode_casefold::UnicodeCaseFold;
 
@@ -22,7 +22,7 @@ pub struct CardMember {
     pub capabilities: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct FocusObservation {
     pub participating: bool,
     pub valid: bool,
@@ -46,16 +46,62 @@ pub struct CardInputs {
     pub emergency_delivery: Option<EmergencyDeliveryCard>,
 }
 
+impl CardInputs {
+    fn same_projection(&self, other: &Self) -> bool {
+        self.group == other.group
+            && self.focus == other.focus
+            && self.exit_baseline == other.exit_baseline
+            && self.microphone_resolution == other.microphone_resolution
+            && self.local_exit_selection_ready == other.local_exit_selection_ready
+            && self.selected_exit == other.selected_exit
+            && self.exit_claim == other.exit_claim
+            && self.emergency_delivery == other.emergency_delivery
+            && self.members.len() == other.members.len()
+            && self.members.iter().zip(&other.members).all(|(a, b)| {
+                a.device == b.device
+                    && a.name == b.name
+                    && a.os == b.os
+                    && a.is_self == b.is_self
+                    && a.ready == b.ready
+                    && a.offline_reason == b.offline_reason
+                    && a.last_seen_ms == b.last_seen_ms
+                    && a.live_boot == b.live_boot
+                    && a.capabilities == b.capabilities
+                    && match (&a.facts, &b.facts) {
+                        (None, None) => true,
+                        (Some(a), Some(b)) => {
+                            Arc::ptr_eq(a, b) || {
+                                // Sequence and link telemetry are not action fences.
+                                // Unknown fields remain significant. Never use the
+                                // monotonically changing Facts sequence as a revision.
+                                a.raw()
+                                    .iter()
+                                    .filter(|(k, _)| !matches!(**k, 2 | 15))
+                                    .eq(b.raw().iter().filter(|(k, _)| !matches!(**k, 2 | 15)))
+                            }
+                        }
+                        _ => false,
+                    }
+            })
+    }
+}
+
 #[derive(Debug)]
 pub struct Projector {
     tokens: ActionTokens,
     current: Option<Arc<DeviceCardsView>>,
+    previous_input: Option<CardInputs>,
+    #[cfg(test)]
+    projections: usize,
 }
 impl Projector {
     pub fn new() -> Result<Self, getrandom::Error> {
         Ok(Self {
             tokens: ActionTokens::new()?,
             current: None,
+            previous_input: None,
+            #[cfg(test)]
+            projections: 0,
         })
     }
     pub fn tokens(&self) -> &ActionTokens {
@@ -67,6 +113,32 @@ impl Projector {
     /// Equal projections retain the exact timestamp and revision. A single
     /// replacement covers both sides of focus/exit handoffs and group changes.
     pub fn update(&mut self, input: &CardInputs, now_ms: u64) -> Option<Arc<DeviceCardsView>> {
+        if self
+            .previous_input
+            .as_ref()
+            .is_some_and(|old| old.same_projection(input))
+        {
+            // RTT remains queryable without reconstructing all cards or signing
+            // identical tokens. Preserve Arc identity too when signals are equal.
+            let current = self.current.as_mut().expect("projected input has a view");
+            for member in &input.members {
+                let signal = Signal::online(member.rtt_ms);
+                if let Some(index) = current.cards.iter().position(|card| {
+                    card.device == member.device
+                        && matches!(&card.connection, CardConnection::Online { signal: old } if *old != signal)
+                }) && let CardConnection::Online { signal: old } =
+                    &mut Arc::make_mut(current).cards[index].connection
+                {
+                    *old = signal;
+                }
+            }
+            return None;
+        }
+        #[cfg(test)]
+        {
+            self.projections += 1;
+        }
+        self.previous_input = Some(input.clone());
         let names: BTreeMap<_, _> = input.members.iter().map(|m| (m.device, m.name.clone())).collect();
         let mut cards: Vec<_> = input.members.iter().map(|m| self.card(input, m, &names)).collect();
         cards.sort_by_cached_key(|card| {
@@ -1019,6 +1091,38 @@ mod tests {
         .collect();
         Arc::new(dto::DeviceFacts::from_raw(raw).unwrap())
     }
+    #[test]
+    fn unchanged_card_inputs_skip_projection_but_refresh_measurements() {
+        let mut member = row(2, "peer", true);
+        member.facts = Some(facts(&member, 0));
+        let mut input = inputs(vec![member]);
+        let mut projector = Projector::new().unwrap();
+        let first = projector.update(&input, 1).unwrap();
+        for tick in 2..102 {
+            input.members[0].rtt_ms = Some(tick as f64);
+            assert!(projector.update(&input, tick).is_none());
+        }
+        assert_eq!(projector.projections, 1);
+        let current = projector.snapshot().unwrap();
+        assert_eq!(current.revision, first.revision);
+        assert_eq!(current.generated_at_ms, first.generated_at_ms);
+        assert!(
+            matches!(&current.cards[0].connection, CardConnection::Online { signal } if *signal == Signal::online(Some(101.)))
+        );
+        input.members[0].live_boot = Some([99; 16]);
+        assert!(projector.update(&input, 102).is_some());
+        assert_eq!(projector.projections, 2);
+        let mut raw = input.members[0].facts.as_ref().unwrap().raw().clone();
+        raw.insert(2, RawValue::Uint(1000));
+        input.members[0].facts = Some(Arc::new(dto::DeviceFacts::from_raw(raw.clone()).unwrap()));
+        assert!(projector.update(&input, 103).is_none());
+        assert_eq!(projector.projections, 2);
+        raw.insert(99, RawValue::Bool(true));
+        input.members[0].facts = Some(Arc::new(dto::DeviceFacts::from_raw(raw).unwrap()));
+        projector.update(&input, 104);
+        assert_eq!(projector.projections, 3, "unknown state must not take the shortcut");
+    }
+
     #[test]
     #[ignore = "isolated resource benchmark; run with --ignored --nocapture"]
     fn resource_card_projection_benchmark() {

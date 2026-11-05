@@ -11,6 +11,7 @@
 use crate::backend_launch::BackendLaunch;
 use std::{
     io,
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -130,16 +131,21 @@ fn denied(message: &'static str) -> io::Error {
 
 fn state(store: &dyn Store, caller: &str) -> io::Result<BackendLaunch> {
     let machine = store.machine()?;
+    let snapshot = ready_from(&machine, store.snapshot_owner()?.as_deref());
+    Ok(reply(&machine, snapshot, caller))
+}
+
+fn reply(machine: &Machine, snapshot: bool, caller: &str) -> BackendLaunch {
     let owner = match machine.owner.as_deref() {
         None => OwnerView::None,
         Some(owner) if owner.eq_ignore_ascii_case(caller) => OwnerView::Caller,
         Some(_) => OwnerView::Other,
     };
-    Ok(BackendLaunch::PreloginState {
+    BackendLaunch::PreloginState {
         enabled: machine.enabled && machine.owner.is_some(),
         owner,
-        snapshot: ready_from(&machine, store.snapshot_owner()?.as_deref()),
-    })
+        snapshot,
+    }
 }
 
 fn same(a: Option<&str>, b: &str) -> bool {
@@ -154,34 +160,68 @@ fn ready_from(machine: &Machine, snapshot_owner: Option<&str>) -> bool {
             .is_some_and(|owner| same(snapshot_owner, owner))
 }
 
-/// Whether the service may start the pre-login backend: enabled, owned, and the
-/// snapshot belongs to that owner (an old owner's snapshot never runs).
-pub(crate) fn ready(store: &dyn Store) -> io::Result<bool> {
-    Ok(ready_from(&store.machine()?, store.snapshot_owner()?.as_deref()))
+/// Return the admitted owner immediately before starting a pre-login backend.
+/// A running child retains it instead of rereading the machine store.
+pub(crate) fn ready(store: &dyn Store) -> io::Result<Option<String>> {
+    let machine = store.machine()?;
+    Ok(ready_from(&machine, store.snapshot_owner()?.as_deref())
+        .then_some(machine.owner)
+        .flatten())
+}
+
+/// The final startup check and launch pipe worker access the same protected store.
+/// Readiness pins a snapshot directory against replacement. Keep that security
+/// pin, and finish reading before publishing/deleting the directory it protects.
+/// This lock covers only store operations, never child-process waits or creation.
+#[derive(Default)]
+pub(crate) struct StoreAccess(Mutex<()>);
+impl StoreAccess {
+    pub(crate) fn ready(&self, store: &dyn Store) -> io::Result<Option<String>> {
+        let _access = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        ready(store)
+    }
+
+    pub(crate) fn handle(
+        &self,
+        store: &mut dyn Store,
+        request: &BackendLaunch,
+        caller: &Caller<'_>,
+    ) -> io::Result<BackendLaunch> {
+        let _access = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        handle(store, request, caller)
+    }
 }
 
 /// Apply one authenticated pre-login request from the active session's user.
 pub(crate) fn handle(store: &mut dyn Store, request: &BackendLaunch, caller: &Caller<'_>) -> io::Result<BackendLaunch> {
     match request {
-        BackendLaunch::PreloginStatus => {}
+        BackendLaunch::PreloginStatus => state(store, caller.sid),
         BackendLaunch::PreloginClaim => {
             if !caller.elevated {
                 return Err(denied("administrator approval is required"));
             }
             // Never leave a previous owner's identity behind a new owner's marker.
-            if !same(store.snapshot_owner()?.as_deref(), caller.sid) {
+            let snapshot = same(store.snapshot_owner()?.as_deref(), caller.sid);
+            if !snapshot {
                 store.delete_snapshot()?;
             }
-            store.set_machine(&Machine {
+            let machine = Machine {
                 enabled: true,
                 owner: Some(caller.sid.to_owned()),
-            })?;
+            };
+            store.set_machine(&machine)?;
+            Ok(reply(&machine, snapshot, caller.sid))
         }
         BackendLaunch::PreloginRelease => {
-            if same(store.machine()?.owner.as_deref(), caller.sid) {
+            let machine = store.machine()?;
+            if same(machine.owner.as_deref(), caller.sid) {
                 // Disable first: a failed delete must not leave a runnable marker.
                 store.set_machine(&Machine::default())?;
                 store.delete_snapshot()?;
+                Ok(reply(&Machine::default(), false, caller.sid))
+            } else {
+                let snapshot = ready_from(&machine, store.snapshot_owner()?.as_deref());
+                Ok(reply(&machine, snapshot, caller.sid))
             }
         }
         BackendLaunch::PreloginSnapshot { files } => {
@@ -191,15 +231,13 @@ pub(crate) fn handle(store: &mut dyn Store, request: &BackendLaunch, caller: &Ca
                 return Err(denied("the caller does not own the pre-login identity"));
             }
             store.write_snapshot(caller.sid, files)?;
+            Ok(reply(&machine, true, caller.sid))
         }
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "expected a pre-login request",
-            ));
-        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a pre-login request",
+        )),
     }
-    state(store, caller.sid)
 }
 
 /// One service observation of the console and machine state.
@@ -211,8 +249,6 @@ pub(crate) struct Observation {
     pub user_present: bool,
     /// Logged-on user owns the snapshot and has an enabled installed Run entry.
     pub owner_autostart: bool,
-    /// [`ready`]: enabled, owned and the owner's snapshot exists.
-    pub ready: bool,
     /// A service-created user backend (UIAccess) is still alive in any session,
     /// for example a disconnected session after fast user switching.
     pub user_backend_alive: bool,
@@ -222,7 +258,7 @@ pub(crate) struct Observation {
 impl Observation {
     pub(crate) fn wanted(&self) -> Option<u32> {
         let session = self.console?;
-        (!self.user_present && self.ready && !self.user_backend_alive && !self.maintenance).then_some(session)
+        (!self.user_present && !self.user_backend_alive && !self.maintenance).then_some(session)
     }
 }
 
@@ -274,10 +310,30 @@ pub(crate) enum Tick {
     Exited,
 }
 impl<C: Child> Supervisor<C> {
+    pub(crate) fn deadline(&self, observed: &Observation, now: Instant) -> Option<Instant> {
+        let deadline = if self.child.is_some() {
+            let handoff = match self.phase {
+                Handoff::AwaitingStart(since) => Some(since + HANDOFF_TIMEOUT),
+                _ => None,
+            };
+            handoff
+                .into_iter()
+                .chain(self.console_lost.map(|since| since + HANDOFF_TIMEOUT))
+                .min()
+        } else if self.phase != Handoff::Stopping && observed.wanted().is_some() {
+            self.last_start.map(|since| since + RESTART_DELAY)
+        } else {
+            None
+        };
+        // Already elapsed conditions were consumed by tick. Never turn an old
+        // timestamp into a zero-timeout busy loop while a process is stopping.
+        deadline.filter(|deadline| *deadline > now)
+    }
     pub(crate) fn child(&self) -> Option<&C> {
         self.child.as_ref()
     }
 
+    #[cfg(test)]
     pub(crate) fn running(&self) -> Option<u32> {
         self.child.as_ref().filter(|c| c.alive()).map(Child::session)
     }
@@ -285,7 +341,8 @@ impl<C: Child> Supervisor<C> {
         &mut self,
         observed: &Observation,
         now: Instant,
-        start: impl FnOnce(u32) -> io::Result<C>,
+        check: impl FnOnce() -> io::Result<Option<String>>,
+        start: impl FnOnce(u32, String) -> io::Result<C>,
     ) -> io::Result<Tick> {
         let wanted = observed.wanted();
         if let Some(child) = &self.child {
@@ -303,7 +360,7 @@ impl<C: Child> Supervisor<C> {
                 let since = *self.console_lost.get_or_insert(now);
                 now.saturating_duration_since(since) < HANDOFF_TIMEOUT
             };
-            let eligible = console_available && observed.ready && !observed.user_backend_alive && !observed.maintenance;
+            let eligible = console_available && !observed.user_backend_alive && !observed.maintenance;
             if eligible && !observed.user_present && self.phase == Handoff::LoginScreen {
                 return Ok(Tick::Running(child.session()));
             }
@@ -332,8 +389,11 @@ impl<C: Child> Supervisor<C> {
         {
             return Ok(Tick::Idle);
         }
+        // Storage is privileged-writer-only. Once admitted, a running child
+        // keeps this owner; no periodic marker/snapshot validation is needed.
+        let Some(owner) = check()? else { return Ok(Tick::Idle) };
         self.last_start = Some(now);
-        self.child = Some(start(session)?);
+        self.child = Some(start(session, owner)?);
         self.phase = Handoff::LoginScreen;
         self.console_lost = None;
         Ok(Tick::Started(session))
@@ -365,7 +425,11 @@ impl<C: Child> Supervisor<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        collections::BTreeMap,
+        rc::Rc,
+    };
 
     #[derive(Default)]
     struct Memory {
@@ -392,6 +456,9 @@ mod tests {
             Ok(())
         }
     }
+    pub(super) fn admitted_owner() -> io::Result<Option<String>> {
+        Ok(Some(A.to_owned()))
+    }
     const A: &str = "S-1-5-21-1-1001";
     const B: &str = "S-1-5-21-1-1002";
     fn files(seed: u8) -> Vec<(SnapshotFile, Vec<u8>)> {
@@ -415,6 +482,127 @@ mod tests {
     }
 
     #[test]
+    fn ready_pin_does_not_make_snapshot_publish_or_release_fail() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+
+        struct Pin {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+        struct PinnedStore {
+            memory: Arc<Mutex<Memory>>,
+            pinned: Arc<AtomicBool>,
+            hold_read: Option<Pin>,
+        }
+        impl PinnedStore {
+            fn writable(&self) -> io::Result<()> {
+                if self.pinned.load(Ordering::Acquire) {
+                    // Model the Windows sharing violation from renaming/deleting
+                    // a snapshot while ready() owns its deny-delete pin. This is
+                    // a portable interleaving test, not a native filesystem test.
+                    Err(io::Error::from_raw_os_error(32))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        impl Store for PinnedStore {
+            fn machine(&self) -> io::Result<Machine> {
+                self.memory.lock().unwrap().machine()
+            }
+            fn set_machine(&mut self, machine: &Machine) -> io::Result<()> {
+                self.memory.lock().unwrap().set_machine(machine)
+            }
+            fn snapshot_owner(&self) -> io::Result<Option<String>> {
+                if let Some(hold) = &self.hold_read {
+                    self.pinned.store(true, Ordering::Release);
+                    hold.entered.send(()).unwrap();
+                    hold.release.recv().unwrap();
+                    self.pinned.store(false, Ordering::Release);
+                }
+                self.memory.lock().unwrap().snapshot_owner()
+            }
+            fn write_snapshot(&mut self, owner: &str, files: &[(SnapshotFile, Vec<u8>)]) -> io::Result<()> {
+                self.writable()?;
+                self.memory.lock().unwrap().write_snapshot(owner, files)
+            }
+            fn delete_snapshot(&mut self) -> io::Result<()> {
+                self.writable()?;
+                self.memory.lock().unwrap().delete_snapshot()
+            }
+        }
+
+        for request in [
+            BackendLaunch::PreloginSnapshot { files: files(2) },
+            BackendLaunch::PreloginRelease,
+        ] {
+            let access = Arc::new(StoreAccess::default());
+            let mut memory = Memory::default();
+            handle(&mut memory, &BackendLaunch::PreloginClaim, &caller(A, true)).unwrap();
+            handle(
+                &mut memory,
+                &BackendLaunch::PreloginSnapshot { files: files(1) },
+                &caller(A, false),
+            )
+            .unwrap();
+            let memory = Arc::new(Mutex::new(memory));
+            let pinned = Arc::new(AtomicBool::new(false));
+            let (entered, pin_entered) = mpsc::channel();
+            let (release_pin, release) = mpsc::channel();
+            let observer = PinnedStore {
+                memory: memory.clone(),
+                pinned: pinned.clone(),
+                hold_read: Some(Pin { entered, release }),
+            };
+            let mut writer = PinnedStore {
+                memory: memory.clone(),
+                pinned,
+                hold_read: None,
+            };
+            let reader_access = access.clone();
+            let reader = std::thread::spawn(move || reader_access.ready(&observer));
+            pin_entered.recv().unwrap();
+            let (starting, started) = mpsc::channel();
+            let (completed, completion) = mpsc::channel();
+            let writing = std::thread::spawn(move || {
+                starting.send(()).unwrap();
+                completed
+                    .send(access.handle(&mut writer, &request, &caller(A, false)))
+                    .unwrap();
+            });
+            started.recv().unwrap();
+            // A test-only observation window: product code has no new timer,
+            // retry or timeout. Always release/join before asserting failures.
+            let during_read = completion.recv_timeout(Duration::from_millis(100));
+            release_pin.send(()).unwrap();
+            let observed = reader.join().unwrap().unwrap();
+            writing.join().unwrap();
+            assert!(observed.is_some());
+            assert!(
+                matches!(during_read, Err(mpsc::RecvTimeoutError::Timeout)),
+                "snapshot mutation reached the pinned directory: {during_read:?}"
+            );
+            let reply = completion.recv().unwrap().unwrap();
+            let (enabled, owner, snapshot) = view(reply);
+            if enabled {
+                assert_eq!((owner, snapshot), (OwnerView::Caller, true));
+                let memory = memory.lock().unwrap();
+                assert_eq!(
+                    memory.snapshot.as_ref().unwrap().1[&SnapshotFile::DeviceKey],
+                    vec![2; 32]
+                );
+            } else {
+                assert_eq!((owner, snapshot), (OwnerView::None, false));
+                assert!(memory.lock().unwrap().snapshot.is_none());
+            }
+        }
+    }
+
+    #[test]
     fn snapshot_files_are_fixed_plain_names_with_unique_ids() {
         let names: std::collections::BTreeSet<_> = SnapshotFile::ALL.iter().map(|f| f.name()).collect();
         assert_eq!(names.len(), SnapshotFile::ALL.len());
@@ -434,14 +622,14 @@ mod tests {
         let claimed = handle(&mut store, &BackendLaunch::PreloginClaim, &caller(A, true)).unwrap();
         assert_eq!(view(claimed), (true, OwnerView::Caller, false));
         // Enabled but not yet runnable: no snapshot.
-        assert!(!ready(&store).unwrap());
+        assert!(ready(&store).unwrap().is_none());
         handle(
             &mut store,
             &BackendLaunch::PreloginSnapshot { files: files(1) },
             &caller(A, false),
         )
         .unwrap();
-        assert!(ready(&store).unwrap());
+        assert!(ready(&store).unwrap().is_some());
         let other = handle(&mut store, &BackendLaunch::PreloginStatus, &caller(B, false)).unwrap();
         assert_eq!(view(other), (true, OwnerView::Other, true));
     }
@@ -486,7 +674,7 @@ mod tests {
         let claimed = handle(&mut store, &BackendLaunch::PreloginClaim, &caller(B, true)).unwrap();
         assert_eq!(view(claimed), (true, OwnerView::Caller, false));
         assert!(store.snapshot.is_none(), "A's identity must not run as B's");
-        assert!(!ready(&store).unwrap());
+        assert!(ready(&store).unwrap().is_none());
         // A's later routine refresh is refused; A no longer owns the identity.
         assert!(
             handle(
@@ -504,7 +692,7 @@ mod tests {
         )
         .unwrap();
         handle(&mut store, &BackendLaunch::PreloginClaim, &caller(B, true)).unwrap();
-        assert!(ready(&store).unwrap());
+        assert!(ready(&store).unwrap().is_some());
     }
 
     #[test]
@@ -519,7 +707,7 @@ mod tests {
         .unwrap();
         let other = handle(&mut store, &BackendLaunch::PreloginRelease, &caller(B, false)).unwrap();
         assert_eq!(view(other), (true, OwnerView::Other, true));
-        assert!(ready(&store).unwrap());
+        assert!(ready(&store).unwrap().is_some());
         // Releasing needs no elevation: it only reduces machine-level access.
         let released = handle(&mut store, &BackendLaunch::PreloginRelease, &caller(A, false)).unwrap();
         assert_eq!(view(released), (false, OwnerView::None, false));
@@ -536,16 +724,16 @@ mod tests {
             },
             snapshot: None,
         };
-        assert!(!ready(&store).unwrap());
+        assert!(ready(&store).unwrap().is_none());
         handle(
             &mut store,
             &BackendLaunch::PreloginSnapshot { files: files(1) },
             &caller(A, false),
         )
         .unwrap();
-        assert!(ready(&store).unwrap());
+        assert!(ready(&store).unwrap().is_some());
         store.machine.enabled = false;
-        assert!(!ready(&store).unwrap());
+        assert!(ready(&store).unwrap().is_none());
     }
 
     struct Fake {
@@ -571,9 +759,178 @@ mod tests {
             console: Some(session),
             user_present: false,
             owner_autostart: true,
-            ready: true,
             user_backend_alive: false,
             maintenance: false,
+        }
+    }
+
+    struct CountedStore {
+        memory: RefCell<Memory>,
+        reads: Cell<(usize, usize)>,
+        changed: Cell<bool>,
+        reads_after_write: Cell<usize>,
+    }
+    impl CountedStore {
+        fn new() -> Self {
+            Self {
+                memory: RefCell::new(Memory {
+                    machine: Machine {
+                        enabled: true,
+                        owner: Some(A.into()),
+                    },
+                    snapshot: Some((A.into(), files(1).into_iter().collect())),
+                }),
+                reads: Cell::new((0, 0)),
+                changed: Cell::new(false),
+                reads_after_write: Cell::new(0),
+            }
+        }
+        fn read(&self, machine: bool) {
+            let (markers, snapshots) = self.reads.get();
+            self.reads
+                .set((markers + usize::from(machine), snapshots + usize::from(!machine)));
+            if self.changed.get() {
+                self.reads_after_write.set(self.reads_after_write.get() + 1);
+            }
+        }
+    }
+    impl Store for CountedStore {
+        fn machine(&self) -> io::Result<Machine> {
+            self.read(true);
+            self.memory.borrow().machine()
+        }
+        fn snapshot_owner(&self) -> io::Result<Option<String>> {
+            self.read(false);
+            self.memory.borrow().snapshot_owner()
+        }
+        fn set_machine(&mut self, machine: &Machine) -> io::Result<()> {
+            self.changed.set(true);
+            self.memory.get_mut().set_machine(machine)
+        }
+        fn write_snapshot(&mut self, owner: &str, files: &[(SnapshotFile, Vec<u8>)]) -> io::Result<()> {
+            self.changed.set(true);
+            self.memory.get_mut().write_snapshot(owner, files)
+        }
+        fn delete_snapshot(&mut self) -> io::Result<()> {
+            self.changed.set(true);
+            self.memory.get_mut().delete_snapshot()
+        }
+    }
+
+    #[test]
+    fn readiness_is_read_once_before_start_and_never_while_running() {
+        let store = CountedStore::new();
+        let access = StoreAccess::default();
+        let mut supervisor = Supervisor::default();
+        let alive = Rc::new(RefCell::new(true));
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let start = |session, owner: String| {
+            assert_eq!(owner, A);
+            Ok(Fake {
+                session,
+                alive: alive.clone(),
+                log: log.clone(),
+            })
+        };
+        let now = Instant::now();
+        assert_eq!(
+            supervisor
+                .tick(&login_screen(1), now, || access.ready(&store), start)
+                .unwrap(),
+            Tick::Started(1)
+        );
+        assert_eq!(store.reads.get(), (1, 1));
+        // Only privileged writers can do this. A running generation keeps its
+        // admitted owner instead of reopening the marker or snapshot directory.
+        store.memory.borrow_mut().machine.enabled = false;
+        store.memory.borrow_mut().snapshot = None;
+        for _ in 0..20 {
+            assert_eq!(
+                supervisor
+                    .tick(&login_screen(1), now, || access.ready(&store), start)
+                    .unwrap(),
+                Tick::Running(1)
+            );
+        }
+        assert_eq!(store.reads.get(), (1, 1));
+        assert!(log.borrow().is_empty());
+        *alive.borrow_mut() = false;
+        assert_eq!(
+            supervisor
+                .tick(&login_screen(1), now, || access.ready(&store), start)
+                .unwrap(),
+            Tick::Exited
+        );
+        assert_eq!(
+            supervisor
+                .tick(&login_screen(1), now, || access.ready(&store), start)
+                .unwrap(),
+            Tick::Idle
+        );
+        assert_eq!(store.reads.get(), (1, 1), "restart backoff does not read storage");
+        assert_eq!(
+            supervisor
+                .tick(&login_screen(1), now + RESTART_DELAY, || access.ready(&store), start)
+                .unwrap(),
+            Tick::Idle
+        );
+        assert_eq!(
+            store.reads.get(),
+            (2, 2),
+            "the next eligible start checks fresh storage once"
+        );
+    }
+
+    #[test]
+    fn readiness_is_not_read_when_another_condition_prevents_start() {
+        let mut supervisor = Supervisor::<Fake>::default();
+        for observed in [
+            Observation::default(),
+            Observation {
+                user_present: true,
+                ..login_screen(1)
+            },
+            Observation {
+                user_backend_alive: true,
+                ..login_screen(1)
+            },
+            Observation {
+                maintenance: true,
+                ..login_screen(1)
+            },
+        ] {
+            assert_eq!(
+                supervisor
+                    .tick(
+                        &observed,
+                        Instant::now(),
+                        || panic!("storage queried without a start candidate"),
+                        |_, _| panic!("must not start")
+                    )
+                    .unwrap(),
+                Tick::Idle
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_replies_do_not_read_back_the_marker_or_snapshot() {
+        for request in [
+            BackendLaunch::PreloginClaim,
+            BackendLaunch::PreloginRelease,
+            BackendLaunch::PreloginSnapshot { files: files(2) },
+        ] {
+            let mut store = CountedStore::new();
+            let reply = StoreAccess::default()
+                .handle(&mut store, &request, &caller(A, true))
+                .unwrap();
+            assert_eq!(store.reads_after_write.get(), 0, "{request:?}: {reply:?}");
+            let expected = if matches!(request, BackendLaunch::PreloginRelease) {
+                (false, OwnerView::None, false)
+            } else {
+                (true, OwnerView::Caller, true)
+            };
+            assert_eq!(view(reply), expected);
         }
     }
 
@@ -581,7 +938,7 @@ mod tests {
     fn supervisor_runs_only_at_a_ready_login_screen_and_stops_for_a_non_owner() {
         let log = Rc::new(RefCell::new(Vec::new()));
         let alive = Rc::new(RefCell::new(true));
-        let start = |session| {
+        let start = |session, _owner| {
             log.borrow_mut().push(format!("start {session}"));
             Ok(Fake {
                 session,
@@ -595,30 +952,36 @@ mod tests {
             (Observation::default(), Tick::Idle),
             (
                 Observation {
-                    ready: false,
-                    ..login_screen(1)
-                },
-                Tick::Idle,
-            ),
-            (
-                Observation {
                     maintenance: true,
                     ..login_screen(1)
                 },
                 Tick::Idle,
             ),
         ] {
-            assert_eq!(supervisor.tick(&observed, t0, start).unwrap(), expected);
+            assert_eq!(supervisor.tick(&observed, t0, admitted_owner, start).unwrap(), expected);
         }
-        assert_eq!(supervisor.tick(&login_screen(1), t0, start).unwrap(), Tick::Started(1));
-        assert_eq!(supervisor.tick(&login_screen(1), t0, start).unwrap(), Tick::Running(1));
+        assert_eq!(
+            supervisor.tick(&login_screen(1), t0, || Ok(None), start).unwrap(),
+            Tick::Idle
+        );
+        assert_eq!(
+            supervisor.tick(&login_screen(1), t0, admitted_owner, start).unwrap(),
+            Tick::Started(1)
+        );
+        assert_eq!(
+            supervisor.tick(&login_screen(1), t0, admitted_owner, start).unwrap(),
+            Tick::Running(1)
+        );
         // A different user signs in: stop immediately.
         let signed_in = Observation {
             user_present: true,
             owner_autostart: false,
             ..login_screen(1)
         };
-        assert_eq!(supervisor.tick(&signed_in, t0, start).unwrap(), Tick::Stopped);
+        assert_eq!(
+            supervisor.tick(&signed_in, t0, admitted_owner, start).unwrap(),
+            Tick::Stopped
+        );
         assert_eq!(supervisor.running(), None);
         assert_eq!(*log.borrow(), ["start 1", "stop 1"]);
     }
@@ -627,7 +990,7 @@ mod tests {
     fn token_before_start_keeps_network_owner_alive() {
         let log = Rc::new(RefCell::new(Vec::new()));
         let mut supervisor = Supervisor::default();
-        let start = |session| {
+        let start = |session, _owner| {
             Ok(Fake {
                 session,
                 alive: Rc::new(RefCell::new(true)),
@@ -635,13 +998,51 @@ mod tests {
             })
         };
         let now = Instant::now();
-        supervisor.tick(&login_screen(1), now, start).unwrap();
+        supervisor.tick(&login_screen(1), now, admitted_owner, start).unwrap();
         let logged_in = Observation {
             user_present: true,
             ..login_screen(1)
         };
-        assert_eq!(supervisor.tick(&logged_in, now, start).unwrap(), Tick::Running(1));
+        assert_eq!(
+            supervisor.tick(&logged_in, now, admitted_owner, start).unwrap(),
+            Tick::Running(1)
+        );
         assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn event_wait_preserves_existing_handoff_console_and_restart_deadlines() {
+        let now = Instant::now();
+        let alive = Rc::new(RefCell::new(true));
+        let start = |session, _owner| {
+            Ok(Fake {
+                session,
+                alive: alive.clone(),
+                log: Rc::new(RefCell::new(vec![])),
+            })
+        };
+        let mut supervisor = Supervisor::default();
+        let screen = login_screen(1);
+        supervisor.tick(&screen, now, admitted_owner, start).unwrap();
+        assert_eq!(supervisor.deadline(&screen, now), None);
+        let detached = Observation {
+            console: None,
+            ..screen
+        };
+        supervisor.tick(&detached, now, admitted_owner, start).unwrap();
+        assert_eq!(supervisor.deadline(&detached, now), Some(now + HANDOFF_TIMEOUT));
+        supervisor.tick(&screen, now, admitted_owner, start).unwrap();
+        assert_eq!(supervisor.deadline(&screen, now), None);
+        let login = Observation {
+            user_present: true,
+            ..screen
+        };
+        supervisor.tick(&login, now, admitted_owner, start).unwrap();
+        assert_eq!(supervisor.deadline(&login, now), Some(now + HANDOFF_TIMEOUT));
+        *alive.borrow_mut() = false;
+        supervisor.tick(&screen, now, admitted_owner, start).unwrap();
+        assert_eq!(supervisor.deadline(&screen, now), Some(now + RESTART_DELAY));
+        assert_eq!(supervisor.deadline(&login, now), None);
     }
 
     #[test]
@@ -649,7 +1050,7 @@ mod tests {
         for autostart in [false, true] {
             let log = Rc::new(RefCell::new(Vec::new()));
             let mut supervisor = Supervisor::default();
-            let start = |session| {
+            let start = |session, _owner| {
                 Ok(Fake {
                     session,
                     alive: Rc::new(RefCell::new(true)),
@@ -657,21 +1058,28 @@ mod tests {
                 })
             };
             let now = Instant::now();
-            supervisor.tick(&login_screen(1), now, start).unwrap();
+            supervisor.tick(&login_screen(1), now, admitted_owner, start).unwrap();
             let logged_in = Observation {
                 user_present: true,
                 owner_autostart: autostart,
                 ..login_screen(1)
             };
             let expected = if autostart { Tick::Running(1) } else { Tick::Stopped };
-            assert_eq!(supervisor.tick(&logged_in, now, start).unwrap(), expected);
+            assert_eq!(
+                supervisor.tick(&logged_in, now, admitted_owner, start).unwrap(),
+                expected
+            );
             if autostart {
                 assert_eq!(
-                    supervisor.tick(&logged_in, now + HANDOFF_TIMEOUT, start).unwrap(),
+                    supervisor
+                        .tick(&logged_in, now + HANDOFF_TIMEOUT, admitted_owner, start)
+                        .unwrap(),
                     Tick::Stopped
                 );
                 assert_eq!(
-                    supervisor.tick(&logged_in, now + HANDOFF_TIMEOUT, start).unwrap(),
+                    supervisor
+                        .tick(&logged_in, now + HANDOFF_TIMEOUT, admitted_owner, start)
+                        .unwrap(),
                     Tick::Idle
                 );
             }
@@ -680,7 +1088,7 @@ mod tests {
         let log = Rc::new(RefCell::new(Vec::new()));
         let mut supervisor = Supervisor::default();
         supervisor
-            .tick(&login_screen(1), Instant::now(), |session| {
+            .tick(&login_screen(1), Instant::now(), admitted_owner, |session, _owner| {
                 Ok(Fake {
                     session,
                     alive: Rc::new(RefCell::new(true)),
@@ -701,7 +1109,7 @@ mod tests {
     fn transient_console_detach_does_not_destroy_network_identity() {
         let log = Rc::new(RefCell::new(Vec::new()));
         let mut supervisor = Supervisor::default();
-        let start = |session| {
+        let start = |session, _owner| {
             Ok(Fake {
                 session,
                 alive: Rc::new(RefCell::new(true)),
@@ -709,16 +1117,27 @@ mod tests {
             })
         };
         let now = Instant::now();
-        supervisor.tick(&login_screen(1), now, start).unwrap();
+        supervisor.tick(&login_screen(1), now, admitted_owner, start).unwrap();
         let detached = Observation {
             console: None,
             ..login_screen(1)
         };
-        assert_eq!(supervisor.tick(&detached, now, start).unwrap(), Tick::Running(1));
-        assert_eq!(supervisor.tick(&login_screen(2), now, start).unwrap(), Tick::Running(1));
-        assert_eq!(supervisor.tick(&detached, now, start).unwrap(), Tick::Running(1));
         assert_eq!(
-            supervisor.tick(&detached, now + HANDOFF_TIMEOUT, start).unwrap(),
+            supervisor.tick(&detached, now, admitted_owner, start).unwrap(),
+            Tick::Running(1)
+        );
+        assert_eq!(
+            supervisor.tick(&login_screen(2), now, admitted_owner, start).unwrap(),
+            Tick::Running(1)
+        );
+        assert_eq!(
+            supervisor.tick(&detached, now, admitted_owner, start).unwrap(),
+            Tick::Running(1)
+        );
+        assert_eq!(
+            supervisor
+                .tick(&detached, now + HANDOFF_TIMEOUT, admitted_owner, start)
+                .unwrap(),
             Tick::Stopped
         );
         assert_eq!(*log.borrow(), ["stop 1"]);
@@ -728,7 +1147,7 @@ mod tests {
     fn active_console_switch_preserves_the_original_network_process() {
         let log = Rc::new(RefCell::new(Vec::new()));
         let mut supervisor = Supervisor::default();
-        let start = |session| {
+        let start = |session, _owner| {
             Ok(Fake {
                 session,
                 alive: Rc::new(RefCell::new(true)),
@@ -736,8 +1155,11 @@ mod tests {
             })
         };
         let now = Instant::now();
-        supervisor.tick(&login_screen(1), now, start).unwrap();
-        assert_eq!(supervisor.tick(&login_screen(2), now, start).unwrap(), Tick::Running(1));
+        supervisor.tick(&login_screen(1), now, admitted_owner, start).unwrap();
+        assert_eq!(
+            supervisor.tick(&login_screen(2), now, admitted_owner, start).unwrap(),
+            Tick::Running(1)
+        );
         assert!(log.borrow().is_empty());
     }
 
@@ -757,7 +1179,9 @@ mod tests {
         }
         let mut supervisor = Supervisor::default();
         let now = Instant::now();
-        supervisor.tick(&login_screen(1), now, |_| Ok(Stuck)).unwrap();
+        supervisor
+            .tick(&login_screen(1), now, admitted_owner, |_, _owner| Ok(Stuck))
+            .unwrap();
         assert!(
             supervisor
                 .handoff(|| -> io::Result<()> { panic!("must not create") })
@@ -778,7 +1202,7 @@ mod tests {
     #[test]
     fn fast_user_switching_with_a_live_user_backend_never_starts_a_second_instance() {
         let log = Rc::new(RefCell::new(Vec::new()));
-        let start = |session| {
+        let start = |session, _owner| {
             log.borrow_mut().push(format!("start {session}"));
             Ok(Fake {
                 session,
@@ -794,20 +1218,29 @@ mod tests {
             user_backend_alive: true,
             ..login_screen(2)
         };
-        assert_eq!(supervisor.tick(&switched, t0, start).unwrap(), Tick::Idle);
+        assert_eq!(
+            supervisor.tick(&switched, t0, admitted_owner, start).unwrap(),
+            Tick::Idle
+        );
         assert!(log.borrow().is_empty());
         // A running pre-login backend is stopped as soon as one appears.
-        assert_eq!(supervisor.tick(&login_screen(2), t0, start).unwrap(), Tick::Started(2));
-        assert_eq!(supervisor.tick(&switched, t0, start).unwrap(), Tick::Stopped);
+        assert_eq!(
+            supervisor.tick(&login_screen(2), t0, admitted_owner, start).unwrap(),
+            Tick::Started(2)
+        );
+        assert_eq!(
+            supervisor.tick(&switched, t0, admitted_owner, start).unwrap(),
+            Tick::Stopped
+        );
         // And it follows the console to a new session, never two at once.
         let later = t0 + RESTART_DELAY;
         assert_eq!(
-            supervisor.tick(&login_screen(3), later, start).unwrap(),
+            supervisor.tick(&login_screen(3), later, admitted_owner, start).unwrap(),
             Tick::Started(3)
         );
         let next = later + RESTART_DELAY;
         assert_eq!(
-            supervisor.tick(&login_screen(4), next, start).unwrap(),
+            supervisor.tick(&login_screen(4), next, admitted_owner, start).unwrap(),
             Tick::Running(3)
         );
         assert_eq!(*log.borrow(), ["start 2", "stop 2", "start 3"]);
@@ -818,7 +1251,7 @@ mod tests {
         let alive = Rc::new(RefCell::new(true));
         let log = Rc::new(RefCell::new(Vec::new()));
         let starts = RefCell::new(0);
-        let start = |session| {
+        let start = |session, _owner| {
             *starts.borrow_mut() += 1;
             *alive.borrow_mut() = true;
             Ok(Fake {
@@ -829,12 +1262,23 @@ mod tests {
         };
         let mut supervisor = Supervisor::default();
         let t0 = Instant::now();
-        assert_eq!(supervisor.tick(&login_screen(1), t0, start).unwrap(), Tick::Started(1));
-        *alive.borrow_mut() = false;
-        assert_eq!(supervisor.tick(&login_screen(1), t0, start).unwrap(), Tick::Exited);
-        assert_eq!(supervisor.tick(&login_screen(1), t0, start).unwrap(), Tick::Idle);
         assert_eq!(
-            supervisor.tick(&login_screen(1), t0 + RESTART_DELAY, start).unwrap(),
+            supervisor.tick(&login_screen(1), t0, admitted_owner, start).unwrap(),
+            Tick::Started(1)
+        );
+        *alive.borrow_mut() = false;
+        assert_eq!(
+            supervisor.tick(&login_screen(1), t0, admitted_owner, start).unwrap(),
+            Tick::Exited
+        );
+        assert_eq!(
+            supervisor.tick(&login_screen(1), t0, admitted_owner, start).unwrap(),
+            Tick::Idle
+        );
+        assert_eq!(
+            supervisor
+                .tick(&login_screen(1), t0 + RESTART_DELAY, admitted_owner, start)
+                .unwrap(),
             Tick::Started(1)
         );
         assert_eq!(*starts.borrow(), 2);
@@ -846,6 +1290,7 @@ mod tests {
 
 #[cfg(test)]
 mod process_exit_tests {
+    use super::tests::admitted_owner;
     use super::*;
     use std::{cell::Cell, rc::Rc};
     struct DelayedExit(Rc<Cell<bool>>);
@@ -870,11 +1315,12 @@ mod process_exit_tests {
         let mut supervisor = Supervisor::default();
         let screen = Observation {
             console: Some(1),
-            ready: true,
             ..Default::default()
         };
         supervisor
-            .tick(&screen, Instant::now(), |_| Ok(DelayedExit(exited.clone())))
+            .tick(&screen, Instant::now(), admitted_owner, |_, _owner| {
+                Ok(DelayedExit(exited.clone()))
+            })
             .unwrap();
         assert!(
             supervisor
@@ -890,7 +1336,9 @@ mod process_exit_tests {
         };
         assert_eq!(
             supervisor
-                .tick(&signed_in, Instant::now(), |_| panic!("new prelogin while signed in"))
+                .tick(&signed_in, Instant::now(), admitted_owner, |_, _owner| panic!(
+                    "new prelogin while signed in"
+                ))
                 .unwrap(),
             Tick::Exited
         );
@@ -902,11 +1350,12 @@ mod process_exit_tests {
         let mut supervisor = Supervisor::default();
         let screen = Observation {
             console: Some(1),
-            ready: true,
             ..Default::default()
         };
         supervisor
-            .tick(&screen, Instant::now(), |_| Ok(DelayedExit(exited.clone())))
+            .tick(&screen, Instant::now(), admitted_owner, |_, _owner| {
+                Ok(DelayedExit(exited.clone()))
+            })
             .unwrap();
         assert!(supervisor.handoff(|| Ok(0)).is_err());
         exited.set(true);

@@ -476,6 +476,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remote_write_then_repeated_chrome_image_metadata_produces_fresh_offers() {
+        use crate::sync::Ordering;
+        use oink_foundation::DeviceId;
+        use std::time::Instant;
+
+        let pb = super::super::test_pasteboard::new();
+        let name = pb.name().to_string();
+        let data = tempfile::tempdir().unwrap();
+        let mut ordering = Ordering::new(DeviceId([31; 32]), 696);
+        let written = write(Some(&name), &[ClipData::Text("remote".into())], Sensitivity::Normal).unwrap();
+        ordering.written(written);
+        assert!(!ordering.local_change(written, Instant::now()));
+        for sequence in 697..701 {
+            let item = NSPasteboardItem::new();
+            // Synthetic metadata, no user clipboard bytes. Capture is lazy and
+            // must not require a valid PNG payload just to publish the offer.
+            for ty in [
+                "public.png",
+                "public.html",
+                "org.chromium.internal.source-rfh-token",
+                "org.chromium.source-url",
+            ] {
+                assert!(item.setData_forType(&NSData::with_bytes(&[sequence as u8]), &NSString::from_str(ty)));
+            }
+            pb.clearContents();
+            assert!(pb.writeObjects(&NSArray::from_retained_slice(&[ProtocolObject::from_retained(item)])));
+            let count = change_count(Some(&name));
+            let now = Instant::now();
+            assert!(ordering.local_change(count, now));
+            assert!(ordering.capture_due(now + crate::sync::SOURCE_QUIET_PERIOD));
+            let captured = super::super::content::capture(Some(&name), data.path()).unwrap();
+            assert_eq!(captured.snapshot.change_count, count);
+            let inventory = captured.content.unwrap().inventory();
+            assert_eq!(inventory.items[0].representations.len(), 4);
+            let offer = ordering
+                .capture(
+                    crate::wire::inventory(&inventory).unwrap(),
+                    count,
+                    Sensitivity::Normal,
+                    0,
+                )
+                .unwrap()
+                .expect("every new native copy must publish");
+            assert_eq!(offer.clock().unwrap(), sequence);
+        }
+        pb.clearContents();
+    }
+
+    #[test]
     fn multi_step_writer_settles_before_announcing_all_formats_on_private_pasteboard() {
         use crate::sync::Ordering;
         use oink_foundation::DeviceId;
@@ -498,12 +547,11 @@ mod tests {
         let mut source = Ordering::new(DeviceId([31; 32]), 0);
         let at = Instant::now();
         assert!(source.local_change(count, at), "ownership is not copy completion");
-        assert!(!source.capture_due(at + Duration::from_millis(299)));
-        // The same owner fills its promised HTML later. changeCount does NOT move,
-        // so no second watcher notification can be assumed to repair an early offer.
-        assert!(pb.setString_forType(&NSString::from_str("<b>copy</b>"), html));
-        assert_eq!(change_count(Some(&name)), count);
-        assert!(source.capture_due(at + Duration::from_millis(300)));
+        assert!(!source.capture_due(at + Duration::from_millis(74)));
+        // The type is already declared, but its bytes are still absent when
+        // the shorter quiet window expires. Metadata capture must keep the
+        // promise rather than snapshotting only the first completed format.
+        assert!(source.capture_due(at + Duration::from_millis(75)));
         let data = tempfile::tempdir().unwrap();
         let captured = super::super::content::capture(Some(&name), data.path()).unwrap();
         let provider = captured.content.unwrap();
@@ -529,6 +577,22 @@ mod tests {
             .collect();
         assert!(formats.contains(&"mime:text/plain;charset=utf-8".into()));
         assert!(formats.contains(&"mime:text/html;charset=utf-8".into()));
+        let html_id = provider
+            .inventory()
+            .items
+            .iter()
+            .flat_map(|item| &item.representations)
+            .find(|rep| rep.standard == Some(crate::model::StandardFormat::Html))
+            .unwrap()
+            .id;
+        // The same owner fills the already declared type without another count
+        // or Offer. Its first demand reads the completed bytes from that owner.
+        assert!(pb.setString_forType(&NSString::from_str("<b>copy</b>"), html));
+        assert_eq!(change_count(Some(&name)), count);
+        assert_eq!(
+            crate::content::read_all(&mut provider.open(html_id).unwrap()).unwrap(),
+            b"<b>copy</b>"
+        );
         assert!(!source.capture_due(at + Duration::from_secs(1)));
         pb.clearContents();
     }

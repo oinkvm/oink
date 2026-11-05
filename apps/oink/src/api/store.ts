@@ -270,4 +270,3 @@ export function start(view = 'main'): Promise<void> {
 }
 export function stop() { warmupGeneration++; if(microphoneWarmup!==null)clearTimeout(microphoneWarmup); microphoneWarmup=null; stopped?.(); stopped = null; starting = null; agent.reset(); }
 export function useAgent(): AgentState { return useSyncExternalStore(agent.subscribe, agent.get); }
-export function adoptLayout(layout: T.Layout) { agent.adopt('layout', layout); }

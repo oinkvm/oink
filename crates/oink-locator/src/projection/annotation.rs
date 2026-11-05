@@ -241,7 +241,6 @@ pub(super) fn raster(named: &NamedProjection, rgb: [u8; 3], font: &dyn TextRaste
         width: w,
         height: h,
         pixels: c.px,
-        handles: vec![],
     })
 }
 
@@ -268,7 +267,6 @@ mod tests {
                 rect: clip,
                 clip,
                 visible: clip,
-                reference_per_native_unit: 1.0,
             },
         }
     }

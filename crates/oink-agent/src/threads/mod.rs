@@ -26,10 +26,6 @@ use oink_routing::{DndCmd, Output};
 /// the next event.
 #[derive(Debug)]
 pub enum MainCommand {
-    ApplicationFocus {
-        command: oink_routing::ApplicationFocusCommand,
-        permit: Option<oink_input::application_focus::Permit>,
-    },
     InputStatusChanged,
     /// Ordinary shutdown nudge; trace queues use the shared park notification.
     Wake,
@@ -64,8 +60,6 @@ pub enum MainCommand {
         from: Option<oink_foundation::DeviceId>,
     },
     ResetUserIdle,
-    DismissOverlay(u64),
-    IdentifyScreens(u64),
     Media {
         event: oink_foundation::input::InjectEvent,
         work: inject::OrdinaryInput,

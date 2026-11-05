@@ -32,19 +32,6 @@ export function CursorMark({ locked, tooltip = true }: {
     </span>
     </Tooltip>);
 }
-export function ScreenOffMark({ tooltip = true }: {
-    tooltip?: boolean;
-}) {
-    return (<Tooltip interactive={false} content={tr('屏幕：禁用')} disabled={!tooltip}>
-      <span className="os-screenoff" role="img" aria-label={tr('屏幕已禁用')}>
-        <svg viewBox="-2 -2 16 16" aria-hidden>
-          <circle className="os-screenoff__knock" cx="6" cy="6" r="7.6"/>
-          <circle cx="6" cy="6" r="4.9"/>
-          <path d="M2.6 2.6l6.8 6.8"/>
-        </svg>
-      </span>
-    </Tooltip>);
-}
 export function GameMark({ tooltip = true }: {
     tooltip?: boolean;
 }) {

@@ -76,7 +76,8 @@ fn allocate(bind_ip: IpAddr, seed: u32, next: &AtomicU32) -> u16 {
     panic!("no isolated test QUIC/discovery/Low port block available");
 }
 
-pub(crate) fn take_udp(address: SocketAddr) -> Option<UdpSocket> {
+/// Take a UDP reservation, including fixtures deliberately blocking QUIC or discovery.
+pub fn take_udp(address: SocketAddr) -> Option<UdpSocket> {
     reservations().lock().unwrap().udp.remove(&address)
 }
 /// Take the Low reservation, also used by tests deliberately blocking Low

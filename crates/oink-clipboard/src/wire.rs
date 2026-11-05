@@ -439,33 +439,6 @@ pub fn reliable_inventory(original: &wire::Inventory) -> v1::Result<wire::Invent
     }
 }
 
-/// Update delivery outcomes in the retained tree without rebuilding descriptors
-/// from their supported native view. Unknown fields remain byte-preservable.
-pub fn updated_inventory(original: &wire::Inventory, local: &domain::Inventory) -> v1::Result<wire::Inventory> {
-    let mut raw = original.raw().clone();
-    let mut items = Vec::new();
-    for item in original.items()?.0 {
-        let mut item_raw = item.raw().clone();
-        let mut representations = Vec::new();
-        for representation in item.representations()?.0 {
-            let mut representation_raw = representation.raw().clone();
-            if let Some(local) = crate::content::find(local, domain::RepresentationId(representation.id()?))
-                && let domain::RepresentationData::Unavailable(reason) = local.data
-                && local_representation(representation.clone())?.data != local.data
-            {
-                representation_raw.insert(
-                    7,
-                    representation_data(&domain::RepresentationData::Unavailable(reason))?.write(),
-                );
-            }
-            representations.push(V::Map(representation_raw));
-        }
-        item_raw.insert(3, V::Array(representations));
-        items.push(V::Map(item_raw));
-    }
-    raw.insert(3, V::Array(items));
-    wire::Inventory::from_raw(raw)
-}
 pub fn local_inventory(value: &wire::Inventory) -> v1::Result<domain::Inventory> {
     let items = value
         .items()?

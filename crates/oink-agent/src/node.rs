@@ -48,7 +48,7 @@ pub(crate) struct Components {
     /// Clipboard, drag and drop, file cache and Cloud Files.
     pub content: bool,
     pub audio: bool,
-    /// Aim game, layout projection/preview, wallpaper, layout profiles, notifications.
+    /// Layout projection/preview, wallpaper, layout profiles, notifications.
     pub companions: bool,
     /// Pairing with devices outside the roster.
     pub pairing: bool,
@@ -169,7 +169,7 @@ pub(crate) struct Inner {
     pub(crate) input_trace: OnceLock<Arc<crate::diagnostics::input_trace::InputTrace>>,
     pub(crate) diagnostics: OnceLock<crate::diagnostics::collection::Collector>,
     /// Wakes the pre-login snapshot export (Windows user backend only).
-    pub(crate) prelogin_export: OnceLock<Arc<tokio::sync::Notify>>,
+    pub(crate) prelogin_export: OnceLock<Arc<crate::prelogin::ExportTrigger>>,
     pub clip: std::sync::OnceLock<ClipHandle>,
     pub(crate) cache: crate::cache::State,
     #[cfg(target_os = "macos")]
@@ -213,10 +213,6 @@ pub(crate) struct Inner {
     #[cfg(test)]
     platform_clock_held: AtomicBool,
     pub rt: tokio::runtime::Handle,
-    pub overlay: Mutex<Option<api::Overlay>>,
-    pub overlay_wake: Arc<tokio::sync::Notify>,
-    /// 瞄准小游戏。
-    pub(crate) aim: crate::aim::Aim,
     pub(crate) projection: crate::projection::State,
     /// 桌面壁纸缩略图。
     pub(crate) wallpaper: crate::wallpaper::State,
@@ -466,9 +462,6 @@ impl Node {
                 #[cfg(test)]
                 platform_clock_held: AtomicBool::new(false),
                 rt: tokio::runtime::Handle::current(),
-                overlay: Mutex::new(None),
-                overlay_wake: Arc::default(),
-                aim: crate::aim::Aim::default(),
                 projection: crate::projection::State::default(),
                 wallpaper: crate::wallpaper::State::new(opts.display_backend),
                 tasks: Mutex::new(Vec::new()),
@@ -480,27 +473,6 @@ impl Node {
     }
     pub fn id(&self) -> DeviceId {
         self.inner.me
-    }
-
-    /// 接上瞄准小游戏的全屏叠加层（平台实现在启动时已接上；测试接假的）。`None`：本机不参加小游戏。
-    pub fn set_aim_surface(&self, surface: Option<Arc<dyn oink_locator::aim::AimSurface>>) {
-        crate::aim::set_surface(self, surface);
-    }
-
-    /// 瞄准小游戏的规则参数（下一局起生效）。测试用它把一局缩短；平时是默认值。
-    pub fn set_aim_config(&self, config: oink_locator::aim::game::Config) {
-        crate::aim::set_config(self, config);
-    }
-
-    /// Control Aim rule time in integration fixtures; transport timers remain real.
-    /// Install once before starting a game, then advance the clock monotonically.
-    #[cfg(debug_assertions)]
-    pub fn set_aim_clock_for_test(&self, clock: Arc<std::sync::atomic::AtomicU64>) {
-        self.inner
-            .aim
-            .test_clock
-            .set(clock)
-            .expect("Aim test clock already installed");
     }
 
     pub fn start_platform_dnd(&self) {
@@ -607,8 +579,6 @@ impl Node {
         self.inner.reports.shutdown();
         self.request_stop();
         self.shutdown_notifications();
-        crate::display_overlay::hide(self);
-        crate::aim::stop(self);
         // The ordinary command owner cancels native DnD before closing its queue.
         // Keep capture/injection and the application event loop alive until then.
         let threads = std::mem::take(&mut *lock(&self.inner.ordinary_threads));

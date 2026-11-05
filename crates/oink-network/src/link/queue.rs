@@ -23,6 +23,11 @@ impl Queued {
     }
 }
 
+pub(super) struct HeartbeatSnapshot {
+    pub messages: Vec<Vec<u8>>,
+    pub observer: Option<Wake>,
+}
+
 pub(super) struct Queue {
     items: ArrayQueue<Queued>,
     pub(super) age: Arc<oink_foundation::pending_age::PendingAge>,
@@ -36,6 +41,7 @@ pub(super) struct Queue {
     pub(super) dropped: AtomicU64,
     pub(super) full: AtomicU64,
     first_motion_epoch: AtomicU64,
+    pub(super) heartbeat: ArcSwapOption<HeartbeatSnapshot>,
 }
 
 impl std::fmt::Debug for Queue {
@@ -63,6 +69,7 @@ impl Queue {
             dropped: AtomicU64::new(0),
             full: AtomicU64::new(0),
             first_motion_epoch: AtomicU64::new(0),
+            heartbeat: ArcSwapOption::empty(),
         })
     }
     pub(super) fn is_closed(&self) -> bool {
@@ -93,6 +100,7 @@ impl Queue {
     }
     pub(super) fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
+            self.heartbeat.store(None);
             while self.pop().is_some() {}
             self.signal();
             if let Some(wake) = self.producer_wake.load().as_ref() {
@@ -116,7 +124,35 @@ impl Queue {
     pub(super) fn post(&self, encoded: Vec<u8>, limit: usize) -> Result<(), PostError> {
         // Also timestamps the in-memory stream test pair, where writer and reader
         // share a queue. Production senders never consume this local metadata.
+        // Invalidate before publishing newer immediate work. The producer refreshes
+        // its snapshot after the state change; a heartbeat must not replay old held state.
+        self.heartbeat.store(None);
         self.post_at(encoded, limit, Some(std::time::Instant::now()), Stage::Enqueue)
+    }
+    pub(super) fn set_heartbeat(
+        &self,
+        messages: Vec<Vec<u8>>,
+        limit: usize,
+        observer: Option<Wake>,
+    ) -> Result<(), PostError> {
+        if self.is_closed() {
+            return Err(PostError::Closed);
+        }
+        if messages.iter().any(|m| m.len() > limit) {
+            return Err(PostError::TooLarge);
+        }
+        if messages.len() > self.spec.messages as usize
+            || messages.iter().map(Vec::len).sum::<usize>() > self.spec.bytes as usize
+        {
+            return Err(PostError::Full);
+        }
+        self.heartbeat.store(if messages.is_empty() {
+            None
+        } else {
+            Some(Arc::new(HeartbeatSnapshot { messages, observer }))
+        });
+        // Registration is memory only: no network wake and no queue insertion.
+        Ok(())
     }
     pub(super) fn post_received(&self, encoded: Vec<u8>, limit: usize) -> Result<(), PostError> {
         self.post_at(encoded, limit, Some(std::time::Instant::now()), Stage::QuicReceive)

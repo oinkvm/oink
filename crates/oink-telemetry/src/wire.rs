@@ -18,7 +18,7 @@ pub fn encode(report: &AdmittedReport) -> Result<Vec<u8>> {
         OsVersionClass::MacOSMajor(v) => format!("macos_{v}"),
         OsVersionClass::Unknown => "unknown".into(),
     };
-    let mut tags = json!({"schema_version":3,"policy_version":3,"os_version_class":os});
+    let mut tags = json!({"schema_version":SCHEMA_VERSION,"policy_version":POLICY_VERSION,"os_version_class":os});
     let release = match report.source_revision {
         Some(revision) => format!(
             "com.hachiwii.oink@{}.{}.{}-beta.{}+{}",
@@ -169,6 +169,63 @@ pub fn encode_persisted(bytes: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn audio_codec_wire_is_closed_and_rejects_old_schema() {
+        for codec in [
+            Codec::Opus5ms,
+            Codec::Opus20ms,
+            Codec::Pcm,
+            Codec::Pcm16_2p5ms,
+            Codec::Unknown,
+        ] {
+            for metric in [
+                Metric::AudioBuffered {
+                    stage: AudioStage::Total,
+                },
+                Metric::AudioReceiveDispatch,
+                Metric::AudioDispatchInsert,
+                Metric::AudioPushToPresentationEstimate,
+                Metric::AudioReportedOutputLatency,
+            ] {
+                let context = MeasurementContext {
+                    metric,
+                    codec: Some(codec),
+                    ..context()
+                };
+                let report = if metric == Metric::AudioPushToPresentationEstimate {
+                    Report::MeasuredInterval(MeasuredInterval {
+                        context,
+                        elapsed_us: 100,
+                    })
+                } else {
+                    Report::PerformanceDistribution(PerformanceDistribution {
+                        context,
+                        histogram: metric.histogram().unwrap(),
+                        bins: sampling::singleton(100),
+                        sample_count: 1,
+                        missing: 0,
+                        saturated: false,
+                        window_us: Some(1000),
+                        seal_us: 1,
+                    })
+                };
+                let mut admitted = AdmittedReport::new(report, 3600).unwrap();
+                let persisted = serde_json::to_vec(&admitted).unwrap();
+                let bytes = encode_persisted(&persisted).unwrap();
+                let event: Value = serde_json::from_slice(bytes.split(|b| *b == b'\n').nth(2).unwrap()).unwrap();
+                assert_eq!(event["tags"]["codec"], serde_json::to_value(codec).unwrap());
+                assert_eq!(event["tags"]["schema_version"], 4);
+                assert_eq!(event["tags"]["policy_version"], 3);
+                let mut poisoned = serde_json::to_value(&admitted).unwrap();
+                poisoned["report"]["data"]["context"]["codec"] = "opus".into();
+                assert!(encode_persisted(&serde_json::to_vec(&poisoned).unwrap()).is_err());
+                admitted.schema_version = 3;
+                assert!(encode(&admitted).is_err());
+                assert!(encode_persisted(&serde_json::to_vec(&admitted).unwrap()).is_err());
+            }
+        }
+    }
+
     #[test]
     fn target_drag_intervals_reach_sentry_with_fixed_stage_and_boundary_tags() {
         for metric in [

@@ -104,24 +104,17 @@ fn patch_transform(origin: &mut Point, scale: &mut f64, old: &crate::api::Placem
     }
 }
 impl Node {
-    /// Explicit manual boundary for legacy UI and projection gestures. Facts,
+    /// Explicit manual boundary for legacy layout APIs. Facts,
     /// hotplug, reconnect and automatic repair use the config actor directly.
     pub(crate) fn commit_manual_layout(
         &self,
         edit: impl FnOnce(&mut oink_display::layout::Layout) -> crate::api::ApiResult<()>,
     ) -> crate::api::ApiResult<()> {
-        self.commit_manual_layout_inner(edit, false)
-    }
-    pub(crate) fn commit_manual_layout_exact(
-        &self,
-        edit: impl FnOnce(&mut oink_display::layout::Layout) -> crate::api::ApiResult<()>,
-    ) -> crate::api::ApiResult<()> {
-        self.commit_manual_layout_inner(edit, true)
+        self.commit_manual_layout_inner(edit)
     }
     fn commit_manual_layout_inner(
         &self,
         edit: impl FnOnce(&mut oink_display::layout::Layout) -> crate::api::ApiResult<()>,
-        exact: bool,
     ) -> crate::api::ApiResult<()> {
         let group = self.link_config()?;
         let original = (*group.applied().layout).clone();
@@ -156,8 +149,7 @@ impl Node {
                     Box::new(move |current| {
                         // Legacy placement APIs have no expected token: apply only the
                         // requested fields to the actor's latest factual geometry.
-                        // Projection gestures retain their original exact-state fence.
-                        if (!exact || *current == original) && delta.apply(current) {
+                        if delta.apply(current) {
                             flag.store(true, std::sync::atomic::Ordering::SeqCst);
                         }
                     }),

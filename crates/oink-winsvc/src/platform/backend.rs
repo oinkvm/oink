@@ -205,20 +205,30 @@ fn receive(pipe: &Handle) -> io::Result<BackendLaunch> {
 }
 
 pub(super) fn serve() {
+    let Some(events) = broker::events() else { return };
     while !broker::STOP.load(Ordering::Acquire) {
         // SAFETY: read-only active console session query.
         let id = unsafe { WTSGetActiveConsoleSessionId() };
-        if id != 0
-            && id != u32::MAX
-            && security::user_sid(id).is_ok()
-            && let Err(error) = serve_session(id)
-        {
-            eprintln!("Oink UIAccess launch broker: {error}");
+        let retry = if id != 0 && id != u32::MAX && security::user_sid(id).is_ok() {
+            match serve_session(id) {
+                Ok(()) => continue,
+                Err(error) => {
+                    eprintln!("Oink UIAccess launch broker: {error}");
+                    // Preserve bind-failure recovery, but never wake periodically
+                    // while a session simply has no interactive user.
+                    Some(std::time::Instant::now() + Duration::from_millis(250))
+                }
+            }
+        } else {
+            None
+        };
+        if super::wake::wait(&[events.stop.raw(), events.launch.raw()], retry).is_err() {
+            break;
         }
-        std::thread::sleep(Duration::from_millis(250));
     }
 }
 fn serve_session(id: u32) -> io::Result<()> {
+    let events = broker::events().ok_or_else(denied)?;
     let user = security::user_sid(id)?;
     let descriptor = security::pipe_security(id)?;
     let attrs = descriptor.attrs();
@@ -240,7 +250,7 @@ fn serve_session(id: u32) -> io::Result<()> {
         op.connect()?;
         loop {
             // SAFETY: event owned by op, non-mutating session query.
-            let ready = unsafe { WaitForSingleObject(op.event(), 250) };
+            let ready = super::wake::wait(&[op.event(), events.stop.raw(), events.launch.raw()], None)?;
             // SAFETY: read-only active console session query.
             let active = unsafe { WTSGetActiveConsoleSessionId() };
             if broker::STOP.load(Ordering::Acquire)
@@ -249,11 +259,8 @@ fn serve_session(id: u32) -> io::Result<()> {
             {
                 return Ok(());
             }
-            if ready == WAIT_OBJECT_0 {
+            if matches!(ready, super::wake::Woke::Signal(0)) {
                 break;
-            }
-            if ready != WAIT_TIMEOUT {
-                return Err(io::Error::last_os_error());
             }
         }
         op.cancel();

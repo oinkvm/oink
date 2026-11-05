@@ -719,8 +719,8 @@ pub(crate) fn default_hotkeys() -> Vec<Hotkey> {
         action: a,
         device: None,
         keys: keys.iter().map(|s| s.to_string()).collect(),
-        // Microphone mute is opt-in; existing default bindings stay enabled.
-        enabled: a != HotkeyAction::ToggleMicrophoneMute,
+        // Window opening and microphone mute are opt-in.
+        enabled: !matches!(a, HotkeyAction::OpenWindow | HotkeyAction::ToggleMicrophoneMute),
     };
     vec![
         k(HotkeyAction::LockFocus, &["Ctrl", "Alt", "L"]),
@@ -742,10 +742,7 @@ pub(crate) fn input_settings(node: &Node) -> InputSettings {
     let speed_mode = s.speed_mode;
     let contacts_injection_available = node.contacts_injection_available();
     InputSettings {
-        application_focus_enabled: node
-            .link_config()
-            .map(|c| c.applied().application_focus_enabled)
-            .unwrap_or(false),
+        keyboard_release_keys: crate::api::keyboard_release_keys(),
         mac_caps_switches_input_source: node.input_backend().caps_lock_switches_input_source(),
         key_support: KeySupport::default(),
         event_frequency: s.event_frequency,
@@ -917,9 +914,6 @@ impl AgentApi for Node {
     }
     fn pairings(&self) -> ApiResult<pairing::PairingSnapshot> {
         Ok((*self.link_config()?.pairings()).clone())
-    }
-    fn group_migration(&self) -> ApiResult<Option<pairing::GroupMigrationStatus>> {
-        Ok((*self.link_config()?.group_migration()).clone())
     }
     fn accept_pairing(
         &self,
@@ -1160,18 +1154,6 @@ impl AgentApi for Node {
         group_view(self)
     }
 
-    fn rename_device(&self, device: DeviceKey, name: String) -> ApiResult<()> {
-        let name = name.trim().to_string();
-        if name.is_empty() {
-            return Err(invalid("名称不能为空"));
-        }
-        self.edit_device_option(
-            device,
-            dto::LocalOption::DeviceName,
-            oink_protocol::v1::RawValue::Text(name),
-        )
-    }
-
     fn remove_member(&self, device: DeviceKey) -> ApiResult<()> {
         let node = self.clone();
         block(self, async move { node.group_remove(device.0).await }).map_err(command_err)
@@ -1194,6 +1176,7 @@ impl AgentApi for Node {
                 })
                 .collect(),
             port: self.links()?.local_addr().port(),
+            low_port: self.links()?.low_local_addr().map(|a| a.port()),
         })
     }
 
@@ -1273,12 +1256,6 @@ impl AgentApi for Node {
         })
     }
 
-    fn layout_projection(&self) -> ApiResult<ProjectionStatus> {
-        Ok(crate::projection::status(self))
-    }
-    fn set_layout_projection(&self, enabled: bool) -> ApiResult<ProjectionStatus> {
-        Ok(crate::projection::set_mode(self, enabled))
-    }
     fn preview_layout_projection(
         &self,
         gesture: u64,
@@ -1350,21 +1327,6 @@ impl AgentApi for Node {
         }
         Ok(crate::wallpaper::list(self))
     }
-    fn identify_screens(&self) -> ApiResult<()> {
-        crate::display_overlay::identify(self);
-        Ok(())
-    }
-    fn aim_status(&self) -> ApiResult<AimStatus> {
-        Ok(crate::aim::status(self))
-    }
-    fn aim_start(&self) -> ApiResult<AimStatus> {
-        crate::aim::start(self)
-    }
-    fn aim_stop(&self) -> ApiResult<()> {
-        crate::aim::stop(self);
-        Ok(())
-    }
-
     fn input_settings(&self) -> ApiResult<InputSettings> {
         Ok(input_settings(self))
     }
@@ -1391,7 +1353,6 @@ impl AgentApi for Node {
         // Preserve an explicit choice equal to the default without pinning siblings.
         let mut local_patch = patch.value();
         if let Some(object) = local_patch.as_object_mut() {
-            object.remove("application_focus_enabled");
             object.remove("touchpad_injection_enabled");
         }
         for key in [
@@ -1455,10 +1416,6 @@ impl AgentApi for Node {
             }
         })?;
         drop(_gate);
-        if patch.value().get("application_focus_enabled").is_some() {
-            self.link_config()?
-                .set_application_focus_enabled(s.application_focus_enabled)?;
-        }
         if patch.value().get("gap_travel").is_some() {
             self.commit_manual_layout(move |layout| {
                 layout.settings.gap_travel = s.gap_travel;

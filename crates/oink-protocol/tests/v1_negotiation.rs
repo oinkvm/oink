@@ -106,7 +106,7 @@ fn exact_transcript_binds_unknown_fields_nonce_capabilities_and_identity() {
         );
     }
     let mut changed = a.clone();
-    add_cap(&mut changed, "oink.aim/1", 4);
+    add_cap(&mut changed, "oink.wallpaper/1", 4);
     assert_ne!(
         baseline,
         admission::offer_hash(&bytes(changed), &bytes(b.clone())).unwrap()
@@ -399,6 +399,40 @@ fn pointer_move_is_optional_and_old_peers_keep_baseline_focus() {
 }
 
 #[test]
+fn hidden_pointer_entry_requires_its_own_optional_capability() {
+    for hidden_peer in [false, true] {
+        let (mut a, mut b) = offers();
+        add_cap(&mut a, "oink.pointer.move/1", 4);
+        add_cap(&mut b, "oink.pointer.move/1", 4);
+        add_cap(&mut a, "oink.pointer.move-hidden/1", 4);
+        if hidden_peer {
+            add_cap(&mut b, "oink.pointer.move-hidden/1", 4);
+        }
+        let negotiated = admission::negotiate(&bytes(a), &bytes(b), registry::CAPABILITIES, false).unwrap();
+        let agreement = admission::Agreement::new(negotiated.enabled().unwrap().0.into_iter().map(|v| v.0)).unwrap();
+        let context = admission::Context {
+            kind: 3,
+            transport: registry::Transport::Reliable,
+            phase: admission::Phase::Member,
+            agreement: &agreement,
+            direct: true,
+            old_member_lane: false,
+        };
+        let entry = Message::ControlMovePointerEnter(
+            ControlFocusEnter::from_raw(support::sample_named("ControlFocusEnter")).unwrap(),
+        );
+        let encoded = frame::encode(&entry, 16384).unwrap();
+        assert_eq!(
+            context
+                .decode(frame::OpaqueFrame::parse_exact(&encoded, 16384).unwrap())
+                .is_ok(),
+            hidden_peer
+        );
+    }
+    assert!(!registry::BASELINE.contains(&"oink.pointer.move-hidden/1"));
+}
+
+#[test]
 fn lock_escape_is_optional_and_requires_both_peers() {
     for new_peer in [false, true] {
         let (mut a, mut b) = offers();
@@ -562,4 +596,38 @@ fn microphone_notifications_negotiate_independently_and_preserve_legacy_payloads
         assert_eq!(decoded.microphone_muted().unwrap(), Some(muted));
         assert_eq!(decoded.kind().unwrap(), notice.kind().unwrap());
     }
+}
+
+#[test]
+fn local_click_requires_its_own_optional_capability() {
+    for hidden_peer in [false, true] {
+        let (mut a, mut b) = offers();
+        add_cap(&mut a, "oink.pointer.move/1", 4);
+        add_cap(&mut b, "oink.pointer.move/1", 4);
+        add_cap(&mut a, "oink.focus.local-click/1", 4);
+        if hidden_peer {
+            add_cap(&mut b, "oink.focus.local-click/1", 4);
+        }
+        let negotiated = admission::negotiate(&bytes(a), &bytes(b), registry::CAPABILITIES, false).unwrap();
+        let agreement = admission::Agreement::new(negotiated.enabled().unwrap().0.into_iter().map(|v| v.0)).unwrap();
+        let context = admission::Context {
+            kind: 3,
+            transport: registry::Transport::Reliable,
+            phase: admission::Phase::Member,
+            agreement: &agreement,
+            direct: true,
+            old_member_lane: false,
+        };
+        let entry = Message::ControlLocalClick(
+            oink_protocol::v1::dto::ControlLocalClick::from_raw(support::sample_named("ControlLocalClick")).unwrap(),
+        );
+        let encoded = frame::encode(&entry, 16384).unwrap();
+        assert_eq!(
+            context
+                .decode(frame::OpaqueFrame::parse_exact(&encoded, 16384).unwrap())
+                .is_ok(),
+            hidden_peer
+        );
+    }
+    assert!(!registry::BASELINE.contains(&"oink.focus.local-click/1"));
 }

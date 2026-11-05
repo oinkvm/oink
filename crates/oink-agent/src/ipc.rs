@@ -1,8 +1,9 @@
 //! Local loopback API used by the UI through [`crate::remote::RemoteApi`] and
 //! by command-line clients through [`Client`].
 //!
-//! - 端口：`OINK_IPC_PORT`，默认 QUIC 端口 + 2（47472）。端口与一次性令牌写在数据目录的 `ipc.json`
-//!   （Unix 上权限 0600；Windows 上在用户自己的 `%APPDATA%` 下），只有能读这个文件的本机用户才能调用。
+//! - Windows uses user-SID-only named pipes; Unix uses a private data-directory
+//!   socket. `ipc.json` publishes the native address, lock owner and one-use secret.
+//!   Legacy loopback endpoint documents remain readable during upgrades.
 //! - 格式：一行一个 JSON。请求 `{"token": "...", ...}`，再带下面其中一项：
 //!   - `"call": Request`（见 [`crate::api::Request`]）→ `{"ok": Reply}` 或 `{"err": ApiError}`；
 //!   - `"hello": true` → [`ServiceInfo`]（版本、进程号）；
@@ -17,14 +18,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::AsyncWriteExt;
+
 use tokio::sync::watch;
 
 use crate::api::{self, ApiError, ApiEvent, Request};
 use crate::node::Node;
 
+mod frames;
+pub(crate) use frames::Frames;
 mod publication;
+pub(crate) mod transport;
+pub(crate) use transport::Listener;
+pub use transport::Stream as LocalStream;
 mod ui;
 pub use ui::UiControl;
 
@@ -32,7 +38,7 @@ pub const IPC_FILE: &str = "ipc.json";
 
 /// A missing owner cannot mean successful stop while its endpoint is live.
 /// Do not send commands to an unowned endpoint: its recorded port may have been
-/// reused. Only an absent file or a refused loopback connection proves it idle;
+/// reused. Only an absent file or a missing/refused native endpoint proves it idle;
 /// unreadable endpoints and other socket errors leave shutdown unverified.
 pub(crate) fn verify_no_listener(data_dir: &Path, file: &str) -> anyhow::Result<()> {
     let text = match std::fs::read(data_dir.join(file)) {
@@ -42,12 +48,15 @@ pub(crate) fn verify_no_listener(data_dir: &Path, file: &str) -> anyhow::Result<
     };
     let endpoint: Endpoint = serde_json::from_slice(&text)
         .map_err(|error| anyhow::anyhow!("cannot verify Oink has stopped: invalid {file}: {error}"))?;
-    let address = std::net::SocketAddr::from(([127, 0, 0, 1], endpoint.port));
-    // Windows 11 reports a refused loopback connect after about two seconds
-    // (measured with a closed private listener). A short UI polling budget
-    // misclassifies stale endpoints as unknown; retain a bounded 3-second check.
-    match std::net::TcpStream::connect_timeout(&address, Duration::from_secs(3)) {
-        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => Ok(()),
+    match endpoint.address.probe() {
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(())
+        }
         Err(error) => anyhow::bail!("cannot verify Oink has stopped: cannot query {file}: {error}"),
         Ok(_) => anyhow::bail!(
             "Oink process ownership unavailable: {file} is still reachable; cannot verify Oink has stopped"
@@ -84,7 +93,8 @@ impl BuildIdentity {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Endpoint {
-    pub port: u16,
+    #[serde(flatten)]
+    pub address: transport::Address,
     pub token: String,
 }
 
@@ -156,59 +166,49 @@ pub struct Server {
     task: tokio::task::JoinHandle<()>,
     publication: publication::Publication,
     file: PathBuf,
-    port: u16,
+    _listener: Arc<Listener>,
     closing: watch::Sender<bool>,
     conns: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl Server {
-    pub(crate) fn configured_port(network_port: u16) -> u16 {
-        oink_foundation::debug_env!("OINK_IPC_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or_else(|| {
-                if network_port == 0 {
-                    0
-                } else {
-                    network_port.wrapping_add(2)
-                }
-            })
-    }
-
-    /// 端口：`OINK_IPC_PORT`，默认 QUIC 端口 + 2。
+    /// Bind a native, user-private endpoint independently of device ports.
     pub async fn start(node: Node) -> anyhow::Result<Self> {
-        let port = Self::configured_port(node.links()?.local_addr().port());
-        Self::start_on(node, port).await
-    }
-
-    /// 在指定端口监听（0 = 系统分配，测试用）；实际端口写进 `ipc.json`。
-    pub async fn start_on(node: Node, port: u16) -> anyhow::Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+        let listener = Listener::bind(node.data_dir(), "agent")?;
         Self::start_listening(node, listener).await
     }
 
-    pub(crate) async fn start_listening(node: Node, listener: TcpListener) -> anyhow::Result<Self> {
-        let port = listener.local_addr()?.port();
+    pub(crate) async fn start_listening(node: Node, listener: Listener) -> anyhow::Result<Self> {
+        let listener = Arc::new(listener);
         let mut secret = [0u8; 32];
         getrandom::fill(&mut secret).map_err(|e| anyhow::anyhow!("IPC token entropy: {e}"))?;
         let token: String = secret.iter().map(|byte| format!("{byte:02x}")).collect();
         let file = node.data_dir().join(IPC_FILE);
         let document = serde_json::to_string(&Endpoint {
-            port,
+            address: listener.address(),
             token: token.clone(),
         })?;
         let publish_path = file.clone();
         let publication = publication::Publication::start(move || write_private(&publish_path, &document))?;
-        tracing::info!(port, "local IPC listening");
+        tracing::info!(address = ?listener.address(), "native local IPC listening");
         let (closing, _) = watch::channel(false);
         let conns: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::default();
         let task = {
             let closing = closing.clone();
             let conns = conns.clone();
+            let listener = listener.clone();
             tokio::spawn(async move {
                 loop {
-                    let Ok((stream, _)) = listener.accept().await else {
-                        continue;
+                    let stream = match listener.accept().await {
+                        Ok((stream, _)) => stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                            tracing::warn!(%error, "native IPC rejected peer credentials");
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, os_error = ?error.raw_os_error(), "native IPC listener failed");
+                            break;
+                        }
                     };
                     let node = node.clone();
                     let token = token.clone();
@@ -228,20 +228,22 @@ impl Server {
             task,
             publication,
             file,
-            port,
+            _listener: listener,
             closing,
             conns,
         })
     }
 
-    pub fn port(&self) -> u16 {
-        self.port
+    #[cfg(test)]
+    pub(crate) fn address(&self) -> transport::Address {
+        self._listener.address()
     }
 
     /// 优雅关闭：告诉事件订阅者服务即将退出（`{"closing": "stopping"}`），等各连接结束（最多 1 秒），
     /// 然后停止监听、删除 `ipc.json`。
     pub async fn close(self) {
         self.disconnect_clients().await;
+        self._listener.release();
         let _ = std::fs::remove_file(&self.file);
     }
 
@@ -262,6 +264,7 @@ impl Server {
     /// 立即停止（不等订阅者）。
     pub fn stop(self) {
         self.task.abort();
+        self._listener.release();
         self.publication.stop();
         self.closing.send_replace(true);
         for h in self.conns.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
@@ -276,22 +279,28 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     // Publish an owner-only, Medium-minimum file even from an elevated UI.
-    // The loopback transport has no UIPI boundary; its secret remains private.
+    // Native IPC also admits this user across UIAccess/Medium/High integrity.
     oink_foundation::storage::atomic_write_quiet(path, text.as_bytes())
 }
 
-async fn write_line(w: &mut tokio::net::tcp::OwnedWriteHalf, v: &serde_json::Value) -> anyhow::Result<()> {
+async fn write_line(w: &mut tokio::io::WriteHalf<transport::AsyncStream>, v: &serde_json::Value) -> anyhow::Result<()> {
     let mut s = serde_json::to_string(v)?;
     s.push('\n');
     w.write_all(s.as_bytes()).await?;
     Ok(())
 }
 
-async fn serve(stream: TcpStream, node: Node, token: String, closing: watch::Receiver<bool>) -> anyhow::Result<()> {
+async fn serve(
+    stream: transport::AsyncStream,
+    node: Node,
+    token: String,
+    closing: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let connection_client = api::request_context::new_client();
-    let (r, mut w) = stream.into_split();
-    let mut lines = BufReader::new(r).lines();
-    while let Some(line) = lines.next_line().await? {
+    let (r, mut w) = tokio::io::split(stream);
+    let mut lines = Frames::new(r);
+    let mut next = lines.first_line().await?;
+    while let Some(line) = next.take() {
         let mut stop = false;
         let reply = match serde_json::from_str::<Envelope>(&line) {
             Err(e) => serde_json::json!({ "err": ApiError::InvalidArgument { message: e.to_string() } }),
@@ -314,6 +323,7 @@ async fn serve(stream: TcpStream, node: Node, token: String, closing: watch::Rec
                     }),
                 )
                 .await?;
+                finish_response(&mut lines).await;
                 return Ok(());
             }
             Ok(env) if env.ui_ready => {
@@ -344,16 +354,29 @@ async fn serve(stream: TcpStream, node: Node, token: String, closing: watch::Rec
         if stop {
             tracing::info!("stop requested over local IPC");
             node.request_stop();
+            finish_response(&mut lines).await;
             return Ok(());
         }
+        next = lines.next_line().await?;
     }
     Ok(())
 }
 
+/// DisconnectNamedPipe discards unread server data. Wait for the client's EOF
+/// after its final response instead of blocking a runtime worker in
+/// FlushFileBuffers (which a stalled client could keep blocked indefinitely).
+/// This is bounded teardown, never a request/port retry.
+async fn finish_response(lines: &mut Frames<tokio::io::ReadHalf<transport::AsyncStream>>) {
+    #[cfg(windows)]
+    let _ = tokio::time::timeout(Duration::from_secs(1), lines.next_line()).await;
+    #[cfg(not(windows))]
+    let _ = lines;
+}
+
 /// 事件订阅：把服务的事件逐行推给这条连接，直到对方断开、服务退出或积压过多。
 async fn stream_events(
-    mut lines: tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
-    mut w: tokio::net::tcp::OwnedWriteHalf,
+    mut lines: Frames<tokio::io::ReadHalf<transport::AsyncStream>>,
+    mut w: tokio::io::WriteHalf<transport::AsyncStream>,
     node: Node,
     mut closing: watch::Receiver<bool>,
     views: api::LiveViews,
@@ -414,6 +437,7 @@ async fn stream_events(
     .await;
     node.unsubscribe(id);
     tracing::info!("UI event subscription ended");
+    finish_response(&mut lines).await;
     let _ = w.shutdown().await;
     result
 }
@@ -467,11 +491,8 @@ impl Client {
 
     // Keep socket setup separate so tests can inspect the kernel's configured deadlines
     // without comparing elapsed wall time (which also includes scheduler delay).
-    fn bounded_stream(&self, timeout: Duration) -> anyhow::Result<std::net::TcpStream> {
-        let address = std::net::SocketAddr::from(([127, 0, 0, 1], self.endpoint.port));
-        let s = std::net::TcpStream::connect_timeout(&address, timeout).map_err(|error| {
-            anyhow::Error::new(error).context(format!("连不上服务进程（端口 {}）", self.endpoint.port))
-        })?;
+    fn bounded_stream(&self, timeout: Duration) -> anyhow::Result<LocalStream> {
+        let s = self.endpoint.address.connect(timeout)?;
         s.set_read_timeout(Some(timeout))?;
         s.set_write_timeout(Some(timeout))?;
         Ok(s)
@@ -563,6 +584,13 @@ impl Client {
     }
 }
 
+/// Open the authenticated-owner transport without sending a request. Used by
+/// local CLI subscriptions and protocol integration fixtures.
+#[doc(hidden)]
+pub fn open_stream(data_dir: &Path, timeout: Duration) -> anyhow::Result<LocalStream> {
+    Endpoint::read(data_dir)?.address.connect(timeout).map_err(Into::into)
+}
+
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
@@ -573,7 +601,9 @@ mod tests {
         assert!(verify_no_listener(dir.path(), IPC_FILE).is_ok());
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let endpoint = Endpoint {
-            port: listener.local_addr().unwrap().port(),
+            address: transport::Address::Legacy {
+                port: listener.local_addr().unwrap().port(),
+            },
             token: "private-test-token".into(),
         };
         write_private(&dir.path().join(IPC_FILE), &serde_json::to_string(&endpoint).unwrap()).unwrap();
@@ -614,7 +644,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let server = Server::start_on(node.clone(), 0).await.unwrap();
+        let server = Server::start(node.clone()).await.unwrap();
         let remote = crate::remote::RemoteApi::new(dir.path());
         // This test node has fake native services: exercise the real IPC/client
         // dispatch and unsupported guard without invoking any operating-system restart.
@@ -703,7 +733,9 @@ mod tests {
         let client = Client {
             client_id: [1; 16],
             endpoint: Endpoint {
-                port: listener.local_addr().unwrap().port(),
+                address: transport::Address::Legacy {
+                    port: listener.local_addr().unwrap().port(),
+                },
                 token: "save-timeout".into(),
             },
         };
@@ -737,7 +769,9 @@ mod tests {
         let client = Client {
             client_id: [1; 16],
             endpoint: Endpoint {
-                port: listener.local_addr().unwrap().port(),
+                address: transport::Address::Legacy {
+                    port: listener.local_addr().unwrap().port(),
+                },
                 token: "deadline-test".into(),
             },
         };
@@ -746,8 +780,9 @@ mod tests {
         // test waiting for an unanswered hello. The CLI fixture separately verifies EOF.
         let timeout = Duration::from_millis(500);
         let stream = client.bounded_stream(timeout).unwrap();
-        assert_eq!(stream.read_timeout().unwrap(), Some(timeout));
-        assert_eq!(stream.write_timeout().unwrap(), Some(timeout));
+        assert!(
+            matches!(stream, LocalStream::Legacy(ref s) if s.read_timeout().unwrap() == Some(timeout) && s.write_timeout().unwrap() == Some(timeout))
+        );
     }
 }
 

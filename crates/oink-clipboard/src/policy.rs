@@ -215,6 +215,14 @@ struct FilteredFiles {
     policy: SharingPolicy,
 }
 impl Namespace for FilteredFiles {
+    fn start_native_delivery(&self) {
+        if self.policy.check().is_ok() {
+            self.inner.start_native_delivery();
+        }
+    }
+    fn cancel_native_delivery(&self) {
+        self.inner.cancel_native_delivery();
+    }
     fn release_fulfilled(&self, roots: &[NodeId]) {
         self.inner.release_fulfilled(roots);
     }
@@ -248,6 +256,10 @@ impl Namespace for FilteredFiles {
     fn prepare(&self) -> io::Result<()> {
         self.policy.check()?;
         self.inner.prepare()
+    }
+    fn prepare_while(&self, current: &dyn Fn() -> bool) -> io::Result<()> {
+        self.policy.check()?;
+        self.inner.prepare_while(current)
     }
     fn native_lease(&self) -> io::Result<content::namespace::NativeLease> {
         self.policy.check()?;

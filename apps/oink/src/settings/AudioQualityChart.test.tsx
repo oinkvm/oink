@@ -12,7 +12,7 @@ it('renders per-source buffer lines and window statistics',async()=>{
  mocks.query.mockResolvedValue({revision:1,sampled_at_ms:60000,output:null,sources:[{device:'peer',name:'Source',samples:[{at_ms:59750,buffer_ms:5},{at_ms:60000,buffer_ms:7}],buffer_avg_ms:6,bitrate_kbps:320,interruptions:2,concealed_ms:60,late_packets:12,glitches:[]}]});
  const {container}=render(<AudioQualityChart span={60} active/>);
  await screen.findByRole('cell',{name:'Source'});
- expect(screen.getAllByRole('columnheader').map(x=>x.textContent)).toEqual(['Device','Buffer Avg','Average bitrate','Interruptions','Concealed audio','Late packets','Discontinuities']);
+ expect(screen.getAllByRole('columnheader').map(x=>x.textContent)).toEqual(['Device','Buffer Avg','Encoding bitrate','Interruptions','Concealed audio','Late packets','Discontinuities']);
  // Plain header, no explanation tooltip; the table scrolls with the project's scrollbar.
  expect(screen.getAllByRole('columnheader')[3].children).toHaveLength(0);
  expect(container.querySelector('.lat__table-scroll')?.classList.contains('ok-scroll')).toBe(true);

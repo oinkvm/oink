@@ -122,6 +122,13 @@ async fn local(
             removed += freed;
             usage.incomplete |= incomplete;
         }
+        #[cfg(target_os = "macos")]
+        {
+            let (size, freed, incomplete) = oink_clipboard::cache::clipboard_files_usage(&data, can_clear);
+            usage.categories.push(size);
+            removed += freed;
+            usage.incomplete |= incomplete;
+        }
         let _ = native;
         for kind in oink_clipboard::store::StoreKind::ALL {
             let (size, freed, incomplete) = oink_clipboard::store::usage(&data, kind, can_clear);
@@ -142,13 +149,16 @@ async fn local(
             usage.categories.push(fulfilled);
         }
         usage.incomplete |= incomplete;
-        // Native deliveries live exclusively in the content store. These
-        // categories have no independent storage producer in this build.
+        // Mac clipboard files have a direct cache above; the other categories
+        // still have no independent storage producer in this build.
         for category in [
             CacheCategory::ClipboardFiles,
             CacheCategory::DragFiles,
             CacheCategory::DeliveredFiles,
         ] {
+            if cfg!(target_os = "macos") && category == CacheCategory::ClipboardFiles {
+                continue;
+            }
             usage.categories.push(CacheSize {
                 category,
                 bytes: 0,

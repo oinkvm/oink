@@ -532,6 +532,7 @@ struct DataIvars {
     source: Arc<dyn Provider>,
     bindings: Vec<(String, RepresentationId)>,
     foreign: bool,
+    file_urls: Option<(NodeId, Arc<super::clipboard_files::FileUrls>)>,
 }
 define_class!(
     #[unsafe(super(NSObject))]
@@ -544,10 +545,39 @@ define_class!(
         fn provide(&self, _board: Option<&NSPasteboard>, item: &NSPasteboardItem, ty: &NSPasteboardType) {
             let callback = content::native_read::Callback::begin();
             let name = ty.to_string();
+            if name == "public.file-url"
+                && let Some((node, urls)) = &self.ivars().file_urls
+            {
+                let mut trace = crate::copy_diagnostics::Read::begin(
+                    self.ivars().source.inventory().id,
+                    crate::copy_diagnostics::Stage::NativeRead,
+                    RepresentationId(0),
+                    7,
+                    crate::copy_diagnostics::Channel::FileProvider,
+                );
+                match urls.read(*node) {
+                    Ok(url) if !callback.timed_out() => {
+                        if item.setString_forType(&NSString::from_str(&url), ty) {
+                            trace.success(url.len() as u64);
+                            callback.served();
+                        }
+                    }
+                    Err(error) => trace.failure(&error),
+                    _ => {}
+                }
+                return;
+            }
             // Several source representations can project to the same native
             // type. AppKit registers that type once, but every candidate retains
             // its own read/failure boundary in the original source order.
             for (_, id) in self.ivars().bindings.iter().filter(|(n, _)| *n == name) {
+                let mut trace = crate::copy_diagnostics::Read::begin(
+                    self.ivars().source.inventory().id,
+                    crate::copy_diagnostics::Stage::NativeRead,
+                    *id,
+                    crate::copy_diagnostics::format(standard(&name)),
+                    crate::copy_diagnostics::Channel::Native,
+                );
                 let mut decoded_link = false;
                 let result = (|| {
                     let mut reader = self.ivars().source.open(*id)?;
@@ -602,16 +632,19 @@ define_class!(
                 // A translator may tolerate a missing sibling format; expiry
                 // still fails this entire callback, never a partial paste.
                 if callback.timed_out() {
+                    trace.failure(&content::unavailable(Unavailable::NoProgress));
                     return;
                 }
                 match result {
                     Ok(bytes) => {
                         if item.setData_forType(&NSData::with_bytes(&bytes), ty) {
+                            trace.success(bytes.len() as u64);
                             callback.served();
                         }
                         return;
                     }
                     Err(error) => {
+                        trace.failure(&error);
                         // Fixed standard-format classes and numeric representation
                         // identity survive diagnostic redaction without logging an
                         // arbitrary private UTI or any clipboard bytes.
@@ -641,11 +674,17 @@ define_class!(
     }
 );
 impl DataProvider {
-    fn new(source: Arc<dyn Provider>, bindings: Vec<(String, RepresentationId)>, foreign: bool) -> Retained<Self> {
+    fn new(
+        source: Arc<dyn Provider>,
+        bindings: Vec<(String, RepresentationId)>,
+        foreign: bool,
+        file_urls: Option<(NodeId, Arc<super::clipboard_files::FileUrls>)>,
+    ) -> Retained<Self> {
         let this = Self::alloc().set_ivars(DataIvars {
             source,
             bindings,
             foreign,
+            file_urls,
         });
         // SAFETY: initialized NSObject subclass with valid Rust ivars.
         unsafe { msg_send![super(this), init] }
@@ -720,6 +759,13 @@ pub(super) fn promise_items(spec: &NativeSpec) -> Result<Vec<NativeItem>, Clipbo
     native_items(spec, None)
 }
 fn native_items(spec: &NativeSpec, urls: Option<&HashMap<NodeId, String>>) -> Result<Vec<NativeItem>, ClipboardError> {
+    native_items_lazy(spec, urls, None)
+}
+fn native_items_lazy(
+    spec: &NativeSpec,
+    urls: Option<&HashMap<NodeId, String>>,
+    lazy_urls: Option<&Arc<super::clipboard_files::FileUrls>>,
+) -> Result<Vec<NativeItem>, ClipboardError> {
     let inventory = &spec.inventory;
     let wanted: HashSet<_> = inventory.wanted(ClipPlatform::Mac).map(|r| r.id).collect();
     let foreign = inventory.platform != ClipPlatform::Mac;
@@ -735,13 +781,15 @@ fn native_items(spec: &NativeSpec, urls: Option<&HashMap<NodeId, String>>) -> Re
                 if foreign {
                     continue;
                 }
-                let url = match urls {
+                let url = match urls.filter(|_| lazy_urls.is_none()) {
                     Some(urls) => urls.get(&node).ok_or(ClipboardError::Unsupported)?.as_str(),
                     None => "",
                 };
                 if names.insert("public.file-url".to_string()) {
                     bindings.push(("public.file-url".into(), rep.id));
-                    file_values.push(url.to_owned());
+                    if lazy_urls.is_none() {
+                        file_values.push(url.to_owned());
+                    }
                 }
                 continue;
             }
@@ -795,7 +843,13 @@ fn native_items(spec: &NativeSpec, urls: Option<&HashMap<NodeId, String>>) -> Re
             if foreign {
                 bindings.sort_by_key(|(_, id)| content::find(inventory, *id).map_or(0, content::url::priority));
             }
-            let provider = DataProvider::new(spec.contents.clone(), bindings, foreign);
+            let node = original.file.or_else(|| {
+                original.representations.iter().find_map(|rep| match rep.data {
+                    RepresentationData::File(node) => Some(node),
+                    _ => None,
+                })
+            });
+            let provider = DataProvider::new(spec.contents.clone(), bindings, foreign, node.zip(lazy_urls.cloned()));
             // Replacing a registered file-url with setString moves that type
             // to the end on macOS. Register each slot once in source order,
             // setting the target URL immediately at its original position.
@@ -831,12 +885,27 @@ fn native_items(spec: &NativeSpec, urls: Option<&HashMap<NodeId, String>>) -> Re
             None
         };
         for root in &inventory.roots {
-            let url = match urls {
+            let url = match urls.filter(|_| lazy_urls.is_none()) {
                 Some(urls) => urls.get(&root.id).ok_or(ClipboardError::Unsupported)?.as_str(),
                 None => "",
             };
             let item = selection.take().unwrap_or_else(NSPasteboardItem::new);
-            if !item.setString_forType(&NSString::from_str(url), &NSString::from_str("public.file-url")) {
+            let ty = NSString::from_str("public.file-url");
+            let ok = if let Some(lazy) = lazy_urls {
+                let provider = DataProvider::new(
+                    spec.contents.clone(),
+                    Vec::new(),
+                    foreign,
+                    Some((root.id, lazy.clone())),
+                );
+                item.setDataProvider_forTypes(
+                    ProtocolObject::from_ref(&*provider),
+                    &NSArray::from_retained_slice(&[ty]),
+                )
+            } else {
+                item.setString_forType(&NSString::from_str(url), &ty)
+            };
+            if !ok {
                 return Err(ClipboardError::Unsupported);
             }
             out.push((Some(root.id), item));
@@ -847,16 +916,29 @@ fn native_items(spec: &NativeSpec, urls: Option<&HashMap<NodeId, String>>) -> Re
     }
     Ok(out)
 }
+#[cfg(all(test, debug_assertions))]
 pub(super) fn write(
     name: Option<&str>,
     spec: &NativeSpec,
     urls: &HashMap<NodeId, String>,
     guard: &dyn Fn() -> std::io::Result<()>,
 ) -> Result<u64, ClipboardError> {
+    write_lazy(name, spec, urls, None, guard)
+}
+pub(super) fn write_lazy(
+    name: Option<&str>,
+    spec: &NativeSpec,
+    urls: &HashMap<NodeId, String>,
+    lazy_urls: Option<Arc<super::clipboard_files::FileUrls>>,
+    guard: &dyn Fn() -> std::io::Result<()>,
+) -> Result<u64, ClipboardError> {
     autoreleasepool(|_| {
-        let items = writers(spec, urls)?;
+        let items: Vec<_> = native_items_lazy(spec, Some(urls), lazy_urls.as_ref())?
+            .into_iter()
+            .map(|(_, item)| ProtocolObject::from_retained(item))
+            .collect();
         let items = if super::dnd::proxy::needed(spec) {
-            super::dnd::proxy::wrap(spec, items)
+            super::dnd::proxy::wrap_with_urls(spec, items, lazy_urls.as_ref())
                 .map_err(|error| ClipboardError::ContentUnavailable(content::reason(&error)))?
                 .0
         } else {
@@ -868,7 +950,17 @@ pub(super) fn write(
         if !pb.writeObjects(&NSArray::from_retained_slice(&items)) {
             return Err(ClipboardError::Unsupported);
         }
-        Ok(pb.changeCount() as u64)
+        let count = pb.changeCount() as u64;
+        crate::copy_diagnostics::event(
+            Some(spec.inventory.id),
+            crate::copy_diagnostics::Stage::NativeDeclared,
+            crate::copy_diagnostics::Values {
+                count,
+                result: 1,
+                ..Default::default()
+            },
+        );
+        Ok(count)
     })
 }
 

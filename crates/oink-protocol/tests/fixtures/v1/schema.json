@@ -19,15 +19,14 @@
     "oink.input.gestures/1",
     "oink.input.contacts/1",
     "oink.input.trail/1",
-    "oink.input.application-focus/1",
     "oink.audio/1",
     "oink.audio.pcm/1",
+    "oink.audio.quality/1",
     "oink.audio.state/1",
     "oink.audio.microphone/1",
     "oink.audio.media-health/1",
     "oink.files.safe-symlinks/1",
     "oink.files.exec-bits/1",
-    "oink.aim/1",
     "oink.wallpaper/1",
     "oink.cache/1",
     "oink.diagnostics.collect/1",
@@ -51,6 +50,8 @@
     "oink.input.touchpad-options/1",
     "oink.input.scroll-pixels/1",
     "oink.pointer.move/1",
+    "oink.pointer.move-hidden/1",
+    "oink.focus.local-click/1",
     "oink.pointer.lock-escape/1",
     "oink.input.keymap-none/1",
     "oink.pointer.entry-protection/1",
@@ -93,163 +94,6 @@
     "source-routing/1"
   ],
   "enums": [
-    [
-      "ApplicationFocusActionKind",
-      [
-        [
-          0,
-          "Observe"
-        ],
-        [
-          1,
-          "Prepare"
-        ],
-        [
-          2,
-          "Commit"
-        ],
-        [
-          3,
-          "Applied"
-        ],
-        [
-          4,
-          "Snapshot"
-        ],
-        [
-          5,
-          "Retire"
-        ],
-        [
-          6,
-          "Sample"
-        ],
-        [
-          7,
-          "Cancel"
-        ]
-      ]
-    ],
-    [
-      "ApplicationForeground",
-      [
-        [
-          0,
-          "Hidden"
-        ],
-        [
-          1,
-          "Windowed"
-        ],
-        [
-          2,
-          "Fullscreen"
-        ],
-        [
-          3,
-          "OrdinaryUnknown"
-        ],
-        [
-          4,
-          "Unclassified"
-        ],
-        [
-          5,
-          "Unavailable"
-        ]
-      ]
-    ],
-    [
-      "ApplicationParkResult",
-      [
-        [
-          0,
-          "Confirmed"
-        ],
-        [
-          1,
-          "FullscreenExempt"
-        ],
-        [
-          2,
-          "UnknownExempt"
-        ],
-        [
-          3,
-          "Denied"
-        ],
-        [
-          4,
-          "Stale"
-        ],
-        [
-          5,
-          "Unavailable"
-        ]
-      ]
-    ],
-    [
-      "ApplicationFocusPhase",
-      [
-        [
-          0,
-          "Off"
-        ],
-        [
-          1,
-          "Preparing"
-        ],
-        [
-          2,
-          "Active"
-        ],
-        [
-          3,
-          "Suspended"
-        ]
-      ]
-    ],
-    [
-      "ApplicationFocusReason",
-      [
-        [
-          0,
-          "Disabled"
-        ],
-        [
-          1,
-          "Ready"
-        ],
-        [
-          2,
-          "NoPointer"
-        ],
-        [
-          3,
-          "PointerNotParticipating"
-        ],
-        [
-          4,
-          "AwaitingApplication"
-        ],
-        [
-          5,
-          "DesktopUnavailable"
-        ],
-        [
-          6,
-          "Drag"
-        ],
-        [
-          7,
-          "Game"
-        ],
-        [
-          8,
-          "CounterExhausted"
-        ]
-      ]
-    ],
     [
       "MouseButtonKind",
       [
@@ -2456,6 +2300,10 @@
         [
           25,
           "MicrophoneInput"
+        ],
+        [
+          29,
+          "AudioQuality"
         ]
       ]
     ],
@@ -2608,23 +2456,6 @@
         [
           1,
           "Ipv6"
-        ]
-      ]
-    ],
-    [
-      "AimPhase",
-      [
-        [
-          0,
-          "Countdown"
-        ],
-        [
-          1,
-          "Running"
-        ],
-        [
-          2,
-          "Finished"
         ]
       ]
     ],
@@ -3134,6 +2965,10 @@
         [
           47,
           "MouseKeysCompensation"
+        ],
+        [
+          48,
+          "KeyboardCapture"
         ]
       ]
     ],
@@ -4681,50 +4516,6 @@
     },
     {
       "capabilities": [
-        "oink.core/1"
-      ],
-      "id": 3,
-      "name": "StreamOpened",
-      "pause": "Allow",
-      "routes": [
-        {
-          "extra_capabilities": [],
-          "kind": 0,
-          "transport": "Reliable"
-        }
-      ],
-      "schema": {
-        "fields": [
-          {
-            "absence": "required",
-            "key": 1,
-            "name": "path_id",
-            "shape": "PathId"
-          },
-          {
-            "absence": "required",
-            "key": 2,
-            "name": "route_revision",
-            "shape": "u64"
-          },
-          {
-            "absence": "required",
-            "key": 3,
-            "name": "kind",
-            "shape": "u16"
-          },
-          {
-            "absence": "required",
-            "key": 4,
-            "name": "ordinal",
-            "shape": "u32"
-          }
-        ],
-        "name": "StreamOpened"
-      }
-    },
-    {
-      "capabilities": [
         "oink.input/1"
       ],
       "id": 256,
@@ -4911,32 +4702,6 @@
           }
         ],
         "name": "ControlFocusLock"
-      }
-    },
-    {
-      "capabilities": [
-        "oink.input/1"
-      ],
-      "id": 261,
-      "name": "ControlIdentifyScreens",
-      "pause": "Suspend",
-      "routes": [
-        {
-          "extra_capabilities": [],
-          "kind": 3,
-          "transport": "Reliable"
-        }
-      ],
-      "schema": {
-        "fields": [
-          {
-            "absence": "required",
-            "key": 1,
-            "name": "id",
-            "shape": "u64"
-          }
-        ],
-        "name": "ControlIdentifyScreens"
       }
     },
     {
@@ -5291,12 +5056,6 @@
             "key": 102,
             "name": "capture_time_us",
             "shape": "Option<u32>"
-          },
-          {
-            "absence": "optional",
-            "key": 103,
-            "name": "application_route",
-            "shape": "Option<ApplicationKeyRoute>"
           }
         ],
         "name": "InputKey"
@@ -5471,18 +5230,6 @@
             "key": 102,
             "name": "capture_time_us",
             "shape": "Option<u32>"
-          },
-          {
-            "absence": "optional",
-            "key": 103,
-            "name": "application_route",
-            "shape": "Option<ApplicationKeyRoute>"
-          },
-          {
-            "absence": "optional",
-            "key": 104,
-            "name": "application_keys",
-            "shape": "Option<List<ApplicationHeldKey,256>>"
           }
         ],
         "name": "InputHeldSync"
@@ -5533,12 +5280,6 @@
             "key": 102,
             "name": "capture_time_us",
             "shape": "Option<u32>"
-          },
-          {
-            "absence": "optional",
-            "key": 103,
-            "name": "application_route",
-            "shape": "Option<ApplicationKeyRoute>"
           }
         ],
         "name": "InputKeyRepeat"
@@ -7539,6 +7280,12 @@
             "key": 4,
             "name": "exit_claim",
             "shape": "ExitClaimStamp"
+          },
+          {
+            "absence": "optional",
+            "key": 5,
+            "name": "preferred_descriptor",
+            "shape": "Option<AudioDescriptor>"
           }
         ],
         "name": "SourceRouteOffer"
@@ -7851,222 +7598,6 @@
     },
     {
       "capabilities": [
-        "oink.aim/1"
-      ],
-      "id": 1792,
-      "name": "AimOpen",
-      "pause": "Allow",
-      "routes": [
-        {
-          "extra_capabilities": [],
-          "kind": 7,
-          "transport": "Reliable"
-        }
-      ],
-      "schema": {
-        "fields": [
-          {
-            "absence": "required",
-            "key": 1,
-            "name": "event",
-            "shape": "GameEvent"
-          }
-        ],
-        "name": "AimOpen"
-      }
-    },
-    {
-      "capabilities": [
-        "oink.aim/1"
-      ],
-      "id": 1793,
-      "name": "AimJoined",
-      "pause": "Allow",
-      "routes": [
-        {
-          "extra_capabilities": [],
-          "kind": 7,
-          "transport": "Reliable"
-        }
-      ],
-      "schema": {
-        "fields": [
-          {
-            "absence": "required",
-            "key": 1,
-            "name": "event",
-            "shape": "GameEvent"
-          }
-        ],
-        "name": "AimJoined"
-      }
-    },
-    {
-      "capabilities": [
-        "oink.aim/1"
-      ],
-      "id": 1794,
-      "name": "AimDeclined",
-      "pause": "Allow",
-      "routes": [
-        {
-          "extra_capabilities": [],
-          "kind": 7,
-          "transport": "Reliable"
-        }
-      ],
-      "schema": {
-        "fields": [
-          {
-            "absence": "required",
-            "key": 1,
-            "name": "event",
-            "shape": "GameEvent"
-          }
-        ],
-        "name": "AimDeclined"
-      }
-    },
-    {
-      "capabilities": [
-        "oink.aim/1"
-      ],
-      "id": 1795,
-      "name": "AimState",
-      "pause": "Allow",
-      "routes": [
-        {
-          "extra_capabilities": [],
-          "kind": 7,
-          "transport": "Reliable"
-        }
-      ],
-      "schema": {
-        "fields": [
-          {
-            "absence": "required",
-            "key": 1,
-            "name": "game",
-            "shape": "GameInstance"
-          },
-          {
-            "absence": "required",
-            "key": 2,
-            "name": "seq",
-            "shape": "u64"
-          },
-          {
-            "absence": "required",
-            "key": 3,
-            "name": "phase",
-            "shape": "AimPhase"
-          },
-          {
-            "absence": "required",
-            "key": 4,
-            "name": "remaining_ms",
-            "shape": "u32"
-          },
-          {
-            "absence": "required",
-            "key": 5,
-            "name": "score",
-            "shape": "u32"
-          },
-          {
-            "absence": "required",
-            "key": 6,
-            "name": "clicks",
-            "shape": "u32"
-          },
-          {
-            "absence": "required",
-            "key": 7,
-            "name": "radius",
-            "shape": "f32"
-          },
-          {
-            "absence": "required",
-            "key": 8,
-            "name": "native_input",
-            "shape": "bool"
-          },
-          {
-            "absence": "required",
-            "key": 9,
-            "name": "targets",
-            "shape": "List<AimTarget,8>"
-          }
-        ],
-        "name": "AimState"
-      }
-    },
-    {
-      "capabilities": [
-        "oink.aim/1"
-      ],
-      "id": 1796,
-      "name": "AimClick",
-      "pause": "Allow",
-      "routes": [
-        {
-          "extra_capabilities": [],
-          "kind": 7,
-          "transport": "Reliable"
-        }
-      ],
-      "schema": {
-        "fields": [
-          {
-            "absence": "required",
-            "key": 1,
-            "name": "event",
-            "shape": "GameEvent"
-          },
-          {
-            "absence": "required",
-            "key": 2,
-            "name": "display",
-            "shape": "Text<512>"
-          },
-          {
-            "absence": "required",
-            "key": 3,
-            "name": "pos",
-            "shape": "Point"
-          }
-        ],
-        "name": "AimClick"
-      }
-    },
-    {
-      "capabilities": [
-        "oink.aim/1"
-      ],
-      "id": 1797,
-      "name": "AimClose",
-      "pause": "Allow",
-      "routes": [
-        {
-          "extra_capabilities": [],
-          "kind": 7,
-          "transport": "Reliable"
-        }
-      ],
-      "schema": {
-        "fields": [
-          {
-            "absence": "required",
-            "key": 1,
-            "name": "event",
-            "shape": "GameEvent"
-          }
-        ],
-        "name": "AimClose"
-      }
-    },
-    {
-      "capabilities": [
         "oink.wallpaper/1",
         "oink.low/1"
       ],
@@ -8266,32 +7797,6 @@
           }
         ],
         "name": "DiagnosticsHello"
-      }
-    },
-    {
-      "capabilities": [
-        "oink.diagnostics.collect/1"
-      ],
-      "id": 2561,
-      "name": "DiagnosticsGoodbye",
-      "pause": "Allow",
-      "routes": [
-        {
-          "extra_capabilities": [],
-          "kind": 8,
-          "transport": "Reliable"
-        }
-      ],
-      "schema": {
-        "fields": [
-          {
-            "absence": "required",
-            "key": 1,
-            "name": "instance",
-            "shape": "Text<128>"
-          }
-        ],
-        "name": "DiagnosticsGoodbye"
       }
     },
     {
@@ -11443,70 +10948,6 @@
     },
     {
       "capabilities": [
-        "oink.layout.projection/1"
-      ],
-      "id": 4353,
-      "name": "ProjectionMode",
-      "pause": "Allow",
-      "routes": [
-        {
-          "extra_capabilities": [],
-          "kind": 12,
-          "transport": "Reliable"
-        }
-      ],
-      "schema": {
-        "fields": [
-          {
-            "absence": "required",
-            "key": 1,
-            "name": "id",
-            "shape": "ModeId"
-          },
-          {
-            "absence": "required",
-            "key": 2,
-            "name": "enabled",
-            "shape": "bool"
-          }
-        ],
-        "name": "ProjectionMode"
-      }
-    },
-    {
-      "capabilities": [
-        "oink.layout.projection/1"
-      ],
-      "id": 4354,
-      "name": "ProjectionGesture",
-      "pause": "Allow",
-      "routes": [
-        {
-          "extra_capabilities": [],
-          "kind": 12,
-          "transport": "Reliable"
-        }
-      ],
-      "schema": {
-        "fields": [
-          {
-            "absence": "required",
-            "key": 1,
-            "name": "id",
-            "shape": "ModeId"
-          },
-          {
-            "absence": "required",
-            "key": 2,
-            "name": "active",
-            "shape": "bool"
-          }
-        ],
-        "name": "ProjectionGesture"
-      }
-    },
-    {
-      "capabilities": [
         "oink.group/1",
         "oink.device-options/1"
       ],
@@ -12566,39 +12007,6 @@
     {
       "capabilities": [
         "oink.input/1",
-        "oink.input.application-focus/1"
-      ],
-      "id": 269,
-      "name": "ApplicationFocus",
-      "pause": "Suspend",
-      "routes": [
-        {
-          "extra_capabilities": [],
-          "kind": 3,
-          "transport": "Reliable"
-        }
-      ],
-      "schema": {
-        "fields": [
-          {
-            "absence": "required",
-            "key": 1,
-            "name": "claim",
-            "shape": "ApplicationFocusClaim"
-          },
-          {
-            "absence": "required",
-            "key": 2,
-            "name": "action",
-            "shape": "ApplicationFocusAction"
-          }
-        ],
-        "name": "ApplicationFocusRecord"
-      }
-    },
-    {
-      "capabilities": [
-        "oink.input/1",
         "oink.pointer.move/1"
       ],
       "id": 4864,
@@ -13135,47 +12543,156 @@
         ],
         "name": "ControlLockRemoteWindows"
       }
+    },
+    {
+      "capabilities": [
+        "oink.input/1",
+        "oink.pointer.move-hidden/1"
+      ],
+      "id": 4865,
+      "name": "ControlMovePointerEnter",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 3,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "epoch",
+            "shape": "u64"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "display",
+            "shape": "Text<512>"
+          },
+          {
+            "absence": "required",
+            "key": 3,
+            "name": "pos",
+            "shape": "Point"
+          },
+          {
+            "absence": "required",
+            "key": 4,
+            "name": "scope",
+            "shape": "FocusScope"
+          },
+          {
+            "absence": "optional",
+            "key": 5,
+            "name": "pointer_source",
+            "shape": "Option<DeviceId>"
+          }
+        ],
+        "name": "ControlFocusEnter"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.audio/1",
+        "oink.audio.quality/1"
+      ],
+      "id": 1563,
+      "name": "AudioQualitySourceOffer",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 5,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "source",
+            "shape": "Boot"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "source_route_generation",
+            "shape": "u64"
+          },
+          {
+            "absence": "required",
+            "key": 3,
+            "name": "receiver",
+            "shape": "Boot"
+          },
+          {
+            "absence": "required",
+            "key": 4,
+            "name": "exit_claim",
+            "shape": "ExitClaimStamp"
+          },
+          {
+            "absence": "optional",
+            "key": 5,
+            "name": "preferred_descriptor",
+            "shape": "Option<AudioDescriptor>"
+          }
+        ],
+        "name": "SourceRouteOffer"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.input/1",
+        "oink.focus.local-click/1"
+      ],
+      "id": 4866,
+      "name": "ControlLocalClick",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 3,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "epoch",
+            "shape": "u64"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "holder",
+            "shape": "DeviceId"
+          },
+          {
+            "absence": "required",
+            "key": 3,
+            "name": "scope",
+            "shape": "FocusScope"
+          },
+          {
+            "absence": "required",
+            "key": 4,
+            "name": "phase",
+            "shape": "u8"
+          }
+        ],
+        "name": "ControlLocalClick"
+      }
     }
   ],
   "open_enums": [
-    [
-      "ApplicationFocusAction",
-      "ApplicationFocusActionKind",
-      [
-        [
-          0,
-          "ApplicationFocusObservation"
-        ],
-        [
-          1,
-          "ApplicationFocusPrepare"
-        ],
-        [
-          2,
-          "ApplicationFocusSnapshot"
-        ],
-        [
-          3,
-          "ApplicationFocusApplied"
-        ],
-        [
-          4,
-          "ApplicationFocusSnapshot"
-        ],
-        [
-          5,
-          "ApplicationFocusRetire"
-        ],
-        [
-          6,
-          null
-        ],
-        [
-          7,
-          "ApplicationFocusPrepare"
-        ]
-      ]
-    ],
     [
       "MouseButton",
       "MouseButtonKind",
@@ -13659,18 +13176,74 @@
       "LayoutValue"
     ],
     [
-      8,
-      "ApplicationFocusSettings"
-    ],
-    [
       4865,
       "PointerShortcutSlots"
     ]
   ],
   "reserved_capabilities": [
-    "oink.calibration/1"
+    "oink.calibration/1",
+    "oink.aim/1",
+    "oink.input.application-focus/1"
   ],
   "reserved_enum_values": [
+    [
+      "ApplicationFocusActionKind",
+      [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    ],
+    [
+      "ApplicationForeground",
+      [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ]
+    ],
+    [
+      "ApplicationParkResult",
+      [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ]
+    ],
+    [
+      "ApplicationFocusPhase",
+      [
+        0,
+        1,
+        2,
+        3
+      ]
+    ],
+    [
+      "ApplicationFocusReason",
+      [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ]
+    ],
     [
       "SizeSource",
       [
@@ -13722,6 +13295,124 @@
     ]
   ],
   "reserved_fields": [
+    [
+      "ApplicationFocusRecord",
+      [
+        1,
+        2
+      ]
+    ],
+    [
+      "ApplicationFocusClaim",
+      [
+        1,
+        2,
+        3
+      ]
+    ],
+    [
+      "ApplicationFocusObservation",
+      [
+        1,
+        2,
+        3,
+        4,
+        5
+      ]
+    ],
+    [
+      "ApplicationFocusPrepare",
+      [
+        1,
+        2,
+        3,
+        4,
+        5
+      ]
+    ],
+    [
+      "ApplicationFocusApplied",
+      [
+        1,
+        2
+      ]
+    ],
+    [
+      "ApplicationFocusSnapshot",
+      [
+        1,
+        2,
+        3,
+        4,
+        5
+      ]
+    ],
+    [
+      "ApplicationFocusRetire",
+      [
+        1,
+        2
+      ]
+    ],
+    [
+      "ApplicationKeyRoute",
+      [
+        1,
+        2,
+        3,
+        4,
+        5
+      ]
+    ],
+    [
+      "ApplicationFocusSettings",
+      [
+        1
+      ]
+    ],
+    [
+      "DiagApplicationFocus",
+      [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ]
+    ],
+    [
+      "ApplicationHeldKey",
+      [
+        1,
+        2
+      ]
+    ],
+    [
+      "InputKey",
+      [
+        103
+      ]
+    ],
+    [
+      "InputKeyRepeat",
+      [
+        103
+      ]
+    ],
+    [
+      "InputHeldSync",
+      [
+        103,
+        104
+      ]
+    ],
+    [
+      "Snapshot",
+      [
+        17
+      ]
+    ],
     [
       "ProtocolError",
       [
@@ -13922,6 +13613,54 @@
   ],
   "reserved_messages": [
     [
+      269,
+      "ApplicationFocus: 已退役，不得复用"
+    ],
+    [
+      1792,
+      "AimOpen: 已退役，不得复用"
+    ],
+    [
+      1793,
+      "AimJoined: 已退役，不得复用"
+    ],
+    [
+      1794,
+      "AimDeclined: 已退役，不得复用"
+    ],
+    [
+      1795,
+      "AimState: 已退役，不得复用"
+    ],
+    [
+      1796,
+      "AimClick: 已退役，不得复用"
+    ],
+    [
+      1797,
+      "AimClose: 已退役，不得复用"
+    ],
+    [
+      4353,
+      "ProjectionMode: 已退役，不得复用"
+    ],
+    [
+      4354,
+      "ProjectionGesture: 已退役，不得复用"
+    ],
+    [
+      261,
+      "ControlIdentifyScreens: 已退役，不得复用"
+    ],
+    [
+      3,
+      "StreamOpened: 已退役，不得复用"
+    ],
+    [
+      2561,
+      "DiagnosticsGoodbye: 已退役，不得复用"
+    ],
+    [
       1024,
       "CalibShowPattern"
     ],
@@ -13944,12 +13683,17 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "reserved_streams": [
     [
       6,
       "K0"
+    ],
+    [
+      7,
+      "A0: 已退役，不得复用"
     ]
   ],
   "revision": "2026-10-15-ui-freeze",
@@ -14265,214 +14009,29 @@
         {
           "absence": "required",
           "key": 1,
-          "name": "claim",
-          "shape": "ApplicationFocusClaim"
-        },
-        {
-          "absence": "required",
-          "key": 2,
-          "name": "action",
-          "shape": "ApplicationFocusAction"
-        }
-      ],
-      "name": "ApplicationFocusRecord"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
           "name": "epoch",
           "shape": "u64"
         },
         {
           "absence": "required",
           "key": 2,
-          "name": "pointer",
-          "shape": "Boot"
+          "name": "holder",
+          "shape": "DeviceId"
         },
         {
           "absence": "required",
           "key": 3,
           "name": "scope",
           "shape": "FocusScope"
-        }
-      ],
-      "name": "ApplicationFocusClaim"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "generation",
-          "shape": "u64"
-        },
-        {
-          "absence": "required",
-          "key": 2,
-          "name": "sequence",
-          "shape": "u64"
-        },
-        {
-          "absence": "required",
-          "key": 3,
-          "name": "foreground",
-          "shape": "ApplicationForeground"
         },
         {
           "absence": "required",
           "key": 4,
-          "name": "hidden_lost",
-          "shape": "bool"
-        },
-        {
-          "absence": "optional",
-          "key": 5,
-          "name": "park_operation",
-          "shape": "Option<u64>"
-        }
-      ],
-      "name": "ApplicationFocusObservation"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "revision",
-          "shape": "u64"
-        },
-        {
-          "absence": "required",
-          "key": 2,
-          "name": "operation",
-          "shape": "u64"
-        },
-        {
-          "absence": "required",
-          "key": 3,
-          "name": "target",
-          "shape": "Boot"
-        },
-        {
-          "absence": "required",
-          "key": 4,
-          "name": "generation",
-          "shape": "u64"
-        },
-        {
-          "absence": "required",
-          "key": 5,
-          "name": "sequence",
-          "shape": "u64"
-        }
-      ],
-      "name": "ApplicationFocusPrepare"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "request",
-          "shape": "ApplicationFocusPrepare"
-        },
-        {
-          "absence": "required",
-          "key": 2,
-          "name": "result",
-          "shape": "ApplicationParkResult"
-        }
-      ],
-      "name": "ApplicationFocusApplied"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "revision",
-          "shape": "u64"
-        },
-        {
-          "absence": "optional",
-          "key": 2,
-          "name": "keyboard",
-          "shape": "Option<Boot>"
-        },
-        {
-          "absence": "required",
-          "key": 3,
           "name": "phase",
-          "shape": "ApplicationFocusPhase"
-        },
-        {
-          "absence": "required",
-          "key": 4,
-          "name": "reason",
-          "shape": "ApplicationFocusReason"
-        },
-        {
-          "absence": "required",
-          "key": 5,
-          "name": "participants",
-          "shape": "List<Boot,16>"
+          "shape": "u8"
         }
       ],
-      "name": "ApplicationFocusSnapshot"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "revision",
-          "shape": "u64"
-        },
-        {
-          "absence": "required",
-          "key": 2,
-          "name": "destination",
-          "shape": "Boot"
-        }
-      ],
-      "name": "ApplicationFocusRetire"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "epoch",
-          "shape": "u64"
-        },
-        {
-          "absence": "required",
-          "key": 2,
-          "name": "pointer",
-          "shape": "Boot"
-        },
-        {
-          "absence": "required",
-          "key": 3,
-          "name": "revision",
-          "shape": "u64"
-        },
-        {
-          "absence": "required",
-          "key": 4,
-          "name": "destination",
-          "shape": "Boot"
-        },
-        {
-          "absence": "required",
-          "key": 5,
-          "name": "press_id",
-          "shape": "u64"
-        }
-      ],
-      "name": "ApplicationKeyRoute"
+      "name": "ControlLocalClick"
     },
     {
       "fields": [
@@ -18884,75 +18443,6 @@
         {
           "absence": "required",
           "key": 1,
-          "name": "authority_boot",
-          "shape": "Boot"
-        },
-        {
-          "absence": "required",
-          "key": 2,
-          "name": "game_counter",
-          "shape": "u64"
-        }
-      ],
-      "name": "GameInstance"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "game_instance",
-          "shape": "GameInstance"
-        },
-        {
-          "absence": "required",
-          "key": 2,
-          "name": "sender_boot",
-          "shape": "Boot"
-        },
-        {
-          "absence": "required",
-          "key": 3,
-          "name": "event_seq",
-          "shape": "u64"
-        }
-      ],
-      "name": "GameEvent"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "id",
-          "shape": "u32"
-        },
-        {
-          "absence": "required",
-          "key": 2,
-          "name": "device",
-          "shape": "DeviceId"
-        },
-        {
-          "absence": "required",
-          "key": 3,
-          "name": "display",
-          "shape": "Text<512>"
-        },
-        {
-          "absence": "required",
-          "key": 4,
-          "name": "pos",
-          "shape": "Point"
-        }
-      ],
-      "name": "AimTarget"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
           "name": "display",
           "shape": "Text<512>"
         },
@@ -20172,6 +19662,12 @@
           "key": 4,
           "name": "exit_claim",
           "shape": "ExitClaimStamp"
+        },
+        {
+          "absence": "optional",
+          "key": 5,
+          "name": "preferred_descriptor",
+          "shape": "Option<AudioDescriptor>"
         }
       ],
       "name": "SourceRouteOffer"
@@ -20854,132 +20350,6 @@
         }
       ],
       "name": "Advert"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "event",
-          "shape": "GameEvent"
-        },
-        {
-          "absence": "required",
-          "key": 2,
-          "name": "display",
-          "shape": "Text<512>"
-        },
-        {
-          "absence": "required",
-          "key": 3,
-          "name": "pos",
-          "shape": "Point"
-        }
-      ],
-      "name": "AimClick"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "event",
-          "shape": "GameEvent"
-        }
-      ],
-      "name": "AimClose"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "event",
-          "shape": "GameEvent"
-        }
-      ],
-      "name": "AimDeclined"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "event",
-          "shape": "GameEvent"
-        }
-      ],
-      "name": "AimJoined"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "event",
-          "shape": "GameEvent"
-        }
-      ],
-      "name": "AimOpen"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "game",
-          "shape": "GameInstance"
-        },
-        {
-          "absence": "required",
-          "key": 2,
-          "name": "seq",
-          "shape": "u64"
-        },
-        {
-          "absence": "required",
-          "key": 3,
-          "name": "phase",
-          "shape": "AimPhase"
-        },
-        {
-          "absence": "required",
-          "key": 4,
-          "name": "remaining_ms",
-          "shape": "u32"
-        },
-        {
-          "absence": "required",
-          "key": 5,
-          "name": "score",
-          "shape": "u32"
-        },
-        {
-          "absence": "required",
-          "key": 6,
-          "name": "clicks",
-          "shape": "u32"
-        },
-        {
-          "absence": "required",
-          "key": 7,
-          "name": "radius",
-          "shape": "f32"
-        },
-        {
-          "absence": "required",
-          "key": 8,
-          "name": "native_input",
-          "shape": "bool"
-        },
-        {
-          "absence": "required",
-          "key": 9,
-          "name": "targets",
-          "shape": "List<AimTarget,8>"
-        }
-      ],
-      "name": "AimState"
     },
     {
       "fields": [
@@ -22947,17 +22317,6 @@
         {
           "absence": "required",
           "key": 1,
-          "name": "id",
-          "shape": "u64"
-        }
-      ],
-      "name": "ControlIdentifyScreens"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
           "name": "epoch",
           "shape": "u64"
         },
@@ -23643,17 +23002,6 @@
         }
       ],
       "name": "DiagnosticsEnvironment"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "instance",
-          "shape": "Text<128>"
-        }
-      ],
-      "name": "DiagnosticsGoodbye"
     },
     {
       "fields": [
@@ -24372,58 +23720,6 @@
     {
       "fields": [
         {
-          "absence": "false",
-          "key": 1,
-          "name": "enabled",
-          "shape": "bool"
-        }
-      ],
-      "name": "ApplicationFocusSettings"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "pointer",
-          "shape": "Text<128>"
-        },
-        {
-          "absence": "optional",
-          "key": 2,
-          "name": "keyboard",
-          "shape": "Option<Text<128>>"
-        },
-        {
-          "absence": "required",
-          "key": 3,
-          "name": "epoch",
-          "shape": "u64"
-        },
-        {
-          "absence": "required",
-          "key": 4,
-          "name": "revision",
-          "shape": "u64"
-        },
-        {
-          "absence": "required",
-          "key": 5,
-          "name": "phase",
-          "shape": "ApplicationFocusPhase"
-        },
-        {
-          "absence": "required",
-          "key": 6,
-          "name": "reason",
-          "shape": "ApplicationFocusReason"
-        }
-      ],
-      "name": "DiagApplicationFocus"
-    },
-    {
-      "fields": [
-        {
           "absence": "required",
           "key": 1,
           "name": "group",
@@ -24643,38 +23939,9 @@
           "key": 102,
           "name": "capture_time_us",
           "shape": "Option<u32>"
-        },
-        {
-          "absence": "optional",
-          "key": 103,
-          "name": "application_route",
-          "shape": "Option<ApplicationKeyRoute>"
-        },
-        {
-          "absence": "optional",
-          "key": 104,
-          "name": "application_keys",
-          "shape": "Option<List<ApplicationHeldKey,256>>"
         }
       ],
       "name": "InputHeldSync"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "code",
-          "shape": "u32"
-        },
-        {
-          "absence": "required",
-          "key": 2,
-          "name": "press_id",
-          "shape": "u64"
-        }
-      ],
-      "name": "ApplicationHeldKey"
     },
     {
       "fields": [
@@ -24713,12 +23980,6 @@
           "key": 102,
           "name": "capture_time_us",
           "shape": "Option<u32>"
-        },
-        {
-          "absence": "optional",
-          "key": 103,
-          "name": "application_route",
-          "shape": "Option<ApplicationKeyRoute>"
         }
       ],
       "name": "InputKey"
@@ -24754,12 +24015,6 @@
           "key": 102,
           "name": "capture_time_us",
           "shape": "Option<u32>"
-        },
-        {
-          "absence": "optional",
-          "key": 103,
-          "name": "application_route",
-          "shape": "Option<ApplicationKeyRoute>"
         }
       ],
       "name": "InputKeyRepeat"
@@ -26491,29 +25746,6 @@
         {
           "absence": "required",
           "key": 1,
-          "name": "owner",
-          "shape": "DeviceId"
-        },
-        {
-          "absence": "required",
-          "key": 2,
-          "name": "serial",
-          "shape": "u64"
-        },
-        {
-          "absence": "required",
-          "key": 3,
-          "name": "boot_nonce",
-          "shape": "Id16"
-        }
-      ],
-      "name": "ModeId"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
           "name": "name",
           "shape": "Text<256>"
         },
@@ -27303,40 +26535,6 @@
         }
       ],
       "name": "Point"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "id",
-          "shape": "ModeId"
-        },
-        {
-          "absence": "required",
-          "key": 2,
-          "name": "active",
-          "shape": "bool"
-        }
-      ],
-      "name": "ProjectionGesture"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "id",
-          "shape": "ModeId"
-        },
-        {
-          "absence": "required",
-          "key": 2,
-          "name": "enabled",
-          "shape": "bool"
-        }
-      ],
-      "name": "ProjectionMode"
     },
     {
       "fields": [
@@ -28136,12 +27334,6 @@
           "key": 16,
           "name": "layout",
           "shape": "Option<CompleteLayout>"
-        },
-        {
-          "absence": "optional",
-          "key": 17,
-          "name": "application_focus",
-          "shape": "Option<DiagApplicationFocus>"
         }
       ],
       "name": "Snapshot"
@@ -28204,35 +27396,6 @@
         }
       ],
       "name": "SpeakerObservation"
-    },
-    {
-      "fields": [
-        {
-          "absence": "required",
-          "key": 1,
-          "name": "path_id",
-          "shape": "PathId"
-        },
-        {
-          "absence": "required",
-          "key": 2,
-          "name": "route_revision",
-          "shape": "u64"
-        },
-        {
-          "absence": "required",
-          "key": 3,
-          "name": "kind",
-          "shape": "u16"
-        },
-        {
-          "absence": "required",
-          "key": 4,
-          "name": "ordinal",
-          "shape": "u32"
-        }
-      ],
-      "name": "StreamOpened"
     },
     {
       "fields": [
@@ -28396,17 +27559,6 @@
     },
     {
       "capabilities": [
-        "oink.aim/1"
-      ],
-      "datagram": false,
-      "kind": 7,
-      "low": false,
-      "name": "A0",
-      "priority": 1,
-      "reliable": true
-    },
-    {
-      "capabilities": [
         "oink.diagnostics.collect/1"
       ],
       "datagram": false,
@@ -28498,6 +27650,18 @@
     }
   ],
   "tombstones": [
+    269,
+    1792,
+    1793,
+    1794,
+    1795,
+    1796,
+    1797,
+    3,
+    261,
+    2561,
+    4353,
+    4354,
     3337,
     3338,
     3339,
@@ -28563,10 +27727,6 @@
     ],
     [
       "Crossing.gap_distance;Crossing.remaining_reference_motion;DiagSegmentKind.Portal.3",
-      "reference ratio"
-    ],
-    [
-      "AimState.radius;AimState.targets;AimClick.pos",
       "reference ratio"
     ]
   ]

@@ -42,32 +42,7 @@ export function toggleShare(d: Device, kind: ShareKind): Device | null {
 export function faultReason(d: Device, kind: ShareKind): string {
     return d.faults?.[kind as keyof NonNullable<Device['faults']>] ?? tr('状态未知');
 }
-export const hasThirdState = (kind: ShareKind) => kind === 'keyboard' || kind === 'speaker';
 const leaveExit = (d: Device): Device => ({ ...d, speaker: { ...d.speaker, mode: 'unused' } });
-export function toggleThird(devices: Device[], id: string, kind: ShareKind): Device[] | null {
-    const d = devices.find((x) => x.id === id);
-    if (!d || !hasThirdState(kind))
-        return null;
-    if (kind === 'keyboard') {
-        const v = d.keyboard;
-        if (v === 'fault' || v === 'unknown')
-            return null;
-        const next: Device = v === 'disabled'
-            ? { ...d, keyboard: 'shared' }
-            : { ...d, keyboard: 'disabled' };
-        return devices.map((x) => (x.id === id ? next : x));
-    }
-    const mode = d.speaker.mode;
-    if (mode === 'fault')
-        return null;
-    if (mode === 'exit')
-        return devices.map((x) => (x.id === id ? leaveExit(x) : x));
-    return devices.map((x) => {
-        if (x.id === id)
-            return { ...x, speaker: { ...x.speaker, mode: 'exit', volume: x.speaker.volume } };
-        return x.speaker.mode === 'exit' ? leaveExit(x) : x;
-    });
-}
 export type ShareValue = 'local' | 'shared' | 'disabled' | 'locked' | 'unused' | 'forwarding' | 'exit';
 export const screenValue = (d: Device): 'locked' | ScreenState => (d.cursor === 'locked' ? 'locked' : d.screen);
 export const gameActive = (d: Device) => d.gameActive === true;

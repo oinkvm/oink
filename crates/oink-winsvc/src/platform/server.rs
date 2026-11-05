@@ -1,9 +1,6 @@
 use super::*;
 use crate::wire::{Command, ErrorStage, FRAME_SIZE, REPLY_SIZE, Reply, Request};
-use std::{
-    collections::BTreeMap,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, time::Instant};
 use windows_sys::Win32::{
     Storage::FileSystem::*,
     System::{Pipes::*, RemoteDesktop::*, StationsAndDesktops::*},
@@ -203,6 +200,9 @@ fn send(cmd: Command) -> io::Result<()> {
 }
 
 impl Injector {
+    fn needs_maintenance(&self) -> bool {
+        !self.held.is_empty() || self.pending.values().any(|held| !held.is_empty())
+    }
     fn release(&mut self) -> io::Result<()> {
         let mut result = Ok(());
         self.held.retain(|_, cmd| match send(*cmd) {
@@ -400,11 +400,9 @@ pub(super) fn run(parent_pid: u32, route: Option<crate::prelogin_route::Source>)
     let stop_name = wide(&format!(r"Global\Oink.Input.Stop.{id}"));
     // SAFETY: existing broker-owned SYSTEM-only event; ACL/identity unchanged.
     let stop = Handle::new(unsafe { OpenEventW(SYNCHRONIZE, 0, stop_name.as_ptr()) })?;
-    // SAFETY: owned maintenance timer. Arrival and worker replies wake independently.
+    // SAFETY: initially unarmed private lease timer. The service alone owns
+    // session retirement and signals stop before replacing this helper.
     let timer = Handle::new(unsafe { CreateWaitableTimerW(ptr::null(), 0, ptr::null()) })?;
-    let due = -1_000_000i64;
-    // SAFETY: timer lives through all waits, unchanged 100-ms lease/session check.
-    check(unsafe { SetWaitableTimer(timer.0, &due, 100, None, ptr::null(), 0) })?;
     'serve: loop {
         let mut connecting = pipe_io::Operation::new(&pipe)?;
         if connecting.connect().is_err() {
@@ -415,20 +413,12 @@ pub(super) fn run(parent_pid: u32, route: Option<crate::prelogin_route::Source>)
             }
             continue;
         }
-        loop {
-            let handles = [connecting.event(), stop.0, parent.0, timer.0];
-            // SAFETY: all handles remain owned/live through wait.
-            match unsafe { WaitForMultipleObjects(4, handles.as_ptr(), 0, INFINITE) } {
-                WAIT_OBJECT_0 => break,
-                n if n == WAIT_OBJECT_0 + 1 || n == WAIT_OBJECT_0 + 2 => break 'serve,
-                n if n == WAIT_OBJECT_0 + 3 => {
-                    // SAFETY: read-only active console session query.
-                    if !current() {
-                        break 'serve;
-                    }
-                }
-                _ => return Err(io::Error::last_os_error()),
-            }
+        let handles = [connecting.event(), stop.0, parent.0];
+        // SAFETY: all handles remain owned/live through wait.
+        match unsafe { WaitForMultipleObjects(3, handles.as_ptr(), 0, INFINITE) } {
+            WAIT_OBJECT_0 => {}
+            n if n == WAIT_OBJECT_0 + 1 || n == WAIT_OBJECT_0 + 2 => break 'serve,
+            _ => return Err(io::Error::last_os_error()),
         }
         connecting.cancel();
         drop(connecting);
@@ -447,6 +437,7 @@ pub(super) fn run(parent_pid: u32, route: Option<crate::prelogin_route::Source>)
                 None => security::peer(pipe, id, false),
             },
             current,
+            Instant::now,
         )?;
         workers.disconnect();
         // SAFETY: connection operations have cancelled/drained before disconnect.
@@ -471,6 +462,44 @@ pub(super) fn run(parent_pid: u32, route: Option<crate::prelogin_route::Source>)
     }
     Ok(())
 }
+/// Own the connection's one-shot timer through every early return/error.
+struct LeaseTimer<'a> {
+    timer: &'a Handle,
+    lease: crate::lease::Lease,
+}
+impl<'a> LeaseTimer<'a> {
+    fn new(timer: &'a Handle, now: Instant) -> io::Result<Self> {
+        let mut alarm = Self {
+            timer,
+            lease: Default::default(),
+        };
+        alarm.lease.connect(now);
+        alarm.arm(now)?;
+        Ok(alarm)
+    }
+    fn arm(&self, now: Instant) -> io::Result<()> {
+        let deadline = self.lease.deadline().expect("connected lease");
+        // Round up to the kernel's 100ns relative-time units. Never request a
+        // periodic timer; rearming occurs only on renewal or an early delivery.
+        let ticks = deadline
+            .saturating_duration_since(now)
+            .as_nanos()
+            .div_ceil(100)
+            .clamp(1, i64::MAX as u128) as i64;
+        let due = -ticks;
+        // SAFETY: private owned timer outlives this connection scope.
+        check(unsafe { SetWaitableTimer(self.timer.0, &due, 0, None, ptr::null(), 0) })
+    }
+}
+impl Drop for LeaseTimer<'_> {
+    fn drop(&mut self) {
+        self.lease.disconnect();
+        // SAFETY: still-live private timer, including failed/closed connections.
+        unsafe {
+            CancelWaitableTimer(self.timer.0);
+        }
+    }
+}
 struct ConnectionContext<'a> {
     id: u32,
     stop: &'a Handle,
@@ -484,6 +513,7 @@ fn serve_connection(
     workers: &mut crate::helper::Server,
     mut authenticate: impl FnMut(HANDLE, u32) -> io::Result<Handle>,
     active_session: impl Fn() -> bool,
+    clock: impl Fn() -> Instant,
 ) -> io::Result<()> {
     let ConnectionContext {
         id,
@@ -500,7 +530,7 @@ fn serve_connection(
     let mut writing = false;
     let mut peer: Option<Handle> = None;
     let mut generation = 0;
-    let mut last = Instant::now();
+    let mut alarm = LeaseTimer::new(timer, clock())?;
     let mut closing = false;
     let mut failure = None;
     // SAFETY: frame remains live and untouched until read completion/cancellation.
@@ -510,6 +540,14 @@ fn serve_connection(
         return Ok(());
     }
     loop {
+        // A continuously signaled read/reply cannot outrank stop or expiry.
+        // SAFETY: retained event/process objects, nonblocking stop queries.
+        let stopped = unsafe {
+            WaitForSingleObject(stop.0, 0) == WAIT_OBJECT_0 || WaitForSingleObject(parent.0, 0) == WAIT_OBJECT_0
+        };
+        if stopped || alarm.lease.expired(clock()) {
+            break;
+        }
         // Completion checks run even under a continuous inbound stream: a
         // ready ACK is never starved by lower-priority query arrivals.
         // SAFETY: zero-time event queries on owned, live operations.
@@ -573,7 +611,12 @@ fn serve_connection(
                         stage = ErrorStage::Decode;
                         let request =
                             request.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid input frame"))?;
-                        if request.command != Command::Heartbeat {
+                        if !alarm.lease.frame(clock(), request.command == Command::Heartbeat) {
+                            return Err(denied());
+                        }
+                        if request.command == Command::Heartbeat {
+                            alarm.arm(clock())?;
+                        } else {
                             workers.submit(crate::helper::Work { generation, request })?;
                         }
                         Ok(())
@@ -585,9 +628,13 @@ fn serve_connection(
                         failure = Some(error_reply(error, stage, id, request.map_or(0, |r| r.id)));
                         closing = true;
                         workers.disconnect();
+                        // Input is already disconnected. Preserve the existing
+                        // two-second error-ACK drain window without renewing any
+                        // admitted input; closing frames are never executed.
+                        alarm.lease.connect(clock());
+                        alarm.arm(clock())?;
                         signal.notify();
                     }
-                    last = Instant::now();
                 }
                 // SAFETY: completed read; frame may be reused, including closing drain.
                 if unsafe { read.read(&mut frame) }.is_err() {
@@ -597,10 +644,10 @@ fn serve_connection(
             n if n == WAIT_OBJECT_0 + 1 || n == WAIT_OBJECT_0 + 2 => {}
             n if n == WAIT_OBJECT_0 + 3 || n == WAIT_OBJECT_0 + 4 => break,
             n if n == WAIT_OBJECT_0 + 5 => {
-                // SAFETY: read-only console session query, unchanged lease timeout.
-                if !active_session() || last.elapsed() >= Duration::from_secs(2) {
+                if alarm.lease.expired(clock()) {
                     break;
                 }
+                alarm.arm(clock())?;
             }
             _ => return Err(io::Error::last_os_error()),
         }
@@ -634,7 +681,7 @@ impl crate::helper::Native for Native {
     fn apply(&mut self, command: Command) -> Reply {
         let mut stage = ErrorStage::Desktop;
         // OpenInputDesktop only follows desktops within this process's session.
-        // Check the physical console at execution (not just the pipe timer), so
+        // Check the physical console at execution (not just the service notification), so
         // queued input cannot enter a retired session after PIN/account switching.
         // Release still acts on the old attached desktop before the helper exits.
         // SAFETY: read-only console query.
@@ -671,8 +718,11 @@ impl crate::helper::Native for Native {
             std::sync::atomic::Ordering::Release,
         );
     }
+    fn needs_maintenance(&self) -> bool {
+        self.injector.needs_maintenance()
+    }
     fn maintain(&mut self) {
-        if !self.injector.held.is_empty() || !self.injector.pending.is_empty() {
+        if self.needs_maintenance() {
             let _ = self.injector.attach();
         }
     }
@@ -816,6 +866,22 @@ impl Drop for Ordinary {
 mod isolated_pipe_tests {
     use super::*;
     use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+    #[test]
+    fn empty_desktop_ledgers_do_not_need_maintenance() {
+        let mut injector = Injector::default();
+        assert!(!injector.needs_maintenance());
+        injector.pending.insert("inactive".into(), BTreeMap::new());
+        assert!(!injector.needs_maintenance());
+        let up = Command::Button { button: 0, down: false };
+        injector.pending.get_mut("inactive").unwrap().insert((0, 0), up);
+        assert!(injector.needs_maintenance());
+        injector.pending.clear();
+        injector.held.insert((0, 0), up);
+        assert!(injector.needs_maintenance());
+        injector.held.clear();
+        assert!(!injector.needs_maintenance());
+    }
     #[test]
     fn final_release_ack_survives_unavailable_cursor_on_retired_desktop() {
         let reply = response_with_cursor(
@@ -861,6 +927,114 @@ mod isolated_pipe_tests {
         }
     }
     #[test]
+    fn virtual_lease_expiry_and_pipe_disconnect_release_held_input() {
+        use crate::isolation_tests::{Native as FakeNative, Os};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct Query;
+        impl crate::helper::Query for Query {
+            fn query(&mut self, _: Command) -> Reply {
+                Reply([0; REPLY_SIZE])
+            }
+        }
+        fn send(pipe: &Handle, command: Command) {
+            let frame = Request {
+                id: u32::from(command != Command::Heartbeat),
+                ordinary: command == Command::Ping,
+                command,
+            }
+            .encode();
+            let mut op = pipe_io::Operation::new(pipe).unwrap();
+            // SAFETY: frame outlives the cancelled/drained private operation.
+            unsafe { op.write(&frame) }.unwrap();
+            assert_eq!(op.wait(2000).unwrap(), FRAME_SIZE as u32);
+            if command != Command::Heartbeat {
+                let mut response = [0u8; REPLY_SIZE];
+                let mut read = pipe_io::Operation::new(pipe).unwrap();
+                // SAFETY: response outlives this private operation and its drain.
+                unsafe { read.read(&mut response) }.unwrap();
+                assert_eq!(read.wait(2000).unwrap(), REPLY_SIZE as u32);
+                assert_eq!(&response[..4], &[0; 4]);
+            }
+        }
+        for expire in [false, true] {
+            let (server, client) = pipe_io::tests::pair();
+            let server = pipe_io::SharedPipe::new(server);
+            let os = Arc::new(Mutex::new(Os::default()));
+            let native = os.clone();
+            let milliseconds = Arc::new(AtomicU64::new(0));
+            let clock = milliseconds.clone();
+            let signal = pipe_io::Signal::new().unwrap();
+            let wake = signal.clone();
+            let (done, finished) = mpsc::channel();
+            let task = std::thread::spawn(move || {
+                let notify = signal.clone();
+                let mut workers = crate::helper::Server::new(
+                    move || Ok(FakeNative { os: native }),
+                    || Query,
+                    Arc::new(move || notify.notify()),
+                )
+                .unwrap();
+                // SAFETY: private unnamed events/timer and our own process pin.
+                let (stop, timer, parent) = unsafe {
+                    (
+                        Handle::new(CreateEventW(ptr::null(), 1, 0, ptr::null())).unwrap(),
+                        Handle::new(CreateWaitableTimerW(ptr::null(), 0, ptr::null())).unwrap(),
+                        Handle::new(OpenProcess(SYNCHRONIZE, 0, GetCurrentProcessId())).unwrap(),
+                    )
+                };
+                let origin = Instant::now();
+                serve_connection(
+                    server.handle(),
+                    ConnectionContext {
+                        id: 1,
+                        stop: &stop,
+                        timer: &timer,
+                        parent: &parent,
+                        signal: &signal,
+                    },
+                    &mut workers,
+                    |_, _| {
+                        // SAFETY: fake authenticated peer is this test process.
+                        Handle::new(unsafe { OpenProcess(SYNCHRONIZE, 0, GetCurrentProcessId()) })
+                    },
+                    || true,
+                    || origin + Duration::from_millis(clock.load(Ordering::Acquire)),
+                )
+                .unwrap();
+                workers.disconnect();
+                workers.stop_native();
+                // The connection scope has ended, so its timer must be disarmed.
+                done.send(()).unwrap();
+            });
+            send(&client, Command::Button { button: 0, down: true });
+            assert_eq!(os.lock().unwrap().held.len(), 1);
+            if expire {
+                milliseconds.store(400, Ordering::Release);
+                send(&client, Command::Heartbeat);
+                send(&client, Command::Ping); // ordered barrier after renewal
+                milliseconds.store(2399, Ordering::Release);
+                send(&client, Command::Ping); // queries must not renew the lease
+                assert_eq!(os.lock().unwrap().held.len(), 1);
+                milliseconds.store(2400, Ordering::Release);
+                wake.notify(); // injected event at the exact virtual deadline
+            } else {
+                drop(client); // cleanup must not wait for the lease deadline
+            }
+            finished
+                .recv_timeout(Duration::from_secs(2))
+                .expect("cleanup after disconnect/lease expiry");
+            task.join().unwrap();
+            assert!(os.lock().unwrap().held.is_empty());
+            assert!(
+                os.lock()
+                    .unwrap()
+                    .events
+                    .contains(&Command::Button { button: 0, down: false })
+            );
+        }
+    }
+
+    #[test]
     fn retired_console_rejects_new_input_then_releases_the_old_ledger() {
         use crate::isolation_tests::{Native as FakeNative, Os};
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -889,8 +1063,8 @@ mod isolated_pipe_tests {
             .unwrap();
             // SAFETY: private test process/event, not the installed service.
             let parent = Handle::new(unsafe { OpenProcess(SYNCHRONIZE, 0, GetCurrentProcessId()) }).unwrap();
-            // The unarmed timer keeps this interleaving deterministic: the next
-            // frame, not maintenance polling, must reject the retired target.
+            // Only a one-shot lease timer is used. The next frame must reject
+            // the retired target, independently of a service stop event.
             // SAFETY: unnamed, private timer, never performs a desktop operation.
             let timer = Handle::new(unsafe { CreateWaitableTimerW(ptr::null(), 0, ptr::null()) }).unwrap();
             // SAFETY: duplicate owned private event for ConnectionContext.
@@ -924,6 +1098,7 @@ mod isolated_pipe_tests {
                     Handle::new(unsafe { OpenProcess(SYNCHRONIZE, 0, GetCurrentProcessId()) })
                 },
                 || current.load(Ordering::Acquire),
+                Instant::now,
             )
             .unwrap();
             workers.disconnect();
@@ -972,9 +1147,6 @@ mod isolated_pipe_tests {
             let parent = Handle::new(unsafe { OpenProcess(SYNCHRONIZE, 0, GetCurrentProcessId()) }).unwrap();
             // SAFETY: unnamed owned test timer, no service/system configuration.
             let timer = Handle::new(unsafe { CreateWaitableTimerW(ptr::null(), 0, ptr::null()) }).unwrap();
-            let due = -1_000_000i64;
-            // SAFETY: owned timer lives until the connection loop exits.
-            check(unsafe { SetWaitableTimer(timer.0, &due, 100, None, ptr::null(), 0) }).unwrap();
             // Test authentication/session callbacks are statically substituted;
             // only the private kernel transport runs, with no desktop backend.
             // SAFETY: duplicate the private event so ConnectionContext owns a live wrapper.
@@ -1008,6 +1180,7 @@ mod isolated_pipe_tests {
                     Handle::new(unsafe { OpenProcess(SYNCHRONIZE, 0, GetCurrentProcessId()) })
                 },
                 || true,
+                Instant::now,
             )
             .unwrap();
             workers.disconnect();

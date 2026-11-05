@@ -11,6 +11,8 @@ pub(crate) struct Observation {
     pub kind: oink_audio::media::Kind,
     pub buffer_ms: Option<f64>,
     pub bytes: u64,
+    /// Negotiated encoder rate, independent of silence and chart window length.
+    pub bitrate: u32,
     pub glitches: [Option<oink_audio::sink::DropoutBucket>; oink_audio::sink::QUALITY_SECONDS],
     pub session: u64,
 }
@@ -144,8 +146,11 @@ impl History {
                     .collect();
                 crate::api::AudioWindowStats {
                     buffer_avg_ms: (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64),
-                    // Include inactive time in the full selected window.
-                    bitrate_kbps: samples.iter().map(|(_, bytes)| *bytes as f64).sum::<f64>() * 8. / window_ms as f64,
+                    // The most recent negotiated parameters remain meaningful during sleep.
+                    bitrate_kbps: source
+                        .previous
+                        .as_ref()
+                        .map_or(0.0, |(_, observation)| f64::from(observation.bitrate) / 1000.0),
                     interruptions: buckets.iter().map(|b| b.interruptions).sum(),
                     output_interruptions: buckets.iter().map(|b| b.output_interruptions).sum(),
                     discontinuities: buckets.iter().map(|b| b.discontinuities).sum(),
@@ -296,10 +301,7 @@ mod tests {
         h.record_output(output);
         let view = h.view(100_250);
         let source = &view.sources[0];
-        assert_eq!(
-            (source.buffer_avg_ms, source.bitrate_kbps),
-            (Some(30.), 20_000. * 8. / 60_000.)
-        );
+        assert_eq!((source.buffer_avg_ms, source.bitrate_kbps), (Some(30.), 320.));
         assert_eq!(
             (source.interruptions, source.concealed_ms, source.late_packets),
             (2, 7., 3)
@@ -307,10 +309,7 @@ mod tests {
         assert_eq!((source.output_interruptions, source.discontinuities), (1, 2));
         let five = &source.stats_5m;
         assert_eq!((five.output_interruptions, five.discontinuities), (4, 6));
-        assert_eq!(
-            (five.buffer_avg_ms, five.bitrate_kbps),
-            (Some(20.), 30_000. * 8. / 300_000.)
-        );
+        assert_eq!((five.buffer_avg_ms, five.bitrate_kbps), (Some(20.), 320.));
         assert_eq!(
             (five.interruptions, five.concealed_ms, five.late_packets),
             (12, 12., 13)
@@ -370,7 +369,7 @@ mod tests {
                 .find(|s| s.kind == oink_audio::media::Kind::Speaker)
                 .unwrap()
                 .bitrate_kbps,
-            1000. * 8. / 60_000.
+            320.
         );
     }
     fn input(value: u64) -> (String, Observation) {
@@ -381,6 +380,7 @@ mod tests {
                 kind: oink_audio::media::Kind::Speaker,
                 buffer_ms: Some(value as f64),
                 bytes: value * 1000,
+                bitrate: 320_000,
                 glitches: {
                     let mut b = [None; oink_audio::sink::QUALITY_SECONDS];
                     b[0] = Some(oink_audio::sink::DropoutBucket {
@@ -406,7 +406,7 @@ mod tests {
         let s = &v.sources[0];
         assert_eq!(s.samples.len(), 1200);
         assert_eq!(s.buffer_avg_ms, Some(1320.5));
-        assert_eq!(s.bitrate_kbps, 32.);
+        assert_eq!(s.bitrate_kbps, 320.);
         assert_eq!(s.interruptions, s.glitches.iter().map(|b| b.interruptions).sum::<u64>());
         h.record(360_250, []);
         assert_eq!(h.view(360_250).sources[0].samples.len(), 1199);
@@ -423,7 +423,7 @@ mod tests {
         let v = h.view(750);
         assert_eq!(v.sources[0].samples.len(), 2);
         assert_eq!(v.sources[0].interruptions, 4);
-        assert_eq!(v.sources[0].bitrate_kbps, 4000. * 8. / 60000.);
+        assert_eq!(v.sources[0].bitrate_kbps, 320.);
     }
     #[test]
     fn silent_sessions_expire_without_recounting_payload_on_resume() {
@@ -448,7 +448,7 @@ mod tests {
         let s = &h.view(312750).sources[0];
         assert_eq!(s.interruptions, 1);
         assert_eq!(s.buffer_avg_ms, Some(3.));
-        assert_eq!(s.bitrate_kbps, 1000. * 8. / 60000.);
+        assert_eq!(s.bitrate_kbps, 320.);
     }
     #[test]
     fn final_counter_flush_shares_a_tick_without_duplicating_samples() {

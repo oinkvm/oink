@@ -48,7 +48,12 @@ pub struct EntryProtection {
 /// Input effects carried by the current Input stream.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ControlMsg {
-    ApplicationFocus(crate::application_focus::Message),
+    LocalClick {
+        epoch: u64,
+        holder: DeviceId,
+        scope: FocusScope,
+        phase: u8,
+    },
     EntryProtection {
         state: EntryProtection,
     },
@@ -87,9 +92,6 @@ pub enum ControlMsg {
     FocusLock {
         state: FocusLock,
     },
-    IdentifyScreens {
-        id: u64,
-    },
     GameMode {
         epoch: u64,
         generation: u64,
@@ -127,6 +129,14 @@ pub enum ControlMsg {
     },
     /// Explicit action; never forwarded to a new focus or converted to keys.
     LockRemoteWindows(WindowsLockRequest),
+    /// Explicit shortcut handoff; hidden screens remain walls for ordinary FocusEnter.
+    MovePointerEnter {
+        epoch: u64,
+        display: String,
+        pos: Point,
+        scope: Option<FocusScope>,
+        pointer_source: Option<DeviceId>,
+    },
 }
 
 /// Bounded continuation. On the wire positions/direction are reference-plane offsets from

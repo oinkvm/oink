@@ -58,7 +58,6 @@ impl<'a> StateChanges<'a> {
                     ApiEvent::Group(group) => ("group", format!("{group:?}")),
                     ApiEvent::PairingChanged { view, .. } => ("pairing", format!("{view:?}")),
                     ApiEvent::PairingRequestsChanged { requests, .. } => ("requests", format!("{requests:?}")),
-                    ApiEvent::GroupMigrationChanged(state) => ("migration", format!("{state:?}")),
                     _ => return,
                 };
                 cache.lock().unwrap().insert(kind, state);
@@ -334,9 +333,7 @@ pub async fn pair(initiator: &Node, responder: &Node) {
             pairings
                 .iter()
                 .all(|p| !p.sessions.iter().any(|s| s.id == pair_id && s.phase == 8)),
-            "pairing terminated before completion: {pairings:?}; initiator={:?}; responder={:?}",
-            initiator.group_migration(),
-            responder.group_migration(),
+            "pairing terminated before completion: {pairings:?}",
         );
         a.id.is_some()
                 && a.id == b.id

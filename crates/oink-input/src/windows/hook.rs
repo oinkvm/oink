@@ -45,6 +45,8 @@ mod external;
 #[cfg(all(test, debug_assertions))]
 mod external_tests;
 mod key_releases;
+mod keyboard_trace;
+mod modifier_reconcile;
 mod observations;
 mod restore;
 
@@ -330,6 +332,7 @@ struct State {
     raw: RawTracker,
     /// 按下中的键 → 按下事件是否被吞掉（识别自动重复、保证本机不卡键）。
     keys: HashMap<u32, bool>,
+    passed_modifiers: crate::windows_keyboard_trace::PassedModifiers,
     continuity: crate::capture_continuity::CaptureContinuity,
     /// 鼠标钩子最近一次被调用，供鼠标看门狗核对。
     last_mouse_hook: Instant,
@@ -383,6 +386,10 @@ pub(super) fn time_us(now: Instant) -> u64 {
     static BASE: OnceLock<Instant> = OnceLock::new();
     now.saturating_duration_since(*BASE.get_or_init(Instant::now))
         .as_micros() as u64
+}
+
+pub(crate) fn reconcile_passed_modifiers(candidates: u8) -> u8 {
+    modifier_reconcile::at_boundary(candidates)
 }
 
 pub(crate) fn on_hook_thread() -> bool {
@@ -798,6 +805,7 @@ fn run(
                 hwnd,
                 raw: RawTracker::default(),
                 keys: HashMap::new(),
+                passed_modifiers: Default::default(),
                 continuity: Default::default(),
                 last_mouse_hook: Instant::now(),
                 raw_registration_ok: true,
@@ -810,6 +818,7 @@ fn run(
                 diagnostic_ticks: 0,
             })
         });
+        keyboard_trace::boundary(keyboard_trace::Stage::Owner, 1, Some(0), Some(pacing.is_some()));
         let _desktop_trace = desktop_trace::Observer::new(hwnd);
         let _credential_focus = super::credential_focus::start(hwnd, WM_CAPTURE_CREDENTIAL);
         capture_availability_changed(false);
@@ -883,6 +892,7 @@ fn run(
                             st.uninstall_hooks();
                             rawinput::unregister();
                             st.keys.clear();
+                            st.passed_modifiers = Default::default();
                             key_releases::clear();
                             external::gap();
                         }
@@ -930,6 +940,12 @@ fn run(
             key_releases::drain();
             report_busy("message", msg.message, t0.elapsed());
         }
+        keyboard_trace::boundary(
+            keyboard_trace::Stage::Owner,
+            0,
+            with_state(|st| keyboard_trace::held(st)),
+            Some(pacing.is_some()),
+        );
         key_releases::clear();
 
         if let Some(observations) = &observations {
@@ -1063,6 +1079,19 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             use windows::Win32::UI::WindowsAndMessaging::{
                 WTS_CONSOLE_CONNECT, WTS_CONSOLE_DISCONNECT, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
             };
+            let session_reason = match wparam.0 as u32 {
+                WTS_CONSOLE_CONNECT => 1,
+                WTS_CONSOLE_DISCONNECT => 2,
+                WTS_SESSION_LOCK => 3,
+                WTS_SESSION_UNLOCK => 4,
+                _ => 0,
+            };
+            keyboard_trace::boundary(
+                keyboard_trace::Stage::Session,
+                session_reason,
+                with_state(|st| keyboard_trace::held(st)),
+                None,
+            );
             if wparam.0 as u32 == WTS_SESSION_LOCK {
                 desktop_trace::session_changed(WTS_SESSION_LOCK, true);
             }
@@ -1243,6 +1272,14 @@ impl State {
                 }
             }
         }
+        if matches!(kind, HookKind::Keyboard) {
+            keyboard_trace::boundary(
+                keyboard_trace::Stage::Installed,
+                0,
+                Some(keyboard_trace::held(self)),
+                Some(true),
+            );
+        }
         super::trace::action(
             crate::native_lifecycle::Kind::HookInstall,
             None,
@@ -1261,6 +1298,14 @@ impl State {
             CAPTURE_HOOKS.fetch_sub(1, Ordering::AcqRel);
             // SAFETY: 句柄由 install_hook 取得，只卸载一次（系统已经静默卸载时这里返回失败，无害）。
             let result = unsafe { UnhookWindowsHookEx(h) };
+            if matches!(kind, HookKind::Keyboard) {
+                keyboard_trace::boundary(
+                    keyboard_trace::Stage::Removed,
+                    0,
+                    Some(keyboard_trace::held(self)),
+                    Some(result.is_ok()),
+                );
+            }
             super::trace::action(
                 crate::native_lifecycle::Kind::HookRemove,
                 None,
@@ -2283,6 +2328,12 @@ fn capture_availability_changed(desktop_changed: bool) {
     // A focused logon password field withdraws the source like a desktop switch
     // (pre-login profile only; see credential_focus for why).
     let desktop_available = desktop_trace::capture_desktop_active() && !super::credential_focus::password_focused();
+    keyboard_trace::boundary(
+        keyboard_trace::Stage::Desktop,
+        u32::from(desktop_changed),
+        with_state(|st| keyboard_trace::held(st)),
+        Some(desktop_available),
+    );
     super::touchpad::contact_desktop(desktop_available);
     let Some((handler, events, available)) = with_state(|st| {
         let available = desktop_available;
@@ -2291,6 +2342,7 @@ fn capture_availability_changed(desktop_changed: bool) {
         }
         st.touchpad.cancel_all();
         st.keys.clear();
+        st.passed_modifiers = Default::default();
         key_releases::clear();
         external::gap();
         let now = time_us(Instant::now());
@@ -2387,7 +2439,11 @@ fn finish(prepared: Option<Prepared>) -> bool {
                 });
             }
             if let Some(code) = track_key {
-                with_state(|st| st.keys.insert(code, swallow));
+                with_state(|st| {
+                    st.keys.insert(code, swallow);
+                    st.passed_modifiers
+                        .first_down(KeyCode(code), event.physical && !swallow);
+                });
             }
             swallow
         }
@@ -2646,6 +2702,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     let t0 = Instant::now();
     let r = keyboard_proc_inner(code, wparam, lparam);
     report_busy("keyboard hook", 0, t0.elapsed());
+    keyboard_trace::duration(t0.elapsed());
     r
 }
 
@@ -2697,20 +2754,50 @@ fn keyboard_proc_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
 }
 
 fn keyboard_proc_with_next(code: i32, wparam: WPARAM, lparam: LPARAM, next: impl FnOnce() -> LRESULT) -> LRESULT {
+    let _callback = modifier_reconcile::KeyboardCallback::enter();
     if code >= 0 {
+        // Observe modifier ingress before any policy/reentry branch. No raw key data escapes.
+        // SAFETY: code >= 0 supplies a live KBDLLHOOKSTRUCT for this callback.
+        let mut key_trace =
+            keyboard_trace::Capture::enter(wparam.0 as u32, unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) });
+        use keyboard_trace::Outcome as TraceOutcome;
+        let next = || {
+            let result = next();
+            if result.0 != 0 {
+                // A downstream hook refused it: our Pass is not OS acceptance.
+                // SAFETY: code >= 0; the original hook struct lives until return.
+                let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+                modifier_reconcile::invalidate(info.vkCode);
+            }
+            result
+        };
         // Complete an earlier reentrant UP before classifying a later DOWN as
         // a repeat. No focus change or elapsed time proves a physical release.
         key_releases::drain();
         // SAFETY: HC_ACTION 时 lparam 指向系统提供的 KBDLLHOOKSTRUCT，回调期间有效。
         let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
         use crate::windows_external_input::Origin;
+        // Synthetic input can change async state independently of the physical
+        // hold. Do not reconcile that identity until its next fresh physical DOWN.
+        if external::key_origin(info) != Origin::Physical {
+            modifier_reconcile::invalidate(info.vkCode);
+        } else {
+            modifier_reconcile::physical_entry(info.vkCode, matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN));
+        }
         match external::key_origin(info) {
-            Origin::Own | Origin::Marker => return next(),
-            Origin::External if external::key_local(wparam.0 as u32, info) => return external::pass_key(next),
+            Origin::Own | Origin::Marker => {
+                keyboard_trace::outcome(&mut key_trace, TraceOutcome::Own);
+                return next();
+            }
+            Origin::External if external::key_local(wparam.0 as u32, info) => {
+                keyboard_trace::outcome(&mut key_trace, TraceOutcome::ExternalLocal);
+                return external::pass_key(next);
+            }
             Origin::Physical => external::observe_physical_key(wparam.0 as u32, info),
             _ => {}
         }
         if !crate::capture_loop::callback_available() || STATE.with(|slot| slot.try_borrow_mut().is_err()) {
+            keyboard_trace::outcome(&mut key_trace, TraceOutcome::Reentrant);
             key_releases::defer(wparam.0 as u32, info);
             let n = REENTERED.fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
@@ -2736,6 +2823,7 @@ fn keyboard_proc_with_next(code: i32, wparam: WPARAM, lparam: LPARAM, next: impl
             crate::capture_loop::keyboard_disabled(),
             crate::capture_loop::keyboard_guard_suspended(),
         ) {
+            keyboard_trace::outcome(&mut key_trace, TraceOutcome::LockGuard);
             // SAFETY: unchanged native event is passed to the next desktop-local hook.
             return next();
         }
@@ -2781,9 +2869,27 @@ fn keyboard_proc_with_next(code: i32, wparam: WPARAM, lparam: LPARAM, next: impl
             }) => Some(*code),
             _ => None,
         };
+        let trace_outcome = if prepared.is_none() {
+            TraceOutcome::StateUnavailable
+        } else if key.is_none() {
+            TraceOutcome::Unmapped
+        } else {
+            TraceOutcome::Passed
+        };
         let guarded = physical_keyboard(info) && crate::capture_loop::keyboard_key_blocked(key);
         let swallowed = finish(prepared) || guarded;
+        keyboard_trace::outcome(
+            &mut key_trace,
+            if guarded {
+                TraceOutcome::DisabledGuard
+            } else if swallowed {
+                TraceOutcome::Swallowed
+            } else {
+                trace_outcome
+            },
+        );
         if swallowed {
+            modifier_reconcile::invalidate(info.vkCode);
             return LRESULT(1);
         }
         let msg = wparam.0 as u32;
@@ -2798,6 +2904,7 @@ fn keyboard_proc_with_next(code: i32, wparam: WPARAM, lparam: LPARAM, next: impl
                 );
             }
         }
+        return next();
     }
     // SAFETY: 交给钩子链中的下一个。
     next()
@@ -3113,6 +3220,7 @@ mod tests {
             relative_requested: false,
             drag_anchor: None,
             keys: HashMap::new(),
+            passed_modifiers: Default::default(),
             continuity: Default::default(),
             last_mouse_hook: now,
             raw_registration_ok: true,

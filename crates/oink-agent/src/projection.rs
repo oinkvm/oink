@@ -1,22 +1,18 @@
-//! Ephemeral projection preview owner. P0 never writes config; only a completed native
-//! gesture submits a normal ConfigModule::edit_layout (and hence normal C0).
+//! Ephemeral canvas projection previews. P0 never writes configuration.
 use crate::{
     api,
     node::{Node, lock},
     streams::{StreamModule, projection::ProjectionStreams},
 };
-use oink_display::{
-    layout::{Layout, ScreenId},
-    projection::Projection,
-};
+use oink_display::layout::{Layout, ScreenId};
 use oink_foundation::DeviceId;
-use oink_locator::projection::{DragPhase, Event, NamedProjection, ProjectionOverlay, View};
+use oink_locator::projection::{NamedProjection, ProjectionOverlay, View};
 use oink_network::link::{ModuleEvent, ModulePort};
 use oink_protocol::v1;
 pub(crate) mod model;
 pub(crate) mod wire;
 use crate::layout_profiles::{render as arrangement, types::ArrangementSnapshot};
-use model::{Action, ModeId, ScreenRect};
+use model::{Action, ScreenRect};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -37,9 +33,6 @@ pub(crate) struct State {
 }
 #[derive(Default)]
 struct Control {
-    serial: u64,
-    mode: Option<(ModeId, Instant)>,
-    closed: BTreeSet<ModeId>,
     ui_closed: u64,
     ui_latest: u64,
     local: Option<Preview>,
@@ -48,9 +41,6 @@ struct Control {
     pending: Throttle<Action>,
     immediate: Vec<Action>,
     sequence: u64,
-    gesture: Option<Gesture>,
-    gestures: BTreeMap<DeviceId, Instant>,
-    input_gesture: bool,
     refusal_log: Option<Instant>,
 }
 struct Preview {
@@ -58,11 +48,6 @@ struct Preview {
     arrangement: Option<Box<ArrangementSnapshot>>,
     affected: Vec<ScreenId>,
     expires: Instant,
-}
-struct Gesture {
-    initial: Layout,
-    projection: Projection,
-    handle: oink_display::projection::Handle,
 }
 
 struct Throttle<T> {
@@ -94,11 +79,6 @@ impl<T> Throttle<T> {
     }
 }
 
-pub(crate) fn status(node: &Node) -> api::ProjectionStatus {
-    api::ProjectionStatus {
-        editing: lock(&node.inner.projection.control).mode.is_some(),
-    }
-}
 // Tests can freeze preview leases while real stream pacing and heartbeats run.
 fn lease_now(node: &Node, now: Instant) -> Instant {
     #[cfg(test)]
@@ -126,39 +106,6 @@ fn preview_wall_now(node: &Node) -> u64 {
     }
 }
 
-fn emit_status(node: &Node) {
-    node.emit(api::ApiEvent::LayoutProjection(status(node)));
-}
-
-pub(crate) fn set_mode(node: &Node, enabled: bool) -> api::ProjectionStatus {
-    let mut c = lock(&node.inner.projection.control);
-    if enabled && c.mode.is_none() {
-        c.serial += 1;
-        let id = ModeId {
-            owner: node.id(),
-            serial: c.serial,
-            boot_nonce: node.boot().nonce,
-        };
-        c.mode = Some((id, lease_now(node, Instant::now()) + LEASE));
-        c.immediate.push(Action::Mode { id, enabled: true });
-    } else if !enabled && let Some((id, _)) = c.mode.take() {
-        c.closed.insert(id);
-        c.gesture = None;
-        c.gestures.clear();
-        c.remote.clear();
-        c.local = None;
-        c.pending.barrier();
-        c.immediate.extend([
-            Action::Mode { id, enabled: false },
-            Action::Gesture { id, active: false },
-        ]);
-        clear_locked(&mut c);
-    }
-    drop(c);
-    node.inner.projection.wake.notify_one();
-    emit_status(node);
-    status(node)
-}
 fn clear_locked(c: &mut Control) {
     c.sequence += 1;
     c.pending.barrier();
@@ -287,7 +234,6 @@ fn receive(node: &Node, peer: DeviceId, msg: Action, now: Instant) {
         refusal(&mut c, peer, "invalid_payload", now);
         return;
     }
-    let was_editing = c.mode.is_some();
     match msg {
         Action::Arrangement {
             sequence,
@@ -365,134 +311,11 @@ fn receive(node: &Node, peer: DeviceId, msg: Action, now: Instant) {
                 );
             }
         }
-        Action::Mode { id, enabled } => {
-            if !enabled {
-                c.closed.insert(id);
-                if c.mode.is_some_and(|(active, _)| active == id) {
-                    c.mode = None;
-                    c.gesture = None;
-                    c.gestures.clear();
-                    c.local = None;
-                    c.remote.clear();
-                    c.pending.barrier();
-                }
-            } else if id.owner == peer
-                && node.links().is_ok_and(|links| {
-                    links
-                        .links()
-                        .by_peer(peer)
-                        .is_some_and(|p| p.peer_boot.nonce == id.boot_nonce)
-                })
-                && !c.closed.contains(&id)
-                && c.mode.is_none_or(|(active, _)| active == id || id < active)
-            {
-                c.mode = Some((id, now + LEASE));
-            }
-            while c.closed.len() > 128 {
-                c.closed.pop_first();
-            }
-        }
-        Action::Gesture { id, active } => {
-            if !c.mode.is_some_and(|(current, _)| current == id) {
-                return;
-            }
-            if active {
-                c.gestures.insert(peer, now + LEASE);
-            } else {
-                c.gestures.remove(&peer);
-            }
-        }
-    }
-    let changed = was_editing != c.mode.is_some();
-    drop(c);
-    if changed {
-        emit_status(node);
-    }
-}
-
-async fn native_event(node: &Node, event: Event, now: Instant) {
-    let now = lease_now(node, now);
-    if matches!(event, Event::Escape) {
-        set_mode(node, false);
-        return;
-    }
-    let Event::Drag {
-        projection,
-        handle,
-        delta,
-        phase,
-    } = event
-    else {
-        return;
-    };
-    tracing::debug!(?phase, ?handle, delta, "projection gesture received");
-    let (initial, next) = {
-        let mut c = lock(&node.inner.projection.control);
-        if c.mode.is_none() {
-            return;
-        }
-        if phase == DragPhase::Begin {
-            if node.input_thread().is_ok_and(|i| i.status().dnd_active) {
-                return;
-            }
-            c.gesture = Some(Gesture {
-                initial: node.layout().0,
-                projection: *projection,
-                handle,
-            });
-            let id = c.mode.expect("active mode").0;
-            c.immediate.push(Action::Gesture { id, active: true });
-        }
-        let Some(gesture) = &c.gesture else { return };
-        let owners = visible_owners(node, &node.link_config().expect("started config").applied().owners);
-        let Some(next) = gesture
-            .projection
-            .edit_with_preferences(&gesture.initial, &owners, gesture.handle, delta)
-        else {
-            if phase == DragPhase::End {
-                c.gesture = None;
-                let id = c.mode.expect("active mode").0;
-                c.immediate.push(Action::Gesture { id, active: false });
-                clear_locked(&mut c);
-            }
-            return;
-        };
-        let affected = next
-            .screens
-            .iter()
-            .filter(|s| s.id.device == gesture.projection.neighbour.device)
-            .map(|s| s.id.clone())
-            .collect();
-        if phase != DragPhase::End {
-            preview_locked(node, &mut c, next, None, affected, now);
-            return;
-        }
-        let initial = c.gesture.take().expect("gesture present").initial;
-        let id = c.mode.expect("active mode").0;
-        c.immediate.push(Action::Gesture { id, active: false });
-        clear_locked(&mut c);
-        (initial, next)
-    };
-    if initial == next {
-        return;
-    }
-    let node = node.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        node.commit_manual_layout_exact(move |current| {
-            if *current == initial {
-                *current = next;
-            }
-            Ok(())
-        })
-    })
-    .await;
-    if !matches!(result, Ok(Ok(()))) {
-        tracing::warn!(?result, "projection edit commit failed");
     }
 }
 
 fn expire_previews(c: &mut Control, now: Instant) {
-    if c.local.as_ref().is_some_and(|p| p.expires <= now) && c.gesture.is_none() {
+    if c.local.as_ref().is_some_and(|p| p.expires <= now) {
         clear_locked(c);
     }
     c.remote.retain(|peer, p| {
@@ -508,43 +331,14 @@ fn expire_previews(c: &mut Control, now: Instant) {
 fn tick(node: &Node, now: Instant, heartbeat: bool) -> Vec<Action> {
     let lease_now = lease_now(node, now);
     let mut c = lock(&node.inner.projection.control);
-    let mut changed = false;
-    if let Some((id, expiry)) = c.mode {
-        if id.owner == node.id() {
-            c.mode = Some((id, lease_now + LEASE));
-            if heartbeat {
-                c.immediate.push(Action::Mode { id, enabled: true });
-            }
-        } else if expiry <= lease_now {
-            c.mode = None;
-            c.gesture = None;
-            c.gestures.clear();
-            changed = true;
-        }
-    }
     expire_previews(&mut c, lease_now);
-    c.gestures.retain(|_, expiry| *expiry > lease_now);
-    if c.gesture.is_some() && heartbeat {
-        let id = c.mode.expect("active mode").0;
-        c.immediate.push(Action::Gesture { id, active: true });
-    }
     if heartbeat && let Some(local) = c.local.as_ref() {
         let (layout, affected, snapshot) = (local.layout.clone(), local.affected.clone(), local.arrangement.clone());
-        // Native held gestures renew themselves; UI previews require the UI's
-        // explicit lease renewal so a closed/crashed editor cannot leave overlays.
+        // UI previews require explicit lease renewal from the editor.
         let expiry = local.expires;
         preview_locked(node, &mut c, layout, snapshot, affected, lease_now);
-        if c.gesture.is_none()
-            && let Some(p) = c.local.as_mut()
-        {
+        if let Some(p) = c.local.as_mut() {
             p.expires = expiry;
-        }
-    }
-    let active_gesture = c.gesture.is_some() || !c.gestures.is_empty();
-    if c.input_gesture != active_gesture || (active_gesture && heartbeat) {
-        c.input_gesture = active_gesture;
-        if let Ok(input) = node.input_thread() {
-            input.send(crate::threads::input::InputCommand::ProjectionGesture(active_gesture));
         }
     }
     let mut messages = std::mem::take(&mut c.immediate);
@@ -560,10 +354,6 @@ fn tick(node: &Node, now: Instant, heartbeat: bool) -> Vec<Action> {
         if message.valid() {
             messages.push(message);
         }
-    }
-    drop(c);
-    if changed {
-        emit_status(node);
     }
     messages
 }
@@ -616,9 +406,8 @@ fn projection_name(layout: &Layout, screen: &ScreenId, computer_name: String) ->
 
 fn view(node: &Node, online: &BTreeSet<DeviceId>) -> View {
     let c = lock(&node.inner.projection.control);
-    let editing = c.mode.is_some();
     let preview = c.local.iter().chain(c.remote.values()).max_by_key(|p| p.expires);
-    if !editing && preview.is_none() {
+    if preview.is_none() {
         return View::default();
     }
     let group = node.link_config().expect("started config");
@@ -655,24 +444,15 @@ fn view(node: &Node, online: &BTreeSet<DeviceId>) -> View {
             })
             .collect();
     let accent = node.resolved_accent();
-    View {
-        projections,
-        accent,
-        show_handles: editing,
-        editable: editing,
-    }
+    View { projections, accent }
 }
 
 // Only live previews and stream retries need a clock; commands and arrivals wake the owner.
 fn next_tick(control: &Control, now: Instant, retry: Option<Instant>) -> Option<Instant> {
-    let active = control.mode.is_some()
-        || control.local.is_some()
+    let active = control.local.is_some()
         || !control.remote.is_empty()
-        || control.gesture.is_some()
-        || !control.gestures.is_empty()
         || control.pending.pending.is_some()
-        || !control.immediate.is_empty()
-        || control.input_gesture;
+        || !control.immediate.is_empty();
     if active {
         Some(retry.map_or(now + INTERVAL, |retry| retry.min(now + INTERVAL)))
     } else {
@@ -729,11 +509,7 @@ pub(crate) fn start(node: Node, mut port: ModulePort, native: bool) -> anyhow::R
                         streams.link_lost(link, peer, reason); online.remove(&peer);
                         send_outcomes.remove(&peer);
                         let mut c = lock(&node.inner.projection.control);
-                        c.remote.remove(&peer); c.seen.remove(&peer); c.gestures.remove(&peer);
-                        let closed_mode = c.mode.is_some_and(|(id, _)| id.owner == peer);
-                        if closed_mode { c.mode = None; c.gesture = None; }
-                        drop(c);
-                        if closed_mode { emit_status(&node); }
+                        c.remote.remove(&peer); c.seen.remove(&peer);
                     },
                     Some(ModuleEvent::Inbound(s)) => streams.inbound(s),
                     Some(ModuleEvent::InboundLow(op)) => streams.inbound_low(*op),
@@ -742,11 +518,6 @@ pub(crate) fn start(node: Node, mut port: ModulePort, native: bool) -> anyhow::R
                 }
             }
             let now = Instant::now();
-            if let Some(surface) = node.inner.projection.surface.get() {
-                for event in surface.take_events() {
-                    native_event(&node, event, now).await;
-                }
-            }
             for (peer, message) in streams.poll(now) {
                 receive(&node, peer, message, now);
             }
@@ -785,7 +556,7 @@ pub(crate) fn start(node: Node, mut port: ModulePort, native: bool) -> anyhow::R
             }
             let active = {
                 let c = lock(&node.inner.projection.control);
-                c.mode.is_some() || c.local.is_some() || !c.remote.is_empty()
+                c.local.is_some() || !c.remote.is_empty()
             };
             if active && (dirty || heartbeat || now.duration_since(last_draw) >= INTERVAL) {
                 draw(&node, &online);
@@ -802,9 +573,6 @@ pub(crate) fn start(node: Node, mut port: ModulePort, native: bool) -> anyhow::R
         if let Some(surface) = node.inner.projection.surface.get() {
             surface.shutdown();
         }
-        if let Ok(input) = node.input_thread() {
-            input.send(crate::threads::input::InputCommand::ProjectionGesture(false));
-        }
     }))
 }
 fn remaining_lease_ms(expires: Instant, now: Instant) -> u32 {
@@ -814,11 +582,6 @@ fn remaining_lease_ms(expires: Instant, now: Instant) -> u32 {
 fn current_messages(node: &Node) -> Vec<Action> {
     let c = lock(&node.inner.projection.control);
     let mut messages = Vec::new();
-    if let Some((id, _)) = c.mode
-        && id.owner == node.id()
-    {
-        messages.push(Action::Mode { id, enabled: true });
-    }
     if let Some(p) = &c.local
         && let remaining = remaining_lease_ms(p.expires, lease_now(node, Instant::now()))
         && remaining > 0
@@ -960,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_keeps_clock_for_pending_clear_and_gesture_expiry() {
+    fn projection_keeps_clock_for_pending_clear() {
         let now = Instant::now();
         let mut control = Control::default();
         control.pending.push(Action::Preview {
@@ -970,9 +733,6 @@ mod tests {
         });
         assert_eq!(next_tick(&control, now, None), Some(now + INTERVAL));
         control.pending.barrier();
-        control.gestures.insert(DeviceId([2; 32]), now + LEASE);
-        assert_eq!(next_tick(&control, now, None), Some(now + INTERVAL));
-        control.gestures.clear();
         assert_eq!(next_tick(&control, now, None), None);
     }
 
@@ -1122,8 +882,14 @@ mod integration_tests {
                 a.layout().0 == b.layout().0 && a.layout().0.screens.len() == 3
             })
             .await;
-            set_mode(&a, true);
-            set_mode(&b, true);
+            {
+                let mut c = lock(&a.inner.projection.control);
+                preview_locked(&a, &mut c, a.layout().0, None, vec![], Instant::now());
+            }
+            {
+                let mut c = lock(&b.inner.projection.control);
+                preview_locked(&b, &mut c, b.layout().0, None, vec![], Instant::now());
+            }
             let online = BTreeSet::from([a.id(), b.id()]);
             let av = view(&a, &online);
             let bv = view(&b, &online);
@@ -1145,7 +911,6 @@ mod integration_tests {
                     .find(|p| p.geometry.neighbour.device == a.id() && p.geometry.neighbour.display == key)
                     .unwrap();
                 assert_eq!(local.name, format!("{} {number}", a.device_name(a.id())));
-                assert!(local.geometry.handles().is_empty());
             }
             let single = av
                 .projections
@@ -1201,7 +966,10 @@ mod integration_tests {
                 a.layout().0 == b.layout().0 && a.layout().0.screens.len() == 2
             })
             .await;
-            set_mode(&a, true);
+            {
+                let mut c = lock(&a.inner.projection.control);
+                preview_locked(&a, &mut c, a.layout().0, None, vec![], Instant::now());
+            }
             let online = BTreeSet::from([a.id(), b.id()]);
             let stored = a.layout().0;
             assert!(!view(&a, &online).projections.is_empty());
@@ -1576,7 +1344,6 @@ mod integration_tests {
             for node in &nodes {
                 let preview = view(node, &online);
                 assert_eq!(preview.projections.len(), 2);
-                assert!(!preview.editable && !preview.show_handles);
             }
             let preview = view(upper, &online);
             let short = &preview
@@ -1657,273 +1424,5 @@ mod integration_tests {
                 node.shutdown().await;
             }
         });
-    }
-
-    #[test]
-    fn previews_are_ephemeral_and_native_edits_commit_through_c0() {
-        crate::test_watchdog::run(module_path!(), "projection C0", Some(6), scenario());
-    }
-    async fn scenario() {
-        let ad = tempfile::tempdir().unwrap();
-        let bd = tempfile::tempdir().unwrap();
-        // Removed preferences are ordinary extras, including an old false value.
-        for (dir, value) in [(ad.path(), true), (bd.path(), false)] {
-            let mut config = crate::config::AgentConfig::load_from(dir).unwrap();
-            config.save().unwrap();
-            let path = config.settings_path();
-            let mut raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            raw["local"]["layout_projection_enabled"] = value.into();
-            std::fs::write(path, serde_json::to_vec(&raw).unwrap()).unwrap();
-        }
-        let a = start_with_clip(
-            &oink_test_support::network_config(ad.path().into(), "projection-a", 0),
-            &Displays::new("a"),
-            None,
-        )
-        .await;
-        let b = start_with_clip(
-            &oink_test_support::network_config(bd.path().into(), "projection-b", 0),
-            &Displays::new("b"),
-            None,
-        )
-        .await;
-        for node in [&a, &b] {
-            node.inner
-                .projection
-                .lease_clock
-                .set(Mutex::new(Instant::now()))
-                .unwrap();
-        }
-        common::pair(&a, &b).await;
-        common::until("same layout", || {
-            a.layout().0 == b.layout().0 && a.layout().0.screens.len() == 2
-        })
-        .await;
-        // Role baselines are persisted independently after membership/layout
-        // convergence. Let that setup finish before testing preview durability.
-        common::until("owner role baselines settled", || {
-            [&a, &b].into_iter().all(|node| {
-                let config = lock(&node.inner.config);
-                let claims = config.owner().claims(node.group_id().unwrap());
-                let microphone = config.owner().microphone_claims(node.group_id().unwrap());
-                [a.id(), b.id()].into_iter().all(|id| {
-                    claims.records.iter().any(|r| r.owner == id) && microphone.records.iter().any(|r| r.owner == id)
-                })
-            })
-        })
-        .await;
-        let online = BTreeSet::from([a.id(), b.id()]);
-        let idle = view(&a, &online);
-        assert_eq!(idle, View::default(), "idle projections must be hidden");
-        let input_streams = [common::input_id(&a, b.id()), common::input_id(&b, a.id())];
-        let initial = a.layout().0;
-        let version = a.layout().1.revision;
-        let id = initial.screens[0].id.clone();
-        let mut placements: Vec<_> = initial
-            .screens
-            .iter()
-            .map(|s| {
-                let (origin, scale) = initial.device_transform(s.id.device).unwrap();
-                api::Placement {
-                    device: s.id.device.into(),
-                    origin,
-                    scale,
-                }
-            })
-            .collect();
-        // A stationary canvas press projects the unchanged group geometry. P0
-        // must reach the peer without entering native edit mode or saving files.
-        let paths: Vec<_> = [ad.path(), bd.path()]
-            .into_iter()
-            .flat_map(|dir| {
-                [
-                    dir.join(crate::config::SETTINGS_FILE),
-                    dir.join(crate::config_module::group_store::STATE_FILE),
-                ]
-            })
-            .collect();
-        let saved: Vec<_> = paths.iter().map(|path| std::fs::read(path).unwrap()).collect();
-        preview_ui(&a, 1, placements.clone(), vec![], false).unwrap();
-        common::until("stationary press reaches B", || {
-            lock(&b.inner.projection.control)
-                .remote
-                .get(&a.id())
-                .is_some_and(|p| p.layout == initial && p.affected.is_empty())
-        })
-        .await;
-        assert!(!status(&a).editing && !status(&b).editing);
-        for node in [&a, &b] {
-            let pressed = view(node, &online);
-            assert!(!pressed.projections.is_empty(), "stationary press shows projections");
-            assert!(!pressed.editable && !pressed.show_handles);
-        }
-        preview_ui(&a, 1, vec![], vec![], true).unwrap();
-        common::until("stationary click clears B", || {
-            lock(&b.inner.projection.control).remote.is_empty()
-        })
-        .await;
-        assert_eq!(view(&a, &online), idle, "ending a preview hides projections");
-        assert_eq!(view(&b, &online), View::default());
-        assert_eq!(a.layout().0, initial);
-        assert_eq!(b.layout().0, initial);
-        assert_eq!(a.layout().1.revision, version);
-        assert_eq!(
-            paths
-                .iter()
-                .map(|path| std::fs::read(path).unwrap())
-                .collect::<Vec<_>>(),
-            saved
-        );
-        set_mode(&a, true);
-        common::until("mode reaches B", || status(&b).editing).await;
-        for node in [&a, &b] {
-            let editing = view(node, &online);
-            assert!(!editing.projections.is_empty());
-            assert!(editing.editable && editing.show_handles);
-        }
-        placements[0].origin.y += 20.0 / 686.0;
-        let affected = vec![api::ScreenKey::from(&id)];
-        preview_ui(&a, 2, placements.clone(), affected.clone(), false).unwrap();
-        common::until("P0 preview reaches B", || {
-            lock(&b.inner.projection.control).remote.get(&a.id()).is_some_and(|p| {
-                (p.layout.screen(&id).unwrap().rect.y - initial.screen(&id).unwrap().rect.y - 20.0 / 686.0).abs() < 1e-8
-            })
-        })
-        .await;
-        assert_eq!(a.layout().0, initial);
-        assert_eq!(b.layout().0, initial);
-        assert_eq!(a.layout().1.revision, version);
-        preview_ui(&a, 2, vec![], vec![], true).unwrap();
-        preview_ui(&a, 2, placements, affected, false).unwrap(); // late IPC result after pointer-up
-        common::until("clear reaches B", || {
-            lock(&b.inner.projection.control).remote.is_empty()
-        })
-        .await;
-        assert!(lock(&a.inner.projection.control).local.is_none());
-        assert!(
-            !view(&a, &online).projections.is_empty(),
-            "edit mode survives preview end"
-        );
-        let closed_id = lock(&a.inner.projection.control).mode.unwrap().0;
-        native_event(&b, Event::Escape, Instant::now()).await;
-        common::until("Esc on B ends A's mode", || !status(&a).editing && !status(&b).editing).await;
-        assert_eq!(view(&a, &online), View::default());
-        assert_eq!(view(&b, &online), View::default());
-        receive(
-            &b,
-            a.id(),
-            Action::Mode {
-                id: closed_id,
-                enabled: true,
-            },
-            Instant::now(),
-        );
-        assert!(!status(&b).editing, "late renewal cannot resurrect a closed mode");
-        set_mode(&a, true);
-        common::until("new mode reaches B", || status(&b).editing).await;
-        receive(
-            &b,
-            a.id(),
-            Action::Gesture {
-                id: closed_id,
-                active: true,
-            },
-            Instant::now(),
-        );
-        assert!(
-            lock(&b.inner.projection.control).gestures.is_empty(),
-            "an old mode cannot block crossing in a new one"
-        );
-        let p = oink_display::projection::compute(
-            &initial.effective(&b.link_config().unwrap().applied().owners),
-            b.id(),
-            |_| true,
-            None,
-        )
-        .remove(0);
-        let old = initial.screen(&p.neighbour).unwrap().rect;
-        for (phase, delta) in [(DragPhase::Begin, 0.0), (DragPhase::End, f64::NAN)] {
-            native_event(
-                &b,
-                Event::Drag {
-                    projection: Box::new(p.clone()),
-                    handle: oink_display::projection::Handle::Middle,
-                    delta,
-                    phase,
-                },
-                Instant::now(),
-            )
-            .await;
-        }
-        assert!(
-            lock(&b.inner.projection.control).gesture.is_none(),
-            "even an invalid up must release the gesture barrier"
-        );
-        assert_eq!(b.layout().1.revision, version);
-        for phase in [DragPhase::Begin, DragPhase::End] {
-            native_event(
-                &b,
-                Event::Drag {
-                    projection: Box::new(p.clone()),
-                    handle: oink_display::projection::Handle::End,
-                    delta: 0.0,
-                    phase,
-                },
-                Instant::now(),
-            )
-            .await;
-        }
-        assert_eq!(b.layout().1.revision, version, "a click is not a config edit");
-
-        native_event(
-            &b,
-            Event::Drag {
-                projection: Box::new(p.clone()),
-                handle: oink_display::projection::Handle::End,
-                delta: 0.0,
-                phase: DragPhase::Begin,
-            },
-            Instant::now(),
-        )
-        .await;
-        native_event(
-            &b,
-            Event::Drag {
-                projection: Box::new(p.clone()),
-                handle: oink_display::projection::Handle::End,
-                delta: 40.0,
-                phase: DragPhase::Update,
-            },
-            Instant::now(),
-        )
-        .await;
-        assert_eq!(b.layout().1.revision, version);
-        native_event(
-            &b,
-            Event::Drag {
-                projection: Box::new(p.clone()),
-                handle: oink_display::projection::Handle::End,
-                delta: 40.0,
-                phase: DragPhase::End,
-            },
-            Instant::now(),
-        )
-        .await;
-        common::until("native resize commits over C0", || {
-            a.layout().0 == b.layout().0 && b.layout().1.revision > version
-        })
-        .await;
-        let next = a.layout().0;
-        let resized = next.screen(&p.neighbour).unwrap();
-        assert!((resized.rect.w / resized.rect.h - old.w / old.h).abs() < 1e-8);
-        assert_eq!(resized.size_source, oink_display::layout::SizeSource::Manual);
-        assert_eq!(
-            [common::input_id(&a, b.id()), common::input_id(&b, a.id())],
-            input_streams
-        );
-        set_mode(&a, false);
-        let _ = b.set_layout_projection(false).unwrap();
-        a.shutdown().await;
-        b.shutdown().await;
     }
 }

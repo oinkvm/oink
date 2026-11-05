@@ -4,7 +4,7 @@
 //! pre-login backend (SYSTEM, started by OinkInput on `winsta0\Winlogon`) captures
 //! on the logon desktop. It creates no visible window there (only message-only
 //! and never-shown windows), so the cursor is parked visibly instead of covered,
-//! and the foreground-capture and application-focus windows are not used. It also
+//! and the foreground-capture windows are not used. It also
 //! withdraws the local source while a password field has focus (see
 //! [`super::credential_focus`]).
 use std::sync::OnceLock;
@@ -15,7 +15,7 @@ pub(crate) struct Profile {
     pub capture_desktop: &'static str,
     /// Withdraw the local source while the focused element is a password field.
     pub credential_gate: bool,
-    /// May show windows (cursor cover, foreground capture, application focus).
+    /// May show windows (cursor cover, foreground capture).
     pub visible_windows: bool,
 }
 pub(crate) const USER: Profile = Profile {

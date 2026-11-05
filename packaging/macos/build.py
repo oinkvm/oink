@@ -15,6 +15,7 @@ import tempfile
 import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'build-support'))
 from provenance import verify, digest
+from identity import artifact_stem
 import package_notes
 from payload import copy_notices
 from report_manifest import write_manifest, image_identity
@@ -322,7 +323,7 @@ def main():
                 if app_notary['status'] == 'Accepted':
                     staple_and_validate(app)
                     app_notary['stapled'] = True
-            stem = f"{I['name']}-{a.version}-{a.build}-macos-{a.arch}"
+            stem = artifact_stem(a.version, 'macos', a.arch)
             dmg = a.output / f'{stem}.dmg'
             from dmg import create
             create(app, dmg, a.sparkle_cache)

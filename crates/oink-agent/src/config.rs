@@ -113,7 +113,12 @@ impl Default for Settings {
             speed_mode: SpeedMode::Physical,
             cursor_trail_duration_ms: 270,
             input_transform: oink_foundation::input_transform::InputTransform::initial(std::env::consts::OS),
-            game_mode: GameModePreference::Auto,
+            // Mac starts with game mode off; Windows keeps automatic detection.
+            game_mode: if cfg!(target_os = "macos") {
+                GameModePreference::Off
+            } else {
+                GameModePreference::Auto
+            },
             accept_contacts: true,
             sync_system_arrangement: false,
         }
@@ -181,6 +186,10 @@ impl AgentConfig {
         let mut extended = owner.ensure_option(
             oink_protocol::v1::dto::LocalOption::SyncSystemArrangement,
             oink_protocol::v1::RawValue::Bool(false),
+        )?;
+        extended |= owner.ensure_option(
+            oink_protocol::v1::dto::LocalOption::AudioQuality,
+            oink_protocol::v1::RawValue::Uint(u64::from(oink_audio::negotiation::Quality::default().number())),
         )?;
         // Upgrade the old receiver choice without changing its behavior: an
         // old OFF becomes parent ON + mapped gestures + the existing scroll feel.
@@ -638,6 +647,28 @@ mod tests {
         assert!(stored(dir.path())["local"]["routing"]["damping"].get("rules").is_none());
     }
     #[test]
+    fn audio_quality_is_source_owned_persistent_and_revision_checked() {
+        use oink_audio::negotiation::Quality;
+        use oink_protocol::v1::{dto::LocalOption, schema::WireValue};
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::load_from(dir.path()).unwrap();
+        let option = LocalOption::AudioQuality;
+        assert_eq!(config.settings.audio.quality, Quality::Quality);
+        for quality in [Quality::Quality, Quality::Lossless, Quality::Smooth] {
+            let revision = config.owner().revision(option).unwrap();
+            config.edit_owner(option, revision, quality.number().write()).unwrap();
+            assert!(config.edit_owner(option, revision, 99_u32.write()).is_err());
+            config.update(|settings| settings.onboarding_done = true).unwrap();
+            config = AgentConfig::load_from(dir.path()).unwrap();
+            assert_eq!(config.settings.audio.quality, quality);
+            assert_eq!(config.owner().value(option), Some(quality.number().write()));
+            assert!(stored(dir.path())["local"]["audio"].get("quality").is_none());
+        }
+        let revision = config.owner().revision(option).unwrap();
+        assert!(config.edit_owner(option, revision, 3_u32.write()).is_err());
+    }
+
+    #[test]
     fn fresh_audio_defaults_and_explicit_owner_choices_survive_unrelated_edits() {
         use oink_protocol::v1::{dto::LocalOption, schema::WireValue};
         let dir = tempfile::tempdir().unwrap();
@@ -1023,14 +1054,23 @@ mod tests {
         );
         let hotkeys = s.hotkeys.as_ref().unwrap();
         assert_eq!(hotkeys, &crate::agent_api::default_hotkeys());
-        assert!(
-            hotkeys
-                .iter()
-                .all(|h| { h.enabled == (h.action != crate::api::HotkeyAction::ToggleMicrophoneMute) })
-        );
+        assert!(hotkeys.iter().all(|h| {
+            h.enabled
+                == !matches!(
+                    h.action,
+                    crate::api::HotkeyAction::ToggleMicrophoneMute | crate::api::HotkeyAction::OpenWindow
+                )
+        }));
         assert!(s.show_status_icon);
         assert!(s.accept_contacts);
-        assert_eq!(s.game_mode, GameModePreference::Auto);
+        assert_eq!(
+            s.game_mode,
+            if cfg!(target_os = "macos") {
+                GameModePreference::Off
+            } else {
+                GameModePreference::Auto
+            }
+        );
         assert_eq!(s.screen_preferences.device_gain, 1.0);
         assert_eq!(s.routing.event_frequency, s.event_frequency);
         assert_eq!(s.routing.cursor_trail_duration_ms, s.cursor_trail_duration_ms);
@@ -1293,6 +1333,39 @@ mod tests {
         assert!(config.preview_preferences(&invalid).is_err());
         assert_eq!(config.owner(), &before);
     }
+    #[test]
+    fn open_window_hotkey_default_and_explicit_choices_survive_restart() {
+        use crate::api::HotkeyAction;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::load_from(dir.path()).unwrap();
+        config
+            .update_local(&serde_json::json!({"confirm_quit":false}), |s| s.confirm_quit = false)
+            .unwrap();
+        assert!(stored(dir.path())["local"].get("hotkeys").is_none());
+        let mut loaded = AgentConfig::load_from(dir.path()).unwrap();
+        let mut keys = crate::hotkeys::configured(loaded.settings.hotkeys.clone());
+        assert!(
+            !keys
+                .iter()
+                .find(|h| h.action == HotkeyAction::OpenWindow)
+                .unwrap()
+                .enabled
+        );
+        for enabled in [true, false] {
+            keys.iter_mut()
+                .find(|h| h.action == HotkeyAction::OpenWindow)
+                .unwrap()
+                .enabled = enabled;
+            loaded
+                .update_local(&serde_json::json!({"hotkeys":&keys}), |s| {
+                    s.hotkeys = Some(keys.clone())
+                })
+                .unwrap();
+            loaded = AgentConfig::load_from(dir.path()).unwrap();
+            assert_eq!(loaded.settings.hotkeys.as_ref(), Some(&keys));
+        }
+    }
+
     #[test]
     fn per_device_hotkey_overrides_persist_with_distinct_target_identity() {
         let dir = tempfile::tempdir().unwrap();

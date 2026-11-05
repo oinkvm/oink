@@ -183,7 +183,7 @@ impl QueueSpec {
             StreamKind::Input => (Self::new(640, 64), Self::new(192, 64)),
             StreamKind::Config => (Self::new(16, 384), Self::new(16, 384)),
             StreamKind::Clipboard => (Self::new(16, 64), Self::new(16, 64)),
-            StreamKind::Aim | StreamKind::Diagnostics => (Self::new(32, 64), Self::new(32, 64)),
+            StreamKind::Diagnostics => (Self::new(32, 64), Self::new(32, 64)),
             _ => (Self::new(8, 64), Self::new(8, 64)),
         }
     }

@@ -177,18 +177,18 @@ impl Interruptions {
         }
         delta
     }
-    pub fn block(&mut self, at_ms: u64, kinds: &[OutputKind], pcm: &[f32], counters: &DropoutCounters) {
+    pub fn block(&mut self, at_ms: u64, rate: u32, kinds: &[OutputKind], pcm: &[f32], counters: &DropoutCounters) {
         let mut concealed = 0;
         let mut missing = 0;
         for (kind, frame) in kinds.iter().copied().zip(pcm.as_chunks::<2>().0) {
             concealed += u64::from(kind == OutputKind::Concealed);
             missing += u64::from(kind == OutputKind::Missing);
-            self.frame(at_ms, 48_000, kind, *frame, counters);
+            self.frame(at_ms, rate, kind, *frame, counters);
         }
         counters.record_quality(DropoutBucket {
             at_ms,
-            concealed_ns: concealed * 1_000_000_000 / 48_000,
-            missing_ns: missing * 1_000_000_000 / 48_000,
+            concealed_ns: concealed * 1_000_000_000 / u64::from(rate),
+            missing_ns: missing * 1_000_000_000 / u64::from(rate),
             ..Default::default()
         });
     }
@@ -314,8 +314,8 @@ mod tests {
         let c = DropoutCounters::default();
         let mut t = Interruptions::default();
         crate::allocation_audit::assert_no_heap(|| {
-            t.block(1000, &[OutputKind::Audio; 120], &[0.2; 240], &c);
-            t.block(1000, &[OutputKind::Concealed; 120], &[0.2; 240], &c);
+            t.block(1000, 48_000, &[OutputKind::Audio; 120], &[0.2; 240], &c);
+            t.block(1000, 48_000, &[OutputKind::Concealed; 120], &[0.2; 240], &c);
         });
         let b = c.snapshot(1000)[1].unwrap();
         assert_eq!(b.concealed_ns, 2_500_000);

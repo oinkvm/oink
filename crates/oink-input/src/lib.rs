@@ -11,7 +11,6 @@ pub use oink_foundation::input::{
     InputPermissions, KeyCode, MouseButton, PermissionState, ScrollPhase, ScrollUnit, SourceKind, SwipeAxis,
 };
 
-pub mod application_focus;
 pub mod capture_continuity;
 #[cfg(any(target_os = "macos", all(test, debug_assertions)))]
 mod contact_capture;
@@ -60,6 +59,9 @@ mod win_lock;
 mod windows;
 #[cfg(any(windows, all(test, debug_assertions)))]
 mod windows_external_input;
+#[cfg(any(windows, all(test, debug_assertions)))]
+#[cfg_attr(not(windows), allow(dead_code))]
+mod windows_keyboard_trace;
 
 #[cfg(windows)]
 pub use windows::raw_capture::dispatch_guard as dispatch_raw_clip_guard;
@@ -123,49 +125,18 @@ pub type EventHandler = Arc<dyn Fn(&CapturedEvent) -> Disposition + Send + Sync>
 /// - 切到 `Remote` 时先隐藏再停靠 / 冻结：光标不能在别处露出来。
 /// - 所有方法可以从任意线程调用。
 pub trait InputBackend: Send + Sync {
+    /// At a modifier-retarget boundary, retire only physical modifiers whose
+    /// first DOWN passed locally and whose observable OS state is now UP.
+    /// HID E0..E7 bit masks. Off the capture owner, inside a keyboard callback,
+    /// or when the platform cannot attest the state, return zero. No polling.
+    fn reconcile_passed_modifiers(&self, _candidates: u8) -> u8 {
+        0
+    }
+
     /// Ordered outside capture callbacks. Windows owns a dedicated foreground
     /// window until false; other platforms retain their native focus behavior.
     fn set_source_foreground(&self, _enabled: bool) {}
 
-    /// A fake platform may drive application-focus deadlines explicitly. This
-    /// hook is absent from releases and defaults to the production wall clock.
-    #[cfg(debug_assertions)]
-    fn application_focus_test_clock(&self) -> Option<oink_foundation::application_focus::TestClock> {
-        None
-    }
-    /// Ordinary-thread application-focus interface. Backends marshal native UI
-    /// work onto their window owner; the capture thread never calls these methods.
-    fn application_focus_supported(&self) -> bool {
-        false
-    }
-    /// Install on the native owner. Each callback captures its pointer claim at
-    /// registration; callers must never relabel queued observations.
-    fn application_focus_watch(&self, _observer: Option<application_focus::Observer>) {}
-    /// Explicit sampling must return a fresh stamp even when the foreground is
-    /// unchanged: a new pointer claim cannot reuse an old claim's evidence.
-    fn application_focus_sample(&self) -> oink_foundation::application_focus::Observation {
-        use oink_foundation::application_focus::{Foreground, Observation, ObservationStamp};
-        Observation {
-            stamp: ObservationStamp {
-                generation: 1,
-                sequence: 1,
-            },
-            foreground: Foreground::Unavailable,
-            hidden_lost: false,
-            park_operation: None,
-        }
-    }
-    fn application_focus_park(
-        &self,
-        _expected: oink_foundation::application_focus::ObservationStamp,
-        _operation: u64,
-        _permit: application_focus::Permit,
-    ) -> oink_foundation::application_focus::ParkResult {
-        oink_foundation::application_focus::ParkResult::Unavailable
-    }
-    fn application_focus_cancel(&self, _operation: u64) {}
-    /// Dismiss our hidden window; this never restores a saved application.
-    fn application_focus_dismiss(&self) {}
     /// Atomic only: no native permission query on capture/injection threads.
     fn input_safety(&self) -> session_gate::InputSafety {
         Default::default()

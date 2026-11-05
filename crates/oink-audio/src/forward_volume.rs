@@ -4,7 +4,7 @@
 /// One millisecond at 48 kHz. Fixed for every setting, so changing gain never
 /// changes stream alignment. Only aggregate levels are diagnosed.
 pub const LOOKAHEAD_FRAMES: usize = 48;
-const DELAY: usize = LOOKAHEAD_FRAMES + 1;
+const MAX_DELAY: usize = 192 + 1;
 const MIN_HOLD: usize = 96;
 const MAX_HOLD: usize = 1440;
 pub const MAX_BOOST_DB: f64 = 12.098_328;
@@ -53,6 +53,7 @@ pub fn amplitude(percent: u16) -> f32 {
 /// exponential release restores headroom between transients. No hard clipping
 /// is used to create loudness; the final clamp only guards floating-point error.
 pub struct Gain {
+    sample_rate: usize,
     current: f32,
     target: f32,
     ramp_step: f32,
@@ -64,8 +65,8 @@ pub struct Gain {
     previous_peak: f32,
     peak_rising: bool,
     cursor: usize,
-    delayed: [[f32; 2]; DELAY],
-    envelope: [f32; DELAY],
+    delayed: [[f32; 2]; MAX_DELAY],
+    envelope: [f32; MAX_DELAY],
 }
 impl std::fmt::Debug for Gain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -81,6 +82,7 @@ impl std::fmt::Debug for Gain {
 impl Default for Gain {
     fn default() -> Self {
         Self {
+            sample_rate: 48_000,
             current: 1.0,
             target: 1.0,
             ramp_step: 0.0,
@@ -92,15 +94,22 @@ impl Default for Gain {
             previous_peak: 0.0,
             peak_rising: false,
             cursor: 0,
-            delayed: [[0.0; 2]; DELAY],
-            envelope: [1.0; DELAY],
+            delayed: [[0.0; 2]; MAX_DELAY],
+            envelope: [1.0; MAX_DELAY],
         }
     }
 }
 impl Gain {
     pub fn new(percent: u16) -> Self {
+        Self::with_rate(percent, 48_000)
+    }
+    pub fn with_rate(percent: u16, sample_rate: u32) -> Self {
+        assert!((8_000..=192_000).contains(&sample_rate));
         let gain = amplitude(percent);
         Self {
+            sample_rate: sample_rate as usize,
+            hold_period: sample_rate as usize * 2 / 1000,
+            since_peak: sample_rate as usize * 30 / 1000 + 1,
             current: gain,
             target: gain,
             ..Self::default()
@@ -111,8 +120,8 @@ impl Gain {
         let target = amplitude(percent);
         if self.target != target {
             self.target = target;
-            self.remaining = 240;
-            self.ramp_step = (target - self.current) / 240.0;
+            self.remaining = self.sample_rate / 200;
+            self.ramp_step = (target - self.current) / self.remaining as f32;
         }
         Ok(())
     }
@@ -122,8 +131,8 @@ impl Gain {
         self.envelope.fill(1.0);
         self.limit = 1.0;
         self.hold = 0;
-        self.hold_period = MIN_HOLD;
-        self.since_peak = MAX_HOLD + 1;
+        self.hold_period = self.sample_rate * 2 / 1000;
+        self.since_peak = self.sample_rate * 30 / 1000 + 1;
         self.previous_peak = 0.0;
         self.peak_rising = false;
     }
@@ -131,6 +140,10 @@ impl Gain {
         self.process_observed(samples, |_| {});
     }
     pub(crate) fn process_observed(&mut self, samples: &mut [f32], mut observe: impl FnMut(&[f32])) {
+        let lookahead = self.sample_rate.div_ceil(1000);
+        let delay = lookahead + 1;
+        let min_hold = self.sample_rate * 2 / 1000;
+        let max_hold = self.sample_rate * 30 / 1000;
         for frame in samples.chunks_mut(2) {
             if self.remaining != 0 {
                 self.current += self.ramp_step;
@@ -149,20 +162,20 @@ impl Gain {
             self.delayed[self.cursor] = input;
             self.envelope[self.cursor] = required;
             if required < 1.0 {
-                for back in 1..=LOOKAHEAD_FRAMES {
-                    let index = (self.cursor + DELAY - back) % DELAY;
-                    let attack = required + (1.0 - required) * (back as f32 / LOOKAHEAD_FRAMES as f32);
+                for back in 1..=lookahead {
+                    let index = (self.cursor + delay - back) % delay;
+                    let attack = required + (1.0 - required) * (back as f32 / lookahead as f32);
                     self.envelope[index] = self.envelope[index].min(attack);
                 }
             }
-            let out = (self.cursor + 1) % DELAY;
+            let out = (self.cursor + 1) % delay;
             // Hold only peaks that need the current attenuation (within
             // 0.1% to cover a sampled sine's changing peak phase). Merely
             // exceeding unity must not latch a past, much larger transient.
             let out_peak = self.delayed[out][0].abs().max(self.delayed[out][1].abs());
-            self.since_peak = (self.since_peak + 1).min(MAX_HOLD + 1);
-            if self.since_peak > MAX_HOLD {
-                self.hold_period = MIN_HOLD;
+            self.since_peak = (self.since_peak + 1).min(max_hold + 1);
+            if self.since_peak > max_hold {
+                self.hold_period = self.sample_rate * 2 / 1000;
             }
             // Follow repeated limiting peaks for 1.25 periods (2..30 ms).
             // Bass must not recover between half-waves; isolated transients
@@ -172,8 +185,8 @@ impl Gain {
                 && self.previous_peak > 1.0
                 && 1.0 / self.previous_peak <= self.limit * 1.001
             {
-                if self.since_peak <= MAX_HOLD {
-                    self.hold_period = (self.since_peak * 5 / 4).clamp(MIN_HOLD, MAX_HOLD);
+                if self.since_peak <= max_hold {
+                    self.hold_period = (self.since_peak * 5 / 4).clamp(min_hold, max_hold);
                 }
                 self.since_peak = 0;
                 self.hold = self.hold.max(self.hold_period);
@@ -186,7 +199,7 @@ impl Gain {
                 self.hold = self.hold_period;
             }
             if self.hold == 0 {
-                self.limit += (1.0 - self.limit) / 480.0;
+                self.limit += (1.0 - self.limit) / (self.sample_rate as f32 / 100.0);
             } else {
                 self.hold -= 1;
             }
@@ -203,6 +216,26 @@ impl Gain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_rate_unity_preserves_samples_with_one_millisecond_lookahead() {
+        for rate in [8_000, 44_100, 48_000, 96_000, 192_000] {
+            let delay = (rate as usize).div_ceil(1000);
+            let input: Vec<_> = (0..4096)
+                .flat_map(|i| {
+                    let v = (i as f32 * 0.03).sin() * 0.5;
+                    [v, -v]
+                })
+                .collect();
+            let mut output = input.clone();
+            let mut gain = Gain::with_rate(100, rate);
+            crate::allocation_audit::assert_no_heap(|| gain.process(&mut output));
+            assert_eq!(&output[delay * 2..], &input[..input.len() - delay * 2]);
+            eprintln!(
+                "source gain rate {rate}: {delay} frames, {} ms",
+                delay as f64 * 1000.0 / f64::from(rate)
+            );
+        }
+    }
     #[test]
     fn continuous_control_ten_percent_is_the_fitted_macos_scalar() {
         let mut gain = Gain::new(10);

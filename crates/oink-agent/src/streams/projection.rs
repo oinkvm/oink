@@ -82,13 +82,7 @@ impl ProjectionStreams {
     }
 
     fn valid(message: &Message) -> bool {
-        matches!(
-            message,
-            Message::ProjectionPreview(_)
-                | Message::ProjectionMode(_)
-                | Message::ProjectionGesture(_)
-                | Message::ArrangementPreview(_)
-        )
+        matches!(message, Message::ProjectionPreview(_) | Message::ArrangementPreview(_))
     }
 
     fn supported(&self, peer: DeviceId) -> bool {

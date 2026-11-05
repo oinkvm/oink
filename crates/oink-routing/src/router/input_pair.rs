@@ -16,10 +16,6 @@ impl Router {
         if boot.device_id == self.me() || self.admitted_boots.get(&boot.device_id) != Some(&boot) {
             return;
         }
-        self.application.outgoing.retire_source(boot);
-        for code in self.application.incoming.forget_boot(boot) {
-            self.release_key_ref(code);
-        }
         if self.peers.get(&boot.device_id).is_some_and(|peer| peer.connected) {
             self.detach_input(boot.device_id);
         } else {
@@ -30,6 +26,7 @@ impl Router {
         // still available above. Then discard its sessions and cached facts so
         // future focus scopes contain no retired members. A replacement Boot
         // starts with a fresh peer record; stale retirement is fenced above.
+        self.local_click_reset_peer(boot.device_id);
         self.peers.remove(&boot.device_id);
         self.admitted_boots.remove(&boot.device_id);
     }
@@ -48,6 +45,10 @@ impl Router {
             return false;
         }
         self.admit_boot(boot);
+        let replaced = self
+            .peers
+            .get(&peer)
+            .is_some_and(|p| p.session.is_some_and(|s| s != instance));
         let state = self.peers.entry(peer).or_insert_with(|| Peer::new(now));
         if state.connected || state.retired_sessions.contains(&instance) {
             return false;
@@ -64,7 +65,14 @@ impl Router {
         state.feel = feel;
         state.connected = true;
         state.focus_ready = false;
-        state.held_sync_nonempty = false;
+        if controllable {
+            self.local_click_cancel();
+        } else {
+            self.local_click_peer_lost(peer);
+        }
+        if replaced {
+            self.local_click_reset_peer(peer);
+        }
         self.validate_focus_lock_session();
         self.dnd_hello(peer);
         self.on_dnd_msg(peer, crate::dnd::DndMsg::Caps { enabled: dnd });
@@ -88,7 +96,6 @@ impl Router {
         self.windows_lock.capable.remove(&peer);
         state.touchpad_contacts = None;
         state.focus_ready = false;
-        state.held_sync_nonempty = false;
         if self.contacts_target == Some(peer) {
             self.cancel_source_contacts();
         }

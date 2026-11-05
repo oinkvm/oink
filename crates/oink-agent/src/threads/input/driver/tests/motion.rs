@@ -90,6 +90,15 @@ fn pending_motion_precedes_buttons_keys_scroll_and_focus_handoff_without_waiting
             }),
             pointer_source: None,
         }),
+        Message::Control(ControlMsg::MovePointerEnter {
+            epoch: 2,
+            display: "remote".into(),
+            pos: oink_foundation::Point::new(0., 0.),
+            scope: Some(oink_routing::control::FocusScope {
+                members: vec![(DeviceId([1; 32]), [1; 16]), (peer(), [2; 16])],
+            }),
+            pointer_source: None,
+        }),
     ];
     for barrier in barriers {
         let mut h = Harness::new();

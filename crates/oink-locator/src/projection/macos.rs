@@ -1,15 +1,15 @@
 //! Transparent, non-activating AppKit projection panels. Only AppKit's main
 //! thread touches native objects; the render thread owns premultiplied bitmaps.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use objc2::rc::Retained;
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSColor, NSEvent, NSPanel, NSPopUpMenuWindowLevel, NSScreen, NSView,
+    NSApplication, NSBackingStoreType, NSColor, NSPanel, NSPopUpMenuWindowLevel, NSScreen, NSView,
     NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CFData, CGPoint, CGRect, CGSize};
@@ -20,58 +20,8 @@ use objc2_core_graphics::{
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize};
 use objc2_quartz_core::{CALayer, CATransaction};
 
-use super::{DRAGGING, DragPhase, Event, Frame, NativeHandle, emit};
+use super::Frame;
 use crate::diagnostics::{Event as DiagnosticEvent, Health};
-
-struct HandleIvars {
-    handle: NativeHandle,
-    start: Cell<f64>,
-}
-define_class!(
-    #[unsafe(super(NSView))]
-    #[thread_kind = MainThreadOnly]
-    #[name = "OinkLayoutProjectionHandle"]
-    #[ivars = HandleIvars]
-    struct HandleView;
-    impl HandleView {
-        #[unsafe(method(acceptsFirstMouse:))]
-        fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool { true }
-        #[unsafe(method(mouseDown:))]
-        fn mouse_down(&self, event: &NSEvent) {
-            self.ivars().start.set(self.along(event));
-            DRAGGING.store(true, Ordering::Release);
-            self.send(event, DragPhase::Begin);
-        }
-        #[unsafe(method(mouseDragged:))]
-        fn mouse_dragged(&self, event: &NSEvent) { self.send(event, DragPhase::Update); }
-        #[unsafe(method(mouseUp:))]
-        fn mouse_up(&self, event: &NSEvent) {
-            self.send(event, DragPhase::End);
-            DRAGGING.store(false, Ordering::Release);
-        }
-    }
-    unsafe impl NSObjectProtocol for HandleView {}
-);
-impl HandleView {
-    fn along(&self, event: &NSEvent) -> f64 {
-        let p = event.locationInWindow();
-        if self.ivars().handle.projection.side.is_vertical() {
-            -p.y
-        } else {
-            p.x
-        }
-    }
-    fn send(&self, event: &NSEvent, phase: DragPhase) {
-        let h = &self.ivars().handle;
-        tracing::debug!(?phase, handle = ?h.hit.handle, delta = self.along(event) - self.ivars().start.get(), "native projection handle");
-        emit(Event::Drag {
-            projection: Box::new(h.projection.clone()),
-            handle: h.hit.handle,
-            delta: self.along(event) - self.ivars().start.get(),
-            phase,
-        });
-    }
-}
 
 define_class!(
     #[unsafe(super(NSPanel))]
@@ -99,7 +49,6 @@ struct Ui {
     desired: usize,
     generation: u64,
     windows: Vec<Window>,
-    handles: Vec<Retained<ProjectionPanel>>,
 }
 thread_local! { static UI: RefCell<Option<Ui>> = const { RefCell::new(None) }; }
 static GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -107,7 +56,6 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 #[derive(Default)]
 struct Update {
     frames: Vec<Frame>,
-    editable: bool,
 }
 pub(super) struct Backend {
     health: Arc<Health>,
@@ -125,8 +73,8 @@ impl Backend {
             posted: Arc::new(AtomicBool::new(false)),
         })
     }
-    pub(super) fn present(&mut self, frames: Vec<Frame>, editable: bool) {
-        *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Update { frames, editable });
+    pub(super) fn present(&mut self, frames: Vec<Frame>) {
+        *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Update { frames });
         if self.posted.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -147,21 +95,14 @@ impl Backend {
             }
             // Observe the existing empty-wake behaviour; do not repair it here.
             let update = update.unwrap_or_default();
-            apply(mtm, generation, health.id, update.frames, update.editable);
+            apply(mtm, generation, health.id, update.frames);
             health.applied();
         });
     }
     pub(super) fn hide(&mut self) {
-        self.present(Vec::new(), false);
+        self.present(Vec::new());
     }
     pub(super) fn pump(&mut self) {}
-    pub(super) fn escape_down(&self) -> bool {
-        unsafe extern "C" {
-            fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
-        }
-        // SAFETY: Passive combined-session Escape state, no tap or focus change.
-        unsafe { CGEventSourceKeyState(0, 53) }
-    }
 }
 
 fn make_window(mtm: MainThreadMarker) -> Window {
@@ -205,7 +146,7 @@ fn make_window(mtm: MainThreadMarker) -> Window {
     Window { panel, layer }
 }
 
-fn apply(mtm: MainThreadMarker, generation: u64, owner: u64, frames: Vec<Frame>, editable: bool) {
+fn apply(mtm: MainThreadMarker, generation: u64, owner: u64, frames: Vec<Frame>) {
     let _ = NSApplication::sharedApplication(mtm);
     let primary_h = NSScreen::screens(mtm)
         .firstObject()
@@ -214,10 +155,6 @@ fn apply(mtm: MainThreadMarker, generation: u64, owner: u64, frames: Vec<Frame>,
         let mut ui = ui.borrow_mut();
         if ui.as_ref().is_none_or(|u| u.generation != generation) {
             if let Some(old) = ui.take() {
-                for panel in old.handles {
-                    panel.orderOut(None);
-                    panel.close();
-                }
                 for w in old.windows {
                     w.panel.orderOut(None);
                     w.panel.close();
@@ -229,47 +166,10 @@ fn apply(mtm: MainThreadMarker, generation: u64, owner: u64, frames: Vec<Frame>,
                 desired: 0,
                 generation,
                 windows: Vec::new(),
-                handles: Vec::new(),
             });
         }
         let ui = ui.as_mut().expect("initialized");
         ui.desired = frames.len();
-        // AppKit retains a down/drag/up tracking sequence outside the small
-        // handle. Keep that window stationary until the gesture ends.
-        // A preview can leave this monitor or lose its neighbour mid-drag.
-        // Keep AppKit's tracking view alive until up; an explicit hide/expiry
-        // passes editable=false and cancels it immediately.
-        if !editable || !DRAGGING.load(Ordering::Acquire) {
-            for panel in ui.handles.drain(..) {
-                panel.orderOut(None);
-                panel.close();
-            }
-            for handle in frames.iter().filter(|_| editable).flat_map(|f| f.handles.iter()) {
-                let panel = make_window(mtm).panel;
-                let b = handle.hit.rect;
-                panel.setFrame_display(
-                    NSRect::new(NSPoint::new(b.x, primary_h - b.bottom()), NSSize::new(b.w, b.h)),
-                    false,
-                );
-                panel.setIgnoresMouseEvents(false);
-                // Only these small bounds take mouse events. All projection
-                // pixels and the outer crossing gutter remain click-through.
-                panel.setBackgroundColor(Some(&NSColor::colorWithWhite_alpha(0.0, 0.01)));
-                let this = HandleView::alloc(mtm).set_ivars(HandleIvars {
-                    handle: handle.clone(),
-                    start: Cell::new(0.0),
-                });
-                // SAFETY: NSView's designated initializer on our subclass.
-                let view: Retained<HandleView> =
-                    unsafe { msg_send![super(this), initWithFrame: NSRect::new(NSPoint::ZERO, NSSize::new(b.w, b.h))] };
-                panel.setContentView(Some(&view));
-                panel.orderFrontRegardless();
-                ui.handles.push(panel);
-            }
-            if frames.is_empty() {
-                DRAGGING.store(false, Ordering::Release);
-            }
-        }
         while ui.windows.len() > frames.len() {
             let w = ui.windows.pop().expect("nonempty");
             w.panel.orderOut(None);
@@ -369,7 +269,6 @@ pub(crate) fn diagnose(health: &Health, mtm: MainThreadMarker) {
                     .iter()
                     .enumerate()
                     .map(|(i, w)| (&*w.panel as &NSPanel, i < u.desired, !w.layer.isHidden()))
-                    .chain(u.handles.iter().map(|w| (&**w as &NSPanel, true, true)))
             })
             .collect();
         crate::diagnostics::macos::visibility(

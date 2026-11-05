@@ -1,6 +1,6 @@
 //! [`LayoutQuery`] 的简单实现：每块屏幕是视平面上的一个轴对齐矩形，本机坐标到视平面是缩放 + 平移。
 //!
-//! 供多设备模拟器、单元测试和本机回环自测使用；正式实现（标定得到的单应、传送门表）由
+//! 供多设备模拟器、单元测试和本机回环自测使用；完整布局与传送门表由
 //! `oink_display::layout` supplies the full implementation. Simplified rules:
 //! - 屏幕 A 的一条边与屏幕 B 的对边间隙在 `[minimum_gap, maximum_gap]` 内、沿边方向有重叠，即为传送门；
 //! - 映射方式为 stitching：跳过间隙，沿边位置不变；
@@ -8,7 +8,6 @@
 //! - 桥接（`bridge_reach`）：两个传送门之间的窄墙从中间劈开；
 //! - 其余为墙：指针沿墙滑动。
 
-use oink_foundation::display::DisplayInfo;
 use oink_foundation::{DeviceId, Point, Rect};
 
 use crate::layout::{LayoutQuery, ScreenId, ScreenPos, StepResult};
@@ -95,30 +94,6 @@ impl SimpleLayout {
     pub fn add_screen(&mut self, id: ScreenId, local: Rect, plane: Rect) -> &mut Self {
         self.screens.retain(|s| s.id != id);
         self.screens.push(SimpleScreen { id, local, plane });
-        self
-    }
-
-    /// 按显示器的物理尺寸把一台设备的屏幕放到视平面上：本机坐标原点对应 `origin`，
-    /// 各屏按各自的 reference_per_native_unit 缩放（物理尺寸未知时按 `fallback_reference_per_native_unit`）。
-    pub fn add_device_displays(
-        &mut self,
-        device: DeviceId,
-        displays: &[DisplayInfo],
-        origin: Point,
-        fallback_reference_per_native_unit: f64,
-    ) -> &mut Self {
-        for d in displays {
-            let s = d
-                .reference_per_native_unit()
-                .unwrap_or(fallback_reference_per_native_unit);
-            let plane = Rect::new(
-                origin.x + d.bounds.x * s,
-                origin.y + d.bounds.y * s,
-                d.bounds.w * s,
-                d.bounds.h * s,
-            );
-            self.add_screen(ScreenId::new(device, d.key.clone()), d.bounds, plane);
-        }
         self
     }
 

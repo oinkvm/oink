@@ -32,6 +32,7 @@ pub(super) fn defer(message: u32, info: &KBDLLHOOKSTRUCT) {
     // both physical and opted-in external releases enter here; own/external-local
     // input was filtered first. Native callback reentry and the affected tail
     // were reproduced through the Windows 11 hook entrance in recording tests.
+    let mut queued = false;
     let wake = PENDING.with_borrow_mut(|pending| {
         // At most one unresolved release per Win32 VK (256 slots). Duplicate
         // UPs add no ownership and cannot consume unbounded memory on reentry.
@@ -39,6 +40,7 @@ pub(super) fn defer(message: u32, info: &KBDLLHOOKSTRUCT) {
             return false;
         }
         let wake = pending.is_empty();
+        queued = true;
         pending.push_back(Release {
             message,
             info: *info,
@@ -47,6 +49,7 @@ pub(super) fn defer(message: u32, info: &KBDLLHOOKSTRUCT) {
         });
         wake
     });
+    keyboard_trace::release(keyboard_trace::Stage::Deferred, info, queued);
     if wake {
         #[cfg(all(test, debug_assertions))]
         if TEST_CURSOR.with(|cursor| cursor.get().is_some()) {
@@ -70,10 +73,17 @@ pub(super) fn drain() {
         let prepared = with_state(|state| state.prepare_key(release.message, &release.info, release.instant));
         // Only retire the original route/held ledgers. The native UP already
         // passed through the nested callback; no second OS event is posted.
+        let available = prepared.is_some();
         finish(prepared);
+        keyboard_trace::release(keyboard_trace::Stage::Drained, &release.info, available);
     }
 }
 
 pub(super) fn clear() {
-    PENDING.with_borrow_mut(VecDeque::clear);
+    PENDING.with_borrow_mut(|pending| {
+        for release in pending.iter() {
+            keyboard_trace::release(keyboard_trace::Stage::QueueCleared, &release.info, true);
+        }
+        pending.clear();
+    });
 }

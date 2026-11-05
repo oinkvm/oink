@@ -22,7 +22,7 @@ NOTES = {'en':'Test update', 'zh-Hans':'测试更新', 'ja':'テスト', 'ko':'�
 
 class MacReleaseTests(unittest.TestCase):
     def record(self):
-        asset = dict(name='Oink-0.1.1-30-macos-arm64.zip', size=20, sha256='c'*64)
+        asset = dict(name='Oink-0.1.1-macos-arm64.zip', size=20, sha256='c'*64)
         common = dict(version='0.1.1', build=30, built_commit=COMMIT, source_tree_sha256=TREE)
         mac = dict(**common, source_commit=None, team_id='893V37X2CW', notarized=True,
                    notarization={k:dict(status='Accepted',stapled=True) for k in ['app','dmg']},
@@ -46,6 +46,13 @@ class MacReleaseTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(ValueError): M.validate_release(bad, notes, 'v0.1.1', COMMIT, TREE)
         for change in [dict(channel='beta'), dict(notes={'en':'missing Chinese'})]:
             with self.assertRaises(ValueError): M.validate_release(record, {**notes,**change}, 'v0.1.1', COMMIT, TREE)
+
+    def test_legacy_asset_names_remain_valid(self):
+        record = self.record()
+        record['artifacts'][0]['name'] = 'Oink-0.1.1-30-macos-arm64.zip'
+        self.assertEqual(M.validate_release(record, dict(channel='stable', severity='normal', notes=NOTES),
+                                           'v0.1.1', COMMIT, TREE)['name'],
+                         'Oink-0.1.1-30-macos-arm64.zip')
 
     def test_manual_dispatch_must_still_be_published_when_queried(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -89,9 +96,11 @@ class MacReleaseTests(unittest.TestCase):
     def test_new_item_preserves_older_notes_archive_and_has_no_beta_channel(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'appcast.xml'
-            metadata = dict(version='0.1.1',build=30,length=20,sha256='c'*64,url='https://github.com/oinkvm/oink/releases/download/v0.1.1/Oink.zip')
+            metadata = dict(version='0.1.1',build=30,length=20,sha256='c'*64,url='https://github.com/oinkvm/oink/releases/download/v0.1.1/Oink-0.1.1-macos-arm64.zip')
             M.write_appcast(path,None,metadata,'public-signature',NOTES)
             older = ET.fromstring(path.read_bytes()).find('./channel/item')
+            self.assertEqual(older.find('enclosure').get('url'), metadata['url'])
+            self.assertEqual(older.findtext(f'{{{M.appcast.SPARKLE}}}version'), '30')
             previous = path.read_bytes()
             M.write_appcast(path,previous,{**metadata,'build':31,'version':'0.1.2'},'new-signature',NOTES)
             items = ET.fromstring(path.read_bytes()).findall('./channel/item')
@@ -119,7 +128,7 @@ class MacReleaseTests(unittest.TestCase):
             tool = Path(os.environ['SPARKLE_TEST_SIGN_UPDATE'])
             signature = M.sign(tool,archive,PUBLIC)
             metadata = dict(version='0.1.1',build=30,length=archive.stat().st_size,sha256=M.feed.digest(archive.read_bytes()),
-                            url='https://github.com/oinkvm/oink/releases/download/v0.1.1/Oink.zip')
+                            url='https://github.com/oinkvm/oink/releases/download/v0.1.1/Oink-0.1.1-macos-arm64.zip')
             path=directory/'appcast.xml'
             M.write_appcast(path,None,metadata,signature,NOTES)
             M.sign(tool,path,PUBLIC,xml=True)

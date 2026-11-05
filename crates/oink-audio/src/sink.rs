@@ -404,13 +404,14 @@ impl SourceState {
         if let Some(counters) = self.status.dropout_counters.get() {
             self.quality.block(
                 (crate::diagnostics::monotonic_us(now).max(0) / 1000) as u64,
+                self.receiver.output_rate(),
                 self.receiver.output_kinds(),
                 out,
                 counters,
             );
         }
         for (frame, kind) in out.as_chunks_mut::<2>().0.iter_mut().zip(self.receiver.output_kinds()) {
-            self.splice.apply(frame, *kind, dsp::SAMPLE_RATE);
+            self.splice.apply(frame, *kind, self.receiver.output_rate());
             self.fade.apply(frame, *kind != quality::OutputKind::Intentional);
         }
         if let Some(rendered) = &mut self.rendered {
@@ -470,6 +471,7 @@ struct Frozen {
     playing: [bool; MAX_SOURCES],
     draining: bool,
     work: crate::playback::CallbackWork,
+    presentation_codec: Option<crate::playback::PresentationCodec>,
 }
 // SAFETY: transferred into exactly one serialized native callback; pointers
 // are dereferenced only there and storage stays pinned until retirement ack.
@@ -481,6 +483,7 @@ impl Default for Frozen {
             playing: [false; MAX_SOURCES],
             draining: false,
             work: Default::default(),
+            presentation_codec: None,
         }
     }
 }
@@ -511,6 +514,11 @@ impl PullInput for PullRender {
     }
     fn drained(&self) -> bool {
         self.registry.drained.load(Ordering::Acquire)
+    }
+    fn presentation_codec(&self) -> crate::playback::PresentationCodec {
+        self.frozen
+            .presentation_codec
+            .unwrap_or(crate::playback::PresentationCodec::Unknown)
     }
     fn work(&self) -> crate::playback::CallbackWork {
         self.frozen.work
@@ -566,14 +574,18 @@ impl Registry {
                 continue;
             }
             if !active {
-                state.fade.start(dsp::SAMPLE_RATE);
+                state.fade.start(state.receiver.output_rate());
             }
+            let frames = (frames as f64 * f64::from(state.receiver.config().sample_rate)
+                / f64::from(state.receiver.output_rate()))
+            .ceil() as usize;
             let codec = state.receiver.config().frame_size();
             let scans = INPUT_BATCH.max(frames.div_ceil(codec) + 2).min(32);
             frozen.work.scan_steps += state.receive_bounded(now, scans, active && !frozen.draining) as u64;
             // A sleeping source has a finite tail even while another source
             // keeps the device active. Drain that tail without inventing PLC.
             let sleeping = state.status.sleeping.get().is_some_and(|sleeping| sleeping(now));
+            state.receiver.set_retiring(!active);
             state.receiver.set_draining(frozen.draining || !active || sleeping);
             // Invalid packet decode may also need PLC: bound both C calls.
             state.codec_budget = 2 * ((frames * 1011).div_ceil(codec * 1000) + 1);
@@ -616,6 +628,7 @@ impl Registry {
             // Output-wide native gaps can only affect sources contributing to
             // this timeline. An intentionally idle port must not inherit them.
             if source_rendering {
+                crate::playback::PresentationCodec::include(&mut frozen.presentation_codec, state.receiver.config());
                 sources[present] = state.id;
             }
             present += 1;
@@ -721,10 +734,6 @@ impl Sink {
     pub fn source(&mut self, config: dsp::Config) -> Result<Source, String> {
         self.source_inner(config, false)
     }
-    /// Enables bounded diagnostic sample copies; never increases playout reserve.
-    pub fn source_observed(&mut self, config: dsp::Config) -> Result<Source, String> {
-        self.source_inner(config, true)
-    }
     fn source_inner(&mut self, config: dsp::Config, observe: bool) -> Result<Source, String> {
         self.reap();
         let index = self
@@ -734,6 +743,7 @@ impl Sink {
             .position(|slot| slot.load(Ordering::Acquire).is_null())
             .ok_or("audio source slots awaiting retirement")?;
         let (source, mut state) = SourceState::prepare(config, observe)?;
+        state.receiver.set_output_rate(self.playback.info().sample_rate);
         let ptr = &mut *state as *mut SourceState;
         self.states.push((index, state));
         self.registry.slots[index].store(ptr, Ordering::Release);
@@ -976,7 +986,7 @@ mod tests {
         }
         assert_eq!(samples.len(), 7 * MIX_SAMPLES);
         assert!(samples.last().unwrap() < &-0.49);
-        for pair in samples.as_chunks::<2>().0.windows(2) {
+        for pair in samples.as_chunks::<2>().0[96..].windows(2) {
             assert!((pair[1][0] - pair[0][0]).abs() < 0.02, "splice step: {pair:?}");
         }
     }
@@ -1030,7 +1040,10 @@ mod tests {
             assert!(output.samples[2..1440].iter().any(|s| *s > 0.01 && *s < 0.24));
             assert!(output.samples[1438..].iter().all(|s| *s == 0.0));
             for pair in output.samples.as_chunks::<2>().0.windows(2) {
-                assert!((pair[1][0] - pair[0][0]).abs() < 0.001);
+                assert!(
+                    (pair[1][0] - pair[0][0]).abs() < 0.001,
+                    "retirement {packets} packets: {pair:?}"
+                );
             }
             assert!(registry.slots[0].load(Ordering::Acquire).is_null());
         }
@@ -1101,7 +1114,7 @@ mod tests {
         }
         state.receive(origin);
         let mut output = [0.0; MIX_SAMPLES];
-        for tick in 0..6 {
+        for tick in 0..7 {
             state.render(origin + Duration::from_millis(100 + tick * 3), 120, &mut output);
         }
         let at = (crate::diagnostics::monotonic_us(origin + Duration::from_millis(200)).max(0) / 1000) as u64;
@@ -1394,20 +1407,14 @@ mod wake_tests {
                 rendered.push(pair[0] * 32768.0);
             }
         }
-        let onset: Vec<_> = rendered
-            .into_iter()
-            .filter(|value| *value >= 2000.0 && *value <= 2959.1)
-            .collect();
-        assert!(!onset.is_empty());
-        assert!(onset[0] < 2001.1, "first onset sample was skipped: {}", onset[0]);
-        // Resampling may interpolate an edge sample; no codec frame or nonzero
-        // block is trimmed to erase startup latency.
-        let peak = onset.iter().copied().fold(0.0_f32, f32::max);
-        assert!(peak > 2957.9, "end of onset missing: {peak}");
-        let peak_index = onset.iter().position(|value| *value == peak).unwrap();
-        // Existing receiver interpolation can hold one boundary sample; allow
-        // that single-sample correction, never a skipped 120-frame PCM packet.
-        for pair in onset[..=peak_index].windows(2) {
+        // The FIR rings at the two discontinuous edges. Its unit DC gain
+        // preserves the complete pulse area, allowing the bounded 1% catch-up.
+        let area: f32 = rendered.iter().sum();
+        let expected_area = (2000.0 + 2959.0) * 960.0 / 2.0;
+        assert!((area / expected_area - 1.0).abs() < 0.015, "onset area {area}");
+        // Interior samples exclude the 96-tap edge response and span every
+        // codec boundary in the ramp. A skipped packet would jump 120 units.
+        for pair in rendered[640..1360].windows(2) {
             assert!(
                 (0.0..=2.025).contains(&(pair[1] - pair[0])),
                 "PCM discontinuity: {pair:?}"
@@ -1483,14 +1490,10 @@ mod wake_tests {
             0,
             "drain must zero fill rather than invent PLC"
         );
-        assert!(
-            output.samples[..output.len]
-                .iter()
-                .filter(|sample| **sample > 0.24)
-                .count()
-                >= 476,
-            "leading zero periods must not acknowledge shutdown before the beep"
-        );
+        // Include both FIR edge responses when checking that all 240 beep
+        // frames survived drain. A threshold count would discard ringing.
+        let area: f32 = output.samples[..output.len].iter().sum();
+        assert!((area - 120.0).abs() < 0.5, "beep area {area}, len {}", output.len);
         assert!(output.samples[..1200].iter().all(|sample| *sample == 0.0));
     }
     #[test]
@@ -1597,6 +1600,11 @@ impl Simulator {
         Ok(source)
     }
     pub fn fill(&mut self, output: &mut [f32], rate: u32, channels: u16, period: u32, at: Instant, gap: Option<u64>) {
+        for (_, state) in &mut self.states {
+            if state.receiver.output_rate() != rate {
+                state.receiver.set_output_rate(rate);
+            }
+        }
         self.render.simulate(output, rate, channels, period, at, gap);
     }
     pub fn metrics(&self) -> PlaybackMetrics {
@@ -1627,5 +1635,108 @@ impl std::fmt::Debug for Simulator {
         f.debug_struct("Simulator")
             .field("sources", &self.states.len())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod mixed_rates_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_codecs_and_native_rates_equal_independent_device_rate_streams() {
+        for rate in [44_100, 48_000, 96_000] {
+            let configs = [
+                dsp::Config::low_latency_opus(),
+                dsp::Config::music_opus(),
+                dsp::Config::lossless(44_100),
+                dsp::Config::lossless(96_000),
+            ];
+            let registry = Arc::new(Registry::new());
+            let mut mixed = PullRender::new(registry.clone());
+            let mut solo = Vec::new();
+            let mut storage = Vec::new();
+            let mut sources = Vec::new();
+            let mut encoders = Vec::new();
+            for (index, config) in configs.iter().copied().enumerate() {
+                let (source, mut state) = SourceState::prepare(config, false).unwrap();
+                state.receiver.set_output_rate(rate);
+                registry.slots[index].store(&mut *state, Ordering::Release);
+                storage.push(state);
+                let single = Arc::new(Registry::new());
+                let (reference, mut state) = SourceState::prepare(config, false).unwrap();
+                state.receiver.set_output_rate(rate);
+                single.slots[0].store(&mut *state, Ordering::Release);
+                storage.push(state);
+                solo.push(PullRender::new(single));
+                sources.push((source, reference));
+                encoders.push(dsp::Encoder::new_with_config(config).unwrap());
+            }
+            let origin = Instant::now();
+            let mut sequence = [0_u64; 4];
+            let mut energies = [0.0_f64; 4];
+            let mut max_error = 0.0_f32;
+            for callback in 0..160 {
+                let elapsed = callback as f64 * 120.0 / f64::from(rate);
+                let now = origin + Duration::from_secs_f64(elapsed + 0.04);
+                for (index, config) in configs.iter().copied().enumerate() {
+                    while sequence[index] as f64 * config.frame_duration_ms() / 1000.0 < elapsed + 0.04 {
+                        let frequency = [997.0, 2003.0, 5003.0, 11003.0][index];
+                        let start = sequence[index] as usize * config.frame_size();
+                        let pcm: Vec<_> = (start..start + config.frame_size())
+                            .flat_map(|frame| {
+                                let value = (std::f64::consts::TAU * frequency * frame as f64
+                                    / f64::from(config.sample_rate))
+                                .sin() as f32
+                                    * 0.05;
+                                [value, -value]
+                            })
+                            .collect();
+                        let payload = encoders[index].encode(&pcm).unwrap();
+                        let source_ns = (sequence[index] as f64 * config.frame_duration_ms() * 1e6) as u64;
+                        let arrival = origin + Duration::from_nanos(source_ns);
+                        let (source, reference) = &mut sources[index];
+                        assert!(source.push(sequence[index], &payload, arrival, Some(source_ns), None));
+                        assert!(reference.push(sequence[index], &payload, arrival, Some(source_ns), None));
+                        sequence[index] += 1;
+                    }
+                }
+                let mut output = [0.0; 240];
+                let mut expected = [0.0; 240];
+                crate::allocation_audit::assert_no_heap(|| {
+                    mixed.begin(120, now);
+                    mixed.pull(&mut output, 120, now);
+                    mixed.end();
+                    assert_eq!(mixed.presentation_codec(), crate::playback::PresentationCodec::Unknown);
+                    for (index, single) in solo.iter_mut().enumerate() {
+                        let mut pcm = [0.0; 240];
+                        single.begin(120, now);
+                        single.pull(&mut pcm, 120, now);
+                        single.end();
+                        assert_eq!(
+                            single.presentation_codec(),
+                            crate::playback::PresentationCodec::from_config(configs[index])
+                        );
+                        for (sum, sample) in expected.iter_mut().zip(pcm) {
+                            *sum += sample;
+                        }
+                        energies[index] += pcm.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>();
+                    }
+                });
+                for (actual, expected) in output.into_iter().zip(expected) {
+                    max_error = max_error.max((actual - expected).abs());
+                    assert!(actual.is_finite());
+                }
+            }
+            assert!(max_error < 1e-7, "output {rate}: mix error {max_error}");
+            assert!(energies.iter().all(|energy| *energy > 10.0), "{rate}: {energies:?}");
+            for state in &storage {
+                assert_eq!(state.receiver.stats().lost, 0);
+                assert_eq!(state.receiver.stats().decode_errors, 0);
+                assert_eq!(state.receiver.stats().work_limited, 0);
+            }
+            eprintln!(
+                "mixed output {rate} Hz: 4 sources, 19200 output frames, max sum error {max_error}, energies {energies:?}"
+            );
+        }
     }
 }

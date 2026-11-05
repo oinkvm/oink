@@ -759,3 +759,95 @@ fn fn_row_native_local_fn_edges_stay_native_without_rearming_on_crossing() {
     assert_eq!(physical(&mut source, KeyCode::APPLE_FN, false), Disposition::Pass);
     assert!(relay_keys(&mut source, &mut target).is_empty());
 }
+
+#[test]
+fn passed_modifier_reconciles_before_remote_snapshot_and_clears_source_ledgers() {
+    let mut source = router(Os::Windows);
+    source.test_connect(SOURCE, 0);
+    assert_eq!(physical(&mut source, KeyCode::LEFT_GUI, true), Disposition::Pass);
+    source.drain_outputs();
+    source.set_modifier_release_probe(Arc::new(|mask| {
+        assert_eq!(mask, 8);
+        8
+    }));
+    source.holder = SOURCE;
+    source.retarget_modifiers();
+    let out = source.drain_outputs();
+    assert!(!out.iter().any(|o| matches!(
+        o,
+        Output::Send {
+            msg: Message::Input(InputMsg::Key {
+                code: KeyCode::LEFT_GUI,
+                ..
+            }),
+            ..
+        }
+    )));
+    assert!(!out.iter().any(|o| matches!(o, Output::Inject(InjectEvent::Key { .. }))));
+    assert!(!source.keys.contains_key(&KeyCode::LEFT_GUI));
+    assert!(!source.physical_keys.contains(&KeyCode::LEFT_GUI));
+    assert!(!source.lock_escape_keys.contains(&KeyCode::LEFT_GUI));
+    assert!(!source.keyboard_pointer_modifiers().contains(&KeyCode::LEFT_GUI));
+    // No second native release, and a genuine new press is a new route.
+    assert_eq!(physical(&mut source, KeyCode::LEFT_GUI, false), Disposition::Pass);
+    assert_eq!(physical(&mut source, KeyCode::LEFT_GUI, true), Disposition::Swallow);
+}
+
+#[test]
+fn passed_modifier_release_retires_old_remote_before_new_destination() {
+    let mut source = router(Os::Windows);
+    source.test_connect(SOURCE, 0);
+    physical(&mut source, KeyCode::LEFT_GUI, true);
+    source.holder = SOURCE;
+    source.retarget_modifiers();
+    source.drain_outputs();
+    source.set_modifier_release_probe(Arc::new(|mask| mask));
+    source.holder = ME;
+    source.retarget_modifiers();
+    let out = source.drain_outputs();
+    assert_eq!(
+        out.iter()
+            .filter(|o| matches!(
+                o,
+                Output::Send {
+                    to: SOURCE,
+                    msg: Message::Input(InputMsg::Key {
+                        code: KeyCode::LEFT_GUI,
+                        pressed: false
+                    }),
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert!(!out.iter().any(|o| matches!(o, Output::Inject(InjectEvent::Key { .. }))));
+    source.retarget_modifiers();
+    assert!(!source.drain_outputs().iter().any(|o| matches!(
+        o,
+        Output::Send {
+            msg: Message::Input(InputMsg::Key { .. }),
+            ..
+        }
+    )));
+}
+
+#[test]
+fn modifier_probe_does_not_run_on_ticks_or_for_swallowed_remote_presses() {
+    let mut source = router(Os::Windows);
+    source.test_connect(SOURCE, 0);
+    physical(&mut source, KeyCode::LEFT_GUI, true);
+    source.set_modifier_release_probe(Arc::new(|_| panic!("not a retarget boundary")));
+    source.tick(1_000_000);
+    source.drain_outputs();
+    source.set_modifier_release_probe(Arc::new(|_| 0));
+    source.holder = SOURCE;
+    source.retarget_modifiers();
+    assert!(source.keys.contains_key(&KeyCode::LEFT_GUI));
+    physical(&mut source, KeyCode::LEFT_GUI, false);
+    physical(&mut source, KeyCode::LEFT_GUI, true);
+    source.set_modifier_release_probe(Arc::new(|_| panic!("swallowed DOWN is not async-observable")));
+    source.holder = ME;
+    source.retarget_modifiers();
+    assert!(source.keys.contains_key(&KeyCode::LEFT_GUI));
+}

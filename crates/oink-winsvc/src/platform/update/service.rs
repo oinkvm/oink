@@ -45,7 +45,7 @@ pub(super) struct State {
     verification_started: Option<Instant>,
     last_check: Option<Instant>,
     revision: u64,
-    wake: Option<std::sync::mpsc::SyncSender<()>>,
+    wake: Option<Arc<super::super::wake::Event>>,
 }
 fn verification_current(state: &State, revision: u64) -> Result<(), Error> {
     if state.status.error == Some(Error::VerificationTimeout) {
@@ -140,7 +140,8 @@ fn journal_status(name: &str) -> Result<(Phase, Option<Error>), Error> {
 pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, request: Request) -> Reply {
     let mut state = state.lock().unwrap();
     state.expire_verification(Instant::now());
-    let wake = !matches!(&request, Request::Poll { .. } | Request::Query);
+    let wake = !matches!(&request, Request::Poll { .. } | Request::Query)
+        || (matches!(&request, Request::Poll { .. }) && state.transaction.is_some() && !state.shutdown);
     if pending() {
         let (phase, error) =
             journal_status("pending.json").unwrap_or((Phase::RepairRequired, Some(Error::RepairRequired)));
@@ -413,7 +414,7 @@ pub(super) fn dispatch(state: &Arc<Mutex<State>>, id: u32, process: &Handle, req
         Ok(Reply::Status { status })
     })();
     if wake && let Some(send) = &state.wake {
-        let _ = send.try_send(());
+        send.signal();
     }
     result.unwrap_or_else(|error| Reply::Error { error })
 }
@@ -462,39 +463,115 @@ fn scheduled_command(
     })
 }
 pub(super) fn serve() {
+    let Some(events) = super::super::broker::events() else {
+        return;
+    };
     if protected::system().is_err() {
         return;
     }
     let Ok(mut initial) = State::new() else {
         return;
     };
-    let (wake, receive) = std::sync::mpsc::sync_channel(1);
-    initial.wake = Some(wake);
+    let wake = events.engine.clone();
+    initial.wake = Some(wake.clone());
     let state = Arc::new(Mutex::new(initial));
     let engine_state = state.clone();
-    let engine = std::thread::spawn(move || engine(engine_state, receive));
-    let mut workers = BTreeMap::<u32, std::thread::JoinHandle<()>>::new();
+    let engine = std::thread::spawn(move || engine(engine_state, wake));
+    let mut workers = BTreeMap::<u32, Endpoint>::new();
+    let mut retries = BTreeMap::<u32, Instant>::new();
     while !super::super::broker::STOP.load(Ordering::Acquire) {
+        let now = Instant::now();
+        let mut unavailable = None;
+        for worker in workers.values() {
+            worker.changed.signal();
+        }
         if let Ok(sessions) = super::pipe::sessions() {
+            let logged_off: Vec<_> = workers.keys().filter(|id| !sessions.contains(id)).copied().collect();
+            for id in logged_off {
+                workers.remove(&id); // Drop cancels and joins the obsolete endpoint.
+            }
+            retries.retain(|id, _| sessions.contains(id));
             for id in sessions {
-                if workers.get(&id).is_some_and(|w| !w.is_finished()) {
+                if workers.get(&id).is_some_and(|worker| !worker.finished()) {
                     continue;
                 }
-                let state = state.clone();
-                workers.insert(
-                    id,
-                    std::thread::spawn(move || {
-                        let _ = super::pipe::serve(id, state);
-                    }),
-                );
+                if let Some(mut worker) = workers.remove(&id)
+                    && let Err(error) = worker.join()
+                {
+                    eprintln!("Oink update session endpoint: {error}");
+                    retries.insert(id, now + Duration::from_millis(500));
+                }
+                if retries.get(&id).is_some_and(|at| *at > now) {
+                    continue;
+                }
+                match Endpoint::new(id, state.clone(), events.update.clone()) {
+                    Ok(worker) => {
+                        workers.insert(id, worker);
+                        retries.remove(&id);
+                    }
+                    Err(error) => {
+                        eprintln!("Oink update session endpoint: {error}");
+                        retries.insert(id, Instant::now() + Duration::from_millis(500));
+                    }
+                }
             }
+        } else {
+            unavailable = Some(now + Duration::from_millis(500));
         }
-        std::thread::sleep(Duration::from_millis(500));
+        // No session enumeration timer at idle. The old recovery cadence is
+        // retained only after an actual endpoint/observation failure.
+        let deadline = retries.values().copied().chain(unavailable).min();
+        if super::super::wake::wait(&[events.stop.raw(), events.update.raw()], deadline).is_err() {
+            break;
+        }
     }
-    for (_, worker) in workers {
-        let _ = worker.join();
-    }
+    drop(workers);
     let _ = engine.join();
+}
+
+struct Endpoint {
+    changed: Arc<super::super::wake::Event>,
+    cancel: Arc<super::super::wake::Event>,
+    task: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    _completion: Option<super::super::wake::Object>,
+}
+impl Endpoint {
+    fn new(id: u32, state: Arc<Mutex<State>>, completed: Arc<super::super::wake::Event>) -> std::io::Result<Self> {
+        let changed = super::super::wake::Event::new(false)?;
+        let cancel = super::super::wake::Event::new(true)?;
+        let (session_changed, cancelled) = (changed.clone(), cancel.clone());
+        let task = std::thread::Builder::new()
+            .name(format!("oink-update-session-{id}"))
+            .spawn(move || super::pipe::serve(id, state, session_changed, cancelled))?;
+        let mut endpoint = Self {
+            changed,
+            cancel,
+            task: Some(task),
+            _completion: None,
+        };
+        // A signal from inside the thread can precede is_finished(). Wait for
+        // the actual thread object instead, so endpoint recreation cannot stall.
+        endpoint._completion = Some(super::super::wake::Object::thread(
+            endpoint.task.as_ref().unwrap(),
+            completed,
+        )?);
+        Ok(endpoint)
+    }
+    fn finished(&self) -> bool {
+        self.task.as_ref().is_none_or(|task| task.is_finished())
+    }
+    fn join(&mut self) -> std::io::Result<()> {
+        self.task.take().map_or(Ok(()), |task| {
+            task.join()
+                .map_err(|_| std::io::Error::other("update endpoint panicked"))?
+        })
+    }
+}
+impl Drop for Endpoint {
+    fn drop(&mut self) {
+        self.cancel.signal();
+        let _ = self.join();
+    }
 }
 pub(super) fn http(url: &str, length: u64, package: bool) -> Result<Vec<u8>, Error> {
     let policy = if package {
@@ -637,19 +714,54 @@ fn download(selected: &mut Selected, roots: &Roots, state: &Arc<Mutex<State>>) -
     )?);
     Ok(())
 }
-fn engine(state: Arc<Mutex<State>>, wake: std::sync::mpsc::Receiver<()>) {
+fn engine(state: Arc<Mutex<State>>, wake: Arc<super::super::wake::Event>) {
+    let events = super::super::broker::events().unwrap();
+    // Arm before reading the durable journal. External installer/worker writes
+    // publish by rename; download stream writes do not wake this loop.
+    let Ok(mut files) = super::maintenance_notifications() else {
+        tracing::error!("update engine cannot subscribe to maintenance storage");
+        return;
+    };
     // In-house builds disable the feed gate. Their elevated local approvals
     // still need a live engine, package inspection, recovery and health checks.
     let roots = oink_update::trust::compiled();
     tracing::info!(feed_enabled = roots.is_ok(), "Windows local update engine running");
     let mut selected: Option<Selected> = None;
     let mut was_pending = pending();
-    let mut housekeeping: Option<std::thread::JoinHandle<Result<(), Error>>> = None;
+    let mut housekeeping: Option<Cleanup> = None;
+    let mut cleanup_retry = None;
+    let mut worker_process: Option<super::super::wake::Process> = None;
+    let mut recovery_retry = None;
     let mut cleanup_needed = true;
+    let mut observed_input = None;
     while !super::super::broker::STOP.load(Ordering::Acquire) {
+        state.lock().unwrap().expire_verification(Instant::now());
         let is_pending = pending();
-        if is_pending {
-            let _ = worker::resume_pending();
+        let input = (is_pending, super::input_allowed());
+        if observed_input != Some(input) {
+            observed_input = Some(input);
+            super::super::broker::changed();
+        }
+        if is_pending && worker_process.as_ref().is_some_and(|process| process.exited()) {
+            worker_process = None;
+            // A worker that exits with pending state is unfinished recovery, not
+            // an idle poll. Preserve the former one-second recovery cadence.
+            recovery_retry = Some(Instant::now() + Duration::from_secs(1));
+        }
+        if is_pending && recovery_retry.is_none_or(|at| Instant::now() >= at) {
+            let watched = (|| {
+                let process =
+                    worker::resume_pending().map_err(|_| std::io::Error::other("update worker unavailable"))?;
+                let identity = super::super::wake::Process::identity(&process)?;
+                if worker_process.as_ref().is_none_or(|old| !old.matches(identity)) {
+                    worker_process = Some(super::super::wake::Process::new(process, wake.clone())?);
+                }
+                Ok::<_, std::io::Error>(())
+            })();
+            recovery_retry = watched.is_err().then(|| Instant::now() + Duration::from_secs(1));
+        } else if !is_pending {
+            worker_process = None;
+            recovery_retry = None;
         }
         if was_pending && !is_pending {
             let mut state = state.lock().unwrap();
@@ -782,30 +894,85 @@ fn engine(state: Arc<Mutex<State>>, wake: std::sync::mpsc::Receiver<()>) {
                 state.status.phase = Phase::Failed;
             }
         }
-        if housekeeping.as_ref().is_some_and(|task| task.is_finished()) {
+        if housekeeping.as_ref().is_some_and(|task| task.thread.is_finished()) {
             cleanup_needed = finish_housekeeping(&mut housekeeping) == Some(Err(Error::Busy));
+            cleanup_retry = cleanup_needed.then(|| Instant::now() + Duration::from_secs(1));
         }
         if cleanup_needed
+            && cleanup_retry.is_none_or(|at| Instant::now() >= at)
             && housekeeping.is_none()
             && !pending()
             && selected.as_ref().is_none_or(|candidate| candidate.prepared.is_none())
         {
-            housekeeping = Some(std::thread::spawn(worker::cleanup_completed));
+            match Cleanup::new(wake.clone()) {
+                Ok(task) => housekeeping = Some(task),
+                Err(error) => {
+                    tracing::warn!(%error, "cannot watch update cleanup completion");
+                    cleanup_retry = Some(Instant::now() + Duration::from_secs(1));
+                }
+            }
         }
-        let preparing = {
+        let deadline = {
             let state = state.lock().unwrap();
-            state.transaction.is_some() && !state.shutdown
+            engine_deadline(&state, Instant::now(), roots.is_ok(), pending())
         };
-        let _ = wake.recv_timeout(if preparing {
-            Duration::from_millis(50)
-        } else {
-            Duration::from_secs(1)
+        let retry = cleanup_retry.filter(|_| {
+            cleanup_needed
+                && housekeeping.is_none()
+                && !pending()
+                && selected.as_ref().is_none_or(|candidate| candidate.prepared.is_none())
         });
+        let deadline = deadline.into_iter().chain(retry).chain(recovery_retry).min();
+        match super::super::wake::wait(&[events.stop.raw(), wake.raw(), files.raw()], deadline) {
+            Ok(super::super::wake::Woke::Signal(0)) => break,
+            Ok(super::super::wake::Woke::Signal(2)) => {
+                if let Err(error) = files.rearm() {
+                    tracing::error!(%error, "cannot rearm maintenance notification");
+                    break;
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "update engine wait failed");
+                break;
+            }
+            _ => {}
+        }
     }
     let _ = finish_housekeeping(&mut housekeeping);
 }
-fn finish_housekeeping(task: &mut Option<std::thread::JoinHandle<Result<(), Error>>>) -> Option<Result<(), Error>> {
-    let result = task.take()?.join().unwrap_or(Err(Error::Storage));
+fn engine_deadline(state: &State, now: Instant, feed_enabled: bool, pending: bool) -> Option<Instant> {
+    let check =
+        (feed_enabled && state.policy.policy.preferences.checks_enabled && state.transaction.is_none() && !pending)
+            .then(|| state.last_check.map_or(now, |at| at + Duration::from_secs(24 * 3600)));
+    let verification = (state.status.phase == Phase::Verifying)
+        .then_some(state.verification_started.map(|at| at + VERIFICATION_BUDGET))
+        .flatten();
+    let handover = (state.transaction.is_some() && !state.shutdown)
+        .then_some(state.prepared_at.map(|at| at + Duration::from_secs(20)))
+        .flatten();
+    [check, verification, handover].into_iter().flatten().min()
+}
+struct Cleanup {
+    thread: std::thread::JoinHandle<Result<(), Error>>,
+    _completion: super::super::wake::Object,
+}
+impl Cleanup {
+    fn new(event: Arc<super::super::wake::Event>) -> std::io::Result<Self> {
+        let thread = std::thread::spawn(worker::cleanup_completed);
+        match super::super::wake::Object::thread(&thread, event) {
+            Ok(completion) => Ok(Self {
+                thread,
+                _completion: completion,
+            }),
+            Err(error) => {
+                let _ = thread.join();
+                Err(error)
+            }
+        }
+    }
+}
+fn finish_housekeeping(task: &mut Option<Cleanup>) -> Option<Result<(), Error>> {
+    let result = task.take()?.thread.join().unwrap_or(Err(Error::Storage));
     if let Err(error) = result
         && error != Error::Busy
     {
@@ -838,6 +1005,9 @@ fn prepare(state: &Arc<Mutex<State>>, selected: &Selected, expected_revision: u6
     state.prepared_at = Some(Instant::now());
     state.status.phase = Phase::Quiescing;
     state.status.blockers.clear();
+    // Publishing a maintenance transaction changes input admission now; the
+    // supervisor no longer discovers it on a fixed polling interval.
+    super::super::broker::changed();
     Ok(())
 }
 fn handover(state: &Arc<Mutex<State>>) -> Result<(), Error> {
@@ -859,7 +1029,7 @@ fn handover(state: &Arc<Mutex<State>>) -> Result<(), Error> {
     }
     if state
         .prepared_at
-        .is_none_or(|at| at.elapsed() > Duration::from_secs(20))
+        .is_none_or(|at| at.elapsed() >= Duration::from_secs(20))
     {
         abort(&mut state)?;
         return Err(Error::Busy);
@@ -968,6 +1138,33 @@ mod tests {
             revision: 0,
             wake: None,
         }
+    }
+    #[test]
+    fn idle_engine_has_no_poll_but_real_business_deadlines_remain() {
+        let now = Instant::now();
+        let mut state = check_state();
+        assert_eq!(engine_deadline(&state, now, false, false), None);
+        state.policy.policy.preferences.checks_enabled = true;
+        state.last_check = Some(now);
+        assert_eq!(
+            engine_deadline(&state, now, true, false),
+            Some(now + Duration::from_secs(24 * 3600))
+        );
+        state.transaction = Some("private-test".into());
+        state.prepared_at = Some(now);
+        assert_eq!(
+            engine_deadline(&state, now, false, true),
+            Some(now + Duration::from_secs(20))
+        );
+        state.shutdown = true;
+        assert_eq!(engine_deadline(&state, now, false, true), None);
+        state.transaction = None;
+        state.status.phase = Phase::Verifying;
+        state.verification_started = Some(now);
+        assert_eq!(
+            engine_deadline(&state, now, false, false),
+            Some(now + VERIFICATION_BUDGET)
+        );
     }
     #[test]
     fn local_package_admission_requires_elevation_and_no_live_transaction() {

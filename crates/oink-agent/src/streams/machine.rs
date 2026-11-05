@@ -226,7 +226,6 @@ mod tests {
             StreamKind::Input,
             StreamKind::Clipboard,
             StreamKind::Audio,
-            StreamKind::Aim,
             StreamKind::Diagnostics,
         ] {
             for failure in [

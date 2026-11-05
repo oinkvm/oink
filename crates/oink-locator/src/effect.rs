@@ -1458,7 +1458,7 @@ mod tests {
     }
 
     #[test]
-    fn calibrated_sizes_are_continuous_in_both_directions_and_on_fast_return() {
+    fn layout_sizes_are_continuous_in_both_directions_and_on_fast_return() {
         for ratio in [0.67, 1.0 / 0.67, 1.0] {
             let (source, t) = circle_effect(1.0);
             let mut state = source.continuation(t).unwrap();

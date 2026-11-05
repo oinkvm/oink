@@ -5,7 +5,6 @@
 #[cfg(all(test, debug_assertions))]
 pub(crate) mod lifecycle_tests;
 
-pub mod aim;
 pub mod audio;
 pub mod clipboard;
 pub mod diagnostics;
@@ -37,13 +36,12 @@ pub struct StreamRule {
     pub kind: StreamKind,
     /// Obeys pause: when this device is paused the module closes the streams it writes,
     /// cancels the low-priority operations it started and opens nothing. Streams and
-    /// operations from the peer are still accepted and kept. Diagnostics and the
-    /// mini-game do not obey pause.
+    /// operations from the peer are still accepted and kept. Diagnostics do not obey pause.
     pub obeys_pause: bool,
     pub opens: OpenWhen,
 }
 
-pub const RULES: [StreamRule; 9] = [
+pub const RULES: [StreamRule; 8] = [
     StreamRule {
         kind: StreamKind::LayoutProfilesV3,
         obeys_pause: false,
@@ -67,11 +65,6 @@ pub const RULES: [StreamRule; 9] = [
     StreamRule {
         kind: StreamKind::Audio,
         obeys_pause: true,
-        opens: OpenWhen::FirstUse,
-    },
-    StreamRule {
-        kind: StreamKind::Aim,
-        obeys_pause: false,
         opens: OpenWhen::FirstUse,
     },
     StreamRule {

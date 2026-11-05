@@ -7,22 +7,28 @@
 //!   同时识别旧的等价类型；精确标记经 Custom 保留，Sensitivity 仅作摘要与旧接口兼容。
 //! - 写：`clearContents` + `writeObjects:`，每个文件一个 `NSPasteboardItem`（只写顶层条目的 URL），其他表示形式
 //!   放在第一个条目上；返回写完后的 `changeCount`。文本里的 CRLF 转成 LF。
-//! - 远端文件：File Provider 占位 URL，粘贴读取时由系统触发内容拉取。
-//! - 监听：macOS 没有剪贴板变化通知，后台线程每 200 ms 轮询 `changeCount`。
+//! - 远端文件：一次声明按需文件 URL；File Provider 元数据在独立线程准备，实际文件读取由系统触发内容拉取。
+//! - 监听：macOS 没有剪贴板变化通知，后台线程每 75 ms 轮询 `changeCount`。
 
+mod clipboard_files;
 mod clipboard_key;
 mod content;
 pub(crate) mod dnd;
 pub mod file_provider;
 mod files;
 mod pasteboard;
+pub(crate) mod small_files;
 #[cfg(all(test, debug_assertions))]
 mod test_pasteboard;
 mod thumbnail;
 
 #[cfg(all(test, debug_assertions))]
 pub(crate) fn run_native_linked_promise_tests() {
-    dnd::proxy::linked_tests::run();
+    if std::env::args().any(|arg| arg == "--lazy-clipboard") {
+        clipboard_files::run_native();
+    } else {
+        dnd::proxy::linked_tests::run();
+    }
 }
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,8 +40,8 @@ use crate::{
     ChangeHandler, ClipData, ClipSnapshot, ClipboardBackend, ClipboardError, FileContents, FileEntry, Sensitivity,
 };
 
-/// 轮询间隔（契约要求 ≤ 250 ms）。
-pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Match the source quiet window, avoiding an additional 200 ms poll delay.
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(75);
 
 pub(crate) fn backend() -> Result<Box<dyn ClipboardBackend>, ClipboardError> {
     Ok(Box::new(MacClipboard {
@@ -50,8 +56,26 @@ struct MacClipboard {
     /// Production uses the system clipboard; tests construct a private named board.
     name: Option<String>,
     watcher: Mutex<Option<Watcher>>,
-    registration: Arc<Mutex<Option<(u64, file_provider::Registration)>>>,
+    registration: Arc<Mutex<Option<(u64, FilePublication)>>>,
     local: Arc<Mutex<Option<(u64, crate::store::Batch)>>>,
+}
+
+enum FilePublication {
+    Ready(file_provider::Registration),
+    Lazy(Arc<clipboard_files::FileUrls>),
+}
+impl FilePublication {
+    fn cancel(&self) {
+        match self {
+            Self::Ready(value) => value.cancel(),
+            Self::Lazy(value) => value.cancel(),
+        }
+    }
+    fn supersede(&self) {
+        if let Self::Lazy(value) = self {
+            value.cancel();
+        }
+    }
 }
 
 impl ClipboardBackend for MacClipboard {
@@ -59,6 +83,7 @@ impl ClipboardBackend for MacClipboard {
         clipboard_key::current(self.name.as_deref())
     }
     fn initialize_store(&self, data: std::path::PathBuf) {
+        small_files::initialize(&data);
         file_provider::initialize(data);
     }
     fn change_count(&self) -> u64 {
@@ -78,32 +103,35 @@ impl ClipboardBackend for MacClipboard {
     }
     fn write_native_guarded(
         &self,
-        mut spec: crate::NativeSpec,
+        spec: crate::NativeSpec,
         guard: crate::content::ReaderGuard,
     ) -> Result<u64, ClipboardError> {
+        self.write_native_cancellable(spec, guard, Arc::new(|| Ok(())))
+    }
+    fn write_native_cancellable(
+        &self,
+        mut spec: crate::NativeSpec,
+        guard: crate::content::ReaderGuard,
+        current: crate::content::ReaderGuard,
+    ) -> Result<u64, ClipboardError> {
         let before = self.change_count();
-        spec.prepare_promises()
+        if let Some((_, old)) = self.registration.lock().unwrap().take() {
+            old.supersede();
+        }
+        spec.prepare_promises_while(&|| current().is_ok())
             .map_err(|error| ClipboardError::ContentUnavailable(crate::content::reason(&error)))?;
-        let registration = if spec.files.is_empty() || spec.file_contents.is_none() {
+        let lazy_urls = if spec.files.is_empty() || spec.file_contents.is_none() {
             None
         } else {
-            let source = spec.file_contents.clone().ok_or(ClipboardError::Unsupported)?;
-            Some(
-                file_provider::publish(&spec.files, source, Duration::from_secs(12)).map_err(|error| match error {
-                    ClipboardError::FileProvider(_) | ClipboardError::ContentUnavailable(_) => error,
-                    _ => ClipboardError::FileProviderUnavailable,
-                })?,
-            )
+            Some(clipboard_files::FileUrls::prepare(spec.clone(), current.clone())?)
         };
         if self.change_count() != before {
             return Err(ClipboardError::Busy);
         }
         let mut urls = std::collections::HashMap::new();
-        if !spec.files.is_empty() {
-            let entries = registration
-                .as_ref()
-                .map_or(spec.files.as_slice(), |registration| registration.entries());
-            let paths: Vec<_> = entries
+        if !spec.files.is_empty() && lazy_urls.is_none() {
+            let paths: Vec<_> = spec
+                .files
                 .iter()
                 .filter(|entry| files::is_top_level(entry))
                 .filter_map(|entry| entry.local_path.as_deref())
@@ -116,8 +144,22 @@ impl ClipboardBackend for MacClipboard {
                 urls.insert(node, pasteboard::file_url_string(path));
             }
         }
-        let count = content::write(self.name.as_deref(), &spec, &urls, guard.as_ref())?;
-        *self.registration.lock().unwrap() = registration.map(|registration| (count, registration));
+        // Busy guards the declaration boundary only. Delayed file completion
+        // sets data on this item's existing type; it never republishes a board
+        // or compares against the pre-declaration count.
+        let check = || {
+            guard()?;
+            if self.change_count() == before {
+                Ok(())
+            } else {
+                Err(crate::content::unavailable(crate::model::Unavailable::Superseded))
+            }
+        };
+        let count = content::write_lazy(self.name.as_deref(), &spec, &urls, lazy_urls.clone(), &check)?;
+        if let Some(urls) = &lazy_urls {
+            urls.published(self.name.as_deref(), count);
+        }
+        *self.registration.lock().unwrap() = lazy_urls.map(|urls| (count, FilePublication::Lazy(urls)));
         *self.local.lock().unwrap() = if spec.file_contents.is_none() && !spec.files.is_empty() {
             spec.contents.local_batch().map(|batch| (count, batch))
         } else {
@@ -128,7 +170,9 @@ impl ClipboardBackend for MacClipboard {
 
     fn write(&self, items: &[ClipData], sensitivity: Sensitivity) -> Result<u64, ClipboardError> {
         let cc = pasteboard::write(self.name.as_deref(), items, sensitivity)?;
-        *self.registration.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if let Some((_, old)) = self.registration.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            old.supersede();
+        }
         *self.local.lock().unwrap_or_else(|e| e.into_inner()) = None;
         Ok(cc)
     }
@@ -151,7 +195,8 @@ impl ClipboardBackend for MacClipboard {
         items.push(ClipData::Files(registration.entries().to_vec()));
         match self.write(&items, sensitivity) {
             Ok(count) => {
-                *self.registration.lock().unwrap_or_else(|e| e.into_inner()) = Some((count, registration));
+                *self.registration.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((count, FilePublication::Ready(registration)));
                 Ok(count)
             }
             Err(e) => {
@@ -193,6 +238,14 @@ impl ClipboardBackend for MacClipboard {
     }
 }
 
+impl Drop for MacClipboard {
+    fn drop(&mut self) {
+        if let Some((_, publication)) = self.registration.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            publication.supersede();
+        }
+    }
+}
+
 struct Watcher {
     paused: Arc<(Mutex<bool>, std::sync::Condvar)>,
     handlers: Arc<Mutex<Vec<ChangeHandler>>>,
@@ -204,7 +257,7 @@ impl Watcher {
     fn start(
         name: Option<String>,
         first: ChangeHandler,
-        registration: Arc<Mutex<Option<(u64, file_provider::Registration)>>>,
+        registration: Arc<Mutex<Option<(u64, FilePublication)>>>,
         local: Arc<Mutex<Option<(u64, crate::store::Batch)>>>,
     ) -> Result<Self, ClipboardError> {
         let handlers = Arc::new(Mutex::new(vec![first]));
@@ -236,9 +289,12 @@ impl Watcher {
                     let cur = pasteboard::change_count(name.as_deref());
                     if cur != last {
                         last = cur;
+                        small_files::clipboard_changed();
                         let mut held = registration.lock().unwrap_or_else(|e| e.into_inner());
-                        if held.as_ref().is_some_and(|(count, _)| *count != cur) {
-                            *held = None;
+                        if held.as_ref().is_some_and(|(count, _)| *count != cur)
+                            && let Some((_, old)) = held.take()
+                        {
+                            old.supersede();
                         }
                         drop(held);
                         let mut held = local.lock().unwrap_or_else(|e| e.into_inner());

@@ -214,7 +214,8 @@ impl AudioStreams {
     fn valid(message: &Message) -> bool {
         matches!(
             message,
-            Message::AudioSourceRouteOffer(_)
+            Message::AudioQualitySourceOffer(_)
+                | Message::AudioSourceRouteOffer(_)
                 | Message::AudioPrepared(_)
                 | Message::AudioPreparedAck(_)
                 | Message::AudioPrepareRefused(_)
@@ -320,6 +321,26 @@ impl AudioStreams {
             self.step(peer, step, now);
         }
         result
+    }
+
+    /// Memory-only M0 snapshot; the network writes it on each fourth Pulse.
+    pub fn set_heartbeat_state(&self, peer: DeviceId, message: &Message) -> Result<(), PostError> {
+        let agreement = self.config.peer_agreement(peer).ok_or(PostError::Closed)?;
+        let bytes = v1::frame::encode(message, v1::limits::RELIABLE_FRAME).map_err(|_| PostError::TooLarge)?;
+        let frame = OpaqueFrame::parse_exact(&bytes, v1::limits::RELIABLE_FRAME).map_err(|_| PostError::TooLarge)?;
+        let direct = self
+            .links
+            .links()
+            .by_peer(peer)
+            .is_some_and(|link| matches!(link.path, oink_network::link::LinkPath::Direct));
+        Self::context(&agreement, direct)
+            .admit(frame.header)
+            .map_err(|_| PostError::Closed)?;
+        self.peers
+            .get(&peer)
+            .and_then(|p| p.tx.as_ref())
+            .ok_or(PostError::Closed)?
+            .set_heartbeat_messages(vec![bytes])
     }
 
     pub fn send(&mut self, peer: DeviceId, message: &Message, now: Instant) -> Result<(), PostError> {
@@ -1437,3 +1458,38 @@ super::lifecycle_tests::owner_lifecycle_tests!(
 
 #[cfg(test)]
 mod pull_tests;
+
+#[cfg(all(test, debug_assertions))]
+mod heartbeat_state_tests {
+    use super::*;
+    use crate::streams::lifecycle_tests::{Fixture, message};
+    #[tokio::test]
+    async fn latest_m0_snapshot_is_registered_and_actual_changes_still_post_immediately() {
+        let fixture = Fixture::<AudioStreams>::start().await;
+        let (links, config) = fixture.context(0);
+        let peer = fixture.context(1).0.id();
+        let link = links.links().by_peer(peer).unwrap().link;
+        let mut streams = AudioStreams::new(links, config);
+        streams.link_ready(link, peer);
+        streams
+            .send(peer, &message(StreamKind::Audio, 1), Instant::now())
+            .unwrap();
+        let initial_id = streams.peers[&peer].tx.as_ref().unwrap().id();
+        for counter in [2, 3] {
+            let state = message(StreamKind::Audio, counter);
+            streams.set_heartbeat_state(peer, &state).unwrap();
+            let tx = streams.peers[&peer].tx.as_ref().unwrap();
+            let latest = oink_network::link::testing::heartbeat_messages(tx);
+            assert_eq!(latest, [v1::frame::encode(&state, v1::limits::RELIABLE_FRAME).unwrap()]);
+            assert_eq!(tx.id(), initial_id, "periodic state stays on the original M0");
+        }
+        streams
+            .send(peer, &message(StreamKind::Audio, 4), Instant::now())
+            .unwrap();
+        assert!(
+            oink_network::link::testing::heartbeat_messages(streams.peers[&peer].tx.as_ref().unwrap()).is_empty(),
+            "immediate post invalidates the older registered state"
+        );
+        fixture.stop().await;
+    }
+}

@@ -1537,7 +1537,7 @@ fn product_installed(product: &str) -> bool {
 
 /// Recovery entry while SCM is still alive handles a crash before task arming.
 /// Once the task exists it independently covers service death and reboot.
-pub(super) fn resume_pending() -> Result<(), Error> {
+pub(super) fn resume_pending() -> Result<Handle, Error> {
     let maintenance = protected::maintenance().map_err(|_| Error::Storage)?;
     let journal = Journal::parse(&protected::read(&maintenance.join("pending.json"), 65536)?)?;
     let directory = transaction_dir(&journal.transaction)?;
@@ -1550,7 +1550,7 @@ pub(super) fn resume_pending() -> Result<(), Error> {
             if unsafe { WaitForSingleObject(process.0, 0) } == WAIT_TIMEOUT
                 && plan.worker_created_filetime == format!("{:016x}", protected::created(process.0)?)
             {
-                return Ok(());
+                return Ok(process);
             }
         }
     }
@@ -1571,7 +1571,7 @@ pub(super) fn resume_pending() -> Result<(), Error> {
     if unsafe { ResumeThread(thread.0) } == u32::MAX {
         return Err(Error::Transaction);
     }
-    Ok(())
+    Ok(process)
 }
 
 #[cfg(test)]

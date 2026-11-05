@@ -49,6 +49,22 @@ impl SendStream {
     pub fn set_wake(&self, wake: Wake) {
         self.queue.set_producer_wake(wake);
     }
+    /// Replace the latest self-healing records, without sending or waking the network.
+    /// Every fourth link heartbeat writes this bounded snapshot on this same stream.
+    /// Immediate `post` invalidates it; the owner must refresh after publishing changes.
+    pub fn set_heartbeat_messages(&self, messages: Vec<Vec<u8>>) -> Result<(), PostError> {
+        self.set_heartbeat_messages_observed(messages, None)
+    }
+    /// As above, with a nonblocking diagnostic observer called when a snapshot is
+    /// admitted to the writer. It runs on the network thread and must return quickly.
+    pub fn set_heartbeat_messages_observed(
+        &self,
+        messages: Vec<Vec<u8>>,
+        observer: Option<Wake>,
+    ) -> Result<(), PostError> {
+        self.queue
+            .set_heartbeat(messages, self.id.tag.kind.max_message(), observer)
+    }
     /// Queue one encoded `Message` and wake the network thread. Returns at once.
     /// During a cut-over messages stay queued; `Full` is reported as usual.
     pub fn post(&self, encoded: impl Into<Vec<u8>>) -> Result<(), PostError> {

@@ -101,17 +101,23 @@ const RETRY_MS: [u64; 8] = [5, 10, 20, 30, 40, 50, 60, 80];
 pub(crate) fn set_clipboard(spec: Spec) -> Result<u64, ClipboardError> {
     let fixed = spec.fixed.clone();
     let (data, shared) = build(spec, true);
-    publish(data, shared, fixed)
+    publish(data, shared, fixed, None)
 }
 pub(crate) fn set_native(
     spec: Spec,
     with_files: bool,
     native: super::content::target::Target,
 ) -> Result<u64, ClipboardError> {
+    let id = native.spec.inventory.id;
     let (data, shared) = build_inner(spec, with_files, Some(native));
-    publish(data, shared, Vec::new())
+    publish(data, shared, Vec::new(), Some(id))
 }
-fn publish(data: IDataObject, shared: Arc<Shared>, fixed: Vec<(u32, Vec<u8>)>) -> Result<u64, ClipboardError> {
+fn publish(
+    data: IDataObject,
+    shared: Arc<Shared>,
+    fixed: Vec<(u32, Vec<u8>)>,
+    id: Option<crate::model::OfferId>,
+) -> Result<u64, ClipboardError> {
     shared.publication.begin();
     let mut last = Ok(());
     for delay in std::iter::once(0).chain(RETRY_MS) {
@@ -129,6 +135,17 @@ fn publish(data: IDataObject, shared: Arc<Shared>, fixed: Vec<(u32, Vec<u8>)>) -
     last.map_err(|e| ClipboardError::Platform(format!("OleSetClipboard: {e}")))?;
     // SAFETY: 无参数的系统调用。
     let published_count = u64::from(unsafe { GetClipboardSequenceNumber() });
+    if let Some(id) = id {
+        crate::copy_diagnostics::event(
+            Some(id),
+            crate::copy_diagnostics::Stage::NativeDeclared,
+            crate::copy_diagnostics::Values {
+                count: published_count,
+                result: 1,
+                ..Default::default()
+            },
+        );
+    }
     CURRENT.with(|c| {
         *c.borrow_mut() = Some(Current {
             published_count,

@@ -96,9 +96,6 @@ pub(super) struct Driver {
     local_emergency_sequence: u64,
     session_locked: Option<bool>,
     capture_initialized: bool,
-    overlay: Option<u64>,
-    projection_until: Option<Instant>,
-    overlay_escape: Option<(u64, Instant)>,
     controllable: bool,
     permission_controllable: bool,
     injection_available: Option<bool>,
@@ -119,10 +116,6 @@ pub(super) struct Driver {
     )>,
     trail_suppressed_sent: Option<bool>,
     status_dirty: bool,
-    application_park: Option<(
-        oink_routing::application_focus::ParkRequest,
-        oink_input::application_focus::Permit,
-    )>,
     input_time: Option<CaptureTime>,
     input_report: Option<crate::telemetry::Stamp>,
     jitter_sources: HashMap<(DeviceId, DeviceId, bool), (oink_input::jitter::Estimator, oink_input::jitter::Estimator)>,
@@ -213,17 +206,8 @@ impl Driver {
         router.set_volume_notifications_probe(Arc::new(oink_audio::device_notifications::recent_windows_notifications));
         router.set_settings((*settings).clone());
         let native = inject.backend();
-        #[cfg(debug_assertions)]
-        if let Some(clock) = native.application_focus_test_clock() {
-            router.set_application_focus_test_clock(clock);
-        }
-        router.set_application_focus_enabled(layout.application_focus_enabled, 0);
-        router.set_application_focus_participation(
-            boot,
-            native.application_focus_supported(),
-            (settings.mouse_mode, settings.keyboard_mode),
-            0,
-        );
+        let modifier_backend = native.clone();
+        router.set_modifier_release_probe(Arc::new(move |mask| modifier_backend.reconcile_passed_modifiers(mask)));
         router.set_local_feel(native.feel_profile());
         let trail = super::trail::Trail::new();
         trail.duration(settings.cursor_trail_duration_ms);
@@ -282,9 +266,6 @@ impl Driver {
             local_emergency_sequence: 0,
             session_locked: None,
             capture_initialized: false,
-            overlay: None,
-            projection_until: None,
-            overlay_escape: None,
             controllable: true,
             permission_controllable: true,
             injection_available: None,
@@ -301,7 +282,6 @@ impl Driver {
             trail_pointer_sent: None,
             trail_suppressed_sent: None,
             status_dirty: true,
-            application_park: None,
             input_time: None,
             input_report: None,
             jitter_sources: HashMap::new(),
@@ -329,10 +309,6 @@ impl Driver {
             let changed = layout.devices != self.layout.devices
                 || layout.layout != self.layout.layout
                 || layout.owners != self.layout.owners;
-            let now = self.micros();
-            self.adapter
-                .router_mut()
-                .set_application_focus_enabled(layout.application_focus_enabled, now);
             self.layout = layout;
             self.sync_layout(changed);
         }
@@ -369,15 +345,6 @@ impl Driver {
                 if disabling_keyboard {
                     self.adapter.router_mut().release_session_keys(&held);
                 }
-                let boot = self.adapter.router().config().boot;
-                let capable = self.inject.backend().application_focus_supported();
-                let now = self.micros();
-                self.adapter.router_mut().set_application_focus_participation(
-                    boot,
-                    capable,
-                    (settings.mouse_mode, settings.keyboard_mode),
-                    now,
-                );
             }
             self.settings = settings;
             let relative = self.adapter.router().game_mode().active
@@ -541,10 +508,7 @@ impl Driver {
         let status = self.shared.status.load();
         let router = self.adapter.router();
         if !self.status_dirty
-            // Remote commits and timer transitions can change application focus
-            // without a native command or an ordinary routing Status event.
             && status.contact_diagnostics == Some(router.contact_diagnostic_state())
-            && status.application_focus.as_ref() == router.application_focus()
             && status.update_held_input == router.update_input_held()
             && status.update_remote_control == router.update_remote_control(self.micros())
             && status.update_locked == (self.session_locked != Some(false) || self.environment.secure_input)
@@ -552,7 +516,6 @@ impl Driver {
             && status.pointer_focus == router.has_pointer_focus()
             && status.dnd_active == (router.dnd_state_name() != "idle")
             && status.dnd_host_pending == router.dnd_host_pending()
-            && status.trail_pinned == router.trail_pinned()
             && status.paused == router.paused()
             && status.emergency_sequence == self.emergency_sequence
             && status.injection_detached == self.inject.detached()
@@ -594,7 +557,6 @@ impl Driver {
         peers.sort_by_key(|peer| peer.peer);
         let status = InputStatus {
             contact_diagnostics: Some(router.contact_diagnostic_state()),
-            application_focus: router.application_focus().cloned(),
             update_held_input: router.update_input_held(),
             update_remote_control: router.update_remote_control(self.micros()),
             update_locked: self.session_locked != Some(false) || self.environment.secure_input,
@@ -615,7 +577,6 @@ impl Driver {
             pointer_focus: self.adapter.router().has_pointer_focus(),
             dnd_active: self.adapter.router().dnd_state_name() != "idle",
             dnd_host_pending: self.adapter.router().dnd_host_pending(),
-            trail_pinned: self.adapter.router().trail_pinned(),
             paused: self.adapter.router().paused(),
             emergency_sequence: self.emergency_sequence,
             local_emergency_sequence: self.local_emergency_sequence,
@@ -789,18 +750,6 @@ impl Driver {
                 | InputCommand::SendMessage { .. }
         );
         match command {
-            InputCommand::ApplicationFocusObserved { claim, observation } => {
-                let now = self.micros();
-                self.adapter
-                    .router_mut()
-                    .application_focus_observed(&claim, observation, now);
-            }
-            InputCommand::ApplicationFocusApplied { request, result } => {
-                let now = self.micros();
-                self.adapter
-                    .router_mut()
-                    .application_focus_park_completed(&request, result, now);
-            }
             InputCommand::ReceiveEmergency { reply } => {
                 let failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
                 self.inject
@@ -911,16 +860,6 @@ impl Driver {
                     }
                 }
             }
-            InputCommand::Overlay(id) => self.overlay = id,
-            InputCommand::IdentifyScreens(id) => {
-                if !self.paused && self.update_hold.is_none() {
-                    for peer in self.pairs.keys().copied().collect::<Vec<_>>() {
-                        if self.adapter.attached(peer) {
-                            self.send(peer, Message::Control(ControlMsg::IdentifyScreens { id }));
-                        }
-                    }
-                }
-            }
             InputCommand::Paused(paused) => {
                 if paused {
                     self.adapter.router_mut().release_input_disables();
@@ -937,7 +876,6 @@ impl Driver {
                     self.inject.suspend();
                 }
                 if paused {
-                    self.overlay_escape = None;
                     self.declarations.clear();
                     self.trail.pause();
                     for peer in self.pairs.keys().copied().collect::<Vec<_>>() {
@@ -994,12 +932,6 @@ impl Driver {
                     self.adapter.clear_received(peer);
                 }
                 self.adapter.router_mut().admit_boot(admission.boot);
-                let now = self.micros();
-                self.adapter.router_mut().set_application_focus_capability(
-                    admission.boot,
-                    admission.application_focus(),
-                    now,
-                );
                 self.pairs.entry(peer).or_default().admission = Some(admission);
             }
             InputCommand::RetirePeer(boot) => {
@@ -1041,11 +973,6 @@ impl Driver {
                 self.adapter.router_mut().keyboard_session_locked(locked);
             }
             InputCommand::GameMode(mode) => self.adapter.router_mut().set_game_mode(mode),
-            InputCommand::ProjectionGesture(active) => {
-                self.projection_until = active.then_some(self.now + Duration::from_secs(2));
-                self.adapter.router_mut().set_projection_gesture(active);
-            }
-            InputCommand::TrailPinned(pinned) => self.adapter.router_mut().set_trail_pinned(pinned),
             InputCommand::LocalFeel(feel) => self.adapter.router_mut().set_local_feel(feel),
             InputCommand::LocalDisplays(displays) => {
                 self.observe_display_fault(if displays.is_empty() {
@@ -1069,7 +996,6 @@ impl Driver {
                 self.observe_display_fault(oink_protocol::v1::dto::ResourceFaultCode::BackendFailed);
             }
             InputCommand::PeerFacts {
-                application_modes,
                 boot,
                 os,
                 displays,
@@ -1088,17 +1014,6 @@ impl Driver {
                     self.adapter.router_mut().set_peer_os(boot.device_id, os, now);
                     self.adapter.router_mut().set_peer_displays(boot.device_id, displays);
                     self.adapter.router_mut().set_peer_input_transform(boot, transform);
-                    let capable = self
-                        .pairs
-                        .get(&boot.device_id)
-                        .and_then(|p| p.admission.as_ref())
-                        .is_some_and(|p| p.application_focus());
-                    self.adapter.router_mut().set_application_focus_participation(
-                        boot,
-                        capable,
-                        application_modes,
-                        now,
-                    );
                 }
             }
             InputCommand::DiagnosticsSnapshot => {
@@ -1502,6 +1417,7 @@ impl Driver {
                         Some(Ok(wire::Decoded::Packet(message))) if valid_reliable(&message) => {
                             self.received(peer, message, arrived, false)
                         }
+                        Some(Ok(wire::Decoded::Retired)) => {}
                         Some(Ok(wire::Decoded::Deferred(message))) => self.received_declaration(peer, message),
                         Some(Err(error)) => {
                             self.protocol_violation(peer, &bytes, error.code, false);
@@ -1532,6 +1448,7 @@ impl Driver {
                     .and_then(|pair| pair.admission.as_ref())
                     .map(|admission| wire::decode(&bytes[..len], admission, true));
                 match decoded {
+                    Some(Ok(wire::Decoded::Retired)) => {}
                     Some(Ok(wire::Decoded::Packet(message))) if valid_datagram(&message) => {
                         progressed = true;
                         self.received(peer, message, arrived, true);
@@ -1593,7 +1510,9 @@ impl Driver {
         let _ = self.main.send(MainCommand::Attachment { peer, stream, message });
     }
     fn received(&mut self, peer: DeviceId, message: Message, arrived: Instant, lossy: bool) {
-        if let Message::Control(ControlMsg::FocusEnter { epoch, .. }) = &message {
+        if let Message::Control(ControlMsg::FocusEnter { epoch, .. } | ControlMsg::MovePointerEnter { epoch, .. }) =
+            &message
+        {
             self.adapter.router_mut().observe_dnd_focus_entry(peer, *epoch, arrived);
         }
         let (message, time) = match message {
@@ -1719,16 +1638,12 @@ impl Driver {
             let _ = self.main.send(MainCommand::Activity { from: Some(peer) });
         }
         let incoming_epoch = match &message {
-            Message::Control(ControlMsg::FocusEnter { epoch, .. }) => Some(*epoch),
+            Message::Control(ControlMsg::FocusEnter { epoch, .. } | ControlMsg::MovePointerEnter { epoch, .. }) => {
+                Some(*epoch)
+            }
             _ => None,
         };
-        if let Message::Control(ControlMsg::IdentifyScreens { id }) = message {
-            if attached && !self.paused {
-                let _ = self.main.send(MainCommand::IdentifyScreens(id));
-            }
-        } else {
-            self.cursor_inbound(peer, message, source);
-        }
+        self.cursor_inbound(peer, message, source);
         if let Some(epoch) = incoming_epoch {
             let focus = self.adapter.router().focus();
             if focus.epoch == epoch && focus.holder == self.local {
@@ -1738,39 +1653,6 @@ impl Driver {
         self.outputs(source);
         self.attach(peer);
     }
-    fn application_focus_command(&mut self, command: oink_routing::ApplicationFocusCommand) {
-        use oink_routing::ApplicationFocusCommand as C;
-        let invalidate = match &command {
-            C::Park(_) | C::Dismiss(_) => true,
-            C::Cancel(request) => self
-                .application_park
-                .as_ref()
-                .is_some_and(|(pending, _)| pending == request),
-            C::Sample(claim) => self
-                .application_park
-                .as_ref()
-                .is_some_and(|(pending, _)| pending.claim != *claim),
-        };
-        if invalidate && let Some((_, permit)) = self.application_park.take() {
-            permit.revoke();
-        }
-        let permit = if let C::Park(request) = &command {
-            let lifetime = Duration::from_millis(250);
-            #[cfg(debug_assertions)]
-            let permit = match self.inject.backend().application_focus_test_clock() {
-                Some(clock) => oink_input::application_focus::Permit::new_for_test(lifetime, clock),
-                None => oink_input::application_focus::Permit::new(lifetime),
-            };
-            #[cfg(not(debug_assertions))]
-            let permit = oink_input::application_focus::Permit::new(lifetime);
-            self.application_park = Some((request.clone(), permit.clone()));
-            Some(permit)
-        } else {
-            None
-        };
-        let _ = self.main.send(MainCommand::ApplicationFocus { command, permit });
-    }
-
     fn outputs(&mut self, from: Option<DeviceId>) {
         self.outputs_at(from, ModeDispatch::Queued);
     }
@@ -1944,7 +1826,6 @@ impl Driver {
                     .inject
                     .push_in_epoch(self.input_safety, InjectItem::LockWindows(permit)),
                 Output::Send { to, msg, delivery: _ } => self.send_from(to, msg, from),
-                Output::ApplicationFocus(command) => self.application_focus_command(command),
                 Output::Inject(event @ InjectEvent::Volume { .. }) => {
                     if let Some(work) = self.inject.ordinary_input(self.input_safety) {
                         let _ = self.main.send(MainCommand::Media { event, work });
@@ -1975,7 +1856,9 @@ impl Driver {
                 // Receipt was reported above independently of the wake setting.
                 Output::UserActivity { .. } => {}
                 Output::ResetUserIdle => {
-                    let _ = self.main.send(MainCommand::ResetUserIdle);
+                    if self.adapter.router().needs_session_idle_refresh() {
+                        let _ = self.main.send(MainCommand::ResetUserIdle);
+                    }
                 }
                 Output::Status(StatusEvent::EmergencyStop { .. }) => {}
                 Output::Status(status) => {
@@ -2001,6 +1884,10 @@ impl Driver {
         }
         if emergency {
             self.notices.post(InputNotice::EmergencyPause);
+        }
+        let peers: Vec<_> = self.pairs.keys().copied().collect();
+        for peer in peers {
+            self.refresh_heartbeat(peer);
         }
     }
     fn dispatch_dnd(&mut self, command: oink_routing::DndCmd) {
@@ -2063,6 +1950,7 @@ impl Driver {
             }
         }
     }
+    #[cfg(test)]
     fn send(&mut self, peer: DeviceId, message: Message) {
         self.send_from(peer, message, None);
     }
@@ -2075,7 +1963,8 @@ impl Driver {
         let time = self.input_time.filter(|_| {
             crate::diagnostics::keyboard::message_source(self.local, &message) == Some(origin.unwrap_or(self.local))
         });
-        if let Message::Control(ControlMsg::FocusEnter { epoch, .. }) = &message
+        if let Message::Control(ControlMsg::FocusEnter { epoch, .. } | ControlMsg::MovePointerEnter { epoch, .. }) =
+            &message
             && let Some(pair) = self.pairs.get_mut(&peer)
         {
             pair.first_motion_epoch = Some(*epoch);
@@ -2257,7 +2146,6 @@ impl Driver {
             .next_deadline()
             .map(|at| self.start + Duration::from_micros(at))
             .into_iter()
-            .chain(self.projection_until)
             .chain(
                 self.adapter
                     .router()
@@ -2312,7 +2200,9 @@ impl Driver {
     fn post(&mut self, peer: DeviceId, message: Message, datagram: bool) {
         if matches!(
             message,
-            Message::Input(_) | Message::TimedInput { .. } | Message::Control(ControlMsg::FocusEnter { .. })
+            Message::Input(_)
+                | Message::TimedInput { .. }
+                | Message::Control(ControlMsg::FocusEnter { .. } | ControlMsg::MovePointerEnter { .. })
         ) && !self.inject.backend().input_safety().accepts(self.input_safety)
         {
             return;
@@ -2356,6 +2246,53 @@ impl Driver {
             }
         }
     }
+    fn refresh_heartbeat(&mut self, peer: DeviceId) {
+        let Some(pair) = self.pairs.get(&peer) else {
+            return;
+        };
+        let Some((stream, _)) = pair.outbound.as_ref() else {
+            return;
+        };
+        let Some(admission) = pair.admission.as_ref() else {
+            return;
+        };
+        let mut records = Vec::new();
+        let mut observed = Vec::new();
+        if !self.paused && !self.stopping {
+            for message in self.adapter.router().heartbeat_messages(peer) {
+                if matches!(message, Message::Input(_))
+                    && !self.inject.backend().input_safety().accepts(self.input_safety)
+                {
+                    continue;
+                }
+                if !wire::supported(&message, admission) {
+                    continue;
+                }
+                let mut buffer = [0; oink_protocol::v1::limits::RELIABLE_FRAME];
+                let Ok(len) = wire::encode(&message, &mut buffer) else {
+                    continue;
+                };
+                let type_id = u16::from_le_bytes([buffer[0], buffer[1]]);
+                if !admission.admits(type_id, false) {
+                    continue;
+                }
+                records.push(buffer[..len].to_vec());
+                observed.push(message);
+            }
+        }
+        let local = self.local;
+        let observer = self.inject.trace.as_ref().map(|trace| {
+            let trace = trace.clone();
+            Arc::new(move || {
+                for message in &observed {
+                    trace.sent_held_sync(local, peer, message);
+                }
+            }) as oink_network::link::Wake
+        });
+        if let Err(error) = stream.set_heartbeat_messages_observed(records, observer) {
+            self.fault(peer, Which::Outbound, error == PostError::Full, StreamCode::None);
+        }
+    }
     fn post_bytes(&mut self, peer: DeviceId, encoded: &[u8], datagram: bool) -> bool {
         let Some((stream, motion)) = self.pairs.get(&peer).and_then(|pair| pair.outbound.as_ref()) else {
             return false;
@@ -2378,6 +2315,7 @@ impl Driver {
             );
             return false;
         }
+        self.refresh_heartbeat(peer);
         true
     }
 }
@@ -2408,7 +2346,9 @@ impl CaptureLoop for Driver {
         Some((focus.holder, focus.epoch))
     }
     fn idle_refresh_allowed(&self) -> bool {
-        self.capture_requested() && self.snapshots.settings.load().wake_displays_on_input
+        self.capture_requested()
+            && self.snapshots.settings.load().wake_displays_on_input
+            && self.adapter.router().needs_session_idle_refresh()
     }
     fn capture_requested(&self) -> bool {
         self.inject.backend().input_safety().active()
@@ -2514,42 +2454,6 @@ impl CaptureLoop for Driver {
             }
             return Disposition::Swallow;
         }
-        if let oink_foundation::input::InputEvent::Key {
-            code: oink_foundation::input::KeyCode::ESCAPE,
-            pressed,
-        } = event.event
-        {
-            if pressed
-                && event.physical
-                && let Some(id) = self.overlay
-            {
-                self.overlay_escape.get_or_insert((id, self.now));
-                let now = self.micros();
-                self.adapter.router_mut().observe_emergency_event(event, now);
-                self.outputs(None);
-                self.wake_if_earlier();
-                if let Some(trace) = &self.inject.trace {
-                    trace.finish_capture(event, captured, Disposition::Swallow);
-                }
-                return Disposition::Swallow;
-            }
-            if !pressed
-                && event.physical
-                && let Some((id, at)) = self.overlay_escape.take()
-            {
-                let now = self.micros();
-                self.adapter.router_mut().observe_emergency_event(event, now);
-                if self.settings.emergency_hold_ms == 0
-                    || self.now.duration_since(at) < Duration::from_millis(u64::from(self.settings.emergency_hold_ms))
-                {
-                    let _ = self.main.send(MainCommand::DismissOverlay(id));
-                }
-                if let Some(trace) = &self.inject.trace {
-                    trace.finish_capture(event, captured, Disposition::Swallow);
-                }
-                return Disposition::Swallow;
-            }
-        }
         self.adapter.at(self.micros());
         self.trail.at(self.micros() as f64 / 1_000_000.);
         let now = self.micros();
@@ -2604,10 +2508,6 @@ impl CaptureLoop for Driver {
             } else {
                 self.adapter.router_mut().set_input_suspended(true);
             }
-        }
-        if self.projection_until.is_some_and(|until| until <= now) {
-            self.projection_until = None;
-            self.adapter.router_mut().set_projection_gesture(false);
         }
         while let Some(command) = self.shared.commands.pop() {
             match command {
@@ -2724,9 +2624,6 @@ impl CaptureLoop for Driver {
 }
 impl Drop for Driver {
     fn drop(&mut self) {
-        if let Some((_, permit)) = self.application_park.take() {
-            permit.revoke();
-        }
         self.shared.stopped.store(true, Ordering::Release);
         self.notices.closed.store(true, Ordering::Release);
         self.notices.changed.notify_one();
@@ -2773,7 +2670,7 @@ fn timed(message: Message, time: Option<CaptureTime>) -> Message {
 fn captured_input(input: &InputMsg) -> bool {
     match input {
         InputMsg::Forwarded { msg, .. } => captured_input(msg),
-        InputMsg::HeldSync { .. } | InputMsg::ApplicationHeldSync { .. } | InputMsg::VolumeKeyOrigin { .. } => false,
+        InputMsg::HeldSync { .. } | InputMsg::VolumeKeyOrigin { .. } => false,
         _ => true,
     }
 }
@@ -2819,5 +2716,9 @@ impl ScopedCaptureDetector {
 
 // Forwarded and timed motion must use the same target constraint as direct input.
 fn clip_decision(message: &Message) -> bool {
-    cursor::pointer_motion(message, true) || matches!(message, Message::Control(ControlMsg::FocusEnter { .. }))
+    cursor::pointer_motion(message, true)
+        || matches!(
+            message,
+            Message::Control(ControlMsg::FocusEnter { .. } | ControlMsg::MovePointerEnter { .. })
+        )
 }

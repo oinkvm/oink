@@ -59,7 +59,7 @@ fn unreadable_group_keeps_ipc_and_reset_starts_sharing_in_same_node() {
     let udp = UdpSocket::bind(("127.0.0.1", port)).unwrap();
     let tcp = TcpListener::bind(("127.0.0.1", port)).unwrap();
     let discovery = UdpSocket::bind(("127.0.0.1", port + 1)).unwrap();
-    let server = rt.block_on(Server::start_on(node.clone(), 0)).unwrap();
+    let server = rt.block_on(Server::start(node.clone())).unwrap();
     let api = RemoteApi::new(dir.path());
     let overview = api.overview().unwrap();
     assert!(overview.group.is_none());
@@ -129,3 +129,68 @@ fn unreadable_group_keeps_ipc_and_reset_starts_sharing_in_same_node() {
 
 #[path = "common/watchdog.rs"]
 mod test_watchdog;
+
+#[test]
+fn occupied_network_ports_do_not_prevent_required_ipc_or_actual_port_facts() {
+    use oink_agent::{
+        host::{AgentHost, IpcMode},
+        ipc::Client,
+    };
+    use std::time::{Duration, Instant};
+    for (hold_udp, hold_tcp, hold_beacon) in [
+        (true, false, false),
+        (false, true, false),
+        (true, true, false),
+        (false, false, true),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = oink_test_support::network_config(directory.path().into(), "port-fallback", 0);
+        config.beacon = hold_beacon;
+        let _beacon = hold_beacon.then(|| {
+            oink_network::test_ports::take_udp((std::net::Ipv4Addr::LOCALHOST, config.discovery_port()).into()).unwrap()
+        });
+        let address = (std::net::Ipv4Addr::LOCALHOST, config.port).into();
+        let udp = oink_network::test_ports::take_udp(address).unwrap();
+        let tcp = oink_network::test_ports::take_tcp(address).unwrap();
+        let _udp = hold_udp.then_some(udp);
+        let _tcp = hold_tcp.then_some(tcp);
+        let input = Arc::new(FakeInput::new());
+        let host = AgentHost::start_with(
+            NodeOptions {
+                net: config,
+                input,
+                displays: vec![],
+                display_backend: None,
+                clipboard: None,
+                mode_switch_in_callback: true,
+                capture_reports_key_repeat: true,
+                cursor_trail: false,
+            },
+            IpcMode::Required,
+        )
+        .unwrap();
+        let client = Client::connect(directory.path()).unwrap();
+        assert_eq!(client.hello().unwrap().pid, std::process::id());
+        let info = host.node().network_info().unwrap();
+        if hold_udp {
+            assert_ne!(info.port, address.port());
+        }
+        if hold_tcp {
+            assert_ne!(info.low_port, Some(address.port()));
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let facts = host.node().link_config().unwrap().local_facts();
+            let endpoints = facts.endpoints().unwrap().0;
+            if !endpoints.is_empty() {
+                assert!(endpoints.iter().all(|e| e.port().unwrap() == info.port));
+                break;
+            }
+            assert!(Instant::now() < deadline, "actual-port facts were not published");
+            std::thread::yield_now();
+        }
+        client.stop().unwrap();
+        host.shutdown();
+        assert!(Client::connect(directory.path()).is_err());
+    }
+}

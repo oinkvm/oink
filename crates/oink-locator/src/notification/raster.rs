@@ -2,7 +2,7 @@
 //! 20px superellipse(1.75) corners with radius factor 1.45, 16px padding,
 //! 30px accent icon, 12px gaps, 14/600 title and 13/450 description.
 use super::{Style, Toast};
-use crate::aim::{
+use crate::{
     raster::{Canvas, Color, over},
     text::{self, Pen, TextRaster},
 };

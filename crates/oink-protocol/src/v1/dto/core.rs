@@ -121,13 +121,6 @@ wire_map!(Negotiated, validate_selected, {
     7 => offer_hash: Hash32 = required;
 });
 
-wire_map!(StreamOpened, no_validation, {
-    1 => path_id: PathId = required;
-    2 => route_revision: u64 = required;
-    3 => kind: u16 = required;
-    4 => ordinal: u32 = required;
-});
-
 wire_map!(Roster, no_validation, {
     1 => group: Id16 = required;
     2 => root_id: Hash32 = required;
@@ -450,10 +443,14 @@ fn validate_register(raw: &RawMap) -> Result<()> {
     if kind == 0 || kind == u32::MAX {
         return Err(ErrorCode::MalformedFrame.into());
     }
-    if crate::v1::registry::RESERVED_REGISTERS.contains(&kind) {
+    // Kind 8 shipped in retained state; retirement reserves its allocation while
+    // preserving it opaquely, unlike the rejected development-only kinds.
+    if kind != 8 && crate::v1::registry::RESERVED_REGISTERS.contains(&kind) {
         return Err(ErrorCode::UnsupportedValue.into());
     }
     if defaulted::<bool>(raw, 5, || false)? {
+        // 0.3.x never emitted or accepted a kind-8 tombstone; keep that rule so
+        // a relayed state stays acceptable to those peers.
         if matches!(kind, 2 | 8) {
             return Err(ErrorCode::UnsupportedValue.into());
         }

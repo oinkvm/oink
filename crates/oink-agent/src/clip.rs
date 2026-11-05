@@ -141,14 +141,6 @@ impl ClipHandle {
         self.shared.links.pause_changed(!active);
         let _ = self.tx.send(Input::Reconfigure);
     }
-    pub fn native_transfer_progress(&self) -> Option<tokio::sync::watch::Receiver<content::TransferProgress>> {
-        self.shared
-            .native_target
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|(_, r)| r.progress())
-    }
     pub fn fetch_files(&self) {
         let _ = self.tx.send(Input::FetchFiles);
     }
@@ -213,6 +205,16 @@ struct Task {
     on_activity: OnActivity,
     name_of: NameOf,
 }
+fn copy_event(id: Option<oink_clipboard::model::OfferId>, stage: oink_clipboard::copy_diagnostics::Stage, count: u64) {
+    oink_clipboard::copy_diagnostics::event(
+        id,
+        stage,
+        oink_clipboard::copy_diagnostics::Values {
+            count,
+            ..Default::default()
+        },
+    );
+}
 impl Task {
     fn active(&self) -> bool {
         self.shared.enabled.load(Ordering::Acquire) && !self.shared.paused.load(Ordering::Acquire)
@@ -236,9 +238,37 @@ impl Task {
         let tx = self.tx.clone();
         self.capture = Some(tokio::task::spawn_blocking(move || {
             let count = backend.change_count();
+            copy_event(None, oink_clipboard::copy_diagnostics::Stage::CaptureBegin, count);
+            let started = Instant::now();
             let captured = backend.capture(&data);
+            oink_clipboard::copy_diagnostics::event(
+                None,
+                oink_clipboard::copy_diagnostics::Stage::CaptureEnd,
+                oink_clipboard::copy_diagnostics::Values {
+                    count,
+                    elapsed_us: started.elapsed().as_micros() as u64,
+                    result: if captured.is_ok() { 1 } else { 2 },
+                    reason: captured
+                        .as_ref()
+                        .err()
+                        .map_or(0, oink_clipboard::copy_diagnostics::backend_reason),
+                    ..Default::default()
+                },
+            );
+            use oink_clipboard::copy_diagnostics::{Stage, capture_handoff};
+            capture_handoff(Stage::ClipboardKeyBegin, count, 0, 0);
+            let key_started = Instant::now();
             let key = backend.clipboard_key().ok();
-            let _ = tx.send(Input::Captured(count, captured, key));
+            capture_handoff(
+                Stage::ClipboardKeyEnd,
+                count,
+                if key.is_some() { 1 } else { 2 },
+                key_started.elapsed().as_micros() as u64,
+            );
+            let sent = tx.send(Input::Captured(count, captured, key)).is_ok();
+            // The actor may consume the message before this event is emitted;
+            // correlate by count, not by assuming stage 18 precedes stage 19.
+            capture_handoff(Stage::CapturedSent, count, if sent { 1 } else { 2 }, 0);
         }));
     }
     fn observe(&mut self, count: u64) {
@@ -263,6 +293,7 @@ impl Task {
         self.cancelled = None;
         self.copy_report = crate::telemetry::producer().and_then(|p| p.stamp());
         self.apply_report = None;
+        copy_event(None, oink_clipboard::copy_diagnostics::Stage::Observed, count);
         self.ordering.local_change(count, Instant::now());
         if !self.sending() {
             self.ordering.revoke_local();
@@ -289,17 +320,28 @@ impl Task {
         );
         false
     }
+    fn capture_discard(&self, reason: oink_clipboard::copy_diagnostics::CaptureDiscard, count: u64) {
+        oink_clipboard::copy_diagnostics::capture_discard(
+            reason,
+            count,
+            self.backend.change_count(),
+            self.ordering.written_count(),
+        );
+    }
     fn captured(
         &mut self,
         before: u64,
         result: Result<oink_clipboard::CapturedClipboard, oink_clipboard::ClipboardError>,
         native_key: Option<[u8; 32]>,
     ) {
+        use oink_clipboard::copy_diagnostics::CaptureDiscard as D;
         self.capture = None;
         if !self.sending() {
+            self.capture_discard(D::Inactive, before);
             return;
         }
         if std::mem::take(&mut self.capture_again) {
+            self.capture_discard(D::CaptureAgain, before);
             if self.ordering.deadline().is_none() {
                 self.capture();
             }
@@ -309,16 +351,19 @@ impl Task {
         // A remote write or local copy may replace it before capture completes.
         let current = self.backend.change_count();
         if current != before {
+            self.capture_discard(D::BeforeChanged, before);
             self.observe(current);
             return;
         }
         let captured = match result {
             Ok(value) => value,
             Err(oink_clipboard::ClipboardError::Busy) => {
+                self.capture_discard(D::Busy, before);
                 self.ordering.local_change(self.backend.change_count(), Instant::now());
                 return;
             }
             Err(oink_clipboard::ClipboardError::ContentUnavailable(reason)) => {
+                self.capture_discard(D::ContentUnavailable, before);
                 // Deleted/inaccessible files and invalid item metadata belong to
                 // this copy, not the lifetime of the native clipboard service.
                 self.fault = None;
@@ -328,6 +373,7 @@ impl Task {
                 return;
             }
             Err(error) => {
+                self.capture_discard(D::BackendFailure, before);
                 self.fault = Some(if matches!(error, oink_clipboard::ClipboardError::Unsupported) {
                     dto::ResourceFaultCode::Unsupported
                 } else {
@@ -341,11 +387,13 @@ impl Task {
         };
         let count = captured.snapshot.change_count;
         if self.backend.change_count() != count {
+            self.capture_discard(D::SnapshotChanged, count);
             self.observe(self.backend.change_count());
             return;
         }
         self.observed = count;
         let Some(provider) = captured.content else {
+            self.capture_discard(D::MissingProvider, count);
             self.fault = Some(dto::ResourceFaultCode::Unsupported);
             self.ordering.revoke_local();
             self.streams.set_offer(None);
@@ -355,6 +403,7 @@ impl Task {
         let identity_source = provider.namespace();
         let provider = self.shared.policy.provider(provider);
         let Ok(inventory) = oink_clipboard::wire::inventory(&provider.inventory()) else {
+            self.capture_discard(D::InvalidInventory, count);
             return;
         };
         let offer = match self.ordering.capture(
@@ -365,6 +414,7 @@ impl Task {
         ) {
             Ok(offer) => offer,
             Err(_) => {
+                self.capture_discard(D::OrderingFailure, count);
                 self.shared.policy.update(false);
                 self.shared.receive_policy.update(false);
                 self.shared.native.cancel_all();
@@ -373,15 +423,26 @@ impl Task {
             }
         };
         let Some(offer) = offer else {
+            self.capture_discard(
+                if count != 0 && count <= self.ordering.written_count() {
+                    D::OwnWrite
+                } else {
+                    D::EmptyInventory
+                },
+                count,
+            );
             self.streams.set_offer(None);
             return;
         };
         if !self.persist() {
+            self.capture_discard(D::PersistFailure, count);
             return;
         }
         let Ok(id) = offer.id().and_then(oink_clipboard::wire::local_offer_id) else {
+            self.capture_discard(D::InvalidOfferId, count);
             return;
         };
+        copy_event(Some(id), oink_clipboard::copy_diagnostics::Stage::OfferReady, count);
         let provider = content::identified(provider, id);
         let lease = match self
             .shared
@@ -389,7 +450,10 @@ impl Task {
             .register_clipboard_identified(provider, native_key, identity_source)
         {
             Ok(lease) => lease,
-            Err(_) => return,
+            Err(_) => {
+                self.capture_discard(D::RegistrationFailure, count);
+                return;
+            }
         };
         self.native_source = Some(lease);
         self.record(
@@ -597,6 +661,15 @@ impl Task {
         tokio::task::spawn_blocking(move || {
             let check = ticket.clone();
             let clipboard = backend.clone();
+            let preparing_ticket = ticket.clone();
+            let preparing_policy = policy.clone();
+            let current: content::ReaderGuard = Arc::new(move || {
+                if preparing_ticket.valid.load(Ordering::Acquire) {
+                    preparing_policy()
+                } else {
+                    Err(content::unavailable(Unavailable::Cancelled))
+                }
+            });
             let guard: content::ReaderGuard = Arc::new(move || {
                 check.publishing.store(true, Ordering::Release);
                 if check.valid.load(Ordering::Acquire) && policy().is_ok() && clipboard.change_count() == before {
@@ -609,8 +682,13 @@ impl Task {
             let mut files = !spec.files.is_empty();
             let materialized = files && spec.file_contents.is_none();
             let non_files = spec.clone().without_files().ok().flatten();
+            copy_event(
+                Some(inventory.id),
+                oink_clipboard::copy_diagnostics::Stage::DeclareBegin,
+                before,
+            );
             let mut result = if ticket.valid.load(Ordering::Acquire) {
-                backend.write_native_guarded(spec, guard.clone())
+                backend.write_native_cancellable(spec, guard.clone(), current.clone())
             } else {
                 Err(oink_clipboard::ClipboardError::Busy)
             };
@@ -627,8 +705,21 @@ impl Task {
             if provider_unavailable && let Some(non_files) = non_files {
                 inventory = non_files.inventory.clone();
                 files = false;
-                result = backend.write_native_guarded(non_files, guard);
+                result = backend.write_native_cancellable(non_files, guard, current);
             }
+            oink_clipboard::copy_diagnostics::event(
+                Some(inventory.id),
+                oink_clipboard::copy_diagnostics::Stage::DeclareEnd,
+                oink_clipboard::copy_diagnostics::Values {
+                    count: result.as_ref().copied().unwrap_or(before),
+                    result: if result.is_ok() { 1 } else { 2 },
+                    reason: result
+                        .as_ref()
+                        .err()
+                        .map_or(0, oink_clipboard::copy_diagnostics::backend_reason),
+                    ..Default::default()
+                },
+            );
             if let Some(stamp) = report
                 && let Some(p) = crate::telemetry::producer()
             {

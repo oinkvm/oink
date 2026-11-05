@@ -761,7 +761,7 @@ mod tests {
                 notes: Some(oink_update::feed::ReleaseNotes::from_json(br#"{"en":"Local fixes"}"#).unwrap()),
             });
         }
-        let server = runtime.block_on(Server::start_on(node.clone(), 0)).unwrap();
+        let server = runtime.block_on(Server::start(node.clone())).unwrap();
         let remote = RemoteApi::new(directory.path());
         let ready = remote.update_status().unwrap();
         assert_eq!(ready.phase, Phase::Ready);

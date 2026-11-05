@@ -11,11 +11,12 @@
 //! [`CursorTrail`] 是可在任意线程调用的句柄：[`CursorTrail::pointer`] 在截获回调里调用，只把点追加到一个
 //! 有界的纯模型；绘制在专门的线程里，只在显示或淡出期间按屏幕刷新率出帧，其余时间睡在条件变量上（零开销）。
 
-pub mod aim;
 pub mod diagnostics;
 pub mod effect;
 pub mod notification;
 pub mod projection;
+pub mod raster;
+pub mod text;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -193,8 +194,7 @@ impl CursorTrail {
         })
     }
 
-    /// Clear all particles and park this renderer. A separate aim-game renderer
-    /// is independent and deliberately remains active during group pause.
+    /// Clear all particles and park this renderer.
     pub fn set_paused(&self, paused: bool) {
         let mut input = lock(&self.shared.input);
         input.paused = paused;

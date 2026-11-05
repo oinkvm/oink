@@ -314,6 +314,9 @@ impl Context {
                 targets.push((member.device, link.link, device));
             }
         }
+        // Reserve equal shares before starting any transfer. A fast/noisy peer
+        // must not consume the slower peer's recent incident window.
+        snapshot.network_member_limit = snapshot.network_member_limit.min(member_share(targets.len()));
         let snapshot = Arc::new(Mutex::new(snapshot));
         self.runtime.block_on(async {
             let mut transfers = tokio::task::JoinSet::new();
@@ -355,6 +358,12 @@ impl Context {
         // Final four-stamp calibration can refine the provisional source bounds.
         // Clip staging segments, so coverage describes exactly the exported rows.
         store.restrict_range(start, end)?;
+        // Transport is newest-first; preserve chronological snapshot precedence
+        // in the archive (timeline rows are independently merged by timestamp).
+        store
+            .segments
+            .make_contiguous()
+            .sort_by_key(|meta| (meta.last_us, meta.seq));
         for member in members.iter().filter(|m| m.device != me) {
             let device = anon.device(member.device);
             if !store.segments.iter().any(|m| m.device == device) {
@@ -496,6 +505,7 @@ impl Context {
                 store.clocks.push(sample);
             }
         }
+        let mut budget = MemberBudget::new(lock(&snapshot).network_member_limit);
         let mut payload = Vec::new();
         let mut environment = false;
         let mut segment_id = 0u64;
@@ -527,6 +537,8 @@ impl Context {
                     let size = remote.encode(MAX_SEGMENT_RAW)?.len();
                     trace.received(size)?;
                     let mut store = lock(&snapshot);
+                    budget.wire(size)?;
+                    budget.expanded(size)?;
                     store.receive_bytes(size)?;
                     store.receive_expanded(size)?;
                     store.network_environment(device, &instance, remote)?;
@@ -545,6 +557,7 @@ impl Context {
                             && bytes.len() <= CHUNK,
                     )?;
                     anyhow::ensure!(payload.len() + bytes.len() <= MAX_SEGMENT_RAW, "member:size_limit");
+                    budget.wire(bytes.len())?;
                     trace.received(bytes.len())?;
                     lock(&snapshot).receive_bytes(bytes.len())?;
                     payload.extend(bytes);
@@ -560,6 +573,7 @@ impl Context {
                             && e.compressed_length()? as usize == payload.len()
                             && e.raw_length()? as usize <= MAX_SEGMENT_RAW,
                     )?;
+                    budget.expanded(e.raw_length()? as usize)?;
                     lock(&snapshot).receive_expanded(e.raw_length()? as usize)?;
                     let bytes = std::mem::take(&mut payload);
                     let compression = compression.clone();
@@ -967,6 +981,60 @@ impl Collector {
         Ok(())
     }
 }
+fn member_share(peers: usize) -> u64 {
+    v1::limits::DIAGNOSTIC_COLLECTION as u64 / peers.max(1) as u64
+}
+struct MemberBudget {
+    limit: u64,
+    wire: u64,
+    expanded: u64,
+}
+impl MemberBudget {
+    fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            wire: 0,
+            expanded: 0,
+        }
+    }
+    fn charge(used: &mut u64, limit: u64, bytes: usize) -> anyhow::Result<()> {
+        let next = used
+            .checked_add(bytes as u64)
+            .filter(|next| *next <= limit)
+            .ok_or_else(|| anyhow::anyhow!("member:size_limit"))?;
+        *used = next;
+        Ok(())
+    }
+    fn wire(&mut self, bytes: usize) -> anyhow::Result<()> {
+        Self::charge(&mut self.wire, self.limit, bytes)
+    }
+    fn expanded(&mut self, bytes: usize) -> anyhow::Result<()> {
+        Self::charge(&mut self.expanded, self.limit, bytes)
+    }
+}
+fn newest_first(source: &mut store::Store) {
+    let mut instances = std::collections::BTreeMap::new();
+    for meta in &source.segments {
+        instances
+            .entry(meta.instance.clone())
+            .and_modify(|last: &mut i64| *last = (*last).max(meta.last_us))
+            .or_insert(meta.last_us);
+    }
+    let current_instance = source.instance.clone();
+    let key = |meta: &store::Meta| {
+        (
+            meta.instance == current_instance,
+            instances[&meta.instance],
+            meta.instance.clone(),
+            meta.seq,
+        )
+    };
+    source
+        .segments
+        .make_contiguous()
+        .sort_by_key(|meta| std::cmp::Reverse(key(meta)));
+}
+
 // Bound blocking work and retained payloads per collection. Retire segments in
 // source order, preserving every frame, validation and collection budget.
 const ENCODERS: usize = 4;
@@ -1017,7 +1085,11 @@ struct SegmentEncoder {
     pending: VecDeque<tokio::task::JoinHandle<anyhow::Result<EncodedSegment>>>,
 }
 impl SegmentEncoder {
-    fn new(source: store::Store, rich: bool, compression: &'static str, width: usize) -> Self {
+    fn new(mut source: store::Store, rich: bool, compression: &'static str, width: usize) -> Self {
+        // Send the incident tail before older history: byte/count limits and
+        // interruptions must retain recent evidence. Group instances first so
+        // a wall-clock backstep cannot reorder segments within one process.
+        newest_first(&mut source);
         let mut encoder = Self {
             source: Arc::new(source),
             rich,
@@ -1313,6 +1385,177 @@ mod tests {
         assert!(expand(&bomb, DEFLATE, MAX_SEGMENT_RAW).is_err());
         assert!(expand(&[1, 2, 3], NONE, 2).is_err());
     }
+    #[test]
+    fn bounded_group_export_keeps_each_peers_incident_tail_and_marks_truncation() {
+        crate::test_watchdog::run(
+            module_path!(),
+            "bounded_group_export_keeps_each_peers_incident_tail_and_marks_truncation",
+            Some(2),
+            async {
+                let mut fixture = Fixture::<DiagnosticsStreams>::start_members(3).await;
+                let end = 10 * 24 * 60 * 60 * 1_000_000;
+                let mut dirs = Vec::new();
+                let mut recorders = Vec::new();
+                let mut contexts = Vec::new();
+                for index in 0..3 {
+                    let (links, config) = fixture.context(index);
+                    let dir = tempfile::tempdir().unwrap();
+                    let recorder = Recorder::start_inner(
+                        dir.path().into(),
+                        links.id(),
+                        Some(config.applied().group),
+                        true,
+                        true,
+                        clock::Clock::new(Arc::new(Frozen(end))),
+                        None,
+                        None,
+                        false,
+                    )
+                    .unwrap();
+                    recorder.wait_recovery();
+                    let row = |count, utc_us| Row {
+                        mono_us: count,
+                        clock_id: 0,
+                        utc_us,
+                        event: Event::State {
+                            kind: StateKind::RecorderTick,
+                            active: true,
+                            count,
+                            value: 0.,
+                        },
+                    };
+                    let mut store = lock(&recorder.inner.store);
+                    store
+                        .append((1..=1024).map(|count| row(count, end - 60_000_000)).collect(), 0)
+                        .unwrap();
+                    store.append(vec![row(1025, end - 1000)], 0).unwrap();
+                    drop(store);
+                    contexts.push(context(links, config));
+                    recorders.push(recorder);
+                    dirs.push(dir);
+                }
+                let mut snapshot = lock(&recorders[0].inner.store).export_snapshot().unwrap();
+                snapshot.prepare_range(Reason::Manual, None).unwrap();
+                // Small deterministic quota exercises the production receiver stop
+                // without generating tens of MiB or stressing a shared test machine.
+                snapshot.network_member_limit = 16 * 1024;
+                let export = contexts[0].clone();
+                let saving = tokio::task::spawn_blocking(move || export.export(snapshot, Reason::Manual, 0, 0));
+                let mut tasks = Vec::new();
+                for index in 1..3 {
+                    let operation = incoming(fixture.port(index)).await;
+                    let collector = Collector {
+                        recorder: recorders[index].clone(),
+                        context: contexts[index].clone(),
+                    };
+                    tasks.push(tokio::spawn(async move {
+                        collector.serve(operation.stream, operation.first).await
+                    }));
+                }
+                let bundle = saving.await.unwrap().unwrap();
+                for task in tasks {
+                    let _ = task.await.unwrap();
+                }
+                let manifest = manifest(&bundle);
+                assert_eq!(bundle.included_device_count, Some(3));
+                assert_eq!(bundle.cutoff_complete, Some(false));
+                for (index, recorder) in recorders.iter().enumerate().skip(1) {
+                    let device = recorder.anonymizer().device(fixture.context(index).0.id());
+                    assert_eq!(manifest["missing_members"][&device], "size_limit");
+                    let coverage: Vec<_> = manifest["coverage"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|meta| meta["device"] == device)
+                        .collect();
+                    assert!(
+                        coverage.iter().any(|meta| meta["last_us"] == end - 1000),
+                        "newest incident retained: {coverage:?}"
+                    );
+                    assert!(
+                        !coverage.iter().any(|meta| meta["first_us"] == end - 60_000_000),
+                        "old history exceeds quota"
+                    );
+                }
+                for recorder in recorders {
+                    recorder.shutdown();
+                }
+                fixture.stop().await;
+            },
+        );
+    }
+
+    #[test]
+    fn collection_shares_are_reserved_before_fast_peers_spend_them() {
+        let share = member_share(2);
+        let mut fast = MemberBudget::new(share);
+        let mut slow = MemberBudget::new(share);
+        fast.wire(share as usize).unwrap();
+        fast.expanded(share as usize).unwrap();
+        for _ in 0..3 {
+            assert!(fast.wire(1).is_err());
+            assert!(fast.expanded(1).is_err());
+        }
+        slow.wire(share as usize).unwrap();
+        slow.expanded(share as usize).unwrap();
+        assert_eq!(fast.wire + slow.wire, v1::limits::DIAGNOSTIC_COLLECTION as u64);
+        assert_eq!(fast.expanded + slow.expanded, v1::limits::DIAGNOSTIC_COLLECTION as u64);
+        assert!(slow.wire(1).is_err());
+        assert!(slow.expanded(1).is_err());
+    }
+
+    #[tokio::test]
+    async fn encoders_send_newest_sequence_first_even_after_wall_clock_backstep() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = store::Store::open(dir.path().into(), "a".repeat(24), true).unwrap();
+        source
+            .append(
+                vec![Row {
+                    mono_us: 0,
+                    clock_id: 0,
+                    utc_us: 400,
+                    event: Event::State {
+                        kind: StateKind::RecorderTick,
+                        active: true,
+                        count: 0,
+                        value: 0.,
+                    },
+                }],
+                0,
+            )
+            .unwrap();
+        source.instance = "b".repeat(24);
+        for (count, utc_us) in [(1, 300), (2, 200), (3, 100)] {
+            source
+                .append(
+                    vec![Row {
+                        mono_us: count,
+                        clock_id: count as i64,
+                        utc_us,
+                        event: Event::State {
+                            kind: StateKind::RecorderTick,
+                            active: true,
+                            count,
+                            value: 0.,
+                        },
+                    }],
+                    0,
+                )
+                .unwrap();
+        }
+        for width in [0, ENCODERS] {
+            let mut encoder = SegmentEncoder::new(source.export_snapshot().unwrap(), false, DEFLATE, width);
+            for (id, expected) in [3, 2, 1, 0].into_iter().enumerate() {
+                let encoded = encoder.next().await.unwrap().unwrap();
+                assert_eq!(encoded.segment_id, id);
+                let raw = expand(&encoded.bytes, DEFLATE, encoded.raw_len).unwrap();
+                let segment = store::wire::segment(&raw).unwrap();
+                assert_eq!(segment.rows().unwrap().0[0].mono_us().unwrap(), expected);
+            }
+            assert!(encoder.next().await.is_none());
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn progress_refreshes_the_thirty_second_idle_deadline() {
         let begin = tokio::time::Instant::now();

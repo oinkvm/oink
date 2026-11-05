@@ -38,16 +38,25 @@ impl Router {
             self.end_focus_lock();
         }
     }
-    /// Move focus without pinning it. Uses the same landing candidates as an
-    /// explicit focus lock, and the normal handoff path (held-key/contact cleanup).
+    /// Move focus without pinning it, including retained hidden screens. Uses
+    /// the normal handoff path (held-key/contact cleanup).
     pub fn move_pointer_to(&mut self, target: DeviceId) -> Result<(), FocusLockError> {
         if self.paused || self.fully_paused {
             return Err(FocusLockError::Paused);
         }
+        let destination = self.layout.pointer_destination(self.me(), target);
+        // Older peers drop 0x1301 unread: both the target and the holder that
+        // sends it must have negotiated the hidden entry, or the source would leave.
+        let hidden = destination
+            .as_ref()
+            .is_some_and(|d| self.hidden_entry(d.screen.device, &d.screen.display));
         if !self.capture_available
             || !self.input_ready(target)
-            || !self.layout.contains_device(target)
+            || (!self.layout.contains_device(target) && destination.is_none())
             || self.layout.source_requires_target(target)
+            || (hidden
+                && target != self.me()
+                && !(self.pointer_move_hidden(target) && self.pointer_move_hidden(self.holder)))
         {
             return Err(FocusLockError::Unavailable);
         }
@@ -68,14 +77,9 @@ impl Router {
             );
             return Ok(());
         }
-        let destination = self
-            .layout
-            .focus_candidates(self.me())
-            .into_iter()
-            .find(|p| p.screen.device == target)
-            .ok_or(FocusLockError::Unavailable)?;
+        let destination = destination.ok_or(FocusLockError::Unavailable)?;
         self.dnd_abort("pointer moved by shortcut");
-        self.hand_off(destination, None);
+        self.hand_off_with_entry(destination, None, hidden);
         Ok(())
     }
     /// Request a normal handoff followed by a lock at the accepted target epoch.
@@ -334,6 +338,9 @@ impl Router {
         self.push_focus_status();
     }
     pub(super) fn receive_focus_lock(&mut self, state: FocusLock) {
+        if self.local_click_obsoletes_lock(&state) {
+            return;
+        }
         if self
             .focus_lock
             .as_ref()
@@ -1261,6 +1268,438 @@ mod tests {
         assert_eq!(a.move_pointer_to(B), Err(FocusLockError::Paused));
         assert_eq!(a.focus().holder, before.holder);
     }
+    fn hidden_group(per_screen: bool) -> Vec<Router> {
+        use oink_display::layout::{Layout, OwnerLayoutPreferences, ScreenPreference};
+        let ids = [A, B, DeviceId([3; 32])];
+        let display = oink_foundation::display::DisplayInfo {
+            key: "screen".into(),
+            name: "screen".into(),
+            bounds: Rect::new(-100., 50., 1000., 600.),
+            pixel_width: 1000,
+            pixel_height: 600,
+            reference_extent: Some(oink_foundation::Size::new(250., 150.)),
+            rotation_deg: 0,
+            is_primary: true,
+            is_builtin: false,
+            is_virtual: false,
+        };
+        let saved = Layout::auto(&ids.map(|id| (id, vec![display.clone()])));
+        let owner = if per_screen {
+            OwnerLayoutPreferences {
+                screens: [(
+                    "screen".into(),
+                    ScreenPreference {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            }
+        } else {
+            OwnerLayoutPreferences {
+                screen_shared: false,
+                ..Default::default()
+            }
+        };
+        let layout: Arc<dyn LayoutQuery> = Arc::new(crate::display_layout::TopologyLayout::from_layout(
+            &saved,
+            &[(B, owner)].into(),
+        ));
+        group_with_layout(&ids.map(|id| (id, vec![display.clone()])), layout, Os::Other)
+    }
+    fn group_with_layout(
+        devices: &[(DeviceId, Vec<oink_foundation::display::DisplayInfo>)],
+        layout: Arc<dyn LayoutQuery>,
+        os: Os,
+    ) -> Vec<Router> {
+        let ids: Vec<_> = devices.iter().map(|(id, _)| *id).collect();
+        let mut routers: Vec<_> = devices
+            .iter()
+            .map(|(id, displays)| {
+                let mut router = Router::new(
+                    RouterConfig::new(
+                        oink_foundation::session::Boot {
+                            device_id: *id,
+                            nonce: [id.0[0]; 16],
+                        },
+                        "test",
+                        os,
+                    ),
+                    layout.clone(),
+                );
+                router.set_local_displays(displays.clone());
+                router
+            })
+            .collect();
+        let sessions: Vec<_> = routers.iter().map(|r| r.session).collect();
+        for (i, router) in routers.iter_mut().enumerate() {
+            for j in 0..ids.len() {
+                if i != j {
+                    router.attach_input(
+                        oink_foundation::session::Boot {
+                            device_id: ids[j],
+                            nonce: sessions[j],
+                        },
+                        sessions[j],
+                        true,
+                        false,
+                        FeelProfile::default(),
+                        0,
+                    );
+                    router.peers.get_mut(&ids[j]).unwrap().focus_ready = true;
+                    router.set_peer_pointer_move_hidden(ids[j], true);
+                }
+            }
+        }
+        routers[0].reclaim_focus(None);
+        pump_hidden_group(&mut routers);
+        routers
+    }
+    fn pump_hidden_group(routers: &mut [Router]) -> Vec<(DeviceId, Output)> {
+        let mut observed = Vec::new();
+        for _ in 0..16 {
+            let mut messages = Vec::new();
+            for router in routers.iter_mut() {
+                let from = router.me();
+                for output in router.drain_outputs() {
+                    if let Output::Send { to, msg, .. } = &output {
+                        messages.push((from, *to, msg.clone()));
+                    }
+                    observed.push((from, output));
+                }
+            }
+            if messages.is_empty() {
+                return observed;
+            }
+            for (from, to, msg) in messages {
+                routers
+                    .iter_mut()
+                    .find(|r| r.me() == to)
+                    .unwrap()
+                    .input_message(from, msg, 1);
+            }
+        }
+        panic!("focus messages did not settle");
+    }
+    #[test]
+    fn pointer_shortcut_enters_hidden_screen_and_leaves_through_remote_holder() {
+        for per_screen in [false, true] {
+            let mut group = hidden_group(per_screen);
+            let landing = Point::new(400., 350.);
+            assert!(!group[0].layout.contains_device(B));
+            group[0].move_pointer_to(B).unwrap();
+            let observed = pump_hidden_group(&mut group);
+            assert!(observed.iter().any(|(_, o)| matches!(o, Output::Send { msg: Message::Control(ControlMsg::MovePointerEnter { pos, .. }), .. } if *pos == landing)));
+            assert!(
+                observed
+                    .iter()
+                    .any(|(id, o)| *id == B && matches!(o, Output::RestoreLocal { at } if *at == landing))
+            );
+            assert!(group.iter().all(|r| r.focus().holder == B && !r.locked()));
+            assert_eq!(group[1].pointer.as_ref().unwrap().local, landing);
+            // The third keyboard, already a source, asks hidden B to hand off to A.
+            group[2].move_pointer_to(A).unwrap();
+            pump_hidden_group(&mut group);
+            assert!(group.iter().all(|r| r.focus().holder == A));
+            // A source whose pointer is on C can also request entry into hidden B.
+            let third = group[2].me();
+            group[0].move_pointer_to(third).unwrap();
+            pump_hidden_group(&mut group);
+            assert!(group.iter().all(|r| r.focus().holder == third));
+            group[0].move_pointer_to(B).unwrap();
+            pump_hidden_group(&mut group);
+            assert!(group.iter().all(|r| r.focus().holder == B));
+            group[0].move_pointer_to(A).unwrap();
+            pump_hidden_group(&mut group);
+            assert!(group.iter().all(|r| r.focus().holder == A));
+            // Recall to a hidden source still uses the existing local-primary centre.
+            group[1].move_pointer_to(B).unwrap();
+            pump_hidden_group(&mut group);
+            assert!(group.iter().all(|r| r.focus().holder == B));
+            assert_eq!(group[1].pointer.as_ref().unwrap().local, landing);
+            group[0].move_pointer_to(A).unwrap();
+            pump_hidden_group(&mut group);
+            assert!(group.iter().all(|r| r.focus().holder == A));
+        }
+    }
+    #[test]
+    fn pointer_shortcut_hidden_screen_keeps_edges_as_walls_for_local_and_remote_motion() {
+        for per_screen in [false, true] {
+            let mut group = hidden_group(per_screen);
+            let third = group[2].me();
+            // Hidden B is absent from the layout: A's edge reaches C directly,
+            // and C's opposite edge returns to A, both as if B did not exist.
+            group[0].local_motion(2000., 0., Some(Point::new(2000., 350.)), 2);
+            pump_hidden_group(&mut group);
+            assert!(group.iter().all(|r| r.focus().holder == third));
+            group[0].local_motion(-10000., 0., None, 2);
+            pump_hidden_group(&mut group);
+            assert!(group.iter().all(|r| r.focus().holder == A));
+            group[0].move_pointer_to(B).unwrap();
+            pump_hidden_group(&mut group);
+            // A's physical mouse sends relative input to the hidden holder B.
+            group[0].local_motion(10000., 0., None, 3);
+            pump_hidden_group(&mut group);
+            assert!(group.iter().all(|r| r.focus().holder == B));
+            assert!(group[1].pointer.as_ref().unwrap().local.x < 900.);
+            // B's native cursor cannot exit either edge, even if OS coordinates crossed it.
+            for dx in [-10000., 10000.] {
+                group[1].local_motion(dx, 0., Some(Point::new(dx, 350.)), 4);
+                pump_hidden_group(&mut group);
+                assert!(group.iter().all(|r| r.focus().holder == B));
+                assert_eq!(group[1].pointer.as_ref().unwrap().screen.display, "screen");
+            }
+            group[0].move_pointer_to(A).unwrap();
+            pump_hidden_group(&mut group);
+            assert!(group.iter().all(|r| r.focus().holder == A));
+        }
+    }
+    /// oinkvm/oink#10: A and B share the middle monitor through different
+    /// inputs and keep both screens in their native extended desktops. The
+    /// visible screen next to a hidden native sibling must route its inner
+    /// edge to the other computer, and the cursor must never enter the hidden copy.
+    #[test]
+    fn shared_monitor_with_hidden_native_copy_crosses_both_ways() {
+        use oink_display::layout::{Layout, OwnerLayoutPreferences, ScreenPreference};
+        let native = |key: &str, x: f64, primary: bool| oink_foundation::display::DisplayInfo {
+            key: key.into(),
+            name: key.into(),
+            bounds: Rect::new(x, 0., 1000., 600.),
+            pixel_width: 1000,
+            pixel_height: 600,
+            reference_extent: Some(oink_foundation::Size::new(250., 150.)),
+            rotation_deg: 0,
+            is_primary: primary,
+            is_builtin: false,
+            is_virtual: false,
+        };
+        let a = vec![native("a1", 0., true), native("a2", 1000., false)];
+        let b = vec![native("b1", 0., true), native("b2", 1000., false)];
+        // Plane: A1 | A2 | B2 with B1 rigidly under A2 (equivalently A1 | B1 | B2 with A2 under B1).
+        let mut saved = Layout::auto(&[(A, a.clone()), (B, b.clone())]);
+        let (origin, k) = saved.device_transform(A).unwrap();
+        assert!(saved.place_device(A, origin, k, true));
+        assert!(saved.place_device(B, Point::new(origin.x + 1000. * k, origin.y), k, true));
+        for os in [Os::Windows, Os::MacOS] {
+            for hide_b1 in [true, false] {
+                let (hidden_dev, hidden, outer, middle_dev, middle, toward) = if hide_b1 {
+                    (B, "b1", "b2", A, "a2", -1.)
+                } else {
+                    (A, "a2", "a1", B, "b1", 1.)
+                };
+                let owner = OwnerLayoutPreferences {
+                    screens: [(
+                        hidden.to_string(),
+                        ScreenPreference {
+                            enabled: false,
+                            ..Default::default()
+                        },
+                    )]
+                    .into(),
+                    ..Default::default()
+                };
+                let layout: Arc<dyn LayoutQuery> = Arc::new(crate::display_layout::TopologyLayout::from_layout(
+                    &saved,
+                    &[(hidden_dev, owner)].into(),
+                ));
+                let mut group = group_with_layout(&[(A, a.clone()), (B, b.clone())], layout, os);
+                let (h, m) = if hidden_dev == A { (0, 1) } else { (1, 0) };
+                if hidden_dev == B {
+                    group[0].move_pointer_to(B).unwrap();
+                } else {
+                    group[0].local_motion(0., 0., Some(Point::new(500., 300.)), 1);
+                }
+                pump_hidden_group(&mut group);
+                assert!(group.iter().all(|r| r.focus().holder == hidden_dev), "{os:?} {hide_b1}");
+                assert_eq!(group[h].pointer.as_ref().unwrap().screen.display, outer);
+                // The native cursor is confined to the visible screen (ClipCursor /
+                // dissociated warp), so the OS cannot carry it into the hidden sibling.
+                let outer_bounds = [&a, &b].into_iter().flatten().find(|d| d.key == outer).unwrap().bounds;
+                assert_eq!(group[h].hidden_cursor_constraint(), Some(outer_bounds));
+                // Push from the visible outer screen toward the hidden native sibling.
+                let mut t = 10;
+                while group[h].focus().holder == hidden_dev && t < 40 {
+                    let at = group[h].pointer.as_ref().unwrap().local;
+                    let native_next = Point::new(at.x + toward * 300., at.y);
+                    group[h].local_motion(toward * 300., 0., Some(native_next), t * 20_000);
+                    assert_ne!(
+                        group[h].pointer.as_ref().unwrap().screen.display,
+                        hidden,
+                        "{os:?} {hide_b1}: cursor entered the hidden native copy"
+                    );
+                    pump_hidden_group(&mut group);
+                    t += 1;
+                }
+                assert!(group.iter().all(|r| r.focus().holder == middle_dev), "{os:?} {hide_b1}");
+                assert_eq!(group[m].pointer.as_ref().unwrap().screen.display, middle);
+                // And back: the middle screen's outer native edge routes to the outer screen.
+                let edge = if hide_b1 {
+                    Point::new(1999., 300.)
+                } else {
+                    Point::new(0., 300.)
+                };
+                while group[m].focus().holder == middle_dev && t < 80 {
+                    group[m].local_motion(-toward * 50., 0., Some(edge), t * 20_000);
+                    pump_hidden_group(&mut group);
+                    t += 1;
+                }
+                assert!(group.iter().all(|r| r.focus().holder == hidden_dev), "{os:?} {hide_b1}");
+                assert_eq!(group[h].pointer.as_ref().unwrap().screen.display, outer);
+                assert_eq!(group[h].hidden_cursor_constraint(), Some(outer_bounds));
+            }
+        }
+    }
+
+    #[test]
+    fn pointer_shortcut_hidden_target_refuses_unavailable_input_and_paused_entry() {
+        for failure in [
+            "offline",
+            "no_input",
+            "not_ready",
+            "source_paused",
+            "source_fully_paused",
+        ] {
+            let mut group = hidden_group(false);
+            match failure {
+                "offline" => group[0].detach_input(B),
+                "no_input" => group[0].peers.get_mut(&B).unwrap().sharing = false,
+                "not_ready" => group[0].peers.get_mut(&B).unwrap().focus_ready = false,
+                "source_paused" => group[0].set_paused(true),
+                "source_fully_paused" => group[0].set_fully_paused(true),
+                _ => unreachable!(),
+            }
+            group[0].drain_outputs();
+            let before = group[0].focus();
+            let expected = if failure.starts_with("source_") {
+                FocusLockError::Paused
+            } else {
+                FocusLockError::Unavailable
+            };
+            assert_eq!(group[0].move_pointer_to(B), Err(expected), "{failure}");
+            assert_eq!(group[0].focus(), before);
+            assert!(!group[0].drain_outputs().iter().any(|o| matches!(
+                o,
+                Output::Send {
+                    msg: Message::Control(ControlMsg::MovePointerEnter { .. }),
+                    ..
+                }
+            )));
+        }
+        // The target rejects an in-flight shortcut if its pause arrives first.
+        let mut group = hidden_group(false);
+        group[0].move_pointer_to(B).unwrap();
+        group[1].set_paused(true);
+        let before = group[1].focus();
+        let observed = pump_hidden_group(&mut group);
+        assert_eq!(group[1].focus().holder, before.holder);
+        assert!(
+            !observed
+                .iter()
+                .any(|(id, o)| *id == B && matches!(o, Output::RestoreLocal { .. }))
+        );
+    }
+
+    #[test]
+    fn pointer_shortcut_hidden_entry_needs_the_capability_at_target_and_holder() {
+        let third = DeviceId([3; 32]);
+        let entry_sent = |outputs: &[Output]| {
+            outputs.iter().any(|o| {
+                matches!(
+                    o,
+                    Output::Send {
+                        msg: Message::Control(
+                            ControlMsg::MovePointerEnter { .. }
+                                | ControlMsg::FocusEnter { .. }
+                                | ControlMsg::MovePointer { .. }
+                        ),
+                        ..
+                    }
+                )
+            })
+        };
+        // An older hidden target would drop 0x1301 after the source had already left.
+        let mut group = hidden_group(false);
+        group[0].set_peer_pointer_move_hidden(B, false);
+        let before = group[0].focus();
+        assert_eq!(group[0].move_pointer_to(B), Err(FocusLockError::Unavailable));
+        assert_eq!(group[0].focus(), before);
+        assert!(!entry_sent(&group[0].drain_outputs()));
+        // Visible older targets keep the ordinary FocusEnter path.
+        group[0].set_peer_pointer_move_hidden(third, false);
+        group[0].move_pointer_to(third).unwrap();
+        pump_hidden_group(&mut group);
+        assert!(group.iter().all(|r| r.focus().holder == third));
+        // A relayed request needs a holder that can send the hidden entry.
+        group[0].set_peer_pointer_move_hidden(B, true);
+        let before = group[0].focus();
+        assert_eq!(group[0].move_pointer_to(B), Err(FocusLockError::Unavailable));
+        assert_eq!(group[0].focus(), before);
+        assert!(!entry_sent(&group[0].drain_outputs()));
+    }
+
+    #[test]
+    fn pointer_shortcut_hidden_entry_keeps_epoch_scope_and_focus_lock_fences() {
+        for failure in ["stale", "old_instance", "locked"] {
+            let mut group = hidden_group(false);
+            group[0].move_pointer_to(B).unwrap();
+            pump_hidden_group(&mut group);
+            if failure == "locked" {
+                group[1].set_locked(true);
+                pump_hidden_group(&mut group);
+            }
+            let before = group[1].focus();
+            let mut scope = group[1].new_focus_scope();
+            if failure == "old_instance" {
+                scope.members.iter_mut().find(|(id, _)| *id == B).unwrap().1 = [99; 16];
+            }
+            group[1].input_message(
+                A,
+                Message::Control(ControlMsg::MovePointerEnter {
+                    epoch: if failure == "stale" {
+                        before.epoch.saturating_sub(1)
+                    } else {
+                        before.epoch + 1
+                    },
+                    display: "screen".into(),
+                    pos: Point::new(42., 84.),
+                    scope: Some(scope),
+                    pointer_source: Some(A),
+                }),
+                10,
+            );
+            assert_eq!(group[1].focus(), before, "{failure}");
+            assert!(!group[1].drain_outputs().iter().any(|o| matches!(
+                o,
+                Output::RestoreLocal { .. } | Output::Inject(InjectEvent::MoveTo { .. })
+            )));
+        }
+    }
+
+    #[test]
+    fn pointer_shortcut_hidden_visits_preserve_owner_lock_and_game_preferences() {
+        for game in [false, true] {
+            let mut group = hidden_group(false);
+            if game {
+                group[0].set_game_mode(GameMode::On);
+            } else {
+                group[0].set_locked(true);
+            }
+            pump_hidden_group(&mut group);
+            group[0].move_pointer_to(B).unwrap();
+            pump_hidden_group(&mut group);
+            assert!(group.iter().all(|r| r.focus().holder == B));
+            group[0].move_pointer_to(A).unwrap();
+            pump_hidden_group(&mut group);
+            assert!(group.iter().all(|r| r.focus().holder == A));
+            if game {
+                assert!(group[0].game_mode().active);
+            } else {
+                assert!(group.iter().all(|r| r.locked_device() == Some(A)));
+            }
+        }
+    }
+
     #[test]
     fn target_lock_follows_handoff_and_waits_for_target_authority() {
         let (mut a, mut b) = pair();

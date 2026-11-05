@@ -74,20 +74,13 @@ export function tailRest(n: number): Pt[] {
 export const STEP_MS = 4;
 const ITERATIONS = 6;
 
-let DAMPING = 0.99;
+const DAMPING = 0.99;
 
-let BEND = 0.22;
+const BEND = 0.22;
 
-let STRETCH = 0.5;
+const STRETCH = 0.5;
 
-let SHAPE = 0.02;
-export const tune = (o: { damping?: number; bend?: number; stretch?: number; shape?: number }) => {
-  if (o.damping != null) DAMPING = o.damping;
-  if (o.bend != null) BEND = o.bend;
-  if (o.stretch != null) STRETCH = o.stretch;
-  if (o.shape != null) SHAPE = o.shape;
-};
-
+const SHAPE = 0.02;
 export function createRope(rest: Pt[], poseAt: (ms: number) => Pose = (ms) => pose(ms / FLY_MS)) {
   const n = rest.length;
   const dist = (a: Pt, b: Pt) => Math.hypot(b.x - a.x, b.y - a.y);

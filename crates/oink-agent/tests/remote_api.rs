@@ -57,7 +57,7 @@ fn layout_profiles_use_the_ui_dispatch_path_over_ipc() {
     let dir = tempfile::tempdir().unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let node = rt.block_on(start(dir.path()));
-    let server = rt.block_on(Server::start_on(node.clone(), 0)).unwrap();
+    let server = rt.block_on(Server::start(node.clone())).unwrap();
     let remote = RemoteApi::new(dir.path());
     // Tauri dispatches through RemoteApi; the generic CLI calls Client directly.
     let query = serde_json::to_value(dispatch(&remote, Request::LayoutProfiles).unwrap()).unwrap();
@@ -183,7 +183,7 @@ fn rigid_ui_edit(native_supported: bool, pause_first_read: bool) {
         }
         rt.block_on(startup).unwrap().unwrap()
     };
-    let server = rt.block_on(Server::start_on(node.clone(), 0)).unwrap();
+    let server = rt.block_on(Server::start(node.clone())).unwrap();
     let client = Client::connect(dir.path()).unwrap();
     let query =
         || -> LayoutProfilesState { serde_json::from_value(client.call(Request::LayoutProfiles).unwrap()).unwrap() };
@@ -355,7 +355,7 @@ fn partial_preference_commands_persist_only_explicit_local_choices() {
     let dir = tempfile::tempdir().unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let node = rt.block_on(start(dir.path()));
-    let server = rt.block_on(Server::start_on(node.clone(), 0)).unwrap();
+    let server = rt.block_on(Server::start(node.clone())).unwrap();
     let remote = RemoteApi::new(dir.path());
     let read =
         || -> Value { serde_json::from_slice(&std::fs::read(dir.path().join("settings.json")).unwrap()).unwrap() };
@@ -460,7 +460,7 @@ fn unrelated_input_preferences_preserve_saved_hotkeys_without_projected_defaults
     let dir = tempfile::tempdir().unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let node = rt.block_on(start(dir.path()));
-    let server = rt.block_on(Server::start_on(node.clone(), 0)).unwrap();
+    let server = rt.block_on(Server::start(node.clone())).unwrap();
     let remote = RemoteApi::new(dir.path());
     let read =
         || -> Value { serde_json::from_slice(&std::fs::read(dir.path().join("settings.json")).unwrap()).unwrap() };
@@ -642,8 +642,8 @@ fn remote_pairing_installs_membership_and_fences_prepared_client() {
     let b_dir = temp.path().join("b");
     let a = rt.block_on(start(&a_dir));
     let b = rt.block_on(start(&b_dir));
-    let sa = rt.block_on(Server::start_on(a.clone(), 0)).unwrap();
-    let sb = rt.block_on(Server::start_on(b.clone(), 0)).unwrap();
+    let sa = rt.block_on(Server::start(a.clone())).unwrap();
+    let sb = rt.block_on(Server::start(b.clone())).unwrap();
     let ra = RemoteApi::new(&a_dir);
     let rb = RemoteApi::new(&b_dir);
     let (send, receive) = std::sync::mpsc::channel();
@@ -787,7 +787,7 @@ fn remote_api_calls_subscribes_and_sees_stop() {
     let _ = std::fs::remove_dir_all(&dir);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let node = rt.block_on(start(&dir));
-    let server = rt.block_on(Server::start_on(node.clone(), 0)).unwrap();
+    let server = rt.block_on(Server::start(node.clone())).unwrap();
 
     let remote = RemoteApi::new(&dir);
     // Receive history is an authenticated local query, independent of UI demand.
@@ -949,10 +949,10 @@ fn remote_api_reconnects_to_new_endpoint_and_sees_crash() {
     assert!(matches!(remote.overview(), Err(ApiError::Unavailable { .. })));
 
     // 先开一个 IPC，再换一个（新的端口与令牌，模拟服务重启）：同一个 RemoteApi 重新读 ipc.json 后照常调用。
-    let first = rt.block_on(Server::start_on(node.clone(), 0)).unwrap();
+    let first = rt.block_on(Server::start(node.clone())).unwrap();
     let id = remote.overview().unwrap().this_device.id;
     rt.block_on(first.close());
-    let server = rt.block_on(Server::start_on(node.clone(), 0)).unwrap();
+    let server = rt.block_on(Server::start(node.clone())).unwrap();
     assert!(
         matches!(remote.overview(), Err(ApiError::Unavailable { .. })),
         "stale pooled connection"
@@ -994,7 +994,7 @@ fn measured_layout_restore_is_exact_and_interactive_resize_is_proportional_over_
     let dir = tempfile::tempdir().unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let node = rt.block_on(start(dir.path()));
-    let server = rt.block_on(Server::start_on(node.clone(), 0)).unwrap();
+    let server = rt.block_on(Server::start(node.clone())).unwrap();
     let remote = RemoteApi::new(dir.path());
     let key = ScreenKey {
         device: node.id().into(),
@@ -1038,7 +1038,7 @@ fn reset_uses_live_display_facts_without_os_writes() {
     let dir = tempfile::tempdir().unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let node = rt.block_on(start(dir.path()));
-    let server = rt.block_on(Server::start_on(node.clone(), 0)).unwrap();
+    let server = rt.block_on(Server::start(node.clone())).unwrap();
     let remote = RemoteApi::new(dir.path());
     remote
         .set_screen_size(
@@ -1066,7 +1066,7 @@ fn rejected_hello_reloads_the_endpoint_on_the_next_probe() {
     let _ = std::fs::remove_dir_all(&dir);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let node = rt.block_on(start(&dir));
-    let server = rt.block_on(Server::start_on(node, 0)).unwrap();
+    let server = rt.block_on(Server::start(node)).unwrap();
     let path = dir.join("ipc.json");
     let fresh = std::fs::read(&path).unwrap();
     let mut stale: serde_json::Value = serde_json::from_slice(&fresh).unwrap();
@@ -1101,7 +1101,7 @@ fn generic_cli_process_calls_api_and_streams_json_events() {
     let dir = tempfile::tempdir().unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let node = rt.block_on(start(dir.path()));
-    let server = rt.block_on(Server::start_on(node.clone(), 0)).unwrap();
+    let server = rt.block_on(Server::start(node.clone())).unwrap();
     let invoke = |args: &[&str]| {
         let result = Command::new(env!("CARGO_BIN_EXE_oink-agent"))
             .args(args)
@@ -1119,7 +1119,7 @@ fn generic_cli_process_calls_api_and_streams_json_events() {
             .arg("events")
             .env("OINK_HOME", dir.path())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap(),
     );

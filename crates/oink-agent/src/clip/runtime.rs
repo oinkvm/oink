@@ -220,7 +220,12 @@ impl Task {
                     Some(ModuleEvent::PathChanged{..})=>{},None=>break,
                 },
                 command=commands.recv()=>match command {
-                    Some(Input::Captured(before,result,key))=>self.captured(before,result,key),
+                    Some(Input::Captured(before,result,key))=>{
+                        oink_clipboard::copy_diagnostics::capture_handoff(
+                            oink_clipboard::copy_diagnostics::Stage::CapturedReceived, before, 0, 0,
+                        );
+                        self.captured(before,result,key);
+                    },
                     Some(Input::Applied{id,ticket,publication})=>self.applied(id,ticket,publication),
                     Some(Input::LocalChange(count))=>if self.active(){self.observe(count);},
                     Some(Input::Reconfigure)=>self.reconfigure(),

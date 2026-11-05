@@ -149,6 +149,30 @@ impl Writer {
             config_drain: 0,
         }
     }
+    /// Prepare periodic records before polling either this stream or N0. Do not
+    /// overtake queued/in-flight input: retry on a later heartbeat under backpressure.
+    pub fn heartbeat(&mut self) -> bool {
+        let Source::User(queue) = &self.source else {
+            return false;
+        };
+        let Some(messages) = queue.heartbeat.load_full() else {
+            return false;
+        };
+        if queue.is_closed() || self.finished || !self.pending.is_empty() || queue.len() != 0 {
+            return false;
+        }
+        if self.stream.is_none() {
+            self.header.encode(&mut self.pending);
+        }
+        for message in messages.messages.iter() {
+            self.pending.extend_from_slice(message);
+        }
+        self.pending_age = queue.age.track(std::time::Instant::now());
+        if let Some(observer) = &messages.observer {
+            observer();
+        }
+        true
+    }
     pub fn private_post(&mut self, bytes: queue::Queued) {
         if let Source::Private(q) = &mut self.source {
             q.push_back(bytes);
@@ -474,5 +498,42 @@ impl Reader {
         } else {
             Ok(Delivery::Message(bytes))
         }
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+    #[test]
+    fn snapshot_never_overtakes_immediate_input_and_keeps_original_stream_header() {
+        let queue = queue::Queue::new(QueueSpec { messages: 4, bytes: 64 });
+        let header = StreamHeader {
+            route_tag: 7,
+            priority: Priority::Interactive,
+            tag: StreamTag {
+                kind: StreamKind::Input,
+                ordinal: 9,
+            },
+            datagram_flow: 0,
+        };
+        let mut writer = Writer::new(0, header, None, Source::User(queue.clone()), None);
+        queue.set_heartbeat(vec![b"old empty held".to_vec()], 64, None).unwrap();
+        queue.post(b"down".to_vec(), 64).unwrap();
+        assert!(
+            !writer.heartbeat(),
+            "post invalidates the old snapshot before a heartbeat can replay it"
+        );
+        queue.set_heartbeat(vec![b"current held".to_vec()], 64, None).unwrap();
+        assert!(!writer.heartbeat(), "queued immediate input goes first");
+        assert_eq!(queue.take().unwrap().unwrap(), b"down");
+        assert!(writer.heartbeat());
+        let mut expected = Vec::new();
+        header.encode(&mut expected);
+        expected.extend(b"current held");
+        assert_eq!(writer.pending, expected);
+        queue.post(b"up".to_vec(), 64).unwrap();
+        assert!(!writer.heartbeat(), "an in-flight heartbeat cannot be overwritten");
+        assert_eq!(queue.take().unwrap().unwrap(), b"up");
+        assert_eq!(writer.header, header);
     }
 }

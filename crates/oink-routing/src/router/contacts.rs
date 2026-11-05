@@ -104,6 +104,14 @@ impl Router {
             p.scroll_pixels = supported;
         }
     }
+    pub fn set_peer_pointer_move_hidden(&mut self, peer: DeviceId, supported: bool) {
+        if let Some(p) = self.peers.get_mut(&peer) {
+            p.pointer_move_hidden = supported;
+        }
+    }
+    pub(super) fn pointer_move_hidden(&self, device: DeviceId) -> bool {
+        device == self.me() || self.peers.get(&device).is_some_and(|p| p.pointer_move_hidden)
+    }
     pub fn set_peer_touchpad_options(&mut self, peer: DeviceId, supported: bool) {
         if let Some(p) = self.peers.get_mut(&peer) {
             p.touchpad_options = supported;

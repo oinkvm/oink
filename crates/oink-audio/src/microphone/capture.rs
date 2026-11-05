@@ -146,7 +146,11 @@ impl Capture {
             },
             hardware_sample_rate: rate,
             hardware_channels: channels,
-            resampler_delay_frames: (32_u64 * 48_000).div_ceil(u64::from(rate)) as u32,
+            resampler_delay_frames: if rate == 48_000 {
+                0
+            } else {
+                (48_u64 * 48_000).div_ceil(u64::from(rate)) as u32
+            },
         };
         let error = Arc::new(Mutex::new(None));
         let health = Arc::new(Health::default());

@@ -16,11 +16,6 @@ use oink_input::{EventHandler, InputBackend, InputError};
 
 #[derive(Default)]
 struct State {
-    #[cfg(debug_assertions)]
-    application_clock: Option<oink_foundation::application_focus::TestClock>,
-    application_focus: Option<oink_foundation::application_focus::Observation>,
-    application_sample_gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
-    application_observer: Option<oink_input::application_focus::Observer>,
     touchpad_contacts: Option<u8>,
     injection_active: bool,
     injection_sessions: u64,
@@ -159,47 +154,6 @@ impl FakeInput {
                 "native_input={native:?} safety={:?}",
                 safety.as_ref().map(|s| s.snapshot())
             )
-        }
-    }
-
-    /// Set before starting the node, so model deadlines and native permits use
-    /// the same clock. Other fake-platform tests retain real wall-clock timing.
-    #[cfg(debug_assertions)]
-    pub fn set_application_focus_clock(&self, clock: oink_foundation::application_focus::TestClock) {
-        self.state.lock().unwrap().application_clock = Some(clock);
-    }
-    /// Hold one native sample until the test releases the gate. Dropping the
-    /// release sender also unblocks it, including on assertion failure.
-    pub fn block_next_application_sample(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
-        let (entered, receive) = std::sync::mpsc::channel();
-        let (release, wait) = std::sync::mpsc::channel();
-        self.state.lock().unwrap().application_sample_gate = Some((entered, wait));
-        (receive, release)
-    }
-
-    pub fn application_foreground(&self) -> Option<oink_foundation::application_focus::Foreground> {
-        self.state.lock().unwrap().application_focus.map(|o| o.foreground)
-    }
-    /// Explicit opt-in for application-focus scenarios. Other fake backends
-    /// retain the unsupported default and never create native focus work.
-    pub fn set_application_foreground(&self, foreground: oink_foundation::application_focus::Foreground) {
-        use oink_foundation::application_focus::{Foreground, Observation, ObservationStamp};
-        let mut s = self.state.lock().unwrap();
-        let previous = s.application_focus;
-        s.application_focus = Some(Observation {
-            stamp: ObservationStamp {
-                generation: 1,
-                sequence: previous.map_or(1, |o| o.stamp.sequence + 1),
-            },
-            foreground,
-            hidden_lost: foreground != Foreground::Hidden
-                && previous.is_some_and(|o| o.hidden_lost || o.foreground == Foreground::Hidden),
-            park_operation: None,
-        });
-        let notify = s.application_observer.clone().zip(s.application_focus);
-        drop(s);
-        if let Some((observer, observation)) = notify {
-            observer(observation);
         }
     }
 
@@ -499,66 +453,6 @@ impl oink_input::display_power::Observation for DisplayPower {
 impl InputBackend for FakeInput {
     fn set_source_foreground(&self, enabled: bool) {
         self.state.lock().unwrap().source_foreground.push(enabled);
-    }
-
-    #[cfg(debug_assertions)]
-    fn application_focus_test_clock(&self) -> Option<oink_foundation::application_focus::TestClock> {
-        self.state.lock().unwrap().application_clock.clone()
-    }
-
-    fn application_focus_watch(&self, observer: Option<oink_input::application_focus::Observer>) {
-        self.state.lock().unwrap().application_observer = observer;
-    }
-    fn application_focus_dismiss(&self) {
-        use oink_foundation::application_focus::Foreground;
-        if self.application_foreground() == Some(Foreground::Hidden) {
-            // Dismiss closes the sink; it does not restore a saved ordinary app.
-            self.set_application_foreground(Foreground::Unknown);
-        }
-    }
-    fn application_focus_supported(&self) -> bool {
-        self.state.lock().unwrap().application_focus.is_some()
-    }
-    fn application_focus_sample(&self) -> oink_foundation::application_focus::Observation {
-        let gate = self.state.lock().unwrap().application_sample_gate.take();
-        if let Some((entered, release)) = gate {
-            let _ = entered.send(());
-            let _ = release.recv();
-        }
-        use oink_foundation::application_focus::{Foreground, Observation, ObservationStamp};
-        let s = self.state.lock().unwrap();
-        s.application_focus.unwrap_or(Observation {
-            stamp: ObservationStamp {
-                generation: 1,
-                sequence: 1,
-            },
-            foreground: Foreground::Unavailable,
-            hidden_lost: false,
-            park_operation: None,
-        })
-    }
-    fn application_focus_park(
-        &self,
-        expected: oink_foundation::application_focus::ObservationStamp,
-        operation: u64,
-        permit: oink_input::application_focus::Permit,
-    ) -> oink_foundation::application_focus::ParkResult {
-        use oink_foundation::application_focus::{Foreground, ParkResult};
-        let mut s = self.state.lock().unwrap();
-        let Some(o) = s.application_focus.as_mut() else {
-            return ParkResult::Unavailable;
-        };
-        if !permit.valid() || o.stamp != expected {
-            return ParkResult::Stale;
-        }
-        if o.foreground != Foreground::Windowed {
-            return ParkResult::UnknownExempt;
-        }
-        o.stamp.sequence += 1;
-        o.foreground = Foreground::Hidden;
-        o.hidden_lost = false;
-        o.park_operation = Some(operation);
-        ParkResult::Confirmed
     }
 
     fn touchpad_contacts(&self) -> Option<u8> {

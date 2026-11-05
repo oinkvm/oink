@@ -17,6 +17,11 @@ use std::{
 pub trait Native: 'static {
     fn apply(&mut self, command: Command) -> Reply;
     fn release(&mut self);
+    /// Only held input or deferred desktop cleanup needs the existing cadence.
+    /// Backends that cannot report their ledger retain the previous cadence.
+    fn needs_maintenance(&self) -> bool {
+        true
+    }
     fn maintain(&mut self);
 }
 pub trait Query: 'static {
@@ -112,7 +117,7 @@ impl Server {
                 });
                 let _ = shared.input.worker.set(thread::current());
                 let mut generation = 0;
-                let mut maintenance = Instant::now();
+                let mut maintenance = None;
                 loop {
                     let current = shared.generation.load(Ordering::Acquire);
                     if generation != current {
@@ -166,15 +171,27 @@ impl Server {
                         }
                         continue;
                     }
-                    let now = Instant::now();
-                    if now >= maintenance {
-                        backend.0.maintain();
-                        maintenance = now + Duration::from_millis(100);
+                    if backend.0.needs_maintenance() {
+                        let now = Instant::now();
+                        let due = maintenance.get_or_insert(now);
+                        if now >= *due {
+                            backend.0.maintain();
+                            *due = now + Duration::from_millis(100);
+                        }
+                    } else {
+                        maintenance = None;
                     }
                     if !shared.input.requests.is_empty() || generation != shared.generation.load(Ordering::Acquire) {
                         continue;
                     }
-                    thread::park_timeout(maintenance.saturating_duration_since(Instant::now()));
+                    // Submission, generation changes and stop each carry an
+                    // unpark token. With no held/deferred input there is no
+                    // desktop cleanup to poll; wait for one of those events.
+                    if let Some(due) = maintenance {
+                        thread::park_timeout(due.saturating_duration_since(Instant::now()));
+                    } else {
+                        thread::park();
+                    }
                 }
             })?;
         started.recv().map_err(io::Error::other)??;

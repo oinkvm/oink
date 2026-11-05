@@ -1415,3 +1415,79 @@ fn mismatched_real_drop_rejects_readers_immediately_with_superseded() {
     assert_eq!(reason(&error), Unavailable::Superseded);
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
 }
+
+#[test]
+fn portable_image_prefers_existing_png_and_preserves_fallback_and_native_order() {
+    struct Image {
+        inventory: Inventory,
+        reads: Arc<Mutex<Vec<RepresentationId>>>,
+        png_failure: Option<Unavailable>,
+    }
+    struct ImageTranslator;
+    impl Translator for ImageTranslator {
+        fn standard(&self, _: &Representation, bytes: &[u8]) -> io::Result<Vec<ClipData>> {
+            Ok(vec![ClipData::Png(bytes.to_vec())])
+        }
+    }
+    impl Provider for Image {
+        fn inventory(&self) -> Inventory {
+            self.inventory.clone()
+        }
+        fn translator(&self) -> Arc<dyn Translator> {
+            Arc::new(ImageTranslator)
+        }
+        fn open(&self, id: RepresentationId) -> io::Result<FileReader> {
+            self.reads.lock().unwrap().push(id);
+            if id == RepresentationId(2)
+                && let Some(reason) = self.png_failure
+            {
+                return Err(unavailable(reason));
+            }
+            Ok(Box::new(io::Cursor::new(if id == RepresentationId(2) {
+                b"PNG"
+            } else {
+                b"DIB"
+            })))
+        }
+    }
+    let mut inventory = fixture().inventory();
+    inventory.platform = ClipPlatform::Windows;
+    inventory.items[0].representations.truncate(2);
+    let reps = &mut inventory.items[0].representations;
+    reps[0].id = RepresentationId(1);
+    reps[0].format = NativeFormat::WindowsPredefined(8);
+    reps[1].id = RepresentationId(2);
+    reps[1].format = NativeFormat::WindowsRegistered("PNG".into());
+    for rep in reps {
+        rep.standard = Some(StandardFormat::Png);
+        rep.data = RepresentationData::Reader {
+            size: ContentSize::Unknown,
+        };
+    }
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let mut source = Image {
+        inventory,
+        reads: reads.clone(),
+        png_failure: None,
+    };
+    let portable = |source: &Image| read_all(&mut open_for(source, RepresentationId(1), ClipPlatform::Mac)?);
+    assert_eq!(portable(&source).unwrap(), b"PNG");
+    assert_eq!(reads.lock().unwrap().as_slice(), [RepresentationId(2)]);
+    reads.lock().unwrap().clear();
+    assert_eq!(
+        read_all(&mut open_for(&source, RepresentationId(1), ClipPlatform::Windows).unwrap()).unwrap(),
+        b"DIB"
+    );
+    assert_eq!(reads.lock().unwrap().as_slice(), [RepresentationId(1)]);
+    reads.lock().unwrap().clear();
+    source.png_failure = Some(Unavailable::InvalidData);
+    assert_eq!(portable(&source).unwrap(), b"DIB");
+    assert_eq!(
+        reads.lock().unwrap().as_slice(),
+        [RepresentationId(2), RepresentationId(1)]
+    );
+    reads.lock().unwrap().clear();
+    source.png_failure = Some(Unavailable::Superseded);
+    assert_eq!(reason(&portable(&source).unwrap_err()), Unavailable::Superseded);
+    assert_eq!(reads.lock().unwrap().as_slice(), [RepresentationId(2)]);
+}

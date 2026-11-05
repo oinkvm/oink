@@ -13,6 +13,7 @@ pub struct Stamp {
     pub generation: u64,
     pub at: Instant,
     pub transport: Option<Transport>,
+    pub codec: Option<crate::Codec>,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct NumericInterval {
@@ -74,6 +75,7 @@ impl Ring {
             generation,
             at,
             transport: None,
+            codec: None,
         })
     }
     #[inline]

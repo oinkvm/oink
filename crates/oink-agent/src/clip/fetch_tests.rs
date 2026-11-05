@@ -126,7 +126,9 @@ async fn file_fetch_scenario(after_publish: bool, mixed: bool) {
         assert_eq!(target.items(), vec![ClipData::Text("previous offer".into())]);
     }
     let file = a.data_dir().join("source.bin");
-    let expected = vec![0x5a; 2_000_000];
+    // This fixture tests explicit File Provider refusal/manual download, not
+    // the Mac ordinary-file automatic-cache route below the shared budget.
+    let expected = vec![0x5a; oink_clipboard::model::AUTO_PULL_BYTES as usize + 1];
     std::fs::write(&file, &expected).unwrap();
     let mut items = vec![ClipData::Files(vec![oink_clipboard::FileEntry {
         path: "传输.bin".into(),

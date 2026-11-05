@@ -49,6 +49,38 @@ fn clipboard_numeric_field(name: &str) -> bool {
     )
 }
 
+fn copy_numeric_field(name: &str) -> bool {
+    matches!(
+        name,
+        "copy_origin_0"
+            | "copy_origin_1"
+            | "copy_origin_2"
+            | "copy_origin_3"
+            | "copy_origin_4"
+            | "copy_origin_5"
+            | "copy_origin_6"
+            | "copy_origin_7"
+            | "copy_offer"
+            | "copy_offer_hi"
+            | "copy_generation"
+            | "copy_generation_hi"
+            | "copy_stage"
+            | "copy_count"
+            | "copy_current_count"
+            | "copy_written_count"
+            | "copy_request"
+            | "copy_representation"
+            | "copy_node"
+            | "copy_format"
+            | "copy_channel"
+            | "copy_elapsed_us"
+            | "copy_bytes"
+            | "copy_result"
+            | "copy_reason"
+            | "copy_mono_us"
+    )
+}
+
 // Reviewed native promise timing scalars. Keep their admission target-scoped;
 // Debug, strings and booleans cannot stand in for clocks or metadata numbers.
 fn promise_numeric_field(name: &str) -> bool {
@@ -553,6 +585,8 @@ impl Scalars {
                     | "latency_trimmed_frames"
                     | "drift_ppm"
                     | "adaptation_ppm"
+                    | "quiet_discarded_ms"
+                    | "quiet_inserted_ms"
                     | "boundary_hold_samples"
                     | "sample_mono_us"
                     | "pacing_id"
@@ -587,6 +621,7 @@ impl Scalars {
                     "file_stage" | "file_request" | "file_index" | "file_code" | "file_reason" | "file_status"
                     | "file_object" | "file_format" | "file_offer" | "file_generation" | "file_node"))
                 || (self.4 == "oink_file_diagnostics" && promise_numeric_field(f.name()))
+                || (self.4 == "oink_copy_diagnostics" && copy_numeric_field(f.name()))
         };
         if permitted && v.is_finite() && self.0.len() < 24 {
             self.0.push((f.name().into(), v));
@@ -666,6 +701,7 @@ impl Visit for Scalars {
             return;
         }
         if clipboard_numeric_field(field.name())
+            || copy_numeric_field(field.name())
             || (self.4 == "oink_clipboard::macos::file_provider" && provider_numeric_field(field.name()))
         {
             return;
@@ -1014,6 +1050,7 @@ impl Visit for Scalars {
     fn record_bool(&mut self, f: &Field, v: bool) {
         if !provider_numeric_field(f.name())
             && !clipboard_numeric_field(f.name())
+            && !copy_numeric_field(f.name())
             && !promise_numeric_field(f.name())
             && !oink_foundation::drag_trace::FIELDS.contains(&f.name())
         {
@@ -1618,6 +1655,108 @@ mod tests {
     }
 
     #[test]
+    fn copy_timeline_retains_exact_numeric_identity_and_rejects_content_and_other_targets() {
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Collect(rows.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            oink_clipboard::copy_diagnostics::event(
+                Some(oink_clipboard::model::OfferId {
+                    clip: oink_foundation::content::ClipId {
+                        origin: DeviceId([255; 32]),
+                        seq: 42,
+                    },
+                    generation: 7,
+                }),
+                oink_clipboard::copy_diagnostics::Stage::NativeRead,
+                oink_clipboard::copy_diagnostics::Values {
+                    bytes: 2048,
+                    result: 1,
+                    ..Default::default()
+                },
+            );
+            tracing::info!(target: "oink_copy_diagnostics", copy_offer = "PRIVATE", copy_result = true,
+                copy_bytes = "PRIVATE", name = "PRIVATE", content = "PRIVATE");
+            tracing::info!(target: "unrelated", copy_offer = 42_u64, copy_bytes = 2048_u64);
+        });
+        let rows = lock(&rows);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].0.len(), 24);
+        assert!(rows[0].0.contains(&("copy_origin_0".into(), u32::MAX as f64)));
+        assert!(rows[0].0.contains(&("copy_origin_7".into(), u32::MAX as f64)));
+        assert!(rows[0].0.contains(&("copy_offer".into(), 42.)));
+        assert!(rows[0].1.is_empty());
+        assert!(rows[1].0.is_empty());
+        assert!(rows[1].1.is_empty());
+        assert!(rows[2].0.is_empty());
+    }
+
+    #[test]
+    fn capture_handoff_retains_key_duration_and_queue_outcomes_without_key_material() {
+        use oink_clipboard::copy_diagnostics::{Stage, capture_handoff};
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Collect(rows.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            capture_handoff(Stage::ClipboardKeyBegin, 25, 0, 0);
+            capture_handoff(Stage::ClipboardKeyEnd, 25, 2, 123456);
+            capture_handoff(Stage::CapturedSent, 25, 1, 0);
+            capture_handoff(Stage::CapturedReceived, 25, 0, 0);
+            capture_handoff(Stage::CapturedSent, 26, 2, 0);
+            tracing::info!(target: "oink_copy_diagnostics", key = "PRIVATE", error = "PRIVATE");
+        });
+        let rows = lock(&rows);
+        for (row, (stage, count, result, elapsed)) in rows.iter().zip([
+            (16., 25., 0., 0.),
+            (17., 25., 2., 123456.),
+            (18., 25., 1., 0.),
+            (19., 25., 0., 0.),
+            (18., 26., 2., 0.),
+        ]) {
+            assert_eq!(row.0.len(), 5);
+            for (name, value) in [
+                ("copy_stage", stage),
+                ("copy_count", count),
+                ("copy_result", result),
+                ("copy_elapsed_us", elapsed),
+                ("copy_reason", 0.),
+            ] {
+                assert!(row.0.contains(&(name.into(), value)));
+            }
+            assert!(row.1.is_empty());
+        }
+        assert_eq!(rows.len(), 6);
+        assert!(rows[5].0.is_empty());
+        assert!(rows[5].1.is_empty());
+    }
+
+    #[test]
+    fn capture_discard_preserves_reason_and_counters_without_clipboard_content() {
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Collect(rows.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            oink_clipboard::copy_diagnostics::capture_discard(
+                oink_clipboard::copy_diagnostics::CaptureDiscard::SnapshotChanged,
+                25,
+                27,
+                23,
+            );
+        });
+        let rows = lock(&rows);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.len(), 6);
+        for (name, value) in [
+            ("copy_stage", 15.),
+            ("copy_reason", 7.),
+            ("copy_count", 25.),
+            ("copy_current_count", 27.),
+            ("copy_written_count", 23.),
+            ("copy_result", 2.),
+        ] {
+            assert!(rows[0].0.contains(&(name.into(), value)));
+        }
+        assert!(rows[0].1.is_empty());
+    }
+
+    #[test]
     fn clipboard_failure_correlation_survives_package_without_names_or_untyped_fields() {
         let temp = tempfile::tempdir().unwrap();
         let recorder = crate::diagnostics::tests::isolated(temp.path().into(), DeviceId([42; 32]), None, true).unwrap();
@@ -1895,6 +2034,7 @@ mod tests {
                 received=1000_u64, late=10_u64, concealed=10_u64,
                 empty_queue_plc_frames=10_u64, gap_plc_frames=0_u64,
                 decode_errors=0_u64, buffered_ms=10.0, arrival_jitter_ms=0.2,
+                quiet_discarded_ms=25.0, quiet_inserted_ms=0.0,
                 peer="private-peer", pcm="private-payload");
         });
         let rows = lock(&rows);
@@ -1906,7 +2046,9 @@ mod tests {
                 ("role".into(), "sender".into())
             ]
         );
-        assert_eq!(rows[1].0.len(), 11);
+        assert_eq!(rows[1].0.len(), 13);
+        assert!(rows[1].0.contains(&("quiet_discarded_ms".into(), 25.0)));
+        assert!(rows[1].0.contains(&("quiet_inserted_ms".into(), 0.0)));
         assert_eq!(rows[1].1, [("kind".into(), "audio_receiver_sample".into())]);
         assert!(rows[1].0.contains(&("late".into(), 10.0)));
     }

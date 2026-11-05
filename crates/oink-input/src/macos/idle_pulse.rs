@@ -1,67 +1,50 @@
-//! Input-driven session-idle accounting, isolated from keyboard delivery.
+//! Input-driven session-idle accounting with a filtered zero-delta scroll carrier.
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use objc2_core_foundation::{CFMachPort, CFRetained, CFRunLoop, CFRunLoopSource, kCFRunLoopCommonModes};
+use objc2_core_foundation::{CFMachPort, CFRetained, CFRunLoop, CFRunLoopSource, CGPoint, kCFRunLoopCommonModes};
 use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventTapOptions,
     CGEventTapPlacement, CGEventTapProxy, CGEventType,
 };
 
-// Keep the source tag across conversion. Quartz on macOS 26.6.2 retains the
-// first EventSourceUserData value when it is set again on the same event.
+// Keep the source tag across conversion. Quartz retains the first user-data
+// value on macOS 26.6.2, so the Null request already carries the final tag.
 pub(super) const TAG: i64 = 0x4f494451;
 const SYNTHETIC: u64 = 0x2000_0000;
-// Provenance: the internal per-event marker behind the deprecated public
-// CGEnableEventStateCombining(false), NOT IOHID's unrelated high-keycode encoding.
-// SLEnableEventStateCombining clears the main connection's eventState byte at
-// 0x185c64f00 (14.7.8) / 0x1870140ac (26.6.2); SLSPostKeyboardEvent then ORs
-// bit 31 at 0x185c8618c / 0x187168a28 when that byte is false. SLSPostEventRecord
-// and sHIDContinuation also apply it. Meaning: do not combine this synthetic
-// event's keyboard state with the session/hardware state. The same mechanism
-// handles suppressed physical HID input (sHIDContinuation: 0x185d28c30 /
-// 0x186f12bc4); it is not synthetic-only or an idle-specific feature.
-// We do NOT call the
-// deprecated connection-wide API: it clears connection key records and affects
-// other injected events on Oink's main connection. Mark only this idle pulse.
-// The flag itself is undocumented, absent from the public SDK. SkyLight's
-// _CGXUpdateScoreboard shows source ID 0 (CombinedSession) + flags bit 31 skips
-// modifier/key-state scoreboard writes, but still records input time/count.
-// Both versions check bit 31 ONLY when sourceID == 0: sourceID != 0 branches
-// PAST that test into ordinary state writes. The annotation accounting call
-// passes w1=0 (14.7.8: 0x185f72fa4; 26.6.2: 0x186ee4b1c), so our converted
-// carrier takes the CombinedSession branch regardless of its private source.
-// Unslid arm64e addresses checked:
-// - macOS 14.7.8 (23H730): function 0x185dc48c4, bit test 0x185dc4940
-//   -> 0x185dc4a54; aggregate time 0x185dc4c28, event count 0x185dc4cbc.
-// - macOS 26.6.2 (25G83): function 0x186dda654, bit test 0x186dda6d0
-//   -> 0x186dda7e0; time/count updates remain downstream of that branch.
-// SkyLight's _SLEventPost ORs SYNTHETIC at 0x185d5b824 (14.7.8) and
-// 0x187171170 (26.6.2). This is observed implementation, not a supported API.
-// loginwindow's ScreenSaverDaemon reads this idle time through
-// CGSSecondsSinceLastInputEvent(-1), not HIDIdleTime (26.6.2 call: 0x100085524).
-// The 26.6.2 native held/release-before/press-before probe reset CGS idle to
-// ~0.20s without changing the expected session/HID modifier state or leaking
-// events past Annotated; Shift was restored. 14.7.8 is STATIC-ONLY evidence:
-// no already-authorized generic GUI probe host was available on that machine.
-// filter_callback logs modifier differences for detection if a future macOS
-// changes this behavior; it never writes a stale snapshot back as a repair.
-// Bit 31 also affects coalescing/repeat dropping, so is NOT globally inert:
-// CGSCanCoalesceEvents rejects different types / bit31 XOR (14.7.8:
-// 0x185c11a20/30; 26.6.2: 0x186cfd138/148). Session queue mask 0x098000e0
-// excludes FlagsChanged; rejection preserves distinct queue items, no new wait.
-// should_discard_event only examines its own event; FlagsChanged bypasses the
-// repeat-key test (14.7.8: 0x185fabebc–c4; 26.6.2: 0x186e74d94–a4). Since
-// the pulse changes no key state and is dropped at Annotated, it cannot change
-// an adjacent real key's repeat-drop decision. Ordinary tap/queue work remains;
-// see group-power-mirroring.md for the bounded argument and exact call sites.
-// Mouse/button and other accounting may still update for other event types.
-// Annotated's system bit31 clear is event+0x80, NOT flags(+0x38): we must drop
-// the whole tagged event, not rely on the OS hiding/clearing its private flags.
+// The per-event form of event-state-combining suppression. The Session
+// continuation's CombinedSession accounting skips modifier/key-state writes
+// when bit 31 is set, while recording input time. This is observed SkyLight
+// behavior, not a public SDK contract. Keep the Annotated filter mandatory.
 const SKIP_COMBINED_KEY_STATE: u64 = 0x8000_0000;
+const PULSE_TYPE: CGEventType = CGEventType::ScrollWheel;
+// Clear the scroll representations, including fractional/pixel deltas
+// and phases, so even earlier scroll observers receive a zero-amount event.
+const SCROLL_FIELDS: [CGEventField; 13] = [
+    CGEventField::ScrollWheelEventDeltaAxis1,
+    CGEventField::ScrollWheelEventDeltaAxis2,
+    CGEventField::ScrollWheelEventDeltaAxis3,
+    CGEventField::ScrollWheelEventFixedPtDeltaAxis1,
+    CGEventField::ScrollWheelEventFixedPtDeltaAxis2,
+    CGEventField::ScrollWheelEventFixedPtDeltaAxis3,
+    CGEventField::ScrollWheelEventPointDeltaAxis1,
+    CGEventField::ScrollWheelEventPointDeltaAxis2,
+    CGEventField::ScrollWheelEventPointDeltaAxis3,
+    CGEventField::ScrollWheelEventScrollPhase,
+    CGEventField::ScrollWheelEventMomentumPhase,
+    CGEventField::ScrollWheelEventScrollCount,
+    CGEventField::ScrollWheelEventIsContinuous,
+];
+
+// A FlagsChanged carrier reached input-method observers before our Annotated
+// filter and acted as a standalone Shift. CombinedSessionState can still lag
+// the preceding real key at Session. Bit 31 protects the CGS scoreboard, but
+// observers interpret the event itself. Use a zero-delta scroll
+// event with metadata-only flags and drop it before application delivery.
+// Sample its location at conversion, so queued requests carry no old position.
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
 thread_local! { static FILTER: RefCell<Option<Filter>> = const { RefCell::new(None) }; }
 struct Filter {
@@ -83,7 +66,7 @@ pub(super) fn install(run_loop: &CFRunLoop) {
             CGEventTapLocation::AnnotatedSessionEventTap,
             CGEventTapPlacement::HeadInsertEventTap,
             CGEventTapOptions::Default,
-            1 << CGEventType::FlagsChanged.0,
+            1 << PULSE_TYPE.0,
             Some(filter_callback),
             std::ptr::null_mut(),
         )
@@ -150,29 +133,35 @@ fn refresh(
     now: Instant,
     available: bool,
     allowed: bool,
-    current_flags: impl FnOnce() -> CGEventFlags,
+    current_position: impl FnOnce() -> Option<CGPoint>,
 ) -> bool {
     if !admit(*last, now, available, allowed) {
         return false;
     }
-    prepare(event, current_flags());
+    let Some(position) = current_position() else {
+        return false;
+    };
+    prepare(event, position);
     *last = Some(now);
     true
 }
 
-fn prepare(event: &CGEvent, current: CGEventFlags) {
-    CGEvent::set_type(Some(event), CGEventType::FlagsChanged);
-    CGEvent::set_integer_value_field(Some(event), CGEventField::KeyboardEventKeycode, 0x38);
-    CGEvent::set_flags(
-        Some(event),
-        CGEventFlags(current.0 | SYNTHETIC | SKIP_COMBINED_KEY_STATE),
-    );
+fn prepare(event: &CGEvent, position: CGPoint) {
+    CGEvent::set_type(Some(event), PULSE_TYPE);
+    CGEvent::set_location(Some(event), position);
+    CGEvent::set_integer_value_field(Some(event), CGEventField::MouseEventDeltaX, 0);
+    CGEvent::set_integer_value_field(Some(event), CGEventField::MouseEventDeltaY, 0);
+    CGEvent::set_integer_value_field(Some(event), CGEventField::KeyboardEventKeycode, 0);
+    for field in SCROLL_FIELDS {
+        CGEvent::set_double_value_field(Some(event), field, 0.);
+    }
+    CGEvent::set_flags(Some(event), CGEventFlags(SYNTHETIC | SKIP_COMBINED_KEY_STATE));
 }
 
 /// Handle before business translation, modifier reconciliation or own-injection
 /// rewriting. A queued request is always consumed when the gate/filter is closed.
 pub(super) fn at_session(ty: CGEventType, event: &CGEvent, allowed: impl FnOnce() -> bool) -> Option<bool> {
-    if ty == CGEventType::FlagsChanged && tagged(event, TAG) {
+    if ty == PULSE_TYPE && tagged(event, TAG) {
         return Some(false);
     }
     if ty != CGEventType::Null || !tagged(event, TAG) {
@@ -184,31 +173,33 @@ pub(super) fn at_session(ty: CGEventType, event: &CGEvent, allowed: impl FnOnce(
             return Some(false);
         };
         let now = Instant::now();
-        // macOS 26.6.2 loginwindow's _checkUserIdleDuringReset reads
-        // CGSSecondsSinceLastInputEvent(-1), not IORegistry HIDIdleTime. Both
-        // DeclareUserActivity and HID Null leave that CGS timer running. A
-        // FlagsChanged reaches its idle accounting before the Annotated tap.
-        // Convert the Null *here*, in stream order, using CURRENT local session
-        // flags. Reading Combined alone is insufficient: a native held/race
-        // probe showed an earlier modifier can still await CGS accounting, so a
-        // pulse would replay stale flags and undo that release/press. Bit 31
-        // (SKIP_COMBINED_KEY_STATE) skips CGS modifier/key-state writes even in that
-        // ordering; the timestamp still advances. Never post through HID (that could
-        // overwrite a concurrently changed physical modifier). Captured physical
-        // modifiers and local session modifiers intentionally remain distinct.
-        // 0x20000000 is Quartz's observed synthetic-event bit, not a modifier;
-        // retain it when replacing the Null. No KeyDown/Up or MouseMoved is sent.
-        // The downstream filter prevents application key/hover delivery, but
-        // earlier global taps can still observe this marked FlagsChanged.
+        // A Null carrier alone does not advance CGS session idle. Conversion
+        // stays in stream order and has no keyboard transition for earlier
+        // observers to interpret. The Annotated filter consumes the pulse
+        // after idle accounting. Read the current pointer position here.
         Some(refresh(
             event,
             &mut filter.last,
             now,
             CGEvent::tap_is_enabled(&filter.port),
             allowed(),
-            || CGEventSource::flags_state(CGEventSourceStateID::CombinedSessionState),
+            || CGEvent::new(None).map(|snapshot| CGEvent::location(Some(&snapshot))),
         ))
     })
+}
+
+fn recover_disabled(ty: CGEventType, available: &AtomicBool, enable: impl FnOnce() -> bool) -> bool {
+    if !matches!(
+        ty,
+        CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+    ) {
+        return false;
+    }
+    available.store(false, Ordering::Release);
+    let enabled = enable();
+    available.store(enabled, Ordering::Release);
+    tracing::warn!(?ty, enabled, "idle pulse filter recovery attempted");
+    true
 }
 
 unsafe extern "C-unwind" fn filter_callback(
@@ -217,44 +208,55 @@ unsafe extern "C-unwind" fn filter_callback(
     event: NonNull<CGEvent>,
     _: *mut c_void,
 ) -> *mut CGEvent {
-    if matches!(
-        ty,
-        CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
-    ) {
-        // Fail closed until capture is reinstalled. Never emit while disabled.
-        AVAILABLE.store(false, Ordering::Release);
+    if recover_disabled(ty, &AVAILABLE, || {
+        FILTER.with(|slot| {
+            slot.borrow().as_ref().is_some_and(|filter| {
+                CGEvent::tap_enable(&filter.port, true);
+                CGEvent::tap_is_enabled(&filter.port)
+            })
+        })
+    }) {
         return event.as_ptr();
     }
     // SAFETY: Quartz supplies a valid event for the callback duration.
-    if ty == CGEventType::FlagsChanged && tagged(unsafe { event.as_ref() }, TAG) {
-        // SAFETY: the event remains valid throughout this callback.
-        let before = CGEvent::flags(Some(unsafe { event.as_ref() }));
-        let after = CGEventSource::flags_state(CGEventSourceStateID::CombinedSessionState);
-        if modifier_state_changed(before, after) {
-            // Detection only: a preceding genuine transition can account after
-            // Session sampled flags. Never replay/repair that snapshot here.
-            tracing::warn!(
-                before = before.0,
-                after = after.0,
-                "session modifier state differs across idle pulse"
-            );
-        }
+    if ty == PULSE_TYPE && tagged(unsafe { event.as_ref() }, TAG) {
         std::ptr::null_mut()
     } else {
         event.as_ptr()
     }
 }
 
-fn modifier_state_changed(before: CGEventFlags, after: CGEventFlags) -> bool {
-    // Standard modifier flags and device-side modifier bits; omit event metadata.
-    const MODIFIERS: u64 = 0x00ff_ffff & !CGEventFlags::MaskNonCoalesced.0;
-    (before.0 ^ after.0) & MODIFIERS != 0
-}
-
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn disabled_filter_recovers_immediately_and_failed_recovery_stays_closed() {
+        for ty in [CGEventType::TapDisabledByTimeout, CGEventType::TapDisabledByUserInput] {
+            for enabled in [true, false] {
+                let available = AtomicBool::new(true);
+                assert!(recover_disabled(ty, &available, || {
+                    assert!(!available.load(Ordering::Acquire), "closed during the OS call");
+                    enabled
+                }));
+                assert_eq!(available.load(Ordering::Acquire), enabled);
+                let event = request_event();
+                let mut last = None;
+                assert_eq!(
+                    refresh(&event, &mut last, Instant::now(), enabled, true, || {
+                        assert!(enabled, "failed enable must not construct a pulse");
+                        Some(CGPoint::new(0., 0.))
+                    }),
+                    enabled
+                );
+                assert_eq!(last.is_some(), enabled);
+            }
+        }
+        let available = AtomicBool::new(true);
+        assert!(!recover_disabled(PULSE_TYPE, &available, || panic!("ordinary event")));
+        assert!(available.load(Ordering::Acquire));
+    }
 
     fn request_event() -> CFRetained<CGEvent> {
         let event = CGEvent::new(None).unwrap();
@@ -281,69 +283,52 @@ mod tests {
     }
 
     #[test]
-    fn held_modifiers_survive_pulses_without_local_or_remote_key_delivery() {
-        let now = Instant::now();
-        // Both sides of Shift, Ctrl, Option, Command, plus Fn/Caps lock. These
-        // are *session* flags; the captured/remote physical ledger is separate.
-        for bits in [
-            0x20002, 0x20004, 0x40001, 0x42000, 0x80020, 0x80040, 0x100008, 0x100010, 0x800000, 0x10000,
-        ] {
-            let mut last = None;
-            for second in 0..3 {
-                let event = request_event();
-                assert!(refresh(
-                    &event,
-                    &mut last,
-                    now + Duration::from_secs(second),
-                    true,
-                    true,
-                    || CGEventFlags(bits)
-                ));
-                assert_eq!(
-                    CGEvent::flags(Some(&event)).0 & !(SYNTHETIC | SKIP_COMBINED_KEY_STATE),
-                    bits
-                );
-                assert!(filtered(&event), "no local key event leaves Annotated");
-                assert_eq!(
-                    at_session(CGEventType::FlagsChanged, &event, || panic!(
-                        "pulse must bypass business routing"
-                    )),
-                    Some(false)
-                );
+    fn idle_carrier_has_no_keyboard_transition_even_with_stale_shift_flags() {
+        for stale in [0, 0x20002, 0x20004, 0x20006, 0x40001, 0x10000] {
+            let event = request_event();
+            CGEvent::set_flags(Some(&event), CGEventFlags(stale));
+            CGEvent::set_integer_value_field(
+                Some(&event),
+                CGEventField::KeyboardEventKeycode,
+                if stale & 4 != 0 { 60 } else { 56 },
+            );
+            CGEvent::set_integer_value_field(Some(&event), CGEventField::MouseEventDeltaX, 12);
+            for field in SCROLL_FIELDS {
+                CGEvent::set_double_value_field(Some(&event), field, 3.5);
             }
+            let position = CGPoint::new(123., 456.);
+            let mut last = None;
+            assert!(refresh(&event, &mut last, Instant::now(), true, true, || Some(
+                position
+            )));
+            assert_eq!(CGEvent::r#type(Some(&event)), CGEventType::ScrollWheel);
+            assert_eq!(
+                CGEvent::integer_value_field(Some(&event), CGEventField::KeyboardEventKeycode),
+                0
+            );
+            assert_eq!(CGEvent::flags(Some(&event)).0, SYNTHETIC | SKIP_COMBINED_KEY_STATE);
+            assert_eq!(CGEvent::location(Some(&event)), position);
+            for field in [CGEventField::MouseEventDeltaX, CGEventField::MouseEventDeltaY] {
+                assert_eq!(CGEvent::integer_value_field(Some(&event), field), 0);
+            }
+            for field in SCROLL_FIELDS {
+                assert_eq!(CGEvent::double_value_field(Some(&event), field), 0.);
+            }
+            assert!(filtered(&event));
+            assert_eq!(
+                at_session(PULSE_TYPE, &event, || panic!("pulse entered routing")),
+                Some(false)
+            );
         }
     }
 
     #[test]
-    fn racing_modifier_change_uses_state_at_session_not_request_time() {
-        for (queued, current) in [(0x20002, 0), (0, 0x20004), (0x20002, 0x20004)] {
-            let event = request_event();
-            CGEvent::set_flags(Some(&event), CGEventFlags(queued));
-            let mut last = None;
-            assert!(refresh(&event, &mut last, Instant::now(), true, true, || CGEventFlags(
-                current
-            )));
-            assert_eq!(
-                CGEvent::flags(Some(&event)).0 & !(SYNTHETIC | SKIP_COMBINED_KEY_STATE),
-                current
-            );
-            assert_ne!(
-                CGEvent::flags(Some(&event)).0 & SKIP_COMBINED_KEY_STATE,
-                0,
-                "a stale flags snapshot must never be allowed to update CombinedSession"
-            );
-            assert!(filtered(&event));
-            // A real change behind the pulse remains an ordinary event. Neither
-            // the Session interception nor the Annotated filter consumes it.
-            let real = request_event();
-            CGEvent::set_type(Some(&real), CGEventType::FlagsChanged);
-            CGEvent::set_integer_value_field(Some(&real), CGEventField::EventSourceUserData, 0);
-            CGEvent::set_integer_value_field(Some(&real), CGEventField::EventSourceUnixProcessID, 0);
-            CGEvent::set_flags(Some(&real), CGEventFlags(queued));
-            assert_eq!(at_session(CGEventType::FlagsChanged, &real, || panic!()), None);
-            assert!(!filtered(&real));
-            assert_eq!(CGEvent::flags(Some(&real)).0, queued);
-        }
+    fn failed_position_sample_does_not_emit_or_spend_activity_budget() {
+        let event = request_event();
+        let mut last = None;
+        assert!(!refresh(&event, &mut last, Instant::now(), true, true, || None));
+        assert_eq!(last, None);
+        assert_eq!(CGEvent::r#type(Some(&event)), CGEventType::Null);
     }
 
     #[test]
@@ -357,13 +342,13 @@ mod tests {
                 Instant::now(),
                 available,
                 allowed,
-                || panic!("closed gate must not read/post flags")
+                || panic!("closed gate must not sample a carrier")
             ));
             assert_eq!(last, None);
             assert_eq!(CGEvent::r#type(Some(&event)), CGEventType::Null);
         }
         // A request arriving after filter withdrawal is swallowed even before
-        // querying the owner, so pause cannot leak a queued synthetic key.
+        // querying the owner, so pause cannot leak a queued carrier.
         let event = request_event();
         assert_eq!(at_session(CGEventType::Null, &event, || panic!()), Some(false));
     }
@@ -383,7 +368,7 @@ mod tests {
             let event = request_event();
             assert_eq!(
                 refresh(&event, &mut last, now + Duration::from_millis(ms), true, true, || {
-                    CGEventFlags(0)
+                    Some(CGPoint::new(0., 0.))
                 }),
                 expected
             );
@@ -393,21 +378,20 @@ mod tests {
     }
 
     #[test]
-    fn modifier_detection_ignores_pulse_metadata_but_observes_press_release_and_side() {
-        assert!(!modifier_state_changed(
-            CGEventFlags(0xa002_0102),
-            CGEventFlags(0x2002_0002)
-        ));
-        for (before, after) in [(0x20002, 0), (0, 0x20002), (0x20002, 0x20004)] {
-            assert!(modifier_state_changed(CGEventFlags(before), CGEventFlags(after)));
-        }
-    }
-
-    #[test]
     fn filter_drops_only_our_pid_and_exact_pulse_kind_and_tag() {
         let event = request_event();
-        prepare(&event, CGEventFlags(0));
+        prepare(&event, CGPoint::new(0., 0.));
         assert!(filtered(&event));
+        for ty in [
+            CGEventType::KeyDown,
+            CGEventType::KeyUp,
+            CGEventType::FlagsChanged,
+            CGEventType::MouseMoved,
+        ] {
+            CGEvent::set_type(Some(&event), ty);
+            assert!(!filtered(&event));
+        }
+        CGEvent::set_type(Some(&event), PULSE_TYPE);
         CGEvent::set_integer_value_field(Some(&event), CGEventField::EventSourceUnixProcessID, 0);
         assert!(!filtered(&event));
         let ordinary = CGEvent::new(None).unwrap();
@@ -416,7 +400,7 @@ mod tests {
             CGEventField::EventSourceUserData,
             super::super::inject::MAGIC,
         );
-        prepare(&ordinary, CGEventFlags(0));
+        prepare(&ordinary, CGPoint::new(0., 0.));
         assert!(!filtered(&ordinary));
     }
 }

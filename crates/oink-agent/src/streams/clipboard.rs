@@ -192,6 +192,25 @@ impl ClipboardStreams {
             let step = state.machine.failed(failure, now);
             self.step(peer, step, now);
         }
+        let sent_offer = match message {
+            Message::ClipboardOffer(offer) => Some(offer),
+            Message::AttachmentHead(_) => self.offer.as_ref(),
+            _ => None,
+        };
+        if result.is_ok()
+            && let Some(offer) = sent_offer
+            && let Ok(id) = offer.id().and_then(oink_clipboard::wire::local_offer_id)
+        {
+            oink_clipboard::copy_diagnostics::event(
+                Some(id),
+                oink_clipboard::copy_diagnostics::Stage::OfferSent,
+                oink_clipboard::copy_diagnostics::Values {
+                    channel: oink_clipboard::copy_diagnostics::Channel::Reliable as u8,
+                    result: 1,
+                    ..Default::default()
+                },
+            );
+        }
         result
     }
 
@@ -292,9 +311,6 @@ impl ClipboardStreams {
 
     pub fn inbound_id(&self, peer: DeviceId) -> Option<StreamId> {
         self.peers.get(&peer)?.rx.as_ref().map(RecvStream::id)
-    }
-    pub fn link_layer(&self) -> LinkLayer {
-        self.links.clone()
     }
     pub fn deadline(&self) -> Option<Instant> {
         self.peers
@@ -657,6 +673,11 @@ impl ClipboardStreams {
         if let Message::ClipboardOffer(offer) = &message
             && let Ok(id) = offer.id().and_then(oink_clipboard::wire::local_offer_id)
         {
+            oink_clipboard::copy_diagnostics::event(
+                Some(id),
+                oink_clipboard::copy_diagnostics::Stage::OfferReceived,
+                oink_clipboard::copy_diagnostics::Values::default(),
+            );
             self.files.accept(peer, id.clip);
         }
         if self.paused {

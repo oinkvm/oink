@@ -110,9 +110,6 @@ impl Gate {
     pub fn input_generation(&self) -> u64 {
         self.0.input_generation.load(Ordering::Acquire)
     }
-    pub fn idle_millis(&self) -> u64 {
-        (self.0.start.elapsed().as_millis() as u64).saturating_sub(self.0.last_input_ms.load(Ordering::Acquire))
-    }
 }
 impl Drop for Lease {
     fn drop(&mut self) {

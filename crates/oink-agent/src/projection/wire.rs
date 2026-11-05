@@ -1,28 +1,11 @@
 //! P0 messages carry ratio-plane rectangles; conversion never writes persisted layout.
-use super::model::{Action, ModeId, ScreenRect};
+use super::model::{Action, ScreenRect};
 use oink_foundation::Rect;
 use oink_network::wire_identity::{device, read_device};
 use oink_protocol::v1::{
     self, Message, RawValue as V, dto,
     schema::{WireDto, WireValue},
 };
-fn mode(id: ModeId) -> v1::Result<dto::ModeId> {
-    dto::ModeId::from_raw(
-        [
-            (1, device(id.owner).write()),
-            (2, id.serial.write()),
-            (3, V::Bytes(id.boot_nonce.to_vec())),
-        ]
-        .into(),
-    )
-}
-fn read_mode(id: dto::ModeId) -> v1::Result<ModeId> {
-    Ok(ModeId {
-        owner: read_device(&id.owner()?)?,
-        serial: id.serial()?,
-        boot_nonce: id.boot_nonce()?.0,
-    })
-}
 fn rect(rect: Rect) -> v1::Result<dto::Rect> {
     dto::Rect::from_raw(
         [
@@ -58,12 +41,6 @@ pub(super) fn encode(action: &Action) -> v1::Result<Message> {
             }
             Message::ArrangementPreview(dto::ArrangementPreview::from_raw(raw)?)
         }
-        Action::Mode { id, enabled } => Message::ProjectionMode(dto::ProjectionMode::from_raw(
-            [(1, mode(*id)?.write()), (2, enabled.write())].into(),
-        )?),
-        Action::Gesture { id, active } => Message::ProjectionGesture(dto::ProjectionGesture::from_raw(
-            [(1, mode(*id)?.write()), (2, active.write())].into(),
-        )?),
         Action::Preview {
             sequence,
             screens,
@@ -111,14 +88,6 @@ pub(crate) fn decode(message: Message) -> v1::Result<Action> {
                 .map(|s| crate::layout_profiles::wire::read_snapshot(s, "").map(Box::new))
                 .transpose()?,
         },
-        Message::ProjectionMode(m) => Action::Mode {
-            id: read_mode(m.id()?)?,
-            enabled: m.enabled()?,
-        },
-        Message::ProjectionGesture(m) => Action::Gesture {
-            id: read_mode(m.id()?)?,
-            active: m.active()?,
-        },
         Message::ProjectionPreview(m) => {
             let screens = m
                 .screens()?
@@ -162,15 +131,9 @@ mod tests {
     use oink_foundation::DeviceId;
 
     #[test]
-    fn projection_conversion_preserves_mode_and_clear_semantics() {
-        let id = ModeId {
-            owner: DeviceId([1; 32]),
-            serial: 7,
-            boot_nonce: [3; 16],
-        };
+    fn projection_conversion_preserves_preview_and_clear_semantics() {
+        let owner = DeviceId([1; 32]);
         for value in [
-            Action::Mode { id, enabled: true },
-            Action::Gesture { id, active: false },
             Action::Preview {
                 sequence: 3,
                 screens: None,
@@ -179,11 +142,11 @@ mod tests {
             Action::Preview {
                 sequence: 4,
                 screens: Some(vec![ScreenRect {
-                    device: id.owner,
+                    device: owner,
                     display: "screen".into(),
                     rect: Rect::new(-0.2, 0.0, 0.5, 0.3),
                 }]),
-                affected: vec![(id.owner, "screen".into())],
+                affected: vec![(owner, "screen".into())],
             },
         ] {
             let bytes = v1::frame::encode(&encode(&value).unwrap(), v1::limits::RELIABLE_FRAME).unwrap();
@@ -196,7 +159,7 @@ mod tests {
         let value = Action::Preview {
             sequence: 5,
             screens: Some(vec![ScreenRect {
-                device: id.owner,
+                device: owner,
                 display: "screen".into(),
                 rect: Rect::new(0.0, 0.0, -1.0, 0.3),
             }]),

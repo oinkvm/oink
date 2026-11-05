@@ -4,6 +4,8 @@ use oink_protocol::v1::schema::{FixedBytes, WireValue};
 
 #[derive(Default)]
 struct State {
+    capture_rate: Option<u32>,
+    capture_rate_error: Option<String>,
     encoder: Option<oink_audio::source::Encoder>,
     omitted_silent_frames: u64,
     volume: Option<oink_audio::volume::Reading>,
@@ -125,6 +127,13 @@ impl AudioPlatform for Platform {
             name: "Synthetic".into(),
             is_default: true,
         }])
+    }
+    fn capture_sample_rate(&self) -> Result<u32, String> {
+        let state = lock(&self.0);
+        match &state.capture_rate_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(state.capture_rate.unwrap_or(48_000)),
+        }
     }
     fn capture_capability(&self) -> String {
         "synthetic".into()
@@ -254,7 +263,10 @@ impl Running {
         this
     }
     async fn before_reconciliation(forwarding_enabled: bool) -> Self {
-        let fixture = Fixture::<AudioStreams>::start().await;
+        Self::with_quality_capability(forwarding_enabled, None).await
+    }
+    async fn with_quality_capability(forwarding_enabled: bool, omitted: Option<&str>) -> Self {
+        let fixture = Fixture::<AudioStreams>::start_profile(2, omitted).await;
         let mut owners = Vec::new();
         let mut platforms = Vec::new();
         let mut directories = Vec::new();
@@ -266,7 +278,7 @@ impl Running {
                 config
                     .update(|settings| {
                         settings.audio.forwarding_enabled = forwarding_enabled;
-                        settings.audio.preferred_format = StreamFormat::Pcm16_2p5ms;
+                        settings.audio.quality = oink_audio::negotiation::Quality::Lossless;
                     })
                     .unwrap();
                 (
@@ -346,8 +358,10 @@ impl Running {
     }
     fn supply(&self, index: usize, level: f32) {
         let now = Instant::now();
-        lock(&self.platforms[index].0).encoder.as_mut().unwrap().supply(
-            &[level; 240],
+        let mut platform = lock(&self.platforms[index].0);
+        let encoder = platform.encoder.as_mut().unwrap();
+        encoder.supply(
+            &vec![level; encoder.config().frame_samples()],
             oink_audio::source::Stamp {
                 first_sample_at: None,
                 callback_at: Some(now),
@@ -908,7 +922,7 @@ async fn native_silent_frame_omission_keeps_capture_dormant_without_reopening() 
     // Onset bypasses the sleeping control owner; no reopen or owner tick is needed.
     let wake = now + Duration::from_secs(66);
     lock(&running.platforms[0].0).encoder.as_mut().unwrap().supply(
-        &[0.2; 240],
+        &[0.2; 320],
         oink_audio::source::Stamp {
             first_sample_at: None,
             callback_at: Some(wake),
@@ -1503,7 +1517,7 @@ async fn prepared_opus_remote_exit() -> Running {
     lock(&running.platforms[1].0).realtime_playback = true;
     for owner in &mut running.owners {
         let mut settings = owner.settings.clone();
-        settings.preferred_format = StreamFormat::Opus5ms;
+        settings.quality = oink_audio::negotiation::Quality::Smooth;
         owner.install_settings(settings).unwrap();
     }
     running.claim(1, true);
@@ -3011,4 +3025,71 @@ async fn cached_peer_outputs_follow_facts_and_disappear_when_the_member_is_remov
     assert!(r.owners[0].peer_outputs.is_empty());
     assert!(r.owners[0].volume.load().is_none());
     r.stop().await;
+}
+
+#[tokio::test]
+async fn source_quality_negotiates_each_profile_and_falls_back_in_both_directions() {
+    use oink_audio::negotiation::{Profile, Quality};
+    for omitted in [None, Some("oink.audio.quality/1")] {
+        for sender in [0, 1] {
+            let mut running = Running::with_quality_capability(true, omitted).await;
+            running
+                .until(|r| r.owners.iter().all(|o| matches!(o.resolution, Resolution::None { .. })))
+                .await;
+            lock(&running.platforms[sender].0).capture_rate = Some(44_100);
+            running.claim(1 - sender, true);
+            for quality in [Quality::Smooth, Quality::Quality, Quality::Lossless] {
+                let mut settings = running.owners[sender].settings.clone();
+                settings.quality = quality;
+                running.owners[sender].install_settings(settings).unwrap();
+                let expected = if omitted.is_some() {
+                    Profile::Opus5ms
+                } else {
+                    quality.profile(44_100)
+                };
+                running
+                    .until(|r| {
+                        r.owners[sender].selected.as_ref().is_some_and(|s| s.format == expected)
+                            && r.owners[sender].capture.is_some()
+                    })
+                    .await;
+                let platform = lock(&running.platforms[sender].0);
+                assert_eq!(platform.encoder.as_ref().unwrap().config(), expected.config());
+                drop(platform);
+                let offer = running.owners[sender].source_session.offer().unwrap();
+                assert_eq!(offer.preferred_descriptor().unwrap().is_some(), omitted.is_none());
+                assert_eq!(running.owners[sender].settings.quality, quality);
+            }
+            running.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn lossless_rate_failure_leaves_no_unsent_offer_behind() {
+    use oink_audio::negotiation::Profile;
+    let mut running = Running::new().await;
+    lock(&running.platforms[0].0).capture_rate_error = Some("no default output".into());
+    running.claim(1, true);
+    running.until(|r| r.owners[0].source_failed).await;
+    // A failed rate query must not leave a begun offer that was never sent:
+    // the next reconciliation would treat it as current and never offer again.
+    assert!(running.owners[0].source_session.offer().is_none());
+    {
+        let mut platform = lock(&running.platforms[0].0);
+        platform.capture_rate_error = None;
+        platform.capture_rate = Some(44_100);
+    }
+    let settings = running.owners[0].settings.clone();
+    running.owners[0].install_settings(settings).unwrap();
+    running.owners[0].apply();
+    running
+        .until(|r| {
+            r.owners[0]
+                .selected
+                .is_some_and(|s| s.format == Profile::Pcm24 { sample_rate: 44_100 })
+                && r.owners[0].capture.is_some()
+        })
+        .await;
+    running.stop().await;
 }

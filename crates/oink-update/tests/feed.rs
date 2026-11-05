@@ -244,6 +244,8 @@ fn signed_packages_and_redirects_accept_any_https_host_without_credentials() {
     for url in [
         "https://github.com/oinkvm/oink/releases/download/v1/a.zip",
         "https://github.com/another/repository/releases/download/v2/a.msi",
+        "https://github.com/oinkvm/oink/releases/download/v0.3.2/Oink-0.3.2-93-windows-x64.msi",
+        "https://github.com/oinkvm/oink/releases/download/v0.3.3/Oink-0.3.3-windows-x64.msi",
         "https://bucket.account.r2.cloudflarestorage.com/windows/Oink%201.0.msi?X-Amz-Signature=abc",
         "https://downloads.example.test:9443/any/path?token=x#package",
         "HTTPS://cdn.example.test/package.msi",

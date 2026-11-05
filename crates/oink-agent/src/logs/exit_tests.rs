@@ -1,5 +1,9 @@
 use super::*;
 
+// Exceed the production queue's 1024 records to exercise backpressure followed
+// by a full exit backlog. The panic hook's two-second deadline is unchanged.
+const STARTUP_RECORDS: usize = 2048;
+
 #[test]
 fn role_exit_fixture() {
     let Ok(mode) = std::env::var("OINK_LOG_EXIT_FIXTURE") else {
@@ -20,7 +24,7 @@ fn role_exit_fixture() {
         // Production installs its crash hook after ordinary logging. It must
         // preserve local panic output without copying that payload into reports.
         let _capture = oink_crash::capsule::Capture::install();
-        for n in 0..2048 {
+        for n in 0..STARTUP_RECORDS {
             tracing::info!(n, "queued startup record");
         }
         if mode == "caught" {
@@ -66,7 +70,12 @@ fn every_role_drains_final_failure_and_panic_before_process_exit() {
                 .filter(|e| e.path().extension().is_some_and(|ext| ext == "log"))
                 .map(|e| std::fs::read_to_string(e.path()).unwrap())
                 .collect::<String>();
-            assert_eq!(logs.matches("queued startup record").count(), 2048, "{role}/{mode}");
+            assert_eq!(
+                logs.matches("queued startup record").count(),
+                STARTUP_RECORDS,
+                "{role}/{mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             assert!(logs.contains("last failure before return"), "{role}/{mode}: {logs}");
             if mode == "panic" || mode == "hook_abort" {
                 assert!(logs.contains("startup panic fixture"), "{logs}");

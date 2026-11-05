@@ -114,6 +114,7 @@ impl FileProviderReason {
 /// `FileContents::open` 返回的读取器。
 pub type FileReader = Box<dyn std::io::Read + Send>;
 
+pub mod copy_diagnostics;
 pub mod dnd;
 pub mod formats;
 #[cfg(target_os = "macos")]
@@ -172,7 +173,11 @@ pub struct NativeSpec {
 impl NativeSpec {
     /// Resolve promise containers on the native publication worker before
     /// creating descriptor tables, placeholders, or target pasteboard items.
+    #[cfg(any(windows, all(test, debug_assertions)))]
     pub(crate) fn prepare_promises(&mut self) -> std::io::Result<()> {
+        self.prepare_promises_while(&|| true)
+    }
+    pub(crate) fn prepare_promises_while(&mut self, current: &dyn Fn() -> bool) -> std::io::Result<()> {
         if !self.inventory.items.iter().any(|item| {
             item.file.is_none()
                 && item
@@ -187,7 +192,7 @@ impl NativeSpec {
             .as_ref()
             .and_then(|files| files.namespace())
             .ok_or_else(|| content::unavailable(crate::model::Unavailable::InvalidData))?;
-        namespace.prepare()?;
+        namespace.prepare_while(current)?;
         self.inventory = content::native_metadata::project_inventory(
             self.inventory.clone(),
             namespace.roots(),
@@ -250,6 +255,18 @@ pub trait ClipboardBackend: Send + Sync {
     /// Recheck owner authority after blocking preparation, immediately before publication.
     fn write_native_guarded(&self, _spec: NativeSpec, _guard: content::ReaderGuard) -> Result<u64, ClipboardError> {
         Err(ClipboardError::Unsupported)
+    }
+    /// `current` is a side-effect-free cancellation check for preparatory
+    /// metadata work. `guard` is called only at the native declaration boundary.
+    /// Existing backends retain their single guarded publication implementation.
+    fn write_native_cancellable(
+        &self,
+        spec: NativeSpec,
+        guard: content::ReaderGuard,
+        current: content::ReaderGuard,
+    ) -> Result<u64, ClipboardError> {
+        current().map_err(|_| ClipboardError::Busy)?;
+        self.write_native_guarded(spec, guard)
     }
     /// 一次性写入多种表示形式，透传原始隐私标记（无显式标记时用旧 `sensitivity`），返回写入后的变化计数
     /// （同步逻辑用它识别「这次变化是自己写的」，防止回环）。

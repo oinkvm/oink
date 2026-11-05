@@ -783,11 +783,15 @@ fn disable_hint(language: crate::config::UiLanguage, kind: u8, mac: bool) -> Str
     if !matches!(kind, 4 | 5) {
         return String::new();
     }
-    let chord = if mac {
-        "Control+Option+Shift+U"
-    } else {
-        "Ctrl+Alt+Shift+U"
-    };
+    let chord = oink_routing::KEYBOARD_RELEASE_KEYS
+        .iter()
+        .map(|key| match (*key, mac) {
+            ("Ctrl", true) => "Control",
+            ("Alt", true) => "Option",
+            _ => key,
+        })
+        .collect::<Vec<_>>()
+        .join("+");
     match language {
         SimplifiedChinese => format!("按住 {chord} 1 秒解除"),
         Japanese => format!("{chord} を1秒間押し続けると解除"),

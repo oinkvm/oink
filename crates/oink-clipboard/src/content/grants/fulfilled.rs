@@ -191,6 +191,10 @@ impl Build {
 }
 
 pub(super) fn collect(journal: &Path, state: &Journal) -> io::Result<()> {
+    collect_with_sync(journal, state, crate::store::sync_directory)
+}
+
+fn collect_with_sync(journal: &Path, state: &Journal, sync: impl FnOnce(&Path) -> io::Result<()>) -> io::Result<()> {
     let directory = journal.parent().unwrap().join(DIRECTORY);
     let retained: HashSet<_> = retained(state).map(|snapshot| name(snapshot.id)).collect();
     let children = match fs::read_dir(&directory) {
@@ -198,6 +202,7 @@ pub(super) fn collect(journal: &Path, state: &Journal) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
+    let mut removed = false;
     for child in children {
         let child = child?;
         let name = child.file_name();
@@ -209,9 +214,14 @@ pub(super) fn collect(journal: &Path, state: &Journal) -> io::Result<()> {
         {
             let _mutation = crate::cache::Mutation(&directory);
             fs::remove_dir_all(child.path())?;
+            removed = true;
         }
     }
-    crate::store::sync_directory(&directory)?;
+    // The periodic ownership probe is read-only unless it retires a snapshot.
+    // Only directory mutations need durability; empty scans must not F_FULLFSYNC.
+    if removed {
+        sync(&directory)?;
+    }
     Ok(())
 }
 
@@ -245,4 +255,40 @@ fn retained(state: &Journal) -> impl Iterator<Item = &Snapshot> {
                 .iter()
                 .flat_map(|current| current.roots.iter().map(|root| &root.snapshot)),
         )
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn collection_syncs_only_directory_mutations() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = temp.path().join("journal.json");
+        let directory = temp.path().join(DIRECTORY);
+        fs::create_dir(&directory).unwrap();
+        let state = Journal {
+            schema: 1,
+            grants: Vec::new(),
+            clipboard: None,
+        };
+        let syncs = Cell::new(0);
+        let sync = |path: &Path| {
+            assert_eq!(path, directory);
+            syncs.set(syncs.get() + 1);
+            Ok(())
+        };
+        for _ in 0..10 {
+            collect_with_sync(&journal, &state, sync).unwrap();
+        }
+        assert_eq!(syncs.get(), 0, "idle maintenance must not force a disk flush");
+        let orphan = directory.join(name([1; 16]));
+        fs::create_dir(&orphan).unwrap();
+        collect_with_sync(&journal, &state, sync).unwrap();
+        assert!(!orphan.exists());
+        assert_eq!(syncs.get(), 1, "a real deletion still needs durability");
+        collect_with_sync(&journal, &state, sync).unwrap();
+        assert_eq!(syncs.get(), 1);
+    }
 }

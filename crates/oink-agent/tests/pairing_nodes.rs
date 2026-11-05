@@ -9,10 +9,7 @@ use oink_agent::{
 };
 use oink_foundation::{Point, Rect, Size, display::DisplayInfo};
 use oink_test_support::input::FakeInput;
-use std::{
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use std::{path::Path, sync::Arc};
 
 fn options(root: &Path, name: &str) -> NodeOptions {
     oink_agent::logs::init();
@@ -530,16 +527,16 @@ async fn either_party_cancels_without_granting_membership_scenario() {
 }
 
 #[test]
-fn three_members_rename_remove_and_last_member_becomes_independent() {
+fn three_members_remove_and_last_member_becomes_independent() {
     common::watchdog::run(
         module_path!(),
-        "three_members_rename_remove_and_last_member_becomes_independent",
+        "three_members_remove_and_last_member_becomes_independent",
         Some(4),
-        three_members_rename_remove_and_last_member_becomes_independent_scenario(),
+        three_members_remove_and_last_member_becomes_independent_scenario(),
     );
 }
 
-async fn three_members_rename_remove_and_last_member_becomes_independent_scenario() {
+async fn three_members_remove_and_last_member_becomes_independent_scenario() {
     let temp = tempfile::tempdir().unwrap();
     let nodes = common::start([
         options(temp.path(), "a"),
@@ -549,8 +546,6 @@ async fn three_members_rename_remove_and_last_member_becomes_independent_scenari
     .await;
     let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
     assert_eq!(a.group_members().len(), 3);
-    c.device_rename("C-renamed".into()).await.unwrap();
-    common::until("device facts rename", || a.device_name(c.id()) == "C-renamed").await;
     a.group_remove(c.id()).await.unwrap();
     common::until("removed peer independent", || {
         c.group_members().len() == 1 && c.group().unwrap().members.len() == 1 && !b.group_members().contains(&c.id())
@@ -721,64 +716,5 @@ async fn different_groups_merge_in_the_explicit_request_direction_scenario() {
     .await;
     for node in first.iter().chain(&second) {
         node.shutdown().await;
-    }
-}
-
-#[test]
-fn becoming_independent_stops_local_old_group_game() {
-    common::watchdog::run(
-        module_path!(),
-        "becoming_independent_stops_local_old_group_game",
-        Some(4),
-        becoming_independent_stops_local_old_group_game_scenario(),
-    );
-}
-
-async fn becoming_independent_stops_local_old_group_game_scenario() {
-    use oink_locator::aim::{AimEvents, AimSurface, OpenSpec, View};
-    #[derive(Default)]
-    struct Surface(Mutex<bool>);
-    impl AimSurface for Surface {
-        fn open(&self, _: OpenSpec, _: AimEvents) -> bool {
-            *self.0.lock().unwrap() = true;
-            true
-        }
-        fn update(&self, _: View) {}
-        fn close(&self) {
-            *self.0.lock().unwrap() = false;
-        }
-    }
-    for removed in [false, true] {
-        let temp = tempfile::tempdir().unwrap();
-        let nodes = common::start([options(temp.path(), "a"), options(temp.path(), "b")]).await;
-        let host = &nodes[0];
-        let surface = Arc::new(Surface::default());
-        host.set_aim_surface(Some(surface.clone()));
-        let api = host.clone();
-        let status = tokio::task::spawn_blocking(move || api.aim_start())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(status.host);
-        assert!(*surface.0.lock().unwrap());
-        if removed {
-            nodes[1].group_remove(host.id()).await.unwrap();
-        } else {
-            host.group_leave().await.unwrap();
-            assert!(
-                !*surface.0.lock().unwrap(),
-                "leave returns only after synchronous local close"
-            );
-            assert_eq!(host.aim_status().unwrap().phase, oink_agent::api::AimPhase::Idle);
-        }
-        common::until("game host becomes independent", || host.group_members().len() == 1).await;
-        assert!(
-            !*surface.0.lock().unwrap(),
-            "independent membership must not be visible before synchronous surface close"
-        );
-        assert_eq!(host.aim_status().unwrap().phase, oink_agent::api::AimPhase::Idle);
-        for node in &nodes {
-            node.shutdown().await;
-        }
     }
 }

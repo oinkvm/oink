@@ -1,5 +1,5 @@
 //! Endpoint publication belongs to the listener's lifetime. Retry only this
-//! idempotent document, retaining the same bound port and authentication token.
+//! idempotent document, retaining the same native address and authentication token.
 use std::{
     io,
     sync::{Mutex, mpsc},

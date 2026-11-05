@@ -112,6 +112,15 @@ impl Source {
         self.offer = Some(offer);
         Ok(self.offer.as_ref().expect("installed offer"))
     }
+    pub fn set_profile(&mut self, profile: Profile) -> Result<&SourceRouteOffer, ControlFailure> {
+        let offer = self.offer.as_mut().ok_or(ControlFailure::RouteChanged)?;
+        offer
+            .edit(|raw| {
+                raw.insert(5, profile.descriptor().write());
+            })
+            .map_err(|_| ControlFailure::InvalidValue)?;
+        Ok(offer)
+    }
     pub fn accept(&mut self, sender: &Boot, wire: AudioPrepared) -> Result<AudioPreparedAck, ControlFailure> {
         let offer = self.offer.as_ref().ok_or(ControlFailure::RouteChanged)?;
         if offer.receiver().as_ref() != Ok(sender) {
@@ -132,6 +141,16 @@ impl Source {
             return Err(ControlFailure::OutputUnavailable);
         }
         let profile = Profile::from_descriptor(&wire.descriptor().map_err(|_| ControlFailure::InvalidValue)?)?;
+        let requested = offer
+            .preferred_descriptor()
+            .map_err(|_| ControlFailure::InvalidValue)?
+            .map(|descriptor| Profile::from_descriptor(&descriptor))
+            .transpose()?
+            .unwrap_or(Profile::Opus5ms);
+        if profile != requested && profile != Profile::Opus5ms {
+            return Err(ControlFailure::Unsupported);
+        }
+
         let stream = wire.stream_id().map_err(|_| ControlFailure::InvalidValue)?;
         if stream == 0 {
             return Err(ControlFailure::InvalidValue);

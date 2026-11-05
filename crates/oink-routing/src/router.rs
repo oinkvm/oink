@@ -28,10 +28,6 @@ use crate::layout::{LayoutQuery, ScreenId, ScreenPos};
 const SCROLL_PIXELS_PER_LINE: f64 = 32.0;
 const LEGACY_SCROLL_REFERENCE_PER_PIXEL: f64 = 0.25 / 686.0;
 
-mod application_focus;
-#[cfg(test)]
-mod application_focus_tests;
-pub use application_focus::NativeCommand as ApplicationFocusCommand;
 #[cfg(test)]
 mod activity_tests;
 mod caps;
@@ -55,6 +51,7 @@ mod game_capture;
 mod hidden;
 mod input_pair;
 pub(crate) mod keyboard;
+mod local_click;
 mod local_modes;
 mod windows_lock;
 pub use windows_lock::WindowsLockPermit;
@@ -88,9 +85,9 @@ pub type Micros = u64;
 /// 光标离屏幕边缘多近（本机单位）算「停在边上」：macOS 光标最多到 `right - ε`，Windows 到 `right - 1`。
 const EDGE_UNITS: f64 = 1.0;
 
-/// 焦点自愈：每隔几次心跳（250 ms × 2 = 500 ms）向每个已连接设备
-/// 通告一次本机所知的焦点（`FocusState`）。
-const FOCUS_GOSSIP_EVERY: u64 = 2;
+/// Relative motion repair keeps its existing two-turn cadence; ordinary
+/// focus/game/held snapshots are registered separately for the network heartbeat.
+const RELATIVE_SYNC_EVERY: u64 = 2;
 
 /// 消息的发送方式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,7 +143,6 @@ pub struct DepartureEvidence<'a> {
 pub trait RoutingDiagnostics: Send + Sync {
     fn touchpad_route(&self, _record: TouchpadRoute) {}
     fn touchpad_source(&self, _record: TouchpadSource) {}
-    fn application_focus(&self, _record: crate::application_focus::Diagnostic) {}
     fn held_buttons(&self, _record: ButtonRefusal) {}
     fn volume(&self, _record: VolumeDecision) {}
     fn source_decision(&self, _record: local_modes::SourceDecision) {}
@@ -217,8 +213,6 @@ pub trait RoutingDiagnostics: Send + Sync {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum Output {
-    /// Ordinary-thread native work; never query the OS in the input callback.
-    ApplicationFocus(application_focus::NativeCommand),
     /// The audio owner validates the pinned claim/output before changing native volume.
     ExitVolumeKey {
         source: oink_foundation::session::Boot,
@@ -411,13 +405,14 @@ struct Peer {
     touchpad_contacts: Option<u8>,
     touchpad_options: bool,
     scroll_pixels: bool,
+    /// Negotiated `oink.pointer.move-hidden/1`: accepts explicit hidden-screen entry.
+    pointer_move_hidden: bool,
+    local_click: bool,
     connected: bool,
     name: String,
     os: Os,
     feel: FeelProfile,
     displays: Vec<DisplayInfo>,
-    /// 上一次发给它的 HeldSync 非空（变空时再发一次空的）。
-    held_sync_nonempty: bool,
     /// SessionInit confirms whether this endpoint can receive input.
     sharing: bool,
     /// 当前对端路由实例；连接变化不会清除，FocusState 持续确认。
@@ -434,12 +429,13 @@ impl Peer {
             touchpad_contacts: None,
             touchpad_options: false,
             scroll_pixels: false,
+            pointer_move_hidden: false,
+            local_click: false,
             connected: false,
             name: String::new(),
             os: Os::Other,
             feel: FeelProfile::default(),
             displays: Vec::new(),
-            held_sync_nonempty: false,
             sharing: true,
             session: None,
             focus_ready: false,
@@ -470,7 +466,6 @@ enum VolumeTarget {
 /// 输入路由状态机。每台设备一个。
 pub struct Router {
     cfg: RouterConfig,
-    application: application_focus::State,
     admitted_boots: HashMap<DeviceId, oink_foundation::session::Boot>,
     /// 当前使用的布局查询（配置模块编译后发布）。
     layout: Arc<dyn LayoutQuery>,
@@ -495,7 +490,6 @@ pub struct Router {
     /// 共享暂停：本机自成一岛，不接受其他设备的焦点与输入。
     paused: bool,
     fully_paused: bool,
-    projection_gesture: bool,
     capture_available: bool,
     keyboard: keyboard::Keyboard,
     windows_lock: windows_lock::State,
@@ -554,6 +548,7 @@ pub struct Router {
     escape_consumed: bool,
     pause_all_consumed: HashSet<KeyCode>,
     volume_exit: Option<Arc<dyn Fn() -> Option<crate::input::VolumeRoute> + Send + Sync>>,
+    modifier_release_probe: Option<Arc<dyn Fn(u8) -> u8 + Send + Sync>>,
     volume_press_id: u64,
     volume_keep_local: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     volume_notifications:
@@ -614,6 +609,7 @@ pub struct Router {
 
     // ---- 跨设备拖放 ----
     dnd: dnd::Dnd,
+    local_click: local_click::State,
 
     // ---- 对端 ----
     peers: BTreeMap<DeviceId, Peer>,
@@ -642,10 +638,8 @@ impl Router {
         getrandom::fill(&mut session).expect("routing session entropy");
         let admitted_boots = HashMap::from([(me, cfg.boot)]);
         let game = GameState::for_owner(cfg.settings.game_mode_preference);
-        let application = application_focus::State::new(cfg.boot);
         let mut router = Self {
             cfg,
-            application,
             admitted_boots,
             layout,
             game,
@@ -664,7 +658,6 @@ impl Router {
             lock_escape_target: None,
             paused: false,
             fully_paused: false,
-            projection_gesture: false,
             capture_available: true,
             keyboard: Default::default(),
             screen_local: false,
@@ -697,6 +690,7 @@ impl Router {
             escape_consumed: false,
             pause_all_consumed: HashSet::new(),
             volume_exit: None,
+            modifier_release_probe: None,
             volume_press_id: 0,
             volume_keep_local: None,
             volume_notifications: None,
@@ -741,6 +735,7 @@ impl Router {
             contacts_observed: false,
             contacts_healthy: false,
             dnd: dnd::Dnd::default(),
+            local_click: Default::default(),
             peers: BTreeMap::new(),
             sync_seq: 0,
             next_sync: None,
@@ -938,6 +933,12 @@ impl Router {
             DecisionReason::NotControllable
         }
     }
+    /// Capture-owner boundary probe, never called by periodic HeldSync/tick.
+    /// Returns released HID E0..E7 bits after retiring their native source holds.
+    pub fn set_modifier_release_probe(&mut self, probe: Arc<dyn Fn(u8) -> u8 + Send + Sync>) {
+        self.modifier_release_probe = Some(probe);
+    }
+
     pub fn set_volume_exit_probe(&mut self, probe: Arc<dyn Fn() -> Option<crate::input::VolumeRoute> + Send + Sync>) {
         self.volume_exit = Some(probe);
     }
@@ -947,17 +948,6 @@ impl Router {
     pub fn set_hotkeys(&mut self, bindings: Vec<HotkeyBinding>) {
         self.hotkeys = Hotkeys::new(bindings);
         self.publish_lock_escape();
-    }
-
-    /// Paused capture still observes every configured emergency method.
-    pub fn emergency_observation_requested(&self) -> bool {
-        self.cfg.settings.emergency_hold_ms > 0
-            || self.cfg.settings.emergency_combo
-            || self
-                .hotkeys
-                .bindings()
-                .iter()
-                .any(|binding| binding.action == "pause_all")
     }
 
     pub fn hotkeys(&self) -> &Hotkeys {
@@ -1030,13 +1020,6 @@ impl Router {
         }
         self.set_cursor(pos);
         true
-    }
-
-    /// Whether the local source ledger still awaits a release, regardless of its target.
-    /// Diagnostic only; this does not inspect or reconcile the platform's physical state.
-    /// A native projection handle owns this gesture only; no persistent focus lock.
-    pub fn set_projection_gesture(&mut self, active: bool) {
-        self.projection_gesture = active;
     }
 
     /// All held input, including local pass-through keys and forwarded sequences.
@@ -1112,6 +1095,9 @@ impl Router {
     /// 暂停共享：本机自成一岛——焦点留在本机、不接受其他设备的焦点与输入（抬起除外），并通告
     /// 其他设备（session admission），它们把本机当作离线。
     pub fn set_paused(&mut self, paused: bool) {
+        if paused {
+            self.local_click_cancel();
+        }
         if paused {
             self.set_owner_pointer_locked(false);
         }
@@ -1254,6 +1240,9 @@ impl Router {
     /// Secure-desktop gaps end this keyboard/mouse's gestures immediately. This is
     /// a source gate, not sharing pause: other devices may still control this machine.
     pub fn set_capture_available(&mut self, available: bool) {
+        if !available {
+            self.local_click_cancel();
+        }
         if self.capture_available == available {
             return;
         }
@@ -1502,11 +1491,6 @@ impl Router {
         self.peers.get(&peer).map(|p| &p.feel)
     }
 
-    /// 本机的手感档案。
-    pub fn local_feel(&self) -> &FeelProfile {
-        &self.feel
-    }
-
     /// 本机显示器。
     pub fn local_displays(&self) -> &[DisplayInfo] {
         &self.displays
@@ -1517,14 +1501,16 @@ impl Router {
         self.peers.get(&peer).map(|p| p.displays.as_slice())
     }
 
-    pub fn peer_name(&self, peer: DeviceId) -> Option<&str> {
-        self.peers.get(&peer).map(|p| p.name.as_str())
-    }
-
     /// Whether an authenticated group activity notification may be honoured.
     /// Display wake is a separate setting; network pacing also uses this gate.
     pub fn accepts_group_user_activity(&self, from: DeviceId) -> bool {
         !self.fully_paused && !self.paused && self.peers.get(&from).is_some_and(|peer| peer.connected)
+    }
+
+    /// macOS input targets already advance CGS idle through delivered input.
+    /// This policy is also checked at Session conversion across focus changes.
+    pub fn needs_session_idle_refresh(&self) -> bool {
+        self.cfg.os != Os::MacOS || self.holder != self.me()
     }
 
     fn broadcast_group_activity(&mut self, now: Micros) {
@@ -1587,7 +1573,6 @@ impl Router {
     pub fn drain_outputs(&mut self) -> Vec<Output> {
         self.refresh_windows_locks();
         self.sync_entry_protection();
-        self.application_sync(self.dnd.now);
         // 任何入口都可能改变焦点、按钮、游戏模式或设置：交出输出前统一同步拖尾状态。
         self.gap_sync();
         self.constrain_system_clip_outputs();
@@ -1615,9 +1600,6 @@ impl Router {
             d = Some(d.map_or(t, |x| x.min(t)));
         }
         let mut take = |t: Micros| d = Some(d.map_or(t, |x| x.min(t)));
-        if let Some(t) = self.application.model.deadline() {
-            take(t);
-        }
         if let Some(t) = self.unconfirmed_since {
             take(t + timeout);
         }
@@ -1638,7 +1620,6 @@ impl Router {
 
     /// 截获回调的快路径：立即决定吞掉还是放行；其余动作进入输出队列。
     pub fn on_local_event(&mut self, ev: &CapturedEvent, now: Micros) -> Disposition {
-        self.application_sync(now);
         if ev.physical {
             self.update_remote_until = 0;
         }
@@ -1676,6 +1657,7 @@ impl Router {
             InputEvent::PointerDelta { dx, dy } | InputEvent::RawPointerDelta { dx, dy } => dx != 0. || dy != 0.,
             _ => true,
         };
+        self.local_click_event(ev, local_mouse_woke);
         let source_local = self.source_is_local(&ev.event);
         if ev.physical && active && !source_local {
             self.last_pointer_source = Some(self.me());
@@ -1811,7 +1793,6 @@ impl Router {
 
     fn receive_message(&mut self, from: DeviceId, msg: Message, now: Micros) {
         self.dnd.now = now;
-        self.application_sync(now);
         if self.fully_paused || from == self.me() {
             return;
         }
@@ -1826,11 +1807,6 @@ impl Router {
     /// 定时器：心跳、超时检测、按键重复、滚动手势目标过期。
     pub fn tick(&mut self, now: Micros) {
         self.dnd.now = now;
-        self.application_sync(now);
-        if self.application.enabled {
-            self.application.model.tick(now);
-            self.application_effects();
-        }
         self.enforce_screen_policy();
         if self
             .keyboard
@@ -2270,9 +2246,6 @@ impl Router {
             if t == Target::Local {
                 self.volume_decision(self.me(), code, None, false);
             }
-            if matches!(t, Target::Local | Target::LocalInjected) && !self.keyboard_local() {
-                self.application_key(self.me(), 0, code, None, true);
-            }
             disposition_for(t == Target::Local)
         } else {
             // 没见过按下（路由启动前按下的）：交给本机。
@@ -2285,7 +2258,6 @@ impl Router {
 
     /// 源端：把键的抬起发往按下时记录的所有目标。返回是否应放行给本机。
     fn release_local_key(&mut self, code: KeyCode, targets: Vec<Target>) -> bool {
-        self.application_key(self.me(), 0, code, None, false);
         self.key_repeats.remove(&code);
         let mut pass = false;
         for t in targets {
@@ -2325,7 +2297,6 @@ impl Router {
         let n = self.key_repeats.entry(code).or_insert(0);
         *n += 1;
         let n = *n;
-        self.application_repeat(self.me(), 0, code, n);
         for d in remote {
             self.send(d, Message::Input(InputMsg::KeyRepeat { code, n }));
         }
@@ -2438,8 +2409,14 @@ impl Router {
     // ================= 对端消息 =================
 
     fn on_control(&mut self, from: DeviceId, msg: ControlMsg, now: Micros) {
+        let pointer_shortcut = matches!(&msg, ControlMsg::MovePointerEnter { .. });
         match msg {
-            ControlMsg::ApplicationFocus(value) => self.application_message(from, value, now),
+            ControlMsg::LocalClick {
+                epoch,
+                holder,
+                scope,
+                phase,
+            } => self.local_click_receive(from, epoch, holder, scope, phase),
             ControlMsg::UserActivity => {
                 if let Some(peer) = self.peers.get(&from) {
                     let respond = self.accepts_group_user_activity(from) && self.cfg.settings.wake_displays_on_input;
@@ -2449,7 +2426,9 @@ impl Router {
                             from,
                             device_name: peer.name.clone(),
                         });
-                        self.out.push(Output::ResetUserIdle);
+                        if self.needs_session_idle_refresh() {
+                            self.out.push(Output::ResetUserIdle);
+                        }
                     }
                 }
             }
@@ -2463,8 +2442,14 @@ impl Router {
                     p.feel = profile;
                 }
             }
-            ControlMsg::IdentifyScreens { .. } => {}
-            ControlMsg::FocusEnter {
+            ControlMsg::MovePointerEnter {
+                epoch,
+                display,
+                pos,
+                scope,
+                pointer_source,
+            }
+            | ControlMsg::FocusEnter {
                 epoch,
                 display,
                 pos,
@@ -2480,7 +2465,7 @@ impl Router {
                     && (epoch, me) == (self.epoch, self.claim)
                     && self.holder == me
                     && !self.paused;
-                if self.layout.source_requires_target(me) || self.hidden_entry(me, &display) {
+                if self.layout.source_requires_target(me) || (!pointer_shortcut && self.hidden_entry(me, &display)) {
                     self.send_focus_state(from);
                     self.dnd_focus_enter_ignored(from, epoch, "target excluded by layout policy");
                     return;
@@ -2544,6 +2529,7 @@ impl Router {
                 if self.epoch == 0 && from != me && self.layout.contains_device(from) {
                     self.last_enabled_focus = Some(from);
                 }
+                let focus_changed = self.epoch != epoch || self.claim != me || self.holder != me;
                 self.claim = me;
                 self.focus_scope = scope;
                 self.focus_joined = true;
@@ -2555,6 +2541,23 @@ impl Router {
                     pointer_source
                 };
                 self.become_holder(epoch, Some(at.clone()));
+                if focus_changed {
+                    if pointer_shortcut {
+                        // Other sources reject unconfirmed claims naming hidden devices.
+                        // Only the accepted target can announce this explicit entry.
+                        let peers: Vec<_> = self
+                            .peers
+                            .iter()
+                            .filter(|(_, p)| p.connected)
+                            .map(|(id, _)| *id)
+                            .collect();
+                        for peer in peers {
+                            self.send_focus_state(peer);
+                        }
+                    } else {
+                        self.send_focus_state(from);
+                    }
+                }
                 self.diagnostic_state("entry_applied");
                 self.last_pointer_source = source;
                 self.trail_focus_entered(from, epoch, &at, now);
@@ -2667,9 +2670,12 @@ impl Router {
         }
     }
 
-    /// 对端通告的焦点（移交时、连接建立 / 恢复时、每 500 ms 一次）。
+    /// 对端通告的焦点（变化时立即发送，周期修复由网络心跳每 2 s 携带）。
     fn on_focus_state(&mut self, from: DeviceId, epoch: u64, holder: DeviceId, scope: Option<FocusScope>, now: Micros) {
         if self.layout.source_requires_target(holder) || (from != holder && self.hidden_device(holder)) {
+            return;
+        }
+        if self.local_click_preparing(epoch, holder) {
             return;
         }
         let theirs = (epoch, holder);
@@ -2698,6 +2704,13 @@ impl Router {
             }
             self.focus_scope = scope;
             self.adopt_claim(epoch, holder);
+            if self.holder == self.me()
+                && holder == self.me()
+                && self.scope_allows(self.focus_scope.as_ref(), holder)
+                && !self.paused
+            {
+                self.send_focus_state(from);
+            }
             return;
         }
         if theirs == mine {
@@ -2784,30 +2797,6 @@ impl Router {
 
     fn on_input(&mut self, from: DeviceId, origin: DeviceId, hops: u8, msg: InputMsg, now: Micros) {
         if !self.admitted_boots.contains_key(&origin) {
-            return;
-        }
-        if let InputMsg::Forwarded {
-            origin: source,
-            hops: forwarded_hops,
-            msg: inner,
-        } = &msg
-            && matches!(
-                **inner,
-                InputMsg::ApplicationKey { .. }
-                    | InputMsg::ApplicationRepeat { .. }
-                    | InputMsg::ApplicationHeldSync { .. }
-            )
-        {
-            if self.admitted_boots.get(&source.device_id) == Some(source) {
-                self.application_input(from, source.device_id, *forwarded_hops, *inner.clone());
-            }
-            return;
-        }
-        if matches!(
-            msg,
-            InputMsg::ApplicationKey { .. } | InputMsg::ApplicationRepeat { .. } | InputMsg::ApplicationHeldSync { .. }
-        ) {
-            self.application_input(from, origin, hops, msg);
             return;
         }
         // A receiver can hold local focus while another device supplies input.
@@ -2960,9 +2949,6 @@ impl Router {
             InputMsg::CapsKey { code, pressed } => {
                 // The source already chose the key and target. Never transform or
                 // forward it again when focus has moved since physical Caps DOWN.
-                if !pressed || !self.is_held(origin, HeldItem::Key(KeyCode::CAPS_LOCK)) {
-                    self.application_key(origin, hops, code, Some(KeyCode::CAPS_LOCK), pressed);
-                }
                 self.target_mapped_key(origin, KeyCode::CAPS_LOCK, code, pressed);
             }
             InputMsg::Key { code, pressed } => {
@@ -3013,10 +2999,7 @@ impl Router {
             InputMsg::HeldSync { keys, buttons } => self.held_sync(from, origin, &keys, &buttons),
             InputMsg::KeyRepeat { code, n } => self.remote_repeat(origin, hops, code, n, msg),
             InputMsg::Gesture { gesture, .. } => self.remote_gesture(origin, hops, gesture, msg),
-            InputMsg::Volume { .. }
-            | InputMsg::ApplicationKey { .. }
-            | InputMsg::ApplicationRepeat { .. }
-            | InputMsg::ApplicationHeldSync { .. } => {}
+            InputMsg::Volume { .. } => {}
         }
     }
 
@@ -3107,9 +3090,6 @@ impl Router {
         }
         match item {
             HeldItem::Key(code) => {
-                if !pressed || !already {
-                    self.application_key(origin, hops, code, None, pressed);
-                }
                 self.target_key(origin, code, pressed);
             }
             HeldItem::Button(b) => self.target_button(origin, b, pressed),
@@ -3152,7 +3132,6 @@ impl Router {
             return;
         }
         *last = n;
-        self.application_repeat(origin, hops, code, n);
         if !repeatable(mapped) {
             return;
         }
@@ -3358,7 +3337,7 @@ impl Router {
             return;
         }
         // A fixed 32 source pixels per line retains the default wheel fallback
-        // without feeding calibrated screen size back into pixel scrolling.
+        // without feeding layout screen size back into pixel scrolling.
         let k = match (unit, out_unit) {
             (ScrollAmount::Pixels, ScrollUnit::Pixel) => 1.0,
             (ScrollAmount::Pixels, ScrollUnit::Line) => 1.0 / SCROLL_PIXELS_PER_LINE / lpn,
@@ -3434,42 +3413,6 @@ impl Router {
         for item in stale_fwd {
             if self.forget_press_route(from, origin, item) {
                 self.release_press(origin, item);
-            }
-        }
-    }
-
-    fn send_forwarded_sync(&mut self) {
-        // Snapshot our outgoing paths, never a source's per-destination list. Sending on
-        // our own heartbeat also heals a lost release after the upstream peer goes away.
-        // Retain empty routes and refresh them every four heartbeats, just like direct
-        // HeldSync: a one-off empty snapshot could itself be lost with the release.
-        let routes: Vec<_> = self.forwarded_sync.iter().copied().collect();
-        for (origin, dst) in routes {
-            // A reflected local press shares the receiver's (from, origin)
-            // identity with our direct presses. send_state_sync includes both;
-            // a second, partial snapshot would release the other contribution.
-            if origin == self.me() {
-                continue;
-            }
-            let mut keys = Vec::new();
-            let mut buttons = Vec::new();
-            for ((o, item), d) in &self.forwarded {
-                if *o == origin && *d == dst {
-                    match item {
-                        HeldItem::Key(k) => keys.push(*k),
-                        HeldItem::Button(b) => buttons.push(*b),
-                    }
-                }
-            }
-            if !keys.is_empty() || !buttons.is_empty() || self.sync_seq.is_multiple_of(4) {
-                self.send(
-                    dst,
-                    Message::Input(InputMsg::Forwarded {
-                        origin: self.admitted_boots[&origin],
-                        hops: 1,
-                        msg: Box::new(InputMsg::HeldSync { keys, buttons }),
-                    }),
-                );
             }
         }
     }
@@ -3564,7 +3507,6 @@ impl Router {
             return;
         }
         if !pressed {
-            self.application_key(origin, 0, code, None, false);
             self.press_routes.remove(&(origin, HeldItem::Key(code)));
         }
         let mapped = self.map_key(origin, code);
@@ -3826,6 +3768,11 @@ impl Router {
 
     /// 本机是焦点机，把焦点交给 `dst` 所在的设备，并立即冻结源光标。
     fn hand_off(&mut self, dst: ScreenPos, trail_head: Option<Point>) {
+        self.hand_off_with_entry(dst, trail_head, false);
+    }
+
+    /// `pointer_shortcut` sends the explicit hidden-screen entry (0x1301).
+    pub(super) fn hand_off_with_entry(&mut self, dst: ScreenPos, trail_head: Option<Point>, pointer_shortcut: bool) {
         self.suspend_focus_lock();
         self.diagnostic_state("departing");
         self.diagnostic(DecisionKind::Handoff, DecisionReason::EdgeCrossed, Some(&dst));
@@ -3844,16 +3791,24 @@ impl Router {
             self.send(to, m);
         }
         self.trail_handoff(&dst, epoch, trail_head);
-        self.send(
-            to,
-            Message::Control(ControlMsg::FocusEnter {
+        let enter = if pointer_shortcut {
+            ControlMsg::MovePointerEnter {
                 epoch,
                 display: dst.screen.display.clone(),
                 pos: dst.local,
                 scope: self.focus_scope.clone(),
                 pointer_source: self.last_pointer_source,
-            }),
-        );
+            }
+        } else {
+            ControlMsg::FocusEnter {
+                epoch,
+                display: dst.screen.display.clone(),
+                pos: dst.local,
+                scope: self.focus_scope.clone(),
+                pointer_source: self.last_pointer_source,
+            }
+        };
+        self.send(to, Message::Control(enter));
         let others: Vec<DeviceId> = self
             .peers
             .iter()
@@ -4049,10 +4004,51 @@ impl Router {
     fn source_sync_modifier(&self, code: KeyCode) -> bool {
         code.is_modifier() || (code == KeyCode::APPLE_FN && self.fn_sync_held)
     }
+    fn reconcile_passed_modifiers(&mut self) {
+        if self.cfg.os != Os::Windows || !self.capture_available {
+            return;
+        }
+        let candidates = self.keys.iter().fold(0u8, |mask, (code, targets)| {
+            if code.is_modifier() && self.physical_keys.contains(code) && targets.contains(&Target::Local) {
+                mask | (1 << (code.usage() - 0xe0))
+            } else {
+                mask
+            }
+        });
+        if candidates == 0 {
+            return;
+        }
+        let released = self
+            .modifier_release_probe
+            .as_ref()
+            .map_or(0, |probe| probe(candidates))
+            & candidates;
+        for index in 0..8 {
+            if released & (1 << index) == 0 {
+                continue;
+            }
+            let code = KeyCode::keyboard(0xe0 + index);
+            self.physical_keys.remove(&code);
+            self.lock_escape_keys.remove(&code);
+            self.pause_all_consumed.remove(&code);
+            self.keyboard.retire_modifier(code);
+            self.gap_input.modifiers.remove(&(self.me(), code));
+            if let Some(targets) = self.keys.remove(&code) {
+                // Release existing destinations before any new snapshot. A Local
+                // target already has OS UP; never inject another native key edge.
+                self.release_local_key(code, targets);
+            }
+        }
+        if released != 0 {
+            self.publish_lock_escape();
+        }
+    }
+
     fn retarget_modifiers(&mut self) {
         if self.keyboard_local() {
             return;
         }
+        self.reconcile_passed_modifiers();
         if self.local_lock_escape_held() {
             // Escape is a hold, not a chord with an ordinary key. Mask the old
             // targets too: releasing a standalone Win/Alt after crossing must
@@ -4183,6 +4179,7 @@ impl Router {
 
     /// 对端断开或心跳超时。
     fn peer_lost(&mut self, peer: DeviceId) {
+        self.local_click_peer_lost(peer);
         if self.lock_escape_sources.remove(&peer) {
             self.lock_escape_changed();
         }
@@ -4271,22 +4268,23 @@ impl Router {
     }
 
     fn sync_step(&self) -> u64 {
-        // Empty intermediate turns send nothing. Preserve the 500 ms focus/game
-        // gossip and 1 s empty HeldSync cadence, including forwarded releases.
-        // A new held key or relative-input mode immediately restores every turn.
-        if self.sync_seq.is_multiple_of(FOCUS_GOSSIP_EVERY)
+        // Only the relative-total repair uses this local timer.
+        // The ordinary focus/game/held snapshots have no router send deadline.
+        if self.sync_seq.is_multiple_of(RELATIVE_SYNC_EVERY)
             && self.keys.is_empty()
             && self.buttons.is_empty()
             && self.forwarded.is_empty()
             && !self.game_mode().active
-            && !self.peers.values().any(|p| p.held_sync_nonempty)
         {
-            FOCUS_GOSSIP_EVERY
+            RELATIVE_SYNC_EVERY
         } else {
             1
         }
     }
     fn sync_deadline(&self) -> Option<Micros> {
+        if !self.game_mode().active {
+            return None;
+        }
         self.next_sync
             .map(|at| at + (self.sync_step() - 1) * self.interval_us())
     }
@@ -4355,8 +4353,7 @@ impl Router {
 
     /// 通往其他设备的边是墙：拖动中（`handoff_blocked`）、锁定当前焦点、共享暂停。
     fn leave_blocked(&self) -> bool {
-        self.projection_gesture
-            || (self.game_mode().active && !self.pointer_lock_escape_held())
+        (self.game_mode().active && !self.pointer_lock_escape_held())
             || (self.locked() && !self.pointer_lock_escape_held())
             || self.system_clip_blocks_exit()
             || self.paused
@@ -4398,7 +4395,7 @@ impl Router {
         );
         // A handoff and its target's lock can reach a third peer in either
         // order. They must describe the same claim when the incarnations match:
-        // application-focus messages compare this proof, including vector order.
+        // Keep the proof deterministic, including vector order.
         members.sort_unstable_by_key(|(device, _)| *device);
         FocusScope { members }
     }
@@ -4420,6 +4417,9 @@ impl Router {
     }
 
     fn send_focus_state(&mut self, peer: DeviceId) {
+        for msg in self.local_click_repair(peer) {
+            self.send(peer, msg);
+        }
         let msg = ControlMsg::FocusState {
             lock_state: self.focus_lock.clone(),
             epoch: self.epoch,
@@ -4444,58 +4444,75 @@ impl Router {
         self.sync_lock_escape();
         self.send_relative_total();
         self.sync_seq += 1;
-        let peers: Vec<DeviceId> = self
-            .peers
+    }
+
+    /// Latest self-healing I0 records. The adapter registers these in memory;
+    /// only the network heartbeat writes them, every four pulses (2 seconds).
+    /// Immediate focus/game/input changes continue through ordinary outputs.
+    pub fn heartbeat_messages(&self, peer: DeviceId) -> Vec<Message> {
+        if self.fully_paused || !self.peers.get(&peer).is_some_and(|p| p.connected) {
+            return Vec::new();
+        }
+        let mut messages = self.local_click_repair(peer);
+        if self.holder == self.me() && self.claim == self.me() {
+            messages.push(self.input_game_state());
+        }
+        messages.push(Message::Control(ControlMsg::FocusState {
+            lock_state: self.focus_lock.clone(),
+            epoch: self.epoch,
+            holder: self.claim,
+            scope: self.focus_scope.clone(),
+            session: Some(self.session),
+        }));
+        let mut keys: Vec<_> = self
+            .keys
             .iter()
-            .filter(|(_, p)| p.connected)
-            .map(|(d, _)| *d)
+            .filter(|(_, targets)| targets.contains(&Target::Remote(peer)))
+            .map(|(k, _)| *k)
             .collect();
-        let gossip = self.sync_seq.is_multiple_of(FOCUS_GOSSIP_EVERY);
-        for d in peers {
-            if gossip {
-                self.send_game_state(d);
-                // 焦点自愈：漏掉的移交、分叉的 epoch 在一两次通告内收敛。
-                self.send_focus_state(d);
+        if self.caps_press.is_some_and(|c| c.held_on(peer)) {
+            keys.push(KeyCode::CAPS_LOCK);
+        }
+        let mut buttons: Vec<_> = self
+            .buttons
+            .iter()
+            .filter(|(_, target)| **target == Target::Remote(peer))
+            .map(|(b, _)| *b)
+            .collect();
+        for (&(origin, item), &dst) in &self.forwarded {
+            if origin == self.me() && dst == peer {
+                match item {
+                    HeldItem::Key(key) if !keys.contains(&key) => keys.push(key),
+                    HeldItem::Button(button) if !buttons.contains(&button) => buttons.push(button),
+                    _ => {}
+                }
             }
-            let mut keys: Vec<KeyCode> = self
-                .keys
-                .iter()
-                .filter(|(_, ts)| ts.contains(&Target::Remote(d)))
-                .map(|(k, _)| *k)
-                .collect();
-            if self.caps_press.is_some_and(|c| c.held_on(d)) {
-                keys.push(KeyCode::CAPS_LOCK);
+        }
+        keys.sort_unstable();
+        messages.push(Message::Input(InputMsg::HeldSync { keys, buttons }));
+        // Keep empty forwarding routes: a lost forwarded UP must heal too.
+        for &(origin, dst) in &self.forwarded_sync {
+            if origin == self.me() || dst != peer {
+                continue;
             }
-            let mut buttons: Vec<MouseButton> = self
-                .buttons
-                .iter()
-                .filter(|(_, t)| **t == Target::Remote(d))
-                .map(|(b, _)| *b)
-                .collect();
-            // During stale focus views our input can return through a peer and
-            // be forwarded again. The direct and reflected paths leave with
-            // the same source identity, so publish their union exactly once.
-            for (&(origin, item), &dst) in &self.forwarded {
-                if origin == self.me() && dst == d {
+            let mut keys = Vec::new();
+            let mut buttons = Vec::new();
+            for (&(source, item), &target) in &self.forwarded {
+                if source == origin && target == peer {
                     match item {
-                        HeldItem::Key(key) if !keys.contains(&key) => keys.push(key),
-                        HeldItem::Button(button) if !buttons.contains(&button) => buttons.push(button),
-                        _ => {}
+                        HeldItem::Key(k) => keys.push(k),
+                        HeldItem::Button(b) => buttons.push(b),
                     }
                 }
             }
-            let nonempty = !keys.is_empty() || !buttons.is_empty();
-            let was = self.peers.get(&d).is_some_and(|p| p.held_sync_nonempty);
-            // 非空时每次都发；变空后补发一次；另外每 4 次心跳发一次（自愈：目标端释放源端已不再按着的键）。
-            if nonempty || was || self.sync_seq.is_multiple_of(4) {
-                self.send(d, Message::Input(InputMsg::HeldSync { keys, buttons }));
-            }
-            if let Some(p) = self.peers.get_mut(&d) {
-                p.held_sync_nonempty = nonempty;
-            }
+            keys.sort_unstable();
+            messages.push(Message::Input(InputMsg::Forwarded {
+                origin: self.admitted_boots[&origin],
+                hops: 1,
+                msg: Box::new(InputMsg::HeldSync { keys, buttons }),
+            }));
         }
-        self.send_forwarded_sync();
-        self.application_state_sync(gossip);
+        messages
     }
 
     fn push_focus_status(&mut self) {
@@ -4685,6 +4702,8 @@ mod caps_tests;
 
 #[cfg(test)]
 mod held_sync_tests;
+#[cfg(test)]
+mod periodic_tests;
 
 #[cfg(test)]
 mod target_cursor_sync_tests;

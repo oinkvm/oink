@@ -182,7 +182,6 @@ fn pause_resume_injection(delay_initial_injection: bool) {
         capture_reports_key_repeat: false,
         local_input_transform: oink_foundation::input_transform::InputTransform::initial(std::env::consts::OS),
         layout: Arc::new(Snapshot::new(RouterLayout {
-            application_focus_enabled: false,
             group: oink_foundation::GroupId([0; 16]),
             owners: Arc::default(),
             version: fixture_version(),
@@ -352,7 +351,6 @@ fn physical_input_driving_a_peer_declares_local_activity_with_group_wake_disable
         (peer(), vec![display]),
     ]));
     h.driver.snapshots.layout.publish(RouterLayout {
-        application_focus_enabled: false,
         group: oink_foundation::GroupId([0; 16]),
         owners: Arc::default(),
         version: fixture_version(),
@@ -425,52 +423,6 @@ fn physical_input_driving_a_peer_declares_local_activity_with_group_wake_disable
         1,
         "remote wake still obeys the setting"
     );
-}
-
-#[test]
-fn overlay_escape_dismisses_on_release_and_hold_still_emergency_pauses() {
-    use oink_foundation::input::{InputEvent, KeyCode, SourceKind};
-    let escape = |pressed| CapturedEvent {
-        event: InputEvent::Key {
-            code: KeyCode::ESCAPE,
-            pressed,
-        },
-        physical: true,
-        source: SourceKind::Keyboard,
-        time_us: 0,
-        cursor: None,
-    };
-    let mut h = Harness::new();
-    let (mut read, _motion) = h.outbound(1);
-    let (write, _incoming_motion) = h.inbound(1);
-    opening(&write, &remote(), true);
-    h.attach();
-    drain(&mut read);
-    h.driver.command(InputCommand::Paused(false));
-    h.driver.command(InputCommand::Overlay(Some(42)));
-    assert_eq!(h.driver.event(&escape(true)), Disposition::Swallow);
-    assert_eq!(h.driver.event(&escape(false)), Disposition::Swallow);
-    assert!(
-        h._main
-            .try_iter()
-            .any(|command| matches!(command, MainCommand::DismissOverlay(42)))
-    );
-    assert!(!h.driver.adapter.fully_paused());
-    assert!(
-        !drain(&mut read)
-            .iter()
-            .any(|message| matches!(message, Message::Input(InputMsg::Key { .. })))
-    );
-    assert_eq!(h.driver.event(&escape(true)), Disposition::Swallow);
-    let (_, held_at) = h.driver.overlay_escape.unwrap();
-    let deadline = held_at + Duration::from_millis(u64::from(h.driver.settings.emergency_hold_ms));
-    h.driver.poll(deadline);
-    assert!(h.driver.adapter.fully_paused());
-    assert!(
-        !h.driver.capture_requested(),
-        "pause removes every input interception path"
-    );
-    assert!(std::iter::from_fn(|| h.driver.notices.take()).any(|notice| notice == InputNotice::EmergencyPause));
 }
 
 #[test]
@@ -567,6 +519,11 @@ fn session_idle_refresh_rechecks_pause_sleep_wake_setting_and_input_safety() {
     let fake = Arc::new(oink_test_support::input::FakeInput::new());
     let mut h = Harness::with_backend(fake.clone());
     h.driver.command(InputCommand::Paused(false));
+    let (_read, _) = h.outbound(1);
+    let (writer, _) = h.inbound(1);
+    opening(&writer, &remote(), true);
+    h.attach();
+    h.driver.command(InputCommand::MovePointerTo(peer()));
     assert!(h.driver.idle_refresh_allowed());
     let mut settings = (*h.driver.snapshots.settings.load()).clone();
     settings.wake_displays_on_input = false;
@@ -575,19 +532,51 @@ fn session_idle_refresh_rechecks_pause_sleep_wake_setting_and_input_safety() {
     settings.wake_displays_on_input = true;
     h.driver.snapshots.settings.publish(settings);
     assert!(h.driver.idle_refresh_allowed());
-    h.driver.command(InputCommand::Paused(true));
-    assert!(!h.driver.idle_refresh_allowed());
-    h.driver.command(InputCommand::Paused(false));
-    wait(|| {
-        h.poll();
-        h.driver.idle_refresh_allowed()
-    });
     Arc::make_mut(&mut h.driver.environment).system_sleeping = true;
     assert!(!h.driver.idle_refresh_allowed());
     Arc::make_mut(&mut h.driver.environment).system_sleeping = false;
+    assert!(h.driver.idle_refresh_allowed());
     fake.set_input_paused(true);
     assert!(
         !h.driver.idle_refresh_allowed(),
         "native safety revocation wins before the next owner poll"
     );
+    fake.set_input_paused(false);
+    assert!(h.driver.idle_refresh_allowed());
+    h.driver.command(InputCommand::Paused(true));
+    assert!(!h.driver.idle_refresh_allowed());
+    h.driver.command(InputCommand::Paused(false));
+    wait(|| {
+        h.poll();
+        h.driver.capture_requested()
+    });
+    assert_eq!(h.driver.adapter.router().focus().holder, h.driver.local);
+    assert_eq!(h.driver.idle_refresh_allowed(), !cfg!(target_os = "macos"));
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn focus_boundaries_gate_group_idle_dispatch_and_queued_carrier_conversion() {
+    let mut h = Harness::new();
+    h.driver.command(InputCommand::Paused(false));
+    let (_read, _) = h.outbound(1);
+    let (writer, _) = h.inbound(1);
+    opening(&writer, &remote(), true);
+    h.attach();
+    let local = h.driver.local;
+    for holder in [local, peer(), local, peer()] {
+        h.driver.command(InputCommand::MovePointerTo(holder));
+        assert_eq!(h.driver.adapter.router().focus().holder, holder);
+        h._main.try_iter().for_each(drop);
+        h.driver.message(peer(), Message::Control(ControlMsg::UserActivity));
+        let resets = h
+            ._main
+            .try_iter()
+            .filter(|c| matches!(c, MainCommand::ResetUserIdle))
+            .count();
+        assert_eq!(resets, usize::from(holder != local));
+        // This is the live predicate used when an already queued Null carrier
+        // reaches Session. Returning home withdraws it before another poll.
+        assert_eq!(h.driver.idle_refresh_allowed(), holder != local);
+    }
 }

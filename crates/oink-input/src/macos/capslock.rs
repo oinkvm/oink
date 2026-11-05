@@ -410,16 +410,52 @@ pub(crate) mod tis {
             .collect()
     }
 
-    fn private_bool(name: &std::ffi::CStr) -> Option<bool> {
+    fn resolve_bool(
+        slot: &std::sync::OnceLock<Option<BoolFn>>,
+        name: &std::ffi::CStr,
+        lookup: impl FnOnce(&std::ffi::CStr) -> *mut c_void,
+    ) -> Option<BoolFn> {
+        // HIToolbox is linked into this process before the first TIS query.
+        // Neither present nor absent exports change when the user's settings do;
+        // cache resolution, not the function's current Boolean result.
+        *slot.get_or_init(|| {
+            let f = lookup(name);
+            if f.is_null() {
+                None
+            } else {
+                // SAFETY: callers supply only TIS Boolean(void) symbol names.
+                Some(unsafe { std::mem::transmute::<*mut c_void, BoolFn>(f) })
+            }
+        })
+    }
+
+    fn private_bool(slot: &std::sync::OnceLock<Option<BoolFn>>, name: &std::ffi::CStr) -> Option<bool> {
         if !on_main("TIS private") {
             return None;
         }
-        let f = find_symbol(name);
-        if f.is_null() {
-            return None;
+        let f = resolve_bool(slot, name, find_symbol)?;
+        // SAFETY: private Boolean(void) function, serialized on main.
+        Some(unsafe { f() } != 0)
+    }
+
+    #[test]
+    fn tis_symbol_resolution_caches_present_and_absent_symbols() {
+        use std::cell::Cell;
+        unsafe extern "C" fn present() -> u8 {
+            1
         }
-        // SAFETY: 私有函数签名 `Boolean f(void)`。
-        Some(unsafe { std::mem::transmute::<*mut c_void, BoolFn>(f)() } != 0)
+        for pointer in [present as *mut c_void, std::ptr::null_mut()] {
+            let slot = std::sync::OnceLock::new();
+            let calls = Cell::new(0);
+            for _ in 0..30 {
+                let value = resolve_bool(&slot, c"test", |_| {
+                    calls.set(calls.get() + 1);
+                    pointer
+                });
+                assert_eq!(value.is_some(), !pointer.is_null());
+            }
+            assert_eq!(calls.get(), 1, "settings refresh must not repeat dyld lookups");
+        }
     }
 
     fn pref() -> PrefValue {
@@ -454,9 +490,11 @@ pub(crate) mod tis {
     pub fn switch_setting() -> SwitchSetting {
         let has_non_roman =
             current().is_some_and(|s| !s.is_roman()) || enabled().into_iter().any(|s| s.is_keyboard_candidate());
+        static ENABLED: std::sync::OnceLock<Option<BoolFn>> = std::sync::OnceLock::new();
+        static ALLOWED: std::sync::OnceLock<Option<BoolFn>> = std::sync::OnceLock::new();
         SwitchSetting {
-            enabled_fn: private_bool(c"TISIsRomanSwitchEnabled"),
-            allowed_fn: private_bool(c"TISIsRomanSwitchAllowed"),
+            enabled_fn: private_bool(&ENABLED, c"TISIsRomanSwitchEnabled"),
+            allowed_fn: private_bool(&ALLOWED, c"TISIsRomanSwitchAllowed"),
             pref: parse_pref(pref()),
             has_non_roman,
         }

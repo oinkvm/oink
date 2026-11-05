@@ -649,27 +649,23 @@ mod connection_tests {
                 .any(|o| matches!(o, Output::Status(StatusEvent::GameMode(_))))
         );
         r.out.clear();
-        for heartbeat in 1..=6 {
+        for _ in 1..=6 {
             r.send_state_sync();
-            let wire: Vec<_> = r
-                .out
-                .iter()
-                .filter_map(|o| match o {
-                    Output::Send {
-                        msg: Message::Control(ControlMsg::GameMode { mode, active, .. }),
-                        ..
-                    } => Some((*mode, *active)),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(
-                wire,
-                if heartbeat % 2 == 0 {
-                    vec![(GameMode::On, true)]
-                } else {
-                    vec![]
+            assert!(!r.out.iter().any(|o| matches!(
+                o,
+                Output::Send {
+                    msg: Message::Control(ControlMsg::GameMode { .. }),
+                    ..
                 }
-            );
+            )));
+            assert!(r.heartbeat_messages(peer).iter().any(|m| matches!(
+                m,
+                Message::Control(ControlMsg::GameMode {
+                    mode: GameMode::On,
+                    active: true,
+                    ..
+                })
+            )));
             assert!(
                 !r.out
                     .iter()

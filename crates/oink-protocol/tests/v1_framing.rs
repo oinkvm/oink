@@ -20,13 +20,13 @@ fn context(agreement: &Agreement) -> Context<'_> {
         old_member_lane: false,
     }
 }
-fn identify() -> Message {
-    Message::ControlIdentifyScreens(ControlIdentifyScreens::from_raw([(1, V::Uint(7))].into()).unwrap())
+fn trail() -> Message {
+    Message::ControlCursorTrail(ControlCursorTrail::from_raw([(1, V::Bool(true))].into()).unwrap())
 }
 #[test]
 fn documented_frame_and_every_split_and_coalescing() {
-    let bytes = encode(&identify(), 16384).unwrap();
-    assert_eq!(bytes, support::unhex("050103000000a10107"));
+    let bytes = encode(&trail(), 16384).unwrap();
+    assert_eq!(bytes, support::unhex("090103000000a101f5"));
     for split in 0..=bytes.len() {
         let mut decoder = FrameDecoder::new(16384);
         let agreement = all();
@@ -70,7 +70,7 @@ fn unknown_type_rejected_at_header_before_body_and_poisoned_stream_never_continu
             .next(&mut input, |h| ctx.admit(h).map_err(|v| v.code.into()))
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::UnknownMessage);
-        let known = encode(&identify(), 16384).unwrap();
+        let known = encode(&trail(), 16384).unwrap();
         let mut input = known.as_slice();
         assert_eq!(
             decoder.next(&mut input, |_| Ok(())).unwrap_err().code,
@@ -88,7 +88,7 @@ fn unknown_type_rejected_at_header_before_body_and_poisoned_stream_never_continu
     assert!(
         context(&all())
             .admit(FrameHeader {
-                type_id: 0x105,
+                type_id: 0x109,
                 payload_length: 3
             })
             .is_ok()
@@ -99,16 +99,16 @@ fn invalid_lengths_fin_reserved_and_extensions_have_typed_errors() {
     for bytes in [
         support::unhex("000001000000a0"),
         support::unhex("ffff01000000a0"),
-        support::unhex("050100000000"),
-        support::unhex("050103000000a1"),
-        support::unhex("050103000000a10107ff"),
+        support::unhex("090100000000"),
+        support::unhex("090103000000a1"),
+        support::unhex("090103000000a101f5ff"),
     ] {
         assert!(OpaqueFrame::parse_exact(&bytes, 16384).is_err());
     }
     assert_eq!(
         FrameHeader::parse(
             &FrameHeader {
-                type_id: 0x105,
+                type_id: 0x109,
                 payload_length: 16379
             }
             .bytes(),
@@ -121,7 +121,7 @@ fn invalid_lengths_fin_reserved_and_extensions_have_typed_errors() {
     assert!(
         FrameHeader::parse(
             &FrameHeader {
-                type_id: 0x105,
+                type_id: 0x109,
                 payload_length: 16378
             }
             .bytes(),
@@ -293,7 +293,7 @@ fn pairing_is_direct_and_low_business_waits_for_membership() {
 }
 #[test]
 fn nested_low_frames_span_record_chunks_without_new_outer_prefix() {
-    let inner = encode(&identify(), 16384).unwrap();
+    let inner = encode(&trail(), 16384).unwrap();
     let mut decoder = FrameDecoder::new(v1::limits::LOW_FRAME);
     let mut completed = vec![];
     for piece in inner.chunks(2) {

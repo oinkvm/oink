@@ -234,13 +234,6 @@ impl Node {
         // immutable logical capability agreement admitted by C0.
         self.publish_local_options();
     }
-    pub async fn device_rename(&self, name: String) -> Result<(), String> {
-        let node = self.clone();
-        tokio::task::spawn_blocking(move || crate::api::AgentApi::rename_device(&node, node.id().into(), name))
-            .await
-            .map_err(|error| error.to_string())?
-            .map_err(|error| error.to_string())
-    }
     pub async fn group_leave(&self) -> Result<(), String> {
         self.link_config()
             .map_err(|e| e.to_string())?

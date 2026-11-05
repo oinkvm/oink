@@ -235,7 +235,7 @@ export const DiagnosticsChart = memo(function DiagnosticsChart({ active, audio =
         <table className={audio ? "lat__table lat__table--audio" : "lat__table"} aria-label={audio ? tr('音频质量') : tr('连接质量')}>
           <thead><tr>
             <th scope="col">{tr('设备名称')}</th>
-            {audio ? <><th scope="col">{tr('平均缓冲')}</th><th scope="col">{tr('平均码率')}</th><th scope="col">{tr('中断')}</th><th scope="col">{tr('补音时长')}</th><th scope="col">{tr('迟到包')}</th><th scope="col">{tr('不连续')}</th></> : <><th scope="col">{tr('当前延迟')}</th><th scope="col">P50</th><th scope="col">{tr('P90')}</th><th scope="col">P99</th><th scope="col">{tr('路径')}</th></>}
+            {audio ? <><th scope="col">{tr('平均缓冲')}</th><th scope="col">{tr('编码码率')}</th><th scope="col">{tr('中断')}</th><th scope="col">{tr('补音时长')}</th><th scope="col">{tr('迟到包')}</th><th scope="col">{tr('不连续')}</th></> : <><th scope="col">{tr('当前延迟')}</th><th scope="col">P50</th><th scope="col">{tr('P90')}</th><th scope="col">P99</th><th scope="col">{tr('路径')}</th></>}
           </tr></thead>
           <tbody>{series.map(s => <tr key={s.id}>
             <td><span className="lat__device">

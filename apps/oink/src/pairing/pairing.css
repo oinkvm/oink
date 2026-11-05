@@ -53,7 +53,6 @@
 }
 .addp__fold[data-collapsed] .peer__actions { display: none; }
 .peer { position: relative; }
-.dev-peek .peer { flex: 1; }   
 
 .peer__expand {
   position: absolute; inset: 0; margin: 0; padding: 0; border: 0; background: none; cursor: pointer;
@@ -100,6 +99,7 @@
   max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font-family: var(--ok-font-mono); font-variant-numeric: tabular-nums; color: var(--ok-text-2);
 }
+.self-info__ports { white-space: normal; text-align: end; overflow: visible; }
 .self-info__more {
   display: inline-flex; align-items: center; gap: 1px; margin: 0 -2px 0 0; padding: 0 2px; border: 0;
   border-radius: 4px; corner-shape: round; --ok-shape: round; background: none; color: var(--ok-accent-text);

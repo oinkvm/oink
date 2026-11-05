@@ -1,5 +1,4 @@
 //! Bounded, privacy-first diagnostic flight recorder. All disk/compression work is off input threads.
-mod application_focus;
 mod buttons;
 pub(crate) mod capture;
 mod clock;
@@ -864,7 +863,7 @@ fn worker(weak: Weak<Inner>) {
             }
             continue;
         }
-        std::thread::park_timeout(Duration::from_secs(1));
+        std::thread::park_timeout(Duration::from_secs(2));
         inner.worker_notified.store(false, Ordering::Release);
         if inner.stopped.load(Ordering::Acquire) {
             return;
@@ -892,18 +891,6 @@ fn runtime_environment(node: &crate::node::Node, anon: &Anonymizer) -> Snapshot 
     let settings = node.settings();
     let os_version = system_version();
     let mut snapshot = Snapshot {
-        application_focus: node
-            .input_status()
-            .ok()
-            .and_then(|status| status.application_focus.clone())
-            .map(|state| store::ApplicationFocus {
-                pointer: anon.device(state.claim.pointer.device_id),
-                keyboard: state.keyboard.map(|boot| anon.device(boot.device_id)),
-                epoch: state.claim.epoch,
-                revision: state.revision,
-                phase: state.phase,
-                reason: state.reason,
-            }),
         #[cfg(target_os = "macos")]
         file_provider: lock(&node.inner.file_provider).snapshot().reason.map(Into::into),
         #[cfg(not(target_os = "macos"))]
@@ -939,11 +926,6 @@ fn runtime_environment(node: &crate::node::Node, anon: &Anonymizer) -> Snapshot 
                 settings.routing.return_pointer_on_display_sleep,
             ),
             ("cursor_trail".into(), settings.routing.cursor_trail),
-            (
-                "application_focus_enabled".into(),
-                node.link_config()
-                    .is_ok_and(|config| config.applied().application_focus_enabled),
-            ),
         ]
         .into(),
         routing_numbers: [
@@ -1056,6 +1038,16 @@ fn runtime_environment(node: &crate::node::Node, anon: &Anonymizer) -> Snapshot 
             .routing_numbers
             .insert("file_provider_reason".into(), provider.code());
     }
+    if let Ok(links) = node.links() {
+        snapshot
+            .routing_numbers
+            .insert("network_quic_port".into(), f64::from(links.local_addr().port()));
+        if let Some(address) = links.low_local_addr() {
+            snapshot
+                .routing_numbers
+                .insert("network_low_tcp_port".into(), f64::from(address.port()));
+        }
+    }
     snapshot
 }
 impl Snapshot {
@@ -1149,9 +1141,7 @@ impl Recorder {
                 dx: *dx,
                 dy: *dy,
             },
-            InputMsg::Key { code, pressed }
-            | InputMsg::CapsKey { code, pressed }
-            | InputMsg::ApplicationKey { code, pressed, .. } => SafeInput::Key {
+            InputMsg::Key { code, pressed } | InputMsg::CapsKey { code, pressed } => SafeInput::Key {
                 class: privacy::KeyClass::from_code(*code),
                 pressed: *pressed,
                 repeat: Some(false),
@@ -1165,7 +1155,7 @@ impl Recorder {
                 repeat: Some(*repeat),
                 diagnostic: privacy::KeyDiagnostic::default(),
             },
-            InputMsg::KeyRepeat { code, .. } | InputMsg::ApplicationRepeat { code, .. } => SafeInput::Key {
+            InputMsg::KeyRepeat { code, .. } => SafeInput::Key {
                 class: privacy::KeyClass::from_code(*code),
                 pressed: true,
                 repeat: Some(true),
@@ -1222,15 +1212,6 @@ impl Recorder {
                     active: !keys.is_empty() || !buttons.is_empty(),
                     count: keys.len() as u64,
                     value: buttons.len() as f64,
-                });
-                return;
-            }
-            InputMsg::ApplicationHeldSync { keys, .. } => {
-                self.record(Event::State {
-                    kind: StateKind::HeldSync,
-                    active: !keys.is_empty(),
-                    count: keys.len() as u64,
-                    value: 0.,
                 });
                 return;
             }

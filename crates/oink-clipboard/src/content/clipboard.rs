@@ -106,6 +106,11 @@ impl namespace::Namespace for CurrentFiles {
         self.inner.prepare()?;
         (self.check)()
     }
+    fn prepare_while(&self, current: &dyn Fn() -> bool) -> io::Result<()> {
+        (self.check)()?;
+        self.inner.prepare_while(current)?;
+        (self.check)()
+    }
     fn cancel(&self) {
         self.inner.cancel();
     }

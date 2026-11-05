@@ -1310,7 +1310,8 @@ impl Router {
         delta_units: (f64, f64),
         at: Point,
     ) {
-        if !self.dnd_enabled()
+        if self.local_click_reserved()
+            || !self.dnd_enabled()
             || (self.focus_pinned() && !self.pointer_lock_escape_held())
             || self.system_clip_active()
             || self.paused
@@ -1963,7 +1964,11 @@ impl Router {
     /// Metadata discovery is independent of edge crossing. Earlier native
     /// detection can call this same entry point without transferring focus.
     pub fn dnd_source_learned(&mut self, id: ClipId, input: DeviceId, items: Vec<ClipData>) {
-        if id.origin != self.me() || !self.dnd_enabled() || (input == self.me() && self.mouse_local()) {
+        if self.local_click_reserved()
+            || id.origin != self.me()
+            || !self.dnd_enabled()
+            || (input == self.me() && self.mouse_local())
+        {
             return;
         }
         let offer = Self::dnd_offer(id);

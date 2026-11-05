@@ -1,7 +1,7 @@
 //! Window-free comparison of the toast path with direct Windows GDI text output.
 #[cfg(windows)]
 mod native {
-    use oink_locator::aim::{
+    use oink_locator::{
         raster::{Canvas, Color},
         text::{self, Mask, Pen, TextRaster},
     };

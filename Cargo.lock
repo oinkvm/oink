@@ -3135,7 +3135,7 @@ dependencies = [
 
 [[package]]
 name = "oink-agent"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3176,6 +3176,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "sha2",
+ "socket2",
  "tempfile",
  "thiserror 2.0.21",
  "time",
@@ -3184,12 +3185,13 @@ dependencies = [
  "tracing-subscriber",
  "unicode-casefold",
  "windows",
+ "windows-sys 0.61.2",
  "zip",
 ]
 
 [[package]]
 name = "oink-audio"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bytes",
  "cc",
@@ -3218,7 +3220,7 @@ dependencies = [
 
 [[package]]
 name = "oink-autostart"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "objc2",
  "objc2-foundation",
@@ -3232,7 +3234,7 @@ dependencies = [
 
 [[package]]
 name = "oink-clipboard"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3265,7 +3267,7 @@ dependencies = [
 
 [[package]]
 name = "oink-crash"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "futures-executor",
  "getrandom 0.3.4",
@@ -3283,7 +3285,7 @@ dependencies = [
 
 [[package]]
 name = "oink-display"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "block2",
  "objc2",
@@ -3303,7 +3305,7 @@ dependencies = [
 
 [[package]]
 name = "oink-foundation"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "arc-swap",
  "serde",
@@ -3317,7 +3319,7 @@ dependencies = [
 
 [[package]]
 name = "oink-input"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "crossbeam-queue",
  "libc",
@@ -3339,7 +3341,7 @@ dependencies = [
 
 [[package]]
 name = "oink-locator"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "libc",
  "objc2",
@@ -3350,7 +3352,6 @@ dependencies = [
  "objc2-quartz-core",
  "oink-display",
  "oink-foundation",
- "oink-protocol",
  "oink-routing",
  "tracing",
  "tracing-subscriber",
@@ -3359,7 +3360,7 @@ dependencies = [
 
 [[package]]
 name = "oink-network"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3401,7 +3402,7 @@ dependencies = [
 
 [[package]]
 name = "oink-protocol"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "minicbor",
  "oink-foundation",
@@ -3414,7 +3415,7 @@ dependencies = [
 
 [[package]]
 name = "oink-routing"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "getrandom 0.3.4",
  "oink-display",
@@ -3428,7 +3429,7 @@ dependencies = [
 
 [[package]]
 name = "oink-telemetry"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "fs2",
  "getrandom 0.3.4",
@@ -3442,7 +3443,7 @@ dependencies = [
 
 [[package]]
 name = "oink-test-support"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "oink-clipboard",
  "oink-foundation",
@@ -3454,7 +3455,7 @@ dependencies = [
 
 [[package]]
 name = "oink-ui"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64 0.22.1",
  "block2",
@@ -3484,7 +3485,7 @@ dependencies = [
 
 [[package]]
 name = "oink-update"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -3500,7 +3501,7 @@ dependencies = [
 
 [[package]]
 name = "oink-winsvc"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64 0.22.1",
  "cab",

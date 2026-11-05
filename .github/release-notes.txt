@@ -1,23 +1,26 @@
-Oink 0.3.2 lets you use Oink at the Windows sign-in screen and fixes several bugs that could get in the way.
+Oink 0.3.3 improves audio forwarding, adds audio quality options and fixes several keyboard, mouse and clipboard issues.
 
 ## New
 
-- Use Oink at the Windows sign-in screen: when Launch at login is on, your other devices can also control the sign-in screen that appears after Windows starts.
-- "Take the foreground when the pointer leaves" on Windows is now off by default. You can turn it back on in Settings.
+- Choose the quality of forwarded audio in Settings: Smooth, Quality or Lossless.
+- Clicking with a mouse that is in local mode now brings control back to that computer.
+- Pointer shortcuts can now move the pointer to screens hidden in the layout.
+- If another app is using Oink's network port, Oink now switches to another port automatically.
+- On a Mac, files of up to 16 MB in total copied on another computer are fetched in advance, so pasting them is faster.
 
 ## Fixes
 
-- Fixed keys typed on a Windows computer not reaching the other computer after the pointer moved there when "Take the foreground when the pointer leaves" was on; an input method box could appear on the Windows computer instead.
-- Fixed images dragged from another computer into Chrome and other browsers on Windows failing to load.
-- Fixed a Mac sometimes staying offline until Oink was restarted, after macOS stopped Oink's network connection (for example, when VPN or security software changed network settings).
-- Fixed apps opened on Windows while the pointer was on another computer losing focus or minimizing (for example, fullscreen games) when the pointer came back.
-- Fixed a newly paired computer or newly connected screen sometimes being hidden in the layout until you showed it manually.
-- Fixed Oink's background process crashing on Windows when starting some drags.
-- When Oink's background process fails to start on Windows, Oink now shows the reason and exit code.
+- Fixed the "Open the Oink window" shortcut not being shown in Settings.
+- Fixed Shift sometimes switching WeChat Input Method between Chinese and English on a Mac controlled from another device.
+- Fixed some keys sometimes staying pressed when a Windows keyboard controls another device.
+- Fixed the pitch of forwarded audio rising and falling every few seconds on Wi-Fi.
+- Fixed images copied on a Mac showing no preview in Windows clipboard history (Win+V).
+- Fixed Macs failing to connect over Tailscale.
+- Oink uses less CPU when idle on Mac and Windows.
 
 ## Compatibility
 
-- 0.3.2 works with 0.3.0 and later.
+- 0.3.3 works with 0.3.0 and later.
 
 ## Downloads
 

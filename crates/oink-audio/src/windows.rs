@@ -428,6 +428,8 @@ fn default_is(enumerator: &IMMDeviceEnumerator, id: &str) -> Result<bool, String
 }
 
 struct RealtimeCaptureData {
+    resampler: crate::resample::StereoResampler,
+    output: Vec<f32>,
     capture: windows::Win32::Media::Audio::IAudioCaptureClient,
     event: Option<usize>,
     max_frames: u32,
@@ -532,7 +534,22 @@ impl RealtimeCaptureData {
             };
             self.expected_position = position.and_then(|p| p.checked_add(u64::from(frames)));
             encoder.observe_wasapi_buffer(silent);
-            encoder.supply(samples, stamp);
+            if stamp.discontinuity {
+                self.resampler.reset();
+            }
+            let (count, mut converted) = self.resampler.process_timed_into(
+                samples,
+                stamp.first_sample_at,
+                stamp.callback_at,
+                position.unwrap_or(0),
+                &mut self.output,
+            );
+            converted.delivered_at = stamp.delivered_at;
+            converted.discontinuity = stamp.discontinuity;
+            if position.is_none() {
+                converted.source_frame_position = None;
+            }
+            encoder.supply(&self.output[..count], converted);
         }
         Ok(())
     }
@@ -556,7 +573,19 @@ impl RealtimeCapture {
         buffer_duration: Duration,
         mut encoder: Box<crate::source::Encoder>,
     ) -> Result<Self, String> {
+        let target_rate = encoder.config().sample_rate;
+        if encoder.config().codec == crate::dsp::Codec::Pcm24 && opened.info.sample_rate != target_rate {
+            return Err("source sample rate changed during audio preparation".into());
+        }
+        let resampler = crate::resample::StereoResampler::with_rates(
+            f64::from(opened.info.sample_rate),
+            f64::from(target_rate),
+            opened.max_frames as usize,
+        );
+        let output = vec![0.0; resampler.output_capacity(opened.max_frames as usize * 2)];
         let mut data = RealtimeCaptureData {
+            resampler,
+            output,
             capture: opened.capture.clone(),
             event: opened.realtime_event(),
             max_frames: opened.max_frames,

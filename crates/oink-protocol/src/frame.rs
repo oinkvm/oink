@@ -41,7 +41,6 @@ pub enum StreamKind {
     Audio = 5,
     // Kind 6 remains reserved.
     /// A0: mini-game.
-    Aim = 7,
     /// D0 (and D1 following it): diagnostics. Low-priority: bundle collection.
     Diagnostics = 8,
     /// Low-priority only: wallpaper sets.
@@ -67,7 +66,6 @@ impl StreamKind {
             3 => Self::Input,
             4 => Self::Clipboard,
             5 => Self::Audio,
-            7 => Self::Aim,
             8 => Self::Diagnostics,
             9 => Self::Wallpaper,
             10 => Self::Dnd,
@@ -88,14 +86,6 @@ impl StreamKind {
         match self {
             Self::Internal | Self::Input => Priority::Interactive,
             _ => Priority::Normal,
-        }
-    }
-    /// Priority of the datagram flow following this kind, if the kind has one.
-    pub fn datagram_priority(self) -> Option<Priority> {
-        match self {
-            Self::Input | Self::Audio => Some(Priority::Interactive),
-            Self::Diagnostics => Some(Priority::Normal),
-            _ => None,
         }
     }
     /// Size limit of one encoded message on the reliable stream of this kind.

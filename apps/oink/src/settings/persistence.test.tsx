@@ -264,3 +264,27 @@ it.each(['macos','windows'])('defaults source wheel lines on and persists only i
   const reloaded=renderHook(usePreferences);
   expect(reloaded.result.current.prefs.forwardWheelByLines).toBe(false);
 });
+
+it('persists source encoding quality independently from the diagnostic chart', async()=>{
+  const {result}=renderHook(usePreferences);
+  expect(result.current.prefs.audioEncodingQuality).toBe('quality');
+  await act(async()=>result.current.set('audioEncodingQuality','lossless'));
+  expect(mocks.audio).toHaveBeenCalledWith({quality:'lossless'});
+});
+
+
+it('persists enabling and rebinding the open-window shortcut', async () => {
+  const h = {action:'open_window',enabled:false,keys:['Ctrl','Alt','A']};
+  mocks.state={...mocks.state,input:{...(mocks.state.input as object),hotkeys:[h]}};
+  const {result}=renderHook(usePreferences);
+  expect(result.current.prefs.shortcuts.openWindow).toEqual({on:false,keys:'Control+Alt+A'});
+  await act(async()=>result.current.set('shortcuts',{...result.current.prefs.shortcuts,openWindow:{on:true,keys:'Control+Shift+W'}}));
+  await waitFor(()=>expect(mocks.input).toHaveBeenCalledExactlyOnceWith({hotkeys:[{...h,enabled:true,keys:['Ctrl','Shift','W']}]}));
+});
+
+it.each(['smooth','quality','lossless'])('keeps explicit source encoding quality %s', quality=>{
+  mocks.state={...mocks.state,audio:{settings:{quality,keep_local_playback:true,receive_output:null}}};
+  const {result}=renderHook(usePreferences);
+  expect(result.current.prefs.audioEncodingQuality).toBe(quality);
+  expect(mocks.audio).not.toHaveBeenCalled();
+});

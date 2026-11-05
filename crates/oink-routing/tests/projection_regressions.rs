@@ -1,6 +1,6 @@
 //! Read-only audit fixtures: pure production geometry, never native input or app IPC.
 use oink_display::{
-    layout::{self as dl, Layout, OwnerLayoutPreferences, ScreenPlacement, ScreenPreference, SizeSource},
+    layout::{self as dl, Layout, ScreenPlacement, SizeSource},
     projection,
 };
 use oink_foundation::{DeviceId, Point, Rect};
@@ -51,84 +51,6 @@ fn short_ineligible_neighbour_occludes_only_its_own_interval() {
     assert_eq!(target(&l, at(0.999, 0.995), (10., 0.)), None);
 }
 #[test]
-fn hidden_or_disabled_screen_does_not_block_native_projection_edit() {
-    let l = layout(vec![
-        s(H, "H", Rect::new(0., 0., 1., 1.)),
-        s(N, "N", Rect::new(1., 0., 1., 1.)),
-        s(F, "Hidden", Rect::new(1., 1.1, 1., 1.)),
-    ]);
-    for disabled_device in [true, false] {
-        let mut owner = OwnerLayoutPreferences {
-            screen_shared: !disabled_device,
-            ..Default::default()
-        };
-        if !disabled_device {
-            owner.screens.insert(
-                "Hidden".into(),
-                ScreenPreference {
-                    enabled: false,
-                    ..Default::default()
-                },
-            );
-        }
-        let owners = std::collections::BTreeMap::from([(F, owner)]);
-        let p = projection::compute(&l.effective(&owners), H, |_| true, None).remove(0);
-        let edited = p
-            .edit_with_preferences(&l, &owners, projection::Handle::Middle, 500.)
-            .unwrap();
-        assert!((edited.screen(&dl::ScreenId::new(N, "N")).unwrap().rect.y - 0.5).abs() < 1e-9);
-    }
-}
-
-#[test]
-fn native_group_growth_stops_at_first_intermediate_collision() {
-    let main = s(N, "N", Rect::new(1., 0., 1., 1.));
-    let mut side = s(N, "Side", Rect::new(3., 0., 1., 1.));
-    side.local = Rect::new(2000., 0., 1000., 1000.);
-    side.primary = false;
-    let l = layout(vec![
-        s(H, "H", Rect::new(0., 0., 1., 1.)),
-        main,
-        side,
-        s(F, "Obstacle", Rect::new(4.1, 0.2, 0.1, 0.1)),
-    ]);
-    let p = projection::compute(&l.effective(&Default::default()), H, |_| true, None)
-        .into_iter()
-        .find(|p| p.neighbour.display == "N")
-        .unwrap();
-    let near = p.edit(&l, projection::Handle::End, 50.).unwrap();
-    let far = p.edit(&l, projection::Handle::End, 1000.).unwrap();
-    let near_w = near.screen(&dl::ScreenId::new(N, "N")).unwrap().rect.w;
-    let far_w = far.screen(&dl::ScreenId::new(N, "N")).unwrap().rect.w;
-    assert!(near_w < 1.04);
-    assert!((far_w - near_w).abs() < 1e-9);
-    let obstacle = l.screens[3].rect;
-    let intermediate = Rect::new(1. + 2. * 1.1, 0., 1.1, 1.1);
-    assert!(dl::facing::overlaps(intermediate, obstacle, 1e-10));
-}
-
-#[test]
-fn native_group_shrink_stops_before_a_crossed_obstacle_too() {
-    let mut side = s(N, "Side", Rect::new(3., 0., 1., 1.));
-    side.local = Rect::new(2000., 0., 1000., 1000.);
-    side.primary = false;
-    let l = layout(vec![
-        s(H, "H", Rect::new(0., 0., 1., 1.)),
-        s(N, "N", Rect::new(1., 0., 1., 1.)),
-        side,
-        s(F, "Obstacle", Rect::new(2.7, 0.2, 0.1, 0.1)),
-    ]);
-    let p = projection::compute(&l.effective(&Default::default()), H, |_| true, None)
-        .into_iter()
-        .find(|p| p.neighbour.display == "N")
-        .unwrap();
-    let edited = p.edit(&l, projection::Handle::End, -500.).unwrap();
-    let scale = edited.screen(&dl::ScreenId::new(N, "N")).unwrap().rect.w;
-    assert!((scale - 0.9).abs() < 1e-9);
-    assert!(edited.overlaps().is_empty());
-}
-
-#[test]
 fn nearer_screen_splits_a_far_portal_into_both_visible_intervals() {
     let l = layout(vec![
         s(H, "H", Rect::new(0., 0., 1., 1.)),
@@ -163,10 +85,6 @@ fn local_annotations_leave_native_and_remote_routes_unchanged() {
     assert_eq!(before, [dl::ScreenId::new(H, "Second"), dl::ScreenId::new(F, "F")]);
     let projections = projection::compute(&l.effective(&Default::default()), H, |_| true, None);
     assert!(projections.iter().any(|p| p.host.device == p.neighbour.device));
-    for p in projections.iter().filter(|p| p.host.device == p.neighbour.device) {
-        assert!(p.handles().is_empty());
-        assert_eq!(p.edit(&l, projection::Handle::Middle, 100.), None);
-    }
     let after = points
         .iter()
         .map(|p| route.first_portal_native(p, (10., 0.)).unwrap().to.screen)

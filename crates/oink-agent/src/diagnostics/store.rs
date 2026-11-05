@@ -116,21 +116,8 @@ impl DiscardCounts {
     }
 }
 
-/// Collection-local aliases only; never native application IDs or raw device IDs.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ApplicationFocus {
-    pub pointer: String,
-    pub keyboard: Option<String>,
-    pub epoch: u64,
-    pub revision: u64,
-    pub phase: oink_routing::application_focus::Phase,
-    pub reason: oink_routing::application_focus::Reason,
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
-    #[serde(default)]
-    pub application_focus: Option<ApplicationFocus>,
     // Provider availability is projected from its typed scalar observation.
     #[serde(skip)]
     pub file_provider: Option<super::ProviderAvailability>,
@@ -266,6 +253,7 @@ pub(crate) struct Store {
     pub previous_instance: Option<String>,
     next: u64,
     pub snapshot: Snapshot,
+    pub(super) network_member_limit: u64,
     pub(super) network_received: u64,
     pub(super) network_expanded: u64,
     pub(super) network_environments: BTreeMap<String, (String, oink_protocol::v1::dto::Snapshot)>,
@@ -412,6 +400,7 @@ impl Store {
             next: 0,
             snapshot: Snapshot::default(),
             gathered_environments: BTreeMap::new(),
+            network_member_limit: oink_protocol::v1::limits::DIAGNOSTIC_COLLECTION as u64,
             network_received: 0,
             network_expanded: 0,
             network_environments: BTreeMap::new(),

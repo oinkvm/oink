@@ -1,4 +1,4 @@
-//! 显示器描述（由「屏幕与布局」的平台实现填写，布局、路由、标定、界面使用）。
+//! 显示器描述（由「屏幕与布局」的平台实现填写，布局、路由、界面使用）。
 
 use crate::geom::{Rect, Size};
 use serde::{Deserialize, Serialize};

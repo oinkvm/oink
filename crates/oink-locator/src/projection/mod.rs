@@ -1,16 +1,15 @@
 //! Layout projections have their own windows and lifetime, independent of cursor
 //! trails, cursor-owner/cover windows and input capture. No cursor APIs are used.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use oink_display::projection::Projection;
 use oink_foundation::Rect;
 
-use crate::aim::raster::{Canvas, Color, over};
+use crate::raster::{Canvas, Color, over};
 mod annotation;
-use crate::aim::text::{self, Pen, TextRaster};
+use crate::text::{self, Pen, TextRaster};
 use annotation::raster;
 
 #[cfg(target_os = "macos")]
@@ -39,57 +38,6 @@ pub struct View {
     pub projections: Vec<NamedProjection>,
     /// Accent resolved by the rendering device, including its effective appearance.
     pub accent: [u8; 3],
-    /// First static checkpoint can show the handles without intercepting input.
-    pub show_handles: bool,
-    pub editable: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DragPhase {
-    Begin,
-    Update,
-    End,
-}
-#[derive(Clone, Debug)]
-pub enum Event {
-    Drag {
-        projection: Box<Projection>,
-        handle: oink_display::projection::Handle,
-        delta: f64,
-        phase: DragPhase,
-    },
-    Escape,
-}
-static EVENTS: Mutex<Vec<Event>> = Mutex::new(Vec::new());
-pub(super) static DRAGGING: AtomicBool = AtomicBool::new(false);
-pub(super) fn emit(event: Event) {
-    let mut events = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
-    if matches!(
-        event,
-        Event::Drag {
-            phase: DragPhase::Update,
-            ..
-        }
-    ) && events.last().is_some_and(|e| {
-        matches!(
-            e,
-            Event::Drag {
-                phase: DragPhase::Update,
-                ..
-            }
-        )
-    }) {
-        events.pop();
-    }
-    if events.len() < 64 {
-        events.push(event);
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct NativeHandle {
-    pub projection: Projection,
-    pub hit: oink_display::projection::HitRegion,
 }
 
 #[derive(Debug, Default)]
@@ -122,8 +70,7 @@ impl ProjectionOverlay {
     }
 
     pub fn update(&self, view: View) {
-        self.health
-            .intent(u64::from(!view.projections.is_empty()) | (u64::from(view.editable) << 1));
+        self.health.intent(u64::from(!view.projections.is_empty()));
         let (state, cv) = &*self.shared;
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         state.view = Some(view);
@@ -133,10 +80,6 @@ impl ProjectionOverlay {
 
     pub fn hide(&self) {
         self.update(View::default());
-    }
-
-    pub fn take_events(&self) -> Vec<Event> {
-        std::mem::take(&mut *EVENTS.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     pub fn shutdown(&self) {
@@ -190,10 +133,7 @@ fn render_thread(shared: Arc<(Mutex<State>, Condvar)>, health: Arc<crate::diagno
     let mut fade = Fade::new(Instant::now());
     let mut frames: Vec<Frame> = Vec::new();
     let mut cached: Vec<(NamedProjection, [u8; 3], Frame)> = Vec::new();
-    let mut editable = false;
-    let mut escaped = false;
     let mut last_view: Option<View> = None;
-    let mut last_dragging = false;
     let mut last_alpha = -1.0;
     let mut reported_frames = None;
     loop {
@@ -213,59 +153,44 @@ fn render_thread(shared: Arc<(Mutex<State>, Condvar)>, health: Arc<crate::diagno
         let now = Instant::now();
         if expired {
             fade.target(false, now);
-            editable = false;
             last_view = None;
             health.hide(Hide::LeaseExpired);
         }
         let mut changed = false;
-        if let Some(view) = view {
-            editable = view.editable;
-            let dragging = DRAGGING.load(Ordering::Acquire);
-            if last_view.as_ref() != Some(&view) || dragging != last_dragging {
-                let mut next_cache = Vec::new();
-                let next: Vec<_> = view
-                    .projections
-                    .iter()
-                    .filter_map(|p| {
-                        let mut frame = if let Some((_, _, frame)) =
-                            cached.iter().find(|(old, rgb, _)| old == p && *rgb == view.accent)
-                        {
-                            frame.clone()
-                        } else {
-                            raster(p, view.accent, &*font)?
-                        };
-                        next_cache.push((p.clone(), view.accent, frame.clone()));
-                        if editable {
-                            frame.handles = p
-                                .geometry
-                                .handles()
-                                .into_iter()
-                                .map(|hit| NativeHandle {
-                                    projection: p.geometry.clone(),
-                                    hit,
-                                })
-                                .collect();
-                        }
-                        Some(frame)
-                    })
-                    .collect();
-                let counts = (view.projections.len(), next.len());
-                if reported_frames != Some(counts) {
-                    tracing::info!(requested = counts.0, frames = counts.1, "projection render visibility");
-                    reported_frames = Some(counts);
-                }
-                cached = next_cache;
-                if next.is_empty() {
-                    health.hide(Hide::Explicit);
-                }
-                fade.target(!next.is_empty(), now);
-                if !next.is_empty() {
-                    frames = next;
-                }
-                last_dragging = dragging;
-                last_view = Some(view);
-                changed = true;
+        if let Some(view) = view
+            && last_view.as_ref() != Some(&view)
+        {
+            let mut next_cache = Vec::new();
+            let next: Vec<_> = view
+                .projections
+                .iter()
+                .filter_map(|p| {
+                    let frame = if let Some((_, _, frame)) =
+                        cached.iter().find(|(old, rgb, _)| old == p && *rgb == view.accent)
+                    {
+                        frame.clone()
+                    } else {
+                        raster(p, view.accent, &*font)?
+                    };
+                    next_cache.push((p.clone(), view.accent, frame.clone()));
+                    Some(frame)
+                })
+                .collect();
+            let counts = (view.projections.len(), next.len());
+            if reported_frames != Some(counts) {
+                tracing::info!(requested = counts.0, frames = counts.1, "projection render visibility");
+                reported_frames = Some(counts);
             }
+            cached = next_cache;
+            if next.is_empty() {
+                health.hide(Hide::Explicit);
+            }
+            fade.target(!next.is_empty(), now);
+            if !next.is_empty() {
+                frames = next;
+            }
+            last_view = Some(view);
+            changed = true;
         }
         let alpha = fade.value(now);
         if needs_present(changed, alpha, last_alpha) {
@@ -275,7 +200,7 @@ fn render_thread(shared: Arc<(Mutex<State>, Condvar)>, health: Arc<crate::diagno
                 frames.iter().map(|frame| frame.with_alpha(alpha)).collect()
             };
             health.frame(if alpha > 0.0 { frames.len() } else { 0 });
-            backend.present(presented, editable);
+            backend.present(presented);
             #[cfg(not(target_os = "macos"))]
             health.applied();
             last_alpha = alpha;
@@ -283,24 +208,15 @@ fn render_thread(shared: Arc<(Mutex<State>, Condvar)>, health: Arc<crate::diagno
                 frames.clear();
             }
         }
-        if alpha > 0.0 || editable {
+        if alpha > 0.0 {
             health.pulse();
         }
         backend.pump();
-        if editable {
-            let down = backend.escape_down();
-            if down && !escaped {
-                emit(Event::Escape);
-            }
-            escaped = down;
-        } else {
-            escaped = false;
-        }
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
         if s.view.is_some() || s.stop {
             continue;
         }
-        if alpha > 0.0 || editable || fade.to > 0.0 {
+        if alpha > 0.0 || fade.to > 0.0 {
             drop(
                 cv.wait_timeout(s, Duration::from_millis(16))
                     .unwrap_or_else(|e| e.into_inner()),
@@ -323,7 +239,6 @@ pub(super) struct Frame {
     pub width: usize,
     pub height: usize,
     pub pixels: Vec<u32>,
-    pub handles: Vec<NativeHandle>,
 }
 
 impl Frame {
@@ -337,7 +252,6 @@ impl Frame {
             bounds: self.bounds,
             width: self.width,
             height: self.height,
-            handles: self.handles.clone(),
             pixels: self
                 .pixels
                 .iter()
@@ -396,7 +310,6 @@ mod lifecycle_tests {
             width: 1,
             height: 1,
             pixels: vec![0x80402010],
-            handles: vec![],
         };
         assert_eq!(f.with_alpha(0.5).pixels, vec![0x40201008]);
     }

@@ -7,6 +7,12 @@ use oink_protocol::v1::{
 };
 use std::time::{Duration, Instant};
 
+/// Quiet period aggregates separately notified writes, not delayed-rendered
+/// bytes. Native capture and every later read still validate the source identity.
+/// Like the former 300 ms heuristic, this cannot detect an owner filling an
+/// already declared type without changing its native generation.
+pub const SOURCE_QUIET_PERIOD: Duration = Duration::from_millis(75);
+
 pub struct Ordering {
     device: DeviceId,
     clock: u64,
@@ -48,7 +54,7 @@ impl Ordering {
         if count <= self.written {
             return false;
         }
-        self.pending = Some((count, now + Duration::from_millis(300)));
+        self.pending = Some((count, now + SOURCE_QUIET_PERIOD));
         self.current = None;
         true
     }
@@ -71,6 +77,10 @@ impl Ordering {
             self.current = None;
         }
         self.pending = None;
+    }
+    /// Last native write accepted by this ordering state (diagnostics only).
+    pub fn written_count(&self) -> u64 {
+        self.written
     }
     pub fn written(&mut self, count: u64) {
         self.written = count;
@@ -218,10 +228,10 @@ mod tests {
         let mut state = Ordering::new(DeviceId([1; 32]), 0);
         let at = Instant::now();
         assert!(state.local_change(1, at));
-        assert!(!state.capture_due(at + Duration::from_millis(299)));
-        assert!(state.local_change(2, at + Duration::from_millis(200)));
-        assert!(!state.capture_due(at + Duration::from_millis(499)));
-        assert!(state.capture_due(at + Duration::from_millis(500)));
+        assert!(!state.capture_due(at + Duration::from_millis(49)));
+        assert!(state.local_change(2, at + Duration::from_millis(50)));
+        assert!(!state.capture_due(at + Duration::from_millis(124)));
+        assert!(state.capture_due(at + Duration::from_millis(125)));
         assert!(!state.capture_due(at + Duration::from_secs(1)));
     }
     #[test]

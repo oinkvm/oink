@@ -360,6 +360,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
             case 'virtualMicrophone': return {desc:<VirtualMicrophoneDescription windows={platform==='win'}/>,node:<VirtualMicrophone windows={platform==='win'} active={open}/>};
             case 'microphoneInput': return {node:<MicrophoneInput/>};
             case 'microphonePermission': return {node:<MicrophonePermission/>};
+            case 'audioEncodingQuality': return {node:<Select size="sm" aria-label={label} value={prefs.audioEncodingQuality} onChange={(v) => set('audioEncodingQuality', v as Prefs['audioEncodingQuality'])} options={[{value:'smooth',label:tr('流畅')},{value:'quality',label:tr('质量')},{value:'lossless',label:tr('无损')}]}/>};
             case 'audioDevice': {
                 const list = agentState.audio?.devices.find(d => d.device.map(v => v.toString(16).padStart(2, '0')).join('') === agentState.overview?.this_device.id)?.outputs ?? [];
                 return {
@@ -421,8 +422,11 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
         }
         if (item.id.startsWith('sc-')) {
             const id = item.id.slice(3) as ShortcutId;
-            const sc = prefs.shortcuts[id] ?? {on:false, keys:''};
-            const clash = sc.on && sc.keys ? shortcuts.find((o) => o.id !== id && prefs.shortcuts[o.id]?.on && prefs.shortcuts[o.id]?.keys === sc.keys) : undefined;
+            const readOnly = id === 'keyboardRelease';
+            const sc = readOnly
+                ? { on: true, keys: (agentState.input?.keyboard_release_keys ?? []).map(key => key === 'Ctrl' ? 'Control' : key).join('+') }
+                : prefs.shortcuts[id] ?? {on:false, keys:''};
+            const clash = !readOnly && sc.on && sc.keys ? shortcuts.find((o) => o.id !== id && prefs.shortcuts[o.id]?.on && prefs.shortcuts[o.id]?.keys === sc.keys) : undefined;
             const err = scError?.id === id ? scError.text : clash ? tr('和「{0}」的快捷键重复', clash.label) : null;
             const setSc = (patch: Partial<typeof sc>) => set('shortcuts', { ...prefs.shortcuts, [id]: { ...sc, ...patch } });
             return {
@@ -430,8 +434,8 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                     ? <span className="setp__sc-err"><Icon name="alert"/>{err}</span>
                     : hl(text(item.desc, platform), query),
                 node: (<span className="setp__sc">
-            <ShortcutRecorder singleKey={id === 'lockEscape'} platform={platform} label={label} value={sc.keys} disabled={!sc.on} invalid={!!clash} onChange={(v) => { setScError(null); setSc({ keys: v }); onLog(tr('快捷键「{0}」→ {1}', label, spokenKeys(platform, v))); }} onReject={(reason) => setScError({ id, text: reason })}/>
-            <Switch aria-label={tr('启用「{0}」快捷键', label)} checked={sc.on} onChange={(v) => { setSc({ on: v }); onLog(tr('快捷键「{0}」：{1}', label, v ? tr('开') : tr('关'))); }}/>
+            <ShortcutRecorder singleKey={id === 'lockEscape'} platform={platform} label={label} value={sc.keys} disabled={readOnly || !sc.on} invalid={!!clash} onChange={(v) => { setScError(null); setSc({ keys: v }); onLog(tr('快捷键「{0}」→ {1}', label, spokenKeys(platform, v))); }} onReject={(reason) => setScError({ id, text: reason })}/>
+            <Switch disabled={readOnly} aria-label={tr('启用「{0}」快捷键', label)} checked={sc.on} onChange={readOnly ? undefined : (v) => { setSc({ on: v }); onLog(tr('快捷键「{0}」：{1}', label, v ? tr('开') : tr('关'))); }}/>
           </span>),
             };
         }

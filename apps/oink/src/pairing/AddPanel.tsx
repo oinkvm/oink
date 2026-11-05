@@ -1,8 +1,6 @@
 import { tr } from '../i18n';
 import { useEffect, useId, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { usePeekScope } from '../devices/peek';
-import type { PeekHandlers } from '../devices/peek';
 import { Button, Dialog, Dots, Icon, Tooltip, VisuallyHidden, speed, useBusy } from 'oink-ui';
 import type { DialogProps } from 'oink-ui';
 import { OsLogo } from '../devices/icons';
@@ -101,7 +99,6 @@ export function RequestsGroup({ pairing, collapsed, onExpand, hidden = false }: 
     const reqs = useListPresence(requests);
     const open = !hidden && requests.length > 0;
     const headingId = useId();
-    const peek = usePeekScope();
     return (<section className="addp__group addp__fold" data-open={open ? '' : undefined} data-collapsed={collapsed ? '' : undefined} aria-labelledby={headingId} aria-hidden={!open || undefined}>
       <div className="addp__fold-in">
         <h3 className="devs__label addp__label" id={headingId}>
@@ -109,7 +106,7 @@ export function RequestsGroup({ pairing, collapsed, onExpand, hidden = false }: 
         </h3>
         <ul className="addp__list">
           {reqs.map(({ item, phase }) => (<FoldItem key={item.id} phase={phase}>
-              <RequestRow req={item} collapsed={collapsed} onExpand={onExpand} onAccept={() => actions.accept(item)} onReject={() => actions.reject(item)} peek={collapsed && peek ? peek.handlers(requestPeekId(item.id)) : undefined}/>
+              <RequestRow req={item} collapsed={collapsed} onExpand={onExpand} onAccept={() => actions.accept(item)} onReject={() => actions.reject(item)}/>
             </FoldItem>))}
         </ul>
       </div>
@@ -132,6 +129,8 @@ export function SelfInfo({ container }: {
         {more && (<button type="button" className="self-info__more ok-focusable" aria-haspopup="dialog" onClick={() => setAll(true)}>{tr('查看全部{0}个', SELF.ips.length)}<Icon name="chevron-right"/>
           </button>)}
       </span>
+      <span className="self-info__label">{tr('本机端口')}</span>
+      <span className="self-info__values"><span className="self-info__value self-info__ports">{network ? tr('QUIC：{0} · 数据传输：{1}', network.port, network.low_port ?? '—') : '—'}</span></span>
       <span className="self-info__label">{tr('本机 ID')}</span>
       <span className="self-info__values"><span className="self-info__value">{SELF.deviceId}</span></span>
       {more && (<Dialog {...containedProps} open={all} onOpenChange={setAll} container={container} size={360} title={tr('本机 IP 地址')} actions={<Button onClick={() => setAll(false)}>{tr('关闭')}</Button>}>
@@ -174,33 +173,27 @@ function RequestMark({ shown }: {
       <svg className="req-mark__dot" data-kind="accept" viewBox="-1.5 -1.5 15 15"><circle cx="6" cy="6" r="6"/><path d="M3.7 6.2 5.3 7.8 8.4 4.5"/></svg>
     </span>);
 }
-export const requestPeekId = (id: string) => `request:${id}`;
-export const fromRequestPeekId = (id: string) => (id.startsWith('request:') ? id.slice(8) : null);
-export function RequestRow({ req, collapsed, onExpand, onAccept, onReject, peek, inPeek }: {
+export function RequestRow({ req, collapsed, onExpand, onAccept, onReject }: {
     req: IncomingRequest;
     collapsed: boolean;
     onExpand: () => void;
     onAccept: () => void;
     onReject: () => void;
-    peek?: PeekHandlers;
-    inPeek?: boolean;
 }) {
     return (<div className="peer" data-ctx={`request:${req.id}`}>
       <PeerInfo peer={req} sub={req.ip} mark={<RequestMark shown={collapsed}/>}/>
       
-      {collapsed && (<button type="button" className="peer__expand ok-focusable" aria-label={tr('{0}（{1}）请求配对，展开侧栏处理', req.name, req.ip)} onClick={onExpand} {...peek}/>)}
+      {collapsed && (<button type="button" className="peer__expand ok-focusable" aria-label={tr('{0}（{1}）请求配对，展开侧栏处理', req.name, req.ip)} onClick={onExpand}/>)}
       <span className="peer__actions">
-        <Button size="sm" iconOnly className="peer__btn peer__btn--reject" aria-label={tr('拒绝 {0} 的配对请求', req.name)} tabIndex={inPeek ? -1 : undefined} onClick={onReject}>
+        <Button size="sm" iconOnly className="peer__btn peer__btn--reject" aria-label={tr('拒绝 {0} 的配对请求', req.name)} onClick={onReject}>
           <Icon name="x"/>
         </Button>
-        <Tooltip content={req.sourceCount===null?tr('接受后，对方的整个设备组将加入当前设备组'):tr('接受后，对方设备组的约 {0} 台设备将加入当前设备组', req.sourceCount)}><Button size="sm" iconOnly className="peer__btn peer__btn--accept" aria-label={tr('接受 {0} 的配对请求', req.name)} tabIndex={inPeek ? -1 : undefined} onClick={onAccept}>
+        <Tooltip content={req.sourceCount===null?tr('接受后，对方的整个设备组将加入当前设备组'):tr('接受后，对方设备组的约 {0} 台设备将加入当前设备组', req.sourceCount)}><Button size="sm" iconOnly className="peer__btn peer__btn--accept" aria-label={tr('接受 {0} 的配对请求', req.name)} onClick={onAccept}>
           <Icon name="check"/>
         </Button></Tooltip>
       </span>
     </div>);
 }
-const nearbyConnectors = new Map<string, () => void>();
-export const connectNearby = (id: string) => nearbyConnectors.get(id)?.();
 export function NearbyRow({ peer, onConnect, sub, ctx = false }: {
     peer: Peer;
     onConnect: () => Promise<unknown> | void;
@@ -215,16 +208,6 @@ export function NearbyRow({ peer, onConnect, sub, ctx = false }: {
         if (r)
             busy.run(r).catch(() => { });
     };
-    const connectRef = useRef(connect);
-    connectRef.current = connect;
-    useEffect(() => {
-        if (!ctx)
-            return;
-        const fn = () => connectRef.current();
-        nearbyConnectors.set(peer.id, fn);
-        return () => { if (nearbyConnectors.get(peer.id) === fn)
-            nearbyConnectors.delete(peer.id); };
-    }, [ctx, peer.id]);
     return (<div className="peer" data-ctx={ctx ? `nearby:${peer.id}` : undefined}>
       <PeerInfo peer={peer} sub={!peer.compatible ? peer.problem ?? tr('协议版本不兼容') : sub ?? formatAddress(peer)}/>
       <span className="peer__actions">

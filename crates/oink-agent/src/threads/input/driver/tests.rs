@@ -25,6 +25,9 @@ fn fixture_admission(peer: DeviceId, link: LinkId) -> wire::PeerAdmission {
                     "oink.clipboard/1",
                     "oink.low/1",
                     "oink.input/1",
+                    "oink.pointer.move/1",
+                    "oink.pointer.move-hidden/1",
+                    "oink.focus.local-click/1",
                     "oink.input.relative/1",
                     "oink.input.gestures/1",
                     "oink.input.contacts/1",
@@ -50,6 +53,7 @@ fn decode(bytes: &[u8]) -> oink_protocol::v1::Result<Message> {
     let frame = oink_protocol::v1::frame::OpaqueFrame::parse_exact(bytes, oink_protocol::v1::limits::RELIABLE_FRAME)?;
     match wire::decode(bytes, &admission, frame.header.type_id == 0x0209)? {
         wire::Decoded::Packet(packet) => Ok(packet),
+        wire::Decoded::Retired => Err(oink_protocol::v1::ErrorCode::UnsupportedValue.into()),
         wire::Decoded::Deferred(message) => crate::dnd::wire::decode(message).map(Message::Dnd),
     }
 }
@@ -160,7 +164,6 @@ impl Harness {
             capture_reports_key_repeat: false,
             local_input_transform: oink_foundation::input_transform::InputTransform::initial(std::env::consts::OS),
             layout: Arc::new(Snapshot::new(RouterLayout {
-                application_focus_enabled: false,
                 group: oink_foundation::GroupId([0; 16]),
                 owners: Arc::default(),
                 version: fixture_version(),
@@ -257,6 +260,34 @@ fn drain(read: &mut oink_network::link::RecvStream) -> Vec<Message> {
         messages.push(decode(&bytes).unwrap());
     }
     messages
+}
+
+#[test]
+fn pointer_shortcut_command_reaches_hidden_target_over_the_input_wire() {
+    use oink_display::layout::OwnerLayoutPreferences;
+    let mut h = Harness::new();
+    let (mut read, _) = h.outbound(1);
+    let (writer, _) = h.inbound(1);
+    opening(&writer, &remote(), true);
+    h.attach();
+    drain(&mut read);
+    let local = h.driver.local;
+    let layout = fixture_layout(local);
+    let owners = [(
+        peer(),
+        OwnerLayoutPreferences {
+            screen_shared: false,
+            ..Default::default()
+        },
+    )]
+    .into();
+    h.driver
+        .adapter
+        .router_mut()
+        .set_layout(Arc::new(oink_routing::TopologyLayout::from_layout(&layout, &owners)));
+    h.driver.command(InputCommand::MovePointerTo(peer()));
+    assert_eq!(h.driver.adapter.router().focus().holder, peer());
+    assert!(drain(&mut read).iter().any(|m| matches!(m, Message::Control(ControlMsg::MovePointerEnter { display, pos, .. }) if display == "screen" && *pos == fixture_display().bounds.center())));
 }
 
 #[test]
@@ -1328,7 +1359,6 @@ fn config_geometry_and_input_pair_availability_commute() {
         // This scenario explicitly starts without any adopted geometry.
         let empty = Arc::new(oink_display::layout::Layout::default());
         h.driver.snapshots.layout.publish(RouterLayout {
-            application_focus_enabled: false,
             group: oink_foundation::GroupId([0; 16]),
             owners: Arc::default(),
             version: fixture_version(),
@@ -1345,7 +1375,6 @@ fn config_geometry_and_input_pair_availability_commute() {
                 BTreeSet::from([local])
             };
             h.driver.snapshots.layout.publish(RouterLayout {
-                application_focus_enabled: false,
                 group: oink_foundation::GroupId([0; 16]),
                 owners: Arc::default(),
                 version: fixture_version(),
@@ -1751,50 +1780,6 @@ fn update_prepare_waits_for_injection_fence_and_abort_restores_admission() {
 }
 
 #[test]
-fn screen_identification_uses_attached_input_stream_and_obeys_pause() {
-    let mut h = Harness::new();
-    let (mut read, _) = h.outbound(1);
-    drain(&mut read);
-    h.driver.command(InputCommand::IdentifyScreens(11));
-    assert!(drain(&mut read).is_empty(), "unattached peers must not receive actions");
-    let (write, _) = h.inbound(1);
-    opening(&write, &remote(), true);
-    h.attach();
-    drain(&mut read);
-    h.driver.command(InputCommand::IdentifyScreens(12));
-    assert!(
-        drain(&mut read)
-            .iter()
-            .any(|message| matches!(message, Message::Control(ControlMsg::IdentifyScreens { id: 12 })))
-    );
-    write
-        .post(encode(&Message::Control(ControlMsg::IdentifyScreens { id: 13 })).unwrap())
-        .unwrap();
-    h.poll();
-    assert!(
-        h._main
-            .try_iter()
-            .any(|command| matches!(command, MainCommand::IdentifyScreens(13)))
-    );
-    h.driver.command(InputCommand::Paused(true));
-    h.driver.command(InputCommand::IdentifyScreens(14));
-    assert!(
-        !drain(&mut read)
-            .iter()
-            .any(|message| matches!(message, Message::Control(ControlMsg::IdentifyScreens { .. })))
-    );
-    write
-        .post(encode(&Message::Control(ControlMsg::IdentifyScreens { id: 15 })).unwrap())
-        .unwrap();
-    h.poll();
-    assert!(
-        !h._main
-            .try_iter()
-            .any(|command| matches!(command, MainCommand::IdentifyScreens(_)))
-    );
-}
-
-#[test]
 fn intentional_capture_withdrawal_keeps_keyboard_health_known() {
     use oink_protocol::v1::dto::ResourceFaultCode as Fault;
     let mut h = Harness::new();
@@ -2182,10 +2167,6 @@ fn migration_peer_facts_before_opening_preserve_caps_tap_mapping() {
             peer_os: initial_os, // Unknown when admission preceded the first DeviceFacts.
         });
         h.driver.command(InputCommand::PeerFacts {
-            application_modes: (
-                oink_foundation::input::InputMode::Shared,
-                oink_foundation::input::InputMode::Shared,
-            ),
             boot: fixture_boot(peer()),
             os: Os::Windows,
             displays: Vec::new(),
@@ -3047,63 +3028,6 @@ fn stale_mouse_disable_cannot_cross_safety_release() {
 }
 
 #[test]
-fn application_focus_cancel_invalidates_park_already_queued_to_stalled_native_owner() {
-    use oink_routing::{
-        ApplicationFocusCommand as C,
-        application_focus::{Claim, ParkRequest},
-    };
-    let mut h = Harness::new();
-    let request = ParkRequest {
-        claim: Claim {
-            epoch: 1,
-            pointer: fixture_boot(peer()),
-            scope: oink_routing::control::FocusScope {
-                members: vec![(h.driver.local, h.driver.adapter.routing_session()), (peer(), [2; 16])],
-            },
-        },
-        revision: 1,
-        operation: 1,
-        target: fixture_boot(h.driver.local),
-        expected: oink_foundation::application_focus::ObservationStamp {
-            generation: 1,
-            sequence: 1,
-        },
-    };
-    h.driver.application_focus_command(C::Park(request.clone()));
-    // The ordinary UI owner has not consumed its queue when cancellation runs.
-    h.driver.application_focus_command(C::Cancel(request.clone()));
-    let queued = h
-        ._main
-        .try_iter()
-        .find_map(|command| match command {
-            MainCommand::ApplicationFocus {
-                command: C::Park(queued),
-                permit,
-            } if queued == request => permit,
-            _ => None,
-        })
-        .expect("queued park permit");
-    assert!(!queued.valid(), "late native dispatch must not activate a window");
-    h.driver.application_focus_command(C::Park(ParkRequest {
-        operation: 2,
-        ..request
-    }));
-    let current = h
-        ._main
-        .try_iter()
-        .find_map(|command| match command {
-            MainCommand::ApplicationFocus {
-                command: C::Park(_),
-                permit,
-            } => permit,
-            _ => None,
-        })
-        .unwrap();
-    h.driver.application_focus_command(C::Dismiss(None));
-    assert!(!current.valid(), "disable also retires already queued native work");
-}
-
-#[test]
 fn passive_game_escape_readback_starts_on_hold_and_stops_on_release() {
     let (mut h, _, _) = target_cursor_fixture();
     h.driver.command(InputCommand::GameMode(GameMode::On));
@@ -3245,64 +3169,6 @@ fn display_enumeration_transient_failure_does_not_latch_a_notice() {
     assert_eq!(h.driver.shared.status.load().display_enumeration_fault, None);
 }
 
-#[test]
-fn application_focus_remote_commit_publishes_without_unrelated_native_work() {
-    use oink_foundation::input::InputMode;
-    use oink_routing::application_focus as a;
-    let mut h = Harness::new();
-    let (_reader, _) = h.outbound(1);
-    let (writer, _) = h.inbound(1);
-    let remote = remote();
-    opening(&writer, &remote, true);
-    h.attach();
-    h.driver.message(
-        peer(),
-        Message::Control(ControlMsg::FocusState {
-            lock_state: None,
-            epoch: 5,
-            holder: peer(),
-            scope: Some(input_scope(&h.driver)),
-            session: Some(remote.router().routing_session()),
-        }),
-    );
-    let local = fixture_boot(h.driver.local);
-    let router = h.driver.adapter.router_mut();
-    for boot in [local, fixture_boot(peer())] {
-        router.set_application_focus_participation(boot, true, (InputMode::Shared, InputMode::Shared), 0);
-    }
-    router.set_application_focus_enabled(true, 0);
-    h.driver.outputs(None);
-    h.driver.publish();
-    assert!(!h.driver.status_dirty);
-    let before = h.driver.shared.status.load();
-    let mut committed = h.driver.adapter.router().application_focus().unwrap().clone();
-    assert_eq!(committed.claim.pointer, fixture_boot(peer()));
-    committed.keyboard = Some(fixture_boot(peer()));
-    committed.phase = a::Phase::Active;
-    committed.reason = a::Reason::Ready;
-    committed.revision += 1;
-    h.driver.message(
-        peer(),
-        Message::Control(ControlMsg::ApplicationFocus(a::Message {
-            claim: committed.claim.clone(),
-            action: a::Action::Commit(committed.clone()),
-        })),
-    );
-    assert_eq!(h.driver.adapter.router().application_focus(), Some(&committed));
-    h.driver.publish();
-    assert_eq!(
-        h.driver.shared.status.load().application_focus.as_ref(),
-        Some(&committed)
-    );
-    assert_ne!(before.application_focus.as_ref(), Some(&committed));
-    let published = h.driver.shared.status.load();
-    h.driver.publish();
-    assert!(
-        Arc::ptr_eq(&published, &h.driver.shared.status.load()),
-        "unchanged state should retain its snapshot"
-    );
-}
-
 mod reconnect;
 
 #[test]
@@ -3353,7 +3219,7 @@ fn source_foreground_driver_follows_departure_return_and_live_policy() {
 }
 
 #[test]
-fn source_foreground_driver_restores_on_normal_return_and_delegates_application_focus() {
+fn source_foreground_driver_restores_on_normal_return() {
     let backend = Arc::new(oink_test_support::input::FakeInput::new());
     let mut h = Harness::with_backend(backend.clone());
     let (_reader, _) = h.outbound(1);
@@ -3366,9 +3232,6 @@ fn source_foreground_driver_restores_on_normal_return_and_delegates_application_
     h.driver.adapter.router_mut().move_pointer_to(peer()).unwrap();
     h.driver.outputs(None);
     h.driver.adapter.router_mut().return_pointer_home();
-    h.driver.outputs(None);
-    h.driver.adapter.router_mut().set_application_focus_enabled(true, 0);
-    h.driver.adapter.router_mut().move_pointer_to(peer()).unwrap();
     h.driver.outputs(None);
     let done = Arc::new(std::sync::atomic::AtomicU8::new(0));
     h.driver.inject.push(InjectItem::UpdateFence(done.clone()));
@@ -3403,4 +3266,39 @@ fn unavailable_injection_target_withdraws_capability_and_faults_both_resources()
     h.driver.command(InputCommand::Controllable(true));
     assert!(h.driver.controllable);
     assert_eq!(h.driver.resource_faults().keyboard, Some(Fault::None));
+}
+
+#[test]
+fn uncontrollable_input_owner_observes_local_click_commit_without_voting() {
+    let mut h = Harness::new();
+    let (mut read, _) = h.outbound(1);
+    let (write, _) = h.inbound(1);
+    let remote = remote();
+    opening(&write, &remote, true);
+    h.attach();
+    drain(&mut read);
+    h.driver.command(InputCommand::Controllable(false));
+    assert!(h.driver.adapter.router().paused());
+    let scope = oink_routing::control::FocusScope {
+        members: vec![(peer(), remote.routing_session())],
+    };
+    for phase in [0, 3] {
+        let message = Message::Control(ControlMsg::LocalClick {
+            epoch: 100,
+            holder: peer(),
+            scope: scope.clone(),
+            phase,
+        });
+        write.post(encode(&message).unwrap()).unwrap();
+        h.poll();
+    }
+    assert_eq!(h.driver.adapter.router().focus_claim(), (100, peer()));
+    assert!(
+        !drain(&mut read)
+            .iter()
+            .any(|m| matches!(m, Message::Control(ControlMsg::LocalClick { phase: 0..=2, .. })))
+    );
+    h.driver.command(InputCommand::Controllable(true));
+    assert!(!h.driver.adapter.router().paused());
+    assert_eq!(h.driver.adapter.router().focus_claim(), (100, peer()));
 }

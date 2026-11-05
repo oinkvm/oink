@@ -112,13 +112,16 @@ async fn manual_query_silent_udp_peer_has_five_second_budget() {
 }
 
 async fn node() -> (LinkLayer, ConfigPort, ModulePort) {
+    node_profile(frames::profile()).await
+}
+async fn node_profile(profile: crate::negotiation::OfferProfile) -> (LinkLayer, ConfigPort, ModulePort) {
     let identity = Arc::new(Identity::generate());
     let boot = Boot {
         device_id: identity.id(),
         nonce: rand::random(),
     };
     let (network, config) = LinkLayer::start(LinkConfig {
-        profile: frames::profile(),
+        profile,
         identity,
         boot,
         bind: (
@@ -134,13 +137,14 @@ async fn node() -> (LinkLayer, ConfigPort, ModulePort) {
     (network, config, module)
 }
 #[tokio::test]
-async fn loopback_fixture_keeps_tcp_and_discovery_reserved_until_their_owners_start() {
+async fn loopback_fixture_starts_low_and_keeps_discovery_reserved() {
     let (network, _, _) = node().await;
     let address = network.local_addr();
-    let tcp = std::net::TcpListener::bind(address);
+    assert_eq!(network.low_local_addr(), Some(address));
+    let tcp = std::net::TcpStream::connect(address);
     let discovery = std::net::UdpSocket::bind((address.ip(), address.port() + 1));
     network.stop().await;
-    // Shutdown releases even a Low reservation whose lazy listener never ran.
+    // Shutdown releases the eagerly started Low listener.
     let _low_after_stop = std::net::TcpListener::bind(address).unwrap();
     // The fixtures share a QUIC/TCP port and the next UDP port is discovery.
     // OS-assigned UDP ports can be excluded for TCP on Windows. Use the
@@ -149,10 +153,7 @@ async fn loopback_fixture_keeps_tcp_and_discovery_reserved_until_their_owners_st
         address.port() < 32768,
         "fixture selected an OS ephemeral UDP port: {address}"
     );
-    assert!(
-        tcp.is_err(),
-        "Low socket must stay reserved until its lazy listener starts"
-    );
+    assert!(tcp.is_ok(), "reserved fixture TCP listener unavailable: {tcp:?}");
     assert!(
         discovery.is_err(),
         "discovery socket must stay reserved until discovery starts"
@@ -582,4 +583,165 @@ async fn a_new_address_connects_during_a_pending_relay_search() {
     assert_eq!(a.links().links.len(), 1);
     assert_eq!(b.links().links.len(), 1);
     tokio::join!(a.stop(), b.stop());
+}
+
+#[tokio::test]
+async fn fourth_heartbeat_writes_n0_i0_m0_in_one_poll_turn_and_repeats_after_two_seconds() {
+    let mut profile = frames::profile();
+    profile
+        .capabilities
+        .extend(["oink.audio/1".into(), "oink.audio.state/1".into()]);
+    let (a, mut ac, _) = node_profile(profile.clone()).await;
+    let (b, mut bc, _) = node_profile(profile).await;
+    let mut input = b.register(&[StreamKind::Input]);
+    let mut audio = b.register(&[StreamKind::Audio]);
+    a.dial(b.id(), vec![b.local_addr()], DialMode::DirectOnly).unwrap();
+    let (al, bl) = tokio::join!(connected(&mut ac), connected(&mut bc));
+    a.set_ready(al.link);
+    b.set_ready(bl.link);
+    timeout(Duration::from_secs(4), async {
+        while !a.links().ready(b.id()) || !b.links().ready(a.id()) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    fn hex(text: &str) -> Vec<u8> {
+        (0..text.trim().len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text.trim()[i..i + 2], 16).unwrap())
+            .collect()
+    }
+    let mut sends = Vec::new();
+    for (kind, encoded) in [
+        (
+            StreamKind::Input,
+            hex(include_str!("../../../../oink-protocol/tests/fixtures/v1/0102.hex")),
+        ),
+        (
+            StreamKind::Audio,
+            hex(include_str!("../../../../oink-protocol/tests/fixtures/v1/0602.hex")),
+        ),
+    ] {
+        let (tx, _) = a
+            .open_stream(
+                al.link,
+                if kind == StreamKind::Input {
+                    Priority::Interactive
+                } else {
+                    Priority::Normal
+                },
+                StreamTag { kind, ordinal: 1 },
+                QueueSpec::reliable(kind).0,
+                None,
+            )
+            .unwrap();
+        // Only registration: the first records must open their original streams on the heartbeat.
+        tx.set_heartbeat_messages(vec![encoded.clone()]).unwrap();
+        sends.push((tx, encoded));
+    }
+    let mut receives = Vec::new();
+    for (port, kind) in [(&mut input, StreamKind::Input), (&mut audio, StreamKind::Audio)] {
+        let inbound = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(ModuleEvent::Inbound(stream)) = port.next().await {
+                    break stream;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let (rx, _) = inbound.accept(QueueSpec::reliable(kind).1, QueueSpec::datagram(kind));
+        receives.push(rx);
+    }
+    for _ in 0..2 {
+        for (index, rx) in receives.iter_mut().enumerate() {
+            assert_eq!(
+                timeout(Duration::from_secs(4), rx.next()).await.unwrap().unwrap(),
+                sends[index].1
+            );
+        }
+    }
+    let batches = a.0.heartbeat_batches.lock().unwrap().clone();
+    tokio::join!(a.stop(), b.stop());
+    let periodic: Vec<_> = batches
+        .iter()
+        .filter(|(_, _, kinds)| kinds.contains(&StreamKind::Input) || kinds.contains(&StreamKind::Audio))
+        .collect();
+    assert!(periodic.len() >= 2);
+    for (nonce, _, kinds) in &periodic {
+        assert!(nonce.is_multiple_of(4));
+        assert!(kinds.contains(&StreamKind::Internal));
+        assert!(kinds.contains(&StreamKind::Input));
+        assert!(kinds.contains(&StreamKind::Audio));
+    }
+    assert_eq!(periodic[1].0 - periodic[0].0, 4);
+    let elapsed = periodic[1].1.duration_since(periodic[0].1);
+    assert!(elapsed >= Duration::from_millis(1900), "period was {elapsed:?}");
+}
+
+#[tokio::test]
+async fn occupied_ports_still_allow_probe_quic_and_low_with_announced_ports() {
+    for (hold_udp, hold_tcp) in [(true, false), (false, true), (true, true)] {
+        let preferred = SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            crate::test_ports::reserve(std::net::Ipv4Addr::LOCALHOST.into()),
+        ));
+        let udp = crate::test_ports::take_udp(preferred).unwrap();
+        let tcp = crate::test_ports::take_tcp(preferred).unwrap();
+        let _udp = hold_udp.then_some(udp);
+        let _tcp = hold_tcp.then_some(tcp);
+        let identity = Arc::new(Identity::generate());
+        let (b, mut bc) = LinkLayer::start(LinkConfig {
+            profile: frames::profile(),
+            boot: Boot {
+                device_id: identity.id(),
+                nonce: rand::random(),
+            },
+            identity,
+            bind: preferred,
+            tier: Tier::Elevated,
+        })
+        .await
+        .unwrap();
+        if hold_udp {
+            assert_ne!(b.local_addr(), preferred);
+        }
+        if hold_tcp {
+            assert_ne!(b.low_local_addr(), Some(preferred));
+        }
+        let mut b_module = b.register(&[StreamKind::Diagnostics]);
+        let (a, mut ac, _) = node().await;
+        // A manual probe opens the actual announced QUIC service.
+        let found = a.probe_address(b.local_addr()).await.unwrap();
+        assert_eq!(found, b.id());
+        let (ac, bc) = tokio::join!(connected(&mut ac), connected(&mut bc));
+        a.set_ready(ac.link);
+        b.set_ready(bc.link);
+        timeout(Duration::from_secs(2), async {
+            while !a.links().ready(b.id()) || !b.links().ready(a.id()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut low = a
+            .open_low(
+                ac.link,
+                StreamKind::Diagnostics,
+                LowOptions {
+                    send_max: 100000,
+                    receive_max: 100000,
+                    operation_max: 200000,
+                },
+            )
+            .await
+            .unwrap();
+        let first = frames::low(7, 1000);
+        low.send(&first).await.unwrap();
+        // TCP can differ from QUIC: only the authenticated frozen Low::Info
+        // contains the dial destination; no port arithmetic can pass this case.
+        assert_eq!(incoming(&mut b_module).await.first, first);
+        tokio::join!(a.stop(), b.stop());
+    }
 }

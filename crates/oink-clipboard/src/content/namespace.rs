@@ -18,8 +18,9 @@ pub use files::Files;
 pub(crate) use files::Flat;
 pub(crate) use files::Names;
 
-/// The OS-owned received copy. Source reads use Namespace::open; native
-/// stream/promise readers use this copy, which may trigger OS hydration.
+/// The received copy owned by the OS provider or direct clipboard cache.
+/// Source reads use Namespace::open; native stream/promise readers use this
+/// copy, which may trigger hydration or bounded cache materialization.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct StoredFile {
     pub node: NodeId,
@@ -60,6 +61,14 @@ pub trait NativeFiles: Send + Sync + 'static {
 }
 
 pub trait Namespace: Send + Sync + 'static {
+    /// A native clipboard consumer has requested actual files. Deferred local
+    /// receivers share this trigger with the explicit receive-files action.
+    fn start_native_delivery(&self) {}
+    /// Cancel a bounded direct receiver's source reads as well as its native
+    /// operation. Ordinary owner loss still uses cancel() and preserves links.
+    fn cancel_native_delivery(&self) {
+        self.cancel();
+    }
     fn native_consumed(&self, _nodes: &[NodeId]) -> io::Result<()> {
         Ok(())
     }
@@ -88,6 +97,19 @@ pub trait Namespace: Send + Sync + 'static {
     /// executor. No native path may be exposed before this succeeds.
     fn prepare(&self) -> io::Result<()> {
         Ok(())
+    }
+    /// A metadata publication may be superseded while it waits on a remote
+    /// grant. Local implementations retain their synchronous preparation.
+    fn prepare_while(&self, current: &dyn Fn() -> bool) -> io::Result<()> {
+        if !current() {
+            return Err(unavailable(Unavailable::Cancelled));
+        }
+        self.prepare()?;
+        if current() {
+            Ok(())
+        } else {
+            Err(unavailable(Unavailable::Cancelled))
+        }
     }
     fn bind_native(&self, _native: std::sync::Weak<dyn NativeFiles>) -> io::Result<()> {
         Ok(())
@@ -225,6 +247,12 @@ impl Restricted {
     }
 }
 impl Namespace for Restricted {
+    fn start_native_delivery(&self) {
+        self.inner.start_native_delivery();
+    }
+    fn cancel_native_delivery(&self) {
+        self.inner.cancel_native_delivery();
+    }
     fn release_fulfilled(&self, roots: &[NodeId]) {
         let roots: Vec<_> = roots
             .iter()
@@ -252,7 +280,10 @@ impl Namespace for Restricted {
         self.inner.requires_native_files()
     }
     fn prepare(&self) -> io::Result<()> {
-        self.inner.prepare()?;
+        self.prepare_while(&|| true)
+    }
+    fn prepare_while(&self, current: &dyn Fn() -> bool) -> io::Result<()> {
+        self.inner.prepare_while(current)?;
         let roots = self.resolved_roots()?;
         let mut allowed = self.allowed.lock().unwrap();
         for previous in &self.roots {

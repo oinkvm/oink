@@ -352,3 +352,280 @@ fn reentrant_fake_shift_up_cannot_displace_the_real_shift_release() {
     assert!(physical_keys().is_empty());
     assert_eq!(with_state(|s| s.keys.len()), Some(0));
 }
+
+#[test]
+fn modifier_trace_distinguishes_filtered_and_deferred_releases_without_changing_routes() {
+    use keyboard_trace::{Outcome, Stage, TEST_RECORDS};
+    let f = Fixture::new();
+    TEST_RECORDS.with_borrow_mut(|r| *r = Some(Vec::new()));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_RECORDS.with_borrow_mut(|r| *r = None);
+        }
+    }
+    let _reset = Reset;
+    deliver(0x5b, 0x5b, true, false, true);
+    assert!(with_state(|s| s.keys.contains_key(&KeyCode::LEFT_GUI.0)).unwrap());
+    // External-local UP is observed, but must not release the physical hold.
+    deliver(0x5b, 0x5b, true, true, false);
+    assert!(with_state(|s| s.keys.contains_key(&KeyCode::LEFT_GUI.0)).unwrap());
+    // A real UP while the owner is borrowed is deferred, not lost.
+    STATE.with(|state| {
+        let _borrow = state.borrow_mut();
+        assert_eq!(deliver(0x5b, 0x5b, true, false, false).0, 0);
+    });
+    key_releases::drain();
+    assert!(!with_state(|s| s.keys.contains_key(&KeyCode::LEFT_GUI.0)).unwrap());
+    let events = f.events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        events[0].event,
+        InputEvent::Key {
+            code: KeyCode::LEFT_GUI,
+            pressed: true
+        }
+    ));
+    assert!(matches!(
+        events[1].event,
+        InputEvent::Key {
+            code: KeyCode::LEFT_GUI,
+            pressed: false
+        }
+    ));
+    drop(events);
+    let records = TEST_RECORDS.with_borrow(|r| r.clone().unwrap());
+    assert_eq!(records.iter().filter(|r| r.reason == Stage::Enter as u32).count(), 3);
+    assert_eq!(records.iter().filter(|r| r.reason == Stage::Exit as u32).count(), 3);
+    assert!(records.iter().any(|r| r.reason == Stage::Exit as u32
+        && r.flags >> 16 == Outcome::ExternalLocal as u32
+        && r.steps == Some(8)));
+    assert!(
+        records
+            .iter()
+            .any(|r| r.reason == Stage::Exit as u32 && r.flags >> 16 == Outcome::Reentrant as u32 && r.steps.is_none())
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r.reason == Stage::Deferred as u32 && r.success == Some(true))
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r.reason == Stage::Drained as u32 && r.steps == Some(0))
+    );
+    // An ordinary key never adds a modifier trace record.
+    let before = records.len();
+    deliver(0x41, 0x1e, false, false, true);
+    deliver(0x41, 0x1e, false, false, false);
+    assert_eq!(TEST_RECORDS.with_borrow(|r| r.as_ref().unwrap().len()), before);
+}
+
+#[test]
+fn modifier_trace_observes_lock_guard_and_own_up_without_clearing_physical_hold() {
+    use keyboard_trace::{Outcome, Stage, TEST_RECORDS};
+    struct Guard;
+    impl crate::capture_loop::CaptureLoop for Guard {
+        fn set_wake(&mut self, _: crate::capture_loop::Wake) {}
+        fn event(&mut self, _: &CapturedEvent) -> Disposition {
+            panic!("guard must bypass handler")
+        }
+        fn poll(&mut self, _: Instant) -> Option<Instant> {
+            None
+        }
+        fn stopped(&self) -> bool {
+            false
+        }
+        fn keyboard_disabled(&self) -> bool {
+            true
+        }
+        fn keyboard_guard_suspended(&self) -> bool {
+            true
+        }
+    }
+    let f = Fixture::new();
+    TEST_RECORDS.with_borrow_mut(|r| *r = Some(Vec::new()));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_RECORDS.with_borrow_mut(|r| *r = None);
+        }
+    }
+    let _reset = Reset;
+    deliver(0x5b, 0x5b, true, false, true);
+    let own = KBDLLHOOKSTRUCT {
+        vkCode: 0x5b,
+        scanCode: 0x5b,
+        flags: KBDLLHOOKSTRUCT_FLAGS(LLKHF_EXTENDED.0 | LLKHF_INJECTED.0 | 0x80),
+        dwExtraInfo: INJECT_TAG,
+        ..Default::default()
+    };
+    keyboard_proc_with_next(
+        0,
+        WPARAM(WM_KEYUP as usize),
+        LPARAM((&own as *const KBDLLHOOKSTRUCT) as isize),
+        || LRESULT(0),
+    );
+    crate::capture_loop::install(Box::new(Guard), Arc::new(|| {}));
+    assert_eq!(deliver(0x5b, 0x5b, true, false, false).0, 0);
+    assert!(with_state(|s| s.keys.contains_key(&KeyCode::LEFT_GUI.0)).unwrap());
+    assert_eq!(f.events.lock().unwrap().len(), 1);
+    let records = TEST_RECORDS.with_borrow(|r| r.clone().unwrap());
+    for reason in [Outcome::Own, Outcome::LockGuard] {
+        assert!(
+            records
+                .iter()
+                .any(|r| r.reason == Stage::Exit as u32 && r.flags >> 16 == reason as u32 && r.steps == Some(8))
+        );
+    }
+}
+
+#[test]
+fn boundary_reconcile_retires_only_locally_passed_physical_modifiers() {
+    let f = Fixture::new();
+    let recorded = f.events.clone();
+    with_state(|s| {
+        s.handler = Arc::new(move |event| {
+            recorded.lock().unwrap().push(event.clone());
+            Disposition::Pass
+        })
+    });
+    deliver(0x5b, 0x5b, true, false, true);
+    assert_eq!(
+        with_state(|s| s.keys.get(&KeyCode::LEFT_GUI.0).copied()),
+        Some(Some(false))
+    );
+    assert_eq!(modifier_reconcile::with_sample_for_test(8, None), 0);
+    assert_eq!(modifier_reconcile::with_sample_for_test(8, Some(8)), 0);
+    {
+        let _in_keyboard_callback = modifier_reconcile::KeyboardCallback::enter();
+        assert_eq!(modifier_reconcile::with_sample_for_test(8, Some(0)), 0);
+    }
+    let events = f.events.lock().unwrap().len();
+    assert_eq!(modifier_reconcile::with_sample_for_test(8, Some(0)), 8);
+    assert_eq!(modifier_reconcile::with_sample_for_test(8, Some(0)), 0);
+    assert_eq!(with_state(|s| s.keys.contains_key(&KeyCode::LEFT_GUI.0)), Some(false));
+    assert!(!physical_keys().contains(&KeyCode::LEFT_GUI));
+    // Router consumes the returned mask. No callback recursion or OS injection.
+    assert_eq!(f.events.lock().unwrap().len(), events);
+}
+
+#[test]
+fn boundary_reconcile_excludes_swallow_external_and_downstream_rejection() {
+    let f = Fixture::new();
+
+    deliver(0x5b, 0x5b, true, false, true);
+    assert_eq!(modifier_reconcile::with_sample_for_test(8, Some(0)), 0);
+    deliver(0x5b, 0x5b, true, false, false);
+    let recorded = f.events.clone();
+    with_state(|s| {
+        s.handler = Arc::new(move |event| {
+            recorded.lock().unwrap().push(event.clone());
+            Disposition::Pass
+        })
+    });
+    deliver(0x5b, 0x5b, true, false, true);
+    // External-local UP affects system state but is not a physical release.
+    // It must invalidate even when the native state is borrowed.
+    with_state(|_| {
+        deliver(0x5b, 0x5b, true, true, false);
+    });
+    assert_eq!(modifier_reconcile::with_sample_for_test(8, Some(0)), 0);
+    deliver(0x5b, 0x5b, true, false, false);
+    let info = KBDLLHOOKSTRUCT {
+        vkCode: 0x5b,
+        scanCode: 0x5b,
+        flags: KBDLLHOOKSTRUCT_FLAGS(1),
+        ..Default::default()
+    };
+    keyboard_proc_with_next(
+        0,
+        WPARAM(WM_KEYDOWN as usize),
+        LPARAM((&info as *const KBDLLHOOKSTRUCT) as isize),
+        || LRESULT(1),
+    );
+    assert_eq!(modifier_reconcile::with_sample_for_test(8, Some(0)), 0);
+    deliver(0x5b, 0x5b, true, false, false);
+    deliver(0x5b, 0x5b, true, false, true);
+    assert_eq!(modifier_reconcile::with_sample_for_test(8, Some(0)), 8);
+}
+
+#[test]
+fn native_boundary_probe_prevents_lost_win_up_from_becoming_remote_control() {
+    let _f = Fixture::new();
+    let mut r = Router::new(
+        RouterConfig::new(
+            Boot {
+                device_id: ME,
+                nonce: [1; 16],
+            },
+            "source",
+            Os::Windows,
+        ),
+        Arc::new(SimpleLayout::new()),
+    );
+    r.attach_input(
+        Boot {
+            device_id: PEER,
+            nonce: [2; 16],
+        },
+        [2; 16],
+        true,
+        false,
+        Default::default(),
+        0,
+    );
+    r.set_peer_os(PEER, Os::MacOS, 0);
+    r.set_modifier_release_probe(Arc::new(|mask| modifier_reconcile::with_sample_for_test(mask, Some(0))));
+    let router = Arc::new(Mutex::new(r));
+    let owner = router.clone();
+    with_state(|s| {
+        s.mode = CaptureMode::Local;
+        s.handler = Arc::new(move |event| owner.lock().unwrap().on_local_event(event, 1));
+    });
+    assert_eq!(deliver(0x5b, 0x5b, true, false, true), LRESULT(0));
+    // Fixture omits the physical UP, but supplies the boundary's OS-up sample.
+    // No real input, async-state query, hook installation or desktop operation.
+    let mut r = router.lock().unwrap();
+    r.drain_outputs();
+    focus_remote(&mut r, 8);
+    let out = r.drain_outputs();
+    assert!(!out.iter().any(|o| matches!(
+        o,
+        Output::Send {
+            msg: Packet::Input(oink_routing::input::InputMsg::Key {
+                code: KeyCode::LEFT_GUI,
+                pressed: true
+            }),
+            ..
+        }
+    )));
+    assert_eq!(with_state(|s| s.keys.contains_key(&KeyCode::LEFT_GUI.0)), Some(false));
+    assert!(!physical_keys().contains(&KeyCode::LEFT_GUI));
+}
+
+#[test]
+fn boundary_reconcile_treats_neutral_synthetic_modifier_as_both_sides() {
+    let f = Fixture::new();
+    let recorded = f.events.clone();
+    with_state(|s| {
+        s.handler = Arc::new(move |event| {
+            recorded.lock().unwrap().push(event.clone());
+            Disposition::Pass
+        })
+    });
+    // Physical LCtrl, RShift and RAlt passed locally; another program then
+    // injects neutral UPs. Async zero no longer describes these physical holds.
+    deliver(0xa2, 0x1d, false, false, true);
+    deliver(0xa1, 0x36, true, false, true);
+    deliver(0xa5, 0x38, true, false, true);
+    assert_eq!(modifier_reconcile::with_sample_for_test(0x61, Some(0)), 0x61);
+    deliver(0xa2, 0x1d, false, false, true);
+    deliver(0xa1, 0x36, true, false, true);
+    deliver(0xa5, 0x38, true, false, true);
+    deliver(0x11, 0, false, true, false);
+    deliver(0x10, 0, false, true, false);
+    deliver(0x12, 0, false, true, false);
+    assert_eq!(modifier_reconcile::with_sample_for_test(0x61, Some(0)), 0);
+}

@@ -12,14 +12,12 @@ use oink_routing::{
 };
 
 type Fields<'a> = &'a [(u32, V<'a>)];
-use oink_routing::application_focus::keys::KeyRoute;
 fn frame(
     name: &str,
     body: Fields<'_>,
     origin: Option<Boot>,
     hops: u8,
     time: Option<n::CaptureTime>,
-    application: Option<&KeyRoute>,
     out: &mut [u8],
 ) -> v1::Result<usize> {
     if origin.is_some() != (hops > 0) {
@@ -34,31 +32,6 @@ fn frame(
     let device = origin.map(|boot| boot.device_id.0).unwrap_or_default();
     let identity = [(1, V::Text(w::ED25519)), (2, V::Bytes(&device))];
     let boot = [(1, V::Map(&identity)), (2, V::Bytes(&nonce))];
-    let empty = KeyRoute {
-        epoch: 0,
-        pointer: Boot {
-            device_id: DeviceId([0; 32]),
-            nonce: [0; 16],
-        },
-        revision: 0,
-        destination: Boot {
-            device_id: DeviceId([0; 32]),
-            nonce: [0; 16],
-        },
-        press_id: 0,
-    };
-    let route = application.unwrap_or(&empty);
-    let pointer_id = [(1, V::Text(w::ED25519)), (2, V::Bytes(&route.pointer.device_id.0))];
-    let pointer_boot = [(1, V::Map(&pointer_id)), (2, V::Bytes(&route.pointer.nonce))];
-    let destination_id = [(1, V::Text(w::ED25519)), (2, V::Bytes(&route.destination.device_id.0))];
-    let destination_boot = [(1, V::Map(&destination_id)), (2, V::Bytes(&route.destination.nonce))];
-    let application_fields = [
-        (1, V::Uint(route.epoch)),
-        (2, V::Map(&pointer_boot)),
-        (3, V::Uint(route.revision)),
-        (4, V::Map(&destination_boot)),
-        (5, V::Uint(route.press_id)),
-    ];
     let mut fields = [(0, V::Null); 11];
     let mut count = 0;
     for field in body.iter().filter(|(key, _)| *key < 100) {
@@ -72,13 +45,6 @@ fn frame(
     }
     if let Some(time) = time {
         fields[count] = (102, V::Uint(u64::from(time.0)));
-        count += 1;
-    }
-    if application.is_some() {
-        if origin.is_none() || route.press_id == 0 {
-            return Err(v1::ErrorCode::MalformedFrame.into());
-        }
-        fields[count] = (103, V::Map(&application_fields));
         count += 1;
     }
     for field in body.iter().filter(|(key, _)| *key >= 103) {
@@ -198,47 +164,8 @@ pub(super) fn encode(input: &InputMsg, time: Option<n::CaptureTime>, out: &mut [
         }
         input => (input, None, 0),
     };
-    let application = match input {
-        InputMsg::ApplicationKey { route, .. }
-        | InputMsg::ApplicationRepeat { route, .. }
-        | InputMsg::ApplicationHeldSync { route, .. } => Some(route),
-        _ => None,
-    };
-    let emit = |name, body: Fields<'_>, out: &mut [u8]| frame(name, body, origin, hops, time, application, out);
+    let emit = |name, body: Fields<'_>, out: &mut [u8]| frame(name, body, origin, hops, time, out);
     match input {
-        InputMsg::ApplicationKey {
-            code,
-            physical_code,
-            pressed,
-            ..
-        } => {
-            let fields = [
-                (1, V::Uint(u64::from(code.0))),
-                (2, V::Bool(*pressed)),
-                (3, V::Uint(u64::from(physical_code.unwrap_or(*code).0))),
-            ];
-            emit("InputKey", &fields[..if physical_code.is_some() { 3 } else { 2 }], out)
-        }
-        InputMsg::ApplicationRepeat { code, n, .. } => emit(
-            "InputKeyRepeat",
-            &[(1, V::Uint(u64::from(code.0))), (2, V::Uint(u64::from(*n)))],
-            out,
-        ),
-        InputMsg::ApplicationHeldSync { keys, .. } => {
-            if keys.len() > 256 {
-                return Err(v1::ErrorCode::UnsupportedValue.into());
-            }
-            let entries: Vec<_> = keys
-                .iter()
-                .map(|(code, id)| [(1, V::Uint(u64::from(code.0))), (2, V::Uint(*id))])
-                .collect();
-            let values: Vec<_> = entries.iter().map(|entry| V::Map(entry)).collect();
-            emit(
-                "InputHeldSync",
-                &[(1, V::Array(&[])), (2, V::Array(&[])), (104, V::Array(&values))],
-                out,
-            )
-        }
         InputMsg::Motion { seq, dx, dy } => emit(
             "InputMotion",
             &[(1, V::Uint(*seq)), (2, V::F64(*dx)), (3, V::F64(*dy))],
@@ -497,20 +424,6 @@ pub(super) fn encode(input: &InputMsg, time: Option<n::CaptureTime>, out: &mut [
     }
 }
 
-fn read_application_route(v: View<'_, w::ApplicationKeyRoute>) -> v1::Result<KeyRoute> {
-    let route = KeyRoute {
-        epoch: v.epoch()?,
-        pointer: read_boot(v.pointer()?)?,
-        revision: v.revision()?,
-        destination: read_boot(v.destination()?)?,
-        press_id: v.press_id()?,
-    };
-    if route.press_id == 0 {
-        return Err(v1::ErrorCode::MalformedFrame.into());
-    }
-    Ok(route)
-}
-
 pub(super) fn decode(frame: OpaqueFrame<'_>) -> v1::Result<Packet> {
     let value = hot::Message::decode(frame)?;
     macro_rules! decoded {
@@ -522,16 +435,6 @@ pub(super) fn decode(frame: OpaqueFrame<'_>) -> v1::Result<Packet> {
                 return Err(v1::ErrorCode::MalformedFrame.into());
             }
             let input = $input;
-            if origin.is_none()
-                && matches!(
-                    input,
-                    InputMsg::ApplicationKey { .. }
-                        | InputMsg::ApplicationRepeat { .. }
-                        | InputMsg::ApplicationHeldSync { .. }
-                )
-            {
-                return Err(v1::ErrorCode::MalformedFrame.into());
-            }
             let input = if let Some(origin) = origin {
                 InputMsg::Forwarded {
                     origin,
@@ -571,29 +474,16 @@ pub(super) fn decode(frame: OpaqueFrame<'_>) -> v1::Result<Packet> {
         ),
         hot::Message::InputKey(v) => decoded!(
             v,
-            if let Some(route) = v.application_route()? {
-                let physical_code = v.physical_code()?.map(n::KeyCode);
-                if physical_code.is_some_and(|code| code != n::KeyCode::CAPS_LOCK) {
-                    return Err(v1::ErrorCode::UnsupportedValue.into());
-                }
-                InputMsg::ApplicationKey {
-                    route: read_application_route(route)?,
+            match v.physical_code()? {
+                None => InputMsg::Key {
                     code: n::KeyCode(v.code()?),
-                    physical_code,
                     pressed: v.pressed()?,
-                }
-            } else {
-                match v.physical_code()? {
-                    None => InputMsg::Key {
-                        code: n::KeyCode(v.code()?),
-                        pressed: v.pressed()?,
-                    },
-                    Some(code) if code == n::KeyCode::CAPS_LOCK.0 => InputMsg::CapsKey {
-                        code: n::KeyCode(v.code()?),
-                        pressed: v.pressed()?,
-                    },
-                    _ => return Err(v1::ErrorCode::UnsupportedValue.into()),
-                }
+                },
+                Some(code) if code == n::KeyCode::CAPS_LOCK.0 => InputMsg::CapsKey {
+                    code: n::KeyCode(v.code()?),
+                    pressed: v.pressed()?,
+                },
+                _ => return Err(v1::ErrorCode::UnsupportedValue.into()),
             }
         ),
         hot::Message::InputButton(v) => decoded!(
@@ -617,47 +507,18 @@ pub(super) fn decode(frame: OpaqueFrame<'_>) -> v1::Result<Packet> {
                     .transpose()?,
             }
         ),
-        hot::Message::InputHeldSync(v) => decoded!(v, {
-            if let Some(route) = v.application_route()? {
-                if v.keys()?.next().is_some() || v.buttons()?.next().is_some() {
-                    return Err(v1::ErrorCode::MalformedFrame.into());
-                }
-                let route = read_application_route(route)?;
-                let keys = v
-                    .application_keys()?
-                    .ok_or(v1::ErrorCode::MalformedFrame)?
-                    .map(|entry| {
-                        let entry = entry?;
-                        Ok((n::KeyCode(entry.code()?), entry.press_id()?))
-                    })
-                    .collect::<v1::Result<Vec<_>>>()?;
-                if keys.iter().any(|(_, id)| *id == 0 || *id > route.press_id) {
-                    return Err(v1::ErrorCode::MalformedFrame.into());
-                }
-                InputMsg::ApplicationHeldSync { route, keys }
-            } else {
-                if v.application_keys()?.is_some() {
-                    return Err(v1::ErrorCode::MalformedFrame.into());
-                }
-                InputMsg::HeldSync {
-                    keys: v.keys()?.map(|v| v.map(n::KeyCode)).collect::<v1::Result<_>>()?,
-                    buttons: v.buttons()?.map(|v| read_button(v?)).collect::<v1::Result<_>>()?,
-                }
+        hot::Message::InputHeldSync(v) => decoded!(
+            v,
+            InputMsg::HeldSync {
+                keys: v.keys()?.map(|v| v.map(n::KeyCode)).collect::<v1::Result<_>>()?,
+                buttons: v.buttons()?.map(|v| read_button(v?)).collect::<v1::Result<_>>()?,
             }
-        }),
+        ),
         hot::Message::InputKeyRepeat(v) => decoded!(
             v,
-            if let Some(route) = v.application_route()? {
-                InputMsg::ApplicationRepeat {
-                    route: read_application_route(route)?,
-                    code: n::KeyCode(v.code()?),
-                    n: v.n()?,
-                }
-            } else {
-                InputMsg::KeyRepeat {
-                    code: n::KeyCode(v.code()?),
-                    n: v.n()?,
-                }
+            InputMsg::KeyRepeat {
+                code: n::KeyCode(v.code()?),
+                n: v.n()?,
             }
         ),
         hot::Message::InputGesture(v) => decoded!(
@@ -737,74 +598,6 @@ pub(super) fn decode(frame: OpaqueFrame<'_>) -> v1::Result<Packet> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn application_keys_preserve_source_hops_capture_time_and_caps_identity() {
-        let source = Boot {
-            device_id: DeviceId([3; 32]),
-            nonce: [3; 16],
-        };
-        let route = KeyRoute {
-            epoch: 9,
-            pointer: Boot {
-                device_id: DeviceId([1; 32]),
-                nonce: [1; 16],
-            },
-            revision: 4,
-            destination: Boot {
-                device_id: DeviceId([2; 32]),
-                nonce: [2; 16],
-            },
-            press_id: 17,
-        };
-        for event in [
-            InputMsg::ApplicationHeldSync {
-                route: route.clone(),
-                keys: vec![(n::KeyCode::CAPS_LOCK, 17)],
-            },
-            InputMsg::ApplicationHeldSync {
-                route: route.clone(),
-                keys: vec![],
-            },
-            InputMsg::ApplicationKey {
-                route: route.clone(),
-                code: n::KeyCode::LEFT_SHIFT,
-                physical_code: Some(n::KeyCode::CAPS_LOCK),
-                pressed: true,
-            },
-            InputMsg::ApplicationKey {
-                route: route.clone(),
-                code: n::KeyCode::LEFT_SHIFT,
-                physical_code: Some(n::KeyCode::CAPS_LOCK),
-                pressed: false,
-            },
-            InputMsg::ApplicationRepeat {
-                route: route.clone(),
-                code: n::KeyCode::keyboard(4),
-                n: 2,
-            },
-        ] {
-            let value = InputMsg::Forwarded {
-                origin: source,
-                hops: 2,
-                msg: Box::new(event.clone()),
-            };
-            let mut bytes = [0; 4096];
-            let len = encode(&value, Some(n::CaptureTime(42)), &mut bytes).unwrap();
-            let frame = OpaqueFrame::parse_exact(&bytes[..len], 4096).unwrap();
-            assert!(matches!(frame.header.type_id, 0x0202 | 0x0205 | 0x0207));
-            assert_eq!(
-                decode(frame).unwrap(),
-                Packet::TimedInput {
-                    time: n::CaptureTime(42),
-                    input: value
-                }
-            );
-            assert!(
-                encode(&event, None, &mut bytes).is_err(),
-                "terminal key requires physical-source provenance"
-            );
-        }
-    }
     fn roundtrip(value: InputMsg) -> InputMsg {
         let mut bytes = [0; v1::limits::RELIABLE_FRAME];
         let len = encode(&value, None, &mut bytes).unwrap();

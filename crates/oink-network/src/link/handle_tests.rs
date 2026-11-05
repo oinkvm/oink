@@ -129,3 +129,28 @@ fn reliable_owner_is_woken_for_space_without_replacing_reader_wake() {
     drop(rx);
     assert!(writers.load(Ordering::Relaxed) > before);
 }
+
+#[test]
+fn heartbeat_registration_is_bounded_silent_and_invalidated_by_immediate_work() {
+    let (tx, mut rx) = testing::reliable_pair(LinkId(1), tag(), QueueSpec { messages: 2, bytes: 8 });
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let count = wakes.clone();
+    rx.set_wake(Arc::new(move || {
+        count.fetch_add(1, Ordering::Relaxed);
+    }));
+    tx.set_heartbeat_messages(vec![b"old".to_vec()]).unwrap();
+    tx.set_heartbeat_messages(vec![b"latest".to_vec()]).unwrap();
+    assert_eq!(wakes.load(Ordering::Relaxed), 0);
+    assert_eq!(rx.take(), Ok(None));
+    assert_eq!(tx.set_heartbeat_messages(vec![vec![0; 9]]), Err(PostError::Full));
+    assert_eq!(
+        tx.queue.heartbeat.load().as_ref().unwrap().messages,
+        [b"latest".to_vec()]
+    );
+    tx.post(b"down").unwrap();
+    assert!(tx.queue.heartbeat.load().is_none());
+    assert_eq!(rx.take().unwrap().unwrap(), b"down");
+    tx.set_heartbeat_messages(vec![b"held".to_vec()]).unwrap();
+    tx.cancel();
+    assert_eq!(tx.set_heartbeat_messages(vec![]), Err(PostError::Closed));
+}

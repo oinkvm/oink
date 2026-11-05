@@ -116,6 +116,7 @@ impl Ingress {
             };
             let mut context = self.context(n.metric);
             context.transport = n.stamp.transport;
+            context.codec = n.stamp.codec;
             self.submit(
                 n.stamp.generation,
                 wall.saturating_sub(age.as_secs()),
@@ -687,6 +688,54 @@ fn native_consent(mut consent: ReportConsent, configured: bool) -> ReportConsent
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn audio_profile_context_survives_distribution_and_realtime_handoff() {
+        use oink_audio::negotiation::Profile;
+        let directory = tempfile::tempdir().unwrap();
+        let owner = Owner::new(directory.path(), ReportConsent::default());
+        let ingress = &owner.ingress;
+        ingress.generation.store(1, Ordering::Release);
+        let at = Instant::now();
+        ingress.realtime.arm(1, at);
+        for (profile, codec) in [
+            (Profile::Opus5ms, Codec::Opus5ms),
+            (Profile::Opus20ms, Codec::Opus20ms),
+            (Profile::Pcm16_2p5ms, Codec::Pcm16_2p5ms),
+            (Profile::Pcm24 { sample_rate: 44100 }, Codec::Pcm),
+            (Profile::Pcm24 { sample_rate: 192000 }, Codec::Pcm),
+        ] {
+            assert_eq!(projections::audio_codec(profile), codec);
+            for metric in [
+                Metric::AudioBuffered {
+                    stage: AudioStage::Total,
+                },
+                Metric::AudioReportedOutputLatency,
+            ] {
+                projections::audio_distribution_value(ingress, 1, metric, profile, 100);
+                let report = ingress.queue.pop().unwrap().report;
+                assert_eq!(report.context().unwrap().codec, Some(codec));
+                report.validate().unwrap();
+            }
+            for metric in [Metric::AudioReceiveDispatch, Metric::AudioDispatchInsert] {
+                projections::audio_histogram_for(ingress, metric, profile, [1; 8], 1);
+                let report = ingress.queue.pop().unwrap().report;
+                assert_eq!(report.context().unwrap().codec, Some(codec));
+                report.validate().unwrap();
+            }
+            let mut stamp = ingress.stamp_at(at).unwrap();
+            stamp.codec = Some(codec);
+            ingress.interval(
+                stamp,
+                Metric::AudioPushToPresentationEstimate,
+                at + Duration::from_micros(100),
+            );
+            ingress.drain_realtime();
+            assert_eq!(
+                ingress.queue.pop().unwrap().report.context().unwrap().codec,
+                Some(codec)
+            );
+        }
+    }
 
     #[test]
     fn unconfigured_native_capture_cannot_inherit_a_stored_report_grant() {

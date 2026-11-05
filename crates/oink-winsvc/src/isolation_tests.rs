@@ -60,6 +60,9 @@ impl helper::Native for Native {
         let releases = std::mem::take(&mut os.held);
         os.events.extend(releases);
     }
+    fn needs_maintenance(&self) -> bool {
+        !self.os.lock().unwrap().held.is_empty()
+    }
     fn maintain(&mut self) {}
 }
 pub(crate) struct Query {
@@ -81,6 +84,8 @@ struct Loopback {
     origin: Instant,
     clock: Arc<AtomicU64>,
     submitted: mpsc::Sender<Command>,
+    pending_send: bool,
+    waiting: mpsc::Sender<()>,
 }
 impl owner::Transport for Loopback {
     fn now(&self) -> Instant {
@@ -100,6 +105,7 @@ impl owner::Transport for Loopback {
             request,
         })?;
         let _ = self.submitted.send(request.command);
+        self.pending_send = true;
         Ok(true)
     }
     fn receive(&mut self) -> io::Result<Option<Reply>> {
@@ -111,6 +117,10 @@ impl owner::Transport for Loopback {
         Ok(None)
     }
     fn wait(&mut self, timeout: Duration) -> io::Result<()> {
+        if self.pending_send {
+            self.pending_send = false;
+            let _ = self.waiting.send(());
+        }
         thread::park_timeout(timeout);
         Ok(())
     }
@@ -131,6 +141,7 @@ struct Fixture {
     clock: Arc<AtomicU64>,
     wake: owner::Wake,
     submitted: mpsc::Receiver<Command>,
+    waiting: mpsc::Receiver<()>,
 }
 fn fixture() -> Fixture {
     let os = Arc::new(Mutex::new(Os::default()));
@@ -155,6 +166,7 @@ fn fixture_native<N: helper::Native>(
     let starts = Arc::new(Mutex::new(0));
     let clock_us = Arc::new(AtomicU64::new(0));
     let (submitted, submissions) = mpsc::channel();
+    let (waiting, waits) = mpsc::channel();
     let transport = Loopback {
         server,
         generation: 0,
@@ -163,6 +175,8 @@ fn fixture_native<N: helper::Native>(
         origin: clock.unwrap_or_else(Instant::now),
         clock: clock_us.clone(),
         submitted,
+        pending_send: false,
+        waiting,
     };
     let client = Arc::new(
         owner::Client::new(transport, wake.clone(), move || {
@@ -180,6 +194,7 @@ fn fixture_native<N: helper::Native>(
         clock: clock_us,
         wake,
         submitted: submissions,
+        waiting: waits,
     }
 }
 #[test]
@@ -213,6 +228,9 @@ fn ordinary_timeout_does_not_disconnect_or_consume_an_input_ack() {
     let ordinary = fixture.client.clone();
     let query = thread::spawn(move || ordinary.request(Command::Position, true, false));
     fixture.entered.recv_timeout(Duration::from_secs(3)).unwrap();
+    // Query entry can happen before send() returns and the owner records its
+    // deadline. Advance time only after that owner reaches the post-send wait.
+    fixture.waiting.recv_timeout(Duration::from_secs(3)).unwrap();
     fixture.clock.store(150_001, Ordering::Release);
     (fixture.wake)();
     assert_eq!(query.join().unwrap().unwrap_err().kind(), io::ErrorKind::TimedOut);
@@ -260,6 +278,10 @@ struct ReconnectCleanupGate {
     checkpoint: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
 }
 impl helper::Native for ReconnectCleanupGate {
+    fn needs_maintenance(&self) -> bool {
+        // This fixture uses idle maintenance as an explicit scheduling gate.
+        true
+    }
     fn apply(&mut self, command: Command) -> Reply {
         let reply = self.native.apply(command);
         self.failed |= reply.0[..4] != [0; 4];
@@ -411,6 +433,9 @@ struct GatedNative {
     gate: mpsc::Receiver<()>,
 }
 impl helper::Native for GatedNative {
+    fn needs_maintenance(&self) -> bool {
+        self.native.needs_maintenance()
+    }
     fn apply(&mut self, command: Command) -> Reply {
         let reply = self.native.apply(command);
         if matches!(command, Command::DragPress { .. } | Command::Key { down: true, .. }) {
@@ -432,6 +457,96 @@ fn until(mut predicate: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "test handshake watchdog");
         thread::yield_now();
     }
+}
+
+#[test]
+fn empty_helper_ledger_sleeps_but_held_and_disconnected_cleanup_still_run() {
+    struct Ledger {
+        held: bool,
+        pending: bool,
+        maintained: mpsc::Sender<u8>,
+    }
+    impl helper::Native for Ledger {
+        fn apply(&mut self, command: Command) -> Reply {
+            if let Command::Button { down, .. } = command {
+                self.held = down;
+            }
+            Reply([0; REPLY_SIZE])
+        }
+        fn release(&mut self) {
+            // Model an old desktop refusing release until maintenance retries.
+            self.pending |= self.held;
+            self.held = false;
+        }
+        fn needs_maintenance(&self) -> bool {
+            self.held || self.pending
+        }
+        fn maintain(&mut self) {
+            let _ = self.maintained.send(if self.pending { 2 } else { u8::from(self.held) });
+            self.pending = false;
+        }
+    }
+    let (maintained, maintenance) = mpsc::channel();
+    let (notify, replies) = mpsc::channel();
+    let mut server = helper::Server::new(
+        move || {
+            Ok(Ledger {
+                held: false,
+                pending: false,
+                maintained,
+            })
+        },
+        || IdleQuery,
+        Arc::new(move || {
+            let _ = notify.send(());
+        }),
+    )
+    .unwrap();
+    let quiet = || {
+        // Cover several existing 100-ms periods; this asserts absent idle work,
+        // not a latency target or a new production timeout.
+        loop {
+            match maintenance.recv_timeout(Duration::from_millis(320)) {
+                // A delayed test thread may still have legitimate held-input
+                // notices queued before the Up ACK; they are not idle work.
+                Ok(active) => assert_ne!(active, 0, "maintenance ran with an empty ledger"),
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(error) => panic!("maintenance worker exited: {error}"),
+            }
+        }
+    };
+    quiet();
+    let generation = server.begin();
+    let button = |id, down| {
+        server
+            .submit(helper::Work {
+                generation,
+                request: Request {
+                    id,
+                    ordinary: false,
+                    command: Command::Button { button: 0, down },
+                },
+            })
+            .unwrap();
+        replies.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(server.receive().unwrap().reply.id(), id);
+    };
+    button(1, true);
+    assert_eq!(maintenance.recv_timeout(Duration::from_secs(3)).unwrap(), 1);
+    button(2, false);
+    quiet();
+    button(3, true);
+    assert_eq!(maintenance.recv_timeout(Duration::from_secs(3)).unwrap(), 1);
+    server.disconnect();
+    loop {
+        let active = maintenance.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_ne!(active, 0, "pending cleanup was lost");
+        if active == 2 {
+            break;
+        }
+    }
+    quiet();
+    server.stop_native();
 }
 #[test]
 fn disconnect_and_restart_release_before_new_input_and_discard_stale_work() {

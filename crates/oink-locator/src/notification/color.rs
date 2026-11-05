@@ -1,6 +1,6 @@
 //! The custom-accent text color follows oink-ui/core/color.ts: retain hue in
 //! OKLab, reduce chroma to fit sRGB and reach 4.6:1 against white or dark card.
-use crate::aim::raster::Color;
+use crate::raster::Color;
 fn linear(v: f64) -> f64 {
     let v = v / 255.;
     if v <= 0.04045 {

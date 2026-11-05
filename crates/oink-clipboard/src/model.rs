@@ -2,7 +2,7 @@
 //! Format names and node names are business data, never diagnostic labels.
 use oink_foundation::clipboard::ClipPlatform;
 
-pub const AUTO_PULL_BYTES: u64 = 16 * 1024 * 1024;
+pub const AUTO_PULL_BYTES: u64 = oink_protocol::v1::limits::AUTO_FETCH as u64;
 pub const REPRESENTATION_BYTES: u64 = 256 * 1024 * 1024;
 pub const SNAPSHOT_BYTES: u64 = 1024 * 1024 * 1024;
 pub const INVENTORY_BYTES: usize = 8 * 1024 * 1024;
@@ -130,33 +130,43 @@ impl Inventory {
             })
         })
     }
-    /// Including inline bytes, all wanted non-file representations share ONE
-    /// budget. Unknown sizes require demand; no per-format budget multiplication.
+    /// Inline bytes and wanted representations share ONE budget. On a Mac,
+    /// ordinary file roots join that same budget; unknown sizes, directories
+    /// and links disallow whole-offer automatic fetching.
     pub fn automatic_pull(&self, target: ClipPlatform) -> bool {
         automatic_pull(
-            self.wanted(target).filter_map(|rep| {
-                let size = rep.data.size()?;
-                if target == self.platform {
-                    return Some(size);
-                }
-                // Foreign encoding can expand text and image bytes. Use a known
-                // conservative translation bound; compressed image conversions have
-                // no such bound and therefore wait for native demand.
-                let bound = match (rep.standard, &rep.format, size) {
-                    (Some(StandardFormat::Url), _, ContentSize::Known(_)) => {
-                        ContentSize::Known(crate::content::url::MAX_WIRE_BYTES as u64)
+            self.wanted(target)
+                .filter_map(|rep| {
+                    let size = rep.data.size()?;
+                    if target == self.platform {
+                        return Some(size);
                     }
-                    (Some(StandardFormat::Text | StandardFormat::Html), _, ContentSize::Known(n)) => {
-                        n.checked_mul(3).map(ContentSize::Known).unwrap_or(ContentSize::Unknown)
-                    }
-                    (Some(StandardFormat::Png), NativeFormat::Mac(name), _) if name != "public.png" => {
+                    // Foreign encoding can expand text and image bytes. Use a known
+                    // conservative translation bound; compressed image conversions have
+                    // no such bound and therefore wait for native demand.
+                    let bound = match (rep.standard, &rep.format, size) {
+                        (Some(StandardFormat::Url), _, ContentSize::Known(_)) => {
+                            ContentSize::Known(crate::content::url::MAX_WIRE_BYTES as u64)
+                        }
+                        (Some(StandardFormat::Text | StandardFormat::Html), _, ContentSize::Known(n)) => {
+                            n.checked_mul(3).map(ContentSize::Known).unwrap_or(ContentSize::Unknown)
+                        }
+                        (Some(StandardFormat::Png), NativeFormat::Mac(name), _) if name != "public.png" => {
+                            ContentSize::Unknown
+                        }
+                        (Some(StandardFormat::Png), NativeFormat::WindowsPredefined(_), _) => ContentSize::Unknown,
+                        _ => size,
+                    };
+                    Some(bound)
+                })
+                .chain(self.roots.iter().filter(|_| target == ClipPlatform::Mac).map(|node| {
+                    if node.parent.is_none() && node.kind == NodeKind::File && node.valid() {
+                        node.size
+                    } else {
                         ContentSize::Unknown
                     }
-                    (Some(StandardFormat::Png), NativeFormat::WindowsPredefined(_), _) => ContentSize::Unknown,
-                    _ => size,
-                };
-                Some(bound)
-            }),
+                }))
+                .chain((target == ClipPlatform::Mac && self.has_promises()).then_some(ContentSize::Unknown)),
             AUTO_PULL_BYTES,
         )
     }
@@ -220,6 +230,73 @@ pub fn automatic_pull(sizes: impl IntoIterator<Item = ContentSize>, budget: u64)
             ContentSize::Unknown => None,
         })
         .is_some()
+}
+
+#[cfg(all(test, debug_assertions))]
+mod automatic_file_tests {
+    use super::*;
+    use crate::content::Provider;
+
+    fn offer(file_bytes: u64, raw: RepresentationData) -> Inventory {
+        let mut inventory = crate::content::tests::fixture().inventory();
+        inventory.items[0].representations.truncate(1);
+        inventory.items[0].representations[0].data = raw;
+        inventory.roots = vec![FileNode {
+            id: NodeId(1),
+            parent: None,
+            name: "file".into(),
+            kind: NodeKind::File,
+            size: ContentSize::Known(file_bytes),
+            version: 1,
+            modified_ms: None,
+            exec_bits: None,
+        }];
+        inventory
+    }
+    #[test]
+    fn files_inline_and_readers_share_exactly_one_protocol_budget() {
+        assert_eq!(AUTO_PULL_BYTES, oink_protocol::v1::limits::AUTO_FETCH as u64);
+        let mut inventory = offer(AUTO_PULL_BYTES - 1, RepresentationData::Inline(vec![1]));
+        assert!(inventory.automatic_pull(ClipPlatform::Mac));
+        inventory.items[0].representations[0].data = RepresentationData::Inline(vec![1, 2]);
+        assert!(!inventory.automatic_pull(ClipPlatform::Mac));
+        inventory.items[0].representations[0].data = RepresentationData::Reader {
+            size: ContentSize::Known(2),
+        };
+        assert!(!inventory.automatic_pull(ClipPlatform::Mac));
+        inventory.items[0].representations[0].data = RepresentationData::Reader {
+            size: ContentSize::Unknown,
+        };
+        assert!(!inventory.automatic_pull(ClipPlatform::Mac));
+    }
+    #[test]
+    fn file_representation_is_not_counted_twice_and_nonordinary_roots_disallow_auto_fetch() {
+        let mut inventory = offer(AUTO_PULL_BYTES, RepresentationData::File(NodeId(1)));
+        assert!(inventory.automatic_pull(ClipPlatform::Mac));
+        inventory.roots[0].size = ContentSize::Unknown;
+        assert!(!inventory.automatic_pull(ClipPlatform::Mac));
+        inventory.roots[0].size = ContentSize::Known(0);
+        inventory.roots[0].kind = NodeKind::Directory;
+        assert!(!inventory.automatic_pull(ClipPlatform::Mac));
+        // Windows retains its existing representation-only native delivery policy.
+        assert!(inventory.automatic_pull(ClipPlatform::Windows));
+    }
+    #[test]
+    fn foreign_translation_bound_joins_the_file_budget() {
+        let mut inventory = offer(
+            AUTO_PULL_BYTES - 3,
+            RepresentationData::Reader {
+                size: ContentSize::Known(1),
+            },
+        );
+        inventory.platform = ClipPlatform::Windows;
+        let rep = &mut inventory.items[0].representations[0];
+        rep.format = NativeFormat::WindowsPredefined(13);
+        rep.standard = Some(StandardFormat::Text);
+        assert!(inventory.automatic_pull(ClipPlatform::Mac));
+        inventory.roots[0].size = ContentSize::Known(AUTO_PULL_BYTES - 2);
+        assert!(!inventory.automatic_pull(ClipPlatform::Mac));
+    }
 }
 
 /// A cursor belongs to one immutable direct-child view, never a live iterator.

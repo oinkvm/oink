@@ -40,6 +40,7 @@ fn prelogin_offer_keeps_the_v1_baseline_and_drops_components_it_does_not_install
     for required in oink_protocol::v1::registry::BASELINE.iter().chain(&[
         "oink.relay/1",
         "oink.input.relative/1",
+        "oink.pointer.move-hidden/1",
         "oink.layout.arrangement/1",
     ]) {
         assert!(offer.capabilities.iter().any(|c| c == required), "{required}");
@@ -50,13 +51,11 @@ fn prelogin_offer_keeps_the_v1_baseline_and_drops_components_it_does_not_install
         .chain(oink_audio::negotiation::CAPABILITIES)
         .chain(&[
             "oink.pairing/1",
-            "oink.aim/1",
             "oink.wallpaper/1",
             "oink.layout.projection/1",
             "oink.layout.profiles/3",
             "oink.notify/1",
             "oink.input.trail/1",
-            "oink.input.application-focus/1",
         ])
     {
         assert!(!offer.capabilities.iter().any(|c| c == absent), "{absent}");

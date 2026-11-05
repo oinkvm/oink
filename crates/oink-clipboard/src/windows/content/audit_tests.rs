@@ -343,3 +343,82 @@ fn malformed_ansi_text_is_unavailable_in_its_declared_locale() {
         .expect("incomplete code-page lead byte was accepted");
     assert_eq!(content::reason(&error), Unavailable::InvalidData);
 }
+
+#[test]
+fn portable_png_reuses_original_bytes_before_dib_conversion() {
+    use std::time::Instant;
+    for (width, height) in [(640, 360), (1280, 720)] {
+        let pixels = super::super::image::Rgba {
+            width,
+            height,
+            pixels_per_meter: None,
+            data: (0..width * height * 4)
+                .map(|i| (i.wrapping_mul(37) % 251) as u8)
+                .collect(),
+        };
+        let png = super::super::image::encode_png(&pixels).unwrap();
+        let dib = super::super::image::rgba_to_dibv5(&pixels);
+        let mut inventory = crate::content::tests::fixture().inventory();
+        inventory.platform = ClipPlatform::Windows;
+        inventory.items[0].representations.truncate(1);
+        let rep = &mut inventory.items[0].representations[0];
+        rep.id = RepresentationId(1);
+        rep.format = NativeFormat::WindowsPredefined(17);
+        rep.medium = Medium::HGlobal;
+        rep.standard = Some(StandardFormat::Png);
+        rep.data = RepresentationData::Reader {
+            size: ContentSize::Unknown,
+        };
+        let mut native_png = rep.clone();
+        native_png.id = RepresentationId(2);
+        native_png.format = NativeFormat::WindowsRegistered("PNG".into());
+        native_png.data = RepresentationData::Reader {
+            size: ContentSize::Unknown,
+        };
+        let bytes = Arc::new(std::collections::HashMap::from([
+            (RepresentationId(1), dib),
+            (RepresentationId(2), png.clone()),
+        ]));
+        let provider = |inventory| {
+            let bytes = bytes.clone();
+            content::clipboard::Clipboard::new(
+                inventory,
+                Box::new(move |id| {
+                    Ok(Box::new(io::Cursor::new(
+                        bytes
+                            .get(&id)
+                            .ok_or_else(|| content::unavailable(Unavailable::NoSuchItem))?
+                            .clone(),
+                    )))
+                }),
+                Arc::new(|| Ok(())),
+                Arc::new(WindowsTranslator),
+                None,
+            )
+            .unwrap()
+        };
+        let baseline = provider(inventory.clone());
+        inventory.items[0].representations.push(native_png);
+        let optimized = provider(inventory);
+        for sample in 0..3 {
+            let began = Instant::now();
+            let before = content::read_all(
+                &mut content::open_for(baseline.as_ref(), RepresentationId(1), ClipPlatform::Mac).unwrap(),
+            )
+            .unwrap();
+            let before_us = began.elapsed().as_micros();
+            let began = Instant::now();
+            let after = content::read_all(
+                &mut content::open_for(optimized.as_ref(), RepresentationId(1), ClipPlatform::Mac).unwrap(),
+            )
+            .unwrap();
+            let after_us = began.elapsed().as_micros();
+            assert_eq!(after, png, "retain the original compressed PNG and its metadata");
+            assert_eq!(super::super::image::decode_png(&before).unwrap().data, pixels.data);
+            println!(
+                "PNG_PREFERENCE width={width} height={height} sample={sample} dib_us={before_us} original_png_us={after_us} bytes={}",
+                after.len()
+            );
+        }
+    }
+}

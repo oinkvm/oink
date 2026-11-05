@@ -18,6 +18,15 @@ impl Remote {
     }
 }
 impl Namespace for Remote {
+    fn start_native_delivery(&self) {
+        self.start_delivery();
+    }
+    fn cancel_native_delivery(&self) {
+        if let Some(files) = &self.0.files {
+            files.cancel_receiving();
+        }
+        self.cancel();
+    }
     fn native_lease(&self) -> io::Result<crate::content::namespace::NativeLease> {
         self.files()?.native()?.lease()
     }
@@ -36,11 +45,18 @@ impl Namespace for Remote {
     fn prepare(&self) -> io::Result<()> {
         self.files()?.ready().map(|_| ())
     }
+    fn prepare_while(&self, current: &dyn Fn() -> bool) -> io::Result<()> {
+        self.files()?.ready_while(current).map(|_| ())
+    }
     fn source_link(&self) -> Option<super::super::linked::Descriptor> {
         self.0.files.as_ref()?.descriptor()
     }
     fn bind_native(&self, native: Weak<dyn NativeFiles>) -> io::Result<()> {
-        self.files()?.bind_native(native)
+        self.files()?.bind_native(native)?;
+        if self.0.automatic_files.load(Ordering::Acquire) {
+            self.start_delivery();
+        }
+        Ok(())
     }
     fn native_list(&self, node: NodeId, cursor: Option<DirectoryCursor>) -> Option<io::Result<DirectoryPage>> {
         match self.files().and_then(|files| files.native()) {

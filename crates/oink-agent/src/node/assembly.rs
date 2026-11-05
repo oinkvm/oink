@@ -59,10 +59,6 @@ impl Node {
             if let Some(trail) = oink_locator::CursorTrail::platform() {
                 let _ = self.inner.cursor_trail.set(trail);
             }
-            if let Some(overlay) = oink_locator::aim::AimOverlay::platform() {
-                self.set_aim_surface(Some(Arc::new(overlay)));
-            }
-            crate::aim::set_follow_trail(self, oink_locator::CursorTrail::platform());
             self.apply_trail_appearance();
             self.watch_trail_appearance();
         }
@@ -80,7 +76,6 @@ impl Node {
         let audio_port = components.audio.then(|| links.register(crate::streams::audio::KINDS));
         let companions = components.companions.then(|| {
             (
-                links.register(crate::streams::aim::KINDS),
                 links.register(crate::streams::projection::KINDS),
                 links.register(crate::streams::wallpaper::KINDS),
                 links.register(&[oink_protocol::frame::StreamKind::LayoutProfilesV3]),
@@ -233,9 +228,7 @@ impl Node {
         if let Some(cache_port) = cache_port {
             tasks.push(crate::cache::start(self.clone(), cache_port));
         }
-        if let Some((aim_port, projection_port, wallpaper_port, profiles_port)) = companions {
-            tasks.push(crate::display_overlay::start(self.clone()).context("start display overlay")?);
-            tasks.push(crate::aim::start_link_runtime(self.clone(), aim_port).context("start aim owner")?);
+        if let Some((projection_port, wallpaper_port, profiles_port)) = companions {
             tasks.push(
                 crate::projection::start(self.clone(), projection_port, self.inner.native_surfaces)
                     .context("start projection owner")?,
@@ -330,9 +323,7 @@ impl crate::config_module::ConfigApplication for Application {
             // Signed self-removal is applied before the fresh group exists;
             // close old-group surfaces before exposing that intermediate roster.
             let roster = oink_network::roster::Roster::verify(roster, anchor).map_err(|error| error.to_string())?;
-            if group.applied().group != state.group() || !roster.contains(inner.me) {
-                crate::aim::stop(&Node { inner: inner.clone() });
-            }
+            if group.applied().group != state.group() || !roster.contains(inner.me) {}
         }
         Ok(())
     }
@@ -361,7 +352,6 @@ fn offer_profile(components: super::Components) -> oink_network::negotiation::Of
     }
     if !components.companions {
         removed.extend([
-            "oink.aim/1",
             "oink.wallpaper/1",
             "oink.layout.projection/1",
             "oink.layout.preview/1",
@@ -370,9 +360,8 @@ fn offer_profile(components: super::Components) -> oink_network::negotiation::Of
             "oink.notify/1",
             "oink.notify.microphone/1",
             "oink.power/1",
-            // No visible windows on the logon desktop: no trail, no app focus.
+            // No visible windows on the logon desktop: no trail.
             "oink.input.trail/1",
-            "oink.input.application-focus/1",
         ]);
     }
     if !components.pairing {
@@ -396,8 +385,9 @@ fn application_profile() -> oink_network::negotiation::OfferProfile {
                 "oink.input.gestures/1",
                 "oink.input.contacts/1",
                 "oink.input.trail/1",
-                "oink.input.application-focus/1",
                 "oink.pointer.move/1",
+                "oink.pointer.move-hidden/1",
+                "oink.focus.local-click/1",
                 "oink.pointer.lock-escape/1",
                 "oink.pointer.entry-protection/1",
                 "oink.input.edge-trigger/1",
@@ -409,7 +399,6 @@ fn application_profile() -> oink_network::negotiation::OfferProfile {
                 "oink.input.keymap-none/1",
                 oink_routing::control::WINDOWS_LOCK_CAPABILITY,
                 "oink.input.scroll-pixels/1",
-                "oink.aim/1",
                 "oink.notify/1",
                 "oink.notify.microphone/1",
                 "oink.power/1",

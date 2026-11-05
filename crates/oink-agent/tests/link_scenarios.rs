@@ -1349,12 +1349,7 @@ async fn restarted_backend_rejoins_and_every_module_works_scenario() {
         b.node.shutdown().await;
         wait_for("A takes focus and native pointer back", 8.0, || local_pointer_ready(&a)).await;
         key(&a.input, 0x52, false);
-        // A changes shared state while B is away.
-        api(&a.node, move |n| {
-            n.rename_device(n.id().into(), format!("renamed {round}"))
-        })
-        .await
-        .unwrap();
+        // A changes clipboard state while B is away.
         a.clip.copy(
             vec![ClipData::Text(format!("copied while away {round}"))],
             Sensitivity::Normal,
@@ -1367,7 +1362,7 @@ async fn restarted_backend_rejoins_and_every_module_works_scenario() {
         );
         assert_eq!(group_anchor(&b).await, original);
         wait_for("B has the state changed while it was away", 10.0, || {
-            b.node.device_name(a.node.id()) == format!("renamed {round}") && a.node.layout().0 == b.node.layout().0
+            a.node.layout().0 == b.node.layout().0
         })
         .await;
         cross(&a, &b, 1.0).await;

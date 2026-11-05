@@ -82,7 +82,6 @@ wire_map!(Snapshot,super::diagnostic_values::validate_snapshot,{
     10=>button_handoff:Option<DiagButtonHandoffValue>=optional;11=>reference_screen:Option<Text<128>>=optional;12=>injection_failures:u64=required;
     13=>session_locked:Option<bool>=optional;14=>backend_uiaccess:Option<bool>=optional;15=>crash_report:DiagCrashSummary=required;
     16=>layout:Option<CompleteLayout>=optional;
-    17=>application_focus:Option<DiagApplicationFocus>=optional;
 });
 wire_map!(NamedScalar,super::diagnostic_values::validate_scalar,{1=>name:Text<256>=required;2=>value:crate::v1::RawValue=required;});
 wire_map!(DiagnosticEvent,super::diagnostic_values::validate_event,{1=>kind:Ascii<96>=required;2=>fields:RawMap=required;});
@@ -131,7 +130,7 @@ open_enum!(LifecycleKind {
     ParkInputTargetMismatch=35,ParkInputHideLost=36,ParkInputHookChainRejected=37,
     ParkInputReadbackMismatch=38,ParkInputCompletionUnavailable=39,
     ContactCapture=40,ContactInjection=41,
-    MarkerSubmission=42,MarkerHookDecision=43,MarkerChainResult=44,MarkerReadback=45,RestoreSafetyReset=46,MouseKeysCompensation=47
+    MarkerSubmission=42,MarkerHookDecision=43,MarkerChainResult=44,MarkerReadback=45,RestoreSafetyReset=46,MouseKeysCompensation=47,KeyboardCapture=48
 });
 wire_map!(DepartureClamp,no_validation,{1=>requested:Point=required;2=>applied:Point=required;3=>bounds:Rect=required;4=>display_revision:u64=required;});
 wire_map!(FeelProfile,no_validation,{
@@ -208,9 +207,3 @@ impl LayoutValue {
         Ok(List(screens))
     }
 }
-
-wire_map!(DiagApplicationFocus,no_validation,{
-    1=>pointer:Text<128>=required;2=>keyboard:Option<Text<128>>=optional;
-    3=>epoch:u64=required;4=>revision:u64=required;
-    5=>phase:ApplicationFocusPhase=required;6=>reason:ApplicationFocusReason=required;
-});

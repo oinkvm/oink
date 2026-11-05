@@ -87,12 +87,6 @@ export interface UndoHandle {
   peer: DeviceKey;
   observed_add: string;
 }
-export interface GroupMigrationStatus {
-  source: GroupRef;
-  target: GroupRef | null;
-  phase: "proof_waiting" | "adopting" | "adopted" | "conflict";
-  problem: PairProblem | null;
-}
 export type PairTarget =
   | { type: "nearby_device"; device: DeviceKey }
   | { type: "prepared_query"; query_id: string; generation: DecimalU64 };
@@ -111,7 +105,6 @@ export type PairingRequest =
       generation: DecimalU64; ip: string; port?: number } }
   | { method: "release_pairing_query"; params: { query_id: string; generation: DecimalU64 } }
   | { method: "start_pairing"; params: { operation_id: OperationId; target: PairTarget } }
-  | { method: "group_migration" }
   | { method: "pairings" }
   | { method: "accept_pairing" | "decline_pairing" | "cancel_pairing";
       params: { pair_id: PairId; expected_revision: DecimalU64 } }
@@ -129,7 +122,6 @@ export type PairingEvent =
       result: { type: "found"; peer: FoundPeer } | { type: "problem"; problem: PairProblem } } }
   | { type: "pairing_changed"; data: { revision: DecimalU64; view: PairView } }
   | { type: "pairing_requests_changed"; data: { revision: DecimalU64; requests: PendingRequest[] } }
-  | { type: "group_migration_changed"; data: GroupMigrationStatus }
   | { type: "pairing_failed"; data: { event_id: DecimalU64; pair_id: PairId;
       peer: PairEndpoint; problem: PairProblem } }
   | { type: "pairing_completed"; data: { event_id: DecimalU64; pair_id: PairId; peer: PeerView;

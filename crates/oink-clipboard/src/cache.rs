@@ -45,7 +45,15 @@ static CHANGES: OnceLock<broadcast::Sender<PathBuf>> = OnceLock::new();
 pub fn subscribe() -> broadcast::Receiver<PathBuf> {
     CHANGES.get_or_init(|| broadcast::channel(128).0).subscribe()
 }
+
+/// Direct Mac clipboard-file cache, independent of received File Provider data.
+#[cfg(target_os = "macos")]
+pub fn clipboard_files_usage(data: &Path, clear: bool) -> (CacheSize, u64, bool) {
+    crate::macos::small_files::cache_usage(data, clear)
+}
 pub(crate) fn changed(root: &Path) {
+    #[cfg(target_os = "macos")]
+    crate::macos::small_files::changed(root);
     let _ = CHANGES.get_or_init(|| broadcast::channel(128).0).send(root.into());
     #[cfg(all(test, debug_assertions))]
     MUTATIONS.with(|changes| {

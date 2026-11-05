@@ -32,7 +32,6 @@ impl Node {
             .name("oink-main-commands".into())
             .spawn(move || {
                 receive.bind();
-                let mut application_focus_started = false;
                 loop {
                     receive.begin_turn();
                     let Some(inner) = weak.upgrade() else { break };
@@ -42,25 +41,12 @@ impl Node {
                         if let Some(dnd) = inner.dnd.get() {
                             dnd.stop_native();
                         }
-                        if application_focus_started {
-                            let backend = &inner.input_backend;
-                            backend.application_focus_watch(None);
-                            backend.application_focus_dismiss();
-                        }
                         break;
                     }
                     let node = Node { inner };
                     node.drain_input_trace();
                     match receive.try_recv() {
                         Ok(command) => {
-                            if let MainCommand::ApplicationFocus { command, .. } = &command {
-                                use oink_routing::ApplicationFocusCommand as C;
-                                match command {
-                                    C::Dismiss(None) => application_focus_started = false,
-                                    C::Cancel(_) => {}
-                                    _ => application_focus_started = true,
-                                }
-                            }
                             node.main_command(command);
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -316,86 +302,11 @@ impl Node {
                     _ => tracing::warn!("input owner sent an unexpected native decoration"),
                 }
             }
-            MainCommand::ApplicationFocus { mut command, permit } => {
-                use oink_routing::ApplicationFocusCommand as C;
-                let routing = &self.settings().routing;
-                let parkable = routing.mouse_mode == oink_foundation::input::InputMode::Shared
-                    && routing.keyboard_mode == oink_foundation::input::InputMode::Shared;
-                if !parkable
-                    || !self
-                        .link_config()
-                        .is_ok_and(|config| config.applied().application_focus_enabled)
-                {
-                    // A queued sample/park may outlive the settings update. Do
-                    // not create a native observer/window after withdrawal.
-                    if matches!(command, C::Sample(_) | C::Park(_)) {
-                        if let Some(permit) = permit {
-                            permit.revoke();
-                        }
-                        return;
-                    }
-                    if matches!(command, C::Dismiss(_)) {
-                        command = C::Dismiss(None);
-                    }
-                }
-                let Ok(input) = self.input_thread() else { return };
-                let backend = self.input_backend();
-                match command {
-                    C::Sample(claim) => {
-                        let observer_input = Arc::downgrade(&input);
-                        let observer_claim = claim.clone();
-                        backend.application_focus_watch(Some(Arc::new(move |observation| {
-                            if let Some(input) = observer_input.upgrade() {
-                                input.send(InputCommand::ApplicationFocusObserved {
-                                    claim: observer_claim.clone(),
-                                    observation,
-                                });
-                            }
-                        })));
-                        let observation = backend.application_focus_sample();
-                        input.send(InputCommand::ApplicationFocusObserved { claim, observation });
-                    }
-                    C::Park(request) => {
-                        let result = if let Some(permit) = permit.filter(|permit| permit.valid()) {
-                            backend.application_focus_park(request.expected, request.operation, permit)
-                        } else {
-                            oink_foundation::application_focus::ParkResult::Stale
-                        };
-                        // Sample the resulting foreground with the same claim;
-                        // never relabel this work with a later pointer epoch.
-                        let observation = backend.application_focus_sample();
-                        input.send(InputCommand::ApplicationFocusObserved {
-                            claim: request.claim.clone(),
-                            observation,
-                        });
-                        input.send(InputCommand::ApplicationFocusApplied { request, result });
-                    }
-                    C::Cancel(request) => backend.application_focus_cancel(request.operation),
-                    C::Dismiss(claim) => {
-                        let observer = claim.map(|claim| {
-                            let input = Arc::downgrade(&input);
-                            Arc::new(move |observation| {
-                                if let Some(input) = input.upgrade() {
-                                    input.send(InputCommand::ApplicationFocusObserved {
-                                        claim: claim.clone(),
-                                        observation,
-                                    });
-                                }
-                            }) as oink_input::application_focus::Observer
-                        });
-                        // Suspension closes the sink but keeps observation alive
-                        // so desktop recovery can be reported. Opt-out stops it.
-                        backend.application_focus_watch(observer);
-                        backend.application_focus_dismiss();
-                    }
-                }
-            }
             MainCommand::TrailDuration(ms) => {
                 let secs = f64::from(ms) / 1000.;
                 if let Some(trail) = self.inner.cursor_trail.get() {
                     trail.set_trail_duration(secs);
                 }
-                crate::aim::set_follow_trail_duration(self, secs);
             }
             MainCommand::TrailSuppressed(hidden) => {
                 if let Some(trail) = self.inner.cursor_trail.get() {
@@ -417,10 +328,15 @@ impl Node {
                 }
                 let _ = crate::threads::declare_activity(self.input_backend().as_ref(), from, self.activity_allowed());
             }
-            MainCommand::IdentifyScreens(id) => crate::display_overlay::identify_local(self, id),
-            MainCommand::DismissOverlay(id) => crate::display_overlay::dismiss(self, id),
             MainCommand::ResetUserIdle => {
-                if self.activity_allowed() {
+                let target_allows = !cfg!(target_os = "macos")
+                    || self.input_status().is_ok_and(|status| {
+                        status
+                            .focus_info
+                            .as_ref()
+                            .is_some_and(|focus| focus.holder != self.id())
+                    });
+                if target_allows && self.activity_allowed() {
                     let _ = self.input_backend().reset_user_idle();
                 }
             }

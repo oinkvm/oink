@@ -26,3 +26,8 @@ mod token_policy;
 mod console_policy;
 #[cfg(any(windows, test))]
 mod prelogin_route;
+#[cfg(any(windows, test))]
+mod supervision;
+
+#[cfg(any(windows, test))]
+mod lease;

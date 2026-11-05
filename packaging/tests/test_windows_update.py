@@ -228,12 +228,12 @@ class PublishedRelease(unittest.TestCase):
         self.event = {'repository': {'default_branch': 'main'}, 'inputs': {'release_tag': 'v1.0.0'}}
         self.msi = b'isolated non-executable TEST MSI bytes'
         def artifact(name, raw): return {'name': name, 'size': len(raw), 'sha256': feed.digest(raw)}
-        self.msi_artifact = artifact('Oink-test.msi', self.msi)
+        self.msi_artifact = artifact('Oink-1.0.0-windows-x64.msi', self.msi)
         self.record = {'schema': 1, 'product': 'Oink', 'build': 3, 'version': '1.0.0', 'built_commit': 'b'*40,
                        'source_tree_sha256': 'a'*64, 'artifacts': [self.msi_artifact],
                        'platforms': {'windows': {'build': 3, 'version': '1.0.0', 'built_commit': 'b'*40,
                                                 'source_tree_sha256': 'a'*64, 'artifacts': [self.msi_artifact]}}}
-        self.raw_assets = {'release.json': feed.encode(self.record), 'Oink-test.msi': self.msi}
+        self.raw_assets = {'release.json': feed.encode(self.record), 'Oink-1.0.0-windows-x64.msi': self.msi}
         self.config = {'repository': 'oinkvm/oink', 'windows': [EPOCH]}
 
     def prepare(self, commit='b'*40, source='a'*64):
@@ -249,13 +249,20 @@ class PublishedRelease(unittest.TestCase):
 
     def test_published_exact_tag_source_and_msi_are_required_without_notes_asset(self):
         self.prepare()
-        self.assertEqual((self.output_path / 'Oink-test.msi').read_bytes(), self.msi)
+        self.assertEqual((self.output_path / 'Oink-1.0.0-windows-x64.msi').read_bytes(), self.msi)
         self.assertFalse((self.output_path / 'update.json').exists())
         self.assertIn('source_tree_sha256=' + 'a'*64, (self.root / 'github-output').read_text())
         for commit, source in [('c'*40, 'a'*64), ('b'*40, 'c'*64)]:
             with self.assertRaises(ValueError): self.prepare(commit, source)
-        self.raw_assets['Oink-test.msi'] = b'replaced asset'
+        self.raw_assets['Oink-1.0.0-windows-x64.msi'] = b'replaced asset'
         with self.assertRaisesRegex(ValueError, 'asset_digest'): self.prepare()
+
+    def test_legacy_filename_remains_downloadable(self):
+        old_name = 'Oink-1.0.0-3-windows-x64.msi'
+        self.msi_artifact['name'] = old_name
+        self.raw_assets = {'release.json': feed.encode(self.record), old_name: self.msi}
+        self.prepare()
+        self.assertEqual((self.output_path / old_name).read_bytes(), self.msi)
 
     def test_live_draft_prerelease_or_release_event_is_rejected_before_signing(self):
         for field in ['draft', 'prerelease']:

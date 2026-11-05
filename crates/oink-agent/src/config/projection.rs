@@ -126,6 +126,7 @@ pub(super) fn values(settings: &Settings) -> Vec<(LocalOption, RawValue)> {
         (TouchpadInjection, r.touchpad_injection.write()),
         (NativeMultifinger, r.native_multifinger.write()),
         (MacScrollFeel, r.mac_scroll_feel.write()),
+        (AudioQuality, a.quality.number().write()),
         (AudioExitClaim, RawValue::Null),
         (MicrophoneShareClaim, RawValue::Null),
         (
@@ -363,6 +364,10 @@ pub(super) fn apply(owner: &OwnerStore, settings: &mut Settings) -> Result<(), S
                 r.wake_displays_on_input = value.wake_displays_on_input()?;
                 r.dnd = value.dnd_enabled()?;
             }
+            AudioQuality => {
+                settings.audio.quality = oink_audio::negotiation::Quality::from_number(u32::read(&value)?)
+                    .ok_or_else(|| oink_protocol::v1::Error::from(oink_protocol::v1::ErrorCode::UnsupportedValue))?;
+            }
             ForwardingControls => {
                 let value = dto::ForwardingControlsValue::read(&value)?;
                 settings.audio.forwarding_volume_percent = value.volume_percent()?;
@@ -444,6 +449,7 @@ pub(super) fn local(settings: &Settings) -> serde_json::Value {
         "forwarding_enabled",
         "forwarding_volume_percent",
         "forwarding_muted",
+        "quality",
     ] {
         audio.remove(field);
     }

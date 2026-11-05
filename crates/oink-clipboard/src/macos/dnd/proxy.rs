@@ -23,18 +23,43 @@ pub(in crate::macos) struct Proxy {
     names: Mutex<Option<Vec<FileNode>>>,
     // A native target can retain the promise and invoke it after drag-ended.
     // Keep the whole consumer alive, including gaps between per-file readers.
-    _lease: content::namespace::NativeLease,
+    _lease: Mutex<Option<content::namespace::NativeLease>>,
+    pending_urls: Option<Arc<super::super::clipboard_files::FileUrls>>,
 }
 impl Proxy {
     fn new(files: Arc<dyn Namespace>, anchor: NodeId) -> io::Result<Self> {
         Ok(Self {
-            _lease: files.native_lease()?,
+            _lease: Mutex::new(Some(files.native_lease()?)),
+            pending_urls: None,
             files,
             anchor,
             names: Mutex::new(None),
         })
     }
+    fn new_lazy(files: Arc<dyn Namespace>, anchor: NodeId, urls: Arc<super::super::clipboard_files::FileUrls>) -> Self {
+        Self {
+            files,
+            anchor,
+            names: Mutex::new(None),
+            _lease: Mutex::new(None),
+            pending_urls: Some(urls),
+        }
+    }
     fn entries(&self) -> io::Result<Vec<FileNode>> {
+        if let Some(urls) = &self.pending_urls {
+            // Clipboard controls must not acquire a native File Provider lease
+            // during declaration: its worker has not bound the native copy yet.
+            // Wait only on real promise demand, independently of AppKit, and
+            // cap this readiness wait with the same 5 s callback budget as URLs.
+            let _callback = content::native_read::remote_read()
+                .is_none()
+                .then(content::native_read::Callback::begin);
+            urls.wait_ready()?;
+            let mut lease = self._lease.lock().unwrap();
+            if lease.is_none() {
+                *lease = Some(self.files.native_lease()?);
+            }
+        }
         let mut cached = self.names.lock().unwrap();
         if let Some(names) = cached.as_ref() {
             return Ok(names.clone());
@@ -492,8 +517,15 @@ pub(in crate::macos) fn wrap(
     spec: &crate::NativeSpec,
     writers: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>>,
 ) -> io::Result<(Writers, Vec<Arc<Proxy>>)> {
+    wrap_with_urls(spec, writers, None)
+}
+pub(in crate::macos) fn wrap_with_urls(
+    spec: &crate::NativeSpec,
+    writers: Writers,
+    urls: Option<&Arc<super::super::clipboard_files::FileUrls>>,
+) -> io::Result<(Writers, Vec<Arc<Proxy>>)> {
     if spec.inventory.platform != oink_foundation::clipboard::ClipPlatform::Mac {
-        return wrap_virtual(spec, writers, false);
+        return wrap_virtual(spec, writers, false, urls);
     }
     let mut output = Vec::new();
     let mut proxies = Vec::new();
@@ -516,7 +548,11 @@ pub(in crate::macos) fn wrap(
             continue;
         };
         let files = spec.contents.namespace().ok_or(io::ErrorKind::InvalidData)?;
-        let proxy = Arc::new(Proxy::new(files, anchor)?);
+        let proxy = Arc::new(if let Some(urls) = urls {
+            Proxy::new_lazy(files, anchor, urls.clone())
+        } else {
+            Proxy::new(files, anchor)?
+        });
         let controls: Vec<_> = original
             .representations
             .iter()
@@ -555,7 +591,16 @@ pub(in crate::macos) fn wrap(
             let writer: Retained<Modern> = unsafe {
                 msg_send![super(this), initWithFileType: &*NSString::from_str(ty), delegate: ProtocolObject::<dyn NSFilePromiseProviderDelegate>::from_ref(&*delegate)]
             };
-            output.push(ProtocolObject::from_retained(writer));
+            // As in wrap_virtual below, AppKit 26.6.2 needs an item relay for
+            // a clipboard promise's lazy companions. Drag retains its writer.
+            if urls.is_some() {
+                let board = NSPasteboard::pasteboardWithUniqueName();
+                output.push(ProtocolObject::from_retained(
+                    Modern::companion_item(writer, &board)?.into_super(),
+                ));
+            } else {
+                output.push(ProtocolObject::from_retained(writer));
+            }
         } else {
             let board = NSPasteboard::pasteboardWithUniqueName();
             let types = extra.writableTypesForPasteboard(&board);
@@ -1267,7 +1312,7 @@ pub(in crate::macos) fn wrap_drag(
     writers: Writers,
 ) -> io::Result<(Writers, Vec<Arc<Proxy>>)> {
     if spec.inventory.platform != oink_foundation::clipboard::ClipPlatform::Mac {
-        wrap_virtual(spec, writers, true)
+        wrap_virtual(spec, writers, true, None)
     } else {
         wrap(spec, writers)
     }
@@ -1277,6 +1322,7 @@ fn wrap_virtual(
     spec: &crate::NativeSpec,
     mut writers: Writers,
     prefer_url: bool,
+    urls: Option<&Arc<super::super::clipboard_files::FileUrls>>,
 ) -> io::Result<(Writers, Vec<Arc<Proxy>>)> {
     // native_items projects the foreign file roots as its final N items, with
     // selection companions attached to the first root for a single IDataObject.
@@ -1304,7 +1350,11 @@ fn wrap_virtual(
             writers.push(extra);
             continue;
         }
-        let proxy = Arc::new(Proxy::new(files.clone(), root.id)?);
+        let proxy = Arc::new(if let Some(urls) = urls {
+            Proxy::new_lazy(files.clone(), root.id, urls.clone())
+        } else {
+            Proxy::new(files.clone(), root.id)?
+        });
         let board = NSPasteboard::pasteboardWithUniqueName();
         let extra_types: Vec<_> = extra
             .writableTypesForPasteboard(&board)
@@ -1332,19 +1382,17 @@ fn wrap_virtual(
         let writer: Retained<Modern> = unsafe {
             msg_send![super(this), initWithFileType: &*NSString::from_str(&ty), delegate: ProtocolObject::<dyn NSFilePromiseProviderDelegate>::from_ref(&*delegate)]
         };
-        if link_drag {
-            // AppKit's NSFilePromiseProvider publication does not service extra
-            // promised URL/title/HTML flavors: their types appear, but a real
-            // pasteboard read returns nil without calling the writer. A direct
-            // property-list call bypasses that failure. Publish a real
-            // NSPasteboardItem with its documented data-provider callbacks;
-            // retain the received namespace/delegate on the item. Its browser
-            // URL promise is fulfilled only when the target supplies a location.
-            // Making these flavors eager would block publication on remote
-            // reads. Only this foreign linked virtual-file drag uses the relay;
-            // source ordering and clipboard/file-URL behavior stay intact.
-            // Private-board/independent-reader verification: macOS 26.6.2;
-            // browser/Finder desktop acceptance remains a manual check.
+        if link_drag || urls.is_some() {
+            // Clipboard promises now also carry delayed file URLs. Publishing
+            // an NSFilePromiseProvider directly declares companions but AppKit
+            // returns nil without calling their providers (private-board
+            // regression on macOS 26.6.2). Relay the unchanged promise controls
+            // and lazy companions through one NSPasteboardItem, retaining the
+            // native provider/delegate for receiver IPC. No second declaration
+            // or eager content read is needed; ordinary drag stays unchanged.
+            // For linked drags the existing legacy browser URL promise is
+            // fulfilled only after the receiver supplies its paste location.
+            // Finder/browser desktop acceptance remains a separate check.
             writers.push(ProtocolObject::from_retained(
                 Modern::companion_item(writer, &board)?.into_super(),
             ));

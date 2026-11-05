@@ -69,6 +69,13 @@ pub trait LayoutQuery: Send + Sync {
     fn focus_candidates(&self, _from: DeviceId) -> Vec<ScreenPos> {
         Vec::new()
     }
+    /// Explicit pointer shortcut landing. Unlike automatic focus candidates,
+    /// implementations may use retained hidden-screen geometry.
+    fn pointer_destination(&self, from: DeviceId, target: DeviceId) -> Option<ScreenPos> {
+        self.focus_candidates(from)
+            .into_iter()
+            .find(|p| p.screen.device == target)
+    }
     /// Ordinary diagnostic projection of the same captured topology; omitted by simple layouts.
     fn first_portal(&self, _from: &ScreenPos, _delta: (f64, f64)) -> Option<oink_display::layout::PortalExit> {
         None

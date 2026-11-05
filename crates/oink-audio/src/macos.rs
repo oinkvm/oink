@@ -675,8 +675,12 @@ impl RealtimeCapture {
         let device = unsafe { oink_audio_capture_device_id(raw) };
         let period_ns = (f64::from(period_frames) * 1e9 / rate).round() as u64;
         let mut schedule = crate::realtime::Schedule::device(device, period_ns)?;
-        let mut resampler = StereoResampler::new(rate);
-        let mut output = vec![0.0; ((4097.0 * 48_000.0 / rate).ceil() as usize + 2) * 2];
+        let target_rate = encoder.config().sample_rate;
+        if encoder.config().codec == crate::dsp::Codec::Pcm24 && rate.round() as u32 != target_rate {
+            return Err("source sample rate changed during audio preparation".into());
+        }
+        let mut resampler = StereoResampler::with_rates(rate, f64::from(target_rate), 4096);
+        let mut output = vec![0.0; resampler.output_capacity(8192)];
         let clock = HostClock::new();
         let reader = CaptureReader(raw);
         let stop = Arc::new(AtomicBool::new(false));
@@ -891,100 +895,10 @@ impl Drop for NativeCapture {
 
 // Continuous interpolation carries one frame and fractional position across
 // HAL callback boundaries; never round each buffer's resampled length.
-struct StereoResampler {
-    step: f64,
-    position: f64,
-    pending: Vec<f32>,
-    pending_time: Option<Instant>,
-    pending_callback: Option<Instant>,
-    pending_sequence: u64,
-}
+use crate::resample::StereoResampler;
 
+#[cfg(test)]
 impl StereoResampler {
-    fn new(rate: f64) -> Self {
-        Self {
-            step: rate / 48_000.0,
-            position: 0.0,
-            pending: {
-                let mut pending = vec![0.0; 8194];
-                std::hint::black_box(&mut pending);
-                pending.clear();
-                pending
-            },
-            pending_time: None,
-            pending_callback: None,
-            pending_sequence: 0,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.pending.clear();
-        self.position = 0.0;
-        self.pending_time = None;
-        self.pending_callback = None;
-        self.pending_sequence = 0;
-    }
-    fn process_timed_into(
-        &mut self,
-        input: &[f32],
-        first_sample_at: Option<Instant>,
-        callback_at: Option<Instant>,
-        sequence: u64,
-        output: &mut [f32],
-    ) -> (usize, crate::source::Stamp) {
-        let previous_frames = self.pending.len() / 2;
-        if previous_frames == 0 {
-            self.pending_time = first_sample_at;
-            self.pending_callback = callback_at;
-            self.pending_sequence = sequence;
-        }
-        let rate = self.step * 48_000.0;
-        let stamp = crate::source::Stamp {
-            first_sample_at: self
-                .pending_time
-                .and_then(|at| at.checked_add(Duration::from_secs_f64(self.position / rate))),
-            callback_at: self.pending_callback,
-            source_frame_position: Some(self.pending_sequence + self.position as u64),
-            delivered_at: Instant::now(),
-            discontinuity: false,
-        };
-        let mut count = 0;
-        if self.step == 1.0 {
-            count = input.len();
-            output[..count].copy_from_slice(input);
-        } else {
-            self.pending.extend_from_slice(input);
-            let frames = self.pending.len() / 2;
-            while self.position + 1.0 < frames as f64 && count + 2 <= output.len() {
-                let frame = self.position as usize;
-                let fraction = (self.position - frame as f64) as f32;
-                for channel in 0..2 {
-                    let a = self.pending[frame * 2 + channel];
-                    let b = self.pending[(frame + 1) * 2 + channel];
-                    output[count + channel] = a + (b - a) * fraction;
-                }
-                count += 2;
-                self.position += self.step;
-            }
-            let consumed = (self.position as usize).min(frames);
-            self.pending.drain(..consumed * 2);
-            self.position -= consumed as f64;
-        }
-        let consumed = previous_frames + input.len() / 2 - self.pending.len() / 2;
-        if consumed >= previous_frames {
-            self.pending_time = first_sample_at
-                .and_then(|at| at.checked_add(Duration::from_secs_f64((consumed - previous_frames) as f64 / rate)));
-            self.pending_callback = callback_at;
-            self.pending_sequence = sequence + (consumed - previous_frames) as u64;
-        } else {
-            self.pending_time = self
-                .pending_time
-                .and_then(|at| at.checked_add(Duration::from_secs_f64(consumed as f64 / rate)));
-            self.pending_sequence += consumed as u64;
-        }
-        (count, stamp)
-    }
-
     #[cfg(test)]
     fn process(&mut self, input: &[f32]) -> Vec<f32> {
         self.process_timed(input, None, None, 0).samples
@@ -998,63 +912,15 @@ impl StereoResampler {
         callback_at: Option<Instant>,
         sequence: u64,
     ) -> CaptureBlock {
-        let previous_frames = self.pending.len() / 2;
-        if previous_frames == 0 {
-            self.pending_time = first_sample_at;
-            self.pending_callback = callback_at;
-            self.pending_sequence = sequence;
-        }
-        let rate = self.step * 48_000.0;
-        let output_time = self
-            .pending_time
-            .and_then(|time| time.checked_add(Duration::from_secs_f64(self.position / rate)));
-        let output_callback = self.pending_callback;
-        let output_sequence = self.pending_sequence + self.position as u64;
-        let samples = self.resample(input);
-        // Update the timestamp of the retained input frame. Refer to the new
-        // callback only once the retained frame belongs to its input block.
-        let consumed = previous_frames + input.len() / 2 - self.pending.len() / 2;
-        if consumed >= previous_frames {
-            self.pending_time = first_sample_at
-                .and_then(|time| time.checked_add(Duration::from_secs_f64((consumed - previous_frames) as f64 / rate)));
-            self.pending_callback = callback_at;
-            self.pending_sequence = sequence + (consumed - previous_frames) as u64;
-        } else {
-            self.pending_time = self
-                .pending_time
-                .and_then(|time| time.checked_add(Duration::from_secs_f64(consumed as f64 / rate)));
-            self.pending_sequence += consumed as u64;
-        }
+        let mut samples = vec![0.0; self.output_capacity(input.len())];
+        let (count, stamp) = self.process_timed_into(input, first_sample_at, callback_at, sequence, &mut samples);
+        samples.truncate(count);
         CaptureBlock {
             samples,
-            first_sample_at: output_time,
-            callback_at: output_callback,
-            source_frame_position: Some(output_sequence),
+            first_sample_at: stamp.first_sample_at,
+            callback_at: stamp.callback_at,
+            source_frame_position: stamp.source_frame_position,
         }
-    }
-
-    #[cfg(test)]
-    fn resample(&mut self, input: &[f32]) -> Vec<f32> {
-        if self.step == 1.0 {
-            return input.to_vec();
-        }
-        self.pending.extend_from_slice(input);
-        let frames = self.pending.len() / 2;
-        let mut output = Vec::with_capacity((frames as f64 / self.step).ceil() as usize * 2);
-        while self.position + 1.0 < frames as f64 {
-            let frame = self.position as usize;
-            let fraction = (self.position - frame as f64) as f32;
-            for channel in 0..2 {
-                let a = self.pending[frame * 2 + channel];
-                let b = self.pending[(frame + 1) * 2 + channel];
-                output.push(a + (b - a) * fraction);
-            }
-            self.position += self.step;
-        }
-        let consumed = (self.position as usize).min(frames);
-        self.pending.drain(..consumed * 2);
-        self.position -= consumed as f64;
-        output
     }
 }
 
@@ -1329,11 +1195,20 @@ mod tests {
         for rate in [8_000.0, 44_100.0, 48_000.0, 96_000.0, 192_000.0] {
             let mut converter = StereoResampler::new(rate);
             let mut output = Vec::new();
-            for _ in 0..100 {
+            for _ in 0..256 {
                 output.extend(converter.process(&[0.25, -0.5, 0.25, -0.5]));
             }
             assert!(!output.is_empty());
-            assert!(output.as_chunks::<2>().0.iter().all(|frame| *frame == [0.25, -0.5]));
+            let settled = if rate == 48_000.0 {
+                0
+            } else {
+                (96.0 * (rate / 48_000.0).floor().max(1.0) * 48_000.0 / rate).ceil() as usize
+            };
+            assert!(
+                output.as_chunks::<2>().0[settled..]
+                    .iter()
+                    .all(|frame| (frame[0] - 0.25).abs() < 1e-6 && (frame[1] + 0.5).abs() < 1e-6)
+            );
         }
     }
 }

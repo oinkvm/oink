@@ -130,14 +130,44 @@ pub struct PlaybackInfo {
     pub reported_output_latency_ms: Option<f64>,
 }
 
+/// Fixed encoding class of the sources actually rendered in a callback.
+/// Mixed classes, unsupported DSP configurations and no source are unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentationCodec {
+    Opus5ms,
+    Opus20ms,
+    Pcm24,
+    Pcm16_2p5ms,
+    Unknown,
+}
+impl PresentationCodec {
+    pub(crate) fn from_config(config: crate::dsp::Config) -> Self {
+        use crate::dsp::{Codec, FrameDuration};
+        match (config.codec, config.frame_duration) {
+            (Codec::Opus, FrameDuration::Ms5) => Self::Opus5ms,
+            (Codec::Opus, FrameDuration::Ms20) => Self::Opus20ms,
+            (Codec::Pcm24, FrameDuration::Samples160) => Self::Pcm24,
+            (Codec::Pcm16, FrameDuration::Ms2p5) => Self::Pcm16_2p5ms,
+            _ => Self::Unknown,
+        }
+    }
+    pub(crate) fn include(current: &mut Option<Self>, config: crate::dsp::Config) {
+        let next = Self::from_config(config);
+        *current = Some(match *current {
+            None => next,
+            Some(previous) if previous == next => previous,
+            _ => Self::Unknown,
+        });
+    }
+}
 /// A content-free native timing hook. The owner must return immediately; no
 /// trace sequence, audio sample or endpoint metadata is passed to the observer.
 struct PresentationObserver {
     enabled: fn() -> bool,
-    record: fn(Instant, Instant),
+    record: fn(Instant, Instant, PresentationCodec),
 }
 static PRESENTATION_OBSERVER: std::sync::OnceLock<PresentationObserver> = std::sync::OnceLock::new();
-pub fn set_presentation_observer(enabled: fn() -> bool, record: fn(Instant, Instant)) {
+pub fn set_presentation_observer(enabled: fn() -> bool, record: fn(Instant, Instant, PresentationCodec)) {
     let _ = PRESENTATION_OBSERVER.set(PresentationObserver { enabled, record });
 }
 #[derive(Clone, Copy, Debug)]
@@ -179,6 +209,9 @@ pub(crate) trait PullInput: Send {
     fn end(&mut self);
     fn gap(&mut self, gap: OutputGap);
     fn drained(&self) -> bool;
+    fn presentation_codec(&self) -> PresentationCodec {
+        PresentationCodec::Unknown
+    }
     fn work(&self) -> CallbackWork {
         CallbackWork::default()
     }
@@ -339,7 +372,7 @@ pub struct Playback {
     error: Arc<Mutex<Option<String>>>,
     started: Instant,
     callback_ms: Arc<AtomicU64>,
-    traces: Mutex<handoff::Consumer<PlaybackTrace>>,
+    _traces: Mutex<handoff::Consumer<PlaybackTrace>>,
     trace_dropped: Arc<AtomicU64>,
     underrun_frames: Arc<AtomicU64>,
     info: PlaybackInfo,
@@ -460,7 +493,7 @@ impl Playback {
             error,
             started,
             callback_ms,
-            traces: Mutex::new(traces),
+            _traces: Mutex::new(traces),
             trace_dropped,
             underrun_frames,
             info,
@@ -470,10 +503,6 @@ impl Playback {
     }
     pub fn info(&self) -> PlaybackInfo {
         self.info.clone()
-    }
-    pub fn take_traces(&self) -> Vec<PlaybackTrace> {
-        let mut traces = self.traces.lock().unwrap_or_else(|e| e.into_inner());
-        std::iter::from_fn(|| traces.pop()).collect()
     }
     pub fn trace_dropped(&self) -> u64 {
         self.trace_dropped.load(Ordering::Relaxed)
@@ -573,15 +602,13 @@ impl Drop for Playback {
     }
 }
 
-// Same-thread scratch covers only this request. No mixed PCM survives except
-// the single interpolation boundary frame. Oversized requests fault to silence.
+// Same-thread scratch at the output device rate. Each source converts before
+// mixing. Oversized requests fault to silence.
 const MAX_PULL_FRAMES: usize = 16_384;
 pub(crate) struct Render {
     input: Box<dyn PullInput>,
     scratch: Box<[f32]>,
     kinds: Box<[crate::sink::quality::OutputKind]>,
-    carry: Option<([f32; 2], crate::sink::quality::OutputKind)>,
-    phase: f64,
     last_sources: [u64; MIX_SOURCES],
     splice: crate::sink::quality::SpliceRamp,
     fade: FadeOut,
@@ -624,8 +651,6 @@ impl Render {
             input,
             scratch,
             kinds,
-            carry: None,
-            phase: 0.0,
             last_sources: [0; MIX_SOURCES],
             splice: Default::default(),
             fade: Default::default(),
@@ -708,10 +733,7 @@ impl Render {
         if frames == 0 {
             return;
         }
-        let step = 48_000.0 / f64::from(rate);
-        let total = self.phase + frames as f64 * step;
-        let consumed = total.floor() as usize;
-        let needed = ((self.phase + (frames - 1) as f64 * step).floor() as usize + 1).max(consumed);
+        let needed = frames;
         if needed > MAX_PULL_FRAMES {
             output.fill(0.0);
             self.metrics.fault.store(true, Ordering::Release);
@@ -747,15 +769,10 @@ impl Render {
                 self.underrun_frames.fetch_add(gap, Ordering::Relaxed);
             }
         }
-        let carried = usize::from(self.carry.is_some());
-        if let Some((sample, kind)) = self.carry.take() {
-            self.scratch[..2].copy_from_slice(&sample);
-            self.kinds[0] = kind;
-        }
-        self.input.begin(needed.saturating_sub(carried), timing.callback_at);
+        self.input.begin(needed, timing.callback_at);
         self.pending_incident.phase_ns[0] = callback_offset_ns(timing.callback_at);
         let mut sources = [0; MIX_SOURCES];
-        let mut offset = carried;
+        let mut offset = 0;
         while offset < needed {
             let end = (offset + 120).min(needed);
             let block = self.input.pull(
@@ -779,21 +796,9 @@ impl Render {
             self.fade.start(rate);
         }
         let mut missing = 0;
-        let phase_start = self.phase;
         for (offset, frame) in output.chunks_exact_mut(channels).enumerate() {
-            let position = phase_start + offset as f64 * step;
-            let index = position.floor() as usize;
-            let fraction = position.fract() as f32;
-            let next = (index + 1).min(needed - 1);
-            let mut kind = self.kinds[index];
-            if fraction > 0.0 && self.kinds[next] != kind {
-                kind = self.kinds[next];
-            }
-            let mut stereo = [0.0; 2];
-            for (channel, sample) in stereo.iter_mut().enumerate() {
-                let a = self.scratch[index * 2 + channel];
-                *sample = a + (self.scratch[next * 2 + channel] - a) * fraction;
-            }
+            let kind = self.kinds[offset];
+            let mut stereo = [self.scratch[offset * 2], self.scratch[offset * 2 + 1]];
             if let Some(counters) = counters {
                 missing += u64::from(kind == OutputKind::Missing && self.quality.established());
                 let audible = if channels == 1 {
@@ -820,13 +825,6 @@ impl Render {
                     0.0
                 };
             }
-        }
-        self.phase = total - consumed as f64;
-        if needed > consumed {
-            self.carry = Some((
-                [self.scratch[consumed * 2], self.scratch[consumed * 2 + 1]],
-                self.kinds[consumed],
-            ));
         }
         self.pending_incident.phase_ns[2] = callback_offset_ns(timing.callback_at);
         self.input.end();
@@ -878,7 +876,7 @@ impl Render {
             && (observer.enabled)()
             && let Some(at) = timing.playback_at
         {
-            (observer.record)(timing.callback_at, at);
+            (observer.record)(timing.callback_at, at, self.input.presentation_codec());
         }
         if self.traces.is_some() {
             self.pending_trace = Some(PlaybackTrace {
@@ -1018,6 +1016,26 @@ impl Render {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn presentation_codec_collapses_rates_but_not_different_encodings() {
+        use crate::dsp::Config;
+        let mut codec = None;
+        PresentationCodec::include(&mut codec, Config::lossless(44100));
+        PresentationCodec::include(&mut codec, Config::lossless(192000));
+        assert_eq!(codec, Some(PresentationCodec::Pcm24));
+        PresentationCodec::include(&mut codec, Config::music_opus());
+        PresentationCodec::include(&mut codec, Config::lossless(44100));
+        assert_eq!(codec, Some(PresentationCodec::Unknown));
+        assert_eq!(
+            PresentationCodec::from_config(Config::low_latency_pcm()),
+            PresentationCodec::Pcm16_2p5ms
+        );
+        assert_eq!(
+            PresentationCodec::from_config(Config::opus_10ms()),
+            PresentationCodec::Unknown
+        );
+    }
+
     use crate::sink::quality::OutputKind;
     struct Control {
         value: std::sync::atomic::AtomicU32,
@@ -1246,7 +1264,7 @@ mod tests {
             (48_000, 65, 128),
             (7999, 2, 128),
             (192_001, 2, 128),
-            (8000, 2, 3000),
+            (8000, 2, 20_000),
         ] {
             let (control, mut render, _) = renderer(false);
             let mut output = vec![0.7; frames * channels.max(1) as usize];
@@ -1420,7 +1438,7 @@ mod tests {
         }
     }
     #[test]
-    fn low_rate_output_keeps_phase_across_pull_boundaries() {
+    fn native_rate_output_consumes_exact_pull_frames_without_second_conversion() {
         for rate in [16_000, 44_100, 96_000] {
             let (control, mut render, _) = renderer(true);
             let mut actual_frames = 0;
@@ -1428,17 +1446,13 @@ mod tests {
                 let mut output = vec![0.0; size * 2];
                 render.fill(&mut output, timing(rate));
                 for (offset, frame) in output.as_chunks::<2>().0.iter().enumerate() {
-                    let expected = (actual_frames + offset) as f64 * 48_000.0 / f64::from(rate) * 0.00001;
-                    // Optional future interpolation is held at the callback's last sample.
+                    let expected = (actual_frames + offset) as f64 * 0.00001;
+                    // Source conversion has already produced device-rate PCM.
                     assert!((f64::from(frame[0]) - expected).abs() < 0.000011);
                 }
                 actual_frames += size;
             }
-            assert!(
-                (control.frames.load(Ordering::Relaxed) as f64 - actual_frames as f64 * 48_000.0 / f64::from(rate))
-                    .abs()
-                    <= 1.0
-            );
+            assert!((control.frames.load(Ordering::Relaxed) as f64 - actual_frames as f64).abs() <= 1.0);
         }
     }
     #[test]
@@ -1446,7 +1460,6 @@ mod tests {
         let (control, mut render, _) = renderer(false);
         render.fill(&mut [0.0; 256], timing(48_000));
         assert_eq!(control.frames.load(Ordering::Relaxed), 128);
-        assert!(render.carry.is_none());
     }
     #[test]
     fn trace_marks_the_current_pull_submission_without_queued_pcm_age() {

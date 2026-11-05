@@ -89,9 +89,6 @@ pub fn sample(schema: Schema) -> RawMap {
             raw.insert(1, V::from("future-event/1"));
         }
 
-        "AimState" => {
-            raw.insert(7, V::F32(7.0 / 686.0));
-        }
         "AttachmentItems" | "AttachmentResult" => {
             raw.insert(4, V::Map(sample_named("OfferId")));
             raw.insert(5, V::Uint(0));

@@ -365,9 +365,7 @@ impl Owner {
                 .update_owner(|owner| owner.switch_group(anchor.group, device))
                 .map_err(|e| fail(&e))?;
         }
-        let application_focus_enabled = stored.application_focus_enabled().map_err(|e| fail(&e))?;
         let applied = AppliedState {
-            application_focus_enabled,
             group: anchor.group,
             roster_digest: state.roster().digest().map_err(|e| fail(&e))?,
             pointer_slots: state.pointer_slots().map_err(|e| fail(&e))?,
@@ -407,7 +405,6 @@ impl Owner {
                 owners: owners.clone(),
             }),
             router: Arc::new(Snapshot::new(RouterLayout {
-                application_focus_enabled,
                 group: anchor.group,
                 version,
                 topology: TopologyLayout::from_effective(&layout.effective(&owners), |d| devices.contains(d)),
@@ -541,6 +538,9 @@ impl Owner {
     }
     async fn run(&mut self, config: oink_network::NetworkConfig) {
         let (sightings, mut sightings_rx) = mpsc::channel(256);
+        // With beacon unavailable and mDNS off/failed there are no producers.
+        // Latch EOF so the otherwise live owner does not spin on a closed queue.
+        let mut sightings_open = true;
         match Discovery::start(
             DiscoveryConfig {
                 bind_ip: config.bind_ip,
@@ -565,7 +565,10 @@ impl Owner {
                 command=self.commands.recv()=>match command{Some(Command::Run(f))=>f(self),Some(Command::Stop)|None=>break},
                 event=self.port.next()=>match event{Some(event)=>self.network(event),None=>break},
                 event=self.incoming.recv()=>if let Some(event)=event{self.incoming(event)},
-                sighting=sightings_rx.recv(),if self.discovery.is_some()=>if let Some(sighting)=sighting{self.sighting(sighting)},
+                sighting=sightings_rx.recv(),if self.discovery.is_some() && sightings_open=>match sighting {
+                    Some(sighting)=>self.sighting(sighting),
+                    None=>sightings_open=false,
+                },
                 _=tokio::time::sleep_until(deadline.into())=>self.tick(),
             }
         }
@@ -1220,15 +1223,25 @@ impl Owner {
                 {
                     return Ok(());
                 }
-                let changed = old.is_none_or(|old| old.capabilities() != facts.capabilities());
-                self.cache
-                    .observe(facts.clone())
-                    .map_err(|_| v1::ErrorCode::StateConflict)?;
+                let telemetry_only = old.is_some_and(|old| super::facts::same_configuration(old, &facts));
+                let changed = !telemetry_only && old.is_none_or(|old| old.capabilities() != facts.capabilities());
+                if !telemetry_only {
+                    // The historical cache excludes sequence and link measurements.
+                    self.cache
+                        .observe(facts.clone())
+                        .map_err(|_| v1::ErrorCode::StateConflict)?;
+                }
                 self.facts.insert(peer.device_id, Arc::new(facts));
-                self.links
-                    .update_addresses(peer.device_id, self.member_candidates(peer.device_id));
+                if !telemetry_only {
+                    self.links
+                        .update_addresses(peer.device_id, self.member_candidates(peer.device_id));
+                }
                 if !self.needs_apply {
-                    self.publish().map_err(|_| v1::ErrorCode::StateConflict)?;
+                    if telemetry_only {
+                        self.publish_fact_observation(peer.device_id);
+                    } else {
+                        self.publish().map_err(|_| v1::ErrorCode::StateConflict)?;
+                    }
                 }
                 self.shared.emit(ConfigChange::Facts {
                     device: peer.device_id,

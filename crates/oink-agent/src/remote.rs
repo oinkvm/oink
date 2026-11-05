@@ -5,10 +5,11 @@
 //! - 事件：[`RemoteApi::follow_events`] 在调用线程上保持一条订阅连接，把事件分发给 [`AgentApi::subscribe`]
 //!   注册的回调，直到连接结束；返回结束的原因，界面随之退出，不重连、不重新拉起后台。
 //!   订阅回调跨重连保留。
-//! - 每次新建连接都重新读 `ipc.json`：服务进程重启后端口与令牌会变。
+//! - 每次新建连接都重新读 `ipc.json`：服务进程重启后地址与令牌会变。
 
+use crate::ipc::LocalStream;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -44,7 +45,7 @@ pub enum EventsEnd {
     Cancelled,
 }
 
-struct Conn<R: Read = TcpStream> {
+struct Conn<R: Read = LocalStream> {
     endpoint: Endpoint,
     reader: BufReader<R>,
 }
@@ -56,7 +57,7 @@ struct Inner {
     sinks: Mutex<Vec<(u64, EventSink)>>,
     next_sink: AtomicU64,
     /// 正在跟随事件的连接（`stop_following` 用它打断阻塞的读取）。
-    events: Mutex<Option<Arc<TcpStream>>>,
+    events: Mutex<Option<Arc<LocalStream>>>,
     cancelled: std::sync::atomic::AtomicBool,
     live_views: Mutex<LiveViews>,
     events_ready: std::sync::atomic::AtomicBool,
@@ -159,10 +160,10 @@ impl RemoteApi {
         connect_timeout: Duration,
     ) -> Result<Conn, ApiError> {
         let endpoint = Endpoint::read(&self.inner.data_dir).map_err(|e| unavailable(format!("{e:#}")))?;
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], endpoint.port));
-        let s = TcpStream::connect_timeout(&addr, connect_timeout)
-            .map_err(|e| unavailable(format!("连不上服务进程（端口 {}）：{e}", endpoint.port)))?;
-        let _ = s.set_nodelay(true);
+        let s = endpoint
+            .address
+            .connect(connect_timeout)
+            .map_err(|e| unavailable(format!("连不上服务进程：{e}")))?;
         s.set_read_timeout(timeout)
             .and_then(|()| s.set_write_timeout(Some(CALL_TIMEOUT)))
             .map_err(|e| unavailable(e.to_string()))?;
@@ -548,9 +549,6 @@ impl AgentApi for RemoteApi {
     fn set_onboarding_connect(&self, active: bool) -> ApiResult<()> {
         self.call(Request::SetOnboardingConnect { active })
     }
-    fn group_migration(&self) -> ApiResult<Option<pairing::GroupMigrationStatus>> {
-        self.call(Request::GroupMigration)
-    }
     fn accept_pairing(
         &self,
         pair_id: String,
@@ -692,10 +690,6 @@ impl AgentApi for RemoteApi {
     fn group(&self) -> ApiResult<GroupView> {
         self.call(Request::Group)
     }
-    fn rename_device(&self, device: DeviceKey, name: String) -> ApiResult<()> {
-        self.call(Request::RenameDevice { device, name })
-    }
-
     fn remove_member(&self, device: DeviceKey) -> ApiResult<()> {
         self.call(Request::RemoveMember { device })
     }
@@ -728,24 +722,6 @@ impl AgentApi for RemoteApi {
     }
     fn wallpapers(&self, refresh: bool) -> ApiResult<Vec<crate::api::ScreenWallpaper>> {
         self.call(Request::Wallpapers { refresh })
-    }
-    fn identify_screens(&self) -> ApiResult<()> {
-        self.call(Request::IdentifyScreens)
-    }
-    fn aim_status(&self) -> ApiResult<AimStatus> {
-        self.call(Request::AimStatus)
-    }
-    fn aim_start(&self) -> ApiResult<AimStatus> {
-        self.call(Request::AimStart)
-    }
-    fn aim_stop(&self) -> ApiResult<()> {
-        self.call(Request::AimStop)
-    }
-    fn layout_projection(&self) -> ApiResult<ProjectionStatus> {
-        self.call(Request::LayoutProjection)
-    }
-    fn set_layout_projection(&self, enabled: bool) -> ApiResult<ProjectionStatus> {
-        self.call(Request::SetLayoutProjection { enabled })
     }
     fn preview_layout_projection(
         &self,
@@ -939,7 +915,9 @@ mod startup_tests {
         std::fs::write(
             dir.path().join(crate::ipc::IPC_FILE),
             serde_json::to_vec(&Endpoint {
-                port: listener.local_addr().unwrap().port(),
+                address: crate::ipc::transport::Address::Legacy {
+                    port: listener.local_addr().unwrap().port(),
+                },
                 token: "stale".into(),
             })
             .unwrap(),

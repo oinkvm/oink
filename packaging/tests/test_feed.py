@@ -178,13 +178,13 @@ class PublicationTests(FeedTests):
         folder = self.state/'input'
         folder.mkdir()
         raw = b'ONLY A TEST MSI PAYLOAD; NOT EXECUTABLE'
-        artifact = {'name': 'Oink-test.msi', 'size': len(raw), 'sha256': feed.digest(raw)}
+        artifact = {'name': 'Oink-1.0.0-windows-x64.msi', 'size': len(raw), 'sha256': feed.digest(raw)}
         record = {'schema': 1, 'product': 'Oink', 'source_tree_sha256': 'a'*64, 'architecture': 'x64',
                   'signing': 'signpath-approved-authenticode-verified', 'updater_included': True,
                   'collector_included': True, 'build': 2, 'protocol_baseline': 1, 'artifacts': [artifact],
                   'version': '1.0.0', 'minimumWindowsBuild': 19045}
         feed.write(folder/'release.json', record)
-        feed.write(folder/'Oink-test.msi', raw)
+        feed.write(folder/'Oink-1.0.0-windows-x64.msi', raw)
         # Notes from the trusted checkout win even if an old input contains update.json.
         feed.write(folder/'update.json', {'channel': 'beta', 'notes': {'en': 'Stale release asset'}})
         notes_path = self.state/'.github/update-notes.json'
@@ -195,6 +195,9 @@ class PublicationTests(FeedTests):
         with patch.dict(os.environ, context), patch.object(feed, 'ROOT', self.state):
             release.sign_package(config, folder, self.state/'output.json')
             output = feed.read(self.state/'output.json')
+            self.assertEqual(output['release']['package']['url'],
+                             'https://github.com/oinkvm/oink/releases/download/v1.0.0/Oink-1.0.0-windows-x64.msi')
+            self.assertEqual(output['release']['build'], 2)
             feed.write(self.state / 'registry.json', {'schema': 1, 'feeds': {EPOCH['epoch']: {
                 c: {'records': [], 'last_allocated': 0, 'manifest_sha256': None} for c in EPOCH['channels']}}})
             with patch.dict(os.environ, {'OINK_PUBLISHED_BUILD': '2'}), patch.object(feed, 'download', return_value=raw):
@@ -226,9 +229,9 @@ class PublicationTests(FeedTests):
                     payload = feed.loads(base64.b64decode(plan['payload']))
                     self.assertEqual(payload['releases'], [output['release']])
             feed.write(notes_path, annotations)
-            (folder/'Oink-test.msi').write_bytes(b'tampered')
+            (folder/'Oink-1.0.0-windows-x64.msi').write_bytes(b'tampered')
             with self.assertRaises(ValueError): release.sign_package(config, folder, self.state/'output.json')
-            (folder/'Oink-test.msi').write_bytes(raw)
+            (folder/'Oink-1.0.0-windows-x64.msi').write_bytes(raw)
             record['signing'] = 'unsigned'
             feed.write(folder/'release.json', record)
             release.sign_package(config, folder, self.state/'output.json')

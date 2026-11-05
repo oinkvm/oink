@@ -13,7 +13,6 @@
 //!   普通 token 的低级 hook 无法稳定采集高完整性窗口。UIAccess 后台只在 Default 采集，
 //!   安全桌面立即收回本机来源并释放已转发按压；现有 SYSTEM helper 的注入职责不变。
 
-mod application_focus;
 mod credential_focus;
 mod cursor;
 mod dpi;
@@ -75,7 +74,6 @@ pub(crate) fn backend() -> Result<Box<dyn InputBackend>, InputError> {
 
 #[derive(Debug, Default)]
 struct WinInput {
-    application_focus: application_focus::Controller,
     source_foreground: source_foreground::Controller,
     safety: crate::session_gate::SessionGate,
     hook: Mutex<Option<hook::HookHandle>>,
@@ -160,6 +158,10 @@ fn cursor_dpi() -> u32 {
 }
 
 impl InputBackend for WinInput {
+    fn reconcile_passed_modifiers(&self, candidates: u8) -> u8 {
+        hook::reconcile_passed_modifiers(candidates)
+    }
+
     fn set_source_foreground(&self, enabled: bool) {
         // The foreground-capture window would be shown on the logon desktop.
         if profile::current().visible_windows {
@@ -167,32 +169,6 @@ impl InputBackend for WinInput {
         }
     }
 
-    fn application_focus_supported(&self) -> bool {
-        profile::current().visible_windows
-    }
-    fn application_focus_watch(&self, observer: Option<crate::application_focus::Observer>) {
-        if !profile::current().visible_windows {
-            return;
-        }
-        self.application_focus.watch(observer);
-    }
-    fn application_focus_sample(&self) -> oink_foundation::application_focus::Observation {
-        self.application_focus.sample()
-    }
-    fn application_focus_park(
-        &self,
-        expected: oink_foundation::application_focus::ObservationStamp,
-        operation: u64,
-        permit: crate::application_focus::Permit,
-    ) -> oink_foundation::application_focus::ParkResult {
-        let result = self.application_focus.park(expected, operation, permit);
-        tracing::info!(target: "oink_application_focus", operation, generation = expected.generation,
-            sequence = expected.sequence, ?result, "native park completed");
-        result
-    }
-    fn application_focus_dismiss(&self) {
-        self.application_focus.dismiss();
-    }
     fn start_injection_session(&self) -> Result<(), InputError> {
         service::initialize()
     }

@@ -18,6 +18,7 @@ use windows::Win32::{
 };
 use windows::core::Interface;
 
+#[cfg(test)]
 const RATE: u32 = 48_000;
 const HNS_PER_SECOND: u64 = 10_000_000;
 const BASELINE_BUFFER_HNS: i64 = 200_000;
@@ -78,17 +79,27 @@ impl OpenedCapture {
     /// None selects the driver-default shared-engine period.
     /// Some(0) requests the driver minimum; Some(n) rounds to a valid quantum.
     pub fn open(device: &IMMDevice, requested: Option<u32>) -> Result<Self, String> {
+        let probe = activate(device)?;
+        // Read the endpoint mix rate, then request float stereo at that same
+        // rate. WASAPI only maps channels/sample representation here. Opus SRC
+        // is performed by the shared band-limited converter on the worker.
+        // SAFETY: GetMixFormat returns an initialized COM allocation, read before freeing it.
+        let rate = unsafe {
+            let mix = probe.GetMixFormat().map_err(|error| error.to_string())?;
+            let rate = (*mix).nSamplesPerSec;
+            CoTaskMemFree(Some(mix.cast()));
+            rate
+        };
         let format = WAVEFORMATEX {
             wFormatTag: 3, // IEEE float
             nChannels: 2,
-            nSamplesPerSec: RATE,
-            nAvgBytesPerSec: RATE * 8,
+            nSamplesPerSec: rate,
+            nAvgBytesPerSec: rate * 8,
             nBlockAlign: 8,
             wBitsPerSample: 32,
             cbSize: 0,
         };
         let mut notes = Vec::new();
-        let probe = activate(device)?;
         let client3 = probe.cast::<IAudioClient3>().ok();
         let periods = match client3.as_ref().map(|client| shared_periods(client, &format)) {
             Some(Ok(periods)) => Some(periods),
@@ -101,7 +112,7 @@ impl OpenedCapture {
                 None
             }
         };
-        let legacy_default = device_default_period(&probe);
+        let legacy_default = device_default_period(&probe, rate);
         let mut selected_period = None;
         let mut initialized = None;
         if let Some(requested) = requested
@@ -111,7 +122,7 @@ impl OpenedCapture {
                 Ok(period) => {
                     selected_period = Some(period);
                     let event = Event::new()?;
-                    // SAFETY: this is a render endpoint and a valid 48kHz
+                    // SAFETY: this is a render endpoint and a valid native-rate
                     // float format. Always retain LOOPBACK: omitting it
                     // would silently open a render stream instead. Some
                     // drivers reject LOOPBACK with the Client3 initializer;
@@ -177,7 +188,10 @@ impl OpenedCapture {
                 client
                     .GetService::<IAudioCaptureClient>()
                     .map_err(|e| format!("get WASAPI capture service: {e}"))?,
-                client.GetStreamLatency().ok().and_then(hns_to_frames),
+                client
+                    .GetStreamLatency()
+                    .ok()
+                    .and_then(|time| hns_to_frames_at(time, rate)),
             )
         };
         let info = CaptureInfo {
@@ -185,9 +199,9 @@ impl OpenedCapture {
             // This is the actual initialized WASAPI client format. Engine
             // periods obtained in another native mix rate are rescaled to this
             // unit; raw engine rate/frames are retained in the diagnostic log.
-            sample_rate: RATE,
+            sample_rate: rate,
             requested_buffer_frames: if requested.is_none() {
-                hns_to_frames(BASELINE_BUFFER_HNS)
+                hns_to_frames_at(BASELINE_BUFFER_HNS, rate)
             } else {
                 selected_period.or(requested)
             },
@@ -216,7 +230,7 @@ impl OpenedCapture {
     pub fn report_started(&mut self) {
         match current_period(&self.client) {
             Ok((frames, rate)) => {
-                self.info.engine_period_frames = rescale_frames(frames, rate, RATE);
+                self.info.engine_period_frames = rescale_frames(frames, rate, self.info.sample_rate);
                 if self.info.backend == "wasapi_client3_loopback"
                     && let (Some(requested), Some(actual)) =
                         (self.info.requested_buffer_frames, self.info.engine_period_frames)
@@ -231,7 +245,7 @@ impl OpenedCapture {
                         self.info.fallback_reason = Some(detail);
                     }
                 }
-                tracing::info!(engine_frames = frames, engine_sample_rate = rate, client_sample_rate = RATE,
+                tracing::info!(engine_frames = frames, engine_sample_rate = rate, client_sample_rate = self.info.sample_rate,
                     ?self.info, "WASAPI capture parameters (observed after Start)");
             }
             Err(error) => {
@@ -312,12 +326,12 @@ fn shared_periods(client: &IAudioClient3, format: &WAVEFORMATEX) -> Result<Perio
     Ok(periods)
 }
 
-fn device_default_period(client: &IAudioClient) -> Option<u32> {
+fn device_default_period(client: &IAudioClient, rate: u32) -> Option<u32> {
     let mut default_hns = 0;
     // SAFETY: valid out pointer. Do not use the legacy minimum as a shared
     // engine minimum: GetDevicePeriod's minimum is for exclusive mode.
     unsafe { client.GetDevicePeriod(Some(&mut default_hns), None) }.ok()?;
-    hns_to_frames(default_hns)
+    hns_to_frames_at(default_hns, rate)
 }
 
 fn current_period(client: &IAudioClient) -> Result<(u32, u32), String> {
@@ -342,11 +356,15 @@ fn current_period(client: &IAudioClient) -> Result<(u32, u32), String> {
     }
 }
 
+#[cfg(test)]
 fn hns_to_frames(hns: i64) -> Option<u32> {
+    hns_to_frames_at(hns, RATE)
+}
+fn hns_to_frames_at(hns: i64, rate: u32) -> Option<u32> {
     let hns = u64::try_from(hns).ok()?;
     u32::try_from(
         u128::from(hns)
-            .checked_mul(u128::from(RATE))?
+            .checked_mul(u128::from(rate))?
             .div_ceil(u128::from(HNS_PER_SECOND)),
     )
     .ok()

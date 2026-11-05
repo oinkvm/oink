@@ -25,7 +25,6 @@ function requireInput(settings:T.InputSettings):T.InputSettings {
 }
 export const api = {
   ...createLayoutProfilesApi(call),
-  notify: (notification: T.Notification) => call<T.NotificationReceipt | null>("notify", { notification }),
   audioQuality: () => call<T.AudioQuality>("audio_quality"),
   connectionQuality: () => call<T.ConnectionQuality>("connection_quality"),
   memberAddresses: (device: string) => call<string[]>('member_addresses', {device}),
@@ -48,7 +47,6 @@ export const api = {
   pauseAll: (requestId:string) => call<import('./cards').PauseAllAccepted>('pause_all',{requestId}),
 
   group: () => call<T.GroupView>("group"),
-  renameDevice: (device: T.DeviceKey, name: string) => call<null>("rename_device", { device, name }),
   removeMember: (device: T.DeviceKey) => call<null>("remove_member", { device }),
   leaveGroup: () => call<null>("leave_group"),
   networkInfo: () => call<T.NetworkInfo>("network_info"),
@@ -56,22 +54,10 @@ export const api = {
   previewLayoutProjection: (gesture: number, placements: T.Placement[], affected: T.ScreenKey[], ended: boolean, arrangement?: import('./layoutProfiles').ArrangementSnapshot) =>
     call<null>('preview_layout_projection', { gesture, placements, affected, ended, arrangement }),
   layout: () => call<T.Layout>("layout").then(requireLayout),
-  saveLayout: (placements: T.Placement[]) => call<T.Layout>("save_layout", { placements }),
   setScreenRemoteGain: (screen: T.ScreenKey, gain: number) => call<null>("set_screen_remote_gain", { screen, gain }),
-  setScreenGain: (screen: T.ScreenKey, gain: number) => call<null>("set_screen_gain", { screen, gain }),
-  setScreenHidden: (screen: T.ScreenKey, hidden: boolean) => call<null>("set_screen_hidden", { screen, hidden }),
-  previewMoveScreen: (screen: T.ScreenKey, origin: T.Point) => call<T.LayoutGeometry | null>("preview_move_screen", { screen, origin }),
-  previewMoveDevice: (device: T.DeviceKey, delta: T.Point) => call<T.LayoutGeometry | null>("preview_move_device", { device, delta }),
-  moveScreen: (screen: T.ScreenKey, origin: T.Point) => call<T.Layout>("move_screen", { screen, origin }),
-  moveDevice: (device: T.DeviceKey, delta: T.Point) => call<T.Layout>("move_device", { device, delta }),
-  setScreenSize: (screen: T.ScreenKey, size: T.Size) => call<T.Layout>("set_screen_size", { screen, size }),
-  identifyScreens: () => call<null>("identify_screens"),
 
   wallpapers: (refresh: boolean) => call<T.ScreenWallpaper[]>("wallpapers", { refresh }),
 
-  aimStatus: () => call<T.AimStatus>("aim_status"),
-  aimStart: () => call<T.AimStatus>("aim_start"),
-  aimStop: () => call<null>("aim_stop"),
 
   inputSettings: () => call<T.InputSettings>("input_settings").then(requireInput),
   setInputSettings: (settings: Partial<T.InputSettings>) => call<null>("set_input_settings", { settings }),
@@ -95,7 +81,6 @@ export const api = {
   restartSystem: () => call<null>("restart_system"),
   microphonePluginStatus: () => call<T.MicrophonePluginStatus>("microphone_plugin_status"),
   microphonePluginAction: (action:'install'|'uninstall') => call<T.MicrophonePluginStatus>("microphone_plugin_action",{action}),
-  refreshAudioDevices: () => call<null>("refresh_audio_devices"),
 
   setAudioSettings: (settings: Partial<T.AudioSettings>) => call<null>("set_audio_settings", { settings }),
 

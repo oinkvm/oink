@@ -106,7 +106,13 @@ pub(super) fn sessions() -> io::Result<Vec<u32>> {
         Ok(ids)
     }
 }
-pub(super) fn serve(id: u32, state: Arc<Mutex<service::State>>) -> io::Result<()> {
+pub(super) fn serve(
+    id: u32,
+    state: Arc<Mutex<service::State>>,
+    changed: Arc<super::super::wake::Event>,
+    cancel: Arc<super::super::wake::Event>,
+) -> io::Result<()> {
+    let events = super::super::broker::events().ok_or_else(denied)?;
     let user = security::user_sid(id)?;
     let descriptor = security::pipe_security(id)?;
     let attrs = descriptor.attrs();
@@ -123,20 +129,26 @@ pub(super) fn serve(id: u32, state: Arc<Mutex<service::State>>) -> io::Result<()
             &attrs,
         )
     })?;
-    while !super::super::broker::STOP.load(Ordering::Acquire) && security::user_sid(id).ok().as_ref() == Some(&user) {
+    while !super::super::broker::STOP.load(Ordering::Acquire)
+        && !cancel.is_set()
+        && security::user_sid(id).ok().as_ref() == Some(&user)
+    {
         let mut operation = pipe_io::Operation::new(&pipe)?;
         operation.connect()?;
         loop {
             // SAFETY: non-owning wait on event owned by operation.
-            let ready = unsafe { WaitForSingleObject(operation.event(), 250) };
-            if ready == WAIT_OBJECT_0 {
-                break;
-            }
-            if ready != WAIT_TIMEOUT
-                || super::super::broker::STOP.load(Ordering::Acquire)
+            let ready = super::super::wake::wait(
+                &[operation.event(), events.stop.raw(), cancel.raw(), changed.raw()],
+                None,
+            )?;
+            if super::super::broker::STOP.load(Ordering::Acquire)
+                || cancel.is_set()
                 || security::user_sid(id).ok().as_ref() != Some(&user)
             {
                 return Ok(());
+            }
+            if matches!(ready, super::super::wake::Woke::Signal(0)) {
+                break;
             }
         }
         operation.cancel();

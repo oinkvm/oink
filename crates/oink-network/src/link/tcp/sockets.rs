@@ -46,57 +46,48 @@ impl Core {
         if listener.is_some() {
             return;
         }
-        let create = || -> std::io::Result<TcpListener> {
-            #[cfg(any(test, feature = "test-support"))]
-            if let Some(socket) = lock(&self.reserved_listener).take() {
-                #[cfg(not(windows))]
-                socket2::SockRef::from(&socket).set_reuse_address(true)?;
-                socket.set_nonblocking(true)?;
-                return TcpListener::from_std(socket);
-            }
-            let addr = SocketAddr::new(self.cfg.bind_ip, self.cfg.port);
-            let socket = socket2::Socket::new(
-                socket2::Domain::for_address(addr),
-                socket2::Type::STREAM,
-                Some(socket2::Protocol::TCP),
-            )?;
-            #[cfg(not(windows))]
-            socket.set_reuse_address(true)?;
-            socket.set_nonblocking(true)?;
-            socket.bind(&addr.into())?;
-            socket.listen(128)?;
-            TcpListener::from_std(socket.into())
-        };
-        match create() {
+        // The production listener is reserved before QUIC startup. This path is
+        // only needed by isolated pool fixtures; a failed listener is not retried.
+        if lock(&self.listener_failure).is_some() {
+            return;
+        }
+        match crate::listeners::tcp(SocketAddr::new(self.cfg.bind_ip, self.cfg.port)).and_then(TcpListener::from_std) {
             Ok(socket) => {
                 *listener = socket.local_addr().ok();
-                *lock(&self.listener_failure) = None;
-                let owner = self.arc();
-                self.spawn_background(async move {
-                    let permits = Arc::new(Semaphore::new(32));
-                    let mut stopped = owner.stopped.subscribe();
-                    loop {
-                        let accepted =
-                            tokio::select! {biased; _=wait_closed(&mut stopped)=>break, result=socket.accept()=>result};
-                        let Ok((socket, _)) = accepted else { break };
-                        let Ok(permit) = permits.clone().try_acquire_owned() else {
-                            continue;
-                        };
-                        let core = owner.clone();
-                        owner.spawn_background(async move {
-                            let _permit = permit;
-                            let trace = super::super::diagnostics::Steps::start(None, super::super::diagnostics::hex(&rand::random::<[u8;16]>()), "tcp_accept");
-                            tracing::info!(target: "oink_link_diagnostics", kind = "low_step", stage = "tcp_accept", result = "completed", candidate = ?socket.peer_addr(),  "TCP accepted");
-                            match tokio::time::timeout(core.cfg.dial_timeout, core.accept(socket, &trace)).await {
-                                Ok(result) => trace.result(&result),
-                                Err(_) => trace.end("failed", "timeout", "TCP accept deadline"),
-                            }
-                        });
-                    }
-                });
+                drop(listener);
+                self.start_listener(socket);
             }
             Err(error) => *lock(&self.listener_failure) = Some(error.to_string()),
         }
+    }
+    pub(super) fn start_listener(&self, socket: TcpListener) {
+        *lock(&self.listener) = socket.local_addr().ok();
+        let owner = self.arc();
+        self.spawn_background(async move {
+            let permits = Arc::new(Semaphore::new(32));
+            let mut stopped = owner.stopped.subscribe();
+            loop {
+                let accepted = tokio::select! {
+                    biased;
+                    _ = wait_closed(&mut stopped) => break,
+                    result = socket.accept() => result,
+                };
+                let Ok((socket, _)) = accepted else { break };
+                let Ok(permit) = permits.clone().try_acquire_owned() else { continue };
+                let core = owner.clone();
+                owner.spawn_background(async move {
+                    let _permit = permit;
+                    let trace = super::super::diagnostics::Steps::start(
+                        None, super::super::diagnostics::hex(&rand::random::<[u8; 16]>()), "tcp_accept",
+                    );
+                    tracing::info!(target: "oink_link_diagnostics", kind = "low_step", stage = "tcp_accept", result = "completed", candidate = ?socket.peer_addr(), "TCP accepted");
+                    match tokio::time::timeout(core.cfg.dial_timeout, core.accept(socket, &trace)).await {
+                        Ok(result) => trace.result(&result),
+                        Err(_) => trace.end("failed", "timeout", "TCP accept deadline"),
+                    }
+                });
+            }
+        });
     }
     pub(super) fn advert(&self) -> LowMsg {
         LowMsg::Info {

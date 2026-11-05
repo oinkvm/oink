@@ -8,7 +8,6 @@ import { canDisableInput, faultReason, formatLastSeen, offlineReasonText, gameAc
 import type { ShareKind } from './data';
 import { VolumeRow, hasVolume } from './VolumeRow';
 import type { SpeakerAction, MicrophoneAction } from './VolumeRow';
-import type { PeekHandlers } from './peek';
 import { PermissionHint, type PermissionHintKind } from '../permissions/PermissionHint';
 import './devices.css';
 import { useCardLatency } from './useCardLatency';
@@ -310,8 +309,8 @@ export function DeviceList({ devices, selectedId, onSelect, onToggle, onSpeaker,
         })}
     </div>);
 }
-function DeviceHit({ d, now, selected, collapsed, inPeek, onSelect }: {
-    d: Device; now: number; selected: boolean; collapsed: boolean; inPeek?: boolean; onSelect: () => void;
+function DeviceHit({ d, now, selected, collapsed, onSelect }: {
+    d: Device; now: number; selected: boolean; collapsed: boolean; onSelect: () => void;
 }) {
     const latency = useCardLatency(d);
     const summary = d.group === 'offline' ? tr('{0}，离线，上次在线 {1}', d.name, formatLastSeen(d.lastSeen, now)) : d.group === 'online' ? tr('{0}，在线，延迟 {1} ms', d.name, latency === null ? tr("未知") : latency) : tr('{0}，本机', d.name);
@@ -320,14 +319,14 @@ function DeviceHit({ d, now, selected, collapsed, inPeek, onSelect }: {
     const game = d.group !== 'offline' && gameActive(d) && (d.cursor === 'local' || d.cursor === 'locked');
     const cursorNote = d.group !== 'offline' && (d.cursor === 'local' || d.cursor === 'locked') ? (d.cursor === 'locked' ? tr('，指针锁定在这里') : tr('，指针在这里')) : '';
     return (<Tooltip interactive={false} placement="right" disabled={!collapsed} content={d.group === 'online' ? `${d.name} · ${latency === null ? tr("延迟未知") : `${Math.round(latency)} ms`}` : d.name}>
-      <button type="button" className="dev__hit ok-focusable" aria-current={selected ? 'true' : undefined} aria-disabled={d.group === 'offline' ? 'true' : undefined} aria-label={summary + pausedNote + (screenOff ? tr('，屏幕已禁用') : '') + (game ? tr('，游戏模式已开启') : '') + cursorNote} tabIndex={inPeek ? -1 : undefined} onClick={onSelect}/>
+      <button type="button" className="dev__hit ok-focusable" aria-current={selected ? 'true' : undefined} aria-disabled={d.group === 'offline' ? 'true' : undefined} aria-label={summary + pausedNote + (screenOff ? tr('，屏幕已禁用') : '') + (game ? tr('，游戏模式已开启') : '') + cursorNote} onClick={onSelect}/>
       </Tooltip>);
 }
 function DeviceSignal({ d, shown }: { d: Device; shown: boolean }) {
     const latency = useCardLatency(d);
     return <SignalMark latency={latency} offline={d.group === 'offline'} shown={shown}/>;
 }
-export function DeviceItem({ d, now, selected, collapsed, exitName = null, onSelect, onToggle, onSpeaker, onMicrophone, volumeOpen = false, grow = false, inPeek, hiddenScreens = 0, onGrantAccessibility, onGrantPermission }: {
+export function DeviceItem({ d, now, selected, collapsed, exitName = null, onSelect, onToggle, onSpeaker, onMicrophone, volumeOpen = false, grow = false, hiddenScreens = 0, onGrantAccessibility, onGrantPermission }: {
     d: Device;
     now: number;
     selected: boolean;
@@ -341,8 +340,6 @@ export function DeviceItem({ d, now, selected, collapsed, exitName = null, onSel
     onPause?: (paused: boolean) => void;
     volumeOpen?: boolean;
     grow?: boolean;
-    peek?: PeekHandlers;
-    inPeek?: boolean;
     hiddenScreens?: number;
     onGrantAccessibility?: () => void;
     onGrantPermission?: (kind: 'input_monitoring' | 'microphone') => void;
@@ -350,7 +347,7 @@ export function DeviceItem({ d, now, selected, collapsed, exitName = null, onSel
     selected = selected && !collapsed;
     const game = d.group !== 'offline' && gameActive(d) && (d.cursor === 'local' || d.cursor === 'locked');
     return (<div className="dev" data-ctx={`device:${d.id}`} data-group={d.group} data-current={selected ? '' : undefined} data-grow={grow && hasVolume(d) ? '' : undefined}>
-      <DeviceHit d={d} now={now} selected={selected} collapsed={collapsed} inPeek={inPeek} onSelect={onSelect}/>
+      <DeviceHit d={d} now={now} selected={selected} collapsed={collapsed} onSelect={onSelect}/>
       <span className="dev__os">
         <OsLogo os={d.os}/>
         
@@ -362,12 +359,12 @@ export function DeviceItem({ d, now, selected, collapsed, exitName = null, onSel
                 : d.group !== 'offline' && (d.cursor === 'local' || d.cursor === 'locked') && <CursorMark locked={d.cursor === 'locked'} tooltip={!collapsed}/>}
       </span>
       <span className="dev__text">
-        <span className="dev__title"><span className="dev__name">{d.name}</span>{d.accessibilityMissing ? <AccessibilityIndicator local={d.group === 'self'} onGrant={onGrantAccessibility} tabbable={!collapsed && !inPeek}/> : hiddenScreens > 0 && <Tooltip interactive={false} content={tr('{0} 块屏幕已隐藏', hiddenScreens)}><span className="dev__hidden" role="img" aria-label={tr('{0} 块屏幕已隐藏', hiddenScreens)}><svg viewBox="0 0 16 16" aria-hidden><path d="M2 8s2.3-4.2 6-4.2S14 8 14 8s-2.3 4.2-6 4.2S2 8 2 8Z"/><circle cx="8" cy="8" r="1.8"/><path d="M3 3l10 10"/></svg></span></Tooltip>}</span>
-        <MetaLine onGrantPermission={onGrantPermission} onSelect={selected ? () => {} : onSelect} onSpeaker={onSpeaker} onMicrophone={onMicrophone} d={d} now={now} onToggle={onToggle} interactive={!collapsed} tabbable={!inPeek} exitName={exitName}/>
+        <span className="dev__title"><span className="dev__name">{d.name}</span>{d.accessibilityMissing ? <AccessibilityIndicator local={d.group === 'self'} onGrant={onGrantAccessibility} tabbable={!collapsed}/> : hiddenScreens > 0 && <Tooltip interactive={false} content={tr('{0} 块屏幕已隐藏', hiddenScreens)}><span className="dev__hidden" role="img" aria-label={tr('{0} 块屏幕已隐藏', hiddenScreens)}><svg viewBox="0 0 16 16" aria-hidden><path d="M2 8s2.3-4.2 6-4.2S14 8 14 8s-2.3 4.2-6 4.2S2 8 2 8Z"/><circle cx="8" cy="8" r="1.8"/><path d="M3 3l10 10"/></svg></span></Tooltip>}</span>
+        <MetaLine onGrantPermission={onGrantPermission} onSelect={selected ? () => {} : onSelect} onSpeaker={onSpeaker} onMicrophone={onMicrophone} d={d} now={now} onToggle={onToggle} interactive={!collapsed} tabbable exitName={exitName}/>
       </span>
       <Connection d={d}/>
       
-      {onSpeaker && d.group !== 'offline' && <VolumeRow d={d} open={(selected || volumeOpen) && !collapsed} tabbable={!inPeek} onSpeaker={onSpeaker}/>}
-      {onMicrophone && d.group !== 'offline' && d.microphone?.mode==='source' && <VolumeRow d={d} microphone open={(selected || volumeOpen) && !collapsed} tabbable={!inPeek} onSpeaker={onMicrophone}/>}
+      {onSpeaker && d.group !== 'offline' && <VolumeRow d={d} open={(selected || volumeOpen) && !collapsed} tabbable onSpeaker={onSpeaker}/>}
+      {onMicrophone && d.group !== 'offline' && d.microphone?.mode==='source' && <VolumeRow d={d} microphone open={(selected || volumeOpen) && !collapsed} tabbable onSpeaker={onMicrophone}/>}
     </div>);
 }

@@ -191,6 +191,9 @@ impl PlaybackStream for oink_audio::sink::Sink {
     }
 }
 trait AudioPlatform: Send + Sync {
+    fn capture_sample_rate(&self) -> Result<u32, String> {
+        Ok(48_000)
+    }
     fn volume_endpoint(
         &self,
         _: &str,
@@ -274,6 +277,9 @@ impl AudioPlatform for SystemAudio {
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Box<dyn oink_audio::volume::Endpoint>, oink_audio::volume::Fault> {
         oink_audio::volume::open(output, wake)
+    }
+    fn capture_sample_rate(&self) -> Result<u32, String> {
+        oink_audio::capture_sample_rate()
     }
     fn capture_encoded(
         &self,

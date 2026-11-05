@@ -9,6 +9,7 @@ pub struct UiControl {
     task: tokio::task::JoinHandle<()>,
     publication: publication::Publication,
     file: PathBuf,
+    _listener: Arc<Listener>,
 }
 
 impl UiControl {
@@ -28,21 +29,22 @@ impl UiControl {
         quit: impl FnOnce() + Send + 'static,
         open: impl Fn() + Send + 'static,
     ) -> anyhow::Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let listener = Arc::new(Listener::bind(data_dir, "ui")?);
         let mut secret = [0u8; 32];
         getrandom::fill(&mut secret).map_err(|error| anyhow::anyhow!("UI IPC token entropy: {error}"))?;
         let endpoint = Endpoint {
-            port: listener.local_addr()?.port(),
+            address: listener.address(),
             token: secret.iter().map(|byte| format!("{byte:02x}")).collect(),
         };
         let file = data_dir.join(FILE);
         let publish_path = file.clone();
         let document = serde_json::to_string(&endpoint)?;
         let publication = publication::Publication::start(move || write_private(&publish_path, &document))?;
+        let listening = listener.clone();
         let task = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let (reader, mut writer) = stream.into_split();
-                let mut lines = BufReader::new(reader).lines();
+            while let Ok((stream, _)) = listening.accept().await {
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut lines = Frames::new(reader);
                 let Ok(Ok(Some(line))) = tokio::time::timeout(Duration::from_secs(1), lines.next_line()).await else {
                     continue;
                 };
@@ -57,6 +59,7 @@ impl UiControl {
                     serde_json::json!({"err": ApiError::InvalidArgument { message: "UI endpoint accepts only authenticated open or stop".into() }})
                 };
                 let _ = tokio::time::timeout(Duration::from_secs(1), write_line(&mut writer, &reply)).await;
+                finish_response(&mut lines).await;
                 if accepted && !stop {
                     open();
                 }
@@ -71,6 +74,7 @@ impl UiControl {
             task,
             publication,
             file,
+            _listener: listener,
         })
     }
 
@@ -136,6 +140,7 @@ impl UiControl {
 impl Drop for UiControl {
     fn drop(&mut self) {
         self.task.abort();
+        self._listener.release();
         self.publication.stop();
         let _ = std::fs::remove_file(&self.file);
     }
@@ -169,7 +174,7 @@ mod tests {
                 write_private(
                     &dir.path().join(FILE),
                     &serde_json::to_string(&Endpoint {
-                        port,
+                        address: transport::Address::Legacy { port },
                         token: "stale".into(),
                     })
                     .unwrap(),

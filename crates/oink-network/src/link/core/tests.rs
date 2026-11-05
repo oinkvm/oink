@@ -1258,3 +1258,43 @@ fn dial_queued_during_inbound_path_install_receives_a_result() {
         assert!(!r.nodes[0].dials.contains_key(&peer));
     }
 }
+
+#[test]
+fn heartbeat_is_half_second_and_existing_loss_deadline_is_two_seconds_on_direct_and_relay() {
+    assert_eq!(HEARTBEAT_INTERVAL, Duration::from_millis(500));
+    assert_eq!(HEARTBEAT_TIMEOUT, Duration::from_secs(2));
+    for relayed in [false, true] {
+        let mut r = Rig::new(if relayed { 3 } else { 2 });
+        if relayed {
+            r.relay();
+        } else {
+            r.connect(0, 1);
+            r.pump();
+        }
+        let link = r.link(0, if relayed { 2 } else { 1 });
+        let started = r.now;
+        let path = r.nodes[0].links[&link].wire.path_id;
+        let step = |r: &mut Rig, at| {
+            r.now = at;
+            for node in &mut r.nodes {
+                node.tick(at);
+            }
+            // Lose only this end-to-end Pong. Relay underlay links keep their
+            // own matched answers; their independent loss must not win this test.
+            r.pump_holding(&mut vec![], |_, effect| matches!(effect,
+                Effect::Control { message, .. } if matches!(message.as_ref(), LinkMsg::Pong(pong) if pong.path_id == path)));
+        };
+        step(&mut r, started);
+        assert_eq!(r.nodes[0].links[&link].heartbeat.nonce, 1);
+        step(&mut r, started + Duration::from_millis(499));
+        assert_eq!(r.nodes[0].links[&link].heartbeat.nonce, 1);
+        step(&mut r, started + Duration::from_millis(500));
+        assert_eq!(r.nodes[0].links[&link].heartbeat.nonce, 2);
+        step(&mut r, started + Duration::from_millis(1999));
+        assert!(r.nodes[0].links.contains_key(&link));
+        r.nodes[0].tick(started + Duration::from_secs(2));
+        assert!(!r.nodes[0].links.contains_key(&link));
+        assert!(r.nodes[0].effects.iter().any(|effect| matches!(effect,
+            Effect::Lost { link: lost, reason: LinkLost::HeartbeatTimeout, .. } if *lost == link)));
+    }
+}

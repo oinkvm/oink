@@ -52,10 +52,11 @@ pub enum ButtonHandoff {
     Allow,
 }
 
-/// 心跳超时的下限（毫秒）。组网换链路时最长有 1 s 的静默宽限期（`oink_network` 的
-/// `Timings::link_grace`），超时必须比它长，否则换一条链路路由就判对端超时、收回焦点。
-/// 设置里更小的值（早期版本把 1000 写进了 `settings.json`）按这个值处理。
-pub const MIN_HEARTBEAT_TIMEOUT_MS: u32 = 1500;
+/// Existing focus-handoff confirmation window's lower bound (milliseconds).
+/// The serialized heartbeat name is retained; actual link liveness uses network's
+/// fixed 500 ms Pulse / 2 s timeout. Accepted focus changes confirm immediately,
+/// including when the other endpoint still uses the old 1.5 s window.
+pub const MIN_HEARTBEAT_TIMEOUT_MS: u32 = 2000;
 
 /// 紧急暂停的默认长按时长（毫秒）。
 pub const DEFAULT_EMERGENCY_HOLD_MS: u32 = 5000;
@@ -66,6 +67,7 @@ pub const DEFAULT_EMERGENCY_HOLD_MS: u32 = 5000;
 pub struct RoutingSettings {
     pub mouse_mode: oink_foundation::input::InputMode,
     pub keyboard_mode: oink_foundation::input::InputMode,
+    /// Local relative-total repair cadence; not the network Pulse interval.
     pub heartbeat_interval_ms: u32,
     pub heartbeat_timeout_ms: u32,
     pub button_handoff: ButtonHandoff,

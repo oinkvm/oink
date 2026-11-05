@@ -42,6 +42,21 @@ fn only_host_unreachable_is_a_dropped_datagram() {
     assert!(send_result(Ok(()), &transmit).is_ok());
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn oversized_mtu_probe_is_a_dropped_datagram() {
+    let transmit = Transmit {
+        destination: "100.64.0.1:47470".parse().unwrap(),
+        ecn: None,
+        contents: &[0; 1452],
+        segment_size: None,
+        src_ip: None,
+    };
+    // Darwin returns EMSGSIZE for a path-MTU probe larger than the interface
+    // MTU; the probe must be lost, not end the connection.
+    assert!(send_result(Err(io::Error::from_raw_os_error(libc::EMSGSIZE)), &transmit).is_ok());
+}
+
 #[derive(Debug)]
 struct FailingSocket {
     inner: Arc<dyn AsyncUdpSocket>,

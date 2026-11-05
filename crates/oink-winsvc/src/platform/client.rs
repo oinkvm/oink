@@ -82,12 +82,6 @@ pub fn prelogin_shutdown_failure() -> Option<ReleaseFailure> {
 pub fn use_prelogin_route() {
     PRELOGIN_ROUTE.store(true, Ordering::Release);
 }
-/// Kept for source compatibility; pre-login injection now always crosses the
-/// separate SYSTEM-only pipe and never uses the network process's session.
-pub fn use_in_process_helper() {
-    use_prelogin_route();
-}
-
 pub fn initialize() -> io::Result<()> {
     PRELOGIN_RELEASED.store(false, Ordering::Release);
     *PRELOGIN_RELEASE_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;

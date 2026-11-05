@@ -29,7 +29,6 @@ impl Node {
         if let Some(trail) = self.inner.cursor_trail.get() {
             trail.set_trail_color(rgb);
         }
-        crate::aim::set_follow_trail_color(self, rgb);
     }
 
     #[cfg(any(target_os = "macos", windows))]
@@ -67,7 +66,7 @@ mod tests {
     use oink_test_support::input::FakeInput;
 
     #[tokio::test]
-    async fn saved_preferences_and_system_changes_recolour_both_local_renderers() {
+    async fn saved_preferences_and_system_changes_recolour_local_renderer() {
         let home = tempfile::tempdir().unwrap();
         let mut config = AgentConfig::load_from(home.path()).unwrap();
         let colors = ThemeAccent {
@@ -91,12 +90,9 @@ mod tests {
         // Native handles remain parked: test the real settings/application path
         // without starting windows, capturing input or simulating native acceptance.
         let trail = oink_locator::CursorTrail::platform().unwrap();
-        let follow = oink_locator::CursorTrail::platform().unwrap();
         node.inner.cursor_trail.set(trail.clone()).unwrap();
-        crate::aim::set_follow_trail(&node, Some(follow.clone()));
         let check = |rgb| {
             assert_eq!(trail.trail_color(), rgb);
-            assert_eq!(follow.trail_color(), rgb);
         };
         node.apply_trail_appearance();
         check(colors.light.rgb());

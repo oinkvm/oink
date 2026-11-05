@@ -74,7 +74,6 @@ pub struct MemberTable {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppliedState {
-    pub application_focus_enabled: bool,
     pub group: GroupId,
     pub roster_digest: [u8; 32],
     pub pointer_slots: BTreeMap<DeviceId, Option<u8>>,
@@ -96,7 +95,6 @@ pub struct LocalDisplays {
 }
 #[derive(Clone)]
 pub struct RouterLayout {
-    pub application_focus_enabled: bool,
     pub group: GroupId,
     pub version: dto::ConfigVersion,
     pub layout: Arc<Layout>,
@@ -376,9 +374,6 @@ impl ConfigModule {
             Ok(result)
         })
     }
-    pub fn publish_local_claim(&self, claim: dto::AudioExitClaim) -> ApiResult<u64> {
-        self.call(move |owner| owner.publish_claim(claim))
-    }
     pub(crate) fn initialize_displays(&self, displays: Vec<DisplayInfo>) -> ApiResult<()> {
         self.call(move |owner| owner.displays_changed(displays))
     }
@@ -401,10 +396,6 @@ impl ConfigModule {
     ) -> ApiResult<bool> {
         self.call(move |owner| owner.edit_layout_if_current(&expected, edit, source))
     }
-    pub fn set_application_focus_enabled(&self, enabled: bool) -> ApiResult<()> {
-        self.call(move |owner| owner.set_application_focus_enabled(enabled))
-    }
-
     pub fn edit_settings(
         &self,
         edit: Box<dyn FnOnce(&mut oink_display::layout::LayoutSettings) + Send>,

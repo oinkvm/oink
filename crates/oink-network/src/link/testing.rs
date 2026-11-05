@@ -137,3 +137,12 @@ pub fn post_datagram_at(
 ) -> Result<(), super::DatagramError> {
     sender.queue.post_lossy_at(bytes, arrived)
 }
+
+/// Inspect the memory-only snapshot without emitting records or advancing time.
+pub fn heartbeat_messages(stream: &SendStream) -> Vec<Vec<u8>> {
+    stream
+        .queue
+        .heartbeat
+        .load_full()
+        .map_or_else(Vec::new, |snapshot| snapshot.messages.clone())
+}

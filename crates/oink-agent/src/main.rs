@@ -96,11 +96,6 @@ enum Cmd {
         #[arg(value_enum)]
         frequency: Option<MotionFrequency>,
     },
-    /// Show or set experimental group application focus (default: off; CLI only).
-    ApplicationFocus {
-        #[arg(value_enum)]
-        state: Option<OnOff>,
-    },
     /// Show or set native contact acceptance on this device (default: on).
     AcceptContacts {
         #[arg(value_enum)]
@@ -168,12 +163,6 @@ enum Cmd {
     Lock { state: OnOff },
     /// 把指针召回本机，同时解除组内焦点锁。
     ReturnPointerHome,
-    /// 瞄准小游戏：start / stop / status。`start` 会在组内每台在线设备的每块
-    /// 屏幕上盖上全屏叠加层，任意一台上按 Esc 结束。
-    Aim {
-        #[arg(default_value = "status")]
-        action: String,
-    },
     /// 屏幕焦点进入：off / on（保存原布局位置，默认本机）。
     Screen {
         state: OnOff,
@@ -468,12 +457,6 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             }
             print(&settings.event_frequency)?;
         }
-        Cmd::ApplicationFocus { state } => {
-            print(&oink_agent::backend::cli::application_focus(
-                &cfg.data_dir,
-                state.map(|s| matches!(s, OnOff::On)),
-            )?)?;
-        }
         Cmd::AcceptContacts { state } => {
             let c = client()?;
             let mut settings: api::InputSettings = serde_json::from_value(c.call(Request::InputSettings)?)?;
@@ -591,15 +574,6 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             request_id: request_uuid()?,
             paused: matches!(state, OnOff::Off),
         })?)?,
-        Cmd::Aim { action } => {
-            let request = match action.as_str() {
-                "status" => Request::AimStatus,
-                "start" => Request::AimStart,
-                "stop" => Request::AimStop,
-                other => anyhow::bail!("未知的操作：{other}（start / stop / status）"),
-            };
-            print(&client()?.call(request)?)?
-        }
         Cmd::Screen { state, device } => {
             let c = client()?;
             let device = match device {
@@ -1006,24 +980,6 @@ mod tests {
         assert!(Cli::try_parse_from(["oink-agent", "test-mac-scroll"]).is_err());
     }
     #[test]
-    fn application_focus_cli_parses_query_and_on_off() {
-        assert!(matches!(
-            Cli::try_parse_from(["oink-agent", "application-focus"]).unwrap().cmd,
-            Cmd::ApplicationFocus { state: None }
-        ));
-        for (arg, expected) in [("on", true), ("off", false)] {
-            let Cmd::ApplicationFocus { state: Some(state) } =
-                Cli::try_parse_from(["oink-agent", "application-focus", arg])
-                    .unwrap()
-                    .cmd
-            else {
-                panic!("wrong command")
-            };
-            assert_eq!(matches!(state, OnOff::On), expected);
-        }
-        assert!(Cli::try_parse_from(["oink-agent", "application-focus", "maybe"]).is_err());
-    }
-    #[test]
     fn accept_contacts_cli_parses_query_and_on_off() {
         assert!(matches!(
             Cli::try_parse_from(["oink-agent", "accept-contacts"]).unwrap().cmd,
@@ -1128,14 +1084,13 @@ mod product_boundary {
             "diagnostics",
             "file-provider",
             "audio",
-            "aim",
         ] {
             assert!(
                 command.find_subcommand(name).is_some(),
                 "missing product command {name}"
             );
         }
-        for name in ["synth", "clip", "debug"] {
+        for name in ["synth", "clip", "debug", "aim"] {
             assert!(command.find_subcommand(name).is_none(), "{name}");
         }
         assert!(command.find_subcommand("loopback").is_none());

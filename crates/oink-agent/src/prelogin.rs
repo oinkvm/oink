@@ -12,13 +12,55 @@
 //!   Node without IPC, tray or UI.
 use crate::node::Node;
 use oink_autostart::{MachineLayer, NoMachineLayer};
+#[cfg(windows)]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[derive(Default)]
+pub(crate) struct ExportTrigger {
+    wake: tokio::sync::Notify,
+    #[cfg(windows)]
+    generation: AtomicU64,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct Exported<T> {
+    last: Option<(u64, T)>,
+}
+
+#[cfg(any(windows, test))]
+impl<T: PartialEq> Exported<T> {
+    fn export(
+        &mut self,
+        generation: u64,
+        snapshot: T,
+        push: impl FnOnce(&T) -> std::io::Result<bool>,
+    ) -> std::io::Result<()> {
+        // ConfigChange also includes periodic live Facts/Members refreshes. They
+        // are hints to inspect the files, not evidence of a durable snapshot edit.
+        if self
+            .last
+            .as_ref()
+            .is_some_and(|(previous, files)| *previous == generation && *files == snapshot)
+        {
+            return Ok(());
+        }
+        // A failed exchange may have replaced the service snapshot before its
+        // reply was lost. Do not trust an earlier success after such an attempt.
+        self.last = None;
+        if push(&snapshot)? {
+            self.last = Some((generation, snapshot));
+        }
+        Ok(())
+    }
+}
 
 /// The machine layer for this backend: the service on a protected Windows
 /// install, nothing elsewhere (macOS, development builds, test fixtures).
 pub(crate) fn machine_layer(node: &Node) -> Box<dyn MachineLayer> {
     #[cfg(windows)]
     if node.native_services_enabled() && oink_winsvc::client::service_installation().unwrap_or(false) {
-        return Box::new(windows::Service);
+        return Box::new(windows::Service(node.clone()));
     }
     let _ = node;
     Box::new(NoMachineLayer)
@@ -28,7 +70,7 @@ impl Node {
     /// Group, layout or settings changed: refresh the exported snapshot (debounced).
     pub(crate) fn prelogin_changed(&self) {
         if let Some(wake) = self.inner.prelogin_export.get() {
-            wake.notify_one();
+            wake.wake.notify_one();
         }
     }
 
@@ -66,7 +108,16 @@ mod windows {
     use oink_winsvc::{OwnerView, SnapshotFile, prelogin};
     use std::{path::Path, sync::Arc, time::Duration};
 
-    pub(super) struct Service;
+    pub(super) struct Service(pub(super) Node);
+    impl Service {
+        /// Claim/release may delete the machine snapshot without changing user files.
+        fn identity_changed(&self) {
+            if let Some(wake) = self.0.inner.prelogin_export.get() {
+                wake.generation.fetch_add(1, Ordering::Relaxed);
+                wake.wake.notify_one();
+            }
+        }
+    }
     fn state(result: std::io::Result<prelogin::State>) -> Result<PreloginState, PreloginProblem> {
         match result {
             Ok(state) if !state.enabled => Ok(PreloginState::Off),
@@ -92,6 +143,7 @@ mod windows {
         fn claim(&self) -> Result<PreloginState, PreloginProblem> {
             match prelogin::elevate_claim() {
                 prelogin::Elevation::Approved => {
+                    self.identity_changed();
                     tracing::info!("pre-login identity claimed for this user");
                     state(prelogin::status())
                 }
@@ -100,7 +152,9 @@ mod windows {
             }
         }
         fn release(&self) -> Result<PreloginState, PreloginProblem> {
-            state(prelogin::release())
+            let result = prelogin::release();
+            self.identity_changed();
+            state(result)
         }
     }
 
@@ -132,33 +186,43 @@ mod windows {
     /// Push only while this user owns an enabled machine identity: the private
     /// key never crosses the pipe otherwise.
     pub(super) fn export(directory: &Path) {
+        if let Err(error) = collect(directory).and_then(|files| push(&files)) {
+            tracing::warn!(%error, "pre-login snapshot export failed");
+        }
+    }
+
+    fn push(files: &[(SnapshotFile, Vec<u8>)]) -> std::io::Result<bool> {
         match prelogin::status() {
             Ok(state) if state.enabled && state.owner == OwnerView::Caller => {}
-            Ok(_) => return,
+            Ok(_) => return Ok(false),
             Err(error) => {
                 tracing::debug!(%error, "pre-login status unavailable; snapshot not exported");
-                return;
+                return Ok(false);
             }
         }
-        let result = collect(directory).and_then(prelogin::push_snapshot);
+        let result = prelogin::push_snapshot(files.to_vec());
         match result {
-            Ok(state) => tracing::info!(snapshot = state.snapshot, "pre-login snapshot exported"),
-            Err(error) => tracing::warn!(%error, "pre-login snapshot export failed"),
+            Ok(state) => {
+                tracing::info!(snapshot = state.snapshot, "pre-login snapshot exported");
+                Ok(true)
+            }
+            Err(error) => Err(error),
         }
     }
 
     pub(super) fn start_export(node: &Node) -> tokio::task::JoinHandle<()> {
-        let wake = Arc::new(tokio::sync::Notify::new());
+        let wake = Arc::new(ExportTrigger::default());
         let _ = node.inner.prelogin_export.set(wake.clone());
         let directory = node.data_dir().to_owned();
         let mut stop = node.stop_receiver();
         // An installer-enabled marker has no snapshot yet: export once at start.
-        wake.notify_one();
+        wake.wake.notify_one();
         tokio::spawn(async move {
+            let mut exported = Exported::default();
             loop {
                 tokio::select! {
                     _ = stop.changed() => break,
-                    () = wake.notified() => {}
+                    () = wake.wake.notified() => {}
                 }
                 // Coalesce a burst of edits (pairing, merge, layout drags).
                 tokio::select! {
@@ -166,7 +230,17 @@ mod windows {
                     () = tokio::time::sleep(Duration::from_secs(2)) => {}
                 }
                 let directory = directory.clone();
-                let _ = tokio::task::spawn_blocking(move || export(&directory)).await;
+                let generation = wake.generation.load(Ordering::Relaxed);
+                exported = tokio::task::spawn_blocking(move || {
+                    let result =
+                        collect(&directory).and_then(|files| exported.export(generation, files, |files| push(files)));
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "pre-login snapshot export failed");
+                    }
+                    exported
+                })
+                .await
+                .expect("pre-login export worker panicked");
             }
         })
     }
@@ -242,6 +316,101 @@ fn run_checked() -> anyhow::Result<()> {
         tracing::warn!(?reason, "pre-login final release unconfirmed; shutdown complete");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::Exported;
+    use std::{cell::Cell, io};
+
+    #[test]
+    fn repeated_config_notifications_export_only_changed_snapshot_bytes() {
+        let mut exported = Exported::default();
+        let calls = Cell::new(0);
+        let push = |_: &_| {
+            calls.set(calls.get() + 1);
+            Ok(true)
+        };
+        let files = vec![("device.key", vec![3; 32]), ("settings.json", b"{}".to_vec())];
+        exported.export(0, files.clone(), push).unwrap();
+        for _ in 0..20 {
+            exported.export(0, files.clone(), push).unwrap();
+        }
+        assert_eq!(
+            calls.get(),
+            1,
+            "Facts/Members notifications must not access the service again"
+        );
+        let mut changed = files.clone();
+        changed[1].1 = b"{\"keyboard\":true}".to_vec();
+        exported.export(0, changed.clone(), push).unwrap();
+        exported.export(0, changed, push).unwrap();
+        assert_eq!(calls.get(), 2);
+        exported.export(0, vec![files[0].clone()], push).unwrap();
+        assert_eq!(calls.get(), 3, "removing an optional snapshot file is a content change");
+    }
+
+    #[test]
+    fn failed_or_ineligible_export_does_not_remember_unexported_bytes() {
+        let mut exported = Exported::default();
+        exported.export(0, vec![1], |_| Ok(true)).unwrap();
+        assert!(
+            exported
+                .export(0, vec![2], |_| Err(io::Error::other("pipe failed")))
+                .is_err()
+        );
+        exported.export(0, vec![2], |_| Ok(false)).unwrap();
+        let calls = Cell::new(0);
+        let push = |_: &_| {
+            calls.set(calls.get() + 1);
+            Ok(true)
+        };
+        exported.export(0, vec![2], push).unwrap();
+        exported.export(0, vec![2], push).unwrap();
+        assert_eq!(calls.get(), 1, "retry identical bytes until the service accepts them");
+    }
+
+    #[test]
+    fn reclaim_exports_identical_files_and_failed_reclaim_is_retried() {
+        let mut exported = Exported::default();
+        exported.export(0, vec![1], |_| Ok(true)).unwrap();
+        assert!(exported.export(1, vec![1], |_| Err(io::Error::other("busy"))).is_err());
+        let calls = Cell::new(0);
+        let push = |_: &_| {
+            calls.set(calls.get() + 1);
+            Ok(true)
+        };
+        exported.export(1, vec![1], push).unwrap();
+        exported.export(1, vec![1], push).unwrap();
+        assert_eq!(
+            calls.get(),
+            1,
+            "claim deletes the machine snapshot even with identical user files"
+        );
+    }
+
+    #[test]
+    fn lost_reply_does_not_leave_previous_success_trusted() {
+        let mut exported = Exported::default();
+        exported.export(0, vec![1], |_| Ok(true)).unwrap();
+        // The service may have replaced the snapshot before its reply was lost.
+        assert!(
+            exported
+                .export(0, vec![2], |_| Err(io::Error::other("reply lost")))
+                .is_err()
+        );
+        let called = Cell::new(false);
+        exported
+            .export(0, vec![1], |_| {
+                called.set(true);
+                Ok(true)
+            })
+            .unwrap();
+        assert!(
+            called.get(),
+            "reverting user bytes must replace the possibly accepted snapshot"
+        );
+    }
 }
 
 #[cfg(all(test, windows))]

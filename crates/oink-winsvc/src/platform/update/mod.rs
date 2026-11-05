@@ -110,6 +110,9 @@ pub(super) fn pending() -> bool {
         .map(|p| p.join("pending.json").exists())
         .unwrap_or(true)
 }
+pub(super) fn maintenance_notifications() -> std::io::Result<super::wake::Directory> {
+    super::wake::Directory::new(&protected::maintenance()?)
+}
 pub fn request(request: oink_update::ipc::Request) -> Result<oink_update::ipc::Reply, Error> {
     pipe::request(request)
 }

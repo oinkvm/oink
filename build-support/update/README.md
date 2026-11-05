@@ -426,3 +426,13 @@ both enabled platforms and absent prefixes. Pass `--platform mac` or
 Windows availability, and Mac publication does not renew Windows metadata.
 Real signed upgrades, rollback, permissions and CDN readback remain release
 qualification; local pure tests do not claim those actions occurred.
+
+### Installer asset filenames
+
+New packages use `Oink-<version>-windows-x64.msi` and
+`Oink-<version>-macos-arm64.dmg` / `.zip`, without a separate build suffix.
+In-house versions already include `-inhouse.<build>` and remain unique.
+Build ordering and embedded metadata are unchanged. Release assembly, checksums,
+Windows manifests and Sparkle enclosures use the asset name from `release.json`;
+retain support for historical names when publishing or retaining old releases.
+See `docs/design/auto-update.md` for legacy client capability/notes constraints.

@@ -126,7 +126,6 @@ fn handoff_scheduled(immediate: bool, local_mouse: bool, freeze_poll_clock: bool
         (peer(), vec![display]),
     ]));
     h.driver.snapshots.layout.publish(RouterLayout {
-        application_focus_enabled: false,
         group: oink_foundation::GroupId([0; 16]),
         owners: Arc::default(),
         version: fixture_version(),

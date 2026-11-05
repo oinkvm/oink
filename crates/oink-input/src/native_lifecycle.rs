@@ -124,6 +124,8 @@ pub enum Kind {
     /// 7=real mouse,8=pause,9=exit,10=crash recovery,11=ownership lost.
     /// flags=SM_MOUSEPRESENT before, extra=after; success=setter/present result.
     MouseKeysCompensation,
+    /// Modifier hook/boundary observations; numeric layout in docs/design/diagnostics.md.
+    KeyboardCapture,
 }
 
 /// A failed park remains covered and is not retried within the same generation.

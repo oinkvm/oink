@@ -15,7 +15,7 @@ thread_local! {
 }
 
 // One capture owner per Windows backend/process. Only observed physical key
-// transitions write this fixed-size snapshot; no key identity is serialized.
+// transitions and attested boundary releases write this fixed-size snapshot; no key identity is serialized.
 static PHYSICAL_KEYS: [AtomicU32; 256] = [const { AtomicU32::new(0) }; 256];
 
 pub(super) fn mouse_origin(info: &MSLLHOOKSTRUCT) -> Origin {
@@ -171,4 +171,11 @@ pub(super) fn report(remote: bool, raw_clip_active: bool) {
         base_registered = snapshot.base_registered, base_rollback = snapshot.base_rollback,
         position_read_failed = snapshot.position_read_failed, remote, raw_clip_active,
         "external synthetic input counts since previous report");
+}
+
+/// The caller has retired this physical hold using an observable boundary sample.
+pub(super) fn retire_physical_modifier(vk: usize) {
+    if let Some(slot) = PHYSICAL_KEYS.get(vk) {
+        slot.store(0, Ordering::Relaxed);
+    }
 }

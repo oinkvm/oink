@@ -83,7 +83,7 @@ impl DiagnosticsStreams {
     }
 
     fn valid(message: &Message) -> bool {
-        matches!(message, Message::DiagnosticsHello(_) | Message::DiagnosticsGoodbye(_))
+        matches!(message, Message::DiagnosticsHello(_))
     }
     fn supported(&self, peer: DeviceId) -> bool {
         self.config

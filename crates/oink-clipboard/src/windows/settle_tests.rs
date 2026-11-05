@@ -207,7 +207,7 @@ fn multi_step_writer_settles_on_private_window_station() {
     changes.recv().unwrap();
     let text_count = reader.change_count();
     assert_eq!(reader.read().unwrap().items, vec![ClipData::Text("copy".into())]);
-    assert!(source.local_change(text_count, at + Duration::from_millis(100)));
+    assert!(source.local_change(text_count, at + Duration::from_millis(25)));
     writer
         .run(|hwnd| {
             let _open = OpenGuard::open(hwnd).unwrap();
@@ -217,9 +217,9 @@ fn multi_step_writer_settles_on_private_window_station() {
     changes.recv().unwrap();
     let final_count = reader.change_count();
     assert_ne!(text_count, final_count);
-    source.local_change(final_count, at + Duration::from_millis(200));
-    assert!(!source.capture_due(at + Duration::from_millis(499)));
-    assert!(source.capture_due(at + Duration::from_millis(500)));
+    source.local_change(final_count, at + Duration::from_millis(50));
+    assert!(!source.capture_due(at + Duration::from_millis(124)));
+    assert!(source.capture_due(at + Duration::from_millis(125)));
     let complete = reader.read().unwrap();
     assert_eq!(complete.change_count, reader.change_count());
     assert_eq!(
@@ -237,7 +237,7 @@ fn multi_step_writer_settles_on_private_window_station() {
         .unwrap();
     changes.recv().unwrap();
     source.local_change(reader.change_count(), at + Duration::from_secs(1));
-    assert!(source.capture_due(at + Duration::from_millis(1300)));
+    assert!(source.capture_due(at + Duration::from_millis(1075)));
     assert!(announced_kinds(&mut source, &reader).contains(&StandardFormat::Rtf));
 
     // One transaction held open across its steps: a reader must fail Busy, never

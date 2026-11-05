@@ -3197,97 +3197,6 @@ fn baseline_collection_omits_rich_layout_and_keeps_typed_availability() {
 }
 
 #[test]
-fn application_keyboard_owner_is_exported_only_as_diagnostic_alias() {
-    use oink_protocol::v1::schema::WireDto;
-    let anon = Anonymizer::new(oink_foundation::GroupId([9; 16]));
-    let pointer = oink_foundation::DeviceId([1; 32]);
-    let keyboard = oink_foundation::DeviceId([2; 32]);
-    let snapshot = Snapshot {
-        application_focus: Some(super::store::ApplicationFocus {
-            pointer: anon.device(pointer),
-            keyboard: Some(anon.device(keyboard)),
-            epoch: 1,
-            revision: 2,
-            phase: oink_routing::application_focus::Phase::Active,
-            reason: oink_routing::application_focus::Reason::Ready,
-        }),
-        ..Snapshot::current_build()
-    };
-    let wire = super::wire_values::snapshot(&snapshot, false).unwrap();
-    let focus = wire.application_focus().unwrap().unwrap();
-    assert_eq!(focus.keyboard().unwrap().unwrap().0, anon.device(keyboard));
-    let json = serde_json::to_string(&snapshot).unwrap();
-    assert!(!json.contains(&keyboard.to_hex()));
-    assert!(!json.contains(&pointer.to_hex()));
-    assert!(wire.raw().contains_key(&17));
-}
-
-#[test]
-fn application_focus_numeric_evidence_exports_without_realtime_tracing_or_raw_identities() {
-    use oink_foundation::application_focus::{Foreground, Observation, ObservationStamp};
-    use oink_routing::{application_focus as a, router::RoutingDiagnostics};
-    let temp = tempfile::tempdir().unwrap();
-    let me = DeviceId([11; 32]);
-    let peer = DeviceId([12; 32]);
-    let recorder = isolated(temp.path().into(), me, None, true).unwrap();
-    recorder.wait_recovery();
-    let trace = input_trace::InputTrace::for_recorder(&recorder);
-    let records = [
-        a::Diagnostic::State {
-            epoch: 8,
-            revision: 3,
-            pointer: me,
-            keyboard: Some(peer),
-            phase: a::Phase::Active,
-            reason: a::Reason::Ready,
-        },
-        a::Diagnostic::Observation {
-            epoch: 8,
-            observer: me,
-            observation: Observation {
-                stamp: ObservationStamp {
-                    generation: 1,
-                    sequence: 4,
-                },
-                foreground: Foreground::Hidden,
-                hidden_lost: false,
-                park_operation: Some(7),
-            },
-            accepted: true,
-        },
-        a::Diagnostic::Key {
-            epoch: 8,
-            revision: 2,
-            destination: peer,
-            stage: a::KeyStage::Rejected(a::KeyRefusal::Generation),
-        },
-        a::Diagnostic::Dismiss { epoch: 8 },
-    ];
-    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
-        for record in records {
-            RoutingDiagnostics::application_focus(&*trace, record);
-        }
-    });
-    for record in records {
-        let event = application_focus::export(record, &recorder);
-        assert!(event.network(false).is_ok());
-        assert!(event.network(true).is_ok());
-    }
-    trace.drain(&recorder);
-    let bundle = recorder.save_range(None).unwrap();
-    let rows = timeline(&bundle.path, "merged.ndjson");
-    let focus: Vec<_> = rows
-        .iter()
-        .filter(|row| row["event"]["Log"]["module"] == "oink_application_focus")
-        .collect();
-    assert_eq!(focus.len(), records.len());
-    let json = serde_json::to_string(&focus).unwrap();
-    assert!(!json.contains(&me.to_hex()));
-    assert!(!json.contains(&peer.to_hex()));
-    assert!(json.contains("Rejected(Generation)"));
-}
-
-#[test]
 #[ignore = "controlled recorder publication profile"]
 fn resource_recorder_publication() {
     let dir = tempfile::tempdir().unwrap();
@@ -3400,4 +3309,107 @@ fn touchpad_route_and_injection_diagnostics_export_only_reviewed_metadata() {
     assert!(!text.contains("987654321"));
     assert!(!text.contains(&source.to_hex()));
     r.shutdown();
+}
+
+#[test]
+fn ordinary_segment_publication_batches_two_seconds_without_changing_retention_or_payload() {
+    let temp = tempfile::tempdir().unwrap();
+    let recorder = isolated(temp.path().into(), DeviceId([123; 32]), None, true).unwrap();
+    recorder.wait_recovery();
+    let started = Instant::now();
+    recorder.record(event(KeyCode::keyboard(4)));
+    // Wake-driven worker, no save/status action that would explicitly drain.
+    std::thread::sleep(Duration::from_millis(1200));
+    let unpublished = lock(&recorder.inner.store).segments.is_empty();
+    // A loaded runner can oversleep past the 2 s batch; only a check made
+    // before that deadline says anything about the old 1 s publication.
+    if started.elapsed() < Duration::from_millis(1900) {
+        assert!(unpublished, "ordinary publication no longer happens at 1 s");
+    }
+    let deadline = started + Duration::from_secs(6);
+    while lock(&recorder.inner.store).segments.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let store = lock(&recorder.inner.store);
+    let last = store
+        .segments
+        .back()
+        .expect("worker publishes its retained events after batching");
+    let segment = store::decode(&store.read(last).unwrap()).unwrap();
+    assert!(segment.rows.iter().any(|row| matches!(row.event, Event::Input { .. })));
+    assert_eq!(MAX_BYTES, 64 * 1024 * 1024);
+    assert!(store.read(last).unwrap().len() <= MAX_SEGMENT_RAW);
+    drop(store);
+    recorder.shutdown();
+}
+
+#[test]
+fn modifier_hook_evidence_preserves_counters_and_unknown_held_state_on_wire() {
+    use oink_protocol::v1::{dto as w, schema::WireDto};
+    for held in [None, Some(8)] {
+        let event = Event::NativeInputLifecycle {
+            at_us: 123,
+            sequence: 9,
+            kind: oink_input::native_lifecycle::Kind::KeyboardCapture,
+            data: oink_input::native_lifecycle::Data {
+                reason: 2,
+                flags: 8 | (3 << 16),
+                extra: 4,
+                reentries: 12,
+                marker: Some(11),
+                chain_result: Some(3),
+                steps: held,
+                ..Default::default()
+            },
+            holder: None,
+            epoch: None,
+        };
+        let dto = event.network(true).unwrap();
+        let bytes = dto.encode(4096).unwrap();
+        let decoded = w::DiagnosticEvent::decode(&bytes, 4096).unwrap();
+        let lifecycle = w::InputLifecycle::from_raw(decoded.fields().unwrap()).unwrap();
+        assert_eq!(lifecycle.kind().unwrap(), w::LifecycleKind::KeyboardCapture);
+        let data = lifecycle.observation().unwrap();
+        assert_eq!(data.steps().unwrap(), held);
+        assert_eq!(data.generation().unwrap(), Some(4));
+        assert_eq!(data.count().unwrap(), Some(12));
+        assert_eq!(data.marker().unwrap(), Some(11));
+        assert_eq!(data.chain_result().unwrap(), Some(3));
+        assert_eq!(data.native_error().unwrap(), Some(8 | (3 << 16)));
+    }
+}
+
+#[test]
+fn modifier_duration_and_boundary_sample_survive_wire_projection() {
+    use oink_protocol::v1::{dto as w, schema::WireDto};
+    for (reason, steps, flags, success) in [
+        (11, Some(1_500_000), 0, None),
+        (12, None, 8, Some(false)),
+        (12, Some(0), 8 | (8 << 16), Some(true)),
+    ] {
+        let event = Event::NativeInputLifecycle {
+            at_us: 123,
+            sequence: 9,
+            kind: oink_input::native_lifecycle::Kind::KeyboardCapture,
+            data: oink_input::native_lifecycle::Data {
+                reason,
+                steps,
+                flags,
+                success,
+                ..Default::default()
+            },
+            holder: None,
+            epoch: None,
+        };
+        let bytes = event.network(true).unwrap().encode(4096).unwrap();
+        let decoded = w::DiagnosticEvent::decode(&bytes, 4096).unwrap();
+        let data = w::InputLifecycle::from_raw(decoded.fields().unwrap())
+            .unwrap()
+            .observation()
+            .unwrap();
+        assert_eq!(data.reason().unwrap(), Some(reason));
+        assert_eq!(data.steps().unwrap(), steps);
+        assert_eq!(data.native_error().unwrap(), Some(flags));
+        assert_eq!(data.success().unwrap(), success);
+    }
 }

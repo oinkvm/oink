@@ -335,11 +335,104 @@ fn open_for_demand(
     target: ClipPlatform,
     hover: bool,
 ) -> io::Result<FileReader> {
+    use crate::copy_diagnostics::{self as diagnostic, Channel, Stage};
     let inventory = provider.inventory();
+    let mut trace = diagnostic::Read::begin(
+        inventory.id,
+        Stage::SourceRead,
+        id,
+        diagnostic::format(find(&inventory, id).and_then(|rep| rep.standard)),
+        Channel::Native,
+    );
+    let result = open_for_inventory(provider, &inventory, id, target, hover);
+    if let Err(error) = &result {
+        trace.failure(error);
+    }
+    // The reader reports actual bytes and final errors through EOF, including
+    // same-platform streams which are intentionally not materialized here.
+    result.map(|reader| {
+        Box::new(DiagnosticReader {
+            reader,
+            trace,
+            bytes: 0,
+        }) as FileReader
+    })
+}
+struct DiagnosticReader {
+    reader: FileReader,
+    trace: crate::copy_diagnostics::Read,
+    bytes: u64,
+}
+impl Read for DiagnosticReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self.reader.read(buffer) {
+            Ok(size) => {
+                self.bytes += size as u64;
+                self.trace.success(self.bytes);
+                Ok(size)
+            }
+            Err(error) => {
+                self.trace.failure(&error);
+                Err(error)
+            }
+        }
+    }
+}
+fn native_png(format: &crate::model::NativeFormat) -> bool {
+    use crate::model::NativeFormat;
+    match format {
+        NativeFormat::Mac(name) => name == "public.png",
+        NativeFormat::WindowsRegistered(name) => {
+            name.eq_ignore_ascii_case("PNG")
+                || name.split(';').next().is_some_and(|mime| {
+                    matches!(mime.trim().to_ascii_lowercase().as_str(), "image/png" | "image/x-png")
+                })
+        }
+        _ => false,
+    }
+}
+fn open_for_inventory(
+    provider: &dyn Provider,
+    inventory: &Inventory,
+    id: RepresentationId,
+    target: ClipPlatform,
+    hover: bool,
+) -> io::Result<FileReader> {
     let rep = inventory
         .wanted(target)
         .find(|r| r.id == id)
         .ok_or_else(|| unavailable(Unavailable::Unsupported))?;
+    // A DIB/TIFF and an existing PNG on the same item describe the same image.
+    // Prefer lossless native PNG only for the portable contract, retaining raw
+    // same-platform order and identity guards. Invalid PNG can fall back; source
+    // expiry or a timed-out native callback cannot restart through a sibling.
+    if target != inventory.platform
+        && rep.standard == Some(crate::model::StandardFormat::Png)
+        && !native_png(&rep.format)
+        && let Some(item) = inventory
+            .items
+            .iter()
+            .find(|item| item.representations.iter().any(|r| r.id == id))
+    {
+        for candidate in item
+            .representations
+            .iter()
+            .filter(|r| r.standard == rep.standard && native_png(&r.format))
+        {
+            match open_for_demand(provider, candidate.id, target, hover) {
+                Ok(reader) => return Ok(reader),
+                Err(error)
+                    if matches!(
+                        reason(&error),
+                        Unavailable::Superseded | Unavailable::Cancelled | Unavailable::NoProgress
+                    ) =>
+                {
+                    return Err(error);
+                }
+                Err(_) => {}
+            }
+        }
+    }
     let guard = provider.reader_guard(id)?;
     guard()?;
     let mut reader = match &rep.data {
@@ -359,7 +452,7 @@ fn open_for_demand(
     }
     if rep.standard == Some(crate::model::StandardFormat::Url) {
         let bytes = url::read(&mut reader)?;
-        let encoded = url::capture(provider, &inventory, rep, &bytes, hover)?.encode()?;
+        let encoded = url::capture(provider, inventory, rep, &bytes, hover)?.encode()?;
         return guarded(Box::new(io::Cursor::new(encoded)), guard);
     }
     let bytes = read_all(&mut reader)?;

@@ -65,8 +65,9 @@ pub fn message(id: u16) -> Option<&'static Entry> {
 }
 /// Dropped development operations/wrappers are permanently unavailable to v1.
 pub const TOMBSTONES: &[u16] = &[
-    0x0d09, 0x0d0a, 0x0d0b, 0x0200, 0x0206, 0x0301, 0x0302, 0x0303, 0x0304, 0x0305, 0x0306, 0x0307, 0x0308, 0x0404,
-    0x0508, 0x0600, 0x0601, 0x0900, 0x0a08, 0x0c12, 0x0e00, 0x0e01, 0x0e02, 0x0e03, 0x1000,
+    0x010d, 0x0700, 0x0701, 0x0702, 0x0703, 0x0704, 0x0705, 0x0003, 0x0105, 0x0a01, 0x1101, 0x1102, 0x0d09, 0x0d0a,
+    0x0d0b, 0x0200, 0x0206, 0x0301, 0x0302, 0x0303, 0x0304, 0x0305, 0x0306, 0x0307, 0x0308, 0x0404, 0x0508, 0x0600,
+    0x0601, 0x0900, 0x0a08, 0x0c12, 0x0e00, 0x0e01, 0x0e02, 0x0e03, 0x1000,
 ];
 pub const BASELINE: &[&str] = &[
     "oink.core/1",
@@ -88,15 +89,14 @@ pub const CAPABILITIES: &[&str] = &[
     "oink.input.gestures/1",
     "oink.input.contacts/1",
     "oink.input.trail/1",
-    "oink.input.application-focus/1",
     "oink.audio/1",
     "oink.audio.pcm/1",
+    "oink.audio.quality/1",
     "oink.audio.state/1",
     "oink.audio.microphone/1",
     "oink.audio.media-health/1",
     "oink.files.safe-symlinks/1",
     "oink.files.exec-bits/1",
-    "oink.aim/1",
     "oink.wallpaper/1",
     "oink.cache/1",
     "oink.diagnostics.collect/1",
@@ -120,6 +120,8 @@ pub const CAPABILITIES: &[&str] = &[
     "oink.input.touchpad-options/1",
     "oink.input.scroll-pixels/1",
     "oink.pointer.move/1",
+    "oink.pointer.move-hidden/1",
+    "oink.focus.local-click/1",
     "oink.pointer.lock-escape/1",
     "oink.input.keymap-none/1",
     "oink.pointer.entry-protection/1",
@@ -157,7 +159,6 @@ pub const STREAMS: &[Stream] = &[
     stream!(3, "I0", 0, &["oink.input/1"], true, true, false),
     stream!(4, "B0", 1, &["oink.clipboard/1"], true, false, true),
     stream!(5, "M0", 1, &["oink.audio/1"], true, true, false),
-    stream!(7, "A0", 1, &["oink.aim/1"], true, false, false),
     stream!(8, "D0", 1, &["oink.diagnostics.collect/1"], true, false, true),
     stream!(9, "Wallpaper", 1, &["oink.wallpaper/1"], false, false, true),
     stream!(10, "Dnd", 1, &["oink.drag/1"], false, false, true),
@@ -200,10 +201,6 @@ pub const fn experimental_message(id: u16) -> bool {
 pub const fn experimental_stream(kind: u16) -> bool {
     (kind >= 0xf0 && kind <= 0xff) || (kind >= 0x8000 && kind != 0xffff)
 }
-pub const fn experimental_field(key: u32) -> bool {
-    key >= 0x8000_0000 && key != u32::MAX
-}
-
 include!("schema_entries.rs");
 #[derive(Debug, Serialize)]
 pub struct Registry {
@@ -267,6 +264,21 @@ pub fn schema_registry() -> Registry {
 /// remain allocated; key4 is retired. These names describe reservations only,
 /// never executable DTO schemas.
 pub const RESERVED_FIELDS: &[(&str, &[u32])] = &[
+    ("ApplicationFocusRecord", &[1, 2]),
+    ("ApplicationFocusClaim", &[1, 2, 3]),
+    ("ApplicationFocusObservation", &[1, 2, 3, 4, 5]),
+    ("ApplicationFocusPrepare", &[1, 2, 3, 4, 5]),
+    ("ApplicationFocusApplied", &[1, 2]),
+    ("ApplicationFocusSnapshot", &[1, 2, 3, 4, 5]),
+    ("ApplicationFocusRetire", &[1, 2]),
+    ("ApplicationKeyRoute", &[1, 2, 3, 4, 5]),
+    ("ApplicationFocusSettings", &[1]),
+    ("DiagApplicationFocus", &[1, 2, 3, 4, 5, 6]),
+    ("ApplicationHeldKey", &[1, 2]),
+    ("InputKey", &[103]),
+    ("InputKeyRepeat", &[103]),
+    ("InputHeldSync", &[103, 104]),
+    ("Snapshot", &[17]),
     ("ProtocolError", &[9, 10]),
     ("ObservedState", &[5]),
     ("ResourceFault", &[2]),
@@ -301,20 +313,33 @@ pub const RESERVED_FIELDS: &[(&str, &[u32])] = &[
 /// The whole 04xx family remains assigned to calibration; no other family may
 /// allocate there. Relays may carry opaque frames without interpreting them.
 pub const RESERVED_MESSAGES: &[(u16, &str)] = &[
+    (0x010d, "ApplicationFocus: 已退役，不得复用"),
+    (0x0700, "AimOpen: 已退役，不得复用"),
+    (0x0701, "AimJoined: 已退役，不得复用"),
+    (0x0702, "AimDeclined: 已退役，不得复用"),
+    (0x0703, "AimState: 已退役，不得复用"),
+    (0x0704, "AimClick: 已退役，不得复用"),
+    (0x0705, "AimClose: 已退役，不得复用"),
+    (0x1101, "ProjectionMode: 已退役，不得复用"),
+    (0x1102, "ProjectionGesture: 已退役，不得复用"),
+    (0x0105, "ControlIdentifyScreens: 已退役，不得复用"),
+    (0x0003, "StreamOpened: 已退役，不得复用"),
+    (0x0a01, "DiagnosticsGoodbye: 已退役，不得复用"),
     (0x0400, "CalibShowPattern"),
     (0x0401, "CalibReady"),
     (0x0402, "CalibStatus"),
     (0x0403, "CalibHide"),
 ];
-pub const RESERVED_STREAMS: &[(u16, &str)] = &[(6, "K0")];
-pub const RESERVED_CAPABILITIES: &[&str] = &["oink.calibration/1"];
-pub const REGISTER_KINDS: &[(u32, &str)] = &[
-    (2, "LayoutValue"),
-    (8, "ApplicationFocusSettings"),
-    (0x1301, "PointerShortcutSlots"),
-];
-pub const RESERVED_REGISTERS: &[u32] = &[1, 3, 4, 5, 6, 7];
+pub const RESERVED_STREAMS: &[(u16, &str)] = &[(6, "K0"), (7, "A0: 已退役，不得复用")];
+pub const RESERVED_CAPABILITIES: &[&str] = &["oink.calibration/1", "oink.aim/1", "oink.input.application-focus/1"];
+pub const REGISTER_KINDS: &[(u32, &str)] = &[(2, "LayoutValue"), (0x1301, "PointerShortcutSlots")];
+pub const RESERVED_REGISTERS: &[u32] = &[1, 3, 4, 5, 6, 7, 8];
 pub const RESERVED_ENUM_VALUES: &[(&str, &[u32])] = &[
+    ("ApplicationFocusActionKind", &[0, 1, 2, 3, 4, 5, 6, 7]),
+    ("ApplicationForeground", &[0, 1, 2, 3, 4, 5]),
+    ("ApplicationParkResult", &[0, 1, 2, 3, 4, 5]),
+    ("ApplicationFocusPhase", &[0, 1, 2, 3]),
+    ("ApplicationFocusReason", &[0, 1, 2, 3, 4, 5, 6, 7, 8]),
     ("SizeSource", &[2]),
     ("LayoutSource", &[2]),
     ("ChangeKind", &[3]),
@@ -358,7 +383,6 @@ pub const UNITS: &[(&str, &str)] = &[
         "Crossing.gap_distance;Crossing.remaining_reference_motion;DiagSegmentKind.Portal.3",
         "reference ratio",
     ),
-    ("AimState.radius;AimState.targets;AimClick.pos", "reference ratio"),
 ];
 pub const DIAGNOSTIC_EVENTS: &[&str] = &[
     "protocol-violation/1",
@@ -417,20 +441,6 @@ pub const ERRORS: &[(u16, &str)] = &[
 ];
 pub type OpenEnumAllocation = (&'static str, &'static str, &'static [(u32, Option<&'static str>)]);
 pub const OPEN_ENUMS: &[OpenEnumAllocation] = &[
-    (
-        "ApplicationFocusAction",
-        "ApplicationFocusActionKind",
-        &[
-            (0, Some("ApplicationFocusObservation")),
-            (1, Some("ApplicationFocusPrepare")),
-            (2, Some("ApplicationFocusSnapshot")),
-            (3, Some("ApplicationFocusApplied")),
-            (4, Some("ApplicationFocusSnapshot")),
-            (5, Some("ApplicationFocusRetire")),
-            (6, None),
-            (7, Some("ApplicationFocusPrepare")),
-        ],
-    ),
     (
         "MouseButton",
         "MouseButtonKind",
@@ -592,9 +602,6 @@ pub const OPEN_ENUMS: &[OpenEnumAllocation] = &[
 ];
 pub fn validate_open(name: &str, raw: &RawMap) -> Result<()> {
     match name {
-        "ApplicationFocusAction" => {
-            ApplicationFocusAction::from_raw(raw.clone())?;
-        }
         "MouseButton" => {
             MouseButton::from_raw(raw.clone())?;
         }
@@ -666,4 +673,17 @@ pub fn validate_open(name: &str, raw: &RawMap) -> Result<()> {
         _ => return Err(ErrorCode::UnsupportedValue.into()),
     }
     Ok(())
+}
+
+/// Retired input allocations are discarded before endpoint DTO projection.
+/// Terminal key extensions must never fall back to ordinary input execution.
+pub fn retired_input_frame(frame: super::frame::OpaqueFrame<'_>) -> super::Result<bool> {
+    if frame.header.type_id == 0x010d {
+        return Ok(true);
+    }
+    if matches!(frame.header.type_id, 0x0202 | 0x0205 | 0x0207) {
+        let map = super::hot::Map::parse(frame.payload(), super::limits::RELIABLE_FRAME)?;
+        return Ok(map.field(103)?.is_some() || frame.header.type_id == 0x0205 && map.field(104)?.is_some());
+    }
+    Ok(false)
 }

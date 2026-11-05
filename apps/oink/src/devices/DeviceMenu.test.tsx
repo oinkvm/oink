@@ -89,13 +89,6 @@ it('offers only hiding on a screen', async () => {
   expect(handlers.onHideScreen).toHaveBeenCalledWith('remote:1');
 });
 
-
-it('keeps application-focus settings and keyboard ownership out of device menus',async()=>{
-  menu({target:'device:remote'});
-  const labels=await items();
-  expect(labels.join(' ')).not.toMatch(/Application focus|Enable on|Keyboard focus/);
-});
-
 it.each(['self','online'] as const)('permission actions stay on the owning device (%s)',async group=>{
   setLanguage('en');
   const grant=vi.fn();

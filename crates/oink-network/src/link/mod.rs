@@ -50,9 +50,9 @@ use oink_protocol::frame::{Priority, StreamCode, StreamKind, StreamTag};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 /// End-to-end heartbeat on N0 (also across a relay, which only carries it).
-pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 /// No matching answer for this long: the link is lost.
-pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(1500);
+pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 /// QUIC idle time-out and keep-alive. A black-holed connection ends after 10 to 15 s;
 /// the heartbeat decides first.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -95,7 +95,8 @@ pub struct LinkConfig {
     pub identity: Arc<crate::identity::Identity>,
     /// This process's instance (device id plus a start-up nonce).
     pub boot: Boot,
-    /// UDP address of the QUIC endpoint; the TCP pool listens next to it.
+    /// Preferred UDP/TCP port. Unavailable ports use OS allocation; Low::Info
+    /// announces the TCP listener independently of the QUIC address.
     pub bind: SocketAddr,
     /// Scheduling tier of the network thread; chosen per platform after measuring.
     pub tier: Tier,
@@ -121,6 +122,11 @@ impl LinkLayer {
     /// module's; there is exactly one.
     pub async fn start(config: LinkConfig) -> Result<(Self, ConfigPort), crate::NetError> {
         Self::launch(config).await
+    }
+
+    /// Actual Low TCP listener. Its port is carried by the existing Low::Info.
+    pub fn low_local_addr(&self) -> Option<SocketAddr> {
+        self.0.pool.get().and_then(|pool| pool.local_addr())
     }
 
     /// Close every link (reason `Stopped`) and stop the thread. Waits for it.

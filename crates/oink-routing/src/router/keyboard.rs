@@ -3,9 +3,10 @@ use super::*;
 use std::collections::BTreeSet;
 
 /// Exact physical chord, either modifier side, held for one second.
-pub const KEYBOARD_RELEASE_CHORD: &str = "Ctrl+Option/Alt+Shift+U";
 pub const KEYBOARD_RELEASE_HOLD_US: Micros = 1_000_000;
-const RELEASE_KEY: KeyCode = KeyCode::keyboard(0x18);
+pub const KEYBOARD_RELEASE_KEYS: [&str; 4] = ["Ctrl", "Alt", "Shift", "U"];
+static RELEASE_CHORD: std::sync::LazyLock<crate::Chord> =
+    std::sync::LazyLock::new(|| crate::Chord::parse(&KEYBOARD_RELEASE_KEYS).expect("valid keyboard release chord"));
 
 #[derive(Debug, Default)]
 pub(super) struct Keyboard {
@@ -16,6 +17,14 @@ pub(super) struct Keyboard {
     since: Option<Micros>,
 }
 impl Keyboard {
+    pub(super) fn retire_modifier(&mut self, code: KeyCode) {
+        self.down.remove(&code);
+        self.local_passed.remove(&code);
+        self.pointer_seed.remove(&code);
+        self.suppressed.remove(&code);
+        self.since = None;
+    }
+
     pub(super) fn suppress(&mut self, code: KeyCode) {
         self.suppressed.insert(code);
         self.local_passed.remove(&code);
@@ -30,17 +39,9 @@ impl Keyboard {
         }
     }
     fn exact(&self) -> bool {
-        self.down.len() == 4
-            && self.down.contains(&RELEASE_KEY)
-            && [KeyCode::LEFT_CTRL, KeyCode::RIGHT_CTRL]
-                .iter()
-                .any(|k| self.down.contains(k))
-            && [KeyCode::LEFT_ALT, KeyCode::RIGHT_ALT]
-                .iter()
-                .any(|k| self.down.contains(k))
-            && [KeyCode::LEFT_SHIFT, KeyCode::RIGHT_SHIFT]
-                .iter()
-                .any(|k| self.down.contains(k))
+        self.down.len() == KEYBOARD_RELEASE_KEYS.len()
+            && self.down.contains(&RELEASE_CHORD.key)
+            && crate::Mods::held(self.down.iter().copied()) == RELEASE_CHORD.mods
     }
     pub(super) fn cancel_release_hold(&mut self) {
         self.since = None;

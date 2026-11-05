@@ -106,20 +106,9 @@ impl<T: Clone> Transactions<T> {
             .filter_map(|(key, p)| (p.deadline <= now).then_some(*key))
             .collect()
     }
-    pub fn outstanding_from(&self, device: DeviceKey) -> Vec<RequestKey> {
-        self.pending
-            .keys()
-            .filter(|key| key.requester.device == device)
-            .copied()
-            .collect()
-    }
     pub fn retain_requesters(&mut self, mut admitted: impl FnMut(Requester) -> bool) {
         self.pending.retain(|key, _| admitted(key.requester));
         self.terminal.retain(|entry| admitted(entry.key.requester));
-    }
-    pub fn retire_requester(&mut self, requester: Requester) {
-        self.pending.retain(|key, _| key.requester != requester);
-        self.terminal.retain(|entry| entry.key.requester != requester);
     }
 }
 

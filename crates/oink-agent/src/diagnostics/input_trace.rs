@@ -46,7 +46,6 @@ struct Dedup {
 }
 #[allow(clippy::large_enum_variant)] // fixed bounded storage; producers cannot allocate boxes
 pub(super) enum Evidence {
-    ApplicationFocus(oink_routing::application_focus::Diagnostic),
     Timing(oink_foundation::handoff_timing::Event),
     PointerCapture(super::capture::Raw),
     CursorClip(super::cursor_clip::Record),
@@ -382,7 +381,6 @@ impl InputTrace {
             }
             recorder.with_capture_stamp(stamped.stamp, || {
                 recorder.record(match stamped.record {
-                    Evidence::ApplicationFocus(record) => super::application_focus::export(record, recorder),
                     Evidence::Timing(record) => timing_event(record),
                     Evidence::PointerCapture(record) => record.export(recorder),
                     Evidence::CursorClip(record) => record.export(recorder),
@@ -630,20 +628,6 @@ impl InputTrace {
 
 #[cfg(all(test, debug_assertions))]
 mod tests {
-    #[test]
-    fn application_focus_evidence_survives_disabled_realtime_tracing() {
-        use super::*;
-        use oink_routing::{application_focus::Diagnostic, router::RoutingDiagnostics};
-        let trace = InputTrace::new(true);
-        let record = Diagnostic::Dismiss { epoch: 42 };
-        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
-            RoutingDiagnostics::application_focus(&*trace, record);
-        });
-        assert!(matches!(trace.evidence.pop().unwrap().record, Evidence::ApplicationFocus(value) if value == record));
-        trace.disable_for_test();
-        RoutingDiagnostics::application_focus(&*trace, record);
-        assert!(trace.evidence.is_empty());
-    }
     #[test]
     fn crossing_timing_is_numeric_projectable_and_obeys_recorder_switch() {
         use super::*;

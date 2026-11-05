@@ -370,7 +370,7 @@ unit!(oink_input::native_lifecycle::Kind=>w::LifecycleKind{
     ParkInputTargetMismatch=>ParkInputTargetMismatch,ParkInputHideLost=>ParkInputHideLost,ParkInputHookChainRejected=>ParkInputHookChainRejected,
     ParkInputReadbackMismatch=>ParkInputReadbackMismatch,ParkInputCompletionUnavailable=>ParkInputCompletionUnavailable,
     ContactCapture=>ContactCapture,ContactInjection=>ContactInjection,
-    MarkerSubmission=>MarkerSubmission,MarkerHookDecision=>MarkerHookDecision,MarkerChainResult=>MarkerChainResult,MarkerReadback=>MarkerReadback,RestoreSafetyReset=>RestoreSafetyReset,MouseKeysCompensation=>MouseKeysCompensation
+    MarkerSubmission=>MarkerSubmission,MarkerHookDecision=>MarkerHookDecision,MarkerChainResult=>MarkerChainResult,MarkerReadback=>MarkerReadback,RestoreSafetyReset=>RestoreSafetyReset,MouseKeysCompensation=>MouseKeysCompensation,KeyboardCapture=>KeyboardCapture
 });
 fn named_scalars<T: Value>(values: impl IntoIterator<Item = (String, T)>) -> v1::Result<RawValue> {
     let mut values = values.into_iter().collect::<Vec<_>>();
@@ -802,9 +802,6 @@ impl Event {
         raw_fields::<w::DiagnosticEvent>([("kind", RawValue::from(kind)), ("fields", RawValue::Map(fields))])
     }
 }
-unit!(oink_routing::application_focus::Phase=>w::ApplicationFocusPhase{Off=>Off,Preparing=>Preparing,Active=>Active,Suspended=>Suspended});
-unit!(oink_routing::application_focus::Reason=>w::ApplicationFocusReason{Disabled=>Disabled,Ready=>Ready,NoPointer=>NoPointer,PointerNotParticipating=>PointerNotParticipating,AwaitingApplication=>AwaitingApplication,DesktopUnavailable=>DesktopUnavailable,Drag=>Drag,Game=>Game,CounterExhausted=>CounterExhausted});
-structure!(super::store::ApplicationFocus=>w::DiagApplicationFocus{pointer,keyboard,epoch,revision,phase,reason});
 
 pub(super) fn snapshot(value: &Snapshot, rich: bool) -> v1::Result<w::Snapshot> {
     let layout = value.layout.as_ref();
@@ -837,7 +834,6 @@ pub(super) fn snapshot(value: &Snapshot, rich: bool) -> v1::Result<w::Snapshot> 
         .transpose()?;
     let mut fields = vec![
         ("group_state", excerpt.write()),
-        ("application_focus", value.application_focus.wire()?),
         ("version", value.version.wire()?),
         ("source_tree_sha256", value.source_tree_sha256.wire()?),
         ("os", value.os.wire()?),

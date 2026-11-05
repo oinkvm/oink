@@ -455,11 +455,6 @@ impl Layout {
     ) -> Topology {
         Topology::with_online(self, owners, online)
     }
-
-    /// 所有屏幕（含未启用的）在视平面上的包围盒。没有屏幕时为 `None`。
-    pub fn bounding_box(&self) -> Option<Rect> {
-        bbox(self.screens.iter().map(|s| s.rect))
-    }
 }
 
 pub(crate) fn bbox(rects: impl IntoIterator<Item = Rect>) -> Option<Rect> {

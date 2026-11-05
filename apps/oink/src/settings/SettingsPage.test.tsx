@@ -260,3 +260,57 @@ it.each([
   expect(within(row).getByRole('switch',{name:label})).toBeTruthy();
   expect(row.querySelector('.ok-row__desc')?.textContent).not.toContain('开启时');
 });
+
+
+it.each(['mac', 'win'] as const)('renders the window shortcut off and recovery shortcut read-only on %s', platform => {
+  setLanguage('en');
+  agent.adopt('input', { keyboard_release_keys: ['Ctrl', 'Alt', 'Shift', 'U'], hotkeys: [] } as unknown as import('../api/types').InputSettings);
+  const update = vi.spyOn(prefs, 'set');
+  const { container } = render(view(platform));
+  const windowRow = container.querySelector<HTMLElement>('[data-item="sc-openWindow"]')!;
+  expect(windowRow.textContent).toContain('Open the Oink window');
+  expect(windowRow.textContent).toContain('Open or bring up the Oink window on this device');
+  const toggle = within(windowRow).getByRole('switch');
+  expect((toggle as HTMLInputElement).checked).toBe(false);
+  expect(toggle.hasAttribute('disabled')).toBe(false);
+  fireEvent.click(toggle);
+  expect(update).toHaveBeenCalledWith('shortcuts', expect.objectContaining({openWindow: {on: true, keys: 'Control+Alt+A'}}));
+  update.mockClear();
+  const release = container.querySelector<HTMLElement>('[data-item="sc-keyboardRelease"]')!;
+  expect(release.textContent).toContain("Re-enable this device's keyboard and mouse");
+  expect(release.textContent).toContain('When the keyboard or mouse is disabled, hold for 1 second to re-enable it');
+  expect([...release.querySelectorAll('kbd')].map(key => key.textContent)).toEqual(platform === 'mac' ? ['⌃', '⌥', '⇧', 'U'] : ['Ctrl', 'Alt', 'Shift', 'U']);
+  const recoveryToggle = within(release).getByRole('switch');
+  expect((recoveryToggle as HTMLInputElement).checked).toBe(true);
+  expect(recoveryToggle.hasAttribute('disabled')).toBe(true);
+  const recorder = within(release).getByRole('button');
+  expect(recorder.getAttribute('aria-disabled')).toBe('true');
+  fireEvent.click(recoveryToggle);
+  fireEvent.click(recorder);
+  fireEvent.keyDown(recorder, {key: 'Enter'});
+  fireEvent.keyDown(recorder, {key: 'W', code: 'KeyW', ctrlKey: true});
+  expect(recorder.getAttribute('aria-pressed')).toBe('false');
+  expect(update).not.toHaveBeenCalled();
+  agent.adopt('input', null);
+});
+
+it.each([
+  ['en', 'window', 'sc-openWindow'], ['en', 're-enable', 'sc-keyboardRelease'],
+  ['zh-Hans', '主界面', 'sc-openWindow'], ['zh-Hans', '解除', 'sc-keyboardRelease'],
+  ['ja', 'ウィンドウ', 'sc-openWindow'], ['ja', '無効', 'sc-keyboardRelease'],
+  ['ko', '창', 'sc-openWindow'], ['ko', '비활성화', 'sc-keyboardRelease'],
+] as const)('finds %s %s in shortcuts', (language, query, id) => {
+  setLanguage(language);
+  const results = searchSections('mac', query).get('shortcuts');
+  expect(results === 'all' || results?.has(id)).toBe(true);
+});
+
+
+it('uses the backend recovery chord directly', () => {
+  setLanguage('en');
+  agent.adopt('input', {keyboard_release_keys:['Ctrl','Shift','F8'],hotkeys:[]} as unknown as import('../api/types').InputSettings);
+  const {container}=render(view());
+  const row=container.querySelector('[data-item="sc-keyboardRelease"]')!;
+  expect([...row.querySelectorAll('kbd')].map(key=>key.textContent)).toEqual(['⌃','⇧','F8']);
+  agent.adopt('input',null);
+});

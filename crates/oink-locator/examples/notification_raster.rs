@@ -1,8 +1,8 @@
 //! Headless native-font evidence: writes PPM images, never creates a surface/window.
 use oink_foundation::{Rect, display::DisplayInfo};
 use oink_locator::{
-    aim::text,
     notification::{Queue, Style, Toast},
+    text,
 };
 use std::{
     io::Write,

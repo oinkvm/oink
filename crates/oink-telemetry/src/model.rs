@@ -1,7 +1,7 @@
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 pub const POLICY_VERSION: u16 = 3;
-pub const SCHEMA_VERSION: u16 = 3;
+pub const SCHEMA_VERSION: u16 = 4;
 
 macro_rules! closed {
     ($name:ident { $($v:ident),+ $(,)? }) => {
@@ -54,7 +54,18 @@ closed!(Platform {
 });
 closed!(NetworkPath { Direct, Relay, Unknown });
 closed!(Transport { Reliable, Lossy });
-closed!(Codec { Pcm, Opus, Unknown });
+/// Schema 4: `pcm` means PCM24 only; schema 3's broad values are never relabeled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Codec {
+    Pcm,
+    #[serde(rename = "opus_5ms")]
+    Opus5ms,
+    #[serde(rename = "opus_20ms")]
+    Opus20ms,
+    Pcm16_2p5ms,
+    Unknown,
+}
 closed!(StartBoundary {
     AppkitWillBegin,
     OleLoopEnter,
@@ -678,8 +689,8 @@ impl AdmittedReport {
         let mut ids = [0; 40];
         getrandom::fill(&mut ids).map_err(|_| Error::Entropy)?;
         Ok(Self {
-            schema_version: 3,
-            policy_version: 3,
+            schema_version: SCHEMA_VERSION,
+            policy_version: POLICY_VERSION,
             event_id: ids[..16].try_into().unwrap(),
             trace_id: ids[16..32].try_into().unwrap(),
             span_id: ids[32..].try_into().unwrap(),
@@ -694,8 +705,8 @@ impl AdmittedReport {
         })
     }
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 3
-            || self.policy_version != 3
+        if self.schema_version != SCHEMA_VERSION
+            || self.policy_version != POLICY_VERSION
             || !self.occurrence_hour.is_multiple_of(3600)
             || self.event_id == [0; 16]
             || self.trace_id == [0; 16]
@@ -785,5 +796,27 @@ mod transfer_bucket_tests {
             ThroughputBucket::UpTo100MiBps
         );
         assert_eq!(ThroughputBucket::measured(u64::MAX, 1), ThroughputBucket::Above100MiBps);
+    }
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+    #[test]
+    fn codec_is_closed_and_legacy_opus_is_not_guessed() {
+        for (codec, name) in [
+            (Codec::Opus5ms, "opus_5ms"),
+            (Codec::Opus20ms, "opus_20ms"),
+            (Codec::Pcm, "pcm"),
+            (Codec::Pcm16_2p5ms, "pcm16_2p5ms"),
+            (Codec::Unknown, "unknown"),
+        ] {
+            let value = serde_json::json!(name);
+            assert_eq!(serde_json::to_value(codec).unwrap(), value);
+            assert_eq!(serde_json::from_value::<Codec>(value).unwrap(), codec);
+        }
+        for name in ["opus", "pcm24_48000", "future_codec", ""] {
+            assert!(serde_json::from_value::<Codec>(serde_json::json!(name)).is_err());
+        }
     }
 }

@@ -64,7 +64,6 @@ pub(crate) struct Fixture<O> {
 const KINDS: &[StreamKind] = &[
     StreamKind::Clipboard,
     StreamKind::Audio,
-    StreamKind::Aim,
     StreamKind::Diagnostics,
     StreamKind::Input,
     StreamKind::Wallpaper,
@@ -77,7 +76,7 @@ impl<O: Owner> Fixture<O> {
     pub(crate) async fn start_members(count: u8) -> Self {
         Self::start_profile(count, None).await
     }
-    async fn start_profile(count: u8, omitted_capability: Option<&str>) -> Self {
+    pub(crate) async fn start_profile(count: u8, omitted_capability: Option<&str>) -> Self {
         Self::start_topology(count, omitted_capability, false).await
     }
     pub(crate) async fn start_relayed() -> Self {
@@ -462,17 +461,6 @@ pub(super) fn message(kind: StreamKind, sequence: u64) -> Message {
             )
             .unwrap(),
         ),
-        StreamKind::Aim => {
-            let boot = Boot {
-                device_id: Identity::from_seed([41; 32]).id(),
-                nonce: [41; 16],
-            };
-            let boot = oink_network::wire_identity::boot(boot);
-            let game = dto::GameInstance::from_raw([(1, boot.write()), (2, 1u64.write())].into()).unwrap();
-            let event =
-                dto::GameEvent::from_raw([(1, game.write()), (2, boot.write()), (3, sequence.write())].into()).unwrap();
-            Message::AimClose(dto::AimClose::from_raw([(1, event.write())].into()).unwrap())
-        }
         StreamKind::Diagnostics => Message::DiagnosticsHello(
             dto::DiagnosticsHello::from_raw(
                 [
@@ -609,7 +597,7 @@ pub(super) async fn replacement_and_pause<O: Owner>() {
     );
     let _ = old_tx.post(encode(&message(O::KIND, 99)).unwrap());
     f.owner.pause_changed(true);
-    let obeys = !matches!(O::KIND, StreamKind::Audio | StreamKind::Aim | StreamKind::Diagnostics);
+    let obeys = !matches!(O::KIND, StreamKind::Audio | StreamKind::Diagnostics);
     assert_eq!(f.owner.current(f.peer).is_none(), obeys);
     assert_eq!(f.owner.incoming(f.peer), Some(new));
     new_tx.post(encode(&message(O::KIND, 4)).unwrap()).unwrap();
@@ -987,7 +975,6 @@ async fn dnd_pause_blocks_own_low_but_keeps_serving_peer_and_input_replacement_c
 async fn capability_changes<O: Owner>() {
     let capability = match O::KIND {
         StreamKind::Audio => "oink.audio/1",
-        StreamKind::Aim => "oink.aim/1",
         _ => unreachable!(),
     };
     // Optional capabilities belong to a connection's negotiated agreement.
@@ -1021,20 +1008,6 @@ fn audio_obeys_negotiated_capabilities_across_new_links() {
 async fn audio_obeys_negotiated_capabilities_across_new_links_scenario() {
     capability_changes::<super::audio::AudioStreams>().await;
 }
-#[test]
-fn aim_obeys_negotiated_capabilities_across_new_links() {
-    crate::test_watchdog::run(
-        module_path!(),
-        "aim_obeys_negotiated_capabilities_across_new_links",
-        None,
-        aim_obeys_negotiated_capabilities_across_new_links_scenario(),
-    );
-}
-
-async fn aim_obeys_negotiated_capabilities_across_new_links_scenario() {
-    capability_changes::<super::aim::AimStreams>().await;
-}
-
 #[test]
 fn clipboard_file_operation_interruption_retains_binding_and_reopens_at_requested_offset() {
     crate::test_watchdog::run(
@@ -1392,53 +1365,6 @@ fn clipboard_unadmitted_tail_expires_and_retires_with_its_link() {
             }
         },
     );
-}
-
-#[test]
-fn game_observes_new_local_displays_from_config_owner() {
-    crate::test_watchdog::run(
-        module_path!(),
-        "game_observes_new_local_displays_from_config_owner",
-        None,
-        game_observes_new_local_displays_from_config_owner_scenario(),
-    );
-}
-
-async fn game_observes_new_local_displays_from_config_owner_scenario() {
-    let f = Fixture::<super::aim::AimStreams>::start().await;
-    let (links, group) = f.context(0);
-    let game = super::aim::AimStreams::new(links, group.clone());
-    for key in ["synthetic-first", "synthetic-replacement"] {
-        group.local_displays_changed(vec![oink_display::DisplayInfo {
-            key: key.into(),
-            name: key.into(),
-            bounds: oink_foundation::Rect::new(0.0, 0.0, 100.0, 100.0),
-            pixel_width: 100,
-            pixel_height: 100,
-            reference_extent: None,
-            rotation_deg: 0,
-            is_primary: true,
-            is_builtin: false,
-            is_virtual: false,
-        }]);
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while f
-                .owner
-                .local_displays()
-                .displays
-                .first()
-                .is_none_or(|display| display.key != key)
-            {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(game.local_displays().displays, f.owner.local_displays().displays);
-        assert_eq!(game.local_displays().displays[0].key, key);
-    }
-    drop(game);
-    f.stop().await;
 }
 
 #[test]

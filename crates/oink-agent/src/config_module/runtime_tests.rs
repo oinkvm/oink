@@ -2463,3 +2463,149 @@ async fn repeated_membership_cycles_pair_rejoin_and_revoke_one_device_across_thr
     }
     stop(&nodes).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn telemetry_facts_refresh_observations_without_rebuilding_configuration() {
+    let nodes = start(same_group(2)).await;
+    assert!(until(|| ready(&nodes)).await);
+    let peer = nodes[0].identity.id();
+    assert!(
+        until(|| nodes[1]
+            .group
+            .members()
+            .members
+            .iter()
+            .any(|m| m.device == peer && m.facts.is_some()))
+        .await
+    );
+    nodes[1]
+        .group
+        .call(move |owner| {
+            let link = *owner
+                .sessions
+                .iter()
+                .find(|(_, s)| s.ready && s.peer_boot.device_id == peer)
+                .unwrap()
+                .0;
+            let router = owner.shared.router.load();
+            let applied = owner.shared.applied.load();
+            let before = owner.facts[&peer].clone();
+            let next = before.fact_sequence().unwrap() + 1;
+            let mut raw = before.raw().clone();
+            raw.insert(2, next.write());
+            if let Some(RawValue::Array(links)) = raw.get_mut(&15) {
+                for link in links {
+                    if let RawValue::Map(link) = link {
+                        link.insert(4, 9876u64.write());
+                        link.insert(6, 123u64.write());
+                    }
+                }
+            }
+            let facts = dto::DeviceFacts::from_raw(raw).unwrap();
+            let bytes = v1::frame::encode(&Message::ConfigFacts(facts.clone()), v1::limits::CONFIG_FRAME).unwrap();
+            owner.control(link, &bytes).map_err(internal)?;
+            assert_eq!(*owner.facts[&peer], facts);
+            assert_eq!(
+                owner
+                    .shared
+                    .members
+                    .load()
+                    .members
+                    .iter()
+                    .find(|m| m.device == peer)
+                    .unwrap()
+                    .facts
+                    .as_deref(),
+                Some(&facts)
+            );
+            let diagnostic = owner.shared.diagnostic_layout.load();
+            assert_eq!(
+                diagnostic
+                    .as_ref()
+                    .as_ref()
+                    .unwrap()
+                    .devices
+                    .iter()
+                    .find(|d| d.device == peer)
+                    .unwrap()
+                    .facts
+                    .as_deref(),
+                Some(&facts)
+            );
+            assert!(
+                Arc::ptr_eq(&router, &owner.shared.router.load()),
+                "network telemetry must not recompile routing/layout"
+            );
+            assert!(Arc::ptr_eq(&applied, &owner.shared.applied.load()));
+
+            // A real metadata edit still follows the full configuration publication.
+            let mut raw = facts.into_raw();
+            raw.insert(2, (next + 1).write());
+            raw.insert(6, RawValue::from("changed name"));
+            let bytes = v1::frame::encode(
+                &Message::ConfigFacts(dto::DeviceFacts::from_raw(raw).unwrap()),
+                v1::limits::CONFIG_FRAME,
+            )
+            .unwrap();
+            owner.control(link, &bytes).map_err(internal)?;
+            assert!(!Arc::ptr_eq(&router, &owner.shared.router.load()));
+            assert_eq!(
+                owner
+                    .shared
+                    .members
+                    .load()
+                    .members
+                    .iter()
+                    .find(|m| m.device == peer)
+                    .unwrap()
+                    .name,
+                "changed name"
+            );
+            Ok(())
+        })
+        .unwrap();
+    stop(&nodes).await;
+}
+
+/// Isolated loopback owners only: no installed service or native desktop backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual CPU-cost comparison; prints elapsed processing time"]
+async fn telemetry_facts_processing_benchmark() {
+    let nodes = start(same_group(2)).await;
+    assert!(until(|| ready(&nodes)).await);
+    let peer = nodes[0].identity.id();
+    assert!(
+        until(|| nodes[1]
+            .group
+            .members()
+            .members
+            .iter()
+            .any(|m| m.device == peer && m.facts.is_some()))
+        .await
+    );
+    for node in &nodes {
+        node.group.hold_periodic_facts();
+    }
+    nodes[1].group.call(move |owner| {
+        let link = owner.selected_session(peer).unwrap().0;
+        for round in 0..3 {
+            let facts = owner.facts[&peer].clone();
+            let sequence = facts.fact_sequence().unwrap();
+            let frames = (1..=300).map(|offset| {
+                let mut raw = facts.raw().clone();
+                raw.insert(2, (sequence + offset).write());
+                v1::frame::encode(&Message::ConfigFacts(dto::DeviceFacts::from_raw(raw).unwrap()), v1::limits::CONFIG_FRAME).unwrap()
+            }).collect::<Vec<_>>();
+            let started = Instant::now();
+            let mut rebuilt = 0;
+            for frame in &frames {
+                let before = owner.shared.router.load();
+                owner.control(link, frame).map_err(internal)?;
+                rebuilt += usize::from(!Arc::ptr_eq(&before, &owner.shared.router.load()));
+            }
+            println!("telemetry facts round={round} count={} frame_bytes={} elapsed_us={} configuration_rebuilds={rebuilt}", frames.len(), frames[0].len(), started.elapsed().as_micros());
+        }
+        Ok(())
+    }).unwrap();
+    stop(&nodes).await;
+}

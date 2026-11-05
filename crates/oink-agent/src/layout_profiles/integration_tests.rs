@@ -2204,8 +2204,16 @@ async fn pairing_without_live_facts(source_permits: bool) {
             .store(true, Ordering::SeqCst);
         assert_eq!(node.profile_snapshot().unwrap_err().code, ErrorCode::FactsUnavailable);
     }
+    // Complete the join only after pairing's state events. Without live facts a
+    // completed join publishes no profile event, so poll the catalog instead.
+    b.inner.profiles.defer_joins.store(true, Ordering::SeqCst);
     common::pair(&a, &b).await;
-    common::converge(&[&a, &b], "saved catalog transferred without live observation", || {
+    common::until("acceptor interrupted before catalog commit", || {
+        b.inner.profiles.deferred_joins.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    b.inner.profiles.defer_joins.store(false, Ordering::SeqCst);
+    common::until("saved catalog transferred without live observation", || {
         lock(&b.inner.profiles.data).catalog.as_ref().is_some_and(|c| {
             !c.completed_joins.is_empty()
                 && c.default_profile().map(|p| &p.id) == original.default_profile().map(|p| &p.id)

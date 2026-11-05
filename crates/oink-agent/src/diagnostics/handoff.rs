@@ -221,7 +221,7 @@ impl input_trace::InputTrace {
         }
         let Message::Control(control) = message else { return };
         let action = match control {
-            ControlMsg::FocusEnter { .. } => {
+            ControlMsg::FocusEnter { .. } | ControlMsg::MovePointerEnter { .. } => {
                 if sent {
                     HandoffAction::FocusEnterSent
                 } else {
@@ -266,7 +266,9 @@ impl input_trace::InputTrace {
         };
         let mut raw = Raw::new(action);
         let scope = match control {
-            ControlMsg::FocusEnter { scope, .. } | ControlMsg::FocusState { scope, .. } => scope.as_ref(),
+            ControlMsg::FocusEnter { scope, .. }
+            | ControlMsg::MovePointerEnter { scope, .. }
+            | ControlMsg::FocusState { scope, .. } => scope.as_ref(),
             ControlMsg::FocusResume { scope, .. } => Some(scope),
             _ => None,
         };
@@ -280,7 +282,14 @@ impl input_trace::InputTrace {
         raw.sender = Some(if sent { local } else { peer });
         raw.recipient = Some(if sent { peer } else { local });
         match control {
-            ControlMsg::FocusEnter {
+            ControlMsg::MovePointerEnter {
+                epoch,
+                display,
+                pos,
+                scope,
+                pointer_source,
+            }
+            | ControlMsg::FocusEnter {
                 epoch,
                 display,
                 pos,
@@ -460,9 +469,6 @@ impl RoutingDiagnostics for input_trace::InputTrace {
     }
     fn touchpad_route(&self, record: oink_routing::router::TouchpadRoute) {
         self.evidence(input_trace::Evidence::TouchpadRoute(record));
-    }
-    fn application_focus(&self, record: oink_routing::application_focus::Diagnostic) {
-        self.evidence(input_trace::Evidence::ApplicationFocus(record));
     }
     fn source_decision(&self, record: oink_routing::router::SourceDecision) {
         self.evidence(input_trace::Evidence::SourceRouting(record));

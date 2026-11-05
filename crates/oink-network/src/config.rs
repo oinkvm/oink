@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 pub use crate::discovery::MdnsMode;
 
-/// 正式 QUIC 端口（交互连接；发现端口 = 47471，大块数据连接 = 47472）。
+/// Preferred QUIC UDP / Low TCP port. Actual ports are announced independently.
 pub const DEFAULT_PORT: u16 = 47470;
 
 /// 组网配置。
@@ -21,7 +21,8 @@ pub struct NetworkConfig {
     pub bind_ip: IpAddr,
     /// QUIC 端口（交互连接）；发现端口 = 端口 + 1。
     pub port: u16,
-    /// Low TCP/TLS 监听端口（默认 = 端口 + 2；0 = 随机），直连/中转每跳共用。
+    /// Legacy configuration retained for source compatibility. The link layer
+    /// prefers `port` for Low TCP and advertises the actual port via Low::Info.
     pub bulk_port: u16,
     /// Enables activity-gated TCP Low pacing. Both neighbors
     /// must agree to disable this policy. This is not the current activity state.

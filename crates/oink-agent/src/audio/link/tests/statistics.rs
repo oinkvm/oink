@@ -63,16 +63,9 @@ async fn local_audio_quality_samples_without_a_ui_and_flushes_on_receiver_retire
     let view = lock(&history).view(at);
     assert_eq!(view.sources.len(), 1);
     assert!(view.sources[0].bitrate_kbps > 0.);
-    let bytes = running.owners[1]
-        .receivers
-        .values()
-        .next()
-        .unwrap()
-        .reader
-        .payload_bytes();
     running.owners[1].receivers.clear();
     let view = lock(&history).view(at);
-    assert_eq!(view.sources[0].bitrate_kbps, bytes as f64 * 8. / 60000.);
+    assert_eq!(view.sources[0].bitrate_kbps, 2304.);
     running.stop().await;
 }
 
@@ -149,6 +142,7 @@ fn speaker_and_microphone_sleep_keep_quality_counters_idle_and_wake_on_media() {
             post(1, sequence, false, now);
         }
         let mut output = [0.; 256];
+        sink.fill(&mut output, 48_000, 2, 128, now + Duration::from_millis(47), None);
         sink.fill(&mut output, 48_000, 2, 128, now + Duration::from_millis(50), None);
         assert!(output.iter().any(|s| s.abs() > 0.1));
         post(1, 9, true, now + Duration::from_millis(50));
@@ -170,6 +164,7 @@ fn speaker_and_microphone_sleep_keep_quality_counters_idle_and_wake_on_media() {
         post(2, 1, false, wake - Duration::from_millis(50));
         sink.fill(&mut output, 48_000, 2, 128, wake, None);
         assert!(!reader.bursts.asleep(wake));
+        sink.fill(&mut output, 48_000, 2, 128, wake + Duration::from_micros(2667), None);
         assert!(output.iter().any(|s| s.abs() > 0.1), "{kind:?} did not wake on media");
     }
 }

@@ -79,6 +79,7 @@ async fn parallel_encoding_preserves_bytes_order_and_first_failure() -> anyhow::
                 let before = before.next().await.unwrap()?;
                 let after_value = after.next().await.unwrap()?;
                 assert_eq!(after_value.segment_id, id);
+                assert_eq!(after_value.first_us, 23 - id as i64);
                 assert_eq!(
                     (before.first_us, before.last_us, before.raw_len, before.bytes),
                     (
@@ -94,7 +95,8 @@ async fn parallel_encoding_preserves_bytes_order_and_first_failure() -> anyhow::
             assert!(after.next().await.is_none());
         }
     }
-    let meta = &source.segments[3];
+    // Both encoders must stop at the fourth segment in newest-first order.
+    let meta = &source.segments[source.segments.len() - 4];
     fs::write(
         dir.path()
             .join("buffer")

@@ -412,6 +412,7 @@ impl Receiver {
             buffer_ms: (!retiring && !self.reader.bursts.asleep(now))
                 .then(|| self.source.as_ref().map_or(0., |s| s.stats().buffered_ms)),
             bytes: self.reader.payload_bytes(),
+            bitrate: self.format.format.config().bitrate,
             glitches: self
                 .reader
                 .dropouts
@@ -1474,7 +1475,9 @@ impl Owner {
                     dropped_at_start: source.packets.dropped(),
                     observed_sleep: false,
                     observed_burst: 0,
-                    events: timing::ReceiveEvents::default(),
+                    events: timing::ReceiveEvents::new(Duration::from_secs_f64(
+                        source.format.config().frame_duration_ms() / 1000.0,
+                    )),
                 }
             });
         }
@@ -2092,7 +2095,7 @@ impl Owner {
                     );
                 });
                 for (peer, receiver) in &mut self.receivers {
-                    let report_active = receiver.events.summary(*peer);
+                    let report_active = receiver.events.summary(*peer, receiver.format.format);
                     let peer = *peer;
                     let Some(source) = &mut receiver.source else {
                         continue;
@@ -2105,23 +2108,23 @@ impl Owner {
                         && let Some(p) = crate::telemetry::producer().as_ref()
                         && let Some(generation) = p.generation()
                     {
-                        crate::telemetry::projections::distribution_value(
+                        crate::telemetry::projections::audio_distribution_value(
                             p,
                             generation,
                             oink_telemetry::Metric::AudioBuffered {
                                 stage: oink_telemetry::AudioStage::Total,
                             },
+                            receiver.format.format,
                             (stats.buffered_ms * 1000.0) as u64,
-                            None,
                         );
                         for latency in &self.output_latencies {
                             if let Some(ms) = latency.reported_latency_ms.filter(|ms| ms.is_finite() && *ms >= 0.0) {
-                                crate::telemetry::projections::distribution_value(
+                                crate::telemetry::projections::audio_distribution_value(
                                     p,
                                     generation,
                                     oink_telemetry::Metric::AudioReportedOutputLatency,
+                                    receiver.format.format,
                                     (ms * 1000.0) as u64,
-                                    None,
                                 );
                             }
                         }
@@ -2141,6 +2144,7 @@ impl Owner {
                             buffered_ms=stats.buffered_ms, arrival_jitter_ms=stats.arrival_jitter_ms,
                             rebufferings=stats.rebufferings, latency_trimmed_frames=stats.latency_trimmed_frames,
                             drift_ppm=stats.drift_ppm, adaptation_ppm=stats.adaptation_ppm,
+                            quiet_discarded_ms=stats.quiet_discarded_ms, quiet_inserted_ms=stats.quiet_inserted_ms,
                             boundary_hold_samples=stats.boundary_hold_samples,
                             "audio receiver counters");
                     });
@@ -2149,7 +2153,7 @@ impl Owner {
             self.report_at = now;
         }
         let semantic_state = crate::event_delivery::device_audio_state(&state);
-        if periodic_report || self.report_pending || self.reported_state.as_ref() != Some(&semantic_state) {
+        if self.report_pending || self.reported_state.as_ref() != Some(&semantic_state) {
             for peer in self.supported.iter().copied() {
                 let _ = self.streams.send(
                     peer,
@@ -2159,6 +2163,12 @@ impl Owner {
             }
             self.reported_state = Some(semantic_state);
             self.report_pending = false;
+        }
+        for peer in self.supported.iter().copied() {
+            let _ = self.streams.set_heartbeat_state(
+                peer,
+                &Message::AudioState(state.to_wire().expect("bounded audio state")),
+            );
         }
         let mut device_states = vec![DeviceState {
             device: self.links.id(),

@@ -121,7 +121,6 @@ unsafe extern "C" {
 }
 
 enum Cmd {
-    Update(Advert),
     Refresh,
     Stop,
 }
@@ -150,11 +149,6 @@ impl DnsSd {
             wake,
             thread: spawned.ok(),
         }
-    }
-
-    pub fn update(&self, a: Advert) {
-        let _ = self.cmd.send(Cmd::Update(a));
-        let _ = self.wake.send(&[1]);
     }
 
     pub fn refresh(&self) {
@@ -459,7 +453,7 @@ fn dealloc(sd: DNSServiceRef) {
     unsafe { DNSServiceRefDeallocate(sd) };
 }
 
-fn run(mut advert: Advert, out: mpsc::Sender<Sighting>, cmd: std_mpsc::Receiver<Cmd>, wake: UnixDatagram) {
+fn run(advert: Advert, out: mpsc::Sender<Sighting>, cmd: std_mpsc::Receiver<Cmd>, wake: UnixDatagram) {
     let mut conn: DNSServiceRef = std::ptr::null_mut();
     // SAFETY: 输出参数。
     let r = unsafe { DNSServiceCreateConnection(&mut conn) };
@@ -488,15 +482,6 @@ fn run(mut advert: Advert, out: mpsc::Sender<Sighting>, cmd: std_mpsc::Receiver<
         // 命令
         loop {
             match cmd.try_recv() {
-                Ok(Cmd::Update(a)) => {
-                    if a != advert {
-                        advert = a;
-                        if let Some(r) = reg.take() {
-                            dealloc(r);
-                        }
-                        reg = register(conn, &advert);
-                    }
-                }
                 Ok(Cmd::Refresh) => last_browse = Instant::now() - Duration::from_secs(3600),
                 Ok(Cmd::Stop) | Err(std_mpsc::TryRecvError::Disconnected) => {
                     for (s, _) in ctx.subs.drain(..) {

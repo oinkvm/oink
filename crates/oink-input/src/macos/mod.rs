@@ -13,7 +13,6 @@
 //! - `system`：手感设置、权限、私有函数查找。
 
 mod activity;
-mod application_focus;
 pub mod capslock;
 mod contacts;
 mod cursor;
@@ -93,29 +92,6 @@ struct MacInput {
 }
 
 impl InputBackend for MacInput {
-    fn application_focus_supported(&self) -> bool {
-        true
-    }
-    fn application_focus_watch(&self, observer: Option<crate::application_focus::Observer>) {
-        application_focus::watch(observer);
-    }
-    fn application_focus_sample(&self) -> oink_foundation::application_focus::Observation {
-        application_focus::sample()
-    }
-    fn application_focus_park(
-        &self,
-        expected: oink_foundation::application_focus::ObservationStamp,
-        operation: u64,
-        permit: crate::application_focus::Permit,
-    ) -> oink_foundation::application_focus::ParkResult {
-        let result = application_focus::park(expected, operation, permit);
-        tracing::info!(target: "oink_application_focus", operation, generation = expected.generation,
-            sequence = expected.sequence, ?result, "native park completed");
-        result
-    }
-    fn application_focus_dismiss(&self) {
-        application_focus::dismiss();
-    }
     fn stop_injection_session(&self) {
         let _ = self.set_cursor_constraint(None);
         self.injector.stop_session();

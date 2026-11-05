@@ -22,7 +22,7 @@ use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize};
 use objc2_quartz_core::{CALayer, CATransaction};
 use oink_foundation::Point;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ffi::c_void,
     sync::{
         Arc, Mutex,
@@ -32,6 +32,7 @@ use std::{
 type Clicks = Arc<Mutex<Vec<Click>>>;
 type Feedbacks = Arc<Mutex<Vec<Feedback>>>;
 struct Hit {
+    poll_position: Cell<Option<NSPoint>>,
     state: RefCell<HitState>,
     clicks: Clicks,
     feedback: Feedbacks,
@@ -50,6 +51,7 @@ define_class!(
         #[unsafe(method(mouseMoved:))] fn moved(&self,event:&NSEvent) { self.pointer(event, Input::Move); }
         #[unsafe(method(mouseDragged:))] fn dragged(&self,event:&NSEvent) { self.pointer(event, Input::Move); }
         #[unsafe(method(mouseExited:))] fn exited(&self,_event:&NSEvent) {
+            self.ivars().poll_position.set(None);
             self.input(Input::Leave);
             if let Some(window)=self.window() { set_passthrough(&window, true); }
         }
@@ -80,6 +82,7 @@ impl ToastView {
         }
     }
     fn pointer(&self, event: &NSEvent, input: fn(Point) -> Input) {
+        self.ivars().poll_position.set(None);
         let p = self.convertPoint_fromView(event.locationInWindow(), None);
         if p.x < 0. || p.y < 0. || p.x >= self.bounds().size.width || p.y >= self.bounds().size.height {
             self.input(Input::Leave);
@@ -108,6 +111,9 @@ struct Window {
 }
 impl Window {
     fn pointer(&self, screen: NSPoint) {
+        if !pointer_changed(&self.view.ivars().poll_position, screen) {
+            return;
+        }
         let local = self.panel.convertPointFromScreen(screen);
         let local = self.view.convertPoint_fromView(local, None);
         let point = Point::new(local.x, self.view.bounds().size.height - local.y);
@@ -115,6 +121,28 @@ impl Window {
         set_passthrough(&self.panel, !self.view.ivars().state.borrow().contains(point));
     }
 }
+fn pointer_changed(previous: &Cell<Option<NSPoint>>, screen: NSPoint) -> bool {
+    // Visible click-through panels still need their existing re-entry poll.
+    // With no cursor motion, new frame or native mouse event, both coordinate
+    // conversion and the alpha hit result are unchanged. Native callbacks and
+    // frame application invalidate this sample before the next check.
+    previous.replace(Some(screen)) != Some(screen)
+}
+
+#[test]
+fn stationary_notification_pointer_does_not_repeat_native_hit_testing() {
+    let previous = Cell::new(None);
+    let point = NSPoint::new(10., 20.);
+    assert!(pointer_changed(&previous, point));
+    for _ in 0..125 {
+        assert!(!pointer_changed(&previous, point));
+    }
+    assert!(pointer_changed(&previous, NSPoint::new(11., 20.)));
+    // A native enter/exit/down/up or a new raster/frame invalidates the sample.
+    previous.set(None);
+    assert!(pointer_changed(&previous, NSPoint::new(11., 20.)));
+}
+
 fn set_passthrough(window: &objc2_app_kit::NSWindow, ignore: bool) {
     // Repeating this setter dirties WindowServer/CA state even when unchanged
     // (macOS 14.7.8 profile, macOS 26 native probe). Keep re-entry polling, but
@@ -245,6 +273,7 @@ fn make_window(mtm: MainThreadMarker, clicks: Clicks, feedback: Feedbacks) -> Wi
     // SAFETY: Window retains the panel until after close/orderOut in Drop.
     unsafe { panel.setReleasedWhenClosed(false) };
     let view = ToastView::alloc(mtm).set_ivars(Hit {
+        poll_position: Cell::new(None),
         state: RefCell::new(HitState::default()),
         clicks,
         feedback,
@@ -294,6 +323,7 @@ fn apply(mtm: MainThreadMarker, frames: Vec<Frame>, clicks: Clicks, feedback: Fe
         CATransaction::begin();
         CATransaction::setDisableActions(true);
         for (w, f) in windows.iter_mut().zip(frames) {
+            w.view.ivars().poll_position.set(None);
             let b = f.bounds;
             w.panel.setFrame_display(
                 NSRect::new(NSPoint::new(b.x, primary_h - b.bottom()), NSSize::new(b.w, b.h)),

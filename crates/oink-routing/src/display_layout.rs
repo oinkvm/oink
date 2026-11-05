@@ -117,6 +117,29 @@ impl LayoutQuery for TopologyLayout {
             .map(|s| ScreenPos::new(from_dl_id(s.id.clone()), s.local.center()))
             .collect()
     }
+    fn pointer_destination(&self, from: DeviceId, target: DeviceId) -> Option<ScreenPos> {
+        // Preserve the existing enabled-screen choice on mixed-visibility devices.
+        self.focus_candidates(from)
+            .into_iter()
+            .find(|p| p.screen.device == target)
+            .or_else(|| {
+                let origin = self.topo.source_origin(from).unwrap_or(Point::new(0., 0.));
+                self.topo
+                    .screens()
+                    .iter()
+                    .filter(|s| s.id.device == target && !s.enabled && self.online(&target))
+                    .min_by(|a, b| {
+                        let distance = |s: &dl::ScreenPlacement| {
+                            let p = s.rect.center();
+                            (p.x - origin.x).hypot(p.y - origin.y)
+                        };
+                        distance(a)
+                            .total_cmp(&distance(b))
+                            .then(a.id.display.cmp(&b.id.display))
+                    })
+                    .map(|s| ScreenPos::new(from_dl_id(s.id.clone()), s.local.center()))
+            })
+    }
     fn first_portal(&self, from: &ScreenPos, delta: (f64, f64)) -> Option<oink_display::layout::PortalExit> {
         self.topo
             .first_portal_filtered(&to_dl_pos(from), delta, |d| self.online(d))
@@ -279,15 +302,10 @@ impl LayoutModel {
         self.layout != layout
     }
 
-    /// 修改布局数据（界面编辑、标定结果），之后不再自动重排。
+    /// 修改布局数据（界面编辑），之后不再自动重排。
     pub fn edit(&mut self, f: impl FnOnce(&mut Layout)) {
         f(&mut self.layout);
         self.auto = false;
-    }
-
-    /// 某台设备最近通告的显示器。
-    pub fn device_displays(&self, device: &DeviceId) -> Option<&[DisplayInfo]> {
-        self.displays.get(device).map(Vec::as_slice)
     }
 
     /// 某台设备的显示器列表（本机启动 / 变化时，或收到对端的显示事实）。
@@ -459,6 +477,82 @@ mod tests {
         let restored = masked.with_online([dev(1), dev(2), dev(3)].into());
         assert!(Arc::ptr_eq(&compiled.topo, &restored.topo));
         assert_eq!(restored.exit_through_edge(&a, (5., 0.)).unwrap().screen.device, dev(2));
+    }
+
+    #[test]
+    fn pointer_destination_uses_hidden_geometry_and_preserves_visible_candidates() {
+        let mut model = model3();
+        model.set_online([dev(1), dev(2), dev(3)].into());
+        let owners = [(
+            dev(2),
+            dl::OwnerLayoutPreferences {
+                screen_shared: false,
+                ..Default::default()
+            },
+        )]
+        .into();
+        let query = model.compile(&owners);
+        assert!(!query.contains_device(dev(2)));
+        assert!(query.focus_candidates(dev(1)).iter().all(|p| p.screen.device != dev(2)));
+        let landing = query.pointer_destination(dev(1), dev(2)).unwrap();
+        assert_eq!(
+            landing,
+            ScreenPos::new(ScreenId::new(dev(2), "x"), Point::new(500., 500.))
+        );
+        assert_eq!(
+            query.pointer_destination(dev(1), dev(3)),
+            query.focus_candidates(dev(1)).into_iter().next()
+        );
+        assert!(
+            query
+                .with_online([dev(1), dev(3)].into())
+                .pointer_destination(dev(1), dev(2))
+                .is_none()
+        );
+        assert!(query.pointer_destination(dev(1), dev(99)).is_none());
+    }
+
+    #[test]
+    fn pointer_destination_prefers_visible_screen_then_sorts_hidden_centres() {
+        let mut d = display("near", 1000., 600., (300., 180.));
+        d.bounds = Rect::new(-1000., -200., 1000., 600.);
+        let far = display("far", 1000., 600., (300., 180.));
+        let layout = Layout::auto(&[
+            (dev(1), vec![display("source", 1000., 600., (300., 180.))]),
+            (dev(2), vec![d.clone(), far]),
+        ]);
+        let owner = dl::OwnerLayoutPreferences {
+            screens: [(
+                "near".into(),
+                dl::ScreenPreference {
+                    enabled: false,
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let query = TopologyLayout::from_layout(&layout, &[(dev(2), owner.clone())].into());
+        let enabled = query
+            .focus_candidates(dev(1))
+            .into_iter()
+            .find(|p| p.screen.device == dev(2));
+        assert_eq!(query.pointer_destination(dev(1), dev(2)), enabled);
+        assert_eq!(enabled.unwrap().screen.display, "far");
+        let query = TopologyLayout::from_layout(
+            &layout,
+            &[(
+                dev(2),
+                dl::OwnerLayoutPreferences {
+                    screen_shared: false,
+                    ..owner
+                },
+            )]
+            .into(),
+        );
+        let landing = query.pointer_destination(dev(1), dev(2)).unwrap();
+        assert_eq!(landing.screen.display, "near");
+        assert_eq!(landing.local, d.bounds.center());
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub(super) struct ReceiveEvents {
     history: History<ReceiveEvent, 16>,
     gap_reports: GapReports,
     gap_count: u64,
+    gap_threshold: Duration,
     previous: Option<Instant>,
     previous_emit: Option<u64>,
     report_started: Option<Instant>,
@@ -39,6 +40,14 @@ impl GapReports {
 }
 
 impl ReceiveEvents {
+    /// Ordinary packet pacing is not a gap: 20 ms for the 5 ms baseline,
+    /// two frames for 20 ms Opus, whose every packet is 20 ms apart.
+    pub fn new(frame: Duration) -> Self {
+        Self {
+            gap_threshold: (frame * 2).max(Duration::from_millis(20)),
+            ..Self::default()
+        }
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn packet(
         &mut self,
@@ -92,8 +101,8 @@ impl ReceiveEvents {
             late_us,
             arrival_late_us,
         ));
-        let exceptional = gap >= Duration::from_millis(20)
-            || sender_gap.is_some_and(|gap| gap >= 20_000_000)
+        let exceptional = gap >= self.gap_threshold
+            || sender_gap.is_some_and(|gap| gap >= self.gap_threshold.as_nanos() as u64)
             || inserted.saturating_duration_since(arrival) >= Duration::from_millis(20)
             || late_us.is_some_and(|late| late >= 20_000);
         if exceptional {
@@ -116,7 +125,7 @@ impl ReceiveEvents {
             });
         }
     }
-    pub fn summary(&mut self, peer: oink_foundation::DeviceId) -> bool {
+    pub fn summary(&mut self, peer: oink_foundation::DeviceId, profile: oink_audio::negotiation::Profile) -> bool {
         let report_now = Instant::now();
         let report_window = self
             .report_started
@@ -133,11 +142,13 @@ impl ReceiveEvents {
         if let Some(window) = report_window {
             crate::telemetry::projections::audio_histogram(
                 oink_telemetry::Metric::AudioReceiveDispatch,
+                profile,
                 quic_to_dispatch.buckets,
                 window,
             );
             crate::telemetry::projections::audio_histogram(
                 oink_telemetry::Metric::AudioDispatchInsert,
+                profile,
                 dispatch_to_insertion.buckets,
                 window,
             );
@@ -205,6 +216,22 @@ mod tests {
         assert_eq!(reports.observe(now + Duration::from_secs(10)), Some(99));
     }
 
+    #[test]
+    fn regular_packet_pacing_is_not_a_gap_for_any_frame_duration() {
+        let peer = oink_foundation::DeviceId([7; 32]);
+        let origin = Instant::now();
+        for (frame_ms, expected) in [(5, 1), (20, 0)] {
+            let mut events = ReceiveEvents::new(Duration::from_millis(frame_ms));
+            // Twenty 20 ms-spaced packets: a stall for 5 ms frames, normal
+            // pacing for 20 ms frames. The first packet has no predecessor.
+            for sequence in 0..20 {
+                let at = origin + Duration::from_millis(sequence * 20);
+                let emit = Some(sequence * 20_000_000);
+                events.packet(peer, sequence, Some(at), at, at, emit, true, None);
+            }
+            assert_eq!(events.gap_count, expected * 19, "{frame_ms} ms frames");
+        }
+    }
     #[test]
     fn isolated_gap_is_reported_immediately_after_quiet() {
         let now = Instant::now();

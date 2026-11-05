@@ -346,7 +346,6 @@ pub enum PairingEvent {
         revision: DecimalU64,
         requests: Vec<PendingRequest>,
     },
-    GroupMigrationChanged(GroupMigrationStatus),
     PairingFailed {
         event_id: DecimalU64,
         pair_id: PairId,
@@ -398,7 +397,6 @@ impl From<PairingEvent> for super::ApiEvent {
             PairingEvent::PairingRequestsChanged { revision, requests } => {
                 Self::PairingRequestsChanged { revision, requests }
             }
-            PairingEvent::GroupMigrationChanged(value) => Self::GroupMigrationChanged(value),
             PairingEvent::PairingFailed {
                 event_id,
                 pair_id,

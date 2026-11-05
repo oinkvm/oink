@@ -202,3 +202,26 @@ fn contact_activity_respects_pause_capture_and_wake_gates() {
         assert_eq!(broadcasts(&r), usize::from(local && !paused));
     }
 }
+
+#[test]
+fn mac_activity_pulses_follow_focus_at_each_notification() {
+    for os in [Os::MacOS, Os::Windows, Os::Other] {
+        let mut r = router();
+        r.cfg.os = os;
+        for (epoch, holder) in [ME, PEER, ME, PEER].into_iter().enumerate() {
+            r.holder = holder;
+            r.out.clear();
+            r.input_message(
+                PEER,
+                Message::Control(ControlMsg::UserActivity),
+                epoch as u64 * 1_000_000,
+            );
+            assert!(r.out.iter().any(|o| matches!(o, Output::UserActivity { .. })));
+            assert_eq!(
+                r.out.iter().any(|o| matches!(o, Output::ResetUserIdle)),
+                os != Os::MacOS || holder != ME
+            );
+            assert_eq!(broadcasts(&r), 0);
+        }
+    }
+}

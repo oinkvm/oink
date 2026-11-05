@@ -1,6 +1,6 @@
 [package]
 name = "oink-locator"
-description = "屏幕覆盖层：光标定位拖尾（快速画圈时在光标后面绘制），瞄准小游戏的规则、画面与全屏叠加层（macOS / Windows）"
+description = "屏幕覆盖层：光标定位拖尾（快速画圈时在光标后面绘制）与布局预览、通知（macOS / Windows）"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,6 @@ repository.workspace = true
 [dependencies]
 oink-foundation.workspace = true
 oink-display.workspace = true
-oink-protocol.workspace = true
 oink-routing.workspace = true
 tracing.workspace = true
 
@@ -60,7 +59,7 @@ tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFRunLoop", "CFString"] }
-# 例子 aim_demo / key_sink：AppKit 的事件循环、一个带文本框的普通窗口
+# 例子 key_sink：AppKit 的事件循环、一个带文本框的普通窗口
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication", "NSWorkspace", "libc", "NSWindow", "NSView", "NSControl", "NSTextField", "NSEvent", "NSScreen", "NSGraphics"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSDate", "NSRunLoop", "NSGeometry"] }
 

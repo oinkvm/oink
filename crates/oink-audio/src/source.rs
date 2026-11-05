@@ -16,9 +16,11 @@ pub fn has_sound(samples: &[f32]) -> bool {
     samples.iter().any(|x| x.is_finite() && x.abs() > SOUND_THRESHOLD)
 }
 pub const SILENCE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
 const PRE_ROLL_SAMPLES: usize = 960;
+const MAX_PRE_ROLL_SAMPLES: usize = 192_000 * 2 / 100;
 
-const MAX_SAMPLES: usize = 48_000 * 2 / 50;
+const MAX_SAMPLES: usize = 192_000 * 2 / 50 + 1920;
 pub const MAX_BACKLOG: Duration = Duration::from_millis(20);
 #[derive(Clone, Copy, Debug)]
 pub struct Stamp {
@@ -77,6 +79,7 @@ struct Shared {
     metrics: realtime::Counters,
 }
 pub struct Encoded {
+    sample_rate: u32,
     requested_revision: u64,
     packets: handoff::Consumer<Option<Packet>>,
     observations: handoff::Consumer<Option<Observation>>,
@@ -90,9 +93,17 @@ impl std::fmt::Debug for Encoded {
     }
 }
 impl Encoded {
+    /// PCM rate supplied by the live capture converter.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
     /// Prepare a fresh codec on the ordinary owner without closing native capture
     /// or its mute lease. Forwarding must stay disabled until reconfigured().
     pub fn reconfigure(&mut self, config: dsp::Config) -> Result<(), String> {
+        if config.sample_rate != self.sample_rate {
+            return Err("capture must reopen before changing its PCM sample rate".into());
+        }
         let encoder = dsp::Encoder::new_with_config(config)?;
         while self.shared.retired.pop().is_some() {}
         self.requested_revision = self
@@ -202,7 +213,7 @@ pub struct Encoder {
     quiet_since: Option<Instant>,
     pre_roll_at: Option<Instant>,
     pre_roll_cursor: usize,
-    pre_roll: [f32; PRE_ROLL_SAMPLES],
+    pre_roll: [f32; MAX_PRE_ROLL_SAMPLES],
     ordinal: u64,
 }
 impl std::fmt::Debug for Encoder {
@@ -240,7 +251,7 @@ pub fn channel(config: dsp::Config, percent: u16, provisional: bool) -> Result<(
     Ok((
         Encoder {
             encoder,
-            gain: Gain::new(percent),
+            gain: Gain::with_rate(percent, config.sample_rate),
             pcm: [0.0; MAX_SAMPLES],
             len: 0,
             delivered_at: None,
@@ -258,10 +269,11 @@ pub fn channel(config: dsp::Config, percent: u16, provisional: bool) -> Result<(
             quiet_since: Some(Instant::now()),
             pre_roll_at: None,
             pre_roll_cursor: 0,
-            pre_roll: [0.0; PRE_ROLL_SAMPLES],
+            pre_roll: [0.0; MAX_PRE_ROLL_SAMPLES],
             ordinal: 0,
         },
         Encoded {
+            sample_rate: config.sample_rate,
             requested_revision: 0,
             packets: rx,
             observations: observed,
@@ -272,6 +284,10 @@ pub fn channel(config: dsp::Config, percent: u16, provisional: bool) -> Result<(
     ))
 }
 impl Encoder {
+    pub fn config(&self) -> dsp::Config {
+        self.encoder.config()
+    }
+
     fn apply_reconfiguration(&mut self) {
         if let Some(next) = self.shared.requested.pop() {
             let old = std::mem::replace(&mut self.encoder, next.encoder);
@@ -401,10 +417,13 @@ impl Encoder {
             self.delivered_at = None;
         }
         let frame_samples = self.encoder.config().frame_samples();
+        let pre_roll_samples =
+            (self.encoder.config().sample_rate as usize * 2 / 100).div_ceil(frame_samples) * frame_samples;
+        let capacity = self.encoder.config().sample_rate as usize * 2 / 50 + frame_samples - 2;
         let count = samples.len();
         let total = self.len.saturating_add(count);
         let discard = total
-            .saturating_sub(MAX_SAMPLES)
+            .saturating_sub(capacity)
             .div_ceil(frame_samples)
             .saturating_mul(frame_samples)
             .min(total);
@@ -439,11 +458,11 @@ impl Encoder {
         // Atomic input is clamped before publication; this validation cannot
         // allocate an error, and the existing Gain implementation is unchanged.
         let _ = self.gain.set_percent(self.shared.percent.load(Ordering::Acquire));
-        for _ in 0..8 {
+        for _ in 0..capacity / frame_samples {
             if self.len < frame_samples {
                 break;
             }
-            let mut frame = [0.0; dsp::FRAME_SAMPLES];
+            let mut frame = [0.0; dsp::FRAME_SAMPLES * 2];
             frame[..frame_samples].copy_from_slice(&self.pcm[..frame_samples]);
             self.pcm.copy_within(frame_samples..self.len, 0);
             self.len -= frame_samples;
@@ -471,8 +490,8 @@ impl Encoder {
                 self.shared.burst.fetch_add(1, Ordering::Release);
                 self.shared.asleep.store(false, Ordering::Release);
                 let pre_roll = self.pre_roll;
-                for offset in (0..PRE_ROLL_SAMPLES).step_by(frame_samples) {
-                    let at = (self.pre_roll_cursor + offset) % PRE_ROLL_SAMPLES;
+                for offset in (0..pre_roll_samples).step_by(frame_samples) {
+                    let at = (self.pre_roll_cursor + offset) % pre_roll_samples;
                     self.emit(&pre_roll[at..at + frame_samples], false, stamp);
                 }
             }
@@ -480,7 +499,7 @@ impl Encoder {
                 self.emit(frame, false, stamp);
             }
             self.pre_roll[self.pre_roll_cursor..self.pre_roll_cursor + frame_samples].copy_from_slice(frame);
-            self.pre_roll_cursor = (self.pre_roll_cursor + frame_samples) % PRE_ROLL_SAMPLES;
+            self.pre_roll_cursor = (self.pre_roll_cursor + frame_samples) % pre_roll_samples;
             // Remainder now belongs to the current native block, if any. Its
             // age is software delivery time, not a native hardware timestamp.
             self.delivered_at = (self.len > 0).then_some(stamp.delivered_at);
@@ -929,7 +948,7 @@ mod sleep_tests {
             }
             assert!(!exit.asleep(wake));
             let mut decoded = Vec::new();
-            for tick in 0..8 {
+            for tick in 0..10 {
                 let at = wake + Duration::from_millis(tick * 5);
                 let a = receiver.render_at(at);
                 assert_eq!(a, reference.render_at(at));
@@ -1252,6 +1271,13 @@ mod sleep_tests {
 mod reconfigure_tests {
     use super::*;
 
+    #[test]
+    fn a_sample_rate_change_requires_reopening_the_capture_converter() {
+        let (_, mut encoded) = channel(dsp::Config::lossless(44_100), 100, false).unwrap();
+        assert_eq!(encoded.sample_rate(), 44_100);
+        assert!(encoded.reconfigure(dsp::Config::low_latency_opus()).is_err());
+        assert!(encoded.reconfigure(dsp::Config::lossless(44_100)).is_ok());
+    }
     #[test]
     fn codec_replacement_keeps_capture_and_applies_latest_request_while_idle() {
         let (mut encoder, mut output) = channel(dsp::Config::low_latency_pcm(), 100, false).unwrap();

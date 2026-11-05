@@ -44,6 +44,7 @@ pub(crate) fn effective(saved: Option<Vec<Hotkey>>, slots: &BTreeMap<DeviceId, O
     let mut saved = configured(saved);
     // New actions are visible at runtime without changing the saved override list.
     for action in [
+        HotkeyAction::OpenWindow,
         HotkeyAction::LockEscape,
         HotkeyAction::ToggleMicrophoneMute,
         HotkeyAction::LockRemoteWindows,
@@ -315,6 +316,32 @@ impl Node {
 mod tests {
     use super::*;
     #[test]
+    fn open_window_defaults_off_and_preserves_customization() {
+        let defaults = effective(None, &BTreeMap::new());
+        let window = defaults.iter().find(|h| h.action == HotkeyAction::OpenWindow).unwrap();
+        assert!(!window.enabled);
+        assert_eq!(window.keys, ["Ctrl", "Alt", "A"]);
+        assert!(
+            !bindings(&defaults)
+                .iter()
+                .any(|binding| binding.action == "open_window")
+        );
+        let empty = effective(Some(vec![]), &BTreeMap::new());
+        assert_eq!(
+            empty.iter().find(|h| h.action == HotkeyAction::OpenWindow),
+            Some(window)
+        );
+        for enabled in [true, false] {
+            let custom = hk(HotkeyAction::OpenWindow, &["Ctrl", "Shift", "W"], enabled);
+            let saved = effective(Some(vec![custom.clone()]), &BTreeMap::new());
+            assert_eq!(
+                saved.iter().find(|h| h.action == HotkeyAction::OpenWindow),
+                Some(&custom)
+            );
+        }
+    }
+
+    #[test]
     fn remote_windows_lock_validation_preserves_saved_choices_and_rejects_bare_win_l() {
         let valid = hk(HotkeyAction::LockRemoteWindows, &["Meta", "Shift", "L"], true);
         assert!(validate(std::slice::from_ref(&valid)).is_ok());
@@ -427,7 +454,7 @@ mod tests {
         assert!(
             configured(None)
                 .iter()
-                .filter(|h| h.action != HotkeyAction::ToggleMicrophoneMute)
+                .filter(|h| !matches!(h.action, HotkeyAction::ToggleMicrophoneMute | HotkeyAction::OpenWindow))
                 .all(|h| h.enabled)
         );
         assert_eq!(configured(None), crate::agent_api::default_hotkeys());

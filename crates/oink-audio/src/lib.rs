@@ -38,6 +38,7 @@ pub mod playback;
 pub mod power;
 pub mod realtime;
 pub mod recovery;
+mod resample;
 pub mod scheduling;
 pub mod sink;
 pub mod source;
@@ -95,10 +96,8 @@ pub struct Settings {
     /// Keep the source audible locally while forwarding. Local only.
     pub keep_local_playback: bool,
     pub capture_scope: CaptureScope,
-    /// Preferred receive format on this device when it is the audio exit.
-    /// Local only: sources follow the exit's MediaPrepared; unsupported preferences
-    /// fall back to the supported intersection.
-    pub preferred_format: StreamFormat,
+    /// Sender-owned encoding quality, edited through the owner preference API.
+    pub quality: negotiation::Quality,
     /// Local source opt-in, off on a fresh install. Selecting an exit does not
     /// enable sources; this preference does not affect exit playback.
     pub forwarding_enabled: bool,
@@ -117,7 +116,7 @@ impl Default for Settings {
             forwarding_off_reason: None,
             keep_local_playback: false,
             capture_scope: CaptureScope::DefaultOutput,
-            preferred_format: StreamFormat::Opus5ms,
+            quality: negotiation::Quality::default(),
             forwarding_enabled: false,
             forwarding_volume_percent: 100,
             forwarding_muted: false,
@@ -342,20 +341,25 @@ mod settings_tests {
         assert!(serde_json::from_str::<Settings>(r#"{"capture_scope":"typo"}"#).is_err());
     }
     #[test]
-    fn receive_profile_defaults_to_opus_five_ms_and_round_trips() {
-        assert_eq!(Settings::default().preferred_format, StreamFormat::Opus5ms);
-        for format in [StreamFormat::Opus5ms, StreamFormat::Pcm16_2p5ms] {
-            let json = serde_json::json!({"preferred_format": format});
-            let settings: Settings = serde_json::from_value(json.clone()).unwrap();
-            assert_eq!(settings.preferred_format, format);
+    fn source_quality_defaults_to_quality_and_round_trips() {
+        use negotiation::Quality;
+        assert_eq!(Settings::default().quality, Quality::Quality);
+        assert_eq!(negotiation::Profile::default(), Quality::default().profile(48_000));
+        assert_eq!(
+            serde_json::from_str::<Settings>("{}").unwrap().quality,
+            Quality::Quality
+        );
+        for quality in [Quality::Smooth, Quality::Quality, Quality::Lossless] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({"quality": quality})).unwrap();
+            assert_eq!(settings.quality, quality);
             assert_eq!(
-                serde_json::to_value(settings).unwrap()["preferred_format"],
-                json["preferred_format"]
+                serde_json::from_value::<Settings>(serde_json::to_value(settings).unwrap())
+                    .unwrap()
+                    .quality,
+                quality
             );
         }
-        let pcm: Settings = serde_json::from_str(r#"{"preferred_format":"pcm16_2p5ms"}"#).unwrap();
-        assert_eq!(pcm.preferred_format, StreamFormat::Pcm16_2p5ms);
-        assert!(serde_json::from_str::<Settings>(r#"{"preferred_format":"typo"}"#).is_err());
+        assert!(serde_json::from_str::<Settings>(r#"{"quality":"typo"}"#).is_err());
     }
     #[test]
     fn forwarding_is_opt_in_and_explicit_choices_round_trip() {
@@ -400,3 +404,14 @@ pub mod idle;
 
 #[cfg(feature = "test-support")]
 pub mod pull_test_support;
+
+/// Read the source endpoint format without opening a capture or playback stream.
+pub fn capture_sample_rate() -> Result<u32, String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    cpal::default_host()
+        .default_output_device()
+        .ok_or("no default audio output")?
+        .default_output_config()
+        .map(|config| config.sample_rate())
+        .map_err(|error| error.to_string())
+}

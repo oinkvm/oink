@@ -11,10 +11,6 @@ impl Router {
             && !self.mouse_local()
             && !self.keyboard_local()
             && !self.dnd_pointer_active()
-            // Application focus deliberately keeps K on the old application
-            // after P leaves. Its own fenced park window owns that workflow;
-            // an independent source sink would steal typing from K or race it.
-            && !self.application.enabled
     }
 }
 
@@ -39,7 +35,7 @@ mod tests {
         r
     }
     #[test]
-    fn setting_modes_native_drag_and_application_focus_keep_the_source_application() {
+    fn setting_modes_native_drag_keep_the_source_application() {
         let mut r = router();
         r.cfg.settings.take_foreground_on_leave = true;
         r.become_source(1, PEER);
@@ -56,9 +52,6 @@ mod tests {
         r.cfg.settings.take_foreground_on_leave = false;
         assert!(!r.source_foreground_capture());
         r.cfg.settings.take_foreground_on_leave = true;
-        r.application.enabled = true;
-        assert!(!r.source_foreground_capture());
-        r.application.enabled = false;
         r.dnd.state = dnd::State::Hosting {
             id: oink_foundation::content::ClipId { origin: ME, seq: 1 },
             input: ME,

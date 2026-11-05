@@ -38,52 +38,6 @@ impl StoredGroupState {
     pub fn to_wire(&self) -> dto::GroupState {
         self.state.clone()
     }
-    pub fn application_focus_enabled(&self) -> Result<bool, StoreError> {
-        for register in self.state.registers()?.0 {
-            if register.kind()? == 8 && !register.deleted()? {
-                return Ok(dto::ApplicationFocusSettings::from_raw(register.value()?)?.enabled()?);
-            }
-        }
-        Ok(false)
-    }
-    /// Independent group register: geometry edits and local owner preferences
-    /// cannot overwrite this choice. Retained LWW ordering resolves concurrent edits.
-    pub fn set_application_focus_enabled(&mut self, enabled: bool) -> Result<bool, StoreError> {
-        if self.application_focus_enabled()? == enabled {
-            return Ok(false);
-        }
-        let mut registers = self.state.registers()?.0;
-        let existing = registers.iter().position(|r| r.kind() == Ok(8));
-        let register = if let Some(index) = existing {
-            let current = &registers[index];
-            retained::edit_register(current, &current.version()?, store::wire_device(self.device), |value| {
-                value.insert(1, enabled.write());
-                Ok(())
-            })?
-        } else {
-            let version =
-                dto::ConfigVersion::from_raw([(1, 1u64.write()), (3, store::wire_device(self.device).write())].into())?;
-            let mut raw = RawMap::from([
-                (1, 8u32.write()),
-                (3, version.write()),
-                (4, RawValue::Map([(1, enabled.write())].into())),
-            ]);
-            raw.insert(6, retained::register_digest(&raw)?.write());
-            dto::Register::from_raw(raw)?
-        };
-        if let Some(index) = existing {
-            registers[index] = register;
-        } else {
-            registers.push(register);
-            registers.sort_by_key(|r| r.kind().expect("validated register"));
-        }
-        let mut raw = self.state.raw().clone();
-        raw.insert(2, RawValue::Array(registers.iter().map(WireValue::write).collect()));
-        let state = dto::GroupState::from_raw(raw)?;
-        validate(&state)?;
-        self.state = state;
-        Ok(true)
-    }
     pub fn layout_register(&self) -> Result<dto::Register, StoreError> {
         self.state
             .registers()?
@@ -137,9 +91,6 @@ fn validate(state: &dto::GroupState) -> Result<(), StoreError> {
     let mut layout = false;
     for register in state.registers()?.0 {
         retained::verify_register(&register)?;
-        if register.kind()? == 8 && !register.deleted()? {
-            dto::ApplicationFocusSettings::from_raw(register.value()?)?;
-        }
         if register.kind()? == 2 {
             layout = true;
         }
@@ -249,42 +200,49 @@ mod tests {
         StoredGroupState::new(device, state).unwrap()
     }
     #[test]
-    fn application_focus_is_one_independent_durable_group_register() {
+    fn retired_register_survives_save_and_layout_edit() {
         let mut state = initial();
-        let layout = state.layout_register().unwrap();
-        assert!(!state.application_focus_enabled().unwrap());
-        assert!(!state.set_application_focus_enabled(false).unwrap());
-        assert!(state.set_application_focus_enabled(true).unwrap());
-        assert_eq!(state.layout_register().unwrap(), layout);
+        let version = state.layout_register().unwrap().version().unwrap();
+        let mut raw: RawMap = [
+            (1, 8u32.write()),
+            (3, version.write()),
+            (
+                4,
+                RawValue::Map([(1, true.write()), (90, RawValue::from("opaque"))].into()),
+            ),
+        ]
+        .into();
+        raw.insert(6, retained::register_digest(&raw).unwrap().write());
+        let register = dto::Register::from_raw(raw).unwrap();
+        let mut raw = state.state.raw().clone();
+        let RawValue::Array(registers) = raw.get_mut(&2).unwrap() else {
+            panic!("registers")
+        };
+        registers.push(register.write());
+        state = StoredGroupState::new(state.device, dto::GroupState::from_raw(raw).unwrap()).unwrap();
+        state
+            .edit_layout(&version, |raw| {
+                raw.insert(12, true.write());
+                Ok(())
+            })
+            .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(STATE_FILE);
         save(&path, &state).unwrap();
-        let mut loaded = load(&path, state.device).unwrap().unwrap();
-        assert!(loaded.application_focus_enabled().unwrap());
-        // A different member edits the same register; no per-owner preference exists.
-        loaded.device = DeviceId([8; 32]);
-        assert!(loaded.set_application_focus_enabled(false).unwrap());
-        let register = loaded
-            .state
-            .registers()
-            .unwrap()
-            .0
-            .into_iter()
-            .find(|r| r.kind() == Ok(8))
-            .unwrap();
-        assert_eq!(register.version().unwrap().counter().unwrap(), 2);
+        let loaded = load(&path, state.device).unwrap().unwrap();
+        assert_eq!(loaded, state);
         assert_eq!(
-            register.version().unwrap().writer().unwrap(),
-            store::wire_device(loaded.device)
-        );
-        assert!(!loaded.application_focus_enabled().unwrap());
-        assert_eq!(loaded.layout_register().unwrap(), layout);
-        assert!(
-            !initial().application_focus_enabled().unwrap(),
-            "a fresh group never inherits another group's choice"
+            loaded
+                .state
+                .registers()
+                .unwrap()
+                .0
+                .into_iter()
+                .find(|r| r.kind() == Ok(8))
+                .unwrap(),
+            register
         );
     }
-
     #[test]
     fn retained_roundtrip_and_fenced_edit() {
         let dir = tempfile::tempdir().unwrap();

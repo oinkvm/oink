@@ -35,6 +35,7 @@ pub struct State {
     pub defer_catalogs: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pub deferred_joins: std::sync::atomic::AtomicUsize,
+    pub(super) joins: Mutex<super::join::JoinCache>,
     pub gate: Mutex<()>,
     pub command_gate: Mutex<()>,
     pub native: super::native::Runtime,

@@ -32,6 +32,7 @@ struct Inner {
     progress: tokio::sync::watch::Sender<super::TransferProgress>,
     last_progress: Mutex<tokio::time::Instant>,
     delivery_started: AtomicBool,
+    automatic_files: AtomicBool,
     delivery_report: std::sync::OnceLock<std::time::Instant>,
     report_drag: bool,
     drop_report: std::sync::OnceLock<Option<std::time::Instant>>,
@@ -195,6 +196,7 @@ impl Remote {
             progress: tokio::sync::watch::channel(super::TransferProgress::new()).0,
             last_progress: Mutex::new(tokio::time::Instant::now()),
             delivery_started: AtomicBool::new(false),
+            automatic_files: AtomicBool::new(false),
             delivery_report: std::sync::OnceLock::new(),
             report_drag: !matches!(demand, Demand::Clipboard),
             drop_report: std::sync::OnceLock::new(),
@@ -242,6 +244,15 @@ impl Remote {
     pub fn automatic_pull(&self) -> bool {
         if !self.0.inventory.automatic_pull(self.0.target) {
             return false;
+        }
+        // Record Offer-time intent; the authorized platform receiver starts
+        // file delivery when it binds. A file-filtered/non-native backend must
+        // not acquire source grants for files it will never admit.
+        if self.0.target == ClipPlatform::Mac && !self.0.inventory.roots.is_empty() {
+            self.0.automatic_files.store(true, Ordering::Release);
+            if self.0.files.as_ref().is_some_and(|files| files.native().is_ok()) {
+                self.start_delivery();
+            }
         }
         for representation in self.0.inventory.wanted(self.0.target) {
             if representation.data.size().is_some()
@@ -536,6 +547,18 @@ impl Remote {
     }
     fn open_until(&self, id: RepresentationId, deadline: Option<std::time::Instant>) -> io::Result<FileReader> {
         let native = super::native_read::remote_read();
+        let cached = self.0.representations.lock().unwrap().contains_key(&id);
+        let diagnostic = crate::copy_diagnostics::Read::begin(
+            self.0.inventory.id,
+            crate::copy_diagnostics::Stage::RemoteRead,
+            id,
+            crate::copy_diagnostics::format(find(&self.0.inventory, id).and_then(|r| r.standard)),
+            if cached {
+                crate::copy_diagnostics::Channel::Cache
+            } else {
+                crate::copy_diagnostics::Channel::Low
+            },
+        );
         let trace = ReadTrace::new(
             read_stage::REMOTE_OPEN,
             ReadContext {
@@ -645,7 +668,17 @@ impl Remote {
             read.cancelled();
         }
         trace.io(&result);
-        result
+        let mut diagnostic = diagnostic;
+        if let Err(error) = &result {
+            diagnostic.failure(error);
+        }
+        result.map(|reader| {
+            Box::new(super::DiagnosticReader {
+                reader,
+                trace: diagnostic,
+                bytes: 0,
+            }) as FileReader
+        })
     }
     fn native_timeout(&self, id: RepresentationId, slot: Option<&Arc<Slot>>, read: &super::native_read::Read) {
         if let Some(slot) = slot {

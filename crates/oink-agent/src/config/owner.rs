@@ -652,6 +652,11 @@ pub fn validate_value(option: LocalOption, value: &RawValue) -> Result<(), Contr
                 return Err(bad);
             }
         }
+        AudioQuality => {
+            if oink_audio::negotiation::Quality::from_number(u32::read(value).map_err(invalid)?).is_none() {
+                return Err(bad);
+            }
+        }
         ForwardingControls | MicrophoneControls => {
             dto::ForwardingControlsValue::read(value).map_err(invalid)?;
         }

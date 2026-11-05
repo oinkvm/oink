@@ -25,14 +25,6 @@ use std::sync::Arc;
 pub enum InputCommand {
     #[cfg(debug_assertions)]
     DndWatchdogSnapshotForTest(std::sync::mpsc::SyncSender<String>),
-    ApplicationFocusObserved {
-        claim: oink_routing::application_focus::Claim,
-        observation: oink_foundation::application_focus::Observation,
-    },
-    ApplicationFocusApplied {
-        request: oink_routing::application_focus::ParkRequest,
-        result: oink_foundation::application_focus::ParkResult,
-    },
     PrepareUpdate {
         generation: u64,
         reply:
@@ -64,9 +56,7 @@ pub enum InputCommand {
         expected_emergency_sequence: u64,
         reply: OwnerApplyReply,
     },
-    Overlay(Option<u64>),
     /// Request identification on currently attached peers through I0.
-    IdentifyScreens(u64),
     /// This device can or cannot be controlled (`set_paused(paused || !controllable)`).
     Controllable(bool),
     /// Observed helper-target availability; separate from capture permissions.
@@ -87,15 +77,12 @@ pub enum InputCommand {
     RetirePeer(oink_foundation::session::Boot),
     SessionLocked(Option<bool>),
     /// Keep the cursor trail lit (mini-game).
-    TrailPinned(bool),
-    ProjectionGesture(bool),
     /// Ordinary observer snapshots of local platform preferences.
     LocalFeel(oink_foundation::input::FeelProfile),
     LocalDisplays(Vec<oink_foundation::display::DisplayInfo>),
     /// Enumeration completed with an error; retain the last good geometry.
     LocalDisplayFailure,
     PeerFacts {
-        application_modes: (oink_foundation::input::InputMode, oink_foundation::input::InputMode),
         boot: oink_foundation::session::Boot,
         os: Os,
         displays: Vec<oink_foundation::display::DisplayInfo>,
@@ -272,7 +259,6 @@ pub struct PeerInput {
 pub struct InputStatus {
     /// Source contact observed/healthy/mode/path; unknown until first owner publication.
     pub contact_diagnostics: Option<[u64; 4]>,
-    pub application_focus: Option<oink_routing::application_focus::Snapshot>,
     pub update_held_input: bool,
     pub update_remote_control: bool,
     pub update_locked: bool,
@@ -299,7 +285,6 @@ pub struct InputStatus {
     pub dnd_active: bool,
     /// Exact host still holding Left, used to revoke asynchronous URL preparation.
     pub dnd_host_pending: Option<(oink_foundation::content::ClipId, u64)>,
-    pub trail_pinned: bool,
     pub paused: bool,
     /// Safety epoch: every local or received emergency invalidates older resumes.
     pub emergency_sequence: u64,

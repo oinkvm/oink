@@ -93,7 +93,6 @@ impl Rig {
             inbound: Mutex::new(HashSet::new()),
             pacers: Mutex::new(HashMap::new()),
             listener: Mutex::new(None),
-            reserved_listener: Mutex::new(None),
             listener_failure: Mutex::new(None),
             runtime: tokio::runtime::Handle::current(),
             stopped: watch::channel(false).0,

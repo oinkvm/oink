@@ -43,6 +43,9 @@ impl Socket {
             Some(socket) => socket,
             None => std::net::UdpSocket::bind(address)?,
         };
+        Self::from_std(socket, wake)
+    }
+    pub(super) fn from_std(socket: std::net::UdpSocket, wake: Arc<tokio::sync::Notify>) -> io::Result<Arc<Self>> {
         crate::qos::set_service_type(&socket, crate::qos::ServiceType::Voice);
         Self::wrap(crate::qos::wrap_udp_socket(socket)?, wake)
     }

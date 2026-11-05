@@ -23,6 +23,21 @@ fn layout_is_the_only_known_register_and_stamp_has_no_clock_authority() {
         Register::from_raw(raw.clone()).unwrap_err().code,
         ErrorCode::UnsupportedValue
     );
+    // Retired kind 8 shipped in 0.3.x state: its value stays opaque, and a
+    // tombstone stays as unacceptable as it was for those peers.
+    let mut retired = support::sample_named("Register");
+    retired.insert(1, V::Uint(8));
+    retired.insert(
+        4,
+        V::Map([(1, V::Bool(true)), (90, support::synthetic_unknown())].into()),
+    );
+    assert!(Register::from_raw(retired.clone()).is_ok());
+    retired.insert(5, V::Bool(true));
+    retired.insert(4, V::Map(RawMap::new()));
+    assert_eq!(
+        Register::from_raw(retired).unwrap_err().code,
+        ErrorCode::UnsupportedValue
+    );
     // Unknown future register tombstones still retain their anti-resurrection data.
     raw.insert(1, V::Uint(400));
     raw.insert(900, support::synthetic_unknown());

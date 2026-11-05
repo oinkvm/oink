@@ -807,7 +807,7 @@ fn audio_settings_api_updates_owner_and_ui_before_reply() {
                     2 => settings.forwarding_enabled = false,
                     3 => settings.forwarding_volume_percent = 135,
                     4 => settings.capture_scope = oink_audio::CaptureScope::Global,
-                    5 => settings.preferred_format = oink_audio::StreamFormat::Pcm16_2p5ms,
+                    5 => settings.quality = oink_audio::negotiation::Quality::Lossless,
                     6 => settings.forwarding_muted = true,
                     7 => {
                         settings.forwarding_enabled = true;

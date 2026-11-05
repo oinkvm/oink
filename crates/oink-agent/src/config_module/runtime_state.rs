@@ -1,13 +1,5 @@
 use super::*;
 impl Owner {
-    pub(crate) fn set_application_focus_enabled(&mut self, enabled: bool) -> ApiResult<()> {
-        let mut stored = self.stored.clone();
-        if stored.set_application_focus_enabled(enabled).map_err(internal)? {
-            self.commit(State::verify(stored.state, self.state.roster().anchor()).map_err(internal)?)?;
-        }
-        Ok(())
-    }
-
     pub(crate) fn receive_revocation(&mut self, candidate: State) -> v1::Result<()> {
         self.commit(candidate).map_err(|_| v1::ErrorCode::StateConflict)?;
         let links = self.sessions.keys().copied().collect::<Vec<_>>();
@@ -377,14 +369,14 @@ impl Owner {
                             && s.peer_boot.device_id == *device
                             && facts.boot().and_then(|b| wire::read_boot(&b)) == Ok(s.peer_boot)
                     }) && !facts.pause().ok().flatten().is_some_and(|p| p.paused() == Ok(true))
-                        && owners.get(device).is_some_and(|o| o.screen_shared)
+                        // Screen participation controls portals, not input availability:
+                        // explicit pointer shortcuts can enter retained hidden screens.
+                        && owners.contains_key(device)
                 })
                 .collect()
         };
         let version = register.version().map_err(internal)?;
-        let application_focus_enabled = self.stored.application_focus_enabled().map_err(internal)?;
         let router = RouterLayout {
-            application_focus_enabled,
             group: self.state.roster().anchor().group,
             version: version.clone(),
             layout: layout.clone(),
@@ -412,7 +404,6 @@ impl Owner {
         }
         let drawing_owners = Arc::new(drawing_owners);
         self.shared.applied.publish(AppliedState {
-            application_focus_enabled,
             group: self.state.roster().anchor().group,
             roster_digest: self.state.roster().digest().map_err(internal)?,
             pointer_slots: self.state.pointer_slots().map_err(internal)?,
@@ -500,6 +491,27 @@ impl Owner {
         self.shared.emit(ConfigChange::Members);
         Ok(())
     }
+    /// Keep public observations current without rebuilding configuration for a
+    /// peer's periodic RTT/loss/sequence update. Those fields are not consumed by
+    /// the router or historical metadata cache; diagnostic layout change detection
+    /// also deliberately ignores facts_version. Export still sees the latest Facts.
+    pub(super) fn publish_fact_observation(&mut self, peer: DeviceId) {
+        let facts = self.facts[&peer].clone();
+        let mut members = (*self.shared.members.load()).clone();
+        if let Some(member) = members.members.iter_mut().find(|member| member.device == peer) {
+            member.facts = Some(facts.clone());
+        }
+        self.shared.members.publish(members);
+        let previous = self.shared.diagnostic_layout.load();
+        if let Some(previous) = previous.as_ref() {
+            let mut inputs = previous.clone();
+            if let Some(device) = inputs.devices.iter_mut().find(|device| device.device == peer) {
+                device.facts = Some(facts);
+            }
+            self.shared.diagnostic_layout.publish(Some(inputs));
+        }
+    }
+
     pub(crate) fn publish_facts(&mut self) -> ApiResult<u64> {
         if self.needs_apply || self.journal.pending_projection().map_err(internal)?.is_some() {
             return Err(internal("group projection pending"));
@@ -595,15 +607,6 @@ impl Owner {
         // completed observation there before returning; otherwise an unrelated
         // startup publication exposes this token later and invalidates Create.
         self.publish()?;
-        self.publish_facts()
-    }
-    pub(crate) fn publish_claim(&mut self, claim: dto::AudioExitClaim) -> ApiResult<u64> {
-        self.local
-            .edit(|raw| {
-                raw.insert(20, claim.write());
-                Ok(())
-            })
-            .map_err(internal)?;
         self.publish_facts()
     }
     pub(crate) fn device_control(&mut self, peer: DeviceId, message: Message) -> ApiResult<()> {
