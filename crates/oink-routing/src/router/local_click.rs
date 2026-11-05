@@ -765,10 +765,7 @@ mod tests {
         assert!(g.iter().all(|r| r.focus_claim() == (11, b)));
         assert_eq!(g[2].holder, b, "the returning member must act as a source of the claim");
     }
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../tools/sim/local_click_focus.rs"
-    ));
+    include!("local_click_sim_tests.rs");
 
     #[test]
     fn click_keeps_existing_modifier_and_ordinary_key_ownership() {
