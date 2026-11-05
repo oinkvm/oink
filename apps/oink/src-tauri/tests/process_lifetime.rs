@@ -170,11 +170,14 @@ fn backend_disappearance_ends_ui_subscription_without_restart() {
             stopped.join().unwrap();
         }
         let end = ended_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(if crash {
-            matches!(end, EventsEnd::Lost(_))
-        } else {
-            end == EventsEnd::Stopping
-        });
+        assert!(
+            if crash {
+                matches!(end, EventsEnd::Lost(_))
+            } else {
+                end == EventsEnd::Stopping
+            },
+            "crash={crash}, actual subscription end={end:?}"
+        );
         ui.join().unwrap();
         assert!(RemoteApi::new(dir.path()).hello().is_err());
     }

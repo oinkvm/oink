@@ -2,7 +2,6 @@ fn main() {
     println!("cargo:rerun-if-changed=native/pull_benchmark.c");
     println!("cargo:rerun-if-changed=native/microphone.m");
     println!("cargo:rerun-if-changed=native/realtime.c");
-    println!("cargo:rerun-if-changed=native/media_pause.m");
     println!("cargo:rerun-if-changed=native/macos.m");
     println!("cargo:rerun-if-changed=native/macos_mute.m");
     println!("cargo:rerun-if-changed=native/capture_permission.m");
@@ -27,7 +26,6 @@ fn main() {
         native
             .file("native/macos.m")
             .file("native/macos_mute.m")
-            .file("native/media_pause.m")
             .file("native/capture_permission.m")
             .file("native/macos_playback.m")
             .file("native/macos_devices.m")

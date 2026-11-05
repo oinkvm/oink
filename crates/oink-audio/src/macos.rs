@@ -166,7 +166,6 @@ unsafe extern "C" {
 /// A running private process tap. Its worker emits 48 kHz interleaved stereo.
 #[derive(Debug)]
 pub struct Capture {
-    forwarding_stop: crate::media_pause::CaptureStop,
     muted_owned: Arc<AtomicBool>,
     local_controls_changed: Arc<AtomicBool>,
     default_output_changed: Arc<AtomicBool>,
@@ -180,10 +179,6 @@ pub struct Capture {
 }
 
 impl Capture {
-    /// Bind the logical forwarding session; None suppresses an internal replacement.
-    pub fn set_forwarding_pause(&self, pause: Option<crate::media_pause::ForwardingPause>) {
-        self.forwarding_stop.attach(pause);
-    }
     /// Sticky for this process. Once HAL cleanup fails, creating another tap is
     /// forbidden even after the default output changes; restart the application
     /// after checking local audio. This query never accesses audio hardware.
@@ -193,7 +188,7 @@ impl Capture {
     }
 
     /// Production data plane: encoding and gain execute in the dedicated
-    /// device-workgroup member; this owner keeps health, pause and HAL lifetime.
+    /// device-workgroup member; this owner keeps health and HAL lifetime.
     pub fn start_encoded(
         encoder: crate::source::Encoder,
         mute: bool,
@@ -285,8 +280,6 @@ impl Capture {
         let worker_restart = restart.clone();
         let omitted_silent_frames = Arc::new(CaptureProgress::default());
         let worker_omitted = omitted_silent_frames.clone();
-        let forwarding_stop = crate::media_pause::CaptureStop::default();
-        let worker_forwarding_stop = forwarding_stop.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let error_state = Arc::new(Mutex::new(None));
@@ -344,7 +337,6 @@ impl Capture {
                 }
                 // An RAII guard also stops the tap if worker code unwinds.
                 let mut native = NativeCapture::new(raw, worker_omitted);
-                let pause_before_restore = crate::media_pause::BeforeRestore(worker_forwarding_stop);
                 let mut native_info = NativeInfo::default();
                 // SAFETY: NativeInfo matches the bridge's C layout; handle is live.
                 unsafe { oink_audio_capture_info(native.0, &mut native_info) };
@@ -411,7 +403,6 @@ impl Capture {
                             let default_changed = mute && Self::current_default_output_id().ok().as_ref() != lease_uid.as_ref();
                             if default_changed { worker_default.store(true, Ordering::Release); }
                             let exit_health = if default_changed { 1 } else { health };
-                            finish_capture_health(&pause_before_restore.0, exit_health);
                             let cleanup = native.finish();
                             if let Err(error) = &cleanup { *worker_cleanup.lock().unwrap() = Some(error.clone()); }
                             let (restart_reason, message) = capture_exit(exit_health, message, cleanup);
@@ -437,7 +428,6 @@ impl Capture {
                     thread::park_timeout(Duration::from_secs(1));
                 }
                 realtime.stop();
-                pause_before_restore.0.finish();
                 if let Err(error) = native.finish()
                     && let Ok(mut state) = worker_error.lock()
                 {
@@ -458,7 +448,6 @@ impl Capture {
             .map_err(|error| format!("Start audio capture worker: {error}"))?;
         match ready_rx.recv() {
             Ok(Ok(info)) => Ok(Self {
-                forwarding_stop,
                 muted_owned,
                 local_controls_changed,
                 default_output_changed,
@@ -638,7 +627,7 @@ impl HostClock {
 }
 
 // The ordinary owner keeps native alive and must join this guard before any
-// pause/restore or HAL close, including unwind and device-change paths.
+// mute restoration or HAL close, including unwind and device-change paths.
 #[derive(Clone, Copy, Debug)]
 struct CaptureReader(*mut c_void);
 // SAFETY: only the RT child calls read/wait. Ordinary owner may wake and query
@@ -866,17 +855,6 @@ impl NativeCapture {
     }
 }
 
-fn finish_capture_health(stop: &crate::media_pause::CaptureStop, health: i32) {
-    // Native health=2 requests an internal replacement after confirmed cleanup,
-    // not the end of forwarding. Retire the physical registration using the
-    // same shape as Windows; only the owner ends the logical ticket on failure
-    // or a real user/network stop. The restore guard also respects this state.
-    if health == 2 {
-        stop.finish_rebuild();
-    } else {
-        stop.finish();
-    }
-}
 fn capture_exit(health: i32, reason: String, cleanup: Result<(), String>) -> (Option<String>, String) {
     match cleanup {
         Ok(()) => ((health == 2).then(|| reason.clone()), reason),
@@ -952,7 +930,6 @@ mod tests {
             fn oink_audio_capture_test_silent_free(raw: *mut c_void);
         }
         let capture = Capture {
-            forwarding_stop: Default::default(),
             muted_owned: Arc::new(AtomicBool::new(false)),
             local_controls_changed: Arc::new(AtomicBool::new(false)),
             default_output_changed: Arc::new(AtomicBool::new(false)),
@@ -1003,78 +980,6 @@ mod tests {
             assert_eq!(super::oink_audio_capture_format_health(0, true, false), 0);
             assert_eq!(super::oink_audio_capture_format_health(-1, true, true), 1);
             assert_eq!(super::oink_audio_capture_format_health(0, false, true), 1);
-        }
-    }
-
-    #[test]
-    fn default_and_format_rebuild_keep_forwarding_media_submissions_after_resume() {
-        use crate::{
-            dsp,
-            media_pause::{CaptureStop, ForwardingPause},
-            source::{self, Stamp},
-        };
-        use std::{
-            sync::{
-                Arc,
-                atomic::{AtomicUsize, Ordering},
-            },
-            time::{Duration, Instant},
-        };
-        for reason in ["default output changed", "output stream format changed"] {
-            let pauses = Arc::new(AtomicUsize::new(0));
-            let paused = pauses.clone();
-            let logical = ForwardingPause::with_backend(move || {
-                paused.fetch_add(1, Ordering::Relaxed);
-            });
-            let sent = Arc::new(AtomicUsize::new(0));
-            let feed = |physical: &CaptureStop, at: Instant| {
-                let (mut encoder, output) = source::channel(dsp::Config::low_latency_pcm(), 100, false).unwrap();
-                let ticket = logical.clone();
-                let packets = sent.clone();
-                output.set_packet_writer(Arc::new(move |_| {
-                    ticket
-                        .submit(|| {
-                            packets.fetch_add(1, Ordering::Relaxed);
-                            Ok::<_, ()>(())
-                        })
-                        .is_some_and(|result| result.is_ok())
-                }));
-                physical.attach(Some(logical.clone()));
-                let stamp = |at| Stamp {
-                    first_sample_at: None,
-                    callback_at: Some(at),
-                    delivered_at: at,
-                    source_frame_position: None,
-                    discontinuity: false,
-                };
-                encoder.supply(&[0.2; 480], stamp(at));
-                // A silent pause followed by resume must still submit encoded
-                // media through the same logical ticket after a physical rebuild.
-                encoder.tick(at + Duration::from_secs(6));
-                encoder.supply(&[0.2; 480], stamp(at + Duration::from_secs(7)));
-            };
-            let old = CaptureStop::default();
-            let at = Instant::now();
-            feed(&old, at);
-            let before = sent.load(Ordering::Relaxed);
-            assert!(before > 0);
-            // Same health-stop call used by the real Mac guardian. Cleanup is
-            // injected as successful; no tap or system audio endpoint is opened.
-            super::finish_capture_health(&old, 2);
-            assert!(capture_exit(2, reason.into(), Ok(())).0.is_some());
-            let rebuilt = CaptureStop::default();
-            feed(&rebuilt, at + Duration::from_secs(8));
-            assert!(
-                sent.load(Ordering::Relaxed) > before,
-                "{reason}: rebuilt/resumed encoder must really submit media"
-            );
-            assert_eq!(
-                pauses.load(Ordering::Relaxed),
-                0,
-                "internal replacement must not pause players"
-            );
-            logical.stop();
-            assert_eq!(pauses.load(Ordering::Relaxed), 1, "real stop still pauses once");
         }
     }
 

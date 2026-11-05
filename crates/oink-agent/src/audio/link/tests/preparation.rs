@@ -122,7 +122,6 @@ async fn packet_outage_during_refill_resumes_on_the_same_live_quic_session() {
     assert!(pcm[..config.frame_samples()].iter().any(|sample| sample.abs() > 0.1));
     assert_eq!(running.owners[0].source_session.prepared(), Some(&session));
     assert_eq!(running.owners[0].settings, settings);
-    assert_eq!(pauses(&running.platforms[0]), 0);
     running.stop().await;
 }
 
@@ -154,7 +153,6 @@ async fn link_loss_retires_source_offer_and_resumes_without_preference_changes()
     let sent = running.owners[0].sent.load(Ordering::Relaxed);
     running.supply(0, 0.1);
     assert!(running.owners[0].sent.load(Ordering::Relaxed) > sent);
-    assert_eq!(pauses(&running.platforms[0]), 0);
     running.stop().await;
 }
 
@@ -247,7 +245,6 @@ async fn receiver_output_generation_changes_without_reusing_old_media() {
         current.session().receiver_output().unwrap().generation().unwrap()
             > old.session().receiver_output().unwrap().generation().unwrap()
     );
-    assert_eq!(pauses(&running.platforms[0]), 0);
     running.stop().await;
 }
 

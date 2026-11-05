@@ -368,7 +368,13 @@ async fn serve(
 /// This is bounded teardown, never a request/port retry.
 async fn finish_response(lines: &mut Frames<tokio::io::ReadHalf<transport::AsyncStream>>) {
     #[cfg(windows)]
-    let _ = tokio::time::timeout(Duration::from_secs(1), lines.next_line()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+        // The UI can still have view updates queued after subscribing. A
+        // complete control frame is not EOF: disconnecting then discards the
+        // unread final response on Windows. Keep the same total drain budget.
+        while let Ok(Some(_)) = lines.next_line().await {}
+    })
+    .await;
     #[cfg(not(windows))]
     let _ = lines;
 }
@@ -817,5 +823,48 @@ mod product_boundary {
             }))
             .is_ok()
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod final_response_tests {
+    use super::*;
+    use std::{
+        future::Future,
+        io::BufRead,
+        task::{Context, Poll, Waker},
+    };
+
+    #[tokio::test]
+    async fn final_response_waits_past_buffered_views_and_preserves_closing() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = Listener::bind(dir.path(), "final-response").unwrap();
+        let mut client = listener.address().connect(Duration::from_secs(1)).unwrap();
+        // Both frames are already queued before the server reads the first.
+        // The second models the UI's view update after subscribing.
+        std::io::Write::write_all(&mut client, b"request\npending-view\n").unwrap();
+        let (stream, ()) = listener.accept().await.unwrap();
+        let (r, mut w) = tokio::io::split(stream);
+        let mut lines = Frames::new(r);
+        assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("request"));
+        write_line(&mut w, &serde_json::json!({"closing": CLOSING_STOPPING}))
+            .await
+            .unwrap();
+        let mut drain = Box::pin(finish_response(&mut lines));
+        assert!(
+            matches!(
+                drain.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            ),
+            "a buffered view frame is not client EOF; disconnecting now discards the closing response"
+        );
+        let mut closing = String::new();
+        std::io::BufReader::new(&client).read_line(&mut closing).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&closing).unwrap()["closing"],
+            CLOSING_STOPPING
+        );
+        drop(client);
+        drain.await;
     }
 }

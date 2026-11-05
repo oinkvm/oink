@@ -64,7 +64,7 @@ trait CaptureStream {
     fn local_controls_changed(&self) -> bool {
         false
     }
-    fn set_forwarding_pause(&self, _: Option<oink_audio::media_pause::ForwardingPause>) {}
+
     fn restart_reason(&self) -> Option<String> {
         None
     }
@@ -117,9 +117,7 @@ impl CaptureStream for Capture {
             false
         }
     }
-    fn set_forwarding_pause(&self, pause: Option<oink_audio::media_pause::ForwardingPause>) {
-        Capture::set_forwarding_pause(self, pause);
-    }
+
     fn restart_reason(&self) -> Option<String> {
         #[cfg(any(target_os = "macos", windows))]
         {
@@ -212,9 +210,7 @@ trait AudioPlatform: Send + Sync {
     ) -> Result<Box<dyn CaptureStream>, String> {
         Err("real-time capture unsupported".into())
     }
-    fn forwarding_pause(&self) -> oink_audio::media_pause::ForwardingPause {
-        oink_audio::media_pause::ForwardingPause::default()
-    }
+
     fn service_generation(&self) -> Option<u64> {
         None
     }

@@ -33,7 +33,6 @@ pub use macos_mute::recover;
 pub mod macos_devices;
 #[cfg(target_os = "macos")]
 mod macos_playback;
-pub mod media_pause;
 pub mod playback;
 pub mod power;
 pub mod realtime;
@@ -265,7 +264,6 @@ pub fn capture_capability() -> &'static str {
 pub struct Capture;
 #[cfg(not(any(target_os = "macos", windows)))]
 impl Capture {
-    pub fn set_forwarding_pause(&self, _: Option<media_pause::ForwardingPause>) {}
     pub fn info(&self) -> CaptureInfo {
         CaptureInfo::default()
     }

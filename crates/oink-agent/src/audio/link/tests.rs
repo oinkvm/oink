@@ -116,10 +116,7 @@ impl AudioPlatform for Platform {
         state.events.push("capture");
         Ok(Box::new(Capture(self.0.clone())))
     }
-    fn forwarding_pause(&self) -> oink_audio::media_pause::ForwardingPause {
-        let state = self.0.clone();
-        oink_audio::media_pause::ForwardingPause::with_backend(move || lock(&state).events.push("pause"))
-    }
+
     fn outputs(&self) -> Result<Vec<OutputDevice>, String> {
         lock(&self.0).queries += 1;
         Ok(vec![OutputDevice {
@@ -266,11 +263,14 @@ impl Running {
         Self::with_quality_capability(forwarding_enabled, None).await
     }
     async fn with_quality_capability(forwarding_enabled: bool, omitted: Option<&str>) -> Self {
-        let fixture = Fixture::<AudioStreams>::start_profile(2, omitted).await;
+        Self::with_members(forwarding_enabled, omitted, 2).await
+    }
+    async fn with_members(forwarding_enabled: bool, omitted: Option<&str>, members: u8) -> Self {
+        let fixture = Fixture::<AudioStreams>::start_profile(members, omitted).await;
         let mut owners = Vec::new();
         let mut platforms = Vec::new();
         let mut directories = Vec::new();
-        for index in 0..2 {
+        for index in 0..usize::from(members) {
             let (links, group) = fixture.context(index);
             let (store, gate) = fixture.owner_store(index);
             let (settings, directory) = {
@@ -444,13 +444,7 @@ impl Running {
         self.fixture.stop().await;
     }
 }
-fn pauses(platform: &Platform) -> usize {
-    lock(&platform.0)
-        .events
-        .iter()
-        .filter(|event| **event == "pause")
-        .count()
-}
+
 fn volume_request(owner: &Owner, id: u8, percent: u8) -> dto::SetExitVolume {
     dto::SetExitVolume::from_raw(
         [
@@ -464,8 +458,52 @@ fn volume_request(owner: &Owner, id: u8, percent: u8) -> dto::SetExitVolume {
     .unwrap()
 }
 
+// A single global exit is not an exclusive source lease. A later source must
+// not retire the earlier source.
 #[tokio::test]
-async fn explicit_clear_pauses_once_but_offline_unknown_and_switch_timeout_do_not() {
+async fn later_source_joins_shared_exit_without_retiring_either_capture() {
+    let mut running = Running::with_members(false, None, 3).await;
+    running
+        .until(|r| r.owners.iter().all(|o| matches!(o.resolution, Resolution::None { .. })))
+        .await;
+    running.claim(1, true);
+    for index in [0, 2] {
+        let mut settings = running.owners[index].settings.clone();
+        settings.forwarding_enabled = true;
+        running.owners[index].install_settings(settings).unwrap();
+        running
+            .until(|r| {
+                for source in [0, 2] {
+                    if r.owners[source].capture.is_some() {
+                        r.supply(source, 0.1);
+                    }
+                }
+                r.owners[index].capture.is_some()
+            })
+            .await;
+    }
+    running
+        .until(|r| {
+            r.supply(0, 0.1);
+            r.supply(2, 0.2);
+            r.owners[1].receive_sessions.len() == 2 && r.owners[1].receive_sessions.values().all(|s| s.ready())
+        })
+        .await;
+    for _ in 0..20 {
+        running.supply(0, 0.1);
+        running.supply(2, 0.2);
+        running.pump().await;
+        for index in [0, 2] {
+            assert!(running.owners[index].capture.is_some());
+            assert_eq!(lock(&running.platforms[index].0).muted, [true]);
+            assert!(!lock(&running.platforms[index].0).events.contains(&"restore"));
+        }
+    }
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn clear_offline_unknown_and_switch_timeout_release_capture() {
     for outcome in 0..4 {
         let mut running = Running::start(true).await;
         let old = running.owners[0].resolution.stamp().unwrap();
@@ -491,15 +529,13 @@ async fn explicit_clear_pauses_once_but_offline_unknown_and_switch_timeout_do_no
             running.owners[0].tick_source();
         }
         assert!(running.owners[0].capture.is_none());
-        assert_eq!(pauses(&running.platforms[0]), usize::from(outcome == 0));
         running.owners[0].stop_source();
-        assert_eq!(pauses(&running.platforms[0]), usize::from(outcome == 0));
         running.stop().await;
     }
 }
 
 #[tokio::test]
-async fn source_becoming_exit_releases_capture_without_capturing_own_mix_or_pausing() {
+async fn source_becoming_exit_releases_capture_without_capturing_own_mix() {
     let mut running = Running::start(true).await;
     running.claim(0, true);
     let me = running.owners[0].links.id();
@@ -508,7 +544,6 @@ async fn source_becoming_exit_releases_capture_without_capturing_own_mix_or_paus
         .await;
     assert!(running.owners[0].capture.is_none());
     assert!(running.owners[0].exit_volume.state().is_some());
-    assert_eq!(pauses(&running.platforms[0]), 0);
     running.stop().await;
 }
 
@@ -556,7 +591,6 @@ async fn muted_forwarding_persists_and_reenable_resets_mute_before_reply() {
     let saved = AgentConfig::load_from(running.directories[0].as_path()).unwrap();
     assert_eq!(saved.settings.audio, owner.settings);
     assert!(!running.directories[0].as_path().join("audio/settings.json").exists());
-    assert_eq!(pauses(&running.platforms[0]), 0);
     running.stop().await;
 }
 
@@ -821,7 +855,7 @@ async fn output_rebinding_rejects_old_volume_version_and_uses_exact_local_output
 }
 
 #[tokio::test]
-async fn capture_denial_and_unconfirmed_cleanup_are_typed_and_never_pause_players() {
+async fn capture_denial_and_unconfirmed_cleanup_are_typed() {
     for denied in [true, false] {
         let mut running = Running::start(true).await;
         if denied {
@@ -841,7 +875,6 @@ async fn capture_denial_and_unconfirmed_cleanup_are_typed_and_never_pause_player
                 dto::UserFacingCode::CleanupFailed
             );
         }
-        assert_eq!(pauses(&running.platforms[0]), 0);
         running.stop().await;
     }
 }
@@ -867,7 +900,6 @@ async fn external_endpoint_takeover_saves_disabled_reason_before_observation() {
             .audio,
         running.owners[0].settings
     );
-    assert_eq!(pauses(&running.platforms[0]), 0);
     running.stop().await;
 }
 
@@ -1018,14 +1050,12 @@ async fn media_stall_faults_the_current_receive_generation() {
 }
 
 #[tokio::test]
-async fn terminal_capture_retirement_never_reuses_an_ended_send_ticket() {
-    for (during_finish, reported_error) in [(false, true), (true, true), (true, false)] {
+async fn terminal_capture_retirement_recovers_after_native_error() {
+    for during_finish in [false, true] {
         let mut running = Running::start(true).await;
-        let ticket = running.owners[0].forwarding_pause.clone();
         let changed = running.platforms[0].0.clone();
         let fail: Box<dyn FnOnce() + Send> = Box::new(move || {
-            ticket.stop();
-            lock(&changed).capture_error = reported_error.then(|| "native capture terminated".into());
+            lock(&changed).capture_error = Some("native capture terminated".into());
         });
         if during_finish {
             lock(&running.platforms[0].0).capture_finish_hook = Some(fail);
@@ -1035,17 +1065,9 @@ async fn terminal_capture_retirement_never_reuses_an_ended_send_ticket() {
         // Both AudioPrepared replacement and an empty transport table retire
         // capture before tick_source's ordinary error check.
         running.owners[0].release_capture();
-        assert!(
-            !running.owners[0].forwarding_pause.is_ended(),
-            "replacement needs a live ticket"
-        );
         assert_eq!(
             running.owners[0].restart_reason.as_deref(),
-            Some(if reported_error {
-                "native capture terminated"
-            } else {
-                "capture send ticket ended"
-            })
+            Some("native capture terminated")
         );
         lock(&running.platforms[0].0).capture_error = None;
         running.until(Running::prepared_route_ready).await;
@@ -1062,15 +1084,12 @@ async fn default_change_during_capture_retirement_switches_to_local_before_reope
     for (during_finish, retired_before_tick) in [(false, false), (true, false), (true, true)] {
         let mut running = Running::start(true).await;
         let claim = running.owners[0].resolution;
-        let ticket = running.owners[0].forwarding_pause.clone();
         let state = running.platforms[0].0.clone();
         let changed = state.clone();
         // The default notification lands after tick_running's first check,
         // either while reading restart_reason or while joining the old worker.
-        // A muted WASAPI default change ends this exact logical ticket.
         let notify: Box<dyn FnOnce() + Send> = Box::new(move || {
             lock(&changed).default_output_changed = true;
-            ticket.stop();
         });
         {
             let mut state = lock(&state);
@@ -1122,9 +1141,8 @@ async fn default_change_during_capture_retirement_switches_to_local_before_reope
             [true],
             "never open/mute the replacement default automatically"
         );
-        assert_eq!(pauses(&running.platforms[0]), 0);
-        // Explicit re-enable is the recovery action. The replacement must have
-        // a live ticket and actually submit media, not merely own a capture.
+        // Explicit re-enable is the recovery action. The replacement must
+        // actually submit media, not merely own a capture.
         {
             let mut state = lock(&state);
             state.default_output_changed = false;
@@ -1164,7 +1182,6 @@ async fn typed_remote_fault_preserves_code_and_delayed_old_context_cannot_stop_n
         running.owners[0].problem().unwrap().code,
         dto::UserFacingCode::DeviceUnavailable
     );
-    assert_eq!(pauses(&running.platforms[0]), 0);
     assert!(!running.owners[0].source_failed);
     running.until(|r| r.owners[0].capture.is_some()).await;
     let current = running.owners[0].source_session.prepared().unwrap().session();
@@ -1279,7 +1296,6 @@ async fn keep_local_rebuilds_once_and_preserves_forwarding_claim() {
     running.until(|r| r.owners[0].capture.is_some()).await;
     assert_eq!(running.owners[0].resolution, claim);
     assert_eq!(lock(&running.platforms[0].0).muted, [true, false]);
-    let ticket = running.owners[0].forwarding_pause.clone();
     let changed = running.platforms[0].0.clone();
     {
         let mut state = lock(&running.platforms[0].0);
@@ -1289,15 +1305,10 @@ async fn keep_local_rebuilds_once_and_preserves_forwarding_claim() {
     running.until(Running::prepared_route_ready).await;
     assert!(running.owners[0].settings.forwarding_enabled);
     assert_eq!(running.owners[0].settings.forwarding_off_reason, None);
-    assert!(
-        !ticket.is_ended(),
-        "keep-local default following preserves the logical ticket"
-    );
     assert_eq!(lock(&running.platforms[0].0).muted, [true, false, false]);
     let sent = running.owners[0].sent.load(Ordering::Relaxed);
     running.supply(0, 0.1);
     assert!(running.owners[0].sent.load(Ordering::Relaxed) > sent);
-    assert_eq!(pauses(&running.platforms[0]), 0);
     running.stop().await;
 }
 
@@ -1910,7 +1921,7 @@ async fn publication_failure_after_save_returns_actual_persisted_owner_result() 
 }
 
 #[tokio::test]
-async fn removing_the_selected_exit_retires_media_without_fallback_or_player_pause() {
+async fn removing_the_selected_exit_retires_media_without_fallback() {
     let mut running = Running::start(true).await;
     let removed = running.owners[1].links.id();
     let selected = running.owners[0].resolution.stamp().unwrap();
@@ -1929,12 +1940,10 @@ async fn removing_the_selected_exit_retires_media_without_fallback_or_player_pau
         .await;
     assert!(running.owners[0].volume.load().is_none());
     assert!(running.owners[0].source_session.prepared().is_none());
-    assert_eq!(pauses(&running.platforms[0]), 0);
     // A later explicit claim may take over; removal itself never elects a fallback.
     running.claim(0, true);
     let local = running.owners[0].links.id();
     running.until(|r| r.owners[0].resolution.owner() == Some(local)).await;
-    assert_eq!(pauses(&running.platforms[0]), 0);
     running.stop().await;
 }
 
@@ -2308,7 +2317,6 @@ async fn exit_driver_operation_retains_source_offer_received_during_maintenance(
     let sent = running.owners[0].sent.load(Ordering::Relaxed);
     running.supply(0, 0.2);
     assert!(running.owners[0].sent.load(Ordering::Relaxed) > sent);
-    assert_eq!(pauses(&running.platforms[0]), 0);
     running.stop().await;
 }
 
@@ -2714,7 +2722,6 @@ async fn remote_exit_fault_keeps_source_speaker_card_healthy() {
     );
     assert_eq!(owner.phase(), AudioPhase::WaitingForExit);
     assert!(owner.capture.is_none());
-    assert_eq!(pauses(&running.platforms[0]), 0);
     running.stop().await;
 }
 

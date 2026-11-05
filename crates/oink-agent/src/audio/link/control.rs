@@ -303,14 +303,11 @@ impl Owner {
         self.volume_context_inputs = None;
     }
     pub(super) fn transition(&mut self, resolution: Resolution) {
-        self.forwarding_pause
-            .set_pause_allowed(matches!(resolution, Resolution::None { .. }));
         if resolution == self.resolution {
             return;
         }
         let previous = self.resolution;
-        // An unavailable selected exit still suppresses player pause, but releases
-        // the capture lease immediately. Only an explicit no-exit barrier pauses.
+        // An unavailable selected exit releases the capture lease immediately.
         let keep_capture = previous.owner().is_some_and(|owner| owner != self.links.id())
             && resolution.owner().is_some_and(|owner| owner != self.links.id())
             && resolution.available()

@@ -45,7 +45,6 @@ use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingl
 /// must drain promptly and impose their own bounded framing queue.
 #[derive(Debug)]
 pub struct Capture {
-    forwarding_stop: crate::media_pause::CaptureStop,
     stop: Arc<AtomicBool>,
     error: Arc<Mutex<Option<String>>>,
     local_controls_changed: Arc<AtomicBool>,
@@ -69,10 +68,7 @@ impl Capture {
         self.shutdown();
         self.cleanup_error.lock().ok().and_then(|error| error.clone())
     }
-    /// Bind the logical forwarding session; None suppresses an internal replacement.
-    pub fn set_forwarding_pause(&self, pause: Option<crate::media_pause::ForwardingPause>) {
-        self.forwarding_stop.attach(pause);
-    }
+
     pub fn start_encoded(encoder: crate::source::Encoder, mute: bool, dir: PathBuf) -> Result<Self, String> {
         Self::start_inner(Box::new(encoder), mute.then_some(dir), Some(0))
     }
@@ -88,8 +84,6 @@ impl Capture {
         recovery_dir: Option<PathBuf>,
         requested: Option<u32>,
     ) -> Result<Self, String> {
-        let forwarding_stop = crate::media_pause::CaptureStop::default();
-        let worker_forwarding_stop = forwarding_stop.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let error = Arc::new(Mutex::new(None));
         let worker_stop = Arc::clone(&stop);
@@ -116,7 +110,6 @@ impl Capture {
                     recovery_dir.as_deref(),
                     worker_muted,
                     requested,
-                    worker_forwarding_stop,
                     WorkerSignals {
                         stop: &worker_stop,
                         changes: &worker_changes,
@@ -156,7 +149,6 @@ impl Capture {
             })
             .map_err(|error| format!("spawn WASAPI capture: {error}"))?;
         let mut capture = Self {
-            forwarding_stop,
             stop,
             error,
             local_controls_changed,
@@ -275,7 +267,6 @@ fn capture_worker(
     recovery_dir: Option<&Path>,
     muted_owned: Arc<AtomicBool>,
     requested: Option<u32>,
-    forwarding_stop: crate::media_pause::CaptureStop,
     signals: WorkerSignals<'_>,
 ) -> Result<bool, String> {
     let WorkerSignals {
@@ -357,7 +348,6 @@ fn capture_worker(
         if let Some(dir) = recovery_dir {
             mute_lease = Some(MuteLease::start(device, dir, muted_owned)?);
         }
-        let pause_before_restore = crate::media_pause::BeforeRestore(forwarding_stop);
         let mut realtime = RealtimeCapture::start(&opened, clock, buffer_duration, encoder)?;
         if ready.send(Ok(opened.info.clone())).is_err() {
             return Ok(false);
@@ -393,7 +383,6 @@ fn capture_worker(
             }
         }
         realtime.stop();
-        finish_capture_session(changes, recovery_dir.is_some(), &pause_before_restore.0);
         drop(running);
         if let Some(lease) = &mut mute_lease
             && let Err(error) = lease.finish()
@@ -403,19 +392,6 @@ fn capture_worker(
         }
         result
     }
-}
-
-fn finish_capture_session(changes: &source_devices::Changes, muted: bool, stop: &crate::media_pause::CaptureStop) {
-    // A format rebuild, or following a default while keeping local playback,
-    // replaces only the physical capture. Do not end the logical forwarding
-    // ticket or pause players: its encoder submissions must work after reopen.
-    // A changed default with a mute lease ends forwarding before restoring the
-    // exact OLD endpoint. The new default is never controlled by this handle.
-    let default = changes.default.load(Ordering::Acquire);
-    if (default && !muted) || (!default && changes.format.load(Ordering::Acquire)) {
-        stop.finish_rebuild();
-    }
-    stop.finish();
 }
 
 fn default_is(enumerator: &IMMDeviceEnumerator, id: &str) -> Result<bool, String> {
@@ -1116,37 +1092,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn device_following_and_format_restart_preserve_the_forwarding_ticket() {
-        for (default, format, muted, ends) in [
-            (true, false, true, true),
-            (true, false, false, false),
-            (false, true, true, false),
-            (false, true, false, false),
-        ] {
-            let changes = source_devices::Changes::default();
-            changes.default.store(default, Ordering::Release);
-            changes.format.store(format, Ordering::Release);
-            let pause = crate::media_pause::ForwardingPause::with_backend(|| {});
-            let stop = crate::media_pause::CaptureStop::default();
-            stop.attach(Some(pause.clone()));
-            finish_capture_session(&changes, muted, &stop);
-            assert_eq!(pause.is_ended(), ends);
-            assert_eq!(
-                pause.submit(|| Ok::<_, ()>(())).is_none(),
-                ends,
-                "reopened capture must still be able to submit media"
-            );
-        }
-    }
-
-    #[test]
     fn local_controls_stop_is_not_a_capture_error() {
         let worker = thread::spawn(|| {});
         while !worker.is_finished() {
             thread::yield_now();
         }
         let capture = Capture {
-            forwarding_stop: Default::default(),
             stop: Arc::new(AtomicBool::new(false)),
             error: Arc::new(Mutex::new(None)),
             local_controls_changed: Arc::new(AtomicBool::new(true)),

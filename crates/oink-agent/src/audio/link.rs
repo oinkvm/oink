@@ -518,7 +518,6 @@ struct Owner {
     observed_source_burst: u64,
     receivers: BTreeMap<DeviceId, Receiver>,
     prepared: BTreeMap<DeviceId, Negotiated>,
-    forwarding_pause: oink_audio::media_pause::ForwardingPause,
     power: Option<oink_audio::power::Monitor>,
     power_state: oink_audio::power::State,
     permission: CapturePermission,
@@ -707,11 +706,6 @@ impl Owner {
             observed_source_burst: 0,
             receivers: BTreeMap::new(),
             prepared: BTreeMap::new(),
-            forwarding_pause: {
-                let pause = platform.forwarding_pause();
-                pause.set_pause_allowed(false);
-                pause
-            },
             power: None,
             power_state: Default::default(),
             permission,
@@ -878,7 +872,6 @@ impl Owner {
             CaptureRetirement::Stopped
         };
         if let Some(mut capture) = self.capture.take() {
-            capture.set_forwarding_pause(None);
             // Join before inspecting terminal state: a notification or generic
             // native failure can arrive during retirement on any control path.
             let cleanup = capture.finish();
@@ -893,23 +886,27 @@ impl Owner {
                 CaptureRetirement::CleanupFailed(error)
             } else if let Some(reason) = off {
                 CaptureRetirement::Takeover(reason)
-            } else if rebuild && (error.is_some() || self.forwarding_pause.is_ended()) {
-                CaptureRetirement::Terminal(error.unwrap_or_else(|| "capture send ticket ended".into()))
+            } else if let Some(error) = error.filter(|_| rebuild) {
+                CaptureRetirement::Terminal(error)
             } else {
                 outcome
             };
+            tracing::info!(
+                ?outcome,
+                restart_reason = ?self.restart_reason,
+                claim_counter = self.resolution.stamp().map_or(0, |stamp| stamp.counter),
+                "audio capture retired"
+            );
         }
         self.encoded = None;
         self.capture_levels = None;
         self.capture_sent_base = self.sent.load(Ordering::Relaxed);
         self.provisional = false;
-        // Every caller passes through this dispatch, including AudioPrepared and
-        // an empty forwarding table. A native terminal ticket is never reusable.
+        // Preserve terminal errors discovered during capture retirement, including
+        // AudioPrepared replacement and an empty forwarding table.
         match &outcome {
             CaptureRetirement::Terminal(error) => {
                 self.restart_reason = Some(error.clone());
-                self.forwarding_pause.stop();
-                self.renew_forwarding_ticket();
             }
             CaptureRetirement::CleanupFailed(error) => {
                 self.mute_cleanup_error = Some(error.clone());
@@ -925,20 +922,14 @@ impl Owner {
         }
         outcome
     }
-    fn renew_forwarding_ticket(&mut self) {
-        self.forwarding_pause = self.platform.forwarding_pause();
-        self.forwarding_pause
-            .set_pause_allowed(matches!(self.resolution, Resolution::None { .. }));
-    }
+
     fn stop_source(&mut self) {
         let _ = self.stop_source_checked();
     }
     fn stop_source_checked(&mut self) -> Option<String> {
         self.exit_switch_deadline = None;
         self.streams.set_forwarding(false, 1.0);
-        self.forwarding_pause.stop();
         let outcome = self.retire_capture(false);
-        self.renew_forwarding_ticket();
         self.verified = false;
         match outcome {
             CaptureRetirement::CleanupFailed(error) => Some(error),
@@ -1378,7 +1369,7 @@ impl Owner {
                 "default output notification: {old_default:?} -> {new_default:?}"
             ));
             // This is the same internal replacement as the native health
-            // restart. Preserve the owner's logical ticket and player state;
+            // restart. Preserve the selected route;
             // only the old physical capture/queued media are retired.
             let _ = self.release_capture();
         }
@@ -1729,8 +1720,7 @@ impl Owner {
         }
         if table.load().to.is_empty() && !self.provisional && !switching {
             // M0 may be reopening independently while the link stays ready. Restore
-            // local sound. Player pause remains reserved for an explicit no-exit
-            // barrier; a control-stream fault preserves the selected exit.
+            // local sound; a control-stream fault preserves the selected exit.
             let _ = self.release_capture();
             return;
         }
@@ -1765,13 +1755,6 @@ impl Owner {
             self.restart_reason = Some("capture produced no frames; reopening".into());
             let _ = self.release_capture();
             self.apply_capture_takeover();
-            return;
-        }
-        if self.capture.is_some() && self.forwarding_pause.is_ended() {
-            let _ = self.release_capture();
-            if self.retired_capture_off_reason.is_some() {
-                self.apply_capture_takeover();
-            }
             return;
         }
         if let Some(error) = self.capture.as_ref().and_then(|capture| capture.error()) {
@@ -1824,14 +1807,11 @@ impl Owner {
             .and_then(|(encoder, output)| {
                 let writer = ForwardTable::source_writer(table.clone(), self.started);
                 let links = self.links.clone();
-                let pause = self.forwarding_pause.clone();
                 let sent = self.sent.clone();
                 let dropped = self.dropped.clone();
                 output.set_muted(self.settings.forwarding_muted);
                 output.set_packet_writer(Arc::new(move |packet| {
-                    let accepted = pause
-                        .submit(|| if writer(packet) { Ok(()) } else { Err(()) })
-                        .is_some_and(|result| result.is_ok());
+                    let accepted = writer(packet);
                     if accepted {
                         if !packet.silent {
                             links.audio_activity();
@@ -1858,7 +1838,6 @@ impl Owner {
                     if !self.settings.keep_local_playback {
                         self.mute_cleanup_error = None;
                     }
-                    capture.set_forwarding_pause(Some(self.forwarding_pause.clone()));
                     self.capture_watchdog.opened(now.max(Instant::now()));
                     self.capture = Some(capture);
                     self.encoded = Some(output);
