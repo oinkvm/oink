@@ -59,7 +59,10 @@ jobs:
       - name: Read back custom domain and commit state with CAS
         id: commit
         # The pinned deploy-pages action polls the deployment API until succeed.
-        # HTTP readback then revalidates CDN caches; there is no delay/retry loop.
+        # Only exact canonical bytes permit CAS. Known frozen-parent bytes may
+        # converge for one Pages cache lifetime; cold probes must authenticate
+        # any other stale cache against the exact target, never unknown origin bytes.
+        # Cache-busted responses are diagnostic only, never deployment proof.
         if: steps.publish.outputs.status == 'succeed'
         run: python3 build-support/update/deploy.py commit
       - name: Restore previous hosted bytes on deployment, readback or CAS failure

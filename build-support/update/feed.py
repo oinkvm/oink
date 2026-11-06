@@ -152,7 +152,7 @@ class Redirects(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def download(url, limit, redirects=False, revalidate=False):
+def download(url, limit, redirects=False, revalidate=False, response_headers=None):
     opener = urllib.request.build_opener(Redirects() if redirects else NoRedirects())
     headers = {'User-Agent': 'Oink-feed-verifier/1'}
     if revalidate:
@@ -162,6 +162,8 @@ def download(url, limit, redirects=False, revalidate=False):
         headers['Cache-Control'] = 'no-cache'
     with opener.open(urllib.request.Request(url, headers=headers), timeout=60) as response:
         require(response.status == 200, 'http_status')
+        if response_headers is not None:
+            response_headers.update(response.headers)
         result = response.read(limit + 1)
         require(len(result) <= limit, 'download_limit')
         return result

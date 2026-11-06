@@ -208,16 +208,37 @@ def merge(state, proposal_dir, output, expected_revision):
                'checked_at': feed.iso(int(feed.dt.datetime.now(feed.dt.timezone.utc).timestamp()))})
 
 
-def verify_public(state, platform=None):
+def verify_public(state, platform=None, previous=None):
     if platform is None:
         verify_all(state, signatures=False)
     else:
         verify_platform(state, platform, feed.trust(platform), signatures=False)
+    if previous is not None:
+        import readback
+        expected = public_files(state, platform)
+        readback.verify(expected, public_files(previous, platform))
+        return
     for path, raw in files(state / 'site').items():
         if platform is not None and not path.startswith(platform + '/'):
             continue
         feed.require(feed.download(feed.BASE + path, max(feed.MAX_FEED, len(raw)), False, True) == raw, 'deployment_digest')
     verify_absent(state_info(state), PLATFORMS if platform is None else (platform,))
+
+
+def absent_paths(reg, platforms=PLATFORMS):
+    return [f'{platform}/v1/{epoch}/{channel}/{filename}'
+            for platform, epoch, filename in (('mac', 'mac-2026-01', 'appcast.xml'),
+                                              ('windows', 'win-2026-01', 'manifest.json'))
+            if platform in platforms and not reg['platforms'][platform]['enabled']
+            for channel in ('stable', 'beta')]
+
+
+def public_files(state, platform=None):
+    result = {path: raw for path, raw in files(state / 'site').items()
+              if platform is None or path.startswith(platform + '/')}
+    for path in absent_paths(state_info(state), PLATFORMS if platform is None else (platform,)):
+        result[path] = None
+    return result
 
 
 def verify_absent(reg, platforms=PLATFORMS):

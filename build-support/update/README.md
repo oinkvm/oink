@@ -189,8 +189,17 @@ The pinned Pages action waits for the deployment API's `succeed` status before
 readback. Every publication and rollback readback sends `Cache-Control: no-cache`
 to revalidate canonical URLs. Pages caches responses for ten minutes; the shared
 heartbeat from an immediately preceding platform publication must not be accepted
-as the current origin snapshot. Each path is requested once; no sleep or retry
-loop substitutes for deployment status or exact byte comparison.
+as the current origin snapshot. API success does not prove canonical URL visibility. Deployment and rollback
+readback record each URL, expected/actual digest, Age, Cache-Control, X-Cache,
+X-Served-By and ETag. Only the already-verified snapshot being replaced (or its
+known absence) is treated as a propagation transition, bounded to the Pages
+600-second cache lifetime plus 30 seconds. Unknown origin bytes and HTTP failures fail
+immediately. If a failed earlier deployment left other canonical cache bytes,
+only an exact target digest from the cold probe permits waiting for convergence;
+the canonical URL must still match before acceptance. A unique query probes origin visibility for diagnostics; it never
+substitutes for a complete exact readback of canonical client URLs. The same
+protocol verifies the frozen signed rollback snapshot; no candidate is committed
+until every canonical URL matches in a complete round.
 A canceled runner or unavailable Pages service cannot guarantee remote rollback;
 the stored parent and previous-feed artifact remain recovery inputs.
 

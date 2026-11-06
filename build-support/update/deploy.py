@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import feed
 import feed_site
+import readback
 
 STATE = Path('feed-state')
 NEXT = Path('next-state')
@@ -22,13 +23,16 @@ def prepare():
     proposal = feed.read(Path('candidate-state/candidate.json'))
     feed.require(platform in feed_site.PLATFORMS and proposal['platform'] == platform, 'candidate_platform')
     reg = feed_site.state_info(STATE)
+    # The archived rollback must itself be a valid signed snapshot before any
+    # new site is deployed; it is not merely a copy of untrusted branch bytes.
+    feed_site.verify_all(STATE)
     feed.write(Path('transaction.json'), {'head': git('rev-parse', 'HEAD'), 'revision': reg['revision']})
     feed_site.merge(STATE, Path('candidate-state'), NEXT, reg['revision'])
 
 
 def commit():
     fence = feed.read(Path('transaction.json'))
-    feed_site.verify_public(NEXT)
+    feed_site.verify_public(NEXT, previous=STATE)
     feed.require(git('rev-parse', 'HEAD') == fence['head'] and
                  feed.registry(STATE)['revision'] == fence['revision'], 'state_cas')
     # The shared workflow lock is held until readback, push and any rollback end.
@@ -60,11 +64,15 @@ def verify_rollback():
     fence = feed.read(Path('transaction.json'))
     reg = feed.loads(subprocess.check_output(['git', '-C', str(STATE), 'show', f'{fence["head"]}:registry.json']))
     names = git('ls-tree', '-r', '--name-only', fence['head'], '--', 'site').splitlines()
+    expected = {}
     for name in names:
         raw = subprocess.check_output(['git', '-C', str(STATE), 'show', f'{fence["head"]}:{name}'])
-        feed.require(feed.download(feed.BASE + name.removeprefix('site/'), max(feed.MAX_FEED, len(raw)), False, True) == raw,
-                     'rollback_digest')
-    feed_site.verify_absent(reg)
+        expected[name.removeprefix('site/')] = raw
+    for path in feed_site.absent_paths(reg):
+        expected[path] = None
+    # Reverse the same verified transition: frozen parent is the target and
+    # the candidate may still be visible while Pages rolls back asynchronously.
+    readback.verify(expected, feed_site.files(NEXT / 'site'), 'rollback_digest')
 
 
 def main():

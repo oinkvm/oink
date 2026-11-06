@@ -486,7 +486,7 @@ class DeploymentTests(unittest.TestCase):
         with patch.object(feed, 'read', return_value={'head': 'a'*40}), \
              patch.object(deploy, 'git', return_value='site/mac/feed.xml'), \
              patch.object(deploy.subprocess, 'check_output', side_effect=[b'{"platforms":{}}', old]) as show, \
-             patch.object(feed_site, 'verify_absent') as absent, \
+             patch.object(feed_site, 'absent_paths', return_value=[]) as absent, \
              patch.object(feed, 'download', return_value=old):
             deploy.verify_rollback()
             self.assertEqual(show.call_args.args[0][-1], 'a'*40 + ':site/mac/feed.xml')
@@ -494,6 +494,7 @@ class DeploymentTests(unittest.TestCase):
         with patch.object(feed, 'read', return_value={'head': 'a'*40}), \
              patch.object(deploy, 'git', return_value='site/mac/feed.xml'), \
              patch.object(deploy.subprocess, 'check_output', side_effect=[b'{"platforms":{}}', old]), \
+             patch.object(feed_site, 'absent_paths', return_value=[]), \
              patch.object(feed, 'download', return_value=b'failed rollback'):
             with self.assertRaisesRegex(ValueError, 'rollback_digest'): deploy.verify_rollback()
 
