@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 import platform
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -30,10 +29,12 @@ def mac_status(app, record):
                 if child.poll() is not None or time.monotonic() > deadline:
                     raise RuntimeError('report configuration backend did not become ready')
                 time.sleep(.05)
-            endpoint = json.loads((home / 'ipc.json').read_text())
-            with socket.create_connection(('127.0.0.1', endpoint['port']), timeout=5) as connection:
-                connection.sendall((json.dumps({'token': endpoint['token'], 'build': {'version': record['version'], 'build': str(record['build']), 'source': record['source_tree_sha256']}, 'call': {'method': 'report_status'}}) + '\n').encode())
-                status = json.loads(connection.makefile().readline())['ok']
+            # The package uses native IPC, not a loopback TCP port. Reuse its
+            # CLI so endpoint ownership, peer identity and build authentication
+            # stay identical to normal clients; keep the isolated HOME/no-report check.
+            cli = app / 'Contents/MacOS/oink-agent'
+            status = json.loads(subprocess.check_output(
+                [str(cli), 'call', 'report_status'], env=env, text=True, timeout=5))
             assert status['configured'] and status['consent']['choice'] == 'unasked'
             assert status['queued_crashes'] == status['queued_performance'] == 0
         finally:
