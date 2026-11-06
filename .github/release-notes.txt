@@ -14,6 +14,7 @@ Oink 0.3.3 improves audio forwarding, adds audio quality options and fixes sever
 - Fixed Shift sometimes switching WeChat Input Method between Chinese and English on a Mac controlled from another device.
 - Fixed some keys sometimes staying pressed when a Windows keyboard controls another device.
 - Fixed the pitch of forwarded audio rising and falling every few seconds on Wi-Fi.
+- Fixed playback on one device being paused repeatedly when several devices forward audio at the same time.
 - Fixed images copied on a Mac showing no preview in Windows clipboard history (Win+V).
 - Fixed Macs failing to connect over Tailscale.
 - Oink uses less CPU when idle on Mac and Windows.
