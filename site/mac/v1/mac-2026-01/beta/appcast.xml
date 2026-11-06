@@ -1,6 +1,54 @@
 <?xml version="1.0" encoding="utf-8" standalone="yes"?><!-- sparkle-sign-warning:
 IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
---><rss xmlns:oink="https://updates.oink.hachiwii.com/xml-namespaces/update" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0"><channel><item><title>Oink 0.3.2</title><sparkle:version>93</sparkle:version><sparkle:shortVersionString>0.3.2</sparkle:shortVersionString><oink:sha256>6adbc577e9ddec40b190585e39e4e5dcf3aabcc0284ad7fab0551f3dfc2a2995</oink:sha256><sparkle:minimumSystemVersion>14.2</sparkle:minimumSystemVersion><enclosure url="https://github.com/oinkvm/oink/releases/download/v0.3.2/Oink-0.3.2-93-macos-arm64.zip" length="41417172" type="application/octet-stream" sparkle:edSignature="WYtEVBXtwRKXKppT912NbUXEYP9ovyUE+5v0msnGs5mnLwaf/90dMsk4vjNoTbb53uV0MUPEpNJjs4R85q+ACQ=="></enclosure><description xml:lang="en" sparkle:format="plain-text">Use Oink at the Windows sign-in screen: when Launch at login is on, your other devices can also control the sign-in screen that appears after Windows starts.
+--><rss xmlns:oink="https://updates.oink.hachiwii.com/xml-namespaces/update" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0"><channel><item><title>Oink 0.3.3</title><sparkle:version>100</sparkle:version><sparkle:shortVersionString>0.3.3</sparkle:shortVersionString><oink:sha256>842b1696a340ddbeccf459cbda94b3bf39f093021dd2cbebf6b39d594783b051</oink:sha256><sparkle:minimumSystemVersion>14.2</sparkle:minimumSystemVersion><enclosure url="https://github.com/oinkvm/oink/releases/download/v0.3.3/Oink-0.3.3-macos-arm64.zip" length="41002600" type="application/octet-stream" sparkle:edSignature="i7BoyXehS/aVDOhtHB+HafPzYy54Ta8i6glwadvAM4d8ot56b7jlXqGIbHDgPzTJmDM2/Eco33olSZp2RzJ4Cg=="></enclosure><description xml:lang="en" sparkle:format="plain-text">Choose the quality of forwarded audio in Settings: Smooth, Quality or Lossless.
+Clicking with a mouse that is in local mode now brings control back to that computer.
+Pointer shortcuts can now move the pointer to screens hidden in the layout.
+If another app is using Oink's network port, Oink now switches to another port automatically.
+On a Mac, files of up to 16 MB in total copied on another computer are fetched in advance, so pasting them is faster.
+Fixed the "Open the Oink window" shortcut not being shown in Settings.
+Fixed Shift sometimes switching WeChat Input Method between Chinese and English on a Mac controlled from another device.
+Fixed some keys sometimes staying pressed when a Windows keyboard controls another device.
+Fixed the pitch of forwarded audio rising and falling every few seconds on Wi-Fi.
+Fixed playback on one device being paused repeatedly when several devices forward audio at the same time.
+Fixed images copied on a Mac showing no preview in Windows clipboard history (Win+V).
+Fixed Macs failing to connect over Tailscale.
+Oink uses less CPU when idle on Mac and Windows.</description><description xml:lang="ja" sparkle:format="plain-text">転送するオーディオの品質を設定で選べるようになりました：スムーズ、高音質、ロスレス。
+ローカルモードのマウスでクリックすると、そのコンピューターに操作を戻せるようになりました。
+ポインターのショートカットで、レイアウトで非表示にした画面にもポインターを移動できるようになりました。
+Oink が使用するネットワークポートがほかのアプリに使われている場合、自動的に別のポートに切り替えるようになりました。
+Mac で、ほかのコンピューターでコピーした合計 16 MB 以内のファイルを事前に取得するため、より速くペーストできるようになりました。
+「Oink ウィンドウを開く」ショートカットが設定に表示されない問題を修正しました。
+ほかのデバイスから操作されている Mac で、Shift を押すと WeChat 入力法の中国語/英語が切り替わることがある問題を修正しました。
+Windows のキーボードでほかのデバイスを操作しているとき、一部のキーが押されたままになることがある問題を修正しました。
+Wi-Fi で転送したオーディオの音程が数秒ごとに上下する問題を修正しました。
+複数のデバイスが同時にオーディオを転送しているとき、そのうち 1 台の再生が繰り返し一時停止される問題を修正しました。
+Mac でコピーした画像が Windows のクリップボード履歴（Win+V）でプレビューされない問題を修正しました。
+Mac が Tailscale 経由で接続できない問題を修正しました。
+Mac と Windows でアイドル時の CPU 使用率が下がりました。</description><description xml:lang="ko" sparkle:format="plain-text">설정에서 전달되는 오디오의 품질을 선택할 수 있습니다: 원활, 고음질, 무손실.
+로컬 모드인 마우스로 클릭하면 그 컴퓨터로 제어를 되돌릴 수 있습니다.
+포인터 단축키로 레이아웃에서 숨긴 화면으로도 포인터를 옮길 수 있습니다.
+Oink가 사용하는 네트워크 포트를 다른 앱이 사용 중이면 자동으로 다른 포트로 전환합니다.
+Mac에서 다른 컴퓨터에서 복사한 파일이 모두 합쳐 16MB 이하이면 미리 가져와 더 빠르게 붙여넣을 수 있습니다.
+'Oink 창 열기' 단축키가 설정에 표시되지 않던 문제를 수정했습니다.
+다른 기기에서 제어되는 Mac에서 Shift를 누르면 WeChat 입력기의 중국어/영어가 전환되는 경우가 있던 문제를 수정했습니다.
+Windows 키보드로 다른 기기를 제어할 때 일부 키가 눌린 상태로 남을 수 있던 문제를 수정했습니다.
+Wi-Fi에서 전달되는 오디오의 음정이 몇 초마다 높아졌다 낮아지던 문제를 수정했습니다.
+여러 기기가 동시에 오디오를 전달할 때 그중 한 기기의 재생이 반복해서 일시 정지되던 문제를 수정했습니다.
+Mac에서 복사한 이미지가 Windows 클립보드 기록(Win+V)에서 미리 보기로 표시되지 않던 문제를 수정했습니다.
+Mac이 Tailscale을 통해 연결하지 못하던 문제를 수정했습니다.
+Mac과 Windows에서 유휴 시 CPU 사용량이 줄었습니다.</description><description xml:lang="zh-Hans" sparkle:format="plain-text">可在设置中选择转发音频的质量：流畅、质量、无损。
+处于本地模式的鼠标点击一下，即可把控制收回到这台电脑。
+允许用快捷键将指针移动到布局中隐藏的屏幕。
+Oink 使用的网络端口被其他程序占用时，会自动改用其他端口。
+Mac 上，从其他电脑复制的文件总计 16 MB 以内时会提前取回，粘贴更快。
+修复「打开 Oink 窗口」快捷键在设置中不可见的问题。
+修复 Mac 被控时，按 Shift 有时会让微信输入法切换中英文的问题。
+修复用 Windows 键盘控制其它设备时，某些按键可能卡在按下状态的问题。
+修复在 Wi-Fi 下转发的音频每隔几秒音调忽高忽低的问题。
+修复多台设备同时转发音频时，其中一台会频繁被暂停的问题。
+修复从 Mac 复制的图片在 Windows 剪贴板历史（Win+V）中没有预览的问题。
+修复 Mac 通过 Tailscale 连接失败的问题。
+Mac 和 Windows 空闲时的 CPU 占用更低。</description><oink:releaseNotes>{"zh-Hans":"可在设置中选择转发音频的质量：流畅、质量、无损。\n处于本地模式的鼠标点击一下，即可把控制收回到这台电脑。\n允许用快捷键将指针移动到布局中隐藏的屏幕。\nOink 使用的网络端口被其他程序占用时，会自动改用其他端口。\nMac 上，从其他电脑复制的文件总计 16 MB 以内时会提前取回，粘贴更快。\n修复「打开 Oink 窗口」快捷键在设置中不可见的问题。\n修复 Mac 被控时，按 Shift 有时会让微信输入法切换中英文的问题。\n修复用 Windows 键盘控制其它设备时，某些按键可能卡在按下状态的问题。\n修复在 Wi-Fi 下转发的音频每隔几秒音调忽高忽低的问题。\n修复多台设备同时转发音频时，其中一台会频繁被暂停的问题。\n修复从 Mac 复制的图片在 Windows 剪贴板历史（Win+V）中没有预览的问题。\n修复 Mac 通过 Tailscale 连接失败的问题。\nMac 和 Windows 空闲时的 CPU 占用更低。","en":"Choose the quality of forwarded audio in Settings: Smooth, Quality or Lossless.\nClicking with a mouse that is in local mode now brings control back to that computer.\nPointer shortcuts can now move the pointer to screens hidden in the layout.\nIf another app is using Oink's network port, Oink now switches to another port automatically.\nOn a Mac, files of up to 16 MB in total copied on another computer are fetched in advance, so pasting them is faster.\nFixed the \"Open the Oink window\" shortcut not being shown in Settings.\nFixed Shift sometimes switching WeChat Input Method between Chinese and English on a Mac controlled from another device.\nFixed some keys sometimes staying pressed when a Windows keyboard controls another device.\nFixed the pitch of forwarded audio rising and falling every few seconds on Wi-Fi.\nFixed playback on one device being paused repeatedly when several devices forward audio at the same time.\nFixed images copied on a Mac showing no preview in Windows clipboard history (Win+V).\nFixed Macs failing to connect over Tailscale.\nOink uses less CPU when idle on Mac and Windows.","ja":"転送するオーディオの品質を設定で選べるようになりました：スムーズ、高音質、ロスレス。\nローカルモードのマウスでクリックすると、そのコンピューターに操作を戻せるようになりました。\nポインターのショートカットで、レイアウトで非表示にした画面にもポインターを移動できるようになりました。\nOink が使用するネットワークポートがほかのアプリに使われている場合、自動的に別のポートに切り替えるようになりました。\nMac で、ほかのコンピューターでコピーした合計 16 MB 以内のファイルを事前に取得するため、より速くペーストできるようになりました。\n「Oink ウィンドウを開く」ショートカットが設定に表示されない問題を修正しました。\nほかのデバイスから操作されている Mac で、Shift を押すと WeChat 入力法の中国語/英語が切り替わることがある問題を修正しました。\nWindows のキーボードでほかのデバイスを操作しているとき、一部のキーが押されたままになることがある問題を修正しました。\nWi-Fi で転送したオーディオの音程が数秒ごとに上下する問題を修正しました。\n複数のデバイスが同時にオーディオを転送しているとき、そのうち 1 台の再生が繰り返し一時停止される問題を修正しました。\nMac でコピーした画像が Windows のクリップボード履歴（Win+V）でプレビューされない問題を修正しました。\nMac が Tailscale 経由で接続できない問題を修正しました。\nMac と Windows でアイドル時の CPU 使用率が下がりました。","ko":"설정에서 전달되는 오디오의 품질을 선택할 수 있습니다: 원활, 고음질, 무손실.\n로컬 모드인 마우스로 클릭하면 그 컴퓨터로 제어를 되돌릴 수 있습니다.\n포인터 단축키로 레이아웃에서 숨긴 화면으로도 포인터를 옮길 수 있습니다.\nOink가 사용하는 네트워크 포트를 다른 앱이 사용 중이면 자동으로 다른 포트로 전환합니다.\nMac에서 다른 컴퓨터에서 복사한 파일이 모두 합쳐 16MB 이하이면 미리 가져와 더 빠르게 붙여넣을 수 있습니다.\n'Oink 창 열기' 단축키가 설정에 표시되지 않던 문제를 수정했습니다.\n다른 기기에서 제어되는 Mac에서 Shift를 누르면 WeChat 입력기의 중국어/영어가 전환되는 경우가 있던 문제를 수정했습니다.\nWindows 키보드로 다른 기기를 제어할 때 일부 키가 눌린 상태로 남을 수 있던 문제를 수정했습니다.\nWi-Fi에서 전달되는 오디오의 음정이 몇 초마다 높아졌다 낮아지던 문제를 수정했습니다.\n여러 기기가 동시에 오디오를 전달할 때 그중 한 기기의 재생이 반복해서 일시 정지되던 문제를 수정했습니다.\nMac에서 복사한 이미지가 Windows 클립보드 기록(Win+V)에서 미리 보기로 표시되지 않던 문제를 수정했습니다.\nMac이 Tailscale을 통해 연결하지 못하던 문제를 수정했습니다.\nMac과 Windows에서 유휴 시 CPU 사용량이 줄었습니다."}</oink:releaseNotes></item><item><title>Oink 0.3.2</title><sparkle:version>93</sparkle:version><sparkle:shortVersionString>0.3.2</sparkle:shortVersionString><oink:sha256>6adbc577e9ddec40b190585e39e4e5dcf3aabcc0284ad7fab0551f3dfc2a2995</oink:sha256><sparkle:minimumSystemVersion>14.2</sparkle:minimumSystemVersion><enclosure url="https://github.com/oinkvm/oink/releases/download/v0.3.2/Oink-0.3.2-93-macos-arm64.zip" length="41417172" type="application/octet-stream" sparkle:edSignature="WYtEVBXtwRKXKppT912NbUXEYP9ovyUE+5v0msnGs5mnLwaf/90dMsk4vjNoTbb53uV0MUPEpNJjs4R85q+ACQ=="></enclosure><description xml:lang="en" sparkle:format="plain-text">Use Oink at the Windows sign-in screen: when Launch at login is on, your other devices can also control the sign-in screen that appears after Windows starts.
 "Take the foreground when the pointer leaves" on Windows is now off by default. You can turn it back on in Settings.
 Fixed keys typed on a Windows computer not reaching the other computer after the pointer moved there when "Take the foreground when the pointer leaves" was on; an input method box could appear on the Windows computer instead.
 Fixed images dragged from another computer into Chrome and other browsers on Windows failing to load.
@@ -181,6 +229,6 @@ Windows updates now clean up their downloaded files after installing.</descripti
 修复 Windows 电脑繁忙时配对有时无法完成的问题。
 修复音频转发偶尔无法启动或无法恢复静音的问题。
 Windows 更新安装完成后会清理下载的文件。</description><oink:releaseNotes>{"en":"Gaps between screens now close up only after you move or resize a screen yourself; a new toolbar button turns this off.\nUpdates now open as a dialog in the main window, with download progress in the title bar and on the Cancel download button.\nDiagnostics has a new audio quality chart showing buffer, bitrate and dropouts per device over the last minute, with each dropout marked on the chart.\nOn Windows without native touchpad input support, multi-finger gestures fall back to standard shortcuts and the touchpad setting is hidden.\nFixed offline screens being hard to see in dark mode.\nFixed the settings page background and content appearing at different times.\nFixed pairing on Windows sometimes failing to finish when the computer is busy.\nFixed a rare case where audio forwarding could fail to start or restore muting.\nWindows updates now clean up their downloaded files after installing.","zh-Hans":"屏幕之间的缝隙现在只会在你手动移动或调整屏幕后自动收拢，工具栏新增按钮可以关闭这个功能。\n更新改为在主窗口中以对话框显示，下载进度显示在标题栏和\"取消下载\"按钮上。\n诊断页新增音频质量图表，显示最近一分钟内每台设备的缓冲、码率和断音情况，并在图上标出每次断音。\n不支持原生触控板输入的 Windows 电脑上，多指手势改用标准快捷键，并隐藏触控板设置。\n修复深色模式下离线屏幕难以看清的问题。\n修复设置页背景和内容出现时间不一致的问题。\n修复 Windows 电脑繁忙时配对有时无法完成的问题。\n修复音频转发偶尔无法启动或无法恢复静音的问题。\nWindows 更新安装完成后会清理下载的文件。"}</oink:releaseNotes></item><item><title>Oink 0.1.2</title><sparkle:version>32</sparkle:version><sparkle:shortVersionString>0.1.2</sparkle:shortVersionString><oink:sha256>58c639e356c054e07a3741eb212a98aafae40b6816fe30302c0c6aaa66f93846</oink:sha256><sparkle:minimumSystemVersion>14.2</sparkle:minimumSystemVersion><enclosure url="https://github.com/oinkvm/oink/releases/download/v0.1.2/Oink-0.1.2-32-macos-arm64.zip" length="35257602" type="application/octet-stream" sparkle:edSignature="dSynyAmBMdKDc3JLuieIZf2W6/CDCZp/Js2Z6SSOtlRjKruGUq3ZA/YFadPHzlUMbPOGiswl7QFC19rZFlzKDQ=="></enclosure><description xml:lang="en" sparkle:format="plain-text">Fixed devices sometimes being unable to reconnect until Oink restarts, after a relayed connection switches to direct. Removed the edge-resistance release after the mouse stays still for 100 ms; edge resistance now always applies as in 0.1.0. The Windows MSI remains unsigned.</description><description xml:lang="zh-Hans" sparkle:format="plain-text">修复中继连接切换为直连后，设备有时必须重启 Oink 才能重新连接的问题。移除鼠标在边缘静止 100 毫秒后释放阻力的行为；边缘阻力现在与 0.1.0 一样始终生效。Windows MSI 仍未签名。</description><oink:releaseNotes>{"en":"Fixed devices sometimes being unable to reconnect until Oink restarts, after a relayed connection switches to direct. Removed the edge-resistance release after the mouse stays still for 100 ms; edge resistance now always applies as in 0.1.0. The Windows MSI remains unsigned.","zh-Hans":"修复中继连接切换为直连后，设备有时必须重启 Oink 才能重新连接的问题。移除鼠标在边缘静止 100 毫秒后释放阻力的行为；边缘阻力现在与 0.1.0 一样始终生效。Windows MSI 仍未签名。"}</oink:releaseNotes></item><title>Oink updates</title></channel></rss><!-- sparkle-signatures:
-edSignature: THjXsuam7MmCJkAQCbxxRC4+YBd/aWHhF8SNNETtknH+7RVXTcVCsVG3Y4JEyYyotFA3EG4IaAmL//yuDShVAg==
-length: 69122
+edSignature: ps8utVGKBhw8DxYcoffa2PqsMKrwgtQze3kZ2AaVqIf722/ifs5H4Hk2OKZQSu8jcEKigfP9CMOllBZ7tqlfAg==
+length: 80983
 -->
