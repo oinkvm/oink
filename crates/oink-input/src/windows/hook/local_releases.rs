@@ -7,6 +7,7 @@ use windows::Win32::UI::WindowsAndMessaging::{WM_KEYUP, WM_SYSKEYUP};
 #[derive(Clone, Copy)]
 pub(super) struct Release {
     code: KeyCode,
+    output: KeyCode,
     generation: u64,
     info: KBDLLHOOKSTRUCT,
     time_us: u64,
@@ -51,8 +52,14 @@ pub(super) fn capture(message: u32, info: &KBDLLHOOKSTRUCT) -> Option<Release> {
     }
     let code = keymap::scancode_to_hid(keyboard_scancode(info)?)?;
     let generation = LEDGER.with_borrow(|ledger| ledger.passed.get(&code).copied())?;
+    // The physical identity is stable across a NumLock transition, while the
+    // routed HID meaning must match the original DOWN.
+    let output = with_state(|st| st.key_outputs.get(&code.0).copied())
+        .flatten()
+        .unwrap_or(code);
     Some(Release {
         code,
+        output,
         generation,
         info: *info,
         time_us: time_us(Instant::now()),
@@ -75,7 +82,7 @@ fn attempt(release: Release) -> Option<bool> {
     }
     let event = CapturedEvent {
         event: InputEvent::Key {
-            code: release.code,
+            code: release.output,
             pressed: false,
         },
         physical: false,
@@ -98,6 +105,7 @@ fn attempt(release: Release) -> Option<bool> {
         // work. Thus no new native DOWN can overtake this press retirement.
         with_state(|st| {
             st.keys.remove(&release.code.0);
+            st.key_outputs.remove(&release.code.0);
             st.continuity.observe(&event.event);
         });
         external::retire_physical_key(release.code);

@@ -24,6 +24,7 @@ Oink 0.3.4 adds automatic unlock, Paste as File and layout shortcuts, and fixes 
 - Fixed pairing occasionally failing.
 - Fixed the audio warning still being shown after audio output recovers.
 - Fixed the pitch of forwarded audio jumping after quiet passages.
+- Fixed Num Lock not taking effect on the remote device.
 - Fixed some UI issues.
 
 ## Compatibility

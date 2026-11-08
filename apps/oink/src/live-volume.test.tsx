@@ -73,6 +73,7 @@ afterEach(() => { backend.harness?.stop(); cleanup(); agent.reset(); vi.useRealT
 
 it('sets the exit volume while dragging, coalesced, and lands the release value', async () => {
   const { container } = render(<App/>);
+  await act(async () => { await vi.advanceTimersByTimeAsync(50); });
   const slider = container.querySelector<HTMLElement>('[role="slider"]')!;
   slider.getBoundingClientRect = () => ({ left: 0, top: 0, x: 0, y: 0, width: 100, height: 20, right: 100, bottom: 20, toJSON() {} });
   fireEvent.pointerDown(slider, { button: 0, clientX: 41, pointerId: 1 });
@@ -96,6 +97,7 @@ it('sets the exit volume while dragging, coalesced, and lands the release value'
 
 it('applies keyboard steps at once through the same coalescing', async () => {
   const { container } = render(<App/>);
+  await act(async () => { await vi.advanceTimersByTimeAsync(50); });
   const slider = container.querySelector<HTMLElement>('[role="slider"]')!;
   for (let i = 0; i < 10; i++) fireEvent.keyDown(slider, { key: 'ArrowUp' });
   expect(slider.getAttribute('aria-valuenow')).toBe('50');

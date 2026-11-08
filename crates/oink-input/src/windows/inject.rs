@@ -518,4 +518,36 @@ mod tests {
         }
         assert!(key(KeyCode::keyboard(0x01), true).is_none());
     }
+
+    #[test]
+    fn numpad_digits_and_decimal_inject_with_vk_and_original_scan() {
+        let ki = |i: INPUT| {
+            // SAFETY: 读取刚构造的联合体的 ki 成员。
+            unsafe { i.Anonymous.ki }
+        };
+        let expected = [
+            (0x59, 0x4F, 0x61),
+            (0x5A, 0x50, 0x62),
+            (0x5B, 0x51, 0x63),
+            (0x5C, 0x4B, 0x64),
+            (0x5D, 0x4C, 0x65),
+            (0x5E, 0x4D, 0x66),
+            (0x5F, 0x47, 0x67),
+            (0x60, 0x48, 0x68),
+            (0x61, 0x49, 0x69),
+            (0x62, 0x52, 0x60),
+            (0x63, 0x53, 0x6E),
+        ];
+        for (usage, scan, vk) in expected {
+            for pressed in [true, false] {
+                let ki = ki(key(KeyCode::keyboard(usage), pressed).unwrap());
+                assert_eq!(
+                    (ki.wVk.0, ki.wScan, ki.dwFlags),
+                    (vk, scan, if pressed { KEYBD_EVENT_FLAGS(0) } else { KEYEVENTF_KEYUP }),
+                    "HID 0x{usage:02X}"
+                );
+                assert!(!ki.dwFlags.contains(KEYEVENTF_SCANCODE));
+            }
+        }
+    }
 }

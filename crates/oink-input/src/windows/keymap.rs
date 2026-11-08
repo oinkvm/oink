@@ -28,6 +28,13 @@ const fn k(usage: u16, scancode: u16) -> KeyEntry {
         vk: 0,
     }
 }
+const fn k_vk(usage: u16, scancode: u16, vk: u16) -> KeyEntry {
+    KeyEntry {
+        hid: ((KeyCode::PAGE_KEYBOARD as u32) << 16) | usage as u32,
+        scancode,
+        vk,
+    }
+}
 const fn c(usage: u16, scancode: u16, vk: u16) -> KeyEntry {
     KeyEntry {
         hid: ((KeyCode::PAGE_CONSUMER as u32) << 16) | usage as u32,
@@ -60,6 +67,21 @@ pub(crate) fn local_brightness_key(scancode: u16) -> Option<KeyCode> {
 
 const VK_PAUSE: u16 = 0x13;
 
+// VK_NUMPAD* and VK_DECIMAL make SendInput independent of the receiver's
+// NumLock state. The scan code is retained so low-level hooks still identify
+// the physical key (and so this remains compatible with the existing mapping).
+const VK_NUMPAD0: u16 = 0x60;
+const VK_NUMPAD1: u16 = 0x61;
+const VK_NUMPAD2: u16 = 0x62;
+const VK_NUMPAD3: u16 = 0x63;
+const VK_NUMPAD4: u16 = 0x64;
+const VK_NUMPAD5: u16 = 0x65;
+const VK_NUMPAD6: u16 = 0x66;
+const VK_NUMPAD7: u16 = 0x67;
+const VK_NUMPAD8: u16 = 0x68;
+const VK_NUMPAD9: u16 = 0x69;
+const VK_DECIMAL: u16 = 0x6E;
+
 /// 主表。同一个扫描码出现多次时，**靠前的条目**用于「扫描码 → HID」反查。
 #[rustfmt::skip]
 pub(crate) const TABLE: &[KeyEntry] = &[
@@ -88,8 +110,10 @@ pub(crate) const TABLE: &[KeyEntry] = &[
     k(0x4E, 0xE051), k(0x4F, 0xE04D), k(0x50, 0xE04B), k(0x51, 0xE050), k(0x52, 0xE048),
     // 小键盘
     k(0x53, 0xE045), k(0x54, 0xE035), k(0x55, 0x37), k(0x56, 0x4A), k(0x57, 0x4E), k(0x58, 0xE01C),
-    k(0x59, 0x4F), k(0x5A, 0x50), k(0x5B, 0x51), k(0x5C, 0x4B), k(0x5D, 0x4C), k(0x5E, 0x4D),
-    k(0x5F, 0x47), k(0x60, 0x48), k(0x61, 0x49), k(0x62, 0x52), k(0x63, 0x53),
+    k_vk(0x59, 0x4F, VK_NUMPAD1), k_vk(0x5A, 0x50, VK_NUMPAD2), k_vk(0x5B, 0x51, VK_NUMPAD3),
+    k_vk(0x5C, 0x4B, VK_NUMPAD4), k_vk(0x5D, 0x4C, VK_NUMPAD5), k_vk(0x5E, 0x4D, VK_NUMPAD6),
+    k_vk(0x5F, 0x47, VK_NUMPAD7), k_vk(0x60, 0x48, VK_NUMPAD8), k_vk(0x61, 0x49, VK_NUMPAD9),
+    k_vk(0x62, 0x52, VK_NUMPAD0), k_vk(0x63, 0x53, VK_DECIMAL),
     // IntlBackslash ContextMenu Power NumpadEqual
     k(0x64, 0x56), k(0x65, 0xE05D), k(0x66, 0xE05E), k(0x67, 0x59),
     // F13..F24
@@ -189,6 +213,27 @@ pub(crate) fn lookup_hid(code: KeyCode) -> Option<&'static KeyEntry> {
     TABLE.iter().find(|e| e.hid == code.0)
 }
 
+/// Translate a numpad physical key to its navigation meaning as reported by
+/// `KBDLLHOOKSTRUCT::vkCode` when the local NumLock is off. This deliberately
+/// consumes the vkCode supplied by the hook instead of querying async state;
+/// a held key therefore remains paired by its physical scan code.
+pub(crate) fn numpad_navigation(scancode: u16, vk: u32) -> Option<KeyCode> {
+    let usage = match (scancode, vk) {
+        (0x4F, 0x23) => 0x4D, // End
+        (0x50, 0x28) => 0x51, // Down
+        (0x51, 0x22) => 0x4E, // PageDown
+        (0x4B, 0x25) => 0x50, // Left
+        (0x4D, 0x27) => 0x4F, // Right
+        (0x47, 0x24) => 0x4A, // Home
+        (0x48, 0x26) => 0x52, // Up
+        (0x49, 0x21) => 0x4B, // PageUp
+        (0x52, 0x2D) => 0x49, // Insert
+        (0x53, 0x2E) => 0x4C, // Delete
+        _ => return None,
+    };
+    Some(KeyCode::keyboard(usage))
+}
+
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
@@ -280,6 +325,48 @@ mod tests {
         for e in TABLE.iter().filter(|e| (e.hid >> 16) as u16 == KeyCode::PAGE_CONSUMER) {
             assert_ne!(e.vk, 0, "Consumer 0x{:X} 缺少虚拟键", e.hid & 0xFFFF);
             assert_eq!(e.scancode >> 8, 0xE0);
+        }
+    }
+
+    #[test]
+    fn numpad_navigation_table_matches_windows_vk_codes() {
+        let cases = [
+            (0x4F, 0x23, 0x4D),
+            (0x50, 0x28, 0x51),
+            (0x51, 0x22, 0x4E),
+            (0x4B, 0x25, 0x50),
+            (0x4D, 0x27, 0x4F),
+            (0x47, 0x24, 0x4A),
+            (0x48, 0x26, 0x52),
+            (0x49, 0x21, 0x4B),
+            (0x52, 0x2D, 0x49),
+            (0x53, 0x2E, 0x4C),
+        ];
+        for (scan, vk, usage) in cases {
+            assert_eq!(numpad_navigation(scan, vk), Some(KeyCode::keyboard(usage)));
+        }
+        assert_eq!(numpad_navigation(0x4C, 0x0C), None); // Numpad 5 / Clear
+        assert_eq!(numpad_navigation(0x4F, VK_NUMPAD1 as u32), None);
+    }
+
+    #[test]
+    fn numpad_digits_and_decimal_use_virtual_keys() {
+        let expected = [
+            (0x59, 0x4F, VK_NUMPAD1),
+            (0x5A, 0x50, VK_NUMPAD2),
+            (0x5B, 0x51, VK_NUMPAD3),
+            (0x5C, 0x4B, VK_NUMPAD4),
+            (0x5D, 0x4C, VK_NUMPAD5),
+            (0x5E, 0x4D, VK_NUMPAD6),
+            (0x5F, 0x47, VK_NUMPAD7),
+            (0x60, 0x48, VK_NUMPAD8),
+            (0x61, 0x49, VK_NUMPAD9),
+            (0x62, 0x52, VK_NUMPAD0),
+            (0x63, 0x53, VK_DECIMAL),
+        ];
+        for (usage, scan, vk) in expected {
+            let entry = lookup_hid(KeyCode::keyboard(usage)).unwrap();
+            assert_eq!((entry.scancode, entry.vk), (scan, vk));
         }
     }
 }

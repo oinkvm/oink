@@ -327,6 +327,10 @@ struct State {
     raw: RawTracker,
     /// 按下中的键 → 按下事件是否被吞掉（识别自动重复、保证本机不卡键）。
     keys: HashMap<u32, bool>,
+    /// Physical key identity → HID emitted for its original DOWN. Numpad
+    /// navigation and digit meanings can differ on a later UP if NumLock was
+    /// toggled while the key was held; release the original emitted key.
+    key_outputs: HashMap<u32, KeyCode>,
     passed_modifiers: crate::windows_keyboard_trace::PassedModifiers,
     continuity: crate::capture_continuity::CaptureContinuity,
     /// 鼠标钩子最近一次被调用，供鼠标看门狗核对。
@@ -780,6 +784,7 @@ fn run(
                 hwnd,
                 raw: RawTracker::default(),
                 keys: HashMap::new(),
+                key_outputs: HashMap::new(),
                 passed_modifiers: Default::default(),
                 continuity: Default::default(),
                 last_mouse_hook: Instant::now(),
@@ -869,6 +874,7 @@ fn run(
                             st.uninstall_hooks();
                             rawinput::unregister();
                             st.keys.clear();
+                            st.key_outputs.clear();
                             st.passed_modifiers = Default::default();
                             key_releases::clear();
                             external::gap();
@@ -1187,8 +1193,14 @@ enum Prepared {
         force_swallow: bool,
         force_pass: bool,
         /// 按键按下：回调后记录是否被吞掉。
-        track_key: Option<u32>,
+        track_key: Option<KeyTrack>,
     },
+}
+
+#[derive(Clone, Copy)]
+struct KeyTrack {
+    physical: u32,
+    output: KeyCode,
 }
 
 impl State {
@@ -1942,7 +1954,7 @@ impl State {
             // disabled-key fallback for otherwise unmapped hardware keys.
             return if remote { Prepared::Swallow } else { Prepared::Pass };
         };
-        let Some(code) = keymap::scancode_to_hid(sc).or_else(|| {
+        let Some(physical_code) = keymap::scancode_to_hid(sc).or_else(|| {
             (physical_keyboard(info) && crate::capture_loop::keyboard_disabled()).then_some(KeyCode::new(0xFFAB, sc))
         }) else {
             tracing::debug!(remote, pressed, mapped = false, "keyboard hook translation");
@@ -1953,11 +1965,27 @@ impl State {
             remote,
             pressed,
             mapped = true,
-            modifier = code.is_modifier(),
+            modifier = physical_code.is_modifier(),
             injected = info.flags.0 & LLKHF_INJECTED.0 != 0,
-            repeat = pressed && self.keys.contains_key(&code.0),
+            repeat = pressed && self.keys.contains_key(&physical_code.0),
             "keyboard hook translation"
         );
+        // Windows has already applied its local NumLock state to vkCode. Use
+        // that result only for the numpad navigation ambiguity; do not call
+        // GetKeyState from this callback. Held bookkeeping remains keyed by
+        // the physical HID/scancode below.
+        let code = if pressed {
+            if let Some(&held) = self.key_outputs.get(&physical_code.0) {
+                held
+            } else {
+                keymap::numpad_navigation(sc, info.vkCode).unwrap_or(physical_code)
+            }
+        } else {
+            self.key_outputs
+                .get(&physical_code.0)
+                .copied()
+                .unwrap_or_else(|| keymap::numpad_navigation(sc, info.vkCode).unwrap_or(physical_code))
+        };
         let source = if external::key_origin(info) == crate::windows_external_input::Origin::External {
             SourceKind::Unknown
         } else {
@@ -1974,7 +2002,7 @@ impl State {
         // repeat suppression belong to the source router, never GetKeyState's
         // toggle bit (which describes lock state rather than a held key).
         let (track_key, force_pass) = if pressed {
-            if let Some(&swallowed) = self.keys.get(&code.0) {
+            if let Some(&swallowed) = self.keys.get(&physical_code.0) {
                 // 系统的自动重复（同一个键没有抬起又按下）：上报给路由，发往远端的键逐个转发
                 // （重复只在源机产生）；吞掉还是放行与首次按下一致。
                 return Prepared::Event {
@@ -1985,16 +2013,23 @@ impl State {
                     track_key: None,
                 };
             }
-            (Some(code.0), false)
+            (
+                Some(KeyTrack {
+                    physical: physical_code.0,
+                    output: code,
+                }),
+                false,
+            )
         } else {
             // 按下时交给了本机的键，抬起也必须交给本机，否则本机卡键
-            let passed = self.keys.remove(&code.0) == Some(false);
-            if passed && !event.physical && local_releases::physical_passed(code) {
+            let passed = self.keys.remove(&physical_code.0) == Some(false);
+            self.key_outputs.remove(&physical_code.0);
+            if passed && !event.physical && local_releases::physical_passed(physical_code) {
                 // Forwarded external UPs already enter normal source routing.
                 // Close only the matched native local physical observation too.
-                external::retire_physical_key(code);
+                external::retire_physical_key(physical_code);
             }
-            local_releases::forget(code);
+            local_releases::forget(physical_code);
             (None, passed)
         };
         Prepared::Event {
@@ -2316,6 +2351,7 @@ fn capture_availability_changed(desktop_changed: bool) {
         }
         st.touchpad.cancel_all();
         st.keys.clear();
+        st.key_outputs.clear();
         st.passed_modifiers = Default::default();
         key_releases::clear();
         external::gap();
@@ -2355,7 +2391,10 @@ fn capture_availability_changed(desktop_changed: bool) {
             || call_handler(&handler, &event),
         );
         if let InputEvent::Key { code, pressed: true } = event.event {
-            with_state(|st| st.keys.insert(code.0, disposition == Disposition::Swallow));
+            with_state(|st| {
+                st.keys.insert(code.0, disposition == Disposition::Swallow);
+                st.key_outputs.insert(code.0, code);
+            });
         }
     }
 }
@@ -2412,12 +2451,12 @@ fn finish(prepared: Option<Prepared>) -> bool {
                     }
                 });
             }
-            if let Some(code) = track_key {
+            if let Some(track) = track_key {
                 with_state(|st| {
-                    local_releases::first_down(KeyCode(code), event.physical && !swallow);
-                    st.keys.insert(code, swallow);
-                    st.passed_modifiers
-                        .first_down(KeyCode(code), event.physical && !swallow);
+                    local_releases::first_down(KeyCode(track.physical), event.physical && !swallow);
+                    st.keys.insert(track.physical, swallow);
+                    st.key_outputs.insert(track.physical, track.output);
+                    st.passed_modifiers.first_down(track.output, event.physical && !swallow);
                 });
             }
             swallow
@@ -2914,6 +2953,81 @@ static REMOTE_KEY_PASSED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 mod tests {
     use super::*;
 
+    fn key_info(scan: u32, vk: u32) -> KBDLLHOOKSTRUCT {
+        KBDLLHOOKSTRUCT {
+            scanCode: scan,
+            vkCode: vk,
+            ..Default::default()
+        }
+    }
+
+    fn prepared_key(state: &mut State, scan: u32, vk: u32, pressed: bool) -> (CapturedEvent, Option<KeyTrack>) {
+        use windows::Win32::UI::WindowsAndMessaging::WM_KEYUP;
+        let msg = if pressed { WM_KEYDOWN } else { WM_KEYUP };
+        let Prepared::Event { event, track_key, .. } = state.prepare_key(msg, &key_info(scan, vk), Instant::now())
+        else {
+            panic!("numpad event must reach routing");
+        };
+        (event, track_key)
+    }
+
+    #[test]
+    fn numpad_navigation_vk_selects_navigation_when_numlock_is_off() {
+        let mut state = remote_state();
+        let (event, track) = prepared_key(&mut state, 0x4F, 0x23, true);
+        assert_eq!(
+            event.event,
+            InputEvent::Key {
+                code: KeyCode::keyboard(0x4D), // End
+                pressed: true
+            }
+        );
+        assert_eq!(
+            track.map(|key| (key.physical, key.output)),
+            Some((KeyCode::keyboard(0x59).0, KeyCode::keyboard(0x4D)))
+        );
+    }
+
+    #[test]
+    fn numpad_navigation_vk_selects_digit_when_numlock_is_on() {
+        let mut state = remote_state();
+        let (event, track) = prepared_key(&mut state, 0x4F, 0x61, true);
+        assert_eq!(
+            event.event,
+            InputEvent::Key {
+                code: KeyCode::keyboard(0x59), // Numpad 1
+                pressed: true
+            }
+        );
+        assert_eq!(
+            track.map(|key| (key.physical, key.output)),
+            Some((KeyCode::keyboard(0x59).0, KeyCode::keyboard(0x59)))
+        );
+    }
+
+    #[test]
+    fn numpad_up_uses_down_output_when_numlock_changes_while_held() {
+        let mut state = remote_state();
+        let (_, Some(track)) = prepared_key(&mut state, 0x4F, 0x23, true) else {
+            panic!("numpad DOWN must be tracked");
+        };
+        state.keys.insert(track.physical, true);
+        state.key_outputs.insert(track.physical, track.output);
+
+        // The physical key is released after NumLock is enabled, so vkCode is
+        // now VK_NUMPAD1. Its UP must still release the End sent on DOWN.
+        let (event, _) = prepared_key(&mut state, 0x4F, 0x61, false);
+        assert_eq!(
+            event.event,
+            InputEvent::Key {
+                code: KeyCode::keyboard(0x4D), // End
+                pressed: false
+            }
+        );
+        assert!(state.keys.is_empty());
+        assert!(state.key_outputs.is_empty());
+    }
+
     #[test]
     fn right_shift_hook_translation_preserves_down_repeat_up_with_extended_flag() {
         use windows::Win32::UI::WindowsAndMessaging::{KBDLLHOOKSTRUCT_FLAGS, WM_KEYUP};
@@ -2937,8 +3051,9 @@ mod tests {
                     }
                 );
                 assert_eq!(event.physical, flags & LLKHF_INJECTED.0 == 0);
-                if let Some(code) = track_key {
-                    state.keys.insert(code, true);
+                if let Some(track) = track_key {
+                    state.keys.insert(track.physical, true);
+                    state.key_outputs.insert(track.physical, track.output);
                 }
             }
             assert!(state.keys.is_empty());
@@ -3217,6 +3332,7 @@ mod tests {
             relative_requested: false,
             drag_anchor: None,
             keys: HashMap::new(),
+            key_outputs: HashMap::new(),
             passed_modifiers: Default::default(),
             continuity: Default::default(),
             last_mouse_hook: now,
@@ -4043,7 +4159,17 @@ mod tests {
             Disposition::Pass
         });
         let code = crate::KeyCode::keyboard(0x6e);
-        for (pressed, track_key) in [(true, Some(code.0)), (true, None), (false, None)] {
+        for (pressed, track_key) in [
+            (
+                true,
+                Some(KeyTrack {
+                    physical: code.0,
+                    output: code,
+                }),
+            ),
+            (true, None),
+            (false, None),
+        ] {
             assert!(!finish(Some(Prepared::Event {
                 event: CapturedEvent {
                     physical: false,
