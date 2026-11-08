@@ -4,7 +4,8 @@ import { cleanup, fireEvent, render } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PinInput } from 'oink-ui';
 import { readFileSync } from 'node:fs';
-const pinCss = readFileSync('../../node_modules/oink-ui/dist/styles/pin-input.css', 'utf8');
+import { createRequire } from 'node:module';
+const pinCss = readFileSync(createRequire(import.meta.url).resolve('oink-ui/styles/pin-input.css'), 'utf8');
 const pairingCss = readFileSync('src/pairing/pairing.css', 'utf8');
 afterEach(cleanup);
 function Input({ complete }: { complete: (code: string) => void }) {

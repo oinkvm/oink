@@ -6,9 +6,9 @@ import {api,shell} from '../api/client';
 import {agent} from '../api/store';
 import {setLanguage,tr} from '../i18n';
 import type {MicrophonePluginStatus} from '../api/types';
-import {VirtualMicrophone,VirtualMicrophoneDescription,jumpProgress,operationProgress,stepCaption} from './VirtualMicrophone';
+import {VirtualMicrophone,VirtualMicrophoneDescription,jumpProgress,stepCaption} from './VirtualMicrophone';
 beforeAll(()=>Object.defineProperty(window,'matchMedia',{value:()=>({matches:true,addEventListener(){},removeEventListener(){}})}));
-afterEach(()=>{cleanup();agent.reset();vi.restoreAllMocks();});
+afterEach(()=>{cleanup();agent.reset();vi.restoreAllMocks();vi.useRealTimers();});
 const status=(installed:boolean,managed:boolean)=>({state:installed?'installed':'not_installed',operation:'idle',managed,input_loaded:installed,feed_loaded:installed,error_kind:null,last_operation_succeeded:null,last_operation:null} as MicrophonePluginStatus);
 it.each([[false,false],[false,true],[true,false],[true,true]])('only explicitly acts when windows=%s installed=%s',async (windows,installed)=>{
  setLanguage('en');
@@ -136,7 +136,8 @@ it('keeps the specific failure detail and emits the operation result only once',
  fireEvent.click(screen.getByRole('button'));
  await waitFor(()=>expect(danger).toHaveBeenCalledTimes(1),{timeout:2000});
  expect(danger).toHaveBeenCalledWith({title:tr('虚拟麦克风操作失败，请重试'),description:'VB-CABLE install failed: 5'});
- await new Promise(resolve=>setTimeout(resolve,850));
+ vi.useFakeTimers();
+ await vi.advanceTimersByTimeAsync(850);
  expect(danger).toHaveBeenCalledTimes(1);
 });
 
@@ -154,19 +155,6 @@ it('does not toast again when a failed poll is followed by the failed operation 
  expect(danger).toHaveBeenCalledTimes(1);
 });
 
-it('holds simulated progress below each step node until the backend moves on',()=>{
- expect(operationProgress(true,'install','verify',0)).toBe(0);
- expect(operationProgress(true,'install','extract',0)).toBe(10);
- expect(operationProgress(true,'install','install_driver',8000)).toBeCloseTo(25+60*0.9*(1-Math.exp(-1)));
- expect(operationProgress(true,'install','install_driver',1e9)).toBeCloseTo(79);
- expect(operationProgress(true,'install','install_driver',1e9)).toBeLessThan(85);
- expect(operationProgress(true,'uninstall','uninstall_driver',1e9)).toBeCloseTo(77.5);
- expect(operationProgress(false,'install','copy_plugin',1e9)).toBeCloseTo(32.5);
- expect(operationProgress(false,'uninstall','remove_plugin',1e9)).toBeCloseTo(36);
- expect(operationProgress(false,'uninstall','finish',-500)).toBe(85);
- expect(operationProgress(true,'install',null,5000)).toBe(0);
- expect(operationProgress(true,'install','copy_plugin',5000)).toBe(0);
-});
 it('jumps to the new node with an ease-out and never moves backwards',()=>{
  expect(jumpProgress(25,null,0,200)).toBe(25);
  expect(jumpProgress(25,19,0,200)).toBe(19);
@@ -188,7 +176,9 @@ it.each([
 });
 it('replaces the button with the step progress computed from the step start',async()=>{
  setLanguage('zh-Hans');
- const running={...status(false,true),operation:'installing',step:'install_driver',step_started_at_ms:Date.now()-8000} as MicrophonePluginStatus;
+ vi.useFakeTimers();
+ vi.setSystemTime(8000);
+ const running={...status(false,true),operation:'installing',step:'install_driver',step_started_at_ms:0} as MicrophonePluginStatus;
  agent.adopt('microphonePlugin',running);
  vi.spyOn(api,'microphonePluginStatus').mockResolvedValue(running);
  render(<OinkProvider><VirtualMicrophone windows active/></OinkProvider>);

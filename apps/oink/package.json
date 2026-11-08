@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "test": "vitest run",
+    "test:slow": "vitest run --config vitest.slow.config.ts",
     "typecheck": "tsc --noEmit",
     "tauri": "tauri"
   },

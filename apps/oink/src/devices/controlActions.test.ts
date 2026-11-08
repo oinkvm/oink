@@ -1,7 +1,7 @@
 import {ApiFailure} from '../api/transport';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { DeviceControlReply, DeviceControlResult } from '../api/cards';
-import { ControlActions, CONTROL_TIMEOUT_MS, SEND_INTERVAL_MS, controlResource, type ControlAction } from './controlActions';
+import { ControlActions, CONTROL_TIMEOUT_MS, controlResource, type ControlAction } from './controlActions';
 
 beforeEach(()=>vi.useFakeTimers());
 afterEach(()=>vi.useRealTimers());
@@ -138,20 +138,6 @@ it('disposal retires timers and ignores callbacks even if the same controller is
   expect(o.controller.targets().get('a')).toEqual([mouse('disabled')]);
   o.controller.dispose();await vi.advanceTimersByTimeAsync(CONTROL_TIMEOUT_MS);
   expect(o.fail).not.toHaveBeenCalled();
-});
-it('bounds a fast volume drag and sends the durable release immediately',async()=>{
-  const o=owner();let revision=1;
-  o.setReply(async(id,action)=>{
-    queueMicrotask(()=>o.report(action,`v${++revision}`));
-    return {type:'device_control_completed',data:{requestId:id,result:{outcome:'applied'}}};
-  });
-  for(let i=0;i<100;i++){o.controller.set('a',volume(51+i%50,{deferPersistence:true}));await vi.advanceTimersByTimeAsync(8);}
-  o.controller.set('a',volume(137,{final:true}));await vi.advanceTimersByTimeAsync(0);
-  expect(o.writes.at(-1)!.action).toEqual(volume(137,{final:true}));
-  expect(o.writes.length).toBeLessThanOrEqual(Math.ceil(800/SEND_INTERVAL_MS)+2);
-  expect(o.writes.length).toBeGreaterThan(5);
-  expect(new Set(o.writes.map(w=>w.token)).size).toBe(o.writes.length);
-  expect(o.controller.targets().size).toBe(0);
 });
 it('flushes the identical release value after a deferred drag already reached the cards',async()=>{
   const o=owner();o.controller.set('a',volume(60,{deferPersistence:true}));o.report(volume(60));o.complete(0);

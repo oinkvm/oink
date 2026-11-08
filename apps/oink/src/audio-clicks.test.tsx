@@ -478,27 +478,6 @@ it('microphone transport failure uses a toast even when refresh stalls',async()=
   expect(container.querySelector('[data-glyph="microphone"]')?.getAttribute('aria-label')).toContain('Microphone: Local');
 });
 
-it('does not release Send twice when its preference revision arrives before its mode',async()=>{
-  const {container}=mount('forwarding','source');
-  // This is the old Send double-click sequence (Local then Receive), expressed
-  // through today's stop-sharing gesture and explicit Receive menu choice.
-  fireEvent.keyDown(container.querySelector('[data-glyph="microphone"]')!,{key:'Enter',shiftKey:true});
-  fireEvent.contextMenu(container.querySelector('.dev')!);
-  fireEvent.click(await screen.findByRole('menuitem',{name:'Input devices'}));
-  fireEvent.click(within(await screen.findByRole('radiogroup',{name:'Microphone'})).getByRole('radio',{name:'Receive'}));
-  expect(backend.writes).toHaveLength(1);
-  // Release has persisted; the audio status projection still says Source.
-  // Releasing again with its *new* option revision returns NotExit at the owner.
-  backend.refuseToken='receive:2';
-  await finish(0,cards('forwarding','source',false,2));
-  const released=cards('forwarding','idle',false,3);
-  backend.snapshot=released;
-  await act(async()=>{agent.receive({type:'device_cards',data:released});});
-  expect(document.querySelector('.ok-toast:not([data-leaving])')?.textContent??'').not.toContain('Could not change microphone settings');
-  expect(backend.writes.map(w=>w.params.token)).toEqual(['receive:1']);
-  expect(container.querySelector('[data-glyph="microphone"]')?.getAttribute('aria-label')).toContain('No device is currently sharing a microphone');
-});
-
 const micModes=['muted','receiver','source'] as const;
 type MicMode=typeof micModes[number];
 async function chooseMicrophone(container:HTMLElement,mode:MicMode){

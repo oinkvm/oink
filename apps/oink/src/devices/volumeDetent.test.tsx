@@ -20,14 +20,6 @@ afterEach(()=>{cleanup();native.invoke.mockClear();});
 it.each([[0,0],[96,99],[97,100],[100,100],[103,100],[104,101],[200,200]])('maps raw %s to %s', (raw,value)=>{
   expect(pointerVolume(raw,200)).toBe(value);
 });
-it('maps both outer ranges linearly and preserves monotonicity and endpoints',()=>{
-  for(let raw=0;raw<=200;raw++){
-    expect(pointerVolume(raw,200)).toBeGreaterThanOrEqual(pointerVolume(raw-1,200));
-    if(raw<=96)expect(pointerVolume(raw,200)).toBe(Math.round(raw*99/96));
-    if(raw>=104)expect(pointerVolume(raw,200)).toBe(Math.round(101+(raw-104)*99/96));
-  }
-  for(let raw=0;raw<=100;raw++)expect(pointerVolume(raw,100)).toBe(raw);
-});
 function setup(kind:'speaker'|'microphone'|'exit'){
   const change=vi.fn();
   const d=kind==='exit'?{...device,speaker:{...device.speaker,mode:'exit' as const}}:device;

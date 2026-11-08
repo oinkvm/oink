@@ -46,5 +46,5 @@ export default defineConfig({
   },
   envPrefix: ["VITE_", "TAURI_ENV_"],
   build: { target: "es2022", outDir: "dist", emptyOutDir: true, sourcemap: symbols ? "hidden" : false },
-  test: { include: ["src/**/*.test.{ts,tsx}"], environment: "node" },
+  test: { include: ["src/**/*.test.{ts,tsx}"], exclude: ["**/*.slow.test.*"], environment: "node" },
 });

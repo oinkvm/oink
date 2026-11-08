@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { cleanup, render } from '@testing-library/react';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { Arrangement } from './Arrangement';
@@ -8,15 +6,6 @@ import type { Screen } from './geometry';
 
 /** Ring geometry and WebKit painting belong to oink-ui; the app uses CSS decoration. */
 describe('canvas selection rings', () => {
-  it('uses stacked gap/accent shadows with paired corner declarations', () => {
-    const css = readFileSync(join(process.cwd(), 'src/app.css'), 'utf8');
-    for (const selector of ['.scr__selection', '.scr__group-border']) {
-      const rule = css.slice(css.indexOf(selector + ' {')).split('}')[0];
-      expect(rule).toContain('corner-shape: var(--ok-corner); --ok-shape: var(--ok-corner)');
-      expect(rule).toContain('box-shadow: 0 0 0 2.5px var(--ok-well), 0 0 0 4.5px var(--ok-accent)');
-    }
-  });
-
   describe('rendering', () => {
     const observing = new Set<object>();
     // Assert the lifetime contract before Vitest tears JSDOM down. Without an

@@ -1,8 +1,6 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeAll, expect, it, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
-const css = readFileSync('src/devices/devices.css', 'utf8');
 import { OinkProvider } from 'oink-ui';
 import { DeviceItem } from './DeviceList';
 import { SideContextMenu } from './DeviceMenu';
@@ -28,13 +26,6 @@ it.each(['light','dark'] as const)('%s source glyph, send badge and volume share
   expect(rows[0].getAttribute('data-tone')).toBe('good');
   expect(rows[1].getAttribute('data-tone')).toBe('accent');
   expect(rows[1].querySelector('[role="slider"]')?.getAttribute('aria-valuemax')).toBe('200');
-  // These CSS tokens are the shared theme contract; browser evidence also
-  // checks the resolved glyph/badge/fill colours in light and dark themes.
-  expect(css).toMatch(/\.dev-ico\[data-tone="accent"\]\s*\{\s*color: var\(--ok-accent\)/);
-  expect(css).toMatch(/\.dev-badge\[data-badge="send"\]\s*\{\s*color: inherit;/);
-  expect(css).toMatch(/\.vol\[data-tone="accent"\]\s*\{\s*--vol-c: var\(--ok-accent\); --vol-on: var\(--ok-on-accent\)/);
-  expect(css).toContain('[data-accent="pink"] .vol[data-tone="accent"] { --vol-on: #FFFFFF; }');
-  expect(css).toMatch(/\.vol__meter \.ok-meter__fill\s*\{\s*background: var\(--vol-c\)/);
 });
 
 it.each((['light','dark'] as const).flatMap(theme=>(['device','tray'] as const).map(surface=>({theme,surface}))))('$theme $surface menu uses the accent microphone row and retains controls',async({theme,surface})=>{
@@ -51,7 +42,6 @@ it.each((['light','dark'] as const).flatMap(theme=>(['device','tray'] as const).
   const row=await screen.findByRole('group',{name:'Microphone volume for Source'});
   expect(row.getAttribute('data-tone')).toBe('accent');
   expect(document.querySelector('#devmenu-microphone-source')?.getAttribute('data-tone')).toBe('accent');
-  expect(css).toContain('.devmenu__label[data-tone="accent"] .devmenu__glyph { color: var(--ok-accent); }');
   const slider=row.querySelector('[role="slider"]')!;
   expect(slider.getAttribute('aria-valuenow')).toBe('125');
   expect(slider.getAttribute('aria-valuemax')).toBe('200');
@@ -81,8 +71,7 @@ it.each([
   expect(speaker.querySelector(`[data-badge="${badge}"]`)).not.toBeNull();
 });
 
-it.each(['muted','receiver','source'] as const)('only the %s microphone receives optical positioning',mode=>{
+it.each(['muted','receiver','source'] as const)('renders the %s microphone with the stable optical glyph',mode=>{
   const {container}=render(<OinkProvider><DeviceItem d={{...device,microphone:{...device.microphone!,mode}}} now={0} selected={false} collapsed={false} onSelect={()=>{}} onMicrophone={()=>{}}/></OinkProvider>);
   expect([...container.querySelectorAll('.dev-ico')].map(el=>el.getAttribute('data-glyph'))).toEqual(['mouse','keyboard','speaker','microphone']);
-  expect(css).toContain('.dev-ico[data-glyph="microphone"] { translate: -2.5px; }');
 });

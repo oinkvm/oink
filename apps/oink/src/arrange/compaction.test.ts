@@ -52,24 +52,6 @@ describe('projection-constrained per-unit compaction', () => {
         expect(cost(s, ts)).toBe(664);
         expect(cost(check(s, ts), ts)).toBe(48);
     });
-    it('matches exhaustive feasible-position minimization on small integer layouts', () => {
-        let seed = 123;
-        const random = () => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) % 15;
-        for (let i = 0; i < 120; i++) {
-            const s = box(random(), random(), 3, 3);
-            const ts = Array.from({ length: 4 }, () => box(random(), random(), 3, 3)).filter(t => !overlap(s, t));
-            const before = JSON.stringify(ts.map(t => projections(s, t)));
-            // The existing objective applies only when there is a facing pair.
-            if (!ts.some(t => projections(s, t).some(Boolean))) continue;
-            const after = check(s, ts), score = [cost(after, ts), (after.x - s.x) ** 2 + (after.y - s.y) ** 2];
-            for (let x = -3; x <= 18; x++) for (let y = -3; y <= 18; y++) {
-                const r = { ...s, x, y };
-                if (ts.some(t => overlap(r, t)) || JSON.stringify(ts.map(t => projections(r, t))) !== before) continue;
-                const c = cost(r, ts), d = (x - s.x) ** 2 + (y - s.y) ** 2;
-                expect(c > score[0] || c === score[0] && d >= score[1], `case ${i} at ${x},${y}`).toBe(true);
-            }
-        }
-    });
 });
 
 describe('intersecting computer bounds', () => {

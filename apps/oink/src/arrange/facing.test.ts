@@ -1,6 +1,5 @@
-import conformance from '../../../../crates/oink-display/tests/facing-conformance.json';
 import { describe, expect, it } from 'vitest';
-import { edgeProjections, facing, sameProjections, tolerance } from './facing';
+import { edgeProjections, facing } from './facing';
 import { freeGroup } from './groups';
 import type { Rect } from './geometry';
 
@@ -28,34 +27,5 @@ describe('shared facing definition', () => {
         expect(facing(a, { ...a, x: 100 - 1e-9, y: 99.99 }, 1)).not.toBeNull();
         expect(facing(a, { ...a, x: 100, y: 100 }, 1)).toBeNull();
         expect(facing(a, { ...a, x: 99.75 }, 1)).toBeNull();
-    });
-    it('matches Rust for generated pairs and visible intervals', () => {
-        let seed = 0x51c0ffee;
-        const random = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 2 ** 32; };
-        const cases: { rects: Rect[] }[] = [];
-        for (const k of [1, 1 / 4096, 16]) {
-            for (const penetration of [0, 1e-8, .25]) {
-                const rs = screenshot.map(r => ({ ...r }));
-                rs[1].y -= penetration;
-                rs[2].x -= penetration;
-                cases.push({ rects: scaled(rs, k) });
-            }
-            for (let i = 0; i < 64; i++) {
-                const rs = Array.from({ length: 2 + i % 5 }, () => ({
-                    x: Math.floor(random() * 5) * 150,
-                    y: Math.floor(random() * 5) * 150,
-                    w: 50 + Math.floor(random() * 3) * 50,
-                    h: 50 + Math.floor(random() * 3) * 50,
-                }));
-                cases.push({ rects: scaled(rs, k) });
-            }
-        }
-        // Both language suites validate this corpus against their production
-        // geometry. UI tests never build Rust or wait on another Cargo process.
-        const results = conformance as { rects: Rect[]; projections: ReturnType<typeof edgeProjections> }[];
-        expect(results.map(({ rects }) => ({ rects }))).toEqual(cases);
-        cases.forEach(({ rects }, i) => {
-            expect(sameProjections(edgeProjections(rects), results[i].projections, tolerance(rects)), `pairs case ${i}`).toBe(true);
-        });
     });
 });

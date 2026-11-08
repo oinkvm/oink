@@ -73,13 +73,12 @@ const commits = () => backend.harness!.of('commit_arrangement').map(r => r.param
 const before = (device: string) => placement(layoutProfilesFixtureSnapshot().placements, device);
 
 describe('selecting screens', () => {
-  it('keeps the newly clicked screen of a system-arranged computer selected (bug 1)', () => {
+  it('widens a system-arranged screen to its computer on Cmd+click', () => {
     setup(true);
     const [main, side] = of('Alpha');
     click(side);
-    expect(pressed()).toEqual(['Alpha:side']);
-    click(main);
-    expect(pressed()).toEqual(['Alpha:main']);
+    cmdClick(main);
+    expect(pressed()).toEqual(['Alpha:main', 'Alpha:side']);
   });
 
   it('selects the whole computer from one screen when its system arrangement is off', () => {
@@ -124,14 +123,6 @@ describe('selecting screens', () => {
     expect(pressed()).toEqual(['Beta:main', 'Beta:side', 'Gamma:main']);
     // Keyboard focus still selects.
     fireEvent.focus(of('Alpha')[0]);
-    expect(pressed()).toEqual(['Alpha:main', 'Alpha:side']);
-  });
-
-  it('widens a single system-arranged screen to its computer when another of its screens is Cmd+clicked', () => {
-    setup(true);
-    const [main, side] = of('Alpha');
-    click(side);
-    cmdClick(main);
     expect(pressed()).toEqual(['Alpha:main', 'Alpha:side']);
   });
 

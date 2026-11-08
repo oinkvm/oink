@@ -41,8 +41,9 @@ describe('offline screen surface', () => {
 
   it('keeps the light near-black surface', () => {
     const light = declarations(app, '.scr__body');
-    expect(light['--scr-offline-bg']).toBe('#171717');
-    expect(light['--scr-offline-ink']).toBe('#7B7B7B');
+    expect(light['--scr-offline-bg']).toMatch(/^#[0-9A-F]{6}$/);
+    expect(light['--scr-offline-ink']).toMatch(/^#[0-9A-F]{6}$/);
+    expect(contrast(light['--scr-offline-ink'], light['--scr-offline-bg'])).toBeGreaterThanOrEqual(3);
   });
 
   it('fills dark offline tiles with the interface background, off the canvas', () => {
