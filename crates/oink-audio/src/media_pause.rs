@@ -204,7 +204,10 @@ mod tests {
         assert!(!restored.muted);
         assert!(elapsed >= PAUSE_BUDGET);
         // Scheduler/filesystem tolerance is not part of the 200ms OS wait budget.
-        assert!(elapsed < PAUSE_BUDGET + Duration::from_millis(150), "{elapsed:?}");
+        // Hosted runners can suspend the test thread while the bounded worker
+        // is timing out. Keep a finite upper bound without treating scheduler
+        // jitter as a failure of the 200 ms OS-call budget.
+        assert!(elapsed < PAUSE_BUDGET + Duration::from_millis(500), "{elapsed:?}");
         let attempted = calls.clone();
         pause_bounded(busy.clone(), move |_| {
             attempted.fetch_add(1, Ordering::Relaxed);

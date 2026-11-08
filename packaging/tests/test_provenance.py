@@ -36,6 +36,7 @@ class Provenance(unittest.TestCase):
                      'README.md', 'README.zh-CN.md', 'README.ja.md', 'README.ko.md',
                      'LICENSE-ADDITIONAL-TERMS.md', 'PRIVACY.md', 'THIRD_PARTY_LICENSES.md', 'licenses/native/LICENSE.md'):
             self.assertTrue(P.product_source(path), path)
+        self.assertTrue(P.product_source('tools/generate-paste-menu-icons.py'))
         for path in ('.claude/agents/developer.md', 'AGENTS.md', 'CLAUDE.md',
                      'RELEASING.md', 'docs/release/packaging.md', 'docs/nested/example.md', 'docs/example.md', 'build-support/update/README.md',
                      'crates/example/README.md', 'scripts/dev.sh', 'tools/probe/main.swift',

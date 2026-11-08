@@ -465,7 +465,7 @@ mod capability_tests {
     fn bridge_feed_gates_legacy_clients_without_changing_document_schema() {
         let release = serde_json::json!({
             "build":36,"version":"0.2.1","tag":"v0.2.1","sourceTreeSha256":"a".repeat(64),
-            "architecture":"x64","minimumWindowsBuild":19045,"protocolBaseline":1,
+            "architecture":"x64","minimumWindowsBuild":17763,"protocolBaseline":1,
             "minimumUpdaterSchema":1,"severity":"normal","notes":{"en":"Test"},
             "package":{"url":"https://example.com/test.msi","length":1,"sha256":"b".repeat(64),
                 "keyId":crate::WINDOWS_EPOCH,"ed25519":STANDARD.encode([0;64])}
@@ -493,7 +493,7 @@ mod capability_tests {
         };
         let quarantine = BTreeSet::new();
         let selection = Selection {
-            windows_build: 19045,
+            windows_build: 17763,
             architecture: "x64",
             installed_build: 36,
             successful_build: 36,

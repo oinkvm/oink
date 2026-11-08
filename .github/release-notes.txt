@@ -35,4 +35,4 @@ Oink 0.3.4 adds automatic unlock, Paste as File and layout shortcuts, and fixes 
 
 - **Mac (Apple silicon):** the `.dmg` file — macOS 14.2 or later.
 - **Mac (Intel):** the `.dmg` file marked `x64` — macOS 14.2 or later.
-- **Windows:** the `.msi` file — x64, Windows 10 22H2 (build 19045) or later, or Windows 11.
+- **Windows:** the `.msi` file — x64, Windows 10 version 1809 (build 17763) or later (versions before 22H2 are untested), or Windows 11. Windows 10 LTSC needs the WebView2 Runtime: https://developer.microsoft.com/microsoft-edge/webview2/

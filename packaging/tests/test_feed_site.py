@@ -425,7 +425,7 @@ class SiteTests(unittest.TestCase):
         url = 'https://github.com/oinkvm/oink/releases/download/v1.0.2/Oink-x64.msi'
         self.packages[url] = raw
         release = {'build': 2, 'version': '1.0.2', 'tag': 'v1.0.2', 'sourceTreeSha256': 'a'*64,
-                   'architecture': 'x64', 'minimumWindowsBuild': 19045, 'protocolBaseline': 1,
+                   'architecture': 'x64', 'minimumWindowsBuild': 17763, 'protocolBaseline': 1,
                    'minimumUpdaterSchema': 1, 'channel': 'stable', 'severity': 'normal',
                    'notes': {'en': 'Test update', 'zh-Hans': '测试更新'},
                    'package': {'url': url, 'length': len(raw), 'sha256': feed.digest(raw),

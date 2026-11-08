@@ -11,6 +11,7 @@ import re
 
 EXCLUDED_DIRS = {'.git', '.claude', 'target', 'node_modules', 'dist', 'build', 'evidence', '.release-tools', '__pycache__'}
 ROOT_EXCLUDED = {'docs', 'scripts', 'tools', 'AGENTS.md', 'CLAUDE.md'}
+PUBLIC_TOOL = 'tools/generate-paste-menu-icons.py'
 
 
 def source_files(root):
@@ -18,10 +19,12 @@ def source_files(root):
     # compiler/provenance inputs. Never follow source links outside the export.
     for directory, dirs, files in os.walk(root, followlinks=False):
         here = Path(directory)
-        dirs[:] = sorted(d for d in dirs if d not in EXCLUDED_DIRS and not (here == root and d in ROOT_EXCLUDED))
+        dirs[:] = sorted(d for d in dirs if d not in EXCLUDED_DIRS and not (here == root and d in ROOT_EXCLUDED and d != 'tools'))
         links = [d for d in dirs if (here / d).is_symlink()]
         dirs[:] = [d for d in dirs if d not in links]
         for name in sorted(files + links):
+            if here == root / 'tools' and name != 'generate-paste-menu-icons.py':
+                continue
             if name == '.DS_Store' or name in EXCLUDED_DIRS or (here == root and name in ROOT_EXCLUDED):
                 continue
             yield here / name

@@ -185,6 +185,10 @@ impl Api {
             // still hydrate via TRANSFER_DATA, but retain received linked bytes
             // locally and reject dehydration. Never fall back to a callback
             // data open/handle-based range FSCTL: it can wait on this hydration.
+            // Cloud Files API functions used here are documented by Microsoft
+            // Learn as Windows 10 version 1709+; selection remains capability
+            // based on the cfapi IntegrationNumber and exported entry point,
+            // rather than assuming Windows 10 22H2.
             let query = GetProcAddress(module, c"CfGetPlaceholderRangeInfoForHydration".as_ptr().cast())
                 .map(|pointer| std::mem::transmute::<unsafe extern "system" fn() -> isize, HydrationRanges>(pointer));
             let hydration_ranges = Self::select_hydration_query(info.IntegrationNumber, query);

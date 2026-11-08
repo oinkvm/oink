@@ -50,7 +50,7 @@
       <RegistrySearch Id="WindowsBuild" Root="HKLM" Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
                       Name="CurrentBuildNumber" Type="raw" Bitness="always64" />
     </Property>
-    <Launch Condition="Installed OR (VersionNT64 AND WINDOWSBUILD &gt;= $(var.MinimumWindowsBuild))" Message="Windows 10 22H2 (build $(var.MinimumWindowsBuild)) or Windows 11 x64 is required." />
+    <Launch Condition="Installed OR (VersionNT64 AND WINDOWSBUILD &gt;= $(var.MinimumWindowsBuild))" Message="Windows 10 version 1809 (build 17763) or later, or Windows 11 x64 is required." />
     <!-- A per-machine product needs the machine-wide Evergreen Runtime so every
          user session can open the UI. Do not silently download during install. -->
     <Property Id="WEBVIEW2RUNTIME">

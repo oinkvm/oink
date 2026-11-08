@@ -6,7 +6,7 @@
   "build": 1,
   "architecture": "x64",
   "minimum_os": "10.0",
-  "minimumWindowsBuild": 19045,
+  "minimumWindowsBuild": 17763,
   "updater_included": true,
   "collector_included": true,
   "protocol_baseline": 1,

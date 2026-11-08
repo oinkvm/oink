@@ -6,7 +6,7 @@
   "repository_org": "oinkvm",
   "macos_minimum": "14.2",
   "windows_minimum": "10.0",
-  "minimumWindowsBuild": 19045,
+  "minimumWindowsBuild": 17763,
   "data_directory": "Oink",
   "unix_data_directory": "oink",
   "macos_logs_directory": "Oink",

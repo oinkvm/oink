@@ -135,7 +135,7 @@ mod tests {
             build: 30,
             architecture: "x64".into(),
             source_tree_sha256: "a".repeat(64),
-            minimum_windows_build: 19045,
+            minimum_windows_build: 17763,
             length: 123,
             sha256: "b".repeat(64),
             notes: None,

@@ -518,7 +518,7 @@ mod tests {
             "INSERT INTO `Property` (`Property`, `Value`) VALUES ('ProductVersion', '0.0.30')".into(),
             "INSERT INTO `Property` (`Property`, `Value`) VALUES ('OINK_VERSION', '0.3.0')".into(),
             format!("INSERT INTO `Property` (`Property`, `Value`) VALUES ('OINK_SOURCE_TREE', '{}')","a".repeat(64)),
-            "INSERT INTO `Property` (`Property`, `Value`) VALUES ('OINK_MINIMUM_WINDOWS_BUILD', '19045')".into(),
+            "INSERT INTO `Property` (`Property`, `Value`) VALUES ('OINK_MINIMUM_WINDOWS_BUILD', '17763')".into(),
         ];
         for query in queries {
             let mut view = 0;

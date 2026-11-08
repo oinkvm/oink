@@ -21,9 +21,14 @@ inline bool info(HANDLE handle, FILE_ATTRIBUTE_TAG_INFO& attributes) {
     return GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &attributes, sizeof(attributes)) != FALSE;
 }
 inline bool erase(HANDLE handle) {
-    // Windows 10 22H2+ supports deleting a read-only entry without changing
-    // its shared attributes. Clearing READONLY would also change an unrelated
-    // hard link outside Oink. Keep normal sharing/image-section checks intact.
+    // Microsoft Learn's SetFileInformationByHandle documentation
+    // (https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfileinformationbyhandle)
+    // lists the API as Windows Vista+. The Windows SDK 10.0.17763.0 WinBase.h
+    // gates FILE_DISPOSITION_INFO_EX at RS1 (Windows 10 1607/build 14393) and
+    // FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE at _WIN32_WINNT_WIN10_RS5
+    // (Windows 10 1809/build 17763). This use therefore meets Oink's 17763
+    // floor; it is not a Windows 10 22H2-only behavior. Clearing READONLY
+    // would also change an unrelated hard link outside Oink.
     FILE_DISPOSITION_INFO_EX disposition{FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE};
     return SetFileInformationByHandle(handle, FileDispositionInfoEx, &disposition, sizeof(disposition)) != FALSE;
 }

@@ -18,7 +18,7 @@ Oink는 "Oink Is Not only a KVM"의 약자로, 여러 대의 Windows와 Mac 사�
 지원하는 운영체제와 버전:
 
 - **Mac**: Apple 실리콘(arm64), macOS 14.2 이상. Intel(x64), macOS 14.2 이상(테스트되지 않음)
-- **Windows**: x64, Windows 10 22H2(빌드 19045) 이상 또는 Windows 11
+- **Windows**: x64, Windows 10 1809(빌드 17763) 이상 또는 Windows 11. 22H2 이전 Windows 10 버전은 테스트되지 않았습니다. Windows 10 LTSC(LTSC 2019 / LTSC 2021 등)에는 WebView2 Runtime이 기본으로 포함되지 않으므로, 먼저 Microsoft Edge WebView2 Runtime(Evergreen)을 설치하세요: https://developer.microsoft.com/microsoft-edge/webview2/
 
 SmartScreen에 "Windows의 PC 보호" 메시지가 표시되면, 해당 옵션이 있을 때만 **추가 정보 → 실행**을 선택하세요. UAC에서 게시자를 알 수 없음으로 표시될 수 있습니다.
 

@@ -182,7 +182,7 @@ class PublicationTests(FeedTests):
         record = {'schema': 1, 'product': 'Oink', 'source_tree_sha256': 'a'*64, 'architecture': 'x64',
                   'signing': 'signpath-approved-authenticode-verified', 'updater_included': True,
                   'collector_included': True, 'build': 2, 'protocol_baseline': 1, 'artifacts': [artifact],
-                  'version': '1.0.0', 'minimumWindowsBuild': 19045}
+                  'version': '1.0.0', 'minimumWindowsBuild': 17763}
         feed.write(folder/'release.json', record)
         feed.write(folder/'Oink-1.0.0-windows-x64.msi', raw)
         # Notes from the trusted checkout win even if an old input contains update.json.

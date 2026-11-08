@@ -12,7 +12,7 @@ fn payload() -> Value {
     json!({"schema":1,"product":PRODUCT,"keyEpoch":WINDOWS_EPOCH,"channel":"stable","sequence":1,
         "generatedAt":"2026-10-14T00:00:00Z","expiresAt":"2026-11-13T00:00:00Z", "releases":[{
             "build":20,"version":"1.0.1","tag":"v1.0.1","sourceTreeSha256":"a".repeat(64),"architecture":"x86_64",
-            "minimumWindowsBuild":10240,"protocolBaseline":1,"minimumUpdaterSchema":1,"severity":"normal","notes":{"zh-Hans":"修复问题。","en":"Fix a problem."},
+            "minimumWindowsBuild":17763,"protocolBaseline":1,"minimumUpdaterSchema":1,"severity":"normal","notes":{"zh-Hans":"修复问题。","en":"Fix a problem."},
             "package":{"url":"https://github.com/oinkvm/oink/releases/download/v1.0.1/update.zip","length":3,
             "sha256":"b".repeat(64),"keyId":WINDOWS_EPOCH,"ed25519":STANDARD.encode([0;64])}}]})
 }
@@ -38,7 +38,7 @@ fn good_signature_selects_highest_compatible_build_without_downgrade() {
     let m = check(&payload(), &Watermark::default(), NOW).unwrap();
     let quarantine = BTreeSet::new();
     let mut s = Selection {
-        windows_build: 19045,
+        windows_build: 17763,
         architecture: "x86_64",
         installed_build: 19,
         successful_build: 19,
@@ -427,7 +427,7 @@ fn bridge_client_selects_capability_two_release_from_schema_one_manifest() {
     let m = check(&p, &Watermark::default(), NOW).unwrap();
     let quarantine = BTreeSet::new();
     let selection = Selection {
-        windows_build: 19045,
+        windows_build: 17763,
         architecture: "x86_64",
         installed_build: 36,
         successful_build: 36,
