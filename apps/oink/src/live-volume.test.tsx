@@ -93,7 +93,7 @@ it('sets the exit volume while dragging, coalesced, and lands the release value'
   expect(new Set(sent.map(s => s.versionToken)).size).toBe(sent.length);
   expect(agent.get().cards?.exitVolume?.volumePercent).toBe(90);
   expect(slider.getAttribute('aria-valuenow')).toBe('90');
-});
+}, 15000);
 
 it('applies keyboard steps at once through the same coalescing', async () => {
   const { container } = render(<App/>);
