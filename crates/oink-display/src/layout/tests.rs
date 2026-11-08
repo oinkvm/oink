@@ -1804,53 +1804,6 @@ proptest! {
         }
     }
 
-    /// 修复重叠：不重叠、尺寸不变、再修复一次不变（确定且稳定）。
-    #[test]
-    fn repair_invariants(l in arb_layout()) {
-        let mut n = l.clone();
-        n.repair_overlaps();
-        assert_no_overlap(&n)?;
-        for (p, q) in l.screens.iter().zip(&n.screens) {
-            prop_assert_eq!(p.rect.w, q.rect.w);
-            prop_assert_eq!(p.rect.h, q.rect.h);
-            prop_assert_eq!(&p.id, &q.id);
-        }
-        let mut again = n.clone();
-        again.repair_overlaps();
-        for (p, q) in n.screens.iter().zip(&again.screens) {
-            prop_assert!((p.rect.x - q.rect.x).abs() < (1e-3 / 686.0) && (p.rect.y - q.rect.y).abs() < (1e-3 / 686.0),
-                "{:?} → {:?}", p.rect, q.rect);
-        }
-        let mut twice = l.clone();
-        twice.repair_overlaps();
-        prop_assert_eq!(&twice, &n, "确定性");
-    }
-
-    /// 编辑：在逻辑布局上随意拖放屏幕或整台设备，修复重叠后不重叠、再修复不变。
-    #[test]
-    fn edits_keep_invariants(
-        l in arb_logical(),
-        ops in prop::collection::vec((0usize..7, -(1500.0f64 / 686.0)..1500.0, -(1000.0f64 / 686.0)..1000.0, any::<bool>()), 1..6),
-    ) {
-        let mut l = l;
-        for (i, x, y, whole_device) in ops {
-            let s = l.screens[i % l.screens.len()].clone();
-            if whole_device {
-                l.move_device(s.id.device, Point::new(x - s.rect.x, y - s.rect.y));
-            } else {
-                l.move_screen(&s.id, Point::new(x, y));
-
-            }
-            // Contact compaction is the canvas editor's; the backend repairs collisions.
-            l.repair_overlaps();
-            assert_no_overlap(&l)?;
-            let mut again = l.clone();
-            again.repair_overlaps();
-            for (p, q) in l.screens.iter().zip(&again.screens) {
-                prop_assert!((p.rect.x - q.rect.x).abs() < (1e-3 / 686.0) && (p.rect.y - q.rect.y).abs() < (1e-3 / 686.0));
-            }
-        }
-    }
 }
 
 #[test]

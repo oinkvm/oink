@@ -1,5 +1,6 @@
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "slow: native callback bridge stress requires explicit native lane"]
 fn native_diagnostics_preserve_audio_and_never_wait_for_a_consumer() {
     // Actual bridge with synthetic callbacks. No audio service is invoked; this
     // is not evidence of live capture or realtime deadline performance.
@@ -29,6 +30,7 @@ fn native_diagnostics_preserve_audio_and_never_wait_for_a_consumer() {
 
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "slow: native callback bridge stress requires explicit native lane"]
 fn native_cleanup_requires_positive_release_evidence() {
     let temp = tempfile::tempdir().unwrap();
     let binary = temp.path().join("capture-cleanup");
@@ -58,6 +60,7 @@ fn native_cleanup_requires_positive_release_evidence() {
 
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "slow: native callback bridge stress requires explicit native lane"]
 fn native_tap_never_owns_local_silence() {
     let temp = tempfile::tempdir().unwrap();
     let binary = temp.path().join("capture-tap-mode");
@@ -88,6 +91,7 @@ fn native_tap_never_owns_local_silence() {
 
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "slow: native callback bridge stress requires explicit native lane"]
 fn native_endpoint_mute_observes_user_takeover_and_exact_device_identity() {
     let temp = tempfile::tempdir().unwrap();
     let binary = temp.path().join("endpoint-mute");
@@ -118,6 +122,7 @@ fn native_endpoint_mute_observes_user_takeover_and_exact_device_identity() {
 
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "slow: native callback bridge stress requires explicit native lane"]
 fn native_exit_volume_callbacks_and_writes_keep_exact_output_identity() {
     let temp = tempfile::tempdir().unwrap();
     let binary = temp.path().join("exit-volume");
@@ -147,6 +152,7 @@ fn native_exit_volume_callbacks_and_writes_keep_exact_output_identity() {
 
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "slow: native callback bridge stress requires explicit native lane"]
 fn native_permission_observation_and_requests_use_fake_tcc() {
     let temp = tempfile::tempdir().unwrap();
     let binary = temp.path().join("capture-permission");

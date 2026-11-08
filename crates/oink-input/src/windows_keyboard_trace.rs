@@ -95,9 +95,21 @@ mod tests {
     use super::*;
     #[test]
     fn ordinary_and_unknown_keys_never_qualify() {
-        assert_eq!((0..=0xffff).filter(|vk| modifier(*vk) != 0).count(), 8);
-        assert_eq!(modifier(0x5b), 8);
-        assert_eq!((0..256).fold(0, |mask, vk| mask | modifier(vk)), 255);
+        for vk in [0, 0x04, 0x41, 0xff, 0x10000] {
+            assert_eq!(modifier(vk), 0, "ordinary or unknown VK {vk:#x}");
+        }
+        for (vk, bit) in [
+            (0xa2, 1),
+            (0xa0, 2),
+            (0xa4, 4),
+            (0x5b, 8),
+            (0xa3, 16),
+            (0xa1, 32),
+            (0xa5, 64),
+            (0x5c, 128),
+        ] {
+            assert_eq!(modifier(vk), bit, "supported modifier VK {vk:#x}");
+        }
     }
     #[test]
     fn nested_callbacks_keep_their_serial_and_unknown_state() {

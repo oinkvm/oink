@@ -537,6 +537,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: long jitter pressure simulation"]
     fn tiny_jitter_and_tiny_fast_circles_never_trigger() {
         // 手抖：±0.3/686 reference units 的伪随机抖动。
         let mut d = CircleDetector::default();

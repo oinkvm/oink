@@ -172,7 +172,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ordinary_declaration_preserves_event_driven_one_second_throttle() {
+    fn ordinary_declaration_and_due_preserve_event_driven_one_second_throttle() {
         let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let count = calls.clone();
         let activity = UserActivity::with_declaration(move |_| {
@@ -187,16 +187,12 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         // Advancing time alone does not ask the worker to renew an assertion.
         assert_eq!(calls.load(Ordering::Relaxed), 2);
-    }
-
-    #[test]
-    fn throttled_to_once_per_interval() {
-        let t = Instant::now();
+        let t = now;
         assert!(due(None, t));
         assert!(!due(Some(t), t));
         assert!(!due(Some(t), t + Duration::from_millis(999)));
         assert!(due(Some(t), t + MIN_INTERVAL));
-        // 时钟回退不会 panic，也不会一直声明
+        // 时钟回退不会 panic，也不会一直声明。
         assert!(!due(Some(t + Duration::from_secs(5)), t));
     }
 }

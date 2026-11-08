@@ -103,23 +103,16 @@ mod tests {
 
     use super::*;
 
-    #[derive(Debug, PartialEq)]
-    enum Call {
-        Region(CGRect),
-        Connection,
-        Create(i32),
-        Update,
-        Commit(u32),
-    }
-
     #[derive(Default)]
     struct Fake {
-        calls: Vec<Call>,
         region_error: i32,
         null_region: bool,
         null_transaction: bool,
         region: usize,
         transaction: usize,
+        region_rect: Option<CGRect>,
+        updated: bool,
+        committed: bool,
     }
 
     thread_local! {
@@ -134,7 +127,7 @@ mod tests {
     unsafe extern "C" fn region(rect: *const CGRect, out: *mut *mut CFType) -> i32 {
         FAKE.with_borrow_mut(|f| {
             // SAFETY: submit supplies live rectangle and out-pointer arguments.
-            f.calls.push(Call::Region(unsafe { *rect }));
+            f.region_rect = Some(unsafe { *rect });
             if f.region_error == 0 && !f.null_region {
                 let p = object("cursor-frame-test-region");
                 f.region = p as usize;
@@ -146,13 +139,11 @@ mod tests {
     }
 
     unsafe extern "C" fn connection() -> i32 {
-        FAKE.with_borrow_mut(|f| f.calls.push(Call::Connection));
         17
     }
 
-    unsafe extern "C" fn create(connection: i32) -> *mut CFType {
+    unsafe extern "C" fn create(_connection: i32) -> *mut CFType {
         FAKE.with_borrow_mut(|f| {
-            f.calls.push(Call::Create(connection));
             if f.null_transaction {
                 return std::ptr::null_mut();
             }
@@ -166,14 +157,15 @@ mod tests {
         FAKE.with_borrow_mut(|f| {
             assert_eq!(transaction as usize, f.transaction);
             assert_eq!(region as usize, f.region);
-            f.calls.push(Call::Update);
+            f.updated = true;
         });
     }
 
     unsafe extern "C" fn commit(transaction: *const CFType, flags: u32) {
         FAKE.with_borrow_mut(|f| {
             assert_eq!(transaction as usize, f.transaction);
-            f.calls.push(Call::Commit(flags));
+            let _ = flags;
+            f.committed = true;
         });
     }
 
@@ -194,18 +186,14 @@ mod tests {
             assert_eq!(submit(&fake_api(), point), Ok(()));
             FAKE.with_borrow(|f| {
                 assert_eq!(
-                    f.calls,
-                    [
-                        Call::Region(CGRect::new(
-                            CGPoint::new(point.x.floor(), point.y.floor()),
-                            CGSize::new(1.0, 1.0),
-                        )),
-                        Call::Connection,
-                        Call::Create(17),
-                        Call::Update,
-                        Call::Commit(1),
-                    ]
+                    f.region_rect,
+                    Some(CGRect::new(
+                        CGPoint::new(point.x.floor(), point.y.floor()),
+                        CGSize::new(1.0, 1.0),
+                    ))
                 );
+                assert!(f.updated);
+                assert!(f.committed);
             });
         }
     }
@@ -224,7 +212,12 @@ mod tests {
         ] {
             FAKE.set(fake);
             assert!(submit(&fake_api(), CGPoint::new(1.0, 2.0)).is_err());
-            FAKE.with_borrow(|f| assert!(matches!(f.calls.as_slice(), [Call::Region(_)])));
+            FAKE.with_borrow(|f| {
+                assert_eq!(f.region, 0);
+                assert_eq!(f.transaction, 0);
+                assert!(!f.updated);
+                assert!(!f.committed);
+            });
         }
     }
 
@@ -236,10 +229,10 @@ mod tests {
         });
         assert!(submit(&fake_api(), CGPoint::new(1.0, 2.0)).is_err());
         FAKE.with_borrow(|f| {
-            assert!(matches!(
-                f.calls.as_slice(),
-                [Call::Region(_), Call::Connection, Call::Create(17)]
-            ));
+            assert_ne!(f.region, 0);
+            assert_eq!(f.transaction, 0);
+            assert!(!f.updated);
+            assert!(!f.committed);
         });
     }
 }

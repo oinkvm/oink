@@ -51,3 +51,4 @@ workspace = true
 [dev-dependencies]
 proptest = "1"
 serde_json.workspace = true
+tempfile = "3"

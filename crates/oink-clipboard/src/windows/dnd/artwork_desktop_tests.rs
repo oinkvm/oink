@@ -411,7 +411,7 @@ fn visible_shell_images(target_process: u32) -> u32 {
     }
 }
 #[test]
-#[ignore = "subprocess endpoint for the bounded Shell image regression"]
+#[ignore = "device: subprocess endpoint for the bounded Shell image regression"]
 fn shell_destination_process() {
     let Some(path) = std::env::var_os("OINK_DND_SHELL_CHILD") else {
         return;
@@ -425,7 +425,7 @@ fn shell_destination_process() {
     thread.join().unwrap();
 }
 #[test]
-#[ignore = "bounded desktop check: two OLE processes, private window, no injected input"]
+#[ignore = "device: bounded desktop check: two OLE processes, private window, no injected input"]
 fn cross_process_thumbnail_replaces_old_shell_visual() {
     use windows::core::Interface;
     // SAFETY: private sampling thread uses physical desktop coordinates.
@@ -697,7 +697,7 @@ fn cross_process_thumbnail_replaces_old_shell_visual() {
     );
 }
 #[test]
-#[ignore = "bounded desktop check: moves pointer over a private test window, starts and cancels OLE"]
+#[ignore = "device: bounded desktop check: moves pointer over a private test window, starts and cancels OLE"]
 fn live_drag_replaces_default_image_at_128_logical_pixels() {
     // SAFETY: private sampling thread uses physical coordinates.
     unsafe {

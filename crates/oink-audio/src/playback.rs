@@ -1472,7 +1472,7 @@ mod tests {
         assert_eq!(trace.callback_frames, 128);
     }
     #[test]
-    #[ignore = "Evidence-only: ordinary-thread CPU/timer scheduling is nondeterministic; no native devices"]
+    #[ignore = "slow: ordinary-thread CPU/timer scheduling stress requires explicit perf lane"]
     fn software_callback_cpu_and_timer_jitter_stress() {
         let (_, mut render, _) = renderer(false);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));

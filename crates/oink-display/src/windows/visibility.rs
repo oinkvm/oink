@@ -727,8 +727,8 @@ mod tests {
     }
     #[test]
     fn disabled_record_survives_recreation_and_only_ack_clears_it() {
-        let root = std::env::temp_dir().join(format!("oink-display-visibility-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
         let native = crate::arrangement::NativeDisplay {
             key: "hidden".into(),
             bounds: oink_foundation::Rect::new(1920.0, 0.0, 1920.0, 1080.0),
@@ -747,16 +747,15 @@ mod tests {
                 released: false,
             },
         )]);
-        save(&root, &store).unwrap();
+        save(root, &store).unwrap();
         drop(store);
-        let reloaded = load(&root).unwrap();
+        let reloaded = load(root).unwrap();
         assert_eq!(reloaded["hidden"].native.mode, "exact-mode");
         assert_eq!(reloaded["hidden"].packet.refresh, [60000, 1001]);
-        acknowledge(&root, &["other".into()]).unwrap();
-        assert_eq!(load(&root).unwrap().len(), 1);
-        acknowledge(&root, &["hidden".into()]).unwrap();
-        assert!(load(&root).unwrap().is_empty());
-        std::fs::remove_dir_all(root).unwrap();
+        acknowledge(root, &["other".into()]).unwrap();
+        assert_eq!(load(root).unwrap().len(), 1);
+        acknowledge(root, &["hidden".into()]).unwrap();
+        assert!(load(root).unwrap().is_empty());
     }
     #[test]
     fn desktop_image_identity_tracks_its_original_source_or_target_role() {

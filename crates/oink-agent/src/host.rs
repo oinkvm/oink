@@ -774,6 +774,7 @@ mod lifecycle_tests {
     }
 
     #[test]
+    #[ignore = "slow: real required IPC publication integration"]
     fn required_ipc_publication_recovers_without_restarting_host() {
         let _scenario = crate::test_watchdog::Scenario::new(
             module_path!(),

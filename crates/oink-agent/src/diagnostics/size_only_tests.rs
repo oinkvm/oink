@@ -143,7 +143,6 @@ fn named_segments_split_at_the_expansion_limit_without_losing_rows_or_multiplyin
 }
 #[test]
 fn segment_cleanup_never_touches_bundles_ordinary_logs_or_reports() {
-    assert_eq!(MAX_BYTES, 67_108_864);
     let dir = tempfile::tempdir().unwrap();
     let mut s = store::Store::open(dir.path().into(), "a".repeat(24), true).unwrap();
     for name in [

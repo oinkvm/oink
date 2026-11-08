@@ -307,24 +307,4 @@ mod tests {
         let no_extended = cpal::DeviceDescriptionBuilder::new("Headphones").build();
         assert_eq!(crate::device_name(&no_extended), "Headphones");
     }
-
-    #[test]
-    #[ignore = "read-only native enumeration; requires an installed standard VB-CABLE pair"]
-    fn installed_vb_cable_is_discovered_without_opening_audio() {
-        let _worker = WorkerApartment::new().unwrap();
-        let output = super::super::virtual_output().unwrap();
-        assert!(
-            matches!(output, super::super::VirtualOutput::Ready { .. }),
-            "{output:?}"
-        );
-        let mut monitor = DemandMonitor::new().unwrap();
-        let demand = monitor.sample();
-        assert!(demand.error.is_none(), "{demand:?}");
-        assert!(
-            super::super::inputs()
-                .unwrap()
-                .iter()
-                .any(|device| device.name == "CABLE Output (VB-Audio Virtual Cable)")
-        );
-    }
 }

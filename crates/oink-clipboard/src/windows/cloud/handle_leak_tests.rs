@@ -102,8 +102,34 @@ mod handle_leak_tests {
     /// Private regular files and absent paths only: no installed provider,
     /// clipboard, desktop, registration or hydration activity is involved.
     #[test]
-    fn native_missing_and_closed_protected_opens_do_not_leak_handles() {
+    fn native_missing_and_closed_protected_opens_have_a_quick_leak_regression_check() {
         const CHILD: &str = "OINK_TEST_CF_HANDLE_LEAK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "windows::cloud::tests::handle_leak_tests::native_missing_and_closed_protected_opens_have_a_quick_leak_regression_check",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+        run_handle_probe(20);
+    }
+
+    #[test]
+    #[ignore = "slow: native handle leak soak test"]
+    fn native_missing_and_closed_protected_opens_do_not_leak_handles() {
+        const CHILD: &str = "OINK_TEST_CF_HANDLE_LEAK_SOAK_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -123,6 +149,10 @@ mod handle_leak_tests {
             print!("{}", String::from_utf8_lossy(&output.stdout));
             return;
         }
+        run_handle_probe(1000);
+    }
+
+    fn run_handle_probe(rounds: usize) {
         use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
         fn handles() -> u32 {
             let mut count = 0;
@@ -143,15 +173,15 @@ mod handle_leak_tests {
                 .unwrap();
             assert_eq!(error.kind(), io::ErrorKind::NotFound);
         };
-        for _ in 0..100 {
+        for _ in 0..rounds {
             round();
         }
         let before = handles();
-        for _ in 0..1000 {
+        for _ in 0..rounds {
             round();
         }
         let after = handles();
-        println!("CF protected opens: success=1000 missing=1000 handles_before={before} handles_after={after}");
+        println!("CF protected opens: success={rounds} missing={rounds} handles_before={before} handles_after={after}");
         assert!(
             after <= before + 2,
             "repeated opens retained {} handles",

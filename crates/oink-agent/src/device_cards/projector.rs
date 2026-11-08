@@ -1135,28 +1135,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "isolated resource benchmark; run with --ignored --nocapture"]
-    fn resource_card_projection_benchmark() {
-        let members = (1..=3)
-            .map(|id| {
-                let mut member = row(id, "synthetic", true);
-                member.facts = Some(facts(&member, 0));
-                member
-            })
-            .collect();
-        let input = inputs(members);
-        let mut projector = Projector::new().unwrap();
-        let started = std::time::Instant::now();
-        for now in 0..1000 {
-            std::hint::black_box(projector.update(&input, now));
-        }
-        println!(
-            "three_card_projections=1000 elapsed_us={}",
-            started.elapsed().as_micros()
-        );
-    }
-
-    #[test]
     fn microphone_fault_and_activity_survive_card_projection() {
         let mut member = row(2, "microphone-owner", true);
         member.capabilities.push("oink.audio.microphone/1".into());

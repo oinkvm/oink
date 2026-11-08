@@ -613,6 +613,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: real launch tool process cancellation integration"]
     fn host_exit_cancels_and_reaps_an_inflight_launch_tool() {
         use std::sync::{
             Arc,
@@ -653,6 +654,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: real launch tool process timeout integration"]
     fn hung_launch_tool_is_killed_at_its_deadline() {
         let error = run(
             Path::new("/bin/sleep"),

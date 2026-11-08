@@ -2,6 +2,7 @@
 use super::*;
 
 #[tokio::test]
+#[ignore = "slow: real QUIC candidate and media integration"]
 async fn unresponsive_candidate_dial_does_not_block_live_media() {
     let running = Running::start(false).await;
     let source = &running.owners[0].links;
@@ -36,6 +37,7 @@ async fn unresponsive_candidate_dial_does_not_block_live_media() {
 }
 
 #[tokio::test]
+#[ignore = "slow: real QUIC packet outage integration"]
 async fn packet_outage_during_refill_resumes_on_the_same_live_quic_session() {
     let running = Running::start(false).await;
     let settings = running.owners[0].settings.clone();

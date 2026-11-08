@@ -213,7 +213,7 @@ impl Drop for Fixture {
 }
 
 #[test]
-#[ignore = "interactive Windows desktop; run on a reserved desktop"]
+#[ignore = "device: interactive Windows desktop; run on a reserved desktop"]
 fn terminal_catcher_cleanup_survives_slow_sta_and_preserves_new_capture() {
     let fixture = Fixture::new();
     for keyed in [true, false] {

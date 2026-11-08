@@ -385,14 +385,12 @@ mod tests {
 
     /// 人工构造的 BMP 条纹：WIC 文件解码、Fant 缩放、裁剪、JPEG 编码/解码全部走原生接口。
     #[test]
+    #[ignore = "device: requires the Windows WIC codec and COM apartment"]
     fn wic_round_trip_crops_to_screen_aspect_and_renders_solid_color() {
         let _com = Apartment::new().unwrap();
         let factory = factory();
-        let name = std::env::var("OINK_WORKTREE").unwrap_or_else(|_| "oink-display-wallpaper-tests".into());
-        let dir = std::env::temp_dir()
-            .join(name)
-            .join(format!("wallpaper-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
         let path = dir.join("bands.bmp");
         let (w, h) = (800u32, 200u32);
         let size = w * h * 3;
@@ -457,6 +455,5 @@ mod tests {
             )
             .is_none()
         );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

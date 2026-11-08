@@ -9,10 +9,6 @@ const MAX_CRASH_PACKAGES: usize = 10;
 const EXPORT_BUFFER: usize = 256 * 1024;
 use std::path::Path;
 use zip::write::SimpleFileOptions;
-#[cfg(all(test, debug_assertions))]
-#[path = "export_bench.rs"]
-pub(super) mod export_bench;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {

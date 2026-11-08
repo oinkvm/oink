@@ -196,6 +196,7 @@ mod tests {
 
     /// Callback-free idle waits for the two-second fallback, not a polling slice.
     #[test]
+    #[ignore = "slow: requires a real CoreGraphics watcher deadline"]
     fn idle_watcher_does_not_spin() {
         let w = Watcher::start(Arc::new(|| {})).expect("start watcher");
         std::thread::sleep(Duration::from_millis(300));

@@ -2,7 +2,7 @@
 use super::*;
 
 #[test]
-#[ignore = "native Windows Shell probe; run on a reserved logged-in desktop"]
+#[ignore = "device: native Windows Shell probe; run on a reserved logged-in desktop"]
 fn shell_folder_drop_receipt() {
     std::thread::spawn(|| {
         use std::os::windows::ffi::OsStrExt;

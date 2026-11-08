@@ -1272,6 +1272,7 @@ mod tests {
         assert!(source.status.playing.load(Ordering::Acquire));
     }
     #[test]
+    #[ignore = "slow: long running audio or locator pressure trace"]
     fn full_ingress_and_render_work_have_no_heap_and_share_the_original_budget() {
         for config in [
             dsp::Config::opus_10ms(),

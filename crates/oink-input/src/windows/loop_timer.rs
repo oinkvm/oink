@@ -99,6 +99,7 @@ impl Drop for Timer {
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "device: requires a Windows waitable timer and message wait"]
     fn high_resolution_deadline_and_external_wake_share_native_wait() {
         let timer = Timer::new().unwrap();
         let due = Instant::now() + std::time::Duration::from_millis(10);

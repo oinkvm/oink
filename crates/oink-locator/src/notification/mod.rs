@@ -1034,6 +1034,7 @@ mod surface_tests {
         }
     }
     #[test]
+    #[ignore = "slow: worker park and wake ordering uses native thread scheduling"]
     fn empty_and_clipped_surfaces_park_and_wake_on_updates() {
         let (tx, rx) = mpsc::channel();
         let overlay = NotificationOverlay::with_surface(
@@ -1064,6 +1065,7 @@ mod surface_tests {
         until(&rx, "clear");
     }
     #[test]
+    #[ignore = "slow: native present release ordering uses worker scheduling"]
     fn clear_during_native_present_is_not_lost_before_parking() {
         let (tx, rx) = mpsc::channel();
         let (release, blocked) = mpsc::channel();

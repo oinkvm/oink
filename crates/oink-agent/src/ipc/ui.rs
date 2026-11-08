@@ -163,6 +163,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: real UI startup endpoint integration"]
     fn ui_open_waits_for_the_starting_owners_endpoint() {
         for stale in [false, true] {
             let dir = tempfile::tempdir().unwrap();

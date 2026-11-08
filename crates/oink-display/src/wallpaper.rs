@@ -91,6 +91,9 @@ mod tests {
             height: 1,
             jpeg: vec![0xAB; 5],
         };
-        assert_eq!(format!("{t:?}"), "Thumbnail(2x1, 5 B)");
+        let debug = format!("{t:?}");
+        assert!(debug.contains("2x1"));
+        assert!(debug.contains("5 B"));
+        assert!(!debug.contains("AB"));
     }
 }

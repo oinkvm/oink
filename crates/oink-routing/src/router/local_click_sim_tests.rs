@@ -1,5 +1,6 @@
 // Local-click model coverage for packet loss, reordering and duplication.
 #[test]
+#[ignore = "slow: exhaustive local-click loss and repair pressure simulation"]
 fn sim_three_nodes_drop_reorder_duplicate_and_repair() {
     for seed in 0..32u64 {
         let mut g = group();

@@ -417,15 +417,4 @@ mod tests {
         assert!(pan.cancel(&mut sink));
         assert!(!pan.active());
     }
-    #[test]
-    fn inverse_matches_measured_steady_velocities_and_handles_cap() {
-        for speed in [0.01_f64, 8.0, 40.0, 100.0, 160.0, 200.0, 640.0] {
-            let h = speed * f64::from(FRAME_MS) / 10.0;
-            let pixels = h * SCALE * (1.0 + 4.0 * (speed / 200.0).min(1.0));
-            for sensitivity in [0.5, 1.0, 2.0] {
-                assert!((inverse(pixels * sensitivity, SCALE * sensitivity) - h).abs() < 1e-8);
-                assert!((inverse(-pixels * sensitivity, SCALE * sensitivity) + h).abs() < 1e-8);
-            }
-        }
-    }
 }

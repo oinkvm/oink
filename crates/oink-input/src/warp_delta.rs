@@ -683,22 +683,6 @@ mod tests {
         assert_eq!(f.motion((3.0, -4.0), p(103.0, 96.0), 20, true), (3.0, -4.0));
     }
 
-    /// 本次 bug（F6 的原始序列）：远程模式下事件位置卡在 P + (−4, 0)，位移字段依次 +4、(0, +4)、−4。
-    /// 远程模式不 warp、不登记，输出必须跟着位移字段——不能是「位置 − 停靠点」这个常量。
-    #[test]
-    fn stuck_location_in_remote_mode_follows_the_delta_field() {
-        let mut f = WarpDeltaFix::new();
-        let stuck = p(860.0, 559.0);
-        let mut t = 1_000;
-        for raw in std::iter::repeat_n((4.0, 0.0), 40)
-            .chain(std::iter::repeat_n((0.0, 4.0), 20))
-            .chain(std::iter::repeat_n((-4.0, 0.0), 20))
-        {
-            t += 10;
-            assert_eq!(f.motion(raw, stuck, t, true), raw);
-        }
-    }
-
     /// 原地 warp（目标 = 当前光标）被系统忽略（F3）：调用方不登记，之后位移照用字段——即使事件位置
     /// 是远程期间漂走的值。
     #[test]

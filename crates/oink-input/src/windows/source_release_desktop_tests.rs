@@ -59,7 +59,7 @@ fn pump_until(ready: impl Fn() -> bool) {
 }
 
 #[test]
-#[ignore = "requires a reserved interactive Windows desktop"]
+#[ignore = "device: requires a reserved interactive Windows desktop"]
 fn source_up_returns_to_recorded_start_after_cursor_moves_to_another_window() {
     assert!(
         std::env::var_os("OINK_OWNED_WINDOW_TEST").is_some(),

@@ -235,7 +235,7 @@ mod tests {
     }
     #[cfg(windows)]
     #[test]
-    #[ignore = "real Windows crash child; first build oink-crash-collector"]
+    #[ignore = "device: Windows crash collector child; build oink-crash-collector first"]
     fn windows_child_crash_is_exported_with_previous_instance() {
         use crate::diagnostics::{Reason, store::Store};
         use oink_telemetry::*;

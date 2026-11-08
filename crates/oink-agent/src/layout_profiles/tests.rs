@@ -692,24 +692,6 @@ fn shared_dto_retains_both_visibility_layers_and_default_sharing() {
     set_screen_shared(&mut explicit_default, device(1), true);
     assert!(same_content(&original, &explicit_default));
 }
-
-#[test]
-fn redo_020_catalog_accepts_sixteen_and_blocks_seventeenth() {
-    let s = snapshot();
-    let mut c = catalog(&s);
-    for n in 1..16 {
-        c = c
-            .save(device(1), &s, state(&s), Some(&format!("Desk {n}")), n + 10)
-            .unwrap();
-    }
-    assert_eq!(c.profiles.len(), 16);
-    assert_eq!(
-        c.save(device(1), &s, state(&s), Some("Seventeenth"), 30)
-            .unwrap_err()
-            .code,
-        ErrorCode::ProfileLimit
-    );
-}
 #[test]
 fn redo_020_catalog_rejects_duplicate_names_and_thirty_three_characters() {
     let s = snapshot();

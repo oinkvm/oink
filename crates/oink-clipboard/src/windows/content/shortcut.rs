@@ -175,11 +175,9 @@ mod tests {
     use crate::content::url::tests::{Projected, source};
     #[test]
     fn shortcut_stream_and_sink_survive_drop_grant_transition() {
-        after_drop(false);
-    }
-    #[test]
-    fn shortcut_stream_and_sink_survive_drop_grant_transition_via_sink() {
-        after_drop(true);
+        for via_sink in [false, true] {
+            after_drop(via_sink);
+        }
     }
     fn after_drop(via_sink: bool) {
         super::super::tests::sta(move || {

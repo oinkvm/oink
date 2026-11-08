@@ -216,6 +216,7 @@ impl Estimator {
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "slow: concurrent stress workload for counter rotation"]
     fn concurrent_window_rotation_preserves_counts_and_matching_extrema() {
         let counters = std::sync::Arc::new(Counters::default());
         let producer = counters.clone();

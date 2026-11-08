@@ -177,29 +177,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "isolated resource benchmark; run with --ignored --nocapture"]
-    fn resource_gap_report_benchmark() {
-        let origin = Instant::now();
-        let mut reports = GapReports::default();
-        let history = History::<ReceiveEvent, 16> {
-            events: [Some((42, Some(1000), 2000, 3000, Some(4000), true, None, None)); 16],
-            next: 0,
-        };
-        let mut emitted = 0;
-        let started = Instant::now();
-        for packet in 0..100_000 {
-            if reports.observe(origin + Duration::from_millis(packet * 10)).is_some() {
-                std::hint::black_box(format!("{history:?}"));
-                emitted += 1;
-            }
-        }
-        println!(
-            "exceptional_packets=100000 context_reports={emitted} elapsed_us={}",
-            started.elapsed().as_micros()
-        );
-    }
-
-    #[test]
     fn gap_report_storm_is_bounded_without_losing_incident_counts() {
         let now = Instant::now();
         let mut reports = GapReports::default();

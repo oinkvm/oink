@@ -160,26 +160,3 @@ fn adapter_is_forwarding_driver(instance: &str) -> Result<bool, String> {
             .contains("VBAUDIOVACWDM")
     }))
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    #[ignore = "read-only native endpoint inventory; no input stream or default write"]
-    fn forwarding_input_identity_matches_the_installed_vendor_endpoint() {
-        let _apartment = super::WorkerApartment::new().unwrap();
-        let candidates = super::super::input_candidates().unwrap();
-        for candidate in &candidates {
-            println!(
-                "input={:?} physical={} built_in={} forwarding_loopback={}",
-                candidate.input, candidate.physical, candidate.built_in, candidate.forwarding_loopback
-            );
-            if candidate.input.name.contains("VB-Audio Virtual Cable") {
-                assert!(
-                    candidate.forwarding_loopback,
-                    "vendor endpoint was not recognized by hardware identity: {:?}",
-                    super::is_forwarding_endpoint(&candidate.input.id)
-                );
-            }
-        }
-    }
-}

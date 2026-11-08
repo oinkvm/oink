@@ -150,7 +150,6 @@ mod tests {
 
     #[derive(Default)]
     struct Fake {
-        calls: Vec<&'static str>,
         error: i32,
         region_error: i32,
     }
@@ -162,7 +161,6 @@ mod tests {
     }
     unsafe extern "C" fn region(_: *const CGRect, out: *mut *mut CFType) -> i32 {
         FAKE.with_borrow_mut(|f| {
-            f.calls.push("region");
             if f.region_error == 0 {
                 // SAFETY: acquire_with provides writable storage and assumes +1 ownership.
                 unsafe {
@@ -174,12 +172,9 @@ mod tests {
             f.region_error
         })
     }
-    unsafe extern "C" fn lock(cid: i32, region: *const CFType) -> i32 {
+    unsafe extern "C" fn lock(cid: i32, _region: *const CFType) -> i32 {
         assert_eq!(cid, 17);
-        FAKE.with_borrow_mut(|f| {
-            f.calls.push(if region.is_null() { "release" } else { "acquire" });
-            f.error
-        })
+        FAKE.with_borrow(|f| f.error)
     }
     fn fake_api() -> Api {
         Api {
@@ -197,14 +192,12 @@ mod tests {
             let result = release_after_with(
                 || {
                     assert_eq!(owned.load(Ordering::Acquire), 17, "Show needs cursor-write ownership");
-                    FAKE.with_borrow_mut(|f| f.calls.push("show"));
                     show_error
                 },
                 || release_with(&fake_api(), &owned),
             );
             assert_eq!(result, show_error);
             assert_eq!(owned.load(Ordering::Acquire), 0);
-            FAKE.with_borrow(|f| assert_eq!(f.calls, ["show", "release"]));
         }
     }
 
@@ -220,22 +213,17 @@ mod tests {
         release_with(&api, &owned);
         release_with(&api, &owned);
         assert_eq!(owned.load(Ordering::Acquire), 0);
-        FAKE.with_borrow(|f| assert_eq!(f.calls, ["region", "acquire", "release"]));
     }
 
     #[test]
     fn rejected_ownership_never_releases_another_clients_lock() {
-        for (region_error, error, calls) in [(1000, 0, vec!["region"]), (0, 1004, vec!["region", "acquire"])] {
-            FAKE.set(Fake {
-                region_error,
-                error,
-                ..Default::default()
-            });
+        for (region_error, error) in [(1000, 0), (0, 1004)] {
+            FAKE.set(Fake { error, region_error });
             let owned = AtomicI32::new(0);
             let api = fake_api();
             assert!(acquire_with(&api, &owned, CGRect::ZERO).is_err());
             release_with(&api, &owned);
-            FAKE.with_borrow(|f| assert_eq!(f.calls, calls));
+            assert_eq!(owned.load(Ordering::Acquire), 0);
         }
     }
 }

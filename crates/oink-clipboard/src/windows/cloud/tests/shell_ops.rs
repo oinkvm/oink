@@ -29,7 +29,7 @@ impl FileContents for Contents {
 }
 
 #[test]
-#[ignore = "child of private native Shell operation fixture"]
+#[ignore = "device: child of private native Shell operation fixture"]
 fn external_operation() {
     let Some(source) = std::env::var_os("OINK_PRIVATE_SHELL_SOURCE") else {
         return;
@@ -207,7 +207,7 @@ fn external_operation() {
 }
 
 #[test]
-#[ignore = "private native Cloud Files + Shell: run on a reserved logged-in desktop"]
+#[ignore = "device: private native Cloud Files + Shell: run on a reserved logged-in desktop"]
 fn native_copy_move_matrix() {
     let _ = tracing_subscriber::fmt().with_test_writer().with_ansi(false).try_init();
     struct Cleanup(Arc<Service>);
@@ -311,7 +311,7 @@ fn native_copy_move_matrix() {
 }
 
 #[test]
-#[ignore = "private native Cloud Files + Shell: run on a reserved logged-in desktop"]
+#[ignore = "device: private native Cloud Files + Shell: run on a reserved logged-in desktop"]
 fn native_empty_selected_root_move() {
     // The real renderer runs on its OLE STA; metadata-bound PIDLs need that
     // apartment even though the Cloud Files service itself uses plain cfapi.

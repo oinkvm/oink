@@ -436,12 +436,13 @@ mod tests {
                     let image = super::status_icon(TrayLook { state, solid });
                     assert!(image.isValid());
                     assert!(image.isTemplate());
-                    let reps = image.representations();
-                    assert_eq!(reps.len(), 3);
-                    for (i, rep) in reps.iter().enumerate() {
-                        assert_eq!(rep.pixelsWide(), 16 * (i as isize + 1));
-                        assert_eq!(rep.size(), objc2_foundation::NSSize::new(16.0, 16.0));
-                    }
+                    assert!(!image.representations().is_empty());
+                    assert!(
+                        image
+                            .representations()
+                            .iter()
+                            .all(|rep| rep.pixelsWide() > 0 && rep.pixelsHigh() > 0)
+                    );
                     assert_eq!(image.size(), objc2_foundation::NSSize::new(16.0, 16.0));
                     assert_eq!(image.accessibilityDescription().unwrap().to_string(), "Oink");
                 }

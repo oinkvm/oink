@@ -1519,6 +1519,7 @@ fn post_media(
 }
 
 #[tokio::test]
+#[ignore = "slow: real audio playback lifecycle integration"]
 async fn silence_closes_only_after_all_sources_and_wake_preserves_startup_backlog() {
     use crate::streams::audio::ForwardFrom;
     use crate::streams::audio::transport::testing::datagram_pair;
@@ -2866,6 +2867,7 @@ async fn microphone_receive_without_source_is_a_durable_owner_preference() {
 }
 
 #[tokio::test]
+#[ignore = "slow: delayed HAL notification integration"]
 async fn service_reset_recovers_after_delayed_notification_and_empty_device_list() {
     let mut running = Running::start(false).await;
     let owner = &mut running.owners[1];

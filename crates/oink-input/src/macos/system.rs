@@ -449,6 +449,7 @@ mod thread_tests {
     }
 
     #[test]
+    #[ignore = "device: requires a serviced macOS main queue and Carbon secure-input state"]
     fn secure_input_from_worker_never_enters_carbon_or_waits_for_main() {
         assert!(!super::super::main_queue::is_main_thread());
         let start = std::time::Instant::now();

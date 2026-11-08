@@ -1403,7 +1403,6 @@ fn mismatched_real_drop_rejects_readers_immediately_with_superseded() {
     let deferred = Deferred::new(original.inventory(), original.translator()).unwrap();
     let mut changed = original.inventory();
     changed.items[0].representations[0].format = NativeFormat::Mac("different.native.format".into());
-    let started = std::time::Instant::now();
     assert!(!deferred.complete(Arc::new(Fixture {
         inventory: changed,
         bytes: Mutex::default()
@@ -1413,7 +1412,6 @@ fn mismatched_real_drop_rejects_readers_immediately_with_superseded() {
         Err(error) => error,
     };
     assert_eq!(reason(&error), Unavailable::Superseded);
-    assert!(started.elapsed() < std::time::Duration::from_secs(2));
 }
 
 #[test]

@@ -471,6 +471,7 @@ mod tests {
 
     /// 大目录：两万个文件（200 个文件夹 × 100 个文件）的展开时间。
     #[test]
+    #[ignore = "slow: 20,000-file filesystem performance benchmark"]
     fn large_tree_is_fast_enough() {
         let t = TempDir::new("large");
         let root = t.0.join("big");

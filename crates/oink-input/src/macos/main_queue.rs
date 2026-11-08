@@ -126,6 +126,7 @@ mod tests {
 
     /// 单元测试的线程都不是主线程，libtest 的主线程也不服务主队列：投递不执行、不阻塞、不崩溃。
     #[test]
+    #[ignore = "device: requires a serviced macOS main dispatch queue"]
     fn off_main_without_a_main_run_loop_degrades() {
         assert!(!is_main_thread());
         let t = std::time::Instant::now();

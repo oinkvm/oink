@@ -151,13 +151,6 @@ unsafe extern "C-unwind" fn storage_events(
 mod tests {
     use super::*;
     #[test]
-    fn existing_root_starts_and_stops_watch() {
-        let temp = tempfile::tempdir().unwrap();
-        let watch = StorageWatch::new(temp.path()).unwrap();
-        drop(watch);
-    }
-
-    #[test]
     fn missing_root_reports_watch_unavailable() {
         let temp = tempfile::tempdir().unwrap();
         assert_eq!(

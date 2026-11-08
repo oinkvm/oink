@@ -4827,7 +4827,7 @@ mod tests {
             .unwrap();
     }
     #[test]
-    #[ignore = "requires a standard interactive Windows desktop session"]
+    #[ignore = "device: requires a standard interactive Windows desktop session"]
     fn native_abandoned_root() {
         let cache = PathBuf::from(std::env::var_os("OINK_CLOUD_NATIVE_CACHE").unwrap());
         let _service = initialize(cache).unwrap();
@@ -4836,7 +4836,7 @@ mod tests {
         std::process::exit(0); // intentionally skip destructors to exercise crash recovery
     }
     #[test]
-    #[ignore = "requires a standard interactive Windows desktop session"]
+    #[ignore = "device: requires a standard interactive Windows desktop session"]
     fn native_reader() {
         let path = std::env::var_os("OINK_CLOUD_NATIVE_READ").unwrap();
         if let Ok(expected) = std::env::var("OINK_CLOUD_NATIVE_VERSION_SIZE") {
@@ -4894,7 +4894,7 @@ mod tests {
         panic!("parent did not release held reader");
     }
     #[test]
-    #[ignore = "requires a standard interactive Windows desktop session"]
+    #[ignore = "device: requires a standard interactive Windows desktop session"]
     fn native_placeholder_rejects_changed_version_before_read() {
         let temp = tempfile::tempdir().unwrap();
         let service = initialize(temp.path().to_owned()).unwrap();
@@ -4992,7 +4992,7 @@ mod tests {
         }
     }
     #[test]
-    #[ignore = "private native Cloud Files tree; run in an interactive Windows session"]
+    #[ignore = "device: private native Cloud Files tree; run in an interactive Windows session"]
     fn native_lazy_tree_population() {
         use crate::content::{
             Provider,
@@ -5222,7 +5222,7 @@ mod tests {
         }
     }
     #[test]
-    #[ignore = "child of native_lazy_tree_population"]
+    #[ignore = "device: child of native_lazy_tree_population"]
     fn native_lazy_tree_consumer() {
         let source = std::env::var("OINK_TREE_SOURCE").unwrap().replace('/', "\\");
         eprintln!("TREE_CONSUMER_SOURCE {source}");
@@ -5292,7 +5292,7 @@ mod tests {
         assert!(!root.exists());
     }
     #[test]
-    #[ignore = "external dehydration child of the private received-retention fixture"]
+    #[ignore = "device: external dehydration child of the private received-retention fixture"]
     fn native_received_external_dehydrate() {
         assert!(std::env::var_os("ACROSS_DEVICE_TEST_HELD").is_some());
         let path = PathBuf::from(std::env::var_os("OINK_RETENTION_EDIT_PATH").unwrap());
@@ -5317,7 +5317,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "child of the private received-retention native fixture"]
+    #[ignore = "device: child of the private received-retention native fixture"]
     fn native_received_local_edit_writer() {
         assert!(std::env::var_os("ACROSS_DEVICE_TEST_HELD").is_some());
         let path = PathBuf::from(std::env::var_os("OINK_RETENTION_EDIT_PATH").unwrap());
@@ -5333,7 +5333,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "private Cloud Files root; run only under the device-test lock"]
+    #[ignore = "device: private Cloud Files root; run only under the device-test lock"]
     #[cfg(debug_assertions)]
     fn native_received_expiry_dehydrates_and_refetches_only_linked_content() {
         assert!(
@@ -5636,7 +5636,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires native Cloud Files on NTFS; uses only a private non-GUI sync root"]
+    #[ignore = "device: requires native Cloud Files on NTFS; uses only a private non-GUI sync root"]
     #[cfg(debug_assertions)]
     fn native_received_package_reader_waits_for_own_and_concurrent_hydration() {
         use std::sync::Condvar;
@@ -5780,7 +5780,7 @@ mod tests {
         }
     }
     #[test]
-    #[ignore = "child process for private non-GUI move fixture"]
+    #[ignore = "device: child process for private non-GUI move fixture"]
     fn native_move_worker() {
         let Some(source) = std::env::var_os("OINK_PRIVATE_MOVE_SOURCE") else {
             return;
@@ -5806,7 +5806,7 @@ mod tests {
         }
     }
     #[test]
-    #[ignore = "requires native Cloud Files on NTFS; uses only a private non-GUI sync root"]
+    #[ignore = "device: requires native Cloud Files on NTFS; uses only a private non-GUI sync root"]
     fn native_move_during_hydration() {
         let _ = tracing_subscriber::fmt().with_test_writer().with_ansi(false).try_init();
         struct Cleanup(Arc<Service>);
@@ -5974,7 +5974,7 @@ mod tests {
         }
     }
     #[test]
-    #[ignore = "requires a standard interactive Windows desktop session"]
+    #[ignore = "device: requires a standard interactive Windows desktop session"]
     fn native_explorer_copy_first_selection_preserves_matching_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let service = initialize(temp.path().to_owned()).unwrap();
@@ -6013,7 +6013,7 @@ mod tests {
         cleanup_native_test_root(&root);
     }
     #[test]
-    #[ignore = "requires a standard interactive Windows desktop session"]
+    #[ignore = "device: requires a standard interactive Windows desktop session"]
     fn native_placeholder_hydrates_and_survives_owner_restart() {
         let temp = tempfile::tempdir().unwrap();
         let abandoned = std::process::Command::new(std::env::current_exe().unwrap())

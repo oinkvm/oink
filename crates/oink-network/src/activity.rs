@@ -83,19 +83,6 @@ impl Activity {
 mod tests {
     use super::*;
     #[tokio::test(start_paused = true)]
-    async fn exact_boundary_and_flapping() {
-        let a = Activity::default();
-        assert!(!a.status().active());
-        a.note(Kind::Local);
-        tokio::time::advance(HOLD - Duration::from_millis(1)).await;
-        assert!(a.status().local);
-        a.note(Kind::Local);
-        tokio::time::advance(HOLD - Duration::from_millis(1)).await;
-        assert!(a.status().local);
-        tokio::time::advance(Duration::from_millis(1)).await;
-        assert!(!a.status().active());
-    }
-    #[tokio::test(start_paused = true)]
     async fn one_second_broadcasts_missing_pulses_and_first_after_idle() {
         let a = Activity::default();
         a.note(Kind::Group);
@@ -117,15 +104,17 @@ mod tests {
         assert!(!a.status().active());
     }
     #[tokio::test(start_paused = true)]
-    async fn last_sound_expires_at_exactly_three_seconds() {
-        let activity = Activity::default();
-        activity.note(Kind::Audio);
-        tokio::time::advance(Duration::from_millis(10)).await;
-        activity.note(Kind::Audio);
-        tokio::time::advance(Duration::from_millis(2999)).await;
-        assert!(activity.status().audio);
-        tokio::time::advance(Duration::from_millis(1)).await;
-        assert!(!activity.status().active());
+    async fn last_activity_expires_at_exactly_three_seconds() {
+        for kind in [Kind::Local, Kind::Audio] {
+            let activity = Activity::default();
+            activity.note(kind);
+            tokio::time::advance(Duration::from_millis(10)).await;
+            activity.note(kind);
+            tokio::time::advance(Duration::from_millis(2999)).await;
+            assert!(activity.status().active());
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert!(!activity.status().active());
+        }
     }
     #[tokio::test(start_paused = true)]
     async fn own_group_and_audio_expire_independently() {

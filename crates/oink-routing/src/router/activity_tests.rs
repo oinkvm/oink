@@ -71,6 +71,7 @@ fn physical_input_still_broadcasts_without_periodic_renewal() {
 }
 
 #[test]
+#[ignore = "slow: dense idle tick simulation"]
 fn captured_physical_input_and_peer_activity_refresh_but_idle_time_does_not() {
     let mut r = router();
     r.cfg.os = Os::MacOS;

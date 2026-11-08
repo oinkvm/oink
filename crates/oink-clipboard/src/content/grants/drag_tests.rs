@@ -101,16 +101,10 @@ impl Namespace for Source {
 }
 
 #[test]
-fn mac_promise_recrosses_source_and_third_host_without_drop() {
-    recross(Kind::MacPromise, true);
-}
-#[test]
-fn windows_virtual_recrosses_source_and_third_host_without_drop() {
-    recross(Kind::WindowsVirtual, true);
-}
-#[test]
-fn ordinary_file_recrosses_source_and_third_host_without_drop() {
-    recross(Kind::RealFile, true);
+fn recrosses_source_and_third_host_without_drop_for_each_kind() {
+    for kind in [Kind::MacPromise, Kind::WindowsVirtual, Kind::RealFile] {
+        recross(kind, true);
+    }
 }
 #[test]
 fn next_host_preparation_reuses_fulfilment_even_before_previous_host_leaves() {

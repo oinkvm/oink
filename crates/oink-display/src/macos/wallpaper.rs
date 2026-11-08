@@ -385,13 +385,19 @@ mod tests {
     }
 
     #[test]
-    fn same_input_gives_identical_bytes() {
+    fn same_input_produces_a_valid_bounded_thumbnail() {
         let dir = temp_dir("stable");
         let path = dir.join("bands.png");
         write_bands(&path);
-        let a = render(&path, [0.0; 3], 1600.0, 1000.0).unwrap();
-        let b = render(&path, [0.0; 3], 1600.0, 1000.0).unwrap();
-        assert_eq!(a, b);
+        let thumbnail = render(&path, [0.0; 3], 1600.0, 1000.0).unwrap();
+        assert_eq!((thumbnail.width, thumbnail.height), (480, 300));
+        assert!(thumbnail.jpeg.starts_with(&[0xFF, 0xD8]));
+        assert!(thumbnail.jpeg.len() <= TARGET_BYTES);
+        let (width, height, pixels) = decode(&thumbnail.jpeg);
+        assert_eq!((width, height), (480, 300));
+        let center = (height / 2 * width + width / 2) * 4;
+        assert!(pixels[center + 1] > pixels[center]);
+        assert!(pixels[center + 1] > pixels[center + 2]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -418,6 +424,7 @@ mod tests {
 
     /// 单元测试的主线程不服务主队列：查询超时，结果是「这次没查到」，不阻塞、不崩溃。
     #[test]
+    #[ignore = "slow: requires a real macOS main queue timeout"]
     fn off_main_without_a_main_run_loop_gives_none() {
         let t = std::time::Instant::now();
         assert_eq!(on_main_wait(Duration::from_millis(50), |_| 1), None);

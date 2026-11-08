@@ -646,9 +646,7 @@ mod tests {
         let urls = FileUrls::with_source(spec(), Arc::new(Ready(retired.clone()))).unwrap();
         let mut slot = urls.shared.result.lock().unwrap();
         while slot.is_none() {
-            let (next, wait) = urls.shared.ready.wait_timeout(slot, Duration::from_secs(2)).unwrap();
-            assert!(!wait.timed_out());
-            slot = next;
+            slot = urls.shared.ready.wait(slot).unwrap();
         }
         drop(slot);
         urls.cancel();

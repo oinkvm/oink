@@ -122,6 +122,7 @@ impl Drop for Timer {
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "device: requires a native CFRunLoop timer and source wake"]
     fn pacing_timer_and_network_source_wake_the_same_run_loop() {
         std::thread::spawn(|| {
             let run_loop = CFRunLoop::current().unwrap();

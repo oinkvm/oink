@@ -103,9 +103,10 @@ pub(super) struct SmallFiles {
     roots: Vec<FileNode>,
     guard: ReaderGuard,
     state: Mutex<State>,
-    changed: Condvar,
+    state_changed: Condvar,
     cancelled: AtomicBool,
     publication: Mutex<Option<io::Result<ClipboardIdentity>>>,
+    publication_changed: Condvar,
     await_publication: AtomicBool,
 }
 impl SmallFiles {
@@ -142,9 +143,10 @@ impl SmallFiles {
             roots,
             guard,
             state: Mutex::new(State::Idle),
-            changed: Condvar::new(),
+            state_changed: Condvar::new(),
             cancelled: AtomicBool::new(false),
             publication: Mutex::new(None),
+            publication_changed: Condvar::new(),
             await_publication: AtomicBool::new(false),
         })
     }
@@ -172,7 +174,7 @@ impl SmallFiles {
                         Ok(urls) => State::Ready(urls),
                         Err(error) => State::Failed(content::reason(&error)),
                     };
-                    this.changed.notify_all();
+                    this.state_changed.notify_all();
                 })
             {
                 *state = State::Failed(content::reason(&error));
@@ -191,7 +193,7 @@ impl SmallFiles {
             })
         });
         *self.publication.lock().unwrap() = Some(identity);
-        self.changed.notify_all();
+        self.publication_changed.notify_all();
     }
 
     /// A paste waits for already-started prefetch within its own 5s budget.
@@ -229,13 +231,13 @@ impl SmallFiles {
             if left.is_zero() {
                 *state = State::Failed(Unavailable::NoProgress);
                 self.cancelled.store(true, Ordering::Release);
-                self.changed.notify_all();
+                self.state_changed.notify_all();
                 drop(state);
                 self.files.cancel_native_delivery();
                 return Err(content::unavailable(Unavailable::NoProgress));
             }
             state = self
-                .changed
+                .state_changed
                 .wait_timeout(state, left.min(Duration::from_millis(10)))
                 .unwrap()
                 .0;
@@ -259,7 +261,7 @@ impl SmallFiles {
         }
         *state = State::Failed(Unavailable::Cancelled);
         self.cancelled.store(true, Ordering::Release);
-        self.changed.notify_all();
+        self.state_changed.notify_all();
         drop(state);
         self.files.cancel_native_delivery();
     }
@@ -384,7 +386,7 @@ impl SmallFiles {
         while self.await_publication.load(Ordering::Acquire) && publication.is_none() {
             self.check(deadline)?;
             publication = self
-                .changed
+                .publication_changed
                 .wait_timeout(publication, Duration::from_millis(10))
                 .unwrap()
                 .0;

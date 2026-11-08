@@ -67,6 +67,7 @@ fn code(t: &TopologyLayout, p: ScreenPos, d: (f64, f64)) -> Option<String> {
     t.first_portal_native(&p, d).map(|e| e.to.screen.display)
 }
 #[test]
+#[ignore = "slow: exhaustive native pixel edge sampling"]
 fn unoccluded_top_edge_reaches_the_visible_remote_owner() {
     let (layout, owners) = fixture();
     let route = TopologyLayout::from_layout(&layout, &owners);

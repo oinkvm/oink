@@ -469,7 +469,7 @@ mod tests {
     /// Device-test lock required. Only opens/closes the contact subscription;
     /// never installs a tap, changes capture mode, or touches cursor/focus/settings.
     #[test]
-    #[ignore = "native contact subscription; run under scripts/device-test.sh"]
+    #[ignore = "device: requires native contact subscription; run under scripts/device-test.sh"]
     fn capture_availability_on_device() {
         static LOCAL: AtomicBool = AtomicBool::new(false);
         let capture = Capture::start(&LOCAL, std::sync::Arc::new(|| {}));

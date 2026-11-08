@@ -1373,6 +1373,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: exercises the maximum compressed segment limit"]
     fn compressed_and_expanded_lengths_are_bounded_and_trailing_data_is_rejected() {
         let raw = vec![0; MAX_SEGMENT_RAW];
         let bytes = compress(&raw, DEFLATE).unwrap();

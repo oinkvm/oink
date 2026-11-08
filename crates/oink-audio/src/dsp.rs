@@ -2328,6 +2328,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: long running audio or locator pressure trace"]
     fn drift_controller_tracks_both_clock_directions_for_ten_minutes() {
         for clock_ppm in [-700.0, 700.0] {
             let mut controller = DriftController::default();
@@ -2344,6 +2345,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: long running audio or locator pressure trace"]
     fn packetized_clocks_remain_bounded_without_loss_for_two_minutes() {
         let packet = packets(1).remove(0);
         for clock_ppm in [-700.0, 700.0] {
@@ -2801,6 +2803,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: long running audio or locator pressure trace"]
     fn low_latency_packet_clocks_stay_bounded_for_two_minutes() {
         let mut config = Config::low_latency_pcm();
         config.jitter.adaptive = false;
@@ -3018,6 +3021,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: long running audio or locator pressure trace"]
     fn larger_ceiling_has_identical_playout_on_a_steady_link() {
         for config in [Config::low_latency_pcm(), Config::low_latency_opus()] {
             let mut limited = config;
@@ -3063,6 +3067,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: long running audio or locator pressure trace"]
     fn recurring_two_hundred_ms_stalls_retain_reserve_and_drain_without_skips() {
         for config in [Config::low_latency_pcm(), Config::low_latency_opus()] {
             for callback_frames in [128_u64, 480] {
@@ -3924,6 +3929,7 @@ mod quiet_recovery_tests {
     }
 
     #[test]
+    #[ignore = "slow: long running audio or locator pressure trace"]
     fn quiet_cut_and_cooldown_keep_the_applied_resampler_rate_within_slew() {
         for config in [
             Config::low_latency_pcm(),
@@ -4239,6 +4245,7 @@ mod quiet_recovery_tests {
     }
 
     #[test]
+    #[ignore = "slow: long running audio or locator pressure trace"]
     fn quiet_backlog_recovers_in_seconds_against_nonquiet_rate_only_reference() {
         for config in [
             Config::low_latency_pcm(),
@@ -4308,6 +4315,7 @@ mod quiet_recovery_tests {
     }
 
     #[test]
+    #[ignore = "slow: long running audio or locator pressure trace"]
     fn speech_pauses_with_minus_55_dbfs_peak_pink_noise_recover_without_cutting_voice() {
         let noise = pink_noise(48_000);
         let rms = (noise.iter().map(|x| x * x).sum::<f32>() / noise.len() as f32).sqrt();

@@ -5,10 +5,10 @@ use super::*;
 const STARTUP_RECORDS: usize = 2048;
 
 #[test]
+#[ignore = "slow: child process exit and logging integration fixture"]
 fn role_exit_fixture() {
-    let Ok(mode) = std::env::var("OINK_LOG_EXIT_FIXTURE") else {
-        return;
-    };
+    let mode = std::env::var("OINK_LOG_EXIT_FIXTURE")
+        .expect("role_exit_fixture is an ignored fixture invoked by its parent test");
     if mode == "hook_abort" {
         // Model an abort-profile panic: no unwinding and no entry guard Drop.
         std::panic::set_hook(Box::new(|_| std::process::abort()));
@@ -53,7 +53,12 @@ fn every_role_drains_final_failure_and_panic_before_process_exit() {
         for mode in ["return", "error", "caught", "panic", "hook_abort", "direct_exit"] {
             let dir = tempfile::tempdir().unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "logs::exit_tests::role_exit_fixture", "--nocapture"])
+                .args([
+                    "--exact",
+                    "logs::exit_tests::role_exit_fixture",
+                    "--nocapture",
+                    "--ignored",
+                ])
                 .env("OINK_HOME", dir.path())
                 .env("OINK_LOG_EXIT_FIXTURE", mode)
                 .env("OINK_LOG_ROLE", role)

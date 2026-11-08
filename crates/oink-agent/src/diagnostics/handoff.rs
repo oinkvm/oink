@@ -385,19 +385,6 @@ impl input_trace::InputTrace {
         raw.success = success;
         self.handoff(raw);
     }
-    #[cfg(all(test, debug_assertions))]
-    pub fn flush(&self, peer: DeviceId, sequence: u64, dx: f64, dy: f64) {
-        self.flush_detail(
-            peer,
-            None,
-            None,
-            sequence,
-            sequence,
-            1,
-            Point::new(dx, dy),
-            FlushReason::Due,
-        );
-    }
     #[allow(clippy::too_many_arguments)]
     pub fn flush_detail(
         &self,

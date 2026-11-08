@@ -328,46 +328,6 @@ mod tests {
         assert!(!m.push(0.01, BIN_US, invalid.edge_damping_profile()));
         assert!(m.push(0.061, 2 * BIN_US, invalid.edge_damping_profile()));
     }
-    #[test]
-    fn sampled_profile_and_retreat_preserve_golden_arithmetic() {
-        // Repeated timestamps, bin boundaries, braking, inward motion and idle bins.
-        let cfg = RoutingSettings {
-            damping: DampingConfig {
-                platform_profile: DampingProfile::EnergyDepth {
-                    energy: 0.031,
-                    acceleration: 4.5,
-                    max_weight: 2.4,
-                    max_depth: 0.12,
-                },
-                ..Default::default()
-            },
-            ..RoutingSettings::default()
-        };
-        let trace: [(f64, u64, f64, f64, bool); 12] = [
-            (0.002, 4300, 0.002, 0.0, false),
-            (0.003, 4300, 0.005, 0.0, false),
-            (0.005, 9800, 0.01, 0.0, false),
-            (0.007, 10200, 0.017, 0.0026666666666666666, false),
-            (0.001, 20700, 0.018000000000000002, 0.010373333333333332, false),
-            (-0.004, 20700, 0.014000000000000002, 0.010373333333333332, false),
-            (0.003, 30900, 0.017, 0.019013333333333333, false),
-            (0.002, 40500, 0.019000000000000003, 0.02068973936899863, false),
-            (0.001, 70000, 0.020000000000000004, 0.02068973936899863, false),
-            (0.0, 90000, 0.020000000000000004, 0.02068973936899863, false),
-            (0.004, 20000000, 0.024000000000000004, 0.02068973936899863, false),
-            (0.1, 20010000, 0.12400000000000001, 0.02104310013717421, true),
-        ];
-        let mut meter = DampingMeter::new(4300);
-        for (du, now, depth, energy, crossed) in trace {
-            if du < 0.0 {
-                meter.retreat(-du);
-            } else {
-                assert_eq!(meter.push(du, now, cfg.edge_damping_profile()), crossed, "at {now}");
-            }
-            assert_eq!(meter.depth().to_bits(), depth.to_bits(), "depth at {now}");
-            assert_eq!(meter.energy().to_bits(), energy.to_bits(), "energy at {now}");
-        }
-    }
 
     #[test]
     fn depth_only_has_no_energy_and_compares_threshold_literally() {

@@ -321,6 +321,7 @@ mod native_tests {
     }
 
     #[test]
+    #[ignore = "slow: image thumbnail performance qualification"]
     fn generated_image_files_have_bounded_thumbnails_and_report_timing() {
         generated_image_files(&[("public.png", "png"), ("public.jpeg", "jpg"), ("public.tiff", "tiff")]);
     }
@@ -330,7 +331,7 @@ mod native_tests {
     // correct; qualify real-time HEIC separately on a quiet physical machine.
     // The normal suite still covers HEIC conversion in content::audit_tests.
     #[test]
-    #[ignore = "HEIC timing qualification requires an otherwise idle machine with hardware HEVC decoding"]
+    #[ignore = "device: HEIC timing qualification requires idle hardware HEVC decoding"]
     fn generated_heic_file_meets_realtime_budget_on_qualified_hardware() {
         #[link(name = "VideoToolbox", kind = "framework")]
         unsafe extern "C" {

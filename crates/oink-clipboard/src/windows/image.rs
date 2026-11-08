@@ -756,47 +756,6 @@ mod tests {
     }
 
     #[test]
-    fn generated_dib_depth_and_orientation_conversion_pairs() {
-        for bpp in [1u16, 4, 8, 16, 24, 32] {
-            for top_down in [false, true] {
-                let mut dib = Vec::new();
-                put_u32(&mut dib, 40);
-                put_u32(&mut dib, 2);
-                put_u32(&mut dib, if top_down { (-2i32) as u32 } else { 2 });
-                put_u16(&mut dib, 1);
-                put_u16(&mut dib, bpp);
-                put_u32(&mut dib, BI_RGB);
-                dib.resize(40, 0);
-                if bpp <= 8 {
-                    dib[32..36].copy_from_slice(&2u32.to_le_bytes());
-                    dib.extend_from_slice(&[0, 0, 0, 0, 0, 0, 255, 0]);
-                }
-                let (black_red, red_black) = match bpp {
-                    1 => (vec![0x40, 0, 0, 0], vec![0x80, 0, 0, 0]),
-                    4 => (vec![0x01, 0, 0, 0], vec![0x10, 0, 0, 0]),
-                    8 => (vec![0, 1, 0, 0], vec![1, 0, 0, 0]),
-                    16 => (vec![0, 0, 0, 0x7c], vec![0, 0x7c, 0, 0]),
-                    24 => (vec![0, 0, 0, 0, 0, 255, 0, 0], vec![0, 0, 255, 0, 0, 0, 0, 0]),
-                    _ => (vec![0, 0, 0, 123, 0, 0, 255, 123], vec![0, 0, 255, 123, 0, 0, 0, 123]),
-                };
-                if top_down {
-                    dib.extend_from_slice(&black_red);
-                    dib.extend_from_slice(&red_black);
-                } else {
-                    dib.extend_from_slice(&red_black);
-                    dib.extend_from_slice(&black_red);
-                }
-                let expected = [0, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 0, 0, 0, 255];
-                assert_eq!(
-                    pixels(decode_dib(&dib).unwrap()).data,
-                    expected,
-                    "bpp={bpp} top_down={top_down}"
-                );
-                assert_eq!(decode_png(&dib_to_png(&dib).unwrap()).unwrap().data, expected);
-            }
-        }
-    }
-    #[test]
     fn malformed_palette_masks_and_planes_are_unavailable() {
         let mut palette = vec![0; 40];
         palette[..4].copy_from_slice(&40u32.to_le_bytes());

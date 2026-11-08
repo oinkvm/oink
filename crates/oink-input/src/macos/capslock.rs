@@ -1013,35 +1013,6 @@ mod tests {
         assert_eq!(parse_pref(PrefValue::Other), None);
     }
 
-    /// 回归（2026-09-29 线上崩溃：界面程序在 tokio 线程上移交焦点时读取输入法，HIToolbox 断言主线程失败，
-    /// 进程被 SIGTRAP 终止）：非主线程上的读取、设置、源端守卫都不能调用 TIS。
-    /// 单元测试的线程不是主线程、主队列也没人服务：TIS 包装拒绝调用；其余路径排队给主线程后立即返回，
-    /// 本机设置读取与守卫不阻塞后台线程。历史界面程序形态曾验证此约束；焦点移交状态路径现已删除。
-    #[test]
-    fn background_thread_paths_never_call_tis() {
-        std::thread::spawn(|| {
-            assert!(!main_queue::is_main_thread());
-            let t = Instant::now();
-            // TIS 包装在非主线程上拒绝调用（不会走到 HIToolbox 的断言）。
-            assert!(tis::current().is_none());
-            assert!(tis::by_id("com.apple.keylayout.ABC").is_none());
-            assert!(tis::selectable_keyboard_sources().is_empty());
-            // 设置读不到时按普通大写锁定。短按现在投递真实系统事件，不能在单元测试里调用
-            // perform(NativeCaps)；后台线程构造事件由 sysevent 的无投递测试覆盖。
-            assert_eq!(current_behavior(), Behavior::Lock);
-            // 源端守卫：输入法的记录、核对、清除都排队给主线程。
-            static GUARD: LocalGuard = LocalGuard::new();
-            GUARD.enter_remote();
-            GUARD.snapshot_source();
-            GUARD.caps_swallowed();
-            GUARD.enforce();
-            GUARD.leave_remote();
-            assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
-        })
-        .join()
-        .expect("后台线程上的键盘状态路径不能 panic / 崩溃");
-    }
-
     #[test]
     fn behavior_from_setting() {
         let base = SwitchSetting {

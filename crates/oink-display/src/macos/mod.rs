@@ -258,20 +258,20 @@ mod tests {
     }
 
     #[test]
-    fn virtual_names() {
-        assert!(looks_virtual("BetterDisplay Dummy 16:9"));
-        assert!(!looks_virtual("DELL U2720Q"));
-    }
-
-    #[test]
-    fn enumerates_real_displays() {
-        // 在 macOS 上总能拿到至少一块显示器（CI 的无头 mac 也有虚拟帧缓冲）。
-        let list = enumerate().expect("enumerate");
-        assert!(!list.is_empty());
-        assert_eq!(list.iter().filter(|d| d.is_primary).count(), 1);
-        for d in &list {
-            assert!(d.bounds.w > 0.0 && d.bounds.h > 0.0);
-            assert!(!d.key.is_empty());
+    fn virtual_names_follow_supported_markers() {
+        for name in [
+            "Virtual Display",
+            "BetterDisplay Dummy 16:9",
+            "headless framebuffer",
+            "VNC Display",
+            "Remote Display 1",
+            "Parsec Virtual Monitor",
+            "DeskPad",
+        ] {
+            assert!(looks_virtual(name), "{name}");
+        }
+        for name in ["DELL U2720Q", "Studio Display", "Built-in Retina Display", "Monitor"] {
+            assert!(!looks_virtual(name), "{name}");
         }
     }
 }

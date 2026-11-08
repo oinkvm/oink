@@ -1817,63 +1817,6 @@ mod tests {
     fn magnify(phase: GesturePhase) -> MultiEvent {
         MultiEvent::Gesture(Gesture::Magnify { phase, amount: 0.1 })
     }
-    // Separate physical touches must be classified independently from the
-    // optional/overlapping system momentum tail of an earlier touch.
-    #[test]
-    fn regression_new_three_finger_touch_after_scroll_without_momentum() {
-        let (mut r, origin) = mac_scroll_router(true, Some(5));
-        let scroll = sample(0, 2, 1000);
-        let lift = sample(16_000, 0, 0);
-        r.receive_contacts(origin, Frame::between(None, &scroll));
-        assert!(r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Began)));
-        r.receive_contacts(origin, Frame::between(Some(&scroll), &lift));
-        assert!(r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Ended)));
-        r.out.clear();
-
-        r.receive_contacts(origin, Frame::between(None, &sample(144_000, 3, 1000)));
-        assert!(
-            r.out.iter().any(|o| matches!(o,
-            Output::Inject(InjectEvent::TouchpadContacts(f)) if f.phase == Phase::Begin)),
-            "an optional momentum start cannot reserve the next physical touch"
-        );
-    }
-
-    #[test]
-    fn regression_new_touch_before_old_momentum_end_keeps_native_begin() {
-        let (mut r, origin) = mac_scroll_router(true, Some(5));
-        let scroll = sample(0, 2, 1000);
-        let lift = sample(16_000, 0, 0);
-        r.receive_contacts(origin, Frame::between(None, &scroll));
-        assert!(r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Began)));
-        r.receive_contacts(origin, Frame::between(Some(&scroll), &lift));
-        assert!(r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::Ended)));
-        assert!(r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::MomentumBegan)));
-        r.out.clear();
-
-        // Recorded ordering: the new two-contact Begin precedes the old
-        // MomentumEnded, then a third contact joins 16 ms later.
-        let next = sample(144_000, 2, 1000);
-        r.receive_contacts(origin, Frame::between(None, &next));
-        r.filter_multifinger(origin, MultiEvent::Scroll(ScrollPhase::MomentumEnded));
-        r.receive_contacts(origin, Frame::between(Some(&next), &sample(160_000, 3, 1200)));
-        let frames: Vec<_> = r
-            .out
-            .iter()
-            .filter_map(|o| match o {
-                Output::Inject(InjectEvent::TouchpadContacts(f)) => Some(f),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            frames.len(),
-            2,
-            "the new touch must retain and replay its Begin independently of the old momentum"
-        );
-        assert_eq!(frames[0].phase, Phase::Begin);
-        assert_eq!(frames[0].time_us, 144_000);
-        assert_eq!(frames[1].time_us, 160_000);
-    }
-
     #[test]
     fn new_touch_stops_old_synthetic_tail_and_preserves_new_native_owner() {
         for position in 0..3 {

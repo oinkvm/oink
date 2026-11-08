@@ -272,7 +272,6 @@ async fn stop_closes_listener_and_unfinished_tls_handshakes_before_returning() {
     rig.core.ensure_listener();
     let address = lock(&rig.core.listener).unwrap();
     let mut unfinished = tokio::net::TcpStream::connect(address).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(10)).await;
     rig.core.stop().await;
     assert_eq!(*rig.core.background.borrow(), 0);
     let mut byte = [0];

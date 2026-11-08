@@ -2,7 +2,10 @@ use super::*;
 use crate::{FileContents, FileEntry, FileMetadata, content::native_metadata::NativeFileMetadata};
 use std::{
     path::PathBuf,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
 };
 
 struct Bodies(AtomicUsize);
@@ -12,14 +15,19 @@ impl FileContents for Bodies {
         Ok(Box::new(io::Cursor::new(vec![index as u8 + 1; index + 4])))
     }
 }
-struct Consumer(Arc<AtomicUsize>);
+struct Consumer {
+    count: Arc<AtomicUsize>,
+    done: mpsc::Sender<()>,
+}
 impl Drop for Consumer {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.count.fetch_sub(1, Ordering::SeqCst);
+        self.done.send(()).unwrap();
     }
 }
 struct Received {
     consumers: Arc<AtomicUsize>,
+    done: mpsc::Sender<()>,
     nodes: Vec<FileNode>,
     paths: HashMap<NodeId, PathBuf>,
     native: NativeFileMetadata,
@@ -27,7 +35,10 @@ struct Received {
 impl Namespace for Received {
     fn native_lease(&self) -> io::Result<namespace::NativeLease> {
         self.consumers.fetch_add(1, Ordering::SeqCst);
-        Ok(Box::new(Consumer(self.consumers.clone())))
+        Ok(Box::new(Consumer {
+            count: self.consumers.clone(),
+            done: self.done.clone(),
+        }))
     }
     fn requires_native_files(&self) -> bool {
         true
@@ -172,8 +183,10 @@ fn original_wide_ansi_headers_and_indices_survive_source_receipts() {
             paths.insert(node.id, path);
         }
         let consumers = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = mpsc::channel();
         let received = Arc::new(Received {
             consumers: consumers.clone(),
+            done: done_tx,
             nodes,
             paths,
             native: files.native_file_metadata(),
@@ -268,11 +281,9 @@ fn original_wide_ansi_headers_and_indices_survive_source_receipts() {
                 assert_eq!(consumers.load(Ordering::SeqCst), 1);
                 drop(retained);
             }
-            // Marshaled final release may be queued on the MTA.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while consumers.load(Ordering::SeqCst) != 0 && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+            // The final release is marshaled to the MTA; Consumer sends an
+            // event when that release has actually completed.
+            done_rx.recv().unwrap();
             assert_eq!(consumers.load(Ordering::SeqCst), 0);
         }
         drop(target);

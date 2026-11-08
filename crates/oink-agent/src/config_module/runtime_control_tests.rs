@@ -1220,6 +1220,7 @@ async fn online_removal_retires_authority_without_discarding_queued_revocation()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "slow: revocation ordering requires runtime clock injection"]
 async fn online_removal_can_finish_revocation_before_shortcut_reconciliation() {
     let nodes = start(same_group(2)).await;
     assert!(until(|| ready(&nodes)).await);

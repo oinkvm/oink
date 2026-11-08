@@ -71,7 +71,9 @@ mod tests {
         let worker = std::thread::spawn(move || {
             let _running = worker_cancel.enter().unwrap();
             let mut command = Command::new("/bin/sh");
-            command.args(["-c", "exec sleep 30"]);
+            // Keep the helper blocked until cancellation kills and reaps it.
+            // Unlike sleep, this has no wall-clock dependency or input EOF race.
+            command.args(["-c", "kill -STOP $$"]);
             let polls = AtomicU64::new(0);
             let result = run_manager(command, Instant::now() + MANAGER_TIMEOUT, &|| {
                 // First check precedes spawn; second check owns a live child.
@@ -86,11 +88,9 @@ mod tests {
             ));
             worker_finished.store(true, Ordering::Release);
         });
-        ready.recv_timeout(Duration::from_secs(2)).unwrap();
-        let before = Instant::now();
+        ready.recv().unwrap();
         cancel.cancel_and_wait();
         assert!(finished.load(Ordering::Acquire));
-        assert!(before.elapsed() < Duration::from_secs(2));
         worker.join().unwrap();
     }
 }

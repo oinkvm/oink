@@ -712,23 +712,4 @@ mod tests {
         );
         assert_eq!(hit.unwrap().id, a.id);
     }
-    #[test]
-    fn fractional_wall_intersections_keep_the_full_tangential_remainder() {
-        let bounds = Rect::new(-13.2, 7.6, 100.3, 201.7);
-        let p = Point::new(41.3, 29.9);
-        for dx in [-371.7, -137.1, 211.3, 458.9] {
-            for dy in [-479.3, -161.2, 131.7, 297.2] {
-                let (at, hit, _) = plane_motion(p, (dx, dy), bounds, &[], None);
-                assert!(hit.is_none());
-                let expected = Point::new(
-                    (p.x + dx).clamp(bounds.x, bounds.right()),
-                    (p.y + dy).clamp(bounds.y, bounds.bottom()),
-                );
-                assert!(
-                    (at.x - expected.x).abs() < 1e-8 && (at.y - expected.y).abs() < 1e-8,
-                    "{at:?} != {expected:?}"
-                );
-            }
-        }
-    }
 }

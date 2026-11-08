@@ -534,32 +534,6 @@ mod tests {
         ));
         assert_eq!(std::fs::read(&path).unwrap(), future);
     }
-    #[test]
-    #[ignore = "controlled periodic metadata persistence profile"]
-    fn resource_metadata_publication() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cache = FactsCache::load(dir.path()).unwrap();
-        cache.observe(facts(3)).unwrap();
-        cache.flush().unwrap();
-        let profile = std::env::var_os("OINK_RESOURCE_PROFILE").is_some();
-        let count = if profile { 1500u64 } else { 100 };
-        let began = std::time::Instant::now();
-        let mut saves = 0;
-        for n in 0..count {
-            let mut raw = facts(3).raw().clone();
-            raw.insert(2, (n + 2).write());
-            cache.observe(dto::DeviceFacts::from_raw(raw).unwrap()).unwrap();
-            saves += u64::from(cache.dirty);
-            cache.flush().unwrap();
-            if profile {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-        eprintln!(
-            "METADATA,updates={count},saves={saves},us={}",
-            began.elapsed().as_micros()
-        );
-    }
 
     fn rich_facts() -> dto::DeviceFacts {
         let mut raw = facts(3).raw().clone();

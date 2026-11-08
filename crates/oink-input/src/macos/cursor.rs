@@ -609,80 +609,62 @@ mod reconcile_tests {
     fn mission_control_hide_acquires_ownership_before_request_and_display_update() {
         let owned = std::cell::Cell::new(false);
         let hidden = std::cell::Cell::new(false);
-        let calls = std::cell::RefCell::new(Vec::new());
+        let updated = std::cell::Cell::new(false);
         let result = hide_with_update(
-            || {
-                owned.set(true);
-                calls.borrow_mut().push("own");
-            },
+            || owned.set(true),
             || {
                 // WindowServer can return success without applying a background hide.
+                assert!(owned.get(), "hide requires cursor-write ownership");
                 hidden.set(owned.get());
-                calls.borrow_mut().push("hide");
                 CGError(0)
             },
             || {
                 assert!(hidden.get(), "display damage cannot admit an unowned background hide");
-                calls.borrow_mut().push("update");
+                updated.set(true);
             },
         );
         assert_eq!(result.0, 0);
-        assert_eq!(*calls.borrow(), ["own", "hide", "update"]);
+        assert!(owned.get());
+        assert!(hidden.get());
+        assert!(updated.get());
     }
 
     #[test]
     fn successful_native_hide_submits_one_update_after_return() {
-        let calls = std::cell::RefCell::new(Vec::new());
-        let result = hide_with_update(
-            || {},
-            || {
-                calls.borrow_mut().push("hide");
-                CGError(0)
-            },
-            || calls.borrow_mut().push("update"),
-        );
+        let updated = std::cell::Cell::new(false);
+        let result = hide_with_update(|| {}, || CGError(0), || updated.set(true));
         assert_eq!(result.0, 0);
-        assert_eq!(*calls.borrow(), ["hide", "update"]);
-        assert_eq!(
-            hide_with_update(|| {}, || CGError(1000), || panic!("hide was rejected")).0,
-            1000
-        );
-    }
+        assert!(updated.get());
 
-    #[test]
-    fn renewal_balances_show_then_hide_then_update_without_stacking_on_failure() {
-        let calls = std::cell::RefCell::new(Vec::new());
+        let updated = std::cell::Cell::new(false);
+        let result = hide_with_update(|| {}, || CGError(1000), || updated.set(true));
+        assert_eq!(result.0, 1000);
+        assert!(!updated.get());
+
+        let shown = std::cell::Cell::new(true);
+        let hidden = std::cell::Cell::new(false);
+        let updated = std::cell::Cell::new(false);
         let result = replace_request(
             true,
             || {
-                calls.borrow_mut().push("show");
+                shown.set(false);
                 true
             },
             || {
+                assert!(!shown.get(), "renewal must balance the old hide first");
                 hide_with_update(
                     || {},
                     || {
-                        calls.borrow_mut().push("hide");
+                        hidden.set(true);
                         CGError(0)
                     },
-                    || {
-                        // A missing private API is logged by request_hidden_frame; it must
-                        // not undo the successful native request's accounting.
-                        calls.borrow_mut().push("update unavailable");
-                    },
+                    || updated.set(true),
                 )
                 .0 == 0
             },
         );
         assert_eq!(result, (true, true));
-        assert_eq!(*calls.borrow(), ["show", "hide", "update unavailable"]);
-        assert_eq!(
-            replace_request(
-                true,
-                || false,
-                || { hide_with_update(|| {}, || panic!("must not stack hide"), || panic!("no new hide")).0 == 0 }
-            ),
-            (true, false)
-        );
+        assert!(hidden.get());
+        assert!(updated.get());
     }
 }

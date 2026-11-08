@@ -1335,6 +1335,7 @@ async fn greeting_reply_closing_its_link_returns_an_error_without_panicking_the_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "slow: real membership connection integration"]
 async fn migration_sleeping_owner_rejects_incoming_member_connection() {
     let nodes = start(same_group(2)).await;
     assert!(until(|| ready(&nodes)).await);
@@ -1837,6 +1838,7 @@ fn larger_id_waits_only_on_its_initial_round_and_identity_rejection_keeps_slow_b
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "slow: runtime retry clock injection required"]
 async fn pre_ready_losses_preserve_admission_backoff() {
     let nodes = start(fresh(1)).await;
     nodes[0]
@@ -1870,6 +1872,7 @@ async fn pre_ready_losses_preserve_admission_backoff() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "slow: runtime retry clock injection required"]
 async fn ready_loss_network_change_and_wake_reset_member_retry_immediately() {
     let nodes = start(fresh(1)).await;
     nodes[0]
@@ -1944,6 +1947,7 @@ async fn ready_loss_network_change_and_wake_reset_member_retry_immediately() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "slow: runtime retry clock injection required"]
 async fn repeated_discovery_does_not_bypass_member_rejection_backoff() {
     let nodes = start(same_group(2).into_iter().take(1).collect()).await;
     nodes[0]
@@ -2287,6 +2291,7 @@ async fn full_trust_unknown_peer_cannot_self_admit_through_greeting_request_repl
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "slow: runtime retry clock injection required"]
 async fn full_trust_unknown_announcement_does_not_dial_and_refused_peer_retries_after_membership_update() {
     let keys = identities(2);
     let base = State::create(&keys[0], "a", "test", 1).unwrap();
@@ -2568,47 +2573,6 @@ async fn telemetry_facts_refresh_observations_without_rebuilding_configuration()
 }
 
 /// Isolated loopback owners only: no installed service or native desktop backend.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "manual CPU-cost comparison; prints elapsed processing time"]
-async fn telemetry_facts_processing_benchmark() {
-    let nodes = start(same_group(2)).await;
-    assert!(until(|| ready(&nodes)).await);
-    let peer = nodes[0].identity.id();
-    assert!(
-        until(|| nodes[1]
-            .group
-            .members()
-            .members
-            .iter()
-            .any(|m| m.device == peer && m.facts.is_some()))
-        .await
-    );
-    for node in &nodes {
-        node.group.hold_periodic_facts();
-    }
-    nodes[1].group.call(move |owner| {
-        let link = owner.selected_session(peer).unwrap().0;
-        for round in 0..3 {
-            let facts = owner.facts[&peer].clone();
-            let sequence = facts.fact_sequence().unwrap();
-            let frames = (1..=300).map(|offset| {
-                let mut raw = facts.raw().clone();
-                raw.insert(2, (sequence + offset).write());
-                v1::frame::encode(&Message::ConfigFacts(dto::DeviceFacts::from_raw(raw).unwrap()), v1::limits::CONFIG_FRAME).unwrap()
-            }).collect::<Vec<_>>();
-            let started = Instant::now();
-            let mut rebuilt = 0;
-            for frame in &frames {
-                let before = owner.shared.router.load();
-                owner.control(link, frame).map_err(internal)?;
-                rebuilt += usize::from(!Arc::ptr_eq(&before, &owner.shared.router.load()));
-            }
-            println!("telemetry facts round={round} count={} frame_bytes={} elapsed_us={} configuration_rebuilds={rebuilt}", frames.len(), frames[0].len(), started.elapsed().as_micros());
-        }
-        Ok(())
-    }).unwrap();
-    stop(&nodes).await;
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unhide_repairs_only_restored_device_in_one_layout_publication() {

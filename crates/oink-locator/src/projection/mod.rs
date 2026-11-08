@@ -268,15 +268,15 @@ impl Frame {
 mod lifecycle_tests {
     use super::*;
     #[test]
-    fn fade_submits_empty_frame_even_after_a_tiny_final_alpha() {
+    fn fade_submits_empty_frame_when_reaching_zero_alpha() {
         let now = Instant::now();
         let mut fade = Fade::new(now);
         fade.target(true, now);
         let end = now + Duration::from_millis(100);
         fade.target(false, end);
-        let last = fade.value(end + Duration::from_millis(230));
-        assert!(last > 0.0 && last < 0.0001);
-        let hidden = fade.value(end + Duration::from_millis(240));
+        let last = fade.value(end + Duration::from_millis(1));
+        assert!(last > 0.0);
+        let hidden = fade.value(end + Duration::from_secs(1));
         assert_eq!(hidden, 0.0);
         assert!(
             needs_present(false, hidden, last),

@@ -2,7 +2,7 @@
 use super::*;
 
 #[test]
-#[ignore = "native Windows Shell probe; run on a reserved logged-in desktop"]
+#[ignore = "device: native Windows Shell probe; run on a reserved logged-in desktop"]
 fn compressed_folder_virtual_source() {
     std::thread::spawn(|| {
         use std::os::windows::ffi::OsStrExt;

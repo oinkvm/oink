@@ -21,7 +21,7 @@ use windows::{
 };
 
 #[test]
-#[ignore = "private Cloud Files + separate zipfldr process; run on a reserved logged-in desktop"]
+#[ignore = "device: private Cloud Files + separate zipfldr process; run on a reserved logged-in desktop"]
 fn native_zip_drop_deletes_only_received_copy() {
     let _ = tracing_subscriber::fmt().with_test_writer().with_ansi(false).try_init();
     for warm in [true, false] {
@@ -270,7 +270,7 @@ struct Dialogs {
 }
 
 #[test]
-#[ignore = "child of private Cloud Files zipfldr fixture"]
+#[ignore = "device: child of private Cloud Files zipfldr fixture"]
 fn external_zip_operation() {
     let Some(hdrop) = std::env::var_os("OINK_PRIVATE_ZIP_HDROP") else {
         return;

@@ -1019,47 +1019,6 @@ mod tests {
         assert!(journal.unreceipted_recoveries(b.id()).unwrap().is_empty());
     }
     #[test]
-    #[ignore = "controlled retained-proof retry comparison"]
-    fn resource_recovery_scan_benchmark() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut journal, a, b, source, proof) = source_journal(&dir.path().join(FILE));
-        journal.commit(&proof, &source).unwrap();
-        let pair = journal.recoveries().unwrap()[0].pair;
-        journal
-            .receipt(pair, 1, [(1, RawValue::from("completed"))].into())
-            .unwrap();
-        let profile = std::env::var_os("OINK_RESOURCE_PROFILE").is_some();
-        let count = if profile { 1500 } else { 1000 };
-        for filtered in [false, true] {
-            if let Ok(mode) = std::env::var("OINK_RESOURCE_FILTERED")
-                && filtered != (mode == "1")
-            {
-                continue;
-            }
-            let began = std::time::Instant::now();
-            for _ in 0..count {
-                let candidates = if filtered {
-                    journal.unreceipted_recoveries(b.id()).unwrap()
-                } else {
-                    journal
-                        .recoveries()
-                        .unwrap()
-                        .into_iter()
-                        .filter(|r| !r.receipt && r.target == b.id() && r.source == a.id())
-                        .collect()
-                };
-                assert!(std::hint::black_box(candidates).is_empty());
-                if profile {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-            }
-            eprintln!(
-                "RECOVERY,filtered={filtered},scans={count},us={}",
-                began.elapsed().as_micros()
-            );
-        }
-    }
-    #[test]
     fn committed_projection_and_receipt_survive_restart_without_duplicate_outcome() {
         let (a, b, source, target, plan) = fixture();
         let dir = tempfile::tempdir().unwrap();

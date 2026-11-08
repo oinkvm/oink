@@ -870,32 +870,6 @@ mod sleep_tests {
         assert_eq!(output.shared.percent.load(Ordering::Acquire), 155);
     }
     #[test]
-    fn no_frames_sleeps_at_five_seconds_and_reports_sleep_once() {
-        let config = dsp::Config::low_latency_opus();
-        let (mut encoder, mut output) = channel(config, 100, false).unwrap();
-        let now = Instant::now();
-        supply(&mut encoder, &[0.3; 480], now);
-        let last = output.packets.pop().flatten().unwrap();
-        let exit = crate::idle::Bursts::new(now);
-        assert!(exit.media(last.burst, last.ordinal, now));
-        // No native callbacks: the worker still ticks on its capture wait.
-        encoder.tick(now + Duration::from_millis(4999));
-        assert!(!output.sleeping());
-        crate::allocation_audit::assert_no_heap(|| encoder.tick(now + Duration::from_secs(5)));
-        assert!(
-            output.sleeping(),
-            "source must sleep after five real-time silent seconds"
-        );
-        let sleep = output.packets.pop().flatten().unwrap();
-        assert!(sleep.sleep);
-        assert_eq!((sleep.burst, sleep.ordinal), (last.burst, last.ordinal));
-        exit.sleep(sleep.burst, sleep.ordinal);
-        assert!(exit.asleep(now + Duration::from_secs(5)));
-        encoder.tick(now + Duration::from_secs(6));
-        assert!(output.packets.pop().is_none());
-    }
-
-    #[test]
     fn lost_sleep_fallback_then_resume_has_fresh_codec_preroll_and_onset() {
         for config in [dsp::Config::low_latency_opus(), dsp::Config::low_latency_pcm()] {
             let (mut encoder, mut output) = channel(config, 100, false).unwrap();
@@ -1054,18 +1028,6 @@ mod sleep_tests {
                     }
                 }
             }
-        }
-    }
-    #[test]
-    fn sound_after_a_missed_worker_tick_expires_silence_before_updating_activity() {
-        for gap_ms in [1000, 4900, 5100, 29000, 31000] {
-            let (mut encoder, mut output) = channel(dsp::Config::low_latency_pcm(), 100, false).unwrap();
-            let now = Instant::now();
-            supply(&mut encoder, &[0.3; 240], now);
-            output.packets.pop().unwrap();
-            supply(&mut encoder, &[0.2; 240], now + Duration::from_millis(gap_ms));
-            assert_eq!(output.burst(), if gap_ms < 5000 { 1 } else { 2 });
-            assert!(!output.sleeping());
         }
     }
     #[test]

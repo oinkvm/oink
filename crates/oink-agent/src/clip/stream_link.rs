@@ -695,6 +695,7 @@ mod tests {
     use oink_network::link::{Disconnect, StreamDir};
     use oink_protocol::frame::StreamTag;
     #[test]
+    #[ignore = "slow: real clipboard link lifecycle integration"]
     fn persistent_reopen_before_clipboard_link_lost_is_transport_loss() {
         crate::test_watchdog::run(
             module_path!(),

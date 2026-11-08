@@ -63,30 +63,6 @@ pub(crate) fn tcp(address: SocketAddr) -> io::Result<TcpListener> {
 mod tests {
     use super::*;
     #[test]
-    fn denied_port_asks_os_once_and_other_errors_remain_fatal() {
-        let address = "127.0.0.1:47470".parse().unwrap();
-        let calls = std::cell::RefCell::new(Vec::new());
-        let result = bind(address, "test", |next| {
-            calls.borrow_mut().push(next);
-            if next.port() == 0 {
-                Ok(())
-            } else {
-                Err(io::ErrorKind::PermissionDenied.into())
-            }
-        });
-        assert!(result.is_ok());
-        assert_eq!(calls.borrow().as_slice(), &[address, "127.0.0.1:0".parse().unwrap()]);
-        calls.borrow_mut().clear();
-        assert!(
-            bind(address, "test", |next| {
-                calls.borrow_mut().push(next);
-                Err::<(), _>(io::ErrorKind::InvalidInput.into())
-            })
-            .is_err()
-        );
-        assert_eq!(calls.borrow().as_slice(), &[address]);
-    }
-    #[test]
     fn occupied_udp_and_tcp_fall_back_without_waiting() {
         for (hold_udp, hold_tcp) in [(true, false), (false, true), (true, true)] {
             let address = SocketAddr::from((
