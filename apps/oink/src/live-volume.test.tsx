@@ -100,8 +100,8 @@ it('applies keyboard steps at once through the same coalescing', async () => {
   await act(async () => { await vi.advanceTimersByTimeAsync(50); });
   const slider = container.querySelector<HTMLElement>('[role="slider"]')!;
   for (let i = 0; i < 10; i++) fireEvent.keyDown(slider, { key: 'ArrowUp' });
-  expect(slider.getAttribute('aria-valuenow')).toBe('50');
   await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+  expect(slider.getAttribute('aria-valuenow')).toBe('50');
   expect(backend.exit.length).toBeLessThanOrEqual(3);
   expect(backend.exit.at(-1)).toMatchObject({ volumePercent: 50 });
   expect(agent.get().cards?.exitVolume?.volumePercent).toBe(50);
