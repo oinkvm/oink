@@ -1509,11 +1509,15 @@ async fn layout_edit_made_while_peer_is_away_reaches_it_after_restart_scenario()
         a.node.layout().0.screens.len() == 2 && a.node.layout().0 == b.node.layout().0
     })
     .await;
-    let mut b = b;
+    // A restart observes native geometry and may publish a same-counter
+    // factual refresh. Use the smaller device as the manual writer so the
+    // required same-counter global-layout tie-break keeps this deliberate edit.
+    let (editor, mut away) = if a.node.id() < b.node.id() { (a, b) } else { (b, a) };
     for round in 0..3 {
-        let before = (a.node.layout(), b.node.layout());
-        b.node.shutdown().await;
-        a.node
+        let before = (editor.node.layout(), away.node.layout());
+        away.node.shutdown().await;
+        editor
+            .node
             .link_config()
             .unwrap()
             .edit_layout(
@@ -1521,10 +1525,10 @@ async fn layout_edit_made_while_peer_is_away_reaches_it_after_restart_scenario()
                 oink_protocol::v1::dto::LayoutSource::Manual,
             )
             .unwrap();
-        let expected = a.node.layout();
-        b = restart(root.path(), &b).await;
+        let expected = editor.node.layout();
+        away = restart(root.path(), &away).await;
         let end = Instant::now() + Duration::from_secs(15);
-        while !(a.node.layout().0 == expected.0 && b.node.layout().0 == expected.0) {
+        while !(editor.node.layout().0 == expected.0 && away.node.layout().0 == expected.0) {
             assert!(
                 Instant::now() < end,
                 "round {round}: the edit made while B was away did not survive B's return.\n before: A {:?} gap={} / B {:?} gap={}\n edited: A {:?} gap={}\n now:    A {:?} gap={} screens={} / B {:?} gap={} screens={}\n A==expected {} B==expected {}{}",
@@ -1534,21 +1538,21 @@ async fn layout_edit_made_while_peer_is_away_reaches_it_after_restart_scenario()
                 before.1.0.settings.gap_travel,
                 expected.1,
                 expected.0.settings.gap_travel,
-                a.node.layout().1,
-                a.node.layout().0.settings.gap_travel,
-                a.node.layout().0.screens.len(),
-                b.node.layout().1,
-                b.node.layout().0.settings.gap_travel,
-                b.node.layout().0.screens.len(),
-                a.node.layout().0 == expected.0,
-                b.node.layout().0 == expected.0,
-                dump(&[&a, &b])
+                editor.node.layout().1,
+                editor.node.layout().0.settings.gap_travel,
+                editor.node.layout().0.screens.len(),
+                away.node.layout().1,
+                away.node.layout().0.settings.gap_travel,
+                away.node.layout().0.screens.len(),
+                editor.node.layout().0 == expected.0,
+                away.node.layout().0 == expected.0,
+                dump(&[&editor, &away])
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        active(&[&a, &b], 15.0, "after restart").await;
+        active(&[&editor, &away], 15.0, "after restart").await;
     }
-    shutdown(vec![a, b]).await;
+    shutdown(vec![editor, away]).await;
 }
 
 // ───────────── 11. Pairing and membership items without a real-stack test ─────────────
@@ -2340,6 +2344,20 @@ async fn display_notifications_refresh_layout_topology_api_and_restore_detached_
         check(&[primary.clone()]) && b.node.layout().0 == a.node.layout().0
     })
     .await;
+    let group = oink_agent::api::GroupKey(a.node.link_config().unwrap().applied().group);
+    let saved_layout = oink_agent::layout_profiles::store::load(&a.dir, group)
+        .unwrap()
+        .unwrap();
+    wait_all(&[&a, &b], "gap layout saved on peer", 10., || {
+        oink_agent::layout_profiles::store::load(&b.dir, group)
+            .unwrap()
+            .is_some_and(|catalog| {
+                catalog.active().content_revision == saved_layout.active().content_revision
+                    && catalog.active().content == saved_layout.active().content
+                    && catalog.active().saved_topology == saved_layout.active().saved_topology
+            })
+    })
+    .await;
     a.input.feed(&CapturedEvent {
         physical: true,
         event: InputEvent::PointerDelta { dx: 2., dy: 0. },
@@ -2426,7 +2444,9 @@ async fn display_notifications_refresh_layout_topology_api_and_restore_detached_
     }
     assert_peer(&fixed_peer);
     let hidden = ScreenKey::from(&second_id);
-    api(&a.node, move |node| node.set_screen_hidden(hidden, true))
+    // A peer may edit another device's screen visibility; the owner only
+    // reacts after the accepted global layout reaches it.
+    api(&b.node, move |node| node.set_screen_hidden(hidden, true))
         .await
         .unwrap();
     wait_all(&[&a, &b], "hidden group member", 10.0, || {
@@ -2440,14 +2460,15 @@ async fn display_notifications_refresh_layout_topology_api_and_restore_detached_
         })
     })
     .await;
-    let group = oink_agent::api::GroupKey(a.node.link_config().unwrap().applied().group);
-    let hidden_profile = oink_agent::layout_profiles::store::load(&a.dir, group)
+    // The edit originates on B; use B's completed autosave as the profile
+    // stream's expected value, then wait for A to receive it.
+    let hidden_profile = oink_agent::layout_profiles::store::load(&b.dir, group)
         .unwrap()
         .unwrap();
-    // The next edit originates on the peer. Wait for the profile stream as
-    // well as C0 so the two deliberate manual edits are causally ordered.
-    wait_all(&[&a, &b], "hidden screen saved on peer", 10.0, || {
-        oink_agent::layout_profiles::store::load(&b.dir, group)
+    // Wait for the profile stream as well as C0 so the two deliberate edits
+    // are causally ordered.
+    wait_all(&[&a, &b], "hidden screen saved on owner", 10.0, || {
+        oink_agent::layout_profiles::store::load(&a.dir, group)
             .unwrap()
             .is_some_and(|catalog| {
                 catalog.active().content_revision == hidden_profile.active().content_revision
@@ -2489,10 +2510,23 @@ async fn display_notifications_refresh_layout_topology_api_and_restore_detached_
         assert!((screen.rect.w / screen.local.w - transform.1 * 1.1).abs() < 1e-12);
     }
     let hidden = ScreenKey::from(&second_id);
-    api(&a.node, move |node| node.set_screen_hidden(hidden, false))
+    api(&b.node, move |node| node.set_screen_hidden(hidden, false))
         .await
         .unwrap();
     wait_all(&[&a, &b], "revealed native group", 10.0, || check(&two)).await;
+    let revealed_profile = oink_agent::layout_profiles::store::load(&b.dir, group)
+        .unwrap()
+        .unwrap();
+    wait_all(&[&a, &b], "revealed screen saved on owner", 10.0, || {
+        oink_agent::layout_profiles::store::load(&a.dir, group)
+            .unwrap()
+            .is_some_and(|catalog| {
+                catalog.active().content_revision == revealed_profile.active().content_revision
+                    && catalog.active().content == revealed_profile.active().content
+                    && catalog.active().saved_topology == revealed_profile.active().saved_topology
+            })
+    })
+    .await;
 
     let saved_before = oink_agent::layout_profiles::store::load(&a.dir, group)
         .unwrap()

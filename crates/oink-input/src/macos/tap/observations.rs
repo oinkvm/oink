@@ -13,7 +13,6 @@ struct Sample {
     at: Instant,
     keys: Vec<KeyCode>,
     buttons: Vec<MouseButton>,
-    secure: bool,
     cursor: Point,
 }
 struct HealthPort(CFRetained<CFMachPort>);
@@ -90,7 +89,6 @@ impl State {
                             } else {
                                 released(held.buttons.iter().copied(), button_physically_down)
                             };
-                            let secure = locked || (!held.keys.is_empty() && system::secure_input_active());
                             let cursor = if buttons.is_empty() {
                                 Point::default()
                             } else {
@@ -102,7 +100,6 @@ impl State {
                                 at: now,
                                 keys,
                                 buttons,
-                                secure,
                                 cursor,
                             }));
                             wake(s);
@@ -170,11 +167,16 @@ impl Reader {
         if !Arc::ptr_eq(&sample.held, current) {
             return None;
         }
-        Some(if sample.secure {
-            sample.held.keys.clone()
-        } else {
-            self.keys.confirm(&sample.keys, sample.at)
-        })
+        // Lock/Secure Input can hide some session-tap events, but neither is
+        // evidence that a captured key was released. Draining held.keys here
+        // invented modifier UPs before a shortcut's primary DOWN and discarded
+        // consumed primary tails. Use the same two hardware observations as in
+        // an unlocked session; modifier checks already use HID flags, not the
+        // unreliable modifier bitmap. This changes no capture permissions or
+        // target injection/ACK policy. Reported source failure: macOS 26.6;
+        // partial secure-input echoes were measured on macOS 14.7.8. No new
+        // lock-screen capture behavior is assumed or claimed by this cleanup.
+        Some(self.keys.confirm(&sample.keys, sample.at))
     }
     pub(super) fn poll(&mut self, s: &Shared) {
         let state = s.observations.as_ref().unwrap();
@@ -253,6 +255,43 @@ impl Reader {
 mod tests {
     use super::*;
     #[test]
+    fn secure_session_keeps_held_chord_and_consumed_primary_until_hardware_release() {
+        // Ctrl/Option reach the router before H. Observer polls between those
+        // events must not invent UPs, including while a consumed H repeats.
+        for keys in [
+            vec![KeyCode::LEFT_CTRL, KeyCode::LEFT_ALT],
+            vec![KeyCode::RIGHT_CTRL, KeyCode::RIGHT_ALT],
+            vec![KeyCode::LEFT_GUI, KeyCode::RIGHT_SHIFT],
+            vec![KeyCode::LEFT_ALT], // Single-key lock escape uses the same observed UPs.
+            vec![KeyCode::LEFT_CTRL, KeyCode::LEFT_ALT, KeyCode::keyboard(0x0b)],
+        ] {
+            let held = Arc::new(Held {
+                keys: keys.clone(),
+                buttons: vec![],
+            });
+            let mut sample = Sample {
+                held: held.clone(),
+                at: Instant::now(),
+                keys: vec![],
+                buttons: vec![],
+                cursor: Point::default(),
+            };
+            let mut reader = Reader::default();
+            for _ in 0..20 {
+                assert!(
+                    reader.sample_keys(&held, &sample).unwrap().is_empty(),
+                    "lock/Secure Input is not evidence of a physical release"
+                );
+                sample.at += Duration::from_millis(50);
+            }
+            // Missing real UPs still retire the chord after two observations.
+            sample.keys = keys.clone();
+            assert!(reader.sample_keys(&held, &sample).unwrap().is_empty());
+            sample.at += LOST_UP_CONFIRM;
+            assert_eq!(reader.sample_keys(&held, &sample).unwrap(), keys);
+        }
+    }
+    #[test]
     fn delayed_hardware_sample_cannot_release_a_new_press() {
         let key = KeyCode::keyboard(4);
         let old = Arc::new(Held {
@@ -268,13 +307,12 @@ mod tests {
             at: Instant::now(),
             keys: vec![key],
             buttons: vec![],
-            secure: true,
             cursor: Point::default(),
         };
         assert!(Reader::default().sample_keys(&new, &sample).is_none());
     }
     #[test]
-    fn missing_up_requires_distinct_hardware_observations_and_secure_input_releases_promptly() {
+    fn missing_up_requires_distinct_hardware_observations_and_held_keys_stay_held() {
         let key = KeyCode::keyboard(4);
         let held = Arc::new(Held {
             keys: vec![key],
@@ -285,15 +323,13 @@ mod tests {
             at: Instant::now(),
             keys: vec![key],
             buttons: vec![],
-            secure: false,
             cursor: Point::default(),
         };
         let mut reader = Reader::default();
         assert!(reader.sample_keys(&held, &sample).unwrap().is_empty());
         sample.at += Duration::from_millis(50);
         assert_eq!(reader.sample_keys(&held, &sample).unwrap(), vec![key]);
-        sample.secure = true;
         sample.keys.clear();
-        assert_eq!(reader.sample_keys(&held, &sample).unwrap(), vec![key]);
+        assert!(reader.sample_keys(&held, &sample).unwrap().is_empty());
     }
 }

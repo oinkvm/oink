@@ -1,5 +1,5 @@
 # Embedded in the agent; stdin is the agent's embedded installer, never a caller
-# file. Shipped 0.2.2 updaters reject a standalone Microphone.ps1 MSI File row.
+# file; the script body is embedded in the signed executable instead.
 # The native caller supplies only validated mode/action/token literals.
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)

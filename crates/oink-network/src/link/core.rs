@@ -66,6 +66,7 @@ struct Heartbeat {
     pending: VecDeque<(u64, Instant)>,
     progress: Instant,
     rtt: Option<Duration>,
+    received: Option<Instant>,
 }
 impl Heartbeat {
     fn new(now: Instant) -> Self {
@@ -75,6 +76,7 @@ impl Heartbeat {
             pending: VecDeque::new(),
             progress: now,
             rtt: None,
+            received: None,
         }
     }
 }
@@ -106,6 +108,7 @@ pub(super) struct Link {
     report_setup_started: Instant,
     report_config_started: Option<Instant>,
     heartbeat: Heartbeat,
+    last_peer_data: Option<Instant>,
     cutover: Option<Cutover>,
     addresses: Vec<SocketAddr>,
     next_direct: Instant,
@@ -613,6 +616,7 @@ impl Core {
                     .map_or(now, |dial| dial.deadline - DIAL_BUDGET),
                 report_config_started: None,
                 heartbeat: Heartbeat::new(now),
+                last_peer_data: None,
                 cutover: None,
                 addresses,
                 next_direct: now + DIRECT_RETRY[0],
@@ -722,6 +726,11 @@ impl Core {
             self.retire_relay_authority(connection);
         }
     }
+    pub(super) fn peer_data_received(&mut self, id: LinkId, now: Instant) {
+        if let Some(link) = self.links.get_mut(&id) {
+            link.last_peer_data = Some(now);
+        }
+    }
     pub fn lose(&mut self, id: LinkId, reason: LinkLost) {
         let Some(link) = self.links.remove(&id) else {
             return;
@@ -744,6 +753,22 @@ impl Core {
                 Disconnect::InputOpeningTimeout => "input_opening_timeout",
             },
         };
+        let observed = Instant::now();
+        // "local" identifies the decision maker, not the network fault origin.
+        // Peer-initiated transport closure is recorded separately by the executor.
+        tracing::info!(target: "oink_link_diagnostics", kind = "link_lost",
+            peer_id = link.peer.device_id.to_hex().as_str(), link_id = id.0,
+            operation = diagnostics::hex(&link.hop.connection_id.random).as_str(),
+            path_counter = link.wire.path_id.coordinator_counter, path_id = ?link.wire.path_id,
+            revision = link.wire.route_revision.0, reason = reason_label,
+            decision_side = "local", initiator = match reason { LinkLost::Local(_) | LinkLost::Stopped | LinkLost::HeartbeatTimeout | LinkLost::CutoverTimeout => "local", LinkLost::PeerRestarted => "peer", _ => "unknown" },
+            peer_data_known = link.last_peer_data.is_some(),
+            peer_data_age_ms = link.last_peer_data.map(|at| observed.saturating_duration_since(at).as_secs_f64() * 1000.),
+            heartbeat_known = link.heartbeat.received.is_some(),
+            heartbeat_age_ms = link.heartbeat.received.map(|at| observed.saturating_duration_since(at).as_secs_f64() * 1000.),
+            pong_known = link.heartbeat.rtt.is_some(),
+            pong_age_ms = link.heartbeat.rtt.map(|_| observed.saturating_duration_since(link.heartbeat.progress).as_secs_f64() * 1000.),
+            "Logical link lost");
         if !link.installed || link.state != LinkState::Ready {
             let result = match reason {
                 LinkLost::Stopped
@@ -1078,6 +1103,7 @@ impl Core {
                 if pulse.path_id != link.wire.path_id || pulse.route_revision != link.wire.route_revision {
                     return;
                 }
+                link.heartbeat.received = Some(now);
                 if pong {
                     if let Some(index) = link
                         .heartbeat

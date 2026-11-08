@@ -138,8 +138,8 @@ impl From<&ScreenKey> for dl::ScreenId {
 
 // ───────────────────────────── 错误 ─────────────────────────────
 
-/// Typed local failures. Clients translate codes; Unavailable also preserves
-/// the local startup/connection reason so users can display and copy it.
+/// Typed local failures. Clients translate codes; Unavailable and
+/// InvalidArgument preserve actionable reasons for users to display and copy.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum ApiError {
@@ -159,7 +159,7 @@ pub enum ApiError {
     },
     /// 参数不合法（例如 IP 地址格式错误、名称为空）。
     InvalidArgument {
-        #[serde(skip)]
+        #[serde(default)]
         message: String,
     },
     /// 当前状态不允许这个操作（例如已有进行中的加入流程）。
@@ -248,7 +248,10 @@ impl ApiError {
 impl Serialize for ApiError {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let fields = if matches!(self, Self::UpdateFailed { .. } | Self::Unavailable { .. }) {
+        let fields = if matches!(
+            self,
+            Self::UpdateFailed { .. } | Self::Unavailable { .. } | Self::InvalidArgument { .. }
+        ) {
             3
         } else {
             2
@@ -256,7 +259,7 @@ impl Serialize for ApiError {
         let mut value = serializer.serialize_struct("ApiError", fields)?;
         value.serialize_field("code", self.code())?;
         value.serialize_field("problem", &self.problem())?;
-        if let Self::Unavailable { message } = self {
+        if let Self::Unavailable { message } | Self::InvalidArgument { message } = self {
             value.serialize_field("message", message)?;
         }
         if let Self::UpdateFailed { update_error } = self {
@@ -753,7 +756,11 @@ pub fn layout_geometry(
                     .screen(placement)
                     .remote_gain,
                 hidden: !v.enabled,
-                device_disabled: owners.get(&v.id.device).is_some_and(|owner| !owner.screen_shared),
+                device_disabled: if placement.device_visibility_known {
+                    placement.device_hidden
+                } else {
+                    owners.get(&v.id.device).is_some_and(|owner| !owner.screen_shared)
+                },
                 online: v.online,
             })
         })
@@ -922,6 +929,8 @@ pub enum HotkeyAction {
     ToggleMicrophoneMute,
     /// Jump to the device identified by Hotkey.device.
     MovePointerTo,
+    /// Load the group layout identified by Hotkey.profile. Local binding only.
+    SwitchLayout,
     /// Hold one key to bypass a pointer lock at normal screen edges.
     LockEscape,
     /// Windows source: lock only the remote Windows pointer focus.
@@ -939,6 +948,7 @@ impl HotkeyAction {
         HotkeyAction::ToggleGameMode,
         HotkeyAction::ToggleMicrophoneMute,
         HotkeyAction::MovePointerTo,
+        HotkeyAction::SwitchLayout,
         HotkeyAction::LockEscape,
         HotkeyAction::LockRemoteWindows,
     ];
@@ -954,6 +964,7 @@ impl HotkeyAction {
             HotkeyAction::ToggleGameMode => "toggle_game_mode",
             HotkeyAction::ToggleMicrophoneMute => "toggle_microphone_mute",
             HotkeyAction::MovePointerTo => "move_pointer_to",
+            HotkeyAction::SwitchLayout => "switch_layout",
             HotkeyAction::LockEscape => "lock_escape",
             HotkeyAction::LockRemoteWindows => "lock_remote_windows",
         }
@@ -973,6 +984,8 @@ pub struct Hotkey {
     pub action: HotkeyAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<DeviceKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     pub keys: Vec<String>,
     pub enabled: bool,
 }
@@ -1657,6 +1670,10 @@ impl From<oink_routing::GameModeStatus> for GameModeStatus {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)] // 只用于传递与序列化，装箱没有收益
 pub enum ApiEvent {
+    MouseShortcutRecorded {
+        token: String,
+        keys: Vec<String>,
+    },
     LayoutProfiles(crate::layout_profiles::types::LayoutProfilesState),
     LayoutProfileOperation(crate::layout_profiles::types::OperationEvent),
     ConnectionQuality(ConnectionQuality),
@@ -1798,6 +1815,22 @@ pub struct SubscriptionId(pub u64);
 /// 界面调用服务进程的接口。实现必须线程安全；命令可能阻塞（例如 `connect_by_ip` 等待网络），
 /// 界面在后台线程调用。
 pub trait AgentApi: Send + Sync {
+    fn auto_unlock_status(&self) -> ApiResult<crate::auto_unlock::Status> {
+        Err(ApiError::Unavailable {
+            message: "自动解锁不可用".into(),
+        })
+    }
+    fn save_auto_unlock(&self, _password: crate::auto_unlock::Password) -> ApiResult<()> {
+        Err(ApiError::Unavailable {
+            message: "自动解锁不可用".into(),
+        })
+    }
+    fn disable_auto_unlock(&self) -> ApiResult<()> {
+        Err(ApiError::Unavailable {
+            message: "自动解锁不可用".into(),
+        })
+    }
+
     fn layout_profile_command(&self, command: crate::layout_profiles::types::Command) -> ApiResult<serde_json::Value>;
 
     fn device_cards(&self) -> ApiResult<crate::device_cards::DeviceCardsView>;
@@ -1989,6 +2022,8 @@ pub trait AgentApi: Send + Sync {
         _choice: oink_telemetry::Choice,
         _policy_version: u16,
     ) -> ApiResult<()>;
+    /// Local, ephemeral recorder lease; never persisted or synchronized.
+    fn record_mouse_shortcut(&self, token: String, active: bool) -> ApiResult<()>;
     fn input_settings(&self) -> ApiResult<InputSettings>;
     fn set_input_settings(&self, settings: PreferencePatch<InputSettings>) -> ApiResult<()>;
 
@@ -2109,6 +2144,12 @@ pub trait AgentApi: Send + Sync {
 #[serde(tag = "method", content = "params", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 pub enum Request {
+    AutoUnlockStatus,
+    SaveAutoUnlock {
+        password: crate::auto_unlock::Password,
+    },
+    DisableAutoUnlock,
+
     LayoutProfiles,
     CreateLayoutProfile(crate::layout_profiles::types::Create),
     RenameLayoutProfile(crate::layout_profiles::types::Rename),
@@ -2116,6 +2157,7 @@ pub enum Request {
     LoadLayoutProfile(crate::layout_profiles::types::Load),
     LayoutProfileOperation(crate::layout_profiles::types::OperationRequest),
     SetSyncSystemArrangement(crate::layout_profiles::types::SettingRequest),
+    SetDisableHiddenDisplays(crate::layout_profiles::types::SettingRequest),
     PreviewSystemArrangement(crate::layout_profiles::types::PreviewRequest),
     CommitArrangement(crate::layout_profiles::types::CommitRequest),
     ResetArrangement(crate::layout_profiles::types::Mutation),
@@ -2243,7 +2285,12 @@ pub enum Request {
     ReportStatus,
     SubmitCrashCapsule {
         generation: u64,
-        crash: oink_telemetry::SafeCrash,
+        // SafeCrash contains fixed frame arrays. Keeping them inline in every
+        // Request makes serde's adjacent-tag visitor duplicate large enum
+        // temporaries and overflow the Windows CLI main stack in debug builds,
+        // even for unrelated calls. Box only this IPC payload: JSON stays the
+        // same and crash producers retain their allocation-free fixed storage.
+        crash: Box<oink_telemetry::SafeCrash>,
         collected_at: u64,
     },
     SetReportConsent {
@@ -2341,6 +2388,10 @@ pub enum Request {
         screen: ScreenKey,
         size: Size,
     },
+    RecordMouseShortcut {
+        token: String,
+        active: bool,
+    },
     InputSettings,
     SetInputSettings {
         settings: PreferencePatch<InputSettings>,
@@ -2412,6 +2463,7 @@ pub enum Request {
 #[serde(untagged)]
 #[allow(clippy::large_enum_variant)]
 pub enum Reply {
+    AutoUnlockStatus(crate::auto_unlock::Status),
     LayoutProfile(serde_json::Value),
     ConnectionQuality(ConnectionQuality),
     AudioQuality(AudioQuality),
@@ -2472,6 +2524,9 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
     use Request as R;
     let unit = |r: ApiResult<()>| r.map(|()| Reply::Unit);
     match req {
+        R::AutoUnlockStatus => api.auto_unlock_status().map(Reply::AutoUnlockStatus),
+        R::SaveAutoUnlock { password } => unit(api.save_auto_unlock(password)),
+        R::DisableAutoUnlock => unit(api.disable_auto_unlock()),
         R::LayoutProfiles => api
             .layout_profile_command(crate::layout_profiles::types::Command::Query)
             .map(Reply::LayoutProfile),
@@ -2492,6 +2547,9 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
             .map(Reply::LayoutProfile),
         R::SetSyncSystemArrangement(v) => api
             .layout_profile_command(crate::layout_profiles::types::Command::Setting(v))
+            .map(Reply::LayoutProfile),
+        R::SetDisableHiddenDisplays(v) => api
+            .layout_profile_command(crate::layout_profiles::types::Command::HiddenDisplaySetting(v))
             .map(Reply::LayoutProfile),
         R::PreviewSystemArrangement(v) => api
             .layout_profile_command(crate::layout_profiles::types::Command::Preview(v))
@@ -2639,13 +2697,14 @@ pub fn dispatch<A: AgentApi + ?Sized>(api: &A, req: Request) -> ApiResult<Reply>
             generation,
             crash,
             collected_at,
-        } => unit(api.submit_crash_capsule(generation, crash, collected_at)),
+        } => unit(api.submit_crash_capsule(generation, *crash, collected_at)),
         R::ReportStatus => api.report_status().map(Reply::ReportStatus),
         R::SetReportConsent {
             expected_generation,
             choice,
             policy_version,
         } => unit(api.set_report_consent(expected_generation, choice, policy_version)),
+        R::RecordMouseShortcut { token, active } => unit(api.record_mouse_shortcut(token, active)),
         R::InputSettings => api.input_settings().map(Reply::InputSettings),
         R::SetInputSettings { settings } => unit(api.set_input_settings(settings)),
         R::CacheUsage { device } => api.cache_usage(device).map(Reply::CacheUsage),
@@ -2717,6 +2776,21 @@ mod tests {
             "backend_exited:3221225477"
         );
     }
+    #[test]
+    fn invalid_setting_reason_survives_shell_forwarding() {
+        let error = ApiError::InvalidArgument {
+            message: "两个快捷键不能相同".into(),
+        };
+        let wire = serde_json::to_value(&error).unwrap();
+        assert_eq!(wire["message"], "两个快捷键不能相同");
+        let forwarded: ApiError = serde_json::from_value(wire).unwrap();
+        assert_eq!(forwarded, error);
+        assert_eq!(
+            serde_json::to_value(forwarded).unwrap()["problem"]["code"],
+            "invalid_value"
+        );
+    }
+
     #[test]
     fn errors_expose_codes_without_backend_diagnostic_text() {
         let error = ApiError::Internal {
@@ -3084,7 +3158,7 @@ fn test_input_settings() -> InputSettings {
         contacts_injection_available: true,
         native_multifinger: true,
         mac_scroll_feel: true,
-        forward_injected_input: false,
+        forward_injected_input: true,
         take_foreground_on_leave: false,
         forward_wheel_by_lines: true,
         emergency_hold_ms: 5000,

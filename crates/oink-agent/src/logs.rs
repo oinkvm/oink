@@ -103,6 +103,11 @@ pub fn init() {
 /// Initialize the background role's ordinary file and UI-ring logging.
 pub fn init_service() {
     install(configured_level(), file_writer("oink"));
+    #[cfg(target_os = "macos")]
+    set_native_exception_capture(crate::config::AgentConfig::load().map_or_else(
+        |_| crate::config::Settings::default().diagnostics_enabled,
+        |config| config.settings.diagnostics_enabled,
+    ));
 }
 
 /// The Windows pre-login backend's own file in the machine-level log directory
@@ -170,6 +175,18 @@ impl DiagnosticBudget {
     }
 }
 
+// Only lifecycle decisions bypass the verbose bootstrap budget. Inspect the
+// typed kind field, never the formatted message or peer-controlled error text.
+#[derive(Default)]
+struct CriticalLinkEvent(bool);
+impl Visit for CriticalLinkEvent {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "kind" {
+            self.0 = matches!(value, "link_lost" | "path_transition" | "connection_step");
+        }
+    }
+    fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+}
 struct LocalLogFilter(Mutex<DiagnosticBudget>);
 impl<S: Subscriber> tracing_subscriber::layer::Filter<S> for LocalLogFilter {
     fn enabled(&self, metadata: &tracing::Metadata<'_>, _: &Context<'_, S>) -> bool {
@@ -181,6 +198,13 @@ impl<S: Subscriber> tracing_subscriber::layer::Filter<S> for LocalLogFilter {
         // diagnostic recorder. Bound their ordinary text/ring copies even when
         // an older peer floods incoming connections; never suppress faults.
         if *metadata.level() > Level::WARN && matches!(metadata.target(), "oink_link_diagnostics" | "oink_dnd_read") {
+            let mut critical = CriticalLinkEvent::default();
+            if metadata.target() == "oink_link_diagnostics" {
+                event.record(&mut critical);
+            }
+            if critical.0 {
+                return true;
+            }
             return self.0.lock().unwrap_or_else(|e| e.into_inner()).admit(Instant::now());
         }
         true
@@ -382,6 +406,41 @@ mod tests {
         );
     }
     #[test]
+    fn link_decisions_survive_exhausted_bootstrap_budget() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = Writer(output.clone());
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .with_filter(local_log_filter()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            for attempt in 0..128 {
+                tracing::info!(target: "oink_link_diagnostics", kind = "low_step", attempt, "bootstrap");
+            }
+            tracing::info!(target: "oink_link_diagnostics", kind = "low_control", "budget exhausted");
+            tracing::info!(target: "oink_link_diagnostics", kind = "link_lost", reason = "heartbeat_timeout", "decision survives");
+            tracing::info!(target: "oink_link_diagnostics", kind = "path_transition", "path survives");
+            tracing::info!(target: "oink_link_diagnostics", kind = "connection_step", "connection survives");
+            tracing::warn!(target: "oink_link_diagnostics", kind = "udp_send", "error context survives");
+            tracing::info!(target: "oink_dnd_read", kind = "connection_step", "unrelated target remains bounded");
+        });
+        let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.lines().count(), 132);
+        for expected in [
+            "decision survives",
+            "path survives",
+            "connection survives",
+            "error context survives",
+        ] {
+            assert!(text.contains(expected), "missing {expected}");
+        }
+        assert!(!text.contains("budget exhausted"));
+        assert!(!text.contains("unrelated target remains bounded"));
+    }
+    #[test]
     fn diagnostic_budget_recovers_on_its_window_without_a_wall_clock() {
         let now = Instant::now();
         let mut budget = DiagnosticBudget::default();
@@ -451,5 +510,31 @@ mod tests {
         assert!(!text.contains("file transfer boundary"));
         assert!(!text.contains("Low pacing observation"));
         assert!(!text.contains("contact availability"));
+    }
+}
+
+/// Observe before native unwinding destroys the throwing frames. Raw NSException
+/// text is kept in a bounded local sidecar, outside ordinary logs/ZIPs/telemetry.
+/// This follows local diagnostic recording, independently of upload consent.
+#[cfg(target_os = "macos")]
+pub(crate) fn set_native_exception_capture(enabled: bool) {
+    static CAPTURE: OnceLock<Mutex<Option<oink_crash::objc::Capture>>> = OnceLock::new();
+    let mut slot = CAPTURE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let directory = log_dir().join("NativeExceptions");
+    if enabled {
+        if slot.is_none() {
+            match oink_crash::objc::Capture::start(&directory) {
+                Ok(capture) => *slot = Some(capture),
+                Err(error) => tracing::warn!(%error, "native exception diagnostic capture unavailable"),
+            }
+        }
+    } else {
+        slot.take();
+        if let Err(error) = oink_crash::objc::erase(&directory) {
+            tracing::warn!(%error, "native exception diagnostic cleanup failed");
+        }
     }
 }

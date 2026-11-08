@@ -2,6 +2,10 @@
 html, body, #root { height: 100%; }
 body { margin: 0; background: var(--ok-bg); color: var(--ok-text); font-family: var(--ok-font); }
 
+/* WebView2 (Windows) adds its own reveal/clear buttons to text and password
+   inputs; the UI kit already draws a show/hide button, so hide the native ones. */
+input::-ms-reveal, input::-ms-clear { display: none; }
+
 /* The UI kit's font stacks list Simplified Chinese faces first, which would
    draw Japanese and Korean with Chinese glyph forms. The document language
    selects each language's own system faces instead (Latin stays on SF / Segoe). */
@@ -459,6 +463,11 @@ body { margin: 0; background: var(--ok-bg); color: var(--ok-text); font-family: 
 @container arrangement-keys (max-width: 359px) {
   .arr__key-label { display: none; }
 }
+.arr__gesture-hint {
+  position: absolute; top: 10px; left: 12px; height: 28px;
+  display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; pointer-events: none;
+  color: var(--ok-text-2); font: 450 11px/1 var(--ok-font);
+}
 .arr__empty { position: absolute; inset: 0; margin: 0; display: grid; place-items: center; color: var(--ok-text-3); font-size: 13px; }
 
 .scr { position: absolute; left: 0; top: 0; touch-action: none; outline: none; -webkit-tap-highlight-color: transparent; }
@@ -723,8 +732,18 @@ body:has(.oink-app:is([data-view="main"], [data-view="panel"])) { background: tr
 .lpm__field { flex: 1; min-width: 0; }
 .lpm__edit .ok-btn { flex: none; }
 /* Settings › Layout: the list, then Create under it on the left. */
+.lpm__item .setp__hotkey { flex: none; width: 168px; min-width: 0; margin-right: 4px; }
+.lpm__note--error { display: inline-flex; align-items: center; gap: 4px; color: var(--ok-danger); }
+.lpm__note--error .ok-icon { width: 13px; height: 13px; flex: none; }
 .lpm-panel { display: grid; gap: 10px; justify-items: start; width: 100%; }
 .lpm-panel > .lpm { width: 100%; }
+
+/* Segoe UI's glyph box sits lower than the SF/Inter box at the same font size.
+   The UI kit's grid alignment centers the line box, which leaves Win/Alt/Shift
+   looking low in Windows WebView2. Center the keycap as a flex box and keep a
+   fixed line-height so the cap's text position does not depend on font leading.
+   This applies to recorder caps and the shared Kbd hints in the canvas. */
+.ok-kbd { display: inline-flex; align-items: center; justify-content: center; line-height: 1; }
 
 /* Main window text is not selectable, except the Settings page and editable fields. */
 .win:not(.about) { user-select: none; -webkit-user-select: none; }
@@ -740,3 +759,6 @@ body:has(.oink-app:is([data-view="main"], [data-view="panel"])) { background: tr
 .oink-app[data-package-drag] .win__titlebar { z-index: 102; }
 .oink-app[data-package-drag] .win__cover-bar { left: 100px; right: auto; color: var(--ok-text-2); font-weight: 600; font-size: 14px; }
 .oink-app[data-package-drag][data-platform="win"] .win__cover-bar { left: 16px; }
+
+.shortcut-mouse { width: 18px; height: 20px; display: block; }
+.shortcut-mouse__active { fill: var(--ok-accent); stroke: var(--ok-accent); }

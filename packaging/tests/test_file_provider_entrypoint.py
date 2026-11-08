@@ -101,7 +101,8 @@ func clearOwnProviderContainer() throws {
 }
 ''')
             obj = tmp / 'runtime.o'
-            target = f'arm64-apple-macos{BUILD.I["macos_minimum"]}'
+            arch = 'x86_64' if os.environ.get('CARGO_BUILD_TARGET') == 'x86_64-apple-darwin' else platform.machine()
+            target = f'{arch}-apple-macos{BUILD.I["macos_minimum"]}'
             subprocess.run(['xcrun', 'clang', '-target', target, '-c', runtime, '-o', obj],
                            check=True, capture_output=True)
             image = tmp / 'bootstrap'

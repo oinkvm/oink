@@ -49,7 +49,8 @@ static SECURE_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
 /// main only; the tap must never wait for main while it may be joining the tap.
 /// Background callers get the last sample and request a coalesced refresh. Before
 /// main has served the first request (or the sample is stale), the value is unknown/false.
-/// This is only the stuck-key cleanup/status hint: macOS itself blocks capture during secure input.
+/// This is a status/idle-refresh hint. Secure input can hide session-tap events;
+/// it is not evidence that a captured physical key was released.
 pub(crate) fn secure_input_active() -> bool {
     if super::main_queue::is_main_thread() {
         refresh_secure_input_on_main();
@@ -80,8 +81,8 @@ fn refresh_secure_input_on_main() {
 }
 
 fn recent_secure_input(sample: Option<(Instant, bool)>, now: Instant) -> bool {
-    // Idle taps skip this query. Do not release newly held keys using an old positive
-    // sample from a password field the user left minutes ago. Normal polling is 500 ms.
+    // Do not report an old password field as still secure after a long idle.
+    // Background callers request a refresh without blocking the capture owner.
     sample.is_some_and(|(at, enabled)| enabled && now.saturating_duration_since(at) < Duration::from_secs(1))
 }
 

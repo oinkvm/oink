@@ -522,7 +522,7 @@ it('device-card screen sharing is one auto-saved edit with undo and redo', async
 });
 
 it('a screen context hides just that screen through the undoable manual edit boundary', async () => {
-  const h = setup();
+  const h = setup(true);
   const {container} = render(<App/>);
   const count = container.querySelectorAll('.scr').length;
   const tile = container.querySelector<HTMLElement>('.scr')!;
@@ -542,7 +542,7 @@ it('a screen context hides just that screen through the undoable manual edit bou
   expect(container.querySelector(`[aria-label="${label}"]`)).toBeTruthy();
 });
 
-it('a screen context offers only hiding that screen', async () => {
+it('an online rigid screen context can hide the selected screen', async () => {
   setup();
   const {container} = render(<App/>);
   fireEvent.contextMenu(container.querySelector<HTMLElement>('.scr')!, {clientX:100,clientY:100});
@@ -551,7 +551,7 @@ it('a screen context offers only hiding that screen', async () => {
 });
 
 it('one hidden screen turns the device item into show all, which unhides it in one undoable edit', async () => {
-  const h = setup();
+  const h = setup(true);
   adoptScreenActions();
   const {container} = render(<App/>);
   fireEvent.contextMenu(container.querySelector<HTMLElement>('.scr')!, {clientX:100,clientY:100});

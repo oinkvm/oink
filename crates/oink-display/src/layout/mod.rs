@@ -117,6 +117,18 @@ pub struct ScreenPlacement {
     /// 是否是内建屏（`DisplayInfo::is_builtin`，给界面标注）。
     #[serde(default)]
     pub builtin: bool,
+    /// Group-layout exclusion, independent of owner preferences. Equal on every screen of a device.
+    #[serde(default)]
+    pub device_hidden: bool,
+    /// Group-layout per-screen exclusion, independent of owner preferences.
+    #[serde(default)]
+    pub screen_hidden: bool,
+    /// Whether the group has an explicit global device visibility record.
+    #[serde(default)]
+    pub device_visibility_known: bool,
+    /// Whether this screen has an explicit global visibility record.
+    #[serde(default)]
+    pub screen_visibility_known: bool,
 }
 
 impl ScreenPlacement {
@@ -131,6 +143,10 @@ impl ScreenPlacement {
             size_source,
             primary: info.is_primary,
             builtin: info.is_builtin,
+            device_hidden: false,
+            screen_hidden: false,
+            device_visibility_known: false,
+            screen_visibility_known: false,
         }
     }
 
@@ -164,6 +180,11 @@ impl ScreenPlacement {
         }
         self.rect.x += dx;
         self.rect.y += dy;
+    }
+
+    /// Hidden screens retain geometry but never obstruct canvas edits.
+    pub fn participates_in_geometry(&self) -> bool {
+        self.is_valid() && !self.device_hidden && !self.screen_hidden
     }
 
     pub(crate) fn is_valid(&self) -> bool {
@@ -314,9 +335,19 @@ impl Default for OwnerLayoutPreferences {
 impl OwnerLayoutPreferences {
     pub fn screen(&self, placement: &ScreenPlacement) -> EffectiveScreen {
         let preference = self.screens.get(&placement.id.display).copied().unwrap_or_default();
+        let device_shared = if placement.device_visibility_known {
+            !placement.device_hidden
+        } else {
+            !placement.device_hidden && self.screen_shared
+        };
+        let screen_enabled = if placement.screen_visibility_known {
+            !placement.screen_hidden
+        } else {
+            !placement.screen_hidden && preference.enabled
+        };
         EffectiveScreen {
             placement: placement.clone(),
-            enabled: self.screen_shared && preference.enabled,
+            enabled: device_shared && screen_enabled,
             gain: self.device_gain * preference.gain,
             remote_gain: preference.remote_gain,
             speed_mode: self.speed_mode,

@@ -19,6 +19,7 @@ mod cloud_files;
 pub mod content;
 pub mod model;
 pub mod negotiation;
+pub mod paste_file;
 pub mod policy;
 pub mod received;
 pub mod timing;

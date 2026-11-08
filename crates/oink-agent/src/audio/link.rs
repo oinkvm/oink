@@ -1141,9 +1141,9 @@ impl Owner {
         let _ = self.exit_volume.refresh(false);
         self.local_output.tick(Instant::now());
         self.refresh_volume_context();
-        let _ = self.publish_observations();
         self.tick_microphone();
         if self.power_state.sleeping {
+            let _ = self.publish_observations();
             self.publish(AudioPhase::SoundSleep);
             return;
         }
@@ -1153,6 +1153,11 @@ impl Owner {
             self.tick_source();
         }
         self.streams.set_media_wake(self.playback.is_none() || self.draining);
+        // Native startup/retirement above resolves the source/exit activity and
+        // faults. Publish those facts before notifying status subscribers, so
+        // restored silent sources do not retain WaitingForExit until another
+        // maintenance or media event.
+        let _ = self.publish_observations();
         self.publish(self.phase());
         // API readers and the UI event emitted by set_audio_settings run as soon
         // as the reply arrives. Publish before acknowledging, including failures.

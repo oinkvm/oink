@@ -275,11 +275,15 @@ fn cache_record(raw: &RawMap) -> Result<RawMap, StoreError> {
                     | dto::LocalOption::ScreenPreferences
                     | dto::LocalOption::SpeedMode
                     | dto::LocalOption::SyncSystemArrangement
+                    | dto::LocalOption::DisableHiddenDisplays
             ) {
                 continue;
             }
             let mut preference = subset(fields, &[1, 3]);
-            if option == dto::LocalOption::SyncSystemArrangement {
+            if matches!(
+                option,
+                dto::LocalOption::SyncSystemArrangement | dto::LocalOption::DisableHiddenDisplays
+            ) {
                 // Its revision participates in the offline arrangement UI token.
                 preference.insert(2, store::required(fields, 2)?.clone());
             }

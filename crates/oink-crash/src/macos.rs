@@ -116,6 +116,17 @@ pub fn extract(
     manifest: &Manifest,
     now: u64,
 ) -> Option<(SafeCrash, u64)> {
+    extract_with_objc(bytes, lifetime, consent, manifest, now, &[])
+}
+/// The throw snapshot is auxiliary evidence, never an independent crash candidate.
+pub fn extract_with_objc(
+    bytes: &[u8],
+    lifetime: Lifetime,
+    consent: ReportConsent,
+    manifest: &Manifest,
+    now: u64,
+    throws: &[u8],
+) -> Option<(SafeCrash, u64)> {
     if bytes.len() > 8 * 1024 * 1024
         || lifetime.schema != 1
         || !consent.granted()
@@ -171,7 +182,102 @@ pub fn extract(
     {
         *slot = Some(frame);
     }
+    attach_objc(&mut crash, &raw, lifetime, manifest, at, throws);
     Some((crash, at))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThrowRecord {
+    schema: u16,
+    fatal: u8,
+    sequence: u64,
+    pid: u32,
+    thread: u64,
+    unix_seconds: u64,
+    name: ExceptionName,
+    frames: Vec<ThrowFrame>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThrowFrame {
+    uuid: String,
+    offset: u64,
+}
+fn attach_objc(crash: &mut SafeCrash, raw: &Value, lifetime: Lifetime, manifest: &Manifest, at: u64, bytes: &[u8]) {
+    // A throw alone is never a fatal candidate. Require the SIGABRT marker
+    // recorded with an escaping exception, plus an attributable OS fatal report
+    // on the same thread/process and within the immediate fatal time window.
+    if crash.exception_class != ExceptionClass::Abort
+        || raw.pointer("/exception/signal").and_then(Value::as_str) != Some("SIGABRT")
+        || bytes.len() > 128 * 1024
+    {
+        return;
+    }
+    let Some(thread) = raw
+        .get("faultingThread")
+        .and_then(Value::as_u64)
+        .and_then(|i| raw.get("threads")?.as_array()?.get(i as usize))
+        .and_then(|thread| thread.get("id")?.as_u64())
+    else {
+        return;
+    };
+    let latest = bytes
+        .split(|b| *b == b'\n')
+        .filter(|line| line.len() <= 16384)
+        .filter_map(|line| serde_json::from_slice::<ThrowRecord>(line).ok())
+        .filter(|record| {
+            record.schema == 1
+                && record.pid == lifetime.pid
+                && record.thread == thread
+                && record.unix_seconds >= lifetime.armed_at
+                && record.unix_seconds <= at
+                && at - record.unix_seconds <= 5
+                && record.frames.len() <= 64
+        })
+        .max_by_key(|record| record.sequence);
+    let Some(record) = latest.filter(|record| record.fatal == 1) else {
+        return;
+    };
+    let mut thrown = ObjcException {
+        name: record.name,
+        frames: [[None; 32]; 2],
+    };
+    let frames = record.frames.into_iter().skip(1).filter_map(|frame| {
+        if frame.uuid.len() != 32 || !frame.uuid.is_ascii() {
+            return None;
+        }
+        let mut id = [0; 16];
+        for (i, byte) in id.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&frame.uuid[i * 2..i * 2 + 2], 16).ok()?;
+        }
+        let image = manifest.image(id, lifetime.image)?;
+        let arch = raw
+            .get("usedImages")?
+            .as_array()?
+            .iter()
+            .find(|i| i.get("uuid").and_then(Value::as_str).and_then(debug_id) == Some(id))?
+            .get("arch")?
+            .as_str()?;
+        let offset = match arch {
+            "arm64" | "arm64e" => (frame.offset & !3).checked_sub(4)?,
+            "x86_64" | "x86_64h" => frame.offset.checked_sub(1)?,
+            _ => return None,
+        };
+        (offset < image.text_size).then_some(Frame::Native {
+            image: image.slot,
+            offset,
+            debug_id: id,
+            debug_age: 0,
+            code_id: None,
+            image_size: image.text_size,
+        })
+    });
+    for (slot, frame) in thrown.frames.iter_mut().flatten().zip(frames) {
+        *slot = Some(frame);
+    }
+    // A sanitized name is still useful when no original caller belongs to a
+    // shipped image. Never include system UUIDs, symbols or memory addresses.
+    crash.objc_exception = Some(thrown);
 }
 /// Shared numeric projection for attributable upload and local diagnostic views.
 pub fn project_frames(raw: &Value, manifest: &Manifest, preferred: ImageSlot) -> Option<Vec<Frame>> {
@@ -228,8 +334,25 @@ pub fn recover(
     manifest: &Manifest,
     now: u64,
 ) -> Option<(SafeCrash, u64)> {
+    recover_with_objc(directory, lifetime, consent, manifest, now, None)
+}
+/// Add a grant-armed throw snapshot to an already attributable fatal OS report.
+pub fn recover_with_objc(
+    directory: &Path,
+    lifetime: Lifetime,
+    consent: ReportConsent,
+    manifest: &Manifest,
+    now: u64,
+    throw_path: Option<&Path>,
+) -> Option<(SafeCrash, u64)> {
     if !consent.granted() || lifetime.generation != consent.generation {
         return None;
+    }
+    let mut throws = Vec::new();
+    if let Some(path) = throw_path
+        && let Ok(file) = std::fs::File::open(path)
+    {
+        let _ = file.take(128 * 1024 + 1).read_to_end(&mut throws);
     }
     let entries = std::fs::read_dir(directory).ok()?;
     for entry in entries.take(1024).flatten() {
@@ -256,7 +379,7 @@ pub fn recover(
             .take(8 * 1024 * 1024 + 1)
             .read_to_end(&mut bytes)
             .ok()?;
-        if let Some(c) = extract(&bytes, lifetime, consent, manifest, now) {
+        if let Some(c) = extract_with_objc(&bytes, lifetime, consent, manifest, now, &throws) {
             return Some(c);
         }
     }

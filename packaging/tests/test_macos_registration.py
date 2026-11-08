@@ -11,6 +11,60 @@ import macos_registration as M
 
 
 class RegistrationCleanup(unittest.TestCase):
+    def test_two_extensions_share_one_host_unregistration(self):
+        with tempfile.TemporaryDirectory(suffix='.noindex') as directory:
+            app = Path(directory).resolve() / 'Oink.app'
+            extensions = [('OinkFileProvider.appex', 'test.provider'),
+                          ('OinkFinderSync.appex', 'test.finder')]
+            registered = {identifier: str(app / 'Contents/PlugIns' / name)
+                          for name, identifier in extensions}
+            commands = []
+            host_registered = True
+
+            def run(command, **kwargs):
+                nonlocal host_registered
+                commands.append(command)
+                if command[0] == M.LSREGISTER:
+                    # LaunchServices owns one registration for the containing
+                    # app; the second nested cleanup fails after the first.
+                    code = 0 if host_registered else 1
+                    host_registered = False
+                    return subprocess.CompletedProcess(command, code, '', '')
+                if command[1] == '-r':
+                    for identifier, path in registered.items():
+                        if path == command[2]:
+                            registered[identifier] = ''
+                    output = ''
+                else:
+                    output = registered[command[-1]] + '\n/Applications/Oink.app'
+                return subprocess.CompletedProcess(command, 0, output, '')
+
+            with patch.object(M.subprocess, 'run', side_effect=run):
+                with M.temporary_registrations(app, extensions):
+                    pass
+            self.assertEqual(commands.count([M.LSREGISTER, '-u', str(app)]), 1)
+            self.assertEqual([c for c in commands if c[1] == '-r'], [
+                ['pluginkit', '-r', str(app / 'Contents/PlugIns' / name)]
+                for name, _ in extensions])
+            self.assertTrue(all(not value for value in registered.values()))
+            for _, identifier in extensions:
+                self.assertEqual(commands.count(['pluginkit', '-mAvvv', '-i', identifier]), 2)
+
+    def test_batch_cleanup_checks_every_extension_and_rejects_tool_failures(self):
+        with tempfile.TemporaryDirectory(suffix='.noindex') as directory:
+            app = Path(directory).resolve() / 'Oink.app'
+            extensions = [('OinkFileProvider.appex', 'test.provider'),
+                          ('OinkFinderSync.appex', 'test.finder')]
+            for failed in ['test.provider', 'test.finder', 'lsregister']:
+                def run(command, **kwargs):
+                    output = str(app / 'Contents/PlugIns' / extensions[failed == 'test.finder'][0]) if command[-1] == failed else ''
+                    code = 1 if failed == 'lsregister' and command[0] == M.LSREGISTER else 0
+                    return subprocess.CompletedProcess(command, code, output, '')
+                with self.subTest(failed=failed), patch.object(M.subprocess, 'run', side_effect=run):
+                    with self.assertRaises(RuntimeError):
+                        with M.temporary_registrations(app, extensions):
+                            pass
+
     def test_only_exact_private_paths_are_unregistered(self):
         with tempfile.TemporaryDirectory(suffix='.noindex') as directory:
             app = Path(directory).resolve() / 'Oink.app'

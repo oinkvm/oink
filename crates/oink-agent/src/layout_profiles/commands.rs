@@ -241,6 +241,41 @@ impl Node {
         self.operation_event(op).map_err(profile_api_error)?;
         result
     }
+
+    /// Visibility is part of the shared layout register. This helper is used
+    /// by both the local UI and legacy remote owner commands; the device that
+    /// owns the displays only reacts after the resulting register is applied.
+    pub(crate) fn edit_global_visibility(
+        &self,
+        device: DeviceKey,
+        screen: Option<&str>,
+        hidden: bool,
+    ) -> crate::api::ApiResult<()> {
+        let screen = screen.map(str::to_owned);
+        let group = self.link_config()?;
+        group.edit_layout(
+            Box::new(move |layout| {
+                if let Some(display) = screen.as_deref() {
+                    if let Some(placement) = layout
+                        .screens
+                        .iter_mut()
+                        .find(|s| s.id.device == device.0 && s.id.display == display)
+                    {
+                        placement.screen_hidden = hidden;
+                        placement.screen_visibility_known = true;
+                    }
+                } else {
+                    for placement in &mut layout.screens {
+                        if placement.id.device == device.0 {
+                            placement.device_hidden = hidden;
+                            placement.device_visibility_known = true;
+                        }
+                    }
+                }
+            }),
+            dto::LayoutSource::Manual,
+        )
+    }
     fn current_profile_catalog(&self) -> Result<model::Catalog> {
         let catalog = lock(&self.inner.profiles.data)
             .catalog
@@ -348,6 +383,7 @@ impl Node {
         let current = snapshot(&state)?;
         let catalog = self.current_profile_catalog()?;
         let now = crate::layout_sync::now_ms();
+        let hidden_setting = matches!(&command, Command::HiddenDisplaySetting(_));
         let reply = match command {
             Command::Query => unreachable!(),
             Command::Create(v) => {
@@ -384,7 +420,7 @@ impl Node {
                 )?)?;
                 json(self.profile_snapshot()?)?
             }
-            Command::Setting(v) => {
+            Command::Setting(v) | Command::HiddenDisplaySetting(v) => {
                 let device = state
                     .devices
                     .iter()
@@ -404,7 +440,26 @@ impl Node {
                     .device_facts(v.device.0)
                     .ok_or_else(|| unavailable("Owner facts unavailable"))?;
                 check(&v.expected_preference_token, &preference_token(&facts))?;
-                self.edit_device_option(v.device, dto::LocalOption::SyncSystemArrangement, v.enabled.write())
+                let option = if hidden_setting {
+                    if facts.os().ok().is_none_or(|os| os.0 != "windows")
+                        || super::state::preference(&facts, dto::LocalOption::DisableHiddenDisplays).is_none()
+                    {
+                        return Err(ProfileError::new(
+                            ErrorCode::Unsupported,
+                            "Hidden-display disabling requires a Windows owner",
+                        ));
+                    }
+                    if v.enabled && !device.sync_system_arrangement {
+                        return Err(ProfileError::new(
+                            ErrorCode::SettingDisabled,
+                            "System arrangement sync is off",
+                        ));
+                    }
+                    dto::LocalOption::DisableHiddenDisplays
+                } else {
+                    dto::LocalOption::SyncSystemArrangement
+                };
+                self.edit_device_option(v.device, option, v.enabled.write())
                     .map_err(unavailable)?;
                 json(self.profile_snapshot()?)?
             }
@@ -496,16 +551,6 @@ impl Node {
                             ErrorCode::InvalidGeometry,
                             "Invalid device visibility patch",
                         ));
-                    }
-                    if state
-                        .devices
-                        .iter()
-                        .any(|d| d.device == patch.device && d.availability == Availability::Offline)
-                    {
-                        return Err(
-                            ProfileError::new(ErrorCode::OwnerOffline, "Cannot edit offline visibility")
-                                .device(patch.device),
-                        );
                     }
                     model::set_screen_shared(&mut target, patch.device, patch.shared);
                 }
@@ -610,36 +655,65 @@ impl Node {
             .find(|p| p.device == v.device)
             .ok_or_else(stale)?
             .clone();
-        let n = current
+        let native_index = current
             .native
-            .iter_mut()
-            .find(|n| n.device == v.device)
+            .iter()
+            .position(|n| n.device == v.device)
             .ok_or_else(stale)?;
+        let original_native = current.native[native_index].clone();
         let desired = Point::new(
             ((v.desired_canvas_origin.x - p.origin.x) / p.scale).round(),
             ((v.desired_canvas_origin.y - p.origin.y) / p.scale).round(),
         );
-        *n = model::snap_native(n, &v.moved_screen, desired)?;
-        // Main-display origin must remain zero. Moving it in the canvas changes
-        // every other native origin and shifts the computer transform equally.
-        let anchor = n
+        let moved_index = original_native
             .screens
             .iter()
-            .find(|s| s.screen == n.primary)
-            .ok_or_else(stale)?
-            .origin;
-        for s in &mut n.screens {
-            s.origin.x -= anchor.x;
-            s.origin.y -= anchor.y;
+            .position(|s| s.screen == v.moved_screen)
+            .ok_or_else(stale)?;
+        let snapped = model::snap_native(&original_native, &v.moved_screen, desired);
+        // A native arrangement can only accept an edge-connected desktop. If
+        // the requested screen origin is not one of those positions, keep the
+        // OS-owned relative geometry and translate this computer's shared
+        // placement so the dragged screen still reaches the requested canvas
+        // point. This is the same rigid transform used when system sync is off.
+        let rigid = match snapped {
+            Ok(ref candidate) => candidate.screens[moved_index].origin != desired,
+            Err(ref error) if error.code == ErrorCode::Disconnected => true,
+            Err(error) => return Err(error),
+        };
+        if rigid {
+            let current_screen = original_native.screens[moved_index].origin;
+            let placement = current
+                .placements
+                .iter_mut()
+                .find(|p| p.device == v.device)
+                .expect("placement");
+            placement.origin.x += v.desired_canvas_origin.x - (p.origin.x + current_screen.x * p.scale);
+            placement.origin.y += v.desired_canvas_origin.y - (p.origin.y + current_screen.y * p.scale);
+        } else {
+            let mut n = snapped.expect("non-rigid native preview");
+            // Main-display origin must remain zero. Moving it in the canvas
+            // changes every other native origin and shifts the transform equally.
+            let anchor = n
+                .screens
+                .iter()
+                .find(|s| s.screen == n.primary)
+                .ok_or_else(stale)?
+                .origin;
+            for s in &mut n.screens {
+                s.origin.x -= anchor.x;
+                s.origin.y -= anchor.y;
+            }
+            let placement = current
+                .placements
+                .iter_mut()
+                .find(|p| p.device == v.device)
+                .expect("placement");
+            placement.origin.x += anchor.x * p.scale;
+            placement.origin.y += anchor.y * p.scale;
+            current.native[native_index] = n;
         }
-        let native = n.clone();
-        let placement = current
-            .placements
-            .iter_mut()
-            .find(|p| p.device == v.device)
-            .expect("placement");
-        placement.origin.x += anchor.x * p.scale;
-        placement.origin.y += anchor.y * p.scale;
+        let native = current.native[native_index].clone();
         // This preview constrains native geometry only. Manual canvas collision
         // release and compaction belong to the frontend, which translates the
         // edited computer against fixed peers before committing its placement.
@@ -844,63 +918,58 @@ impl Node {
                 error: None,
             });
             self.operation_event(operation.clone())?;
-            // Apply the idempotent sharing preference before native work: an
-            // unknown native receipt must not leave a later visibility patch
-            // queued for recovery or falsely report that patch as applied.
-            let visibility = if sharing_changed {
-                self.edit_device_option(device.device, dto::LocalOption::ScreenShared, V::Bool(sharing))
-                    .map_err(unavailable)
-            } else {
+            // Visibility is committed in the shared layout below. Native work
+            // is an owner response to that layout, so it never edits an owner
+            // preference or creates a second source of truth.
+            let result = if bits.is_empty() && native.is_none() {
                 Ok(())
-            };
-            let result = visibility.and_then(|()| {
-                if bits.is_empty() && native.is_none() {
-                    Ok(())
-                } else if native.is_none()
-                    && matches!(
-                        device.availability,
-                        Availability::Unsupported | Availability::Unavailable
-                    )
+            } else {
                 {
-                    // Released owners understand screen visibility option 7. Never
-                    // send a new arrangement message to those peers.
-                    self.edit_device_option(
-                        device.device,
-                        dto::LocalOption::ScreenPreferences,
-                        native::visibility_patch(&bits),
-                    )
-                    .map_err(unavailable)
-                } else {
-                    self.make_arrangement_request(&id, device.device, native, &bits)
-                        .and_then(|request| {
-                            lock(&self.inner.profiles.data)
-                                .unknown
-                                .entry(id.clone())
-                                .or_default()
-                                .push((device.device, request.clone()));
-                            self.persist_profile_operations()?;
-                            let result = self.request_arrangement(device.device, request);
-                            let unknown = result.as_ref().is_err_and(|e| e.code == ErrorCode::OutcomeUnknown)
-                                || result.as_ref().is_ok_and(|r| r.outcome() == Ok(native::UNKNOWN));
-                            if !unknown && let Some(requests) = lock(&self.inner.profiles.data).unknown.get_mut(&id) {
-                                requests.retain(|(owner, _)| *owner != device.device);
-                            }
-                            if let (Some(target), Ok(reply)) = (native, &result)
-                                && reply.outcome() == Ok(native::APPLIED)
-                                && let Some(actual) =
-                                    reply.native().ok().flatten().and_then(|n| wire::read_native(n).ok())
-                                && !model::same_native(target, &actual)
-                            {
-                                operation.adjustments.push(Adjustment {
-                                    code: AdjustmentCode::NativeSnapped,
-                                    device: device.device,
-                                    screen: None,
-                                });
-                            }
-                            result.and_then(owner_result)
-                        })
+                    if native.is_none()
+                        && !(device.sync_system_arrangement && device.disable_hidden_displays)
+                        && matches!(
+                            device.availability,
+                            Availability::Unsupported | Availability::Unavailable
+                        )
+                    {
+                        // Older peers do not know the arrangement request, so
+                        // they retain their own legacy owner preference. The
+                        // new shared register remains authoritative for new
+                        // peers and is safely opaque to those nodes.
+                        Ok(())
+                    } else {
+                        self.make_arrangement_request(&id, device.device, native, &bits)
+                            .and_then(|request| {
+                                lock(&self.inner.profiles.data)
+                                    .unknown
+                                    .entry(id.clone())
+                                    .or_default()
+                                    .push((device.device, request.clone()));
+                                self.persist_profile_operations()?;
+                                let result = self.request_arrangement(device.device, request);
+                                let unknown = result.as_ref().is_err_and(|e| e.code == ErrorCode::OutcomeUnknown)
+                                    || result.as_ref().is_ok_and(|r| r.outcome() == Ok(native::UNKNOWN));
+                                if !unknown && let Some(requests) = lock(&self.inner.profiles.data).unknown.get_mut(&id)
+                                {
+                                    requests.retain(|(owner, _)| *owner != device.device);
+                                }
+                                if let (Some(target), Ok(reply)) = (native, &result)
+                                    && reply.outcome() == Ok(native::APPLIED)
+                                    && let Some(actual) =
+                                        reply.native().ok().flatten().and_then(|n| wire::read_native(n).ok())
+                                    && !model::same_native(target, &actual)
+                                {
+                                    operation.adjustments.push(Adjustment {
+                                        code: AdjustmentCode::NativeSnapped,
+                                        device: device.device,
+                                        screen: None,
+                                    });
+                                }
+                                result.and_then(owner_result)
+                            })
+                    }
                 }
-            });
+            };
             let owner = operation.owners.last_mut().expect("owner progress");
             match result {
                 Ok(()) => owner.phase = OwnerPhase::Applied,
@@ -921,10 +990,20 @@ impl Node {
             .map_err(unavailable)?
             .edit_layout(
                 Box::new(move |layout| {
-                    layout.settings = target.topology;
+                    layout.settings = target.topology.clone();
                     // Offline geometry is retained drawing data. Online native geometry
                     // comes exclusively from each owner's observed ConfigFacts/layout.
                     for s in &mut layout.screens {
+                        s.device_hidden = !model::screen_shared(&target, DeviceKey(s.id.device));
+                        s.device_visibility_known = true;
+                        if let Some(bit) = target
+                            .disabled
+                            .iter()
+                            .find(|bit| bit.screen.device.0 == s.id.device && bit.screen.display == s.id.display)
+                        {
+                            s.screen_hidden = bit.disabled;
+                            s.screen_visibility_known = true;
+                        }
                         if !online.contains(&DeviceKey(s.id.device))
                             && let Some(n) = target
                                 .native
@@ -1102,6 +1181,10 @@ mod manual_layout_delta_tests {
                 size_source: source,
                 primary: true,
                 builtin: false,
+                device_hidden: false,
+                screen_hidden: false,
+                device_visibility_known: false,
+                screen_visibility_known: false,
             }],
             ..Layout::default()
         }

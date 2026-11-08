@@ -56,12 +56,12 @@ def published(tag):
     return published_release.published(tag, request=lambda path: feed.loads(command(['gh', 'api', path])))
 
 
-def validate_release(record, annotations, tag, commit, tree):
+def validate_release(record, annotations, tag, commit, tree, platform="macos"):
     feed.require(record['schema'] == 1 and record['product'] == 'Oink' and
                  record['version'] == tag.removeprefix('v') and record['built_commit'] == commit and
                  record['source_tree_sha256'] == tree and type(record['build']) is int and
                  0 < record['build'] < 2**31, 'release_provenance')
-    mac = record['platforms']['macos']
+    mac = record['platforms'][platform]
     feed.require(all(mac.get(k) == record[k] for k in ('version', 'build', 'built_commit', 'source_tree_sha256')) and
                  mac.get('source_commit') is None and mac['notarized'] is True and
                  mac['team_id'] == '893V37X2CW' and
@@ -129,57 +129,71 @@ def candidate(state, output, cache, tag):
     base = f'https://github.com/{config["repository"]}/releases/download/{tag}/'
     record = feed.loads(feed.download(base + 'release.json', feed.MAX_FEED, redirects=True))
     annotations = published_release.update_notes()
-    asset = validate_release(record, annotations, tag, commit, tree)
+    assets = {platform: validate_release(record, annotations, tag, commit, tree, platform)
+              for platform in ('macos', 'macos-x64') if platform in record['platforms']}
+    feed.require('macos' in assets, 'sparkle_archive_required')
     reg = feed_site.state_info(state)
     feed_site.verify_platform(state, 'mac', config, signatures=False)
-    relative = f'mac/v1/{config["mac"]["epoch"]}/stable/appcast.xml'
     catalog = reg['platforms']['mac'].get('catalog', {}).copy()
-    if relative in catalog:
-        feed.require(record['build'] > catalog[relative]['build'], 'release_not_monotonic')
     output.mkdir(parents=True, exist_ok=False)
     for name, raw in feed_site.files(state / 'site/mac').items():
         feed.write(output / 'site/mac' / name, raw)
-    with tempfile.TemporaryDirectory(prefix='oink-mac-release-') as tmp:
-        directory = Path(tmp)
-        archive = directory / asset['name']
-        raw = feed.download(base + asset['name'], feed.MAX_PACKAGE, redirects=True)
-        feed.require(len(raw) == asset['size'] and feed.digest(raw) == asset['sha256'], 'archive_digest')
-        archive.write_bytes(raw)
-        del raw
-        # These exact stapled bytes came from the gated package run. Recheck
-        # their native signature/ticket before granting a new update signature.
-        staging = directory / 'staging.noindex'
-        command(['ditto', '-x', '-k', archive, staging])
-        app = staging / 'Oink.app'
-        sys.path.insert(0, str(feed.ROOT / 'packaging/macos'))
-        from signing import verify_published_app
-        from content import verify_update_transport
-        from macos_imports import verify_imports
-        info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
-        feed.require(info['CFBundleIdentifier'] == 'com.hachiwii.oink' and
-                     info['CFBundleVersion'] == str(record['build']) and
-                     info['CFBundleShortVersionString'] == record['version'] and
-                     info['SUPublicEDKey'] == config['mac']['public_key'], 'archive_bundle_identity')
-        verify_update_transport(info)
-        verify_imports([app], '14.2')
-        verify_published_app(app, '893V37X2CW')
-        signer = prepare(cache) / 'bin/sign_update'
-        signature = sign(signer, archive, config['mac']['public_key'])
-        metadata = dict(architecture='arm64', build=record['build'], version=record['version'],
-                        url=base + asset['name'], length=asset['size'], sha256=asset['sha256'],
-                        developer_id_verified=True, notarized=True, qualified_build=record['build'])
-        # Stable updates are eligible for beta subscribers too. Keep a newer
-        # beta feed byte-for-byte if a stable promotion is older/equal; never
-        # strand a persisted beta preference on a missing/obsolete feed.
-        for channel in ('stable', 'beta'):
-            relative = f'mac/v1/{config["mac"]["epoch"]}/{channel}/appcast.xml'
-            if channel == 'beta' and catalog.get(relative, {}).get('build', 0) >= record['build']:
-                continue
-            path = output / 'site' / relative
-            previous = path.read_bytes() if path.exists() else None
-            write_appcast(path, previous, metadata, signature, annotations['notes'])
-            sign(signer, path, config['mac']['public_key'], xml=True)
-            catalog[relative] = metadata
+    for platform in ('macos', 'macos-x64'):
+        # Historical arm-only releases remain publishable; new Intel records
+        # receive an independent catalog and never enter the existing ARM feed.
+        if platform not in record['platforms']:
+            continue
+        architecture = 'x64' if platform == 'macos-x64' else 'arm64'
+        arch_path = 'x64/' if architecture == 'x64' else ''
+        asset = assets[platform]
+        feed.require(record['platforms'][platform]['architecture'] == architecture, 'archive_architecture')
+        relative = f'mac/v1/{config["mac"]["epoch"]}/{arch_path}stable/appcast.xml'
+        if relative in catalog:
+            feed.require(record['build'] > catalog[relative]['build'], 'release_not_monotonic')
+        with tempfile.TemporaryDirectory(prefix='oink-mac-release-') as tmp:
+            directory = Path(tmp)
+            archive = directory / asset['name']
+            raw = feed.download(base + asset['name'], feed.MAX_PACKAGE, redirects=True)
+            feed.require(len(raw) == asset['size'] and feed.digest(raw) == asset['sha256'], 'archive_digest')
+            archive.write_bytes(raw)
+            del raw
+            # These exact stapled bytes came from the gated package run. Recheck
+            # their native signature/ticket before granting a new update signature.
+            staging = directory / 'staging.noindex'
+            command(['ditto', '-x', '-k', archive, staging])
+            app = staging / 'Oink.app'
+            sys.path.insert(0, str(feed.ROOT / 'packaging/macos'))
+            from signing import verify_published_app
+            from content import verify_update_transport
+            from macos_imports import verify_imports
+            info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+            feed.require(info['CFBundleIdentifier'] == 'com.hachiwii.oink' and
+                         info['CFBundleVersion'] == str(record['build']) and
+                         info['CFBundleShortVersionString'] == record['version'] and
+                         info['SUPublicEDKey'] == config['mac']['public_key'], 'archive_bundle_identity')
+            native_arch = 'x86_64' if architecture == 'x64' else 'arm64'
+            arches = command(['lipo', '-archs', app / 'Contents/MacOS/oink-backend']).decode().split()
+            feed.require(arches == [native_arch], 'archive_architecture')
+            verify_update_transport(info)
+            verify_imports([app], '14.2')
+            verify_published_app(app, '893V37X2CW')
+            signer = prepare(cache) / 'bin/sign_update'
+            signature = sign(signer, archive, config['mac']['public_key'])
+            metadata = dict(architecture=architecture, build=record['build'], version=record['version'],
+                            url=base + asset['name'], length=asset['size'], sha256=asset['sha256'],
+                            developer_id_verified=True, notarized=True, qualified_build=record['build'])
+            # Stable updates are eligible for beta subscribers too. Keep a newer
+            # beta feed byte-for-byte if a stable promotion is older/equal; never
+            # strand a persisted beta preference on a missing/obsolete feed.
+            for channel in ('stable', 'beta'):
+                relative = f'mac/v1/{config["mac"]["epoch"]}/{arch_path}{channel}/appcast.xml'
+                if channel == 'beta' and catalog.get(relative, {}).get('build', 0) >= record['build']:
+                    continue
+                path = output / 'site' / relative
+                previous = path.read_bytes() if path.exists() else None
+                write_appcast(path, previous, metadata, signature, annotations['notes'])
+                sign(signer, path, config['mac']['public_key'], xml=True)
+                catalog[relative] = metadata
     feed.write(output / 'catalog.json', catalog)
     return record['build']
 

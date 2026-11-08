@@ -17,7 +17,7 @@ Oink は「Oink Is Not only a KVM」の略で、複数の Windows と Mac のあ
 
 対応 OS とバージョン：
 
-- **Mac**：Apple シリコン（arm64）のみ、macOS 14.2 以降
+- **Mac**：Apple シリコン（arm64）、macOS 14.2 以降。Intel（x64）、macOS 14.2 以降（未テスト）
 - **Windows**：x64、Windows 10 22H2（ビルド 19045）以降、または Windows 11
 
 SmartScreen に「Windows によって PC が保護されました」と表示された場合は、選択肢が表示されたときに限り **詳細情報 → 実行** を選んでください。UAC では発行元が不明と表示されることがあります。

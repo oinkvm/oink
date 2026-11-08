@@ -58,9 +58,11 @@ pub(super) fn open(node: &Node, path: &str) -> ApiResult<UpdateStatus> {
     let mut state = lock(&node.inner.update);
     let result = staged.and_then(|staged| {
         #[cfg(target_os = "macos")]
-        staged
-            .package
-            .validate_codesigned_dmg(&state.status.version, state.status.current_build, "arm64")?;
+        staged.package.validate_codesigned_dmg(
+            &state.status.version,
+            state.status.current_build,
+            super::local_mac::architecture(),
+        )?;
         #[cfg(not(target_os = "macos"))]
         staged.package.validate(
             &state.status.version,

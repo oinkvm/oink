@@ -59,6 +59,37 @@ class SiteTests(unittest.TestCase):
         self.assertEqual(feed_site.files(initial), before)
         self.assertEqual(set(feed_site.files(output)), {'CNAME', 'index.html'})
 
+    def test_disabled_mac_snapshot_includes_x64_absence(self):
+        expected = feed_site.public_files(self.state, 'mac')
+        for channel in ('stable', 'beta'):
+            path = f'mac/v1/mac-2026-01/x64/{channel}/appcast.xml'
+            self.assertIn(path, expected)
+            self.assertIsNone(expected[path])
+
+    def test_arm_only_snapshot_includes_x64_absence(self):
+        self.install('mac')
+        expected = feed_site.public_files(self.state, 'mac')
+        self.assertEqual(expected[MAC_PATH], (self.state / 'site' / MAC_PATH).read_bytes())
+        for channel in ('stable', 'beta'):
+            path = f'mac/v1/mac-2026-01/x64/{channel}/appcast.xml'
+            self.assertIn(path, expected)
+            self.assertIsNone(expected[path])
+
+    def test_arm_only_public_readback_rejects_leftover_x64_feed(self):
+        import urllib.error
+        self.install('mac')
+        active = feed_site.files(self.state / 'site')
+        def download(url, *args):
+            path = url.removeprefix(feed.BASE)
+            if '/x64/' in path:
+                return b'leftover Intel candidate'
+            if path in active:
+                return active[path]
+            raise urllib.error.HTTPError(url, 404, 'Not Found', {}, None)
+        with patch.object(feed, 'download', side_effect=download):
+            with self.assertRaisesRegex(ValueError, 'disabled_feed_present'):
+                feed_site.verify_public(self.state)
+
     def test_bootstrap_refuses_live_or_modified_state(self):
         for change in ('revision', 'enabled', 'site', 'record', 'symlink'):
             with self.subTest(change=change):
@@ -93,6 +124,28 @@ class SiteTests(unittest.TestCase):
                   'notarized': True, 'sha256': feed.digest(package), 'url': url, 'length': len(package), 'version': f'1.0.{build}'}
         feed.write(self.state / 'site' / MAC_PATH.replace('/beta/', f'/{channel}/'), raw)
         return record
+
+    def test_intel_catalog_is_separate_and_rejects_arm_metadata(self):
+        arm = self.mac(2, "stable")
+        intel = self.mac(3, "stable")
+        intel['architecture'] = 'x64'
+        arm_path = MAC_PATH.replace('/beta/', '/stable/')
+        intel_path = arm_path.replace('/stable/', '/x64/stable/')
+        (self.state / 'site' / arm_path).rename(self.state / 'site' / 'intel-temporary.xml')
+        feed.write(self.state / 'site' / intel_path, (self.state / 'site/intel-temporary.xml').read_bytes())
+        (self.state / 'site/intel-temporary.xml').unlink()
+        arm = self.mac(2, "stable")
+        reg = feed.registry(self.state)
+        reg['platforms']['mac'] = {'enabled': True, 'revision': 3,
+            'files': {'mac/' + name: feed.digest(raw) for name, raw in feed_site.files(self.state / 'site/mac').items()},
+            'catalog': {arm_path: arm, intel_path: intel}}
+        feed.write(self.state / 'registry.json', reg)
+        feed_site.verify_platform(self.state, 'mac', self.config, signatures=False)
+        reg = feed.registry(self.state)
+        reg['platforms']['mac']['catalog'][intel_path]['architecture'] = 'arm64'
+        feed.write(self.state / 'registry.json', reg)
+        with self.assertRaisesRegex(ValueError, 'mac_qualification'):
+            feed_site.verify_platform(self.state, 'mac', self.config, signatures=False)
 
     def windows(self, sequence, releases=None):
         reg = feed.registry(self.state)
@@ -434,6 +487,27 @@ class TrustTests(unittest.TestCase):
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_rollback_to_arm_only_includes_x64_absence(self):
+        arm = 'mac/v1/mac-2026-01/stable/appcast.xml'
+        intel = [f'mac/v1/mac-2026-01/x64/{channel}/appcast.xml' for channel in ('stable', 'beta')]
+        reg = {'platforms': {
+            'mac': {'enabled': True, 'files': {arm: feed.digest(b'ARM parent')}},
+            'windows': {'enabled': False, 'files': {}},
+        }}
+        with patch.object(feed, 'read', return_value={'head': 'a'*40}), \
+             patch.object(deploy, 'git', return_value='site/' + arm), \
+             patch.object(deploy.subprocess, 'check_output', side_effect=[feed.encode(reg), b'ARM parent']), \
+             patch.object(feed_site, 'files', return_value={path: b'Intel candidate' for path in intel}), \
+             patch.object(deploy.readback, 'verify') as verify:
+            deploy.verify_rollback()
+        expected, previous, error = verify.call_args.args
+        self.assertEqual(expected[arm], b'ARM parent')
+        self.assertEqual(error, 'rollback_digest')
+        for path in intel:
+            self.assertIn(path, expected)
+            self.assertIsNone(expected[path])
+            self.assertEqual(previous[path], b'Intel candidate')
+
     def test_readback_failure_does_not_write_or_commit_state(self):
         with patch.object(feed, 'read', return_value={'head': 'a'*40, 'revision': 1}), \
              patch.object(feed_site, 'verify_public', side_effect=ValueError('deployment_digest')), \

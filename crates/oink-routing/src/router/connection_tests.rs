@@ -445,3 +445,115 @@ fn replacing_member_boot_discards_old_sessions_and_stale_retirement_keeps_succes
     assert!(scope.members.contains(&(PEER, [3; 16])));
     assert!(!scope.members.contains(&(PEER, [2; 16])));
 }
+
+#[test]
+fn reconnect_replays_unconfirmed_focus_entry_after_pair_detach() {
+    let mut source = router();
+    source.set_local_displays(vec![DisplayInfo {
+        key: "screen".into(),
+        name: "screen".into(),
+        bounds: Rect::new(0., 0., 1000., 600.),
+        pixel_width: 1000,
+        pixel_height: 600,
+        reference_extent: None,
+        rotation_deg: 0,
+        is_primary: true,
+        is_builtin: false,
+        is_virtual: false,
+    }]);
+    source.set_cursor(Point::new(500., 300.));
+    initialize(&mut source, true);
+    source.drain_outputs();
+
+    source.reclaim_focus(None);
+    source.drain_outputs();
+    let entry = ScreenPos::new(ScreenId::new(PEER, "screen"), Point::new(40., 50.));
+    source.hand_off(entry.clone(), None);
+    // The first FocusEnter is lost while the transport is being replaced.
+    source.drain_outputs();
+    source.detach_input(PEER);
+    source.drain_outputs();
+
+    assert!(source.attach_input(
+        oink_foundation::session::Boot {
+            device_id: PEER,
+            nonce: [2; 16],
+        },
+        [2; 16],
+        true,
+        false,
+        FeelProfile::default(),
+        1,
+    ));
+    let replay = source.drain_outputs();
+    assert!(replay.iter().any(|output| matches!(
+        output,
+        Output::Send {
+            to,
+            msg: Message::Control(ControlMsg::FocusEnter { epoch: 2, display, pos, .. }),
+            ..
+        } if *to == PEER && display == "screen" && *pos == entry.local
+    )));
+}
+
+#[test]
+fn confirmed_focus_entry_is_not_replayed_on_a_later_reconnect() {
+    let mut source = router();
+    initialize(&mut source, true);
+    source.drain_outputs();
+    source.reclaim_focus(None);
+    source.drain_outputs();
+    source.hand_off(
+        ScreenPos::new(ScreenId::new(PEER, "screen"), Point::new(40., 50.)),
+        None,
+    );
+    source.drain_outputs();
+    source.detach_input(PEER);
+    source.drain_outputs();
+    assert!(source.attach_input(
+        oink_foundation::session::Boot {
+            device_id: PEER,
+            nonce: [2; 16],
+        },
+        [2; 16],
+        true,
+        false,
+        FeelProfile::default(),
+        1,
+    ));
+    source.drain_outputs();
+
+    let scope = source.focus_scope.clone();
+    source.input_message(
+        PEER,
+        Message::Control(ControlMsg::FocusState {
+            epoch: 2,
+            holder: PEER,
+            scope,
+            session: Some([2; 16]),
+            lock_state: None,
+        }),
+        2,
+    );
+    source.drain_outputs();
+    source.detach_input(PEER);
+    source.drain_outputs();
+    assert!(source.attach_input(
+        oink_foundation::session::Boot {
+            device_id: PEER,
+            nonce: [2; 16],
+        },
+        [2; 16],
+        true,
+        false,
+        FeelProfile::default(),
+        3,
+    ));
+    assert!(!source.drain_outputs().iter().any(|output| matches!(
+        output,
+        Output::Send {
+            msg: Message::Control(ControlMsg::FocusEnter { .. } | ControlMsg::MovePointerEnter { .. }),
+            ..
+        }
+    )));
+}

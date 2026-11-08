@@ -27,6 +27,9 @@ static NODE: Mutex<Option<Node>> = Mutex::new(None);
 pub(crate) fn attach(node: &Node) {
     *NODE.lock().unwrap() = Some(node.clone());
     crate::update::attach(node);
+    if let Err(error) = crate::paste_file::apply(&node.settings()) {
+        tracing::warn!(%error, "could not apply Paste as File shell integration");
+    }
     #[cfg(windows)]
     node.subscribe_views(
         std::sync::Arc::new(|event: &ApiEvent| {

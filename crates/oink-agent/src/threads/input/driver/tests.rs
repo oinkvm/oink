@@ -28,6 +28,7 @@ fn fixture_admission(peer: DeviceId, link: LinkId) -> wire::PeerAdmission {
                     "oink.pointer.move/1",
                     "oink.pointer.move-hidden/1",
                     "oink.focus.local-click/1",
+                    "oink.auto-unlock/1",
                     "oink.input.relative/1",
                     "oink.input.gestures/1",
                     "oink.input.contacts/1",
@@ -67,7 +68,7 @@ struct Harness {
 #[test]
 fn external_forwarding_reads_the_latest_local_snapshot_without_restart_or_poll() {
     let h = Harness::new();
-    assert!(!h.driver.forward_injected_input());
+    assert!(h.driver.forward_injected_input());
     for enabled in [true, false, true] {
         let mut settings = (*h.driver.snapshots.settings.load()).clone();
         settings.forward_injected_input = enabled;
@@ -3301,4 +3302,181 @@ fn uncontrollable_input_owner_observes_local_click_commit_without_voting() {
     h.driver.command(InputCommand::Controllable(true));
     assert!(!h.driver.adapter.router().paused());
     assert_eq!(h.driver.adapter.router().focus_claim(), (100, peer()));
+}
+
+#[test]
+fn auto_unlock_requires_accepted_entry_and_consumes_one_source_reply() {
+    let mut h = Harness::new();
+    let (mut read, _) = h.outbound(1);
+    let (writer, _) = h.inbound(1);
+    opening(&writer, &remote(), true);
+    h.attach();
+    drain(&mut read);
+    h.driver.command(InputCommand::MovePointerTo(peer()));
+    h.driver.command(InputCommand::SessionLocked(Some(true)));
+    let epoch = h.driver.adapter.router().focus().epoch + 1;
+    let enter = Message::Control(ControlMsg::FocusEnter {
+        epoch,
+        display: "screen".into(),
+        pos: oink_foundation::Point::new(4., 4.),
+        scope: Some(input_scope(&h.driver)),
+        pointer_source: Some(peer()),
+    });
+    h.driver.message(peer(), enter.clone());
+    assert_eq!(
+        drain(&mut read)
+            .iter()
+            .filter(|m| matches!(m,Message::Control(ControlMsg::UnlockQuery { epoch:e }) if *e==epoch))
+            .count(),
+        1
+    );
+    while h._main.try_recv().is_ok() {}
+    for _ in 0..2 {
+        h.driver.message(
+            peer(),
+            Message::Control(ControlMsg::UnlockReply { epoch, unlocked: true }),
+        );
+    }
+    assert_eq!(
+        std::iter::from_fn(|| h._main.try_recv().ok())
+            .filter(|m| matches!(m,MainCommand::UnlockAttempt {epoch:e, ..} if *e==epoch))
+            .count(),
+        1
+    );
+    h.driver.message(peer(), enter);
+    assert!(
+        !drain(&mut read)
+            .iter()
+            .any(|m| matches!(m, Message::Control(ControlMsg::UnlockQuery { .. })))
+    );
+}
+
+#[test]
+fn auto_unlock_uses_authoritative_lock_state_when_observer_cache_lags() {
+    struct AuthoritativeLocked(oink_test_support::input::FakeInput);
+    impl oink_input::InputBackend for AuthoritativeLocked {
+        fn start(&self, handler: oink_input::EventHandler) -> Result<(), oink_input::InputError> {
+            self.0.start(handler)
+        }
+        fn stop(&self) {
+            self.0.stop();
+        }
+        fn set_mode(&self, mode: oink_foundation::input::CaptureMode) -> Result<(), oink_input::InputError> {
+            self.0.set_mode(mode)
+        }
+        fn inject(&self, event: &oink_foundation::input::InjectEvent) -> Result<(), oink_input::InputError> {
+            self.0.inject(event)
+        }
+        fn cursor_position(&self) -> Result<oink_foundation::Point, oink_input::InputError> {
+            self.0.cursor_position()
+        }
+        fn feel_profile(&self) -> oink_foundation::input::FeelProfile {
+            self.0.feel_profile()
+        }
+        fn permissions(&self) -> oink_input::InputPermissions {
+            self.0.permissions()
+        }
+        fn session_locked(&self) -> Option<bool> {
+            Some(true)
+        }
+    }
+
+    let backend = Arc::new(AuthoritativeLocked(oink_test_support::input::FakeInput::new()));
+    let mut h = Harness::with_backend(backend);
+    let (mut read, _) = h.outbound(1);
+    let (writer, _) = h.inbound(1);
+    opening(&writer, &remote(), true);
+    h.attach();
+    drain(&mut read);
+    h.driver.command(InputCommand::MovePointerTo(peer()));
+    // The observer has not delivered SessionLocked yet; only the platform
+    // query in the FocusEnter path knows that the session is already locked.
+    let epoch = h.driver.adapter.router().focus().epoch + 1;
+    h.driver.message(
+        peer(),
+        Message::Control(ControlMsg::FocusEnter {
+            epoch,
+            display: "screen".into(),
+            pos: oink_foundation::Point::new(4., 4.),
+            scope: Some(input_scope(&h.driver)),
+            pointer_source: Some(peer()),
+        }),
+    );
+    assert_eq!(
+        drain(&mut read)
+            .iter()
+            .filter(|m| matches!(m, Message::Control(ControlMsg::UnlockQuery { epoch: e }) if *e == epoch))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn auto_unlock_does_not_trigger_when_target_locked_with_focus() {
+    let mut h = Harness::new();
+    let (mut read, _) = h.outbound(1);
+    let (writer, _) = h.inbound(1);
+    opening(&writer, &remote(), true);
+    h.attach();
+    drain(&mut read);
+    h.driver.command(InputCommand::SessionLocked(Some(true)));
+    let epoch = h.driver.adapter.router().focus().epoch + 1;
+    h.driver.message(
+        peer(),
+        Message::Control(ControlMsg::FocusEnter {
+            epoch,
+            display: "screen".into(),
+            pos: oink_foundation::Point::new(4., 4.),
+            scope: Some(input_scope(&h.driver)),
+            pointer_source: Some(peer()),
+        }),
+    );
+    assert!(
+        !drain(&mut read)
+            .iter()
+            .any(|m| matches!(m, Message::Control(ControlMsg::UnlockQuery { .. })))
+    );
+}
+
+#[test]
+fn local_unlock_admission_survives_focus_leaving_before_first_character() {
+    use std::sync::mpsc;
+    let mut h = Harness::new();
+    let (_read, _) = h.outbound(1);
+    let (writer, _) = h.inbound(1);
+    opening(&writer, &remote(), true);
+    h.attach();
+    h.driver.command(InputCommand::SessionLocked(Some(true)));
+    let (busy, started) = mpsc::sync_channel(1);
+    let (release, wait) = mpsc::sync_channel(1);
+    let (done, _) = mpsc::sync_channel(1);
+    h.driver
+        .inject
+        .push(InjectItem::LocalUnlock(crate::auto_unlock::typing::Job::new(
+            Box::new(move |_| {
+                busy.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(1)).unwrap();
+                Ok(())
+            }),
+            done,
+        )));
+    started.recv_timeout(Duration::from_secs(1)).unwrap();
+    let (reply, result) = mpsc::sync_channel(1);
+    let job = crate::auto_unlock::typing::Job::new(
+        Box::new(|allowed| {
+            if allowed.load(std::sync::atomic::Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err("focus departure revoked admission")
+            }
+        }),
+        reply,
+    );
+    h.driver.command(InputCommand::LocalUnlock {
+        epoch: h.driver.adapter.router().focus().epoch,
+        job,
+    });
+    h.driver.command(InputCommand::MovePointerTo(peer()));
+    release.send(()).unwrap();
+    assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().is_ok());
 }

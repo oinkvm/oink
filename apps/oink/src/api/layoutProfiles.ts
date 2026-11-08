@@ -38,6 +38,7 @@ export interface ProfileSummary {
 export interface DeviceArrangementState {
   device: DeviceKey;
   sync_system_arrangement: boolean;
+  disable_hidden_displays?: boolean;
   preference_token: Token;
   native_token: Token | null;
   availability: 'ready' | 'offline' | 'unsupported' | 'unavailable';
@@ -164,6 +165,7 @@ export function createLayoutProfilesApi(call: ProfileCall) {
       invoke<OperationReply>('load_layout_profile', request),
     layoutProfileOperation: (request_id: string) => invoke<OperationQuery>('layout_profile_operation', { request_id }),
     setSyncSystemArrangement: (request: SettingRequest) => invoke<LayoutProfilesState>('set_sync_system_arrangement', request),
+    setDisableHiddenDisplays: (request: SettingRequest) => invoke<LayoutProfilesState>('set_disable_hidden_displays', request),
     previewSystemArrangement: (request: PreviewRequest) => invoke<PreviewReply>('preview_system_arrangement', request),
     commitArrangement: (request: CommitRequest) => invoke<OperationReply>('commit_arrangement', request),
     resetArrangement: (request: Mutation) => invoke<OperationReply>('reset_arrangement', request),

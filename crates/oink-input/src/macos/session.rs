@@ -30,6 +30,69 @@ pub(crate) fn idle_refresh_allowed() -> bool {
         && flag("CGSSessionScreenIsLocked") != Some(true)
 }
 
+/// Synchronous authoritative sample, never called from an event-tap callback.
+/// IOConsoleLocked is primary: on macOS 14.7.8 CG/notifications preceded the
+/// actual password lock by 5.422 seconds (the configured grace period). Missing
+/// or contradictory observations remain unknown; notifications cannot grant it.
+pub(crate) fn authoritative() -> Option<bool> {
+    type Cf = *const c_void;
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IORegistryGetRootEntry(port: u32) -> u32;
+        fn IORegistryEntryCreateCFProperty(entry: u32, key: Cf, allocator: Cf, options: u32) -> Cf;
+        fn IOObjectRelease(object: u32) -> i32;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(value: Cf);
+        fn CFGetTypeID(value: Cf) -> usize;
+        fn CFBooleanGetTypeID() -> usize;
+        fn CFBooleanGetValue(value: Cf) -> u8;
+    }
+    let key = CFString::from_static_str("IOConsoleLocked");
+    // SAFETY: read-only registry lookup, release both returned owned references;
+    // only read a CFBoolean after validating its runtime type.
+    let io = unsafe {
+        let root = IORegistryGetRootEntry(0);
+        if root == 0 {
+            return None;
+        }
+        let value = IORegistryEntryCreateCFProperty(root, (&*key as *const CFString).cast(), std::ptr::null(), 0);
+        IOObjectRelease(root);
+        if value.is_null() {
+            return None;
+        }
+        let flag = (CFGetTypeID(value) == CFBooleanGetTypeID()).then(|| CFBooleanGetValue(value) != 0);
+        CFRelease(value);
+        flag
+    };
+    let dict = CGSessionCopyCurrentDictionary()?;
+    // SAFETY: CG's dictionary uses CFString keys and CF object values.
+    let dict: &CFDictionary<CFString, CFType> = unsafe { dict.cast_unchecked() };
+    let flag = |key| {
+        dict.get(&CFString::from_static_str(key))
+            .and_then(|v| v.downcast_ref::<CFBoolean>().map(CFBoolean::as_bool))
+    };
+    authoritative_state(
+        io,
+        flag("CGSSessionScreenIsLocked"),
+        flag("kCGSSessionOnConsoleKey"),
+        flag("kCGSessionLoginDoneKey"),
+    )
+}
+fn authoritative_state(io: Option<bool>, cg: Option<bool>, console: Option<bool>, login: Option<bool>) -> Option<bool> {
+    if console != Some(true) || login != Some(true) {
+        return None;
+    }
+    match (io, cg) {
+        (Some(true), Some(true)) => Some(true),
+        // The unlocked dictionary normally omits the lock key. IO must
+        // positively confirm false; absence of CG's key alone is insufficient.
+        (Some(false), None | Some(false)) => Some(false),
+        _ => None,
+    }
+}
+
 /// Callback-safe second gate. The ordinary request path already queried the
 /// console/login dictionary; never perform that synchronous query inside a tap.
 pub(crate) fn idle_refresh_unshielded() -> bool {
@@ -176,6 +239,33 @@ pub(crate) fn init() {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+    #[test]
+    fn authoritative_lock_requires_io_and_handles_unlocked_missing_cg_key() {
+        assert_eq!(
+            authoritative_state(Some(true), Some(true), Some(true), Some(true)),
+            Some(true)
+        );
+        for cg in [None, Some(false)] {
+            assert_eq!(
+                authoritative_state(Some(false), cg, Some(true), Some(true)),
+                Some(false)
+            );
+            assert_eq!(authoritative_state(Some(true), cg, Some(true), Some(true)), None);
+        }
+        assert_eq!(
+            authoritative_state(Some(false), Some(true), Some(true), Some(true)),
+            None
+        );
+        assert_eq!(authoritative_state(None, Some(true), Some(true), Some(true)), None);
+        assert_eq!(
+            authoritative_state(Some(true), Some(true), Some(false), Some(true)),
+            None
+        );
+        assert_eq!(
+            authoritative_state(Some(true), Some(true), Some(true), Some(false)),
+            None
+        );
+    }
     #[test]
     fn startup_session_sample_handles_already_locked_and_unlocked_without_a_lock_key() {
         assert_eq!(initial_lock_state(Some(true), Some(true), Some(true)), Some(true));

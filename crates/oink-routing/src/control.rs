@@ -69,6 +69,14 @@ pub enum ControlMsg {
     Feel {
         profile: FeelProfile,
     },
+    /// Fresh target challenge for the original source's own session state.
+    UnlockQuery {
+        epoch: u64,
+    },
+    UnlockReply {
+        epoch: u64,
+        unlocked: bool,
+    },
     FocusEnter {
         epoch: u64,
         display: String,
@@ -129,7 +137,7 @@ pub enum ControlMsg {
     },
     /// Explicit action; never forwarded to a new focus or converted to keys.
     LockRemoteWindows(WindowsLockRequest),
-    /// Explicit shortcut handoff; hidden screens remain walls for ordinary FocusEnter.
+    /// Explicit shortcut handoff; hidden destinations reject ordinary FocusEnter.
     MovePointerEnter {
         epoch: u64,
         display: String,

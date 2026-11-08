@@ -32,6 +32,7 @@ pub(super) struct Socket {
     fragment: bool,
     transmit_segments: usize,
     receive_segments: usize,
+    send_errors: Option<crate::qos::SendErrors>,
 }
 impl Socket {
     pub(super) fn bind(address: SocketAddr, wake: Arc<tokio::sync::Notify>) -> io::Result<Arc<Self>> {
@@ -49,8 +50,20 @@ impl Socket {
         crate::qos::set_service_type(&socket, crate::qos::ServiceType::Voice);
         Self::wrap(crate::qos::wrap_udp_socket(socket)?, wake)
     }
+    pub(super) fn from_std_observed(
+        socket: std::net::UdpSocket,
+        wake: Arc<tokio::sync::Notify>,
+        errors: crate::qos::SendErrors,
+    ) -> io::Result<Arc<Self>> {
+        crate::qos::set_service_type(&socket, crate::qos::ServiceType::Voice);
+        let inner = crate::qos::wrap_udp_socket_observed(socket, errors.clone())?;
+        let mut wrapped = Self::wrap(inner, wake)?;
+        Arc::get_mut(&mut wrapped).expect("new socket").send_errors = Some(errors);
+        Ok(wrapped)
+    }
     fn wrap(inner: Arc<dyn AsyncUdpSocket>, wake: Arc<tokio::sync::Notify>) -> io::Result<Arc<Self>> {
         Ok(Arc::new(Self {
+            send_errors: None,
             address: inner.local_addr()?,
             fragment: inner.may_fragment(),
             transmit_segments: inner.max_transmit_segments(),
@@ -97,7 +110,12 @@ impl Socket {
             slot.io = None;
         }
         drop(state);
-        let result = Self::bind(self.address, self.wake.clone()).and_then(|socket| {
+        let bound = match &self.send_errors {
+            Some(errors) => std::net::UdpSocket::bind(self.address)
+                .and_then(|socket| Self::from_std_observed(socket, self.wake.clone(), errors.clone())),
+            None => Self::bind(self.address, self.wake.clone()),
+        };
+        let result = bound.and_then(|socket| {
             endpoint.rebind_abstract(socket.clone())?;
             Ok(socket)
         });

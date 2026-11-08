@@ -9,6 +9,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/macos_devices.m");
     println!("cargo:rerun-if-changed=native/power.m");
     println!("cargo:rerun-if-changed=native/exit_volume.m");
+    println!("cargo:rerun-if-changed=native/media_pause.m");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         if std::env::var_os("CARGO_FEATURE_TEST_SUPPORT").is_some() {
             cc::Build::new()
@@ -32,6 +33,7 @@ fn main() {
             .file("native/power.m")
             .file("native/microphone.m")
             .file("native/exit_volume.m")
+            .file("native/media_pause.m")
             .flag("-fobjc-arc")
             .flag("-std=c11")
             // Compile with weak references to process-tap entry points. The

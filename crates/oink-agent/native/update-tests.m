@@ -60,7 +60,11 @@ int main(void) {
     @autoreleasepool {
         OinkUpdateDriver *stableDriver=[OinkUpdateDriver new];
         SPUUpdater *stableUpdater=(SPUUpdater *)[TestUpdater new];
+        #if defined(__x86_64__)
+        assert([[stableDriver feedURLStringForUpdater:stableUpdater] isEqualToString:@"https://updates.oink.hachiwii.com/mac/v1/mac-2026-01/x64/stable/appcast.xml"]);
+        #else
         assert([[stableDriver feedURLStringForUpdater:stableUpdater] isEqualToString:@"https://updates.oink.hachiwii.com/mac/v1/mac-2026-01/stable/appcast.xml"]);
+        #endif
         assert([stableDriver allowedChannelsForUpdater:stableUpdater].count==0);
         // Sparkle wraps URLSession failures in SUDownloadError before showing
         // them to our driver. A TLS failure must stay Network across the bridge.

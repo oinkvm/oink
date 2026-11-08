@@ -54,8 +54,10 @@ impl StoredGroupState {
         patch: impl FnOnce(&mut RawMap) -> v1::Result<()>,
     ) -> Result<bool, StoreError> {
         let current = self.layout_register()?;
-        let edited = retained::edit_register(&current, expected, store::wire_device(self.device), patch)?;
-        if edited.value()? == current.value()? {
+        let edited = v1::layout::edit_register(&current, expected, store::wire_device(self.device), patch)?;
+        if edited.value()? == current.value()?
+            && edited.raw().get(&v1::layout::VISIBILITY_KEY) == current.raw().get(&v1::layout::VISIBILITY_KEY)
+        {
             return Ok(false);
         }
         self.replace_layout(edited)
@@ -171,7 +173,15 @@ mod tests {
             ),
             (
                 4,
-                RawValue::Map([(90, RawValue::Map([(91, RawValue::Text("future".into()))].into()))].into()),
+                RawValue::Map(
+                    [
+                        (1, RawValue::Array(vec![])),
+                        (2, dto::LayoutSource::Default.write()),
+                        (4, RawValue::Map(RawMap::new())),
+                        (90, RawValue::Map([(91, RawValue::Text("future".into()))].into())),
+                    ]
+                    .into(),
+                ),
             ),
         ]
         .into();

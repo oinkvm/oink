@@ -12,6 +12,10 @@ fn screen(device: DeviceId, key: &str, rect: Rect, upm: f64) -> ScreenPlacement 
 
         primary: false,
         builtin: false,
+        device_hidden: false,
+        screen_hidden: false,
+        device_visibility_known: false,
+        screen_visibility_known: false,
     }
 }
 /// Trigger zones are off by default; these tests exercise them at the former 8/686 reference units reach.

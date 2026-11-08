@@ -5,14 +5,18 @@ use super::*;
 use crate::v1::RawMap;
 use crate::v1::schema::{defaulted, no_validation, open_enum, required, wire_map};
 wire_map!(ScreenId,no_validation,{1=>device:DeviceId=required;2=>display:Text<512>=required;});
+// Keys 5 and 11 are only local projections. Wire layouts must move them to
+// Register.layout_visibility via v1::layout::edit_register; public v1
+// executors reject unknown geometry keys, even when false.
 wire_map!(DevicePlacement,no_validation,{
     1=>device:DeviceId=required;2=>origin:Point=required;3=>scale:f64=required;
     4=>screens:List<ScreenPlacement,256>=required;
+    5=>hidden:bool=false;
 });
 wire_map!(ScreenPlacement,no_validation,{
     1=>id:ScreenId=required;2=>name:Text<256>=required;3=>local:Rect=required;
     5=>size_source:SizeSource=required;
-    9=>primary:bool=required;10=>builtin:bool=required;
+    9=>primary:bool=required;10=>builtin:bool=required;11=>hidden:bool=false;
 });
 open_enum!(SizeSource {Reported=0,Estimated=1,Manual=3});
 open_enum!(KeyPreset {WinFeel=0,MacFeel=1,Custom=2,None=3});

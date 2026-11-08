@@ -111,7 +111,11 @@ static char updateReadinessContext;
     if (_callback) _callback(event,_build,_expected,progress,"","");
 }
 - (NSString *)feedURLStringForUpdater:(SPUUpdater *)updater {
+#if defined(__x86_64__)
+    return @"https://updates.oink.hachiwii.com/mac/v1/mac-2026-01/x64/stable/appcast.xml";
+#else
     return @"https://updates.oink.hachiwii.com/mac/v1/mac-2026-01/stable/appcast.xml";
+#endif
 }
 - (NSSet<NSString *> *)allowedChannelsForUpdater:(SPUUpdater *)updater {return [NSSet set];}
 - (void)showUpdatePermissionRequest:(SPUUpdatePermissionRequest *)request reply:(void (^)(SUUpdatePermissionResponse *))reply {

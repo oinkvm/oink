@@ -24,7 +24,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "archive": {
         "url": "https://github.com/sparkle-project/Sparkle/releases/download/2.9.6/Sparkle-2.9.6.tar.xz",
@@ -88,6 +89,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "cargoPackage": {
@@ -196,7 +198,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "archive": {
         "url": "https://codeload.github.com/gavv/libASPL/tar.gz/633e0f70203edd87d320fc5a3cae901e1363aac5",
@@ -265,6 +268,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "licenseFiles": [
@@ -300,6 +304,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "licenseFiles": [
@@ -335,6 +340,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "licenseFiles": [
@@ -369,7 +375,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -438,6 +445,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "licenseFiles": [
@@ -472,7 +480,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -506,7 +515,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -676,7 +686,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -745,6 +756,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "licenseFiles": [
@@ -779,7 +791,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -813,7 +826,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -847,7 +861,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -881,7 +896,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -915,7 +931,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -949,7 +966,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -983,7 +1001,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1017,7 +1036,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1051,7 +1071,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1085,7 +1106,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1119,7 +1141,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1153,7 +1176,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1187,7 +1211,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1221,7 +1246,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1255,7 +1281,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1289,7 +1316,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1323,7 +1351,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1357,7 +1386,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1391,7 +1421,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1425,7 +1456,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1459,7 +1491,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1493,7 +1526,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1527,7 +1561,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1561,7 +1596,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1595,7 +1631,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1629,7 +1666,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1663,7 +1701,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1697,7 +1736,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1731,7 +1771,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1765,7 +1806,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1799,7 +1841,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1833,7 +1876,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1867,7 +1911,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1901,7 +1946,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1935,7 +1981,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -1969,7 +2016,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "licenseFiles": [
         {
@@ -2481,6 +2529,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "licenseFiles": [
@@ -2937,6 +2986,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "licenseFiles": [
@@ -2974,6 +3024,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "licenseFiles": [
@@ -2990,6 +3041,302 @@
       "ownership": "first-party",
       "provenance": "Project-authored WeChat Pay mark introduced in 74004ec174219de1eb63f6707949c0c91b704f49 as WeChatPayMark. Exported with tile=true to a standalone SVG in 19f9f255163731c4148da5c9d2cdf94fd89d8836; geometry, colors and tile transform are unchanged, with JSX presentation attributes serialized as standard SVG attributes.",
       "trademarkNotice": "WeChat Pay names and brand identifiers remain the property of their respective owners. The project license covers this project-authored SVG implementation and grants no trademark rights or endorsement."
+    },
+    {
+      "id": "asset:oink-paste-menu-mark.svg@083518ebc616",
+      "name": "Oink Paste as File mark.svg",
+      "version": "083518ebc616896ef5fdeb1b35364d432290772f76e1756a3e6e20e04a0a202a",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink",
+      "source": {
+        "url": "https://github.com/oinkvm/oink",
+        "integrity": "sha256:083518ebc616896ef5fdeb1b35364d432290772f76e1756a3e6e20e04a0a202a"
+      },
+      "path": "apps/finder-sync/Resources/mark.svg",
+      "sha256": "083518ebc616896ef5fdeb1b35364d432290772f76e1756a3e6e20e04a0a202a",
+      "licenseExpression": "GPL-3.0-only",
+      "selectedLicense": "GPL-3.0-only",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "LICENSE",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "path": "LICENSE-ADDITIONAL-TERMS.md",
+          "sha256": "c69f265a607a09f13de139896a182f61fae5c650d6d45269313297c07606286e"
+        }
+      ],
+      "copyright": [],
+      "ownership": "first-party",
+      "provenance": "Copied from the VI b2 brand mark source used by the native menu icon generator."
+    },
+    {
+      "id": "asset:oink-paste-menu-mark-reversed.svg@073acecbc07d",
+      "name": "Oink Paste as File mark-reversed.svg",
+      "version": "073acecbc07d5c5a76583885c0347f1d28b1c7f9ff894ee40760423aa3a6933c",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink",
+      "source": {
+        "url": "https://github.com/oinkvm/oink",
+        "integrity": "sha256:073acecbc07d5c5a76583885c0347f1d28b1c7f9ff894ee40760423aa3a6933c"
+      },
+      "path": "apps/finder-sync/Resources/mark-reversed.svg",
+      "sha256": "073acecbc07d5c5a76583885c0347f1d28b1c7f9ff894ee40760423aa3a6933c",
+      "licenseExpression": "GPL-3.0-only",
+      "selectedLicense": "GPL-3.0-only",
+      "modified": false,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "LICENSE",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "path": "LICENSE-ADDITIONAL-TERMS.md",
+          "sha256": "c69f265a607a09f13de139896a182f61fae5c650d6d45269313297c07606286e"
+        }
+      ],
+      "copyright": [],
+      "ownership": "first-party",
+      "provenance": "Copied from the VI b2 brand mark source used by the native menu icon generator."
+    },
+    {
+      "id": "asset:oink-paste-menu-OinkPasteMenu.png@c196a4444c98",
+      "name": "Oink Paste as File OinkPasteMenu.png",
+      "version": "c196a4444c985331d26be1e7b2798543af16eeb289f0d9601d932a05e7099e75",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink",
+      "source": {
+        "url": "https://github.com/oinkvm/oink",
+        "integrity": "sha256:c196a4444c985331d26be1e7b2798543af16eeb289f0d9601d932a05e7099e75"
+      },
+      "path": "apps/finder-sync/Resources/OinkPasteMenu.png",
+      "sha256": "c196a4444c985331d26be1e7b2798543af16eeb289f0d9601d932a05e7099e75",
+      "licenseExpression": "GPL-3.0-only",
+      "selectedLicense": "GPL-3.0-only",
+      "modified": true,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "LICENSE",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "path": "LICENSE-ADDITIONAL-TERMS.md",
+          "sha256": "c69f265a607a09f13de139896a182f61fae5c650d6d45269313297c07606286e"
+        }
+      ],
+      "copyright": [],
+      "ownership": "first-party",
+      "provenance": "Rendered by tools/generate-paste-menu-icons.py from the VI b2 mark SVG."
+    },
+    {
+      "id": "asset:oink-paste-menu-OinkPasteMenu@2x.png@5645c702c824",
+      "name": "Oink Paste as File OinkPasteMenu@2x.png",
+      "version": "5645c702c8240c231a365ede0104b2549ad8d9979a805baccdc019d702c37315",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink",
+      "source": {
+        "url": "https://github.com/oinkvm/oink",
+        "integrity": "sha256:5645c702c8240c231a365ede0104b2549ad8d9979a805baccdc019d702c37315"
+      },
+      "path": "apps/finder-sync/Resources/OinkPasteMenu@2x.png",
+      "sha256": "5645c702c8240c231a365ede0104b2549ad8d9979a805baccdc019d702c37315",
+      "licenseExpression": "GPL-3.0-only",
+      "selectedLicense": "GPL-3.0-only",
+      "modified": true,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "LICENSE",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "path": "LICENSE-ADDITIONAL-TERMS.md",
+          "sha256": "c69f265a607a09f13de139896a182f61fae5c650d6d45269313297c07606286e"
+        }
+      ],
+      "copyright": [],
+      "ownership": "first-party",
+      "provenance": "Rendered by tools/generate-paste-menu-icons.py from the VI b2 mark SVG."
+    },
+    {
+      "id": "asset:oink-paste-menu-OinkPasteMenuDark.png@3b5bc78187d9",
+      "name": "Oink Paste as File OinkPasteMenuDark.png",
+      "version": "3b5bc78187d9f595b52431d4403b4731683ce8bb6fe08135af7aaa88c4a73d0d",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink",
+      "source": {
+        "url": "https://github.com/oinkvm/oink",
+        "integrity": "sha256:3b5bc78187d9f595b52431d4403b4731683ce8bb6fe08135af7aaa88c4a73d0d"
+      },
+      "path": "apps/finder-sync/Resources/OinkPasteMenuDark.png",
+      "sha256": "3b5bc78187d9f595b52431d4403b4731683ce8bb6fe08135af7aaa88c4a73d0d",
+      "licenseExpression": "GPL-3.0-only",
+      "selectedLicense": "GPL-3.0-only",
+      "modified": true,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "LICENSE",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "path": "LICENSE-ADDITIONAL-TERMS.md",
+          "sha256": "c69f265a607a09f13de139896a182f61fae5c650d6d45269313297c07606286e"
+        }
+      ],
+      "copyright": [],
+      "ownership": "first-party",
+      "provenance": "Rendered by tools/generate-paste-menu-icons.py from the VI b2 mark SVG."
+    },
+    {
+      "id": "asset:oink-paste-menu-OinkPasteMenuDark@2x.png@8957e494306c",
+      "name": "Oink Paste as File OinkPasteMenuDark@2x.png",
+      "version": "8957e494306c37df27dba812625e57a551d8c88188e7c88ee3b31fcb4c299d1d",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink",
+      "source": {
+        "url": "https://github.com/oinkvm/oink",
+        "integrity": "sha256:8957e494306c37df27dba812625e57a551d8c88188e7c88ee3b31fcb4c299d1d"
+      },
+      "path": "apps/finder-sync/Resources/OinkPasteMenuDark@2x.png",
+      "sha256": "8957e494306c37df27dba812625e57a551d8c88188e7c88ee3b31fcb4c299d1d",
+      "licenseExpression": "GPL-3.0-only",
+      "selectedLicense": "GPL-3.0-only",
+      "modified": true,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "LICENSE",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "path": "LICENSE-ADDITIONAL-TERMS.md",
+          "sha256": "c69f265a607a09f13de139896a182f61fae5c650d6d45269313297c07606286e"
+        }
+      ],
+      "copyright": [],
+      "ownership": "first-party",
+      "provenance": "Rendered by tools/generate-paste-menu-icons.py from the VI b2 mark SVG."
+    },
+    {
+      "id": "asset:oink-paste-menu-OinkPasteMenu.ico@a2ae03e04626",
+      "name": "Oink Paste as File OinkPasteMenu.ico",
+      "version": "a2ae03e04626499ebfded131953234e7a3891a292bb1d7d40f0c45aac66c483c",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink",
+      "source": {
+        "url": "https://github.com/oinkvm/oink",
+        "integrity": "sha256:a2ae03e04626499ebfded131953234e7a3891a292bb1d7d40f0c45aac66c483c"
+      },
+      "path": "packaging/windows/OinkPasteMenu.ico",
+      "sha256": "a2ae03e04626499ebfded131953234e7a3891a292bb1d7d40f0c45aac66c483c",
+      "licenseExpression": "GPL-3.0-only",
+      "selectedLicense": "GPL-3.0-only",
+      "modified": true,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "LICENSE",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "path": "LICENSE-ADDITIONAL-TERMS.md",
+          "sha256": "c69f265a607a09f13de139896a182f61fae5c650d6d45269313297c07606286e"
+        }
+      ],
+      "copyright": [],
+      "ownership": "first-party",
+      "provenance": "Rendered by tools/generate-paste-menu-icons.py from the VI b2 mark SVG."
+    },
+    {
+      "id": "asset:oink-paste-menu-OinkPasteMenuDark.ico@fc38e0387eea",
+      "name": "Oink Paste as File OinkPasteMenuDark.ico",
+      "version": "fc38e0387eea815c26da514a0e6165ce70e8d8454c30c772bbfba12beac99982",
+      "ecosystem": "asset",
+      "repository": "https://github.com/oinkvm/oink",
+      "source": {
+        "url": "https://github.com/oinkvm/oink",
+        "integrity": "sha256:fc38e0387eea815c26da514a0e6165ce70e8d8454c30c772bbfba12beac99982"
+      },
+      "path": "packaging/windows/OinkPasteMenuDark.ico",
+      "sha256": "fc38e0387eea815c26da514a0e6165ce70e8d8454c30c772bbfba12beac99982",
+      "licenseExpression": "GPL-3.0-only",
+      "selectedLicense": "GPL-3.0-only",
+      "modified": true,
+      "scope": [
+        "runtime"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "macos-x64",
+        "windows-x64"
+      ],
+      "licenseFiles": [
+        {
+          "path": "LICENSE",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "path": "LICENSE-ADDITIONAL-TERMS.md",
+          "sha256": "c69f265a607a09f13de139896a182f61fae5c650d6d45269313297c07606286e"
+        }
+      ],
+      "copyright": [],
+      "ownership": "first-party",
+      "provenance": "Rendered by tools/generate-paste-menu-icons.py from the VI b2 mark SVG."
     }
   ],
   "systemComponents": [

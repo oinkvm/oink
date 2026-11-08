@@ -1,0 +1,4 @@
+LIBRARY OinkCredentialProvider
+EXPORTS
+ DllGetClassObject PRIVATE
+ DllCanUnloadNow PRIVATE

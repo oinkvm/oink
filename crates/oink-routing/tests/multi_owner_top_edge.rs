@@ -42,6 +42,10 @@ fn fixture() -> (Layout, BTreeMap<DeviceId, OwnerLayoutPreferences>) {
             size_source: SizeSource::Manual,
             primary: code.ends_with('1'),
             builtin: device != A && code.ends_with('1'),
+            device_hidden: false,
+            screen_hidden: false,
+            device_visibility_known: false,
+            screen_visibility_known: false,
         });
         let owner = owners.entry(device).or_default();
         owner.screen_shared = !s["disabled"].as_bool().unwrap();

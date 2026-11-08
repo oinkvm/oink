@@ -34,6 +34,9 @@ pub struct FocusObservation {
 pub struct CardInputs {
     pub group: Option<GroupKey>,
     pub members: Vec<CardMember>,
+    /// Device-level screen visibility from the shared layout register. The
+    /// legacy owner preference remains only the command CAS shell.
+    pub screen_shared: Vec<(DeviceKey, bool)>,
     pub focus: FocusObservation,
     /// None with baseline=false is unknown; None with baseline=true means no claim.
     pub exit_baseline: bool,
@@ -49,6 +52,7 @@ pub struct CardInputs {
 impl CardInputs {
     fn same_projection(&self, other: &Self) -> bool {
         self.group == other.group
+            && self.screen_shared == other.screen_shared
             && self.focus == other.focus
             && self.exit_baseline == other.exit_baseline
             && self.microphone_resolution == other.microphone_resolution
@@ -639,13 +643,19 @@ impl<'a> OwnerContext<'a> {
         pause: Option<&LocalPauseCard>,
     ) -> DeviceCardStatus {
         let paused = pause.is_some_and(|p| p.paused);
-        let screen = self.boolean(6).map(|shared| {
-            if shared {
-                SharingMode::Shared
-            } else {
-                SharingMode::Local
-            }
-        });
+        let screen = input
+            .screen_shared
+            .iter()
+            .find(|(device, _)| *device == self.member.device)
+            .map(|(_, shared)| *shared)
+            .or_else(|| self.boolean(6))
+            .map(|shared| {
+                if shared {
+                    SharingMode::Shared
+                } else {
+                    SharingMode::Local
+                }
+            });
         let clipboard = self.boolean(3).map(|shared| {
             if shared {
                 SharingMode::Shared
@@ -1001,6 +1011,7 @@ mod tests {
         CardInputs {
             group: Some(oink_foundation::GroupId([1; 16]).into()),
             members,
+            screen_shared: vec![],
             focus: FocusObservation::default(),
             exit_baseline: false,
             microphone_resolution: Default::default(),

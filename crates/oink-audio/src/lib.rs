@@ -6,6 +6,8 @@ pub mod claims;
 #[cfg(any(target_os = "macos", test))]
 mod endpoint_mute;
 pub mod media;
+#[cfg(any(target_os = "macos", windows, test))]
+mod media_pause;
 pub mod microphone;
 pub mod model;
 pub mod negotiation;

@@ -104,7 +104,7 @@ pub struct RoutingSettings {
     /// sources keep AcceptContacts and today's synthetic scroll behavior.
     pub touchpad_injection: bool,
     pub native_multifinger: bool,
-    /// Windows capture-local opt-in to legacy forwarding of other apps' injected input.
+    /// Windows capture-local preference: forward other apps' injected input by default.
     pub forward_injected_input: bool,
     /// Windows source-local foreground capture; never published to peers.
     pub take_foreground_on_leave: bool,
@@ -155,7 +155,7 @@ impl Default for RoutingSettings {
             mac_scroll_feel: true,
             touchpad_injection: true,
             native_multifinger: true,
-            forward_injected_input: false,
+            forward_injected_input: true,
             take_foreground_on_leave: false,
             game_mode_preference: crate::GameMode::Auto,
             return_pointer_on_display_sleep: true,
@@ -208,5 +208,19 @@ impl RouterConfig {
 impl RoutingSettings {
     pub(crate) fn edge_damping_profile(&self) -> crate::damping::DampingProfile {
         self.damping.platform_profile
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn injected_input_defaults_on_but_explicit_false_is_preserved() {
+        assert!(RoutingSettings::default().forward_injected_input);
+        let absent: RoutingSettings = serde_json::from_str("{}").unwrap();
+        assert!(absent.forward_injected_input);
+        let explicit: RoutingSettings = serde_json::from_str(r#"{"forward_injected_input":false}"#).unwrap();
+        assert!(!explicit.forward_injected_input);
     }
 }

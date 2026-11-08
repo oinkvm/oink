@@ -15,6 +15,11 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 struct Displays {
+    #[cfg(windows)]
+    visibility: std::sync::atomic::AtomicBool,
+    disabled: Mutex<Vec<String>>,
+    #[cfg(windows)]
+    returned: Mutex<Vec<String>>,
     state: Mutex<NativeConfiguration>,
     calls: AtomicUsize,
     reads: AtomicUsize,
@@ -26,6 +31,11 @@ struct Displays {
 impl Displays {
     fn new() -> Arc<Self> {
         Arc::new(Self {
+            #[cfg(windows)]
+            visibility: std::sync::atomic::AtomicBool::new(false),
+            disabled: Mutex::new(Vec::new()),
+            #[cfg(windows)]
+            returned: Mutex::new(Vec::new()),
             state: Mutex::new(NativeConfiguration {
                 displays: vec![
                     NativeDisplay {
@@ -77,6 +87,14 @@ impl DisplayBackend for Displays {
             })
             .collect())
     }
+    fn active_displays(&self) -> std::result::Result<Vec<DisplayInfo>, DisplayError> {
+        let disabled = lock(&self.disabled);
+        Ok(self
+            .displays()?
+            .into_iter()
+            .filter(|d| !disabled.contains(&d.key))
+            .collect())
+    }
     fn watch(&self, watcher: ChangeHandler) -> std::result::Result<(), DisplayError> {
         lock(&self.watchers).push(watcher);
         Ok(())
@@ -88,6 +106,61 @@ impl DisplayBackend for Displays {
             return Err(DisplayError::Platform("Injected native read failure".into()));
         }
         Ok(lock(&self.state).clone())
+    }
+    #[cfg(windows)]
+    fn apply_native_layout(
+        &self,
+        expected: &NativeConfiguration,
+        origins: &[NativeOrigin],
+        bits: &[(String, bool)],
+    ) -> std::result::Result<NativeConfiguration, DisplayError> {
+        if !self.visibility.load(Ordering::SeqCst) {
+            return if origins.is_empty() || expected.with_origins(origins)? == *expected {
+                Ok(expected.clone())
+            } else {
+                self.apply_native_origins(expected, origins)
+            };
+        }
+        let mut state = lock(&self.state);
+        assert_eq!(&*state, expected);
+        let mut hidden = lock(&self.disabled);
+        let active = state
+            .sources()
+            .filter(|d| !hidden.contains(&d.key))
+            .map(|d| d.key.clone())
+            .collect::<Vec<_>>();
+        let enabled = oink_display::arrangement::enabled_targets(&active, bits);
+        let next_hidden = state
+            .sources()
+            .filter(|d| !enabled.contains(&d.key))
+            .map(|d| d.key.clone())
+            .collect::<Vec<_>>();
+        let next = if origins.is_empty() {
+            state.clone()
+        } else {
+            state.with_origins(origins)?
+        };
+        if *state != next || *hidden != next_hidden {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+        *state = next;
+        *hidden = next_hidden;
+        Ok(state.clone())
+    }
+    #[cfg(windows)]
+    fn release_disabled_displays(&self) -> std::result::Result<(), DisplayError> {
+        lock(&self.disabled).clear();
+        Ok(())
+    }
+    #[cfg(windows)]
+    fn reconnected_displays(&self) -> std::result::Result<Vec<String>, DisplayError> {
+        Ok(lock(&self.returned).clone())
+    }
+    #[cfg(windows)]
+    fn acknowledge_reconnected(&self, keys: &[String]) -> std::result::Result<(), DisplayError> {
+        lock(&self.returned).retain(|key| !keys.contains(key));
+        lock(&self.disabled).retain(|key| !keys.contains(key));
+        Ok(())
     }
     fn apply_native_origins(
         &self,
@@ -109,6 +182,12 @@ impl DisplayBackend for Displays {
     }
 }
 async fn start(dir: &std::path::Path, displays: Arc<Displays>) -> Node {
+    if !dir.join(crate::config::SETTINGS_FILE).exists() {
+        crate::config::AgentConfig::load_from_with_device_name(dir, "profiles-fixture".into())
+            .unwrap()
+            .update(|s| s.sync_system_arrangement = false)
+            .unwrap();
+    }
     let node = Node::start(NodeOptions {
         net: oink_test_support::network_config(dir.into(), "profiles-fixture", 0),
         input: Arc::new(oink_test_support::input::FakeInput::new()),
@@ -400,6 +479,61 @@ fn native_screen_preview_leaves_other_computers_fixed_for_frontend_release() {
 }
 
 #[test]
+fn native_screen_preview_translates_whole_device_when_offset_is_disallowed() {
+    crate::test_watchdog::run(module_path!(), "native preview rigid fallback", Some(4), async {
+        let dir = tempfile::tempdir().unwrap();
+        let displays = Displays::new();
+        let node = start(dir.path(), displays.clone()).await;
+        enable(&node, node.id().into(), "enable-native-edit").await;
+        let state = query(&node).await;
+        let current = state.snapshot.as_ref().unwrap();
+        let placement = current
+            .placements
+            .iter()
+            .find(|p| p.device == node.id().into())
+            .unwrap();
+        let desired = Point::new(placement.origin.x - 50.0 * placement.scale, placement.origin.y);
+        let preview: PreviewReply = call(
+            &node,
+            Request::PreviewSystemArrangement(PreviewRequest {
+                sequence: "rigid-1".into(),
+                expected_token: state.token,
+                device: node.id().into(),
+                moved_screen: crate::api::ScreenKey {
+                    device: node.id().into(),
+                    display: "second".into(),
+                },
+                desired_canvas_origin: desired,
+            }),
+        )
+        .await;
+        assert_eq!(
+            preview
+                .native
+                .screens
+                .iter()
+                .find(|s| s.screen.display == "second")
+                .unwrap()
+                .origin,
+            Point::new(100.0, 0.0),
+            "the rejected internal offset must leave native sibling geometry unchanged"
+        );
+        let moved = preview
+            .placements
+            .iter()
+            .find(|p| p.device == node.id().into())
+            .unwrap();
+        assert_eq!(
+            moved.origin,
+            Point::new(placement.origin.x - 150.0 * placement.scale, placement.origin.y)
+        );
+        assert!(preview.adjustments.is_empty());
+        assert_eq!(displays.calls.load(Ordering::SeqCst), 0);
+        node.shutdown().await;
+    });
+}
+
+#[test]
 fn profile_ipc_native_edit_dedup_load_undo_and_restart() {
     crate::test_watchdog::run(module_path!(), "profile IPC owner", Some(4), async {
         let dir = tempfile::tempdir().unwrap();
@@ -498,12 +632,39 @@ fn profile_ipc_native_edit_dedup_load_undo_and_restart() {
         .await;
         assert_eq!(undone.state.active_profile_id, Some(vertical.clone()));
         assert_eq!(display.calls.load(Ordering::SeqCst), 3);
+        let changed = common::StateChanges::new(&[&node], "hotkey native load");
+        let n = node.clone();
+        let target = default.clone();
+        tokio::task::spawn_blocking(move || n.on_hotkey(&format!("switch_layout:{target}")))
+            .await
+            .unwrap();
+        loop {
+            let state = query(&node).await;
+            if state.active_profile_id == Some(default.clone())
+                && state
+                    .operation
+                    .as_ref()
+                    .is_some_and(|o| o.status != OperationStatus::Running)
+            {
+                break;
+            }
+            changed.notified().await;
+        }
+        assert_eq!(display.calls.load(Ordering::SeqCst), 4);
+        let before = query(&node).await;
+        let n = node.clone();
+        let target = default.clone();
+        tokio::task::spawn_blocking(move || n.on_hotkey(&format!("switch_layout:{target}")))
+            .await
+            .unwrap();
+        assert_eq!(query(&node).await.operation, before.operation);
+        assert_eq!(display.calls.load(Ordering::SeqCst), 4);
         node.shutdown().await;
         let restarted = start(dir.path(), display.clone()).await;
         let restored = query(&restarted).await;
-        assert_eq!(restored.active_profile_id, Some(vertical));
+        assert_eq!(restored.active_profile_id, Some(default));
         assert_eq!(restored.profiles.len(), 3);
-        assert_eq!(display.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(display.calls.load(Ordering::SeqCst), 4);
         restarted.shutdown().await;
     });
 }
@@ -582,6 +743,21 @@ fn profiles_merge_and_sync_over_low_without_applying_native() {
         .await;
         let state = query(&a).await;
         assert!(!state.create_enabled);
+        let removed = state.active_profile_id.clone().unwrap();
+        let binding = crate::api::Hotkey {
+            action: crate::api::HotkeyAction::SwitchLayout,
+            device: None,
+            profile: Some(removed.clone()),
+            keys: vec!["Ctrl".into(), "Shift".into(), "F9".into()],
+            enabled: true,
+        };
+        // This local choice must never travel with the shared catalog.
+        b.update_settings(|s| s.hotkeys = Some(vec![binding.clone()])).unwrap();
+        assert!(!a.effective_hotkeys().iter().any(|h| h.profile == Some(removed.clone())));
+        let mut local_binding = binding.clone();
+        local_binding.keys[2] = "F10".into();
+        a.update_settings(|s| s.hotkeys = Some(vec![local_binding.clone()]))
+            .unwrap();
         let _: LayoutProfilesState = call(
             &a,
             Request::DeleteLayoutProfile(Delete {
@@ -597,6 +773,16 @@ fn profiles_merge_and_sync_over_low_without_applying_native() {
             ca.as_ref().is_some_and(|c| c.profiles.len() == 15) && ca == cb
         })
         .await;
+        assert!(!a.settings().hotkeys.unwrap().contains(&local_binding));
+        assert!(!b.settings().hotkeys.unwrap().contains(&binding));
+        assert!(
+            !crate::config::AgentConfig::load_from(dirs[1].path())
+                .unwrap()
+                .settings
+                .hotkeys
+                .unwrap()
+                .contains(&binding)
+        );
         let qa = query(&a).await;
         let qb = query(&b).await;
         assert!(qa.create_enabled);
@@ -1693,6 +1879,26 @@ async fn pairing_visibility_matrix(source_count: usize, target_count: usize) {
             &format!("visibility {source_count}+{target_count} selection {selection} merged layout"),
         )
         .await;
+        // The completed handoff may perform a later global edit while adding
+        // the second singleton. Use the final register writer to identify the
+        // authoritative visibility snapshot for this convergence assertion.
+        let writer = nodes[0]
+            .link_config()
+            .unwrap()
+            .applied()
+            .version
+            .writer()
+            .unwrap()
+            .ordering_key()
+            .unwrap();
+        let source_key = oink_network::wire_identity::device(nodes[0].id())
+            .ordering_key()
+            .unwrap();
+        let winner = if writer == source_key {
+            &before_source
+        } else {
+            &before_target
+        };
         for after in after_layouts {
             for before in before_source
                 .geometry
@@ -1701,7 +1907,16 @@ async fn pairing_visibility_matrix(source_count: usize, target_count: usize) {
                 .chain(&before_target.geometry.screens)
             {
                 let screen = after.geometry.screens.iter().find(|s| s.key == before.key).unwrap();
-                assert_eq!(screen.hidden, before.hidden, "pairing changed per-screen visibility");
+                let expected_hidden = winner
+                    .geometry
+                    .screens
+                    .iter()
+                    .find(|candidate| candidate.key == before.key)
+                    .is_some_and(|candidate| candidate.hidden);
+                assert_eq!(
+                    screen.hidden, expected_hidden,
+                    "pairing did not apply the global visibility winner"
+                );
                 assert_eq!(screen.device_disabled, before.device_disabled);
                 assert!(screen.online);
             }
@@ -2087,9 +2302,11 @@ fn manual_layout_fixture_waits_for_target_catalog_after_screen_facts() {
                 n.link_config()
                     .unwrap()
                     .applied()
-                    .owners
-                    .get(&peer.0)
-                    .is_some_and(|owner| !owner.screen_shared)
+                    .layout
+                    .screens
+                    .iter()
+                    .filter(|screen| screen.id.device == peer.0)
+                    .all(|screen| screen.device_hidden)
             })
         })
         .await;
@@ -2847,3 +3064,581 @@ fn remote_hotplug_profile_return(delay_manual_layout: bool) {
 
 #[path = "join_order_tests.rs"]
 mod join_order_tests;
+
+#[test]
+fn offline_device_hide_is_shared_layout_and_survives_reconnect() {
+    crate::test_watchdog::run(module_path!(), "offline whole device visibility", Some(4), async {
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let displays = [Displays::new(), Displays::new()];
+        #[cfg(windows)]
+        for (dir, display) in dirs.iter().zip(&displays) {
+            display.visibility.store(true, Ordering::SeqCst);
+            crate::config::AgentConfig::load_from_with_device_name(dir.path(), "profiles-fixture".into())
+                .unwrap()
+                .update(|settings| {
+                    settings.sync_system_arrangement = true;
+                    settings.disable_hidden_displays = true;
+                })
+                .unwrap();
+        }
+        let a = start(dirs[0].path(), displays[0].clone()).await;
+        let b = start(dirs[1].path(), displays[1].clone()).await;
+        let default = query(&b).await.active_profile_id.unwrap();
+        common::pair(&a, &b).await;
+        common::profile_handoff(&[&a, &b], &default).await;
+        let peer = b.id();
+        enable(&a, peer.into(), "enable-peer").await;
+        b.shutdown().await;
+        common::until("peer offline", || {
+            a.link_config()
+                .unwrap()
+                .members()
+                .members
+                .iter()
+                .any(|m| m.device == peer && !m.online)
+        })
+        .await;
+        let state = query(&a).await;
+        assert!(
+            !state
+                .devices
+                .iter()
+                .find(|d| d.device.0 == peer)
+                .unwrap()
+                .can_edit_screens
+        );
+        let before = state.snapshot.clone().unwrap();
+        let edited: OperationReply = call(
+            &a,
+            Request::CommitArrangement(CommitRequest {
+                request_id: "offline-hide".into(),
+                expected_token: state.token,
+                placements: before.placements.clone(),
+                disabled: vec![],
+                native_plan_tokens: vec![],
+                screen_shared: vec![DeviceSharing {
+                    device: peer.into(),
+                    shared: false,
+                }],
+            }),
+        )
+        .await;
+        assert_eq!(
+            edited.state.operation.as_ref().unwrap().status,
+            OperationStatus::Applied
+        );
+        assert!(!model::screen_shared(
+            edited.state.snapshot.as_ref().unwrap(),
+            peer.into()
+        ));
+        assert!(edited.state.operation.as_ref().unwrap().history_required);
+        assert_eq!(displays[1].calls.load(Ordering::SeqCst), 0);
+        let op = edited.state.operation.unwrap();
+        let undone: OperationReply = call(
+            &a,
+            Request::ReplayArrangement(ReplayRequest {
+                request_id: "undo-offline-hide".into(),
+                expected_token: edited.state.token,
+                from: op.after.clone().unwrap(),
+                target: op.before.clone(),
+                native_restore_devices: vec![],
+                direction: Direction::Undo,
+                original_kind: HistoryKind::Edit,
+            }),
+        )
+        .await;
+        assert!(model::screen_shared(
+            undone.state.snapshot.as_ref().unwrap(),
+            peer.into()
+        ));
+        let _: OperationReply = call(
+            &a,
+            Request::ReplayArrangement(ReplayRequest {
+                request_id: "redo-offline-hide".into(),
+                expected_token: undone.state.token,
+                from: op.before,
+                target: op.after.unwrap(),
+                native_restore_devices: vec![],
+                direction: Direction::Redo,
+                original_kind: HistoryKind::Edit,
+            }),
+        )
+        .await;
+        a.shutdown().await;
+        let a = start(dirs[0].path(), displays[0].clone()).await;
+        assert!(!model::screen_shared(
+            query(&a).await.snapshot.as_ref().unwrap(),
+            peer.into()
+        ));
+        let b = start(dirs[1].path(), displays[1].clone()).await;
+        // Restarted fixtures bind fresh ephemeral ports. Discover the current
+        // address explicitly, as the existing restart scenarios do.
+        common::query(&a, &b).await;
+        common::active(&[&a, &b]).await;
+        common::until("reconnected hidden layout", || {
+            let layout = crate::api::AgentApi::layout(&b).unwrap();
+            layout
+                .geometry
+                .screens
+                .iter()
+                .filter(|s| s.key.device.0 == peer)
+                .count()
+                == 2
+                && layout
+                    .geometry
+                    .screens
+                    .iter()
+                    .filter(|s| s.key.device.0 == peer)
+                    .all(|s| s.hidden)
+        })
+        .await;
+        let calls_before_show = displays[1].calls.load(Ordering::SeqCst);
+        // Reconnect publications may advance the token between query and
+        // admission. Retry only a definitive pre-acceptance stale refusal.
+        let n = a.clone();
+        tokio::task::spawn_blocking(move || {
+            loop {
+                let state = n.profile_snapshot().unwrap();
+                let reply = serde_json::to_value(
+                    dispatch(
+                        &n,
+                        Request::CommitArrangement(CommitRequest {
+                            request_id: "show-peer".into(),
+                            expected_token: state.token,
+                            placements: state.snapshot.unwrap().placements,
+                            disabled: vec![],
+                            native_plan_tokens: vec![],
+                            screen_shared: vec![DeviceSharing {
+                                device: peer.into(),
+                                shared: true,
+                            }],
+                        }),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                if reply["type"] == "profile_error" && reply["error"]["code"] == "stale_state" {
+                    continue;
+                }
+                assert!(reply.get("operation_id").is_some(), "{reply}");
+                break;
+            }
+        })
+        .await
+        .unwrap();
+        common::until("peer shown", || {
+            crate::api::AgentApi::layout(&b)
+                .unwrap()
+                .geometry
+                .screens
+                .iter()
+                .filter(|s| s.key.device.0 == peer)
+                .all(|s| !s.hidden)
+        })
+        .await;
+        #[cfg(windows)]
+        common::until("owner applies the global unhide", || {
+            displays[1].calls.load(Ordering::SeqCst) > calls_before_show
+        })
+        .await;
+        #[cfg(not(windows))]
+        assert_eq!(displays[1].calls.load(Ordering::SeqCst), calls_before_show);
+        a.shutdown().await;
+        b.shutdown().await;
+    });
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_visibility_startup_and_external_unhide_are_one_shot() {
+    crate::test_watchdog::run(module_path!(), "Windows target visibility", Some(12), async {
+        let dir = tempfile::tempdir().unwrap();
+        let displays = Displays::new();
+        displays.visibility.store(true, Ordering::SeqCst);
+        let node = start(dir.path(), displays.clone()).await;
+        enable(&node, node.id().into(), "enable-windows-targets").await;
+        enable_hidden_policy(&node, "enable-hidden-policy").await;
+        assert_eq!(displays.calls.load(Ordering::SeqCst), 0, "setting toggle wrote OS");
+        let screen = crate::api::ScreenKey {
+            device: node.id().into(),
+            display: "second".into(),
+        };
+        let _: serde_json::Value = call(
+            &node,
+            Request::SetScreenHidden {
+                screen: screen.clone(),
+                hidden: true,
+            },
+        )
+        .await;
+        assert_eq!(*lock(&displays.disabled), vec!["second"]);
+        assert_eq!(displays.calls.load(Ordering::SeqCst), 1);
+        let _: serde_json::Value = call(
+            &node,
+            Request::SetScreenHidden {
+                screen: screen.clone(),
+                hidden: false,
+            },
+        )
+        .await;
+        assert!(lock(&displays.disabled).is_empty());
+        assert_eq!(displays.calls.load(Ordering::SeqCst), 2);
+        let _: serde_json::Value = call(
+            &node,
+            Request::SetScreenHidden {
+                screen: screen.clone(),
+                hidden: true,
+            },
+        )
+        .await;
+        lock(&displays.returned).push("second".into());
+        let n = node.clone();
+        tokio::task::spawn_blocking(move || n.refresh_native_arrangement())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !query(&node)
+                .await
+                .snapshot
+                .unwrap()
+                .disabled
+                .iter()
+                .find(|b| b.screen == screen)
+                .unwrap()
+                .disabled
+        );
+        assert_eq!(
+            displays.calls.load(Ordering::SeqCst),
+            3,
+            "observation fought external enable"
+        );
+        let _: serde_json::Value = call(
+            &node,
+            Request::SetScreenHidden {
+                screen: screen.clone(),
+                hidden: true,
+            },
+        )
+        .await;
+        let calls = displays.calls.load(Ordering::SeqCst);
+        node.shutdown().await;
+        assert!(
+            lock(&displays.disabled).is_empty(),
+            "exit did not release Oink-disabled screens"
+        );
+        assert_eq!(displays.calls.load(Ordering::SeqCst), calls);
+        // Simulate system position drift across a crash/restart; cached hidden
+        // geometry stays present in the backend, like the Windows local file.
+        lock(&displays.state).displays[1].bounds = Rect::new(0.0, 100.0, 100.0, 100.0);
+        let restarted = start(dir.path(), displays.clone()).await;
+        assert_eq!(
+            lock(&displays.state).displays[1].bounds,
+            Rect::new(100.0, 0.0, 100.0, 100.0)
+        );
+        assert_eq!(*lock(&displays.disabled), vec!["second"]);
+        assert_eq!(
+            displays.calls.load(Ordering::SeqCst),
+            calls + 2,
+            "startup did not apply global visibility and native geometry"
+        );
+        restarted.shutdown().await;
+        assert_eq!(displays.calls.load(Ordering::SeqCst), calls + 2);
+    });
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_external_unhide_wins_a_command_arriving_before_its_display_event() {
+    crate::test_watchdog::run(module_path!(), "Windows external unhide command race", Some(8), async {
+        let dir = tempfile::tempdir().unwrap();
+        let displays = Displays::new();
+        displays.visibility.store(true, Ordering::SeqCst);
+        let node = start(dir.path(), displays.clone()).await;
+        enable(&node, node.id().into(), "race-enable-sync").await;
+        enable_hidden_policy(&node, "race-enable-policy").await;
+        let screen = crate::api::ScreenKey {
+            device: node.id().into(),
+            display: "second".into(),
+        };
+        let _: serde_json::Value = call(
+            &node,
+            Request::SetScreenHidden {
+                screen: screen.clone(),
+                hidden: true,
+            },
+        )
+        .await;
+        node.hold_platform_sensor_clock().await;
+        let n = node.clone();
+        let request = tokio::task::spawn_blocking(move || {
+            n.make_arrangement_request(
+                "before-external-unhide",
+                n.id().into(),
+                None,
+                &[Disabled { screen, disabled: true }],
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let calls = displays.calls.load(Ordering::SeqCst);
+        lock(&displays.returned).push("second".into());
+        let n = node.clone();
+        let reply = tokio::task::spawn_blocking(move || n.owner_arrangement(n.id().into(), request))
+            .await
+            .unwrap();
+        assert_eq!(reply.outcome(), Ok(super::native::FAILED));
+        assert_eq!(reply.error().unwrap().unwrap().0, "stale_state");
+        assert!(lock(&displays.disabled).is_empty());
+        assert_eq!(
+            displays.calls.load(Ordering::SeqCst),
+            calls,
+            "stale command fought the OS"
+        );
+        node.resume_platform_sensor_clock();
+        node.shutdown().await;
+    });
+}
+
+#[cfg(windows)]
+async fn enable_hidden_policy(node: &Node, id: &str) {
+    let state = query(node).await;
+    let owner = state.devices.iter().find(|d| d.device.0 == node.id()).unwrap();
+    let _: LayoutProfilesState = call(
+        node,
+        Request::SetDisableHiddenDisplays(SettingRequest {
+            request_id: id.into(),
+            device: owner.device,
+            expected_preference_token: owner.preference_token.clone(),
+            enabled: true,
+        }),
+    )
+    .await;
+}
+
+#[cfg(windows)]
+async fn set_hidden_policy(node: &Node, enabled: bool, id: &str) {
+    let state = query(node).await;
+    let owner = state.devices.iter().find(|d| d.device.0 == node.id()).unwrap();
+    let _: LayoutProfilesState = call(
+        node,
+        Request::SetDisableHiddenDisplays(SettingRequest {
+            request_id: id.into(),
+            device: owner.device,
+            expected_preference_token: owner.preference_token.clone(),
+            enabled,
+        }),
+    )
+    .await;
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_hidden_policy_defaults_off_and_releases_on_both_switches_and_exit() {
+    crate::test_watchdog::run(module_path!(), "Windows release lifecycle", Some(12), async {
+        let dir = tempfile::tempdir().unwrap();
+        let displays = Displays::new();
+        displays.visibility.store(true, Ordering::SeqCst);
+        let node = start(dir.path(), displays.clone()).await;
+        enable(&node, node.id().into(), "release-parent-on").await;
+        assert!(!query(&node).await.devices[0].disable_hidden_displays);
+        let screen = crate::api::ScreenKey {
+            device: node.id().into(),
+            display: "second".into(),
+        };
+        let _: serde_json::Value = call(
+            &node,
+            Request::SetScreenHidden {
+                screen: screen.clone(),
+                hidden: true,
+            },
+        )
+        .await;
+        assert!(
+            lock(&displays.disabled).is_empty(),
+            "default-off policy changed OS visibility"
+        );
+        set_hidden_policy(&node, true, "release-policy-on").await;
+        assert!(lock(&displays.disabled).is_empty(), "enabling a preference wrote OS");
+        let _: serde_json::Value = call(
+            &node,
+            Request::SetScreenHidden {
+                screen: screen.clone(),
+                hidden: false,
+            },
+        )
+        .await;
+        assert!(lock(&displays.disabled).is_empty());
+        let _: serde_json::Value = call(
+            &node,
+            Request::SetScreenHidden {
+                screen: screen.clone(),
+                hidden: true,
+            },
+        )
+        .await;
+        assert_eq!(*lock(&displays.disabled), vec!["second"]);
+        let geometry = lock(&displays.state).clone();
+        set_hidden_policy(&node, false, "release-policy-off").await;
+        assert!(lock(&displays.disabled).is_empty());
+        assert!(
+            query(&node)
+                .await
+                .snapshot
+                .unwrap()
+                .disabled
+                .iter()
+                .find(|b| b.screen == screen)
+                .unwrap()
+                .disabled
+        );
+        assert_eq!(*lock(&displays.state), geometry, "policy-off restored positions");
+        set_hidden_policy(&node, true, "release-policy-back-on").await;
+        let _: serde_json::Value = call(
+            &node,
+            Request::SetScreenHidden {
+                screen: screen.clone(),
+                hidden: false,
+            },
+        )
+        .await;
+        let _: serde_json::Value = call(
+            &node,
+            Request::SetScreenHidden {
+                screen: screen.clone(),
+                hidden: true,
+            },
+        )
+        .await;
+        let state = query(&node).await;
+        let owner = &state.devices[0];
+        let _: LayoutProfilesState = call(
+            &node,
+            Request::SetSyncSystemArrangement(SettingRequest {
+                request_id: "release-parent-off".into(),
+                device: owner.device,
+                expected_preference_token: owner.preference_token.clone(),
+                enabled: false,
+            }),
+        )
+        .await;
+        assert!(lock(&displays.disabled).is_empty());
+        assert!(
+            query(&node)
+                .await
+                .snapshot
+                .unwrap()
+                .disabled
+                .iter()
+                .find(|b| b.screen == screen)
+                .unwrap()
+                .disabled
+        );
+        assert_eq!(*lock(&displays.state), geometry, "parent-off restored positions");
+        enable(&node, node.id().into(), "release-parent-back-on").await;
+        let _: serde_json::Value = call(
+            &node,
+            Request::SetScreenHidden {
+                screen: screen.clone(),
+                hidden: false,
+            },
+        )
+        .await;
+        let _: serde_json::Value = call(
+            &node,
+            Request::SetScreenHidden {
+                screen: screen.clone(),
+                hidden: true,
+            },
+        )
+        .await;
+        assert_eq!(*lock(&displays.disabled), vec!["second"]);
+        node.shutdown().await;
+        assert!(lock(&displays.disabled).is_empty());
+        assert_eq!(*lock(&displays.state), geometry);
+        let restarted = start(dir.path(), displays.clone()).await;
+        assert_eq!(
+            *lock(&displays.disabled),
+            vec!["second"],
+            "startup missed saved hidden state"
+        );
+        assert!(
+            query(&restarted)
+                .await
+                .snapshot
+                .unwrap()
+                .disabled
+                .iter()
+                .find(|b| b.screen == screen)
+                .unwrap()
+                .disabled
+        );
+        restarted.shutdown().await;
+        assert!(lock(&displays.disabled).is_empty());
+    });
+}
+
+#[test]
+fn retained_disabled_catalog_never_replaces_active_input_geometry() {
+    crate::test_watchdog::run(module_path!(), "active desktop versus catalog", Some(4), async {
+        use oink_foundation::input::{CapturedEvent, Disposition, InputEvent, SourceKind};
+        let dir = tempfile::tempdir().unwrap();
+        let displays = Displays::new();
+        lock(&displays.disabled).push("second".into());
+        // Match the reported startup policy; either switch being off correctly
+        // releases Oink-disabled targets on Windows before input starts.
+        crate::config::AgentConfig::load_from_with_device_name(dir.path(), "active-desktop-fixture".into())
+            .unwrap()
+            .update(|s| {
+                s.sync_system_arrangement = true;
+                s.disable_hidden_displays = true;
+            })
+            .unwrap();
+        let input = Arc::new(oink_test_support::input::FakeInput::new());
+        let node = Node::start(NodeOptions {
+            net: oink_test_support::network_config(dir.path().into(), "active-desktop-fixture", 0),
+            input: input.clone(),
+            displays: displays.displays().unwrap(),
+            display_backend: Some(displays.clone()),
+            clipboard: None,
+            mode_switch_in_callback: true,
+            capture_reports_key_repeat: false,
+            cursor_trail: false,
+        })
+        .await
+        .unwrap();
+        let _: serde_json::Value = call(
+            &node,
+            Request::SetScreenHidden {
+                screen: crate::api::ScreenKey {
+                    device: node.id().into(),
+                    display: "second".into(),
+                },
+                hidden: true,
+            },
+        )
+        .await;
+        assert_eq!(node.current_active_displays().unwrap().len(), 1);
+        common::until("input captures", || input.capture_sessions() > 0).await;
+        for _ in 0..3 {
+            // Repeated catalog publications must never reintroduce the retained
+            // target into the router's active desktop list through InputStreams.
+            node.link_config()
+                .unwrap()
+                .initialize_displays(displays.displays().unwrap())
+                .unwrap();
+            node.refresh_active_input_displays().unwrap();
+            let result = input.feed(&CapturedEvent {
+                physical: true,
+                event: InputEvent::PointerDelta { dx: -1., dy: 0. },
+                source: SourceKind::Mouse,
+                time_us: 100,
+                cursor: Some(Point::new(50., 50.)),
+            });
+            assert_eq!(result, Disposition::Pass);
+        }
+        assert_eq!(node.layout().0.screens.len(), 2, "retained target remains editable");
+        node.shutdown().await;
+    });
+}

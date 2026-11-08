@@ -2,8 +2,8 @@
 //!
 //! 回调里只做：识别并放过自己注入的事件、翻译、调用处理函数、决定吞掉与否。所有发给 WindowServer 的
 //! 同步调用（warp、解耦、隐藏光标）都推迟到回调返回之后，由本线程的循环执行（见 `Pending`）。
-//! 循环每 250 ms 醒来一次：执行推迟的光标操作；每 5 s 检查 tap 是否仍启用；每 0.5 s 检查安全输入，
-//! 开启时给仍按着的键补发抬起。
+//! 循环每 250 ms 醒来一次：执行推迟的光标操作；每 5 s 检查 tap 是否仍启用。
+//! 锁屏或安全输入不代表物理键已松开；抬键清理统一使用下面的 HID 核对。
 //!
 //! **tap 被系统停用后的核对**：回调超时（或用户输入）使系统停用 tap 时，停用期间的事件（可能包括抬起）
 //! 不会交给我们。重新启用后，把「截获到仍按着的键和按钮」与 HID 系统状态（`CGEventSourceKeyState` /
@@ -411,12 +411,6 @@ impl Tap {
         self.schedule_apply();
     }
 
-    pub(crate) fn set_cursor_constraint(&self, active: bool) {
-        let s = self.shared;
-        let _guard = s.cursor_lock.lock().unwrap_or_else(|e| e.into_inner());
-        cursor::constrain(active && s.capture_permitted());
-    }
-
     pub(crate) fn set_keyboard_remote(&self, remote: bool) {
         let s = self.shared;
         let remote = remote && s.capture_permitted();
@@ -700,7 +694,6 @@ fn apply_mode_locked(s: &'static Shared, hidden: &mut HiddenCursor) {
         s.owner_generation.store(0, Ordering::Release);
         s.owner_posts.lock().unwrap_or_else(|e| e.into_inner()).count = 0;
         *hidden = HiddenCursor::Shown;
-        cursor::constrain(false);
         cursor::source_disabled(false);
         cursor::restore();
         return;
@@ -775,7 +768,6 @@ fn apply_mode_locked(s: &'static Shared, hidden: &mut HiddenCursor) {
         s.owner_generation.store(0, Ordering::Release);
         *hidden = HiddenCursor::Shown;
         if stop {
-            cursor::constrain(false);
             cursor::source_disabled(false);
         }
         cursor::restore();
@@ -1180,7 +1172,6 @@ fn run(
     }
     let mut observed = observations::Reader::default();
     let mut last_health = Instant::now();
-    let mut last_secure = Instant::now();
     let mut last_diagnostics = Instant::now();
     let mut session_state = super::session::snapshot();
     let mut display_power = crate::display_power::Monitor::new().ok();
@@ -1325,10 +1316,6 @@ fn run(
                 reconcile_with_hardware(s);
             }
         }
-        if pacing.is_none() && last_secure.elapsed() >= Duration::from_millis(500) {
-            last_secure = Instant::now();
-            release_keys_if_secure_input(s);
-        }
     }
 
     if let Some(observations) = &s.observations {
@@ -1360,7 +1347,6 @@ fn run(
     CFMachPort::invalidate(&port);
     let _g = s.cursor_lock.lock().unwrap_or_else(|e| e.into_inner());
     *s.hidden.lock().unwrap_or_else(|e| e.into_inner()) = HiddenCursor::Shown;
-    cursor::constrain(false);
     cursor::source_disabled(false);
     cursor::restore();
     tracing::debug!("事件 tap 已停止");
@@ -1573,7 +1559,6 @@ fn run_owned(
     s.caps_guard.leave_remote();
     let _guard = s.cursor_lock.lock().unwrap_or_else(|e| e.into_inner());
     *s.hidden.lock().unwrap_or_else(|e| e.into_inner()) = HiddenCursor::Shown;
-    cursor::constrain(false);
     cursor::source_disabled(false);
     cursor::restore();
 }
@@ -1595,20 +1580,6 @@ fn release_lost_ups(s: &Shared, check: &mut LostUps) {
         if let Some(k) = disp_key(code) {
             KEY_DISPOSITION.with(|d| d.borrow_mut().remove(&k));
         }
-        release_key(s, code);
-    }
-}
-
-/// 安全输入开启后 tap 收不到按键：给截获到仍按着的键补发抬起。
-fn release_keys_if_secure_input(s: &Shared) {
-    let has_pressed = PRESSED.with(|p| !p.borrow().is_empty());
-    if !has_pressed || !(super::session::locked() == Some(true) || system::secure_input_active()) {
-        return;
-    }
-    let keys: Vec<KeyCode> = PRESSED.with(|p| p.borrow_mut().drain().collect());
-    KEY_DISPOSITION.with(|d| d.borrow_mut().clear());
-    tracing::info!(count = keys.len(), "安全输入已开启，补发抬键");
-    for code in keys {
         release_key(s, code);
     }
 }
@@ -1849,6 +1820,10 @@ fn owner_modifier_flags(
 fn marked_own_event(ev: &CGEvent) -> bool {
     let tag = CGEvent::integer_value_field(Some(ev), CGEventField::EventSourceUserData);
     tag == MAGIC || cursor::owner::event_generation(tag).is_some()
+}
+
+fn pointer_swallow(remote: bool, disabled: bool, pointer: bool, physical: bool) -> bool {
+    (remote || (disabled && physical)) && pointer
 }
 
 fn physical_keyboard_event(ty: CGEventType, ev: &CGEvent) -> bool {
@@ -2335,17 +2310,9 @@ unsafe extern "C-unwind" fn callback(
         Disposition::Pass
     };
 
-    if !remote
-        && t.pointer
-        && let Some(at) = crate::capture_loop::constrained_cursor()
-    {
-        // A visible but dissociated local pointer uses the routing prediction
-        // for clicks/scrolls too, not the hardware event's stale location.
-        CGEvent::set_location(Some(ev), objc2_core_foundation::CGPoint::new(at.x, at.y));
-    }
     let source_motion = is_motion(ty) && s.drag_anchor.lock().unwrap_or_else(|e| e.into_inner()).is_some();
     let routed_swallow = source_motion
-        || ((remote || crate::capture_loop::mouse_disabled()) && t.pointer)
+        || pointer_swallow(remote, crate::capture_loop::mouse_disabled(), t.pointer, physical)
         || disposition == Disposition::Swallow;
     // Keep the existing local HIToolbox path and LocalGuard behavior. Only the
     // capture source changes: forwarding NX Caps must not also forward FlagsChanged.
@@ -3083,6 +3050,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn issue20_disabled_pointer_only_blocks_physical() {
+        assert!(!pointer_swallow(false, true, true, false));
+        assert!(pointer_swallow(false, true, true, true));
+        assert!(pointer_swallow(true, false, true, false));
+        assert!(!pointer_swallow(false, true, false, true));
+    }
+
+    #[test]
     fn remote_freeze_ownership_does_not_depend_on_relocation_or_hit_window() {
         use crate::warp_delta::{DockSide, DockZone};
         use oink_foundation::Rect;
@@ -3537,6 +3512,42 @@ mod tests {
         assert_eq!(observation.last_placement.unwrap().delta, (0., 0.));
         assert_eq!(observation.last_placement.unwrap().at, at);
         assert!(matches!(*shared.hidden.lock().unwrap(), HiddenCursor::Frozen { at: frozen, .. } if frozen == at));
+    }
+
+    #[test]
+    fn marked_password_events_pass_without_entering_remote_routing() {
+        // Password characters injected by Oink must remain local even when the
+        // pointer/focus is currently owned by another device. Exercise the
+        // production callback so this assertion covers the early own-event
+        // boundary before translation, capture, or routing.
+        let calls = Arc::new(AtomicU64::new(0));
+        let observed = calls.clone();
+        let shared = fake_shared(Arc::new(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            Disposition::Swallow
+        }));
+        shared.remote.store(true, Ordering::Release);
+        for ty in [CGEventType::KeyDown, CGEventType::KeyUp] {
+            let event = CGEvent::new_keyboard_event(None, 0x04, ty == CGEventType::KeyDown).unwrap();
+            CGEvent::set_integer_value_field(Some(&event), CGEventField::EventSourceUserData, MAGIC);
+            // A posted event can look physical at this boundary; the own-event
+            // marker is the security boundary that must win over focus state.
+            CGEvent::set_integer_value_field(Some(&event), CGEventField::EventSourceUnixProcessID, 0);
+            let pointer = CFRetained::as_ptr(&event);
+            // SAFETY: shared and the unposted event remain alive through the
+            // synchronous callback; the marked-event branch only reads and
+            // updates the local modifier ledger.
+            let result = unsafe {
+                callback(
+                    std::ptr::null_mut(),
+                    ty,
+                    pointer,
+                    (&shared as *const Shared).cast_mut().cast(),
+                )
+            };
+            assert_eq!(result, pointer.as_ptr());
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "own password events entered routing");
     }
 
     #[test]

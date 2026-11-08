@@ -102,12 +102,12 @@ def verify_platform(state, platform, config, packages=False, signatures=True, ve
         feed.require(set(slot['catalog']) == set(actual), 'mac_catalog')
         verified = set()
         for path, record in slot['catalog'].items():
-            match = re.fullmatch(r'mac/v1/mac-2026-01/(stable|beta)/appcast.xml', path)
-            feed.require(match and record['architecture'] == 'arm64' and
+            match = re.fullmatch(r'mac/v1/mac-2026-01/(x64/)?(stable|beta)/appcast.xml', path)
+            feed.require(match and record['architecture'] == ('x64' if match[1] else 'arm64') and
                          record['developer_id_verified'] is True and record['notarized'] is True and
                          record['qualified_build'] == record['build'], 'mac_qualification')
             raw = (state / 'site' / path).read_bytes()
-            entries = appcast(raw, config, match[1], signatures and actual[path] != (verified_files or {}).get(path) and raw not in verified)
+            entries = appcast(raw, config, match[2], signatures and actual[path] != (verified_files or {}).get(path) and raw not in verified)
             verified.add(raw)
             latest = max(entries, key=lambda entry: entry['build'])
             feed.require(all(record[k] == v for k, v in latest.items()) and re.fullmatch('[0-9a-f]{64}', record['sha256']), 'mac_catalog')
@@ -226,11 +226,20 @@ def verify_public(state, platform=None, previous=None):
 
 
 def absent_paths(reg, platforms=PLATFORMS):
-    return [f'{platform}/v1/{epoch}/{channel}/{filename}'
-            for platform, epoch, filename in (('mac', 'mac-2026-01', 'appcast.xml'),
-                                              ('windows', 'win-2026-01', 'manifest.json'))
-            if platform in platforms and not reg['platforms'][platform]['enabled']
-            for channel in ('stable', 'beta')]
+    result = []
+    for platform, epoch, filename in (('mac', 'mac-2026-01', 'appcast.xml'),
+                                     ('windows', 'win-2026-01', 'manifest.json')):
+        if platform not in platforms:
+            continue
+        slot = reg['platforms'][platform]
+        channels = ('stable', 'beta', 'x64/stable', 'x64/beta') if platform == 'mac' else ('stable', 'beta')
+        for channel in channels:
+            path = f'{platform}/v1/{epoch}/{channel}/{filename}'
+            # ARM can remain enabled while Intel is first introduced or rolled
+            # back. Its missing channels are known absence in that snapshot too.
+            if not slot['enabled'] or (platform == 'mac' and path not in slot['files']):
+                result.append(path)
+    return result
 
 
 def public_files(state, platform=None):
@@ -242,22 +251,18 @@ def public_files(state, platform=None):
 
 
 def verify_absent(reg, platforms=PLATFORMS):
-    # A successful rollback must also remove a newly introduced platform prefix.
+    # Share the snapshot's absence set with deployment and rollback convergence.
     import urllib.error
-    for platform in platforms:
-        if not reg['platforms'][platform]['enabled']:
-            epoch = 'mac-2026-01' if platform == 'mac' else 'win-2026-01'
-            filename = 'appcast.xml' if platform == 'mac' else 'manifest.json'
-            for channel in ('stable', 'beta'):
-                try:
-                    feed.download(f'{feed.BASE}{platform}/v1/{epoch}/{channel}/{filename}', feed.MAX_FEED, False, True)
-                except urllib.error.HTTPError as error:
-                    try:
-                        feed.require(error.code == 404, 'disabled_feed_status')
-                    finally:
-                        error.close()
-                else:
-                    raise ValueError('disabled_feed_present')
+    for path in absent_paths(reg, platforms):
+        try:
+            feed.download(feed.BASE + path, feed.MAX_FEED, False, True)
+        except urllib.error.HTTPError as error:
+            try:
+                feed.require(error.code == 404, 'disabled_feed_status')
+            finally:
+                error.close()
+        else:
+            raise ValueError('disabled_feed_present')
 
 
 def initialize(output):

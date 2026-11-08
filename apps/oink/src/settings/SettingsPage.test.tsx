@@ -4,7 +4,8 @@ import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/re
 import { OinkProvider, Toaster, toast } from 'oink-ui';
 import { agent } from '../api/store';
 import type { Overview } from '../api/types';
-import { api as backend, shell } from '../api/client';
+import { ApiFailure, api as backend, shell } from '../api/client';
+import type { AutoUnlockStatus } from '../api/client';
 import { setLanguage } from '../i18n';
 import { SettingsPage, type PermState } from './SettingsPage';
 import { DEFAULT_PREFS, type PermissionId, type PrefsApi } from './prefs';
@@ -120,7 +121,9 @@ describe('Layout section', () => {
 
   it('turns system arrangement sync on for this device with its preference token', async () => {
     setLanguage('en');
-    const fixture = arrangement('ready');
+    const fixture = createLayoutProfilesFixture({ devices: createLayoutProfilesFixture().state().devices.map(d => ({ ...d, sync_system_arrangement: false })) });
+    agent.adopt('overview', { this_device: { id: self } } as unknown as Overview);
+    agent.adopt('layoutProfiles', fixture.state());
     const set = vi.spyOn(backend, 'setSyncSystemArrangement').mockImplementation(request => fixture.api.setSyncSystemArrangement(request));
     const { container } = render(view());
     const row = container.querySelector<HTMLElement>('[data-item="syncSystemArrangement"]')!;
@@ -313,4 +316,157 @@ it('uses the backend recovery chord directly', () => {
   const row=container.querySelector('[data-item="sc-keyboardRelease"]')!;
   expect([...row.querySelectorAll('kbd')].map(key=>key.textContent)).toEqual(['⌃','⇧','F8']);
   agent.adopt('input',null);
+});
+
+it('shows the hidden-display policy only on Windows as a disabled child when arrangement sync is off', () => {
+  setLanguage('zh-Hans');
+  const self = 'a'.repeat(64);
+  const fixture = createLayoutProfilesFixture();
+  const state = fixture.state();
+  state.devices.find(d => d.device === self)!.sync_system_arrangement = false;
+  agent.adopt('overview', { this_device: { id: self } } as unknown as Overview);
+  agent.adopt('layoutProfiles', state);
+  const { container, unmount } = render(view('win'));
+  const row = container.querySelector<HTMLElement>('[data-item="disableHiddenDisplays"]')!;
+  expect(row).not.toBeNull();
+  expect(row.dataset.parent).toBe('syncSystemArrangement');
+  expect(row.querySelector('.ok-row__label')?.textContent).toBe('在系统中禁用隐藏的屏幕');
+  expect(row.querySelector('.ok-row__desc')?.textContent).toBe('隐藏屏幕会同时在系统设置中禁用它，每台设备最后一块屏幕不会被禁用');
+  const toggle = within(row).getByRole('switch') as HTMLInputElement;
+  expect(toggle.checked).toBe(false);
+  expect(toggle.disabled).toBe(true);
+  unmount();
+  expect(render(view('mac')).container.querySelector('[data-item="disableHiddenDisplays"]')).toBeNull();
+  agent.adopt('layoutProfiles', null);
+});
+
+it.each([
+  ['en', 'Disable hidden displays in the system'],
+  ['ja', '非表示のディスプレイをシステムで無効にする'],
+  ['ko', '숨긴 디스플레이를 시스템에서 비활성화'],
+] as const)('saves the Windows child policy through its owner in %s', async (language, label) => {
+  setLanguage(language);
+  const self = 'a'.repeat(64);
+  const fixture = createLayoutProfilesFixture();
+  agent.adopt('overview', { this_device: { id: self } } as unknown as Overview);
+  agent.adopt('layoutProfiles', fixture.state());
+  const save = vi.spyOn(backend, 'setDisableHiddenDisplays').mockImplementation(request => fixture.api.setDisableHiddenDisplays(request));
+  const { container } = render(view('win'));
+  const row = container.querySelector<HTMLElement>('[data-item="disableHiddenDisplays"]')!;
+  const toggle = within(row).getByRole('switch', { name: label }) as HTMLInputElement;
+  expect(toggle.checked).toBe(false);
+  expect(toggle.disabled).toBe(false);
+  fireEvent.click(toggle);
+  await waitFor(() => expect(toggle.checked).toBe(true));
+  expect(save).toHaveBeenCalledWith(expect.objectContaining({ device: self, enabled: true, expected_preference_token: `preference:${self}:1` }));
+  agent.adopt('layoutProfiles', null);
+});
+
+it('loads local auto unlock state and keeps a categorized failure visible until password changes', async () => {
+  setLanguage('zh-Hans');
+  let status: AutoUnlockStatus={enabled:true,failure:'password_incorrect',windows_hello_only:false};
+  vi.spyOn(backend,'autoUnlockStatus').mockImplementation(async()=>status);
+  const save=vi.spyOn(backend,'saveAutoUnlock').mockImplementation(async()=>{status={enabled:true,failure:null,windows_hello_only:false};return null;});
+  const disable=vi.spyOn(backend,'disableAutoUnlock').mockImplementation(async()=>{status={enabled:false,failure:null,windows_hello_only:false};return null;});
+  const {container,getByRole}=render(view('win'));
+  const row=container.querySelector<HTMLElement>('[data-item="autoUnlock"]')!;
+  await waitFor(()=>expect(row.textContent).toContain('上次解锁失败：密码错误，请修改密码'));
+  expect(row.querySelector('.setp__unlock-failed')).not.toBeNull();
+  expect(row.querySelector('.setp__unlock-on')).toBeNull();
+  fireEvent.click(within(row).getByRole('button',{name:'修改密码'}));
+  const dialog=getByRole('dialog');
+  const field=within(dialog).getByLabelText('登录密码（非 PIN）');
+  fireEvent.change(field,{target:{value:'synthetic-only-secret'}});
+  fireEvent.submit(dialog.querySelector('form') ?? dialog);
+  await waitFor(()=>expect(save).toHaveBeenCalledExactlyOnceWith('synthetic-only-secret'));
+  await waitFor(()=>expect(row.textContent).not.toContain('上次解锁失败'));
+  fireEvent.click(within(row).getByRole('button',{name:'关闭'}));
+  await waitFor(()=>expect(disable).toHaveBeenCalledOnce());
+  await waitFor(()=>expect(within(row).getByRole('button',{name:'启用'})).toBeTruthy());
+});
+
+it.each([
+  ['zh-Hans', 'password_incorrect', '上次解锁失败：密码错误，请修改密码'],
+  ['en', 'windows_hello_only', 'Last unlock failed: Windows Hello-only sign-in is enabled; turn it off in Settings'],
+  ['ja', 'login_ui_not_ready', '前回のロック解除に失敗しました：サインイン画面の準備ができていません。設定を確認してください'],
+  ['ko', 'unknown', '마지막 잠금 해제 실패: 알 수 없는 원인입니다. 설정과 로그인 화면을 확인하세요'],
+] as const)('maps %s auto-unlock failure categories to localized warning copy', async (language, failure, copy) => {
+  setLanguage(language);
+  vi.spyOn(backend, 'autoUnlockStatus').mockResolvedValue({enabled: true, failure, windows_hello_only:false});
+  const {container} = render(view('win'));
+  const row = container.querySelector<HTMLElement>('[data-item="autoUnlock"]')!;
+  await waitFor(() => expect(row.querySelector('.ok-row__desc')?.textContent).toBe(copy));
+  expect(row.querySelector('.setp__unlock-failed')).not.toBeNull();
+  expect(row.querySelector('.setp__unlock-on')).toBeNull();
+});
+
+it('disables Windows auto-unlock enablement with a Hello-only tooltip and polls every second', async () => {
+  setLanguage('zh-Hans');
+  let helloOnly = true;
+  vi.spyOn(backend, 'autoUnlockStatus').mockImplementation(async () => ({ enabled: false, failure: null, windows_hello_only: helloOnly }));
+  const interval = vi.spyOn(window, 'setInterval');
+  const clear = vi.spyOn(window, 'clearInterval');
+  const { container, unmount } = render(view('win'));
+  const row = container.querySelector<HTMLElement>('[data-item="autoUnlock"]')!;
+  await within(row).findByRole('button', { name: '启用' });
+  await waitFor(() => expect((within(row).getByRole('button', { name: '启用' }) as HTMLButtonElement).disabled).toBe(true));
+  const enable = within(row).getByRole('button', { name: '启用' });
+  expect(interval).toHaveBeenCalledWith(expect.any(Function), 1000);
+  fireEvent.pointerEnter(enable.parentElement!);
+  expect((await within(document.body).findByRole('tooltip')).textContent).toContain('请先在系统设置中关闭“仅允许 Windows Hello 登录”');
+
+  helloOnly = false;
+  const refresh = interval.mock.calls.at(-1)?.[0] as (() => void) | undefined;
+  expect(refresh).toBeDefined();
+  refresh!();
+  await waitFor(() => expect((within(row).getByRole('button', { name: '启用' }) as HTMLButtonElement).disabled).toBe(false));
+  unmount();
+  expect(clear).toHaveBeenCalled();
+});
+
+it('shows the Hello-only warning while enabled and restores the saved failure after it is turned off', async () => {
+  setLanguage('zh-Hans');
+  let status: AutoUnlockStatus = { enabled: true, failure: 'password_incorrect', windows_hello_only: true };
+  vi.spyOn(backend, 'autoUnlockStatus').mockImplementation(async () => status);
+  const interval = vi.spyOn(window, 'setInterval');
+  const { container } = render(view('win'));
+  const row = container.querySelector<HTMLElement>('[data-item="autoUnlock"]')!;
+  await waitFor(() => expect(row.querySelector('.ok-row__desc')?.textContent).toBe('自动解锁不可用：请在系统设置中关闭“仅允许 Windows Hello 登录”'));
+  expect(row.querySelector('.setp__unlock-failed')).not.toBeNull();
+
+  status = { ...status, windows_hello_only: false };
+  const refresh = interval.mock.calls.at(-1)?.[0] as (() => void) | undefined;
+  refresh!();
+  await waitFor(() => expect(row.querySelector('.ok-row__desc')?.textContent).toBe('上次解锁失败：密码错误，请修改密码'));
+});
+
+
+it('shows a toast and retains enabled state when disabling auto unlock fails', async () => {
+  setLanguage('zh-Hans');
+  vi.spyOn(backend,'autoUnlockStatus').mockResolvedValue({enabled:true,failure:null,windows_hello_only:false});
+  vi.spyOn(backend,'disableAutoUnlock').mockRejectedValue(new Error('synthetic-only-secret'));
+  const {container} = render(view('win'));
+  const row = container.querySelector<HTMLElement>('[data-item="autoUnlock"]')!;
+  fireEvent.click(await within(row).findByRole('button',{name:'关闭'}));
+  expect(await within(document.body).findByText('无法更改「自动解锁本机」')).toBeTruthy();
+  expect(within(row).getByRole('button',{name:'关闭'})).toBeTruthy();
+  expect(document.body.textContent).not.toContain('synthetic-only-secret');
+});
+
+it('shows an incorrect-password refusal and keeps auto unlock disabled', async () => {
+  setLanguage('zh-Hans');
+  vi.spyOn(backend, 'autoUnlockStatus').mockResolvedValue({enabled:false,failure:null,windows_hello_only:false});
+  vi.spyOn(backend, 'saveAutoUnlock').mockRejectedValue(new ApiFailure({
+    code: 'unavailable',
+    message: '密码不正确',
+    problem: {code:'local_service_unavailable',unknownCode:null,nativeCode:null,retryAfterMs:null},
+  }));
+  const {container,getByRole}=render(view('win'));
+  const row=container.querySelector<HTMLElement>('[data-item="autoUnlock"]')!;
+  fireEvent.click(await within(row).findByRole('button',{name:'启用'}));
+  const dialog=getByRole('dialog');
+  fireEvent.change(within(dialog).getByLabelText('登录密码（非 PIN）'),{target:{value:'synthetic-only-secret'}});
+  fireEvent.submit(dialog.querySelector('form') ?? dialog);
+  expect(await within(dialog).findByText('密码不正确')).toBeTruthy();
+  expect(within(row).getByRole('button',{name:'启用'})).toBeTruthy();
 });

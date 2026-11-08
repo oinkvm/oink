@@ -1298,3 +1298,60 @@ fn heartbeat_is_half_second_and_existing_loss_deadline_is_two_seconds_on_direct_
             Effect::Lost { link: lost, reason: LinkLost::HeartbeatTimeout, .. } if *lost == link)));
     }
 }
+
+#[test]
+fn lost_decision_identifies_binding_and_distinguishes_unobserved_from_recent_data() {
+    super::super::diagnostics::tests::init();
+    use tracing_subscriber::layer::SubscriberExt;
+    let rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(super::super::diagnostics::tests::Capture(rows.clone()));
+    tracing::subscriber::with_default(subscriber, || {
+        let mut r = Rig::new(2);
+        r.connect(0, 1);
+        r.pump();
+        let id = r.link(0, 1);
+        let connection = r.nodes[0].links[&id].hop.connection_id;
+        let progress = r.nodes[0].links[&id].heartbeat.progress;
+        let binding = r.nodes[0].links[&id].hop;
+        let wire = r.nodes[0].links[&id].wire;
+        // A received Pulse is observable without counting as a matched Pong.
+        r.nodes[0].receive(
+            connection,
+            binding.route_tag,
+            LinkMsg::Pulse(Pulse {
+                path_id: wire.path_id,
+                route_revision: wire.route_revision,
+                nonce: 77,
+            }),
+            r.now,
+        );
+        r.nodes[0].peer_data_received(id, r.now);
+        assert_eq!(
+            r.nodes[0].links[&id].heartbeat.progress, progress,
+            "observations cannot renew liveness"
+        );
+        r.nodes[0].lose(id, LinkLost::HeartbeatTimeout);
+        let other = r.link(1, 0);
+        r.nodes[1].lose(other, LinkLost::ConnectionLost);
+        let logs = rows.lock().unwrap();
+        let row = logs
+            .iter()
+            .find(|row| row.contains(&("kind".into(), "link_lost".into())))
+            .unwrap();
+        for (key, value) in [
+            ("reason", "heartbeat_timeout".to_string()),
+            ("decision_side", "local".to_string()),
+            ("operation", super::super::diagnostics::hex(&connection.random)),
+            ("link_id", id.0.to_string()),
+            ("peer_data_known", "true".to_string()),
+        ] {
+            assert!(row.contains(&(key.into(), value)), "{row:?}");
+        }
+        assert!(row.iter().any(|(key, _)| key == "path_id"));
+        assert!(row.iter().any(|(key, _)| key == "heartbeat_age_ms"));
+        assert!(row.contains(&("heartbeat_known".into(), "true".into())));
+        assert!(row.contains(&("pong_known".into(), "false".into())));
+        assert!(logs.iter().any(|row| row.contains(&("kind".into(), "link_lost".into()))
+            && row.contains(&("peer_data_known".into(), "false".into()))));
+    });
+}

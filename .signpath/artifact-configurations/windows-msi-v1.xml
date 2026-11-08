@@ -18,6 +18,12 @@
         <pe-file path="oink-crash-collector.exe">
           <authenticode-sign />
         </pe-file>
+        <pe-file path="OinkPasteMenu.dll">
+          <authenticode-sign />
+        </pe-file>
+        <pe-file path="OinkCredentialProvider.dll">
+          <authenticode-sign />
+        </pe-file>
       </directory>
       <authenticode-sign />
     </msi-file>

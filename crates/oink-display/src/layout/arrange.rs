@@ -113,7 +113,7 @@ impl Layout {
             .filter(|s| !old.iter().any(|o| o.id == s.id))
             .map(|s| s.id.clone())
             .collect::<Vec<_>>();
-        let (origin, scale) = placement.unwrap_or_else(|| {
+        let (mut origin, scale) = placement.unwrap_or_else(|| {
             let group = bbox(fresh.iter().map(|s| s.rect));
             let existing = bbox(self.screens.iter().filter(|s| s.id.device != device).map(|s| s.rect));
             let offset = match (existing, group) {
@@ -124,11 +124,45 @@ impl Layout {
             let scale = fresh.first().map(|s| s.rect.w / s.local.w).unwrap_or(1.0);
             (offset, scale)
         });
+        let mut frame_rebased = false;
+        // Disabling the primary Windows desktop translates every remaining
+        // source (and our retained hidden sources) into a new native frame.
+        // A pure frame change must not move the monitors on the group canvas.
+        // Require matching identities/sizes and the same translation for all
+        // screens; an actual relative rearrangement still follows the OS.
+        if let Some(primary) = fresh.iter().find(|s| s.primary)
+            && let Some(previous) = old.iter().find(|s| s.id == primary.id && !s.primary)
+            && old.len() == fresh.len()
+        {
+            let dx = primary.local.x - previous.local.x;
+            let dy = primary.local.y - previous.local.y;
+            if fresh.iter().all(|s| {
+                old.iter().any(|o| {
+                    o.id == s.id
+                        && o.local.w == s.local.w
+                        && o.local.h == s.local.h
+                        && s.local.x - o.local.x == dx
+                        && s.local.y - o.local.y == dy
+                })
+            }) {
+                origin.x -= dx * scale;
+                origin.y -= dy * scale;
+                frame_rebased = true;
+            }
+        }
         let manual = self
             .screens
             .iter()
             .any(|s| s.id.device == device && s.size_source == SizeSource::Manual);
+        let device_hidden = old.iter().any(|s| s.device_hidden);
+        let device_visibility_known = old.iter().any(|s| s.device_visibility_known);
         for screen in &mut fresh {
+            screen.device_hidden = device_hidden;
+            screen.device_visibility_known = device_visibility_known;
+            if let Some(previous) = old.iter().find(|old| old.id == screen.id) {
+                screen.screen_hidden = previous.screen_hidden;
+                screen.screen_visibility_known = previous.screen_visibility_known;
+            }
             screen.rect = Rect::new(
                 origin.x + screen.local.x * scale,
                 origin.y + screen.local.y * scale,
@@ -153,7 +187,7 @@ impl Layout {
         self.screens.extend(fresh);
         if !added.is_empty() {
             self.repair_new_screens(device, &added);
-        } else if geometry_changed {
+        } else if geometry_changed && !frame_rebased {
             self.repair_native_change(device);
         }
     }

@@ -110,13 +110,25 @@ pub enum InputError {
 /// 返回值决定这个事件是否被吞掉。
 pub type EventHandler = Arc<dyn Fn(&CapturedEvent) -> Disposition + Send + Sync>;
 
+/// Read-only result of the platform session-lock query.
+///
+/// `None` is deliberately distinct from `Some(false)`: callers must not treat
+/// a failed or unrecognised query as an unlocked session. The numeric error
+/// code is retained only for diagnostics and is never a credential or input
+/// value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionLockObservation {
+    pub state: Option<bool>,
+    pub error_code: Option<u32>,
+}
+
 /// 一台电脑的输入能力。
 ///
 /// 平台实现的约定：
 /// - 必须过滤掉自己注入的事件，不交给回调（用事件上的来源标记识别，如 macOS
 ///   `kCGEventSourceUserData`、Windows `dwExtraInfo`）。
-/// - Windows keeps other software's flagged injected input local by default;
-///   the local forward_injected_input preference opts into legacy source routing.
+/// - Windows forwards other software's flagged injected input by default;
+///   disabling the local forward_injected_input preference keeps it local.
 ///   macOS retains its existing source-input policy.
 /// - `Remote` 模式下本机光标隐藏且不动，位移以 `PointerDelta` 上报（已含系统加速），
 ///   事件的 `cursor` 为 `None`（光标停在停靠点或原地冻结，那不是用户指针的位置）。
@@ -186,6 +198,15 @@ pub trait InputBackend: Send + Sync {
     fn session_locked(&self) -> Option<bool> {
         None
     }
+    /// Read-only lock observation with the platform error code, when the
+    /// platform query itself failed. The default preserves existing backend
+    /// behaviour for platforms without a richer query result.
+    fn session_lock_observation(&self) -> SessionLockObservation {
+        SessionLockObservation {
+            state: self.session_locked(),
+            error_code: None,
+        }
+    }
 
     /// Only synthetic backends may retain key details in diagnostics.
     fn diagnostic_key_details(&self) -> bool {
@@ -205,10 +226,6 @@ pub trait InputBackend: Send + Sync {
     }
     /// Cursor visibility/coupling only; it need not follow group focus.
     fn set_mode(&self, mode: CaptureMode) -> Result<(), InputError>;
-    /// Ordered, visible local-pointer confinement. Never moves the pointer on acquisition.
-    fn set_cursor_constraint(&self, _bounds: Option<oink_foundation::Rect>) -> Result<(), InputError> {
-        Ok(())
-    }
     /// Native keyboard side effects follow the keyboard source route independently
     /// of the mouse cursor mode (notably macOS Caps Lock and input-source guarding).
     fn set_keyboard_remote(&self, _remote: bool) -> Result<(), InputError> {
@@ -427,3 +444,9 @@ pub fn platform_backend() -> Result<Box<dyn InputBackend>, InputError> {
 mod mouse_keys;
 #[cfg(any(windows, all(test, debug_assertions)))]
 mod touchpad;
+
+/// Synchronous IOConsoleLocked + CGSession observation. Not callback-safe.
+#[cfg(target_os = "macos")]
+pub fn session_locked_authoritative() -> Option<bool> {
+    macos::session_locked_authoritative()
+}

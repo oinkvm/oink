@@ -241,7 +241,7 @@ function MetaLine({ d, now, onToggle, onSpeaker, onMicrophone, onGrantPermission
             // A disabled input has one gesture: the first click restores sharing and a
             // double-click must not disable it again.
             const inputDouble = (kind === 'keyboard' || kind === 'mouse') && d[kind] !== 'disabled' && canDisableInput(d, kind);
-            if (inputDouble) tooltip.push(tr('双击：{0}', tr('input-action|禁用')));
+            if (inputDouble) tooltip.push(tr('双击：禁用（防误触）'));
             const needsPermission = (kind === 'mouse' || kind === 'keyboard') && (d.inputPermissionMissing || d.actionability?.[kind] === 'open_permissions' || (d.group === 'self' && d.os === 'mac' && d[kind] === 'fault'));
             const permission = needsPermission ? { kind: d.inputPermissionMissing ? 'input_monitoring' as const : 'permissions' as const, local: d.group === 'self',
                 onGrant: !interactive ? undefined : d.inputPermissionMissing && onGrantPermission ? () => onGrantPermission('input_monitoring') : activate ? () => activate('single') : undefined } : undefined;

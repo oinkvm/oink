@@ -590,7 +590,7 @@ mod connection_tests {
         a.pointer = Some(at.clone());
         a.set_game_mode(GameMode::On);
         a.drain_outputs();
-        a.local_motion_unconstrained(5000., 0., Some(at.local), 1);
+        a.local_motion(5000., 0., Some(at.local), 1);
         assert_eq!(a.holder, a.me());
         assert!(a.game_mode().active);
         assert!(!a.out.iter().any(|o| matches!(
@@ -605,7 +605,7 @@ mod connection_tests {
         b.set_cursor(Point::new(0., 300.));
         // A real edge decision uses the same owner restoration as an explicit
         // focus command. The screens touch, so no gap/portal threshold applies.
-        b.local_motion_unconstrained(-5000., 0., Some(Point::new(0., 300.)), 2);
+        b.local_motion(-5000., 0., Some(Point::new(0., 300.)), 2);
         assert_eq!(b.holder, a.me(), "ordinary edge routing hands focus back");
         deliver(&mut b, &mut a);
         assert_eq!(a.game_mode().mode, GameMode::On);

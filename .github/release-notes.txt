@@ -1,29 +1,37 @@
-Oink 0.3.3 improves audio forwarding, adds audio quality options and fixes several keyboard, mouse and clipboard issues.
+Oink 0.3.4 adds automatic unlock, Paste as File and layout shortcuts, and fixes several pointer, shortcut and audio issues.
 
 ## New
 
-- Choose the quality of forwarded audio in Settings: Smooth, Quality or Lossless.
-- Clicking with a mouse that is in local mode now brings control back to that computer.
-- Pointer shortcuts can now move the pointer to screens hidden in the layout.
-- If another app is using Oink's network port, Oink now switches to another port automatically.
-- On a Mac, files of up to 16 MB in total copied on another computer are fetched in advance, so pasting them is faster.
+- Automatic unlock: move the pointer from an unlocked computer onto a locked Mac or Windows computer, and Oink unlocks it with the saved password. The password is verified when you save it and is stored encrypted on that computer.
+- Paste as File: turn it on under Tools in Settings to save text or images on the clipboard as a file from the context menu in Finder or File Explorer.
+- Saved layouts can have shortcuts, so you can switch layouts with one key combination.
+- The middle and side mouse buttons can be used as shortcuts.
+- Hiding a screen in the layout now applies on every device in the group, and offline devices can be hidden or moved as a whole.
+- On Windows, after turning on "Disable hidden displays in the system" in Settings, screens hidden in the layout are also disabled in Windows, so the pointer can't stray onto them.
+- Moving devices with several screens in the layout works better.
+- On Windows, keyboard and mouse input simulated by other apps is now forwarded to other devices by default. You can turn this off in Settings.
+- When audio forwarding ends, media that is playing is paused before local sound is restored.
+- Oink is now available for Intel Macs.
 
 ## Fixes
 
-- Fixed the "Open the Oink window" shortcut not being shown in Settings.
-- Fixed Shift sometimes switching WeChat Input Method between Chinese and English on a Mac controlled from another device.
-- Fixed some keys sometimes staying pressed when a Windows keyboard controls another device.
-- Fixed the pitch of forwarded audio rising and falling every few seconds on Wi-Fi.
-- Fixed playback on one device being paused repeatedly when several devices forward audio at the same time.
-- Fixed images copied on a Mac showing no preview in Windows clipboard history (Win+V).
-- Fixed Macs failing to connect over Tailscale.
-- Oink uses less CPU when idle on Mac and Windows.
+- Fixed the pointer not being able to return to the computer's other screens after entering a screen hidden in the layout.
+- Fixed a still cursor being left at the top of the screen after opening Mission Control on a Mac.
+- Fixed shortcuts held down while the computer locks no longer working.
+- Fixed external input also not working on a Mac whose local input is disabled.
+- Fixed images copied on one Windows computer showing no preview in clipboard history (Win+V) on another Windows computer.
+- Fixed default pointer shortcuts for a device sometimes duplicating existing shortcuts.
+- Fixed pairing occasionally failing.
+- Fixed the audio warning still being shown after audio output recovers.
+- Fixed the pitch of forwarded audio jumping after quiet passages.
+- Fixed some UI issues.
 
 ## Compatibility
 
-- 0.3.3 works with 0.3.0 and later.
+- 0.3.4 works with 0.3.0 and later.
 
 ## Downloads
 
-- **Mac:** the `.dmg` file — Apple silicon, macOS 14.2 or later.
+- **Mac (Apple silicon):** the `.dmg` file — macOS 14.2 or later.
+- **Mac (Intel):** the `.dmg` file marked `x64` — macOS 14.2 or later.
 - **Windows:** the `.msi` file — x64, Windows 10 22H2 (build 19045) or later, or Windows 11.

@@ -7,7 +7,26 @@ use oink_protocol::v1::{
     schema::{WireDto, WireValue},
 };
 pub fn validate(layout: &dto::LayoutValue) -> v1::Result<()> {
-    v1::layout::require_supported_geometry(layout)
+    // Screen key 11 is an in-process projection of register key 7. Strip it
+    // before applying the frozen executable-geometry validator; it is never
+    // retained in the baseline value sent to an old peer.
+    let mut raw = layout.raw().clone();
+    if let Some(RawValue::Array(groups)) = raw.get_mut(&1) {
+        for group in groups {
+            if let RawValue::Map(group) = group {
+                group.remove(&5);
+                if let Some(RawValue::Array(screens)) = group.get_mut(&4) {
+                    for screen in screens {
+                        if let RawValue::Map(screen) = screen {
+                            screen.remove(&11);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let clean = dto::LayoutValue::from_raw(raw)?;
+    v1::layout::require_supported_geometry(&clean)
 }
 fn native_device(device: &dto::DeviceId) -> v1::Result<DeviceId> {
     Ok(DeviceId(
@@ -46,6 +65,10 @@ pub fn from_wire(value: &dto::LayoutValue) -> v1::Result<Layout> {
                 },
                 primary: screen.primary()?,
                 builtin: screen.builtin()?,
+                device_hidden: group.hidden()?,
+                screen_hidden: screen.hidden()?,
+                device_visibility_known: group.raw().contains_key(&5),
+                screen_visibility_known: screen.raw().contains_key(&11),
             });
         }
     }
@@ -62,6 +85,24 @@ pub fn from_wire(value: &dto::LayoutValue) -> v1::Result<Layout> {
         },
     })
 }
+pub fn from_register(register: &dto::Register) -> v1::Result<Layout> {
+    from_wire(&v1::layout::register_value(register)?)
+}
+pub fn has_device_visibility_record(register: &dto::Register, device: DeviceId) -> v1::Result<bool> {
+    let Some(metadata) = register.layout_visibility()? else {
+        return Ok(false);
+    };
+    for key in [1, 3] {
+        let Some(value) = metadata.get(&key) else {
+            continue;
+        };
+        let list = oink_protocol::v1::schema::List::<dto::DeviceId, 256>::read(value)?;
+        if list.0.iter().any(|candidate| native_device(candidate) == Ok(device)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 fn rect(r: Rect) -> RawValue {
     RawValue::Map([(1, r.x.write()), (2, r.y.write()), (3, r.w.write()), (4, r.h.write())].into())
 }
@@ -69,34 +110,37 @@ fn point(p: Point) -> RawValue {
     RawValue::Map([(1, p.x.write()), (2, p.y.write())].into())
 }
 fn to_screen(s: &ScreenPlacement) -> v1::Result<dto::ScreenPlacement> {
-    dto::ScreenPlacement::from_raw(
-        [
-            (
-                1,
-                RawValue::Map(
-                    [
-                        (1, crate::config::store::wire_device(s.id.device).write()),
-                        (2, RawValue::from(s.id.display.as_str())),
-                    ]
-                    .into(),
-                ),
+    let mut fields = [
+        (
+            1,
+            RawValue::Map(
+                [
+                    (1, crate::config::store::wire_device(s.id.device).write()),
+                    (2, RawValue::from(s.id.display.as_str())),
+                ]
+                .into(),
             ),
-            (2, RawValue::from(s.name.as_str())),
-            (3, rect(s.local)),
-            (
-                5,
-                match s.size_source {
-                    SizeSource::Reported => dto::SizeSource::Reported,
-                    SizeSource::Estimated => dto::SizeSource::Estimated,
-                    SizeSource::Manual => dto::SizeSource::Manual,
-                }
-                .write(),
-            ),
-            (9, s.primary.write()),
-            (10, s.builtin.write()),
-        ]
-        .into(),
-    )
+        ),
+        (2, RawValue::from(s.name.as_str())),
+        (3, rect(s.local)),
+        (
+            5,
+            match s.size_source {
+                SizeSource::Reported => dto::SizeSource::Reported,
+                SizeSource::Estimated => dto::SizeSource::Estimated,
+                SizeSource::Manual => dto::SizeSource::Manual,
+            }
+            .write(),
+        ),
+        (9, s.primary.write()),
+        (10, s.builtin.write()),
+    ]
+    .into_iter()
+    .collect::<RawMap>();
+    if s.screen_visibility_known {
+        fields.insert(11, s.screen_hidden.write());
+    }
+    dto::ScreenPlacement::from_raw(fields)
 }
 pub fn to_wire(layout: &Layout, source: dto::LayoutSource) -> v1::Result<dto::LayoutValue> {
     let mut groups = Vec::new();
@@ -128,15 +172,28 @@ pub fn to_wire(layout: &Layout, source: dto::LayoutSource) -> v1::Result<dto::La
             }
             screens.push(to_screen(s)?.write());
         }
-        groups.push(RawValue::Map(
-            [
-                (1, crate::config::store::wire_device(device).write()),
-                (2, point(origin)),
-                (3, k.write()),
-                (4, RawValue::Array(screens)),
-            ]
-            .into(),
-        ));
+        let mut fields: RawMap = [
+            (1, crate::config::store::wire_device(device).write()),
+            (2, point(origin)),
+            (3, k.write()),
+            (4, RawValue::Array(screens)),
+        ]
+        .into();
+        if layout
+            .screens
+            .iter()
+            .any(|s| s.id.device == device && s.device_visibility_known)
+        {
+            fields.insert(
+                5,
+                layout
+                    .screens
+                    .iter()
+                    .any(|s| s.id.device == device && s.device_hidden)
+                    .write(),
+            );
+        }
+        groups.push(RawValue::Map(fields));
     }
     let s = &layout.settings;
     let value = dto::LayoutValue::from_raw(
@@ -207,6 +264,45 @@ pub fn owner_preferences(
         speed_mode,
         screens,
     })
+}
+
+/// Seed one device's legacy owner visibility into the shared layout. The
+/// caller invokes this only when that device has no key7 record; later starts
+/// and later peers never rewrite an existing global value.
+pub fn seed_owner_visibility(
+    raw: &mut RawMap,
+    device: DeviceId,
+    owner: &oink_display::layout::OwnerLayoutPreferences,
+) -> v1::Result<()> {
+    let value = dto::LayoutValue::from_raw(raw.clone())?;
+    let mut groups = value.devices()?.0;
+    for group in &mut groups {
+        if native_device(&group.device()?)? != device {
+            continue;
+        }
+        let mut fields = group.raw().clone();
+        fields.entry(5).or_insert_with(|| (!owner.screen_shared).write());
+        let screens = group
+            .screens()?
+            .0
+            .into_iter()
+            .map(|screen| {
+                let mut fields = screen.raw().clone();
+                let enabled = owner
+                    .screens
+                    .get(&screen.id()?.display()?.0)
+                    .is_none_or(|preference| preference.enabled);
+                fields.entry(11).or_insert_with(|| (!enabled).write());
+                Ok(RawValue::Map(fields))
+            })
+            .collect::<v1::Result<Vec<_>>>()?;
+        fields.insert(4, RawValue::Array(screens));
+        *group = dto::DevicePlacement::from_raw(fields)?;
+    }
+    let mut root = value.into_raw();
+    root.insert(1, RawValue::Array(groups.iter().map(WireValue::write).collect()));
+    *raw = root;
+    Ok(())
 }
 pub(crate) fn same_screen(a: &dto::ScreenId, b: &dto::ScreenId) -> v1::Result<bool> {
     Ok(a.device()?.ordering_key()? == b.device()?.ordering_key()? && a.display()? == b.display()?)
@@ -342,6 +438,11 @@ pub fn sync_local_displays(
         }
         raw.insert(2, origin);
         raw.insert(3, groups[i].scale()?.write());
+        if groups[i].raw().contains_key(&5) {
+            raw.insert(5, groups[i].hidden()?.write());
+        } else {
+            raw.remove(&5);
+        }
     }
     let mut records = Vec::new();
     for screen in group.screens()?.0.into_iter().filter(|_| !displays.is_empty()) {
@@ -415,7 +516,7 @@ pub fn patch(current: &mut RawMap, before: &dto::LayoutValue, after: &dto::Layou
         if let Some(next) = next {
             let mut raw = group.raw().clone();
             if let Some(prior) = prior {
-                fields(&mut raw, prior.raw(), next.raw(), &[2, 3]);
+                fields(&mut raw, prior.raw(), next.raw(), &[2, 3, 5]);
             }
             let old_screens = group.screens()?.0;
             let screens = next
@@ -615,6 +716,40 @@ mod tests {
         (device, to_wire(&layout, dto::LayoutSource::Manual).unwrap())
     }
     #[test]
+    fn device_exclusion_roundtrips_and_survives_empty_group_and_new_screen() {
+        let (device, wire) = fixture();
+        let mut layout = from_wire(&wire).unwrap();
+        for s in &mut layout.screens {
+            s.device_hidden = true;
+            s.device_visibility_known = true;
+        }
+        let hidden = to_wire(&layout, dto::LayoutSource::Manual).unwrap();
+        assert!(hidden.devices().unwrap().0[0].hidden().unwrap());
+        let removed = sync_local_displays(&hidden, device, &[device], &[], &Default::default(), 1).unwrap();
+        assert!(removed.layout.devices().unwrap().0[0].hidden().unwrap());
+        let restored = sync_local_displays(
+            &removed.layout,
+            device,
+            &[device],
+            &[display("a", 0., 0.), display("new", 1000., 0.)],
+            &removed.detached,
+            2,
+        )
+        .unwrap();
+        let observed = from_wire(&restored.layout).unwrap();
+        assert_eq!(observed.screens.len(), 2);
+        assert!(observed.screens.iter().all(|s| s.device_hidden));
+        assert!(
+            to_wire(&observed, dto::LayoutSource::Manual)
+                .unwrap()
+                .devices()
+                .unwrap()
+                .0[0]
+                .hidden()
+                .unwrap()
+        );
+    }
+    #[test]
     fn native_refresh_preserves_exact_stored_origin_when_first_screen_has_negative_bounds() {
         let (device, wire) = fixture();
         let mut groups = wire.devices().unwrap().0;
@@ -739,6 +874,33 @@ mod tests {
         assert_eq!(expanded.device_transform(b).unwrap().0, Point::new(0.0, -600.0));
         assert!(expanded.overlaps().is_empty());
     }
+    #[test]
+    fn primary_origin_rebase_preserves_persisted_canvas_anchor() {
+        let (device, value) = fixture();
+        let before = from_wire(&value).unwrap();
+        let mut a = display("a", 1000., -100.);
+        let mut b = display("b", 0., 0.);
+        a.is_primary = false;
+        b.is_primary = true;
+        let update = sync_local_displays(
+            &value,
+            device,
+            &[device],
+            &[a.clone(), b.clone()],
+            &Default::default(),
+            1,
+        )
+        .unwrap();
+        let after = from_wire(&update.layout).unwrap();
+        for screen in before.screens {
+            let actual = after.screen(&screen.id).unwrap();
+            assert!((actual.rect.x - screen.rect.x).abs() < 1e-12);
+            assert!((actual.rect.y - screen.rect.y).abs() < 1e-12);
+        }
+        let repeated = sync_local_displays(&update.layout, device, &[device], &[a, b], &update.detached, 2).unwrap();
+        assert!(!repeated.changed);
+    }
+
     #[test]
     fn live_native_rearrangement_keeps_native_origin_and_one_scale() {
         let (device, value) = fixture();

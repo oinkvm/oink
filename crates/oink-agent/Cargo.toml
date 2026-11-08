@@ -12,6 +12,7 @@ repository.workspace = true
 sparkle = []
 
 [dependencies]
+zeroize = "1.8"
 oink-update = { path = "../oink-update" }
 oink-foundation.workspace = true
 oink-telemetry.workspace = true
@@ -36,7 +37,7 @@ crossbeam-channel = "0.5"
 arc-swap = "1.7"
 tempfile = "3"
 flate2 = "1.1"
-time = { version = "0.3", features = ["formatting", "parsing"] }
+time = { version = "0.3", features = ["formatting", "parsing", "macros", "local-offset"] }
 zip = { version = "9.0", default-features = false, features = ["deflate"] }
 serde.workspace = true
 serde_path_to_error = "0.1"

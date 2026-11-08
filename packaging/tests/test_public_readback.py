@@ -102,4 +102,27 @@ class ReadbackTests(unittest.TestCase):
         elapsed,_=self.run_case(responses,{'feed.xml':None},{'feed.xml':b'candidate'})
         self.assertEqual(elapsed,5)
 
+    def test_intel_channels_require_canonical_convergence_in_same_round(self):
+        paths = [f'mac/v1/mac-2026-01/x64/{channel}/appcast.xml' for channel in ('stable', 'beta')]
+        def responses(url, t):
+            if '?' not in url and t < (5 if '/stable/' in url else 10):
+                return b'old Intel feed'
+            return b'new Intel feed'
+        elapsed, seen = self.run_case(responses, dict.fromkeys(paths, b'new Intel feed'),
+                                      dict.fromkeys(paths, b'old Intel feed'))
+        self.assertEqual(elapsed, 10)
+        for path in paths:
+            self.assertEqual(seen.count(feed.BASE + path), 3)
+
+    def test_first_intel_publication_can_converge_from_known_absence(self):
+        import urllib.error
+        path = 'mac/v1/mac-2026-01/x64/stable/appcast.xml'
+        def responses(url, t):
+            if t < 5:
+                raise urllib.error.HTTPError(url, 404, 'Not Found', {}, None)
+            return b'new Intel feed'
+        elapsed, seen = self.run_case(responses, {path: b'new Intel feed'}, {path: None})
+        self.assertEqual(elapsed, 5)
+        self.assertEqual(seen.count(feed.BASE + path), 2)
+
 if __name__=='__main__':unittest.main()

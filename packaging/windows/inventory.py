@@ -1,29 +1,21 @@
-"""Build gate for the immutable Windows updater shipped in Oink 0.2.2.
-
-Both public 67c272655 and main-derived 8c07d26ba enforce this same allow-list.
-The current service accepts more resources, but cannot change those readers.
-"""
+"""Validate incoming MSI paths using the product-root policy used since 0.3.0."""
 import re
-
-FILES = {
-    'oink.exe', 'oink-agent.exe', 'oink-service.exe', 'oink-update-worker.exe',
-    'oink-crash-collector.exe', 'installed.json', 'oink-build.json',
-    'report-manifest.json', 'third-party-licenses.json', 'THIRD_PARTY_LICENSES.md',
-    'NOTICE', 'LICENSE', 'LICENSE-ADDITIONAL-TERMS.md',
-    'AudioPlugin/VBCABLE_Driver_Pack45.zip',
-}
 
 
 def relative_file(directory, name, directories):
+    if '/' in name:
+        raise ValueError('embedded file separator')
     parts, seen = [name], set()
     while directory != 'INSTALLFOLDER':
         if directory in seen or directory not in directories:
             raise ValueError('file is outside INSTALLFOLDER or has cyclic ancestry')
         seen.add(directory)
         directory, part = directories[directory]
+        if '/' in part:
+            raise ValueError('embedded directory separator')
         parts.append(part)
     path = '/'.join(reversed(parts))
-    # Match 0.2.2 package::validate_path, including its installed.json exception.
+    # Match the supported inspector: exact receipt exception, case-folded reserved paths.
     if path != 'installed.json':
         if not path or len(path) > 240 or not path.isascii() or '\\' in path or ':' in path:
             raise ValueError('invalid resource path')
@@ -33,21 +25,19 @@ def relative_file(directory, name, directories):
                     or part.endswith(('.', ' ')) or stem in ('CON', 'PRN', 'AUX', 'NUL')
                     or re.fullmatch(r'(COM|LPT)[1-9]', stem)):
                 raise ValueError('invalid resource component')
-        if path == 'files.json' or path.startswith('maintenance/'):
+        if path.lower() in ('files.json','installed.json','maintenance') or path.lower().startswith('maintenance/'):
             raise ValueError('reserved resource path')
-    if path not in FILES and not path.startswith('licenses/'):
-        raise ValueError('path not admitted by the shipped 0.2.2 updater')
     return path
 
 
 def verify_file_table(tables):
     """Inspect actual MSI File/Component/Directory rows, never source filenames."""
-    # Shipped 0.2.2 updaters reject the WHOLE package on any unlisted File row.
-    # Keep this gate even though today's service validator is directory-based.
+    # Keep extraction below INSTALLFOLDER; authenticated future resource names
+    # are intentionally not constrained by the installed version's inventory.
     directories = {row[0]: (row[1], row[2].split('|')[-1])
                    for row in tables['Directory']}
     components = {row[0]: row[2] for row in tables['Component']}
-    if not tables['File']:
+    if not tables['File'] or len(tables['File']) > 4096:
         raise RuntimeError('MSI contains no File rows')
     paths, errors = [], []
     for row in tables['File']:
@@ -56,5 +46,7 @@ def verify_file_table(tables):
         except (KeyError, ValueError) as error:
             errors.append(f'{row[0]} ({row[2]}): {error}')
     if errors:
-        raise RuntimeError('MSI is incompatible with shipped 0.2.2 updaters: ' + '; '.join(errors))
+        raise RuntimeError('Invalid MSI product-root inventory: ' + '; '.join(errors))
+    if len(set(path.lower() for path in paths)) != len(paths):
+        raise RuntimeError('Duplicate case-insensitive MSI path')
     return paths

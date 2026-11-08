@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
 """Compile both release Swift entry points and optionally run pure provider tests."""
 import argparse
+import platform
 from pathlib import Path
 import tempfile
-from build import I, ROOT, run, write_swift_identity, compile_provider_extension
+from build import I, ROOT, run, write_swift_identity, compile_provider_extension, compile_finder_extension, compile_paste_helper
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--test', action='store_true')
+    p.add_argument('--arch', choices=['arm64', 'x86_64'], default=platform.machine())
     args = p.parse_args()
     with tempfile.TemporaryDirectory(prefix='oink-swift-') as temporary:
         tmp = Path(temporary)
         generated = tmp / 'ReleaseIdentity.swift'
         write_swift_identity(generated)
         common = ['xcrun', 'swiftc', '-swift-version', '5', '-parse-as-library', '-D', 'OINK_RELEASE',
-                  '-target', f'arm64-apple-macos{I["macos_minimum"]}']
+                  '-target', f'{args.arch}-apple-macos{I["macos_minimum"]}']
+        compile_finder_extension(common, tmp / 'finder-extension')
+        compile_paste_helper(common, tmp / 'paste-helper')
         shared = [generated, ROOT / 'apps/file-provider/Shared.swift',
                   ROOT / 'apps/file-provider/Upgrade.swift', ROOT / 'apps/file-provider/ContainerCleanup.swift']
         for entry in ['Extension.swift', 'Manager.swift']:
             flags = (['-application-extension', ROOT / 'apps/file-provider/ReportCapture.swift']
                      if entry == 'Extension.swift' else [ROOT / 'apps/file-provider/Uninstall.swift', ROOT / 'apps/file-provider/NativeReceived.swift'])
             run(*common, '-typecheck', *shared, *flags, ROOT / 'apps/file-provider' / entry)
-        run('xcrun', 'clang', '-O2', '-std=c11', '-target', f'arm64-apple-macos{I["macos_minimum"]}',
+        run('xcrun', 'clang', '-O2', '-std=c11', '-target', f'{args.arch}-apple-macos{I["macos_minimum"]}',
             '-c', ROOT / 'apps/file-provider/CrashCapture.c', '-o', tmp / 'crash-capture.o')
         # Exercise the release link, including its bootstrap, rather than only
         # typechecking callbacks. ExtensionKit reads __swift5_entry and calls
@@ -38,6 +42,12 @@ def main():
         if '_OinkFileProviderMain' not in symbols:
             raise RuntimeError('File Provider bootstrap entry is missing from the release image')
         if args.test:
+            run(*common, ROOT / 'apps/finder-sync/Request.swift', ROOT / 'apps/finder-sync/RequestTests.swift',
+                '-o', tmp / 'paste-request-tests')
+            run(tmp / 'paste-request-tests')
+            run(*common, ROOT / 'apps/finder-sync/Request.swift', ROOT / 'apps/finder-sync/Extension.swift',
+                ROOT / 'apps/finder-sync/MenuIconTests.swift', '-o', tmp / 'paste-menu-icon-tests')
+            run(tmp / 'paste-menu-icon-tests')
             for entry in ['UpgradeTests.swift', 'Tests.swift', 'EnumeratorTests.swift', 'UninstallTests.swift', 'ReceivedTests.swift', 'NativeReceivedTests.swift']:
                 extension = [ROOT / 'apps/file-provider/Extension.swift', ROOT / 'apps/file-provider/ReportCapture.swift',
                              tmp / 'crash-capture.o'] if entry == 'EnumeratorTests.swift' else []

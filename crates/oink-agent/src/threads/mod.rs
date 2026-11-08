@@ -26,6 +26,20 @@ use oink_routing::{DndCmd, Output};
 /// the next event.
 #[derive(Debug)]
 pub enum MainCommand {
+    UnlockQuery {
+        peer: oink_foundation::DeviceId,
+        stream: oink_network::link::StreamId,
+        epoch: u64,
+    },
+    UnlockAttempt {
+        epoch: u64,
+        source: oink_foundation::DeviceId,
+        initial_input_age_ms: Option<u32>,
+    },
+    UnlockRemoteInput {
+        source: oink_foundation::DeviceId,
+        age_ms: u32,
+    },
     InputStatusChanged,
     /// Ordinary shutdown nudge; trace queues use the shared park notification.
     Wake,

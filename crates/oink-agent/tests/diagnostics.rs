@@ -149,21 +149,40 @@ fn each_member_exports_its_current_runtime_environment_without_a_local_save() {
             for round in 0..2 {
                 let excluded = b.id();
                 let expected_version = a.link_config().unwrap().applied().version.clone();
+                let owner_screen_shared = a
+                    .link_config()
+                    .unwrap()
+                    .applied()
+                    .owners
+                    .get(&excluded)
+                    .map(|preferences| preferences.screen_shared);
                 call(&a, move |n| n.set_screen_disabled(excluded.into(), round == 0))
                     .await
                     .unwrap();
-                wait("current screen owner preference", || {
+                wait("current shared layout visibility", || {
                     [&a, &b, &c].iter().all(|n| {
                         n.link_config()
                             .unwrap()
                             .applied()
-                            .owners
-                            .get(&excluded)
-                            .is_some_and(|p| p.screen_shared == (round != 0))
+                            .layout
+                            .screens
+                            .iter()
+                            .filter(|screen| screen.id.device == excluded)
+                            .all(|screen| screen.device_hidden == (round == 0))
                     })
                 })
                 .await;
-                assert_eq!(a.link_config().unwrap().applied().version, expected_version);
+                assert_ne!(a.link_config().unwrap().applied().version, expected_version);
+                assert_eq!(
+                    a.link_config()
+                        .unwrap()
+                        .applied()
+                        .owners
+                        .get(&excluded)
+                        .map(|preferences| preferences.screen_shared),
+                    owner_screen_shared,
+                    "global visibility edit must not rewrite the owner preference"
+                );
                 for (index, node) in [&a, &b, &c].into_iter().enumerate() {
                     call(node, move |n| {
                         let mut settings = n.input_settings().unwrap();

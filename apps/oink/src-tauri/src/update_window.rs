@@ -3,8 +3,14 @@
 /// Decode inside the command boundary so rejected updater arguments have a
 /// logged, typed receipt instead of Tauri's unstructured argument-error string.
 pub(crate) fn decode(request: serde_json::Value) -> Result<oink_agent::api::Request, oink_agent::api::ApiError> {
+    let sensitive = request.get("method").and_then(|value| value.as_str()) == Some("save_auto_unlock");
     let updating = request.get("method").and_then(|value| value.as_str()) == Some("update");
     serde_json::from_value(request).map_err(|error| {
+        if sensitive {
+            return oink_agent::api::ApiError::InvalidArgument {
+                message: "invalid password request".into(),
+            };
+        }
         tracing::warn!(step = "request_decode", %error, "API request rejected");
         if updating {
             oink_agent::api::ApiError::UpdateFailed {
@@ -59,6 +65,15 @@ impl Owner {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    #[test]
+    fn invalid_password_requests_never_echo_the_submitted_value() {
+        let error = decode(
+            serde_json::json!({"method":"save_auto_unlock","params":{"password":{"synthetic-only-secret":true}}}),
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "invalid password request");
+        assert!(!format!("{error:?}").contains("synthetic-only-secret"));
+    }
     #[test]
     fn install_arguments_decode_before_any_window_or_backend_action() {
         use oink_agent::api::{ApiError, Request, UpdateCommand, UpdateError};

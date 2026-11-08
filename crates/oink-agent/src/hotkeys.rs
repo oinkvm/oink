@@ -16,19 +16,20 @@ pub(crate) fn configured(saved: Option<Vec<Hotkey>>) -> Vec<Hotkey> {
     saved.unwrap_or_else(crate::agent_api::default_hotkeys)
 }
 
-/// Slot indices 0..9 correspond to digits 1..9,0. OFF has no assigned key.
+/// The retained slots order members across peers; local chord occupancy
+/// determines whether a default is available.
+/// Chords are assigned only in `effective`, after reserving local choices.
 fn defaults(slots: &BTreeMap<DeviceId, Option<u8>>) -> Vec<Hotkey> {
     let mut slots = slots.iter().collect::<Vec<_>>();
     slots.sort_by_key(|(device, slot)| (slot.unwrap_or(10), **device));
     slots
         .into_iter()
-        .map(|(device, slot)| Hotkey {
+        .map(|(device, _slot)| Hotkey {
             action: HotkeyAction::MovePointerTo,
             device: Some((*device).into()),
-            enabled: slot.is_some(),
-            keys: slot
-                .map(|s| vec!["Ctrl".into(), "Alt".into(), ((s + 1) % 10).to_string()])
-                .unwrap_or_default(),
+            profile: None,
+            enabled: true,
+            keys: Vec::new(),
         })
         .collect()
 }
@@ -37,6 +38,11 @@ fn action_name(h: &Hotkey) -> String {
         && let Some(device) = h.device
     {
         return format!("move_pointer_to:{}", device.0.to_hex());
+    }
+    if h.action == HotkeyAction::SwitchLayout
+        && let Some(profile) = &h.profile
+    {
+        return format!("switch_layout:{profile}");
     }
     h.action.as_str().into()
 }
@@ -63,14 +69,37 @@ pub(crate) fn effective(saved: Option<Vec<Hotkey>>, slots: &BTreeMap<DeviceId, O
         .filter(|h| h.action != HotkeyAction::MovePointerTo)
         .cloned()
         .collect();
-    for default in defaults(slots) {
-        list.push(
-            saved
-                .iter()
-                .find(|h| h.action == default.action && h.device == default.device)
-                .cloned()
-                .unwrap_or(default),
-        );
+    let defaults = defaults(slots);
+    // Local overrides survive group merges, whose retained slot register can
+    // have a different numbering. Reserve active overrides before assigning any
+    // projected default; departed-device overrides must not consume digits.
+    let mut used: Vec<_> = saved
+        .iter()
+        .filter(|h| {
+            h.action != HotkeyAction::LockEscape
+                && (h.action != HotkeyAction::MovePointerTo || defaults.iter().any(|d| d.device == h.device))
+        })
+        .filter_map(|h| Chord::parse(&h.keys).ok())
+        .collect();
+    for mut default in defaults {
+        if let Some(custom) = saved
+            .iter()
+            .find(|h| h.action == default.action && h.device == default.device)
+        {
+            list.push(custom.clone());
+            continue;
+        }
+        if default.enabled {
+            default.keys = (0..10)
+                .map(|slot| vec!["Ctrl".into(), "Alt".into(), ((slot + 1) % 10).to_string()])
+                .find(|keys| !used.contains(&Chord::parse(keys).expect("valid digit chord")))
+                .unwrap_or_default();
+            default.enabled = !default.keys.is_empty();
+            if default.enabled {
+                used.push(Chord::parse(&default.keys).expect("valid assigned chord"));
+            }
+        }
+        list.push(default);
     }
     list
 }
@@ -82,37 +111,39 @@ pub(crate) fn save_overrides(
     slots: &BTreeMap<DeviceId, Option<u8>>,
 ) -> Vec<Hotkey> {
     let saved = configured(saved);
-    let defaults = defaults(slots);
-    let mut out: Vec<_> = incoming
-        .iter()
-        .filter(|h| h.action != HotkeyAction::MovePointerTo)
-        .cloned()
-        .collect();
-    out.extend(
-        saved
-            .iter()
-            .filter(|h| {
-                h.action == HotkeyAction::MovePointerTo
-                    && !incoming.iter().any(|i| i.action == h.action && i.device == h.device)
-            })
-            .cloned(),
-    );
-    out.extend(
-        incoming
-            .iter()
-            .filter(|h| {
-                h.action == HotkeyAction::MovePointerTo
-                    && (saved.iter().any(|old| old.action == h.action && old.device == h.device)
-                        || !defaults.contains(h))
-            })
-            .cloned(),
-    );
+    let defaults = effective(Some(saved.clone()), slots);
+    let mut out = Vec::new();
+    let mut push = |hotkey: &Hotkey| {
+        if !out.contains(hotkey) {
+            out.push(hotkey.clone());
+        }
+    };
+    for hotkey in incoming.iter().filter(|h| h.action != HotkeyAction::MovePointerTo) {
+        push(hotkey);
+    }
+    for hotkey in saved.iter().filter(|h| {
+        h.action == HotkeyAction::MovePointerTo
+            && !incoming.iter().any(|i| i.action == h.action && i.device == h.device)
+    }) {
+        push(hotkey);
+    }
+    for hotkey in incoming.iter().filter(|h| {
+        h.action == HotkeyAction::MovePointerTo
+            && (saved.iter().any(|old| old.action == h.action && old.device == h.device) || !defaults.contains(h))
+    }) {
+        push(hotkey);
+    }
     out
 }
 
 /// 保存前检查：启用的快捷键键名有效、互不相同。
 pub(crate) fn validate(list: &[Hotkey]) -> Result<(), String> {
     for h in list {
+        if (h.action == HotkeyAction::SwitchLayout) != h.profile.is_some()
+            || h.profile.as_ref().is_some_and(|id| id.is_empty())
+        {
+            return Err("Layout shortcuts require a target profile".into());
+        }
         if (h.action == HotkeyAction::MovePointerTo) != h.device.is_some() {
             return Err("Move-pointer shortcuts require a target device".into());
         }
@@ -140,8 +171,30 @@ pub(crate) fn validate(list: &[Hotkey]) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate only edited assignments. Pre-existing conflicts must not veto
+/// an unrelated shortcut edit or a preference patch. Disabled assignments also
+/// reserve their chord, matching the recorder's conflict checks.
+pub(crate) fn validate_edits(list: &[Hotkey], previous: &[Hotkey]) -> Result<(), String> {
+    for h in list.iter().filter(|h| !previous.contains(h)) {
+        validate(std::slice::from_ref(h))?;
+        if h.keys.is_empty() {
+            continue;
+        }
+        let Ok(chord) = Chord::parse(&h.keys) else {
+            continue;
+        };
+        if let Some(other) = list
+            .iter()
+            .find(|other| *other != h && Chord::parse(&other.keys).ok() == Some(chord))
+        {
+            return Err(format!("hotkey_conflict:{}", action_name(other)));
+        }
+    }
+    Ok(())
+}
+
 /// 启用且键名有效的快捷键 → 路由的绑定。无效的（键名无法识别、与紧急暂停相同）记 warn 并跳过；
-/// 两条相同的组合键只保留第一条（界面与 API 都会拒绝保存这种设置）。
+/// 两条相同的组合键只保留第一条；显式编辑快捷键时会拒绝冲突，既存冲突不阻塞其他设置。
 pub(crate) fn bindings(list: &[Hotkey]) -> Vec<HotkeyBinding> {
     let mut out: Vec<HotkeyBinding> = Vec::new();
     for h in list.iter().filter(|h| h.enabled && !h.keys.is_empty()) {
@@ -193,12 +246,40 @@ impl Node {
         effective(self.settings().hotkeys, &slots)
     }
 
+    pub(crate) fn prune_profile_hotkeys(&self, ids: &[String]) -> crate::layout_profiles::types::Result<()> {
+        let is_stale = |h: &Hotkey| {
+            h.action == HotkeyAction::SwitchLayout && !h.profile.as_ref().is_some_and(|id| ids.contains(id))
+        };
+        if !self
+            .settings()
+            .hotkeys
+            .as_ref()
+            .is_some_and(|list| list.iter().any(is_stale))
+        {
+            return Ok(());
+        }
+        self.update_settings(|s| {
+            if let Some(list) = &mut s.hotkeys {
+                list.retain(|h| !is_stale(h));
+            }
+        })
+        .map_err(crate::layout_profiles::state::unavailable)?;
+        self.apply_hotkeys(&self.effective_hotkeys());
+        self.emit(ApiEvent::InputSettings(crate::agent_api::input_settings(self)));
+        Ok(())
+    }
+
     /// 把快捷键交给路由（启动时、设置变化时），立即生效。
     pub(crate) fn apply_hotkeys(&self, list: &[Hotkey]) {
-        let b = bindings(list);
-        tracing::debug!(count = b.len(), "hotkeys applied");
         if let Ok(input) = self.input_thread() {
+            let mut applied = crate::node::lock(&self.inner.applied_hotkeys);
+            if applied.as_deref() == Some(list) {
+                return;
+            }
+            let b = bindings(list);
+            tracing::debug!(count = b.len(), "hotkeys applied");
             input.send(crate::threads::input::InputCommand::Hotkeys(b));
+            *applied = Some(list.to_vec());
         }
     }
 
@@ -244,6 +325,28 @@ impl Node {
 
     /// 路由识别到了本机键盘上的快捷键。
     pub(crate) fn on_hotkey(&self, action: &str) {
+        if let Some(profile_id) = action.strip_prefix("switch_layout:") {
+            let result = self.profile_snapshot().map(|state| {
+                // The menu ignores selection of the active layout.
+                if state.active_profile_id.as_deref() == Some(profile_id) {
+                    return;
+                }
+                let reply = self.layout_profile_command(crate::layout_profiles::types::Command::Load(
+                    crate::layout_profiles::types::Load {
+                        request_id: crate::device_controls::runtime::fresh_request_id(),
+                        expected_token: state.token,
+                        profile_id: profile_id.into(),
+                    },
+                ));
+                if reply.get("error").is_some() {
+                    tracing::warn!(?reply, "layout hotkey load refused");
+                }
+            });
+            if let Err(error) = result {
+                tracing::warn!(?error, "layout hotkey failed");
+            }
+            return;
+        }
         if action.starts_with("move_pointer_to:") {
             if let Some(target) = self
                 .effective_hotkeys()
@@ -261,7 +364,7 @@ impl Node {
             return;
         };
         let r = match action {
-            HotkeyAction::MovePointerTo | HotkeyAction::LockEscape => Ok(()),
+            HotkeyAction::MovePointerTo | HotkeyAction::SwitchLayout | HotkeyAction::LockEscape => Ok(()),
             HotkeyAction::LockRemoteWindows => Ok(()), // Router captured and dispatched the exact target.
             HotkeyAction::LockFocus => {
                 // The router already requested the toggle at physical key-down,
@@ -315,6 +418,140 @@ impl Node {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+    #[test]
+    fn mouse_hotkeys_validate_all_actions_and_reserve_disabled_duplicates() {
+        for name in ["Mouse3", "Mouse4", "Mouse5"] {
+            for keys in [vec![name], vec!["Ctrl", name]] {
+                let global = hk(HotkeyAction::OpenWindow, &keys, true);
+                assert!(validate(std::slice::from_ref(&global)).is_ok());
+                let mut device = hk(HotkeyAction::MovePointerTo, &keys, true);
+                device.device = Some(DeviceId([1; 32]).into());
+                let mut layout = hk(HotkeyAction::SwitchLayout, &keys, false);
+                layout.profile = Some("profile".into());
+                assert!(validate(std::slice::from_ref(&device)).is_ok());
+                assert!(validate_edits(&[global.clone(), layout.clone()], &[layout]).is_err());
+                assert!(validate(&[global, device]).is_err());
+                assert_eq!(bindings(&[hk(HotkeyAction::OpenWindow, &keys, true)]).len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn layout_targets_are_local_opt_in_and_clearing_removes_the_override() {
+        assert!(
+            !effective(None, &BTreeMap::new())
+                .iter()
+                .any(|h| h.action == HotkeyAction::SwitchLayout)
+        );
+        let mut h = hk(HotkeyAction::SwitchLayout, &["Ctrl", "Shift", "F9"], true);
+        assert!(validate(std::slice::from_ref(&h)).is_err());
+        h.profile = Some("desk".into());
+        assert!(validate(std::slice::from_ref(&h)).is_ok());
+        let encoded = serde_json::to_value(&h).unwrap();
+        assert_eq!(serde_json::from_value::<Hotkey>(encoded).unwrap(), h);
+        let mut list = effective(Some(vec![h.clone()]), &BTreeMap::new());
+        list.retain(|entry| entry.action != HotkeyAction::SwitchLayout);
+        assert!(
+            !save_overrides(&list, Some(vec![h]), &BTreeMap::new())
+                .iter()
+                .any(|h| h.action == HotkeyAction::SwitchLayout)
+        );
+    }
+
+    #[test]
+    fn saving_recorded_layout_shortcuts_removes_exact_duplicate_entries() {
+        let mut layout = hk(HotkeyAction::SwitchLayout, &["Ctrl", "Alt", "F9"], true);
+        layout.profile = Some("desk".into());
+        let saved = save_overrides(
+            &[layout.clone(), layout.clone()],
+            Some(vec![layout.clone()]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(saved, vec![layout]);
+    }
+
+    #[test]
+    fn profile_binding_keeps_target_and_checks_only_new_edits() {
+        let mut profile = hk(HotkeyAction::SwitchLayout, &["Ctrl", "Shift", "F9"], true);
+        profile.profile = Some("work".into());
+        assert_eq!(bindings(std::slice::from_ref(&profile))[0].action, "switch_layout:work");
+        let broken = vec![
+            hk(HotkeyAction::OpenWindow, &["Ctrl", "A"], true),
+            hk(HotkeyAction::LockFocus, &["Ctrl", "A"], true),
+        ];
+        let mut next = broken.clone();
+        next.push(profile.clone());
+        assert!(validate_edits(&next, &broken).is_ok());
+        profile.keys = vec!["Ctrl".into(), "A".into()];
+        next.pop();
+        next.push(profile);
+        assert!(validate_edits(&next, &broken).is_err());
+    }
+
+    #[test]
+    fn exhausted_digits_leave_no_default_and_projection_is_not_saved() {
+        let device = DeviceId([1; 32]);
+        let slots = [(device, Some(0))].into();
+        let mut saved = Vec::new();
+        for digit in ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"] {
+            saved.push(hk(HotkeyAction::OpenWindow, &["Alt", "Ctrl", digit], false));
+        }
+        let list = effective(Some(saved.clone()), &slots);
+        let default = list.iter().find(|h| h.device.is_some()).unwrap();
+        assert!(!default.enabled);
+        assert!(default.keys.is_empty());
+        assert!(
+            save_overrides(&list, Some(saved.clone()), &slots)
+                .iter()
+                .all(|h| h.device.is_none())
+        );
+        saved.pop();
+        let list = effective(Some(saved), &slots);
+        assert_eq!(
+            list.iter().find(|h| h.device.is_some()).unwrap().keys,
+            ["Ctrl", "Alt", "0"]
+        );
+    }
+
+    #[test]
+    fn fourth_member_gets_first_free_digit_across_all_actions() {
+        let devices = [
+            DeviceId([1; 32]),
+            DeviceId([2; 32]),
+            DeviceId([3; 32]),
+            DeviceId([4; 32]),
+        ];
+        let slots = devices.iter().enumerate().map(|(i, d)| (*d, Some(i as u8))).collect();
+        let mut saved = Vec::new();
+        for (device, key) in devices[..3].iter().zip(["1", "8", "9"]) {
+            let mut h = hk(HotkeyAction::MovePointerTo, &["Ctrl", "Alt", key], true);
+            h.device = Some((*device).into());
+            saved.push(h);
+        }
+        saved.push(hk(HotkeyAction::OpenWindow, &["Ctrl", "Alt", "2"], false));
+        let list = effective(Some(saved), &slots);
+        assert_eq!(
+            list.iter().find(|h| h.device == Some(devices[3].into())).unwrap().keys,
+            ["Ctrl", "Alt", "3"]
+        );
+        assert!(validate(&list).is_ok());
+    }
+
+    #[test]
+    fn new_member_default_does_not_collide_with_saved_member_override() {
+        let a = DeviceId([1; 32]);
+        let b = DeviceId([2; 32]);
+        let mut old = hk(HotkeyAction::MovePointerTo, &["Ctrl", "Alt", "1"], true);
+        old.device = Some(b.into());
+        let list = effective(Some(vec![old.clone()]), &[(a, Some(0)), (b, Some(1))].into());
+        assert!(validate(&list).is_ok());
+        assert_eq!(list.iter().find(|h| h.device == old.device), Some(&old));
+        assert_eq!(
+            list.iter().find(|h| h.device == Some(a.into())).unwrap().keys,
+            ["Ctrl", "Alt", "2"]
+        );
+    }
+
     #[test]
     fn open_window_defaults_off_and_preserves_customization() {
         let defaults = effective(None, &BTreeMap::new());
@@ -399,6 +636,7 @@ mod tests {
         Hotkey {
             action,
             device: None,
+            profile: None,
             keys: keys.iter().map(|s| s.to_string()).collect(),
             enabled,
         }
@@ -469,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_include_local_and_off_without_persisting_unedited_keys() {
+    fn defaults_include_local_without_persisting_unedited_keys() {
         let a = DeviceId([1; 32]);
         let b = DeviceId([2; 32]);
         let c = DeviceId([3; 32]);
@@ -480,15 +718,16 @@ mod tests {
             .filter(|h| h.action == HotkeyAction::MovePointerTo)
             .collect();
         assert_eq!(devices[0].keys, ["Ctrl", "Alt", "1"]);
-        assert_eq!(devices[1].keys, ["Ctrl", "Alt", "0"]);
-        assert!(!devices[2].enabled);
-        assert!(devices[2].keys.is_empty());
+        assert_eq!(devices[1].keys, ["Ctrl", "Alt", "2"]);
+        // A group overflow marker cannot veto a digit freed by local choices.
+        assert!(devices[2].enabled);
+        assert_eq!(devices[2].keys, ["Ctrl", "Alt", "3"]);
         assert_eq!(
             bindings(&effective)
                 .iter()
                 .filter(|b| b.action.starts_with("move_pointer_to:"))
                 .count(),
-            2
+            3
         );
         assert!(
             save_overrides(&effective, None, &slots)
@@ -526,11 +765,11 @@ mod tests {
     }
 
     #[test]
-    fn device_defaults_use_the_existing_conflict_validation() {
+    fn device_defaults_avoid_other_action_overrides() {
         let a = DeviceId([1; 32]);
         let slots = [(a, Some(0))].into();
         let saved = vec![hk(HotkeyAction::LockFocus, &["Alt", "Ctrl", "1"], true)];
-        assert!(validate(&effective(Some(saved), &slots)).is_err());
+        assert!(validate(&effective(Some(saved), &slots)).is_ok());
     }
 
     #[test]

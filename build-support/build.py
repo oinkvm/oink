@@ -16,7 +16,7 @@ from update_qualification import origin as test_origin, verify_binaries
 
 ROOT = Path(__file__).resolve().parents[1]
 IDENTITY = json.loads((ROOT / 'packaging/identity.json').read_text())
-TARGETS = ('aarch64-apple-darwin', 'x86_64-pc-windows-msvc')
+TARGETS = ('aarch64-apple-darwin', 'x86_64-pc-windows-msvc', 'x86_64-apple-darwin')
 
 
 def run(*args, **kwargs):
@@ -103,9 +103,9 @@ def main():
     flags += [f'--remap-path-prefix={ROOT}=oink', f'--remap-path-prefix={cargo_home}=cargo']
     # Opus C assertions retain __FILE__ at runtime. Rust's path remapping does
     # not affect native C/C++; MSVC pathmap requires deterministic compilation.
-    native = [] if a.target == TARGETS[0] else ['/experimental:deterministic']
+    native = [] if a.target.endswith('-apple-darwin') else ['/experimental:deterministic']
     for directory, logical in ((ROOT, 'oink'), (cargo_home, 'cargo')):
-        native.append(f'-ffile-prefix-map={directory}={logical}' if a.target == TARGETS[0]
+        native.append(f'-ffile-prefix-map={directory}={logical}' if a.target.endswith('-apple-darwin')
                       else f'/pathmap:{directory}={logical}')
     environment['CC_SHELL_ESCAPED_FLAGS'] = '1'
     for name in ('CFLAGS', 'CXXFLAGS'):
@@ -119,7 +119,7 @@ def main():
     features = 'custom-protocol'
     if a.windows_update_test_feed:
         features += ',oink-winsvc/test-feed'
-    macos = a.target == TARGETS[0]
+    macos = a.target.endswith('-apple-darwin')
     if macos:
         # rustc must gather native objects while its LTO temporary directories
         # still exist; running dsymutil later loses their debug information.
@@ -163,6 +163,9 @@ def main():
     output = Path(environment.get('CARGO_TARGET_DIR', ROOT / 'target')) / a.target / 'release'
     names = [IDENTITY['binaries'][role] + ('' if macos else '.exe') for role in roles]
     if not macos:
+        from windows_credential_provider import build as build_credential_provider
+        build_credential_provider(output, environment)
+        names.append('OinkCredentialProvider.dll')
         from windows_version import set_display_version
         for name in names:
             changed = set_display_version(output / name, display_version)

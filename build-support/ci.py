@@ -63,6 +63,19 @@ def main():
             # real embedded framework loader in its mandatory signed smoke.
             subprocess.run(['cargo', 'check', '--release', '--locked', '-p', 'oink-agent', '--features', 'sparkle'],
                            cwd=ROOT, env=environment, check=True)
+            # Run the production bridge's isolated continuation/feed tests in
+            # the selected architecture (Rosetta executes x86 tests on ARM).
+            arch = {'x86_64-apple-darwin': 'x86_64', 'aarch64-apple-darwin': 'arm64'}.get(
+                environment.get('CARGO_BUILD_TARGET'), platform.machine())
+            native = Path(cache) / 'update-tests'
+            subprocess.run(['xcrun', 'clang', '-target', f'{arch}-apple-macos14.2',
+                            '-fobjc-arc', '-fblocks', '-Werror',
+                            '-F' + environment['SPARKLE_FRAMEWORK_DIR'],
+                            '-framework', 'AppKit', '-framework', 'Sparkle',
+                            '-Wl,-rpath,' + environment['SPARKLE_FRAMEWORK_DIR'],
+                            str(ROOT / 'crates/oink-agent/native/update-tests.m'), '-o', str(native)],
+                           cwd=ROOT, env=environment, check=True)
+            subprocess.run([str(native)], cwd=ROOT, env=environment, check=True)
 
 
 if __name__ == '__main__':

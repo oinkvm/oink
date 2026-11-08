@@ -92,6 +92,7 @@ struct Network {
     violations: HashMap<(Boot, Option<oink_foundation::session::PathId>), (Instant, u32, u64)>,
     started: Instant,
     core: Core,
+    send_errors: crate::qos::SendErrors,
     endpoint: quinn::Endpoint,
     #[cfg(any(target_os = "macos", test))]
     socket: Arc<udp::Socket>,
@@ -168,15 +169,16 @@ pub(super) async fn run(
             None
         }
     };
+    let send_errors = crate::qos::SendErrors::default();
     let setup = || -> Result<_, crate::NetError> {
         let (server, client) = transport(&credentials)?;
         #[cfg(any(target_os = "macos", test))]
-        let socket = udp::Socket::from_std(udp_socket, shared.wake.clone())?;
+        let socket = udp::Socket::from_std_observed(udp_socket, shared.wake.clone(), send_errors.clone())?;
         #[cfg(not(any(target_os = "macos", test)))]
         let socket = {
             let socket = udp_socket;
             crate::qos::set_service_type(&socket, crate::qos::ServiceType::Voice);
-            crate::qos::wrap_udp_socket(socket)?
+            crate::qos::wrap_udp_socket_observed(socket, send_errors.clone())?
         };
         let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
             Default::default(),
@@ -219,6 +221,7 @@ pub(super) async fn run(
         started: now,
         core: Core::new(config.boot),
         endpoint,
+        send_errors,
         #[cfg(any(target_os = "macos", test))]
         socket,
         probe_client,
@@ -280,6 +283,7 @@ pub(super) async fn run(
             }
         }
         let mut cx = Context::from_waker(&waker);
+        network.log_send_errors(began);
         network.core.tick(began);
         network.probe_tick(began);
         network.retry_n1(began);
@@ -1138,8 +1142,12 @@ impl Network {
                     let _ = reply.send(Err(AddressProbeError::Busy));
                 } else {
                     let setup = || -> Result<_, AddressProbeError> {
-                        let socket = super::probe_socket::Socket::new(address, self.shared.wake.clone())
-                            .map_err(|e| AddressProbeError::from_io(&e))?;
+                        let socket = super::probe_socket::Socket::new(
+                            address,
+                            self.shared.wake.clone(),
+                            self.send_errors.clone(),
+                        )
+                        .map_err(|e| AddressProbeError::from_io(&e))?;
                         let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
                             Default::default(),
                             None,
@@ -1436,6 +1444,9 @@ impl Network {
                 true
             }
             Ok(Delivery::Message(bytes)) => {
+                if let Some(id) = reader.id {
+                    self.core.peer_data_received(id.link, Instant::now());
+                }
                 let header = reader.header.expect("header");
                 if header.tag.kind == StreamKind::LowControl {
                     reader.pending_low = self.low_message(reader.uid, bytes);
@@ -1493,7 +1504,7 @@ impl Network {
             tracing::info!(target: "oink_link_diagnostics", kind = "connection_step", peer_id = p.peer.to_hex().as_str(),
                 operation = p.id.map(|id| diagnostics::hex(&id.random)).unwrap_or_default().as_str(),
                 stage = if waiting == "none" { "quic" } else if waiting == "instance" { "instance" } else { "selection" },
-                result = "failed", reason = "control_stream_failed", waiting, waiting_on, "Connection internal stream closed");
+                result = "failed", reason = "control_stream_failed", waiting, waiting_on, remote_address = %p.connection.remote_address(), transport_error = ?p.connection.close_reason(), transport_id = p.connection.stable_id(), "Connection internal stream closed");
         }
         let Some(connection) = self.physical.get(&uid).and_then(|p| p.id) else {
             self.remove_physical(uid);
@@ -1807,6 +1818,9 @@ impl Network {
                     .find(|r| r.uid == uid && r.header.is_some_and(|h| h.datagram_flow == flow))
                     && let Some(queue) = &reader.datagram
                 {
+                    if let Some(id) = reader.id {
+                        self.core.peer_data_received(id.link, Instant::now());
+                    }
                     if reader
                         .id
                         .and_then(|id| self.core.links.get(&id.link))
@@ -1865,6 +1879,78 @@ impl Network {
         }
         progress
     }
+    fn peer_send_bindings(&self, peer: DeviceId) -> Vec<String> {
+        self.core
+            .links
+            .values()
+            .filter(|l| l.peer.device_id == peer)
+            .map(|l| {
+                format!(
+                    "link={:?} connection={} path={:?} revision={:?} route={:?}",
+                    l.id,
+                    diagnostics::hex(&l.hop.connection_id.random),
+                    l.wire.path_id,
+                    l.wire.route_revision,
+                    l.path()
+                )
+            })
+            .collect()
+    }
+    fn log_send_errors(&self, now: Instant) {
+        // Drain before liveness decisions retire the selected binding. Quinn's
+        // driver runs between owner turns; all address matches are reported,
+        // since an OS error has no QUIC connection ID and candidates can share IPs.
+        let failures = std::mem::take(&mut *self.send_errors.lock().unwrap_or_else(|e| e.into_inner()));
+        if failures.dropped != 0 {
+            tracing::warn!(target: "oink_link_diagnostics", kind = "udp_send", dropped = failures.dropped, "UDP error context mailbox overflow");
+        }
+        for (at, destination, error) in failures.events {
+            let mut matched = false;
+            for physical in self
+                .physical
+                .values()
+                .filter(|p| p.connection.remote_address() == destination)
+            {
+                matched = true;
+                let links: Vec<_> = self
+                    .core
+                    .links
+                    .values()
+                    .filter(|l| Some(l.hop.connection_id) == physical.id)
+                    .map(|l| (l.id, l.wire.path_id, l.wire.route_revision))
+                    .collect();
+                tracing::warn!(target: "oink_link_diagnostics", kind = "udp_send", stage = "kernel",
+                    %destination, %error, peer_id = physical.peer.to_hex().as_str(),
+                    operation = physical.id.map(|id| diagnostics::hex(&id.random)).unwrap_or_default().as_str(),
+                    transport_id = physical.connection.stable_id(),
+                    selected = physical.id.is_some_and(|id| self.core.selected_connection_id(id)),
+                    bindings = ?links, peer_bindings = ?self.peer_send_bindings(physical.peer), context_age_ms = now.saturating_duration_since(at).as_secs_f64() * 1000.,
+                    association = "destination_matches", "UDP send failed with connection context");
+            }
+            // A send may fail before TLS/instance authentication; these
+            // attempts are not in physical yet. Keep the failed candidate and
+            // the peer's actual selected route separate in the same record.
+            for trace in self
+                .dials
+                .iter()
+                .flat_map(|dial| dial.attempts.iter())
+                .filter_map(|attempt| attempt.trace.as_ref())
+                .filter(|trace| trace.address == destination)
+            {
+                matched = true;
+                tracing::warn!(target: "oink_link_diagnostics", kind = "udp_send", stage = "kernel",
+                    %destination, %error, peer_id = trace.peer.to_hex().as_str(), operation = trace.operation.as_str(),
+                    selected = false, peer_bindings = ?self.peer_send_bindings(trace.peer),
+                    association = "candidate_destination_matches", context_age_ms = now.saturating_duration_since(at).as_secs_f64() * 1000.,
+                    "UDP send failed on pending candidate");
+            }
+            if !matched {
+                tracing::warn!(target: "oink_link_diagnostics", kind = "udp_send", stage = "kernel", %destination, %error,
+                    association = "no_live_match", context_age_ms = now.saturating_duration_since(at).as_secs_f64() * 1000.,
+                    "UDP send failed without live connection match");
+            }
+        }
+    }
     fn connections_one(&mut self, now: Instant, cx: &mut Context<'_>) -> bool {
         let mut progress = false;
         let lost: Vec<_> = self
@@ -1885,7 +1971,7 @@ impl Network {
                 tracing::info!(target: "oink_link_diagnostics", kind = "connection_step", peer_id = p.peer.to_hex().as_str(),
                     operation = p.id.map(|id| diagnostics::hex(&id.random)).unwrap_or_default().as_str(),
                     stage = match p.id { None => "instance", Some(id) if !self.core.selected_connection_id(id) => "selection", Some(_) => "quic" },
-                    result = "failed", waiting, waiting_on, reason = error.as_ref().map_or("timeout", diagnostics::quic_reason),
+                    result = "failed", waiting, waiting_on, transport_id = p.connection.stable_id(), remote_address = %p.connection.remote_address(), decision_side = "local", reason = error.as_ref().map_or("timeout", diagnostics::quic_reason),
                     elapsed_ms = now.saturating_duration_since(p.deadline - DIAL_BUDGET).as_secs_f64() * 1000., error = ?error, "Physical connection ended");
             }
             self.remove_physical(uid);

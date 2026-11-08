@@ -251,4 +251,45 @@ mod tests {
             assert!(retained.receive_update(state.wire(), b.id(), a.id()).is_err());
         }
     }
+
+    #[test]
+    fn stale_layout_update_keeps_local_winner_for_resync() {
+        let a = Identity::from_seed([1; 32]);
+        let b = Identity::from_seed([2; 32]);
+        let fresh = State::create(&a, "source", "test", 1).unwrap();
+        let state = fresh
+            .with_roster(&fresh.roster().add(&a, b.id(), "peer", "test", 2).unwrap())
+            .unwrap();
+        let newer = retained::edit_register(
+            &state.layout().unwrap(),
+            &state.layout().unwrap().version().unwrap(),
+            wire::device(a.id()),
+            |raw| {
+                raw.insert(90, RawValue::from("newer layout"));
+                Ok(())
+            },
+        )
+        .unwrap();
+        let mut registers = state.wire().registers().unwrap().0;
+        let slot = registers.iter_mut().find(|r| r.kind() == Ok(2)).unwrap();
+        *slot = dto::Register::read(&newer.write()).unwrap();
+        let local = State::verify(
+            dto::GroupState::from_raw(
+                [
+                    (1, state.wire().group().unwrap().write()),
+                    (2, RawValue::Array(registers.iter().map(WireValue::write).collect())),
+                    (3, state.wire().roster().unwrap().write()),
+                ]
+                .into(),
+            )
+            .unwrap(),
+            state.roster().anchor(),
+        )
+        .unwrap();
+        let candidate = local.receive_update(state.wire(), b.id(), a.id()).unwrap();
+        assert_eq!(candidate.layout().unwrap(), local.layout().unwrap());
+        assert_ne!(candidate.layout().unwrap(), state.layout().unwrap());
+        // The config actor uses this mismatch to send candidate.wire() back to
+        // the source after accepting the stale state.
+    }
 }

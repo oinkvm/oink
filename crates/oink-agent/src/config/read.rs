@@ -7,6 +7,7 @@ use super::{Settings, SettingsIssue, SettingsIssueKind};
 #[derive(Default)]
 pub(crate) struct Reader {
     pub issues: Vec<SettingsIssue>,
+    pub repaired: bool,
 }
 
 fn child(path: &str, key: &str) -> String {
@@ -134,7 +135,7 @@ impl Reader {
             "settings.routing.damping" => {
                 serde_json::to_value(self.object(value, oink_routing::damping::DampingConfig::default(), path)).unwrap()
             }
-            "settings.hotkeys" => self.entries::<crate::api::Hotkey>(value, path),
+            "settings.hotkeys" => self.hotkeys(value, path),
             "settings.routing.damping.rules" => self.entries::<oink_routing::damping::DampingRule>(value, path),
             _ => value,
         }
@@ -142,6 +143,35 @@ impl Reader {
 
     pub fn settings(&mut self, value: Value) -> Settings {
         self.object(value, Settings::default(), "settings")
+    }
+
+    /// Parse local settings after removing exact duplicate hotkey records. The
+    /// raw object is edited in place so a damaged settings file is repaired on
+    /// this read and saved atomically by the caller, while unknown fields on the
+    /// surviving record remain intact.
+    pub fn settings_in_place(&mut self, value: &mut Value) -> Settings {
+        self.dedupe_hotkeys(value);
+        self.settings(value.clone())
+    }
+
+    fn hotkeys(&mut self, value: Value, path: &str) -> Value {
+        self.entries::<crate::api::Hotkey>(value, path)
+    }
+
+    fn dedupe_hotkeys(&mut self, value: &mut Value) {
+        let Some(entries) = value.get_mut("hotkeys").and_then(Value::as_array_mut) else {
+            return;
+        };
+        let mut unique = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.drain(..).enumerate() {
+            if unique.iter().any(|old| old == &entry) {
+                self.repaired = true;
+                self.issue(format!("settings.hotkeys[{index}]"), SettingsIssueKind::DuplicateEntry);
+            } else {
+                unique.push(entry);
+            }
+        }
+        *entries = unique;
     }
 }
 
@@ -287,4 +317,31 @@ fn known_equal(raw: &Value, known: &Value) -> bool {
 fn hotkey_identity(a: &Value, b: &Value) -> bool {
     a.get("action") == b.get("action")
         && a.get("device").filter(|v| !v.is_null()) == b.get("device").filter(|v| !v.is_null())
+        && a.get("profile").filter(|v| !v.is_null()) == b.get("profile").filter(|v| !v.is_null())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn switch_layout_patch_uses_profile_as_the_target_identity() {
+        let before = serde_json::json!([
+            {"action":"switch_layout","profile":"office","keys":["Ctrl","Alt","1"],"enabled":true},
+            {"action":"switch_layout","profile":"home","keys":["Ctrl","Alt","2"],"enabled":true}
+        ]);
+        let after = serde_json::json!([
+            {"action":"switch_layout","profile":"office","keys":["Ctrl","Alt","3"],"enabled":true},
+            {"action":"switch_layout","profile":"home","keys":["Ctrl","Alt","4"],"enabled":true}
+        ]);
+        let mut raw = serde_json::json!([
+            {"action":"switch_layout","profile":"office","keys":["Ctrl","Alt","1"],"enabled":true,"future":"office"},
+            {"action":"switch_layout","profile":"home","keys":["Ctrl","Alt","2"],"enabled":true,"future":"home"}
+        ]);
+        patch_json(&mut raw, &before, &after);
+        assert_eq!(raw[0]["future"], "office");
+        assert_eq!(raw[1]["future"], "home");
+        assert_eq!(raw[0]["profile"], "office");
+        assert_eq!(raw[1]["profile"], "home");
+    }
 }

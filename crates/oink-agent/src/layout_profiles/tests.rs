@@ -96,6 +96,7 @@ fn devices(s: &ArrangementSnapshot) -> Vec<DeviceArrangementState> {
         .map(|p| DeviceArrangementState {
             device: p.device,
             sync_system_arrangement: false,
+            disable_hidden_displays: false,
             preference_token: "1".into(),
             native_token: Some("test".into()),
             availability: Availability::Ready,
@@ -1135,4 +1136,24 @@ fn older_writer_cannot_rebind_retained_physical_topology() {
     let encoded = wire::catalog(&received).unwrap();
     assert!(!encoded.profiles().unwrap().0[0].raw().contains_key(&8));
     assert!(!encoded.profiles().unwrap().0[0].raw().contains_key(&9));
+}
+
+#[test]
+fn profile_unhide_moves_restored_owner_instead_of_lower_priority_peer() {
+    for whole_device in [false, true] {
+        let mut live = snapshot();
+        live.placements[1].origin.x = 100.;
+        if whole_device {
+            set_screen_shared(&mut live, device(1), false);
+        }
+        let mut target = live.clone();
+        target.disabled[1].disabled = false;
+        set_screen_shared(&mut target, device(1), true);
+        let plan = restore(&target, &live, &devices(&live)).unwrap();
+        assert_eq!(plan.snapshot.placements[1], live.placements[1]);
+        assert_ne!(plan.snapshot.placements[0].origin, live.placements[0].origin);
+        assert_eq!(plan.snapshot.native, live.native);
+        let replayed = replay(&live, &target, &live, &devices(&live), &[]).unwrap();
+        assert_eq!(replayed.snapshot.placements, plan.snapshot.placements);
+    }
 }

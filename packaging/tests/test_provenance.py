@@ -127,6 +127,7 @@ class Provenance(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         self.assertEqual((P.ROOT / '.signpath/artifact-configurations/windows-msi-v1.xml').read_bytes(), module.signpath_configuration())
+        self.assertIn(b'path="OinkPasteMenu.dll"', module.signpath_configuration())
 
 
 if __name__ == '__main__':

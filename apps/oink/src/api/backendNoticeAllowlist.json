@@ -83,7 +83,7 @@
     "agent.fail('permission_denied')"
   ],
   "settings/model.ts": [
-    "agent.fail('unavailable')"
+    "agent.fail(failure.problem.code,failure.detail)"
   ],
   "settings/useGrant.ts": [
     "agent.fail('permission_denied')"

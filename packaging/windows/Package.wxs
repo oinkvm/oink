@@ -116,6 +116,15 @@
                                 Grouping="$(var.ProductName)" Protocol="tcp" Profile="all"
                                 Scope="any" Outbound="no" Action="allow" Enabled="yes" IgnoreFailure="no" />
         </Component>
+        <Component Id="PasteMenu" Guid="*">
+          <!-- The transparent light/dark marks are compiled into the signed
+               state-handler DLL; keeping this component as the protected
+               install boundary makes Icon registry values safe to resolve. -->
+          <File Id="PasteMenuDll" Source="$(var.Payload)/OinkPasteMenu.dll" KeyPath="yes" />
+        </Component>
+        <Component Id="CredentialProvider" Guid="*">
+          <File Id="CredentialProviderDll" Source="$(var.Payload)/OinkCredentialProvider.dll" KeyPath="yes" />
+        </Component>
         <Component Id="RecoveryCli" Guid="*">
           <File Id="AgentExe" Source="$(var.Payload)/$(var.AgentExe)" KeyPath="yes" />
         </Component>
@@ -191,7 +200,15 @@
          to drain other sessions. Nested old-product removal skips the request.
          No Restart Manager force-close or process kill. -->
     <CustomAction Id="PrepareUserSessions" BinaryRef="InstallerCA" DllEntry="PrepareUserSessions" Execute="immediate" Return="check" />
+    <!-- OinkInput registers only its own CLSID on startup. Uninstall asks the
+         protected SYSTEM service image to remove it before any payload is removed.
+         Upgrade keeps registration pointing at the stable MSI-owned DLL path. -->
+    <CustomAction Id="UnregisterCredentialProvider" FileRef="ServiceExe"
+                  ExeCommand="--unregister-credential-provider" Execute="deferred"
+                  Impersonate="no" Return="check" />
     <InstallExecuteSequence>
+      <Custom Action="UnregisterCredentialProvider" Before="RemoveFiles"
+              Condition='REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE' />
       <Custom Action="PrepareUserSessions" Before="InstallValidate" Condition="NOT UPGRADINGPRODUCTCODE" />
       <!-- RegisterProduct writes the numeric upgrade version to ARP. Apply the
            human version afterward through the transactional Registry table, so
@@ -219,6 +236,8 @@
       <ComponentRef Id="InputService" />
       <ComponentRef Id="UserEntry" />
       <ComponentRef Id="RecoveryCli" />
+      <ComponentRef Id="PasteMenu" />
+      <ComponentRef Id="CredentialProvider" />
       <ComponentRef Id="Receipt" />
       <ComponentRef Id="BuildMetadata" />
       <ComponentRef Id="ReportManifest" />

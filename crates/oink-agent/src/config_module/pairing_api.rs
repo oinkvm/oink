@@ -651,7 +651,22 @@ impl Owner {
         self.start_connecting(device);
         if self.connecting.contains_key(&id) {
             if prepared.is_some() {
-                self.fail_connecting(device, dto::PairCode::PreparedPeerLost);
+                // The probe's authenticated C0 can lose network selection in
+                // the same turn that its result is consumed.  The stale
+                // session remains in `sessions` until its queued Lost event is
+                // handled, while `selected_session` already has no usable C0.
+                // Keep the pairing lease alive and let the replacement
+                // greeting call `start_connecting`; dialing the queried
+                // endpoint also covers the case where selection retired every
+                // physical candidate before the replacement was queued.
+                if self.selected_session(device).is_none() {
+                    match self.links.dial(device, vec![address], DialMode::DirectOnly) {
+                        Ok(()) | Err(oink_network::link::DialRefused::AlreadyLinked) => {}
+                        Err(_) => self.fail_connecting(device, dto::PairCode::PreparedPeerLost),
+                    }
+                } else {
+                    self.fail_connecting(device, dto::PairCode::PreparedPeerLost);
+                }
             } else {
                 match self.links.dial(device, vec![address], DialMode::DirectOnly) {
                     Ok(()) => {}

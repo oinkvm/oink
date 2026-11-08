@@ -107,7 +107,28 @@ pub(crate) fn udp_send_status() -> crate::UdpSendStatus {
 // Quinn logs terminal send errors when its connection driver exits. Carry the
 // destination in that existing line, also with QoS disabled. No extra send/log.
 #[derive(Debug)]
-struct DestinationSocket(Arc<dyn quinn::AsyncUdpSocket>);
+struct DestinationSocket(Arc<dyn quinn::AsyncUdpSocket>, Option<SendErrors>);
+
+/// Error-only bounded mailbox. Never changes the socket result or sends packets.
+#[derive(Debug, Default)]
+pub(crate) struct SendFailures {
+    pub events: std::collections::VecDeque<(std::time::Instant, std::net::SocketAddr, String)>,
+    pub dropped: u64,
+}
+pub(crate) type SendErrors = Arc<std::sync::Mutex<SendFailures>>;
+impl SendFailures {
+    fn observe(&mut self, destination: std::net::SocketAddr, error: &std::io::Error) {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return;
+        }
+        if self.events.len() == 32 {
+            self.events.pop_front();
+            self.dropped += 1;
+        }
+        self.events
+            .push_back((std::time::Instant::now(), destination, error.to_string()));
+    }
+}
 #[derive(Debug)]
 struct SendError {
     destination: std::net::SocketAddr,
@@ -135,9 +156,15 @@ impl quinn::AsyncUdpSocket for DestinationSocket {
         self.0.clone().create_io_poller()
     }
     fn try_send(&self, transmit: &quinn::udp::Transmit<'_>) -> std::io::Result<()> {
-        self.0
-            .try_send(transmit)
-            .map_err(|e| send_error(e, transmit.destination))
+        self.0.try_send(transmit).map_err(|e| {
+            if let Some(errors) = &self.1 {
+                errors
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .observe(transmit.destination, &e);
+            }
+            send_error(e, transmit.destination)
+        })
     }
     fn poll_recv(
         &self,
@@ -174,8 +201,24 @@ impl quinn::AsyncUdpSocket for DestinationSocket {
 /// limited token; that does not establish NIC egress or Quinn per-packet marking.
 /// No Windows marking is configured here. Arbitrary QOSSetOutgoingDSCPValue needs
 /// Administrators/Network Configuration Operators.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn wrap_udp_socket(socket: std::net::UdpSocket) -> std::io::Result<Arc<dyn quinn::AsyncUdpSocket>> {
-    Ok(Arc::new(DestinationSocket(wrap_udp_socket_inner(socket)?)))
+    Ok(Arc::new(DestinationSocket(wrap_udp_socket_inner(socket)?, None)))
+}
+pub(crate) fn observe_udp_socket(
+    inner: Arc<dyn quinn::AsyncUdpSocket>,
+    errors: SendErrors,
+) -> Arc<dyn quinn::AsyncUdpSocket> {
+    Arc::new(DestinationSocket(inner, Some(errors)))
+}
+pub(crate) fn wrap_udp_socket_observed(
+    socket: std::net::UdpSocket,
+    errors: SendErrors,
+) -> std::io::Result<Arc<dyn quinn::AsyncUdpSocket>> {
+    Ok(Arc::new(DestinationSocket(
+        wrap_udp_socket_inner(socket)?,
+        Some(errors),
+    )))
 }
 /// Manual lookups must surface native unreachability instead of treating it as
 /// packet loss until Quinn's idle timeout. This socket is dedicated/connected;
@@ -238,5 +281,70 @@ mod tests {
         set_service_type(&bulk, ServiceType::BestEffort);
         assert_eq!(read_service_type(&interactive), 4);
         assert_eq!(read_service_type(&bulk), 0);
+    }
+}
+
+#[cfg(test)]
+mod send_failure_tests {
+    use super::*;
+    #[derive(Debug)]
+    struct FailingSend;
+    impl quinn::AsyncUdpSocket for FailingSend {
+        fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
+            unreachable!("send-only fixture")
+        }
+        fn try_send(&self, _: &quinn::udp::Transmit<'_>) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::NetworkUnreachable.into())
+        }
+        fn poll_recv(
+            &self,
+            _: &mut std::task::Context<'_>,
+            _: &mut [std::io::IoSliceMut<'_>],
+            _: &mut [quinn::udp::RecvMeta],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            unreachable!("send-only fixture")
+        }
+        fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+            unreachable!("send-only fixture")
+        }
+    }
+    #[test]
+    fn observed_socket_preserves_terminal_error_and_records_destination() {
+        let failures = SendErrors::default();
+        let socket = observe_udp_socket(Arc::new(FailingSend), failures.clone());
+        let destination = "127.0.0.1:47470".parse().unwrap();
+        let error = socket
+            .try_send(&quinn::udp::Transmit {
+                destination,
+                contents: b"packet",
+                ecn: None,
+                segment_size: None,
+                src_ip: None,
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NetworkUnreachable);
+        assert!(error.to_string().contains(&destination.to_string()));
+        let failures = failures.lock().unwrap();
+        assert_eq!(failures.events.len(), 1);
+        assert_eq!(failures.events[0].1, destination);
+        assert_eq!(failures.dropped, 0);
+    }
+    #[test]
+    fn error_observations_are_bounded_and_ignore_would_block() {
+        let mut failures = SendFailures::default();
+        let destination = "127.0.0.1:47470".parse().unwrap();
+        failures.observe(destination, &std::io::ErrorKind::WouldBlock.into());
+        assert!(failures.events.is_empty());
+        for _ in 0..35 {
+            failures.observe(destination, &std::io::ErrorKind::NetworkUnreachable.into());
+        }
+        assert_eq!(failures.events.len(), 32);
+        assert_eq!(failures.dropped, 3);
+        assert!(
+            failures
+                .events
+                .iter()
+                .all(|(_, address, error)| *address == destination && !error.is_empty())
+        );
     }
 }

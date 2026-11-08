@@ -300,6 +300,10 @@ impl Owner {
         let mut journal =
             Journal::load(&deps.data_dir.join(oink_network::pair_journal::FILE), device).map_err(|e| fail(&e))?;
         journal.recover().map_err(|e| fail(&e))?;
+        // A committed pairing projection must be acknowledged against its
+        // exact signed target state before the one-time legacy visibility seed
+        // can advance the shared layout register.
+        let defer_visibility_seed = journal.pending_projection().map_err(|e| fail(&e))?.is_some();
         if let Some(projected) = journal.pending_projection().map_err(|e| fail(&e))? {
             if let Some(bundle) = journal.pending_bundle().map_err(|e| fail(&e))? {
                 let intent = bundle.certificate().and_then(|c| c.intent()).map_err(|e| fail(&e))?;
@@ -324,9 +328,47 @@ impl Owner {
             stored.state = state.wire().clone();
             group_store::save(&path, &stored).map_err(|e| fail(&e))?;
         }
+        // One-time upgrade of this device's legacy owner visibility. This is
+        // an initial global value, not repair of malformed geometry; an
+        // existing key7 record is left exactly as authored by the group.
+        let owner_visibility = {
+            let config_guard = deps.config.lock().map_err(|e| fail(&e))?;
+            layout_wire::owner_preferences(&config_guard.owner().preferences()).map_err(|e| fail(&e))?
+        };
+        let seed_marker = deps.data_dir.join("layout-visibility-seeded");
+        let register = stored.layout_register().map_err(|e| fail(&e))?;
+        let has_visibility = layout_wire::has_device_visibility_record(&register, device).map_err(|e| fail(&e))?;
+        let owner_has_screen = v1::layout::register_value(&register)
+            .map_err(|e| fail(&e))?
+            .devices()
+            .map_err(|e| fail(&e))?
+            .0
+            .into_iter()
+            .find(|group| {
+                group
+                    .device()
+                    .and_then(|id| oink_network::wire_identity::read_device(&id))
+                    .ok()
+                    == Some(device)
+            })
+            .is_some_and(|group| group.screens().is_ok_and(|screens| !screens.0.is_empty()));
+        if !defer_visibility_seed && !seed_marker.exists() && !has_visibility && owner_has_screen {
+            let version = register.version().map_err(|e| fail(&e))?;
+            if stored
+                .edit_layout(&version, |raw| {
+                    layout_wire::seed_owner_visibility(raw, device, &owner_visibility)
+                })
+                .map_err(|e| fail(&e))?
+            {
+                state = State::verify(stored.to_wire(), state.roster().anchor()).map_err(|e| fail(&e))?;
+                group_store::save(&path, &stored).map_err(|e| fail(&e))?;
+                oink_foundation::storage::atomic_write(&seed_marker, b"1").map_err(|e| fail(&e))?;
+            }
+        } else if !defer_visibility_seed && !seed_marker.exists() && !owner_has_screen {
+            oink_foundation::storage::atomic_write(&seed_marker, b"1").map_err(|e| fail(&e))?;
+        }
         let anchor = state.roster().anchor();
-        let value = dto::LayoutValue::from_raw(state.layout().map_err(|e| fail(&e))?.value().map_err(|e| fail(&e))?)
-            .map_err(|e| fail(&e))?;
+        let value = v1::layout::register_value(&state.layout().map_err(|e| fail(&e))?).map_err(|e| fail(&e))?;
         let layout = Arc::new(layout_wire::from_wire(&value).map_err(|e| fail(&e))?);
         let owners = Arc::new(BTreeMap::new());
         let devices = BTreeSet::from([device]);
@@ -519,6 +561,36 @@ impl Owner {
                 .journal
                 .projected(owner.state.digest().map_err(|e| fail(&e))?)
                 .map_err(|e| fail(&e))?;
+        }
+        if defer_visibility_seed {
+            let owner_visibility = {
+                let config_guard = owner.config.lock().map_err(|e| fail(&e))?;
+                layout_wire::owner_preferences(&config_guard.owner().preferences()).map_err(|e| fail(&e))?
+            };
+            let seed_marker = owner.data_dir.join("layout-visibility-seeded");
+            let register = owner.stored.layout_register().map_err(|e| fail(&e))?;
+            let has_visibility = layout_wire::has_device_visibility_record(&register, device).map_err(|e| fail(&e))?;
+            if !seed_marker.exists() && !has_visibility {
+                let version = register.version().map_err(|e| fail(&e))?;
+                if owner
+                    .stored
+                    .edit_layout(&version, |raw| {
+                        layout_wire::seed_owner_visibility(raw, device, &owner_visibility)
+                    })
+                    .map_err(|e| fail(&e))?
+                {
+                    owner.state =
+                        State::verify(owner.stored.to_wire(), owner.state.roster().anchor()).map_err(|e| fail(&e))?;
+                    group_store::save(&path, &owner.stored).map_err(|e| fail(&e))?;
+                    oink_foundation::storage::atomic_write(&seed_marker, b"1").map_err(|e| fail(&e))?;
+                    owner
+                        .application
+                        .apply_state(&owner.stored)
+                        .map_err(StartError::Unreadable)?;
+                }
+            } else if !seed_marker.exists() {
+                oink_foundation::storage::atomic_write(&seed_marker, b"1").map_err(|e| fail(&e))?;
+            }
         }
         owner.publish().map_err(|e| fail(&e))?;
         std::thread::Builder::new().name("oink-config".into()).spawn(move || {
@@ -1265,7 +1337,17 @@ impl Owner {
                     held.push((id, state));
                     return Ok(());
                 }
+                let incoming_layout = state
+                    .registers()?
+                    .0
+                    .into_iter()
+                    .find(|register| register.kind() == Ok(2))
+                    .ok_or(v1::ErrorCode::MalformedFrame)?;
                 let candidate = self.state.receive_update(&state, peer.device_id, self.identity.id())?;
+                // A stale or losing concurrent layout update is valid input,
+                // but the sender must learn the register selected by our
+                // counter-only merge and device-id tie-break.
+                let resend_layout = candidate.layout()? != incoming_layout;
                 let local_removed = !candidate.roster().contains(self.identity.id());
                 let removed = self
                     .sessions
@@ -1289,6 +1371,9 @@ impl Owner {
                     // keeps the previous applied view and streams until tick retries;
                     // it does not invalidate the peer's C0 admission.
                     tracing::warn!(%error, "saved group update awaits native application");
+                }
+                if resend_layout {
+                    self.send(id, Message::ConfigState(self.state.wire().clone()))?;
                 }
                 for link in removed {
                     self.close(link, Disconnect::MemberRemoved);

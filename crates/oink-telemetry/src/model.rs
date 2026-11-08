@@ -530,6 +530,47 @@ pub enum Frame {
         column: u32,
     },
 }
+/// Only bounded ASCII runtime class identifiers may cross the report boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ExceptionName(String);
+impl ExceptionName {
+    pub fn from_native(name: &str) -> Self {
+        Self(if Self::valid(name) { name } else { "other" }.into())
+    }
+    fn valid(name: &str) -> bool {
+        !name.is_empty() && name.len() <= 128 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl TryFrom<String> for ExceptionName {
+    type Error = &'static str;
+    fn try_from(name: String) -> std::result::Result<Self, Self::Error> {
+        if Self::valid(&name) {
+            Ok(Self(name))
+        } else {
+            Err("invalid exception identifier")
+        }
+    }
+}
+impl From<ExceptionName> for String {
+    fn from(name: ExceptionName) -> Self {
+        name.0
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjcException {
+    pub name: ExceptionName,
+    pub frames: [[Option<Frame>; 32]; 2],
+}
+impl ObjcException {
+    pub fn frames(&self) -> impl Iterator<Item = &Frame> {
+        self.frames.iter().flatten().flatten()
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SafeCrash {
@@ -538,6 +579,8 @@ pub struct SafeCrash {
     pub crash_kind: CrashKind,
     pub exception_class: ExceptionClass,
     pub exception_code: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objc_exception: Option<ObjcException>,
     // Two fixed arrays keep both producer allocation and deserialization bounded.
     pub frames: [[Option<Frame>; 32]; 2],
     pub callsite: Option<u32>,
@@ -557,6 +600,7 @@ impl SafeCrash {
             crash_kind,
             exception_class,
             exception_code: None,
+            objc_exception: None,
             frames: [[None; 32]; 2],
             callsite: None,
             line: None,
@@ -622,15 +666,26 @@ impl Report {
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::SafeCrash(c) => {
-                if c.frames().any(|f| match f {
-                    Frame::Native {
-                        debug_id,
-                        offset,
-                        image_size,
-                        ..
-                    } => *debug_id == [0; 16] || *image_size == 0 || *offset >= *image_size,
-                    Frame::Script { line, .. } => *line == 0,
-                }) {
+                if let Some(throw) = &c.objc_exception
+                    && (c.crash_kind != CrashKind::NativeException
+                        || c.exception_class != ExceptionClass::Abort
+                        || !matches!(c.build.os_version_class, OsVersionClass::MacOSMajor(_))
+                        || throw.frames().any(|f| !matches!(f, Frame::Native { .. })))
+                {
+                    return Err(Error::Invalid);
+                }
+                if c.frames()
+                    .chain(c.objc_exception.iter().flat_map(ObjcException::frames))
+                    .any(|f| match f {
+                        Frame::Native {
+                            debug_id,
+                            offset,
+                            image_size,
+                            ..
+                        } => *debug_id == [0; 16] || *image_size == 0 || *offset >= *image_size,
+                        Frame::Script { line, .. } => *line == 0,
+                    })
+                {
                     return Err(Error::Invalid);
                 }
             }

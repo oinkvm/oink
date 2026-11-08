@@ -33,6 +33,13 @@ impl Node {
             self.id(),
         )
         .context("read group state before sharing")?;
+        if components.companions
+            && let Some(backend) = &self.inner.display_backend
+        {
+            backend
+                .initialize_visibility(&self.inner.data_dir)
+                .context("initialize display visibility storage")?;
+        }
         let initial_displays = self.current_displays().context("read initial displays")?;
         {
             let _gate = self.owner_gate();
@@ -108,6 +115,20 @@ impl Node {
         // The module retains startup state and broadcasts later changes itself.
         self.publish_local_options();
         self.publish_local_permissions();
+        #[cfg(windows)]
+        let initial_displays = {
+            let node = self.clone();
+            tokio::task::spawn_blocking(move || {
+                if components.companions
+                    && let Err(error) = node.apply_windows_startup_layout()
+                {
+                    tracing::warn!(%error,"Windows startup display layout apply failed");
+                }
+                node.current_displays()
+            })
+            .await
+            .context("join Windows startup display layout")??
+        };
         let initial_group = group.clone();
         tokio::task::spawn_blocking(move || initial_group.initialize_displays(initial_displays))
             .await
@@ -191,6 +212,9 @@ impl Node {
             .input
             .set(input.clone())
             .map_err(|_| anyhow::anyhow!("input already started"))?;
+        // Native input must not use the layout catalog's retained disabled targets.
+        self.refresh_active_input_displays()
+            .context("read active input displays")?;
         input.send(InputCommand::Hotkeys(crate::hotkeys::bindings(
             &self.effective_hotkeys(),
         )));
@@ -303,15 +327,16 @@ impl crate::config_module::ConfigApplication for Application {
     }
 
     fn apply_state(&self, state: &crate::config_module::group_store::StoredGroupState) -> Result<(), String> {
-        use oink_protocol::v1::{dto::LayoutValue, schema::WireDto};
         let inner = self.0.upgrade().ok_or("backend stopped")?;
-        let layout = state
-            .layout_register()
-            .map_err(|error| error.to_string())?
-            .value()
-            .map_err(|error| error.to_string())?;
-        let layout = LayoutValue::from_raw(layout).map_err(|error| error.to_string())?;
-        crate::config_module::layout_wire::validate(&layout).map_err(|error| error.to_string())?;
+        let register = state.layout_register().map_err(|error| error.to_string())?;
+        let value = oink_protocol::v1::layout::register_value(&register).map_err(|error| error.to_string())?;
+        let layout = crate::config_module::layout_wire::from_wire(&value).map_err(|error| error.to_string())?;
+        // Native visibility is a side effect of an accepted global layout.
+        // A platform failure is reported by the owner path and must not make
+        // a valid shared register fail C0 admission.
+        if let Err(error) = (crate::node::Node { inner: inner.clone() }).apply_global_layout_visibility(&layout) {
+            tracing::warn!(%error, "global layout visibility could not be applied locally");
+        }
 
         if let Some(group) = inner.group.get() {
             let roster = state.state.roster().map_err(|error| error.to_string())?;
@@ -388,6 +413,7 @@ fn application_profile() -> oink_network::negotiation::OfferProfile {
                 "oink.pointer.move/1",
                 "oink.pointer.move-hidden/1",
                 "oink.focus.local-click/1",
+                "oink.auto-unlock/1",
                 "oink.pointer.lock-escape/1",
                 "oink.pointer.entry-protection/1",
                 "oink.input.edge-trigger/1",

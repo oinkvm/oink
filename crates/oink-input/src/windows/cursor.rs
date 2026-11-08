@@ -648,10 +648,6 @@ impl Hider {
         self.hidden = false;
     }
 
-    pub(crate) fn show_moved_away(&mut self) {
-        self.show_at(None);
-    }
-
     /// Uncover completion, never a wait or a stale warp to the old entry point.
     pub(crate) fn finish_show(&mut self, generation: u64) {
         if self.hidden || generation != self.generation {

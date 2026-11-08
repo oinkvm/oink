@@ -169,6 +169,45 @@ async fn pending_human_pairing_keeps_its_own_lifetime_before_admission() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_pairing_waits_for_a_replacement_greeting_after_selection_race() {
+    let nodes = start(fresh(2)).await;
+    let client = [27; 16];
+    let found = query(&nodes[0], &nodes[1], client).await;
+    let peer = nodes[1].links.boot();
+    nodes[0]
+        .group
+        .call(move |owner| {
+            let link = owner.peer_link(peer).unwrap();
+            owner.links.disconnect(link, Disconnect::HandshakeFailed);
+            // Reproduce the network/owner ordering at the reported failure:
+            // N0 has already stopped selecting the prepared C0, but its Lost
+            // event has not yet removed the stale session from this owner.
+            oink_network::link::testing::flush_commands(&owner.links);
+            assert!(
+                owner
+                    .links
+                    .links()
+                    .by_peer(peer.device_id)
+                    .is_none_or(|selected| selected.link != link)
+            );
+            assert!(owner.sessions.contains_key(&link));
+            let result = owner.start_pairing(
+                client,
+                "selection-race".into(),
+                api::PairTarget::PreparedQuery {
+                    query_id: found.query_id,
+                    generation: found.generation,
+                },
+            )?;
+            assert!(matches!(result, api::PairReply::Value(api::Started::Started { .. })));
+            assert_eq!(owner.connecting.len(), 1);
+            Ok(())
+        })
+        .unwrap();
+    stop(&nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn advancing_proof_chunks_extend_admission_but_replays_do_not() {
     let nodes = start(fresh(2)).await;
     let _ = query(&nodes[0], &nodes[1], [26; 16]).await;

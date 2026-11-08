@@ -212,7 +212,7 @@ mark.setp__hit { background: var(--ok-accent-tint); color: inherit; border-radiu
 .lat__glitch-hit { position: absolute; width: 12px; }
 .lat__glitch-devices { display: grid; gap: 4px; }
 
-.setp__row[data-parent="touchpadInject"] { padding-inline-start: 40px; }
+.setp__row[data-parent="touchpadInject"], .setp__row[data-parent="syncSystemArrangement"] { padding-inline-start: 40px; }
 
 .setp__microphone-description { display: block; }
 .setp__microphone-link { color: var(--ok-info); text-decoration: none; }
@@ -237,3 +237,6 @@ mark.setp__hit { background: var(--ok-accent-tint); color: inherit; border-radiu
 .setp__row--chart > .ok-row__text { grid-column: 1; grid-row: 1; }
 .setp__row--chart > .lat__span { grid-column: 2; grid-row: 1; }
 .setp__row--chart > .lat { grid-column: 1 / -1; }
+.setp__unlock-on { color: var(--ok-success); width: 18px; height: 18px; }
+.setp__unlock-failed { color: var(--ok-warning); width: 18px; height: 18px; }
+.setp__disabled-btn { display: inline-flex; }

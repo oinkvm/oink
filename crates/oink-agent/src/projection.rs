@@ -367,8 +367,7 @@ fn draw(node: &Node, online: &BTreeSet<DeviceId>) {
 
 // Pause is runtime state, not a stored arrangement preference. Apply it after
 // rendering any preview, so stale snapshots cannot make paused screens visible.
-fn visible_owners(node: &Node, owners: &arrangement::Owners) -> arrangement::Owners {
-    let mut visible = owners.clone();
+fn visible_owners(node: &Node, layout: &mut Layout, owners: &mut arrangement::Owners) {
     if let Ok(config) = node.link_config() {
         for member in &config.members().members {
             if member.facts.as_ref().is_some_and(|facts| {
@@ -378,11 +377,19 @@ fn visible_owners(node: &Node, owners: &arrangement::Owners) -> arrangement::Own
                     .flatten()
                     .is_some_and(|pause| pause.paused() == Ok(true))
             }) {
-                visible.entry(member.device).or_default().screen_shared = false;
+                // The durable layout is authoritative for visibility. A pause
+                // is a transient rendering override, so hide this device in
+                // the copied layout used for the projection instead of
+                // changing the retained register or relying on an owner
+                // preference that the global record intentionally supersedes.
+                for placement in layout.screens.iter_mut().filter(|s| s.id.device == member.device) {
+                    placement.device_hidden = true;
+                    placement.device_visibility_known = true;
+                }
+                owners.entry(member.device).or_default().screen_shared = false;
             }
         }
     }
-    visible
 }
 
 // Label selection is local rendering over the already synchronized inventory.
@@ -418,10 +425,10 @@ fn view(node: &Node, online: &BTreeSet<DeviceId>) -> View {
         .and_then(|p| p.arrangement.as_deref())
         .cloned()
         .unwrap_or_else(|| arrangement::capture(layout, &applied.owners));
-    let Ok((layout, owners)) = arrangement::render(&snapshot, current, &applied.owners) else {
+    let Ok((mut layout, mut owners)) = arrangement::render(&snapshot, current, &applied.owners) else {
         return View::default();
     };
-    let owners = visible_owners(node, &owners);
+    visible_owners(node, &mut layout, &mut owners);
     let displays = group.local_displays();
     let projections =
         oink_display::projection::compute(&layout.effective(&owners), node.id(), |d| online.contains(d), None)
@@ -802,6 +809,10 @@ mod label_tests {
                     local: Rect::new(i as f64 * 100., 0., 100., 100.),
                     primary: *primary,
                     builtin: false,
+                    device_hidden: false,
+                    screen_hidden: false,
+                    device_visibility_known: false,
+                    screen_visibility_known: false,
                     size_source: SizeSource::Reported,
                 })
                 .collect(),

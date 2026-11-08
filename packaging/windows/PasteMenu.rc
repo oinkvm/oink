@@ -1,0 +1,35 @@
+#include <windows.h>
+#include "paste-menu-version.h"
+
+#define IDI_PASTE_MENU_LIGHT 101
+#define IDI_PASTE_MENU_DARK 102
+IDI_PASTE_MENU_LIGHT ICON "OinkPasteMenu.ico"
+IDI_PASTE_MENU_DARK ICON "OinkPasteMenuDark.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,0,OINK_BUILD_HIGH,OINK_BUILD_LOW
+ PRODUCTVERSION 0,0,OINK_BUILD_HIGH,OINK_BUILD_LOW
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS 0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+ FILESUBTYPE 0
+BEGIN
+ BLOCK "StringFileInfo"
+ BEGIN
+  BLOCK "040904b0"
+  BEGIN
+   VALUE "CompanyName", "Oink contributors\0"
+   VALUE "FileDescription", "Oink Paste as File menu state\0"
+   VALUE "FileVersion", OINK_DISPLAY_VERSION "\0"
+   VALUE "InternalName", "OinkPasteMenu\0"
+   VALUE "OriginalFilename", "OinkPasteMenu.dll\0"
+   VALUE "ProductName", "Oink\0"
+   VALUE "ProductVersion", OINK_DISPLAY_VERSION "\0"
+  END
+ END
+ BLOCK "VarFileInfo"
+ BEGIN
+  VALUE "Translation", 0x0409, 1200
+ END
+END

@@ -159,6 +159,44 @@ impl Node {
 
     fn main_command(&self, command: MainCommand) {
         match command {
+            MainCommand::UnlockQuery { peer, stream, epoch } => {
+                crate::auto_unlock::record_flow_diagnostic(4, epoch, 2);
+                // Query the source itself on an ordinary thread; never infer its
+                // unlocked state from capture ability or a previous holder.
+                let unlocked =
+                    crate::auto_unlock::source_unlocked(self.profile(), self.input_backend().session_locked());
+                if let Ok(input) = self.input_thread() {
+                    input.send(crate::threads::input::InputCommand::UnlockReplyReady {
+                        peer,
+                        stream,
+                        epoch,
+                        unlocked,
+                    });
+                }
+            }
+            MainCommand::UnlockRemoteInput { source, age_ms } => {
+                self.inner.rt.spawn_blocking(move || {
+                    crate::auto_unlock::remote_input(source, age_ms);
+                });
+            }
+            MainCommand::UnlockAttempt {
+                epoch,
+                source,
+                initial_input_age_ms,
+            } => {
+                crate::auto_unlock::record_flow_diagnostic(7, epoch, 0);
+                let node = self.clone();
+                self.inner.rt.spawn_blocking(move || {
+                    if node.input_status().is_ok_and(|s| {
+                        !s.paused
+                            && s.focus_info
+                                .as_ref()
+                                .is_some_and(|f| f.epoch == epoch && f.holder == node.id())
+                    }) {
+                        crate::auto_unlock::attempt(&node, epoch, source, initial_input_age_ms);
+                    }
+                });
+            }
             MainCommand::Wake => {}
             MainCommand::InputStatusChanged => {
                 self.sync_notifications();
@@ -479,6 +517,9 @@ impl Node {
                 self.emit(ApiEvent::Focus(self.focus_view(&focus)));
             }
             StatusEvent::Hotkey { action } => self.on_hotkey(&action),
+            StatusEvent::MouseShortcutRecorded { token, keys } => {
+                self.emit(ApiEvent::MouseShortcutRecorded { token, keys })
+            }
             StatusEvent::AudioVolumeKey { code } => {
                 if let Some(audio) = self.inner.audio.get() {
                     audio.volume_key(code);

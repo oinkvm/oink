@@ -7,6 +7,43 @@ use super::{
 use oink_foundation::{DeviceId, Point, Rect, Size};
 
 impl Layout {
+    /// Unhide moves only the restored owner, and only when a newly visible
+    /// screen collides. Hidden siblings follow its rigid transform as usual.
+    /// Called once by the author of a layout edit, never by remote acceptance.
+    pub fn repair_unhidden_screens(&mut self, previous: &Layout) {
+        let restored = self
+            .screens
+            .iter()
+            .filter(|s| {
+                s.participates_in_geometry()
+                    && previous
+                        .screen(&s.id)
+                        .is_some_and(|old| old.device_hidden || old.screen_hidden)
+            })
+            .map(|s| s.id.clone())
+            .collect::<Vec<_>>();
+        let owners = restored
+            .iter()
+            .map(|id| id.device)
+            .collect::<std::collections::BTreeSet<_>>();
+        for owner in owners {
+            let collides = self
+                .screens
+                .iter()
+                .filter(|s| s.id.device == owner && restored.contains(&s.id))
+                .any(|s| {
+                    self.screens.iter().any(|other| {
+                        other.id.device != owner
+                            && other.participates_in_geometry()
+                            && overlaps(s.rect, other.rect, tolerance(&[s.rect, other.rect]))
+                    })
+                });
+            if collides {
+                self.repair_native_change(owner);
+            }
+        }
+    }
+
     /// Newly attached screens pin their owner. Only computers intersecting a new
     /// screen in the initial import may move; siblings follow their rigid unit.
     /// Visit colliders by device identity, choosing the nearest free translation
@@ -16,7 +53,7 @@ impl Layout {
         let new = self
             .screens
             .iter()
-            .filter(|s| added.contains(&s.id) && s.is_valid())
+            .filter(|s| added.contains(&s.id) && s.participates_in_geometry())
             .map(|s| s.rect)
             .collect::<Vec<_>>();
         let colliders = self
@@ -24,7 +61,7 @@ impl Layout {
             .iter()
             .filter(|s| {
                 s.id.device != owner
-                    && s.is_valid()
+                    && s.participates_in_geometry()
                     && new.iter().any(|r| overlaps(s.rect, *r, tolerance(&[s.rect, *r])))
             })
             .map(|s| s.id.device)
@@ -41,7 +78,7 @@ impl Layout {
         let group = self
             .screens
             .iter()
-            .filter(|s| s.id.device == device && s.is_valid())
+            .filter(|s| s.id.device == device && s.participates_in_geometry())
             .map(|s| s.rect)
             .collect::<Vec<_>>();
         if group.is_empty() {
@@ -50,7 +87,7 @@ impl Layout {
         let obstacles = self
             .screens
             .iter()
-            .filter(|s| s.id.device != device && s.is_valid())
+            .filter(|s| s.id.device != device && s.participates_in_geometry())
             .map(|s| s.rect)
             .collect::<Vec<_>>();
         let moved = |r: Rect, x, y| Rect::new(r.x + x, r.y + y, r.w, r.h);
@@ -115,7 +152,7 @@ impl Layout {
         let mut devices = self
             .screens
             .iter()
-            .filter(|s| s.is_valid())
+            .filter(|s| s.participates_in_geometry())
             .map(|s| s.id.device)
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
@@ -132,7 +169,7 @@ impl Layout {
             let group = self
                 .screens
                 .iter()
-                .filter(|s| s.id.device == device && s.is_valid())
+                .filter(|s| s.id.device == device && s.participates_in_geometry())
                 .map(|s| s.rect)
                 .collect::<Vec<_>>();
             let fits = |dx: f64, dy: f64| {
@@ -166,7 +203,7 @@ impl Layout {
             }
             for s in self.screens.iter_mut().filter(|s| s.id.device == device) {
                 s.translate(dx, dy);
-                if s.is_valid() {
+                if s.participates_in_geometry() {
                     placed.push(s.rect);
                 }
             }
@@ -182,7 +219,12 @@ impl Layout {
     }
 
     pub fn device_bounds(&self, device: DeviceId) -> Option<Rect> {
-        super::bbox(self.screens.iter().filter(|s| s.id.device == device).map(|s| s.rect))
+        super::bbox(
+            self.screens
+                .iter()
+                .filter(|s| s.id.device == device && s.participates_in_geometry())
+                .map(|s| s.rect),
+        )
     }
 
     /// Apply a group transform to every screen, including disabled screens.
@@ -206,9 +248,12 @@ impl Layout {
         found
     }
 
-    /// 这个点（plane）落在哪块屏幕上（编辑器命中测试；含未启用、离线设备的屏幕）。
+    /// 这个点（plane）落在哪块屏幕上（编辑器命中测试；排除隐藏屏，包含离线设备）。
     pub fn screen_at(&self, plane: Point) -> Option<&ScreenId> {
-        self.screens.iter().find(|s| s.rect.contains(plane)).map(|s| &s.id)
+        self.screens
+            .iter()
+            .find(|s| s.participates_in_geometry() && s.rect.contains(plane))
+            .map(|s| &s.id)
     }
 
     /// 拖动预览：合法位置原样保留；重叠时取最近的合法边界位置（左上角）。
@@ -271,12 +316,16 @@ impl Layout {
             .screens
             .iter()
             .enumerate()
-            .filter(|(i, s)| !members.contains(i) && s.is_valid())
+            .filter(|(i, s)| !members.contains(i) && s.participates_in_geometry())
             .map(|(_, s)| s.rect)
             .collect();
         let group: Vec<Rect> = members
             .iter()
-            .filter_map(|&i| self.screens[i].is_valid().then_some(self.screens[i].rect))
+            .filter_map(|&i| {
+                self.screens[i]
+                    .participates_in_geometry()
+                    .then_some(self.screens[i].rect)
+            })
             .collect();
         let fits = |d: Point| {
             group.iter().all(|g| {
@@ -371,7 +420,9 @@ impl Layout {
         let mut out = Vec::new();
         for i in 0..self.screens.len() {
             for j in i + 1..self.screens.len() {
-                if self.screens[i].id.device != self.screens[j].id.device
+                if self.screens[i].participates_in_geometry()
+                    && self.screens[j].participates_in_geometry()
+                    && self.screens[i].id.device != self.screens[j].id.device
                     && overlaps(
                         self.screens[i].rect,
                         self.screens[j].rect,

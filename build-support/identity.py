@@ -31,6 +31,8 @@ def signpath_configuration():
     directory = child(installer, 'directory', path=f"application/{IDENTITY['windows']['install_directory']}")
     for role in ['ui', 'agent', 'service', 'update_worker', 'crash_collector']:
         child(child(directory, 'pe-file', path=IDENTITY['binaries'][role] + '.exe'), 'authenticode-sign')
+    child(child(directory, 'pe-file', path='OinkPasteMenu.dll'), 'authenticode-sign')
+    child(child(directory, 'pe-file', path='OinkCredentialProvider.dll'), 'authenticode-sign')
     child(installer, 'authenticode-sign')
     ET.indent(root)
     return ET.tostring(root, encoding='utf-8', xml_declaration=True) + b'\n'

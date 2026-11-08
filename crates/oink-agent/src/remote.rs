@@ -175,9 +175,12 @@ impl RemoteApi {
 
     fn roundtrip<R: Read + Write>(conn: &mut Conn<R>, env: &Envelope) -> Result<serde_json::Value, ApiError> {
         let lost = |e: std::io::Error| unavailable(format!("与服务进程的连接中断：{e}"));
-        let mut line = serde_json::to_string(env).map_err(|e| ApiError::Internal { message: e.to_string() })?;
+        let mut line = zeroize::Zeroizing::new(serde_json::to_string(env).map_err(|_| ApiError::Internal {
+            message: "local API encoding failed".into(),
+        })?);
         line.push('\n');
         conn.reader.get_mut().write_all(line.as_bytes()).map_err(lost)?;
+        zeroize::Zeroize::zeroize(&mut *line);
         let mut out = String::new();
         if conn.reader.read_line(&mut out).map_err(|error| {
             if matches!(env.call, Some(Request::ExportDiagnostics { .. })) {
@@ -423,6 +426,16 @@ impl RemoteApi {
 }
 
 impl AgentApi for RemoteApi {
+    fn auto_unlock_status(&self) -> ApiResult<crate::auto_unlock::Status> {
+        self.call(Request::AutoUnlockStatus)
+    }
+    fn save_auto_unlock(&self, password: crate::auto_unlock::Password) -> ApiResult<()> {
+        self.call(Request::SaveAutoUnlock { password })
+    }
+    fn disable_auto_unlock(&self) -> ApiResult<()> {
+        self.call(Request::DisableAutoUnlock)
+    }
+
     fn layout_profile_command(&self, command: crate::layout_profiles::types::Command) -> ApiResult<serde_json::Value> {
         use crate::layout_profiles::types::Command;
         self.call(match command {
@@ -433,6 +446,7 @@ impl AgentApi for RemoteApi {
             Command::Load(v) => Request::LoadLayoutProfile(v),
             Command::Operation(v) => Request::LayoutProfileOperation(v),
             Command::Setting(v) => Request::SetSyncSystemArrangement(v),
+            Command::HiddenDisplaySetting(v) => Request::SetDisableHiddenDisplays(v),
             Command::Preview(v) => Request::PreviewSystemArrangement(v),
             Command::Commit(v) => Request::CommitArrangement(v),
             Command::Reset(v) => Request::ResetArrangement(v),
@@ -763,7 +777,7 @@ impl AgentApi for RemoteApi {
     ) -> ApiResult<()> {
         self.call(Request::SubmitCrashCapsule {
             generation,
-            crash,
+            crash: Box::new(crash),
             collected_at,
         })
     }
@@ -781,6 +795,9 @@ impl AgentApi for RemoteApi {
             choice,
             policy_version,
         })
+    }
+    fn record_mouse_shortcut(&self, token: String, active: bool) -> ApiResult<()> {
+        self.call(Request::RecordMouseShortcut { token, active })
     }
     fn input_settings(&self) -> ApiResult<InputSettings> {
         self.call(Request::InputSettings)

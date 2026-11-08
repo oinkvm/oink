@@ -77,6 +77,23 @@ impl Router {
         self.dnd_hello(peer);
         self.on_dnd_msg(peer, crate::dnd::DndMsg::Caps { enabled: dnd });
         self.dnd_member_attached(peer);
+        if let Some((target, message)) = self.pending_focus_entry.clone()
+            && target == peer
+            && self.holder == self.me()
+            && self.claim == peer
+            && self.rejoin
+            && matches!(
+                &message,
+                ControlMsg::FocusEnter { scope: Some(scope), .. }
+                    | ControlMsg::MovePointerEnter { scope: Some(scope), .. }
+                    if self.scope_allows(Some(scope), peer)
+            )
+        {
+            // Mirror the original handoff ordering: the target gets the entry
+            // before the ordinary state repair, so it can apply the position
+            // instead of merely adopting the claim as a local island.
+            self.send(peer, Message::Control(message));
+        }
         self.send_focus_state(peer);
         self.send_game_state(peer);
         self.send_entry_protection(peer);

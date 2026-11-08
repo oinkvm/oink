@@ -32,7 +32,7 @@ class LocalVersions(unittest.TestCase):
         pattern = ET.fromstring(signpath_configuration()).find('.//{*}msi-file').get('path')
         self.assertEqual(signpath_configuration(), (ROOT / '.signpath/artifact-configurations/windows-msi-v1.xml').read_bytes())
         for version in ('0.3.3', '0.3.3-beta.1', '0.3.3-inhouse.97'):
-            for platform, arch, extensions in [('windows', 'x64', ['msi']), ('macos', 'arm64', ['dmg', 'zip'])]:
+            for platform, arch, extensions in [('windows', 'x64', ['msi']), ('macos', 'arm64', ['dmg', 'zip']), ('macos', 'x64', ['dmg', 'zip'])]:
                 for ext in extensions:
                     name = f'{artifact_stem(version, platform, arch)}.{ext}'
                     self.assertEqual(name, f'Oink-{version}-{platform}-{arch}.{ext}')

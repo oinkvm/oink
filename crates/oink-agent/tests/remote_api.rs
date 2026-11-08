@@ -188,7 +188,7 @@ fn rigid_ui_edit(native_supported: bool, pause_first_read: bool) {
     let query =
         || -> LayoutProfilesState { serde_json::from_value(client.call(Request::LayoutProfiles).unwrap()).unwrap() };
     let state = query();
-    assert!(!state.devices[0].sync_system_arrangement);
+    assert!(state.devices[0].sync_system_arrangement);
     if !native_supported {
         assert_eq!(state.devices[0].availability, Availability::Unavailable);
         // Even an enabled preference cannot turn a rigid edit into a native write.
@@ -202,7 +202,7 @@ fn rigid_ui_edit(native_supported: bool, pause_first_read: bool) {
             .unwrap();
     }
     let state = query();
-    assert_eq!(state.devices[0].sync_system_arrangement, !native_supported);
+    assert!(state.devices[0].sync_system_arrangement);
     if returned_before_observation {
         assert_eq!(state.devices[0].availability, Availability::Unavailable);
         resume.send(()).unwrap();
@@ -1108,7 +1108,11 @@ fn generic_cli_process_calls_api_and_streams_json_events() {
             .env("OINK_HOME", dir.path())
             .output()
             .unwrap();
-        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        assert!(
+            result.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
         serde_json::from_slice::<serde_json::Value>(&result.stdout).unwrap()
     };
     let overview = invoke(&["call", "overview"]);

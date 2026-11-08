@@ -2609,3 +2609,92 @@ async fn telemetry_facts_processing_benchmark() {
     }).unwrap();
     stop(&nodes).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unhide_repairs_only_restored_device_in_one_layout_publication() {
+    let nodes = start(same_group(2)).await;
+    let group = &nodes[0].group;
+    let owner = nodes[0].identity.id();
+    let peer = nodes[1].identity.id();
+    assert!(until(|| ready(&nodes)).await);
+    for whole_device in [false, true] {
+        for collision in [false, true] {
+            group
+                .edit_layout(
+                    Box::new(move |layout| {
+                        let mut sibling = display("sibling");
+                        sibling.bounds.x = 800.;
+                        let mut retained = display("retained-hidden");
+                        retained.bounds.x = 1600.;
+                        *layout = Layout::auto(&[
+                            (owner, vec![display("main"), sibling, retained]),
+                            (peer, vec![display("peer")]),
+                        ]);
+                        let (origin, scale) = layout.device_transform(owner).unwrap();
+                        layout.place_device(
+                            peer,
+                            oink_foundation::Point::new(
+                                origin.x + if collision { 800. } else { 2400. } * scale,
+                                origin.y,
+                            ),
+                            scale,
+                            true,
+                        );
+                        for screen in &mut layout.screens {
+                            screen.screen_visibility_known = true;
+                            screen.device_visibility_known = true;
+                            screen.device_hidden = whole_device && screen.id.device == owner;
+                            screen.screen_hidden = screen.id.device == owner
+                                && (screen.id.display == "retained-hidden"
+                                    || (!whole_device && screen.id.display == "sibling"));
+                        }
+                    }),
+                    dto::LayoutSource::Manual,
+                )
+                .unwrap();
+            let before = group.applied();
+            group
+                .edit_layout(
+                    Box::new(move |layout| {
+                        for screen in &mut layout.screens {
+                            if screen.id.device == owner {
+                                screen.screen_hidden = screen.id.display == "retained-hidden";
+                                screen.device_hidden = false;
+                            }
+                        }
+                    }),
+                    dto::LayoutSource::Manual,
+                )
+                .unwrap();
+            let after = group.applied();
+            assert_eq!(after.version.counter().unwrap(), before.version.counter().unwrap() + 1);
+            assert!(until(|| nodes[1].group.applied().version == after.version).await);
+            assert_eq!(
+                nodes[1].group.applied().layout,
+                after.layout,
+                "remote acceptance must not repair again"
+            );
+            assert!(after.layout.overlaps().is_empty(), "unhide left overlapping screens");
+            assert_eq!(
+                after.layout.device_transform(peer),
+                before.layout.device_transform(peer)
+            );
+            let a = before.layout.device_transform(owner).unwrap();
+            let b = after.layout.device_transform(owner).unwrap();
+            assert_eq!(a.1, b.1);
+            assert_eq!(a.0 == b.0, !collision);
+            for screen in before.layout.screens.iter().filter(|s| s.id.device == owner) {
+                let moved = after.layout.screen(&screen.id).unwrap();
+                assert!((moved.rect.x - screen.rect.x - (b.0.x - a.0.x)).abs() < 1e-8);
+                assert!((moved.rect.y - screen.rect.y - (b.0.y - a.0.y)).abs() < 1e-8);
+            }
+            group.edit_layout(Box::new(|_| {}), dto::LayoutSource::Manual).unwrap();
+            assert_eq!(
+                group.applied().layout,
+                after.layout,
+                "repeated edit moved the device twice"
+            );
+        }
+    }
+    stop(&nodes).await;
+}

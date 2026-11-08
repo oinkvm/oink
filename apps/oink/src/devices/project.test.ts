@@ -145,6 +145,23 @@ describe('owner card presentation',()=>{
     source.status!.speaker.activity='waiting_for_exit';
     expect(indicators(presentCards(view(source),[])[0],true).find(i=>i.glyph==='speaker')?.badge).toBe('warning');
   });
+  it('clears the restored-exit warning from silent source facts and preserves actual faults',()=>{
+    const source=card();
+    Object.assign(source.status!.speaker,{configuredMode:'source',icon:'forwarding',activity:'waiting_for_exit',receiverDevice:null});
+    const store=createAgentStore();
+    const badge=()=>indicators(presentCards(store.get().cards,[])[0],true)[2].badge;
+    store.receive({type:'device_cards',data:view(source)});
+    expect(badge()).toBe('warning');
+    // No Audio/AudioStatistics event or sound is needed to update this badge.
+    const restored=structuredClone(source);
+    Object.assign(restored.status!.speaker,{activity:'sound_sleep',receiverDevice:'3'.repeat(64),forwarding:{volumePercent:100,volumeBars:3,muted:false}});
+    store.receive({type:'device_cards',data:{...view(restored),revision:'2'}});
+    expect(badge()).toBe('send');
+    const failed=structuredClone(restored);
+    Object.assign(failed.status!.speaker,{icon:'fault',activity:'failed',condition:'faulted',fault:{code:'capture_unavailable',unknownCode:null,problem:null}});
+    store.receive({type:'device_cards',data:{...view(failed),revision:'3'}});
+    expect(badge()).toBe('warning');
+  });
 });
 
 describe('unavailable resource presentation',()=>{

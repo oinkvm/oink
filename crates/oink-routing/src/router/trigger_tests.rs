@@ -14,6 +14,10 @@ fn placement(device: DeviceId, rect: Rect) -> ScreenPlacement {
         size_source: SizeSource::Manual,
         primary: true,
         builtin: false,
+        device_hidden: false,
+        screen_hidden: false,
+        device_visibility_known: false,
+        screen_visibility_known: false,
     }
 }
 fn owners(mode: SpeedMode) -> std::collections::BTreeMap<DeviceId, OwnerLayoutPreferences> {

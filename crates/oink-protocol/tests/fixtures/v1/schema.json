@@ -52,6 +52,7 @@
     "oink.pointer.move/1",
     "oink.pointer.move-hidden/1",
     "oink.focus.local-click/1",
+    "oink.auto-unlock/1",
     "oink.pointer.lock-escape/1",
     "oink.input.keymap-none/1",
     "oink.pointer.entry-protection/1",
@@ -2304,6 +2305,10 @@
         [
           29,
           "AudioQuality"
+        ],
+        [
+          30,
+          "DisableHiddenDisplays"
         ]
       ]
     ],
@@ -12690,6 +12695,66 @@
         ],
         "name": "ControlLocalClick"
       }
+    },
+    {
+      "capabilities": [
+        "oink.input/1",
+        "oink.auto-unlock/1"
+      ],
+      "id": 4867,
+      "name": "ControlUnlockQuery",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 3,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "epoch",
+            "shape": "u64"
+          }
+        ],
+        "name": "ControlUnlockQuery"
+      }
+    },
+    {
+      "capabilities": [
+        "oink.input/1",
+        "oink.auto-unlock/1"
+      ],
+      "id": 4868,
+      "name": "ControlUnlockReply",
+      "pause": "Suspend",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 3,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": {
+        "fields": [
+          {
+            "absence": "required",
+            "key": 1,
+            "name": "epoch",
+            "shape": "u64"
+          },
+          {
+            "absence": "required",
+            "key": 2,
+            "name": "unlocked",
+            "shape": "bool"
+          }
+        ],
+        "name": "ControlUnlockReply"
+      }
     }
   ],
   "open_enums": [
@@ -13698,6 +13763,34 @@
   ],
   "revision": "2026-10-15-ui-freeze",
   "schemas": [
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "epoch",
+          "shape": "u64"
+        }
+      ],
+      "name": "ControlUnlockQuery"
+    },
+    {
+      "fields": [
+        {
+          "absence": "required",
+          "key": 1,
+          "name": "epoch",
+          "shape": "u64"
+        },
+        {
+          "absence": "required",
+          "key": 2,
+          "name": "unlocked",
+          "shape": "bool"
+        }
+      ],
+      "name": "ControlUnlockReply"
+    },
     {
       "fields": [
         {
@@ -26765,6 +26858,12 @@
           "key": 6,
           "name": "digest",
           "shape": "Hash32"
+        },
+        {
+          "absence": "optional",
+          "key": 7,
+          "name": "layout_visibility",
+          "shape": "Option<RawMap>"
         }
       ],
       "name": "Register"
@@ -27060,6 +27159,12 @@
           "key": 4,
           "name": "screens",
           "shape": "List<ScreenPlacement,256>"
+        },
+        {
+          "absence": "false",
+          "key": 5,
+          "name": "hidden",
+          "shape": "bool"
         }
       ],
       "name": "DevicePlacement"
@@ -27100,6 +27205,12 @@
           "absence": "required",
           "key": 10,
           "name": "builtin",
+          "shape": "bool"
+        },
+        {
+          "absence": "false",
+          "key": 11,
+          "name": "hidden",
           "shape": "bool"
         }
       ],

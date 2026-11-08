@@ -6,10 +6,10 @@ param(
 $ErrorActionPreference = 'Stop'
 function Copy-ExtractedPe([xml]$Manifest, [string]$Extracted, [string]$Name, [string]$Destination) {
     # WiX extracts by File-table ID, not the installed long filename. Resolve
-    # the ID through its decompiled name, then restore .exe for Authenticode's
+    # the ID through its decompiled name, then restore .exe/.dll for Authenticode's
     # subject provider. Never follow a decompiled Source path outside extraction.
     $entries = @($Manifest.SelectNodes("//*[local-name()='File']") | Where-Object { $_.GetAttribute('Name') -ceq $Name })
-    if ($entries.Count -ne 1 -or $Name -notmatch '^[A-Za-z0-9_.-]+\.exe$') { throw 'Unexpected installed executable inventory.' }
+    if ($entries.Count -ne 1 -or $Name -notmatch '^[A-Za-z0-9_.-]+\.(exe|dll)$') { throw 'Unexpected installed executable inventory.' }
     $id = $entries[0].GetAttribute('Id')
     if ($id -notmatch '^[A-Za-z_][A-Za-z0-9_.]*$') { throw 'Invalid extracted file identifier.' }
     $source = Join-Path (Join-Path $Extracted 'File') $id
@@ -31,8 +31,9 @@ $extracted = Join-Path $Directory 'verified-extracted'
 if ($LASTEXITCODE -ne 0) { throw 'Signed MSI decompilation failed.' }
 [xml]$manifest = Get-Content -Raw -LiteralPath (Join-Path $Directory 'verified.wxs')
 $verifiedComponents = @()
-foreach ($role in @('ui','agent','service','update_worker','crash_collector')) {
-    $name = $identity.binaries.$role + '.exe'
+$nativeNames = @('ui','agent','service','update_worker','crash_collector') | ForEach-Object { $identity.binaries.$_ + '.exe' }
+$nativeNames += 'OinkPasteMenu.dll','OinkCredentialProvider.dll'
+foreach ($name in $nativeNames) {
     $file = Copy-ExtractedPe -Manifest $manifest -Extracted $extracted -Name $name -Destination (Join-Path $Directory 'verified-pe')
     $sig = Get-AuthenticodeSignature -LiteralPath $file
     if ($sig.Status -ne 'Valid' -or -not $sig.TimeStamperCertificate -or $sig.SignerCertificate.Thumbprint -ne $signature.SignerCertificate.Thumbprint) {

@@ -243,6 +243,7 @@ wire_map!(Register, validate_register, {
     4 => value: RawMap = required;
     5 => deleted: bool = false;
     6 => digest: Hash32 = required;
+    7 => layout_visibility: Option<RawMap> = optional;
 });
 
 wire_map!(Request, validate_request, {

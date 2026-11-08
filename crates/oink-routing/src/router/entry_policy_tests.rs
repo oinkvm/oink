@@ -401,117 +401,96 @@ fn hiding_current_screen_preserves_focus_position_and_native_cursor() {
 }
 
 #[test]
-fn hidden_native_seam_blocks_both_directions_in_shared_and_local_mouse_modes() {
-    use oink_display::layout::{OwnerLayoutPreferences, ScreenPreference};
+fn hidden_native_motion_is_observed_without_virtualization() {
     use oink_foundation::input::InputMode;
-    for mode in [InputMode::Shared, InputMode::Local] {
-        for hidden in ["middle", "left"] {
-            let mut displays = Vec::new();
-            for (i, key) in ["left", "middle", "right"].into_iter().enumerate() {
-                let mut d = display();
-                d.key = key.into();
-                d.bounds.x = i as f64 * 1000.;
-                d.is_primary = i == 0;
-                displays.push(d);
+    for (os, mode) in [Os::Windows, Os::MacOS]
+        .into_iter()
+        .flat_map(|os| [InputMode::Shared, InputMode::Local].map(|mode| (os, mode)))
+    {
+        for gap in [false, true] {
+            let mut second = display();
+            second.key = "hidden".into();
+            second.bounds.x = 1000.;
+            let displays = vec![display(), second];
+            let mut layout = Layout::auto(&[(ME, displays.clone())]);
+            layout.settings.gap_travel = gap;
+            layout.screens[1].screen_hidden = true;
+            layout.screens[1].screen_visibility_known = true;
+            let mut r = router();
+            r.cfg.os = os;
+            r.set_local_displays(displays);
+            let mut settings = r.config().settings.clone();
+            settings.mouse_mode = mode;
+            r.set_settings(settings);
+            r.set_layout(Arc::new(TopologyLayout::from_layout(&layout, &Default::default())));
+            r.set_cursor(Point::new(990., 30.));
+            r.drain_outputs();
+            for (dx, x, key) in [(20., 1010., "hidden"), (-20., 990., "screen")] {
+                assert_eq!(r.local_motion(dx, 0., Some(Point::new(x, 30.)), 100), Disposition::Pass);
+                assert_eq!(r.local_cursor.as_ref().unwrap().screen.display, key);
+                assert!(
+                    !r.drain_outputs()
+                        .iter()
+                        .any(|o| matches!(o, Output::Inject(_) | Output::RestoreLocal { .. } | Output::SetMode(_)))
+                );
             }
-            let layout = Layout::auto(&[(ME, displays.clone())]);
-            let mut owners = std::collections::BTreeMap::new();
-            let mut owner = OwnerLayoutPreferences::default();
-            owner.screens.insert(
-                hidden.into(),
-                ScreenPreference {
-                    enabled: false,
-                    ..Default::default()
-                },
+            assert!(r.reconcile_target_cursor(Point::new(1500., 30.)));
+            assert_eq!(r.pointer.as_ref().unwrap().screen.display, "hidden");
+            assert_eq!(
+                r.local_motion(-600., 0., Some(Point::new(900., 30.)), 200),
+                Disposition::Pass
             );
-            owners.insert(ME, owner);
-            for (from, at, dx, native) in [
-                ("left", Point::new(990., 30.), 20., Point::new(1010., 30.)),
-                ("middle", Point::new(1010., 30.), -20., Point::new(990., 30.)),
-            ] {
-                let mut r = router();
-                r.set_local_displays(displays.clone());
-                let mut settings = r.config().settings.clone();
-                settings.mouse_mode = mode;
-                r.set_settings(settings);
-                r.set_cursor(at);
-                r.set_layout(Arc::new(TopologyLayout::from_layout(&layout, &owners)));
-                r.drain_outputs();
-                let disposition = r.local_motion(dx, 0., Some(native), 100);
-                assert_eq!(disposition, Disposition::Swallow);
-                assert_eq!(r.local_cursor.as_ref().unwrap().screen.display, from);
-                let expected = if from == "left" { 999. } else { 1000. };
-                assert!((r.local_cursor.as_ref().unwrap().local.x - expected).abs() < 1.);
-            }
+            assert!(!r.drain_outputs().iter().any(|o| matches!(o, Output::Inject(_))));
         }
     }
 }
 
 #[test]
-fn hidden_native_constraint_repairs_foreign_warps_and_releases_on_pause() {
-    let mut r = router();
-    r.set_cursor(Point::new(50., 60.));
-    exclude(&mut r, ME);
-    let out = r.drain_outputs();
-    assert!(out.iter().any(|o| matches!(o, Output::ConstrainCursor(Some(_)))));
-    assert!(!r.reconcile_target_cursor(Point::new(1200., 60.)));
-    assert!(r.drain_outputs().iter().any(|o| matches!(o,
-        Output::Inject(InjectEvent::MoveTo { pos }) if *pos == Point::new(50., 60.))));
-    r.set_paused(true);
-    assert!(
-        r.drain_outputs()
-            .iter()
-            .any(|o| matches!(o, Output::ConstrainCursor(None)))
-    );
-    assert_eq!(r.hidden_cursor_constraint(), None);
-}
-
-#[test]
-fn hidden_neighbor_does_not_lock_enabled_native_seams_and_constraint_precedes_move() {
-    use oink_display::layout::{OwnerLayoutPreferences, ScreenPreference};
-    let displays: Vec<_> = ["left", "middle", "right"]
-        .into_iter()
-        .enumerate()
-        .map(|(i, key)| {
-            let mut d = display();
-            d.key = key.into();
-            d.bounds.x = i as f64 * 1000.;
-            d
-        })
-        .collect();
-    let layout = Layout::auto(&[(ME, displays.clone())]);
-    let mut owner = OwnerLayoutPreferences::default();
-    owner.screens.insert(
-        "right".into(),
-        ScreenPreference {
-            enabled: false,
-            ..Default::default()
-        },
-    );
-    let owners = [(ME, owner)].into_iter().collect();
-    let mut r = router();
-    r.set_local_displays(displays);
-    r.set_cursor(Point::new(990., 30.));
-    r.set_layout(Arc::new(TopologyLayout::from_layout(&layout, &owners)));
-    r.drain_outputs();
-    assert_eq!(
-        r.local_motion(20., 0., Some(Point::new(1010., 30.)), 100),
-        Disposition::Swallow
-    );
-    let out = r.drain_outputs();
-    assert_eq!(r.pointer.as_ref().unwrap().screen.display, "middle");
-    let bounds = out
-        .iter()
-        .position(|o| matches!(o,Output::ConstrainCursor(Some(rect)) if rect.x==1000.))
-        .unwrap();
-    let motion = out
-        .iter()
-        .position(|o| {
-            matches!(
-                o,
-                Output::Inject(InjectEvent::MoveToWithDelta { .. } | InjectEvent::MoveTo { .. })
-            )
-        })
-        .unwrap();
-    assert!(bounds < motion, "new native bounds must precede the crossing: {out:?}");
+fn hidden_native_seam_and_hidden_source_can_depart_to_peer() {
+    for gap in [false, true] {
+        for hidden_source in [false, true] {
+            let mut second = display();
+            second.key = "hidden".into();
+            second.bounds.x = 1000.;
+            let displays = vec![display(), second];
+            let mut layout = Layout::auto(&[(ME, displays.clone()), (PEER, vec![display()])]);
+            layout.settings.gap_travel = gap;
+            let scale = layout.device_transform(ME).unwrap().1;
+            layout
+                .screens
+                .iter_mut()
+                .find(|s| s.id.display == "hidden")
+                .unwrap()
+                .screen_hidden = true;
+            layout
+                .screens
+                .iter_mut()
+                .find(|s| s.id.display == "hidden")
+                .unwrap()
+                .screen_visibility_known = true;
+            layout.place_device(
+                PEER,
+                Point::new(if hidden_source { 2000. } else { 1000. } * scale, 0.),
+                scale,
+                true,
+            );
+            let mut r = router();
+            r.set_local_displays(displays);
+            r.set_layout(Arc::new(TopologyLayout::from_layout(&layout, &Default::default())));
+            let x = if hidden_source { 1999. } else { 990. };
+            r.set_cursor(Point::new(x, 30.));
+            r.drain_outputs();
+            assert_eq!(
+                r.local_motion(
+                    20.,
+                    0.,
+                    Some(Point::new(if hidden_source { 1999. } else { 1010. }, 30.)),
+                    100
+                ),
+                Disposition::Swallow,
+                "gap={gap}, hidden_source={hidden_source}"
+            );
+            assert_eq!(r.focus().holder, PEER);
+        }
+    }
 }

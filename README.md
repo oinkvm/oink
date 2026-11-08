@@ -17,7 +17,7 @@ Get installers and matching source from [GitHub Releases](https://github.com/oin
 
 Supported operating systems and versions:
 
-- **Mac:** Apple silicon (arm64) only, macOS 14.2+
+- **Mac:** Apple silicon (arm64), macOS 14.2+; Intel (x64), macOS 14.2+ (untested)
 - **Windows:** x64, Windows 10 22H2 (build 19045)+ or Windows 11
 
 If SmartScreen says "Windows protected your PC", use **More info → Run anyway** only if offered. UAC may show an unknown publisher.

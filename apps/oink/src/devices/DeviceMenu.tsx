@@ -66,7 +66,7 @@ const ROWS: Array<{
     { kind: 'mouse', glyph: 'mouse', get label() {
             return tr('鼠标');
         }, options: [
-            { value: 'disabled', get label() { return tr('禁用'); }, get tip() { return tr('禁用该设备的鼠标'); } },
+            { value: 'disabled', get label() { return tr('禁用'); }, get tip() { return tr('禁用该设备的鼠标（防误触）'); } },
             { value: 'local', get label() {
                     return tr('本地');
                 }, get tip() { return tr('该设备的鼠标只能控制自己'); } },
@@ -79,7 +79,7 @@ const ROWS: Array<{
         }, options: [
             { value: 'disabled', get label() {
                     return tr('禁用');
-                }, get tip() { return tr('禁用该设备的键盘'); } },
+                }, get tip() { return tr('禁用该设备的键盘（防误触）'); } },
             { value: 'local', get label() {
                     return tr('本地');
                 }, get tip() { return tr('该设备的键盘只能控制自己'); } },
@@ -134,6 +134,8 @@ export interface SideContextMenuProps {
     /** Device menu: hide all of its screens, or show them all again when any is hidden. */
     onScreensHidden: (deviceId: string, hidden: boolean) => void;
     screenEditPending?: boolean;
+    /** Kept for callers compiled against the old owner-editability contract. */
+    editableScreenDevices?: ReadonlySet<string>;
     requests: IncomingRequest[];
     nearby: Peer[];
     onShare: (id: string, kind: ShareKind, value: ShareValue) => void;
@@ -155,7 +157,7 @@ export interface SideContextMenuProps {
     children: ReactNode;
     standalone?: boolean;
 }
-export function SideContextMenu({ devices, screens = [], onHideScreen, onScreensHidden, screenEditPending = false, requests, nearby, onShare, onMicrophone, onGrantPermission, onGameMode, onPause, onLeave, onEditAddress, onShowWindow, onAbout, onQuit, onAccept, onReject, onPair, onBlock, onOpenChange, children, standalone = false }: SideContextMenuProps) {
+export function SideContextMenu({ devices, screens = [], onHideScreen, onScreensHidden, screenEditPending = false, editableScreenDevices: _editableScreenDevices, requests, nearby, onShare, onMicrophone, onGrantPermission, onGameMode, onPause, onLeave, onEditAddress, onShowWindow, onAbout, onQuit, onAccept, onReject, onPair, onBlock, onOpenChange, children, standalone = false }: SideContextMenuProps) {
     const [ctx, setCtx] = useState<Ctx | null>(null);
     const [open, setOpenState] = useState(false);
     const ctxRef = useRef<Ctx | null>(null);
@@ -208,7 +210,7 @@ export function SideContextMenu({ devices, screens = [], onHideScreen, onScreens
         const unavailable = (kind: ShareKind) => d.unknown || d.actionability?.[kind] === 'unavailable';
         const leaveItem = <MenuItem icon={LeaveIcon} tone="danger" onSelect={() => onLeave(d.id)}>{leave}</MenuItem>;
         body = <Fragment key={`${tray ? 'tray' : 'device'}:${d.id}`}>
-          {ro ? <><MenuItem icon="edit" onSelect={() => onEditAddress(d.id)}>{tr('编辑 IP')}</MenuItem><MenuSeparator/>{leaveItem}</> : <>
+          {ro ? <><MenuItem icon={anyHidden ? 'eye' : EyeOffIcon} disabled={screenEditPending} onSelect={() => onScreensHidden(d.id, !anyHidden)}>{anyHidden ? tr('显示全部屏幕') : tr('隐藏全部屏幕')}</MenuItem><MenuItem icon="edit" onSelect={() => onEditAddress(d.id)}>{tr('编辑 IP')}</MenuItem><MenuSeparator/>{leaveItem}</> : <>
             <MenuItem icon={locked ? UnlockIcon : 'lock'} disabled={unavailable('screen')} onSelect={() => onShare(d.id, 'screen', locked ? 'shared' : 'locked')}>{locked ? tr('解锁指针') : tr('锁定指针')}</MenuItem>
             <MenuItem icon={anyHidden ? 'eye' : EyeOffIcon} disabled={unavailable('screen') || screenEditPending} onSelect={() => onScreensHidden(d.id, !anyHidden)}>{anyHidden ? tr('显示全部屏幕') : tr('隐藏全部屏幕')}</MenuItem>
             <MenuSub label={tr('输入设备')} icon={glyph('keyboard')}>
@@ -248,8 +250,12 @@ export function SideContextMenu({ devices, screens = [], onHideScreen, onScreens
         </Fragment>;
     }
     else if (screen) {
+        const owner = devices.find(d => d.id === screen.device);
+        // Visibility is a shared layout bit. Any online member may edit one
+        // screen; an offline member still exposes only the whole-device action.
+        const individual = owner?.group !== 'offline';
         body = <Fragment key={`screen:${screen.id}`}>
-          <MenuItem icon={EyeOffIcon} disabled={screenEditPending} onSelect={() => onHideScreen(screen.id)}>{tr('隐藏此屏幕')}</MenuItem>
+          <MenuItem icon={EyeOffIcon} disabled={screenEditPending} onSelect={() => individual ? onHideScreen(screen.id) : onScreensHidden(screen.device, true)}>{individual ? tr('隐藏此屏幕') : tr('隐藏全部屏幕')}</MenuItem>
         </Fragment>;
     }
     else if (request) {

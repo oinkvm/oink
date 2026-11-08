@@ -24,7 +24,7 @@ from sparkle import prepare as prepare_sparkle, VERSION as SPARKLE_VERSION, SHA2
 from localizations import DECLARATIONS, STRINGS, write_localizations
 from macos_imports import verify_imports
 from macos_launch_smoke import launch_smoke
-from macos_registration import temporary_registration
+from macos_registration import temporary_registrations
 
 from versioning import release_version, macos_version_fields
 
@@ -57,11 +57,22 @@ def compile_provider_extension(common, generated, crash_object, output):
         ROOT / 'apps/file-provider/Extension.swift', crash_object, '-o', output)
 
 
+def compile_finder_extension(common, output):
+    run(*common, '-module-name', 'OinkFinderSync', '-application-extension',
+        '-Xlinker', '-e', '-Xlinker', '_OinkFinderSyncMain', '-l', 'extension',
+        ROOT / 'apps/finder-sync/Request.swift', ROOT / 'apps/finder-sync/ExtensionMain.swift',
+        ROOT / 'apps/finder-sync/Extension.swift', '-o', output)
+
+
+def compile_paste_helper(common, output):
+    run(*common, ROOT / 'apps/finder-sync/Request.swift', ROOT / 'apps/finder-sync/Helper.swift', '-o', output)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--binaries', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
-    p.add_argument('--arch', choices=['arm64'], default='arm64')
+    p.add_argument('--arch', choices=['arm64', 'x64'], default='arm64')
     p.add_argument('--version', default=I['version'])
     p.add_argument('--update-notes-file', type=Path, help='Prepared embedded package notes')
     p.add_argument('--source-commit', help='Full source commit for a in-house build-labelled version')
@@ -74,6 +85,7 @@ def main():
     p.add_argument('--notary-keychain', type=Path, help='Optional non-default keychain containing the notary profile')
     p.add_argument('--sparkle-cache', type=Path)
     a = p.parse_args()
+    native_arch = 'x86_64' if a.arch == 'x64' else 'arm64'
     if not re.fullmatch(r'[0-9a-f]{64}', a.source_tree_sha256) or not 1 <= a.build < 2**31:
         p.error('source tree SHA256 and positive build required')
     if a.version != I['version']:
@@ -87,7 +99,7 @@ def main():
         p.error('enabled Mac updates require the compiled Sparkle public key')
     a.sparkle_public_key = trust['mac']['public_key']
     a.identity = select_identity(a.team, a.signing_fingerprint)
-    provenance = verify(a.binaries, a.source_tree_sha256, a.version, 'aarch64-apple-darwin', a.build, a.source_commit)
+    provenance = verify(a.binaries, a.source_tree_sha256, a.version, ('aarch64-apple-darwin' if a.arch == 'arm64' else 'x86_64-apple-darwin'), a.build, a.source_commit)
     if not a.sparkle_cache:
         p.error('the Mac package requires Sparkle.framework')
     if bool(a.sparkle_cache) != provenance.get('sparkle', False):
@@ -168,13 +180,32 @@ def main():
         NSExtensionPrincipalClass=b['file_provider_class'], NSExtensionFileProviderDocumentGroup=group,
         NSExtensionFileProviderSupportsEnumeration=True, NSFileProviderUserInteractions=[])
     plist(ext / 'Contents/Info.plist', ext_info)
+    finder = app / 'Contents/PlugIns/OinkFinderSync.appex'
+    (finder / 'Contents/MacOS').mkdir(parents=True)
+    finder_resources = finder / 'Contents/Resources'
+    finder_resources.mkdir()
+    for name in ('OinkPasteMenu.png', 'OinkPasteMenu@2x.png',
+                 'OinkPasteMenuDark.png', 'OinkPasteMenuDark@2x.png'):
+        shutil.copy2(ROOT / 'apps/finder-sync/Resources' / name, finder_resources / name)
+    plist(finder / 'Contents/Info.plist', dict(CFBundleIdentifier=I['bundle_id'] + '.findersync',
+        CFBundleName='Oink Finder', CFBundleExecutable='OinkFinderSync', CFBundlePackageType='XPC!',
+        **macos_version_fields(a.version, a.build), LSMinimumSystemVersion=I['macos_minimum'],
+        **DECLARATIONS, OinkAppGroup=group, NSExtension=dict(NSExtensionPointIdentifier='com.apple.FinderSync',
+        NSExtensionPrincipalClass='OinkFinderSync')))
+    paste_helper = app / 'Contents/Helpers/OinkPaste.app'
+    (paste_helper / 'Contents/MacOS').mkdir(parents=True)
+    plist(paste_helper / 'Contents/Info.plist', dict(CFBundleIdentifier=I['bundle_id'] + '.paste',
+        CFBundleName='Oink Paste', CFBundleExecutable='OinkPaste', CFBundlePackageType='APPL',
+        **macos_version_fields(a.version, a.build), LSMinimumSystemVersion=I['macos_minimum'], LSUIElement=True, OinkAppGroup=group, **DECLARATIONS))
+    write_localizations(finder)
+    write_localizations(paste_helper)
     copy_notices(resources)
     with tempfile.TemporaryDirectory(prefix='release-package-') as tmp:
         tmp = Path(tmp)
         # Offline HAL tests load the bundle directly, without registering it
         # with CoreAudio or starting I/O. Installation is a separate user action.
         plugin_build = tmp / 'audio-plugin'
-        run('bash', ROOT / 'apps/audio-plugin/build.sh', plugin_build, a.source_tree_sha256)
+        run('bash', ROOT / 'apps/audio-plugin/build.sh', plugin_build, a.source_tree_sha256, native_arch)
         plugin_payload = resources / 'AudioPlugin'
         plugin_payload.mkdir()
         plugin = plugin_payload / 'OinkMicrophone.driver'
@@ -184,6 +215,8 @@ def main():
         write_swift_identity(generated)
         host = {'com.apple.security.application-groups': [group], 'com.apple.security.device.audio-input': True}
         plist(tmp / 'host.plist', host)
+        plist(tmp / 'paste-host.plist', {'com.apple.security.application-groups': [group]})
+        plist(tmp / 'finder.plist', {'com.apple.security.application-groups': [group], 'com.apple.security.app-sandbox': True})
         plist(tmp / 'extension.plist', {'com.apple.security.application-groups': [group],
               'com.apple.security.app-sandbox': True, 'com.apple.security.network.client': True})
         manager = dict(CFBundleIdentifier=I['bundle_id'], CFBundleName=I['name'], **macos_version_fields(a.version, a.build))
@@ -191,9 +224,11 @@ def main():
         plist(tmp / 'manager.plist', manager)
         common = ['xcrun', 'swiftc', '-swift-version', '5', '-O', '-g', '-debug-prefix-map', f'{ROOT}=oink',
                   '-debug-prefix-map', f'{tmp}=oink/generated',
-                  '-target', f'{a.arch}-apple-macos{I["macos_minimum"]}', '-parse-as-library', '-D', 'OINK_RELEASE']
-        run('xcrun', 'clang', '-O2', '-g', f'-ffile-prefix-map={ROOT}=oink', '-std=c11', '-target', f'arm64-apple-macos{I["macos_minimum"]}',
+                  '-target', f'{native_arch}-apple-macos{I["macos_minimum"]}', '-parse-as-library', '-D', 'OINK_RELEASE']
+        run('xcrun', 'clang', '-O2', '-g', f'-ffile-prefix-map={ROOT}=oink', '-std=c11', '-target', f'{native_arch}-apple-macos{I["macos_minimum"]}',
             '-c', ROOT / 'apps/file-provider/CrashCapture.c', '-o', tmp / 'crash-capture.o')
+        compile_finder_extension(common, finder / 'Contents/MacOS/OinkFinderSync')
+        compile_paste_helper(common, paste_helper / 'Contents/MacOS/OinkPaste')
         compile_provider_extension(common, generated, tmp / 'crash-capture.o',
                                    ext / 'Contents/MacOS' / b['file_provider_extension'])
         run(*common, '-Xlinker', '-sectcreate', '-Xlinker', '__TEXT', '-Xlinker', '__info_plist',
@@ -212,11 +247,13 @@ def main():
         plugin_dsym = plugin_build / 'OinkMicrophone.dSYM'
         run('xcrun', 'dsymutil', plugin_image, '-o', plugin_dsym)
         symbol_images.append(plugin_image)
+        symbol_images.append(finder / 'Contents/MacOS/OinkFinderSync')
+        symbol_images.append(paste_helper / 'Contents/MacOS/OinkPaste')
         symbol_images += [helper / 'Contents/MacOS' / b['ui'], ext / 'Contents/MacOS' / b['file_provider_extension']]
         symbol_records = []
         for image in symbol_images:
             dsym = symbols / (image.name + '.dSYM')
-            generated = (image.parent if image.name in (b['file_provider_manager'], b['file_provider_extension'])
+            generated = (image.parent if image.name in (b['file_provider_manager'], b['file_provider_extension'], 'OinkFinderSync', 'OinkPaste')
                          else a.binaries) / (image.name + '.dSYM')
             if image == plugin_image:
                 generated = plugin_dsym
@@ -232,7 +269,7 @@ def main():
             # Swift uses the installed executable name. Bind by UUID below.
             dwarfs = list((dsym / 'Contents/Resources/DWARF').iterdir())
             if len(dwarfs) != 1 or not dwarfs[0].is_file():
-                raise RuntimeError('Expected one arm64 DWARF image in the dSYM')
+                raise RuntimeError('Expected one thin DWARF image in the dSYM')
             dwarf = dwarfs[0]
             output = subprocess.check_output(['xcrun', 'dwarfdump', '--uuid', str(dwarf)], text=True)
             identifier = re.search(r'UUID: ([0-9A-Fa-f-]{36})', output)
@@ -282,9 +319,9 @@ def main():
                     bundle = path.is_dir() and path.suffix in ['.app', '.xpc', '.framework']
                     if executable:
                         arches = run('lipo', '-archs', path, capture_output=True, text=True).stdout.split()
-                        if arches != ['arm64']:
-                            thinned = tmp / 'arm64-image'
-                            run('lipo', path, '-thin', 'arm64', '-output', thinned)
+                        if arches != [native_arch]:
+                            thinned = tmp / 'thin-image'
+                            run('lipo', path, '-thin', native_arch, '-output', thinned)
                             shutil.copymode(path, thinned)
                             shutil.move(thinned, path)
                     if executable or bundle:
@@ -293,15 +330,19 @@ def main():
                 private_run('codesign', '--force', '--options', 'runtime', '--timestamp', '--sign', a.identity,
                     '--preserve-metadata=identifier,entitlements', framework)
             sign(plugin, 'com.hachiwii.oink.microphone.driver')
+            sign(finder, I['bundle_id'] + '.findersync', tmp / 'finder.plist')
+            sign(paste_helper, I['bundle_id'] + '.paste', tmp / 'paste-host.plist')
             sign(ext, I['macos']['file_provider_id'], tmp / 'extension.plist')
-            sign(mac / b['file_provider_manager'], I['bundle_id'], tmp / 'host.plist')
+            # Classic Keychain trusted-application ACLs compare signing identity.
+            # The manager must not share the credential-owning backend's identity.
+            sign(mac / b['file_provider_manager'], I['bundle_id'] + '.file-provider-manager', tmp / 'host.plist')
             sign(helper, I['macos']['ui_id'])
             sign(mac / b['agent'], I['macos']['agent_id'])
             sign(mac / b['crash_collector'], I['bundle_id'] + '.crash-collector')
             sign(app, I['bundle_id'], tmp / 'host.plist')
             from content import verify_app
-            record['components'] = verify_app(app, I)
-            run('node', ROOT / 'build-support/check-package-licenses.mjs', app, 'macos-arm64', cwd=ROOT)
+            record['components'] = verify_app(app, I, native_arch)
+            run('node', ROOT / 'build-support/check-package-licenses.mjs', app, 'macos-' + a.arch, cwd=ROOT)
             # Exercise the shipping signature, hardened runtime and embedded loader
             # before notarization. Private smoke state never contacts the user host.
             backend = mac / b['backend']
@@ -309,7 +350,9 @@ def main():
             # even though smoke disables File Provider work. Remove only this
             # disposable bundle's registrations before another installation can
             # choose it as its provider host; do this on smoke failures too.
-            with temporary_registration(app, I['macos']['file_provider_bundle'], I['macos']['file_provider_id']):
+            with temporary_registrations(app, [
+                    (I['macos']['file_provider_bundle'], I['macos']['file_provider_id']),
+                    ('OinkFinderSync.appex', I['bundle_id'] + '.findersync')]):
                 launch_smoke(backend, seconds=10)
             record['launch_smoke'] = {'status': 'passed', 'seconds': 10, 'signed': True,
                                       'backend': backend.relative_to(app).as_posix(),

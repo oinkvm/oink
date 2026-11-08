@@ -221,33 +221,42 @@ impl Router {
             self.publish_lock_escape();
         }
     }
-    pub(super) fn local_lock_escape_held(&self) -> bool {
-        self.capture_available
-            && !self.paused
-            && !self.keyboard_disabled()
-            && self
-                .hotkeys
-                .bindings()
-                .iter()
-                .filter(|b| b.action == "lock_escape")
-                .any(|b| {
-                    self.lock_escape_keys.iter().any(|key| {
-                        if let Some(modifier) = Mods::of(b.chord.key) {
-                            Mods::of(*key) == Some(modifier)
-                        } else {
-                            *key == b.chord.key
-                        }
-                    })
+    fn lock_escape_binding_held(&self, mouse: bool) -> bool {
+        self.hotkeys
+            .bindings()
+            .iter()
+            .filter(|b| b.action == "lock_escape")
+            .filter(|b| (b.chord.key.page() == 9) == mouse)
+            .any(|b| {
+                self.lock_escape_keys.iter().any(|key| {
+                    if let Some(modifier) = Mods::of(b.chord.key) {
+                        Mods::of(*key) == Some(modifier)
+                    } else {
+                        *key == b.chord.key
+                    }
                 })
+            })
     }
-    /// The keyboard source interprets its binding. Only its current shared focus
-    /// receives the boolean; injected key events never contribute to this state.
+
+    fn local_keyboard_lock_escape_held(&self) -> bool {
+        self.capture_available && !self.paused && !self.keyboard_disabled() && self.lock_escape_binding_held(false)
+    }
+
+    fn local_mouse_lock_escape_held(&self) -> bool {
+        self.capture_available && !self.paused && !self.mouse_disabled() && self.lock_escape_binding_held(true)
+    }
+
+    pub(super) fn local_lock_escape_held(&self) -> bool {
+        self.local_keyboard_lock_escape_held() || self.local_mouse_lock_escape_held()
+    }
+    /// Keyboard and mouse sources interpret their own binding. Only the current
+    /// shared focus receives the boolean; injected events never contribute.
     pub(super) fn publish_lock_escape(&mut self) {
-        let held = self.local_lock_escape_held();
+        let keyboard_held = self.local_keyboard_lock_escape_held();
+        let mouse_held = self.local_mouse_lock_escape_held();
+        let held = keyboard_held || mouse_held;
         let target = (self.holder != self.me()
-            && !self.keyboard_local()
-            && !self.keyboard_disabled()
-            && !self.paused
+            && ((!self.keyboard_local() && keyboard_held) || (!self.mouse_local() && mouse_held))
             && self.input_ready(self.holder))
         .then_some(self.holder);
         if held != self.last_lock_escape || target != self.lock_escape_target {
@@ -617,6 +626,45 @@ mod tests {
         a.lock_escape_keys.clear();
         assert!(a.leave_blocked());
     }
+
+    #[test]
+    fn windows_mouse_escape_reaches_remote_lock_owner_and_releases() {
+        let (mut source, mut owner) = pair();
+        source.cfg.os = Os::Windows;
+        owner.cfg.os = Os::Windows;
+        source.set_hotkeys(vec![HotkeyBinding {
+            action: "lock_escape".into(),
+            chord: crate::hotkey::Chord::parse(&["Mouse4"]).unwrap(),
+        }]);
+        source.lock_focus_to(B).unwrap();
+        for _ in 0..3 {
+            deliver(&mut source, &mut owner);
+            deliver(&mut owner, &mut source);
+        }
+
+        physical(
+            &mut source,
+            InputEvent::Button {
+                button: MouseButton::Back,
+                pressed: true,
+            },
+        );
+        deliver(&mut source, &mut owner);
+        assert!(owner.source_lock_escape_held(A));
+        assert!(owner.pointer_lock_escape_held());
+
+        physical(
+            &mut source,
+            InputEvent::Button {
+                button: MouseButton::Back,
+                pressed: false,
+            },
+        );
+        deliver(&mut source, &mut owner);
+        assert!(!owner.source_lock_escape_held(A));
+        assert!(!owner.pointer_lock_escape_held());
+    }
+
     fn physical(r: &mut Router, event: InputEvent) {
         let source = if matches!(event, InputEvent::Key { .. }) {
             SourceKind::Keyboard
@@ -1424,7 +1472,7 @@ mod tests {
         }
     }
     #[test]
-    fn pointer_shortcut_hidden_screen_keeps_edges_as_walls_for_local_and_remote_motion() {
+    fn pointer_shortcut_hidden_screen_can_depart_for_local_and_remote_motion() {
         for per_screen in [false, true] {
             let mut group = hidden_group(per_screen);
             let third = group[2].me();
@@ -1438,18 +1486,15 @@ mod tests {
             assert!(group.iter().all(|r| r.focus().holder == A));
             group[0].move_pointer_to(B).unwrap();
             pump_hidden_group(&mut group);
-            // A's physical mouse sends relative input to the hidden holder B.
+            // Remote deltas and B's physical mouse may both leave a hidden source.
             group[0].local_motion(10000., 0., None, 3);
             pump_hidden_group(&mut group);
-            assert!(group.iter().all(|r| r.focus().holder == B));
-            assert!(group[1].pointer.as_ref().unwrap().local.x < 900.);
-            // B's native cursor cannot exit either edge, even if OS coordinates crossed it.
-            for dx in [-10000., 10000.] {
-                group[1].local_motion(dx, 0., Some(Point::new(dx, 350.)), 4);
-                pump_hidden_group(&mut group);
-                assert!(group.iter().all(|r| r.focus().holder == B));
-                assert_eq!(group[1].pointer.as_ref().unwrap().screen.display, "screen");
-            }
+            assert!(group.iter().all(|r| r.focus().holder == third));
+            group[0].move_pointer_to(B).unwrap();
+            pump_hidden_group(&mut group);
+            group[1].local_motion(-10000., 0., Some(Point::new(-100., 350.)), 4);
+            pump_hidden_group(&mut group);
+            assert!(group.iter().all(|r| r.focus().holder == A));
             group[0].move_pointer_to(A).unwrap();
             pump_hidden_group(&mut group);
             assert!(group.iter().all(|r| r.focus().holder == A));
@@ -1513,10 +1558,6 @@ mod tests {
                 pump_hidden_group(&mut group);
                 assert!(group.iter().all(|r| r.focus().holder == hidden_dev), "{os:?} {hide_b1}");
                 assert_eq!(group[h].pointer.as_ref().unwrap().screen.display, outer);
-                // The native cursor is confined to the visible screen (ClipCursor /
-                // dissociated warp), so the OS cannot carry it into the hidden sibling.
-                let outer_bounds = [&a, &b].into_iter().flatten().find(|d| d.key == outer).unwrap().bounds;
-                assert_eq!(group[h].hidden_cursor_constraint(), Some(outer_bounds));
                 // Push from the visible outer screen toward the hidden native sibling.
                 let mut t = 10;
                 while group[h].focus().holder == hidden_dev && t < 40 {
@@ -1546,7 +1587,6 @@ mod tests {
                 }
                 assert!(group.iter().all(|r| r.focus().holder == hidden_dev), "{os:?} {hide_b1}");
                 assert_eq!(group[h].pointer.as_ref().unwrap().screen.display, outer);
-                assert_eq!(group[h].hidden_cursor_constraint(), Some(outer_bounds));
             }
         }
     }

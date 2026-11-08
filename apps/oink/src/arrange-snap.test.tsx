@@ -59,26 +59,30 @@ function setup(sync: boolean) {
   return h;
 }
 const of = (name: string) => Array.from(document.querySelectorAll<HTMLElement>('.scr:not(.scr--group)')).filter(s => s.getAttribute('aria-label')!.startsWith(`${name},`));
-async function drag(el: HTMLElement, dx: number, dy: number, select = false) {
+async function drag(el: HTMLElement, dx: number, dy: number, select = false, shiftKey = false) {
   if (select) { fireEvent.pointerDown(el, { button: 0, clientX: 600, clientY: 300 }); fireEvent.pointerUp(el); }
   const zoom = cameraStore.get()!.zoom;
-  fireEvent.pointerDown(el, { button: 0, clientX: 600, clientY: 300 });
-  fireEvent.pointerMove(el, { clientX: 600 + dx * 4096 * zoom, clientY: 300 + dy * 4096 * zoom });
+  fireEvent.pointerDown(el, { button: 0, clientX: 600, clientY: 300, shiftKey });
+  fireEvent.pointerMove(el, { clientX: 600 + dx * 4096 * zoom, clientY: 300 + dy * 4096 * zoom, shiftKey });
   await act(async () => { fireEvent.pointerUp(el); });
   await backend.harness!.settle();
 }
 
 describe('snapping while dragging', () => {
-  it('snaps one screen of a system-arranged computer to its sibling\'s edges', async () => {
+  it('moves the whole computer when the requested native offset is not allowed', async () => {
     const h = setup(true);
     const [, side] = of('Alpha');
-    // 190 down: the side screen's bottom (600 tall) lands 10 short of the main screen's bottom (800).
-    await drag(side, 0, .19, true);
+    // Pushing the side screen left into the main screen is not an allowed
+    // native arrangement. The computer should move as a rigid unit so the
+    // pointer preview and release result agree.
+    await drag(side, -1.1, 0, true, true);
     const previews = h.of('preview_system_arrangement');
-    expect((previews.at(-1)!.params!.desired_canvas_origin as { y: number }).y).toBeCloseTo(.2, 9);
+    expect((previews.at(-1)!.params!.desired_canvas_origin as { x: number }).x).toBeCloseTo(.1, 9);
     const last = previews.at(-1)!.reply as PreviewReply;
-    expect(last.native.screens.find(s => s.screen.display === 'side')!.origin).toEqual({ x: 1200, y: 200 });
-    expect(h.of('commit_arrangement')[0].params!.native_plan_tokens).toEqual([last.plan_token]);
+    expect(last.native.screens.find(s => s.screen.display === 'side')!.origin).toEqual({ x: 1200, y: 0 });
+    expect(last.placements.find(p => p.device === A)!.origin.x).toBeCloseTo(-1.1, 9);
+    expect(h.of('commit_arrangement')[0].params!.native_plan_tokens).toEqual([]);
+    expect((h.of('commit_arrangement')[0].params!.placements as Placement[]).find(p => p.device === A)!.origin.x).toBeCloseTo(-1.1, 9);
   });
 
   it('snaps one screen of a system-arranged computer to another computer\'s edge', async () => {

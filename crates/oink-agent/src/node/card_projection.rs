@@ -32,6 +32,7 @@ impl Node {
                     facts: None,
                     capabilities: vec![],
                 }],
+                screen_shared: vec![],
                 focus,
                 exit_baseline: false,
                 microphone_resolution: Default::default(),
@@ -42,6 +43,15 @@ impl Node {
             };
         };
         let state = config.applied();
+        let mut screen_shared = std::collections::BTreeMap::new();
+        for screen in &state.layout.screens {
+            if !screen.device_visibility_known {
+                continue;
+            }
+            screen_shared
+                .entry(screen.id.device.into())
+                .or_insert(!screen.device_hidden);
+        }
         // A current local option revision does not prove that the owner can
         // order a selection above every member. Use the same durable baseline
         // coverage as the audio command, including records retained while peers
@@ -124,6 +134,7 @@ impl Node {
         CardInputs {
             group: Some(state.group.into()),
             members,
+            screen_shared: screen_shared.into_iter().collect(),
             focus,
             exit_baseline,
             microphone_resolution: self

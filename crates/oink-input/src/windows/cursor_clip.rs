@@ -45,9 +45,6 @@ pub(super) fn application() -> windows::core::Result<Option<Rect>> {
 /// confinement. Keep the underlying clip so another owner's game mode cannot
 /// clear this device's passive-lock entry protection while focus is away.
 pub(super) fn acquire(clip: RECT, previous: RECT) -> windows::core::Result<()> {
-    acquire_confinement(clip, previous)
-}
-pub(super) fn acquire_confinement(clip: RECT, previous: RECT) -> windows::core::Result<()> {
     let mut owner = owner().lock().unwrap_or_else(|e| e.into_inner());
     if current()? != previous {
         return Err(windows::core::Error::new(

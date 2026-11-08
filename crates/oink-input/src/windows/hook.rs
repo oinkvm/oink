@@ -46,6 +46,7 @@ mod external;
 mod external_tests;
 mod key_releases;
 mod keyboard_trace;
+mod local_releases;
 mod modifier_reconcile;
 mod observations;
 mod restore;
@@ -117,12 +118,6 @@ pub(crate) type RestoreCompletion = Box<dyn FnOnce(bool) + Send>;
 pub(crate) enum Command {
     DragAnchor(Option<oink_foundation::dnd::DragAnchor>, mpsc::SyncSender<bool>),
     RelativeCapture(bool),
-    CursorConstraint {
-        owned: windows::Win32::Foundation::RECT,
-        previous: windows::Win32::Foundation::RECT,
-        acquire: bool,
-        reply: mpsc::SyncSender<Result<(), InputError>>,
-    },
     SetMode(CaptureMode, mpsc::SyncSender<Option<Marker>>),
     RestoreLocal(Point, Option<RestoreCompletion>, mpsc::SyncSender<Option<Marker>>),
     Touchpad(
@@ -607,26 +602,6 @@ impl HookHandle {
             .map_err(|e| InputError::Platform(format!("PostThreadMessageW: {e}")))
     }
 
-    /// Confinement's helper handshake runs on the injection worker, while the
-    /// cursor mutation and thread-local warp accounting stay on the hook owner.
-    pub(crate) fn cursor_constraint(
-        &self,
-        owned: windows::Win32::Foundation::RECT,
-        previous: windows::Win32::Foundation::RECT,
-        acquire: bool,
-    ) -> Result<(), InputError> {
-        let (reply, received) = mpsc::sync_channel(1);
-        self.post(Command::CursorConstraint {
-            owned,
-            previous,
-            acquire,
-            reply,
-        })?;
-        received
-            .recv_timeout(Duration::from_secs(1))
-            .map_err(|_| InputError::Platform("cursor confinement owner did not acknowledge".into()))?
-    }
-
     pub(crate) fn set_mode(&self, mode: CaptureMode) -> Result<(), InputError> {
         let (tx, rx) = mpsc::sync_channel(1);
         self.post(Command::SetMode(mode, tx))?;
@@ -842,6 +817,7 @@ fn run(
         let mut capture_retry = Instant::now();
         let mut resume_hotkey = super::resume_hotkey::Manager::default();
         loop {
+            local_releases::drain();
             if let Some(timer) = &pacing {
                 timer.begin_turn();
                 let now = Instant::now();
@@ -852,6 +828,7 @@ fn run(
                 // Native work during poll may have pumped a nested key UP.
                 // The routing owner is no longer borrowed at this boundary.
                 key_releases::drain();
+                local_releases::drain();
                 resume_hotkey.update(crate::capture_loop::paused_hotkey());
                 let requested = crate::capture_loop::capture_requested();
                 mouse_keys.sharing(requested);
@@ -934,10 +911,12 @@ fn run(
                 process_commands();
             } else if msg.hwnd.is_invalid() && msg.message == key_releases::MESSAGE {
                 key_releases::drain();
+                local_releases::drain();
             } else {
                 DispatchMessageW(&msg);
             }
             key_releases::drain();
+            local_releases::drain();
             report_busy("message", msg.message, t0.elapsed());
         }
         keyboard_trace::boundary(
@@ -1005,22 +984,6 @@ fn process_commands() {
                     st.relative_requested = enabled;
                     st.update_raw_capture();
                 });
-            }
-            Some(Command::CursorConstraint {
-                owned,
-                previous,
-                acquire,
-                reply,
-            }) => {
-                let result = if acquire {
-                    super::cursor_clip::acquire_confinement(owned, previous)
-                        .map_err(|e| InputError::Platform(e.to_string()))
-                } else if super::cursor_clip::restore(previous, owned) {
-                    Ok(())
-                } else {
-                    Err(InputError::Platform("cursor confinement restore failed".into()))
-                };
-                let _ = reply.send(result);
             }
             Some(Command::SetMode(mode, reply)) => {
                 let marker = with_state(|st| st.request(Transition::of_mode(mode))).flatten();
@@ -1782,7 +1745,11 @@ impl State {
             }
         }
         self.restoring_from_marker = None;
-        self.hider.show_moved_away();
+        // The cover must remain over the complete native restore path until it
+        // is hidden.  Using only the old park point leaves the entry outside
+        // the cover, so the marker's park -> entry move becomes visible.
+        let entry = self.restore_watch.as_ref().map(|watch| watch.at);
+        self.hider.show_at(entry);
         self.check_restore_completion();
         true
     }
@@ -1859,7 +1826,7 @@ impl State {
         // Swallowing here also suppresses WM_INPUT. Raw game capture instead
         // confines the pointer under our cursor-cover window and allows only
         // physical MOVE. External synthetic input was classified before this path;
-        // only the explicit forwarding opt-in reaches routed translation.
+        // only input with forwarding enabled reaches routed translation.
         if remote
             && msg == WM_MOUSEMOVE
             && external::mouse_origin(info) == crate::windows_external_input::Origin::Physical
@@ -2021,7 +1988,14 @@ impl State {
             (Some(code.0), false)
         } else {
             // 按下时交给了本机的键，抬起也必须交给本机，否则本机卡键
-            (None, self.keys.remove(&code.0) == Some(false))
+            let passed = self.keys.remove(&code.0) == Some(false);
+            if passed && !event.physical && local_releases::physical_passed(code) {
+                // Forwarded external UPs already enter normal source routing.
+                // Close only the matched native local physical observation too.
+                external::retire_physical_key(code);
+            }
+            local_releases::forget(code);
+            (None, passed)
         };
         Prepared::Event {
             event,
@@ -2440,6 +2414,7 @@ fn finish(prepared: Option<Prepared>) -> bool {
             }
             if let Some(code) = track_key {
                 with_state(|st| {
+                    local_releases::first_down(KeyCode(code), event.physical && !swallow);
                     st.keys.insert(code, swallow);
                     st.passed_modifiers
                         .first_down(KeyCode(code), event.physical && !swallow);
@@ -2774,6 +2749,7 @@ fn keyboard_proc_with_next(code: i32, wparam: WPARAM, lparam: LPARAM, next: impl
         // Complete an earlier reentrant UP before classifying a later DOWN as
         // a repeat. No focus change or elapsed time proves a physical release.
         key_releases::drain();
+        local_releases::drain();
         // SAFETY: HC_ACTION 时 lparam 指向系统提供的 KBDLLHOOKSTRUCT，回调期间有效。
         let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
         use crate::windows_external_input::Origin;
@@ -2790,8 +2766,29 @@ fn keyboard_proc_with_next(code: i32, wparam: WPARAM, lparam: LPARAM, next: impl
                 return next();
             }
             Origin::External if external::key_local(wparam.0 as u32, info) => {
+                // Observe only the recovery chord: external-local keys must not
+                // enter routing or opt into forwarding as a side effect.
+                if let Some(sc) = keyboard_scancode(info) {
+                    let code = keymap::scancode_to_hid(sc).unwrap_or_else(|| KeyCode::new(0xFFAB, sc));
+                    crate::capture_loop::injected_disable_release(
+                        code,
+                        matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN),
+                    );
+                }
                 keyboard_trace::outcome(&mut key_trace, TraceOutcome::ExternalLocal);
-                return external::pass_key(next);
+                // WeType 3.0.0.38 physical trials on Windows 11 26200 showed
+                // a physical local DOWN followed by an external replacement UP.
+                // Keep opted-out synthetic input local, but pair an accepted UP
+                // only if the original physical press still has a Local-only
+                // route. Remote/crossed presses retain their existing ownership.
+                // Capture the press generation before CallNext can reenter; a
+                // rejected UP or a later press must never retire this identity.
+                let release = local_releases::capture(wparam.0 as u32, info);
+                let result = external::pass_key(next);
+                if result.0 == 0 {
+                    local_releases::accepted(release);
+                }
+                return result;
             }
             Origin::Physical => external::observe_physical_key(wparam.0 as u32, info),
             _ => {}

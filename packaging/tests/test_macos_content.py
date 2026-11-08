@@ -132,3 +132,23 @@ class MacTccPolicy(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class MacUnlockEntitlements(unittest.TestCase):
+    def test_classic_keychain_needs_no_group_and_preserves_file_provider_permissions(self):
+        files = 'TEAM123456.com.hachiwii.oink.files'
+        unlock = 'TEAM123456.com.hachiwii.oink.auto-unlock'
+        for role in ('backend', 'file_provider_manager', 'file_provider_extension', 'finder_sync', 'paste_helper', 'ui', 'agent', 'crash_collector'):
+            expected = [files] if role in ('backend', 'file_provider_manager', 'file_provider_extension', 'finder_sync', 'paste_helper') else []
+            C.verify_component_groups(role, {'com.apple.security.application-groups': expected}, files)
+            with self.subTest(role=role), self.assertRaisesRegex(RuntimeError, 'App Group'):
+                C.verify_component_groups(role, {'com.apple.security.application-groups': expected + [unlock]}, files)
+        with self.assertRaisesRegex(RuntimeError, 'App Group'):
+            C.verify_component_groups('backend', {}, files)
+        with self.assertRaisesRegex(RuntimeError, 'restricted Keychain'):
+            C.verify_component_groups('backend', {'com.apple.security.application-groups': [files],
+                                                  'keychain-access-groups': [unlock]}, files)
+
+    def test_manager_designated_identity_is_distinct_from_credential_owner(self):
+        C.verify_manager_signing_identity('Identifier=com.hachiwii.oink.file-provider-manager\n', 'com.hachiwii.oink')
+        with self.assertRaisesRegex(RuntimeError, 'Keychain signing identity'):
+            C.verify_manager_signing_identity('Identifier=com.hachiwii.oink\n', 'com.hachiwii.oink')

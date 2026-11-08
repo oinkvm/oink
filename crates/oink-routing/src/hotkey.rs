@@ -9,7 +9,7 @@
 //! 键名约定与 `oink_agent::api::Hotkey` 相同：修饰键 `Ctrl` `Alt` `Shift` `Meta`（Mac 上是 Cmd，Windows 上是
 //! Win 键），其余为 `KeyboardEvent.code` 去掉 `Key` / `Digit` 前缀（`L`、`5`、`F12`、`Backquote`、`Numpad1`）。
 
-use oink_foundation::input::KeyCode;
+use oink_foundation::input::{KeyCode, MouseButton};
 
 /// 修饰键集合（左右不分）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -138,6 +138,29 @@ pub fn single_key<S: AsRef<str>>(keys: &[S]) -> Result<KeyCode, ChordError> {
     }
 }
 
+/// Button-page codes are local shortcut identities only. They never become
+/// InputEvent::Key or enter the network protocol; mouse routing remains Button.
+pub fn mouse_key(button: MouseButton) -> Option<KeyCode> {
+    Some(KeyCode::new(
+        9,
+        match button {
+            MouseButton::Middle => 3,
+            MouseButton::Back => 4,
+            MouseButton::Forward => 5,
+            _ => return None,
+        },
+    ))
+}
+
+pub fn mouse_name(button: MouseButton) -> Option<&'static str> {
+    match button {
+        MouseButton::Middle => Some("Mouse3"),
+        MouseButton::Back => Some("Mouse4"),
+        MouseButton::Forward => Some("Mouse5"),
+        _ => None,
+    }
+}
+
 /// 一条快捷键绑定。`action` 是界面 API 的动作名（例如 `"lock_focus"`），焦点锁由路由在物理按下时立即处理；其余动作交给 agent。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HotkeyBinding {
@@ -178,6 +201,14 @@ impl Hotkeys {
 
 /// 键名（`KeyboardEvent.code` 去掉 `Key` / `Digit` 前缀）→ HID 键码。修饰键名不在这里（见 [`Chord::parse`]）。
 pub fn key_code(name: &str) -> Option<KeyCode> {
+    if let Some(usage) = match name {
+        "Mouse3" => Some(3),
+        "Mouse4" => Some(4),
+        "Mouse5" => Some(5),
+        _ => None,
+    } {
+        return Some(KeyCode::new(9, usage));
+    }
     let k = KeyCode::keyboard;
     let b = name.as_bytes();
     // 字母、数字。
@@ -268,6 +299,26 @@ mod tests {
 
     fn chord(keys: &[&str]) -> Chord {
         Chord::parse(keys).unwrap()
+    }
+
+    #[test]
+    fn mouse_shortcuts_parse_and_match_exact_modifiers() {
+        for name in ["Mouse3", "Mouse4", "Mouse5"] {
+            let bare = chord(&[name]);
+            let ctrl = chord(&["Ctrl", name]);
+            let hotkeys = Hotkeys::new(vec![HotkeyBinding {
+                chord: ctrl,
+                action: "open_window".into(),
+            }]);
+            assert_eq!(bare.mods, Mods::NONE);
+            assert_eq!(bare.key.page(), 9);
+            assert_eq!(hotkeys.matching(bare.key, Mods::CTRL), Some("open_window"));
+            assert_eq!(hotkeys.matching(bare.key, Mods::NONE), None);
+            assert_eq!(hotkeys.matching(bare.key, Mods::CTRL | Mods::SHIFT), None);
+        }
+        for name in ["Mouse1", "Mouse2", "Mouse6"] {
+            assert!(Chord::parse(&["Ctrl", name]).is_err());
+        }
     }
 
     #[test]

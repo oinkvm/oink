@@ -2,7 +2,7 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeAll, expect, it, vi } from 'vitest';
 import { OinkProvider } from 'oink-ui';
-import { setLanguage } from '../i18n';
+import { setLanguage, tr } from '../i18n';
 import { SideContextMenu } from './DeviceMenu';
 import type { SideContextMenuProps } from './DeviceMenu';
 import type { Device } from './types';
@@ -126,4 +126,42 @@ it('can stop a failed source even while no exit is online', async () => {
   const handlers=menu({target:'device:remote',devices:[source]});
   fireEvent.click(await screen.findByRole('menuitem',{name:'Stop sharing'}));
   expect(handlers.onShare).toHaveBeenCalledExactlyOnceWith('remote','speaker','unused');
+});
+
+it.each([
+  ['zh-Hans', '禁用该设备的鼠标（防误触）', '禁用该设备的键盘（防误触）'],
+  ['en', 'Disable this device’s mouse (prevents accidental input)', 'Disable this device’s keyboard (prevents accidental input)'],
+  ['ja', 'このデバイスのマウスを無効にする（誤操作防止）', 'このデバイスのキーボードを無効にします（誤操作防止）'],
+  ['ko', '이 기기의 마우스 비활성화 (오조작 방지)', '이 기기의 키보드를 비활성화합니다 (오조작 방지)'],
+] as const)('%s explains why mouse and keyboard can be disabled', async (language, mouse, keyboard) => {
+  setLanguage(language);
+  menu({ target: 'device:remote' });
+  const input = await screen.findByRole('menuitem', { name: tr('输入设备') });
+  input.focus();
+  fireEvent.keyDown(input, { key: 'ArrowRight' });
+  await screen.findByRole('radio', { name: `${tr('禁用')}：${mouse}` });
+  const labels = [...document.querySelectorAll('[aria-label]')].map(el => el.getAttribute('aria-label'));
+  expect(labels.some(label => label?.endsWith(mouse))).toBe(true);
+  expect(labels.some(label => label?.endsWith(keyboard))).toBe(true);
+});
+
+it('offers whole-device hide for offline canvas screens and device rows', async () => {
+  const handlers = menu({ target: 'screen:remote:1', devices: [{ ...remote, group: 'offline' }],
+    screens: [{ id: 'remote:1', device: 'remote', name: 'One', hidden: false }] });
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'Hide all screens' }));
+  expect(handlers.onScreensHidden).toHaveBeenCalledWith('remote', true);
+  expect(handlers.onHideScreen).not.toHaveBeenCalled();
+});
+it('allows offline device rows to show hidden screens', async () => {
+  const handlers = menu({ target: 'device:remote', devices: [{ ...remote, group: 'offline', screenSharing: false }] });
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'Show all screens' }));
+  expect(handlers.onScreensHidden).toHaveBeenCalledWith('remote', false);
+});
+
+it('offers single-screen hide for an online rigid computer', async () => {
+  const handlers = menu({ target: 'screen:remote:1', editableScreenDevices: new Set(),
+    screens: [{ id: 'remote:1', device: 'remote', name: 'One', hidden: false }] });
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'Hide this screen' }));
+  expect(handlers.onHideScreen).toHaveBeenCalledWith('remote:1');
+  expect(handlers.onScreensHidden).not.toHaveBeenCalled();
 });

@@ -194,7 +194,7 @@ describe('layout profile fixture contract', () => {
   });
 
   it('provides a read-only connected native preview and records native replay eligibility', async () => {
-    const f = createLayoutProfilesFixture();
+    const f = createLayoutProfilesFixture({ devices: createLayoutProfilesFixture().state().devices.map(d => ({ ...d, sync_system_arrangement: false, can_edit_screens: false })) });
     const d = f.state().devices[0], moved = f.state().snapshot!.native[0].screens[1].screen;
     await expect(f.api.previewSystemArrangement({ sequence: '1', expected_token: f.state().token, device: d.device,
       moved_screen: moved, desired_canvas_origin: { x: 0, y: -.6 } })).rejects.toMatchObject({ problem: { code: 'setting_disabled' } });
@@ -230,4 +230,24 @@ describe('layout profile fixture contract', () => {
     await expect(f.api.loadLayoutProfile({ ...req, profile_id: 'different' })).rejects.toMatchObject({ problem: { code: 'stale_state' } });
     unsubscribe();
   });
+});
+
+it('hides and shows a rigid offline device as one layout edit', async () => {
+  const f = createLayoutProfilesFixture();
+  const id = f.state().devices[0].device;
+  f.setOnline(id, false);
+  for (const shared of [false, true]) {
+    await f.api.commitArrangement({ request_id: `offline-${shared}`, expected_token: f.state().token,
+      placements: f.state().snapshot!.placements, native_plan_tokens: [], disabled: [], screen_shared: [{ device: id, shared }] });
+    await f.flush();
+    expect(f.state().snapshot!.screen_shared!.find(d => d.device === id)!.shared).toBe(shared);
+    expect(f.state().operation?.history_required).toBe(true);
+  }
+  f.setOnline(id, true);
+  expect(f.state().devices.find(d => d.device === id)!.availability).toBe('ready');
+});
+
+it('defaults to system arrangement on and hidden-display disabling off', () => {
+  const devices = createLayoutProfilesFixture().state().devices;
+  expect(devices.every(d => d.sync_system_arrangement && d.disable_hidden_displays === false)).toBe(true);
 });

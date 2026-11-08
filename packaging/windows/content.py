@@ -234,13 +234,22 @@ def verify_msi(manifest, extracted, identity, tables):
     if actual != expected:
         raise RuntimeError('MSI executable inventory differs from the five product roles')
     components = []
-    for name in sorted(expected):
+    if "OinkPasteMenu.dll" not in names:
+        raise RuntimeError("Paste as File state handler DLL missing from MSI")
+    for name in sorted(expected | {"OinkPasteMenu.dll"}):
         path = extracted / 'File' / names[name].get('Id')
         if not path.is_file() or path.read_bytes()[:2] != b'MZ':
             raise RuntimeError('MSI payload executable is missing or invalid')
         image_identity(path)  # Require actual x64 CodeView identity for every role.
         verify_no_builder_paths(path)
         components.append({'path': name, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+    provider_name = 'OinkCredentialProvider.dll'
+    if provider_name not in names:
+        raise RuntimeError('MSI Credential Provider DLL missing')
+    provider = extracted / 'File' / names[provider_name].get('Id')
+    image_identity(provider)
+    verify_no_builder_paths(provider)
+    components.append({'path': provider_name, 'sha256': hashlib.sha256(provider.read_bytes()).hexdigest()})
     service = elements(root, 'ServiceInstall')
     if len(service) != 1 or service[0].get('Name') != identity['windows']['service_name'] or service[0].get('Account') != 'LocalSystem' or service[0].get('Start') != 'auto':
         raise RuntimeError('MSI must install one automatic LocalSystem OinkInput service')

@@ -905,3 +905,7 @@ fn validate_local_click(raw: &RawMap) -> Result<()> {
     }
     Ok(())
 }
+
+// Source answers about its own current console; no credential or credential status.
+wire_map!(ControlUnlockQuery,no_validation,{1=>epoch:u64=required;});
+wire_map!(ControlUnlockReply,no_validation,{1=>epoch:u64=required;2=>unlocked:bool=required;});

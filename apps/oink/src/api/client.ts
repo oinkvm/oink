@@ -5,6 +5,9 @@ import { createLayoutProfilesApi } from './layoutProfiles';
 
 export { ApiFailure } from "./transport";
 
+export type AutoUnlockFailure = 'password_incorrect' | 'windows_hello_only' | 'login_ui_not_ready' | 'unknown';
+export type AutoUnlockStatus = { enabled: boolean; failure: AutoUnlockFailure | null; windows_hello_only: boolean };
+
 export async function call<R>(method: string, params?: Record<string, unknown>): Promise<R> {
   try {
     return await transport.call<R>(params ? { method, params } : { method });
@@ -24,6 +27,9 @@ function requireInput(settings:T.InputSettings):T.InputSettings {
   return settings;
 }
 export const api = {
+  autoUnlockStatus: () => call<AutoUnlockStatus>('auto_unlock_status'),
+  saveAutoUnlock: (password:string) => call<null>('save_auto_unlock', {password}),
+  disableAutoUnlock: () => call<null>('disable_auto_unlock'),
   ...createLayoutProfilesApi(call),
   audioQuality: () => call<T.AudioQuality>("audio_quality"),
   connectionQuality: () => call<T.ConnectionQuality>("connection_quality"),

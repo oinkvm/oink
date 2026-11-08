@@ -26,7 +26,15 @@ pub fn capture(layout: &Layout, owners: &Owners) -> ArrangementSnapshot {
         let owner = owners.get(&id).cloned().unwrap_or_default();
         snapshot.screen_shared.push(DeviceSharing {
             device,
-            shared: owner.screen_shared,
+            shared: if layout
+                .screens
+                .iter()
+                .any(|s| s.id.device == id && s.device_visibility_known)
+            {
+                !layout.screens.iter().any(|s| s.id.device == id && s.device_hidden)
+            } else {
+                owner.screen_shared
+            },
         });
         let screens = layout.screens.iter().filter(|s| s.id.device == id).collect::<Vec<_>>();
         let primary = screens.iter().find(|s| s.primary).unwrap_or(&screens[0]);
@@ -45,7 +53,11 @@ pub fn capture(layout: &Layout, owners: &Owners) -> ArrangementSnapshot {
         });
         snapshot.disabled.extend(screens.into_iter().map(|s| Disabled {
             screen: ScreenKey::from(&s.id),
-            disabled: !owner.screens.get(&s.id.display).is_none_or(|p| p.enabled),
+            disabled: if s.screen_visibility_known {
+                s.screen_hidden
+            } else {
+                !owner.screens.get(&s.id.display).is_none_or(|p| p.enabled)
+            },
         }));
     }
     model::canonicalize(&mut snapshot);
@@ -76,7 +88,7 @@ pub fn render(snapshot: &ArrangementSnapshot, base: &Layout, owners: &Owners) ->
         }
     }
     let mut layout = base.clone();
-    let mut owners = owners.clone();
+    let owners = owners.clone();
     layout.settings = snapshot.topology.clone();
     for n in &snapshot.native {
         let p = snapshot
@@ -84,14 +96,21 @@ pub fn render(snapshot: &ArrangementSnapshot, base: &Layout, owners: &Owners) ->
             .iter()
             .find(|p| p.device == n.device)
             .ok_or_else(invalid)?;
-        let owner = owners.entry(n.device.0).or_default();
-        owner.screen_shared = model::screen_shared(snapshot, n.device);
         for native in &n.screens {
             let s = layout
                 .screens
                 .iter_mut()
                 .find(|s| ScreenKey::from(&s.id) == native.screen)
                 .ok_or_else(invalid)?;
+            s.device_hidden = !model::screen_shared(snapshot, n.device);
+            s.device_visibility_known = true;
+            s.screen_hidden = snapshot
+                .disabled
+                .iter()
+                .find(|bit| bit.screen == native.screen)
+                .ok_or_else(invalid)?
+                .disabled;
+            s.screen_visibility_known = true;
             s.local = Rect::new(native.origin.x, native.origin.y, native.size.w, native.size.h);
             s.rect = Rect::new(
                 p.origin.x + native.origin.x * p.scale,
@@ -99,12 +118,8 @@ pub fn render(snapshot: &ArrangementSnapshot, base: &Layout, owners: &Owners) ->
                 native.size.w * p.scale,
                 native.size.h * p.scale,
             );
-            owner.screens.entry(native.screen.display.clone()).or_default().enabled = !snapshot
-                .disabled
-                .iter()
-                .find(|b| b.screen == native.screen)
-                .ok_or_else(invalid)?
-                .disabled;
+            // Visibility is global layout content. Leave owner preferences
+            // unchanged; gains and other owner-only fields remain there.
         }
     }
     Ok((layout, owners))

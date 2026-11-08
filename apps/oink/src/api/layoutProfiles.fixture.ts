@@ -147,8 +147,8 @@ export interface LayoutProfilesFixtureOptions {
 export function createLayoutProfilesFixture(options: LayoutProfilesFixtureOptions = {}) {
   let snapshot = copy(options.snapshot ?? layoutProfilesFixtureSnapshot());
   let devices: DeviceArrangementState[] = copy(options.devices ?? snapshot.native.map(n => ({
-    device: n.device, sync_system_arrangement: false, preference_token: `preference:${n.device}:1`,
-    native_token: n.token, availability: 'ready', can_edit_screens: false,
+    device: n.device, sync_system_arrangement: true, disable_hidden_displays: false, preference_token: `preference:${n.device}:1`,
+    native_token: n.token, availability: 'ready', can_edit_screens: true,
   })));
   const initialScales = new Map(snapshot.placements.map(p => [p.device, p.scale]));
   let sequence = 1n, catalog = 1n, clock = 0n, nextId = 2n, revision = 1;
@@ -325,14 +325,46 @@ export function createLayoutProfilesFixture(options: LayoutProfilesFixtureOption
     if (!device.sync_system_arrangement) return failure('setting_disabled', 'System arrangement is disabled', device.device);
     const source = snapshot.native.find(n => n.device === request.device)!;
     const placements = copy(snapshot.placements), placement = placements.find(p => p.device === request.device)!;
-    let native = snap(source, request.moved_screen, { x: (request.desired_canvas_origin.x - placement.origin.x) / placement.scale,
-      y: (request.desired_canvas_origin.y - placement.origin.y) / placement.scale });
-    const main = native.screens.find(s => key(s.screen) === key(native.primary))!;
-    const offset = copy(main.origin);
-    native = { ...native, screens: native.screens.map(s => ({ ...s, origin: { x: s.origin.x - offset.x, y: s.origin.y - offset.y } })) };
-    placement.origin.x += offset.x * placement.scale; placement.origin.y += offset.y * placement.scale;
+    const desired = { x: (request.desired_canvas_origin.x - placement.origin.x) / placement.scale,
+      y: (request.desired_canvas_origin.y - placement.origin.y) / placement.scale };
+    const moved = source.screens.find(s => key(s.screen) === key(request.moved_screen))!;
+    let candidate: NativeState | null;
+    try {
+      candidate = snap(source, request.moved_screen, desired);
+    } catch (error) {
+      // Production treats a disconnected native request as a rigid computer
+      // move. Keep the fixture on the same path so preview and release agree
+      // even when no connected native candidate exists at all.
+      if (!(error instanceof LayoutProfileFailure) || error.problem.code !== 'disconnected') throw error;
+      candidate = null;
+    }
+    let native = source;
+    let nativeChanged = false;
+    const rounded = { x: Math.sign(desired.x) * Math.round(Math.abs(desired.x)), y: Math.sign(desired.y) * Math.round(Math.abs(desired.y)) };
+    const moveRigid = () => {
+      // A null candidate means the native graph cannot accept any connected
+      // position. Keep the native desktop rigid and translate the computer
+      // placement to the requested canvas point, matching production.
+      placement.origin.x += request.desired_canvas_origin.x - (placement.origin.x + moved.origin.x * placement.scale);
+      placement.origin.y += request.desired_canvas_origin.y - (placement.origin.y + moved.origin.y * placement.scale);
+    };
+    if (candidate === null) {
+      moveRigid();
+    } else {
+      const candidateMoved = candidate.screens.find(s => key(s.screen) === key(request.moved_screen));
+      if (!candidateMoved || candidateMoved.origin.x !== rounded.x || candidateMoved.origin.y !== rounded.y) {
+        moveRigid();
+      } else {
+        native = candidate;
+        nativeChanged = true;
+        const main = native.screens.find(s => key(s.screen) === key(native.primary))!;
+        const offset = copy(main.origin);
+        native = { ...native, screens: native.screens.map(s => ({ ...s, origin: { x: s.origin.x - offset.x, y: s.origin.y - offset.y } })) };
+        placement.origin.x += offset.x * placement.scale; placement.origin.y += offset.y * placement.scale;
+      }
+    }
     const result: PreviewReply = { sequence: request.sequence, native, placements,
-      plan_token: `plan:${sequence}:${plans.size}`, adjustments: [{ code: 'native_snapped', device: request.device, screen: request.moved_screen }] };
+      plan_token: `plan:${sequence}:${plans.size}`, adjustments: nativeChanged ? [{ code: 'native_snapped', device: request.device, screen: request.moved_screen }] : [] };
     plans.set(result.plan_token, { state: token(), preview: copy(result) });
     return result;
   }
@@ -363,13 +395,16 @@ export function createLayoutProfilesFixture(options: LayoutProfilesFixtureOption
       return { operation: copy(op), state: state() };
     }
     if (method === 'preview_system_arrangement') return preview(p as unknown as PreviewRequest);
-    if (method === 'set_sync_system_arrangement') {
+    if (method === 'set_sync_system_arrangement' || method === 'set_disable_hidden_displays') {
       if (busy()) return failure('busy', 'An arrangement operation is pending');
       const d = devices.find(d => d.device === p.device) ?? failure('not_member', 'Unknown device');
       if (d.availability !== 'ready') return failure(d.availability === 'offline' ? 'owner_offline' : 'unsupported', 'Owner unavailable');
       if (d.preference_token !== p.expected_preference_token) return failure('stale_state', 'Refresh the owner preference');
       if (typeof p.enabled !== 'boolean') return failure('invalid_geometry', 'Expected a boolean setting');
-      d.sync_system_arrangement = p.enabled; d.can_edit_screens = effectiveSystemSync(p.enabled, true);
+      if (method === 'set_disable_hidden_displays') {
+        if (p.enabled && !d.sync_system_arrangement) return failure('setting_disabled', 'System arrangement is disabled');
+        d.disable_hidden_displays = p.enabled;
+      } else { d.sync_system_arrangement = p.enabled; d.can_edit_screens = effectiveSystemSync(p.enabled, true); }
       d.preference_token = `preference:${d.device}:${sequence + 1n}`; changed(); return state();
     }
     const catalogOnly = method === 'rename_layout_profile' || method === 'delete_layout_profile';
@@ -431,8 +466,7 @@ export function createLayoutProfilesFixture(options: LayoutProfilesFixtureOption
         nativeDevices.push(plan.preview.native.device);
       }
       for (const sharing of request.screen_shared ?? []) {
-        const device = devices.find(d => d.device === sharing.device) ?? failure('not_member', 'Unknown device');
-        if (device.availability === 'offline') return failure('owner_offline', 'Cannot edit offline visibility', device.device);
+        if (!devices.some(d => d.device === sharing.device)) return failure('not_member', 'Unknown device');
         next.screen_shared = [...(next.screen_shared ?? []).filter(d => d.device !== sharing.device), copy(sharing)];
       }
       for (const bit of request.disabled) {
@@ -470,7 +504,7 @@ export function createLayoutProfilesFixture(options: LayoutProfilesFixtureOption
   }
   const transport: Transport = {
     async call<R>({ method, params = {} }: { method: string; params?: Record<string, unknown> }): Promise<R> {
-      if (!['layout_profiles', 'layout', 'layout_profile_operation', 'preview_system_arrangement', 'set_sync_system_arrangement',
+      if (!['layout_profiles', 'layout', 'layout_profile_operation', 'preview_system_arrangement', 'set_sync_system_arrangement', 'set_disable_hidden_displays',
         'create_layout_profile', 'rename_layout_profile', 'delete_layout_profile',
         'load_layout_profile', 'commit_arrangement', 'reset_arrangement', 'replay_arrangement'].includes(method) && options.fallback) return options.fallback.call({ method, params });
       try {

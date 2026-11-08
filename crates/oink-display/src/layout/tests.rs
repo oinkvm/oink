@@ -21,6 +21,10 @@ fn screen(dev: DeviceId, key: &str, rect: Rect, upm: f64) -> ScreenPlacement {
 
         primary: false,
         builtin: false,
+        device_hidden: false,
+        screen_hidden: false,
+        device_visibility_known: false,
+        screen_visibility_known: false,
     }
 }
 
@@ -1910,8 +1914,10 @@ fn hidden_geometry_is_retained_for_every_existing_portal_rule() {
                 })
                 .is_some()
             );
-            for side in Side::ALL {
-                assert!(portals(&t, &sid(X, "x"), side).iter().all(|p| p.2.is_none()));
+            for id in [sid(A, "a"), sid(B, "b")] {
+                for side in Side::ALL {
+                    assert!(portals(&t, &id, side).iter().all(|p| p.2.as_deref() != Some("x")));
+                }
             }
             // Hiding does not change the device's source scale or stored geometry.
             assert_eq!(
@@ -2097,6 +2103,10 @@ fn moving_and_resizing_a_screen_transform_only_its_own_computer() {
             size_source: SizeSource::Reported,
             primary: name == "a",
             builtin: false,
+            device_hidden: false,
+            screen_hidden: false,
+            device_visibility_known: false,
+            screen_visibility_known: false,
         });
     }
     // Other computers remain fixed targets; the backend must not add a global
@@ -2134,7 +2144,7 @@ fn native_seams_ignore_cross_computer_wall_extension_and_minimum_portal() {
 }
 
 #[test]
-fn hidden_screens_are_absent_for_others_and_wall_their_own_edges() {
+fn hidden_screens_are_absent_for_others_but_can_depart_to_visible_peers() {
     for same_device in [false, true] {
         for hide_all in [false, true] {
             let hidden_device = if same_device { A } else { X };
@@ -2190,16 +2200,22 @@ fn hidden_screens_are_absent_for_others_and_wall_their_own_edges() {
                 };
                 assert_eq!(topology.step(&from, (2., 0.)).unwrap().to.screen, sid(B, "far"));
             }
-            // A pointer on the hidden screen never crosses out by itself.
+            // Hidden sources may return locally or depart to visible peers.
             for delta in [(-2., 0.), (2., 0.), (0., -2.), (0., 2.)] {
                 let from = ScreenPos {
                     screen: hidden_id.clone(),
                     local: Point::new(1500., 500.),
                 };
                 let step = topology.step(&from, delta).unwrap();
-                assert_eq!(step.to.screen, hidden_id);
-                assert!(step.crossed.is_empty());
-                assert!(step.blocked_x || step.blocked_y);
+                if delta.0 < 0. {
+                    assert_eq!(step.to.screen, sid(A, "left"));
+                } else if delta.0 > 0. {
+                    assert_eq!(step.to.screen, sid(B, "far"));
+                } else {
+                    assert_eq!(step.to.screen, hidden_id);
+                    assert!(step.crossed.is_empty());
+                    assert!(step.blocked_x || step.blocked_y);
+                }
             }
         }
     }
@@ -2269,15 +2285,106 @@ fn shared_monitor_hidden_native_neighbour_does_not_wall_the_visible_screen() {
             )
             .unwrap();
         assert_eq!(step.to.screen, sid(outer_dev, outer), "hide_b1={hide_b1}");
-        // The hidden copy itself is walled on every side.
-        for delta in [(-0.2, 0.), (0.2, 0.)] {
-            let from = ScreenPos {
-                screen: sid(hidden_dev, hidden),
-                local: Point::new(if hide_b1 { 500. } else { 1500. }, 300.),
-            };
-            assert_eq!(t.step(&from, delta).unwrap().to.screen, from.screen);
-        }
+        // A hidden copy must be able to return through its own computer's
+        // native sibling; hidden destinations remain absent for other sources.
+        let from = ScreenPos {
+            screen: sid(hidden_dev, hidden),
+            local: Point::new(if hide_b1 { 500. } else { 1500. }, 300.),
+        };
+        let step = t.step(&from, if hide_b1 { (1.2, 0.) } else { (-1.2, 0.) }).unwrap();
+        assert_eq!(step.to.screen.device, hidden_dev);
+        assert_ne!(step.to.screen, from.screen);
     }
+}
+
+#[test]
+fn hidden_screen_can_return_to_native_sibling_or_continue_to_peer() {
+    let native = |dev, key, x: f64, plane_x: f64| ScreenPlacement {
+        local: Rect::new(x, 0., 1000., 600.),
+        ..screen(dev, key, Rect::new(plane_x, 0., 1., 0.6), 1000.)
+    };
+    let saved = layout(vec![
+        native(A, "a1", 0., 0.),
+        native(A, "hidden", 1000., 1.),
+        native(A, "a2", 2000., 2.),
+        native(B, "b", 3000., 3.),
+    ]);
+    let owners = BTreeMap::from([(
+        A,
+        OwnerLayoutPreferences {
+            screens: [(
+                "hidden".into(),
+                ScreenPreference {
+                    enabled: false,
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        },
+    )]);
+    let t = saved.topology(&owners);
+    let hidden = ScreenPos {
+        screen: sid(A, "hidden"),
+        local: Point::new(1500., 300.),
+    };
+
+    let back = t.step(&hidden, (-1.2, 0.)).unwrap();
+    assert_eq!(back.to.screen, sid(A, "a1"));
+    assert!(back.crossed.is_empty() || back.crossed == vec![sid(A, "a1")]);
+
+    let long = t.step(&hidden, (3., 0.)).unwrap();
+    assert_eq!(long.to.screen, sid(B, "b"));
+    assert!(long.crossed.contains(&sid(A, "a2")));
+    assert!(
+        t.edges()
+            .iter()
+            .filter(|edge| edge.screen != sid(A, "hidden"))
+            .flat_map(|edge| edge.segments.iter())
+            .all(|segment| !matches!(segment.kind, SegmentKind::Portal { ref to, .. } if to == &sid(A, "hidden")))
+    );
+}
+
+#[test]
+fn hidden_native_chain_can_return_without_enabling_hidden_destinations() {
+    let saved = layout(
+        ["visible", "hidden-near", "hidden-far"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, key)| screen(A, key, Rect::new(i as f64, 0., 1., 1.), 1000.))
+            .collect(),
+    );
+    let owners = BTreeMap::from([(
+        A,
+        OwnerLayoutPreferences {
+            screens: ["hidden-near", "hidden-far"]
+                .into_iter()
+                .map(|key| {
+                    (
+                        key.into(),
+                        ScreenPreference {
+                            enabled: false,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        },
+    )]);
+    let topology = saved.topology(&owners);
+    let from = ScreenPos {
+        screen: sid(A, "hidden-far"),
+        local: Point::new(2500., 500.),
+    };
+    let back = topology.step(&from, (-2., 0.)).unwrap();
+    assert_eq!(back.to.screen, sid(A, "visible"));
+    assert_eq!(back.crossed, vec![sid(A, "hidden-near"), sid(A, "visible")]);
+    assert!(
+        portals(&topology, &sid(A, "visible"), Side::Right)
+            .iter()
+            .all(|(_, _, to)| to.is_none())
+    );
 }
 
 #[test]
@@ -2323,4 +2430,96 @@ fn hotplug_keeps_owner_and_noncolliders_fixed_and_moves_colliding_rigid_computer
         Rect::new(2.0, 0.6, 1.0, 0.6)
     );
     assert!(l.overlaps().is_empty());
+}
+
+#[test]
+fn device_layout_exclusion_preserves_owner_preferences_and_applies_to_view_and_routing() {
+    let mut l = layout(vec![
+        screen(A, "one", Rect::new(0., 0., 1., 1.), 100.),
+        screen(A, "two", Rect::new(1., 0., 1., 1.), 100.),
+    ]);
+    let owners = BTreeMap::from([(A, OwnerLayoutPreferences::default())]);
+    let before = owners.clone();
+    for s in &mut l.screens {
+        s.device_hidden = true;
+        s.device_visibility_known = true;
+    }
+    assert!(l.effective(&owners).screens().iter().all(|s| !s.enabled));
+    assert!(l.view(&owners, |_| true).screens.iter().all(|s| !s.enabled));
+    assert_eq!(owners, before);
+    for s in &mut l.screens {
+        s.device_hidden = false;
+        s.device_visibility_known = true;
+    }
+    assert!(l.effective(&owners).screens().iter().all(|s| s.enabled));
+}
+
+#[test]
+fn explicit_global_visibility_overrides_legacy_owner_preferences() {
+    let mut l = layout(vec![screen(A, "one", Rect::new(0., 0., 1., 1.), 100.)]);
+    let mut owners = BTreeMap::from([(A, OwnerLayoutPreferences::default())]);
+    owners.get_mut(&A).unwrap().screen_shared = false;
+    owners.get_mut(&A).unwrap().screens.insert(
+        "one".into(),
+        ScreenPreference {
+            enabled: false,
+            ..Default::default()
+        },
+    );
+    l.screens[0].device_visibility_known = true;
+    l.screens[0].screen_visibility_known = true;
+    l.screens[0].device_hidden = false;
+    l.screens[0].screen_hidden = false;
+    assert!(l.effective(&owners).screens()[0].enabled);
+    l.screens[0].screen_hidden = true;
+    assert!(!l.effective(&owners).screens()[0].enabled);
+    l.screens[0].screen_hidden = false;
+    l.screens[0].device_hidden = true;
+    assert!(!l.effective(&owners).screens()[0].enabled);
+}
+
+#[test]
+fn primary_origin_rebase_preserves_canvas_positions() {
+    let mut a = display("a", Rect::new(0., 0., 1000., 600.), (1000, 600), None);
+    let mut b = display("b", Rect::new(1000., 120., 1000., 600.), (1000, 600), None);
+    a.is_primary = true;
+    b.is_primary = false;
+    let mut l = Layout::auto(&[(A, vec![a.clone(), b.clone()])]);
+    l.place_device(A, Point::new(4., 2.), 0.001, true);
+    l.screen_mut(&sid(A, "a")).unwrap().screen_hidden = true;
+    let before = l.clone();
+    a.bounds.x -= 1000.;
+    a.bounds.y -= 120.;
+    a.is_primary = false;
+    b.bounds.x = 0.;
+    b.bounds.y = 0.;
+    b.is_primary = true;
+    l.sync_device(A, &[a.clone(), b.clone()]);
+    for s in &before.screens {
+        assert_eq!(l.screen(&s.id).unwrap().rect, s.rect);
+    }
+    let rebased = l.clone();
+    l.sync_device(A, &[a, b]);
+    assert_eq!(l, rebased, "a repeated observation must not shift again");
+}
+
+#[test]
+fn hidden_geometry_does_not_collide_or_push_during_edits() {
+    for whole_device in [false, true] {
+        let mut hidden = screen(B, "hidden", Rect::new(0., 0., 1., 1.), 1000.);
+        hidden.screen_hidden = !whole_device;
+        hidden.device_hidden = whole_device;
+        let original = layout(vec![screen(A, "a", Rect::new(0., 0., 1., 1.), 1000.), hidden]);
+        assert!(original.overlaps().is_empty());
+        let mut edited = original.clone();
+        edited.repair_overlaps();
+        assert_eq!(edited, original);
+        edited.repair_native_change(A);
+        edited.repair_new_screens(A, &[sid(A, "a")]);
+        assert_eq!(edited, original);
+        edited.move_device(A, Point::new(0.2, 0.));
+        assert_eq!(edited.screen(&sid(A, "a")).unwrap().rect.x, 0.2);
+        edited.move_device(B, Point::new(0.3, 0.));
+        assert_eq!(edited.screen(&sid(B, "hidden")).unwrap().rect.x, 0.3);
+    }
 }

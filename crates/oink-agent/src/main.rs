@@ -51,6 +51,8 @@ enum DiagnosticsCmd {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Save the current local clipboard into a folder.
+    PasteAsFile { destination: PathBuf },
     /// Internal continuation; requires the installed elevated executable on Windows.
     #[cfg(windows)]
     #[command(hide = true)]
@@ -406,6 +408,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     }
     let mut cfg = AgentConfig::load()?;
     match cli.cmd {
+        Cmd::PasteAsFile { destination } => {
+            print(&oink_agent::paste_file::save(&destination, &cfg.settings)?)?;
+        }
         #[cfg(windows)]
         Cmd::CompleteMicrophoneInstallation { .. } => unreachable!("handled before CLI state initialization"),
         #[cfg(windows)]

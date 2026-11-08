@@ -200,6 +200,10 @@ the canonical URL must still match before acceptance. A unique query probes orig
 substitutes for a complete exact readback of canonical client URLs. The same
 protocol verifies the frozen signed rollback snapshot; no candidate is committed
 until every canonical URL matches in a complete round.
+Mac snapshots include both ARM and x64 stable/beta URLs. Missing Mac channels
+are explicit expected 404s even while another architecture remains enabled, so
+first Intel publication can converge from known absence and rollback must remove
+Intel URLs before it succeeds. Direct readback and convergence share this set.
 A canceled runner or unavailable Pages service cannot guarantee remote rollback;
 the stored parent and previous-feed artifact remain recovery inputs.
 

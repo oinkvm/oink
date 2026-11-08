@@ -14,6 +14,10 @@ fn run() -> std::process::ExitCode {
     if let Some(code) = oink_agent::dispatch_raw_clip_guard() {
         return code;
     }
+    #[cfg(windows)]
+    if let Some(code) = oink_agent::paste_file::dispatch_shell_args() {
+        return code;
+    }
     // Backend/maintenance roles finish before any interactive shell is created.
     if let Some(code) = oink_ui::service::dispatch_args() {
         return code;

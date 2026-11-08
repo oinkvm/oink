@@ -136,6 +136,8 @@ def main():
     if provenance.get('update_test_feed') != a.windows_update_test_feed:
         p.error('qualification origin must match the exact binary build')
     verify_binaries([a.binaries / name for name in provenance['files']], a.windows_update_test_feed)
+    if 'OinkCredentialProvider.dll' not in provenance['files']:
+        p.error('Credential Provider DLL must be in the exact binary build provenance')
     has_worker = provenance.get('updater_included', False)
     if not has_worker or not provenance.get('collector_included'):
         p.error('the product MSI requires both the update worker and crash collector')
@@ -154,6 +156,7 @@ def main():
     roles = ['ui', 'agent', 'service'] + (['update_worker'] if has_worker else []) + (['crash_collector'] if has_collector else [])
     for role in roles:
         shutil.copy2(a.binaries / (b[role] + '.exe'), payload)
+    shutil.copy2(a.binaries / 'OinkCredentialProvider.dll', payload)
     report = write_manifest(payload / 'report-manifest.json', a.source_tree_sha256, a.version, a.build,
                             [('agent', payload / (b['ui'] + '.exe')),
                              ('agent', payload / (b['agent'] + '.exe')),
@@ -174,6 +177,14 @@ def main():
         shutil.copy2(pdb, symbols / pdb.name)
         symbol_records.append({'image': name + '.exe', **image_identity(payload / (name + '.exe')),
                                'pdb': pdb.name, 'pdb_sha256': digest(pdb)})
+    provider = payload / 'OinkCredentialProvider.dll'
+    provider_pdb = a.binaries / 'OinkCredentialProvider.pdb'
+    provider_identity = image_identity(provider)
+    if pdb_identity(provider_pdb) != {key: provider_identity[key] for key in ('debug_id', 'debug_age')}:
+        raise RuntimeError('Credential Provider PDB identity mismatch')
+    shutil.copy2(provider_pdb, symbols / provider_pdb.name)
+    symbol_records.append({'image': provider.name, **provider_identity, 'pdb': provider_pdb.name,
+                           'pdb_sha256': digest(provider_pdb)})
     (symbols / 'manifest.json').write_text(json.dumps({'source_tree_sha256': a.source_tree_sha256,
                                                      'images': symbol_records}, indent=2) + '\n')
     record = dict(schema=1, product=I['name'], provenance='source-tree', source_tree_sha256=a.source_tree_sha256, version=a.version, source_commit=a.source_commit, build=a.build,
@@ -234,6 +245,21 @@ def main():
             key, separator, value = line.partition('=')
             if separator and key:
                 os.environ[key] = value
+    # Version the DLL by the global build sequence, independently of display
+    # semver. MSI can replace an installed versioned state handler on upgrades.
+    (a.output / 'paste-menu-version.h').write_text(
+        f'#define OINK_BUILD_HIGH {a.build >> 16}\n#define OINK_BUILD_LOW {a.build & 65535}\n'
+        f'#define OINK_DISPLAY_VERSION {json.dumps(a.version)}\n')
+    run('rc.exe', '/nologo', f'/i{a.output}', f'/i{ROOT / "packaging/windows"}',
+        f'/fo{a.output}/PasteMenu.res', ROOT / 'packaging/windows/PasteMenu.rc')
+    run('cl.exe', '/nologo', '/LD', '/Z7', '/experimental:deterministic', f'/pathmap:{ROOT}=oink',
+        '/EHsc', '/std:c++17', '/W4', '/WX', '/MT', '/DUNICODE', '/D_UNICODE',
+        ROOT / 'packaging/windows/PasteMenu.cpp', a.output / 'PasteMenu.res', f'/Fo{a.output}/PasteMenu.obj', '/link',
+        '/DEBUG:FULL', f'/PDB:{symbols}/OinkPasteMenu.pdb', '/PDBALTPATH:%_PDB%',
+        f'/OUT:{payload}/OinkPasteMenu.dll', f'/IMPLIB:{a.output}/PasteMenu.lib',
+        f'/DEF:{ROOT}/packaging/windows/PasteMenu.def', 'user32.lib', 'uuid.lib')
+    symbol_records.append({'image': 'OinkPasteMenu.dll', **image_identity(payload / 'OinkPasteMenu.dll'),
+        'pdb': 'OinkPasteMenu.pdb', 'pdb_sha256': digest(symbols / 'OinkPasteMenu.pdb')})
     if has_worker:
         for role in roles:
             imports = subprocess.check_output(['dumpbin.exe', '/nologo', '/dependents', str(payload / (b[role] + '.exe'))], text=True)
@@ -263,6 +289,7 @@ def main():
             f'/Fo{a.output}/{test}.obj', f'/Fe{a.output}/{test}.exe', 'advapi32.lib', 'user32.lib')
         run(a.output / f'{test}.exe')
     run('powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ROOT / 'packaging/windows/MicrophoneTests.ps1')
+    run('powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ROOT / 'packaging/windows/VerifyPeTests.ps1')
     notices = a.output / 'notices.wxs'
     write_notices(notices, payload, notice_files)
     run('node', ROOT / 'build-support/check-package-licenses.mjs', payload, 'windows-x64', cwd=ROOT)
@@ -279,7 +306,7 @@ def main():
     from content import verify_msi
     from tables import read_content_tables
     tables = read_content_tables(msi)
-    from bridge_022 import verify_file_table
+    from inventory import verify_file_table
     verify_file_table(tables)
     package_notes.verify_windows_embedding(tables, notes_file)
     (a.output / 'content-tables.json').write_text(json.dumps(tables, indent=2) + '\n')

@@ -17,13 +17,17 @@ pub(super) struct Socket {
     wake: Arc<tokio::sync::Notify>,
 }
 impl Socket {
-    pub fn new(address: SocketAddr, wake: Arc<tokio::sync::Notify>) -> io::Result<Arc<Self>> {
+    pub fn new(
+        address: SocketAddr,
+        wake: Arc<tokio::sync::Notify>,
+        errors: crate::qos::SendErrors,
+    ) -> io::Result<Arc<Self>> {
         let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?;
         socket.connect(address)?;
         socket.set_nonblocking(true)?;
         crate::qos::set_service_type(&socket, crate::qos::ServiceType::Voice);
         Ok(Arc::new(Self {
-            inner: crate::qos::wrap_probe_socket(socket)?,
+            inner: crate::qos::observe_udp_socket(crate::qos::wrap_probe_socket(socket)?, errors),
             error: Mutex::new(None),
             wake,
         }))

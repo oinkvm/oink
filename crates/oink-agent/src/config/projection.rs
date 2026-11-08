@@ -147,6 +147,7 @@ pub(super) fn values(settings: &Settings) -> Vec<(LocalOption, RawValue)> {
                 .write(),
         ),
         (SyncSystemArrangement, settings.sync_system_arrangement.write()),
+        (DisableHiddenDisplays, settings.disable_hidden_displays.write()),
     ]
 }
 fn keyboard(value: &input::KeyboardMapping) -> RawValue {
@@ -391,6 +392,7 @@ pub(super) fn apply(owner: &OwnerStore, settings: &mut Settings) -> Result<(), S
             NativeMultifinger => settings.routing.native_multifinger = bool::read(&value)?,
             MacScrollFeel => settings.routing.mac_scroll_feel = bool::read(&value)?,
             SyncSystemArrangement => settings.sync_system_arrangement = bool::read(&value)?,
+            DisableHiddenDisplays => settings.disable_hidden_displays = bool::read(&value)?,
             MicrophoneControls => {
                 let value = dto::ForwardingControlsValue::read(&value)?;
                 settings.microphone.volume_percent = value.volume_percent()?;

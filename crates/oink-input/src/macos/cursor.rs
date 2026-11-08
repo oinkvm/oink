@@ -31,25 +31,20 @@ pub(crate) mod owner;
 #[path = "cursor_frame.rs"]
 mod frame;
 
+#[path = "cursor_region.rs"]
+mod region;
+
 /// 进程级状态：退出钩子据此判断需要恢复什么。
 static HIDDEN: AtomicBool = AtomicBool::new(false);
 // Desired hidden state is separate from a successful native hide request. Never stack hides.
 static HIDE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static DISSOCIATED: AtomicBool = AtomicBool::new(false);
 static SOURCE_DISABLED: AtomicBool = AtomicBool::new(false);
-static CONFINED: AtomicBool = AtomicBool::new(false);
-
-/// Called under the capture cursor lock, outside native callbacks.
-pub(crate) fn constrain(active: bool) {
-    CONFINED.store(active, Ordering::Release);
-    source_disabled(SOURCE_DISABLED.load(Ordering::Acquire));
-}
-
 /// Capture-thread reconciliation, outside event callbacks. Disable physical
 /// motion without changing visibility/position or blocking tagged remote input.
 pub(crate) fn source_disabled(disabled: bool) {
     SOURCE_DISABLED.store(disabled, Ordering::Release);
-    let dissociate = disabled || CONFINED.load(Ordering::Acquire) || HIDDEN.load(Ordering::Acquire);
+    let dissociate = disabled || HIDDEN.load(Ordering::Acquire);
     if DISSOCIATED.load(Ordering::Acquire) != dissociate {
         install_exit_hooks();
         let result = CGAssociateMouseAndMouseCursorPosition(!dissociate);
@@ -79,6 +74,7 @@ pub(crate) fn hide() {
         handoff_timing::native(TimingStage::HideStarted, 0);
         let mut e1 = None;
         let e0 = hide_with_update(
+            region::acquire,
             || {
                 let e0 = CGDisplayHideCursor(CGMainDisplayID());
                 handoff_timing::native(TimingStage::HideCompleted, e0.0 as u32);
@@ -138,7 +134,7 @@ fn renew_hide() -> bool {
     let (next, ok) = replace_request(
         requested,
         || CGDisplayShowCursor(CGMainDisplayID()).0 == 0,
-        || hide_with_update(|| CGDisplayHideCursor(CGMainDisplayID()), request_hidden_frame).0 == 0,
+        || hide_with_update(|| {}, || CGDisplayHideCursor(CGMainDisplayID()), request_hidden_frame).0 == 0,
     );
     HIDE_REQUESTED.store(next, Ordering::Release);
     ok
@@ -152,7 +148,8 @@ fn request_hidden_frame() {
 
 // A frame submission failure must not turn a successful hide into a failed request:
 // the matching Show is still owed, and another Hide would stack the native hide count.
-fn hide_with_update(hide: impl FnOnce() -> CGError, update: impl FnOnce()) -> CGError {
+fn hide_with_update(ownership: impl FnOnce(), hide: impl FnOnce() -> CGError, update: impl FnOnce()) -> CGError {
+    ownership();
     let result = hide();
     if result.0 == 0 {
         update();
@@ -355,8 +352,7 @@ pub(crate) fn restore() {
     owner::release();
     tracing::debug!(target: "oink_cursor_timing", "cursor latency: owner release end");
     handoff_timing::native(TimingStage::ShowStarted, 0);
-    let (associate, show, flush) =
-        restore_native_guarded(SOURCE_DISABLED.load(Ordering::Acquire) || CONFINED.load(Ordering::Acquire));
+    let (associate, show, flush) = restore_native_guarded(SOURCE_DISABLED.load(Ordering::Acquire));
     handoff_timing::native(
         TimingStage::ShowCompleted,
         (associate.unwrap_or(0) | show.unwrap_or(0) | flush.unwrap_or(0)) as u32 | (u32::from(show.is_none()) << 31),
@@ -391,7 +387,6 @@ pub(crate) fn restore() {
 }
 
 fn restore_native() -> (Option<i32>, Option<i32>, Option<i32>) {
-    CONFINED.store(false, Ordering::Release);
     SOURCE_DISABLED.store(false, Ordering::Release);
     restore_native_guarded(false)
 }
@@ -399,15 +394,19 @@ fn restore_native_guarded(disabled: bool) -> (Option<i32>, Option<i32>, Option<i
     let associate = (DISSOCIATED.swap(disabled, Ordering::AcqRel) != disabled)
         .then(|| CGAssociateMouseAndMouseCursorPosition(!disabled).0);
     HIDDEN.store(false, Ordering::Release);
-    let (show, flush) = if HIDE_REQUESTED.swap(false, Ordering::AcqRel) {
-        let show = CGDisplayShowCursor(CGMainDisplayID()).0;
-        // As with hide(), flush the visibility change at the already-warped entry point.
-        // A successful ShowCursor alone can leave the cursor hidden until the next move.
-        let flush = CGAssociateMouseAndMouseCursorPosition(!disabled).0;
-        (Some(show), Some(flush))
-    } else {
-        (None, None)
-    };
+    // Shared by Local, pause/stop and exit/signal restoration.
+    let (show, flush) = region::release_after(|| {
+        if HIDE_REQUESTED.swap(false, Ordering::AcqRel) {
+            let show = CGDisplayShowCursor(CGMainDisplayID()).0;
+            // As with hide(), flush the visibility change at the already-warped entry point.
+            // A successful ShowCursor alone can leave the cursor hidden until the next move.
+            let flush = CGAssociateMouseAndMouseCursorPosition(!disabled).0;
+            (Some(show), Some(flush))
+        } else {
+            (None, None)
+        }
+    });
+
     // No logging/allocation here: signal and exit hooks also call this function.
     (associate, show, flush)
 }
@@ -607,9 +606,35 @@ mod reconcile_tests {
     }
 
     #[test]
+    fn mission_control_hide_acquires_ownership_before_request_and_display_update() {
+        let owned = std::cell::Cell::new(false);
+        let hidden = std::cell::Cell::new(false);
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = hide_with_update(
+            || {
+                owned.set(true);
+                calls.borrow_mut().push("own");
+            },
+            || {
+                // WindowServer can return success without applying a background hide.
+                hidden.set(owned.get());
+                calls.borrow_mut().push("hide");
+                CGError(0)
+            },
+            || {
+                assert!(hidden.get(), "display damage cannot admit an unowned background hide");
+                calls.borrow_mut().push("update");
+            },
+        );
+        assert_eq!(result.0, 0);
+        assert_eq!(*calls.borrow(), ["own", "hide", "update"]);
+    }
+
+    #[test]
     fn successful_native_hide_submits_one_update_after_return() {
         let calls = std::cell::RefCell::new(Vec::new());
         let result = hide_with_update(
+            || {},
             || {
                 calls.borrow_mut().push("hide");
                 CGError(0)
@@ -619,7 +644,7 @@ mod reconcile_tests {
         assert_eq!(result.0, 0);
         assert_eq!(*calls.borrow(), ["hide", "update"]);
         assert_eq!(
-            hide_with_update(|| CGError(1000), || panic!("hide was rejected")).0,
+            hide_with_update(|| {}, || CGError(1000), || panic!("hide was rejected")).0,
             1000
         );
     }
@@ -635,6 +660,7 @@ mod reconcile_tests {
             },
             || {
                 hide_with_update(
+                    || {},
                     || {
                         calls.borrow_mut().push("hide");
                         CGError(0)
@@ -654,7 +680,7 @@ mod reconcile_tests {
             replace_request(
                 true,
                 || false,
-                || { hide_with_update(|| panic!("must not stack hide"), || panic!("no new hide")).0 == 0 }
+                || { hide_with_update(|| {}, || panic!("must not stack hide"), || panic!("no new hide")).0 == 0 }
             ),
             (true, false)
         );

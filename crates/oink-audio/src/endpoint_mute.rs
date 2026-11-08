@@ -27,7 +27,7 @@ impl<B: EndpointBackend> Lease<B> {
         // An already-muted device belongs to the user. Never toggle it, even
         // transiently, and preserve that original bit on every release path.
         if !before.muted {
-            self.backend.set_mute(&before.endpoint, true)?;
+            self.backend.mute(&before.endpoint)?;
         }
         let mut expected = before;
         expected.muted = true;
@@ -100,6 +100,7 @@ mod tests {
         mute_changed: Cell<bool>,
         journal: std::path::PathBuf,
     }
+    use crate::recovery::RestorePermit;
     impl EndpointBackend for Rc<Fake> {
         fn permanently_removed(&self, _: &str) -> Result<bool, String> {
             Ok(self.removed.get())
@@ -107,7 +108,8 @@ mod tests {
         fn read(&self, id: &str) -> Result<Option<EndpointState>, String> {
             Ok(self.state.borrow().clone().filter(|s| s.endpoint == id))
         }
-        fn set_mute(&self, id: &str, mute: bool) -> Result<(), String> {
+        fn mute(&self, id: &str) -> Result<(), String> {
+            let mute = true;
             let entry: serde_json::Value = serde_json::from_slice(&std::fs::read(&self.journal).unwrap()).unwrap();
             assert_eq!(entry["entry"]["original"]["endpoint"], id);
             assert_eq!(entry["entry"]["owned"], true, "write-ahead before OS change");
@@ -124,8 +126,9 @@ mod tests {
         fn mute_ownership_lost(&self) -> bool {
             self.mute_changed.get()
         }
-        fn release_owned_mute(&self, _: &str) -> Result<(), String> {
+        fn restore_mute(&self, _: &str, release_only: bool, _: &RestorePermit) -> Result<(), String> {
             assert!(!self.mute_changed.get());
+            assert!(release_only || !self.changed.get());
             self.state.borrow_mut().as_mut().unwrap().muted = false;
             self.writes.set(self.writes.get() + 1);
             Ok(())

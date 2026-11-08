@@ -64,24 +64,21 @@ func assertCacheMutation<T>(_ mutation: () throws -> T) rethrows -> T {
 
 private let anchorLog = Logger(subsystem: providerLogSubsystem, category: "enumeration")
 
-// These records authorize local content operations. Unknown execution fields or
-// schemas must fail closed instead of being silently omitted during recovery.
-private struct LocalKey: CodingKey {
-    let stringValue: String
-    var intValue: Int? { nil }
-    init?(stringValue: String) { self.stringValue = stringValue }
-    init?(intValue: Int) { return nil }
+// Local JSON can gain fields as the Rust writer evolves. Decode only the
+// fields this reader uses, retaining schema and operation-specific validation.
+private struct LocalSchema: Decodable { let schema: UInt8 }
+private func validateLocalSchema(_ decoder: Decoder) throws {
+    guard try LocalSchema(from: decoder).schema == 1 else {
+        throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unsupported local schema"))
+    }
 }
-private func validateLocalKeys(_ decoder: Decoder, allowed: [String], schema: Bool = false) throws {
-    let values = try decoder.container(keyedBy: LocalKey.self)
-    guard values.allKeys.allSatisfy({ allowed.contains($0.stringValue) }) else {
-        throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unknown local field"))
-    }
-    if schema {
-        guard try values.decode(UInt8.self, forKey: LocalKey(stringValue: "schema")!) == 1 else {
-            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unsupported local schema"))
-        }
-    }
+
+// In 102 the paste preference writer accidentally used the catalog directory.
+// Keep ignoring its exact legacy filename even after the writer is corrected;
+// do not swallow decode failures for real catalogs (which protect user files).
+private func catalogFiles(in root: URL) throws -> [URL] {
+    try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+        .filter { $0.pathExtension == "json" && $0.lastPathComponent != "paste-as-file.json" }
 }
 
 struct Record: Codable, Equatable {
@@ -129,7 +126,6 @@ struct Record: Codable, Equatable {
     }
     enum CodingKeys: String, CodingKey { case id, parent, name, directory, size, modified, created, node, version, children, hidden, keep_local, refetchable, symlink_target, exec_bits }
     init(from decoder: Decoder) throws {
-        try validateLocalKeys(decoder, allowed: ["id", "parent", "name", "directory", "size", "modified", "created", "node", "version", "children", "hidden", "keep_local", "refetchable", "symlink_target", "exec_bits"])
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(String.self, forKey: .id)
         parent = try values.decode(String.self, forKey: .parent)
@@ -162,7 +158,7 @@ struct CurrentMetadata: Codable {
     let exec_bits: UInt16?
     enum CodingKeys: String, CodingKey { case schema, size, modified, version, exec_bits }
     init(from decoder: Decoder) throws {
-        try validateLocalKeys(decoder, allowed: ["schema", "size", "modified", "version", "exec_bits"], schema: true)
+        try validateLocalSchema(decoder)
         let values = try decoder.container(keyedBy: CodingKeys.self)
         schema = try values.decode(UInt8.self, forKey: .schema)
         size = try values.decode(UInt64.self, forKey: .size)
@@ -203,7 +199,7 @@ struct Catalog: Codable {
     }
     enum CodingKeys: String, CodingKey { case schema, token, port, records, urls, received_at, move_state }
     init(from decoder: Decoder) throws {
-        try validateLocalKeys(decoder, allowed: ["schema", "token", "port", "records", "source", "settlement", "arrived", "failed", "urls", "received_at", "move_state", "consumed"], schema: true)
+        try validateLocalSchema(decoder)
         let values = try decoder.container(keyedBy: CodingKeys.self)
         schema = try values.decode(UInt8.self, forKey: .schema)
         token = try values.decode(String.self, forKey: .token)
@@ -362,8 +358,7 @@ func container() throws -> URL {
 }
 func catalogs() throws -> [Catalog] { try catalogs(in: container()) }
 private func rawCatalogs(in root:URL) throws -> [Catalog] {
-    try FileManager.default.contentsOfDirectory(at:root,includingPropertiesForKeys:nil)
-        .filter {$0.pathExtension=="json"}.map { url in
+    try catalogFiles(in: root).map { url in
             let catalog = try JSONDecoder().decode(Catalog.self, from: Data(contentsOf: url))
             // Source folders have no file payload or delivery received_at. For
             // an existing undated source, its catalog's real creation time is
@@ -871,7 +866,7 @@ struct PlaceholderLedger: Codable {
     let urls: [String]
     enum CodingKeys: String, CodingKey { case schema, parent, urls }
     init(from decoder: Decoder) throws {
-        try validateLocalKeys(decoder, allowed: ["schema", "parent", "urls"], schema: true)
+        try validateLocalSchema(decoder)
         let values = try decoder.container(keyedBy: CodingKeys.self)
         schema = try values.decode(UInt8.self, forKey: .schema)
         parent = try values.decodeIfPresent(String.self, forKey: .parent)
@@ -1123,8 +1118,7 @@ func receivedHandoff(_ record:Record,in root:URL,at date:Date=Date()) throws {
 }
 func receivedDelete(_ ids:[String],in root:URL) throws {
     try withReceived(in:root) {
-        let raw=try FileManager.default.contentsOfDirectory(at:root,includingPropertiesForKeys:nil)
-            .filter {$0.pathExtension=="json"}.flatMap { try JSONDecoder().decode(Catalog.self,from:Data(contentsOf:$0)).records }
+        let raw=try rawCatalogs(in: root).flatMap { $0.records }
         for (key,group) in Dictionary(grouping:ids,by:receivedKey) {
             var entries=try readReceived(key,in:root)
             for id in group {

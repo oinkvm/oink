@@ -13,7 +13,7 @@ vi.mock('../api/client',()=>({call:mocks.call,api:{group:mocks.group,setInputTra
 beforeEach(()=>{
   vi.clearAllMocks();localStorage.clear();
   mocks.group.mockResolvedValue({members:[]});
-  mocks.state={localPreferences:{notification_level:'default',ui_language:'system',theme_mode:'system',theme_accent:{light:'#2E7BFF',dark:'#5599FF'},show_status_icon:true,confirm_quit:true,log_level:'info',log_max_mb:1024},
+  mocks.state={localPreferences:{notification_level:'default',ui_language:'system',theme_mode:'system',theme_accent:{light:'#2E7BFF',dark:'#5599FF'},show_status_icon:true,confirm_quit:true,paste_as_file:true,log_level:'info',log_max_mb:1024},
     input:{event_frequency:'unlimited',wake_displays_on_input:true,cursor_trail:false,accept_contacts:true,touchpad_injection_enabled:true,mac_scroll_feel:true,device_gain:1,emergency_hold_ms:5000,hotkeys:[]},
     clipboard:{text:true,rich_text:true,images:true,files:true,custom:true},audio:{settings:{keep_local_playback:true,receive_output:null,forwarding_enabled:true}}};
   mocks.call.mockResolvedValue(mocks.state.localPreferences);
@@ -56,13 +56,24 @@ it('keeps the stored touchpad preference while injection is temporarily unavaila
   expect(mocks.input).toHaveBeenCalledExactlyOnceWith({wake_displays_on_input:false});
   expect(result.current.prefs.touchpadInject).toBe(true);
 });
-it('defaults external input forwarding off and persists only its local input patch', async()=>{
+it('defaults external input forwarding on and persists only its local input patch', async()=>{
   const {result}=renderHook(usePreferences);
-  expect(result.current.prefs.forwardInjectedInput).toBe(false);
+  expect(result.current.prefs.forwardInjectedInput).toBe(true);
   expect(result.current.canEdit('forwardInjectedInput')).toBe(true);
-  await act(async()=>result.current.set('forwardInjectedInput',true));
-  expect(mocks.input).toHaveBeenCalledExactlyOnceWith({forward_injected_input:true});
+  await act(async()=>result.current.set('forwardInjectedInput',false));
+  expect(mocks.input).toHaveBeenCalledExactlyOnceWith({forward_injected_input:false});
   expect(localStorage.getItem('oink:prefs')).toBeNull();
+});
+it.each([false,true])('preserves explicit external forwarding=%s during unrelated edits', async enabled=>{
+  mocks.state.input={...(mocks.state.input as object),forward_injected_input:enabled};
+  const mounted=renderHook(usePreferences);
+  expect(mounted.result.current.prefs.forwardInjectedInput).toBe(enabled);
+  await act(async()=>mounted.result.current.set('keepAwake',false));
+  expect(mocks.input).toHaveBeenCalledExactlyOnceWith({wake_displays_on_input:false});
+  expect(mounted.result.current.prefs.forwardInjectedInput).toBe(enabled);
+  mounted.unmount();
+  const reloaded=renderHook(usePreferences);
+  expect(reloaded.result.current.prefs.forwardInjectedInput).toBe(enabled);
 });
 it.each([false,true])('Settings reflects the onboarding-confirmed login=%s and can edit it afterwards',async enabled=>{
   mocks.state.launch={state:'disabled',problem:null,configured:false};
@@ -242,7 +253,7 @@ it('defaults foreground capture off for old settings and saves only the local ed
     editing.unmount();
     const reloaded=renderHook(usePreferences);
     expect(reloaded.result.current.prefs.takeForegroundOnLeave).toBe(enabled);
-    expect(reloaded.result.current.prefs.forwardInjectedInput).toBe(false);
+    expect(reloaded.result.current.prefs.forwardInjectedInput).toBe(true);
     reloaded.unmount();
   }
   expect(mocks.transform).not.toHaveBeenCalled();
@@ -287,4 +298,28 @@ it.each(['smooth','quality','lossless'])('keeps explicit source encoding quality
   const {result}=renderHook(usePreferences);
   expect(result.current.prefs.audioEncodingQuality).toBe(quality);
   expect(mocks.audio).not.toHaveBeenCalled();
+});
+
+it('preserves the actual setting rejection instead of reporting backend failure',async()=>{
+  const {agent}=await import('../api/store');
+  const reason={code:'invalid_argument',message:'两个快捷键不能相同',problem:{code:'invalid_value',unknownCode:null,nativeCode:null,retryAfterMs:null}};
+  mocks.input.mockRejectedValueOnce(reason);
+  const {result}=renderHook(usePreferences);
+  await act(async()=>result.current.set('pollLimit','125'));
+  expect(agent.fail).toHaveBeenCalledWith('invalid_value','两个快捷键不能相同');
+  expect(result.current.prefs.pollLimit).toBe('none');
+});
+
+it('saves Paste as File only through local preferences and restores its value',async()=>{
+  const mounted=renderHook(usePreferences);
+  expect(mounted.result.current.prefs.pasteAsFile).toBe(true);
+  await act(async()=>mounted.result.current.set('pasteAsFile',false));
+  expect(mocks.call).toHaveBeenCalledExactlyOnceWith('set_ui_preferences',{settings:{paste_as_file:false}});
+  expect(mocks.clipboard).not.toHaveBeenCalled();
+  expect(mocks.input).not.toHaveBeenCalled();
+  expect(localStorage.getItem('oink:prefs')).toBeNull();
+  mounted.unmount();
+  mocks.state={...mocks.state,localPreferences:{...(mocks.state.localPreferences as object),paste_as_file:false}};
+  const restored=renderHook(usePreferences);
+  expect(restored.result.current.prefs.pasteAsFile).toBe(false);
 });

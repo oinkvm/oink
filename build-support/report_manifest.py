@@ -17,8 +17,8 @@ def image_identity(path):
     debug_age, code_id = 0, None
     if data[:4] == b'\xcf\xfa\xed\xfe':
         cpu, _, _, count, size, _, _ = unpack(data, 'iiIIIII', 4)
-        if cpu != 0x100000c or size > len(data) - 32:
-            raise ValueError('Expected a thin arm64 Mach-O image')
+        if cpu not in (0x100000c, 0x1000007) or size > len(data) - 32:
+            raise ValueError('Expected a thin arm64 or x86_64 Mach-O image')
         offset, identifier, text_size = 32, None, None
         for _ in range(count):
             command, length = unpack(data, 'II', offset)

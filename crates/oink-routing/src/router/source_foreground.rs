@@ -70,7 +70,7 @@ mod tests {
         for game in [true, false] {
             r.set_game_mode(if game { GameMode::On } else { GameMode::Off });
             r.set_locked(!game);
-            r.local_motion_unconstrained(5000., 0., Some(Point::new(99., 50.)), 1);
+            r.local_motion(5000., 0., Some(Point::new(99., 50.)), 1);
             assert_eq!(r.focus().holder, ME);
             assert!(!r.source_foreground_capture());
         }

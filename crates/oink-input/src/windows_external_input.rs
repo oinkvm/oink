@@ -42,7 +42,7 @@ pub(crate) struct ExternalInput {
 impl Default for ExternalInput {
     fn default() -> Self {
         Self {
-            forward: false,
+            forward: true,
             keys: [false; 256],
             buttons: [false; 256],
             held: 0,

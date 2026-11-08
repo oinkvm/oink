@@ -1,7 +1,7 @@
 //! HAL endpoint observer plus the same durable mute journal used on Windows.
 use crate::{
     endpoint_mute::Lease,
-    recovery::{EndpointBackend, EndpointState, Journal, RecoveryOutcome, RecoveryReport},
+    recovery::{EndpointBackend, EndpointState, Journal, RecoveryOutcome, RecoveryReport, RestorePermit},
 };
 use std::{
     ffi::{CStr, CString, c_char, c_void},
@@ -100,6 +100,9 @@ fn message(error: &[c_char]) -> String {
     unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy().into_owned()
 }
 impl EndpointBackend for Observer {
+    fn pause_before_restore(&self) {
+        crate::media_pause::before_restore();
+    }
     fn read(&self, uid: &str) -> Result<Option<EndpointState>, String> {
         if uid != self.uid {
             return Err("source mute endpoint mismatch".into());
@@ -117,17 +120,17 @@ impl EndpointBackend for Observer {
             _ => Err(message(&error)),
         }
     }
-    fn set_mute(&self, uid: &str, mute: bool) -> Result<(), String> {
-        self.write(uid, mute, false)
+    fn mute(&self, uid: &str) -> Result<(), String> {
+        self.write(uid, true, false)
+    }
+    fn restore_mute(&self, uid: &str, release_only: bool, _: &RestorePermit) -> Result<(), String> {
+        self.write(uid, false, release_only)
     }
     fn ownership_lost(&self) -> bool {
         self.flags() & 1 != 0
     }
     fn mute_ownership_lost(&self) -> bool {
         self.flags() & 2 != 0
-    }
-    fn release_owned_mute(&self, uid: &str) -> Result<(), String> {
-        self.write(uid, false, true)
     }
 }
 impl Drop for Observer {
@@ -142,7 +145,10 @@ impl EndpointBackend for Unavailable {
     fn read(&self, _: &str) -> Result<Option<EndpointState>, String> {
         Ok(None)
     }
-    fn set_mute(&self, _: &str, _: bool) -> Result<(), String> {
+    fn mute(&self, _: &str) -> Result<(), String> {
+        Err("source output unavailable".into())
+    }
+    fn restore_mute(&self, _: &str, _: bool, _: &RestorePermit) -> Result<(), String> {
         Err("source output unavailable".into())
     }
     fn ownership_lost(&self) -> bool {

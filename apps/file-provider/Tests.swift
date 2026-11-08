@@ -212,7 +212,42 @@ struct Tests {
         precondition(pauses == 1)
     }
 
+    static func additiveLocalJSONFields() throws {
+        // Additive Rust fields must not prevent older native readers from
+        // reading their view. Known fields and schemas remain validated by the rejection tests.
+        _ = try JSONDecoder().decode(CurrentMetadata.self, from: Data(#"{"schema":1,"size":1,"version":1,"future":{}}"#.utf8))
+        _ = try JSONDecoder().decode(Catalog.self, from: Data(#"{"schema":1,"token":"","port":0,"records":[{"id":"x","parent":"root","name":"x","directory":false,"version":1,"future":true}],"urls":[],"future":{}}"#.utf8))
+        _ = try JSONDecoder().decode(PlaceholderLedger.self, from: Data(#"{"schema":1,"parent":null,"urls":[],"future":true}"#.utf8))
+    }
+
+    static func catalogNamespaceIgnoresLegacyPastePreferences() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        // The previous writer placed these settings beside catalogs.
+        let key = String(repeating: "b", count: 64)
+        let source = "source" + String(repeating: "c", count: 64)
+        for name in [key, source] {
+            try JSONEncoder().encode(Catalog(token: "", port: 0, records: []))
+                .write(to: root.appendingPathComponent(name + ".json"))
+        }
+        try Data(#"{"enabled":true,"language":"zh-Hans"}"#.utf8)
+            .write(to: root.appendingPathComponent("paste-as-file.json"))
+        let loaded = try catalogs(in: root)
+        precondition(loaded.count == 2, "non-catalog JSON entered provider enumeration")
+        try receivedDelete([], in: root)
+        // Recognized catalog corruption must still stop enumeration.
+        try Data("{}".utf8).write(to: root.appendingPathComponent(key + ".json"))
+        do {
+            _ = try catalogs(in: root)
+            preconditionFailure("corrupt catalog silently omitted")
+        } catch {}
+        print("Catalog namespace: legacy paste preference JSON ignored; corrupt catalogs rejected")
+    }
+
     static func main() async throws {
+        try additiveLocalJSONFields()
+        try catalogNamespaceIgnoresLegacyPastePreferences()
         try await placeholderRetirementIsItemScoped()
         try failureDiagnosticsKeepCodesWithoutPrivateData()
         try await publicationIncludesRootSymlinks()
@@ -244,7 +279,8 @@ struct Tests {
         for invalid in [
             #"{"size":1,"version":1}"#,
             #"{"schema":2,"size":1,"version":1}"#,
-            #"{"schema":1,"size":1,"version":1,"action":"unknown"}"#
+            #"{"schema":1,"size":"one","version":1}"#,
+            #"{"schema":1,"size":1,"version":1,"exec_bits":511}"#,
         ] {
             do {
                 _ = try JSONDecoder().decode(CurrentMetadata.self, from: Data(invalid.utf8))
@@ -254,7 +290,7 @@ struct Tests {
         for invalid in [
             #"{"token":"secret","port":1,"records":[],"urls":[]}"#,
             #"{"schema":2,"token":"secret","port":1,"records":[],"urls":[]}"#,
-            #"{"schema":1,"token":"secret","port":1,"records":[],"urls":[],"execute":true}"#
+            #"{"schema":1,"token":"secret","port":1,"records":[],"urls":[],"move_state":"execute"}"#,
         ] {
             do {
                 _ = try JSONDecoder().decode(Catalog.self, from: Data(invalid.utf8))

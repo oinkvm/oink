@@ -73,6 +73,63 @@ fn router(action: &str) -> Router {
     r.drain_outputs();
     r
 }
+
+fn mouse_lock_escape_router() -> Router {
+    let mut r = router("lock_focus");
+    let mut settings = r.config().settings.clone();
+    settings.keyboard_mode = oink_foundation::input::InputMode::Local;
+    r.set_settings(settings);
+    r.set_hotkeys(vec![HotkeyBinding {
+        chord: Chord::parse(&["Mouse4"]).unwrap(),
+        action: "lock_escape".into(),
+    }]);
+    r.drain_outputs();
+    r
+}
+
+fn deliver_xbutton(xbutton: u16, pressed: bool) -> LRESULT {
+    let info = MSLLHOOKSTRUCT {
+        pt: POINT { x: 1920, y: 1080 },
+        mouseData: u32::from(xbutton) << 16,
+        ..Default::default()
+    };
+    mouse_proc_with_next(
+        0,
+        WPARAM(if pressed { WM_XBUTTONDOWN } else { WM_XBUTTONUP } as usize),
+        LPARAM((&info as *const MSLLHOOKSTRUCT) as isize),
+        || LRESULT(0),
+    )
+}
+
+#[test]
+fn xbutton_lock_escape_is_a_mouse_hold_even_when_keyboard_is_local() {
+    let f = Fixture::new();
+    let r = Arc::new(Mutex::new(mouse_lock_escape_router()));
+    let owner = r.clone();
+    with_state(|s| {
+        s.handler = Arc::new(move |event| owner.lock().unwrap().on_local_event(event, 1));
+    });
+
+    assert_eq!(deliver_xbutton(1, true), LRESULT(1));
+    assert!(r.lock().unwrap().drain_outputs().iter().any(|output| matches!(
+        output,
+        Output::Send {
+            to: PEER,
+            msg: Packet::Control(ControlMsg::LockEscape { held: true }),
+            ..
+        }
+    )));
+    assert_eq!(deliver_xbutton(1, false), LRESULT(1));
+    assert!(r.lock().unwrap().drain_outputs().iter().any(|output| matches!(
+        output,
+        Output::Send {
+            to: PEER,
+            msg: Packet::Control(ControlMsg::LockEscape { held: false }),
+            ..
+        }
+    )));
+    assert!(f.events.lock().unwrap().is_empty(), "both XBUTTON edges stay swallowed");
+}
 fn deliver(vk: u32, scan: u32, extended: bool, injected: bool, pressed: bool) -> LRESULT {
     let info = KBDLLHOOKSTRUCT {
         vkCode: vk,
@@ -628,4 +685,280 @@ fn boundary_reconcile_treats_neutral_synthetic_modifier_as_both_sides() {
     deliver(0x10, 0, false, true, false);
     deliver(0x12, 0, false, true, false);
     assert_eq!(modifier_reconcile::with_sample_for_test(0x61, Some(0)), 0);
+}
+
+#[test]
+fn passed_win_missing_up_before_crossing_uses_boundary_state_without_releasing_a_real_hold() {
+    // A local Win DOWN can reach us while an IME consumes the rest of its
+    // chord. The observed source sequence contains no Ctrl or Win UP before
+    // crossing; do not invent synthetic edges or infer release from the chord.
+    // The boundary sample is supplied, not a claim about an IME's OS behavior.
+    for system_down in [Some(0), Some(8), None] {
+        let _f = Fixture::new();
+        let mut r = Router::new(
+            RouterConfig::new(
+                Boot {
+                    device_id: ME,
+                    nonce: [1; 16],
+                },
+                "source",
+                Os::Windows,
+            ),
+            Arc::new(SimpleLayout::new()),
+        );
+        r.attach_input(
+            Boot {
+                device_id: PEER,
+                nonce: [2; 16],
+            },
+            [2; 16],
+            true,
+            false,
+            Default::default(),
+            0,
+        );
+        r.set_peer_os(PEER, Os::MacOS, 0);
+        r.set_modifier_release_probe(Arc::new(move |mask| {
+            assert_eq!(mask, 8);
+            modifier_reconcile::with_sample_for_test(mask, system_down)
+        }));
+        let r = Arc::new(Mutex::new(r));
+        let owner = r.clone();
+        with_state(|s| {
+            s.mode = CaptureMode::Local;
+            s.handler = Arc::new(move |event| owner.lock().unwrap().on_local_event(event, 1));
+        });
+        assert_eq!(deliver(0x5b, 0x5b, true, false, true), LRESULT(0));
+        r.lock().unwrap().drain_outputs();
+        focus_remote(&mut r.lock().unwrap(), 8);
+        let out = r.lock().unwrap().drain_outputs();
+        let win_edges = |out: &[Output]| {
+            out.iter()
+                .filter_map(|o| match o {
+                    Output::Send {
+                        to: PEER,
+                        msg:
+                            Packet::Input(InputMsg::Key {
+                                code: KeyCode::LEFT_GUI,
+                                pressed,
+                            }),
+                        ..
+                    } => Some(*pressed),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let retained = system_down != Some(0);
+        assert_eq!(win_edges(&out), if retained { vec![true] } else { vec![] });
+        assert_eq!(physical_keys().contains(&KeyCode::LEFT_GUI), retained);
+        // Other physical input must not inherit a stale Win after retirement.
+        // Conversely, a held or unobservable Win is never released wholesale.
+        assert_eq!(deliver(0xa2, 0x1d, false, false, true), LRESULT(1));
+        assert_eq!(deliver(0xa2, 0x1d, false, false, false), LRESULT(1));
+        let out = r.lock().unwrap().drain_outputs();
+        assert!(win_edges(&out).is_empty());
+        assert_eq!(deliver(0x5b, 0x5b, true, false, false), LRESULT(0));
+        let out = r.lock().unwrap().drain_outputs();
+        assert_eq!(win_edges(&out), if retained { vec![false] } else { vec![] });
+        assert!(!physical_keys().contains(&KeyCode::LEFT_GUI));
+        assert!(!out.iter().any(|o| matches!(o, Output::Inject(_))));
+    }
+}
+
+#[test]
+fn local_physical_win_is_closed_by_replacement_up_before_crossing_with_forwarding_off() {
+    let (_fixture, r) = local_release_fixture();
+    assert_eq!(deliver(0x5b, 0x5b, true, false, true), LRESULT(0));
+    assert_eq!(deliver(0x5b, 0x5b, true, true, false), LRESULT(0));
+    r.lock().unwrap().drain_outputs();
+    focus_remote(&mut r.lock().unwrap(), 20);
+    let out = r.lock().unwrap().drain_outputs();
+    assert!(
+        !out.iter().any(|o| matches!(
+            o,
+            Output::Send {
+                msg: Packet::Input(InputMsg::Key {
+                    code: KeyCode::LEFT_GUI,
+                    pressed: true
+                }),
+                ..
+            }
+        )),
+        "a replacement local UP must not become a stale remote modifier"
+    );
+    assert_eq!(with_state(|s| s.keys.contains_key(&KeyCode::LEFT_GUI.0)), Some(false));
+    assert!(!physical_keys().contains(&KeyCode::LEFT_GUI));
+}
+
+fn local_release_fixture() -> (Fixture, Arc<Mutex<Router>>) {
+    let fixture = Fixture::new();
+    let mut r = router("unused");
+    r.return_pointer_home();
+    r.set_peer_os(PEER, Os::MacOS, 0);
+    // No OS-up assumption: the replacement edge itself must retire the local
+    // press. The observed failure involved an external UP, not an async sample.
+    r.set_modifier_release_probe(Arc::new(|mask| modifier_reconcile::with_sample_for_test(mask, None)));
+    let r = Arc::new(Mutex::new(r));
+    crate::capture_loop::install(Box::new(LocalReleaseOwner(r.clone())), Arc::new(|| {}));
+    let owner = r.clone();
+    with_state(|s| {
+        s.mode = CaptureMode::Local;
+        s.handler = Arc::new(move |event| owner.lock().unwrap().on_local_event(event, 1));
+    });
+    (fixture, r)
+}
+
+struct LocalReleaseOwner(Arc<Mutex<Router>>);
+impl crate::capture_loop::CaptureLoop for LocalReleaseOwner {
+    fn forward_injected_input(&self) -> bool {
+        false
+    }
+    fn set_wake(&mut self, _: crate::capture_loop::Wake) {}
+    fn event(&mut self, _: &CapturedEvent) -> Disposition {
+        panic!("fixture handler owns input")
+    }
+    fn poll(&mut self, _: Instant) -> Option<Instant> {
+        None
+    }
+    fn stopped(&self) -> bool {
+        false
+    }
+    fn release_local_key(&mut self, event: &CapturedEvent) -> bool {
+        self.0.lock().unwrap().release_local_passed_key(event, 1)
+    }
+}
+
+#[test]
+fn replacement_up_never_releases_remote_or_crossed_physical_presses() {
+    for crossed in [false, true] {
+        let _f = Fixture::new();
+        let mut r = router("unused");
+        if crossed {
+            r.return_pointer_home();
+        }
+        let r = Arc::new(Mutex::new(r));
+        crate::capture_loop::install(Box::new(LocalReleaseOwner(r.clone())), Arc::new(|| {}));
+        let owner = r.clone();
+        with_state(|s| s.handler = Arc::new(move |e| owner.lock().unwrap().on_local_event(e, 1)));
+        assert_eq!(deliver(0x5b, 0x5b, true, false, true), LRESULT(isize::from(!crossed)));
+        if crossed {
+            focus_remote(&mut r.lock().unwrap(), 20);
+        }
+        r.lock().unwrap().drain_outputs();
+        deliver(0x5b, 0x5b, true, true, false);
+        assert!(r.lock().unwrap().drain_outputs().is_empty());
+        assert_eq!(with_state(|s| s.keys.contains_key(&KeyCode::LEFT_GUI.0)), Some(true));
+        assert!(physical_keys().contains(&KeyCode::LEFT_GUI));
+        deliver(0x5b, 0x5b, true, false, false);
+        assert!(r.lock().unwrap().drain_outputs().iter().any(|o| matches!(
+            o,
+            Output::Send {
+                msg: Packet::Input(InputMsg::Key {
+                    code: KeyCode::LEFT_GUI,
+                    pressed: false
+                }),
+                ..
+            }
+        )));
+    }
+}
+
+#[test]
+fn local_replacement_release_waits_for_borrowed_state_and_preserves_a_later_press() {
+    let (_fixture, r) = local_release_fixture();
+    deliver(0x5b, 0x5b, true, false, true);
+    STATE.with(|slot| {
+        let _borrow = slot.borrow_mut();
+        assert_eq!(deliver(0x5b, 0x5b, true, true, false), LRESULT(0));
+    });
+    // The safe turn closes the old identity before the next physical DOWN.
+    local_releases::drain();
+    assert!(!physical_keys().contains(&KeyCode::LEFT_GUI));
+    assert_eq!(with_state(|s| s.keys.contains_key(&KeyCode::LEFT_GUI.0)), Some(false));
+    deliver(0x5b, 0x5b, true, false, true);
+    focus_remote(&mut r.lock().unwrap(), 20);
+    assert!(
+        r.lock().unwrap().drain_outputs().iter().any(|o| matches!(
+            o,
+            Output::Send {
+                msg: Packet::Input(InputMsg::Key {
+                    code: KeyCode::LEFT_GUI,
+                    pressed: true
+                }),
+                ..
+            }
+        )),
+        "a genuinely held new press must still cross"
+    );
+}
+
+#[test]
+fn local_replacement_release_rejected_downstream_cannot_close_the_press() {
+    let (_fixture, r) = local_release_fixture();
+    deliver(0x5b, 0x5b, true, false, true);
+    let info = KBDLLHOOKSTRUCT {
+        vkCode: 0x5b,
+        scanCode: 0x5b,
+        flags: KBDLLHOOKSTRUCT_FLAGS(LLKHF_EXTENDED.0 | LLKHF_INJECTED.0 | 0x80),
+        ..Default::default()
+    };
+    assert_eq!(
+        keyboard_proc_with_next(
+            0,
+            WPARAM(WM_KEYUP as usize),
+            LPARAM((&info as *const KBDLLHOOKSTRUCT) as isize),
+            || LRESULT(1)
+        ),
+        LRESULT(1)
+    );
+    local_releases::drain();
+    assert!(physical_keys().contains(&KeyCode::LEFT_GUI));
+    focus_remote(&mut r.lock().unwrap(), 20);
+    assert!(r.lock().unwrap().drain_outputs().iter().any(|o| matches!(
+        o,
+        Output::Send {
+            msg: Packet::Input(InputMsg::Key {
+                code: KeyCode::LEFT_GUI,
+                pressed: true
+            }),
+            ..
+        }
+    )));
+}
+
+#[test]
+fn forwarded_replacement_up_closes_the_local_native_physical_snapshot() {
+    let (_fixture, r) = local_release_fixture();
+    // Keep this owner's router callback but select normal external routing.
+    struct ForwardOwner;
+    impl crate::capture_loop::CaptureLoop for ForwardOwner {
+        fn set_wake(&mut self, _: crate::capture_loop::Wake) {}
+        fn event(&mut self, _: &CapturedEvent) -> Disposition {
+            unreachable!()
+        }
+        fn poll(&mut self, _: Instant) -> Option<Instant> {
+            None
+        }
+        fn stopped(&self) -> bool {
+            false
+        }
+        fn forward_injected_input(&self) -> bool {
+            true
+        }
+    }
+    crate::capture_loop::install(Box::new(ForwardOwner), Arc::new(|| {}));
+    assert_eq!(deliver(0x5b, 0x5b, true, false, true), LRESULT(0));
+    assert_eq!(deliver(0x5b, 0x5b, true, true, false), LRESULT(0));
+    assert!(!physical_keys().contains(&KeyCode::LEFT_GUI));
+    focus_remote(&mut r.lock().unwrap(), 20);
+    assert!(!r.lock().unwrap().drain_outputs().iter().any(|o| matches!(
+        o,
+        Output::Send {
+            msg: Packet::Input(InputMsg::Key {
+                code: KeyCode::LEFT_GUI,
+                pressed: true
+            }),
+            ..
+        }
+    )));
 }

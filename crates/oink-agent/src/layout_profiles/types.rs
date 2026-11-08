@@ -69,6 +69,8 @@ pub fn effective_system_sync(setting: bool, online: bool) -> bool {
 pub struct DeviceArrangementState {
     pub device: DeviceKey,
     pub sync_system_arrangement: bool,
+    #[serde(default)]
+    pub disable_hidden_displays: bool,
     pub preference_token: String,
     pub native_token: Option<String>,
     pub availability: Availability,
@@ -326,6 +328,7 @@ pub enum Command {
     Load(Load),
     Operation(OperationRequest),
     Setting(SettingRequest),
+    HiddenDisplaySetting(SettingRequest),
     Preview(PreviewRequest),
     Commit(CommitRequest),
     Reset(Mutation),
@@ -340,7 +343,7 @@ impl Command {
             Self::Rename(v) => &v.request_id,
             Self::Delete(v) => &v.request_id,
             Self::Load(v) => &v.request_id,
-            Self::Setting(v) => &v.request_id,
+            Self::Setting(v) | Self::HiddenDisplaySetting(v) => &v.request_id,
             Self::Commit(v) => &v.request_id,
             Self::Replay(v) => &v.request_id,
         })

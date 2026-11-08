@@ -25,6 +25,12 @@ pub fn verify_register(register: &Register) -> Result<()> {
 pub fn version_cmp(a: &ConfigVersion, b: &ConfigVersion) -> Result<std::cmp::Ordering> {
     Ok((a.counter()?, a.writer()?.ordering_key()?).cmp(&(b.counter()?, b.writer()?.ordering_key()?)))
 }
+/// Compare layout register versions under the frozen global-counter rule.
+/// The writer is only used by `merge_register` when equal counters carry
+/// different values; it never makes one counter newer than another.
+pub fn layout_version_cmp(a: &ConfigVersion, b: &ConfigVersion) -> Result<std::cmp::Ordering> {
+    Ok(a.counter()?.cmp(&b.counter()?))
+}
 /// Merge the whole winning register, including every unknown envelope/value key.
 /// The caller has already authenticated/authorised the layout writer.
 pub fn merge_register(current: &Register, incoming: &Register) -> Result<Register> {
@@ -33,14 +39,23 @@ pub fn merge_register(current: &Register, incoming: &Register) -> Result<Registe
     if current.kind()? != incoming.kind()? {
         return Err(ErrorCode::StateConflict.into());
     }
-    match version_cmp(&current.version()?, &incoming.version()?)? {
+    let compare = if current.kind()? == 2 {
+        layout_version_cmp(&current.version()?, &incoming.version()?)?
+    } else {
+        version_cmp(&current.version()?, &incoming.version()?)?
+    };
+    match compare {
         std::cmp::Ordering::Less => Ok(incoming.clone()),
         std::cmp::Ordering::Greater => Ok(current.clone()),
         std::cmp::Ordering::Equal => {
             if current.digest()? == incoming.digest()? {
                 Ok(current.clone())
-            } else {
+            } else if current.version()?.writer()?.ordering_key()? == incoming.version()?.writer()?.ordering_key()? {
                 Err(ErrorCode::StateConflict.into())
+            } else if current.version()?.writer()?.ordering_key()? < incoming.version()?.writer()?.ordering_key()? {
+                Ok(current.clone())
+            } else {
+                Ok(incoming.clone())
             }
         }
     }
@@ -122,4 +137,62 @@ pub fn record_signature_input(record: &SignedRecord) -> Result<Vec<u8>> {
     let mut bytes = super::labels::ROSTER_SIGNATURE.to_vec();
     bytes.extend(RawValue::Map(record.body()?).encode(super::limits::CONFIG_STATE)?);
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device(byte: u8) -> DeviceId {
+        DeviceId::from_raw([(1, RawValue::from(ED25519)), (2, RawValue::Bytes(vec![byte; 32]))].into()).unwrap()
+    }
+
+    fn register(counter: u64, writer: u8, marker: &str) -> Register {
+        let mut raw: RawMap = [
+            (1, 2u32.write()),
+            (
+                3,
+                RawValue::Map([(1, counter.write()), (3, device(writer).write())].into()),
+            ),
+            (4, RawValue::Map([(90, RawValue::from(marker))].into())),
+        ]
+        .into();
+        raw.insert(6, register_digest(&raw).unwrap().write());
+        Register::from_raw(raw).unwrap()
+    }
+
+    #[test]
+    fn same_counter_conflict_selects_smaller_device_id() {
+        let current = register(7, 9, "large");
+        let incoming = register(7, 1, "small");
+        let selected = merge_register(&current, &incoming).unwrap();
+        assert_eq!(selected.raw().get(&4), incoming.raw().get(&4));
+    }
+
+    #[test]
+    fn lower_counter_is_old_even_when_its_device_id_is_smaller() {
+        let current = register(7, 9, "latest");
+        let incoming = register(6, 1, "old");
+        let selected = merge_register(&current, &incoming).unwrap();
+        assert_eq!(selected.raw().get(&4), current.raw().get(&4));
+        assert_eq!(
+            layout_version_cmp(&current.version().unwrap(), &incoming.version().unwrap()).unwrap(),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn non_layout_registers_keep_the_frozen_writer_order() {
+        let current = register(7, 9, "large");
+        let incoming = register(7, 1, "small");
+        let mut current_raw = current.raw().clone();
+        current_raw.insert(1, 8u32.write());
+        current_raw.insert(6, register_digest(&current_raw).unwrap().write());
+        let mut incoming_raw = incoming.raw().clone();
+        incoming_raw.insert(1, 8u32.write());
+        incoming_raw.insert(6, register_digest(&incoming_raw).unwrap().write());
+        let current = Register::from_raw(current_raw).unwrap();
+        let incoming = Register::from_raw(incoming_raw).unwrap();
+        assert_eq!(merge_register(&current, &incoming).unwrap(), current);
+    }
 }

@@ -456,6 +456,29 @@ describe('canvas key hints', () => {
     expect(container.querySelector('.arr__keys')).toBeNull();
   });
 
+  it.each([
+    ['zh-Hans', 'mac', '按住 ⇧ 微调'], ['en', 'mac', 'Hold ⇧ for fine adjustment'], ['en', 'win', 'Hold ⇧ for fine adjustment'],
+    ['ja', 'mac', '⇧ を押しながら微調整'], ['ko', 'mac', '⇧ 키를 누른 채 미세 조절'],
+  ] as const)('shows the Shift fine-adjustment hint top-left while dragging or resizing in %s on %s', (language, platform, text) => {
+    setLanguage(language);
+    const { container } = render(<Arrangement {...props} selectedId="one" platform={platform}/>);
+    const hint = () => container.querySelector('.arr__gesture-hint');
+    const screen = container.querySelector('.scr')!;
+    expect(hint()).toBeNull();
+    fireEvent.pointerDown(screen, { button: 0, clientX: 300, clientY: 300 });
+    expect(hint()).toBeNull();
+    fireEvent.pointerMove(screen, { clientX: 330, clientY: 300 });
+    expect(hint()?.textContent).toBe(text);
+    fireEvent.pointerUp(screen);
+    expect(hint()).toBeNull();
+    const handle = container.querySelector('.scr__hz[data-c="se"]')!;
+    fireEvent.pointerDown(handle, { button: 0, clientX: 600, clientY: 400 });
+    fireEvent.pointerMove(handle, { clientX: 620, clientY: 410 });
+    expect(hint()?.textContent).toBe(text);
+    fireEvent.pointerUp(handle);
+    expect(hint()).toBeNull();
+  });
+
   it('keeps the same hint mounted while a click switches the selection', () => {
     setLanguage('en');
     const pair: Screen[] = [screens[0], { ...screens[0], id: 'two', name: 'Second', x: 1000 }];

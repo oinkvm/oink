@@ -8,6 +8,7 @@ use oink_protocol::v1::{
     Message, RawMap, dto,
     schema::{List, WireDto, WireValue},
 };
+use std::collections::BTreeMap;
 type Failure = dto::ControlFailure;
 fn field<T>(result: oink_protocol::v1::Result<T>) -> Result<T, Failure> {
     result.map_err(|_| Failure::InvalidValue)
@@ -23,6 +24,86 @@ fn current(item: &dto::DevicePreference) -> Result<dto::LocalOptionState, Failur
         .collect(),
     )
     .map_err(|_| Failure::InvalidValue)
+}
+
+#[derive(Clone, Debug)]
+struct GlobalVisibilityEdit {
+    screen: Option<String>,
+    hidden: bool,
+}
+
+/// Return the visibility changes represented by an old owner preference edit.
+/// The owner preference remains the CAS input and response compatibility shell;
+/// the actual visibility is committed to the shared layout register below.
+fn screen_visibility_edits(
+    before: &oink_protocol::v1::RawValue,
+    after: &oink_protocol::v1::RawValue,
+) -> Result<Vec<GlobalVisibilityEdit>, Failure> {
+    let before = dto::ScreenPreferencesValue::read(before).map_err(|_| Failure::InvalidValue)?;
+    let after = dto::ScreenPreferencesValue::read(after).map_err(|_| Failure::InvalidValue)?;
+    let before_enabled = before
+        .screens()
+        .map_err(|_| Failure::InvalidValue)?
+        .0
+        .into_iter()
+        .map(|screen| {
+            Ok((
+                screen.display().map_err(|_| Failure::InvalidValue)?.0,
+                screen.enabled().map_err(|_| Failure::InvalidValue)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, Failure>>()?;
+    let edits = after
+        .screens()
+        .map_err(|_| Failure::InvalidValue)?
+        .0
+        .into_iter()
+        .filter_map(|screen| {
+            let display = screen.display().ok()?.0;
+            let enabled = screen.enabled().ok()?;
+            (before_enabled.get(&display).copied() != Some(enabled)).then_some(GlobalVisibilityEdit {
+                screen: Some(display),
+                hidden: !enabled,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(edits)
+}
+
+/// Build the owner-only remainder of a legacy ScreenPreferences edit. This
+/// preserves gain and future fields while restoring enabled values to the old
+/// baseline, so owner preferences can no longer become visibility authority.
+fn without_screen_visibility(
+    before: &oink_protocol::v1::RawValue,
+    after: &oink_protocol::v1::RawValue,
+) -> Result<oink_protocol::v1::RawValue, Failure> {
+    let before = dto::ScreenPreferencesValue::read(before).map_err(|_| Failure::InvalidValue)?;
+    let enabled = before
+        .screens()
+        .map_err(|_| Failure::InvalidValue)?
+        .0
+        .into_iter()
+        .map(|screen| {
+            Ok((
+                screen.display().map_err(|_| Failure::InvalidValue)?.0,
+                screen.enabled().map_err(|_| Failure::InvalidValue)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, Failure>>()?;
+    let mut raw = after.as_map().map_err(|_| Failure::InvalidValue)?.clone();
+    if let Some(oink_protocol::v1::RawValue::Array(screens)) = raw.get_mut(&1) {
+        for screen in screens {
+            let oink_protocol::v1::RawValue::Map(fields) = screen else {
+                return Err(Failure::InvalidValue);
+            };
+            let display = match fields.get(&1) {
+                Some(oink_protocol::v1::RawValue::Text(display)) => display.clone(),
+                _ => return Err(Failure::InvalidValue),
+            };
+            fields.insert(3, enabled.get(&display).copied().unwrap_or(true).write());
+        }
+    }
+    Ok(oink_protocol::v1::RawValue::Map(raw))
 }
 impl Node {
     pub(crate) fn edit_local_input_settings(
@@ -275,19 +356,97 @@ impl Node {
                 item.persisted,
             )
         } else {
+            #[cfg(windows)]
+            let _observation = if matches!(
+                option,
+                dto::LocalOption::SyncSystemArrangement | dto::LocalOption::DisableHiddenDisplays
+            ) {
+                let guard = lock(&self.inner.profiles.native.observation_gate);
+                let _ = self.follow_windows_reconnections().map_err(|_| Failure::ApplyFailed)?;
+                Some(guard)
+            } else {
+                None
+            };
             let _gate = self.owner_gate();
             self.owner_authority(requester, group, &Message::ConfigSetLocalOption(request.clone()))?;
             let emergency_sequence = self
                 .input_status()
                 .map_err(|_| Failure::ApplyFailed)?
                 .emergency_sequence;
-            let item = {
-                let mut config = lock(&self.inner.config);
+            let (mut item, owner_patch, persist_owner, global_edits) = {
+                let config = lock(&self.inner.config);
                 let mut candidate = config.owner().clone();
                 candidate.edit(option, expected, patch.clone())?;
-                self.preflight_owner_preferences(candidate.preferences())?;
-                config.edit_owner(option, expected, patch)?
+                if option == dto::LocalOption::ScreenShared {
+                    (
+                        config.owner().item(option).ok_or(Failure::UnsupportedOption)?,
+                        patch.clone(),
+                        false,
+                        vec![GlobalVisibilityEdit {
+                            screen: None,
+                            hidden: !bool::read(&patch).map_err(|_| Failure::InvalidValue)?,
+                        }],
+                    )
+                } else if option == dto::LocalOption::ScreenPreferences {
+                    let before = config.owner().value(option).ok_or(Failure::UnsupportedOption)?;
+                    let after = candidate.value(option).ok_or(Failure::UnsupportedOption)?;
+                    let global_edits = screen_visibility_edits(&before, &after)?;
+                    if global_edits.is_empty() {
+                        (
+                            candidate.item(option).ok_or(Failure::UnsupportedOption)?,
+                            patch.clone(),
+                            true,
+                            global_edits,
+                        )
+                    } else {
+                        let owner_value = without_screen_visibility(&before, &after)?;
+                        let owner_patch = crate::config::owner::typed_patch(option, &before, &owner_value);
+                        let mut owner_candidate = config.owner().clone();
+                        let persist_owner = !owner_patch.as_map().map_err(|_| Failure::InvalidValue)?.is_empty();
+                        let item = if persist_owner {
+                            owner_candidate.edit(option, expected, owner_patch.clone())?
+                        } else {
+                            owner_candidate.item(option).ok_or(Failure::UnsupportedOption)?
+                        };
+                        (item, owner_patch, persist_owner, global_edits)
+                    }
+                } else {
+                    (
+                        candidate.item(option).ok_or(Failure::UnsupportedOption)?,
+                        patch.clone(),
+                        true,
+                        Vec::new(),
+                    )
+                }
             };
+            let owner_preferences = if persist_owner {
+                let mut candidate = lock(&self.inner.config).owner().clone();
+                candidate.edit(option, expected, owner_patch.clone())?;
+                candidate.preferences()
+            } else {
+                lock(&self.inner.config).owner().preferences()
+            };
+            self.preflight_owner_preferences(owner_preferences)?;
+            #[cfg(windows)]
+            if matches!(
+                option,
+                dto::LocalOption::SyncSystemArrangement | dto::LocalOption::DisableHiddenDisplays
+            ) && !bool::read(&patch).map_err(|_| Failure::InvalidValue)?
+                && let Some(backend) = &self.inner.display_backend
+            {
+                backend.release_disabled_displays().map_err(|_| Failure::ApplyFailed)?;
+                self.link_config()
+                    .map_err(|_| Failure::Offline)?
+                    .initialize_displays(backend.displays().map_err(|_| Failure::ApplyFailed)?)
+                    .map_err(|_| Failure::ApplyFailed)?;
+            }
+            if persist_owner {
+                item = lock(&self.inner.config).edit_owner(option, expected, owner_patch)?;
+            }
+            let global_apply = global_edits.into_iter().try_for_each(|edit| {
+                self.edit_global_visibility(self.id().into(), edit.screen.as_deref(), edit.hidden)
+                    .map_err(|_| Failure::ApplyFailed)
+            });
             // Both Shared and Disabled leave the screen's Locked menu mode.
             // The command already reached the screen owner; release that owner's
             // pin even when the durable preference is unchanged. The input fence
@@ -308,7 +467,14 @@ impl Node {
             } else {
                 Ok(())
             };
-            let applied = released.and_then(|()| self.apply_saved_input_owner(emergency_sequence));
+            let owner_changed = field(item.revision())? != expected;
+            let applied = released.and(global_apply).and_then(|()| {
+                if owner_changed {
+                    self.apply_saved_input_owner(emergency_sequence)
+                } else {
+                    Ok(())
+                }
+            });
             let publication = self.publish_owner_preferences();
             let failure = applied.err().or_else(|| publication.as_ref().err().copied());
             let outcome = if failure.is_some() {

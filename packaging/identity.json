@@ -46,6 +46,6 @@
     "crash_collector": "oink-crash-collector"
   },
   "metadata_file": "oink-build.json",
-  "version": "0.3.3",
-  "inhouse_version": "0.3.3"
+  "version": "0.3.4",
+  "inhouse_version": "0.3.4"
 }

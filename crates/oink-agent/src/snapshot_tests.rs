@@ -493,7 +493,9 @@ async fn restart_both_selects_one_seed_and_rejoins_without_pairing_scenario() {
     assert_ne!(b.boot(), boots[1]);
     active(&a, &b).await;
     until("both owner facts restored after restart", || {
-        a.link_config().unwrap().applied() == expected && b.link_config().unwrap().applied() == expected
+        let a_state = a.link_config().unwrap().applied();
+        let b_state = b.link_config().unwrap().applied();
+        a_state == expected && b_state == expected
     })
     .await;
     assert_eq!(a.link_config().unwrap().applied(), expected);
@@ -986,8 +988,8 @@ fn local_contacts_capability_and_effective_preference_recover() {
         }
         assert!(a.input_settings().unwrap().mac_scroll_feel);
         assert!(b.input_settings().unwrap().mac_scroll_feel);
-        assert!(!a.input_settings().unwrap().forward_injected_input);
-        assert!(!b.input_settings().unwrap().forward_injected_input);
+        assert!(a.input_settings().unwrap().forward_injected_input);
+        assert!(b.input_settings().unwrap().forward_injected_input);
         assert!(!a.input_settings().unwrap().take_foreground_on_leave);
         assert!(!b.input_settings().unwrap().take_foreground_on_leave);
         for enabled in [false, true] {
@@ -1011,7 +1013,7 @@ fn local_contacts_capability_and_effective_preference_recover() {
                 !b.input_settings().unwrap().take_foreground_on_leave,
                 "must not propagate to peer"
             );
-            assert!(!b.input_settings().unwrap().forward_injected_input);
+            assert!(b.input_settings().unwrap().forward_injected_input);
         }
         for enabled in [true, false] {
             let node = a.clone();
@@ -1041,7 +1043,7 @@ fn local_contacts_capability_and_effective_preference_recover() {
                 serde_json::from_slice(&std::fs::read(configs[0].data_dir.join("settings.json")).unwrap()).unwrap();
             assert_eq!(stored["local"]["routing"]["forward_injected_input"], enabled);
             assert!(
-                !b.input_settings().unwrap().forward_injected_input,
+                b.input_settings().unwrap().forward_injected_input,
                 "capture preference must not propagate to peer"
             );
         }
@@ -1357,6 +1359,84 @@ fn healthy_keyboard_card_does_not_depend_on_optional_service_permission() {
                 })
             })
             .await;
+            node.shutdown().await;
+        },
+    );
+}
+
+#[test]
+fn unrelated_input_patch_survives_stored_duplicate_hotkeys() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "unrelated_input_patch_survives_stored_duplicate_hotkeys",
+        Some(4),
+        async {
+            let dir = tempfile::tempdir().unwrap();
+            let config = oink_test_support::network_config(dir.path().join("a"), "a", 0);
+            let node = start_with_clip(&config, &Displays::new("a"), None).await;
+            let mut list = crate::agent_api::default_hotkeys();
+            let duplicate = list
+                .iter()
+                .find(|h| h.action == crate::api::HotkeyAction::LockFocus)
+                .unwrap()
+                .keys
+                .clone();
+            list.iter_mut()
+                .find(|h| h.action == crate::api::HotkeyAction::ToggleSharing)
+                .unwrap()
+                .keys = duplicate;
+            let warning_log = dir.path().join("hotkey-warnings.log");
+            let file = std::fs::File::create(&warning_log).unwrap();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(file)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                node.apply_hotkeys(&list);
+                node.apply_hotkeys(&list);
+            });
+            let warnings = std::fs::read_to_string(warning_log).unwrap();
+            assert_eq!(warnings.matches("hotkey duplicates another one").count(), 1);
+            crate::node::lock(&node.inner.config).settings.hotkeys = Some(list);
+            let cloned = node.clone();
+            tokio::task::spawn_blocking(move || {
+                cloned
+                    .set_input_settings(
+                        serde_json::from_value(serde_json::json!({"cursor_trail_duration_ms":270})).unwrap(),
+                    )
+                    .unwrap();
+                let mut changed = cloned.input_settings().unwrap().hotkeys;
+                changed
+                    .iter_mut()
+                    .find(|h| h.action == crate::api::HotkeyAction::OpenWindow)
+                    .unwrap()
+                    .enabled = true;
+                cloned
+                    .set_input_settings(serde_json::from_value(serde_json::json!({"hotkeys":changed})).unwrap())
+                    .unwrap();
+                // An unrelated shortcut edit survives the old conflict, but a
+                // newly introduced conflict is still refused on its own.
+                let mut changed = cloned.input_settings().unwrap().hotkeys;
+                let keys = changed
+                    .iter()
+                    .find(|h| h.action == crate::api::HotkeyAction::LockFocus)
+                    .unwrap()
+                    .keys
+                    .clone();
+                changed
+                    .iter_mut()
+                    .find(|h| h.action == crate::api::HotkeyAction::OpenWindow)
+                    .unwrap()
+                    .keys = keys;
+                assert!(
+                    cloned
+                        .set_input_settings(serde_json::from_value(serde_json::json!({"hotkeys":changed})).unwrap())
+                        .is_err()
+                );
+            })
+            .await
+            .unwrap();
             node.shutdown().await;
         },
     );

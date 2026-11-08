@@ -19,7 +19,7 @@ test('native asset inventory matches source bytes and covers backend tray artwor
     assert.equal(asset.ownership, 'first-party', path);
     const mac = name.startsWith('mac-');
     assert.deepEqual(asset.scope, [mac ? 'runtime' : 'test'], path);
-    assert.deepEqual(asset.platforms, [mac ? 'macos-arm64' : 'windows-x64'], path);
+    assert.deepEqual(asset.platforms, mac ? ['macos-arm64', 'macos-x64'] : ['windows-x64'], path);
   }
 });
 test('generator excludes first-party artwork while retaining its package inventory and project license', () => {
@@ -67,7 +67,7 @@ test('bundled sponsor marks retain project provenance, terms and brand notices',
     assert.equal(asset.ownership, 'first-party', path);
     assert.equal(asset.licenseExpression, 'GPL-3.0-only', path);
     assert.equal(asset.selectedLicense, 'GPL-3.0-only', path);
-    assert.deepEqual(asset.platforms, ['macos-arm64', 'windows-x64'], path);
+    assert.deepEqual(asset.platforms, ['macos-arm64', 'macos-x64', 'windows-x64'], path);
     assert.deepEqual(asset.scope, ['runtime'], path);
     assert.deepEqual(asset.licenseFiles.map(file => file.path), ['LICENSE', 'LICENSE-ADDITIONAL-TERMS.md'], path);
     assert.match(asset.provenance, /Project-authored.*Mark/, path);

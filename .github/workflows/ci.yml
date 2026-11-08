@@ -26,12 +26,16 @@ jobs:
           - os: macos-15
             target: aarch64-apple-darwin
             jobs: '2'
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            jobs: '2'
           - os: windows-2022
             target: x86_64-pc-windows-msvc
             jobs: '4'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
       CARGO_BUILD_JOBS: ${{ matrix.jobs }}
       RUST_TEST_THREADS: '4'
     steps:
@@ -61,7 +65,7 @@ jobs:
       - name: Assert product architecture and pin npm
         shell: bash
         run: |
-          if [[ "$RUNNER_OS" == macOS ]]; then test "$(uname -m)" = arm64; fi
+          if [[ "$RUNNER_OS" == macOS ]]; then test "$(uname -m)" = "${{ matrix.target == 'aarch64-apple-darwin' && 'arm64' || 'x86_64' }}"; fi
           if [[ "$RUNNER_OS" == Windows ]]; then test "$PROCESSOR_ARCHITECTURE" = AMD64; fi
           npm install --global npm@11.11.0
       - name: Select OpenSSL 3 for macOS feed tests

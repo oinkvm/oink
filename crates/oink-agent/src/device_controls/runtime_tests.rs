@@ -25,6 +25,148 @@ async fn execute(node: &Node, request: Message) -> dto::LocalEditResult {
 }
 
 #[test]
+fn legacy_screen_shared_command_edits_global_layout_without_owner_visibility_write() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "legacy_screen_shared_command_edits_global_layout_without_owner_visibility_write",
+        Some(4),
+        async {
+            let dir = tempfile::tempdir().unwrap();
+            let node = start_with_clip(
+                &oink_test_support::network_config(dir.path().join("owner"), "owner", 0),
+                &Displays::new("owner"),
+                None,
+            )
+            .await;
+            let option = dto::LocalOption::ScreenShared;
+            let owner_revision = lock(&node.inner.config).owner().revision(option).unwrap();
+            let version = node.layout().1.revision;
+            let binding = TokenBinding {
+                owner: OwnerVersion {
+                    group: node.link_config().unwrap().applied().group.into(),
+                    device: node.id().into(),
+                    boot_nonce: node.inner.boot.nonce,
+                    revision: owner_revision,
+                },
+                operation: TokenOperation::OwnerOption {
+                    option: option.number(),
+                },
+            };
+            let request =
+                requests::option_request(&binding, &fresh_request_id(), option.number(), false.write()).unwrap();
+            let response = execute(&node, request.clone()).await;
+            assert_eq!(response.outcome().unwrap(), dto::ControlOutcome::NoChange);
+            assert_eq!(response.current().unwrap().unwrap().revision().unwrap(), owner_revision);
+            assert!(response.persisted().unwrap());
+            assert_eq!(
+                completion::validate(&request, &Message::ConfigLocalEditResult(response.clone())),
+                Ok(DeviceControlResult::NoChange)
+            );
+            assert_eq!(node.layout().1.revision, version + 1);
+            assert!(node.layout().0.screens.iter().all(|screen| screen.device_hidden));
+            assert_eq!(
+                lock(&node.inner.config).owner().revision(option),
+                Some(owner_revision),
+                "legacy visibility must not advance the owner preference revision"
+            );
+            assert_eq!(
+                lock(&node.inner.config).owner().value(option),
+                Some(true.write()),
+                "the retained owner visibility value is only an upgrade seed"
+            );
+            node.shutdown().await;
+        },
+    );
+}
+
+#[test]
+fn legacy_screen_preferences_enabled_patch_edits_global_layout_only() {
+    crate::test_watchdog::run(
+        module_path!(),
+        "legacy_screen_preferences_enabled_patch_edits_global_layout_only",
+        Some(4),
+        async {
+            let dir = tempfile::tempdir().unwrap();
+            let node = start_with_clip(
+                &oink_test_support::network_config(dir.path().join("owner"), "owner", 0),
+                &Displays::new("owner"),
+                None,
+            )
+            .await;
+            let option = dto::LocalOption::ScreenPreferences;
+            let owner_revision = lock(&node.inner.config).owner().revision(option).unwrap();
+            let version = node.layout().1.revision;
+            let binding = TokenBinding {
+                owner: OwnerVersion {
+                    group: node.link_config().unwrap().applied().group.into(),
+                    device: node.id().into(),
+                    boot_nonce: node.inner.boot.nonce,
+                    revision: owner_revision,
+                },
+                operation: TokenOperation::OwnerOption {
+                    option: option.number(),
+                },
+            };
+            let patch = oink_protocol::v1::RawValue::Map(
+                [(
+                    1,
+                    oink_protocol::v1::RawValue::Map(
+                        [(
+                            1,
+                            oink_protocol::v1::RawValue::Array(vec![oink_protocol::v1::RawValue::Map(
+                                [
+                                    (1, oink_protocol::v1::RawValue::Text("owner".into())),
+                                    (3, false.write()),
+                                ]
+                                .into(),
+                            )]),
+                        )]
+                        .into(),
+                    ),
+                )]
+                .into(),
+            );
+            let request = requests::option_request(&binding, &fresh_request_id(), option.number(), patch).unwrap();
+            let response = execute(&node, request.clone()).await;
+            assert_eq!(response.outcome().unwrap(), dto::ControlOutcome::NoChange);
+            assert_eq!(response.current().unwrap().unwrap().revision().unwrap(), owner_revision);
+            assert!(response.persisted().unwrap());
+            assert_eq!(
+                completion::validate(&request, &Message::ConfigLocalEditResult(response.clone())),
+                Ok(DeviceControlResult::NoChange)
+            );
+            assert_eq!(node.layout().1.revision, version + 1);
+            assert!(
+                node.layout()
+                    .0
+                    .screens
+                    .iter()
+                    .any(|screen| screen.id.display == "owner" && screen.screen_hidden)
+            );
+            let value = lock(&node.inner.config).owner().value(option).unwrap();
+            let preferences = dto::ScreenPreferencesValue::read(&value).unwrap();
+            assert!(
+                preferences
+                    .screens()
+                    .unwrap()
+                    .0
+                    .iter()
+                    .find(|screen| screen.display().unwrap().0 == "owner")
+                    .unwrap()
+                    .enabled()
+                    .unwrap()
+            );
+            assert_eq!(
+                lock(&node.inner.config).owner().revision(option),
+                Some(owner_revision),
+                "enabled remains a global layout field after a legacy command"
+            );
+            node.shutdown().await;
+        },
+    );
+}
+
+#[test]
 fn frozen_v1_keyboard_mode_rejects_disabled_value() {
     crate::test_watchdog::run(
         module_path!(),

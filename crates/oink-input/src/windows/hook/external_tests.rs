@@ -3,7 +3,8 @@
 use super::*;
 use std::sync::{Arc, Mutex, MutexGuard, atomic::AtomicBool};
 use windows::Win32::UI::WindowsAndMessaging::{
-    KBDLLHOOKSTRUCT_FLAGS, LLKHF_LOWER_IL_INJECTED, LLMHF_LOWER_IL_INJECTED, WM_KEYUP, WM_SYSKEYUP,
+    KBDLLHOOKSTRUCT_FLAGS, LLKHF_LOWER_IL_INJECTED, LLMHF_LOWER_IL_INJECTED, WM_KEYUP, WM_SYSKEYUP, WM_XBUTTONDOWN,
+    WM_XBUTTONUP,
 };
 
 struct Owner(Arc<AtomicBool>);
@@ -85,6 +86,22 @@ impl Fixture {
             0,
             WPARAM(msg as usize),
             LPARAM((&info as *const KBDLLHOOKSTRUCT) as isize),
+            || LRESULT(0),
+        )
+        .0
+    }
+
+    fn xbutton(&self, msg: u32, xbutton: u16, flags: u32) -> isize {
+        let info = MSLLHOOKSTRUCT {
+            pt: POINT { x: 1920, y: 1080 },
+            flags,
+            mouseData: u32::from(xbutton) << 16,
+            ..Default::default()
+        };
+        mouse_proc_with_next(
+            0,
+            WPARAM(msg as usize),
+            LPARAM((&info as *const MSLLHOOKSTRUCT) as isize),
             || LRESULT(0),
         )
         .0
@@ -206,6 +223,29 @@ fn external_buttons_and_keys_do_not_release_physical_remote_holds_in_either_orde
             with_state(|s| s.continuity.transition(false, |_| false, 0))
                 .unwrap()
                 .is_empty()
+        );
+    }
+}
+
+#[test]
+fn physical_xbuttons_preserve_down_up_pair_and_button_identity() {
+    for (xbutton, expected) in [(1, MouseButton::Back), (2, MouseButton::Forward)] {
+        let f = Fixture::new();
+        assert_eq!(f.xbutton(WM_XBUTTONDOWN, xbutton, 0), 1);
+        assert_eq!(f.xbutton(WM_XBUTTONUP, xbutton, 0), 1);
+        let events = f.events.lock().unwrap();
+        assert_eq!(
+            events.iter().map(|event| event.event.clone()).collect::<Vec<_>>(),
+            [
+                InputEvent::Button {
+                    button: expected,
+                    pressed: true,
+                },
+                InputEvent::Button {
+                    button: expected,
+                    pressed: false,
+                },
+            ]
         );
     }
 }

@@ -110,7 +110,7 @@ impl Record {
 }
 
 /// Minimal backend for deterministic recovery tests and platform integration.
-/// `set_mute` must distinguish its own notifications where the OS permits it
+/// Mute writes must distinguish its own notifications where the OS permits it
 /// (WASAPI event context; CoreAudio serialized value/readback observation).
 /// It must not change volume, default devices, or any other endpoint.
 pub trait EndpointBackend {
@@ -122,7 +122,17 @@ pub trait EndpointBackend {
     fn permanently_removed(&self, _endpoint: &str) -> Result<bool, String> {
         Ok(false)
     }
-    fn set_mute(&self, endpoint: &str, muted: bool) -> Result<(), String>;
+    /// Acquisition can only apply mute. Restoration requires the unforgeable
+    /// permit minted by this module's single pause-and-restore function.
+    fn mute(&self, endpoint: &str) -> Result<(), String>;
+    /// Bare restore primitive: release mute only, never write volume/default.
+    /// `release_only` permits a level-only user override; always recheck the
+    /// corresponding ownership latch immediately before the native write.
+    fn restore_mute(&self, endpoint: &str, release_only: bool, permit: &RestorePermit) -> Result<(), String>;
+    /// Best-effort pause before an actual owned-output restore, including crash
+    /// recovery. Implementations must isolate native media APIs on a worker and
+    /// bound any wait. No route/claim/session-lifecycle decisions belong here.
+    fn pause_before_restore(&self) {}
     /// An event-driven latch, not a comparison of current endpoint values.
     fn ownership_lost(&self) -> bool;
     /// True if an external event changed the mute bit, including toggling back.
@@ -130,11 +140,34 @@ pub trait EndpointBackend {
     fn mute_ownership_lost(&self) -> bool {
         self.ownership_lost()
     }
-    /// Release only our applied mute after a level-only external change. Must
-    /// recheck mute ownership immediately before the tagged OS write.
-    fn release_owned_mute(&self, endpoint: &str) -> Result<(), String> {
-        self.set_mute(endpoint, false)
+}
+
+/// Capability for the bare restore primitive. Only `restore_local_output` can
+/// create it, so a platform caller cannot accidentally skip the preceding pause.
+///
+/// ```compile_fail
+/// let bypass = oink_audio::recovery::RestorePermit { _private: () };
+/// ```
+#[derive(Debug)]
+pub struct RestorePermit {
+    _private: (),
+}
+
+// Both ordinary/crash restoration and level-only release must enter here.
+// The only raw restore calls are inside this function; acquiring a lease has a
+// separate mute-only API. No source/route/claim decisions are made here.
+fn restore_local_output<B: EndpointBackend>(backend: &B, endpoint: &str, release_only: bool) -> Result<(), String> {
+    backend.pause_before_restore();
+    // Player dispatch can consume the bounded grace period. Recheck user
+    // ownership after it; native backends recheck at the actual tagged write too.
+    if if release_only {
+        backend.mute_ownership_lost()
+    } else {
+        backend.ownership_lost()
+    } {
+        return Ok(());
     }
+    backend.restore_mute(endpoint, release_only, &RestorePermit { _private: () })
 }
 
 /// One exclusive process owns the recovery record until this object is dropped.
@@ -357,7 +390,7 @@ impl Journal {
             self.revoke()?;
             return Ok(report(RecoveryOutcome::UserOverride, false));
         }
-        if let Err(error) = backend.set_mute(&entry.original.endpoint, entry.original.muted) {
+        if let Err(error) = restore_local_output(backend, &entry.original.endpoint, false) {
             // A driver can disappear between the readback and the tagged write.
             // Classify that race by the exact endpoint, never by error text.
             if backend.read(&entry.original.endpoint)?.is_none() {
@@ -422,7 +455,7 @@ impl Journal {
             return Ok(());
         };
         if current.muted && !backend.mute_ownership_lost() {
-            backend.release_owned_mute(&entry.original.endpoint)?;
+            restore_local_output(backend, &entry.original.endpoint, true)?;
         }
         Ok(())
     }
@@ -502,6 +535,8 @@ mod tests {
         changed: AtomicBool,
         mute_changed: AtomicBool,
         writes: AtomicUsize,
+        events: Mutex<Vec<&'static str>>,
+        override_on_pause: AtomicBool,
         journal: PathBuf,
     }
     impl EndpointBackend for Fake {
@@ -520,7 +555,31 @@ mod tests {
                 .filter(|s| s.endpoint == endpoint)
                 .cloned())
         }
-        fn set_mute(&self, endpoint: &str, muted: bool) -> Result<(), String> {
+        fn mute(&self, endpoint: &str) -> Result<(), String> {
+            self.write_mute(endpoint, true)
+        }
+        fn pause_before_restore(&self) {
+            self.events.lock().unwrap().push("pause");
+            if self.override_on_pause.load(Ordering::SeqCst) {
+                self.changed.store(true, Ordering::SeqCst);
+            }
+        }
+        fn restore_mute(&self, endpoint: &str, release_only: bool, _: &RestorePermit) -> Result<(), String> {
+            self.events.lock().unwrap().push("restore");
+            if release_only {
+                return self.release_owned_mute(endpoint);
+            }
+            self.write_mute(endpoint, false)
+        }
+        fn ownership_lost(&self) -> bool {
+            self.changed.load(Ordering::SeqCst)
+        }
+        fn mute_ownership_lost(&self) -> bool {
+            self.mute_changed.load(Ordering::SeqCst)
+        }
+    }
+    impl Fake {
+        fn write_mute(&self, endpoint: &str, muted: bool) -> Result<(), String> {
             if !muted && self.vanish_on_restore.load(Ordering::SeqCst) {
                 self.state.lock().unwrap().take();
                 return Err("endpoint vanished during mute write".into());
@@ -532,12 +591,6 @@ mod tests {
             self.writes.fetch_add(1, Ordering::SeqCst);
             self.state.lock().unwrap().as_mut().unwrap().muted = muted;
             Ok(())
-        }
-        fn ownership_lost(&self) -> bool {
-            self.changed.load(Ordering::SeqCst)
-        }
-        fn mute_ownership_lost(&self) -> bool {
-            self.mute_changed.load(Ordering::SeqCst)
         }
         fn release_owned_mute(&self, _: &str) -> Result<(), String> {
             assert!(!self.mute_ownership_lost());
@@ -563,6 +616,8 @@ mod tests {
             changed: AtomicBool::new(false),
             mute_changed: AtomicBool::new(false),
             writes: AtomicUsize::new(0),
+            events: Mutex::new(vec![]),
+            override_on_pause: AtomicBool::new(false),
             journal: dir.path().join(JOURNAL_NAME),
         };
         let journal = Journal::open(dir.path()).unwrap();
@@ -570,7 +625,86 @@ mod tests {
     }
     fn apply(journal: &mut Journal, backend: &Fake, before: EndpointState) {
         journal.prepare(before).unwrap();
-        backend.set_mute("headphones-1", true).unwrap();
+        backend.mute("headphones-1").unwrap();
+    }
+
+    #[test]
+    fn every_live_or_crash_restore_pauses_once_before_writing_and_repeated_recovery_is_idle() {
+        for after_crash in [false, true] {
+            let (dir, mut journal, backend, before) = setup();
+            apply(&mut journal, &backend, before);
+            if after_crash {
+                drop(journal);
+                journal = Journal::open(dir.path()).unwrap();
+            }
+            assert_eq!(
+                journal.recover(&backend, after_crash).unwrap().outcome,
+                RecoveryOutcome::Restored
+            );
+            journal.recover(&backend, after_crash).unwrap();
+            assert_eq!(*backend.events.lock().unwrap(), ["pause", "restore"]);
+        }
+    }
+
+    #[test]
+    fn no_pause_without_a_restore() {
+        for after_crash in [false, true] {
+            for scenario in 0..6 {
+                let (_dir, mut journal, backend, mut before) = setup();
+                if scenario == 1 {
+                    before.muted = true;
+                    *backend.state.lock().unwrap() = Some(before.clone());
+                }
+                if scenario != 0 {
+                    apply(&mut journal, &backend, before);
+                }
+                match scenario {
+                    2 => {
+                        backend.state.lock().unwrap().take();
+                    }
+                    3 => {
+                        backend.changed.store(true, Ordering::SeqCst);
+                    }
+                    4 => {
+                        backend.state.lock().unwrap().as_mut().unwrap().volume = 0.7;
+                    }
+                    5 => {
+                        journal.revoke().unwrap();
+                    }
+                    _ => {}
+                }
+                journal.recover(&backend, after_crash).unwrap();
+                assert!(
+                    backend.events.lock().unwrap().is_empty(),
+                    "scenario {scenario}, crash {after_crash}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn level_only_release_uses_the_same_pause_then_restore_once() {
+        let (_dir, mut journal, backend, before) = setup();
+        apply(&mut journal, &backend, before);
+        backend.changed.store(true, Ordering::SeqCst);
+        backend.state.lock().unwrap().as_mut().unwrap().volume = 0.7;
+        journal.release_after_volume_change(&backend).unwrap();
+        journal.release_after_volume_change(&backend).unwrap();
+        journal.recover(&backend, false).unwrap();
+        assert_eq!(*backend.events.lock().unwrap(), ["pause", "restore"]);
+    }
+
+    #[test]
+    fn user_override_during_pause_still_wins_over_restore() {
+        let (_dir, mut journal, backend, before) = setup();
+        apply(&mut journal, &backend, before);
+        backend.override_on_pause.store(true, Ordering::SeqCst);
+        assert_eq!(
+            journal.recover(&backend, false).unwrap().outcome,
+            RecoveryOutcome::UserOverride
+        );
+        assert_eq!(*backend.events.lock().unwrap(), ["pause"]);
+        assert!(backend.state.lock().unwrap().as_ref().unwrap().muted);
     }
 
     #[test]
@@ -596,7 +730,18 @@ mod tests {
             fn read(&self, endpoint: &str) -> Result<Option<EndpointState>, String> {
                 Ok(self.states.lock().unwrap().get(endpoint).cloned())
             }
-            fn set_mute(&self, endpoint: &str, muted: bool) -> Result<(), String> {
+            fn mute(&self, endpoint: &str) -> Result<(), String> {
+                self.write(endpoint, true)
+            }
+            fn restore_mute(&self, endpoint: &str, _: bool, _: &RestorePermit) -> Result<(), String> {
+                self.write(endpoint, false)
+            }
+            fn ownership_lost(&self) -> bool {
+                false
+            }
+        }
+        impl Pair {
+            fn write(&self, endpoint: &str, muted: bool) -> Result<(), String> {
                 self.states
                     .lock()
                     .unwrap()
@@ -605,9 +750,6 @@ mod tests {
                     .muted = muted;
                 self.writes.lock().unwrap().push((endpoint.into(), muted));
                 Ok(())
-            }
-            fn ownership_lost(&self) -> bool {
-                false
             }
         }
         for old_missing in [false, true] {
@@ -631,7 +773,7 @@ mod tests {
                     writes: Mutex::new(vec![]),
                 };
                 journal.prepare(old.clone()).unwrap();
-                backend.set_mute(&old.endpoint, true).unwrap();
+                backend.mute(&old.endpoint).unwrap();
                 let leased = backend.states.lock().unwrap().get(&old.endpoint).unwrap().clone();
                 if old_missing {
                     backend.states.lock().unwrap().remove(&old.endpoint);
@@ -818,7 +960,7 @@ mod tests {
         };
         *backend.state.lock().unwrap() = Some(replacement.clone());
         journal.prepare(replacement.clone()).unwrap();
-        backend.set_mute("new-default", true).unwrap();
+        backend.mute("new-default").unwrap();
         drop(journal); // both independent records survive a crash
         let mut journal = Journal::open(dir.path()).unwrap();
         assert_eq!(journal.endpoints().len(), 2);

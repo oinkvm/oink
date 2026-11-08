@@ -9,6 +9,18 @@ from native_image_fixtures import GUID, pe_image, macho_image
 
 
 class LinkedIdentity(unittest.TestCase):
+    def test_x64_macho_uses_the_same_uuid_and_bounds(self):
+        import struct
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'image'
+            arm = macho_image()
+            path.write_bytes(arm)
+            expected = image_identity(path)
+            intel = bytearray(arm)
+            struct.pack_into('<I', intel, 4, 0x01000007)
+            path.write_bytes(intel)
+            self.assertEqual(image_identity(path), expected)
+
     def test_native_guid_normalization_and_image_relative_bounds(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'image'

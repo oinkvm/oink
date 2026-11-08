@@ -171,6 +171,8 @@ pub struct Owner {
     capture: Mutex<Option<Arc<oink_crash::capsule::Capture>>>,
     #[cfg(target_os = "macos")]
     inbox: Arc<Mutex<Option<inbox::Inbox>>>,
+    #[cfg(target_os = "macos")]
+    objc_capture: Mutex<Option<oink_crash::objc::ReportCapture>>,
     #[cfg(windows)]
     collector: Mutex<Option<oink_crash::collector::Collector>>,
     #[cfg(windows)]
@@ -255,6 +257,8 @@ impl Owner {
             capture: Mutex::new(None),
             #[cfg(target_os = "macos")]
             inbox: Arc::new(Mutex::new(None)),
+            #[cfg(target_os = "macos")]
+            objc_capture: Mutex::new(None),
             #[cfg(windows)]
             collector: Mutex::new(None),
             #[cfg(windows)]
@@ -437,6 +441,7 @@ impl Owner {
         #[cfg(target_os = "macos")]
         {
             self.inbox.lock().map_err(|_| Error::Io)?.take();
+            self.objc_capture.lock().map_err(|_| Error::Io)?.take();
         }
         #[cfg(windows)]
         {
@@ -560,12 +565,13 @@ impl Owner {
                 && let Ok(lifetime) = serde_json::from_slice::<oink_crash::macos::Lifetime>(&bytes)
                 && let Some(home) = std::env::var_os("HOME")
             {
-                recovered = oink_crash::macos::recover(
+                recovered = oink_crash::macos::recover_with_objc(
                     &PathBuf::from(home).join("Library/Logs/DiagnosticReports"),
                     lifetime,
                     consent,
                     manifest,
                     now(),
+                    Some(&self.dir.join("capsules/objc-report.jsonl")),
                 );
             }
         }
@@ -605,8 +611,12 @@ impl Owner {
                 debug_id: image.debug_id,
                 build: self.ingress.build,
             };
-            if let Ok(bytes) = serde_json::to_vec(&lifetime) {
-                let _ = oink_telemetry::store::atomic_write(&self.dir.join("capsules/lifetime.json"), &bytes);
+            if let Ok(bytes) = serde_json::to_vec(&lifetime)
+                && oink_telemetry::store::atomic_write(&self.dir.join("capsules/lifetime.json"), &bytes).is_ok()
+            {
+                let mut capture = self.objc_capture.lock().unwrap_or_else(|e| e.into_inner());
+                capture.take();
+                *capture = oink_crash::objc::ReportCapture::start(&self.dir.join("capsules/objc-report.jsonl")).ok();
             }
         }
     }
@@ -640,6 +650,8 @@ impl Owner {
         #[cfg(target_os = "macos")]
         {
             self.inbox.lock().unwrap_or_else(|e| e.into_inner()).take();
+            self.objc_capture.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let _ = std::fs::remove_file(self.dir.join("capsules/objc-report.jsonl"));
         }
         #[cfg(windows)]
         {

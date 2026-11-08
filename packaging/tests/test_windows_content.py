@@ -47,6 +47,10 @@ class MsiContent(unittest.TestCase):
             ET.SubElement(xml, 'File', Name=IDENTITY['binaries'][role] + '.exe', Id=role)
             guid = uuid.UUID('11223344-5566-7788-99aa-bbccddeeff00') if role == 'agent' else None
             (extracted / 'File' / role).write_bytes(pe_image(guid) if guid else pe_image())
+        ET.SubElement(xml, 'File', Name='OinkPasteMenu.dll', Id='paste_menu')
+        (extracted / 'File' / 'paste_menu').write_bytes(pe_image())
+        ET.SubElement(xml, 'File', Name='OinkCredentialProvider.dll', Id='provider')
+        (extracted / 'File' / 'provider').write_bytes(pe_image())
         for name in ('installed.json', 'oink-build.json'):
             ET.SubElement(xml, 'File', Name=name, Id=name)
             (extracted / 'File' / name).write_text(json.dumps({

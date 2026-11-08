@@ -234,8 +234,6 @@ pub enum Output {
     LockWindows(WindowsLockPermit),
     /// 切换本机截获模式（焦点离开本机时 `Remote`，回到本机且不知道光标落点时 `Local`）。
     SetMode(CaptureMode),
-    /// Ordered native confinement; None releases only our own lease.
-    ConstrainCursor(Option<Rect>),
     /// 焦点回到本机：切回 `Local`，光标出现在 `at`（`InputBackend::restore_local`，由 backend 原子地
     /// 「放光标、切模式、显示」）。与 `SetMode` 共用模式切换的顺序（执行方按产生顺序执行两者）。
     RestoreLocal {
@@ -318,6 +316,10 @@ pub enum StatusEvent {
     /// （界面 API 的 `HotkeyAction` 名字，例如 `"toggle_sharing"`）。
     Hotkey {
         action: String,
+    },
+    MouseShortcutRecorded {
+        token: String,
+        keys: Vec<String>,
     },
 }
 
@@ -494,7 +496,6 @@ pub struct Router {
     keyboard: keyboard::Keyboard,
     windows_lock: windows_lock::State,
     screen_local: bool,
-    native_constraint: Option<Rect>,
     last_enabled_focus: Option<DeviceId>,
     displays: Vec<DisplayInfo>,
     display_revision: u64,
@@ -538,6 +539,9 @@ pub struct Router {
     /// `FocusEnter { epoch }` 还没到（直连慢了一点，别的设备的通告先到）。它到达时照常处理（光标放到进入点、
     /// 采用键盘状态、带着的拖拽开始），而不是当作已知的焦点忽略。本机用过自己的键鼠、焦点变化时清除。
     enter_due: Option<u64>,
+    /// The reliable FocusEnter may be lost while its input pair is replaced.
+    /// Keep the exact entry until the target confirms this claim.
+    pending_focus_entry: Option<(DeviceId, ControlMsg)>,
 
     // ---- 紧急暂停 ----
     /// 本机因紧急暂停而暂停：触发它的设备。
@@ -559,6 +563,10 @@ pub struct Router {
     trail_probe: Option<Arc<dyn Fn(Point) -> Option<crate::control::TrailContinuation> + Send + Sync>>,
     /// 全局快捷键：在本机键盘上识别，不论焦点在哪台设备。
     hotkeys: Hotkeys,
+    // A consumed DOWN owes an UP even when pause clears ordinary routing holds.
+    consumed_mouse_shortcuts: HashSet<MouseButton>,
+    mouse_release_actions: HashMap<MouseButton, String>,
+    mouse_shortcut_recording: Option<(String, Micros)>,
 
     // ---- 源端 ----
     keys: HashMap<KeyCode, Vec<Target>>,
@@ -661,7 +669,6 @@ impl Router {
             capture_available: true,
             keyboard: Default::default(),
             screen_local: false,
-            native_constraint: None,
             last_enabled_focus: None,
             displays: Vec::new(),
             display_revision: 0,
@@ -684,6 +691,7 @@ impl Router {
             unconfirmed_since: None,
             rejoin: false,
             enter_due: None,
+            pending_focus_entry: None,
             emergency: None,
             esc_down_at: None,
             physical_keys: HashSet::new(),
@@ -699,6 +707,9 @@ impl Router {
             volume_targets: HashMap::new(),
             trail_probe: None,
             hotkeys: Hotkeys::default(),
+            consumed_mouse_shortcuts: HashSet::new(),
+            mouse_release_actions: HashMap::new(),
+            mouse_shortcut_recording: None,
             windows_lock: Default::default(),
             keys: HashMap::new(),
             buttons: HashMap::new(),
@@ -965,7 +976,6 @@ impl Router {
 
     /// 告诉路由本机光标当前位置（启动时，或平台实现发现光标被其他程序移动时）。
     pub fn set_cursor(&mut self, pos: Point) {
-        let pos = self.hidden_cursor_constraint().map_or(pos, |bounds| bounds.clamp(pos));
         let pos = self.system_clip_position(pos).map_or(pos, |at| at.local);
         let was_gap = self.gap.is_some();
         self.resistance = None;
@@ -982,16 +992,6 @@ impl Router {
     /// travel or edge pressure when the physical parked point has not changed.
     /// Off-desktop / failed reads preserve the existing prediction.
     pub fn reconcile_target_cursor(&mut self, pos: Point) -> bool {
-        if let Some(bounds) = self.hidden_cursor_constraint() {
-            if pos.x.is_finite()
-                && pos.y.is_finite()
-                && !bounds.contains(pos)
-                && let Some(pos) = self.constrained_local_cursor()
-            {
-                self.out.push(Output::Inject(InjectEvent::MoveTo { pos }));
-            }
-            return false;
-        }
         if !self.has_pointer_focus()
             || self.paused
             || self.game_mode().active
@@ -1000,12 +1000,7 @@ impl Router {
         {
             return false;
         }
-        let Some(display) = self.displays.iter().find(|d| d.bounds.contains(pos)) else {
-            return false;
-        };
-        if self.layout.gap_topology().is_some_and(|topology| {
-            !topology.is_active(&oink_display::layout::ScreenId::new(self.me(), display.key.clone()))
-        }) {
+        if !self.displays.iter().any(|d| d.bounds.contains(pos)) {
             return false;
         }
         // pointer is the current physical parked point even during virtual gap
@@ -1241,6 +1236,10 @@ impl Router {
     /// a source gate, not sharing pause: other devices may still control this machine.
     pub fn set_capture_available(&mut self, available: bool) {
         if !available {
+            // The native capture generation ended; its UP can no longer arrive.
+            // A fresh tap/hook must not inherit a consumed button or pending pause.
+            self.consumed_mouse_shortcuts.clear();
+            self.mouse_release_actions.clear();
             self.local_click_cancel();
         }
         if self.capture_available == available {
@@ -1340,6 +1339,7 @@ impl Router {
         if self.holder == me && !self.fresh_join {
             return;
         }
+        self.pending_focus_entry = None;
         let epoch = self.epoch + 1;
         self.focus_scope = Some(self.new_focus_scope());
         self.focus_joined = true;
@@ -1394,6 +1394,8 @@ impl Router {
     /// 紧急暂停在本机生效：释放发往别处的键和按钮、释放为其他设备注入的键和按钮、暂停共享、回到本机
     /// 并显示光标。只改本机状态（「岛」：组内焦点 `claim` 不变），不依赖网络。
     fn apply_emergency(&mut self, origin: DeviceId) {
+        // Escape emergency wins immediately over a mouse pause waiting for UP.
+        self.mouse_release_actions.clear();
         self.set_owner_pointer_locked(false);
         self.cancel_system_clip_motion();
         self.cancel_source_contacts();
@@ -1576,7 +1578,6 @@ impl Router {
         // 任何入口都可能改变焦点、按钮、游戏模式或设置：交出输出前统一同步拖尾状态。
         self.gap_sync();
         self.constrain_system_clip_outputs();
-        self.sync_hidden_constraint();
         self.trail_sync();
         std::mem::take(&mut self.out)
     }
@@ -1618,10 +1619,54 @@ impl Router {
         d
     }
 
+    /// Complete a backend-attested physical local press with a replacement UP.
+    /// Never consume a release on behalf of a remote/crossed or injected route.
+    pub fn release_local_passed_key(&mut self, event: &CapturedEvent, now: Micros) -> bool {
+        let InputEvent::Key { code, pressed: false } = event.event else {
+            return false;
+        };
+        if self.cfg.os != Os::Windows
+            || event.physical
+            || self.fully_paused
+            || !self.capture_available
+            || self
+                .keys
+                .get(&code)
+                .is_none_or(|targets| targets.as_slice() != [Target::Local])
+        {
+            return false;
+        }
+        self.on_local_event(event, now);
+        !self.keys.contains_key(&code)
+    }
+
     /// 截获回调的快路径：立即决定吞掉还是放行；其余动作进入输出队列。
     pub fn on_local_event(&mut self, ev: &CapturedEvent, now: Micros) -> Disposition {
         if ev.physical {
             self.update_remote_until = 0;
+        } else if self.cfg.os == Os::Windows
+            && !self.fully_paused
+            && self.capture_available
+            && let InputEvent::Key { code, pressed: false } = ev.event
+            && self
+                .keys
+                .get(&code)
+                .is_some_and(|targets| targets.as_slice() == [Target::Local])
+        {
+            // The ordinary opt-in path and the backend-attested local-only
+            // replacement path both close a native local physical observation.
+            // A remote or crossed press retains its existing source ownership.
+            self.physical_keys.remove(&code);
+            self.pause_all_consumed.remove(&code);
+            if code == KeyCode::ESCAPE {
+                self.esc_down_at = None;
+                self.escape_consumed = false;
+            }
+            self.keyboard.retire_modifier(code);
+            self.gap_input.modifiers.remove(&(self.me(), code));
+        }
+        if let Some(disposition) = self.mouse_shortcut_event(ev, now) {
+            return disposition;
         }
         self.local_rewrite = None;
         self.dnd.now = now;
@@ -1629,7 +1674,11 @@ impl Router {
         let decision_start = self.out.len();
         // Block the source before any local-cursor reveal, portal, gesture or
         // touch contact routing. Remote injected input never enters this gate.
-        if self.mouse_disabled() && !self.fully_paused && !matches!(ev.event, InputEvent::Key { .. }) {
+        if self.mouse_disabled()
+            && (ev.physical || self.cfg.os != Os::MacOS)
+            && !self.fully_paused
+            && !matches!(ev.event, InputEvent::Key { .. })
+        {
             self.source_decision(&ev.event, Disposition::Swallow, decision_start);
             return Disposition::Swallow;
         }
@@ -1857,12 +1906,6 @@ impl Router {
     // ================= 本机事件（源端） =================
 
     fn local_motion(&mut self, dx: f64, dy: f64, cursor: Option<Point>, now: Micros) -> Disposition {
-        if let Some(disposition) = self.hidden_local_motion(dx, dy, now) {
-            return disposition;
-        }
-        self.local_motion_unconstrained(dx, dy, cursor, now)
-    }
-    fn local_motion_unconstrained(&mut self, dx: f64, dy: f64, cursor: Option<Point>, now: Micros) -> Disposition {
         if self.mouse_local() {
             if let Some(cursor) = cursor
                 && let Some((key, bounds)) = self.locate(cursor)
@@ -1930,18 +1973,6 @@ impl Router {
         let cur = ScreenPos::new(ScreenId::new(me, key), bounds.clamp(c));
         self.pointer = Some(cur.clone());
         self.local_cursor = Some(cur.clone());
-        // Gap geometry owns edge decisions even when this step stayed on the
-        // screen. The legacy edge band below would otherwise hand off one pixel
-        // early (or at the inclusive left/top edge), skipping the entire gap.
-        // Keep OS cursor tracking above, including completed same-device moves;
-        // held buttons and native drags still take the stitching path below.
-        if self.gap_allowed() {
-            self.retain_resistance(&cur, me, (dx, dy));
-            self.dnd_off_edge();
-            return Disposition::Pass;
-        }
-        self.retain_resistance(&cur, me, (dx, dy));
-
         // 1. 系统把光标移到了本机的另一块屏幕：按布局看这一步从原来的屏幕出发通往哪里。
         //    通往其他设备（布局里本机屏幕之间的排列与系统排列不同）→ 移交；否则尊重系统的跨屏。
         if let Some(prev) = prev.clone().filter(|p| p.screen != cur.screen && p.screen.device == me) {
@@ -1974,6 +2005,18 @@ impl Router {
             self.dnd_off_edge();
             return Disposition::Pass;
         }
+
+        // Gap geometry owns edge decisions even when this step stayed on the
+        // screen. The legacy edge band below would otherwise hand off one pixel
+        // early (or at the inclusive left/top edge), skipping the entire gap.
+        // Keep OS cursor tracking above, including completed same-device moves;
+        // held buttons and native drags still take the stitching path below.
+        if self.gap_allowed() && !self.hidden_entry(me, &cur.screen.display) {
+            self.retain_resistance(&cur, me, (dx, dy));
+            self.dnd_off_edge();
+            return Disposition::Pass;
+        }
+        self.retain_resistance(&cur, me, (dx, dy));
 
         // 2. 光标停在系统排列的屏幕外缘（系统挡住了，`cursor` 是处理这个事件之后的位置）且继续向外移动。
         let c = cur.local;
@@ -2436,7 +2479,7 @@ impl Router {
             m @ ControlMsg::CursorTrailHandoff { .. } => self.trail_receive(from, m, now),
             // Consumed by the input module's adapter (it becomes the peer's
             // `sharing` flag when the pair attaches); the router itself does not act on it.
-            ControlMsg::InputCapability { .. } => {}
+            ControlMsg::InputCapability { .. } | ControlMsg::UnlockQuery { .. } | ControlMsg::UnlockReply { .. } => {}
             ControlMsg::Feel { profile } => {
                 if let Some(p) = self.peers.get_mut(&from) {
                     p.feel = profile;
@@ -2714,6 +2757,18 @@ impl Router {
             return;
         }
         if theirs == mine {
+            if self.pending_focus_entry.as_ref().is_some_and(|(peer, message)| {
+                *peer == from
+                    && holder == from
+                    && matches!(
+                        message,
+                        ControlMsg::FocusEnter { epoch: pending_epoch, .. }
+                            | ControlMsg::MovePointerEnter { epoch: pending_epoch, .. }
+                            if *pending_epoch == epoch
+                    )
+            }) {
+                self.pending_focus_entry = None;
+            }
             // A later proof for the same claim may admit this incarnation.
             if !self.focus_joined && scope.is_some() && self.scope_allows(scope.as_ref(), holder) {
                 self.focus_scope = scope;
@@ -3808,6 +3863,7 @@ impl Router {
                 pointer_source: self.last_pointer_source,
             }
         };
+        self.pending_focus_entry = Some((to, enter.clone()));
         self.send(to, Message::Control(enter));
         let others: Vec<DeviceId> = self
             .peers
@@ -4707,3 +4763,8 @@ mod periodic_tests;
 
 #[cfg(test)]
 mod target_cursor_sync_tests;
+
+#[cfg(test)]
+mod mouse_hotkey_tests;
+
+mod mouse_hotkeys;

@@ -24,6 +24,20 @@ impl Node {
         }
     }
 
+    pub(crate) fn current_active_displays(&self) -> anyhow::Result<Vec<DisplayInfo>> {
+        match &self.inner.display_backend {
+            Some(backend) => Ok(backend.active_displays()?),
+            None => Ok(self.inner.initial_displays.clone()),
+        }
+    }
+
+    pub(crate) fn refresh_active_input_displays(&self) -> anyhow::Result<()> {
+        if let Ok(input) = self.input_thread() {
+            input.send(InputCommand::LocalDisplays(self.current_active_displays()?));
+        }
+        Ok(())
+    }
+
     // Release-profile unit tests need the same sensor/input command ordering.
     #[cfg(test)]
     pub(crate) async fn hold_platform_sensor_clock(&self) {
@@ -118,8 +132,15 @@ impl Node {
                         node.emit(ApiEvent::Permissions(crate::agent_api::permission_items(&node)));
                     }
                     let backend = node.input_backend();
-                    let session = backend.session_locked();
+                    let observation_started = Instant::now();
+                    let session_observation = backend.session_lock_observation();
+                    let session = session_observation.state;
                     if last_session != Some(session) {
+                        crate::auto_unlock::record_session_lock_diagnostic_timed(
+                            session_observation,
+                            1,
+                            Some(observation_started.elapsed()),
+                        );
                         input.send(InputCommand::SessionLocked(session));
                         last_session = Some(session);
                     }
@@ -148,6 +169,12 @@ impl Node {
                     if refresh_displays {
                         display_fallback_at = Instant::now() + Duration::from_secs(30);
                         let _arrangement = lock(&node.inner.profiles.native.observation_gate);
+                        #[cfg(windows)]
+                        if let Err(error) = node.follow_windows_reconnections() {
+                            tracing::warn!(%error,"Windows display reactivation preference update failed");
+                            display_retry_at = Some(Instant::now() + Duration::from_millis(250));
+                            continue;
+                        }
                         match node.current_displays() {
                             Ok(displays) => {
                                 if displays.is_empty() {
@@ -175,10 +202,19 @@ impl Node {
                                     enumerated = None;
                                 }
                                 group.local_displays_changed(displays.clone());
-                                input.send(InputCommand::LocalDisplays(displays.clone()));
-                                node.update_notification_displays(&displays);
-                                if let Some(trail) = node.inner.cursor_trail.get() {
-                                    trail.set_displays(displays);
+                                match node.current_active_displays() {
+                                    Ok(active) => {
+                                        input.send(InputCommand::LocalDisplays(active.clone()));
+                                        node.update_notification_displays(&active);
+                                        if let Some(trail) = node.inner.cursor_trail.get() {
+                                            trail.set_displays(active);
+                                        }
+                                    }
+                                    Err(error) => {
+                                        input.send(InputCommand::LocalDisplayFailure);
+                                        tracing::warn!(%error, "active desktop refresh failed");
+                                        display_retry_at = Some(Instant::now() + Duration::from_millis(250));
+                                    }
                                 }
                             }
                             Err(error) => {

@@ -268,7 +268,12 @@ pub(crate) fn group_view(node: &Node) -> ApiResult<GroupView> {
                     input_transform: m.is_self.then(|| {
                         InputTransform::from(node.settings().input_transform).with_local_exclusions(m.device, &m.os)
                     }),
-                    screen_disabled: state.owners.get(&m.device).map(|owner| !owner.screen_shared),
+                    screen_disabled: state
+                        .layout
+                        .screens
+                        .iter()
+                        .find(|screen| screen.id.device == m.device && screen.device_visibility_known)
+                        .map(|screen| screen.device_hidden),
                     screen_local_input: options.as_ref().and_then(|options| options.screen_local_input().ok()),
                     mouse_mode: mode(
                         resources
@@ -718,6 +723,7 @@ pub(crate) fn default_hotkeys() -> Vec<Hotkey> {
     let k = |a, keys: &[&str]| Hotkey {
         action: a,
         device: None,
+        profile: None,
         keys: keys.iter().map(|s| s.to_string()).collect(),
         // Window opening and microphone mute are opt-in.
         enabled: !matches!(a, HotkeyAction::OpenWindow | HotkeyAction::ToggleMicrophoneMute),
@@ -800,6 +806,16 @@ fn check_size(s: Size) -> ApiResult<()> {
 }
 
 impl AgentApi for Node {
+    fn auto_unlock_status(&self) -> ApiResult<crate::auto_unlock::Status> {
+        crate::auto_unlock::status(self.data_dir())
+    }
+    fn save_auto_unlock(&self, password: crate::auto_unlock::Password) -> ApiResult<()> {
+        crate::auto_unlock::save(self.data_dir(), password)
+    }
+    fn disable_auto_unlock(&self) -> ApiResult<()> {
+        crate::auto_unlock::disable(self.data_dir())
+    }
+
     fn layout_profile_command(&self, command: crate::layout_profiles::types::Command) -> ApiResult<serde_json::Value> {
         Ok(Node::layout_profile_command(self, command))
     }
@@ -1003,6 +1019,13 @@ impl AgentApi for Node {
         })?;
         #[cfg(target_os = "macos")]
         crate::backend::set_status_icon_visible(applied.show_status_icon);
+        if self.native_services_enabled()
+            && (patch.value().get("paste_as_file").is_some() || patch.value().get("ui_language").is_some())
+        {
+            crate::paste_file::apply(&self.settings()).map_err(|error| ApiError::Internal {
+                message: format!("applying Paste as File: {error}"),
+            })?;
+        }
         self.emit(ApiEvent::UiPreferences(applied.clone()));
         Ok(applied)
     }
@@ -1097,7 +1120,7 @@ impl AgentApi for Node {
     }
     fn set_screen_disabled(&self, device: DeviceKey, disabled: bool) -> ApiResult<()> {
         self.commit_manual_visibility(device, None, disabled, || {
-            self.edit_device_option(device, dto::LocalOption::ScreenShared, (!disabled).write())
+            self.edit_global_visibility(device, None, disabled)
         })
     }
     fn set_input_transform(&self, device: DeviceKey, settings: InputTransform) -> ApiResult<()> {
@@ -1247,12 +1270,18 @@ impl AgentApi for Node {
         if Node::layout(self).0.screen(&id).is_none() {
             return Err(not_found("没有这块屏幕"));
         }
+        if self
+            .profile_snapshot()
+            .ok()
+            .and_then(|state| state.devices.into_iter().find(|d| d.device == screen.device))
+            .is_some_and(|device| device.availability == crate::layout_profiles::types::Availability::Offline)
+        {
+            return Err(ApiError::InvalidState {
+                message: "离线设备只能整体隐藏屏幕".into(),
+            });
+        }
         self.commit_manual_visibility(screen.device, Some(&screen.display), hidden, || {
-            self.edit_device_option(
-                screen.device,
-                dto::LocalOption::ScreenPreferences,
-                screen_preference_patch(screen.display.clone(), 3, (!hidden).write()),
-            )
+            self.edit_global_visibility(screen.device, Some(&screen.display), hidden)
         })
     }
 
@@ -1327,13 +1356,23 @@ impl AgentApi for Node {
         }
         Ok(crate::wallpaper::list(self))
     }
+    fn record_mouse_shortcut(&self, token: String, active: bool) -> ApiResult<()> {
+        self.input_thread()?
+            .send(crate::threads::input::InputCommand::RecordMouseShortcut { token, active });
+        Ok(())
+    }
     fn input_settings(&self) -> ApiResult<InputSettings> {
         Ok(input_settings(self))
     }
 
     fn set_input_settings(&self, patch: PreferencePatch<InputSettings>) -> ApiResult<()> {
+        // Match catalog-command lock order so deletion cannot race a local binding save.
+        let _profiles = patch
+            .value()
+            .get("hotkeys")
+            .map(|_| crate::node::lock(&self.inner.profiles.gate));
         let _gate = self.owner_gate();
-        let s = patch.apply(&input_settings(self))?;
+        let mut s = patch.apply(&input_settings(self))?;
         let edits_contacts = patch.value().get("accept_contacts").is_some();
         if edits_contacts && s.accept_contacts && !self.contacts_injection_available() {
             return Err(invalid("Native contact injection is unavailable"));
@@ -1348,7 +1387,34 @@ impl AgentApi for Node {
             return Err(invalid("Cursor trail duration must be within 100–60000 ms"));
         }
         let emergency_hold = crate::config::EmergencyHoldMs::try_from(s.emergency_hold_ms).map_err(invalid)?;
-        crate::hotkeys::validate(&s.hotkeys).map_err(invalid)?;
+        // Released 0.3.3 configurations can contain conflicting local
+        // shortcuts after a group merge. Reject bad shortcut edits, but do not
+        // let existing shortcut damage veto an unrelated preference patch.
+        if patch.value().get("hotkeys").is_some() {
+            let previous = self.effective_hotkeys();
+            crate::hotkeys::validate_edits(&s.hotkeys, &previous).map_err(invalid)?;
+            let state = self.profile_snapshot().map_err(|e| invalid(e.message))?;
+            for h in s.hotkeys.iter().filter(|h| !previous.contains(h)) {
+                if h.action == HotkeyAction::SwitchLayout
+                    && !state.profiles.iter().any(|p| Some(&p.id) == h.profile.as_ref())
+                {
+                    return Err(invalid("Layout profile no longer exists"));
+                }
+                if h.action == HotkeyAction::SwitchLayout
+                    && !h.keys.is_empty()
+                    && oink_routing::Chord::parse(&h.keys).ok()
+                        == oink_routing::Chord::parse(&s.keyboard_release_keys).ok()
+                {
+                    return Err(invalid("hotkey_conflict:keyboard_release"));
+                }
+            }
+            // Initialization can prune a saved orphan while taking the snapshot.
+            // Do not let an unchanged entry in the incoming projection resurrect it.
+            s.hotkeys.retain(|h| {
+                h.action != HotkeyAction::SwitchLayout
+                    || state.profiles.iter().any(|p| Some(&p.id) == h.profile.as_ref())
+            });
+        }
         // InputSettings is flat; explicit local overrides use the durable routing path.
         // Preserve an explicit choice equal to the default without pinning siblings.
         let mut local_patch = patch.value();
@@ -1416,6 +1482,7 @@ impl AgentApi for Node {
             }
         })?;
         drop(_gate);
+        drop(_profiles);
         if patch.value().get("gap_travel").is_some() {
             self.commit_manual_layout(move |layout| {
                 layout.settings.gap_travel = s.gap_travel;
@@ -1646,6 +1713,10 @@ impl AgentApi for Node {
                 .map_err(|e| ApiError::Internal { message: e.to_string() })?;
         }
         let applied = d.recorder.set_enabled(enabled);
+        #[cfg(target_os = "macos")]
+        if self.inner.native_services {
+            crate::logs::set_native_exception_capture(d.recorder.enabled());
+        }
         #[cfg(windows)]
         if self.inner.native_services {
             self.inner.reports.set_local_capture(d.recorder.crash_target());

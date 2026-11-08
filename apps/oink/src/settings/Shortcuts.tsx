@@ -1,4 +1,5 @@
 import { tr } from '../i18n';
+import { call, onAgentEvent } from '../api/client';
 import { useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { VisuallyHidden, animate } from 'oink-ui';
@@ -114,7 +115,8 @@ const SPOKEN: Record<Platform, Record<string, string>> = {
 const ORDER: Record<Platform, Mod[]> = { mac: ['Control', 'Alt', 'Shift', 'Meta'], win: ['Meta', 'Control', 'Alt', 'Shift'] };
 export const splitKeys = (v: string) => v.split('+').filter(Boolean);
 const sortKeys = (p: Platform, keys: string[]) => [...ORDER[p].filter((m) => keys.includes(m)), ...keys.filter((k) => !isMod(k))];
-export const spokenKeys = (p: Platform, v: string) => sortKeys(p, splitKeys(v)).map((k) => SPOKEN[p][k] ?? LABELS[p][k] ?? k).join(' + ');
+const mouseLabel = (key: string) => key === 'Mouse3' ? tr('鼠标中键') : key === 'Mouse4' ? tr('鼠标侧键 1') : key === 'Mouse5' ? tr('鼠标侧键 2') : undefined;
+export const spokenKeys = (p: Platform, v: string) => sortKeys(p, splitKeys(v)).map((k) => mouseLabel(k) ?? SPOKEN[p][k] ?? LABELS[p][k] ?? k).join(' + ');
 export function matches(e: KeyboardEvent, v: string) {
     const keys = splitKeys(v);
     const main = keys.find((k) => !isMod(k));
@@ -123,7 +125,8 @@ export function matches(e: KeyboardEvent, v: string) {
     const held = heldMods(e);
     return held.length === keys.length - 1 && held.every((m) => keys.includes(m));
 }
-function Cap({ label, index }: {
+function Cap({ label, index, mouseKey }: {
+    mouseKey?: string;
     label: string;
     index: number;
 }) {
@@ -131,11 +134,23 @@ function Cap({ label, index }: {
     useEffect(() => {
         animate(ref.current, [{ transform: 'scale(.3) translateY(8px)', opacity: 0 }, { transform: 'none', opacity: 1 }], { spring: 'bouncy', delay: index * 45 });
     }, []);
-    return <kbd ref={ref} className="ok-kbd">{label}</kbd>;
+    return <kbd ref={ref} className="ok-kbd" aria-label={mouseKey ? label : undefined}>
+      {mouseKey ? <svg className="shortcut-mouse" viewBox="0 0 24 28" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round">
+        <path d="M7 11V9a6.5 6.5 0 0 1 13 0v10a6.5 6.5 0 0 1-13 0v-1"/>
+        <path d="M13.5 3v3m0 6v3M8 14h11" opacity=".45"/>
+        <rect x="12" y="6" width="3" height="6" rx="1.5" className={mouseKey === 'Mouse3' ? 'shortcut-mouse__active' : undefined}/>
+        <rect x="4" y="9" width="3" height="5" rx="1.2" className={mouseKey === 'Mouse5' ? 'shortcut-mouse__active' : undefined}/>
+        <rect x="4" y="15.5" width="3" height="5" rx="1.2" className={mouseKey === 'Mouse4' ? 'shortcut-mouse__active' : undefined}/>
+      </svg> : label}
+    </kbd>;
 }
-export function ShortcutRecorder({ platform, value, onChange, onReject, disabled, invalid, label, singleKey = false }: {
+export function ShortcutRecorder({ platform, value, onChange, onReject, disabled, invalid, label, singleKey = false, placeholder, clearable = false }: {
     platform: Platform;
     singleKey?: boolean;
+    /** Shown in the empty state instead of 未设置. */
+    placeholder?: string;
+    /** Backspace while recording clears the shortcut. */
+    clearable?: boolean;
     value: string;
     onChange: (v: string) => void;
     onReject: (reason: string) => void;
@@ -146,6 +161,37 @@ export function ShortcutRecorder({ platform, value, onChange, onReject, disabled
     const [recording, setRecording] = useState(false);
     const [mods, setMods] = useState<string[]>([]);
     const [pointer, setPointer] = useState(false);
+    const callbacks = useRef({onChange, onReject, singleKey});
+    callbacks.current = {onChange, onReject, singleKey};
+    useEffect(() => {
+        if (!recording || disabled) return;
+        const token = crypto.randomUUID();
+        let cancelled = false;
+        let unsubscribe: (() => void) | undefined;
+        // WKWebView does not consistently deliver X1/X2 DOM events. Capture in
+        // the input owner also prevents an existing binding from firing first.
+        void onAgentEvent(event => {
+            if (cancelled || event.type !== 'mouse_shortcut_recorded' || event.data.token !== token) return;
+            const keys = event.data.keys.map(key => key === 'Ctrl' ? 'Control' : key);
+            if (callbacks.current.singleKey) keys.splice(0, keys.length - 1);
+            setRecording(false);
+            setMods([]);
+            callbacks.current.onChange(keys.join('+'));
+        }).then(unlisten => {
+            unsubscribe = unlisten;
+            if (cancelled) { unlisten(); return; }
+            return call('record_mouse_shortcut', {token, active:true});
+        }).catch(() => {
+            if (!cancelled) callbacks.current.onReject(tr('无法录制鼠标快捷键'));
+        });
+        const timeout = setTimeout(() => { setRecording(false); setMods([]); }, 60_000);
+        return () => {
+            cancelled = true;
+            clearTimeout(timeout);
+            unsubscribe?.();
+            void call('record_mouse_shortcut', {token, active:false}).catch(() => {});
+        };
+    }, [recording, disabled]);
     const keys = splitKeys(value);
     const stop = () => { setRecording(false); setMods([]); };
     const start = () => { if (!disabled && !recording) {
@@ -180,6 +226,11 @@ export function ShortcutRecorder({ platform, value, onChange, onReject, disabled
             return;
         }
         const held = heldMods(e);
+        if (clearable && e.key === 'Backspace' && !held.length) {
+            stop();
+            onChange('');
+            return;
+        }
         if (isMod(e.key)) {
             setMods(held);
             return;
@@ -192,11 +243,11 @@ export function ShortcutRecorder({ platform, value, onChange, onReject, disabled
         onChange([...held, mainKey(e)].join('+'));
     };
     const shown = sortKeys(platform, recording ? mods : keys);
-    const hint = recording ? (mods.length ? '…' : tr(singleKey ? '按下单个按键' : '按下组合键')) : keys.length ? '' : tr('未设置');
-    return (<div role="button" tabIndex={disabled ? -1 : 0} className="ok-hotkey ok-hotkey--sm ok-focusable setp__hotkey" aria-label={tr('{0}的快捷键', label)} aria-disabled={disabled || undefined} aria-pressed={recording} aria-invalid={invalid || undefined} data-recording={recording ? '' : undefined} data-pointer={pointer ? '' : undefined} onPointerDown={() => setPointer(true)} onClick={start} onKeyDown={onKeyDown} onKeyUp={(e) => { if (!recording) return;
+    const hint = recording ? (mods.length ? '…' : tr(singleKey ? '按下单个按键' : '按下组合键')) : keys.length ? '' : placeholder ?? tr('未设置');
+    return (<div role="button" tabIndex={disabled ? -1 : 0} className="ok-hotkey ok-hotkey--sm ok-focusable setp__hotkey" aria-label={tr('{0}的快捷键', label)} aria-disabled={disabled || undefined} aria-pressed={recording} aria-invalid={invalid || undefined} data-recording={recording ? '' : undefined} data-pointer={pointer ? '' : undefined} onPointerDown={(e) => { setPointer(true); if (recording && e.button > 0) e.preventDefault(); }} onAuxClick={(e) => { if (recording) e.preventDefault(); }} onContextMenu={(e) => { if (recording) e.preventDefault(); }} onClick={start} onKeyDown={onKeyDown} onKeyUp={(e) => { if (!recording) return;
         if (!singleKey) setMods(heldMods(e)); }} onBlur={() => { setPointer(false); if (recording)
         stop(); }}>
-      {shown.map((k, i) => <Cap key={`${k}-${recording}`} label={LABELS[platform][k] ?? k} index={i}/>)}
+      {shown.map((k, i) => <Cap key={`${k}-${recording}`} label={mouseLabel(k) ?? LABELS[platform][k] ?? k} mouseKey={mouseLabel(k) ? k : undefined} index={i}/>)}
       {hint && <span className="ok-hotkey__hint">{hint}</span>}
       <VisuallyHidden aria-live="polite">{recording ? tr(singleKey ? '正在录制，按下单个按键' : '正在录制，按下组合键') : keys.length ? tr('当前：{0}', spokenKeys(platform, value)) : tr('未设置')}</VisuallyHidden>
     </div>);

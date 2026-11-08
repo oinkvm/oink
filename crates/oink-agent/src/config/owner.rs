@@ -597,6 +597,7 @@ pub fn validate_value(option: LocalOption, value: &RawValue) -> Result<(), Contr
         | NativeMultifinger
         | MacScrollFeel
         | SyncSystemArrangement
+        | DisableHiddenDisplays
         | MicrophoneReceiveMuted => {
             bool::read(value).map_err(invalid)?;
         }

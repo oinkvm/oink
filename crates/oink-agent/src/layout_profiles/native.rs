@@ -160,6 +160,43 @@ fn response(
     d::LayoutArrangementResult::from_raw(raw).expect("bounded result")
 }
 impl Node {
+    /// The owner reacts to global layout visibility after the register has
+    /// been accepted. The OS write is deliberately downstream of the shared
+    /// register; it never edits owner visibility preferences.
+    pub(crate) fn apply_global_layout_visibility(&self, layout: &oink_display::layout::Layout) -> Result<()> {
+        let settings = self.settings();
+        if !settings.sync_system_arrangement {
+            return Ok(());
+        }
+        let backend = self
+            .inner
+            .display_backend
+            .as_ref()
+            .ok_or_else(|| fail(ErrorCode::Unsupported, "Native arrangement unavailable"))?;
+        let current = backend.native_configuration().map_err(unavailable)?;
+        let disabled = if cfg!(windows) && settings.disable_hidden_displays {
+            current
+                .sources()
+                .map(|source| {
+                    let hidden = layout
+                        .screens
+                        .iter()
+                        .find(|screen| screen.id.device == self.id() && screen.id.display == source.key)
+                        .is_some_and(|screen| screen.screen_hidden || screen.device_hidden);
+                    (source.key.clone(), hidden)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let applied = backend.apply_native_layout(&current, &[], &disabled);
+        // Query active geometry even after a partial OS failure. The layout
+        // catalog deliberately retains disabled targets and is not cursor space.
+        self.refresh_active_input_displays().map_err(unavailable)?;
+        applied.map_err(unavailable)?;
+        Ok(())
+    }
+
     /// Record the observation without changing the caller's error/retry policy.
     pub(crate) fn observe_native_arrangement(&self, call_site: &'static str) -> Result<NativeState> {
         self.refresh_native_arrangement().inspect_err(|error| {
@@ -171,6 +208,8 @@ impl Node {
     /// ConfigModule actor (publishing Facts synchronously calls that actor).
     pub(crate) fn refresh_native_arrangement(&self) -> Result<NativeState> {
         let _observation = lock(&self.inner.profiles.native.observation_gate);
+        #[cfg(windows)]
+        let _ = self.follow_windows_reconnections()?;
         let backend = self
             .inner
             .display_backend
@@ -339,6 +378,10 @@ impl Node {
         // owner preferences. A pre-transaction callback must not publish stale
         // geometry after the transaction's final observation.
         let _observation = lock(&self.inner.profiles.native.observation_gate);
+        // Close the event/command race: an outside reactivation is an unhide
+        // even when an explicit Oink command arrives before the display worker.
+        #[cfg(windows)]
+        let reconnected = self.follow_windows_reconnections()?;
         let _gate = self.owner_gate();
         let config = self.link_config().map_err(unavailable)?;
         if !config.applied().members.contains(&peer.0)
@@ -370,6 +413,13 @@ impl Node {
             .map(wire::read_disabled)
             .collect::<oink_protocol::v1::Result<Vec<_>>>()
             .map_err(wire::invalid)?;
+        #[cfg(windows)]
+        if bits
+            .iter()
+            .any(|bit| bit.disabled && reconnected.iter().any(|display| display == &bit.screen.display))
+        {
+            return Err(fail(ErrorCode::StaleState, "Display was re-enabled by Windows"));
+        }
         let backend = self
             .inner
             .display_backend
@@ -385,7 +435,6 @@ impl Node {
                 "Visibility references an unknown screen",
             ));
         }
-        let screen_revision = request.screen_revision().map_err(wire::invalid)?;
         {
             let stored = lock(&self.inner.config);
             let owner = stored.owner();
@@ -405,43 +454,158 @@ impl Node {
                     .with_origins(&origins)
                     .map_err(|e| fail(ErrorCode::Disconnected, e.to_string()))?;
             }
-            if !bits.is_empty() {
-                if screen_revision != owner.revision(d::LocalOption::ScreenPreferences) {
-                    return Err(fail(ErrorCode::StaleState, "Screen visibility changed"));
-                }
-                let mut candidate = owner.clone();
-                candidate
-                    .edit(
-                        d::LocalOption::ScreenPreferences,
-                        screen_revision.expect("matched revision"),
-                        visibility_patch(&bits),
-                    )
-                    .map_err(|e| fail(ErrorCode::InvalidGeometry, format!("{e:?}")))?;
-                self.preflight_owner_preferences(candidate.preferences())
-                    .map_err(|e| fail(ErrorCode::SizeLimit, format!("{e:?}")))?;
-            }
         }
-        if !origins.is_empty() {
+        let settings = self.settings();
+        let write_visibility =
+            cfg!(windows) && settings.sync_system_arrangement && settings.disable_hidden_displays && !bits.is_empty();
+        if !origins.is_empty() || write_visibility {
             // The backend rechecks the complete snapshot immediately before one
             // session-scoped OS transaction, then re-enumerates the result.
+            #[cfg(windows)]
+            let result = {
+                let settings = self.settings();
+                let layout = config.applied().layout.clone();
+                let visibility = current
+                    .sources()
+                    .filter(|_| settings.disable_hidden_displays)
+                    .map(|s| {
+                        let hidden = bits
+                            .iter()
+                            .find(|b| b.screen.display == s.key)
+                            .map(|b| b.disabled)
+                            .unwrap_or_else(|| {
+                                layout
+                                    .screens
+                                    .iter()
+                                    .find(|p| p.id.device == self.id() && p.id.display == s.key)
+                                    .is_some_and(|p| p.screen_hidden)
+                            });
+                        (s.key.clone(), hidden)
+                    })
+                    .collect::<Vec<_>>();
+                backend.apply_native_layout(&current, &origins, &visibility)
+            };
+            #[cfg(not(windows))]
             let result = backend.apply_native_origins(&current, &origins);
             // Even a failed transaction can have changed the desktop. Publish
             // only re-enumerated actual geometry, never the requested origins.
+            self.refresh_active_input_displays().map_err(unavailable)?;
             let observed = backend.displays().map_err(unavailable)?;
             config.initialize_displays(observed).map_err(unavailable)?;
             result.map_err(|e| fail(ErrorCode::OsApplyFailed, e.to_string()))?;
         }
-        if !bits.is_empty() {
-            lock(&self.inner.config)
-                .edit_owner(
-                    d::LocalOption::ScreenPreferences,
-                    screen_revision.expect("validated revision"),
-                    visibility_patch(&bits),
-                )
-                .map_err(|e| fail(ErrorCode::PersistenceFailed, format!("{e:?}")))?;
-            self.publish_owner_preferences()
-                .map_err(|e| fail(ErrorCode::PersistenceFailed, format!("{e:?}")))?;
+        Ok(())
+    }
+    /// Called only while observation_gate is held. The OS is authoritative for
+    /// reactivation, even if Windows (rather than a human) restored the target.
+    #[cfg(windows)]
+    pub(crate) fn follow_windows_reconnections(&self) -> Result<Vec<String>> {
+        let Some(backend) = &self.inner.display_backend else {
+            return Ok(Vec::new());
+        };
+        let keys = backend
+            .reconnected_displays()
+            .map_err(|e| unavailable(format!("{e:?}")))?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
         }
+        let device = self.id();
+        let reconnected = keys.clone();
+        // A Windows re-enable is an external native observation. Clear Oink's
+        // bookkeeping before publishing the corresponding global unhide so
+        // the accepted layout change does not fight the OS with a redundant
+        // disable/enable transaction.
+        backend
+            .acknowledge_reconnected(&keys)
+            .map_err(|e| unavailable(format!("{e:?}")))?;
+        let layout = self.link_config().map_err(unavailable)?;
+        layout
+            .edit_layout(
+                Box::new(move |current| {
+                    for screen in &mut current.screens {
+                        if screen.id.device == device && reconnected.iter().any(|key| key == &screen.id.display) {
+                            screen.screen_hidden = false;
+                            screen.screen_visibility_known = true;
+                        }
+                    }
+                }),
+                d::LayoutSource::Manual,
+            )
+            .map_err(unavailable)?;
+        Ok(keys)
+    }
+    /// Normal exit releases only Oink-owned disabled paths.
+    /// Existing positions and hidden owner preferences remain authoritative.
+    #[cfg(windows)]
+    pub(crate) fn release_windows_displays(&self) -> Result<()> {
+        let _observation = lock(&self.inner.profiles.native.observation_gate);
+        let _ = self.follow_windows_reconnections()?;
+        let _gate = self.owner_gate();
+        let Some(backend) = &self.inner.display_backend else {
+            return Ok(());
+        };
+        backend.release_disabled_displays().map_err(unavailable)?;
+        self.refresh_active_input_displays().map_err(unavailable)?;
+        Ok(())
+    }
+    /// A fresh startup applies this owner's current layout once. Neither display
+    /// callbacks nor preference enablement call this writer. Shutdown releases targets
+    /// without undoing arrangement positions.
+    #[cfg(windows)]
+    pub(crate) fn apply_windows_startup_layout(&self) -> Result<()> {
+        let _observation = lock(&self.inner.profiles.native.observation_gate);
+        let _ = self.follow_windows_reconnections()?;
+        let _gate = self.owner_gate();
+        let settings = self.settings();
+        let Some(backend) = &self.inner.display_backend else {
+            return Ok(());
+        };
+        if !settings.sync_system_arrangement || !settings.disable_hidden_displays {
+            backend.release_disabled_displays().map_err(unavailable)?;
+        }
+        if !settings.sync_system_arrangement {
+            return Ok(());
+        }
+        let config = self.link_config().map_err(unavailable)?;
+        let applied = config.applied();
+        let current = backend.native_configuration().map_err(unavailable)?;
+        let saved = |key: &str| {
+            applied
+                .layout
+                .screens
+                .iter()
+                .find(|s| s.id.device == self.id() && s.id.display == key)
+        };
+        let anchor = current
+            .sources()
+            .find(|d| d.primary)
+            .and_then(|d| saved(&d.key))
+            .map(|s| Point::new(s.local.x, s.local.y))
+            .unwrap_or_default();
+        let origins = current
+            .sources()
+            .map(|d| NativeOrigin {
+                key: d.key.clone(),
+                origin: saved(&d.key)
+                    .map(|s| Point::new(s.local.x - anchor.x, s.local.y - anchor.y))
+                    .unwrap_or(Point::new(d.bounds.x, d.bounds.y)),
+            })
+            .collect::<Vec<_>>();
+        let bits = current
+            .sources()
+            .filter(|_| settings.disable_hidden_displays)
+            .filter_map(|d| {
+                applied
+                    .layout
+                    .screens
+                    .iter()
+                    .find(|p| p.id.device == self.id() && p.id.display == d.key)
+                    .map(|p| (d.key.clone(), p.screen_hidden || p.device_hidden))
+            })
+            .collect::<Vec<_>>();
+        backend
+            .apply_native_layout(&current, &origins, &bits)
+            .map_err(|e| fail(ErrorCode::OsApplyFailed, e.to_string()))?;
         Ok(())
     }
     pub(super) fn request_arrangement(
@@ -475,7 +639,7 @@ impl Node {
                     if !status_only {
                         loop {
                             let layout_ready = result.layout_version().map_err(wire::invalid)?.is_none_or(|v| {
-                                oink_protocol::v1::retained::version_cmp(&config.applied().version, &v)
+                                oink_protocol::v1::retained::layout_version_cmp(&config.applied().version, &v)
                                     .is_ok_and(|o| o != std::cmp::Ordering::Less)
                             });
                             let facts_ready = result.fact_sequence().map_err(wire::invalid)?.is_none_or(|sequence| {

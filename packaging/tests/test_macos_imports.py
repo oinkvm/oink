@@ -1,4 +1,5 @@
 """Deployment-target import regressions; compiled fixtures are never launched."""
+import os
 from pathlib import Path
 import platform
 import subprocess
@@ -71,7 +72,7 @@ class MacImports(unittest.TestCase):
                                   'int main(void) { return IOHIDAccessCheckAuditToken '
                                   '? IOHIDAccessCheckAuditToken(1, (token_t){{0}}) : 0; }\n')
                 image = root / ('weak' if weak else 'strong')
-                subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-macos14.2', str(source),
+                subprocess.run(['xcrun', 'clang', '-target', ('x86_64' if os.environ.get('CARGO_BUILD_TARGET') == 'x86_64-apple-darwin' else platform.machine()) + '-apple-macos14.2', str(source),
                                 '-framework', 'IOKit', '-o', str(image)], check=True, capture_output=True)
                 if weak:
                     self.assertEqual(M.verify_imports([image]), [image])

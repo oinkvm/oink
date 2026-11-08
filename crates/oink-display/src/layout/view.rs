@@ -29,7 +29,7 @@ pub struct ScreenView {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LayoutView {
     pub screens: Vec<ScreenView>,
-    /// 所有屏幕的包围盒（plane），用于缩放到画布；没有屏幕时为 `None`。
+    /// 可见屏幕的包围盒（plane），用于缩放到画布；没有屏幕时为 `None`。
     pub bounds: Option<Rect>,
 }
 
@@ -57,7 +57,7 @@ impl Layout {
             })
             .collect();
         LayoutView {
-            bounds: bbox(screens.iter().map(|s| s.rect)),
+            bounds: bbox(screens.iter().filter(|s| s.enabled).map(|s| s.rect)),
             screens,
         }
     }

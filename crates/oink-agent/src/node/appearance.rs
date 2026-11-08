@@ -36,6 +36,10 @@ impl Node {
         self.inner.system_dark.store(dark, Ordering::Release);
         self.apply_trail_appearance();
         self.apply_notification_preferences();
+        #[cfg(windows)]
+        if let Err(error) = crate::paste_file::refresh_windows_icon(crate::appearance::taskbar_dark()) {
+            tracing::warn!(%error, "could not refresh Paste as File shell icon appearance");
+        }
     }
 
     pub(super) fn watch_trail_appearance(&self) {

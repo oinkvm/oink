@@ -130,7 +130,7 @@ export function SelfInfo({ container }: {
           </button>)}
       </span>
       <span className="self-info__label">{tr('本机端口')}</span>
-      <span className="self-info__values"><span className="self-info__value self-info__ports">{network ? tr('QUIC：{0} · 数据传输：{1}', network.port, network.low_port ?? '—') : '—'}</span></span>
+      <span className="self-info__values"><span className="self-info__value">{network?.port ?? '—'}</span></span>
       <span className="self-info__label">{tr('本机 ID')}</span>
       <span className="self-info__values"><span className="self-info__value">{SELF.deviceId}</span></span>
       {more && (<Dialog {...containedProps} open={all} onOpenChange={setAll} container={container} size={360} title={tr('本机 IP 地址')} actions={<Button onClick={() => setAll(false)}>{tr('关闭')}</Button>}>

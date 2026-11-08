@@ -425,6 +425,7 @@ mod tests {
                 facts: None,
                 capabilities: vec![],
             }],
+            screen_shared: vec![],
             focus: FocusObservation::default(),
             exit_baseline: false,
             microphone_resolution: Default::default(),

@@ -9,6 +9,8 @@ use crate::shell_policy::{Activation, OpenTrigger, PANEL_HEIGHT, PANEL_WIDTH, Vi
 #[derive(Default)]
 pub struct Shell {
     anchor: Mutex<Option<PanelAnchor>>,
+    #[cfg(target_os = "macos")]
+    pub(crate) paint: Mutex<crate::window_paint::PaintGate>,
     creation: crate::creation_queue::CreationQueue<WindowRequest>,
     window_ready: Mutex<crate::shell_policy::WindowReadyGate>,
     activation: Mutex<std::collections::HashMap<String, Activation>>,
@@ -283,6 +285,8 @@ pub fn shell_ready(app: AppHandle, window: tauri::WebviewWindow, generation: u32
     if !View::from_label(window.label()).is_some_and(View::normal) {
         return;
     }
+    #[cfg(target_os = "macos")]
+    tracing::debug!(view = window.label(), generation, "window presentation: DOM ready");
     crate::app::on_main(&app, move |app| {
         let ready = {
             let shell = app.state::<Shell>();
@@ -376,11 +380,9 @@ fn create_normal(app: &AppHandle, view: View) -> tauri::Result<()> {
             crate::main_window_macos::prepare(&window)?;
             crate::local_drop::attach(&window)?;
         }
-        // Keep the native window ordered out until React commits its initial
-        // DOM/theme and fonts. No alpha-zero orderFront or WebKit rAF wait:
-        // invisible/occluded WKWebViews can stop frames even with background
-        // throttling disabled (observed on macOS 26). The DOM-ready IPC runs
-        // without a frame; showing/activating then permits the first paint.
+        // React first acknowledges committed DOM/theme and fonts. On macOS,
+        // show_normal then waits for WebKit's native drawing barrier while the
+        // window remains ordered out; hidden rAF is not a drawing barrier.
     }
     if let Some(window) = app.get_webview_window(label) {
         tracing::info!(view = label, "product window prepared");
@@ -445,6 +447,12 @@ fn finish_normal_windows(
     })
 }
 
+#[cfg(target_os = "macos")]
+fn show_normal(app: &AppHandle, window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    crate::window_paint_macos::show(app, window)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn show_normal(_app: &AppHandle, window: &tauri::WebviewWindow) -> tauri::Result<()> {
     // Startup, retained ShowWindow and LaunchServices Reopen can request the
     // same view. Restore only when needed; an already focused window needs no
@@ -508,6 +516,7 @@ fn show_windows(window: &tauri::WebviewWindow, activation: Activation) -> tauri:
     Ok(())
 }
 
+#[cfg(windows)]
 fn focus_window(window: &tauri::WebviewWindow) -> tauri::Result<()> {
     #[cfg(windows)]
     {
@@ -598,6 +607,8 @@ pub fn panel_visible(app: &AppHandle) -> bool {
 }
 
 pub fn window_destroyed(app: &AppHandle, label: &str) {
+    #[cfg(target_os = "macos")]
+    app.state::<Shell>().paint.lock().unwrap().cancel(label);
     app.state::<Shell>().window_ready.lock().unwrap().forget(label);
     #[cfg(target_os = "macos")]
     if label == "main" {

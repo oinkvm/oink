@@ -4,6 +4,7 @@ use oink_protocol::v1::schema::{FixedBytes, WireValue};
 
 #[derive(Default)]
 struct State {
+    restore_probe: bool,
     capture_rate: Option<u32>,
     capture_rate_error: Option<String>,
     encoder: Option<oink_audio::source::Encoder>,
@@ -42,7 +43,63 @@ struct State {
 }
 #[derive(Default)]
 struct Platform(Arc<Mutex<State>>);
-struct Capture(Arc<Mutex<State>>);
+struct Capture(Arc<Mutex<State>>, Option<RestoreProbe>);
+
+// Exercise the production journal's pause-and-restore function, with no native
+// audio or player access, when route tests opt in to observing restores.
+struct RestoreProbe {
+    journal: oink_audio::recovery::Journal,
+    backend: ProbeEndpoint,
+    _directory: tempfile::TempDir,
+}
+struct ProbeEndpoint {
+    state: Arc<Mutex<State>>,
+    muted: std::cell::Cell<bool>,
+}
+impl oink_audio::recovery::EndpointBackend for ProbeEndpoint {
+    fn read(&self, endpoint: &str) -> Result<Option<oink_audio::recovery::EndpointState>, String> {
+        Ok(Some(oink_audio::recovery::EndpointState {
+            endpoint: endpoint.into(),
+            muted: self.muted.get(),
+            volume: 0.3,
+        }))
+    }
+    fn mute(&self, _: &str) -> Result<(), String> {
+        self.muted.set(true);
+        Ok(())
+    }
+    fn restore_mute(&self, _: &str, _: bool, _: &oink_audio::recovery::RestorePermit) -> Result<(), String> {
+        self.muted.set(false);
+        lock(&self.state).events.push("probe-restore");
+        Ok(())
+    }
+    fn pause_before_restore(&self) {
+        lock(&self.state).events.push("pause");
+    }
+    fn ownership_lost(&self) -> bool {
+        false
+    }
+}
+impl RestoreProbe {
+    fn new(state: Arc<Mutex<State>>) -> Self {
+        use oink_audio::recovery::EndpointBackend;
+        let directory = tempfile::tempdir().unwrap();
+        let mut journal = oink_audio::recovery::Journal::open(directory.path()).unwrap();
+        let backend = ProbeEndpoint {
+            state,
+            muted: std::cell::Cell::new(false),
+        };
+        journal
+            .prepare(backend.read("synthetic-output").unwrap().unwrap())
+            .unwrap();
+        backend.mute("synthetic-output").unwrap();
+        Self {
+            journal,
+            backend,
+            _directory: directory,
+        }
+    }
+}
 
 impl CaptureStream for Capture {
     fn omitted_silent_frames(&self) -> u64 {
@@ -81,6 +138,9 @@ impl CaptureStream for Capture {
 }
 impl Drop for Capture {
     fn drop(&mut self) {
+        if let Some(probe) = &mut self.1 {
+            probe.journal.recover(&probe.backend, false).unwrap();
+        }
         let mut state = lock(&self.0);
         state.encoder = None;
         state.events.push("restore");
@@ -114,7 +174,8 @@ impl AudioPlatform for Platform {
         }
         state.encoder = Some(encoder);
         state.events.push("capture");
-        Ok(Box::new(Capture(self.0.clone())))
+        let probe = (state.restore_probe && muted).then(|| RestoreProbe::new(self.0.clone()));
+        Ok(Box::new(Capture(self.0.clone(), probe)))
     }
 
     fn outputs(&self) -> Result<Vec<OutputDevice>, String> {
@@ -328,6 +389,13 @@ impl Running {
         }
         this
     }
+    async fn start_probed() -> Self {
+        let mut this = Self::new().await;
+        lock(&this.platforms[0].0).restore_probe = true;
+        this.claim(1, true);
+        this.until(Self::prepared_route_ready).await;
+        this
+    }
     fn prepared_route_ready(&self) -> bool {
         let source = &self.owners[0];
         let receiver = &self.owners[1];
@@ -463,6 +531,9 @@ fn volume_request(owner: &Owner, id: u8, percent: u8) -> dto::SetExitVolume {
 #[tokio::test]
 async fn later_source_joins_shared_exit_without_retiring_either_capture() {
     let mut running = Running::with_members(false, None, 3).await;
+    for source in [0, 2] {
+        lock(&running.platforms[source].0).restore_probe = true;
+    }
     running
         .until(|r| r.owners.iter().all(|o| matches!(o.resolution, Resolution::None { .. })))
         .await;
@@ -496,8 +567,61 @@ async fn later_source_joins_shared_exit_without_retiring_either_capture() {
         for index in [0, 2] {
             assert!(running.owners[index].capture.is_some());
             assert_eq!(lock(&running.platforms[index].0).muted, [true]);
-            assert!(!lock(&running.platforms[index].0).events.contains(&"restore"));
+            let state = lock(&running.platforms[index].0);
+            assert!(!state.events.contains(&"restore"));
+            assert!(!state.events.contains(&"pause"));
         }
+    }
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn exit_change_with_live_capture_does_not_pause_or_restore() {
+    let mut running = Running::with_members(true, None, 3).await;
+    lock(&running.platforms[0].0).restore_probe = true;
+    running.claim(1, true);
+    running.until(Running::prepared_route_ready).await;
+    running.supply(0, 0.1);
+    let captures = lock(&running.platforms[0].0).muted.len();
+    let next_exit = running.owners[2].links.id();
+    running.claim(2, true);
+    running
+        .until(|r| {
+            if r.owners[0].capture.is_some() {
+                r.supply(0, 0.1);
+            }
+            r.owners[0].resolution.owner() == Some(next_exit)
+                && r.owners[0].exit_switch_deadline.is_none()
+                && r.owners[2].receive_sessions.values().any(|s| s.ready())
+        })
+        .await;
+    assert!(running.owners[0].capture.is_some());
+    {
+        let state = lock(&running.platforms[0].0);
+        assert_eq!(state.muted.len(), captures);
+        assert!(!state.events.contains(&"pause"));
+        assert!(!state.events.contains(&"restore"));
+    }
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn local_settings_off_restores_with_pause_once_and_in_order() {
+    let mut running = Running::start_probed().await;
+    running.supply(0, 0.1);
+    let mut settings = running.owners[0].settings.clone();
+    settings.forwarding_enabled = false;
+    running.owners[0].install_settings(settings).unwrap();
+    running.owners[0].stop_source();
+    {
+        let state = lock(&running.platforms[0].0);
+        let events: Vec<_> = state
+            .events
+            .iter()
+            .copied()
+            .filter(|e| ["pause", "probe-restore"].contains(e))
+            .collect();
+        assert_eq!(events, ["pause", "probe-restore"]);
     }
     running.stop().await;
 }
@@ -505,7 +629,7 @@ async fn later_source_joins_shared_exit_without_retiring_either_capture() {
 #[tokio::test]
 async fn clear_offline_unknown_and_switch_timeout_release_capture() {
     for outcome in 0..4 {
-        let mut running = Running::start(true).await;
+        let mut running = Running::start_probed().await;
         let old = running.owners[0].resolution.stamp().unwrap();
         let next = match outcome {
             0 => Resolution::None { barrier: Some(old) },
@@ -530,6 +654,12 @@ async fn clear_offline_unknown_and_switch_timeout_release_capture() {
         }
         assert!(running.owners[0].capture.is_none());
         running.owners[0].stop_source();
+        let events = lock(&running.platforms[0].0).events.clone();
+        let restores: Vec<_> = events
+            .into_iter()
+            .filter(|e| ["pause", "probe-restore"].contains(e))
+            .collect();
+        assert_eq!(restores, ["pause", "probe-restore"], "outcome {outcome}");
         running.stop().await;
     }
 }
@@ -922,7 +1052,7 @@ fn repeated_no_frame_capture_probes_back_off_and_valid_frames_reset_the_deadline
 
 #[tokio::test]
 async fn native_silent_frame_omission_keeps_capture_dormant_without_reopening() {
-    let mut running = Running::start(false).await;
+    let mut running = Running::start_probed().await;
     running.supply(0, 0.0);
     let now = Instant::now();
     running.owners[0].tick_source_at(now);
@@ -949,7 +1079,10 @@ async fn native_silent_frame_omission_keeps_capture_dormant_without_reopening() 
         );
         assert_eq!(running.owners[0].phase(), AudioPhase::SoundSleep);
         assert_eq!(running.owners[0].sent.load(Ordering::Relaxed), sent);
-        assert_eq!(lock(&running.platforms[0].0).muted.len(), opens);
+        let state = lock(&running.platforms[0].0);
+        assert_eq!(state.muted.len(), opens);
+        assert!(!state.events.contains(&"pause"));
+        assert!(!state.events.contains(&"restore"));
     }
     // Onset bypasses the sleeping control owner; no reopen or owner tick is needed.
     let wake = now + Duration::from_secs(66);
@@ -1951,6 +2084,78 @@ fn permission_card(group: &ConfigModule, source: DeviceId, nonce: [u8; 16]) -> c
     speaker_card(group, source, nonce, true).resource.icon
 }
 
+#[tokio::test]
+async fn restoring_exit_publishes_silent_source_recovery_before_status_notification() {
+    use crate::device_cards::{SpeakerActivity, SpeakerIcon};
+    let mut r = Running::start(false).await;
+    r.claim(1, false);
+    r.until(|r| r.owners.iter().all(|o| matches!(o.resolution, Resolution::None { .. })))
+        .await;
+    let source = &mut r.owners[0];
+    let group = source.group.clone();
+    let id = source.links.id();
+    let nonce = source.links.boot().nonce;
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let observed = observations.clone();
+    source.on_status = Some(Arc::new(move |status| {
+        if matches!(status.phase, AudioPhase::Forwarding | AudioPhase::SoundSleep) {
+            let card = speaker_card(&group, id, nonce, true);
+            lock(&observed).push((status.phase, card.resource.icon, card.activity));
+        }
+    }));
+    r.claim(1, true);
+    r.until(Running::prepared_route_ready).await;
+    assert_eq!(r.owners[0].sent.load(Ordering::Relaxed), 0);
+    let observations = lock(&observations).clone();
+    eprintln!("silent source recovery status/card observations: {observations:?}");
+    assert!(!observations.is_empty());
+    assert!(
+        observations.iter().all(|(_, icon, activity)| {
+            *icon == SpeakerIcon::Forwarding
+                && matches!(activity, SpeakerActivity::Forwarding | SpeakerActivity::SoundSleep)
+        }),
+        "a recovered source notification must carry recovered card facts, without another tick or media"
+    );
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn restoring_exit_publishes_a_real_source_fault_before_status_notification() {
+    use crate::device_cards::{ResourceFaultCode, SpeakerActivity, SpeakerIcon};
+    let mut r = Running::start(false).await;
+    r.claim(1, false);
+    r.until(|r| r.owners.iter().all(|o| matches!(o.resolution, Resolution::None { .. })))
+        .await;
+    lock(&r.platforms[0].0).capture_init_error = Some("synthetic capture unavailable".into());
+    let source = &mut r.owners[0];
+    let group = source.group.clone();
+    let id = source.links.id();
+    let nonce = source.links.boot().nonce;
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let observed = observations.clone();
+    source.on_status = Some(Arc::new(move |status| {
+        if status.phase == AudioPhase::Failed {
+            let card = speaker_card(&group, id, nonce, true);
+            lock(&observed).push((card.resource.icon, card.activity, card.resource.fault.unwrap().code));
+        }
+    }));
+    r.claim(1, true);
+    r.until(|r| r.owners[0].source_failed).await;
+    assert_eq!(r.owners[0].sent.load(Ordering::Relaxed), 0);
+    let observations = lock(&observations).clone();
+    eprintln!("failed source recovery card observations: {observations:?}");
+    assert_eq!(
+        observations,
+        vec![(
+            SpeakerIcon::Fault,
+            SpeakerActivity::Failed,
+            ResourceFaultCode::CaptureUnavailable
+        )],
+        "restoring an exit must not hide a real capture failure"
+    );
+    r.stop().await;
+}
+
 fn speaker_card(
     group: &ConfigModule,
     source: DeviceId,
@@ -1996,6 +2201,7 @@ fn speaker_card(
             facts: Some(facts),
             capabilities: vec!["oink.device-options/1".into(), "oink.device-resources/1".into()],
         }],
+        screen_shared: vec![],
         focus: FocusObservation::default(),
         exit_baseline,
         microphone_resolution: Default::default(),

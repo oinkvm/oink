@@ -54,17 +54,20 @@ pub struct PortalExit {
 /// 从 [`Layout`] 编译出的只读查询结构。
 ///
 /// **在线设备与隐藏屏**：离线设备的屏幕和隐藏屏（整机 `screen_shared=false` 或单屏
-/// `enabled=false`）在逻辑上视为不存在——不是任何传送门的目标，也不挡路（隔着它的两块
-/// 屏幕直接相连，穿越时跳过它所占的位置），也不构成本机屏幕之间的原生接缝；它自己的边全是墙。它仍在 [`Topology::screens`] 里
-/// （界面照常画在原位置），[`Topology::is_active`] 为 `false`。用 [`Topology::with_online`] 传入
-/// 在线设备（包括本机）；[`Topology::new`] 把所有设备都当作在线。
+/// `enabled=false`）对其它屏幕视为不存在——不是任何传送门的目标，也不挡路（隔着它的两块
+/// 屏幕直接相连，穿越时跳过它所占的位置），也不构成本机屏幕之间的原生接缝。
+/// 隐藏屏自身可沿原生接缝返回同机屏（允许经过其它隐藏屏），也可按布局前往可见的远端屏。
+/// 本机进入隐藏屏由系统处理；隐藏屏不能作为其它设备的普通进入目标。
+/// 隐藏屏仍保留在 [`Topology::screens`] 里，
+/// [`Topology::is_active`] 为 `false`。用 [`Topology::with_online`] 传入在线设备（包括本机）；
+/// [`Topology::new`] 把所有设备都当作在线。
 #[derive(Clone, Debug)]
 pub struct Topology {
     screens: Vec<EffectiveScreen>,
     index: HashMap<ScreenId, usize>,
     /// 是否参与传送门：启用且所属设备在线。
     active: Vec<bool>,
-    /// `edges[i][side.index()]`：每条边的切分；不参与的屏幕整条边都是墙。
+    /// `edges[i][side.index()]`：每条边的切分；隐藏屏只保留本机原生出口，离线屏全是墙。
     edges: Vec<[Vec<Seg>; 4]>,
     zones: Vec<[Vec<super::trigger::Zone>; 4]>,
     /// 视平面 plane / 手部 plane。
@@ -96,75 +99,85 @@ impl Topology {
         // Hidden screens, like offline ones, are absent for every other screen:
         // they neither receive portals nor occlude or wall anything behind them.
         let active: Vec<bool> = screens.iter().map(|s| s.enabled && online(&s.id.device)).collect();
+        // Hidden sources may reach active peers and their own native siblings.
+        // Hidden destinations never participate in other screens' geometry.
+        let hidden_source_targets: Vec<Vec<bool>> = screens
+            .iter()
+            .map(|source| {
+                screens
+                    .iter()
+                    .enumerate()
+                    .map(|(i, screen)| active[i] || screen.id.device == source.id.device)
+                    .collect()
+            })
+            .collect();
+        let no_targets = vec![false; screens.len()];
         let st = layout.settings();
         let edges: Vec<[Vec<Seg>; 4]> = (0..screens.len())
             .map(|i| {
                 Side::ALL.map(|side| {
-                    if active[i] {
-                        let segments = compute_side(&rects, &active, i, side, st, |b| {
-                            if screens[i].id.device != screens[b].id.device {
-                                return Some(st.minimum_portal);
-                            }
-                            // Same-computer edges come only from native OS adjacency.
-                            // Cross-computer positive-gap portals remain layout policy.
-                            let a = screens[i].local;
-                            let b = screens[b].local;
-                            let eps = super::facing::tolerance(&[a, b]);
-                            super::facing::facing(a, b, side, eps)
-                                .filter(|f| f.gap <= eps)
-                                .map(|_| 0.0)
-                        });
-                        // Cross-computer wall/snap policy cannot extend a native OS seam.
-                        segments
-                            .into_iter()
-                            .flat_map(|segment| {
-                                let Some((target, _)) = segment.portal else {
-                                    return vec![segment];
-                                };
-                                if screens[target].id.device != screens[i].id.device {
-                                    return vec![segment];
-                                }
-                                let (_, lo, hi) = edge(&rects[i], side);
-                                let (_, blo, bhi) = edge(&rects[target], side.opposite());
-                                let from = segment.from.max(lo.max(blo));
-                                let to = segment.to.min(hi.min(bhi));
-                                let mut pieces = Vec::new();
-                                if segment.from < from {
-                                    pieces.push(Seg {
-                                        from: segment.from,
-                                        to: from,
-                                        portal: None,
-                                        blocked: false,
-                                    });
-                                }
-                                if from < to {
-                                    pieces.push(Seg {
-                                        from,
-                                        to,
-                                        portal: segment.portal,
-                                        blocked: segment.blocked,
-                                    });
-                                }
-                                if to < segment.to {
-                                    pieces.push(Seg {
-                                        from: to,
-                                        to: segment.to,
-                                        portal: None,
-                                        blocked: false,
-                                    });
-                                }
-                                pieces
-                            })
-                            .collect()
+                    let candidates = if active[i] {
+                        &active
+                    } else if online(&screens[i].id.device) {
+                        &hidden_source_targets[i]
                     } else {
-                        let (_, lo, hi) = edge(&rects[i], side);
-                        vec![Seg {
-                            from: lo,
-                            to: hi,
-                            portal: None,
-                            blocked: false,
-                        }]
-                    }
+                        &no_targets
+                    };
+                    let segments = compute_side(&rects, candidates, i, side, st, |b| {
+                        if screens[i].id.device != screens[b].id.device {
+                            return Some(st.minimum_portal);
+                        }
+                        // Same-computer edges come only from native OS adjacency.
+                        // Cross-computer positive-gap portals remain layout policy.
+                        let a = screens[i].local;
+                        let b = screens[b].local;
+                        let eps = super::facing::tolerance(&[a, b]);
+                        super::facing::facing(a, b, side, eps)
+                            .filter(|f| f.gap <= eps)
+                            .map(|_| 0.0)
+                    });
+                    // Cross-computer wall/snap policy cannot extend a native OS seam.
+                    segments
+                        .into_iter()
+                        .flat_map(|segment| {
+                            let Some((target, _)) = segment.portal else {
+                                return vec![segment];
+                            };
+                            if screens[target].id.device != screens[i].id.device {
+                                return vec![segment];
+                            }
+                            let (_, lo, hi) = edge(&rects[i], side);
+                            let (_, blo, bhi) = edge(&rects[target], side.opposite());
+                            let from = segment.from.max(lo.max(blo));
+                            let to = segment.to.min(hi.min(bhi));
+                            let mut pieces = Vec::new();
+                            if segment.from < from {
+                                pieces.push(Seg {
+                                    from: segment.from,
+                                    to: from,
+                                    portal: None,
+                                    blocked: false,
+                                });
+                            }
+                            if from < to {
+                                pieces.push(Seg {
+                                    from,
+                                    to,
+                                    portal: segment.portal,
+                                    blocked: segment.blocked,
+                                });
+                            }
+                            if to < segment.to {
+                                pieces.push(Seg {
+                                    from: to,
+                                    to: segment.to,
+                                    portal: None,
+                                    blocked: false,
+                                });
+                            }
+                            pieces
+                        })
+                        .collect::<Vec<_>>()
                 })
             })
             .collect();
@@ -217,7 +230,8 @@ impl Topology {
             .zip(&self.active)
             .any(|(s, active)| *active && s.id.device == device)
     }
-    /// Hidden screens retain their focus until an explicit focus command.
+
+    /// Hiding a screen does not require changing the device's focus holder.
     pub fn source_requires_target(&self, _device: DeviceId) -> bool {
         false
     }

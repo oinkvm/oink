@@ -17,7 +17,7 @@ Oink 是 Oink Is Not only a KVM 的缩写，是一款在多台 Windows 和 Mac �
 
 支持的操作系统和版本：
 
-- **Mac**：仅支持 Apple 芯片（arm64），macOS 14.2 及以上
+- **Mac**：Apple 芯片（arm64），macOS 14.2 及以上；Intel（x64），macOS 14.2 及以上（未经测试）
 - **Windows**：x64，Windows 10 22H2（build 19045）及以上，或 Windows 11
 
 如果 SmartScreen 提示“Windows 已保护你的电脑”，仅在出现相应选项时点击 **更多信息 → 仍要运行**。UAC 可能显示发布者未知。

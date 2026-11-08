@@ -341,6 +341,10 @@ mod tests {
                     size_source: SizeSource::Manual,
                     primary: true,
                     builtin: true,
+                    device_hidden: false,
+                    screen_hidden: false,
+                    device_visibility_known: false,
+                    screen_visibility_known: false,
                 };
                 let rb = if vertical {
                     Rect::new(0., 268., 201., 134.)

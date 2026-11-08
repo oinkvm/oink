@@ -9,7 +9,7 @@ import {
     growGroupAvoiding,
     mergeVisibleGroups,
 } from './groups';
-import { tr } from '../i18n';
+import { tr, trNodes } from '../i18n';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, RefObject } from 'react';
 import { Icon, ICONS, Kbd, VisuallyHidden } from 'oink-ui';
@@ -800,6 +800,10 @@ export function Arrangement({ screens, platform = 'mac', geometryScreens = scree
             <Kbd k="Shift" size="sm"/><span className="arr__key-label">{tr('微调')}</span>
           </span>
         </div>
+      </div>}
+      {/* The shortcut row yields to a gesture; Shift (no snapping) is what still applies. */}
+      {active && size.h >= 48 && <div className="arr__gesture-hint" aria-hidden>
+        {trNodes('按住 {0} 微调', <Kbd k="Shift" size="sm"/>)}
       </div>}
       {screens.length === 0 && <p className="arr__empty">{tr('没有可共享的屏幕')}</p>}
       <VisuallyHidden aria-live="polite">{announce}</VisuallyHidden>

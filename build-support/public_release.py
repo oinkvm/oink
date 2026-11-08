@@ -29,7 +29,7 @@ def inputs(build, environment):
 
 
 def locate(packages, platform):
-    directory = 'macos-arm64' if platform == 'macos' else 'windows-x64'
+    directory = 'macos-*' if platform == 'macos' else platform if platform == 'macos-x64' else 'windows-x64'
     records = list(Path(packages).glob('*/' + directory + '/release.json'))
     if len(records) != 1:
         raise ValueError('expected one platform package record')
@@ -50,7 +50,7 @@ def stage(packages, output, platform, build, commit):
     proof = json.loads((path.parent / 'report-configuration-check.json').read_text())
     if proof != {'configured': True, 'report_sent': False, 'version': record['version'], 'build': build}:
         raise ValueError('production reporting/version verification missing')
-    if platform == 'macos':
+    if platform.startswith('macos'):
         if not record.get('notarized') or not all(record['notarization'][k].get('stapled') and record['notarization'][k]['status'] == 'Accepted' for k in ['app', 'dmg']):
             raise ValueError('app and DMG must be Accepted and stapled')
         if record.get('launch_smoke', {}).get('status') != 'passed' or not record['launch_smoke'].get('signed') or record['launch_smoke'].get('seconds') != 10:
@@ -63,28 +63,31 @@ def stage(packages, output, platform, build, commit):
         if source.suffix in ('.dmg', '.msi', '.zip'):
             shutil.copy2(source, output / source.name)
     record['artifacts'] = [a for a in record['artifacts'] if Path(a['name']).suffix in ('.dmg', '.msi', '.zip')]
-    if sorted(Path(a['name']).suffix for a in record['artifacts']) != (['.dmg', '.zip'] if platform == 'macos' else ['.msi']):
+    if sorted(Path(a['name']).suffix for a in record['artifacts']) != (['.dmg', '.zip'] if platform.startswith('macos') else ['.msi']):
         raise ValueError('expected Mac DMG + Sparkle ZIP, or Windows MSI')
     record.update(built_commit=commit, reporting=proof)
-    (output / f'release-{platform}.json').write_text(json.dumps(record, indent=2) + '\n')
+    (output / f'release-{"macos-x64" if platform.startswith("macos") and record.get("architecture") == "x64" else platform}.json').write_text(json.dumps(record, indent=2) + '\n')
 
 
 def assemble(downloads, output, build, commit):
     records = {}
     artifacts = []
     output.mkdir(parents=True, exist_ok=True)
-    for platform, suffix in [('macos', '.dmg'), ('windows', '.msi')]:
+    for platform, suffix in [('macos', '.dmg'), ('macos-x64', '.dmg'), ('windows', '.msi')]:
         paths = list(downloads.rglob(f'release-{platform}.json'))
         if len(paths) != 1:
             raise ValueError('both successful platform records required')
         path = paths[0]; record = json.loads(path.read_text(encoding='utf-8-sig'))
         if (record['version'], record['build'], record['built_commit'], record['source_tree_sha256']) != (IDENTITY['version'], build, commit, source_tree_sha256()):
             raise ValueError('platform packages do not share the built source/version/build')
-        if platform == 'macos' and not record.get('notarized'):
+        expected_arch = 'arm64' if platform == 'macos' else 'x64'
+        if record.get('architecture') != expected_arch:
+            raise ValueError('platform architecture mismatch')
+        if platform.startswith('macos') and not record.get('notarized'):
             raise ValueError('Mac notarization missing')
         if record['reporting'] != {'configured': True, 'report_sent': False, 'version': record['version'], 'build': build}:
             raise ValueError('reporting check missing')
-        expected = ['.dmg', '.zip'] if platform == 'macos' else [suffix]
+        expected = ['.dmg', '.zip'] if platform.startswith('macos') else [suffix]
         if sorted(Path(a['name']).suffix for a in record['artifacts']) != expected:
             raise ValueError('Mac DMG + ZIP and Windows MSI required')
         for a in record['artifacts']:

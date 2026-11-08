@@ -34,15 +34,15 @@ class PublicRelease(unittest.TestCase):
         self.assertTrue(R.inputs('28', {**env, 'SIGNPATH_PROJECT_SLUG':'x', 'SIGNPATH_ORGANIZATION_ID':'x', 'SIGNPATH_API_TOKEN':'fixture'}))
 
     def package(self, root, platform):
-        path = root / TREE / ('macos-arm64' if platform == 'macos' else 'windows-x64')
+        path = root / TREE / ('macos-arm64' if platform == 'macos' else platform if platform == 'macos-x64' else 'windows-x64')
         path.mkdir(parents=True)
-        name = 'Oink-0.1.0-' + ('macos-arm64.dmg' if platform == 'macos' else 'windows-x64.msi')
+        name = 'Oink-0.1.0-' + ('macos-arm64.dmg' if platform == 'macos' else 'macos-x64.dmg' if platform == 'macos-x64' else 'windows-x64.msi')
         f = path / name; f.write_bytes(platform.encode())
-        record = dict(version='0.1.0', build=28, source_commit=None, source_tree_sha256=TREE,
+        record = dict(architecture='x64' if platform == 'macos-x64' else 'arm64' if platform == 'macos' else 'x64', version='0.1.0', build=28, source_commit=None, source_tree_sha256=TREE,
             notarized=True, notarization={k:dict(status='Accepted',stapled=True) for k in ['app','dmg']},
             launch_smoke=dict(status='passed',signed=True,seconds=10),
             artifacts=[dict(name=name,size=f.stat().st_size,sha256=digest(f))])
-        if platform == 'macos':
+        if platform.startswith('macos'):
             archive = path / name.replace('.dmg', '.zip')
             archive.write_bytes(b'Stapled Sparkle archive')
             record['artifacts'].append(dict(name=archive.name, size=archive.stat().st_size, sha256=digest(archive)))
@@ -56,9 +56,9 @@ class PublicRelease(unittest.TestCase):
     def test_both_platforms_assemble_without_update_notes_and_with_package_hashes(self, _hash):
         with tempfile.TemporaryDirectory() as tmp:
             p=Path(tmp)
-            for platform in ['macos','windows']:
-                self.package(p/'packages',platform)
-                R.stage(p/'packages',p/'download'/platform,platform,28,COMMIT)
+            for platform in ['macos','macos-x64','windows']:
+                self.package(p/'packages'/platform,platform)
+                R.stage(p/'packages'/platform,p/'download'/platform,platform,28,COMMIT)
             # An empty working directory has no .github/update-notes.json.
             previous = Path.cwd()
             try:
@@ -67,7 +67,7 @@ class PublicRelease(unittest.TestCase):
             finally:
                 os.chdir(previous)
             self.assertEqual({x.suffix for x in assets},{'.dmg','.zip','.msi','.json',''})
-            self.assertEqual(len(list((p/'final').iterdir())),5)
+            self.assertEqual(len(list((p/'final').iterdir())),7)
             self.assertFalse((p/'final/update.json').exists())
             release=json.loads((p/'final/release.json').read_text())
             self.assertEqual({a['name'] for a in release['artifacts']},

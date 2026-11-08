@@ -20,6 +20,16 @@ pub trait CaptureLoop: Send {
     /// Called on the capture thread before startup is reported complete.
     fn set_wake(&mut self, wake: Wake);
     fn event(&mut self, event: &CapturedEvent) -> Disposition;
+    /// Observe external local keys solely for the Disabled release chord.
+    fn injected_disable_release(&mut self, _code: crate::KeyCode, _pressed: bool) {}
+    /// Retire an observed local replacement UP only when its source press is
+    /// still exclusively Local. The native owner attests a physical first DOWN
+    /// passed locally and an UP not rejected by the downstream chain.
+    /// Bookkeeping only: queue native outputs for the next poll, never dispatch
+    /// native work here (the caller must finish retiring the same native press).
+    fn release_local_key(&mut self, _event: &CapturedEvent) -> bool {
+        false
+    }
     /// Local source gate; receiving remote input remains independent.
     fn capture_available(&mut self, _available: bool) {}
     /// Capture was intentionally withdrawn (permission/safety/pause), not a
@@ -48,18 +58,15 @@ pub trait CaptureLoop: Send {
         None
     }
     /// Source mouse guard includes untranslated native pointer/gesture events.
-    fn constrained_cursor(&self) -> Option<oink_foundation::Point> {
-        None
-    }
     fn mouse_disabled(&self) -> bool {
         false
     }
     fn keyboard_disabled(&self) -> bool {
         false
     }
-    /// Windows-local opt-in. Other backends retain their existing source policy.
+    /// Windows-local preference, enabled by default. Other backends retain their source policy.
     fn forward_injected_input(&self) -> bool {
-        false
+        true
     }
     /// Guard-specific pass-through for the Windows capturable lock curtain.
     fn keyboard_guard_suspended(&self) -> bool {
@@ -156,9 +163,15 @@ pub(crate) fn callback_available() -> bool {
     OWNER.with(|slot| slot.try_borrow_mut().is_ok())
 }
 
-#[cfg(target_os = "macos")]
-pub(crate) fn constrained_cursor() -> Option<oink_foundation::Point> {
-    OWNER.with(|slot| slot.borrow().as_ref().and_then(|owner| owner.constrained_cursor()))
+#[cfg(windows)]
+pub(crate) fn injected_disable_release(code: crate::KeyCode, pressed: bool) {
+    OWNER.with(|slot| {
+        if let Ok(mut owner) = slot.try_borrow_mut()
+            && let Some(owner) = owner.as_mut()
+        {
+            owner.injected_disable_release(code, pressed);
+        }
+    });
 }
 pub(crate) fn mouse_disabled() -> bool {
     OWNER.with(|slot| slot.borrow().as_ref().is_some_and(|owner| owner.mouse_disabled()))
@@ -174,7 +187,7 @@ pub(crate) fn forward_injected_input() -> Option<bool> {
     OWNER.with(|slot| {
         slot.try_borrow()
             .ok()
-            .map(|owner| owner.as_ref().is_some_and(|owner| owner.forward_injected_input()))
+            .map(|owner| owner.as_ref().is_none_or(|owner| owner.forward_injected_input()))
     })
 }
 
@@ -235,5 +248,15 @@ pub(crate) fn pointer_holder() -> bool {
     OWNER.with(|slot| {
         slot.try_borrow()
             .is_ok_and(|slot| slot.as_ref().is_none_or(|owner| owner.pointer_holder()))
+    })
+}
+
+#[cfg(windows)]
+pub(crate) fn release_local_key(event: &CapturedEvent) -> bool {
+    OWNER.with(|slot| {
+        slot.try_borrow_mut()
+            .ok()
+            .and_then(|mut slot| slot.as_mut().map(|owner| owner.release_local_key(event)))
+            .unwrap_or(false)
     })
 }

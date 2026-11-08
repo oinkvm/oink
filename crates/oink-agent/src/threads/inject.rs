@@ -16,6 +16,8 @@ use oink_foundation::{
 /// is skipped if a newer mode was already applied inside a capture callback.
 #[derive(Clone, Debug)]
 pub enum InjectItem {
+    /// Local password work holds the existing FIFO, including every remote key pair.
+    LocalUnlock(crate::auto_unlock::typing::Job),
     /// Native FIFO read barrier. Failure is a readback fallback, not an input fault.
     CursorRead {
         scope: u64,
@@ -37,7 +39,6 @@ pub enum InjectItem {
     },
     /// Non-callback mode switches keep their order relative to injected events.
     SetMode(CaptureMode),
-    ConstrainCursor(Option<oink_foundation::Rect>),
     SetRelativeCapture(bool),
     /// Ordinary UI work; never activate a window inside a native input callback.
     SetSourceForeground(bool),
@@ -163,7 +164,6 @@ fn session_sensitive(item: &InjectItem) -> bool {
         InjectItem::Inject { .. }
             | InjectItem::LockWindows(_)
             | InjectItem::CursorRead { .. }
-            | InjectItem::ConstrainCursor(Some(_))
             | InjectItem::SetMode(_)
             | InjectItem::RestoreLocal { .. }
             | InjectItem::SetRelativeCapture(true)
@@ -971,6 +971,7 @@ pub(crate) fn start_with_trace(
                 }
                 let _scope = handoff_timing::enter_scope(queued.crossing);
                 match queued.item {
+                    InjectItem::LocalUnlock(job) => job.run(),
                     InjectItem::CursorRead { scope, reply } => {
                         let _ = reply.try_send(cursor.sample(native.as_ref(), scope));
                         if let Some(wake) = input_wake.get() {
@@ -1086,18 +1087,6 @@ pub(crate) fn start_with_trace(
                             wake();
                         }
                         measured.native_end(oink_input::timing::CallClass::Mode, called.elapsed().as_micros() as u64);
-                    }
-                    InjectItem::ConstrainCursor(bounds) => {
-                        cursor.clear();
-                        let result = native.set_cursor_constraint(bounds);
-                        if result.is_err() {
-                            failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        if native_faults.mouse(super::input::faults::native_result(&result))
-                            && let Some(wake) = input_wake.get()
-                        {
-                            wake();
-                        }
                     }
                     InjectItem::SetSourceForeground(active) => native.set_source_foreground(active),
                     InjectItem::SetRelativeCapture(active) => {
@@ -1315,6 +1304,139 @@ impl Held {
 
 #[cfg(all(test, debug_assertions))]
 mod tests {
+    #[test]
+    fn local_unlock_pause_discards_buffered_keys_cleans_held_and_stops_local_typing() {
+        use super::*;
+        use oink_input::{InputBackend, KeyCode};
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicU8, AtomicU64, Ordering},
+                mpsc,
+            },
+            time::{Duration, Instant},
+        };
+        let backend = Arc::new(oink_test_support::input::FakeInput::new());
+        backend.start(Arc::new(|_| oink_input::Disposition::Pass)).unwrap();
+        let handle = start_with_backend(backend.clone(), Box::new(|_| {})).unwrap();
+        let source = DeviceId([1; 32]);
+        handle.push(InjectItem::Inject {
+            from: Some(source),
+            event: InjectEvent::Key {
+                code: KeyCode::keyboard(4),
+                pressed: true,
+            },
+        });
+        let (ready, started) = mpsc::sync_channel(1);
+        let (release, wait) = mpsc::sync_channel(1);
+        let (reply, done) = mpsc::sync_channel(1);
+        handle.push(InjectItem::LocalUnlock(crate::auto_unlock::typing::Job::new(
+            Box::new(move |_| {
+                let mut typing = crate::auto_unlock::typing::Typing::new(Instant::now());
+                typing.before_character(Instant::now(), true, Some(true))?;
+                ready.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(1)).unwrap();
+                // Pause revokes the local transaction after its first character too.
+                typing.before_character(Instant::now(), false, Some(true))
+            }),
+            reply,
+        )));
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        backend.take_injected();
+        for pressed in [true, false] {
+            handle.push(InjectItem::Inject {
+                from: Some(DeviceId([2; 32])),
+                event: InjectEvent::Key {
+                    code: KeyCode::keyboard(5),
+                    pressed,
+                },
+            });
+        }
+        backend.set_input_paused(true);
+        release.send(()).unwrap();
+        assert!(done.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+        let ack = Arc::new(AtomicU8::new(0));
+        handle.push(InjectItem::OwnerFence {
+            state: ack.clone(),
+            failures: Arc::new(AtomicU64::new(0)),
+            expect_released: true,
+        });
+        let until = Instant::now() + Duration::from_secs(1);
+        while ack.load(Ordering::Acquire) == 0 && Instant::now() < until {
+            std::thread::yield_now();
+        }
+        assert_eq!(ack.load(Ordering::Acquire), 1);
+        let keys: Vec<_> = backend
+            .take_injected()
+            .into_iter()
+            .filter(|e| matches!(e, InjectEvent::Key { .. }))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![InjectEvent::Key {
+                code: KeyCode::keyboard(4),
+                pressed: false
+            }]
+        );
+    }
+
+    #[test]
+    fn local_unlock_buffers_all_sources_key_pairs_in_fifo_on_finish_or_abort() {
+        use super::*;
+        use oink_foundation::input::KeyCode;
+        use std::{
+            sync::{Arc, mpsc},
+            time::Duration,
+        };
+        for abort in [false, true] {
+            let backend = Arc::new(oink_test_support::input::FakeInput::new());
+            let handle = start_with_backend(backend.clone(), Box::new(|_| {})).unwrap();
+            let (started, ready) = mpsc::sync_channel(1);
+            let (finish, wait) = mpsc::sync_channel(1);
+            let (reply, result) = mpsc::sync_channel(1);
+            handle.push(InjectItem::LocalUnlock(crate::auto_unlock::typing::Job::new(
+                Box::new(move |_| {
+                    started.send(()).unwrap();
+                    wait.recv_timeout(Duration::from_secs(1)).unwrap();
+                    if abort { Err("synthetic abort") } else { Ok(()) }
+                }),
+                reply,
+            )));
+            ready.recv_timeout(Duration::from_secs(1)).unwrap();
+            let events = vec![
+                (DeviceId([1; 32]), 4, true),
+                (DeviceId([2; 32]), 5, true),
+                (DeviceId([1; 32]), 4, false),
+                (DeviceId([2; 32]), 5, false),
+            ];
+            for &(source, key, pressed) in &events {
+                handle.push(InjectItem::Inject {
+                    from: Some(source),
+                    event: InjectEvent::Key {
+                        code: KeyCode::keyboard(key),
+                        pressed,
+                    },
+                });
+            }
+            assert!(backend.take_injected().is_empty());
+            finish.send(()).unwrap();
+            assert_eq!(result.recv_timeout(Duration::from_secs(1)).unwrap().is_err(), abort);
+            let (done, ack) = mpsc::sync_channel(1);
+            handle.push(InjectItem::CursorRead { scope: 0, reply: done });
+            ack.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(
+                backend.take_injected(),
+                events
+                    .into_iter()
+                    .map(|(_, key, pressed)| InjectEvent::Key {
+                        code: KeyCode::keyboard(key),
+                        pressed
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
     #[test]
     fn windows_lock_native_queue_orders_releases_and_rejects_revoked_or_duplicate_authority() {
         use super::*;

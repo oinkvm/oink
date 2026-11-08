@@ -55,7 +55,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::win_actions::{self, GestureMapper, WinAction};
-use crate::{EventHandler, InputBackend, InputError};
+use crate::{EventHandler, InputBackend, InputError, SessionLockObservation};
 
 /// The SYSTEM pre-login backend captures only on Winlogon; injection uses the
 /// broker-authorized active-console helper. No visible windows.
@@ -85,7 +85,6 @@ struct WinInput {
     /// 映射为快捷键、仍按着的 Mac 系统功能键：重复的按下不再触发。
     shortcut_keys: Mutex<HashSet<KeyCode>>,
     lock_chord: Mutex<crate::win_lock::LockChord>,
-    confinement: Mutex<raw_capture::Confinement>,
 }
 
 /// 执行 Mac 手势 / 系统功能键映射出的动作（`win_actions`）。
@@ -119,7 +118,6 @@ impl WinInput {
 
 impl Drop for WinInput {
     fn drop(&mut self) {
-        let _ = self.set_cursor_constraint(None);
         oink_winsvc::client::release_if_connected();
         if let Some(h) = self.take_hook() {
             h.stop();
@@ -174,7 +172,6 @@ impl InputBackend for WinInput {
     }
     fn stop_injection_session(&self) {
         self.source_foreground.set(false);
-        let _ = self.set_cursor_constraint(None);
         oink_winsvc::client::suspend();
         *self.scroll_acc.lock().unwrap_or_else(|e| e.into_inner()) = (0., 0.);
         *self.relative_acc.lock().unwrap_or_else(|e| e.into_inner()) = (0., 0.);
@@ -221,12 +218,15 @@ impl InputBackend for WinInput {
     }
 
     fn held_session_keys(&self) -> Vec<KeyCode> {
-        if session_locked() == Some(true) {
+        if session_locked().state == Some(true) {
             return Vec::new();
         }
         hook::physical_keys()
     }
     fn session_locked(&self) -> Option<bool> {
+        self.session_lock_observation().state
+    }
+    fn session_lock_observation(&self) -> SessionLockObservation {
         session_locked()
     }
 
@@ -279,7 +279,6 @@ impl InputBackend for WinInput {
 
     fn stop(&self) {
         self.source_foreground.stop();
-        let _ = self.set_cursor_constraint(None);
         oink_winsvc::client::release_if_connected();
         // 先取出句柄再等待线程退出：回调里若调用 set_mode，不会因为这把锁死锁
         if let Some(h) = self.take_hook() {
@@ -287,16 +286,6 @@ impl InputBackend for WinInput {
         }
     }
 
-    fn set_cursor_constraint(&self, bounds: Option<oink_foundation::Rect>) -> Result<(), InputError> {
-        let hook = self
-            .hook
-            .lock()
-            .map_err(|_| InputError::Platform("capture lock poisoned".into()))?;
-        self.confinement
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .set(bounds, hook.as_ref())
-    }
     fn set_mode(&self, mode: CaptureMode) -> Result<(), InputError> {
         let mode = if self.input_safety().active() {
             mode
@@ -755,21 +744,29 @@ impl InputBackend for WinInput {
     }
 }
 
-fn session_locked() -> Option<bool> {
+fn session_locked() -> SessionLockObservation {
     use windows::Win32::System::RemoteDesktop::{
         WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK, WTS_SESSIONSTATE_UNLOCK, WTSFreeMemory, WTSINFOEXW,
         WTSQuerySessionInformationW, WTSSessionInfoEx,
     };
     let mut buffer = windows::core::PWSTR::null();
     let mut len = 0;
-    // SAFETY: outputs are writable; queries only the current session, with no change to its state.
-    if unsafe { WTSQuerySessionInformationW(None, WTS_CURRENT_SESSION, WTSSessionInfoEx, &mut buffer, &mut len) }
-        .is_err()
-    {
-        return None;
+    let query = {
+        // SAFETY: outputs are writable; queries only the current session, with
+        // no change to its state. WTS owns the returned buffer until freed.
+        unsafe { WTSQuerySessionInformationW(None, WTS_CURRENT_SESSION, WTSSessionInfoEx, &mut buffer, &mut len) }
+    };
+    if let Err(error) = query {
+        return SessionLockObservation {
+            state: None,
+            error_code: Some(error.code().0 as u32),
+        };
     }
     if buffer.is_null() {
-        return None;
+        return SessionLockObservation {
+            state: None,
+            error_code: None,
+        };
     }
     let result = if len as usize >= std::mem::size_of::<WTSINFOEXW>() {
         // SAFETY: successful WTS query allocated this aligned structure; length checked above.
@@ -789,5 +786,8 @@ fn session_locked() -> Option<bool> {
     };
     // SAFETY: buffer was allocated by the successful WTS query and is freed exactly once.
     unsafe { WTSFreeMemory(buffer.0.cast()) };
-    result
+    SessionLockObservation {
+        state: result,
+        error_code: None,
+    }
 }

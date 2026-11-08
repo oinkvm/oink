@@ -43,7 +43,8 @@ pub fn encode(report: &AdmittedReport) -> Result<Vec<u8>> {
             tags["component"] = json!(c.component);
             tags["crash_kind"] = json!(c.crash_kind);
             let mut images = Vec::<Value>::new();
-            let mut frames: Vec<Value> = c.frames().map(|f| match f {
+            let mut project = |source: Vec<&Frame>| -> Vec<Value> {
+                let mut frames: Vec<Value> = source.into_iter().map(|f| match f {
                 Frame::Native { image, offset, debug_id, debug_age, code_id, image_size } => {
                     let mut id = uuid(debug_id);
                     if *debug_age != 0 { id.push_str(&format!("-{debug_age:x}")); }
@@ -64,8 +65,15 @@ pub fn encode(report: &AdmittedReport) -> Result<Vec<u8>> {
                 Frame::Script { script: ScriptSlot::Main, line, column } =>
                     json!({"filename":"app:///main.js","lineno":line,"colno":column,"in_app":true}),
             }).collect();
+                frames.reverse();
+                frames
+            };
+            let frames = project(c.frames().collect());
+            let thrown = c
+                .objc_exception
+                .as_ref()
+                .map(|throw| (throw, project(throw.frames().collect())));
             // Capture order is fault -> callers; Sentry expects oldest -> newest.
-            frames.reverse();
             if !images.is_empty() {
                 event["debug_meta"] = json!({"images":images});
             }
@@ -79,7 +87,17 @@ pub fn encode(report: &AdmittedReport) -> Result<Vec<u8>> {
                 // filtering; Relay must never adjust this shortened stack again.
                 exception["stacktrace"] = json!({"frames":frames,"instruction_addr_adjustment":"none"});
             }
-            event["exception"] = json!({"values":[exception]});
+            let mut exceptions = Vec::new();
+            if let Some((throw, throw_frames)) = thrown {
+                let mut original =
+                    json!({"type":throw.name.as_str(),"mechanism":{"type":"oink_objc_throw","handled":false}});
+                if !throw_frames.is_empty() {
+                    original["stacktrace"] = json!({"frames":throw_frames,"instruction_addr_adjustment":"none"});
+                }
+                exceptions.push(original);
+            }
+            exceptions.push(exception);
+            event["exception"] = json!({"values":exceptions});
             event["contexts"] = json!({"oink_crash":{"type":"oink_crash","exception_code":c.exception_code,"stack_available":!frames.is_empty(),"callsite":c.callsite,"line":c.line,"column":c.column}});
             "event"
         }
@@ -679,5 +697,104 @@ mod tests {
         assert!(
             serde_json::from_str::<AppVersion>(r#"{"major":"poison-name","minor":0,"patch":0,"build":0}"#).is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod objc_privacy_tests {
+    use super::*;
+    fn crash(name: &str) -> SafeCrash {
+        let mut crash = SafeCrash::empty(
+            BuildContext {
+                app_version: AppVersion {
+                    major: 1,
+                    minor: 0,
+                    patch: 0,
+                    build: 1,
+                },
+                os_version_class: OsVersionClass::MacOSMajor(27),
+            },
+            Component::Agent,
+            CrashKind::NativeException,
+            ExceptionClass::Abort,
+        );
+        let frame = |offset| {
+            Some(Frame::Native {
+                image: ImageSlot::Agent,
+                offset,
+                debug_id: [1; 16],
+                debug_age: 0,
+                code_id: None,
+                image_size: 4096,
+            })
+        };
+        crash.frames[0][0] = frame(24);
+        let mut thrown = ObjcException {
+            name: ExceptionName::from_native(name),
+            frames: [[None; 32]; 2],
+        };
+        thrown.frames[0][0] = frame(48);
+        crash.objc_exception = Some(thrown);
+        crash
+    }
+    #[test]
+    fn fatal_throw_has_its_own_symbolicatable_stack_and_identifier_only() {
+        for (name, expected) in [
+            ("NSInvalidArgumentException", "NSInvalidArgumentException"),
+            ("/Users/private/file", "other"),
+            ("private reason text", "other"),
+            ("原因", "other"),
+            ("", "other"),
+            (&"a".repeat(129), "other"),
+        ] {
+            let report = AdmittedReport::new(Report::SafeCrash(crash(name)), 3600).unwrap();
+            let bytes = encode(&report).unwrap();
+            let event: Value = serde_json::from_slice(bytes.split(|b| *b == b'\n').nth(2).unwrap()).unwrap();
+            let exceptions = event["exception"]["values"].as_array().unwrap();
+            assert_eq!(exceptions.len(), 2);
+            assert_eq!(exceptions[0]["type"], expected);
+            assert_eq!(exceptions[0]["stacktrace"]["frames"][0]["instruction_addr"], "0x30");
+            assert_eq!(exceptions[1]["type"], "abort");
+            assert_eq!(exceptions[1]["stacktrace"]["frames"][0]["instruction_addr"], "0x18");
+            assert_eq!(event["debug_meta"]["images"].as_array().unwrap().len(), 1);
+            for exception in exceptions {
+                assert!(exception.get("value").is_none());
+                assert!(exception.get("reason").is_none());
+                assert_eq!(exception["mechanism"]["handled"], false);
+            }
+            assert!(!String::from_utf8_lossy(&bytes).contains("private"));
+            assert_eq!(event["tags"]["policy_version"], POLICY_VERSION);
+        }
+    }
+    #[test]
+    fn persisted_report_cannot_smuggle_reason_or_nonidentifier_name() {
+        let report = AdmittedReport::new(Report::SafeCrash(crash("NSException")), 3600).unwrap();
+        let clean = serde_json::to_value(report).unwrap();
+        let mut poisoned = clean.clone();
+        poisoned["report"]["data"]["objc_exception"]["reason"] = json!("/Users/private/free text");
+        assert!(encode_persisted(&serde_json::to_vec(&poisoned).unwrap()).is_err());
+        poisoned = clean.clone();
+        poisoned["report"]["data"]["objc_exception"]["name"] = json!("/Users/private/free text");
+        assert!(encode_persisted(&serde_json::to_vec(&poisoned).unwrap()).is_err());
+        // Reasons at the fatal envelope's top level also fail the closed schema.
+        poisoned = clean;
+        poisoned["reason"] = json!("/Users/private/free text");
+        assert!(encode_persisted(&serde_json::to_vec(&poisoned).unwrap()).is_err());
+    }
+    #[test]
+    fn only_native_mac_abort_can_carry_throw_evidence() {
+        let mut report = crash("NSException");
+        report.exception_class = ExceptionClass::BadAccess;
+        assert!(Report::SafeCrash(report).validate().is_err());
+        let mut report = crash("NSException");
+        report.build.os_version_class = OsVersionClass::Windows11;
+        assert!(Report::SafeCrash(report).validate().is_err());
+        let mut report = crash("NSException");
+        report.objc_exception.as_mut().unwrap().frames[0][0] = Some(Frame::Script {
+            script: ScriptSlot::Main,
+            line: 1,
+            column: 1,
+        });
+        assert!(Report::SafeCrash(report).validate().is_err());
     }
 }

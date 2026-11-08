@@ -64,7 +64,21 @@ def verify_product_name(bundle, info, name):
         raise RuntimeError('Mac app basename must match its user-visible name: ' + name)
 
 
-def verify_app(app, identity):
+def verify_component_groups(role, entitlements, files_group):
+    if 'keychain-access-groups' in entitlements:
+        raise RuntimeError('Unexpected restricted Keychain entitlement')
+    expected = [files_group] if role in ('backend', 'file_provider_manager', 'file_provider_extension', 'finder_sync', 'paste_helper') else []
+    if entitlements.get('com.apple.security.application-groups', []) != expected:
+        raise RuntimeError('Component App Group isolation mismatch: ' + role)
+
+
+def verify_manager_signing_identity(details, backend_id):
+    expected = 'Identifier=' + backend_id + '.file-provider-manager'
+    if expected not in details.splitlines():
+        raise RuntimeError('File Provider manager must not share backend Keychain signing identity')
+
+
+def verify_app(app, identity, architecture='arm64'):
     verify_imports([app], identity['macos_minimum'])
     if any(app.rglob('*.dSYM')) or any(app.rglob('*.pdb')) or any(app.rglob('*.map')):
         raise RuntimeError('Private symbols must not be embedded in the Mac app')
@@ -84,22 +98,43 @@ def verify_app(app, identity):
     ext_info = plistlib.loads((extension / 'Contents/Info.plist').read_bytes())
     if ext_info[mac['app_group_key']] != group or ext_info['LSMinimumSystemVersion'] != '14.2':
         raise RuntimeError('File Provider identity or deployment target mismatch')
-    binaries = [app / 'Contents/MacOS' / b[role] for role in
-                ('backend', 'agent', 'crash_collector', 'file_provider_manager')]
-    binaries += [helper / 'Contents/MacOS' / b['ui'], extension / 'Contents/MacOS' / b['file_provider_extension']]
+    finder = app / 'Contents/PlugIns/OinkFinderSync.appex'
+    finder_info = plistlib.loads((finder / 'Contents/Info.plist').read_bytes())
+    paste = app / 'Contents/Helpers/OinkPaste.app'
+    paste_info = plistlib.loads((paste / 'Contents/Info.plist').read_bytes())
+    if (finder_info['CFBundleIdentifier'] != identity['bundle_id'] + '.findersync'
+            or finder_info[mac['app_group_key']] != group
+            or finder_info['NSExtension']['NSExtensionPointIdentifier'] != 'com.apple.FinderSync'
+            or paste_info['CFBundleIdentifier'] != identity['bundle_id'] + '.paste'
+            or paste_info['CFBundleExecutable'] != 'OinkPaste'
+            or paste_info[mac['app_group_key']] != group):
+        raise RuntimeError('Paste as File shell integration identity mismatch')
+    binaries = {role: app / 'Contents/MacOS' / b[role] for role in
+                ('backend', 'agent', 'crash_collector', 'file_provider_manager')}
+    binaries.update(ui=helper / 'Contents/MacOS' / b['ui'],
+                    file_provider_extension=extension / 'Contents/MacOS' / b['file_provider_extension'],
+                    finder_sync=finder / 'Contents/MacOS/OinkFinderSync',
+                    paste_helper=paste / 'Contents/MacOS/OinkPaste')
     components = []
-    for binary in binaries:
+    for role, binary in binaries.items():
+        signed = private_run('codesign', '-d', '--entitlements', ':-', binary)
+        entitlements = plistlib.loads(signed.stdout.encode()) if signed.stdout.strip() else {}
+        verify_component_groups(role, entitlements, group)
+        if role == 'file_provider_manager':
+            details = private_run('codesign', '-dv', binary).stderr
+            verify_manager_signing_identity(details, identity['bundle_id'])
         # Private dSYM/debug-map records have already been moved out and stripped.
         verify_no_builder_paths(binary)
         arches = subprocess.check_output(['lipo', '-archs', str(binary)], text=True).strip()
         commands = subprocess.check_output(['otool', '-l', str(binary)], text=True)
         minimum = re.findall(r'^\s+minos\s+(\S+)', commands, re.MULTILINE)
         minimum += re.findall(r'cmd LC_VERSION_MIN_MACOSX\n.*?version\s+(\S+)', commands, re.DOTALL)
-        if arches != 'arm64' or minimum not in (['14.2'], ['14.2.0']):
-            raise RuntimeError(f'Expected arm64 and macOS 14.2 deployment target: {binary.name}')
-        components.append({'path': binary.relative_to(app).as_posix(), 'sha256': digest(binary),
-                           'architecture': 'arm64', 'minimum_os': '14.2', 'signature_verified': True})
-    for bundle, bundle_info in ((app, info), (helper, ui), (extension, ext_info)):
+        if arches != architecture or minimum not in (['14.2'], ['14.2.0']):
+            raise RuntimeError(f'Expected {architecture} and macOS 14.2 deployment target: {binary.name}')
+        components.append({'role': role, 'path': binary.relative_to(app).as_posix(), 'sha256': digest(binary),
+                           'image_identity': image_identity(binary),
+                           'architecture': architecture, 'minimum_os': '14.2', 'signature_verified': True})
+    for bundle, bundle_info in ((app, info), (helper, ui), (extension, ext_info), (finder, finder_info), (paste, paste_info)):
         verify_update_transport(bundle_info)
         verify_localizations(bundle, bundle_info, permissions=bundle == app)
         result = private_run('codesign', '-d', '--entitlements', ':-', bundle)
@@ -107,8 +142,8 @@ def verify_app(app, identity):
         verify_tcc_policy(bundle_info, entitlements)
         if bundle == app:
             verify_audio_capture_host(bundle_info, entitlements, b['backend'])
-        if bundle != helper and entitlements.get('com.apple.security.application-groups') != [group]:
-            raise RuntimeError('Host/extension signed App Group mismatch')
+        role = 'backend' if bundle == app else 'ui' if bundle == helper else 'finder_sync' if bundle == finder else 'paste_helper' if bundle == paste else 'file_provider_extension'
+        verify_component_groups(role, entitlements, group)
     metadata = json.loads((app / 'Contents/Resources' / identity['metadata_file']).read_text())
     from provenance import ROOT
     trust = json.loads((ROOT / 'packaging/update-trust.json').read_bytes())['mac']
@@ -119,12 +154,14 @@ def verify_app(app, identity):
         raise RuntimeError('Mac package provenance or update trust mismatch')
     if metadata['version'] != release_version(identity['version'], metadata.get('source_commit'), metadata['build']):
         raise RuntimeError('Mac display version differs from the release build')
-    for bundle_info in (info, ui, ext_info):
+    for bundle_info in (info, ui, ext_info, finder_info, paste_info):
         if any(bundle_info.get(key) != value for key, value in macos_version_fields(metadata['version'], metadata['build']).items()):
             raise RuntimeError('Mac numeric/display bundle versions differ from the release receipt')
     report = json.loads((app / 'Contents/Resources/report-manifest.json').read_text())
-    expected = [('agent', binaries[0]), ('agent', binaries[1]),
-                ('ui_rust', binaries[-2]), ('file_provider', binaries[-1])]
+    # The runtime manifest has four image slots. Additional signed components
+    # belong to the role-keyed package inventory above, not to its UI/FP slots.
+    expected = [('agent', binaries['backend']), ('agent', binaries['agent']),
+                ('ui_rust', binaries['ui']), ('file_provider', binaries['file_provider_extension'])]
     if (report['schema'] != 1 or report['source_tree_sha256'] != metadata['source_tree_sha256'] or
             report['images'] != [{'slot': slot, **image_identity(image)} for slot, image in expected] or
             (helper / 'Contents/Resources/report-manifest.json').read_bytes() !=

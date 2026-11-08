@@ -1,4 +1,4 @@
-//! External synthetic input is a native local stream by default. This state
+//! External synthetic input can be opted out into a native local stream. This state
 //! lives outside State so a reentrant downstream hook cannot bypass ownership
 //! or lose the native cursor commit while the router/capture state is borrowed.
 use super::*;
@@ -10,7 +10,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 thread_local! {
     static POLICY: RefCell<ExternalInput> = RefCell::new(ExternalInput::default());
-    static REQUESTED: Cell<bool> = const { Cell::new(false) };
+    static REQUESTED: Cell<bool> = const { Cell::new(true) };
     static COUNTS: RefCell<(u64, Counters)> = RefCell::new((0, Counters::default()));
 }
 
@@ -177,5 +177,13 @@ pub(super) fn report(remote: bool, raw_clip_active: bool) {
 pub(super) fn retire_physical_modifier(vk: usize) {
     if let Some(slot) = PHYSICAL_KEYS.get(vk) {
         slot.store(0, Ordering::Relaxed);
+    }
+}
+
+pub(super) fn retire_physical_key(code: KeyCode) {
+    // Neutral and sided VKs can describe the same HID key. Retire the matched
+    // physical identity, not just the replacement event's potentially neutral VK.
+    for slot in &PHYSICAL_KEYS {
+        let _ = slot.compare_exchange(code.0, 0, Ordering::Relaxed, Ordering::Relaxed);
     }
 }

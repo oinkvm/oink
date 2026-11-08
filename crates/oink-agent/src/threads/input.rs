@@ -76,6 +76,16 @@ pub enum InputCommand {
     PeerAdmission(PeerAdmission),
     RetirePeer(oink_foundation::session::Boot),
     SessionLocked(Option<bool>),
+    LocalUnlock {
+        epoch: u64,
+        job: crate::auto_unlock::typing::Job,
+    },
+    UnlockReplyReady {
+        peer: DeviceId,
+        stream: StreamId,
+        epoch: u64,
+        unlocked: bool,
+    },
     /// Keep the cursor trail lit (mini-game).
     /// Ordinary observer snapshots of local platform preferences.
     LocalFeel(oink_foundation::input::FeelProfile),
@@ -101,6 +111,10 @@ pub enum InputCommand {
         Arc<std::sync::atomic::AtomicBool>,
     ),
     Hotkeys(Vec<oink_routing::HotkeyBinding>),
+    RecordMouseShortcut {
+        token: String,
+        active: bool,
+    },
     EventFrequency(oink_display::layout::EventFrequency),
     /// Explicit recording start/save snapshot; no periodic input-owner work.
     DiagnosticsSnapshot,

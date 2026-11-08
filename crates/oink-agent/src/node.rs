@@ -136,6 +136,7 @@ impl NodeOptions {
     }
 }
 pub(crate) struct Inner {
+    pub(crate) applied_hotkeys: Mutex<Option<Vec<crate::api::Hotkey>>>,
     pub(crate) reports: crate::telemetry::Owner,
 
     pub(crate) update: Mutex<crate::update::Controller>,
@@ -383,6 +384,7 @@ impl Node {
         let native = opts.cursor_trail;
         let node = Self {
             inner: Arc::new(Inner {
+                applied_hotkeys: Mutex::new(None),
                 reports: if components.reports {
                     crate::telemetry::Owner::new(&data_dir, config.settings.reports)
                 } else {
@@ -590,6 +592,16 @@ impl Node {
             }
         })
         .await;
+        #[cfg(windows)]
+        if self.inner.profile.components().companions {
+            let node = self.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(error) = node.release_windows_displays() {
+                    tracing::warn!(%error,"failed to re-enable Oink-disabled displays on exit");
+                }
+            })
+            .await;
+        }
         if let Some(input) = self.inner.input.get().cloned() {
             let _ = tokio::task::spawn_blocking(move || input.stop()).await;
         }

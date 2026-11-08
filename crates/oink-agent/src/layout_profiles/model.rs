@@ -573,8 +573,14 @@ pub fn snap_native(n: &NativeState, screen: &ScreenKey, desired: Point) -> Resul
         .iter()
         .position(|s| s.screen == *screen)
         .ok_or_else(|| ProfileError::new(ErrorCode::InvalidGeometry, "Unknown screen"))?;
-    let p = arrangement::snap(&native_rects(n), i, desired)
-        .map_err(|_| ProfileError::new(ErrorCode::Disconnected, "No connected native position").device(n.device))?;
+    let p = arrangement::snap(&native_rects(n), i, desired).map_err(|error| {
+        let code = match error {
+            arrangement::ArrangementError::Invalid => ErrorCode::InvalidGeometry,
+            arrangement::ArrangementError::Disconnected => ErrorCode::Disconnected,
+            arrangement::ArrangementError::Overlap | arrangement::ArrangementError::Changed => ErrorCode::Disconnected,
+        };
+        ProfileError::new(code, "No connected native position").device(n.device)
+    })?;
     let mut next = n.clone();
     next.screens[i].origin = p;
     Ok(next)
@@ -744,7 +750,9 @@ pub fn restore(
         }
     };
     let mut order = devices.iter().map(|d| d.device).collect::<Vec<_>>();
-    order.sort_by_key(|d| (rank(*d), *d));
+    // A visibility restoration yields to already-visible peers, independent
+    // of the saved profile's device order or native-change priority.
+    order.sort_by_key(|d| (restores_visibility(current, &next, *d), rank(*d), *d));
     repair_collisions(&mut next, &order, &mut adjustments)?;
     canonicalize(&mut next);
     validate_snapshot(&next)?;
@@ -839,6 +847,13 @@ pub fn replay(
         device.sync_system_arrangement &= restore_native;
     }
     let mut plan = restore(target, current, &owners)?;
+    // An offline history step may restore the group layout exclusion. It must
+    // never turn into a deferred owner preference or native display write.
+    for device in devices.iter().filter(|d| d.availability == Availability::Offline) {
+        if screen_shared(from, device.device) != screen_shared(target, device.device) {
+            set_screen_shared(&mut plan.snapshot, device.device, screen_shared(target, device.device));
+        }
+    }
     let added = current
         .placements
         .iter()
@@ -855,9 +870,22 @@ pub fn replay(
         order.push(p.device);
     }
     order.extend(target.placements.iter().map(|p| p.device));
+    order.sort_by_key(|d| restores_visibility(current, &plan.snapshot, *d));
     repair_collisions(&mut plan.snapshot, &order, &mut plan.adjustments)?;
     Ok(plan)
 }
+fn restores_visibility(before: &ArrangementSnapshot, after: &ArrangementSnapshot, device: DeviceKey) -> bool {
+    screen_shared(after, device)
+        && after.disabled.iter().any(|bit| {
+            bit.screen.device == device
+                && !bit.disabled
+                && before
+                    .disabled
+                    .iter()
+                    .any(|old| old.screen == bit.screen && (old.disabled || !screen_shared(before, device)))
+        })
+}
+
 fn visible_rects(s: &ArrangementSnapshot, device: DeviceKey) -> Vec<Rect> {
     if !screen_shared(s, device) {
         return Vec::new();

@@ -10,6 +10,7 @@ pub mod api;
 pub mod appearance;
 mod attachment;
 mod audio_quality;
+pub mod auto_unlock;
 mod cache;
 pub mod clip;
 pub mod config;
@@ -30,6 +31,7 @@ pub mod layout_sync;
 pub mod logs;
 
 pub mod node;
+pub mod paste_file;
 pub mod prelogin;
 mod projection;
 pub mod remote;

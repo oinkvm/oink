@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, call } from '../api/client';
+import { toFailure } from '../api/transport';
 import { agent, useAgent } from '../api/store';
 import type { InputTransform, KeyboardMapping } from '../api/types';
 import { setLanguage } from '../i18n';
@@ -94,8 +95,8 @@ export function usePreferences(): PrefsApi {
     if(busy.current)return;
     setPrefs(p=>{
       const next:Prefs={...p,
-        ...(local?{notificationLevel:local.notification_level,showInMenuBar:local.show_status_icon,confirmQuit:local.confirm_quit,language:local.ui_language,logLevel:local.log_level,logMaxMb:String(local.log_max_mb)}:{}),
-        ...(state.input?{pollLimit:state.input.event_frequency==='hz125'?'125':'none',keepAwake:state.input.wake_displays_on_input,pointerTrail:state.input.cursor_trail,touchpadInject:state.input.touchpad_injection_enabled,nativeMultifinger:state.input.native_multifinger??true,macScrollFeel:state.input.mac_scroll_feel,forwardWheelByLines:state.input.forward_wheel_by_lines??true,forwardInjectedInput:state.input.forward_injected_input??false,takeForegroundOnLeave:state.input.take_foreground_on_leave??false,pointerGain:state.input.device_gain,escStop:state.input.emergency_hold_ms!==0,
+        ...(local?{notificationLevel:local.notification_level,showInMenuBar:local.show_status_icon,confirmQuit:local.confirm_quit,pasteAsFile:local.paste_as_file,language:local.ui_language,logLevel:local.log_level,logMaxMb:String(local.log_max_mb)}:{}),
+        ...(state.input?{pollLimit:state.input.event_frequency==='hz125'?'125':'none',keepAwake:state.input.wake_displays_on_input,pointerTrail:state.input.cursor_trail,touchpadInject:state.input.touchpad_injection_enabled,nativeMultifinger:state.input.native_multifinger??true,macScrollFeel:state.input.mac_scroll_feel,forwardWheelByLines:state.input.forward_wheel_by_lines??true,forwardInjectedInput:state.input.forward_injected_input??true,takeForegroundOnLeave:state.input.take_foreground_on_leave??false,pointerGain:state.input.device_gain,escStop:state.input.emergency_hold_ms!==0,
           shortcuts:{...Object.fromEntries(Object.entries(p.shortcuts).filter(([id])=>!id.startsWith('move:'))),...Object.fromEntries(state.input.hotkeys.filter(h=>shortcutId(h)).map(h=>[shortcutId(h),{on:h.enabled,keys:h.keys.map(k=>k==='Ctrl'?'Control':k).join('+')}]))}} as const:{}),
         ...(state.clipboard?{clipReceive:state.clipboard.receive ?? true,clipSend:state.clipboard.send ?? true,removeDsStore:state.clipboard.remove_ds_store ?? true}:{}),
         ...(state.audio?{audioEncodingQuality:state.audio.settings.quality??'quality',keepLocalPlayback:state.audio.settings.keep_local_playback,audioDevice:state.audio.settings.receive_output??'default'}:{}),
@@ -148,9 +149,9 @@ export function usePreferences(): PrefsApi {
         if(!current.audio)throw new Error('unavailable');
         await api.setAudioSettings({...(changed('audioEncodingQuality')?{quality:next.audioEncodingQuality}:{}),...(changed('keepLocalPlayback')?{keep_local_playback:next.keepLocalPlayback}:{}),...(changed('audioDevice')?{receive_output:next.audioDevice==='default'?null:next.audioDevice}:{})});
       }
-      if((['showInMenuBar','confirmQuit','notificationLevel','language','logLevel','logMaxMb'] as const).some(changed)){
+      if((['pasteAsFile','showInMenuBar','confirmQuit','notificationLevel','language','logLevel','logMaxMb'] as const).some(changed)){
         if(!appliedLocal)throw new Error('unavailable');
-        await agent.query('localPreferences',()=>call<LocalPreferences>('set_ui_preferences',{settings:{...(changed('notificationLevel')?{notification_level:next.notificationLevel}:{}),...(changed('showInMenuBar')?{show_status_icon:next.showInMenuBar}:{}),...(changed('confirmQuit')?{confirm_quit:next.confirmQuit}:{}),...(changed('language')?{ui_language:next.language}:{}),...(changed('logLevel')?{log_level:next.logLevel}:{}),...(changed('logMaxMb')?{log_max_mb:Number(next.logMaxMb)}:{})}}));
+        await agent.query('localPreferences',()=>call<LocalPreferences>('set_ui_preferences',{settings:{...(changed('pasteAsFile')?{paste_as_file:next.pasteAsFile}:{}),...(changed('notificationLevel')?{notification_level:next.notificationLevel}:{}),...(changed('showInMenuBar')?{show_status_icon:next.showInMenuBar}:{}),...(changed('confirmQuit')?{confirm_quit:next.confirmQuit}:{}),...(changed('language')?{ui_language:next.language}:{}),...(changed('logLevel')?{log_level:next.logLevel}:{}),...(changed('logMaxMb')?{log_max_mb:Number(next.logMaxMb)}:{})}}));
       }
       if((['scrollInvert','keyPreset','keyCustom','capsSplit','allowFnMapping'] as const).some(changed)){
         if(!transform||!current.overview)throw new Error('unavailable');
@@ -162,11 +163,11 @@ export function usePreferences(): PrefsApi {
         await agent.query('report',()=>call<ReportStatus>('report_status'));
       }
       committed.current=next;setPrefs(queued.current??next);
-    }catch{setPrefs(previous);queued.current=null;agent.fail('unavailable');}
+    }catch(error){setPrefs(previous);queued.current=null;const failure=toFailure(error);agent.fail(failure.problem.code,failure.detail);}
     finally{busy.current=false;setPending(false);const follow=queued.current;queued.current=null;if(follow)void save(follow);}
   };
   return{prefs,pending,launchStatus:state.launch,canEdit: key => {
-      if(['language','showInMenuBar','confirmQuit','notificationLevel','logLevel','logMaxMb','theme','accent'].includes(key))return local!==null;
+      if(['pasteAsFile','language','showInMenuBar','confirmQuit','notificationLevel','logLevel','logMaxMb','theme','accent'].includes(key))return local!==null;
       if(['keymap','scrollInvert'].includes(key))return transform!==null;
       if(['pollLimit','pointerGain','keepAwake','pointerTrail','touchpadInject','nativeMultifinger','macScrollFeel','forwardWheelByLines','forwardInjectedInput','takeForegroundOnLeave','escStop'].includes(key)||key.startsWith('sc-'))return state.input!==null;
       if(key.startsWith('clip')||key==='removeDsStore')return state.clipboard!==null;

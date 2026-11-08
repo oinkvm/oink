@@ -1148,8 +1148,21 @@ fn screen_card_commands_release_the_targets_lock_from_either_member() {
                         })
                     })
                     .await;
-                    assert_eq!(b.node.settings().screen_shared, shared);
-                    assert!(a.node.settings().screen_shared);
+                    assert!(
+                        [&a.node, &b.node].into_iter().all(|node| {
+                            node.layout()
+                                .0
+                                .screens
+                                .iter()
+                                .filter(|screen| screen.id.device == target)
+                                .all(|screen| screen.device_hidden == !shared)
+                        }),
+                        "the screen card command must update shared layout visibility on both members"
+                    );
+                    assert!(
+                        b.node.settings().screen_shared && a.node.settings().screen_shared,
+                        "legacy owner visibility preferences remain unchanged"
+                    );
                     a.node.shutdown().await;
                     b.node.shutdown().await;
                 }

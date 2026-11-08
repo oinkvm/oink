@@ -131,6 +131,15 @@ fn read_trail(value: w::TrailContinuation) -> v1::Result<TrailContinuation> {
 
 pub(super) fn encode(value: &ControlMsg) -> v1::Result<Message> {
     Ok(match value {
+        ControlMsg::UnlockQuery { epoch } => {
+            Message::ControlUnlockQuery(w::ControlUnlockQuery::from_raw(map([(1, epoch.write())]))?)
+        }
+        ControlMsg::UnlockReply { epoch, unlocked } => {
+            Message::ControlUnlockReply(w::ControlUnlockReply::from_raw(map([
+                (1, epoch.write()),
+                (2, unlocked.write()),
+            ]))?)
+        }
         ControlMsg::LockRemoteWindows(request) => {
             Message::ControlLockRemoteWindows(w::ControlLockRemoteWindows::from_raw(map([
                 (1, boot(request.source).write()),
@@ -275,6 +284,11 @@ pub(super) fn encode(value: &ControlMsg) -> v1::Result<Message> {
 }
 pub(super) fn decode(value: Message) -> v1::Result<ControlMsg> {
     Ok(match value {
+        Message::ControlUnlockQuery(v) => ControlMsg::UnlockQuery { epoch: v.epoch()? },
+        Message::ControlUnlockReply(v) => ControlMsg::UnlockReply {
+            epoch: v.epoch()?,
+            unlocked: v.unlocked()?,
+        },
         Message::ControlLockRemoteWindows(v) => {
             ControlMsg::LockRemoteWindows(oink_routing::control::WindowsLockRequest {
                 source: read_boot(&v.source()?)?,

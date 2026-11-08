@@ -1,3 +1,4 @@
+import { hotkeyName, profileHotkeyConflict } from './arrange/profileHotkeys';
 import { LayoutProjectionPreview } from './arrange/projection';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Button, Confirmer, Icon, OinkProvider, Toaster, Tooltip, VisuallyHidden, mergeRefs, speed, toast } from 'oink-ui';
@@ -466,6 +467,28 @@ export function App() {
             return null;
         } catch (e) { return failureText(e); }
     };
+    const profileHotkeys = Object.fromEntries((state.input?.hotkeys ?? []).filter(h => h.action === 'switch_layout' && h.profile).map(h => [h.profile!, h.keys.map(k => k === 'Ctrl' ? 'Control' : k).join('+')]));
+    const setProfileHotkey = async (profile: ProfileSummary, keys: string) => {
+        const input = agent.get().input;
+        if (!input) return problemText('unavailable');
+        const clash = profileHotkeyConflict(profile.id, keys, input.hotkeys, profiles?.profiles ?? [], state.cards?.cards ?? []);
+        if (clash) return tr('和「{0}」的快捷键重复', clash);
+        if (keys && [...input.keyboard_release_keys].sort().join('+') === keys.split('+').map(k => k === 'Control' ? 'Ctrl' : k).sort().join('+')) return tr('和「{0}」的快捷键重复', tr('解除本机键盘和鼠标禁用'));
+        const hotkeys = input.hotkeys.filter(h => !(h.action === 'switch_layout' && h.profile === profile.id));
+        if (keys) hotkeys.push({ action: 'switch_layout', profile: profile.id, keys: keys.split('+').map(k => k === 'Control' ? 'Ctrl' : k), enabled: true });
+        try {
+            await api.setInputSettings({ hotkeys });
+            await agent.query('input', api.inputSettings);
+            return null;
+        } catch (e) {
+            if (e instanceof ApiFailure && e.detail?.startsWith('hotkey_conflict:')) {
+                const [action, target] = e.detail.slice('hotkey_conflict:'.length).split(':');
+                const name = action === 'keyboard_release' ? tr('解除本机键盘和鼠标禁用') : hotkeyName({ action: action as import('./api/types').HotkeyAction, device: action === 'move_pointer_to' ? target : undefined, profile: action === 'switch_layout' ? target : undefined, keys: [], enabled: true }, profiles?.profiles ?? [], state.cards?.cards ?? []);
+                return tr('和「{0}」的快捷键重复', name);
+            }
+            return failureText(e);
+        }
+    };
     const deleteProfile = async (profile: ProfileSummary) => {
         const current = agent.get().layoutProfiles;
         if (!current) return;
@@ -591,11 +614,11 @@ export function App() {
     for (const s of menuScreens) if (s.hidden) hiddenScreens.set(s.device, (hiddenScreens.get(s.device) ?? 0) + 1);
     const menu: Omit<SideContextMenuProps, 'children'> = {
         devices, screens: menuScreens,
-        screenEditPending: savingLayout,
+        screenEditPending: savingLayout, editableScreenDevices: editable,
         onHideScreen: id => {
             const present = history.value;
             const key = menuScreens.find(s => s.id === id)?.key;
-            if (!present || !key || savingLayout) return;
+            if (!present || !key || savingLayout || devices.find(d => d.id === key.device)?.group === 'offline') return;
             const patch = { screen: key, disabled: true };
             const disabled = [...present.disabled.filter(d => d.screen.device !== key.device || d.screen.display !== key.display), patch];
             void commitEdit({ ...present, disabled }, tr('隐藏此屏幕'), undefined,
@@ -604,9 +627,24 @@ export function App() {
         // Hiding all turns the device's screen sharing off; showing all turns it back on and
         // clears every per-screen hidden bit of the device, as one undoable edit.
         onScreensHidden: (id, hidden) => {
-            if (hidden) { changeShare(id, 'screen', 'disabled'); return; }
+            if (devices.find(d => d.id === id)?.group === 'offline') {
+                const present = history.value;
+                if (!present || savingLayout) return;
+                const sharing = [{ device: id, shared: !hidden }];
+                const screen_shared = [...(present.screen_shared ?? []).filter(d => d.device !== id), ...sharing];
+                void commitEdit({ ...present, screen_shared }, hidden ? tr('隐藏全部屏幕') : tr('显示全部屏幕'), undefined,
+                    { placements: present.placements, native_plan_tokens: [], disabled: [], screen_shared: sharing }, []);
+                return;
+            }
             const present = history.value;
             if (!present || savingLayout) return;
+            if (hidden) {
+                const sharing = [{ device: id, shared: false }];
+                const screen_shared = [...(present.screen_shared ?? []).filter(d => d.device !== id), ...sharing];
+                void commitEdit({ ...present, screen_shared }, tr('隐藏全部屏幕'), undefined,
+                    { placements: present.placements, native_plan_tokens: [], disabled: [], screen_shared: sharing }, []);
+                return;
+            }
             const patches = present.disabled.filter(d => d.screen.device === id && d.disabled).map(d => ({ screen: d.screen, disabled: false }));
             const sharedNow = present.screen_shared?.find(d => d.device === id)?.shared;
             const off = sharedNow === false || (sharedNow === undefined && devices.find(d => d.id === id)?.screen === 'disabled');
@@ -694,7 +732,7 @@ export function App() {
             <Arrangement platform={platform} screens={visible} geometryScreens={screens} onProjection={previewScreens} onScreensChange={(next, change) => { void saveScreens(next, change.label, change.merge); }} selectedId={selected} onSelect={selectScreen} settings={{ showHotZones: false, snapping: true, compact: compactLayout, padding: navOpen ? 24 : 48, step: 10 }} keyScope={canvas} hintId={hint} selectedGroup={!screenOnly && selectedDevice ? new Set(screens.filter(s => s.device === selectedDevice).map(s => s.id)) : selection.length > 1 ? new Set(selection) : undefined} contextFor={s => `screen:${s.id}`} screenEditable={s => !!s.device && editable.has(s.device) && independent(s)} screenPreview={screenPreview} onScreenMove={move => { void moveScreen(move); }}/>
           </div>
         </div>
-        {settingsMounted && <SettingsPage open={navMode === 'settings'} platform={platform} api={prefs} capsIme={state.input?.mac_caps_switches_input_source ?? null} query={query} jump={jump} onActive={setSection} version={state.boot?.version ?? version} upgrade={{ available: false, next: '' }} perms={permissions} onGrant={grant} onOpenPermissionSettings={openPermissionSettings} onLog={() => { }} onAbout={menu.onAbout} onBlocklist={() => setBlockedOpen(true)} layoutProfiles={<ProfileList state={profiles} onRename={renameProfile} onDelete={deleteProfile}/>} onOnboarding={replayOnboarding}/>}
+        {settingsMounted && <SettingsPage open={navMode === 'settings'} platform={platform} api={prefs} capsIme={state.input?.mac_caps_switches_input_source ?? null} query={query} jump={jump} onActive={setSection} version={state.boot?.version ?? version} upgrade={{ available: false, next: '' }} perms={permissions} onGrant={grant} onOpenPermissionSettings={openPermissionSettings} onLog={() => { }} onAbout={menu.onAbout} onBlocklist={() => setBlockedOpen(true)} layoutProfiles={<ProfileList state={profiles} platform={platform} hotkeys={profileHotkeys} onHotkey={setProfileHotkey} onRename={renameProfile} onDelete={deleteProfile}/>} onOnboarding={replayOnboarding}/>}
       </DesktopWindow>
     </SideContextMenu>;
     // oink-ui ships built-in component strings (default aria labels, key names)

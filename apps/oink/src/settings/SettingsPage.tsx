@@ -6,7 +6,8 @@ import type { MotionMode, ThemeMode } from 'oink-ui';
 import type { Platform } from '../window/DesktopWindow';
 import { ACCENT_SWATCHES, DEFAULT_ACCENT } from './appearance';
 import type { ReceivedFilesCleanup } from '../api/types';
-import { api as backend, shell } from '../api/client';
+import { ApiFailure, api as backend, shell } from '../api/client';
+import type { AutoUnlockFailure, AutoUnlockStatus } from '../api/client';
 import { agent, useAgent } from '../api/store';
 import { MicrophoneInput } from './MicrophoneInput';
 import { ScreenPointerGains } from './ScreenPointerGains';
@@ -19,6 +20,7 @@ import { PermissionRow } from '../permissions/PermissionRow';
 import { PermissionControl } from '../permissions/PermissionControl';
 import { useGrant } from './useGrant';
 import { UninstallControl } from './UninstallControl';
+import { AutoUnlockControl } from './AutoUnlock';
 import { UpdateCheck, UpdatePreferences, manualUpdates } from './UpdatePreferences';
 import { SHORTCUTS, deviceShortcuts, ShortcutRecorder, spokenKeys } from './Shortcuts';
 import type { ShortcutId } from './Shortcuts';
@@ -42,6 +44,14 @@ function hl(s: string, q: string): ReactNode {
         return s;
     return <>{s.slice(0, i)}<mark className="setp__hit">{s.slice(i, i + k.length)}</mark>{s.slice(i + k.length)}</>;
 }
+function autoUnlockFailureText(failure: AutoUnlockFailure): string {
+    switch (failure) {
+        case 'password_incorrect': return tr('上次解锁失败：密码错误，请修改密码');
+        case 'windows_hello_only': return tr('上次解锁失败：已开启“仅允许 Windows Hello 登录”，请在设置中关闭');
+        case 'login_ui_not_ready': return tr('上次解锁失败：登录界面未就绪，请检查锁屏状态后重试');
+        case 'unknown': return tr('上次解锁失败：未知原因，请检查设置和登录界面');
+    }
+}
 const formatSize = (b: number) => {
     const units = ['B', 'KB', 'MB', 'GB'];
     let i = 0;
@@ -52,7 +62,7 @@ const formatSize = (b: number) => {
     }
     return `${i === 0 ? v : v.toFixed(1)} ${units[i]}`;
 };
-export function SettingsPage({ open, platform, api, capsIme, query, jump, onActive, version, perms, onGrant, onOpenPermissionSettings, onLog, onAbout, onBlocklist, layoutProfiles, onOnboarding, }: {
+export function SettingsPage({ open, platform, api, capsIme, query, jump, onActive, version, perms, onGrant, onOpenPermissionSettings, onLog, onAbout, onBlocklist, layoutProfiles, onOnboarding, autoUnlockFixture, }: {
     open: boolean;
     platform: Platform;
     api: PrefsApi;
@@ -74,6 +84,8 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
     /** Settings › Layout's profile list (create, rename, delete), owned by the app. */
     layoutProfiles?: ReactNode;
     onOnboarding?: () => void;
+    /** Development fixture input; when present no local backend is queried. */
+    autoUnlockFixture?: AutoUnlockStatus;
 }) {
     const { prefs, set } = api;
     const [logDraft,setLogDraft] = useState(prefs.logMaxMb);
@@ -86,13 +98,14 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
     const arrangement = agentState.layoutProfiles?.devices.find(d => d.device === agentState.overview?.this_device.id);
     const [syncPending, setSyncPending] = useState(false);
     const applicable = (item: ItemMeta) => (item.id !== 'perm-network' || perms.network !== 'not_required')
-        && (item.id !== 'syncSystemArrangement' || arrangement?.availability !== 'unsupported');
+        && (!['syncSystemArrangement', 'disableHiddenDisplays'].includes(item.id) || arrangement?.availability !== 'unsupported');
     const contactsAvailable = agentState.input?.contacts_injection_available === true;
-    const setSync = async (enabled: boolean, label: string) => {
+    const setSync = async (enabled: boolean, label: string, hiddenDisplays = false) => {
         if (!arrangement) return;
         setSyncPending(true);
         try {
-            agent.adoptProfiles(await backend.setSyncSystemArrangement({ request_id: crypto.randomUUID(), device: arrangement.device, expected_preference_token: arrangement.preference_token, enabled }));
+            const write = hiddenDisplays ? backend.setDisableHiddenDisplays : backend.setSyncSystemArrangement;
+            agent.adoptProfiles(await write({ request_id: crypto.randomUUID(), device: arrangement.device, expected_preference_token: arrangement.preference_token, enabled }));
             onLog(`${label}：${enabled ? tr('开') : tr('关')}`);
         } catch (e) {
             toast.danger({ title: tr('无法更改「{0}」', label), description: e instanceof LayoutProfileFailure ? profileErrorText(e.problem) : tr('不可用') });
@@ -156,6 +169,30 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
     },[open]);
     const received=agentState.receivedFiles;
     const [receivedSaving,setReceivedSaving]=useState(false);
+    const [autoUnlock,setAutoUnlock]=useState<AutoUnlockStatus|null>(null);
+    const autoUnlockRevision=useRef(0);
+    useEffect(()=>{
+        if(!open) return;
+        if (autoUnlockFixture) {
+            setAutoUnlock(autoUnlockFixture);
+            return;
+        }
+        let active=true;
+        const refresh=()=>{const revision=autoUnlockRevision.current;void backend.autoUnlockStatus().then(value=>{if(active && revision===autoUnlockRevision.current)setAutoUnlock(value);}).catch(()=>{if(active && revision===autoUnlockRevision.current)setAutoUnlock(null);});};
+        refresh();
+        const timer=window.setInterval(refresh,1000);
+        return ()=>{active=false;window.clearInterval(timer);};
+    },[open, autoUnlockFixture]);
+    const saveAutoUnlock=async(password:string)=>{
+        autoUnlockRevision.current++;
+        try {await backend.saveAutoUnlock(password);autoUnlockRevision.current++;setAutoUnlock(await backend.autoUnlockStatus());return null;}
+        catch (error) {return error instanceof ApiFailure && error.detail === '密码不正确' ? tr('密码不正确') : tr('无法保存登录密码');}
+    };
+    const disableAutoUnlock=async()=>{
+        autoUnlockRevision.current++;
+        try {await backend.disableAutoUnlock();autoUnlockRevision.current++;setAutoUnlock(await backend.autoUnlockStatus());}
+        catch {toast.danger({title:tr('无法更改「{0}」',tr('自动解锁本机')),description:tr('不可用')});}
+    };
     const openReceived=()=>{void backend.openReceivedFiles().catch(()=>agent.fail('unavailable'));};
     const setReceivedCleanup=async(value:ReceivedFilesCleanup)=>{
         if(receivedSaving) return;
@@ -251,6 +288,7 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
             }
             case 'showInMenuBar':
             case 'confirmQuit':
+            case 'pasteAsFile':
             case 'escStop':
             case 'scrollInvert':
             case 'forwardWheelByLines':
@@ -271,6 +309,12 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
             case 'nativeMultifinger': return { node: <Switch aria-label={label} checked={prefs.nativeMultifinger} onChange={toggle('nativeMultifinger',label)} disabled={!contactsAvailable || !prefs.touchpadInject}/> };
             case 'macScrollFeel': return { node: <Switch aria-label={label} checked={prefs.macScrollFeel} onChange={toggle('macScrollFeel',label)} disabled={!contactsAvailable || !prefs.touchpadInject}/> };
             case 'hideSponsor': return { node: <Switch aria-label={label} checked={api.presentation?.hide_sponsor ?? false} onChange={v => api.savePresentation({ hide_sponsor: v })}/> };
+            case 'autoUnlock': return {
+                desc: platform === 'win' && autoUnlock?.enabled && autoUnlock.windows_hello_only
+                    ? tr('自动解锁不可用：请在系统设置中关闭“仅允许 Windows Hello 登录”')
+                    : autoUnlock?.failure ? autoUnlockFailureText(autoUnlock.failure) : undefined,
+                node: <AutoUnlockControl platform={platform} enabled={autoUnlock?.enabled ?? false} failure={autoUnlock?.failure ?? null} windowsHelloOnly={platform === 'win' && (autoUnlock?.windows_hello_only ?? false)} label={label} onSave={saveAutoUnlock} onDisable={disableAutoUnlock}/>,
+            };
             case 'onboarding': return { node: <Button size="sm" onClick={onOnboarding}>{tr('显示')}</Button> };
             case 'uninstall': return { node: <UninstallControl/> };
             case 'blocklist':
@@ -279,8 +323,12 @@ export function SettingsPage({ open, platform, api, capsIme, query, jump, onActi
                 const ready = agentState.layoutProfiles?.readiness === 'ready' && arrangement?.availability === 'ready';
                 return {
                     desc: arrangement?.availability === 'unavailable' ? <>{text(item.desc, platform)} · {tr('暂时读不到系统屏幕排列')}</> : undefined,
-                    node: <Switch aria-label={label} checked={arrangement?.sync_system_arrangement ?? false} disabled={!ready || syncPending} onChange={v => { void setSync(v, label); }}/>,
+                    node: <Switch aria-label={label} checked={arrangement?.sync_system_arrangement ?? true} disabled={!ready || syncPending} onChange={v => { void setSync(v, label); }}/>,
                 };
+            }
+            case 'disableHiddenDisplays': {
+                const ready = agentState.layoutProfiles?.readiness === 'ready' && arrangement?.availability === 'ready';
+                return { node: <Switch aria-label={label} checked={arrangement?.disable_hidden_displays ?? false} disabled={!ready || !arrangement?.sync_system_arrangement || syncPending} onChange={v => { void setSync(v, label, true); }}/> };
             }
             case 'manageLayouts':
                 return { node: layoutProfiles ?? null, stack: true };

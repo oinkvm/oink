@@ -1,0 +1,4 @@
+LIBRARY OinkPasteMenu
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE

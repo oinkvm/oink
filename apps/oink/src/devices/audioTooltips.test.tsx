@@ -75,7 +75,7 @@ it.each((['keyboard','mouse'] as const).flatMap(kind=>(['shared','local','disabl
   const action=mode==='disabled'?'恢复共享':mode==='shared'?'停止共享':'切换为共享';
   expect([...screen.getByRole('tooltip').querySelectorAll('.dev-ico__tip > span')].map(line=>line.textContent)).toEqual([
     `${kind==='keyboard'?'键盘':'鼠标'}：${state}`,`单击：${action}`,
-    ...(mode!=='disabled'&&(kind==='keyboard'||canDisableMouse)?['双击：禁用']:[]),
+    ...(mode!=='disabled'&&(kind==='keyboard'||canDisableMouse)?['双击：禁用（防误触）']:[]),
   ]);
 });
 
@@ -89,7 +89,7 @@ it.each((['en','ja','ko'] as const).flatMap((language,index)=>(['keyboard','mous
   const single={shared:['Stop sharing','共有を停止','공유 중지'],local:['Switch to Shared','共有に切り替え','공유(으)로 전환'],disabled:['Resume sharing','共有を再開','공유 재개']}[mode][index];
   expect([...screen.getByRole('tooltip').querySelectorAll('.dev-ico__tip > span')].map(line=>line.textContent)).toEqual([
     name+[': ','：',': '][index]+state,['Click: ','クリック：','클릭: '][index]+single,
-    ...(mode==='disabled'?[]:[['Double-click: Disable','ダブルクリック：無効にする','두 번 클릭: 사용 안 함'][index]]),
+    ...(mode==='disabled'?[]:[['Double-click: Disable (prevents accidental input)','ダブルクリック：無効にする（誤操作防止）','두 번 클릭: 사용 안 함 (오조작 방지)'][index]]),
   ]);
 });
 it.each((['keyboard','mouse'] as const).flatMap(kind=>[

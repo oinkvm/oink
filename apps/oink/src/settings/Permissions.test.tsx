@@ -17,7 +17,7 @@ beforeAll(() => {
   vi.spyOn(backend, 'cacheUsage').mockResolvedValue([]);
 });
 afterEach(cleanup);
-it.each(['en','ja','ko','zh-Hans'])('shows default-off external forwarding only on Windows and searches it in %s', language => {
+it.each(['en','ja','ko','zh-Hans'])('shows default-on external forwarding only on Windows and searches it in %s', language => {
   setLanguage(language);
   const set=vi.fn();
   const {container,unmount}=render(view(initial,'',vi.fn(),undefined,'win',{...prefs,set}));
@@ -25,9 +25,9 @@ it.each(['en','ja','ko','zh-Hans'])('shows default-off external forwarding only 
   expect(row).not.toBeNull();
   expect(row.classList.contains('ok-row--stack')).toBe(false);
   const control=within(row).getByRole('switch') as HTMLInputElement;
-  expect(control.checked).toBe(false);
+  expect(control.checked).toBe(true);
   fireEvent.click(control);
-  expect(set).toHaveBeenCalledWith('forwardInjectedInput',true);
+  expect(set).toHaveBeenCalledWith('forwardInjectedInput',false);
   const item=sectionsFor('win').flatMap(section=>section.items).find(item=>item.id==='forwardInjectedInput')!;
   if(language==='en') {
     expect(item.label).toBe('Forward injected input');

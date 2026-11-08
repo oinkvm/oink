@@ -404,6 +404,17 @@ fn allowed(name: &str) -> bool {
             | "placeholder_prepare_us"
             | "placeholder_final_us"
             | "placeholder_fallback"
+            | "auto_unlock_event"
+            | "auto_unlock_session_locked"
+            | "auto_unlock_observation_source"
+            | "auto_unlock_wts_error_code"
+            | "auto_unlock_wts_query_failed"
+            | "auto_unlock_source_status"
+            | "auto_unlock_entry_rejection"
+            | "auto_unlock_observation_us"
+            | "auto_unlock_flow_stage"
+            | "auto_unlock_flow_epoch"
+            | "auto_unlock_flow_outcome"
     )
 }
 impl Scalars {
@@ -504,6 +515,16 @@ impl Scalars {
             matches!(
                 f.name(),
                 "elapsed_ms"
+                    | "link_id"
+                    | "peer_data_known"
+                    | "peer_data_age_ms"
+                    | "heartbeat_known"
+                    | "heartbeat_age_ms"
+                    | "pong_known"
+                    | "pong_age_ms"
+                    | "context_age_ms"
+                    | "selected"
+                    | "dropped"
                     | "os_error"
                     | "os_error_known"
                     | "duration_ms"
@@ -601,6 +622,17 @@ impl Scalars {
                     | "bytes"
                     | "total_bytes"
                     | "file_count"
+                    | "auto_unlock_event"
+                    | "auto_unlock_session_locked"
+                    | "auto_unlock_observation_source"
+                    | "auto_unlock_wts_error_code"
+                    | "auto_unlock_wts_query_failed"
+                    | "auto_unlock_source_status"
+                    | "auto_unlock_entry_rejection"
+                    | "auto_unlock_observation_us"
+                    | "auto_unlock_flow_stage"
+                    | "auto_unlock_flow_epoch"
+                    | "auto_unlock_flow_outcome"
             )
         } else {
             allowed(f.name())
@@ -776,6 +808,7 @@ impl Visit for Scalars {
                 "kind" => matches!(
                     value,
                     "path_transition"
+                        | "link_lost"
                         | "udp_send"
                         | "candidate_dial"
                         | "connection_step"
@@ -1074,6 +1107,7 @@ pub(crate) fn bundle_only_target(target: &str) -> bool {
             | "oink_collection_diagnostics"
             | "oink_audio_diagnostics"
             | "oink_overlay_diagnostics"
+            | "oink_auto_unlock_diagnostics"
             | "oink_windows_external_input"
             | "oink_touchpad_diagnostics"
     )
@@ -1291,6 +1325,39 @@ mod tests {
         );
     }
     use tracing_subscriber::layer::SubscriberExt;
+
+    #[test]
+    fn auto_unlock_diagnostic_scalars_keep_lock_state_source_and_gate_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::start(dir.path().into(), DeviceId([93; 32]), None, true).unwrap();
+        recorder.wait_recovery();
+        let subscriber = tracing_subscriber::registry().with(scoped(&recorder));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "oink_auto_unlock_diagnostics",
+                auto_unlock_event = 1_u64,
+                auto_unlock_session_locked = -1_i64,
+                auto_unlock_observation_source = 2_u64,
+                auto_unlock_wts_error_code = 0_u32,
+                auto_unlock_wts_query_failed = false,
+                auto_unlock_source_status = 4_u64,
+                auto_unlock_entry_rejection = 3_u64,
+                "automatic unlock diagnostic sample"
+            );
+        });
+        let row = std::iter::from_fn(|| recorder.inner.queue.load().pop()).find_map(|row| match row.event {
+            Event::Log {
+                module, fields, labels, ..
+            } if module == "oink_auto_unlock_diagnostics" => Some((fields, labels)),
+            _ => None,
+        });
+        recorder.shutdown();
+        let (fields, labels) = row.expect("automatic unlock diagnostic must enter the ring");
+        assert!(labels.is_empty());
+        assert!(fields.contains(&("auto_unlock_session_locked".into(), -1.)));
+        assert!(fields.contains(&("auto_unlock_observation_source".into(), 2.)));
+        assert!(fields.contains(&("auto_unlock_entry_rejection".into(), 3.)));
+    }
 
     #[test]
     fn drag_panel_recovery_warning_reaches_the_ring_with_ownership_fields() {

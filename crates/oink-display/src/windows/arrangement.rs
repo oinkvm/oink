@@ -10,15 +10,15 @@ use windows::Win32::{
     Graphics::Gdi::DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE,
 };
 
-struct Snapshot {
-    paths: Vec<DISPLAYCONFIG_PATH_INFO>,
-    modes: Vec<DISPLAYCONFIG_MODE_INFO>,
-    configuration: NativeConfiguration,
+pub(super) struct Snapshot {
+    pub(super) paths: Vec<DISPLAYCONFIG_PATH_INFO>,
+    pub(super) modes: Vec<DISPLAYCONFIG_MODE_INFO>,
+    pub(super) configuration: NativeConfiguration,
     // Every target, including clone followers with independent source modes.
-    sources: BTreeMap<String, usize>,
+    pub(super) sources: BTreeMap<String, usize>,
 }
 
-fn source_index(path: &DISPLAYCONFIG_PATH_INFO) -> u32 {
+pub(super) fn source_index(path: &DISPLAYCONFIG_PATH_INFO) -> u32 {
     // SAFETY: both union representations contain the same initialized u32. With
     // virtual awareness the high 16 bits are sourceModeInfoIdx, not the full word.
     let value = unsafe { path.sourceInfo.Anonymous.modeInfoIdx };
@@ -30,7 +30,12 @@ fn source_index(path: &DISPLAYCONFIG_PATH_INFO) -> u32 {
 }
 
 fn query() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), DisplayError> {
-    let flags = QDC_ONLY_ACTIVE_PATHS | QDC_VIRTUAL_MODE_AWARE;
+    query_with_flags(QDC_ONLY_ACTIVE_PATHS | QDC_VIRTUAL_MODE_AWARE)
+}
+
+pub(super) fn query_with_flags(
+    flags: QUERY_DISPLAY_CONFIG_FLAGS,
+) -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), DisplayError> {
     for _ in 0..4 {
         let (mut np, mut nm) = (0, 0);
         // SAFETY: output pointers refer to live local counts.
@@ -72,7 +77,7 @@ fn query() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>
     Err(ArrangementError::Changed.into())
 }
 
-fn target_name(path: &DISPLAYCONFIG_PATH_INFO, display_paths: usize) -> Result<String, DisplayError> {
+pub(super) fn target_name(path: &DISPLAYCONFIG_PATH_INFO, display_paths: usize) -> Result<String, DisplayError> {
     let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME {
         header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
             r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
@@ -103,7 +108,7 @@ fn target_name(path: &DISPLAYCONFIG_PATH_INFO, display_paths: usize) -> Result<S
     Ok(key)
 }
 
-fn read() -> Result<Snapshot, DisplayError> {
+pub(super) fn read() -> Result<Snapshot, DisplayError> {
     let (paths, modes) = query()?;
     let visible = super::enumerate::displays().inspect_err(|error| {
         tracing::warn!(target: "oink_arrangement", operation = "enumerate",
@@ -221,7 +226,7 @@ pub(super) fn configuration() -> Result<NativeConfiguration, DisplayError> {
     read().map(|s| s.configuration)
 }
 
-fn patch_sources(
+pub(super) fn patch_sources(
     modes: &mut [DISPLAYCONFIG_MODE_INFO],
     sources: &BTreeMap<String, usize>,
     target: &NativeConfiguration,
@@ -243,9 +248,9 @@ fn patch_sources(
     Ok(())
 }
 
-const VALIDATE: SET_DISPLAY_CONFIG_FLAGS =
+pub(super) const VALIDATE: SET_DISPLAY_CONFIG_FLAGS =
     SET_DISPLAY_CONFIG_FLAGS(SDC_VALIDATE.0 | SDC_USE_SUPPLIED_DISPLAY_CONFIG.0 | SDC_VIRTUAL_MODE_AWARE.0);
-const APPLY: SET_DISPLAY_CONFIG_FLAGS =
+pub(super) const APPLY: SET_DISPLAY_CONFIG_FLAGS =
     SET_DISPLAY_CONFIG_FLAGS(SDC_APPLY.0 | SDC_USE_SUPPLIED_DISPLAY_CONFIG.0 | SDC_VIRTUAL_MODE_AWARE.0);
 
 pub(super) fn apply(

@@ -378,8 +378,36 @@ pub(crate) fn build_drag(spec: NativeSpec) -> Result<Target, ClipboardError> {
 pub(crate) fn build(spec: NativeSpec) -> Result<Target, ClipboardError> {
     build_inner(spec, true)
 }
-fn build_inner(spec: NativeSpec, clipboard: bool) -> Result<Target, ClipboardError> {
+fn build_inner(mut spec: NativeSpec, clipboard: bool) -> Result<Target, ClipboardError> {
     let foreign = spec.inventory.platform != ClipPlatform::Windows;
+    if clipboard && !foreign {
+        // Windows 11 (26200.9711) history selects the first OLE bitmap and wraps
+        // DIBV5 with bfOffBits=14, which WIC cannot decode. A native OLE comparison
+        // decodes the same pixels with DIB first. Reorder only these equivalent
+        // ordinary bitmap slots within each item of this target's inventory:
+        // formats_with_files rebuilds enumeration from that inventory as well.
+        // Other positions, explicit PNG/V5 bytes, lazy reads and drag order stay
+        // intact; the source provider still reads by the original representation IDs.
+        for item in &mut spec.inventory.items {
+            let bitmap = |cf| {
+                item.representations.iter().position(|rep| {
+                    rep.format == NativeFormat::WindowsPredefined(cf)
+                        && rep.medium == Medium::HGlobal
+                        && rep.aspect == DVASPECT_CONTENT.0
+                        && rep.index == -1
+                        && !matches!(
+                            rep.data,
+                            RepresentationData::File(_) | RepresentationData::Unavailable(_)
+                        )
+                })
+            };
+            if let (Some(v5), Some(dib)) = (bitmap(17), bitmap(8))
+                && v5 < dib
+            {
+                item.representations.swap(v5, dib);
+            }
+        }
+    }
     let mut bindings = Vec::<Binding>::new();
     for rep in spec.inventory.wanted(ClipPlatform::Windows) {
         if matches!(rep.data, RepresentationData::File(_)) {
@@ -681,6 +709,101 @@ pub(crate) mod tests {
                     assert_eq!(&bytes[52..56], &0xff00_0000_u32.to_le_bytes());
                 }
             }
+        });
+    }
+    #[test]
+    fn windows_image_history_prefers_dib_preserving_other_formats_and_lazy_bytes() {
+        use crate::content::url::tests::source;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        super::super::tests::sta(|| {
+            struct Counted {
+                inner: crate::content::url::tests::Memory,
+                opens: Arc<AtomicUsize>,
+            }
+            impl Provider for Counted {
+                fn inventory(&self) -> Inventory {
+                    self.inner.inventory()
+                }
+                fn translator(&self) -> Arc<dyn Translator> {
+                    self.inner.translator()
+                }
+                fn open(&self, id: RepresentationId) -> io::Result<crate::FileReader> {
+                    self.opens.fetch_add(1, Ordering::Relaxed);
+                    self.inner.open(id)
+                }
+            }
+            let png = super::super::super::formats().png as u16;
+            let image = super::super::super::prepare(
+                &[crate::ClipData::Png(crate::dnd::preview::asymmetric_png())],
+                crate::Sensitivity::Normal,
+            );
+            let dib = image.iter().find(|(cf, _)| *cf == 8).unwrap().1.clone();
+            let v5 = image.iter().find(|(cf, _)| *cf == 17).unwrap().1.clone();
+            let png_bytes = image.iter().find(|(cf, _)| *cf == png as u32).unwrap().1.clone();
+            let mut memory = source(
+                ClipPlatform::Windows,
+                &[
+                    ("before", vec![1]),
+                    ("v5", v5.clone()),
+                    ("between", vec![2]),
+                    ("PNG", png_bytes.clone()),
+                    ("dib", dib.clone()),
+                    ("after", vec![3]),
+                ],
+            );
+            memory.inventory.items[0].representations[1].format = NativeFormat::WindowsPredefined(17);
+            memory.inventory.items[0].representations[4].format = NativeFormat::WindowsPredefined(8);
+            let original: Vec<_> = memory.inventory.items[0]
+                .representations
+                .iter()
+                .map(|r| format_id(&r.format).unwrap())
+                .collect();
+            let opens = Arc::new(AtomicUsize::new(0));
+            let spec = NativeSpec {
+                inventory: memory.inventory(),
+                contents: Arc::new(Counted {
+                    inner: memory,
+                    opens: opens.clone(),
+                }),
+                files: vec![],
+                file_contents: None,
+                sensitivity: crate::Sensitivity::Normal,
+            };
+            assert_eq!(
+                build_drag(spec.clone())
+                    .unwrap()
+                    .formats()
+                    .iter()
+                    .map(|f| f.cfFormat)
+                    .collect::<Vec<_>>(),
+                original
+            );
+            let target = build(spec).unwrap();
+            let mut expected = original;
+            expected.swap(1, 4);
+            assert_eq!(
+                target.formats().iter().map(|f| f.cfFormat).collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                target
+                    .formats_with_files(&[])
+                    .iter()
+                    .map(|f| f.cfFormat)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(opens.load(Ordering::Relaxed), 0);
+            for (cf, expected) in [(8, dib), (17, v5), (png, png_bytes)] {
+                let format = target.formats().into_iter().find(|f| f.cfFormat == cf).unwrap();
+                let mut value = target
+                    .get(&format, || super::diagnostics::Publication::new().observe(None))
+                    .unwrap();
+                assert_eq!(medium::serialize(&value, Medium::HGlobal).unwrap(), expected);
+                // SAFETY: get returned an owned medium; release exactly once.
+                unsafe { ReleaseStgMedium(&mut value) };
+            }
+            assert_eq!(opens.load(Ordering::Relaxed), 3);
         });
     }
     #[test]

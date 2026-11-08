@@ -257,7 +257,6 @@ impl InputStreams {
     pub fn new(links: LinkLayer, config: ConfigModule, input: Arc<InputThread>, controllable: bool) -> Self {
         let touchpad_contacts = input.touchpad_contacts();
         let paused = config.applied().paused;
-        input.send(InputCommand::LocalDisplays(config.local_displays().displays.clone()));
         input.send(InputCommand::Controllable(controllable));
         input.send(InputCommand::Paused(paused));
         Self {
@@ -331,7 +330,9 @@ impl InputStreams {
                     Some(crate::config_module::ConfigChange::Facts { device, capabilities_changed }) => {
                         self.facts_changed(device,capabilities_changed);
                     },
-                    Some(crate::config_module::ConfigChange::LocalDisplays) => self.input.send(InputCommand::LocalDisplays(self.config.local_displays().displays.clone())),
+                    // The platform observer owns active native input geometry.
+                    // Config facts also retain OS-disabled screens for the editor.
+                    Some(crate::config_module::ConfigChange::LocalDisplays) => self.input.wake()(),
                     Some(_) => {
                         self.input.wake()(); // Apply the shared layout even when native capability stays None (Mac source).
                         self.refresh_contacts();

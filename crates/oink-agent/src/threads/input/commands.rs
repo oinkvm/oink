@@ -18,7 +18,7 @@ type StateKey = (u8, Option<oink_foundation::DeviceId>);
 fn state_key(command: &InputCommand) -> Option<StateKey> {
     use InputCommand::*;
     let kind = match command {
-        DndPrepared(_) => return None,
+        DndPrepared(_) | RecordMouseShortcut { .. } => return None,
         #[cfg(debug_assertions)]
         DndWatchdogSnapshotForTest(_) => return None,
         Paused(_) => 0,
@@ -63,6 +63,8 @@ fn state_key(command: &InputCommand) -> Option<StateKey> {
         | PeerMessage { .. }
         | DndDeliveryReceipt { .. }
         | DndContentDemand { .. }
+        | LocalUnlock { .. }
+        | UnlockReplyReady { .. }
         | SendMessage { .. } => return None,
     };
     Some((kind, None))

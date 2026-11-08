@@ -159,10 +159,9 @@ impl Owner {
             return Err(invalid("layout dependency belongs to another group"));
         }
         if !self.display_layout_pending()?
-            || self
-                .display_layout_dependency
-                .as_ref()
-                .is_some_and(|(_, current)| v1::retained::version_cmp(current, &version).is_ok_and(|o| o.is_lt()))
+            || self.display_layout_dependency.as_ref().is_some_and(|(_, current)| {
+                v1::retained::layout_version_cmp(current, &version).is_ok_and(|o| o.is_lt())
+            })
         {
             self.display_layout_dependency = Some((group, version));
         }
@@ -174,7 +173,9 @@ impl Owner {
         };
         let current = self.state.layout().and_then(|r| r.version()).map_err(internal)?;
         if *group == self.state.roster().anchor().group
-            && v1::retained::version_cmp(&current, version).map_err(internal)?.is_lt()
+            && v1::retained::layout_version_cmp(&current, version)
+                .map_err(internal)?
+                .is_lt()
         {
             return Ok(true);
         }
@@ -201,7 +202,7 @@ impl Owner {
             return Ok(());
         }
         let register = self.state.layout().map_err(internal)?;
-        let layout = dto::LayoutValue::from_raw(register.value().map_err(internal)?).map_err(internal)?;
+        let layout = v1::layout::register_value(&register).map_err(internal)?;
         let members = self.state.roster().members().map(|m| m.device).collect::<Vec<_>>();
         let update = layout_wire::sync_local_displays(
             &layout,
@@ -325,7 +326,7 @@ impl Owner {
             tracing::warn!(%error, "could not persist last live link time; will retry");
         }
         let register = self.state.layout().map_err(internal)?;
-        let value = dto::LayoutValue::from_raw(register.value().map_err(internal)?).map_err(internal)?;
+        let value = v1::layout::register_value(&register).map_err(internal)?;
         let mut layout = layout_wire::from_wire(&value).map_err(internal)?;
         // Retained geometry is replicated verbatim, while executable geometry
         // can only reference current members. Offline members remain in the roster.
@@ -681,9 +682,13 @@ impl Owner {
         source: dto::LayoutSource,
     ) -> ApiResult<()> {
         let register = self.state.layout().map_err(internal)?;
-        let before = dto::LayoutValue::from_raw(register.value().map_err(internal)?).map_err(internal)?;
+        let before = v1::layout::register_value(&register).map_err(internal)?;
         let mut domain = layout_wire::from_wire(&before).map_err(internal)?;
+        let previous = domain.clone();
         edit(&mut domain);
+        // Author the visibility and its rigid-device collision repair in one
+        // register edit. Remote acceptance never changes the winning geometry.
+        domain.repair_unhidden_screens(&previous);
         let after = layout_wire::to_wire(&domain, source).map_err(internal)?;
         let mut stored = self.stored.clone();
         stored
@@ -710,7 +715,7 @@ impl Owner {
             return Ok(());
         }
         let register = self.state.layout().map_err(internal)?;
-        let before = dto::LayoutValue::from_raw(register.value().map_err(internal)?).map_err(internal)?;
+        let before = v1::layout::register_value(&register).map_err(internal)?;
         let members = self.state.roster().members().map(|m| m.device).collect::<Vec<_>>();
         let update = layout_wire::sync_local_displays(
             &before,

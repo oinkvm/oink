@@ -851,3 +851,84 @@ fn modifier_probe_does_not_run_on_ticks_or_for_swallowed_remote_presses() {
     source.retarget_modifiers();
     assert!(source.keys.contains_key(&KeyCode::LEFT_GUI));
 }
+
+#[test]
+fn replacement_local_up_retires_only_local_routes_and_their_physical_observations() {
+    for code in [KeyCode::LEFT_GUI, KeyCode::keyboard(4), KeyCode::ESCAPE] {
+        let mut source = router(Os::Windows);
+        source.test_connect(SOURCE, 0);
+        assert_eq!(physical(&mut source, code, true), Disposition::Pass);
+        let release = CapturedEvent {
+            event: InputEvent::Key { code, pressed: false },
+            physical: false,
+            source: oink_foundation::input::SourceKind::Unknown,
+            time_us: 1,
+            cursor: None,
+        };
+        let retired = source.release_local_passed_key(&release, 1);
+        source.holder = SOURCE;
+        source.retarget_modifiers();
+        assert!(!source.drain_outputs().iter().any(|o| matches!(o,
+            Output::Send { msg: Message::Input(InputMsg::Key { code: sent, .. }), .. } if *sent == code
+        )));
+        assert!(source.heartbeat_messages(SOURCE).iter().all(|m| !matches!(m,
+            Message::Input(InputMsg::HeldSync { keys, .. }) if keys.contains(&code)
+        )));
+        assert!(retired);
+        assert!(!source.keys.contains_key(&code));
+        assert!(!source.physical_keys.contains(&code));
+        assert!(!source.lock_escape_keys.contains(&code));
+        assert!(!source.keyboard_pointer_modifiers().contains(&code));
+        if code == KeyCode::ESCAPE {
+            assert!(source.esc_down_at.is_none());
+        }
+    }
+}
+
+#[test]
+fn replacement_local_up_preserves_remote_crossed_and_locally_injected_press_routes() {
+    for targets in [
+        vec![Target::Remote(SOURCE)],
+        vec![Target::Local, Target::Remote(SOURCE)],
+        vec![Target::LocalInjected],
+    ] {
+        let mut source = router(Os::Windows);
+        source.keys.insert(KeyCode::LEFT_GUI, targets.clone());
+        source.physical_keys.insert(KeyCode::LEFT_GUI);
+        let release = CapturedEvent {
+            event: InputEvent::Key {
+                code: KeyCode::LEFT_GUI,
+                pressed: false,
+            },
+            physical: false,
+            source: oink_foundation::input::SourceKind::Unknown,
+            time_us: 1,
+            cursor: None,
+        };
+        assert!(!source.release_local_passed_key(&release, 1));
+        assert_eq!(source.keys.get(&KeyCode::LEFT_GUI), Some(&targets));
+        assert!(source.physical_keys.contains(&KeyCode::LEFT_GUI));
+        assert!(source.drain_outputs().is_empty());
+    }
+}
+
+#[test]
+fn forwarded_replacement_local_up_also_retires_the_local_physical_observation() {
+    let mut source = router(Os::Windows);
+    assert_eq!(physical(&mut source, KeyCode::LEFT_GUI, true), Disposition::Pass);
+    let release = CapturedEvent {
+        event: InputEvent::Key {
+            code: KeyCode::LEFT_GUI,
+            pressed: false,
+        },
+        physical: false,
+        source: oink_foundation::input::SourceKind::Unknown,
+        time_us: 1,
+        cursor: None,
+    };
+    assert_eq!(source.on_local_event(&release, 1), Disposition::Pass);
+    assert!(!source.keys.contains_key(&KeyCode::LEFT_GUI));
+    assert!(!source.physical_keys.contains(&KeyCode::LEFT_GUI));
+    assert!(!source.lock_escape_keys.contains(&KeyCode::LEFT_GUI));
+    assert!(!source.keyboard_pointer_modifiers().contains(&KeyCode::LEFT_GUI));
+}

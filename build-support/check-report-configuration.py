@@ -117,7 +117,8 @@ def main():
         from identity import IDENTITY
         from signing import private_run, ticket_operation
         from macos_imports import verify_imports
-        from macos_registration import temporary_registration
+        from macos_registration import temporary_registrations
+        architecture = {'arm64': 'arm64', 'x64': 'x86_64'}[record['architecture']]
         dmg = package / next(x['name'] for x in record['artifacts'] if x['name'].endswith('.dmg'))
         ticket_operation('validate', dmg)
         private_run('spctl', '--assess', '--type', 'open', '--context', 'context:primary-signature', dmg)
@@ -125,13 +126,15 @@ def main():
         with tempfile.TemporaryDirectory(suffix='.noindex') as tmp:
             subprocess.run(['ditto', '-x', '-k', str(archive), tmp], check=True)
             app = Path(tmp) / 'Oink.app'
-            verify_app(app, IDENTITY); verify_imports([app], '14.2')
+            verify_app(app, IDENTITY, architecture); verify_imports([app], '14.2')
             ticket_operation('validate', app)
             private_run('spctl', '--assess', '--type', 'exec', app)
             assert all(private in (app / 'Contents/MacOS' / name).read_bytes() for name in ['oink-backend', 'oink-agent'])
             manager = (app / 'Contents/MacOS/oink-file-provider').read_bytes()
             assert all(c.encode() in manager for c in ['remove-domain', 'prepare-update', 'finish-update'])
-            with temporary_registration(app, 'OinkFileProvider.appex', 'com.hachiwii.oink.fileprovider'):
+            with temporary_registrations(app, [
+                    ('OinkFileProvider.appex', 'com.hachiwii.oink.fileprovider'),
+                    ('OinkFinderSync.appex', 'com.hachiwii.oink.findersync')]):
                 mac_status(app, record)
             cli = app / 'Contents/MacOS/oink-agent'
             with tempfile.TemporaryDirectory() as home:
@@ -142,7 +145,7 @@ def main():
             mount = Path(tmp) / 'volume'; mount.mkdir()
             subprocess.run(['hdiutil', 'attach', '-readonly', '-nobrowse', '-noautoopen', '-mountpoint', str(mount), str(dmg)], check=True, capture_output=True)
             try:
-                verify_app(mount / 'Oink.app', IDENTITY)
+                verify_app(mount / 'Oink.app', IDENTITY, architecture)
                 verify_imports([mount / 'Oink.app'], IDENTITY['macos_minimum'])
                 from provenance import digest
                 assert digest(mount / 'Oink.app/Contents/MacOS/oink-backend') == record['launch_smoke']['backend_sha256']

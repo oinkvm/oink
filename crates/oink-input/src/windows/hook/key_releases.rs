@@ -80,6 +80,7 @@ pub(super) fn drain() {
 }
 
 pub(super) fn clear() {
+    local_releases::clear();
     PENDING.with_borrow_mut(|pending| {
         for release in pending.iter() {
             keyboard_trace::release(keyboard_trace::Stage::QueueCleared, &release.info, true);

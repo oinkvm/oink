@@ -175,6 +175,7 @@ impl Router {
             }
         }
         if mouse != self.cfg.settings.mouse_mode {
+            self.keyboard.cancel_injected_release_hold();
             self.local_click_cancel_own();
             self.out
                 .push(Output::Status(StatusEvent::MouseDisabled(mouse == InputMode::Disabled)));

@@ -93,7 +93,12 @@ impl Manifest {
         if crash.build.app_version != self.version {
             return Err(Error::Invalid);
         }
-        for frame in crash.frames.iter_mut().flatten() {
+        for frame in crash.frames.iter_mut().flatten().chain(
+            crash
+                .objc_exception
+                .iter_mut()
+                .flat_map(|throw| throw.frames.iter_mut().flatten()),
+        ) {
             if let Some(Frame::Native {
                 image,
                 offset,

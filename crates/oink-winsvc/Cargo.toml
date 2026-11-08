@@ -48,3 +48,6 @@ workspace = true
 [[bin]]
 name = "oink-service"
 path = "src/main.rs"
+
+[build-dependencies]
+cc = "1"

@@ -36,6 +36,7 @@ export interface Prefs {
     launchAtLogin: boolean;
     showInMenuBar: boolean;
     confirmQuit: boolean;
+    pasteAsFile: boolean;
     notificationLevel: import("../api/cards").UiPreferences["notification_level"];
     escStop: boolean;
     language: string;
@@ -73,6 +74,7 @@ export const DEFAULT_PREFS: Prefs = {
     launchAtLogin: false,
     showInMenuBar: true,
     confirmQuit: true,
+    pasteAsFile: true,
     notificationLevel: 'default',
     escStop: true,
     language: 'auto',
@@ -89,7 +91,7 @@ export const DEFAULT_PREFS: Prefs = {
     touchpadInject: true,
     nativeMultifinger: true,
     macScrollFeel: true,
-    forwardInjectedInput: false,
+    forwardInjectedInput: true,
     takeForegroundOnLeave: false,
     pointerTrail: true,
     clipReceive: true,

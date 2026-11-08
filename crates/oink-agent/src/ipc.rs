@@ -301,9 +301,14 @@ async fn serve(
     let mut lines = Frames::new(r);
     let mut next = lines.first_line().await?;
     while let Some(line) = next.take() {
+        let mut line = zeroize::Zeroizing::new(line);
+        let request = serde_json::from_str::<Envelope>(&line);
+        zeroize::Zeroize::zeroize(&mut *line);
         let mut stop = false;
-        let reply = match serde_json::from_str::<Envelope>(&line) {
-            Err(e) => serde_json::json!({ "err": ApiError::InvalidArgument { message: e.to_string() } }),
+        let reply = match request {
+            Err(_) => {
+                serde_json::json!({ "err": ApiError::InvalidArgument { message: "invalid local API request".into() } })
+            }
             Ok(env) if env.token != token => {
                 serde_json::json!({ "err": ApiError::InvalidArgument { message: "令牌不对".into() } })
             }
@@ -508,9 +513,10 @@ impl Client {
         use std::io::{BufRead, Write};
         let mut s = self.bounded_stream(timeout.unwrap_or(Duration::from_secs(30)))?;
         s.set_read_timeout(timeout)?;
-        let mut line = serde_json::to_string(env)?;
+        let mut line = zeroize::Zeroizing::new(serde_json::to_string(env)?);
         line.push('\n');
         s.write_all(line.as_bytes())?;
+        zeroize::Zeroize::zeroize(&mut *line);
         let mut r = std::io::BufReader::new(s);
         let mut out = String::new();
         r.read_line(&mut out).map_err(|error| {

@@ -68,6 +68,7 @@ unsafe extern "system" fn control(
         let notification = unsafe { &*data.cast::<WTSSESSION_NOTIFICATION>() };
         if notification.cbSize >= std::mem::size_of::<WTSSESSION_NOTIFICATION>() as u32 {
             let id = notification.dwSessionId;
+            super::auto_unlock::queue_event(kind, id);
             let event = match kind {
                 WTS_CONSOLE_CONNECT => SessionEvent::ConsoleConnect(id),
                 WTS_CONSOLE_DISCONNECT => SessionEvent::ConsoleDisconnect(id),
@@ -128,6 +129,9 @@ unsafe extern "system" fn main(_argc: u32, _argv: *mut *mut u16) {
     // pipe at logon. Otherwise an early connection races SERVICE_START_PENDING,
     // where QueryServiceStatusEx does not guarantee a valid PID.
     status(handle, SERVICE_RUNNING, 0);
+    if let Err(error) = super::auto_unlock::start() {
+        eprintln!("Oink auto unlock unavailable: {error}");
+    }
     let launcher = thread::spawn(super::backend::serve);
     let updater = thread::spawn(super::update::serve);
     let result = supervise(events().unwrap());
@@ -140,6 +144,7 @@ unsafe extern "system" fn main(_argc: u32, _argv: *mut *mut u16) {
     if let Err(error) = super::prelogin::stop() {
         eprintln!("Oink pre-login stop failed: {error}");
     }
+    super::auto_unlock::stop();
     let _ = launcher.join();
     let _ = updater.join();
     status(
@@ -170,6 +175,7 @@ fn supervise(events: &super::wake::Hub) -> io::Result<()> {
     }
     while !STOP.load(Ordering::Acquire) {
         let now = std::time::Instant::now();
+        super::auto_unlock::drain_events();
         while let Some(event) = events.sessions.pop() {
             schedule.session(event, now);
         }

@@ -14,6 +14,7 @@ mod arrangement;
 mod dpi;
 mod edid;
 mod enumerate;
+mod visibility;
 mod wallpaper;
 mod watch;
 
@@ -32,6 +33,7 @@ pub(crate) fn backend() -> Result<Box<dyn DisplayBackend>, DisplayError> {
 
 #[derive(Default)]
 struct WinDisplay {
+    visibility_root: Mutex<Option<std::path::PathBuf>>,
     handlers: watch::Handlers,
     watcher: Mutex<Option<watch::Watcher>>,
 }
@@ -44,21 +46,68 @@ impl std::fmt::Debug for WinDisplay {
 
 impl DisplayBackend for WinDisplay {
     fn native_configuration(&self) -> Result<crate::arrangement::NativeConfiguration, DisplayError> {
-        arrangement::configuration()
+        match self.visibility_root.lock().unwrap().as_deref() {
+            Some(root) => visibility::configuration(root),
+            None => arrangement::configuration(),
+        }
     }
     fn apply_native_origins(
         &self,
         expected: &crate::arrangement::NativeConfiguration,
         origins: &[crate::arrangement::NativeOrigin],
     ) -> Result<crate::arrangement::NativeConfiguration, DisplayError> {
-        arrangement::apply(expected, origins)
+        match self.visibility_root.lock().unwrap().as_deref() {
+            Some(root) => visibility::apply(root, expected, origins, &[]),
+            None => arrangement::apply(expected, origins),
+        }
+    }
+    fn initialize_visibility(&self, root: &std::path::Path) -> Result<(), DisplayError> {
+        *self.visibility_root.lock().unwrap() = Some(root.to_owned());
+        Ok(())
+    }
+    fn apply_native_layout(
+        &self,
+        expected: &crate::arrangement::NativeConfiguration,
+        origins: &[crate::arrangement::NativeOrigin],
+        disabled: &[(String, bool)],
+    ) -> Result<crate::arrangement::NativeConfiguration, DisplayError> {
+        let root = self.visibility_root.lock().unwrap();
+        let root = root
+            .as_deref()
+            .ok_or_else(|| DisplayError::Platform("Visibility storage not initialized".into()))?;
+        visibility::apply(root, expected, origins, disabled)
+    }
+    fn release_disabled_displays(&self) -> Result<(), DisplayError> {
+        match self.visibility_root.lock().unwrap().as_deref() {
+            Some(root) => visibility::release(root),
+            None => Ok(()),
+        }
+    }
+    fn reconnected_displays(&self) -> Result<Vec<String>, DisplayError> {
+        match self.visibility_root.lock().unwrap().as_deref() {
+            Some(root) => visibility::returned(root),
+            None => Ok(Vec::new()),
+        }
+    }
+    fn acknowledge_reconnected(&self, keys: &[String]) -> Result<(), DisplayError> {
+        match self.visibility_root.lock().unwrap().as_deref() {
+            Some(root) => visibility::acknowledge(root, keys),
+            None => Ok(()),
+        }
     }
     fn wallpapers(&self) -> Option<Vec<crate::wallpaper::DisplayWallpaper>> {
         wallpaper::read_all()
     }
 
-    fn displays(&self) -> Result<Vec<DisplayInfo>, DisplayError> {
+    fn active_displays(&self) -> Result<Vec<DisplayInfo>, DisplayError> {
         enumerate::displays()
+    }
+
+    fn displays(&self) -> Result<Vec<DisplayInfo>, DisplayError> {
+        match self.visibility_root.lock().unwrap().as_deref() {
+            Some(root) => visibility::displays(root),
+            None => enumerate::displays(),
+        }
     }
 
     fn watch(&self, on_change: ChangeHandler) -> Result<(), DisplayError> {

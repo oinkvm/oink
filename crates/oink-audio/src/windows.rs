@@ -10,7 +10,7 @@
 //! arbitrary Windows drivers. See `recovery` for crash/user-intent limitations.
 
 use crate::CaptureInfo;
-use crate::recovery::{EndpointBackend, EndpointState, Journal, RecoveryOutcome, RecoveryReport};
+use crate::recovery::{EndpointBackend, EndpointState, Journal, RecoveryOutcome, RecoveryReport, RestorePermit};
 #[path = "windows_capture.rs"]
 mod capture_engine;
 #[path = "windows_source_devices.rs"]
@@ -889,6 +889,9 @@ impl VolumeSubscription {
     }
 }
 impl EndpointBackend for VolumeSubscription {
+    fn pause_before_restore(&self) {
+        crate::media_pause::before_restore();
+    }
     fn read(&self, endpoint: &str) -> Result<Option<EndpointState>, String> {
         if endpoint != self.id {
             return Err("audio recovery endpoint mismatch".into());
@@ -902,7 +905,7 @@ impl EndpointBackend for VolumeSubscription {
     fn permanently_removed(&self, endpoint: &str) -> Result<bool, String> {
         endpoint_removed(endpoint)
     }
-    fn set_mute(&self, endpoint: &str, muted: bool) -> Result<(), String> {
+    fn mute(&self, endpoint: &str) -> Result<(), String> {
         if endpoint != self.id {
             return Err("audio recovery endpoint mismatch".into());
         }
@@ -911,7 +914,7 @@ impl EndpointBackend for VolumeSubscription {
         }
         // SAFETY: live endpoint on its COM worker, and this lease's GUID is valid
         // during the call. Only mute is written; volume/default remain untouched.
-        unsafe { self.volume.SetMute(muted, &self.context) }.map_err(|e| format!("set endpoint mute: {e}"))
+        unsafe { self.volume.SetMute(true, &self.context) }.map_err(|e| format!("set endpoint mute: {e}"))
     }
     fn ownership_lost(&self) -> bool {
         self.revoked.load(Ordering::Acquire)
@@ -919,16 +922,23 @@ impl EndpointBackend for VolumeSubscription {
     fn mute_ownership_lost(&self) -> bool {
         self.mute_changed.load(Ordering::Acquire)
     }
-    fn release_owned_mute(&self, endpoint: &str) -> Result<(), String> {
+    fn restore_mute(&self, endpoint: &str, release_only: bool, _: &RestorePermit) -> Result<(), String> {
         if endpoint != self.id {
             return Err("audio recovery endpoint mismatch".into());
         }
-        if self.mute_ownership_lost() {
+        let lost = || {
+            if release_only {
+                self.mute_ownership_lost()
+            } else {
+                self.ownership_lost()
+            }
+        };
+        if lost() {
             return Ok(());
         }
         // SAFETY: live interface on its COM worker. Read the exact endpoint's
         // current mute; the user's level is never written, read back or restored.
-        if !unsafe { self.volume.GetMute() }.map_err(|e| e.to_string())?.as_bool() || self.mute_ownership_lost() {
+        if !unsafe { self.volume.GetMute() }.map_err(|e| e.to_string())?.as_bool() || lost() {
             return Ok(());
         }
         // SAFETY: release only the mute this lease applied; its own event GUID
@@ -964,7 +974,10 @@ impl EndpointBackend for UnavailableEndpoint {
     fn read(&self, _: &str) -> Result<Option<EndpointState>, String> {
         Ok(None)
     }
-    fn set_mute(&self, _: &str, _: bool) -> Result<(), String> {
+    fn mute(&self, _: &str) -> Result<(), String> {
+        Err("audio endpoint unavailable".into())
+    }
+    fn restore_mute(&self, _: &str, _: bool, _: &RestorePermit) -> Result<(), String> {
         Err("audio endpoint unavailable".into())
     }
     fn ownership_lost(&self) -> bool {
@@ -1035,7 +1048,7 @@ impl MuteLease {
             lease.journal.revoke()?;
             return Err("endpoint controls changed during mute setup; no mute ownership taken".into());
         }
-        lease.observer.set_mute(&lease.observer.id, true)?;
+        lease.observer.mute(&lease.observer.id)?;
         let mut expected = before;
         expected.muted = true;
         let observed = lease.observer.read(&lease.observer.id)?;

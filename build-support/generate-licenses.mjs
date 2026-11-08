@@ -20,7 +20,7 @@ process.chdir(root);
 const args = process.argv.slice(2);
 if (args.includes('--help')) {
   console.log(readFileSync(fileURLToPath(import.meta.url), 'utf8').split('import {')[0]);
-  console.log('Optional: --package-root <unpacked directory> --platform macos-arm64|windows-x64');
+  console.log('Optional: --package-root <unpacked directory> --platform macos-arm64|macos-x64|windows-x64');
   console.log('--release-sources rejects the explicitly approved local-beta UI package before public export.');
   process.exit(0);
 }
@@ -78,7 +78,7 @@ for (const review of reviews) {
     if (hash(readFileSync(join(dirname(p.manifest_path),path))) !== sha) throw Error(`Reviewed source changed: ${p.name}/${path}`);
   }
 }
-const platforms = [['macos-arm64','aarch64-apple-darwin'],['windows-x64','x86_64-pc-windows-msvc']];
+const platforms = [['macos-arm64','aarch64-apple-darwin'],['macos-x64','x86_64-apple-darwin'],['windows-x64','x86_64-pc-windows-msvc']];
 const reachability = new Map();
 for (const [platform,target] of platforms) {
   const m = jsonFromRun(['metadata','--locked','--all-features','--format-version','1','--filter-platform',target]);
@@ -204,7 +204,7 @@ for (const [path,locked] of Object.entries(npmLock.packages)) {
 components.push(...npmComponents.values());
 function npmPlatforms(p) {
   const matches=(list,value)=>!list || (!list.includes(`!${value}`) && (!list.some(x=>!x.startsWith('!')) || list.includes(value)));
-  return platforms.map(([platform])=>platform).filter(platform=>matches(p.os,platform==='macos-arm64'?'darwin':'win32') && matches(p.cpu,platform==='macos-arm64'?'arm64':'x64'));
+  return platforms.map(([platform])=>platform).filter(platform=>matches(p.os,platform.startsWith('macos-')?'darwin':'win32') && matches(p.cpu,platform==='macos-arm64'?'arm64':'x64'));
 }
 const native=json('licenses/native-inventory.json');
 for (const c of native.components) {

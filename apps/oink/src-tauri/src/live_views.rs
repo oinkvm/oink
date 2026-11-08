@@ -68,8 +68,13 @@ pub(crate) fn refresh(app: &AppHandle) {
             if let Some(visible) = native
                 && let Some(window) = app.get_webview_window(&label)
             {
-                let webview: &tauri::Webview = window.as_ref();
-                let result = if visible { webview.show() } else { webview.hide() };
+                #[cfg(target_os = "macos")]
+                let result = crate::window_paint_macos::visibility(app, &window, visible);
+                #[cfg(windows)]
+                let result = {
+                    let webview: &tauri::Webview = window.as_ref();
+                    if visible { webview.show() } else { webview.hide() }
+                };
                 if let Err(error) = result {
                     tracing::debug!(%error, label, "could not update webview visibility");
                 }

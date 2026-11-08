@@ -28,6 +28,7 @@ pub enum SettingsIssueKind {
     UnknownKey,
     Defaulted,
     DroppedEntry,
+    DuplicateEntry,
 }
 
 pub const SETTINGS_FILE: &str = "settings.json";
@@ -61,6 +62,7 @@ pub struct Settings {
     pub theme_accent: ThemeAccent,
     pub show_status_icon: bool,
     pub confirm_quit: bool,
+    pub paste_as_file: bool,
     pub emergency_hold_ms: EmergencyHoldMs,
     #[serde(skip)]
     pub clipboard_enabled: bool,
@@ -80,6 +82,8 @@ pub struct Settings {
     pub accept_contacts: bool,
     #[serde(skip)]
     pub sync_system_arrangement: bool,
+    #[serde(skip)]
+    pub disable_hidden_displays: bool,
 }
 
 impl Default for Settings {
@@ -106,6 +110,7 @@ impl Default for Settings {
             theme_accent: ThemeAccent::default(),
             show_status_icon: true,
             confirm_quit: true,
+            paste_as_file: true,
             emergency_hold_ms: EmergencyHoldMs::default(),
             clipboard_enabled: true,
             screen_shared: true,
@@ -120,7 +125,8 @@ impl Default for Settings {
                 GameModePreference::Auto
             },
             accept_contacts: true,
-            sync_system_arrangement: false,
+            sync_system_arrangement: true,
+            disable_hidden_displays: false,
         }
     }
 }
@@ -159,16 +165,20 @@ impl AgentConfig {
         };
         let mut reader = read::Reader::default();
         let (mut envelope, mut settings, mut owner) = if let Some(bytes) = bytes {
-            let envelope: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let mut envelope: serde_json::Value = serde_json::from_slice(&bytes)?;
             anyhow::ensure!(
                 envelope.get("schema").and_then(serde_json::Value::as_u64) == Some(1),
                 "unsupported settings schema"
             );
-            let local = envelope
+            let mut local = envelope
                 .get("local")
                 .filter(|value| value.is_object())
+                .cloned()
                 .ok_or(store::StoreError::Invalid)?;
-            let settings = reader.settings(local.clone());
+            let settings = reader.settings_in_place(&mut local);
+            if reader.repaired {
+                envelope["local"] = local;
+            }
             let encoded = envelope
                 .get("device_options_cbor")
                 .and_then(serde_json::Value::as_str)
@@ -185,6 +195,10 @@ impl AgentConfig {
         };
         let mut extended = owner.ensure_option(
             oink_protocol::v1::dto::LocalOption::SyncSystemArrangement,
+            oink_protocol::v1::RawValue::Bool(true),
+        )?;
+        extended |= owner.ensure_option(
+            oink_protocol::v1::dto::LocalOption::DisableHiddenDisplays,
             oink_protocol::v1::RawValue::Bool(false),
         )?;
         extended |= owner.ensure_option(
@@ -254,6 +268,7 @@ impl AgentConfig {
             envelope,
             deferred: None,
         };
+        extended |= reader.repaired;
         if extended {
             config.save()?;
         }
@@ -823,10 +838,17 @@ mod tests {
     }
 
     #[test]
-    fn injected_input_forwarding_defaults_off_and_persists_only_locally() {
+    fn injected_input_forwarding_defaults_on_and_persists_only_locally() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = AgentConfig::load_from(dir.path()).unwrap();
-        assert!(!config.settings.routing.forward_injected_input);
+        assert!(config.settings.routing.forward_injected_input);
+        config.save().unwrap();
+        assert!(
+            stored(dir.path())["local"]["routing"]
+                .get("forward_injected_input")
+                .is_none(),
+            "untouched defaults stay absent, including after unrelated saves"
+        );
         for forward in [true, false] {
             config
                 .update_local(
@@ -958,6 +980,20 @@ mod tests {
         let mut config = AgentConfig::load_from(dir.path()).unwrap();
         config.update(|s| s.onboarding_done = true).unwrap();
         assert_eq!(stored(dir.path())["local"], serde_json::json!({"onboarding_done":true}));
+    }
+    #[test]
+    fn paste_as_file_defaults_on_and_is_only_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::load_from(dir.path()).unwrap();
+        assert!(config.settings.paste_as_file);
+        let owner = config.owner.encode().unwrap();
+        config
+            .update_local(&serde_json::json!({"paste_as_file":false}), |s| s.paste_as_file = false)
+            .unwrap();
+        let reloaded = AgentConfig::load_from(dir.path()).unwrap();
+        assert!(!reloaded.settings.paste_as_file);
+        assert_eq!(stored(dir.path())["local"]["paste_as_file"], false);
+        assert_eq!(reloaded.owner.encode().unwrap(), owner);
     }
     #[test]
     fn login_confirmation_survives_restart_without_persisting_system_state() {
@@ -1367,6 +1403,27 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_layout_hotkeys_are_deduplicated_and_repaired_on_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::load_from(dir.path()).unwrap();
+        config.save().unwrap();
+        let mut raw = stored(dir.path());
+        let duplicate = serde_json::json!({
+            "action": "switch_layout",
+            "profile": "profile-office",
+            "keys": ["Ctrl", "Alt", "1"],
+            "enabled": true
+        });
+        raw["local"]["hotkeys"] = serde_json::json!([duplicate.clone(), duplicate]);
+        std::fs::write(config.settings_path(), serde_json::to_vec(&raw).unwrap()).unwrap();
+
+        let loaded = AgentConfig::load_from(dir.path()).unwrap();
+        assert_eq!(loaded.settings.hotkeys.as_ref().unwrap().len(), 1);
+        let saved = stored(dir.path());
+        assert_eq!(saved["local"]["hotkeys"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
     fn per_device_hotkey_overrides_persist_with_distinct_target_identity() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = AgentConfig::load_from(dir.path()).unwrap();
@@ -1375,6 +1432,7 @@ mod tests {
             .map(|seed| crate::api::Hotkey {
                 action: crate::api::HotkeyAction::MovePointerTo,
                 device: Some(oink_foundation::DeviceId([seed; 32]).into()),
+                profile: None,
                 keys: vec!["Ctrl".into(), "Alt".into(), seed.to_string()],
                 enabled: true,
             })
@@ -1410,5 +1468,42 @@ mod tests {
             .unwrap();
         assert_eq!(stored(dir.path())["local"]["hotkeys"], serde_json::json!(&keys));
         assert_eq!(AgentConfig::load_from(dir.path()).unwrap().settings.hotkeys, Some(keys));
+    }
+}
+
+#[cfg(test)]
+mod display_policy_defaults_tests {
+    use super::*;
+    use base64::Engine;
+    use oink_protocol::v1::{RawValue, dto::LocalOption};
+
+    #[test]
+    fn arrangement_defaults_on_but_explicit_off_is_preserved_without_migration() {
+        assert!(Settings::default().sync_system_arrangement);
+        let dir = tempfile::tempdir().unwrap();
+        for explicit in [None, Some(false), Some(true)] {
+            let defaults = Settings::default();
+            let values = projection::values(&defaults).into_iter().filter(|(option, _)| {
+                !matches!(
+                    option,
+                    LocalOption::SyncSystemArrangement | LocalOption::DisableHiddenDisplays
+                )
+            });
+            let mut owner = owner::OwnerStore::new(values).unwrap();
+            if let Some(enabled) = explicit {
+                owner
+                    .ensure_option(LocalOption::SyncSystemArrangement, RawValue::Bool(enabled))
+                    .unwrap();
+            }
+            std::fs::write(dir.path().join(SETTINGS_FILE), serde_json::to_vec(&serde_json::json!({
+                "schema":1,"local":{},"device_options_cbor":base64::engine::general_purpose::STANDARD.encode(owner.encode().unwrap())
+            })).unwrap()).unwrap();
+            let loaded = AgentConfig::load_from(dir.path()).unwrap();
+            assert_eq!(loaded.settings.sync_system_arrangement, explicit.unwrap_or(true));
+            assert_eq!(
+                loaded.owner().value(LocalOption::from_number(30)),
+                Some(RawValue::Bool(false))
+            );
+        }
     }
 }

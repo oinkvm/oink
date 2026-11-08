@@ -264,6 +264,7 @@ export interface UiPreferences {
   theme_accent: { light: string; dark: string }; // validated opaque #RRGGBB
   show_status_icon: boolean;
   confirm_quit: boolean;
+  paste_as_file: boolean;
   log_level: "error" | "warn" | "info" | "debug" | "trace";
   log_max_mb: number; // positive u32, decimal megabytes
 }

@@ -110,21 +110,25 @@ describe('offline device row', () => {
     expect(container.querySelector('.dev__seen')?.textContent).toBe(language === 'en' ? 'Last seen Unknown' : '上次在线 未知');
   });
 
-  it.each(['en', 'zh-Hans'] as const)('offers only edit IP and removal for an offline device in %s', async language => {
+  it.each(['en', 'zh-Hans'] as const)('offers whole-device hiding, edit IP and removal for an offline device in %s', async language => {
     setLanguage(language);
     const now = new Date(2026, 5, 15, 12).getTime();
     vi.spyOn(Date, 'now').mockReturnValue(now);
     const noop = () => {};
+    const hide = vi.fn();
     render(<OinkProvider defaultMotion="reduced"><SideContextMenu
       devices={[{...device, group:'offline', lastSeen:now - 3_600_000}]} requests={[]} nearby={[]}
       onShare={noop} onGameMode={noop} onPause={noop} onLeave={noop} onEditAddress={noop}
-      onShowWindow={noop} onAbout={noop} onQuit={noop} onSpeaker={noop} onHideScreen={noop} onScreensHidden={noop}
+      onShowWindow={noop} onAbout={noop} onQuit={noop} onSpeaker={noop} onHideScreen={noop} onScreensHidden={hide}
       onAccept={noop} onReject={noop} onPair={noop} onBlock={noop}
     ><button data-ctx="device:remote">Open device menu</button></SideContextMenu></OinkProvider>);
     fireEvent.contextMenu(screen.getByRole('button', {name:'Open device menu'}));
     expect(await screen.findByRole('menuitem', {name:language === 'en' ? 'Edit IP' : '编辑 IP'})).toBeTruthy();
-    expect(screen.getAllByRole('menuitem')).toHaveLength(2);
+    expect(screen.getAllByRole('menuitem')).toHaveLength(3);
+    const hidden = screen.getByRole('menuitem', {name: language === 'en' ? 'Hide all screens' : '隐藏全部屏幕'});
     expect(screen.queryByText(language === 'en' ? 'Last seen 1 hour ago' : '上次在线 1 小时前')).toBeNull();
+    fireEvent.click(hidden);
+    expect(hide).toHaveBeenCalledExactlyOnceWith('remote', true);
   });
 });
 

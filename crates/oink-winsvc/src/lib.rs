@@ -31,3 +31,9 @@ mod supervision;
 
 #[cfg(any(windows, test))]
 mod lease;
+
+mod auto_unlock;
+pub use auto_unlock::{
+    AutoUnlockFailure, AutoUnlockResult, AutoUnlockStatus, auto_unlock_attempt, auto_unlock_disable,
+    auto_unlock_remote_input, auto_unlock_save, auto_unlock_status,
+};

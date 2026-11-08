@@ -26,6 +26,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "licenseFiles": [
@@ -220,6 +221,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -258,6 +260,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -297,6 +300,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -328,6 +332,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -356,6 +361,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -388,6 +394,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -420,6 +427,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -483,6 +491,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -517,6 +526,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -550,6 +560,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -585,6 +596,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -616,6 +628,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -680,6 +693,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -720,6 +734,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -754,7 +769,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2015 Alice Maz"
@@ -790,6 +806,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -826,6 +843,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -861,6 +879,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -898,6 +917,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -934,6 +954,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -969,6 +990,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -1005,6 +1027,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -1040,6 +1063,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -1083,6 +1107,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -1118,7 +1143,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -1176,6 +1202,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -1211,6 +1238,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -1246,6 +1274,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -1281,6 +1310,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -1320,6 +1350,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -1355,6 +1386,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -1395,6 +1427,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -1425,6 +1458,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -1485,6 +1519,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -1518,6 +1553,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -1551,6 +1587,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -1579,6 +1616,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -1612,6 +1650,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -1647,6 +1686,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -1679,6 +1719,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -1714,6 +1755,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -1749,6 +1791,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -1812,6 +1855,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -1844,6 +1888,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -1876,6 +1921,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -1908,6 +1954,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -1941,6 +1988,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -1975,6 +2023,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -2008,6 +2057,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -2043,6 +2093,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -2079,6 +2130,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -2116,7 +2168,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2012-2013 Mozilla Foundation"
@@ -2149,7 +2202,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2012-2013 Mozilla Foundation"
@@ -2182,7 +2236,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2012-2013 Mozilla Foundation"
@@ -2215,7 +2270,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2012-2013 Mozilla Foundation"
@@ -2248,7 +2304,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2012-2013 Mozilla Foundation"
@@ -2319,7 +2376,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2015"
@@ -2354,6 +2412,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -2383,6 +2442,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -2417,6 +2477,7 @@
         "test"
       ],
       "platforms": [
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -2452,6 +2513,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -2486,6 +2548,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -2526,6 +2589,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -2561,6 +2625,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -2596,6 +2661,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -2631,6 +2697,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -2660,6 +2727,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -2689,6 +2757,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -2721,6 +2790,7 @@
         "test"
       ],
       "platforms": [
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -2754,6 +2824,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -2791,6 +2862,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -2822,6 +2894,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -2853,6 +2926,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -2884,6 +2958,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -2913,6 +2988,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -2975,6 +3051,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -3010,6 +3087,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -3046,6 +3124,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -3082,6 +3161,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -3113,6 +3193,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -3144,6 +3225,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -3179,6 +3261,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -3214,6 +3297,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -3249,7 +3333,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -3279,6 +3364,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -3312,6 +3398,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -3342,6 +3429,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -3388,6 +3476,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -3417,6 +3506,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -3450,6 +3540,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -3483,6 +3574,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -3516,6 +3608,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -3547,6 +3640,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -3615,6 +3709,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -3644,7 +3739,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2020 Nikolai Vazquez"
@@ -3722,6 +3818,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -3757,6 +3854,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -3789,7 +3887,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2014 Chris Wong"
@@ -3858,6 +3957,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -3891,6 +3991,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -3922,6 +4023,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -3955,6 +4057,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -3990,6 +4093,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -4019,6 +4123,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -4054,6 +4159,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -4085,6 +4191,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -4119,6 +4226,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -4154,6 +4262,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -4183,7 +4292,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2017 The foreign-types Developers"
@@ -4216,7 +4326,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2017 The foreign-types Developers"
@@ -4249,7 +4360,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2017 The foreign-types Developers"
@@ -4285,6 +4397,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -4353,6 +4466,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -4386,7 +4500,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2015 Pierre Baillet"
@@ -4417,6 +4532,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -4453,6 +4569,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -4523,6 +4640,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -4559,6 +4677,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -4595,6 +4714,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -4631,6 +4751,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -4667,6 +4788,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -4703,6 +4825,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -4734,6 +4857,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -4763,6 +4887,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -4799,6 +4924,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -4836,6 +4962,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -4905,6 +5032,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -4940,6 +5068,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -4973,6 +5102,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5008,6 +5138,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5043,6 +5174,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5078,6 +5210,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5114,6 +5247,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5150,6 +5284,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5185,6 +5320,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5220,6 +5356,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5251,6 +5388,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5283,6 +5421,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5319,6 +5458,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5354,6 +5494,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5394,6 +5535,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5429,6 +5571,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5460,6 +5603,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5490,6 +5634,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5522,6 +5667,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5555,6 +5701,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5588,6 +5735,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5621,6 +5769,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5654,6 +5803,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5687,6 +5837,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5720,6 +5871,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5752,6 +5904,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -5782,6 +5935,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5818,6 +5972,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -5851,6 +6006,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5887,6 +6043,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5923,6 +6080,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -5956,6 +6114,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -5987,6 +6146,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -6022,6 +6182,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -6057,6 +6218,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -6088,6 +6250,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -6122,6 +6285,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -6189,6 +6353,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -6222,6 +6387,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -6257,6 +6423,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -6292,6 +6459,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -6327,6 +6495,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -6362,6 +6531,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -6398,6 +6568,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -6432,6 +6603,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -6465,6 +6637,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -6501,6 +6674,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -6536,6 +6710,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -6574,6 +6749,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -6608,7 +6784,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2019 Nick Fitzgerald, 2021 Yuki Okushi"
@@ -6680,6 +6857,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -6715,6 +6893,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -6746,6 +6925,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -6782,6 +6962,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -6854,6 +7035,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -6889,6 +7071,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -7042,6 +7225,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -7089,6 +7273,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -7136,6 +7321,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -7167,6 +7353,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -7201,6 +7388,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -7275,6 +7463,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -7310,6 +7499,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -7339,7 +7529,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2015 Carl Lerche + nix-rust Authors"
@@ -7397,7 +7588,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2023 Notify Contributors",
@@ -7431,7 +7623,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -7460,6 +7653,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -7493,6 +7687,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -7560,6 +7755,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -7573,6 +7769,43 @@
         {
           "path": "licenses/texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt",
           "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ]
+    },
+    {
+      "id": "cargo:num_threads@0.1.7",
+      "name": "num_threads",
+      "version": "0.1.7",
+      "ecosystem": "cargo",
+      "repository": "https://github.com/jhpratt/num_threads",
+      "source": {
+        "url": "https://crates.io/api/v1/crates/num_threads/0.1.7/download",
+        "integrity": "sha256:5c7398b9c8b70908f6371f47ed36737907c87c52af34c268fed0bf0ceb92ead9"
+      },
+      "licenseExpression": "MIT OR Apache-2.0",
+      "selectedLicense": "MIT",
+      "modified": false,
+      "scope": [
+        "build",
+        "runtime",
+        "test"
+      ],
+      "platforms": [
+        "macos-arm64",
+        "macos-x64"
+      ],
+      "copyright": [
+        "Copyright (c) 2021 Jacob Pratt",
+        "Copyright 2021 Jacob Pratt"
+      ],
+      "licenseFiles": [
+        {
+          "path": "licenses/texts/b4bf94a9fceb8846320fda938ee53fc16b506572609da5cf1d2d289a5597a8f8.txt",
+          "sha256": "b4bf94a9fceb8846320fda938ee53fc16b506572609da5cf1d2d289a5597a8f8"
+        },
+        {
+          "path": "licenses/texts/c69b72788ec261765e460532016b4bb78372f238e449b5e70e3268ec1e18fd15.txt",
+          "sha256": "c69b72788ec261765e460532016b4bb78372f238e449b5e70e3268ec1e18fd15"
         }
       ]
     },
@@ -7594,7 +7827,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -7622,7 +7856,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -7650,7 +7885,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -7678,7 +7914,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -7707,7 +7944,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -7735,7 +7973,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -7764,7 +8003,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -7793,7 +8033,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -7822,7 +8063,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -7851,7 +8093,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -7879,7 +8122,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -7907,7 +8151,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -7935,7 +8180,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -7962,7 +8208,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -7989,7 +8236,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -8018,7 +8266,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -8047,6 +8296,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8082,6 +8332,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -8146,6 +8397,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -8175,6 +8427,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8210,6 +8463,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8302,6 +8556,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8338,6 +8593,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8402,6 +8658,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8437,6 +8694,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8469,6 +8727,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8504,6 +8763,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8534,6 +8794,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8565,6 +8826,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8596,6 +8858,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8627,6 +8890,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8658,6 +8922,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8689,6 +8954,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -8722,6 +8988,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8757,6 +9024,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8788,6 +9056,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8823,6 +9092,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8859,6 +9129,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8892,6 +9163,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8928,6 +9200,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8964,6 +9237,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -8996,6 +9270,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -9070,6 +9345,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9159,6 +9435,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9193,6 +9470,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9228,6 +9506,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9263,6 +9542,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9294,6 +9574,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9329,6 +9610,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9364,6 +9646,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9400,6 +9683,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -9433,6 +9717,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9473,6 +9758,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9512,6 +9798,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9552,6 +9839,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9591,6 +9879,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9632,6 +9921,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9671,6 +9961,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9710,6 +10001,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9750,6 +10042,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9789,6 +10082,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9861,6 +10155,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9901,6 +10196,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9937,6 +10233,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -9973,6 +10270,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -10008,6 +10306,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -10043,6 +10342,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -10079,6 +10379,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -10114,6 +10415,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -10145,6 +10447,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -10260,6 +10563,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -10296,6 +10600,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -10329,6 +10634,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -10363,7 +10669,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -10403,7 +10710,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [],
       "licenseFiles": [
@@ -10444,6 +10752,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -10480,6 +10789,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -10511,6 +10821,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -10552,6 +10863,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -10584,6 +10896,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -10619,6 +10932,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -10656,6 +10970,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -10725,6 +11040,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -10756,6 +11072,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -10793,6 +11110,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -10882,7 +11200,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2015 Steven Fackler"
@@ -10915,7 +11234,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2015 Steven Fackler"
@@ -10950,6 +11270,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -10980,6 +11301,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -11013,6 +11335,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -11047,6 +11370,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -11081,6 +11405,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -11115,6 +11440,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -11148,6 +11474,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -11182,6 +11509,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -11214,6 +11542,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -11246,6 +11575,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -11279,6 +11609,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -11312,6 +11643,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -11347,6 +11679,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -11382,6 +11715,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -11416,6 +11750,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -11450,6 +11785,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -11485,6 +11821,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -11518,6 +11855,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -11555,6 +11893,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -11586,6 +11925,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -11621,7 +11961,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2017 tokio-jsonrpc developers"
@@ -11656,6 +11997,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -11691,6 +12033,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -11751,6 +12094,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -11791,6 +12135,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -11831,6 +12176,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -11863,6 +12209,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -11927,6 +12274,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -11958,6 +12306,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12026,6 +12375,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12061,6 +12411,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12092,6 +12443,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12128,6 +12480,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12162,6 +12515,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12205,6 +12559,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12236,6 +12591,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12270,6 +12626,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12305,6 +12662,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12338,6 +12696,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12370,6 +12729,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12408,7 +12768,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2023 The swift-rs Developers",
@@ -12445,6 +12806,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -12479,6 +12841,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -12512,6 +12875,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -12546,6 +12910,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12575,7 +12940,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2024 Mullvad VPN AB"
@@ -12608,7 +12974,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2024 Mullvad VPN AB"
@@ -12642,6 +13009,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -12674,6 +13042,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12708,6 +13077,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12742,6 +13112,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12776,6 +13147,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12810,6 +13182,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12845,6 +13218,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12879,6 +13253,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12910,6 +13285,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12945,6 +13321,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -12980,6 +13357,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13016,6 +13394,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -13050,6 +13429,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -13083,6 +13463,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13118,6 +13499,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13150,6 +13532,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -13184,6 +13567,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -13218,6 +13602,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -13251,6 +13636,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13283,6 +13669,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13316,6 +13703,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13348,6 +13736,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13387,6 +13776,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13418,6 +13808,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13449,6 +13840,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13485,6 +13877,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -13514,6 +13907,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -13547,6 +13941,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -13580,6 +13975,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -13613,6 +14009,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -13646,6 +14043,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13677,6 +14075,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13708,6 +14107,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13739,6 +14139,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13770,6 +14171,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13801,6 +14203,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13837,6 +14240,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13868,6 +14272,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13899,6 +14304,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13929,6 +14335,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13968,6 +14375,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -13999,6 +14407,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -14032,6 +14441,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -14065,6 +14475,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -14104,6 +14515,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -14136,6 +14548,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -14166,6 +14579,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -14242,6 +14656,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -14274,6 +14689,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -14309,6 +14725,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -14340,6 +14757,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -14376,6 +14794,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -14412,6 +14831,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -14447,6 +14867,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -14483,6 +14904,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -14575,6 +14997,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -14610,6 +15033,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -14649,6 +15073,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -14680,6 +15105,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -14716,6 +15142,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -14751,6 +15178,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -14861,6 +15289,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -14965,6 +15394,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -15620,6 +16050,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -15679,6 +16110,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -15710,6 +16142,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -15753,6 +16186,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -15788,6 +16222,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -15819,6 +16254,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -15849,6 +16285,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -15882,6 +16319,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -15914,6 +16352,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -15954,6 +16393,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -15995,6 +16435,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -16028,6 +16469,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -16060,6 +16502,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -16095,6 +16538,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -16131,6 +16575,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -16164,6 +16609,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -16197,6 +16643,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -16228,6 +16675,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -16259,6 +16707,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -16289,6 +16738,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -16317,6 +16767,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -16348,6 +16799,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -16377,6 +16829,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -16414,6 +16867,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -16443,6 +16897,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -16493,6 +16948,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "modificationNotice": "The opusic-sys upstream vendor applies opus.patch to CMake runtime and OSCE build definitions. Oink makes no further Opus source changes; the patch is preserved with the native terms.",
@@ -16523,7 +16979,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (c) 2006-2013 Andy Matuschak.",
@@ -16657,7 +17114,8 @@
         "runtime"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (C) 2012 Apple Inc. All Rights Reserved.",
@@ -16683,6 +17141,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -16714,6 +17173,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -16745,6 +17205,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -16776,6 +17237,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -16807,6 +17269,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -16836,6 +17299,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -16867,6 +17331,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -16898,6 +17363,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -16929,6 +17395,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -16960,6 +17427,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -16991,6 +17459,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -17022,6 +17491,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -17053,6 +17523,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -17187,7 +17658,9 @@
         "build",
         "test"
       ],
-      "platforms": [],
+      "platforms": [
+        "macos-x64"
+      ],
       "copyright": [
         "Copyright (c) 2017 [these people](https://github.com/rollup/rollup/graphs/contributors)",
         "Copyright (c) 2020 Evan Wallace",
@@ -17599,6 +18072,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -17629,6 +18103,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -17696,7 +18171,9 @@
         "build",
         "test"
       ],
-      "platforms": [],
+      "platforms": [
+        "macos-x64"
+      ],
       "copyright": [
         "Copyright (c) 2017 - Present Tauri Apps Contributors"
       ],
@@ -18020,6 +18497,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -18055,6 +18533,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -18086,6 +18565,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -18117,6 +18597,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -18146,6 +18627,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -18175,6 +18657,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -18204,6 +18687,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -18233,6 +18717,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -18262,6 +18747,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -18291,6 +18777,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -18320,6 +18807,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -18351,6 +18839,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -18382,6 +18871,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -18413,6 +18903,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -18444,6 +18935,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -18473,6 +18965,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -18502,6 +18995,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -18533,6 +19027,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -18564,6 +19059,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -18595,6 +19091,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -18626,6 +19123,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -18657,6 +19155,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -18688,6 +19187,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -18717,6 +19217,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -18748,6 +19249,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -18777,6 +19279,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -18809,6 +19312,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -18840,6 +19344,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -18871,6 +19376,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -18900,6 +19406,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -18929,6 +19436,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -18960,6 +19468,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -18991,6 +19500,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -19020,6 +19530,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19051,6 +19562,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19082,6 +19594,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19113,6 +19626,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19144,6 +19658,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19175,6 +19690,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19206,6 +19722,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19237,6 +19754,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19268,6 +19786,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19298,7 +19817,8 @@
         "test"
       ],
       "platforms": [
-        "macos-arm64"
+        "macos-arm64",
+        "macos-x64"
       ],
       "copyright": [
         "Copyright (C) 2010-2020 by Philipp Dunkel, Ben Noordhuis, Elan Shankar, Paul Miller"
@@ -19329,6 +19849,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19360,6 +19881,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19391,6 +19913,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19422,6 +19945,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19453,6 +19977,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19484,6 +20009,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19515,6 +20041,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -19544,6 +20071,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -19573,6 +20101,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19604,6 +20133,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19635,6 +20165,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19666,6 +20197,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -19695,6 +20227,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19726,6 +20259,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -19809,7 +20343,9 @@
         "build",
         "test"
       ],
-      "platforms": [],
+      "platforms": [
+        "macos-x64"
+      ],
       "copyright": [],
       "licenseFiles": [
         {
@@ -20047,6 +20583,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -20076,6 +20613,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20107,6 +20645,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20138,6 +20677,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20169,6 +20709,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20200,6 +20741,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20232,6 +20774,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20264,6 +20807,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20295,6 +20839,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20326,6 +20871,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20357,6 +20903,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20389,6 +20936,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20420,6 +20968,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20451,6 +21000,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20482,6 +21032,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20513,6 +21064,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20544,6 +21096,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -20573,6 +21126,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -20601,6 +21155,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -20630,6 +21185,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -20658,6 +21214,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -20687,6 +21244,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20724,6 +21282,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -20753,6 +21312,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20784,6 +21344,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -20812,6 +21373,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -20841,6 +21403,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20872,6 +21435,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20907,6 +21471,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -20942,6 +21507,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -20975,6 +21541,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -21004,6 +21571,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -21035,6 +21603,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -21066,6 +21635,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -21097,6 +21667,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -21128,6 +21699,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -21159,6 +21731,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -21190,6 +21763,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -21221,6 +21795,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -21250,6 +21825,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -21287,6 +21863,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -21316,6 +21893,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -21417,6 +21995,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -21471,6 +22050,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -21500,6 +22080,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -21531,6 +22112,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -21560,6 +22142,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -21589,6 +22172,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -21618,6 +22202,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -21649,6 +22234,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [
@@ -21682,6 +22268,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],
@@ -21711,6 +22298,7 @@
       ],
       "platforms": [
         "macos-arm64",
+        "macos-x64",
         "windows-x64"
       ],
       "copyright": [],

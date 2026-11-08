@@ -2,7 +2,7 @@
 use super::*;
 use std::collections::BTreeSet;
 
-/// Exact physical chord, either modifier side, held for one second.
+/// Exact source chord, either modifier side, held for one second.
 pub const KEYBOARD_RELEASE_HOLD_US: Micros = 1_000_000;
 pub const KEYBOARD_RELEASE_KEYS: [&str; 4] = ["Ctrl", "Alt", "Shift", "U"];
 static RELEASE_CHORD: std::sync::LazyLock<crate::Chord> =
@@ -15,6 +15,8 @@ pub(super) struct Keyboard {
     pointer_seed: BTreeSet<KeyCode>,
     suppressed: BTreeSet<KeyCode>,
     since: Option<Micros>,
+    injected_down: BTreeSet<KeyCode>,
+    injected_since: Option<Micros>,
 }
 impl Keyboard {
     pub(super) fn retire_modifier(&mut self, code: KeyCode) {
@@ -39,21 +41,55 @@ impl Keyboard {
         }
     }
     fn exact(&self) -> bool {
-        self.down.len() == KEYBOARD_RELEASE_KEYS.len()
-            && self.down.contains(&RELEASE_CHORD.key)
-            && crate::Mods::held(self.down.iter().copied()) == RELEASE_CHORD.mods
+        Self::exact_keys(&self.down)
+    }
+    fn exact_keys(down: &BTreeSet<KeyCode>) -> bool {
+        down.len() == KEYBOARD_RELEASE_KEYS.len()
+            && down.contains(&RELEASE_CHORD.key)
+            && crate::Mods::held(down.iter().copied()) == RELEASE_CHORD.mods
+    }
+    pub(super) fn cancel_injected_release_hold(&mut self) {
+        self.injected_down.clear();
+        self.injected_since = None;
     }
     pub(super) fn cancel_release_hold(&mut self) {
         self.since = None;
         self.down.clear();
+        self.cancel_injected_release_hold();
     }
     pub(super) fn deadline(&self, disabled: bool) -> Option<Micros> {
         self.since
             .filter(|_| disabled && self.exact())
+            .into_iter()
+            .chain(
+                self.injected_since
+                    .filter(|_| disabled && Self::exact_keys(&self.injected_down)),
+            )
             .map(|t| t + KEYBOARD_RELEASE_HOLD_US)
+            .min()
     }
 }
 impl Router {
+    /// Observe other applications' input without changing its routing policy.
+    /// Keep its chord separate from hardware and Oink's own injected echoes.
+    pub fn observe_injected_disable_release(&mut self, code: KeyCode, pressed: bool, now: Micros) {
+        if self.fully_paused || !(self.keyboard_disabled() || self.mouse_disabled()) {
+            self.keyboard.injected_down.clear();
+            self.keyboard.injected_since = None;
+            return;
+        }
+        if pressed {
+            self.keyboard.injected_down.insert(code);
+        } else {
+            self.keyboard.injected_down.remove(&code);
+        }
+        if !Keyboard::exact_keys(&self.keyboard.injected_down) {
+            self.keyboard.injected_since = None;
+        } else if self.keyboard.injected_since.is_none() {
+            self.keyboard.injected_since = Some(now);
+        }
+    }
+
     pub(super) fn brightness_event(&mut self, event: &InputEvent) -> Option<Disposition> {
         let InputEvent::Key { code, pressed } = *event else {
             return None;
@@ -189,6 +225,8 @@ impl Router {
         }
         self.out.push(Output::Status(StatusEvent::InputDisablesReleased));
         self.keyboard.since = None;
+        self.keyboard.injected_since = None;
+        self.keyboard.injected_down.clear();
         let mut settings = self.cfg.settings.clone();
         for mode in [&mut settings.keyboard_mode, &mut settings.mouse_mode] {
             if *mode == InputMode::Disabled {
@@ -213,6 +251,7 @@ impl Router {
     pub(super) fn keyboard_mode_changed(&mut self, disabled: bool) {
         self.publish_lock_escape();
         self.keyboard.since = None;
+        self.keyboard.cancel_injected_release_hold();
         self.keyboard.pointer_seed.clear();
         // Presses made under the guard (including its release chord) must be lifted
         // before they can start a new gesture. Auto-repeat cannot revive them.
@@ -274,7 +313,7 @@ impl Router {
     pub fn keyboard_session_locked(&mut self, locked: Option<bool>) {
         if (self.keyboard_disabled() || self.mouse_disabled()) && locked.is_some() {
             self.keyboard.since = None;
-            self.keyboard.down.clear();
+            self.keyboard.cancel_release_hold();
             self.keyboard.suppressed.clear();
             self.keyboard.pointer_seed.clear();
         }
@@ -284,6 +323,9 @@ impl Router {
         let InputEvent::Key { code, pressed } = ev.event else {
             return None;
         };
+        if !ev.physical {
+            self.observe_injected_disable_release(code, pressed, now);
+        }
         if self.keyboard_disabled() && ev.physical && code.is_brightness() {
             // Return Pass here, before suppression, transforms and forwarding.
             return Some(Disposition::Pass);

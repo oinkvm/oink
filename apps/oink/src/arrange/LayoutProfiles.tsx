@@ -4,6 +4,8 @@ import type { DialogProps } from 'oink-ui';
 import type { LayoutProfilesState, ProfileSummary } from '../api/layoutProfiles';
 import { tr } from '../i18n';
 import { nameProblem, profileName } from './snapshot';
+import { ShortcutRecorder } from '../settings/Shortcuts';
+import type { Platform } from '../window/DesktopWindow';
 
 const contained = { contained: true } as Partial<DialogProps>;
 
@@ -85,13 +87,18 @@ export function CreateProfileDialog({ open, state, container, onClose, onSubmit 
 
 /** Settings › Layout: the profiles in MRU order with the current one marked; rename
  * inline and delete after confirmation (never the last one). */
-export function ProfileList({ state, onRename, onDelete }: {
+export function ProfileList({ state, platform, hotkeys, onHotkey, onRename, onDelete }: {
   state: LayoutProfilesState | null;
+  platform: Platform;
+  /** Profile id → recorded keys; a deleted profile's entry goes with it. */
+  hotkeys: Record<string, string>;
+  onHotkey: (profile: ProfileSummary, keys: string) => string | null | Promise<string | null>;
   onRename: (profile: ProfileSummary, name: string) => Promise<string | null>;
   onDelete: (profile: ProfileSummary) => Promise<void>;
 }) {
   const [editing, setEditing] = useState<{ id: string; name: string; refusal: string | null } | null>(null);
   const [pending, setPending] = useState<string | null>(null);
+  const [hotkeyError, setHotkeyError] = useState<{ id: string; text: string } | null>(null);
   const profiles = state?.profiles ?? [];
   const ready = state?.readiness === 'ready';
   const rename = async (p: ProfileSummary) => {
@@ -127,8 +134,14 @@ export function ProfileList({ state, onRename, onDelete }: {
           </form> : <>
             <span className="lpm__text">
               <span className="lpm__name" title={name}>{name}</span>
-              {p.active && <span className="lpm__note">{tr('当前布局')}</span>}
+              {hotkeyError?.id === p.id
+                ? <span className="lpm__note lpm__note--error"><Icon name="alert"/>{hotkeyError.text}</span>
+                : p.active && <span className="lpm__note">{tr('当前布局')}</span>}
             </span>
+            <ShortcutRecorder platform={platform} clearable placeholder={tr('设置快捷键')} label={tr('切换到「{0}」', name)}
+              value={hotkeys[p.id] ?? ''} disabled={!ready || !!pending} invalid={hotkeyError?.id === p.id || undefined}
+              onChange={async keys => { setPending(p.id); try { const clash = await onHotkey(p, keys); setHotkeyError(clash ? { id: p.id, text: clash } : null); } finally { setPending(null); } }}
+              onReject={text => setHotkeyError({ id: p.id, text })}/>
             <Button size="sm" variant="ghost" iconOnly aria-label={tr('重命名「{0}」', name)} disabled={!ready || !!pending}
               onClick={() => setEditing({ id: p.id, name: p.name.kind === 'custom' ? p.name.value : name, refusal: null })}><Icon name="edit"/></Button>
             <Tooltip interactive={false} placement="top" content={last ? tr('至少保留一个布局') : tr('删除「{0}」', name)}>

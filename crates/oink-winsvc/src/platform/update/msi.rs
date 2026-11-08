@@ -23,7 +23,6 @@ const FILES: &[&str] = &[
     "oink-build.json",
     "report-manifest.json",
 ];
-const AUDIO_DRIVER_ARCHIVE: &str = "AudioPlugin/VBCABLE_Driver_Pack45.zip";
 const NOTICES: &[&str] = &[
     "third-party-licenses.json",
     "THIRD_PARTY_LICENSES.md",
@@ -108,25 +107,18 @@ pub(super) fn installed_inventory(receipt: &Receipt, product_code: String) -> Re
     if receipt.collector_included {
         paths.insert("oink-crash-collector.exe".into(), root.join("oink-crash-collector.exe"));
     }
-    // Older installations may predate the bundled optional driver. Capture its
-    // installed hash when present for this first-install rollback baseline.
-    // Incoming packages use their complete MSI File-table inventory instead.
-    if root.join(AUDIO_DRIVER_ARCHIVE).exists() {
-        paths.insert(AUDIO_DRIVER_ARCHIVE.into(), root.join(AUDIO_DRIVER_ARCHIVE));
-    }
-    let mut directories = vec![root.join("licenses")];
+    // Seed required core files above, then include every installed product resource.
+    // A fresh MSI has no committed updater inventory yet; future DLLs/resources
+    // must still participate in rollback health. Maintenance is service state.
+    let mut directories = vec![root.clone()];
     while let Some(directory) = directories.pop() {
         for path in protected::entries(&directory).map_err(|_| Error::Storage)? {
+            let Some(name) = installed_resource_name(&root, &path)? else {
+                continue;
+            };
             if path.is_dir() {
                 directories.push(path);
             } else {
-                let name = path
-                    .strip_prefix(&root)
-                    .map_err(|_| Error::Storage)?
-                    .to_str()
-                    .ok_or(Error::Metadata)?
-                    .replace('\\', "/");
-                oink_update::package::validate_path(&name)?;
                 paths.insert(name, path);
             }
         }
@@ -143,6 +135,22 @@ pub(super) fn installed_inventory(receipt: &Receipt, product_code: String) -> Re
         build: receipt.build,
         hashes,
     })
+}
+fn installed_resource_name(root: &Path, path: &Path) -> Result<Option<String>, Error> {
+    let name = path
+        .strip_prefix(root)
+        .map_err(|_| Error::Storage)?
+        .to_str()
+        .ok_or(Error::Metadata)?
+        .replace('\\', "/");
+    let folded = name.to_ascii_lowercase();
+    if folded == "maintenance" || folded.starts_with("maintenance/") {
+        return Ok(None);
+    }
+    if name != "installed.json" {
+        oink_update::package::validate_path(&folded)?;
+    }
+    Ok(Some(name))
 }
 struct Msi(u32);
 impl Drop for Msi {
@@ -201,6 +209,10 @@ fn stream(row: &Msi, field: u32, max: usize) -> Result<Vec<u8>, Error> {
         }
         bytes.extend_from_slice(&buf[..length as usize]);
     }
+}
+fn code_payload(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.ends_with(".exe") || name.ends_with(".dll")
 }
 type FileTable = (BTreeMap<String, (String, u64)>, BTreeSet<String>);
 
@@ -426,7 +438,7 @@ pub(super) fn inspect(
             // and a second payload tree to delete after the update.
             retain_member(&extracted, &output)?;
             hashes.insert(name.clone(), hex(&Sha256::digest(&bytes)));
-            if name.to_ascii_lowercase().ends_with(".exe") {
+            if code_payload(name) {
                 signature::verify(&output, pins)?;
             } else if name == "installed.json" {
                 let receipt: Receipt = oink_update::feed::strict_json(&bytes)?;
@@ -660,6 +672,41 @@ mod tests {
         );
     }
     #[test]
+    fn first_install_baseline_covers_future_resources_but_never_maintenance() {
+        let root = Path::new("C:/Product");
+        for name in [
+            "OinkPasteMenu.dll",
+            "OinkCredentialProvider.dll",
+            "resources/future.dat",
+            "installed.json",
+        ] {
+            assert_eq!(
+                installed_resource_name(root, &root.join(name)).unwrap(),
+                Some(name.into())
+            );
+        }
+        assert_eq!(
+            installed_resource_name(root, &root.join("MaInTeNaNcE/private.json")).unwrap(),
+            None
+        );
+        assert!(installed_resource_name(root, &root.join("Files.json")).is_err());
+        assert!(installed_resource_name(root, &root.join("../escape.dll")).is_err());
+    }
+    #[test]
+    fn executable_and_dll_payloads_share_signer_validation() {
+        for name in [
+            "oink.exe",
+            "OinkPasteMenu.dll",
+            "OinkCredentialProvider.dll",
+            "resources/HELPER.DLL",
+        ] {
+            assert!(code_payload(name));
+        }
+        for name in ["file.txt", "archive.zip", "dll.txt"] {
+            assert!(!code_payload(name));
+        }
+    }
+    #[test]
     fn product_file_table_accepts_build_49_and_future_payloads() {
         let directories = BTreeMap::from([
             ("AudioPlugin".into(), ("INSTALLFOLDER".into(), "AudioPlugin".into())),
@@ -693,7 +740,7 @@ mod tests {
         }
     }
     #[test]
-    fn feed_and_local_inspection_share_forward_compatible_file_table() {
+    fn version_030_feed_and_local_reader_accepts_new_menu_dll() {
         let root = tempfile::tempdir().unwrap();
         let mut database = 0;
         // SAFETY: CREATE a disposable database only; never run an installer.
@@ -713,6 +760,8 @@ mod tests {
             "INSERT INTO `Directory` (`Directory`, `Directory_Parent`, `DefaultDir`) VALUES ('AudioPlugin', 'INSTALLFOLDER', 'AudioPlugin')".into(),
             "INSERT INTO `Component` (`Component`, `Directory_`) VALUES ('Root', 'INSTALLFOLDER')".into(),
             "INSERT INTO `Component` (`Component`, `Directory_`) VALUES ('Audio', 'AudioPlugin')".into(),
+            "INSERT INTO `File` (`File`, `Component_`, `FileName`, `FileSize`) VALUES ('Menu', 'Root', 'OinkPasteMenu.dll', 1)".into(),
+            "INSERT INTO `File` (`File`, `Component_`, `FileName`, `FileSize`) VALUES ('Collector', 'Root', 'oink-crash-collector.exe', 1)".into(),
         ];
         for (index, name) in FILES
             .iter()
@@ -733,7 +782,32 @@ mod tests {
         // Feed and locally approved packages both enter inspect() and this
         // exact File/Component/Directory-table reader, before any installation.
         let (files, _) = file_table(&database).unwrap();
-        assert_eq!(files.len(), FILES.len() + 2);
+        assert_eq!(files.len(), FILES.len() + 4);
+        assert_eq!(files["Menu"].0, "OinkPasteMenu.dll");
+        // 0.3.0's strict receipt schema lists executable roles only. Keep it
+        // unchanged; all File rows (including the DLL) still enter hashes.
+        let names: BTreeSet<_> = files.values().map(|(name, _)| name.to_ascii_lowercase()).collect();
+        let roles: BTreeSet<_> = names
+            .iter()
+            .filter(|n| n.ends_with(".exe") && !n.contains('/'))
+            .cloned()
+            .collect();
+        assert_eq!(roles.len(), 5);
+        let receipt: Receipt = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/tests/fixtures/windows-receipt.json"
+        )))
+        .unwrap();
+        assert_eq!(
+            receipt
+                .components
+                .iter()
+                .map(|name| name.to_ascii_lowercase())
+                .collect::<BTreeSet<_>>(),
+            roles
+        );
+        assert!(!roles.contains("oinkpastemenu.dll"));
+        assert!(names.contains("oinkpastemenu.dll"));
         assert_eq!(files[&format!("F{}", FILES.len())].0, "AudioPlugin/Microphone.ps1");
         assert_eq!(
             files[&format!("F{}", FILES.len() + 1)].0,

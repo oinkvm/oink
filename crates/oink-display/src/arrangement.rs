@@ -173,6 +173,25 @@ pub fn snap(rectangles: &[Rect], moving: usize, desired: Point) -> Result<Point,
     best.map(|(_, p)| p).ok_or(ArrangementError::Disconnected)
 }
 
+/// Windows target policy. A hidden final desktop source stays system-active;
+/// an explicit unhide may supply its replacement in the same transaction.
+pub fn enabled_targets(active: &[String], disabled: &[(String, bool)]) -> Vec<String> {
+    let mut enabled = active.iter().cloned().collect::<BTreeSet<_>>();
+    for (key, hidden) in disabled {
+        if *hidden {
+            enabled.remove(key);
+        } else {
+            enabled.insert(key.clone());
+        }
+    }
+    if enabled.is_empty()
+        && let Some(key) = active.first()
+    {
+        enabled.insert(key.clone());
+    }
+    enabled.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +268,28 @@ mod tests {
         assert_eq!(next.displays[1], config.displays[1]);
         assert_eq!(next.displays[2].mode, "mode-c");
         assert!(config.with_origins(&[]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::*;
+    #[test]
+    fn hidden_last_active_target_stays_in_windows() {
+        let active = vec!["a".to_string()];
+        assert_eq!(enabled_targets(&active, &[("a".into(), true)]), active);
+    }
+    #[test]
+    fn hiding_two_outputs_keeps_one_and_unhide_can_replace_it() {
+        let active = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(enabled_targets(&active, &[("b".into(), true)]), vec!["a"]);
+        assert_eq!(
+            enabled_targets(&active, &[("a".into(), true), ("b".into(), true)]).len(),
+            1
+        );
+        assert_eq!(
+            enabled_targets(&["a".into()], &[("a".into(), true), ("b".into(), false)]),
+            vec!["b"]
+        );
     }
 }

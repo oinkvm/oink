@@ -83,6 +83,12 @@ pub fn preference_token(facts: &dto::DeviceFacts) -> String {
     let raw = [
         (1, boot.unwrap_or(oink_protocol::v1::RawValue::Null)),
         (2, p.unwrap_or(oink_protocol::v1::RawValue::Null)),
+        (
+            3,
+            preference(facts, dto::LocalOption::DisableHiddenDisplays)
+                .map(|p| p.write())
+                .unwrap_or(oink_protocol::v1::RawValue::Null),
+        ),
     ]
     .into();
     model::hash(&oink_protocol::v1::cbor::encode_map(&raw, 4096).unwrap_or_default())
@@ -127,7 +133,7 @@ impl Node {
                 .and_then(|f| preference(f, dto::LocalOption::SyncSystemArrangement))
                 .and_then(|p| p.value().ok())
                 .and_then(|v| bool::read(&v).ok())
-                .unwrap_or(false);
+                .unwrap_or(true);
             let supported = member.is_self
                 || config
                     .peer_agreement(member.device)
@@ -147,6 +153,11 @@ impl Node {
             devices.push(DeviceArrangementState {
                 device,
                 sync_system_arrangement: enabled,
+                disable_hidden_displays: facts
+                    .and_then(|f| preference(f, dto::LocalOption::DisableHiddenDisplays))
+                    .and_then(|p| p.value().ok())
+                    .and_then(|v| bool::read(&v).ok())
+                    .unwrap_or(false),
                 preference_token: facts.map(|f| preference_token(f)).unwrap_or_default(),
                 native_token: token.clone(),
                 availability,
@@ -156,14 +167,13 @@ impl Node {
             let Some((origin, scale)) = layout.device_transform(member.device) else {
                 continue;
             };
-            let owners = applied
-                .owners
-                .get(&member.device)
-                .ok_or_else(|| unavailable("Owner screen preferences are unavailable"))?;
             snapshot.placements.push(Placement { device, origin, scale });
             snapshot.screen_shared.push(DeviceSharing {
                 device,
-                shared: owners.screen_shared,
+                shared: !layout
+                    .screens
+                    .iter()
+                    .any(|s| s.id.device == member.device && s.device_hidden),
             });
             let screens = layout
                 .screens
@@ -192,7 +202,7 @@ impl Node {
                 };
                 snapshot.disabled.push(Disabled {
                     screen: screen.clone(),
-                    disabled: !owners.screens.get(&s.id.display).is_none_or(|p| p.enabled),
+                    disabled: s.screen_hidden,
                 });
                 native.screens.push(NativeScreen {
                     screen,
@@ -215,7 +225,7 @@ impl Node {
             },
         })
     }
-    pub(super) fn profile_snapshot(&self) -> Result<LayoutProfilesState> {
+    pub(crate) fn profile_snapshot(&self) -> Result<LayoutProfilesState> {
         let mut observation = self.observe_profiles()?;
         let group = self
             .group_id()
@@ -314,6 +324,7 @@ impl Node {
             if recovered.group == group {
                 store::save_with_operations(&self.inner.data_dir, &recovered, &receipts)?;
             }
+            self.prune_profile_hotkeys(&recovered.profiles.iter().map(|p| p.id.clone()).collect::<Vec<_>>())?;
             data.catalog = Some(recovered);
         }
         let applied_version = self.link_config().map_err(unavailable)?.applied().version.clone();
@@ -440,6 +451,7 @@ impl Node {
         {
             data.restore_tracker = super::topology::RestoreTracker::default();
         }
+        self.prune_profile_hotkeys(&catalog.profiles.iter().map(|p| p.id.clone()).collect::<Vec<_>>())?;
         data.catalog = Some(catalog);
         self.inner.profiles.wake.notify_waiters();
         Ok(())

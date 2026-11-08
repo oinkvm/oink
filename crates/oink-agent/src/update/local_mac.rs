@@ -44,19 +44,28 @@ pub fn verify_app(path: &Path) -> Result<(), Error> {
     tracing::info!(step = "authenticate_bundle", ?result, "local upgrade");
     result
 }
-fn arm64_executable(path: &Path) -> Result<bool, Error> {
+pub(super) fn architecture() -> &'static str {
+    if cfg!(target_arch = "x86_64") { "x64" } else { "arm64" }
+}
+fn compatible_executable(path: &Path) -> Result<bool, Error> {
     // /usr/bin/lipo is a developer-tools shim and can show an Xcode-install
     // dialog on an end-user Mac. Read only bounded Mach-O CPU records here;
     // Security.framework subsequently authenticates every complete slice.
     let mut file = fs::File::open(path).map_err(|_| Error::CorruptPackage)?;
     let mut header = [0u8; 8];
     file.read_exact(&mut header).map_err(|_| Error::CorruptPackage)?;
-    let arm = |cpu: u32, subtype: u32| cpu == 0x0100_000c && (subtype & 0x00ff_ffff) <= 1;
+    let compatible = |cpu: u32, subtype: u32| {
+        if cfg!(target_arch = "x86_64") {
+            cpu == 0x0100_0007 && matches!(subtype & 0x00ff_ffff, 0 | 3)
+        } else {
+            cpu == 0x0100_000c && (subtype & 0x00ff_ffff) <= 1
+        }
+    };
     match header[..4] {
         [0xcf, 0xfa, 0xed, 0xfe] => {
             let mut subtype = [0u8; 4];
             file.read_exact(&mut subtype).map_err(|_| Error::CorruptPackage)?;
-            Ok(arm(
+            Ok(compatible(
                 u32::from_le_bytes(header[4..8].try_into().unwrap()),
                 u32::from_le_bytes(subtype),
             ))
@@ -79,7 +88,7 @@ fn arm64_executable(path: &Path) -> Result<bool, Error> {
                 let mut record = [0u8; 32];
                 file.read_exact(&mut record[..length])
                     .map_err(|_| Error::CorruptPackage)?;
-                if arm(
+                if compatible(
                     number(record[..4].try_into().unwrap()),
                     number(record[4..8].try_into().unwrap()),
                 ) {
@@ -205,7 +214,7 @@ pub(super) fn stage(path: &Path) -> Result<Staged, Error> {
     if executable != "oink-backend" {
         return Err(Error::WrongProduct);
     }
-    if !arm64_executable(&app.join("Contents/MacOS/oink-backend"))? {
+    if !compatible_executable(&app.join("Contents/MacOS/oink-backend"))? {
         return Err(Error::WrongArchitecture);
     }
     verify_app(&app)?;
@@ -222,7 +231,7 @@ pub(super) fn stage(path: &Path) -> Result<Staged, Error> {
         build: plist(&info, "CFBundleVersion")?
             .parse()
             .map_err(|_| Error::CorruptPackage)?,
-        architecture: "arm64".into(),
+        architecture: architecture().into(),
         source_tree_sha256,
         minimum_windows_build: 0,
         length,
@@ -603,21 +612,31 @@ mod tests {
     fn architecture_check_needs_no_developer_tool_or_process() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("image");
-        for (cpu, expected) in [(0x0100_000cu32, true), (0x0100_0007u32, false)] {
+        for (cpu, expected) in [
+            (0x0100_000cu32, cfg!(target_arch = "aarch64")),
+            (0x0100_0007u32, cfg!(target_arch = "x86_64")),
+        ] {
             let mut bytes = vec![0xcf, 0xfa, 0xed, 0xfe];
             bytes.extend(cpu.to_le_bytes());
             bytes.extend(0u32.to_le_bytes());
             fs::write(&path, bytes).unwrap();
-            assert_eq!(arm64_executable(&path), Ok(expected));
+            assert_eq!(compatible_executable(&path), Ok(expected));
         }
         let mut fat = vec![0xca, 0xfe, 0xba, 0xbe];
         fat.extend(1u32.to_be_bytes());
-        fat.extend(0x0100_000cu32.to_be_bytes());
+        fat.extend(
+            (if cfg!(target_arch = "x86_64") {
+                0x0100_0007u32
+            } else {
+                0x0100_000cu32
+            })
+            .to_be_bytes(),
+        );
         fat.extend([0u8; 16]);
         fs::write(&path, fat).unwrap();
-        assert_eq!(arm64_executable(&path), Ok(true));
+        assert_eq!(compatible_executable(&path), Ok(true));
         fs::write(&path, b"damaged executable").unwrap();
-        assert_eq!(arm64_executable(&path), Err(Error::CorruptPackage));
+        assert_eq!(compatible_executable(&path), Err(Error::CorruptPackage));
     }
     #[test]
     fn bundle_tree_accepts_internal_links_and_rejects_external_links() {

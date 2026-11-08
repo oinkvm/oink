@@ -82,7 +82,6 @@ pub(super) struct Driver {
     clip_diagnostics: crate::diagnostics::cursor_clip::State,
     cursor: cursor::State,
     relative_capture: bool,
-    queued_cursor_constraints: bool,
     keyboard_remote: bool,
     source_foreground: bool,
     source_modes_revision: u64,
@@ -95,6 +94,9 @@ pub(super) struct Driver {
     emergency_sequence: u64,
     local_emergency_sequence: u64,
     session_locked: Option<bool>,
+    auto_unlock: crate::auto_unlock::EntryGate,
+    recent_remote_input: Option<(DeviceId, Instant)>,
+    local_unlock_admission: Option<Arc<std::sync::atomic::AtomicBool>>,
     capture_initialized: bool,
     controllable: bool,
     permission_controllable: bool,
@@ -252,7 +254,6 @@ impl Driver {
             clip_diagnostics: Default::default(),
             cursor: Default::default(),
             relative_capture: false,
-            queued_cursor_constraints: false,
             keyboard_remote: false,
             source_foreground: false,
             source_modes_revision: 1,
@@ -265,6 +266,9 @@ impl Driver {
             emergency_sequence: 0,
             local_emergency_sequence: 0,
             session_locked: None,
+            auto_unlock: Default::default(),
+            recent_remote_input: None,
+            local_unlock_admission: None,
             capture_initialized: false,
             controllable: true,
             permission_controllable: true,
@@ -593,6 +597,10 @@ impl Driver {
         }
     }
     fn detach(&mut self, peer: DeviceId) {
+        self.auto_unlock.cancel();
+        if let Some(allowed) = &self.local_unlock_admission {
+            allowed.store(false, Ordering::Release);
+        }
         // Relayed origins share an upstream stream. Reset just that stream's
         // baselines; an unrelated peer disappearing must not hide a live stall.
         self.jitter_sources.retain(|(upstream, _, _), _| *upstream != peer);
@@ -969,6 +977,8 @@ impl Driver {
                 if self.session_locked != locked {
                     self.cursor_invalidate();
                 }
+                self.auto_unlock
+                    .observe(locked, self.adapter.router().focus().holder, self.local);
                 self.session_locked = locked;
                 self.adapter.router_mut().keyboard_session_locked(locked);
             }
@@ -1047,10 +1057,16 @@ impl Driver {
                     .router_mut()
                     .set_volume_keep_local_probe(Arc::new(move || keep.load(Ordering::Acquire)));
             }
+            InputCommand::RecordMouseShortcut { token, active } => {
+                let now = self.micros();
+                self.adapter.router_mut().record_mouse_shortcut(token, active, now);
+            }
             InputCommand::Hotkeys(hotkeys) => {
                 self.resume_hotkey = hotkeys
                     .iter()
-                    .find(|binding| binding.action == "toggle_sharing")
+                    // Carbon/RegisterHotKey cannot register mouse buttons. Pausing
+                    // deliberately removes all input taps/hooks, including this binding.
+                    .find(|binding| binding.action == "toggle_sharing" && binding.chord.key.page() != 9)
                     .map(|binding| {
                         use oink_routing::Mods;
                         let chord = binding.chord;
@@ -1271,6 +1287,36 @@ impl Driver {
                         self.refresh_system_cursor_clip();
                     }
                     self.adapter.inbound(peer, message);
+                }
+            }
+            InputCommand::LocalUnlock { epoch, job } => {
+                let focus = self.adapter.router().focus();
+                if !self.paused
+                    && self.update_hold.is_none()
+                    && self.session_locked == Some(true)
+                    && focus.holder == self.local
+                    && focus.epoch == epoch
+                {
+                    self.local_unlock_admission = Some(job.admission());
+                    self.inject
+                        .push_in_epoch(self.input_safety, InjectItem::LocalUnlock(job));
+                } else {
+                    job.reject();
+                }
+            }
+            InputCommand::UnlockReplyReady {
+                peer,
+                stream,
+                epoch,
+                unlocked,
+            } => {
+                crate::auto_unlock::record_flow_diagnostic(5, epoch, u64::from(unlocked));
+                if !self.paused && self.current_inbound(peer, stream) && self.adapter.attached(peer) {
+                    self.send_from(
+                        peer,
+                        Message::Control(ControlMsg::UnlockReply { epoch, unlocked }),
+                        None,
+                    );
                 }
             }
             InputCommand::SendMessage { peer, stream, message } => {
@@ -1520,6 +1566,19 @@ impl Driver {
             message => (message, None),
         };
         let source = crate::diagnostics::keyboard::message_source(peer, &message).unwrap_or(peer);
+        let remote_input = matches!(
+            &message,
+            Message::Input(_)
+                | Message::TimedInput { .. }
+                | Message::Control(ControlMsg::FocusEnter { .. } | ControlMsg::MovePointerEnter { .. })
+        );
+        if remote_input && self.adapter.attached(peer) && source != self.local {
+            self.recent_remote_input = Some((source, arrived));
+            if self.auto_unlock.authorized(source, arrived) {
+                let age_ms = arrived.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+                let _ = self.main.send(MainCommand::UnlockRemoteInput { source, age_ms });
+            }
+        }
         // Only admitted group sources get estimator state. Raw identities/times
         // never enter diagnostics; every source uses its own unsynchronised clock.
         let measure = self.adapter.attached(peer) && self.layout.devices.contains(&source);
@@ -1558,6 +1617,27 @@ impl Driver {
         let dispatch = dispatch.observe(time, d);
         self.shared.jitter.record(lossy, ingress, dispatch);
     }
+
+    // The observer polls the platform lock state on its ordinary cadence. A
+    // FocusEnter can arrive during that polling gap, so refresh the authoritative
+    // read before Router changes the holder to this device. EntryGate must see
+    // the old remote holder here in order to arm exactly this crossing.
+    fn refresh_session_lock_before_focus_enter(&mut self) {
+        let started = Instant::now();
+        let observation = self.inject.backend().session_lock_observation();
+        crate::auto_unlock::record_session_lock_diagnostic_timed(observation, 2, Some(started.elapsed()));
+        let Some(locked) = observation.state else {
+            return;
+        };
+        if self.session_locked != Some(locked) {
+            self.cursor_invalidate();
+            self.session_locked = Some(locked);
+            self.adapter.router_mut().keyboard_session_locked(Some(locked));
+        }
+        let holder = self.adapter.router().focus().holder;
+        self.auto_unlock.observe(Some(locked), holder, self.local);
+    }
+
     // This runs only from queued work/network dispatch or poll(), never event().
     // Reading before each remote motion makes clipping/release authoritative at
     // the target decision, independent of the idle refresh period or Auto mode.
@@ -1637,17 +1717,85 @@ impl Driver {
             // Low pacing observes activity even when OS display wake is disabled.
             let _ = self.main.send(MainCommand::Activity { from: Some(peer) });
         }
+        if attached && !self.paused {
+            match &message {
+                Message::Control(ControlMsg::UnlockQuery { epoch }) => {
+                    crate::auto_unlock::record_flow_diagnostic(4, *epoch, 1);
+                    if let Some((stream, _)) = self.pairs[&peer].inbound.as_ref() {
+                        let _ = self.main.send(MainCommand::UnlockQuery {
+                            peer,
+                            stream: stream.id(),
+                            epoch: *epoch,
+                        });
+                    }
+                    return;
+                }
+                Message::Control(ControlMsg::UnlockReply { epoch, unlocked }) => {
+                    crate::auto_unlock::record_flow_diagnostic(6, *epoch, u64::from(*unlocked));
+                    let focus = self.adapter.router().focus();
+                    if focus.holder == self.local
+                        && focus.epoch == *epoch
+                        && self
+                            .auto_unlock
+                            .confirm(peer, *epoch, *unlocked, Instant::now())
+                            .is_some()
+                    {
+                        let age_ms = self
+                            .recent_remote_input
+                            .filter(|(source, _)| *source == peer)
+                            .map(|(_, at)| at.elapsed().as_millis().min(u128::from(u32::MAX)) as u32);
+                        let _ = self.main.send(MainCommand::UnlockAttempt {
+                            epoch: *epoch,
+                            source: peer,
+                            initial_input_age_ms: age_ms,
+                        });
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let incoming_source = match &message {
+            Message::Control(
+                ControlMsg::FocusEnter { pointer_source, .. } | ControlMsg::MovePointerEnter { pointer_source, .. },
+            ) => *pointer_source,
+            _ => None,
+        };
         let incoming_epoch = match &message {
             Message::Control(ControlMsg::FocusEnter { epoch, .. } | ControlMsg::MovePointerEnter { epoch, .. }) => {
                 Some(*epoch)
             }
             _ => None,
         };
+        if incoming_epoch.is_some() {
+            crate::auto_unlock::record_flow_diagnostic(1, incoming_epoch.unwrap_or_default(), 0);
+            self.refresh_session_lock_before_focus_enter();
+        }
         self.cursor_inbound(peer, message, source);
         if let Some(epoch) = incoming_epoch {
             let focus = self.adapter.router().focus();
             if focus.epoch == epoch && focus.holder == self.local {
                 self.inject.crossing(epoch, true);
+                let (source_status, result) = match incoming_source {
+                    None => (1, Err(crate::auto_unlock::EntryRejection::Source)),
+                    Some(source) if source == self.local => (2, Err(crate::auto_unlock::EntryRejection::Source)),
+                    Some(source) if !self.adapter.attached(source) => {
+                        (3, Err(crate::auto_unlock::EntryRejection::NotAttached))
+                    }
+                    Some(source) => (4, self.auto_unlock.enter_with_reason(source, epoch, Instant::now())),
+                };
+                crate::auto_unlock::record_entry_gate_diagnostic(source_status, result.as_ref().err().copied());
+                crate::auto_unlock::record_flow_diagnostic(
+                    2,
+                    epoch,
+                    result.as_ref().err().map_or(0, |e| e.diagnostic_code()),
+                );
+                if result.is_ok()
+                    && let Some(source) = incoming_source
+                {
+                    crate::auto_unlock::record_flow_diagnostic(3, epoch, 0);
+                    self.send_from(source, Message::Control(ControlMsg::UnlockQuery { epoch }), None);
+                }
             }
         }
         self.outputs(source);
@@ -1657,6 +1805,16 @@ impl Driver {
         self.outputs_at(from, ModeDispatch::Queued);
     }
     fn outputs_at(&mut self, from: Option<DeviceId>, dispatch: ModeDispatch) {
+        if (self.paused || self.update_hold.is_some() || self.session_locked != Some(true))
+            && let Some(allowed) = &self.local_unlock_admission
+        {
+            allowed.store(false, Ordering::Release);
+        }
+        self.auto_unlock
+            .observe(self.session_locked, self.adapter.router().focus().holder, self.local);
+        if self.paused || self.update_hold.is_some() {
+            self.auto_unlock.cancel();
+        }
         self.cursor_scope();
         if dispatch == ModeDispatch::Callback {
             self.cursor.revision = self.cursor.revision.wrapping_add(1);
@@ -1744,13 +1902,7 @@ impl Driver {
             self.adapter.router_mut().set_input_suspended(true);
             outputs.extend(self.adapter.router_mut().drain_outputs());
         }
-        // Once confinement has entered this session's native FIFO, subsequent
-        // mode switches use that FIFO too; a callback must not overtake a clip
-        // release/resize that is still waiting on the injection worker.
-        self.queued_cursor_constraints |= outputs.iter().any(|o| matches!(o, Output::ConstrainCursor(_)));
-        let immediate_modes = dispatch != ModeDispatch::Queued
-            && self.snapshots.mode_switch_in_callback
-            && !self.queued_cursor_constraints;
+        let immediate_modes = dispatch != ModeDispatch::Queued && self.snapshots.mode_switch_in_callback;
         // Record only mode boundaries. An ordinary motion does not read the trace switch.
         for output in &outputs {
             if immediate_modes && let Some(trace) = &self.inject.trace {
@@ -1837,9 +1989,6 @@ impl Driver {
                     self.input_time,
                     self.input_report.take(),
                 ),
-                Output::ConstrainCursor(bounds) => self
-                    .inject
-                    .push_in_epoch(self.input_safety, InjectItem::ConstrainCursor(bounds)),
                 Output::SetMode(_) | Output::RestoreLocal { .. } if immediate_modes => {}
                 Output::SetMode(mode) => self.inject.push_in_epoch(self.input_safety, InjectItem::SetMode(mode)),
                 Output::RestoreLocal { at } => self
@@ -2320,6 +2469,39 @@ impl Driver {
     }
 }
 impl CaptureLoop for Driver {
+    fn injected_disable_release(&mut self, code: oink_foundation::input::KeyCode, pressed: bool) {
+        if !self.inject.backend().input_safety().accepts(self.input_safety) {
+            return;
+        }
+        self.now = Instant::now();
+        let now = self.micros();
+        self.adapter
+            .router_mut()
+            .observe_injected_disable_release(code, pressed, now);
+    }
+
+    fn release_local_key(&mut self, event: &CapturedEvent) -> bool {
+        if !self.inject.backend().input_safety().accepts(self.input_safety) {
+            return false;
+        }
+        self.now = Instant::now();
+        let now = self.micros();
+        self.adapter.at(now);
+        let captured = self.inject.trace.as_ref().and_then(|trace| trace.begin_capture());
+        if !self.adapter.router_mut().release_local_passed_key(event, now) {
+            return false;
+        }
+        if let Some(trace) = &self.inject.trace {
+            trace.finish_capture(event, captured, Disposition::Pass);
+        }
+        // The native hook still owns retirement of its press. Only wake the
+        // next safe turn; do not pump native mode/injection work inside here.
+        if let Some(wake) = self.shared.wake.get() {
+            wake();
+        }
+        true
+    }
+
     fn paused_hotkey(&self) -> Option<oink_input::capture_loop::ResumeHotkey> {
         self.resume_hotkey.filter(|_| self.paused && !self.stopping)
     }
@@ -2367,11 +2549,6 @@ impl CaptureLoop for Driver {
     fn keyboard_remote(&self) -> Option<bool> {
         let router = self.adapter.router();
         Some(router.focus().holder != self.local && !router.keyboard_local() && !router.paused())
-    }
-    fn constrained_cursor(&self) -> Option<oink_foundation::Point> {
-        (!self.paused)
-            .then(|| self.adapter.router().constrained_local_cursor())
-            .flatten()
     }
     fn mouse_disabled(&self) -> bool {
         !self.paused && self.adapter.router().mouse_disabled()

@@ -26,7 +26,7 @@ def bundle(cache: Path, payload: Path):
     relative = 'AudioPlugin/' + archive.name
     (payload / 'AudioPlugin').mkdir(exist_ok=True)
     shutil.copy2(archive, payload / relative)
-    # Shipped 0.2.2 updaters admit the vendor ZIP, but reject a separate script.
+    # The signed executables embed the runtime script; ship only the vendor ZIP.
     # The agent embeds/stages the installer; never alter the vendor archive.
     (payload / 'AudioPlugin/Microphone.ps1').unlink(missing_ok=True)
     return [relative]

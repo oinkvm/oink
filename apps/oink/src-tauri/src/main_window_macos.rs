@@ -43,7 +43,7 @@ fn accepts_pointer(frame: NSRect, point: NSPoint, fullscreen: bool) -> bool {
 fn sync_mouse_region(native: &NSWindow, captured: &Cell<bool>) {
     // A normal window stays ordered out while its DOM is prepared. Mouse
     // tracking must not make that hidden window interactive.
-    if !native.isVisible() {
+    if !native.isVisible() || native.alphaValue() == 0.0 {
         native.setIgnoresMouseEvents(true);
         return;
     }

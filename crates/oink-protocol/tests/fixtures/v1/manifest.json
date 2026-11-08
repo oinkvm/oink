@@ -81257,6 +81257,239 @@
       "file": "dto-ControlLocalClick.hex",
       "kind": "dto",
       "schema": "ControlLocalClick"
+    },
+    {
+      "expected": {
+        "uint": "30"
+      },
+      "file": "enum-LocalOption-30.hex",
+      "kind": "enum",
+      "schema": "LocalOption"
+    },
+    {
+      "capabilities": [
+        "oink.input/1",
+        "oink.auto-unlock/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          }
+        }
+      },
+      "file": "1303.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 3,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": "ControlUnlockQuery",
+      "type_id": 4867
+    },
+    {
+      "capabilities": [
+        "oink.input/1",
+        "oink.auto-unlock/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "1303-future.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 3,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": "ControlUnlockQuery",
+      "type_id": 4867
+    },
+    {
+      "capabilities": [
+        "oink.input/1",
+        "oink.auto-unlock/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          },
+          "2": {
+            "bool": false
+          }
+        }
+      },
+      "file": "1304.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 3,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": "ControlUnlockReply",
+      "type_id": 4868
+    },
+    {
+      "capabilities": [
+        "oink.input/1",
+        "oink.auto-unlock/1"
+      ],
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          },
+          "2": {
+            "bool": false
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "1304-future.hex",
+      "kind": "frame",
+      "routes": [
+        {
+          "extra_capabilities": [],
+          "kind": 3,
+          "transport": "Reliable"
+        }
+      ],
+      "schema": "ControlUnlockReply",
+      "type_id": 4868
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-ControlUnlockQuery.hex",
+      "kind": "dto",
+      "schema": "ControlUnlockQuery"
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          },
+          "2": {
+            "bool": false
+          },
+          "900": {
+            "map": {
+              "1": {
+                "uint": "18446744073709551615"
+              },
+              "2": {
+                "f32_bits": "3fa00000"
+              },
+              "3": {
+                "f64_bits": "c004000000000000"
+              },
+              "4": {
+                "list": [
+                  null,
+                  {
+                    "bytes": "00ff"
+                  },
+                  {
+                    "negative_argument": "18446744073709551615"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-ControlUnlockReply.hex",
+      "kind": "dto",
+      "schema": "ControlUnlockReply"
     }
   ],
   "frozen": false,
@@ -81269,5 +81502,5 @@
     "reliable_frame": 16384
   },
   "revision": "2026-10-15-ui-freeze",
-  "schema_sha256": "27942b8d9b41f1a11b26ba177f2e82ed0ccad2222796e57e205495aea4aecc0e"
+  "schema_sha256": "833f34b726faeae44be1df7afaf9f0695c6e3f2644d48413db0a06b60610f52d"
 }

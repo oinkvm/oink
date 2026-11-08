@@ -120,7 +120,10 @@ pub(crate) fn decode(bytes: &[u8], peer: &PeerAdmission, datagram: bool) -> v1::
             Ok(Decoded::Deferred(message))
         }
         _ if (0x0100..=0x010f).contains(&frame.header.type_id)
-            || matches!(frame.header.type_id, 0x1300 | 0x1301 | 0x1302 | 0x0111) =>
+            || matches!(
+                frame.header.type_id,
+                0x1300 | 0x1301 | 0x1302 | 0x1303 | 0x1304 | 0x0111
+            ) =>
         {
             control::decode(message).map(|value| Decoded::Packet(Packet::Control(value)))
         }
@@ -146,6 +149,7 @@ pub(crate) fn supported(message: &Packet, peer: &PeerAdmission) -> bool {
         Packet::Control(ControlMsg::GameMode { .. } | ControlMsg::SetGameMode { .. }) => "oink.input.relative/1",
         Packet::Control(ControlMsg::CursorTrail { .. } | ControlMsg::CursorTrailHandoff { .. }) => "oink.input.trail/1",
         Packet::Dnd(_) => "oink.drag/1",
+        Packet::Control(ControlMsg::UnlockQuery { .. } | ControlMsg::UnlockReply { .. }) => "oink.auto-unlock/1",
         Packet::Control(ControlMsg::LocalClick { .. }) => "oink.focus.local-click/1",
         Packet::Control(ControlMsg::MovePointer { .. }) => "oink.pointer.move/1",
         Packet::Control(ControlMsg::MovePointerEnter { .. }) => "oink.pointer.move-hidden/1",
@@ -414,6 +418,11 @@ mod dispatch_tests {
             locked: true,
         };
         vec![
+            ControlMsg::UnlockQuery { epoch: 1 },
+            ControlMsg::UnlockReply {
+                epoch: 1,
+                unlocked: true,
+            },
             ControlMsg::LocalClick {
                 epoch: 1,
                 holder: device,

@@ -3,7 +3,7 @@ import { Icon } from 'oink-ui';
 import type { ReactNode } from 'react';
 import type { Platform } from '../window/DesktopWindow';
 import { SHORTCUTS } from './Shortcuts';
-export type SectionId = 'general' | 'appearance' | 'layout' | 'input' | 'clipboard' | 'audio' | 'shortcuts' | 'permissions' | 'diagnostics';
+export type SectionId = 'general' | 'appearance' | 'layout' | 'input' | 'clipboard' | 'audio' | 'shortcuts' | 'tools' | 'permissions' | 'diagnostics';
 type Text = string | ((p: Platform) => string);
 export interface ItemMeta {
     id: string;
@@ -64,6 +64,9 @@ export const SECTIONS: SectionMeta[] = [
                 }, get desc() {
                     return tr('在其他设备上操作时，本机不会因为闲置而熄屏、锁屏');
                 }, get keywords() { return tr('休眠 熄屏 锁屏 唤醒 其它设备活动时，本机保持屏幕点亮 其他设备活动时，保持屏幕常亮'); } },
+            { id: 'autoUnlock', get label() { return tr('自动解锁本机'); },
+              get desc() { return tr('本机锁定时，从其它设备移入指针自动解锁。需要输入登录密码，密码加密储存在本地。'); },
+              get keywords() { return tr('解锁 锁屏 密码 登录 自动登录 自动解锁'); } },
             { id: 'confirmQuit', get label() {
                     return tr('退出前确认');
                 }, get desc() {
@@ -128,6 +131,7 @@ export const SECTIONS: SectionMeta[] = [
         items: [
             { id: 'manageLayouts', get label() { return tr('保存的布局'); }, get desc() { return tr('调整排列会自动保存到当前布局；切换布局会恢复它保存的排列'); }, get keywords() { return tr('布局 保存 切换 新建 重命名 删除 方案 预设 profile'); } },
             { id: 'syncSystemArrangement', get label() { return tr('允许修改本机系统屏幕排列'); }, get desc() { return tr('本机有多个屏幕时，在布局页进行的调整同步到系统屏幕排列'); }, get keywords() { return tr('显示器 屏幕 排列 系统设置 多屏 主屏 副屏 拼接 位置 允许 权限 同步调整系统屏幕排列 display arrangement'); } },
+            { id: 'disableHiddenDisplays', only: 'win', parent: 'syncSystemArrangement', get label() { return tr('在系统中禁用隐藏的屏幕'); }, get desc() { return tr('隐藏屏幕会同时在系统设置中禁用它，每台设备最后一块屏幕不会被禁用'); } },
             // Remote pointer speed: how fast other devices' pointers cross this computer's screens.
             { id: 'pointerGain', get label() {
                     return tr('被控时指针速度增益');
@@ -223,6 +227,11 @@ export const SECTIONS: SectionMeta[] = [
         },
         icon: <Icon name="command"/>,
         items: SHORTCUTS.map((s) => ({ id: `sc-${s.id}`, get label() { return s.label; }, get desc() { return s.desc; }, get keywords() { return `${tr('快捷键 热键')} ${s.keywords}`; } })),
+    },
+    {
+        id: 'tools', get title() { return tr('工具'); }, icon: <Icon name="settings"/>,
+        items: [{ id: 'pasteAsFile', get label() { return tr('在右键菜单添加“粘贴为文件”'); },
+            desc: p => p === 'mac' ? tr('复制图片、文本时，可在 Finder 中粘贴为文件') : tr('复制图片、文本时，可在资源管理器中粘贴为文件') }],
     },
     {
         id: 'permissions',
