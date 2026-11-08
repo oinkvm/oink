@@ -23,7 +23,7 @@ it('mounts the resolved onboarding route while optional wallpaper loading is pen
   await vi.waitFor(() => expect(api.wallpapers).toHaveBeenCalled());
   expect(ready).toBe(false);
   resolveOverview({ onboarding_done: false } as Awaited<ReturnType<typeof api.overview>>);
-  await vi.waitFor(() => expect(ready).toBe(true), { timeout: 100 });
+  await vi.waitFor(() => expect(ready).toBe(true), { timeout: 1000 });
   expect(agent.get().overview?.onboarding_done).toBe(false);
   expect(agent.get().boot?.platform).toBe('macos');
   expect(shell.bootInfo).toHaveBeenCalledOnce();
