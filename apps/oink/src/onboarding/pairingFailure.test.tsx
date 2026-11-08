@@ -11,6 +11,8 @@ import { usePairing } from '../pairing/usePairing';
 import { setLanguage } from '../i18n';
 import { Onboarding, type OnboardingProps } from './Onboarding';
 
+vi.mock('oink-ui', async original => ({ ...await original<typeof import('oink-ui')>(), speed: () => 0 }));
+
 const peer = { device: 'remote', name: 'Peer', os: 'macos', remote: { family: 0, address: [192, 0, 2, 1], port: 47470, interface_scope: 0 }, listen: null } satisfies PeerView;
 const failed: PairView = { id: 'pair', revision: '2', direction: 'outgoing', phase: 8,
   peer: { address: peer.remote, expected_id: peer.device, verified: null }, attempts_left: 3, feedback: 'waiting', terminal: pairProblem(4) };
