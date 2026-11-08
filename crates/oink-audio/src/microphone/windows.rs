@@ -292,8 +292,6 @@ pub(super) fn switch_default_input(expected: &str, replacement: &str) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn full_endpoint_name_survives_cpal_device_description() {
         let description = cpal::DeviceDescriptionBuilder::new("CABLE Output")
