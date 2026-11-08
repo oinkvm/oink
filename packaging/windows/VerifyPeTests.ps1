@@ -1,5 +1,8 @@
 # Exercise the real extraction function without invoking signing or an installer.
 $ErrorActionPreference='Stop'
+# The packaging child uses Windows PowerShell, possibly inherited from pwsh.
+# Load its own Utility module explicitly instead of relying on command discovery.
+Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Utility/Microsoft.PowerShell.Utility.psd1') -ErrorAction Stop
 $tokens=$null; $errors=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'verify.ps1'),[ref]$tokens,[ref]$errors)
 if($errors.Count){throw 'Verifier syntax invalid'}
